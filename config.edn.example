@@ -1,0 +1,94 @@
+;; dvergr configuration example
+;; Copy to config.local.edn and fill in your secrets.
+;; config.local.edn is gitignored — never commit it.
+
+{;; ============================================================
+ ;; Telegram
+ ;; ============================================================
+ :telegram {:token "YOUR_TELEGRAM_BOT_TOKEN"}
+
+ ;; ============================================================
+ ;; GitHub metrics
+ ;; Can also be set via GITHUB_DVERGR_TOKEN env var.
+ ;; Needs repo scope for traffic data on replikativ org repos.
+ ;; ============================================================
+ :github {:token "ghp_YOUR_TOKEN_HERE"}
+
+ ;; ============================================================
+ ;; Slack (personal user token — xoxp-...)
+ ;; Create app at https://api.slack.com/apps → From a manifest
+ ;; User token scopes (manifest oauth_config.scopes.user):
+ ;;   channels:history  channels:read   groups:history  groups:read
+ ;;   im:history        im:read         mpim:history    mpim:read
+ ;;   search:read       reactions:read
+ ;; Note: use search:read (not search:messages) in the manifest.
+ ;; No features/bot_user block needed — user token only app.
+ ;; Can also be set via SLACK_USER_TOKEN env var.
+ ;; ============================================================
+ :slack {:token "xoxp-YOUR_USER_TOKEN_HERE"}
+
+ ;; ============================================================
+ ;; Mail accounts (briefkasten IMAP/SMTP)
+ ;; Each key is an account identifier used by intake tools.
+ ;; ============================================================
+ :mail
+ {:datahike-contact
+  {:email     "admin@datahike.io"
+   :imap      {:host "mail.example.com" :port 993
+               :user "admin@datahike.io" :pass "YOUR_PASSWORD"}
+   :smtp      {:host "mail.example.com" :port 587
+               :user "admin@datahike.io" :pass "YOUR_PASSWORD"}
+   :data-path "/home/USER/.local/share/dvergr/mail/datahike-contact"}}
+
+ ;; ============================================================
+ ;; Agents
+ ;; Each key becomes the agent's :id in the registry.
+ ;; Profile markdown loaded from resources/agents/<id>.md
+ ;; ============================================================
+ :agents
+ {:var       {:provider    :fireworks
+              :model       "accounts/fireworks/models/minimax-m2p5"
+              :tags        #{:secretary}
+              :description "Primary interface — chat and task routing"}
+
+  :huginn    {:provider    :fireworks
+              :model       "accounts/fireworks/models/minimax-m2p5"
+              :tags        #{:intake}
+              :interval-ms 3600000  ;; 1h production; 300000 for testing (5 min)
+              :budget-dollars 1.0
+              :max-turns   20
+              :description "Intake monitor — watches all channels"}
+
+  :muninn    {:provider    :fireworks
+              :model       "accounts/fireworks/models/minimax-m2p5"
+              :tags        #{:analytics}
+              :description "Analyst and memory keeper — predictions and reports"}
+
+  :skald     {:provider    :fireworks
+              :model       "accounts/fireworks/models/minimax-m2p5"
+              :tags        #{:content}
+              :description "Content creator and community voice"}
+
+  :volva     {:provider    :fireworks
+              :model       "accounts/fireworks/models/minimax-m2p5"
+              :tags        #{:strategy}
+              :description "Strategist — launch sequencing and priorities"}
+
+  :runa      {:provider    :fireworks
+              :model       "accounts/fireworks/models/minimax-m2p5"
+              :tags        #{:technical}
+              :description "Technical authority — precise answers on all products"}}
+
+ ;; ============================================================
+ ;; Access control
+ ;; Telegram user objects: {:id 123456 :username "handle"}
+ ;; ============================================================
+ :allowed-users []
+
+ ;; Default agent for new Telegram sessions
+ :default-agent :var
+
+ ;; ============================================================
+ ;; HTTP server (optional)
+ ;; ============================================================
+ :http {:port 8080}}

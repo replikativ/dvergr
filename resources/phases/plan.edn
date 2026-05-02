@@ -1,0 +1,6 @@
+{:id :plan
+ :tools #{:read_file :glob :grep :knowledge_add :budget}
+ :system-prompt-suffix "Write a step-by-step implementation plan based on your exploration. Output a clear, structured plan as your final response. Do NOT make code changes."
+ :completion-criteria :explicit
+ :output-as :artifact
+ :context-strategy :incremental}

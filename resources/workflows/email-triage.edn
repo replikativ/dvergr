@@ -1,0 +1,6 @@
+{:id :email-triage-workflow
+ :description "Triage incoming emails, draft responses for urgent items, present for approval."
+ :phases [:email-triage]
+ :triggers {:schedule {:interval-minutes 30
+                       :agent-id :ops
+                       :task "Run email triage workflow: check inbox, classify emails by urgency, draft responses for high-priority items."}}}

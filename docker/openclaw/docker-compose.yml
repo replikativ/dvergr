@@ -1,0 +1,79 @@
+# Dvergr + OpenClaw development environment
+#
+# Usage:
+#   ./docker/openclaw/dev.sh build    # First time: build images
+#   ./docker/openclaw/dev.sh up       # Start gateway
+#   ./docker/openclaw/dev.sh test     # Run a test agent task
+#   ./docker/openclaw/dev.sh shell    # Shell into the container
+#   ./docker/openclaw/dev.sh logs     # Tail gateway logs
+#   ./docker/openclaw/dev.sh down     # Stop everything
+#
+# Architecture:
+#   - OpenClaw gateway runs in container (isolated from host)
+#   - Config dir bind-mounted: edit openclaw.json5 on host, restart to pick up
+#   - dvergr-mcp.jar bind-mounted: rebuild jar on host, restart to pick up
+#   - Workspace bind-mounted: inspect agent work on host
+#   - dvergr data bind-mounted: inspect datahike state on host
+
+services:
+  openclaw-gateway:
+    image: dvergr-openclaw:dev
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
+      FIREWORKS_API_KEY: ${FIREWORKS_API_KEY}
+    volumes:
+      # Config: bind-mounted so edits on host take effect on restart
+      - ./config:/home/node/.openclaw
+      # Workspace: bind-mounted for host inspection of agent work
+      - ./workspace:/home/node/.openclaw/workspace
+      # dvergr-mcp uberjar: rebuild on host, restart container to pick up
+      - ${DVERGR_MCP_JAR}:/opt/dvergr/dvergr-mcp.jar:ro
+      # dvergr data dir: datahike storage, inspectable from host
+      - ./data:/opt/dvergr/data
+    ports:
+      - "${OPENCLAW_GATEWAY_PORT:-18789}:18789"
+    init: true
+    restart: unless-stopped
+    mem_limit: 4g
+    pids_limit: 512
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    command:
+      [
+        "node",
+        "dist/index.js",
+        "gateway",
+        "--bind",
+        "lan",
+        "--port",
+        "18789",
+      ]
+
+  # One-shot CLI for running agent tasks and management commands
+  openclaw-cli:
+    image: dvergr-openclaw:dev
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
+      BROWSER: echo
+      FIREWORKS_API_KEY: ${FIREWORKS_API_KEY}
+    volumes:
+      - ./config:/home/node/.openclaw
+      - ./workspace:/home/node/.openclaw/workspace
+      - ${DVERGR_MCP_JAR}:/opt/dvergr/dvergr-mcp.jar:ro
+      - ./data:/opt/dvergr/data
+    stdin_open: true
+    tty: true
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    entrypoint: ["node", "dist/index.js"]

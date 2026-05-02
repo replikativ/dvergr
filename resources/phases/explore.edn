@@ -1,0 +1,5 @@
+{:id :explore
+ :tools #{:read_file :glob :grep :web_search :knowledge_search :datalog_query :code_query :budget}
+ :system-prompt-suffix "Focus on reading and understanding the codebase. Do NOT make any changes yet — only explore and gather information."
+ :completion-criteria :signal
+ :context-strategy :incremental}

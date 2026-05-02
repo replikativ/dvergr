@@ -1,0 +1,122 @@
+{:paths ["src" "resources"]
+
+ :deps {;; Explicit local override to resolve spindel's transitive dep conflict
+        is.simm/partial-cps       {:local/root "../partial-cps"}
+
+        org.clojure/clojure       {:mvn/version "1.12.0"}
+
+        ;; HTTP client for provider APIs
+        hato/hato                  {:mvn/version "1.0.0"}
+
+        ;; JSON encoding/decoding
+        metosin/jsonista           {:mvn/version "0.3.8"}
+
+        ;; Schema validation
+        metosin/malli              {:mvn/version "0.16.4"}
+
+        ;; File system utilities
+        babashka/fs {:mvn/version "0.5.21"}
+
+        ;; Time handling
+        clojure.java-time/clojure.java-time {:mvn/version "1.4.2"}
+
+        ;; ANSI colors for REPL output
+        io.aviso/pretty            {:mvn/version "1.4.4"}
+
+        ;; Async utilities
+        org.clojure/core.async     {:mvn/version "1.6.681"}
+
+        ;; SCI - Small Clojure Interpreter for sandboxing
+        org.babashka/sci           {:local/root "../sci"}
+
+        ;; Spindel - Reactive runtime with CoW forking
+        is.simm/spindel            {:local/root "../spindel"}
+
+        ;; rewrite-clj for structural editing
+        rewrite-clj/rewrite-clj    {:mvn/version "1.1.48"}
+
+        ;; Datahike for persistent storage
+        org.replikativ/datahike    {:local/root "../datahike"}
+
+        ;; Yggdrasil for CoW branching
+        ;; Same group-id as scriptum's transitive dep so local/root overrides it
+        org.replikativ/yggdrasil   {:local/root "../yggdrasil"}
+
+        ;; tools.analyzer for code indexing
+        org.clojure/tools.analyzer.jvm {:mvn/version "1.3.0"}
+
+        ;; Paren repair utilities (from clojure-mcp, EPL-2.0)
+        borkdude/edamame               {:mvn/version "1.5.35"}
+        org.clojars.oakes/parinfer     {:mvn/version "0.4.0"}
+
+        ;; clj-kondo for linting
+        clj-kondo/clj-kondo            {:local/root "../clj-kondo"}
+
+        ;; Email channel: IMAP reading + SMTP sending
+        io.forward/clojure-mail        {:mvn/version "1.0.8"}
+        com.draines/postal             {:mvn/version "2.0.5"}
+
+        ;; Scriptum — COW Lucene indices for fulltext search
+        org.replikativ/scriptum        {:local/root "../scriptum"}
+
+        ;; Briefkasten — local IMAP mirror with datahike + scriptum
+        org.replikativ/briefkasten     {:local/root "../briefkasten"}
+
+        ;; Kabel — WebSocket peer-to-peer transport (for distributed agents)
+        org.replikativ/kabel            {:local/root "../kabel"}
+        org.replikativ/hasch            {:local/root "../hasch"}
+        org.replikativ/incognito        {:local/root "../incognito"}
+        org.replikativ/konserve         {:local/root "../konserve"}
+
+        ;; Distributed-scope — remote function invocation over kabel
+        is.simm/distributed-scope      {:local/root "../distributed-scope"}
+
+        ;; Kabel auth — authentication middleware
+        org.replikativ/kabel-auth       {:local/root "../kabel-auth"}
+
+        ;; Supervision for go-super
+        org.replikativ/superv.async     {:local/root "../superv.async"}
+
+        ;; HTTP-kit for kabel WebSocket server + dvergr web dashboard
+        http-kit/http-kit              {:mvn/version "2.8.0"}
+
+        ;; Hiccup for HTML generation (dashboard + agent web UIs)
+        hiccup/hiccup                  {:mvn/version "2.0.0"}
+
+        ;; Structured logging
+        com.taoensso/telemere          {:mvn/version "1.2.1"}}
+
+ :aliases
+ {:dev  {:extra-paths ["dev" "test" "src-tui"]
+         :extra-deps  {nrepl/nrepl {:mvn/version "1.3.0"}
+                       cider/cider-nrepl {:mvn/version "0.50.2"}
+                       org.replikativ/spindel-tui {:local/root "../spindel-tui"}}}
+
+  :test {:extra-paths ["test"]
+         :extra-deps  {lambdaisland/kaocha {:mvn/version "1.91.1392"}}
+         :main-opts   ["-m" "kaocha.runner"]}
+
+  :repl {:main-opts ["-m" "nrepl.cmdline"
+                     "--middleware" "[cider.nrepl/cider-middleware]"
+                     "--interactive"]}
+
+  ;; Local development with sibling projects
+  :local {:extra-deps {org.replikativ/datahike {:local/root "../datahike"}
+                       org.replikativ/scriptum {:local/root "../scriptum"}
+                       org.replikativ/yggdrasil {:local/root "../yggdrasil"}
+                       org.replikativ/spindel {:local/root "../spindel"}}}
+
+  ;; MCP server for exposing dvergr capabilities to OpenClaw/Claude Code
+  :mcp-server {:main-opts ["-m" "dvergr.mcp.server"]}
+
+  ;; Dashboard TUI (spindel-tui + nREPL)
+  :dashboard {:extra-paths ["src-tui"]
+              :extra-deps {org.replikativ/spindel-tui {:local/root "../spindel-tui"}
+                           nrepl/nrepl {:mvn/version "1.3.0"}}
+              ;; Suppress JVM module-system warnings from Lucene native access
+              :jvm-opts ["--enable-native-access=ALL-UNNAMED"]
+              :main-opts ["-m" "dvergr.main"]}
+
+  ;; Build uberjar for MCP server distribution
+  :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.5"}}
+          :ns-default build}}}

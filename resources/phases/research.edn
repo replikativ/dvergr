@@ -1,0 +1,8 @@
+{:id :research
+ :tools #{:read_file :glob :grep :web_search :web_fetch :knowledge_search :knowledge_add :budget
+          :hn_top :hn_search :lobsters_top :reddit_top :reddit_search
+          :devto_top :github_trending :github_releases :github_search
+          :mastodon_trending :bluesky_search}
+ :system-prompt-suffix "Research the topic thoroughly. Search the web, read documentation, and build knowledge. Summarize your findings clearly."
+ :completion-criteria :explicit
+ :context-strategy :incremental}

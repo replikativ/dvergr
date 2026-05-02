@@ -1,0 +1,42 @@
+# Clojure
+.cpcache/
+.nrepl-port
+.lsp/
+.clj-kondo/.cache/
+target/
+pom.xml
+*.jar
+*.class
+
+# REPL logs
+nrepl.log
+.nrepl.log
+repl.log
+
+# Dvergr data (sessions, web-pages, etc.)
+data/
+.worktrees/
+.git-worktrees/
+
+# Test data (optional - uncomment if you don't want to track)
+# test-data/
+
+# Editor files
+.DS_Store
+*~
+*.swp
+*.swo
+.#*
+\#*\#
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Internal working docs (design drafts, experiments, research)
+.internal/
+.datahike
+
+# Local config — contains secrets, never commit
+config.local.edn

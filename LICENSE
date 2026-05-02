@@ -1,0 +1,46 @@
+# Dvergr License
+
+## Dual License
+
+Dvergr is dual-licensed to allow both open source and commercial use.
+
+### For Open Source Use
+
+Licensed under the **Eclipse Public License v2.0 (EPL-2.0)**
+
+See EPL-2.0-LICENSE.txt for full license text.
+
+### For Commercial/Proprietary Use
+
+Commercial license available from Christian Weilbach.
+
+Contact: christian.weilbach@gmail.com
+
+---
+
+## Third-Party Components
+
+### Pattern Matching Code (EPL-2.0 only)
+
+The following files contain code adapted from **clojure-mcp**:
+
+- `src/dvergr/sexp/match.clj`
+- `src/dvergr/sexp/paren_utils.clj`
+- `src/dvergr/tools/paren_repair.clj`
+
+**Original Source**: https://github.com/bhauman/clojure-mcp
+**Copyright**: (c) Bruce Hauman and clojure-mcp contributors
+**License**: Eclipse Public License v2.0
+
+These files are licensed under EPL-2.0 **only** and are NOT covered by the commercial license option.
+
+See THIRD-PARTY-LICENSES.md for details and full license texts.
+
+---
+
+## Copyright Notice
+
+Copyright (c) 2026 Christian Weilbach
+
+Licensed under Eclipse Public License v2.0 for open source use.
+Commercial license available separately.

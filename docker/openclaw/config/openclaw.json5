@@ -1,0 +1,78 @@
+// OpenClaw configuration for dvergr-mcp integration testing
+// This file is injected into the container at setup time.
+//
+// Fireworks.ai is configured as an OpenAI-compatible custom provider.
+// dvergr-mcp is configured as an MCP tool server (stdio transport).
+{
+  gateway: {
+    mode: "local",
+    port: 18789,
+    bind: "lan",
+    auth: {
+      mode: "token"
+      // Token provided via OPENCLAW_GATEWAY_TOKEN env var
+    }
+  },
+
+  agents: {
+    defaults: {
+      workspace: "~/.openclaw/workspace",
+      model: {
+        // Use a cheap Fireworks model for testing
+        primary: "fireworks/qwen3-coder-480b-a35b-instruct"
+      }
+    }
+  },
+
+  // Configure Fireworks.ai as custom OpenAI-compatible provider
+  models: {
+    mode: "merge",
+    providers: {
+      fireworks: {
+        baseUrl: "https://api.fireworks.ai/inference/v1",
+        apiKey: "${FIREWORKS_API_KEY}",
+        api: "openai-completions",
+        models: [
+          {
+            id: "qwen3-coder-480b-a35b-instruct",
+            name: "Qwen3 Coder 480B (Fireworks)",
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0.90, output: 0.90, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 40000,
+            maxTokens: 16384
+          },
+          {
+            id: "kimi-k2-instruct",
+            name: "Kimi K2 Instruct (Fireworks)",
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0.90, output: 0.90, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 131072,
+            maxTokens: 32768
+          },
+          {
+            id: "deepseek-v3",
+            name: "DeepSeek V3 (Fireworks)",
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0.90, output: 0.90, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 131072,
+            maxTokens: 32768
+          }
+        ]
+      }
+    }
+  },
+
+  // dvergr-mcp as MCP tool server
+  mcpServers: {
+    dvergr: {
+      command: "java",
+      args: ["-jar", "/opt/dvergr/dvergr-mcp.jar"],
+      env: {
+        DVERGR_DATA_DIR: "/opt/dvergr/data"
+      }
+    }
+  }
+}
