@@ -125,15 +125,23 @@
        (try (eval-code ctx code)
             (finally (cancel!))))"
   [timeout-ms]
-  (let [target   (Thread/currentThread)
-        done?    (atom false)
+  (let [target     (Thread/currentThread)
+        cancelled? (atom false)
+        ;; Set true when the watchdog actually fired its interrupt (as
+        ;; opposed to being cancelled by `cancel!` after a clean
+        ;; completion). Callers use this to distinguish a
+        ;; watchdog-caused InterruptedException from one with another
+        ;; origin, so the timeout can be surfaced clearly rather than
+        ;; as a bare InterruptedException.
+        fired?     (atom false)
         watchdog (doto (Thread.
                          ^Runnable
                          (fn []
                            (try
                              (Thread/sleep (long timeout-ms))
                              ;; Timeout elapsed — signal the eval thread unless cancelled
-                             (when-not @done?
+                             (when-not @cancelled?
+                               (reset! fired? true)
                                (.interrupt target))
                              (catch InterruptedException _
                                ;; Watchdog interrupted by cancel! — exit quietly
@@ -142,8 +150,9 @@
                    (.setDaemon true)
                    .start)]
     {:cancel! (fn []
-                (reset! done? true)
-                (.interrupt watchdog))}))
+                (reset! cancelled? true)
+                (.interrupt watchdog))
+     :fired?  (fn [] @fired?)}))
 
 ;; ---------------------------------------------------------------------------
 ;; IO Audit Log + Policies
@@ -370,7 +379,7 @@
           stderr      (StringWriter.)
           eval-future (future
                         ;; Watchdog starts here on the eval thread
-                        (let [{:keys [cancel!]} (make-timeout timeout-ms)]
+                        (let [{:keys [cancel! fired?]} (make-timeout timeout-ms)]
                           (try
                             (sci/binding [sci/out stdout sci/err stderr]
                               (let [result (sci/eval-string* sci-ctx code)]
@@ -380,24 +389,55 @@
                               ;; Catch Throwable so JVM Errors (StackOverflowError,
                               ;; OutOfMemoryError) also produce a structured result
                               ;; rather than crashing the future unhandled.
-                              {:error {:message (.getMessage e)
-                                       :type     (str (class e))
-                                       :data     (when (instance? clojure.lang.ExceptionInfo e)
-                                                   (ex-data e))
-                                       :stacktrace (when (instance? Exception e)
-                                                     (sci/stacktrace e))}
-                               :stdout (str stdout)
-                               :stderr (str stderr)
-                               :success false})
+                              ;;
+                              ;; If the watchdog fired, the exception is the
+                              ;; downstream effect of Thread.interrupt() —
+                              ;; surface it as a CLEAN timeout error rather
+                              ;; than a confusing bare InterruptedException
+                              ;; (or whatever the interrupted op raised),
+                              ;; matching the layer-2 outer-fence message.
+                              ;; Otherwise the eval-thread inner catch (the
+                              ;; watchdog path through @spin / LockSupport)
+                              ;; would surface to the agent as e.g. "sleep
+                              ;; interrupted / InterruptedException" and the
+                              ;; agent has to GUESS it was a timeout.
+                              (if (fired?)
+                                {:error   {:message (str "Timed out after " timeout-ms "ms"
+                                                         " — your code likely got stuck"
+                                                         " (a (spin …) that never resolved,"
+                                                         " an infinite loop, or oversized"
+                                                         " inference). Try fewer particles,"
+                                                         " bound your loops, or check for"
+                                                         " hung @spin / await.")
+                                           :type    "TimeoutException"
+                                           :data    {:timeout-ms timeout-ms
+                                                     :cause :watchdog-interrupt}}
+                                 :stdout  (str stdout)
+                                 :stderr  (str stderr)
+                                 :success false}
+                                {:error {:message (.getMessage e)
+                                         :type     (str (class e))
+                                         :data     (when (instance? clojure.lang.ExceptionInfo e)
+                                                     (ex-data e))
+                                         :stacktrace (when (instance? Exception e)
+                                                       (sci/stacktrace e))}
+                                 :stdout (str stdout)
+                                 :stderr (str stderr)
+                                 :success false}))
                             (finally
                               ;; Always cancel the watchdog when eval finishes
                               (cancel!)))))]
       ;; Outer fence: generous buffer beyond the inner watchdog
       (let [result (deref eval-future (+ timeout-ms 5000) ::timed-out)]
         (if (= result ::timed-out)
-          {:error   {:message (str "Timed out after " timeout-ms "ms (non-interruptible)")
+          {:error   {:message (str "Timed out after " timeout-ms "ms"
+                                   " (the eval thread didn't respond to"
+                                   " interruption — likely a non-interruptible"
+                                   " blocking syscall). Avoid uninterruptible"
+                                   " blocking IO and bound long computations.")
                      :type    "TimeoutException"
-                     :data    {:timeout-ms timeout-ms}}
+                     :data    {:timeout-ms timeout-ms
+                               :cause :outer-fence-non-interruptible}}
            :stdout  (str stdout)
            :stderr  (str stderr)
            :success false}

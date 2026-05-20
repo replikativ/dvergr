@@ -375,6 +375,13 @@
    - You can require namespaces
    - Changes don't affect other sessions
 
+   Execution budget: a 60-second hard timeout applies to each call. If
+   you exceed it the tool returns a TimeoutException with a hint about
+   likely causes (hung @spin, infinite loop, oversized inference). Keep
+   loops bounded; for inference use modest particle counts (e.g. 50–200)
+   and prefer loop/recur/dotimes over map/for/repeatedly for iterated
+   sample/observe.
+
    Use this to:
    - Test Clojure code snippets
    - Perform calculations
@@ -391,9 +398,18 @@
               ;; Native mode: use real Clojure eval
               (if (= :native isolation)
                 (native-eval code eval-ns)
-                ;; SCI mode: use sandboxed eval
+                ;; SCI mode: use sandboxed eval.
+                ;;
+                ;; Hard timeout: a hung eval (e.g. `@(spin …)` on a spin
+                ;; that never resolves) parks a core.async dispatch
+                ;; thread forever. Core.async's dispatch pool is fixed
+                ;; (≈8 threads); a handful of hung evals deadlocks it
+                ;; and the entire agent system hangs. The watchdog in
+                ;; sandbox/eval-code interrupts the eval thread after
+                ;; the timeout and returns an error result, freeing
+                ;; the dispatch thread.
                 (if sci-ctx
-                  (let [result (sandbox/eval-code sci-ctx code)]
+                  (let [result (sandbox/eval-code sci-ctx code :timeout-ms 60000)]
                     (if (:success result)
                       {:type :success
                        :content (str "=> " (pr-str (:value result))

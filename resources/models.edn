@@ -1,16 +1,37 @@
 ;; Dvergr Model Registry
 ;; Edit this file to add/modify models without changing source code.
-;; Loaded at startup via (registry/load-models-resource!)
+;; Loaded at startup via (registry/load-models-resource!).
+;;
+;; Availability verified 2026-05-15 via direct chat-completion probes
+;; (the /v1/models endpoint under-reports on this account). Models that
+;; return HTTP 404 "Model not found, inaccessible, and/or not deployed"
+;; are intentionally absent: kimi-k2-thinking, glm-5, qwen3-8b.
 
 {:models
  {;; ── Fireworks (OpenAI-compatible) ──────────────────────────────────────────
+
+  ;; ─── Kimi family ───────────────────────────────────────────────────────────
+
+  "accounts/fireworks/models/kimi-k2p6"
+  {:name "Kimi K2.6"
+   :provider :fireworks
+   :api-type :openai-chat
+   :capabilities #{:tools :streaming}
+   :context 262144
+   :max-output 8192
+   :pricing {:input 0.95 :cache-read 0.10 :output 4.00}
+   ;; Kimi family on Fireworks: temperature fixed at 1.0 (immutable),
+   ;; top_p default 0.95; same tool-id quirks as K2.5.
+   :quirks {:tool-id-in-every-chunk? true
+            :kimi-tool-id-format? true
+            :default-top-p 0.95}}
 
   "accounts/fireworks/models/kimi-k2p5"
   {:name "Kimi K2.5"
    :provider :fireworks
    :api-type :openai-chat
    :capabilities #{:tools :streaming}
-   :context 131072
+   :context 262144
    :max-output 8192
    :pricing {:input 0.60 :cache-read 0.10 :output 3.00}
    ;; K2.5 requires temperature=1.0 (immutable on Fireworks), top_p=0.95
@@ -18,19 +39,29 @@
             :kimi-tool-id-format? true
             :default-top-p 0.95}}
 
-  "accounts/fireworks/models/kimi-k2-thinking"
-  {:name "Kimi K2 Thinking"
+  ;; ─── GLM ───────────────────────────────────────────────────────────────────
+
+  "accounts/fireworks/models/glm-5p1"
+  {:name "GLM 5.1"
    :provider :fireworks
    :api-type :openai-chat
-   :capabilities #{:tools :streaming :thinking}
-   :context 131072
+   :capabilities #{:tools :streaming}
+   :context 202752
    :max-output 8192
-   :pricing {:input 0.60 :cache-read 0.10 :output 2.40}
-   ;; K2 thinking requires temperature=1.0 (immutable on Fireworks), top_p=0.95
-   :quirks {:tool-id-in-every-chunk? true
-            :kimi-tool-id-format? true
-            :default-top-p 0.95
-            :thinking-in-content? true}}
+   :pricing {:input 1.40 :cache-read 0.20 :output 4.40}
+   :quirks {}}
+
+  ;; ─── MiniMax (cheap, tool-capable — the default for primary + compaction) ──
+
+  "accounts/fireworks/models/minimax-m2p7"
+  {:name "MiniMax M2.7"
+   :provider :fireworks
+   :api-type :openai-chat
+   :capabilities #{:tools :streaming}
+   :context 196608
+   :max-output 8192
+   :pricing {:input 0.30 :cache-read 0.03 :output 1.20}
+   :quirks {}}
 
   "accounts/fireworks/models/minimax-m2p5"
   {:name "MiniMax M2.5"
@@ -42,17 +73,35 @@
    :pricing {:input 0.30 :cache-read 0.03 :output 1.20}
    :quirks {}}
 
-  "accounts/fireworks/models/glm-5"
-  {:name "GLM-5"
+  ;; ─── Qwen ──────────────────────────────────────────────────────────────────
+
+  "accounts/fireworks/models/qwen3p6-plus"
+  {:name "Qwen3.6 Plus"
    :provider :fireworks
    :api-type :openai-chat
    :capabilities #{:tools :streaming}
    :context 131072
    :max-output 8192
-   :pricing {:input 1.00 :cache-read 0.20 :output 3.20}
+   :pricing {:input 0.50 :output 3.00}
    :quirks {}}
 
-  ;; ── Cheaper models for summarization, classification, stats ─────────────────
+  ;; ─── DeepSeek (1M context, worth knowing about) ────────────────────────────
+  ;; Add a confirmed cache-read price once Fireworks publishes one.
+
+  "accounts/fireworks/models/deepseek-v4-pro"
+  {:name "DeepSeek V4 Pro"
+   :provider :fireworks
+   :api-type :openai-chat
+   :capabilities #{:tools :streaming}
+   :context 1048576
+   :max-output 8192
+   :pricing {}
+   :quirks {}}
+
+  ;; ─── Cheapest open-source — summarization, classification, stats ──────────
+  ;; Both still hosted as of 2026-05-15; gpt-oss-20b is cheapest, 120b is
+  ;; the smarter version for the same role. Uses internal "thinking" tokens
+  ;; — keep max-tokens >= 200 for reliable observable output.
 
   "accounts/fireworks/models/gpt-oss-20b"
   {:name "GPT-OSS 20B"
@@ -61,36 +110,38 @@
    :capabilities #{:streaming}
    :context 131072
    :max-output 8192
-   ;; Cheapest available on Fireworks at time of testing (2026-02-22)
-   ;; Note: uses thinking tokens internally; use max-tokens >= 200 for actual output
    :pricing {:input 0.07 :output 0.30}
    :quirks {}}
 
-  "accounts/fireworks/models/qwen3-8b"
-  {:name "Qwen3 8B"
+  "accounts/fireworks/models/gpt-oss-120b"
+  {:name "GPT-OSS 120B"
    :provider :fireworks
    :api-type :openai-chat
    :capabilities #{:streaming}
-   :context 40960
-   :max-output 4096
-   ;; Flat $0.20/M in+out; uses thinking tokens internally
-   :pricing {:input 0.20 :output 0.20}
+   :context 131072
+   :max-output 8192
+   :pricing {:input 0.15 :output 0.60}
    :quirks {}}
 
   }
 
  :aliases
- {"kimi"       "accounts/fireworks/models/kimi-k2p5"
-  "minimax"    "accounts/fireworks/models/minimax-m2p5"
-  "glm"        "accounts/fireworks/models/glm-5"
-  "gpt-oss"    "accounts/fireworks/models/gpt-oss-20b"
-  "qwen3-8b"   "accounts/fireworks/models/qwen3-8b"}
+ {"kimi"        "accounts/fireworks/models/kimi-k2p6"
+  "kimi-k2p5"   "accounts/fireworks/models/kimi-k2p5"
+  "glm"         "accounts/fireworks/models/glm-5p1"
+  "minimax"     "accounts/fireworks/models/minimax-m2p7"
+  "minimax-m2p5" "accounts/fireworks/models/minimax-m2p5"
+  "qwen"        "accounts/fireworks/models/qwen3p6-plus"
+  "deepseek"    "accounts/fireworks/models/deepseek-v4-pro"
+  "gpt-oss"     "accounts/fireworks/models/gpt-oss-20b"
+  "gpt-oss-120b" "accounts/fireworks/models/gpt-oss-120b"}
 
  ;; ── Defaults ────────────────────────────────────────────────────────────────
+ ;; Keeping MiniMax as primary + compaction — cheapest tool-capable option
+ ;; at $0.30 in / $1.20 out, bumped to the latest M2.7. gpt-oss-20b stays
+ ;; the cheapest one-off summary model.
 
  :defaults
- {:compaction-model "accounts/fireworks/models/minimax-m2p5"
-  :primary-model    "accounts/fireworks/models/minimax-m2p5"
-  ;; Cheapest available model for one-off summaries / stats (no streaming, low volume)
-  ;; Uses thinking tokens; max-tokens should be >= 200 for reliable output
+ {:compaction-model "accounts/fireworks/models/minimax-m2p7"
+  :primary-model    "accounts/fireworks/models/minimax-m2p7"
   :summary-model    "accounts/fireworks/models/gpt-oss-20b"}}
