@@ -55,15 +55,14 @@
    Roles reduce the tool schema sent to the LLM (fewer input tokens)
    and prevent unintended actions."
   {:researcher   #{"read_file" "glob" "grep" "datalog_query" "knowledge_search"
-                   "web_search" "web_fetch" "clojure_eval" "repl_history" "code_query"
-                   "fulltext_search"}
+                   "clojure_eval" "repl_history" "code_query" "fulltext_search"}
    :coder        #{"read_file" "write_file" "edit_file" "clojure_edit" "glob"
                    "grep" "shell" "clojure_eval" "datalog_query" "run_tests"
                    "code_query" "repl_history" "clj_kondo"}
    :reviewer     #{"read_file" "glob" "grep" "datalog_query" "code_query"
                    "clojure_eval" "repl_history" "clj_kondo"}
    :planner      #{"read_file" "glob" "grep" "datalog_query" "knowledge_search"
-                   "web_search" "web_fetch" "request_plan_review"}
+                   "request_plan_review"}
    :unrestricted nil})
 
 (defn tools-for-role
@@ -1272,163 +1271,6 @@ Note: changes take effect on the next agent restart or reload."
                                    "\nChanges take effect on next daemon restart or profile reload.")})
                   (catch Exception e
                     {:type :error :error (str "Failed to write profile: " (.getMessage e))}))))})
-
-;; ---------------------------------------------------------------------------
-;; Web Search Tools
-;; ---------------------------------------------------------------------------
-
-;; Lazy require to avoid loading at compile time
-(defn- web-search-ns []
-  (require 'dvergr.web.search)
-  (find-ns 'dvergr.web.search))
-
-(register!
-  {:name "web_search"
-   :description "Search the web using Brave Search API.
-
-   Use this to find current information, documentation, tutorials, or research topics.
-   Results are stored in the knowledge graph for future reference and can be fetched
-   for full content.
-
-   Options:
-   - query: Search query (required)
-   - count: Number of results (1-50, default 5)
-   - freshness: Time filter - pd (24h), pw (week), pm (month), py (year)
-   - store: Whether to store results in knowledge graph (default true)
-
-   Returns search results with titles, URLs, and descriptions.
-   Use web_fetch to get full content of interesting results.
-
-   Example: Search for Clojure async libraries
-   {\"query\": \"clojure core.async tutorial\", \"count\": 10}
-
-   Example: Find recent news
-   {\"query\": \"clojure 2024 news\", \"freshness\": \"pm\", \"count\": 5}"
-   :parameters {:type "object"
-                :properties {:query {:type "string"
-                                     :description "Search query"}
-                             :count {:type "integer"
-                                     :description "Number of results (1-50, default 5)"}
-                             :freshness {:type "string"
-                                         :enum ["pd" "pw" "pm" "py"]
-                                         :description "Freshness filter: pd=24h, pw=week, pm=month, py=year"}
-                             :store {:type "boolean"
-                                     :description "Store results in knowledge graph (default true)"}}
-                :required ["query"]}
-   :execute (fn [{:keys [query count freshness store]} {:keys [db-conn]}]
-              (try
-                (let [ws-ns (web-search-ns)
-                      search! (ns-resolve ws-ns 'search!)
-                      result (search! db-conn query
-                                      :count (or count 5)
-                                      :freshness freshness
-                                      :store? (if (some? store) store true))]
-                  (if (:success result)
-                    {:type :success
-                     :content (str "Search results for: " query "\n"
-                                   "Found " (clojure.core/count (:results result)) " results"
-                                   (when (:stored result)
-                                     (str " (stored " (:stored result) " in knowledge graph)"))
-                                   "\n\n"
-                                   (str/join "\n\n"
-                                     (map-indexed
-                                       (fn [i r]
-                                         (str (inc i) ". " (:title r) "\n"
-                                              "   URL: " (:url r) "\n"
-                                              "   " (:description r)
-                                              (when (:age r)
-                                                (str "\n   Age: " (:age r)))))
-                                       (:results result))))
-                     :metadata {:query query
-                                :result-count (clojure.core/count (:results result))
-                                :stored (:stored result)
-                                :results (:results result)}}
-                    {:type :error
-                     :error (:error result)
-                     :body (:body result)}))
-                (catch Exception e
-                  {:type :error
-                   :error (str "Web search failed: " (.getMessage e))})))})
-
-(register!
-  {:name "web_fetch"
-   :description "Fetch and optionally summarize web page content.
-
-   Use this after web_search to get full content from interesting results.
-   Pages are stored locally with content-addressable hashing (deduplication)
-   and indexed in the knowledge graph with freshness timestamps.
-
-   Options:
-   - url: URL to fetch (required)
-   - summarize: Generate AI summary (default false)
-   - prompt: Custom summarization prompt (uses default if not provided)
-   - store: Store in knowledge graph (default true)
-   - extract_text: Strip HTML tags (default true)
-
-   Returns the page content, optional summary, and file path where stored.
-   Summaries include [[wiki-links]] for key concepts.
-
-   Example: Fetch and summarize documentation
-   {\"url\": \"https://clojure.org/guides/async\", \"summarize\": true}
-
-   Example: Fetch with custom prompt
-   {\"url\": \"https://example.com/api\",
-    \"summarize\": true,
-    \"prompt\": \"Extract the API endpoints and their parameters\"}"
-   :parameters {:type "object"
-                :properties {:url {:type "string"
-                                   :description "URL to fetch"}
-                             :summarize {:type "boolean"
-                                         :description "Generate AI summary (default false)"}
-                             :prompt {:type "string"
-                                      :description "Custom summarization prompt"}
-                             :store {:type "boolean"
-                                     :description "Store in knowledge graph (default true)"}
-                             :extract_text {:type "boolean"
-                                            :description "Strip HTML tags (default true)"}}
-                :required ["url"]}
-   :execute (fn [{:keys [url summarize prompt store extract_text]} {:keys [db-conn]}]
-              (try
-                (let [ws-ns (web-search-ns)
-                      fetch! (ns-resolve ws-ns 'fetch!)
-                      result (fetch! db-conn url
-                                     :summarize? (boolean summarize)
-                                     :prompt prompt
-                                     :store? (if (some? store) store true)
-                                     :extract-text? (if (some? extract_text) extract_text true))]
-                  (if (:success result)
-                    (let [content (:content result)
-                          ;; Truncate content for display if too long
-                          display-content (if (> (count content) 10000)
-                                            (str (subs content 0 10000)
-                                                 "\n\n[Content truncated, "
-                                                 (count content) " chars total]")
-                                            content)]
-                      {:type :success
-                       :content (str "Fetched: " url "\n"
-                                     (when (:title result)
-                                       (str "Title: " (:title result) "\n"))
-                                     (when (:file-path result)
-                                       (str "Stored at: " (:file-path result) "\n"))
-                                     (when (:content-hash result)
-                                       (str "Hash: " (subs (:content-hash result) 0 12) "...\n"))
-                                     "\n"
-                                     (when (:summary result)
-                                       (str "=== Summary ===\n" (:summary result) "\n\n"))
-                                     "=== Content ===\n"
-                                     display-content)
-                       :metadata {:url url
-                                  :title (:title result)
-                                  :file-path (:file-path result)
-                                  :content-hash (:content-hash result)
-                                  :content-length (count content)
-                                  :summarized (boolean (:summary result))}})
-                    {:type :error
-                     :error (:error result)
-                     :url url}))
-                (catch Exception e
-                  {:type :error
-                   :error (str "Web fetch failed: " (.getMessage e))})))})
 
 ;; ---------------------------------------------------------------------------
 ;; Code Linting Tools

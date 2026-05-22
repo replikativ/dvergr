@@ -32,13 +32,6 @@
             [dvergr.chat.context :as chat-ctx]
             [dvergr.tools :as tools]
             [dvergr.web.server :as web-server]
-            [dvergr.web.intake :as web-intake]
-            [dvergr.web.rooms]
-            [dvergr.web.proposals]
-            [dvergr.web.entities]
-            [dvergr.web.feed]
-            [dvergr.web.conversations]
-            [dvergr.web.chat]
             [dvergr.scheduler.core :as scheduler]
             [dvergr.calendar.core :as cal]
             [dvergr.calendar.schema :as cal-schema]
@@ -979,13 +972,7 @@
       (bus/init! exec-ctx)
       (when-let [sys (rtc/get-state [:external-refs "dvergr-chat-db"])]
         (stats/init! (:conn sys))
-        (dvergr.web.wiki/init! (:conn sys))
         (rooms/init! (:conn sys))
-        (dvergr.web.rooms/init! (:conn sys))
-        (dvergr.web.proposals/init! (:conn sys))
-        (dvergr.web.entities/init! (:conn sys))
-        (dvergr.web.feed/init! (:conn sys))
-        (dvergr.web.conversations/init! (:conn sys))
 
         ;; Auto-create boardroom room (idempotent)
         (when-not (rooms/get-room-by-slug (:conn sys) "boardroom")
@@ -1012,13 +999,10 @@
                :type  :internal})
             (tel/log! {:id :daemon/intel-room-created :data {:slug slug}} "Created intel room")))
 
-        ;; Initialize web intake handler with shared datahike
-        (web-intake/init! (:conn sys))
 
         ;; Calendar: install schema, init web module, sync iCal feeds, start dispatcher
         (try
           (cal/install-schema! (:conn sys))
-          (dvergr.web.calendar/init! (:conn sys))
           (tel/log! {:id :daemon/calendar-schema-installed} "Calendar schema installed")
           ;; Start iCal sync loop if configured
           (when-let [feeds (get-in config [:calendar :ical-feeds])]

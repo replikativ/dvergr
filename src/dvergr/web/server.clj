@@ -15,17 +15,9 @@
             [clojure.string :as str]
             [dvergr.registry :as registry]
             [dvergr.stats :as stats]
-            [dvergr.web.wiki :as wiki]
-            [dvergr.web.rooms :as web-rooms]
-            [dvergr.web.proposals :as web-proposals]
-            [dvergr.web.entities :as web-entities]
-            [dvergr.web.feed :as web-feed]
+            [dvergr.web.dashboard :as web-dashboard]
             [dvergr.web.agents :as web-agents]
-            [dvergr.web.chat :as web-chat]
-            [dvergr.web.conversations :as web-convos]
-            [dvergr.web.calendar :as web-calendar]
-            [dvergr.web.intake :as web-intake]
-            [dvergr.web.search-ui :as web-search]))
+            [dvergr.web.chat :as web-chat]))
 
 ;; ============================================================================
 ;; State
@@ -199,59 +191,35 @@
 (defn- root-handler [daemon req]
   (let [uri (:uri req)]
     (cond
-      ;; Calendar
-      (= uri "/calendar")                 (html-response 200 (web-calendar/calendar-page))
-      (str/starts-with? uri "/api/calendar/") (web-calendar/api-handler req)
-
-      ;; CORS preflight for extension
-      (and (= :options (:request-method req))
-           (str/starts-with? uri "/api/intake/"))
-      (web-intake/handle-cors-preflight req)
-
-      ;; Page intake from browser extension
-      (and (= uri "/api/intake/page") (= :post (:request-method req)))
-      (web-intake/handle-page-intake req)
-
       ;; API routes
       (= uri "/api/health")               (api-health req daemon)
       (= uri "/api/agents")               (api-agents req daemon)
       (str/starts-with? uri "/api/agents/") (handle-agent-api req daemon)
       (= uri "/api/schedules")            (api-schedules req daemon)
-      (= uri "/api/feed")                  (web-feed/api-feed req)
-      (= uri "/api/rooms")                (web-rooms/api-rooms req)
 
-      ;; Chat messages API (before /api/chat catch-all)
+      ;; Chat messages API
       (and (str/starts-with? uri "/api/chat/")
            (str/ends-with? uri "/messages"))
-      (let [;; /api/chat/var/messages → var
-            path-part (subs uri (count "/api/chat/"))  ;; "var/messages"
+      (let [path-part (subs uri (count "/api/chat/"))
             agent-id-str (subs path-part 0 (str/index-of path-part "/"))]
         (web-chat/api-chat-messages req daemon agent-id-str))
 
-      ;; Homepage = feed (/ and /dashboard and /feed all serve the feed)
-      (or (= uri "/") (= uri "/dashboard") (= uri "/feed"))
-      (html-response 200 (web-feed/feed-page (:query-string req)))
+      ;; Homepage / ops dashboard
+      (or (= uri "/") (= uri "/dashboard"))
+      (html-response 200 (web-dashboard/dashboard-page))
 
-      ;; Agent list (must come before /agents/:id dispatch)
+      ;; Agent list
       (= uri "/agents")
       (html-response 200 (web-agents/agents-list-page))
 
       ;; Agent UI dispatch
       (str/starts-with? uri "/agents/")    (dispatch-agent-ui req)
 
-      ;; Conversations
-      (= uri "/conversations")
-      (html-response 200 (web-convos/conversations-list-page (:query-string req)))
-      (str/starts-with? uri "/conversations/")
-      (let [chat-id-str (subs uri (count "/conversations/"))]
-        (html-response 200 (web-convos/conversation-detail-page chat-id-str (:query-string req))))
-
       ;; Chat send (POST /chat/:agent-id/send)
       (and (str/starts-with? uri "/chat/")
            (str/ends-with? uri "/send")
            (= :post (:request-method req)))
-      (let [;; /chat/var/send → var
-            path-part (subs uri (count "/chat/"))  ;; "var/send"
+      (let [path-part (subs uri (count "/chat/"))
             agent-id-str (subs path-part 0 (str/index-of path-part "/"))]
         (web-chat/handle-send req daemon agent-id-str))
 
@@ -260,47 +228,6 @@
            (= :get (:request-method req)))
       (let [agent-id-str (subs uri (count "/chat/"))]
         (web-chat/chat-page req daemon agent-id-str))
-
-      ;; Entities
-      (= uri "/entities")                   (let [params (some-> (:query-string req)
-                                                                  (str/split #"&")
-                                                                  (->> (keep #(when (str/starts-with? % "type=")
-                                                                                (keyword (subs % 5))))
-                                                                       first))]
-                                             (html-response 200 (web-entities/entities-list-page params)))
-      (str/starts-with? uri "/entities/")  (let [encoded (subs uri (count "/entities/"))
-                                                 title   (java.net.URLDecoder/decode encoded "UTF-8")]
-                                             (html-response 200 (web-entities/entity-detail-page title)))
-
-      ;; Search
-      (= uri "/search")                    (html-response 200 (web-search/search-page (:query-string req)))
-
-      ;; Wiki
-      (= uri "/wiki")                      (html-response 200 (wiki/wiki-list-page))
-      (str/starts-with? uri "/wiki/")      (let [encoded (subs uri (count "/wiki/"))
-                                                 title   (java.net.URLDecoder/decode encoded "UTF-8")]
-                                             (html-response 200 (wiki/wiki-entry-page title)))
-
-      ;; Rooms
-      (= uri "/rooms")                     (html-response 200 (web-rooms/rooms-list-page))
-      (str/starts-with? uri "/rooms/")     (let [slug (subs uri (count "/rooms/"))]
-                                             (html-response 200 (web-rooms/room-detail-page slug)))
-
-      ;; Proposals
-      (= uri "/proposals")               (html-response 200 (web-proposals/proposals-list-page))
-      (and (str/starts-with? uri "/proposals/")
-           (str/ends-with? uri "/accept")
-           (= :post (:request-method req)))
-      (let [pid (subs uri (count "/proposals/") (- (count uri) (count "/accept")))]
-        (web-proposals/handle-accept pid))
-      (and (str/starts-with? uri "/proposals/")
-           (str/ends-with? uri "/reject")
-           (= :post (:request-method req)))
-      (let [pid (subs uri (count "/proposals/") (- (count uri) (count "/reject")))]
-        (web-proposals/handle-reject pid))
-      (str/starts-with? uri "/proposals/")
-      (let [pid (subs uri (count "/proposals/"))]
-        (html-response 200 (web-proposals/proposal-detail-page pid)))
 
       :else                                (json-response 404 {:error "Not found"}))))
 

@@ -517,10 +517,6 @@
 ;; Full Schema
 ;; ============================================================================
 
-;; Web schema is defined in dvergr.web.search namespace
-;; and should be installed separately or included via:
-;; (require '[dvergr.web.search :as web])
-;; (web/install-web-schema! conn)
 
 ;; ============================================================================
 ;; Ledger Schema (detailed cost tracking with numéraire conversion)
@@ -929,8 +925,7 @@
 ;; ============================================================================
 
 (def full-schema
-  "Complete chat schema for dvergr.
-   Note: Web schema (web-result, web-page) is in dvergr.web.search."
+  "Complete chat schema for dvergr."
   (vec (concat chat-schema
                participant-schema
                message-schema
@@ -975,16 +970,6 @@
     ;; Install all tool schemas from registry
     (when-let [registry (get-tool-registry)]
       (tool-schema/install-all-tool-schemas! conn registry))
-    ;; Install web search schema
-    (try
-      (require 'dvergr.web.search)
-      (let [ws-ns (find-ns 'dvergr.web.search)
-            install-web-schema! (ns-resolve ws-ns 'install-web-schema!)]
-        (when install-web-schema!
-          (install-web-schema! conn)))
-      (catch Exception e
-        ;; Web search is optional, don't fail if not available
-        nil))
     conn))
 
 (defn ensure-full-schema!
@@ -1006,16 +991,6 @@
   ;; Install all tool schemas from registry
   (when-let [registry (get-tool-registry)]
     (tool-schema/install-all-tool-schemas! conn registry))
-  ;; Install web search schema
-  (try
-    (require 'dvergr.web.search)
-    (let [ws-ns (find-ns 'dvergr.web.search)
-          install-web-schema! (ns-resolve ws-ns 'install-web-schema!)]
-      (when install-web-schema!
-        (install-web-schema! conn)))
-    (catch Exception e
-      ;; Web search is optional
-      nil))
   ;; Install knowledge schema (for compaction note creation)
   (try
     (require 'dvergr.knowledge.schema)
