@@ -14,7 +14,8 @@
    Standalone:
      java -jar dvergr-mcp.jar --stdio          # stdio mode
      java -jar dvergr-mcp.jar --port 17888     # TCP mode"
-  (:require [dvergr.mcp.json-rpc :as json-rpc]
+  (:require [clojure.string :as str]
+            [dvergr.mcp.json-rpc :as json-rpc]
             [jsonista.core :as json])
   (:import (java.net ServerSocket Socket)
            (java.io BufferedReader InputStreamReader BufferedWriter OutputStreamWriter))
@@ -36,6 +37,16 @@
 
 ;; Atom of {agent-id-kw -> Agent}. Server-level state shared across connections.
 (defonce agent-registry (atom {}))
+
+;; Optional datahike connection — set by dvergr.daemon via set-db-conn!
+;; Enables memory_query / memory_transact / memory_history tools.
+(defonce server-db-conn (atom nil))
+
+(defn set-db-conn!
+  "Wire the daemon's datahike connection into the MCP server.
+   Call this after daemon start so memory_* tools have access."
+  [conn]
+  (reset! server-db-conn conn))
 
 ;; ============================================================================
 ;; Tool definitions — dynamic atom for hot-swap and agent-created tools
@@ -127,7 +138,104 @@
               (control {:cmd :stop}))
             (swap! agent-registry dissoc agent-id)
             {:content [{:type "text" :text (str "Agent stopped and removed: " (name agent-id))}]
-             :isError false}))))}))
+             :isError false}))))
+
+    "runtime_list"
+    (fn [_context _arguments]
+      (let [agents @agent-registry]
+        {:content [{:type "text"
+                    :text (str "MCP server — active agents (" (count agents) "):\n"
+                               (if (seq agents)
+                                 (str/join "\n"
+                                   (map (fn [[id ag]]
+                                          (str "  " (name id) ": "
+                                               (name (get @(:state-a ag) :status :unknown))))
+                                        agents))
+                                 "  (none)")
+                               "\ndb-conn: " (if @server-db-conn "connected" "not configured"))}]
+         :isError false}))
+
+    "repl_eval"
+    (fn [_context arguments]
+      (let [code (:code arguments)
+            ns-str (or (:namespace arguments) "user")
+            timeout-ms (or (:timeout_ms arguments) 30000)]
+        (try
+          (let [ns-sym (symbol ns-str)
+                the-ns (or (find-ns ns-sym) (create-ns ns-sym))
+                out (java.io.StringWriter.)
+                result-p (future
+                           (binding [*out* out *ns* the-ns]
+                             (eval (read-string code))))
+                result (deref result-p timeout-ms ::timeout)]
+            (if (= result ::timeout)
+              (do (future-cancel result-p)
+                  {:content [{:type "text"
+                               :text (str "Evaluation timed out after " timeout-ms "ms")}]
+                   :isError true})
+              {:content [{:type "text"
+                          :text (str (let [s (str out)] (when (seq s) (str "Output:\n" s "\n")))
+                                     "=> " (pr-str result))}]
+               :isError false}))
+          (catch Exception e
+            {:content [{:type "text" :text (str "Error: " (.getMessage e))}]
+             :isError true}))))
+
+    "memory_query"
+    (fn [_context arguments]
+      (if-let [conn @server-db-conn]
+        (try
+          (require 'datahike.api)
+          (let [d-q (ns-resolve (find-ns 'datahike.api) 'q)
+                query (read-string (:query arguments))
+                extra-args (mapv read-string (or (:args arguments) []))
+                result (apply d-q query @conn extra-args)]
+            {:content [{:type "text" :text (pr-str result)}]
+             :isError false})
+          (catch Exception e
+            {:content [{:type "text" :text (str "Query error: " (.getMessage e))}]
+             :isError true}))
+        {:content [{:type "text"
+                    :text "No database connection. Call set-db-conn! or start via daemon."}]
+         :isError true}))
+
+    "memory_transact"
+    (fn [_context arguments]
+      (if-let [conn @server-db-conn]
+        (try
+          (require 'datahike.api)
+          (let [d-transact! (ns-resolve (find-ns 'datahike.api) 'transact!)
+                tx-data (read-string (:tx_data arguments))
+                result (d-transact! conn tx-data)]
+            {:content [{:type "text"
+                        :text (str "Transaction complete. tx-id: " (:db/current-tx result))}]
+             :isError false})
+          (catch Exception e
+            {:content [{:type "text" :text (str "Transaction error: " (.getMessage e))}]
+             :isError true}))
+        {:content [{:type "text"
+                    :text "No database connection. Call set-db-conn! or start via daemon."}]
+         :isError true}))
+
+    "memory_history"
+    (fn [_context arguments]
+      (if-let [conn @server-db-conn]
+        (try
+          (require 'datahike.api)
+          (let [d-q (ns-resolve (find-ns 'datahike.api) 'q)
+                d-history (ns-resolve (find-ns 'datahike.api) 'history)
+                entity-id (:entity_id arguments)
+                attr (keyword (str/replace (str (:attribute arguments)) #"^:" ""))
+                result (d-q '[:find ?v ?tx :in $ ?e ?a :where [?e ?a ?v ?tx true]]
+                            (d-history @conn) entity-id attr)]
+            {:content [{:type "text" :text (pr-str (sort-by second result))}]
+             :isError false})
+          (catch Exception e
+            {:content [{:type "text" :text (str "History error: " (.getMessage e))}]
+             :isError true}))
+        {:content [{:type "text"
+                    :text "No database connection. Call set-db-conn! or start via daemon."}]
+         :isError true}))}))
 
 (def tool-definitions
   "Atom of tool definition vectors. Dynamic for agent-created tools and REPL hot-swap."
