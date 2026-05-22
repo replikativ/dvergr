@@ -165,7 +165,7 @@
   {:pre [(keyword? agent-id)
          (string? task)
          (or (pos-int? interval-ms) (map? schedule))]}
-  (let [schedule-id (UUID/randomUUID)
+  (let [schedule-id (or (:id config) (UUID/randomUUID))
         full-config (assoc config :id schedule-id)
         exec-ctx (or (when daemon (:execution-ctx daemon))
                      rtc/*execution-context*)
@@ -196,18 +196,20 @@
                      (.println *err* (str "dvergr-scheduler: schedule error " schedule-id ": " e))
                      (.flush *err*))))))
 
-    ;; Track in active-schedules
+    ;; Track in active-schedules (store db-conn for cancel-schedule! to deactivate)
     (swap! active-schedules assoc schedule-id
-           {:spin nil :config full-config})
+           {:spin nil :config full-config :db-conn db-conn})
 
     (println "[scheduler] Created schedule:" schedule-id
              "- every" (/ interval-ms 60000.0) "min →" (name agent-id))
     schedule-id)))
 
 (defn cancel-schedule!
-  "Cancel an active schedule."
+  "Cancel an active schedule and mark it inactive in datahike."
   [schedule-id]
   (when-let [entry (get @active-schedules schedule-id)]
+    (when-let [db-conn (:db-conn entry)]
+      (deactivate-schedule! db-conn schedule-id))
     (swap! active-schedules dissoc schedule-id)
     (println "[scheduler] Cancelled schedule:" schedule-id)
     :cancelled))
@@ -235,7 +237,8 @@
     (when-let [db-conn (some-> exec-ctx deref :db-conn)]
       (let [saved (load-active-schedules db-conn)]
         (doseq [s saved]
-          (let [config (cond-> {:agent-id    (:schedule/agent-id s)
+          (let [config (cond-> {:id          (:schedule/id s)
+                                :agent-id    (:schedule/agent-id s)
                                 :task        (:schedule/task s)
                                 :description (:schedule/description s)}
                          (:schedule/interval-ms s)
