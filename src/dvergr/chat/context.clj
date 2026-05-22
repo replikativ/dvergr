@@ -547,14 +547,28 @@
    :spindel-snapshot (ctx/serialize-context (:spindel-ctx chat-ctx))})
 
 (defn restore-chat
-  "Restore chat from snapshot.
+  "Restore chat from a snapshot produced by snapshot-chat.
 
-   Note: This creates a new chat context, doesn't modify existing."
-  [snapshot]
-  ;; Implementation would deserialize spindel context
-  ;; and recreate chat context
-  ;; For now, just placeholder
-  (throw (ex-info "restore-chat not yet implemented" {:snapshot snapshot})))
+   Creates a fresh ChatContext with a new spindel execution context,
+   then loads messages, budget, and status from the snapshot.
+   The spindel context is not deserialized — only the data is restored.
+
+   Returns the restored ChatContext."
+  [{:keys [chat-id title messages budget status] :as snapshot}]
+  (let [chat-ctx (create-chat-context
+                  {:title (or title "Restored chat")
+                   :budget (or (:total budget) (* 1000000 1))})]
+    ;; Restore messages
+    (when (seq messages)
+      (replace-messages! chat-ctx messages))
+    ;; Restore budget (overwrite the fresh budget with saved state)
+    (when budget
+      (binding [rtc/*execution-context* (:spindel-ctx chat-ctx)]
+        (reset! (:budget-signal chat-ctx) budget)))
+    ;; Restore status
+    (when (and status (not= status :active))
+      (set-status! chat-ctx status))
+    chat-ctx))
 
 (comment
   ;; Example usage:
