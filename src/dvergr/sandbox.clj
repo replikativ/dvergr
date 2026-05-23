@@ -1783,48 +1783,6 @@
                          'raw  hiccup/raw})))
 
 ;; ---------------------------------------------------------------------------
-;; Trial App Integration
-;; ---------------------------------------------------------------------------
-
-(defn add-trial-app-ns!
-  "Add trial app namespace to SCI context.
-
-   Exposes the core app functions so agents can use natural Clojure:
-   - (require 'app) in SCI, then
-   - (app/list-notes), (app/search! \"query\"), etc.
-
-   This avoids the need for wrapper tools - agents can compose
-   function calls naturally.
-
-   Note: The app must be initialized before calling this.
-   The functions use YggRef so they automatically work with
-   forked datahike in agent contexts."
-  [sci-ctx]
-  ;; Require the app namespace at runtime to avoid circular deps
-  (require 'dvergr.trial.app)
-  (let [app-ns (find-ns 'dvergr.trial.app)
-        ;; Get the public functions we want to expose
-        list-notes (ns-resolve app-ns 'list-notes)
-        search! (ns-resolve app-ns 'search!)
-        create-note! (ns-resolve app-ns 'create-note!)
-        get-note (ns-resolve app-ns 'get-note)
-        update-note! (ns-resolve app-ns 'update-note!)
-        delete-note! (ns-resolve app-ns 'delete-note!)
-        activity-summary (ns-resolve app-ns 'activity-summary)
-        detect-patterns (ns-resolve app-ns 'detect-patterns)
-        activity (ns-resolve app-ns 'activity)]
-    (sci/add-namespace! sci-ctx 'app
-                        {'list-notes @list-notes
-                         'search! @search!
-                         'create-note! @create-note!
-                         'get-note @get-note
-                         'update-note! @update-note!
-                         'delete-note! @delete-note!
-                         'activity-summary @activity-summary
-                         'detect-patterns @detect-patterns
-                         'activity @activity})))
-
-;; ---------------------------------------------------------------------------
 ;; Context Manipulation
 ;; ---------------------------------------------------------------------------
 
