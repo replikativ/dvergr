@@ -226,6 +226,32 @@
   (swap! (:participants room) dissoc participant-id)
   nil)
 
+(defn close-room!
+  "Tear down a room: deregister every participant and stop the room's
+   execution context. The context's drain thread (a virtual thread on
+   JDK 21+, see spindel.engine.context) exits and any in-flight drain
+   completes before this returns.
+
+   Use this when a room's lifecycle is bounded — tests, the daemon's
+   shutdown path, an MCP session ending — so the room doesn't depend on
+   GC running before the JVM reclaims its resources. Closing a fork is
+   a no-op for the context (forks share the parent's drain); only the
+   participants atom is cleared.
+
+   No-op on already-closed rooms."
+  [room]
+  (when room
+    (reset! (:participants room) {})
+    (let [ctx (:ctx room)]
+      ;; stop-context! only does work on root contexts; forks share the
+      ;; parent's drain thread and treat this as a no-op.
+      (when ctx
+        (when-let [stop! (try (requiring-resolve
+                                'org.replikativ.spindel.engine.context/stop-context!)
+                              (catch Exception _ nil))]
+          (stop! ctx)))))
+  nil)
+
 ;; ============================================================================
 ;; Drivers — §5.5 (multi-channel event sources alongside the inbox)
 ;;

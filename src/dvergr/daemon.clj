@@ -1397,6 +1397,15 @@
   ;; Unregister execution context
   (sdist/unregister-context! :default)
 
+  ;; Tear down the discourse room — clears participants, stops the
+  ;; spindel ExecutionContext drain thread. Without this, dvergr tests
+  ;; (or any short-lived embedding) accumulate one drain thread per
+  ;; start!/stop! cycle. Virtual-thread-backed since spindel 0.1.10, so
+  ;; the leak is invisible — but explicit teardown is the right contract.
+  (when-let [room (:discourse-room daemon)]
+    (try (d/close-room! room)
+         (catch Exception _)))
+
   (reset! (:status daemon) :stopped)
   (reset! current-daemon nil)
   (tel/log! {:id :daemon/stopped} "Daemon stopped")
