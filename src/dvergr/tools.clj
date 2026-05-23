@@ -1571,16 +1571,20 @@ Note: changes take effect on the next agent restart or reload."
 
 ;; ---------------------------------------------------------------------------
 ;; Agent Spawning Tool
+;;
+;; spawn_agent delegates a one-shot task to a sub-agent that runs in a forked
+;; dvergr.discourse room — auto-merges on success. For deferred human review,
+;; use propose_change instead.
 ;; ---------------------------------------------------------------------------
 
-;; Lazy require agent primitives to avoid circular deps
-(defn- agent-primitives-ns []
-  (require 'dvergr.agent.task)
-  (find-ns 'dvergr.agent.task))
+(defn- discourse-hire []
+  (requiring-resolve 'dvergr.discourse/hire))
 
-(defn- agent-config-ns []
-  (require 'dvergr.agent.config)
-  (find-ns 'dvergr.agent.config))
+(defn- llm-agent []
+  (requiring-resolve 'dvergr.discourse.llm/llm-agent))
+
+(defn- current-daemon []
+  (some-> (requiring-resolve 'dvergr.daemon/current-daemon) deref deref))
 
 (defn- load-agent-profile
   "Load a markdown agent profile from resources/agents/<name>.md."
@@ -1592,9 +1596,9 @@ Note: changes take effect on the next agent restart or reload."
   {:name "spawn_agent"
    :description "Spawn a sub-agent to handle a delegated task.
 
-   The sub-agent runs in a forked execution context (isolated git branch,
-   separate datahike) and returns its result. The parent agent can review
-   the output before deciding whether to merge or discard changes.
+   The sub-agent runs in a forked dvergr.discourse room (substrate-fork
+   coming with Open Q #11; today only the room log is isolated). The
+   reply is auto-merged into the parent room and returned as text.
 
    Use this to delegate sub-tasks to specialized agents.
 
@@ -1603,10 +1607,6 @@ Note: changes take effect on the next agent restart or reload."
    - profile: Agent profile name — loads system prompt from resources/agents/<profile>.md
               Available: 'worker' (default), 'developer' (dvergr self-programming), 'planner'
    - budget: Budget in dollars for the sub-agent (default: 0.50)
-   - phases: Optional list of phase names to run as a workflow.
-             Available phases: 'explore', 'plan', 'implement', 'verify', 'research'
-             When provided, the agent runs through each phase sequentially with
-             per-phase tool narrowing and automatic self-check on verify phases.
 
    Returns the sub-agent's final text response.
 
@@ -1614,64 +1614,52 @@ Note: changes take effect on the next agent restart or reload."
    {\"task\": \"Research Clojure transducers and write a summary\"}
 
    Example: Delegate with developer profile
-   {\"task\": \"Add a new tool that counts lines of code\", \"profile\": \"developer\", \"budget\": 1.0}
-
-   Example: Delegate with workflow phases
-   {\"task\": \"Implement feature X\", \"phases\": [\"explore\", \"implement\", \"verify\"], \"budget\": 1.0}"
+   {\"task\": \"Add a new tool that counts lines of code\", \"profile\": \"developer\", \"budget\": 1.0}"
    :parameters {:type "object"
                 :properties {:task {:type "string"
                                     :description "Task description for the sub-agent"}
                              :profile {:type "string"
                                        :description "Agent profile: worker (default), developer, planner"}
                              :budget {:type "number"
-                                      :description "Budget in dollars (default 0.50)"}
-                             :phases {:type "array"
-                                      :items {:type "string"}
-                                      :description "Workflow phases: explore, plan, implement, verify, research"}}
+                                      :description "Budget in dollars (default 0.50)"}}
                 :required ["task"]}
-   :execute (fn [{:keys [task profile budget phases]} {:keys [execution-ctx chat-ctx]}]
+   :execute (fn [{:keys [task profile budget]} {:keys [execution-ctx]}]
               (try
-                (let [prim-ns (agent-primitives-ns)
-                      cfg-ns (agent-config-ns)
-                      ask! (ns-resolve prim-ns 'ask!)
-                      extract-result (ns-resolve prim-ns 'extract-result)
-                      make-agent (ns-resolve cfg-ns 'make-agent)
-
+                (let [hire         (discourse-hire)
+                      make-worker  (llm-agent)
+                      daemon       (current-daemon)
+                      room         (:discourse-room daemon)
+                      ctx          (or execution-ctx (:execution-ctx daemon))
                       profile-name (or profile "worker")
-                      system-prompt (or (load-agent-profile profile-name)
-                                       "You are a capable AI worker. Complete the given task thoroughly.")
+                      prompt-text  (or (load-agent-profile profile-name)
+                                       "You are a capable AI worker. Complete the given task thoroughly.")]
+                  (cond
+                    (nil? room)
+                    {:type :error
+                     :error "spawn_agent requires a running daemon (no discourse room)."}
 
-                      agent-cfg (make-agent
-                                  {:name (str profile-name "-sub")
-                                   :provider :fireworks
-                                   :model "accounts/fireworks/models/qwen3-coder-480b-a35b-instruct"
-                                   :isolation :sci
-                                   :system-prompt system-prompt})
+                    (nil? ctx)
+                    {:type :error
+                     :error "No execution context available. spawn_agent requires a spindel runtime."}
 
-                      ;; Use provided execution context, or current binding
-                      ctx (or execution-ctx
-                             (try
-                               (require 'org.replikativ.spindel.engine.core)
-                               @(ns-resolve (find-ns 'org.replikativ.spindel.engine.core)
-                                            '*execution-context*)
-                               (catch Exception _ nil)))]
-
-                  (if ctx
-                    (let [result (binding [rtc/*execution-context* ctx]
-                                  @(ask! agent-cfg task
-                                         (cond-> {:budget-dollars (or budget 0.50)
-                                                  :parent-chat-ctx chat-ctx}
-                                           (seq phases)
-                                           (assoc :workflow (mapv keyword phases)))))
-                          text (extract-result result)]
+                    :else
+                    (let [worker (binding [rtc/*execution-context* ctx]
+                                   (make-worker
+                                     {:id     (keyword (str profile-name "-sub"))
+                                      :spec   {:provider      :fireworks
+                                               :model         "accounts/fireworks/models/qwen3-coder-480b-a35b-instruct"
+                                               :system-prompt prompt-text}
+                                      :budget {:dollars (or budget 0.50)}
+                                      :ctx    ctx}))
+                          outcome (binding [rtc/*execution-context* ctx]
+                                    @(hire room worker {:goal task}))
+                          reply   (:reply outcome)
+                          text    (str (:content reply))]
                       {:type :success
                        :content (str "Sub-agent (" profile-name ") result:\n\n" text)
                        :metadata {:profile profile-name
-                                  :status (:status result)
-                                  :turns (:turns result)
-                                  :agent (:agent result)}})
-                    {:type :error
-                     :error "No execution context available. spawn_agent requires a spindel runtime."}))
+                                  :status  (:status outcome)
+                                  :agent   (:id worker)}})))
                 (catch Exception e
                   {:type :error
                    :error (str "spawn_agent failed: " (.getMessage e))})))})
@@ -1686,12 +1674,6 @@ Note: changes take effect on the next agent restart or reload."
 ;; already resolves agent.task).
 (defn- proposals-propose! []
   (requiring-resolve 'dvergr.proposals/propose!))
-
-(defn- llm-agent []
-  (requiring-resolve 'dvergr.discourse.llm/llm-agent))
-
-(defn- current-daemon []
-  (some-> (requiring-resolve 'dvergr.daemon/current-daemon) deref deref))
 
 (register!
   {:name "propose_change"

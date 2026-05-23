@@ -260,58 +260,67 @@
 
 ;; ============================================================================
 ;; Integration Tests — require FIREWORKS_API_KEY
+;;
+;; These exercise end-to-end delegation against the live Fireworks API; the
+;; legacy versions used dvergr.agent.task primitives, the current versions
+;; use dvergr.discourse + dvergr.discourse.llm/llm-agent + dvergr.discourse/hire.
+;; Skipped by default; opt in with kaocha --focus-meta :integration.
 ;; ============================================================================
 
 (deftest ^:integration test-single-agent-eval
-  (testing "Single agent completes a clojure_eval task with minimax-m2p5"
-    (let [prim (requiring-resolve 'dvergr.agent.task/ask!)
-          extract (requiring-resolve 'dvergr.agent.task/extract-result)
-          successful? (requiring-resolve 'dvergr.agent.task/successful?)
-          make-agent (requiring-resolve 'dvergr.agent.config/make-agent)
-          rtc (requiring-resolve 'org.replikativ.spindel.engine.core/*execution-context*)
-          create-ctx (requiring-resolve 'org.replikativ.spindel.engine.context/create-execution-context)
-
-          ctx (create-ctx)
-          worker (make-agent {:name "test-eval"
-                              :provider :fireworks
-                              :model "accounts/fireworks/models/minimax-m2p5"
-                              :isolation :sci
-                              :system-prompt "Use clojure_eval. Be concise."})
-
-          result (binding [org.replikativ.spindel.engine.core/*execution-context* ctx]
-                   @(prim worker
-                         "Evaluate (reduce + (range 100)) with clojure_eval. State the number."
-                         {:budget-dollars 0.10}))]
-
-      (is (successful? result) "Agent should complete successfully")
-      (is (str/includes? (extract result) "4950")
-          "Result should contain 4950"))))
+  (testing "Single agent completes a clojure_eval task via discourse"
+    (require 'dvergr.discourse 'dvergr.discourse.llm
+             'org.replikativ.spindel.engine.context
+             'org.replikativ.spindel.engine.core)
+    (let [d         (resolve 'dvergr.discourse/room)
+          hire      (resolve 'dvergr.discourse/hire)
+          llm-agent (resolve 'dvergr.discourse.llm/llm-agent)
+          create-ctx (resolve 'org.replikativ.spindel.engine.context/create-execution-context)
+          ctx       (create-ctx)
+          room      (binding [org.replikativ.spindel.engine.core/*execution-context* ctx]
+                      (d :integration-test ctx))
+          worker    (binding [org.replikativ.spindel.engine.core/*execution-context* ctx]
+                      (llm-agent
+                        {:id     :test-eval
+                         :spec   {:provider      :fireworks
+                                  :model         "accounts/fireworks/models/minimax-m2p5"
+                                  :system-prompt "Use clojure_eval. Be concise."}
+                         :tools  #{"clojure_eval"}
+                         :budget {:dollars 0.10}
+                         :ctx    ctx}))
+          outcome   (binding [org.replikativ.spindel.engine.core/*execution-context* ctx]
+                      @(hire room worker
+                             {:goal "Evaluate (reduce + (range 100)) with clojure_eval. State the number."
+                              :timeout-ms 120000}))]
+      (is (= :merged (:status outcome)) "Hire should resolve as :merged")
+      (is (str/includes? (str (:content (:reply outcome))) "4950")
+          "Reply should contain 4950"))))
 
 (deftest ^:integration test-nested-spawn-agent
-  (testing "Orchestrator delegates to sub-agent via spawn_agent"
-    (let [prim (requiring-resolve 'dvergr.agent.task/ask!)
-          extract (requiring-resolve 'dvergr.agent.task/extract-result)
-          successful? (requiring-resolve 'dvergr.agent.task/successful?)
-          tool-uses (requiring-resolve 'dvergr.agent.task/extract-tool-uses)
-          make-agent (requiring-resolve 'dvergr.agent.config/make-agent)
-          create-ctx (requiring-resolve 'org.replikativ.spindel.engine.context/create-execution-context)
-
-          ctx (create-ctx)
-          orchestrator (make-agent
-                         {:name "orchestrator"
-                          :provider :fireworks
-                          :model "accounts/fireworks/models/minimax-m2p5"
-                          :isolation :sci
-                          :system-prompt "You MUST use spawn_agent to delegate tasks. Never do work yourself."})
-
-          result (binding [org.replikativ.spindel.engine.core/*execution-context* ctx]
-                   @(prim orchestrator
-                         "Use spawn_agent to have a worker evaluate (+ 21 21) and report the answer."
-                         {:budget-dollars 0.50}))]
-
-      (is (successful? result) "Orchestrator should complete")
-      (is (some #(= "spawn_agent" (:tool-use/name %))
-                (tool-uses result))
-          "Orchestrator should have used spawn_agent")
-      (is (str/includes? (extract result) "42")
+  (testing "Orchestrator delegates via the spawn_agent tool"
+    (require 'dvergr.discourse 'dvergr.discourse.llm
+             'org.replikativ.spindel.engine.context
+             'org.replikativ.spindel.engine.core)
+    (let [d            (resolve 'dvergr.discourse/room)
+          hire         (resolve 'dvergr.discourse/hire)
+          llm-agent    (resolve 'dvergr.discourse.llm/llm-agent)
+          create-ctx   (resolve 'org.replikativ.spindel.engine.context/create-execution-context)
+          ctx          (create-ctx)
+          room         (binding [org.replikativ.spindel.engine.core/*execution-context* ctx]
+                         (d :integration-test ctx))
+          orchestrator (binding [org.replikativ.spindel.engine.core/*execution-context* ctx]
+                         (llm-agent
+                           {:id     :orchestrator
+                            :spec   {:provider      :fireworks
+                                     :model         "accounts/fireworks/models/minimax-m2p5"
+                                     :system-prompt "You MUST use spawn_agent to delegate. Never do work yourself."}
+                            :tools  #{"spawn_agent"}
+                            :budget {:dollars 0.50}
+                            :ctx    ctx}))
+          outcome      (binding [org.replikativ.spindel.engine.core/*execution-context* ctx]
+                         @(hire room orchestrator
+                                {:goal "Use spawn_agent to have a worker evaluate (+ 21 21) and report the answer."
+                                 :timeout-ms 120000}))]
+      (is (= :merged (:status outcome)))
+      (is (str/includes? (str (:content (:reply outcome))) "42")
           "Final result should contain 42"))))

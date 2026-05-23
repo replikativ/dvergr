@@ -23,9 +23,9 @@
   (:require [dvergr.config :as config]
             [dvergr.discourse :as d]
             [dvergr.discourse.enrichment :as enr]
+            [dvergr.discourse.llm :as llm]
+            [dvergr.proposals :as proposals]
             [dvergr.chat.agent :as chat-agent]
-            [dvergr.agent.task :as prim]
-            [dvergr.agent.config :as agent-cfg]
             [dvergr.channels.core :as channels]
             [dvergr.channels.telegram :as tg]
             [dvergr.registry :as registry]
@@ -565,7 +565,8 @@
    travels through the Message's :metadata; we deliberately do NOT use
    `dvergr.discourse.llm/llm-agent` here because llm-agent assumes a
    single per-participant chat-ctx, which is the wrong model for a daemon
-   serving multiple Telegram chats."
+   serving multiple Telegram chats. The /task delegation pathway DOES
+   use llm-agent + dvergr.proposals (one-off worker, no shared session)."
   [daemon agent-config]
   (let [base-prompt  (or (:system-prompt agent-config)
                          (load-agent-prompt (or (:profile agent-config)
@@ -577,22 +578,14 @@
         intake?      (contains? tags :intake)
         sweep-count  (atom 0)
         eval-every-n (:evaluator-every-n agent-config)
-        ;; Build worker config once for secretary /task delegation. Still
-        ;; uses dvergr.agent.task (yggdrasil fork-context) — that namespace
-        ;; isn't migrated to d/hire yet (tracked as task #96).
-        worker-cfg   (when secretary?
-                       (let [worker-prompt
-                             (or (:worker-system-prompt agent-config)
-                                 (load-agent-prompt
-                                   (or (:worker-profile agent-config) :worker))
-                                 "You are a capable AI worker. Complete the given task thoroughly.")]
-                         (agent-cfg/make-agent
-                           {:name          "worker"
-                            :provider      (or (:provider agent-config) :fireworks)
-                            :model         (or (:model agent-config)
-                                               "accounts/fireworks/models/minimax-m2p5")
-                            :isolation     :sci
-                            :system-prompt worker-prompt})))]
+        ;; Worker spec for secretary /task delegation — a fresh llm-agent
+        ;; Participant is built per /task call (so each fork gets its own
+        ;; clean chat-ctx). The prompt + model are captured here.
+        worker-prompt (when secretary?
+                        (or (:worker-system-prompt agent-config)
+                            (load-agent-prompt
+                              (or (:worker-profile agent-config) :worker))
+                            "You are a capable AI worker. Complete the given task thoroughly."))]
     (fn [participant envelope]
       (let [aid       (:id participant)
             ctx       (:execution-ctx daemon)
@@ -625,34 +618,59 @@
                           (or (= trimmed "merge") (= trimmed "*merge*"))
                           (if-let [pending (and chat-id
                                                 (sessions/get-pending-fork chat-id aid))]
-                            (do (prim/merge! (:result pending))
-                                (sessions/clear-pending-fork! chat-id aid)
-                                "Merged! Changes have been applied to the main context.")
+                            (let [conn   (some-> (rtc/get-state [:external-refs "dvergr-chat-db"])
+                                                 :conn)
+                                  result (proposals/accept-proposal! conn (:proposal-id pending))]
+                              (sessions/clear-pending-fork! chat-id aid)
+                              (if (= :accepted result)
+                                "Merged! Changes have been applied to the main context."
+                                (str "Merge failed: " (or (:message result) (pr-str result)))))
                             "No pending work to merge.")
 
                           (or (= trimmed "discard") (= trimmed "*discard*"))
                           (if-let [pending (and chat-id
                                                 (sessions/get-pending-fork chat-id aid))]
-                            (do (prim/discard! (:result pending))
-                                (sessions/clear-pending-fork! chat-id aid)
-                                "Discarded. Work has been thrown away.")
+                            (let [conn   (some-> (rtc/get-state [:external-refs "dvergr-chat-db"])
+                                                 :conn)
+                                  result (proposals/reject-proposal! conn (:proposal-id pending))]
+                              (sessions/clear-pending-fork! chat-id aid)
+                              (if (= :rejected result)
+                                "Discarded. Work has been thrown away."
+                                (str "Discard failed: " (or (:message result) (pr-str result)))))
                             "No pending work to discard.")
 
                           (str/starts-with? trimmed "/task ")
-                          (let [task-text (str/trim (subs text (count "/task ")))]
+                          (let [task-text (str/trim (subs text (count "/task ")))
+                                conn      (some-> (rtc/get-state [:external-refs "dvergr-chat-db"])
+                                                  :conn)
+                                room      (:discourse-room daemon)]
                             (when chat-id
                               (doseq [sink @(:response-sinks daemon)]
                                 (try (sink aid "Working on your task...")
                                      (catch Exception _))))
-                            (let [result (await (prim/ask! worker-cfg task-text
-                                                           {:parent-chat-ctx cctx
-                                                            :budget-dollars  (or (:budget-dollars agent-config) 0.50)}))]
-                              (when chat-id
-                                (sessions/register-pending-fork!
-                                  chat-id aid result (prim/extract-result result)))
-                              (str (prim/extract-result result)
-                                   (when chat-id
-                                     "\n\n---\nWork is ready in an isolated context. Reply *merge* to apply or *discard* to cancel."))))
+                            (if-not (and conn room)
+                              "Cannot delegate task: missing db-conn or discourse room."
+                              (let [worker   (llm/llm-agent
+                                               {:id     (keyword (str (name aid) "-worker"))
+                                                :spec   {:provider      (or (:provider agent-config) :fireworks)
+                                                         :model         (or (:model agent-config)
+                                                                            "accounts/fireworks/models/minimax-m2p5")
+                                                         :system-prompt worker-prompt}
+                                                :budget {:dollars (or (:budget-dollars agent-config) 0.50)}
+                                                :ctx    ctx})
+                                    proposal (await (proposals/propose!
+                                                      {:room   room
+                                                       :worker worker
+                                                       :goal   task-text
+                                                       :conn   conn
+                                                       :budget-dollars (or (:budget-dollars agent-config) 0.50)}))
+                                    summary  (str (:proposal/summary proposal))]
+                                (when chat-id
+                                  (sessions/register-pending-fork!
+                                    chat-id aid (:proposal/id proposal) summary))
+                                (str summary
+                                     (when chat-id
+                                       "\n\n---\nWork is ready in an isolated context. Reply *merge* to apply or *discard* to cancel.")))))
 
                           :else nil)))]
                 (if secretary-cmd

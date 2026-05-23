@@ -114,15 +114,16 @@
 ;; ============================================================================
 
 (defn register-pending-fork!
-  "Store the full result from ask! so merge!/discard! can be called later.
+  "Track a pending proposal so merge / discard can be issued later.
 
-   result - the map returned by prim/ask! (contains :child-ctx, :messages, etc.)
-   summary - human-readable description of what the worker did"
-  [chat-id agent-id result summary]
+   proposal-id - UUID of a dvergr.proposals/propose! proposal (used to
+                 look up the fork on accept-proposal! / reject-proposal!).
+   summary     - human-readable description of what the worker did."
+  [chat-id agent-id proposal-id summary]
   (swap! sessions assoc-in [[chat-id agent-id] :pending-fork]
-         {:result     result
-          :summary    summary
-          :created-at (java.util.Date.)})
+         {:proposal-id proposal-id
+          :summary     summary
+          :created-at  (java.util.Date.)})
   nil)
 
 (defn get-pending-fork
