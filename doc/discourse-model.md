@@ -646,33 +646,83 @@ The framing carries over from discrete-time FK because resampling is bound to ch
 |-----------|-----------|------|-------------|
 | 0 — no inference | Plain composition; one trajectory | 1× | The default; most workflows |
 | 1 — local exploration | `fork-room` → try → `merge-room` or `discard` | ~2× | "What if we tried this?" — accept/reject a single speculative move |
-| 2 — population SMC | `smc-discourse` with N particles | ~N× | Hard exploration; needs population to find a good trajectory |
+| 2 — population inference | spindel's existing `kernel-infer` over a room-evolution spin | ~N× | Hard exploration; needs population to find a good trajectory |
 
-The user picks. Most code stays at intensity 0.
+The user picks. Most code stays at intensity 0. `dvergr.discourse` adds **no** new inference primitive at intensity 2 — see §10.3.
 
-### 10.3 `smc-discourse`
+### 10.3 Inference is orthogonal — use spindel's existing kernels
+
+dvergr.discourse adds **no specific inference function** (no `smc-discourse`, no `pimh-discourse`, etc.). Population-level inference over rooms is *exactly what spindel's existing inference machinery already provides*, applied to a room-evolution spin. The architecture spindel already has is the right one:
+
+- **Model primitives** (algorithm-agnostic, in `org.replikativ.spindel.inference.effects`): `choose` (with `:observe` / `:where` / `:init` / `:id` / `:tags`), `sample`, `observe`. A participant's spin or a room-orchestration spin calls these at decision points (utterance candidates, action selections, branch choices, conditioning on a constraint).
+- **Inference kernels** (`org.replikativ.spindel.inference.kernel`): the `PKernel` protocol, with composable building blocks — `ImportanceKernel`, `ResampleKernel`, `MCMCKernel`, `RandomWalkMHKernel`, `compose-kernels`, `conditional-kernel`, `conditional-resample`, `mh-chain`, `filter-particles`, `reset-weights`, `map-contexts`. **Kernels compose** — the user assembles the inference algorithm from primitives.
+- **Inference entry point** (`org.replikativ.spindel.inference.inference`): `kernel-infer model-spin kernel N opts` is the canonical API. The convenience wrappers `smc-infer`, `importance-sampling`, `pimh-infer`, `pgibbs-infer`, `pgas-infer`, `ipmcmc-infer`, `bbvi-infer` are pre-composed kernel-infer calls.
+
+The discourse-level usage pattern:
 
 ```clojure
-(smc-discourse room
-  {:particles    16
-   :potential    score-signal            ; Room → Number (or Signal[Number])
-   :resample-at  potential-signal        ; barrier — when to resample
-   :kernel       :smc-standard           ; or :smc-steer (no-replacement K-beam)
-   :resampler    :systematic             ; or :multinomial :stratified :residual
-   :ess-thresh   0.5                     ; resample when ESS/N < this
-   :max-time-ms  60000})
-;; → Spin[EmpiricalMeasure[Room]]
+(require '[org.replikativ.spindel.core :as sp]
+         '[org.replikativ.spindel.inference.inference :as inf]
+         '[org.replikativ.spindel.inference.kernel :as k]
+         '[org.replikativ.spindel.inference.measure :as m]
+         '[org.replikativ.spindel.inference.effects :refer [choose observe]]
+         '[dvergr.discourse :as d])
+
+(defn room-evolution
+  "A spin describing the room running for N turns under uncertainty.
+   Participants and the orchestrator may call `choose`/`observe` wherever they
+   want — at utterance-candidate selection, at moderator picks, at common-ground
+   acceptance, etc. Each call advances the inference trace."
+  [room-spec n-turns]
+  (spin
+    (let [room (await (d/setup-room room-spec))
+          _    (run-turns room n-turns)              ; participants may `choose`/`observe` internally
+          cg   @(:common-ground room)
+          _    (observe (uniform 0 1) (cg-coverage cg))]  ; potential at end-of-trajectory
+      room)))
+
+(spin
+  (let [measure (await (inf/kernel-infer
+                         (room-evolution my-spec 5)        ; the model spin
+                         (k/compose-kernels                ; the inference algorithm — composed
+                           (k/importance-kernel ...)
+                           (k/conditional-resample 0.5 (k/resample-kernel :systematic)))
+                         16                                 ; N particles
+                         {:barrier-policy :every-observe}))]
+    (m/query measure best-trajectory)))
 ```
 
-Implementation: `(repeatedly N #(fork-room room))` creates the particle population. Each particle runs its own spin dynamics. At each resampling barrier, the potential is evaluated across particles, weights normalised, ESS computed; if below threshold, resample by the chosen rule (steal LLaMPPL's optimal-without-replacement for `smc-steer`). Resampling concretely means: yggdrasil-merge winners into a shared lineage and yggdrasil-discard losers, then re-fork to repopulate.
+What this gets right architecturally:
 
-The output is an `EmpiricalMeasure[Room]` — exactly spindel's existing inference output type. You can call `query` to get statistics or `predict` to sample from the population.
+1. **The model is written once.** A room-evolution spin uses `choose`/`observe` wherever it has uncertainty. It has no idea whether IS, SMC, PIMH, PGAS, BBVI, or something custom will interpret those calls.
+2. **Inference algorithms compose.** Want SMC with periodic MH rejuvenation? `(k/compose-kernels (k/importance-kernel …) (k/conditional 0.5 (k/resample-kernel …)) (k/mh-chain 3 …))`. Want PIMH? It's already a convenience wrapper. Want something nobody has tried? Compose your own from the building blocks.
+3. **Resampling barriers are chosen by the model**, not hardcoded by us. Whether barriers fire at every `observe`, at turn boundaries, at moderator-declared rounds, or never — the model picks via `(observe ...)` placement and the `:barrier-policy` opt.
+4. **Three engineering tricks fold into spindel, not dvergr**: async batching across participants' LLM calls, LLaMPPL-style optimal-without-replacement resampling (as a new kernel constructor in `spindel.inference.kernel`), and ESS-threshold gating (already in `conditional-resample`). These belong in spindel.
 
-### 10.4 Engineering tricks adopted from LLaMPPL
+### 10.4 Gap: particle isolation should support yggdrasil-fork, not just snapshot
 
-1. **Async batching with timeout/batch-size.** When N participants' spins concurrently `await` LLM calls, coalesce HTTP requests with a small window (~20ms) so providers see one batched request per provider rather than N. We already do this partially in dvergr; LLaMPPL's pattern shows the clean shape.
-2. **Optimal-without-replacement resampling** (`smc-steer`). Deterministic copies of high-weight particles plus stratified sampling of the rest, with weight rescaling to stay unbiased. Worth porting.
-3. **ESS-threshold gating**. Don't resample every turn — only when effective sample size drops below θ × N.
+Spindel's inference currently creates particles via `fork-particle-context` (`coordinator.cljc:117`) — which uses `snapshot-context` + `restore-snapshot` to produce independent `AtomBackend` copies, *not* yggdrasil `fork-context` with `PForkable` dispatch. There's a workaround comment referencing a historical overlay-backend bug.
+
+For *room-level* inference where a particle is a forked room (datahike branch + signals + git + SCI all forked together), the snapshot approach is the wrong primitive. The discourse model wants `ctx/fork-context` so:
+
+- Datahike branches with the particle (KB writes go to a fork branch; merge if winner, discard if loser)
+- SCI sandbox forks (participants in a particle have their own SCI state)
+- Git worktree forks if registered
+- Shared lineage when resampling promotes a winner
+
+**Proposed extension to spindel inference** (a separate piece of work, not part of dvergr):
+
+```clojure
+(inf/kernel-infer model kernel N
+  {:isolation :snapshot   ; current default — independent AtomBackend per particle (cheap, no yggdrasil)
+   ;; or
+   :isolation :fork       ; new — yggdrasil fork-context per particle (rich, branch-aware)
+   })
+```
+
+Underneath, `fork-particle-context` would dispatch on `:isolation` and call either `(ctx/snapshot+restore ctx)` or `(ctx/fork-context ctx)`. The choice is the user's per inference run. Discourse-level inference picks `:fork`; simpler probabilistic programs without yggdrasil-managed substrate stay on `:snapshot`.
+
+This is the one piece of spindel-side rethinking the discourse model actually motivates. It's a small change (~50 LOC in coordinator + inference) but it's what makes intensity-2 inference *cleanly compose with the fork primitive* the rest of our model already uses. See Open Q #11.
 
 ### 10.5 Training utility (informative; not part of this MVP)
 
@@ -763,6 +813,8 @@ These do not block the MVP. They will be settled by experience with real workflo
 9. **`Pact` watch-item** (Basis Research, April 2026) — a multi-agent coordination language announced after this doc's drafting. Potentially adjacent or competitive with `dvergr.discourse`. Worth examining the design and deciding whether (a) we adopt their primitives where they're cleaner, (b) we explicitly differentiate, or (c) we collaborate. The substrate-and-worldview alignment with Basis is otherwise the strongest of any lab surveyed (their `effectful` library is in the spindel algebraic-effects family).
 
 10. **DR-MDP audit of `align-on`** (Carroll 2024 [33], Lang 2024). The Habermas-Machine pattern is vulnerable to participants nudging others' beliefs through framing/ordering, biasing the converged common-ground. A correctness test: simulate the same `align-on` multiple times with permuted speaking order / dropped participants and verify stability of the converged result. Deception detection becomes a property test, not an afterthought. Tracks AI-safety work on preference dynamics (DR-MDP).
+
+11. **Spindel inference: `:isolation :fork` for particle creation.** Currently `fork-particle-context` uses snapshot+restore (independent AtomBackend); this works for token-level probabilistic programs without yggdrasil-managed substrate but is the wrong primitive for room-level discourse inference (§10.4). The fix is small (~50 LOC) and additive (the `:snapshot` default stays). Lands as a spindel PR, then the discourse-level inference patterns in §10.3 light up.
 
 ## 14. Relationship to existing namespaces
 
