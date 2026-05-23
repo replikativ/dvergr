@@ -11,7 +11,7 @@
   (:require [dvergr.web.layout :as layout]
             [dvergr.registry :as registry]
             [dvergr.sessions :as sessions]
-            [dvergr.agent.process :as agent]
+            [dvergr.discourse :as d]
             [dvergr.chat.context :as chat-ctx]
             [hiccup2.core :as h]
             [hiccup.util :as hu]
@@ -269,12 +269,12 @@
             user-info {:username "web-user" :first_name "Web"}
             session (binding [rtc/*execution-context* (:execution-ctx daemon)]
                       (sessions/get-or-create-session! kw-chat-id agent-kw user-info))]
-        (when-let [ag (registry/get-agent agent-kw)]
-          (binding [rtc/*execution-context* (:execution-ctx daemon)]
-            (agent/send! ag {:content text
-                             :chat-id kw-chat-id
-                             :user-info user-info
-                             :chat-ctx (:chat-ctx session)})))))
+        (when (registry/get-agent agent-kw)
+          (d/post! (:discourse-room daemon)
+                   (d/message :web-chat agent-kw text nil
+                              {:chat-id   kw-chat-id
+                               :user-info user-info
+                               :chat-ctx  (:chat-ctx session)})))))
     {:status 303
      :headers {"Location" (str "/chat/" agent-id-str)}
      :body ""}))

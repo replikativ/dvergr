@@ -31,21 +31,23 @@
 
    Args:
      agent-id    - Keyword identifier
-     agent       - Agent record (from dvergr.agent.process)
+     agent       - The agent value — typically a dvergr.discourse Participant.
+                   The registry treats it opaquely; metadata lives on the
+                   entry, not inside the agent.
      opts        - Map with:
        :tags        - Set of keyword tags (e.g., #{:coding :research})
        :description - Human-readable description
        :context-id  - Spindel execution context id for distributed addressing
                       (auto-derived as :agent/<id> if not provided)
-
-   If :context-id is provided and the agent has an execution context,
-   it will also be registered in spindel's execution-context-registry."
-  [agent-id agent & {:keys [tags description context-id]}]
+       :config      - Optional agent config map (model, provider, system-prompt,
+                      tools) — stored for stats/UI introspection."
+  [agent-id agent & {:keys [tags description context-id config]}]
   (let [ctx-id (or context-id (keyword "agent" (name agent-id)))
         entry {:agent agent
                :status :registered
                :tags (or tags #{})
                :description (or description "")
+               :config (or config {})
                :created-at (java.util.Date.)
                :context-id ctx-id}]
     (swap! registry assoc agent-id entry)
@@ -95,20 +97,17 @@
 
    Returns vector of maps with :id, :status, :tags, :description, :created-at."
   [& {:keys [status tags]}]
-  (let [entries (vals @registry)
-        filtered (cond->> entries
-                   status (filter #(= status (:status %)))
-                   tags   (filter #(every? (:tags %) tags)))]
-    (mapv (fn [entry]
-            (let [agent (:agent entry)
-                  agent-status (when-let [state-a (:state-a agent)]
-                                 (:status @state-a))]
-              {:id (:id (:config (:agent entry)))
-               :status (or agent-status (:status entry))
-               :tags (:tags entry)
-               :description (:description entry)
-               :created-at (:created-at entry)
-               :context-id (:context-id entry)}))
+  (let [pairs (seq @registry)
+        filtered (cond->> pairs
+                   status (filter #(= status (:status (second %))))
+                   tags   (filter #(every? (:tags (second %)) tags)))]
+    (mapv (fn [[agent-id entry]]
+            {:id agent-id
+             :status (:status entry)
+             :tags (:tags entry)
+             :description (:description entry)
+             :created-at (:created-at entry)
+             :context-id (:context-id entry)})
           filtered)))
 
 (defn agents-by-tag

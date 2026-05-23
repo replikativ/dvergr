@@ -21,8 +21,9 @@
      (list-agents d)
      (stop! d)"
   (:require [dvergr.config :as config]
-            [dvergr.agent.process :as agent]
-            [dvergr.agent.turn :as turn]
+            [dvergr.discourse :as d]
+            [dvergr.discourse.enrichment :as enr]
+            [dvergr.chat.agent :as chat-agent]
             [dvergr.agent.task :as prim]
             [dvergr.agent.config :as agent-cfg]
             [dvergr.channels.core :as channels]
@@ -31,6 +32,7 @@
             [dvergr.sessions :as sessions]
             [dvergr.chat.context :as chat-ctx]
             [dvergr.tools :as tools]
+            [dvergr.git :as git]
             [dvergr.web.server :as web-server]
             [dvergr.scheduler.core :as scheduler]
             [dvergr.calendar.core :as cal]
@@ -43,7 +45,6 @@
             [dvergr.rooms :as rooms]
             [dvergr.rooms.bus :as bus]
             [dvergr.rooms.telegram-bridge :as telegram-bridge]
-            [dvergr.agent.enrichment :as enrichment]
             [dvergr.search :as search]
             ;; Intake tools — require for side-effect registration
             [dvergr.intake.hn]
@@ -62,12 +63,15 @@
             [dvergr.intake.twitter]
             [dvergr.intake.adzuna]
             [dvergr.llm-call]
+            [datahike.api :as dh]
+            [yggdrasil.adapters.datahike :as dh-adapter]
             [org.replikativ.spindel.engine.core :as rtc]
             [org.replikativ.spindel.engine.context :as ctx]
+            [org.replikativ.spindel.yggdrasil :as ygg]
             [org.replikativ.spindel.distributed.core :as sdist]
-            [org.replikativ.spindel.core :refer [spin await]]
+            [org.replikativ.spindel.core :as sp :refer [spin await]]
+            [org.replikativ.spindel.spin.sync :as sync]
             [org.replikativ.spindel.spin.combinators :as comb]
-            [org.replikativ.spindel.core :as sync]
             [clojure.string :as str]
             [clojure.set]
             [clojure.java.io :as io]
@@ -79,15 +83,22 @@
 
 (defrecord Daemon
   [config          ;; Original config map
-   execution-ctx   ;; Spindel execution context
+   execution-ctx   ;; Spindel execution context (== room's :ctx)
+   discourse-room  ;; dvergr.discourse Room — all agents are participants here
    telegram-ch     ;; Connected Telegram channel (or nil)
    http-server     ;; HTTP server state (or nil)
-   outbox-watchers ;; Atom<{agent-id -> future}> for response forwarding
+   system-watcher  ;; Atom<future> for the spin draining the :_system inbox
    response-sinks  ;; Atom<[sink-fn ...]> - each (fn [agent-id text]) called on response
    status])        ;; Atom<:starting/:running/:stopping/:stopped>
 
 ;; Global daemon atom for REPL access: @current-daemon, (stop! @current-daemon)
 (defonce current-daemon (atom nil))
+
+;; Reserved participant id used as the originator (`:from`) for daemon-injected
+;; messages (Telegram dispatch, scheduler ticks). Agent replies addressed to
+;; this id flow through a single drain spin that fans them out to all
+;; registered response sinks.
+(def ^:private system-id :_system)
 
 ;; ============================================================================
 ;; Safety
@@ -112,6 +123,75 @@
    so the registry is fully populated."
   []
   (into {} (remove (fn [[k _]] (excluded-from-daemon k))) @tools/registry))
+
+;; ============================================================================
+;; Shared Execution Context
+;;
+;; Each daemon owns one spindel execution context with git + datahike systems
+;; registered for forkable agent worktrees and persistent chat DB. Moved here
+;; from the deleted dvergr.agent.process; the daemon is the only caller.
+;; ============================================================================
+
+(defn create-shared-context
+  "Create a shared execution context with optional git + datahike systems
+   registered for fork-isolated agent work and persistent chat DB.
+
+   Options:
+     :with-git?       — register git system for isolated agent worktrees
+                        (default true)
+     :with-datahike?  — register Datahike system for the chat DB
+                        (default true)
+     :repo-path       — git repo path (default cwd)
+     :worktrees-dir   — where to create worktrees (default \".git-worktrees\")
+     :db-path         — datahike file-store path (default \"<repo>/.datahike\")"
+  [& {:keys [with-git? with-datahike? repo-path worktrees-dir db-path]
+      :or {with-git?      true
+           with-datahike? true
+           repo-path      (System/getProperty "user.dir")
+           worktrees-dir  ".git-worktrees"}}]
+  (let [base-ctx      (ctx/create-execution-context)
+        db-store-path (or db-path (str repo-path "/.datahike"))]
+    (binding [rtc/*execution-context* base-ctx]
+      (when with-git?
+        (try
+          (ygg/register! (git/create-git-system
+                           :repo-path repo-path
+                           :worktrees-dir worktrees-dir))
+          (catch Exception e
+            (tel/log! {:level :warn :id :daemon/git-init-failed
+                       :data {:error (.getMessage e)}}
+                      "Could not register git system"))))
+      (when with-datahike?
+        (try
+          (let [db-id  (java.util.UUID/nameUUIDFromBytes
+                         (.getBytes db-store-path))
+                db-cfg {:store {:backend :file
+                                :path db-store-path
+                                :id db-id}
+                        :keep-history? true
+                        :schema-flexibility :write}
+                _      (when-not (dh/database-exists? db-cfg)
+                         (dh/create-database db-cfg))
+                conn   (dh/connect db-cfg)
+                dh-sys (dh-adapter/create
+                         conn {:system-name "dvergr-chat-db"})]
+            (try
+              (require 'dvergr.chat.schema)
+              ((resolve 'dvergr.chat.schema/ensure-full-schema!) conn)
+              (catch Exception e
+                (tel/log! {:level :warn :id :daemon/schema-install-failed
+                           :data {:error (.getMessage e)}}
+                          "Could not install chat schema")))
+            (ygg/register! dh-sys)
+            (tel/log! {:id :daemon/datahike-registered
+                       :data {:path db-store-path}}
+                      "Registered Datahike system"))
+          (catch Exception e
+            (tel/log! {:level :warn :id :daemon/datahike-init-failed
+                       :error e
+                       :data {:error (.getMessage e)}}
+                      "Could not register Datahike system"))))
+      base-ctx)))
 
 ;; ============================================================================
 ;; Agent Profiles
@@ -337,6 +417,10 @@
 ;; the spin body in make-think-fn because `await` requires CPS transformation
 ;; which doesn't cross function boundaries.
 
+;; Forward declare for fire-evaluator! and make-on-message (both reference
+;; the spindel-bridging turn runner, defined just below the evaluator).
+(declare run-turn-async!)
+
 ;; ============================================================================
 ;; Evaluator (Self-Improvement)
 ;; ============================================================================
@@ -393,7 +477,7 @@
                 (loop [turn 0]
                   (if (>= turn 3)
                     (tel/log! {:id :agent/eval-max-turns :data {:agent-id (:id agent)}} "Evaluator max turns")
-                    (let [r (await (turn/run-turn-async eval-ctx opts exec-ctx))]
+                    (let [r (await (run-turn-async! eval-ctx opts exec-ctx))]
                       (if (or (= :error (:status r)) (= :complete (:result r)))
                         (tel/log! {:level :info :id :agent/eval-done
                                    :data {:agent-id (:id agent)
@@ -407,24 +491,81 @@
                               "Evaluator error"))))))))
 
 ;; ============================================================================
-;; Unified Think Function
+;; Turn Bridge — chat-agent/run-agent-turn! into a spindel Deferred
+;;
+;; Replaces dvergr.agent.turn/run-turn-async. The blocking LLM + tool work
+;; runs on a future; deliver! routes the result back into the spin chain.
 ;; ============================================================================
 
-(defn- make-think-fn
-  "Create a unified think function for any daemon-managed agent.
+(defn- run-turn-async!
+  "Run one chat-agent turn off the spindel executor; return a Deferred that
+   awaits to the turn result map: {:status :ok :result <:continue|:complete>}
+   or {:status :error :error e :message m}."
+  [chat-ctx opts execution-ctx]
+  (let [d (binding [rtc/*execution-context* execution-ctx]
+            (sync/deferred))]
+    (future
+      (binding [rtc/*execution-context* execution-ctx]
+        (try
+          (sync/deliver! d {:status :ok
+                            :result (chat-agent/run-agent-turn! chat-ctx opts)})
+          (catch Exception e
+            (sync/deliver! d {:status :error :error e
+                              :message (.getMessage e)})))))
+    d))
 
-   Behaviour is driven by agent tags:
+;; ============================================================================
+;; Envelope Adapter
+;;
+;; The legacy think-fn took a task map; the new on-message takes a discourse
+;; envelope. `task-from-envelope` collapses both into the legacy task shape
+;; so format-task-message, resolve-chat-context, and the secretary command
+;; pre-dispatch keep working without per-call surgery.
+;; ============================================================================
+
+(defn- task-from-envelope
+  "Convert a discourse envelope into the legacy task shape:
+     Message       → {:content str :chat-id N :user-info U :chat-ctx C}
+                     (carried via the Message's :metadata)
+     {:type :tick} → {:type :tick}
+     {:type :source :name K :msg E}
+                   → {:type :source :name K :msg E}"
+  [envelope]
+  (cond
+    (= :tick (:type envelope))
+    {:type :tick}
+
+    (= :source (:type envelope))
+    {:type :source :name (:name envelope) :msg (:msg envelope)}
+
+    :else
+    (merge {:content (:content envelope)} (:metadata envelope))))
+
+;; ============================================================================
+;; Unified on-message
+;; ============================================================================
+
+(defn- make-on-message
+  "Create a dvergr.discourse `on-message` handler for a daemon-managed agent.
+
+   The participant receives:
+     - inbox Messages from `dispatch!` (Telegram dialogue) or scheduler
+     - {:type :tick} envelopes from `d/with-cadence` (intake sweeps)
+     - {:type :source ...} envelopes from `d/with-sources` (room subscriptions)
+
+   It returns a discourse reply-spec `{:to <from-id> :content text}` or
+   nil for no reply. The handler's behaviour is tag-driven, matching the
+   legacy `make-think-fn`:
      :secretary — chat mode with command pre-dispatch (status/merge/discard/task)
-     :intake    — sweep mode with knowledge_add enforcement + evaluator
-     (neither)  — generic agent with standard turn loop
+     :intake    — sweep mode with knowledge_add / tool-use enforcement
+                  + optional self-evaluator
+     (neither)  — generic agent with the standard turn loop
 
-   Direct messages (with :chat-ctx in task) reuse the session's ChatContext,
-   so agents see their full conversation history. Tick sweeps and sourceless
-   events get a fresh ephemeral context.
-
-   Args:
-     daemon       - Daemon record
-     agent-config - Agent configuration map"
+   Per-session chat-ctx (different (chat-id, agent-id) → different history)
+   travels through the Message's :metadata; we deliberately do NOT use
+   `dvergr.discourse.llm/llm-agent` here because llm-agent assumes a
+   single per-participant chat-ctx, which is the wrong model for a daemon
+   serving multiple Telegram chats."
   [daemon agent-config]
   (let [base-prompt  (or (:system-prompt agent-config)
                          (load-agent-prompt (or (:profile agent-config)
@@ -436,53 +577,66 @@
         intake?      (contains? tags :intake)
         sweep-count  (atom 0)
         eval-every-n (:evaluator-every-n agent-config)
-        ;; Build worker config once for secretary task delegation
+        ;; Build worker config once for secretary /task delegation. Still
+        ;; uses dvergr.agent.task (yggdrasil fork-context) — that namespace
+        ;; isn't migrated to d/hire yet (tracked as task #96).
         worker-cfg   (when secretary?
-                       (let [worker-prompt (or (:worker-system-prompt agent-config)
-                                              (load-agent-prompt (or (:worker-profile agent-config) :worker))
-                                              "You are a capable AI worker. Complete the given task thoroughly.")]
+                       (let [worker-prompt
+                             (or (:worker-system-prompt agent-config)
+                                 (load-agent-prompt
+                                   (or (:worker-profile agent-config) :worker))
+                                 "You are a capable AI worker. Complete the given task thoroughly.")]
                          (agent-cfg/make-agent
                            {:name          "worker"
                             :provider      (or (:provider agent-config) :fireworks)
                             :model         (or (:model agent-config)
-                                              "accounts/fireworks/models/minimax-m2p5")
+                                               "accounts/fireworks/models/minimax-m2p5")
                             :isolation     :sci
                             :system-prompt worker-prompt})))]
-    (fn [agent task]
-      (let [ctx       (or (:execution-ctx agent) (:execution-ctx daemon) rtc/*execution-context*)
-            task-type (:type task)]
+    (fn [participant envelope]
+      (let [aid       (:id participant)
+            ctx       (:execution-ctx daemon)
+            task      (task-from-envelope envelope)
+            task-type (:type task)
+            from-id   (when (instance? dvergr.discourse.Message envelope)
+                        (:from envelope))
+            ;; Build a reply-spec; tolerate missing from-id (tick/source-only
+            ;; participants have no individual sender to reply to — the
+            ;; response sinks read :from on the Message we emit, so :to
+            ;; defaults to :_system for fan-out).
+            ->reply   (fn [text]
+                        (when (and (string? text) (not (str/blank? text)))
+                          {:to (or from-id system-id) :content text}))]
         (binding [rtc/*execution-context* ctx]
           (spin
             (try
               ;; ---- Secretary command pre-dispatch ----
-              ;; Inlined here because /task uses await (CPS can't cross fn boundary)
-              (let [aid (:id agent)
-                    secretary-cmd
+              (let [secretary-cmd
                     (when secretary?
-                      (let [text    (if (string? task) task (get task :content ""))
+                      (let [text    (get task :content "")
                             trimmed (str/lower-case (str/trim text))
                             chat-id (:chat-id task)
                             cctx    (:chat-ctx task)]
                         (cond
                           (or (= trimmed "status") (= trimmed "/status"))
-                          {:status :complete
-                           :content (or (and chat-id (sessions/describe-pending chat-id aid))
-                                        "No pending work.")
-                           :agent-id aid}
+                          (or (and chat-id (sessions/describe-pending chat-id aid))
+                              "No pending work.")
 
                           (or (= trimmed "merge") (= trimmed "*merge*"))
-                          (if-let [pending (and chat-id (sessions/get-pending-fork chat-id aid))]
+                          (if-let [pending (and chat-id
+                                                (sessions/get-pending-fork chat-id aid))]
                             (do (prim/merge! (:result pending))
                                 (sessions/clear-pending-fork! chat-id aid)
-                                {:status :complete :content "Merged! Changes have been applied to the main context." :agent-id aid})
-                            {:status :complete :content "No pending work to merge." :agent-id aid})
+                                "Merged! Changes have been applied to the main context.")
+                            "No pending work to merge.")
 
                           (or (= trimmed "discard") (= trimmed "*discard*"))
-                          (if-let [pending (and chat-id (sessions/get-pending-fork chat-id aid))]
+                          (if-let [pending (and chat-id
+                                                (sessions/get-pending-fork chat-id aid))]
                             (do (prim/discard! (:result pending))
                                 (sessions/clear-pending-fork! chat-id aid)
-                                {:status :complete :content "Discarded. Work has been thrown away." :agent-id aid})
-                            {:status :complete :content "No pending work to discard." :agent-id aid})
+                                "Discarded. Work has been thrown away.")
+                            "No pending work to discard.")
 
                           (str/starts-with? trimmed "/task ")
                           (let [task-text (str/trim (subs text (count "/task ")))]
@@ -492,17 +646,17 @@
                                      (catch Exception _))))
                             (let [result (await (prim/ask! worker-cfg task-text
                                                            {:parent-chat-ctx cctx
-                                                            :budget-dollars (or (:budget-dollars agent-config) 0.50)}))]
+                                                            :budget-dollars  (or (:budget-dollars agent-config) 0.50)}))]
                               (when chat-id
-                                (sessions/register-pending-fork! chat-id aid result (prim/extract-result result)))
-                              {:status :complete
-                               :content (str (prim/extract-result result)
-                                             (when chat-id "\n\n---\nWork is ready in an isolated context. Reply *merge* to apply or *discard* to cancel."))
-                               :agent-id aid}))
+                                (sessions/register-pending-fork!
+                                  chat-id aid result (prim/extract-result result)))
+                              (str (prim/extract-result result)
+                                   (when chat-id
+                                     "\n\n---\nWork is ready in an isolated context. Reply *merge* to apply or *discard* to cancel."))))
 
                           :else nil)))]
                 (if secretary-cmd
-                  secretary-cmd
+                  (->reply secretary-cmd)
                   ;; ---- Standard LLM path ----
                   (let [chat-ctx  (resolve-chat-context task agent-config ctx)
                         user-msg  (format-task-message task task-type agent-config)
@@ -517,7 +671,7 @@
                                      :isolation :sci :execution-ctx ctx})
                         opts      {:provider (or (:provider agent-config) :fireworks)
                                    :model    (or (:model agent-config)
-                                                "accounts/fireworks/models/minimax-m2p5")
+                                                 "accounts/fireworks/models/minimax-m2p5")
                                    :tools    tools-map
                                    :tool-ctx tool-ctx}
                         max-turns (or (:max-turns agent-config)
@@ -525,14 +679,17 @@
                         ka-required (and intake? (= :tick task-type))]
                     ;; System prompt on first message
                     (when (empty? (chat-ctx/get-messages chat-ctx))
-                      (chat-ctx/add-message! chat-ctx {:role :system :content system-prompt}))
+                      (chat-ctx/add-message! chat-ctx
+                                             {:role :system :content system-prompt}))
                     ;; User message (with identity prefix for secretary group chats)
                     (when-not (str/blank? user-msg)
                       (let [prefix (when (and secretary? (:user-info task))
-                                    (when-let [uname (or (:first_name (:user-info task))
-                                                         (:username (:user-info task)))]
-                                      (str "[" uname "] ")))]
-                        (chat-ctx/add-message! chat-ctx {:role :user :content (str prefix user-msg)})))
+                                     (when-let [uname (or (:first_name (:user-info task))
+                                                          (:username (:user-info task)))]
+                                       (str "[" uname "] ")))]
+                        (chat-ctx/add-message! chat-ctx
+                                               {:role :user
+                                                :content (str prefix user-msg)})))
                     ;; ---- Turn loop (inlined — await needs CPS) ----
                     (loop [turn 0]
                       (cond
@@ -541,53 +698,57 @@
                           (when (and intake? (= :tick task-type))
                             (let [n (swap! sweep-count inc)]
                               (tel/log! {:level :info :id :agent/sweep-done
-                                         :data {:agent-id (:id agent) :turns turn}} "Sweep complete (max-turns)")
-                              (when (and eval-every-n (pos? n) (zero? (mod n eval-every-n)))
-                                (fire-evaluator! agent summary base-prompt agent-config ctx))))
-                          {:status :complete :content summary :agent-id (:id agent)})
+                                         :data {:agent-id aid :turns turn}}
+                                        "Sweep complete (max-turns)")
+                              (when (and eval-every-n (pos? n)
+                                         (zero? (mod n eval-every-n)))
+                                (fire-evaluator! participant summary
+                                                 base-prompt agent-config ctx))))
+                          (->reply summary))
 
                         (not (chat-ctx/check-budget! chat-ctx))
-                        {:status :complete :content "Budget limit reached." :agent-id (:id agent)}
+                        (->reply "Budget limit reached.")
 
                         :else
                         (do
                           (tel/log! {:level :info :id :agent/turn
-                                     :data {:agent-id (:id agent) :turn turn}} "Turn starting")
-                          (let [r (await (turn/run-turn-async chat-ctx opts ctx))]
+                                     :data {:agent-id aid :turn turn}}
+                                    "Turn starting")
+                          (let [r (await (run-turn-async! chat-ctx opts ctx))]
                             (tel/log! {:level :info :id :agent/turn-done
-                                       :data {:agent-id (:id agent) :turn turn
-                                              :result (:result r) :status (:status r)}} "Turn done")
+                                       :data {:agent-id aid :turn turn
+                                              :result (:result r) :status (:status r)}}
+                                      "Turn done")
                             (if (or (= :error (:status r)) (= :complete (:result r)))
-                              ;; Model stopped — check enforcements
                               (cond
                                 ;; knowledge_add enforcement for tick sweeps
                                 (and ka-required
                                      (= :complete (:result r))
                                      (not (tool-called-in-ctx? chat-ctx "knowledge_add"))
                                      (< turn (dec max-turns)))
-                                (do (tel/log! {:level :info :id :agent/knowledge-add-reminder
-                                               :data {:agent-id (:id agent) :turn turn}}
+                                (do (tel/log! {:level :info
+                                               :id :agent/knowledge-add-reminder
+                                               :data {:agent-id aid :turn turn}}
                                               "knowledge_add not called — injecting reminder")
                                     (chat-ctx/add-message! chat-ctx
                                       {:role :user
                                        :content (str "Before ending: you haven't called knowledge_add yet. "
                                                      "Call it now with the sweep summary (required). "
                                                      "Even if nothing was found, call: "
-                                                     "knowledge_add {:title \"Sweep " (java.time.Instant/now) "\""
+                                                     "knowledge_add {:title \"Sweep "
+                                                     (java.time.Instant/now) "\""
                                                      " :source \"internal\" :summary \"Brief sweep summary here\"}")})
                                     (recur (inc turn)))
 
-                                ;; Tool-use enforcement for interactive intake requests:
-                                ;; If an intake agent completes on the first turn without
-                                ;; calling ANY tool, the model just acknowledged instead
-                                ;; of doing actual research — inject a reminder.
+                                ;; Tool-use enforcement for interactive intake requests
                                 (and intake? (not ka-required)
                                      (= :complete (:result r))
                                      (zero? turn)
                                      (not (any-tool-called? chat-ctx))
                                      (< turn (dec max-turns)))
-                                (do (tel/log! {:level :info :id :agent/tool-use-reminder
-                                               :data {:agent-id (:id agent) :turn turn}}
+                                (do (tel/log! {:level :info
+                                               :id :agent/tool-use-reminder
+                                               :data {:agent-id aid :turn turn}}
                                               "No tools called on interactive request — injecting reminder")
                                     (chat-ctx/add-message! chat-ctx
                                       {:role :user
@@ -603,19 +764,19 @@
                                   (when (and intake? (= :tick task-type))
                                     (let [n (swap! sweep-count inc)]
                                       (tel/log! {:level :info :id :agent/sweep-done
-                                                 :data {:agent-id (:id agent) :turns turn
+                                                 :data {:agent-id aid :turns turn
                                                         :knowledge-add? (tool-called-in-ctx? chat-ctx "knowledge_add")}}
                                                 "Sweep complete")
-                                      (when (and eval-every-n (pos? n) (zero? (mod n eval-every-n)))
-                                        (fire-evaluator! agent summary base-prompt agent-config ctx))))
-                                  {:status :complete :content summary :agent-id (:id agent)}))
+                                      (when (and eval-every-n (pos? n)
+                                                 (zero? (mod n eval-every-n)))
+                                        (fire-evaluator! participant summary
+                                                         base-prompt agent-config ctx))))
+                                  (->reply summary)))
                               (recur (inc turn))))))))))
               (catch Exception e
                 (tel/log! {:level :error :id :agent/think-error :error e
-                           :data {:agent-id (:id agent)}} "Think error")
-                {:status   :error
-                 :content  (str "Sorry, I hit an error: " (.getMessage e))
-                 :agent-id (:id agent)}))))))))
+                           :data {:agent-id aid}} "Think error")
+                (->reply (str "Sorry, I hit an error: " (.getMessage e)))))))))))
 
 ;; ============================================================================
 ;; Response Sinks
@@ -628,182 +789,151 @@
   (swap! (:response-sinks daemon) conj sink-fn)
   daemon)
 
-(defn- extract-response-text
-  "Extract text content from an agent response."
-  [response]
-  (cond
-    (string? response) response
-    (map? response)
-    (let [last-msg (last (:messages response))]
-      (or ;; Direct :content at top level (from secretary think-fn)
-          (:content response)
-          ;; Namespace-qualified keys from datahike
-          (:message/content last-msg)
-          ;; Plain keys
-          (:content last-msg)
-          (:summary response)
-          (pr-str response)))
-    :else (pr-str response)))
-
 ;; ============================================================================
-;; Outbox Watcher — forwards agent responses to all registered sinks
+;; System Receiver + Watcher
+;;
+;; Agent replies addressed to `:_system` flow through one drain spin that
+;; fans them out to all registered response sinks. Replaces the legacy
+;; per-agent outbox-watcher (one future per agent) with a single drain.
 ;; ============================================================================
 
-(defn- start-outbox-watcher!
-  "Watch an agent's outbox and forward responses to all registered sinks.
+(defn- system-receiver
+  "Inert Participant that just collects messages on its inbox — never
+   replies. Joined into the daemon room at start time."
+  []
+  (d/participant
+    {:id system-id
+     :on-message (fn [_p _msg] (spin nil))}))
 
-   Runs as a spin loop so that (await mailbox) works correctly across iterations.
-   Returns a future wrapping the spin for lifecycle management."
-  [daemon agent-id]
-  (let [exec-ctx (:execution-ctx daemon)]
+(defn- start-system-watcher!
+  "Spawn a single spin that awaits the system participant's inbox and
+   fans each delivered reply to all response sinks. Stores the resulting
+   future in `(:system-watcher daemon)` for shutdown."
+  [daemon]
+  (let [exec-ctx  (:execution-ctx daemon)
+        room      (:discourse-room daemon)
+        sys-p     (get @(:participants room) system-id)]
     (binding [rtc/*execution-context* exec-ctx]
       (let [watcher-spin
             (spin
               (loop []
-                (when (and (not (contains? #{:stopping :stopped} @(:status daemon)))
-                           (registry/get-agent agent-id))
-                  (let [agent    (registry/get-agent agent-id)
-                        response (await (:outbox agent))]
-                    (when-not (= :skipped (:status response))
-                      (let [text (extract-response-text response)]
-                        (doseq [sink @(:response-sinks daemon)]
-                          (try
-                            (sink agent-id text)
-                            (catch Exception e
-                              (tel/log! {:level :error :id :daemon/sink-error
-                                         :data {:agent-id agent-id :error (.getMessage e)}}
-                                        "Sink error"))))))
+                (when-not (contains? #{:stopping :stopped} @(:status daemon))
+                  (let [msg      (await (:inbox sys-p))
+                        agent-id (:from msg)
+                        text     (:content msg)]
+                    (doseq [sink @(:response-sinks daemon)]
+                      (try (sink agent-id text)
+                           (catch Exception e
+                             (tel/log! {:level :error :id :daemon/sink-error
+                                        :data {:agent-id agent-id
+                                               :error (.getMessage e)}}
+                                       "Sink error"))))
                     (recur)))))]
-        ;; Fire and forget — spin runs on spindel executor
         (watcher-spin
-          (fn [_] (tel/log! {:id :daemon/watcher-exited :data {:agent-id agent-id}} "Outbox watcher exited"))
+          (fn [_] (tel/log! {:id :daemon/watcher-exited} "System watcher exited"))
           (fn [e] (tel/log! {:level :error :id :daemon/watcher-error
-                             :data {:agent-id agent-id :error (str e)}} "Outbox watcher error")))
-        ;; Return a future wrapping the spin for stop-agent! compatibility
-        (future @watcher-spin)))))
+                             :data {:error (str e)}} "System watcher error")))
+        (reset! (:system-watcher daemon) (future @watcher-spin))))))
 
 ;; ============================================================================
 ;; Agent Creation
 ;; ============================================================================
 
 (defn create-agent!
-  "Create, register, and start a new agent in the daemon.
+  "Build a discourse Participant for this agent, apply the enrichment
+   chain + drivers, and join it into the daemon's discourse room.
 
    Security defaults applied unless explicitly overridden:
-     :isolation    - :sci (sandboxed Clojure eval, no native JVM access)
-     :tools        - safe-tools (excludes shell, run_tests, telegram_* tools)
-     :budget-dollars - 0.25 per task (overridable)
-     :max-turns    - 10 per task (overridable)
+     :isolation     - :sci (sandboxed Clojure eval, no native JVM access)
+     :tools         - safe-tools (excludes shell, run_tests, telegram_* tools)
+     :budget-dollars - 0.25 per task
+     :max-turns     - 10 per task
 
-   To grant extra power, pass explicit overrides in agent-config, e.g.:
-     :isolation :native   — full JVM (trusted agents only, never Telegram)
+   To grant extra power, pass explicit overrides in agent-config:
+     :isolation :native       — full JVM (trusted agents only, never Telegram)
      :tools (tools/all-tools) — unrestricted (trusted agents only)
 
-   Args:
-     daemon       - Daemon record
-     agent-config - Map with :id :provider :model :system-prompt :tags etc.
-
-   Returns the created Agent record."
+   Returns the registered Participant."
   [daemon agent-config]
-  (let [exec-ctx (:execution-ctx daemon)
-        agent-id (or (:id agent-config) (keyword (gensym "agent-")))
-        ;; Load profile-based system prompt at creation time
-        profile-name (or (:profile agent-config) agent-id)
-        profile-prompt (load-agent-prompt profile-name)
+  (let [exec-ctx        (:execution-ctx daemon)
+        room            (:discourse-room daemon)
+        agent-id        (or (:id agent-config) (keyword (gensym "agent-")))
+        profile-name    (or (:profile agent-config) agent-id)
+        profile-prompt  (load-agent-prompt profile-name)
         ;; Apply security defaults; explicit config values override these
-        safe-config (merge {:isolation    :sci
-                            :budget-dollars 0.25
-                            :max-turns    10}
-                           agent-config
-                           {:id    agent-id
-                            ;; Tools: use safe set unless agent explicitly specifies
-                            :tools (or (:tools agent-config) (safe-tools))}
-                           ;; Apply profile prompt if no explicit system-prompt
-                           (when (and profile-prompt (not (:system-prompt agent-config)))
-                             {:system-prompt profile-prompt}))]
+        safe-config     (merge {:isolation      :sci
+                                :budget-dollars 0.25
+                                :max-turns      10}
+                               agent-config
+                               {:id agent-id
+                                :tools (or (:tools agent-config) (safe-tools))}
+                               (when (and profile-prompt
+                                          (not (:system-prompt agent-config)))
+                                 {:system-prompt profile-prompt}))
+        room-slugs       (:rooms safe-config)
+        sources          (when (and (seq room-slugs) (bus/initialized?))
+                           (vec (keep (fn [slug]
+                                        (when-let [src (bus/subscribe-room (str slug))]
+                                          {:name   (keyword "room" (str slug))
+                                           :source src}))
+                                      room-slugs)))
+        intel-room-slugs (remove #{"boardroom"} room-slugs)
+        ;; Build the base Participant; on-message captures the agent's
+        ;; behaviour (tag-driven), then wrappers add room-aware extras.
+        base-p           (d/participant
+                           {:id agent-id
+                            :ctx exec-ctx
+                            :on-message (make-on-message daemon safe-config)})
+        conn-of-ref      (fn []
+                           (some-> (rtc/get-state [:external-refs "dvergr-chat-db"])
+                                   :conn))
+        conn             (binding [rtc/*execution-context* exec-ctx]
+                           (conn-of-ref))
+        room-chat-ids    (when (and conn (seq room-slugs))
+                           (->> room-slugs
+                                (keep (fn [slug]
+                                        (when-let [r (rooms/get-room-by-slug
+                                                       conn (str slug))]
+                                          (:chat/id r))))
+                                vec))
+        participant      (cond-> base-p
+                           ;; Drop :source events the agent itself authored
+                           (seq room-slugs)
+                           (enr/with-self-filter)
+                           ;; Prepend room history to incoming Messages
+                           (and conn (seq room-chat-ids))
+                           (enr/with-room-context
+                             {:conn conn :room-ids room-chat-ids})
+                           ;; Treat [SKIP] / blank replies as no-reply
+                           (seq room-slugs)
+                           (enr/with-silence)
+                           ;; Post replies back to the source room for
+                           ;; non-boardroom intel rooms (boardroom uses
+                           ;; the global sink instead).
+                           (and conn (seq intel-room-slugs))
+                           (enr/with-intel-room-routing {:conn conn})
+                           ;; Attach drivers
+                           (seq sources)        (d/with-sources sources)
+                           (:interval-ms safe-config)
+                           (d/with-cadence (:interval-ms safe-config)))]
     (binding [rtc/*execution-context* exec-ctx]
-      (let [ag (agent/create-agent safe-config)
-            base-think-fn (make-think-fn daemon safe-config)
-
-            ;; Room sources — subscribe to configured room slugs via bus
-            room-slugs (:rooms safe-config)
-            sources    (when (and (seq room-slugs) (bus/initialized?))
-                         (vec (keep (fn [slug]
-                                      (when-let [src (bus/subscribe-room (str slug))]
-                                        {:name   (keyword "room" (str slug))
-                                         :source src}))
-                                    room-slugs)))
-
-            ;; Wrap think-fn: self-filter first (prevents echo loops),
-            ;; then room context enrichment, then silence option (allows [SKIP]),
-            ;; then intel routing (for non-boardroom rooms only)
-            intel-room-slugs (remove #{"boardroom"} room-slugs)
-            think-fn   (cond-> base-think-fn
-                         ;; Self-filter: drop source events authored by this agent
-                         (seq room-slugs)
-                         (enrichment/with-self-filter agent-id)
-                         ;; Room context: inject recent room history into task
-                         (seq room-slugs)
-                         (as-> tfn
-                           (let [conn (when-let [sys (rtc/get-state [:external-refs "dvergr-chat-db"])]
-                                        (:conn sys))
-                                 room-chat-ids (when conn
-                                                 (->> room-slugs
-                                                      (keep (fn [slug]
-                                                              (when-let [room (rooms/get-room-by-slug conn (str slug))]
-                                                                (:chat/id room))))
-                                                      vec))]
-                             (if (and conn (seq room-chat-ids))
-                               (enrichment/with-room-context tfn conn room-chat-ids)
-                               tfn)))
-                         ;; Silence option: allows agents to output [SKIP] to stay quiet
-                         (seq room-slugs)
-                         (enrichment/with-silence-option)
-                         ;; Intel routing: post response back to the exact source room
-                         ;; Only for non-boardroom rooms (boardroom uses the global sink)
-                         (seq intel-room-slugs)
-                         (as-> tfn
-                           (if-let [conn (some-> (rtc/get-state [:external-refs "dvergr-chat-db"]) :conn)]
-                             (enrichment/with-intel-room-routing tfn conn)
-                             tfn)))]
-
-        ;; Register in registry
-        (registry/register! agent-id ag
-                            :tags (or (:tags agent-config) #{})
-                            :description (or (:description agent-config) ""))
-
-        ;; Start the agent loop — intake agents self-tick via FRP sleep
-        (agent/start! ag think-fn
-                      :interval-ms (:interval-ms safe-config)
-                      :sources sources)
-
-        ;; Update registry status
-        (registry/update-status! agent-id :running)
-
-        ;; Start outbox watcher for Telegram forwarding
-        (swap! (:outbox-watchers daemon) assoc agent-id
-               (start-outbox-watcher! daemon agent-id))
-
-        ag))))
+      (d/join room participant))
+    (registry/register! agent-id participant
+                        :tags        (or (:tags agent-config) #{})
+                        :description (or (:description agent-config) "")
+                        :config      safe-config)
+    (registry/update-status! agent-id :running)
+    participant))
 
 (defn stop-agent!
-  "Stop and unregister an agent.
-
-   Args:
-     daemon   - Daemon record
-     agent-id - Agent ID to stop"
+  "Leave the participant from the daemon room and unregister it. The
+   participant's spin (and any driver pumps) continue running on the
+   shared executor — discourse has no per-spin cancel today — but no
+   further messages are routed to it."
   [daemon agent-id]
   (binding [rtc/*execution-context* (:execution-ctx daemon)]
-    ;; Stop outbox watcher
-    (when-let [watcher (get @(:outbox-watchers daemon) agent-id)]
-      (future-cancel watcher)
-      (swap! (:outbox-watchers daemon) dissoc agent-id))
-
-    ;; Stop agent loop
-    (when-let [ag (registry/get-agent agent-id)]
-      (agent/stop! ag))
-
-    ;; Unregister
+    (when-let [room (:discourse-room daemon)]
+      (d/leave room agent-id))
     (registry/unregister! agent-id)
     :stopped))
 
@@ -897,14 +1027,14 @@
 
           ;; Agent addressed — route to specific agent with its own session
           (:agent-id parsed)
-          (if-let [ag (registry/get-agent (:agent-id parsed))]
+          (if (registry/get-agent (:agent-id parsed))
             (let [target-id (:agent-id parsed)
                   session (sessions/get-or-create-session! chat-id target-id user-info)]
-              (binding [rtc/*execution-context* (:execution-ctx daemon)]
-                (agent/send! ag {:content (:text parsed)
-                                 :chat-id chat-id
-                                 :user-info user-info
-                                 :chat-ctx (:chat-ctx session)})))
+              (d/post! (:discourse-room daemon)
+                       (d/message system-id target-id (:text parsed) nil
+                                  {:chat-id   chat-id
+                                   :user-info user-info
+                                   :chat-ctx  (:chat-ctx session)})))
             ;; Unknown agent — send error
             (doseq [sink @(:response-sinks daemon)]
               (try (sink default-agent-id
@@ -915,12 +1045,12 @@
           ;; Plain text — route to default agent (var) with its own session
           :else
           (let [session (sessions/get-or-create-session! chat-id default-agent-id user-info)]
-            (when-let [ag (registry/get-agent default-agent-id)]
-              (binding [rtc/*execution-context* (:execution-ctx daemon)]
-                (agent/send! ag {:content text
-                                 :chat-id chat-id
-                                 :user-info user-info
-                                 :chat-ctx (:chat-ctx session)}))))))))))
+            (when (registry/get-agent default-agent-id)
+              (d/post! (:discourse-room daemon)
+                       (d/message system-id default-agent-id text nil
+                                  {:chat-id   chat-id
+                                   :user-info user-info
+                                   :chat-ctx  (:chat-ctx session)}))))))))))
 
 ;; ============================================================================
 ;; Daemon Lifecycle
@@ -942,12 +1072,17 @@
   [config]
   (tel/log! {:id :daemon/starting} "Starting dvergr daemon")
 
-  ;; Create execution context
-  (let [exec-ctx (agent/create-shared-context
-                   :with-git? true
-                   :with-datahike? true)
-        status-a (atom :starting)
-        daemon (->Daemon config exec-ctx nil nil (atom {}) (atom []) status-a)]
+  ;; Create execution context, daemon-wide discourse room, and the
+  ;; :_system receiver that drains all agent replies into the sink fan-out.
+  (let [exec-ctx       (create-shared-context :with-git? true
+                                              :with-datahike? true)
+        discourse-room (d/room :daemon exec-ctx)
+        status-a       (atom :starting)
+        daemon         (->Daemon config exec-ctx discourse-room
+                                 nil nil (atom nil) (atom []) status-a)]
+    (binding [rtc/*execution-context* exec-ctx]
+      (d/join discourse-room (system-receiver)))
+    (start-system-watcher! daemon)
 
     ;; Register execution context for distributed addressing
     (sdist/register-context! :default exec-ctx)
@@ -1173,8 +1308,10 @@
 
         ;; Install scheduler schema and restore schedules
         (try
-          (when-let [db-conn (some-> exec-ctx deref :db-conn)]
-            (scheduler/install-schema! db-conn))
+          (binding [rtc/*execution-context* exec-ctx]
+            (when-let [conn (some-> (rtc/get-state [:external-refs "dvergr-chat-db"])
+                                    :conn)]
+              (scheduler/install-schema! conn)))
           (scheduler/restore-schedules! daemon-with-http)
           (catch Exception e
             (tel/log! {:level :warn :id :daemon/scheduler-restore-skipped
@@ -1188,27 +1325,29 @@
 (defn stop!
   "Orderly shutdown of the daemon.
 
-   1. Stop all agents
-   2. Disconnect channels
-   3. Close sessions
+   1. Stop the system watcher
+   2. Leave all participants from the discourse room
+   3. Disconnect channels, close sessions
    4. Unregister execution context"
   [daemon]
   (tel/log! {:id :daemon/stopping} "Stopping daemon")
   (reset! (:status daemon) :stopping)
 
-  ;; Stop all outbox watchers
-  (doseq [[_id watcher] @(:outbox-watchers daemon)]
-    (future-cancel watcher))
-  (reset! (:outbox-watchers daemon) {})
+  ;; Cancel the single system watcher (replaces per-agent outbox watchers)
+  (when-let [watcher @(:system-watcher daemon)]
+    (future-cancel watcher)
+    (reset! (:system-watcher daemon) nil))
 
-  ;; Stop all registered agents
+  ;; Leave all registered participants from the discourse room and
+  ;; unregister them. Driver pumps + participant spins remain on the
+  ;; executor (discourse has no per-spin cancel today) but no further
+  ;; messages are routed to them.
   (doseq [agent-id (registry/agent-ids)]
     (tel/log! {:id :daemon/stop-agent :data {:agent-id agent-id}} "Stopping agent")
     (binding [rtc/*execution-context* (:execution-ctx daemon)]
-      (when-let [ag (registry/get-agent agent-id)]
-        (try
-          (agent/stop! ag)
-          (catch Exception _))))
+      (when-let [room (:discourse-room daemon)]
+        (try (d/leave room agent-id)
+             (catch Exception _))))
     (registry/unregister! agent-id))
 
   ;; Cancel all schedules

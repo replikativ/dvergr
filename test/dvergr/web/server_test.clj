@@ -19,9 +19,10 @@
 (defn- make-mock-daemon []
   {:config {}
    :execution-ctx (atom nil)
+   :discourse-room nil
    :telegram-ch nil
    :http-server nil
-   :outbox-watchers (atom {})
+   :system-watcher (atom nil)
    :response-sinks (atom [])
    :status (atom :running)})
 

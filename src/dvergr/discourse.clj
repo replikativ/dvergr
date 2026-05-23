@@ -263,7 +263,11 @@
 
 (defn ask
   "Send a message to target-id and await their reply. Returns Spin[Message].
-   The asker is a transient stub (id + mailbox only) — no spin spawned."
+   The asker is a transient stub (id + mailbox only) — no spin spawned.
+
+   `msg-spec` is `{:content str & opts}` where `:metadata` (optional) is
+   attached to the dispatched Message — used by agent handlers that pull
+   per-session state (chat-ctx, source provenance) from the envelope."
   [room target-id msg-spec]
   (sp/spin
     (let [asker-id  (keyword (str "ask-" (random-uuid)))
@@ -271,7 +275,8 @@
                       (sync/create-mailbox (:ctx room)))]
       (swap! (:participants room) assoc asker-id
              {:id asker-id :inbox asker-mbx})
-      (post! room (message asker-id target-id (:content msg-spec) nil nil))
+      (post! room (message asker-id target-id (:content msg-spec) nil
+                           (:metadata msg-spec)))
       (let [reply (sp/await asker-mbx)]
         (swap! (:participants room) dissoc asker-id)
         reply))))

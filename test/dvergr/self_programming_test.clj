@@ -239,8 +239,8 @@
                                  :model "test"
                                  :profile :worker
                                  :tags #{:worker}}}})]
-      (let [ag (registry/get-agent :worker)
-            sys-prompt (get-in ag [:config :system-prompt])]
+      ;; Config now lives on the registry entry, not on the discourse Participant.
+      (let [sys-prompt (get-in (registry/lookup :worker) [:config :system-prompt])]
         (is (some? sys-prompt) "System prompt should be loaded from profile")
         (is (str/includes? (str sys-prompt) "Worker Agent")
             "Should contain markdown profile content"))
@@ -254,8 +254,7 @@
                                  :profile :worker
                                  :system-prompt "Custom prompt"
                                  :tags #{:worker}}}})]
-      (let [ag (registry/get-agent :worker)
-            sys-prompt (get-in ag [:config :system-prompt])]
+      (let [sys-prompt (get-in (registry/lookup :worker) [:config :system-prompt])]
         (is (= "Custom prompt" sys-prompt)))
       (daemon/stop! d))))
 

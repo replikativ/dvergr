@@ -20,7 +20,8 @@
      - Execution context registry for agent addressing"
   (:refer-clojure :exclude [await])
   (:require [dvergr.registry :as registry]
-            [dvergr.agent.process :as agent]
+            [dvergr.daemon :as daemon]
+            [dvergr.discourse :as d]
             [dvergr.sessions :as sessions]
             [org.replikativ.spindel.engine.core :as rtc]
             [org.replikativ.spindel.core :refer [spin await]]
@@ -45,16 +46,31 @@
 ;; Remote Operations
 ;; ============================================================================
 
+(defn- task->message-spec
+  "Coerce the legacy task shape (a string or {:content ...}) into a content
+   string + metadata pair suitable for d/message."
+  [task]
+  (if (string? task)
+    [task nil]
+    [(or (:content task) "") (dissoc task :content)]))
+
 (defn-spin-remote ask-agent [server-id agent-id task]
   (spin-remote server-id [agent-id task]
-    (let [ag (registry/get-agent agent-id)]
-      (if ag
-        (do
-          (agent/send! ag task)
-          (await (:outbox ag)))
+    (let [daemon @daemon/current-daemon
+          room   (:discourse-room daemon)]
+      (cond
+        (nil? daemon)
+        {:error :daemon-not-running :agent-id agent-id}
+
+        (nil? (registry/get-agent agent-id))
         {:error :agent-not-found
          :agent-id agent-id
-         :available (registry/agent-ids)}))))
+         :available (registry/agent-ids)}
+
+        :else
+        (let [[content meta] (task->message-spec task)]
+          (await (d/ask room agent-id (cond-> {:content content}
+                                        meta (assoc :metadata meta)))))))))
 
 (defn-spin-remote list-remote-agents [server-id]
   (spin-remote server-id []
@@ -62,17 +78,30 @@
 
 (defn-spin-remote send-to-agent [server-id agent-id message]
   (spin-remote server-id [agent-id message]
-    (if-let [ag (registry/get-agent agent-id)]
-      (do
-        (agent/send! ag message)
-        :sent)
-      {:error :agent-not-found
-       :agent-id agent-id})))
+    (let [daemon @daemon/current-daemon]
+      (cond
+        (nil? daemon)
+        {:error :daemon-not-running :agent-id agent-id}
+
+        (nil? (registry/get-agent agent-id))
+        {:error :agent-not-found :agent-id agent-id}
+
+        :else
+        (let [[content meta] (task->message-spec message)]
+          (d/post! (:discourse-room daemon)
+                   (d/message :remote agent-id content nil meta))
+          :sent)))))
 
 (defn-spin-remote agent-status [server-id agent-id]
   (spin-remote server-id [agent-id]
-    (if-let [ag (registry/get-agent agent-id)]
-      (agent/status ag)
+    (if-let [entry (registry/lookup agent-id)]
+      ;; Status now lives on the registry entry — the Participant itself
+      ;; carries no lifecycle state.
+      {:id          agent-id
+       :status      (:status entry)
+       :tags        (:tags entry)
+       :description (:description entry)
+       :created-at  (:created-at entry)}
       {:error :agent-not-found
        :agent-id agent-id})))
 

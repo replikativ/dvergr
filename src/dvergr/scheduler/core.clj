@@ -13,7 +13,7 @@
      (list-schedules)
      (cancel-schedule! schedule-id)"
   (:require [dvergr.registry :as registry]
-            [dvergr.agent.process :as agent]
+            [dvergr.discourse :as disc]
             [dvergr.sessions :as sessions]
             [dvergr.scheduler.schema :as schema]
             [dvergr.scheduler.cron :as cron]
@@ -22,6 +22,12 @@
             [org.replikativ.spindel.spin.combinators :as comb]
             [datahike.api :as d])
   (:import [java.util Date UUID]))
+
+;; Resolve the daemon's `current-daemon` atom lazily — `dvergr.daemon`
+;; requires this namespace, so a hard `:require` would create a cycle.
+(defn- current-daemon
+  []
+  (some-> (requiring-resolve 'dvergr.daemon/current-daemon) deref deref))
 
 ;; ============================================================================
 ;; State
@@ -110,30 +116,28 @@
                        (cron/next-fire-ms spec)
                        (:interval-ms config))]
         (await (comb/sleep sleep-ms)))
-      (when-let [ag (registry/get-agent (:agent-id config))]
-        (try
-          (agent/send! ag {:content (:task config)
-                           :source :scheduler
-                           :schedule-id (:id config)})
-          ;; If we have a notify-fn, await the outbox for the response
-          (when notify-fn
-            (try
-              (let [response (await (:outbox ag))
-                    text (cond
-                           (string? response) response
-                           (map? response)    (or (:content response)
-                                                  (:summary response)
-                                                  (pr-str response))
-                           :else              (pr-str response))]
-                (notify-fn text))
-              (catch Exception e
-                (binding [*err* *err*]
-                  (.println *err* (str "dvergr-scheduler: notify error for " (:id config) ": " (.getMessage e)))
-                  (.flush *err*)))))
-          (catch Exception e
-            (binding [*err* *err*]
-              (.println *err* (str "dvergr-scheduler: dispatch error for " (:id config) ": " (.getMessage e)))
-              (.flush *err*)))))
+      (let [d    (current-daemon)
+            room (:discourse-room d)
+            aid  (:agent-id config)]
+        (when (and room (registry/get-agent aid))
+          (try
+            (if notify-fn
+              ;; Synchronous: ask + await reply, hand text to notify-fn.
+              (let [reply (await (disc/ask room aid
+                                           {:content (:task config)
+                                            :metadata {:source :scheduler
+                                                       :schedule-id (:id config)}}))]
+                (notify-fn (str (:content reply))))
+              ;; Fire-and-forget.
+              (disc/post! room
+                          (disc/message :scheduler aid (:task config) nil
+                                        {:source :scheduler
+                                         :schedule-id (:id config)})))
+            (catch Exception e
+              (binding [*err* *err*]
+                (.println *err* (str "dvergr-scheduler: dispatch error for "
+                                     (:id config) ": " (.getMessage e)))
+                (.flush *err*))))))
       (when db-conn
         (update-last-run! db-conn (:id config)))
       ;; Check if still active
