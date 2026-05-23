@@ -347,3 +347,54 @@
           via-ask    (await-spin r #(d/ask     % :bot   {:content "hi"}))]
       (is (= 1 (count via-fanout)))
       (is (= (:content (first via-fanout)) (:content via-ask))))))
+
+;; ============================================================================
+;; Hire — fork + spawn + send + merge|discard
+;; ============================================================================
+
+(deftest hire-accepts-and-merges
+  (testing "Successful hire: worker reply accepted, fork merged into parent"
+    (let [r (d/room :t)
+          ;; Build worker in parent's ctx; hire forks and joins it
+          worker (binding [ec/*execution-context* (:ctx r)]
+                   (d/scripted :researcher ["Here is my research"]))
+          outcome (await-spin r #(d/hire % worker {:goal "Research X"
+                                                   :timeout-ms 2000}))]
+      (is (= :merged (:status outcome)))
+      (is (= "Here is my research" (:content (:reply outcome))))
+      (is (= 2 (count @(:log r))) "fork's exchange flowed into parent"))))
+
+(deftest hire-rejects-and-discards
+  (testing "Worker reply fails accept-fn → fork discarded, parent untouched"
+    (let [r (d/room :t)
+          worker (binding [ec/*execution-context* (:ctx r)]
+                   (d/scripted :worker ["bad output"]))
+          outcome (await-spin r
+                    #(d/hire % worker
+                             {:goal "Do the thing"
+                              :accept-fn (fn [m] (re-find #"^good"
+                                                          (:content m)))
+                              :timeout-ms 2000}))]
+      (is (= :discarded (:status outcome)))
+      (is (= "bad output" (:content (:reply outcome))))
+      (is (zero? (count @(:log r))) "discard left parent log empty"))))
+
+(deftest hire-isolates-multiple-workers
+  (testing "Two hires in parallel each get their own fork; logs separate"
+    (let [r (d/room :t)
+          w1 (binding [ec/*execution-context* (:ctx r)]
+               (d/scripted :w1 ["result-1"]))
+          w2 (binding [ec/*execution-context* (:ctx r)]
+               (d/scripted :w2 ["result-2"]))
+          out (await-spin r
+                (fn [room]
+                  (sp/spin
+                    (sp/await
+                      (comb/parallel
+                        (d/hire room w1 {:goal "task-1" :timeout-ms 2000})
+                        (d/hire room w2 {:goal "task-2" :timeout-ms 2000}))))))]
+      (is (every? #(= :merged (:status %)) out))
+      (is (= #{"result-1" "result-2"}
+             (set (map #(get-in % [:reply :content]) out))))
+      ;; Both succeed → both merge. Parent log has both exchanges (4 entries)
+      (is (= 4 (count @(:log r)))))))

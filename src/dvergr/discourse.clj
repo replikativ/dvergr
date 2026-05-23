@@ -291,6 +291,58 @@
   parent)
 
 ;; ============================================================================
+;; Hire — fork + spawn + send + merge|discard (the §5.8 primitive)
+;; ============================================================================
+
+(defn hire
+  "Spawn `worker` (a Participant) in a forked room, send it `goal`, wait
+   for its reply or timeout. Then:
+     - if `accept-fn` returns truthy, merge the fork into parent
+     - otherwise, discard the fork
+
+   Returns Spin yielding one of:
+     {:status :merged    :reply Message :log [Message]}
+     {:status :discarded :reply Message :log [Message]}
+     {:status :timeout                  :log [Message]}
+
+   Options:
+     :goal        — string content of the initial message (required)
+     :accept-fn   — (fn [reply] -> bool) — decides merge vs discard
+                    (default: always merge if reply received)
+     :timeout-ms  — wall-clock timeout (default 60000)
+     :from        — :from id for the goal message (default :hire-caller)
+
+   The worker should be a fresh Participant not joined elsewhere; its
+   on-message will receive the goal as the first message it sees. Pair
+   with `dvergr.discourse.llm/llm-agent` for real LLM workers, or with
+   `scripted`/`echo` for tests."
+  [room worker {:keys [goal accept-fn timeout-ms from]
+                :or   {accept-fn (constantly true)
+                       timeout-ms 60000
+                       from :hire-caller}}]
+  (sp/spin
+    (let [fork  (fork-room room)
+          _     (join fork worker)
+          reply (sp/await
+                  (comb/timeout
+                    (ask fork (:id worker) {:content goal})
+                    timeout-ms
+                    ::timeout))
+          log   @(:log fork)]
+      (cond
+        (= reply ::timeout)
+        (do (discard fork)
+            {:status :timeout :log log})
+
+        (accept-fn reply)
+        (do (merge-room room fork)
+            {:status :merged :reply reply :log log})
+
+        :else
+        (do (discard fork)
+            {:status :discarded :reply reply :log log})))))
+
+;; ============================================================================
 ;; Patterns — decomposing to the algebra
 ;; ============================================================================
 
