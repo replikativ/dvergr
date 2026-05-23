@@ -79,34 +79,47 @@
 
    :id          — keyword participant id (required)
    :spec        — {:provider :model :system-prompt} (required)
-   :tools       — set or vector of tool names from `dvergr.tools` registry,
-                  or nil for no tools
+   :tools       — set/vector of tool names from `dvergr.tools` registry, OR
+                  a map of name → tool-def (for pre-wrapped tools)
    :db-conn     — datahike connection for chat persistence (optional)
    :budget      — {:dollars n :max-turns n} (default {:dollars 1.0 :max-turns 8})
    :compaction  — {:auto? bool :model str} (default {:auto? true})
+   :chat-ctx    — pre-built ChatContext (optional). When provided, llm-agent
+                  uses it as-is (no fresh creation, no system-prompt seeding).
+                  Use this when the caller needs richer setup — replayed
+                  history, custom SCI bindings, owner-specific persistence.
+   :tool-ctx    — pre-built tool execution context (optional). Default is
+                  `(tools/make-context {:db-conn :chat-ctx})`. Override
+                  when SCI sandbox, KB write namespaces, or pre-wrapped
+                  tools are needed.
    :run-turn-fn — (fn [chat-ctx opts] → :complete | :continue | :error)
-                  Override for testing; default calls
-                  `dvergr.chat.agent/run-agent-turn!`
+                  Override for testing or to inject per-turn behaviour
+                  (e.g. usage logging). Default calls
+                  `dvergr.chat.agent/run-agent-turn!`.
    :ctx         — discourse room's execution context
                   (default: `*execution-context*`)"
-  [{:keys [id spec tools db-conn budget compaction run-turn-fn ctx]
+  [{:keys [id spec tools db-conn budget compaction
+           chat-ctx tool-ctx run-turn-fn ctx]
     :or   {budget      {:dollars 1.0 :max-turns 8}
            compaction  {:auto? true}
            run-turn-fn default-run-turn}}]
   {:pre [(keyword? id) (map? spec)]}
   (let [ctx       (or ctx ec/*execution-context*)
-        chat-ctx  (cc/create-chat-context
-                    {:title          (str "agent " (name id))
-                     :budget-dollars (:dollars budget 1.0)
-                     :db-conn        db-conn
-                     :with-sci?      false})
-        ;; Seed system prompt if provided
-        _         (when-let [sp (:system-prompt spec)]
-                    (cc/add-message! chat-ctx {:role :system :content sp}))
+        chat-ctx  (or chat-ctx
+                      (let [c (cc/create-chat-context
+                                {:title          (str "agent " (name id))
+                                 :budget-dollars (:dollars budget 1.0)
+                                 :db-conn        db-conn
+                                 :with-sci?      false})]
+                        ;; Seed system prompt if provided (only for fresh ctx)
+                        (when-let [sp (:system-prompt spec)]
+                          (cc/add-message! c {:role :system :content sp}))
+                        c))
         max-turns (:max-turns budget 8)
-        tool-ctx  (tools/make-context
-                    {:db-conn  db-conn
-                     :chat-ctx chat-ctx})
+        tool-ctx  (or tool-ctx
+                      (tools/make-context
+                        {:db-conn  db-conn
+                         :chat-ctx chat-ctx}))
         turn-opts {:provider         (:provider spec)
                    :model            (:model spec)
                    :tools            tools
