@@ -40,3 +40,6 @@ data/
 
 # Local config — contains secrets, never commit
 config.local.edn
+
+# Related-work PDFs (large, fetchable from sources)
+doc/related-work/pdfs/

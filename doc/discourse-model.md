@@ -152,6 +152,8 @@ Three reasons this is load-bearing:
 
 3. **Fork-merge identity is a bisimulation.** The fork-identity law (§7) — "applying ops in a fork and merging equals applying ops in place when no isolation diverges" — is exactly the statement that a forked participant is bisimilar to the parent at fork time and diverges only via differential evidence. This is what makes speculative exploration *sound*.
 
+**Bisimulation by features (the sharper form, for open-weights participants).** Behavioural bisimulation is the default we just defined; it is checkable by running scripts against both participants and comparing outbox streams. For open-weights participants, **Geiger 2023's *causal abstraction* + DAS (Distributed Alignment Search)** [19] gives a strictly sharper notion: two participants are bisimilar *by features* iff their internal SAE activations are mapped by an alignment to a common abstract circuit. With open SAEs available today (Gemma Scope, Goodfire), this is *checkable* for open-weights participants — not just a definition. Behavioural bisimulation remains the default for closed-weights or scripted participants; feature bisimulation is the upgrade when both parties expose their internals. The two combine: behavioural for the algebra-as-tested, feature-level for the strongest soundness claims.
+
 ### 5.5 Drivers: inbox is not the only signal
 
 A participant's spin races over **six channels**, not just inbox:
@@ -297,6 +299,8 @@ The pattern for agents-hiring-agents:
 
 The user composes participants and rooms through a small algebra. Every primitive is either FRP-pure (returns a value) or returns a spin (a continuous-time process that yields a value upon completion).
 
+**Formal foundation.** The asymmetric primitives — `ask`, `fan-out`, `race`, `pipeline` — sit naturally in the **algebraic-effects** tradition for LLM composition: **Pangolin (Tan, Wei, Sen, Zaharia LMPL 2025) [15]** types LLM calls as first-class algebraic effects, and the **selection monad (Plotkin & Xie PLDI 2025) [16]** provides reward-based choice over non-deterministic outputs. These two together cover 4 of our 5 algebraic combinators directly. The fifth — `debate` — requires the **coalgebraic view** of §5.4 because it has peer-symmetric communication that algebraic-effects alone cannot express. This is why our §5.4 commitment is *load-bearing*, not decorative: algebra covers the asymmetric primitives, coalgebra covers the symmetric ones, both compose under one substrate.
+
 ### 6.1 Addressing
 
 ```clojure
@@ -416,6 +420,8 @@ Small local SMC (Intensity 1 in §10.2) over three candidate utterances, picked 
 
 These are testable invariants the implementation must satisfy. Property-based tests (§9) enforce them with `script`/`with-latency`/`flaky` participants — no LLMs needed.
 
+**The formal home for these laws is Plotkin & Xie's effect-handler equational theory** [16] — the standard algebraic account of how effect handlers compose and what equations they preserve. Our combinators inherit those equations directly (`pipeline` associativity, `fan-out` singleton, etc.); we add the coalgebraic laws (fork-identity, idle quiescence) on top.
+
 | Law | Statement |
 |-----|-----------|
 | Pipeline associativity | `(pipeline [a (pipeline [b c])] m) ≡ (pipeline [a b c] m)` |
@@ -441,6 +447,16 @@ Each participant carries a `belief` signal — a model of (a) the topic, (b) wha
 - a tensor produced by raster, for learned beliefs
 
 The substrate only requires that `belief` is a signal updated on each new inbox message. The spin's body may read it when composing utterances. This is the RSA hook [4]: a speaker chooses an utterance by predicting how its listener will update *their* belief; the speaker's `belief` includes the listener's belief model.
+
+**Three coupled substrates for `belief`.** Belief lives at three substrates simultaneously, each useful for different things:
+
+| Substrate | What it holds | Inspected by | Implementation |
+|-----------|---------------|--------------|----------------|
+| **Symbolic** | Discrete maps / propositions / dialogue states | Read with `@belief`; printable; queryable in datahike | The default; what scripted and closed-weights participants expose |
+| **Population-coded** | Residual-stream embeddings | Compared by cosine similarity; clustered for "common stance" | Captured from LLM forward passes when the participant is LLM-driven |
+| **Feature-coded** | SAE feature activations [17][18] | Inspected feature-by-feature; mapped by DAS [19] for bisimulation-by-features (§5.4); manipulable via `with-steering` | Available today for open-weights participants via Gemma Scope / Goodfire |
+
+The symbolic substrate is always present; the latter two come "for free" when a participant is an open-weights LLM whose activations we can read. A participant's `with-steering` wrapper (sibling of `with-system`) applies activation-level deltas (RepE [39], CAA [40], single-direction interventions [41]) to nudge feature-coded belief at inference time — cheap, deterministic, composable. Mechanistic interpretability research (the SAE lineage [17][18], DAS [19], steering [39][40][41]) supplies the tools; we just consume them through the substrate.
 
 ### 8.2 Common-ground signal (room-level)
 
@@ -622,6 +638,8 @@ A Feynman–Kac process [10] is a sequence of measures Mₜ defined by a propaga
 
 The framing carries over from discrete-time FK because resampling is bound to chosen barriers, not a uniform clock. Between barriers, particles evolve freely under their own continuous-time spin dynamics. This generalisation is the *point* of running SMC on FRP [9] [11].
 
+**Where this sits in the existing FK-on-LLMs literature.** Token-level FK on LLMs is established (LLaMPPL [1]). The closest existing work at higher granularity is **DisCIPL** (Grand, Lew et al. 2025) [21] — self-steering inference where an LLM generates a probabilistic program and SMC steers it — and **MSA** (Wong et al. 2025) [22] — ephemeral world models synthesised on demand. Both still operate at the single-mind level (one LLM, one inference). Our position: lift FK to *room granularity*, with the population being forked rooms rather than forked token sequences. A discourse particle is a *conversational trajectory* across many participants, not a token sequence inside one LLM. The substrate is the same (spindel's fork + SMC kernels); the granularity is one level up.
+
 ### 10.2 Three intensities of inference
 
 | Intensity | Mechanism | Cost | When to use |
@@ -702,6 +720,17 @@ Six steps, each REPL-validated before the next. Each step is small enough that w
 
 After Step 6 the codebase has one substrate, one set of laws, one programming model.
 
+### Step 7 (post-MVP) — Concordia / Melting Pot benchmark
+
+The cleanest empirical claim our differentiator makes is *forkable runtime + `simulate-reply` improves ad-hoc teamwork*. The cooperative-AI community has thousands of vetted multi-agent scenarios in **Concordia** and **Melting Pot** [34]. Concrete experiment:
+
+1. Pick one Concordia scenario (e.g., a coordination/negotiation game)
+2. Implement the same participants in `dvergr.discourse` with **only the baseline algebra** (`ask`/`pipeline`/`debate`) — no theory of mind
+3. Re-run with `simulate-reply` (§6.5) added as the only delta — participants may now run hypothetical replies in forked rooms before committing utterances
+4. Measure: outcome quality, AHT coverage-set membership, token cost
+
+This is a *falsifiable* claim, not a marketing one. If `simulate-reply` doesn't help AHT, we know to revisit the theory-of-mind framing. If it does, we have a publishable result and a concrete differentiator. Deferred to after the substrate is stable (post-Step 6).
+
 ## 12. Reflectivity — same algebra inside SCI
 
 The substrate is **reflective**: anything a developer composes in Clojure, an agent inside the SCI sandbox can compose with identical syntax. We add the lift in `dvergr.sandbox/setup-agent-namespaces!`:
@@ -731,6 +760,10 @@ These do not block the MVP. They will be settled by experience with real workflo
 
 8. **Finer-grained capability/approval model.** v1 capabilities are SCI tool exposure (§5.8). v2 should add per-operation `ExecApprovalRequirement` (auto / required / never) inspired by Codex's exec-policy, with policy inheritance from parent to child. This becomes necessary when (a) the same tool is acceptable in some contexts and not others (e.g., `fs/write` to fork-only paths vs system paths), or (b) users want UI-driven approval-on-demand rather than static lift/no-lift.
 
+9. **`Pact` watch-item** (Basis Research, April 2026) — a multi-agent coordination language announced after this doc's drafting. Potentially adjacent or competitive with `dvergr.discourse`. Worth examining the design and deciding whether (a) we adopt their primitives where they're cleaner, (b) we explicitly differentiate, or (c) we collaborate. The substrate-and-worldview alignment with Basis is otherwise the strongest of any lab surveyed (their `effectful` library is in the spindel algebraic-effects family).
+
+10. **DR-MDP audit of `align-on`** (Carroll 2024 [33], Lang 2024). The Habermas-Machine pattern is vulnerable to participants nudging others' beliefs through framing/ordering, biasing the converged common-ground. A correctness test: simulate the same `align-on` multiple times with permuted speaking order / dropped participants and verify stability of the converged result. Deception detection becomes a property test, not an afterthought. Tracks AI-safety work on preference dynamics (DR-MDP).
+
 ## 14. Relationship to existing namespaces
 
 | Existing | After migration | Notes |
@@ -745,19 +778,54 @@ These do not block the MVP. They will be settled by experience with real workflo
 | `dvergr.rooms.bus` | one possible `delivery` for distributed rooms | optional plug-in |
 | `dvergr.sandbox` | adds the SCI lift for `dvergr.discourse` (§12) | reflectivity |
 | simmis `room_agents/dispatch-to-agents!` | replaced by `(iterative-refinement … )` or `(chat-loop …)` | validates the model from the consumer side |
+| Basis Research `effectful` (Python) | *substrate sibling, external* — same algebraic-effects family as spindel | not a dependency; worth studying for idiom transfer; see Open Q #9 (`Pact`) |
 
 ## 15. Comparison to SoTA coding assistants
 
-Our peer set as of mid-2026:
+Our peer set as of mid-2026. Two clusters: (a) coding assistants (single-agent-rooted with delegation), (b) multi-agent LLM frameworks (population-of-agents-from-the-start). We are closest in spirit to the second cluster, while having to compete with the first on solo-developer UX.
+
+**Coding assistants:**
 
 | System | Architecture | Sub-agents | Sandbox | Forking | Fork resumability |
 |--------|--------------|------------|---------|---------|-------------------|
 | **Codex** (OpenAI) | Rust core; single-agent root with delegation | Yes — thread-fork with policy inheritance | OS-level (Seatbelt / Linux / Windows) | Snapshot only | No — fresh context per sub |
 | **Claude Code** | Single agent with long context + tools | Effectively no (deep prompting only) | Sandbox via tool list | No | No |
 | **OpenCode** (sst) | TS effect-based tool dispatch | Permission-mode subagent | No OS sandbox; permission gates only | No | No |
-| **OpenClaw** | Channel-multiplex bot (Telegram/Slack/…) | No | No | No | No |
-| **t3code** | Web GUI aggregator over Codex/Claude/OpenCode | n/a | n/a | n/a | n/a |
-| **dvergr** (this) | Coalgebra of participants + comonadic signals | Yes — `hire` in forked rooms | SCI sandbox + yggdrasil fork | Native (any room is forkable) | **Yes — resumable from any track checkpoint** |
+
+**Multi-agent LLM frameworks** (4 "AutoGens" is now real — v0.2 is the original paper-era; **v0.4** is the actor-model + event-driven rewrite (Jan 2025); **AG2** is the community fork by the original authors after their Sep 2024 Microsoft departure; **MS Agent Framework / Semantic Kernel** is the merger announced Oct 2025, RC1 Feb 2026):
+
+| System | Communication | State / fork | Sandbox | Theory of mind | Notes |
+|--------|---------------|--------------|---------|----------------|-------|
+| **AutoGen v0.4** | Actor model; direct + topic pub/sub; distributed runtime; OTel | Per-actor state; no fork | None native | No first-class | **Closest mainstream comparison.** Turn-based actors, not delta-reactive spins |
+| **MetaGPT** | Typed-artefact pub/sub pool | Shared artefacts; no fork | None | No | Second-closest at message routing |
+| **CAMEL** | Role-play dyads | Per-role state; no fork | None | No | Strong as a *pattern library*; weak as substrate |
+| **LangGraph** | Stateful graph nodes | **Checkpointers + time-travel** (graph state only) | None | No | Closest at the state/replay layer; forks state, not runtime |
+| **CrewAI Flows** | Sequential + parallel tasks | Pluggable state; no fork | None | No | Strong ergonomics; weak isolation |
+| **OpenAI Swarm** | Function-handoff | Stateless | None | No | Experimental; minimal |
+| **Magentic-One** | Orchestrator + team Ledger | Dual ledger (task plan + facts) | None | No | Closest at *orchestration-with-team-model* |
+
+**And us:**
+
+| System | Communication | Fork | Sandbox | Theory of mind | Bisimulation |
+|--------|---------------|------|---------|----------------|--------------|
+| **dvergr.discourse** | Continuous-time, mailbox-delta-driven, typed-message envelopes; six-driver participant spins (§5.5) | **Forkable entire runtime** — datahike + SCI + signals + git via spindel/yggdrasil; *resumable* from any track checkpoint | SCI sandbox + yggdrasil fork = belt-and-braces capability | First-class via `simulate-reply` (§6.5); ToM as fork-and-run, not just prompt | **Both behavioural and feature-level** (§5.4): DAS-based feature bisim available for open-weights participants today |
+
+What we adopt from Codex: the `ExecApprovalRequirement` model for finer-grained capability gating (Open Q #8). Codex's policy inheritance from parent to child is the right shape.
+
+What we adopt from AutoGen v0.4 / MetaGPT / LangGraph: **OTel tracing**, **MCP tool interop** (we already have `dvergr.mcp`), **A2A protocol** for inter-room interop, **LangGraph-style subgraphs** for composability ergonomics, **AutoGenBench/Studio-style trace UI** as inspiration for simmis.
+
+**What we offer that none of them do:**
+
+1. **Resumable forks.** Codex snapshots; LangGraph forks graph state only. Ours are runtime *values* — we can jump back to any track checkpoint. This is what makes `simulate-reply` cheap enough to do several times per emission decision.
+2. **Many participants, each with separate KBs.** Specialised reasoning + token economy beat single-long-context for multi-hour open-ended work.
+3. **Explicit theory of mind via `simulate-reply`.** RSA-as-implementation, not RSA-as-prompt.
+4. **Continuous-time personas with multi-driver spins** (§5.5–§5.6). Agents that work between user messages — reactive, proactive, observational, introspective.
+5. **Modelling primitives, not just task execution.** simmis is built for *modelling* (board meetings, code reviews, research investigations).
+6. **Compositional algebra + coalgebra with bisimulation** (§5.4, §6). Surrogates and virtuals interoperate; tests and production share semantics by formal substitution.
+7. **FK / SMC at room granularity** (§10). DisCIPL and MSA do token-level FK; we do conversational-trajectory-level FK.
+8. **Three-substrate `belief`** (§8.1). Symbolic + population-coded + feature-coded; prototype-ready today on open-weights participants via SAE/DAS.
+
+**Where we will be worse, initially:** single-agent polish. Codex and Claude Code have years of UX iteration on "developer asks a question, gets a great answer." simmis's solo-use path must not lose too badly here. The model is multi-agent-first, but every use of `(ask single-agent msg)` must still feel as fast and clean as the competition. We have to invest specifically here, not just on the headline multi-agent scenarios.
 
 What we adopt from Codex: the `ExecApprovalRequirement` model for finer-grained capability gating (Open Q #8 in §13). Codex's policy inheritance from parent to child is the right shape; we'll implement it as v2 evolves.
 
@@ -801,6 +869,86 @@ What we adopt from Codex: the `ExecApprovalRequirement` model for finer-grained 
 [13] **Sap, M. et al. (2022); Kosinski, M. (2023); Shapira, et al. (2023)** — Empirical work on (and critiques of) Theory-of-Mind in LLMs. Motivates the explicit `belief` signal in our model: ToM cannot be assumed; it has to be modelled.
 
 [14] **Zelikman, E. et al. (2022)** — *STaR: Bootstrapping Reasoning With Reasoning*. CoT-as-EM; in the user's logseq.
+
+### Algebraic foundations (the formal home of §6 and §7)
+
+[15] **Tan, K., Wei, A., Sen, A., Zaharia, M. (2025)** — *Pangolin*. LMPL 2025. Types LLM calls as first-class algebraic effects; the closest formal account of LLM-call composition. Grounds 4/5 of our algebra primitives directly (`ask`/`fan-out`/`race`/`pipeline`); `debate` is the coalgebraic holdout.
+
+[16] **Plotkin, G., Xie, N. (2025)** — *Selection monad for reward-based choice*. PLDI 2025; arXiv:2504.03890. The formal home for our laws (§7). Together with Pangolin, the algebraic-effects line for LLM composition.
+
+### Mechanistic interpretability (the technical substrate for §5.4 feature-bisim and §8.1 feature-coded belief)
+
+[17] **Bricken, T. et al. (Anthropic, 2023)** — *Towards Monosemanticity*. Founding sparse-autoencoder paper.
+
+[18] **Templeton, A. et al. (Anthropic, 2024)** — *Scaling Monosemanticity*. SAE on Claude 3 Sonnet; Golden Gate Claude.
+
+[19] **Geiger, A. et al. (2023)** — *Causal Abstraction + DAS (Distributed Alignment Search)*. The formal account for **bisimulation-by-features** (§5.4).
+
+[20] **Lieberum, T. et al. (DeepMind, 2024)** — *Gemma Scope*. Open SAEs across Gemma 2; makes feature-coded belief substrate prototype-ready today.
+
+### PLoT lineage (the language→PPL→runtime agenda — what §1 inherits from)
+
+[21] **Wong, L., Grand, G., Lew, A. K., Goodman, N. D., Mansinghka, V. K., Tenenbaum, J. B., Andreas, J. (2023)** — *From Word Models to World Models: Translating from Natural Language to the Probabilistic Language of Thought*. arXiv:2306.12672. **The agenda paper.** LLMs as generators of probabilistic programs.
+
+[22] **Grand, G. et al. (2025)** — *DisCIPL: Self-Steering Probabilistic Inference*. The closest existing FK/SMC-on-LLMs work at the level above token; single-mind. We lift to room granularity (§10).
+
+[23] **Wong, L. et al. (2025)** — *Open-World Cognition via Modeling-the-Self-Awareness (MSA)*. Ephemeral world models synthesised on demand.
+
+[24] **Ying, L. et al. (2024)** — *LaBToM: Language-Based Theory of Mind*. Operational Bayesian ToM; candidate belief updater inside a participant.
+
+[25] **Kim, J. et al. (2025)** — *Thought Tracing*. ToM tracing in dialogue.
+
+[26] **Chandra, K. et al. (Tenenbaum group, 2025)** — *memo: a DSL for stable world models*.
+
+[27] **Zhi-Xuan, T. et al. (Mansinghka group, 2024)** — *CLIPS: Continual LLM-Backed Probabilistic Synthesis*.
+
+### Cognitive science + LLMs
+
+[28] **Gandhi, K. et al. (Goodman, 2023)** — *BigToM*. Benchmark for theory of mind in LLMs.
+
+[29] **Liu, R. et al. (Griffiths, 2024)** — *LLMs Are Too Rational*. Resource-rational analysis of LLM cognition.
+
+[30] **Binz, M., Schulz, E. et al. (Griffiths, 2024 → Nature 2025)** — *Centaur*. LLM fine-tuned as a foundation model of human cognition.
+
+### Multi-agent LLM frameworks (§15 — the engineering peer set)
+
+[31] **Wu, Q. et al. (Microsoft, 2025)** — *AutoGen v0.4*. Actor-model + event-driven rewrite. Closest mainstream comparison to dvergr.discourse.
+
+[32] **Hong, S. et al. (2024)** — *MetaGPT*. Software-company-as-agents; typed-artefact pub/sub.
+
+### Multi-agent RL / cooperative AI (§11 Step 7 benchmark; §13 Open Q #10)
+
+[33] **Cross, L., Yamins, D., Haber, N. (2024)** — *Hypothetical Minds*. Closest ToM-via-NL-hypothesis prior art to our `simulate-reply`.
+
+[34] **Hughes, E., Leibo, J. Z. et al. (DeepMind)** — *Melting Pot* and *Concordia*. The empirical benchmark suite proposed in §11 Step 7.
+
+[35] **Laidlaw, C., Dragan, A., Russell, S. (Russell lab, 2025)** — *AssistanceZero*. Scalable cooperative IRL.
+
+[36] **Carroll, M. et al. (Russell lab, 2024)** — *Influenceable Rewards / DR-MDP*. Preference dynamics under partial observability; basis for the `align-on` audit (Open Q #10).
+
+[37] **Hammond, L. et al. (CAIF, 2025)** — *Multi-Agent Risks from Advanced AI*. Agenda paper for the Cooperative-AI community.
+
+[38] **Critch, A. (2023)** — *TASRA: Trustworthy AI Systems Risk Analysis*. Societal-scale multi-agent risk taxonomy.
+
+### Activation steering (§8.1 `with-steering`)
+
+[39] **Zou, A. et al. (2023)** — *Representation Engineering (RepE)*. Activation-space steering directions.
+
+[40] **Panickssery, N. et al. (2023)** — *Contrastive Activation Addition (CAA)*. Practical activation steering.
+
+[41] **Arditi, A. et al. (2024)** — *Refusal in LLMs as a Single Direction*. Single-direction interventions.
+
+### Categorical semantics of LLMs (background only — §5.4 paraphrase-bisimulation gestures)
+
+[42] **Bradley, T., Terilla, J., Vlassopoulos, Y. (2021)** — *An Enriched Category Theory of Language*. arXiv:2106.07890. Foundational.
+
+[43] **Mahadevan, S. (2025)** — *Categorical Homotopy for LLMs*. arXiv:2508.10018. Markov-category model; paraphrase as weak equivalence.
+
+[44] **Zhang, Y. (2025)** — *Markov Categorical Framework for Language Modeling*. arXiv:2507.19247.
+
+### Substrate sibling (§14 row)
+
+[45] **Tavares, Z., Bingham, E., Mackevicius, E. (Basis Research Institute, 2023–2025)** — `chirho` (causal PPL), `effectful` (algebraic-effects metaprogramming in spindel's family), `Autumn` (causal reactive programs), *NeuroAI for AI Safety* roadmap. Closest substrate-and-worldview alignment of any external lab. April 2026 `Pact` multi-agent coordination language is a watch-item (Open Q #9).
 
 ---
 
