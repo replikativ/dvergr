@@ -1,14 +1,17 @@
 (ns dev.discourse-scratch
-  "Scratch: Steps 1-3 of dvergr/doc/discourse-model.md §11.
+  "Scratch: Steps 1-4 of dvergr/doc/discourse-model.md §11.
 
    Step 1: Message / Participant / Room with mailbox-driven spins.
    Step 2: ask / fan-out / race / quorum / pipeline + with-latency / flaky.
    Step 3: fork-room / merge-room / discard via spindel sp/fork-context.
+   Step 4: iterative-refinement / debate / moderate / align-on /
+           simulate-reply (the theory-of-mind killer demo).
 
    Participants gain a `:factory` field so they can be cloned into a forked
    room with their current internal state captured (e.g., a script's
    remaining replies)."
-  (:require [org.replikativ.spindel.core :as sp]
+  (:require [clojure.string :as str]
+            [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.spin.sync :as sync]
             [org.replikativ.spindel.spin.combinators :as comb]))
@@ -102,6 +105,23 @@
                    (sp/spin
                      {:to (:from msg) :content (str "echo: " (:content msg))}))
      :factory (fn [new-ctx] (echo id new-ctx))}))
+
+(defn responder
+  "Reply-to-sender scripted participant. `contents` is a vector of strings;
+   each incoming message gets the next content as reply, addressed back to
+   whoever sent it. Pairs naturally with `ask`-based patterns (iterative-
+   refinement, debate, align-on) where the conversation partner is the
+   sender, not a fixed target."
+  [id contents ctx]
+  (let [remaining (atom (vec contents))]
+    (participant
+      {:id id :ctx ctx
+       :on-message (fn [_p msg]
+                     (sp/spin
+                       (when-let [next-content (first @remaining)]
+                         (swap! remaining subvec 1)
+                         {:to (:from msg) :content next-content})))
+       :factory (fn [new-ctx] (responder id (vec @remaining) new-ctx))})))
 
 ;; ============================================================================
 ;; Step 2 — Combinators
@@ -273,3 +293,114 @@
        :log @(:log r)
        :participant-states (into {} (for [[id p] @(:participants r)]
                                       [id @(:state p)]))})))
+
+;; ============================================================================
+;; Step 4 — Higher patterns (everything below decomposes to Steps 1-3)
+;; ============================================================================
+
+(defn iterative-refinement
+  "Producer drafts, critic reviews; loop until `accept?` fires or max-iter.
+   Returns Spin yielding {:result :accepted|::max-iter :iterations n :draft m :review m}."
+  [room producer-id critic-id initial-msg
+   {:keys [accept? max-iter] :or {max-iter 5}}]
+  (sp/spin
+    (loop [i 0
+           current initial-msg]
+      (if (>= i max-iter)
+        {:result ::max-iter :iterations i :last current}
+        (let [draft  (sp/await (ask room producer-id current))
+              review (sp/await (ask room critic-id   {:content (:content draft)}))]
+          (if (accept? review)
+            {:result :accepted :iterations i :draft draft :review review}
+            (recur (inc i)
+                   {:content (str "Refine. Last: " (:content draft)
+                                  " | Feedback: " (:content review))})))))))
+
+(defn debate
+  "Round-robin between targets for N rounds. Each round all targets reply to
+   the concatenated previous-round content. Returns Spin yielding the history
+   as a vector of round-vectors of replies."
+  [room targets {:keys [rounds initial-content] :or {rounds 2 initial-content ""}}]
+  (sp/spin
+    (loop [round   0
+           content initial-content
+           history []]
+      (if (>= round rounds)
+        history
+        (let [replies (sp/await (fan-out room targets {:content content}))
+              next-content (str/join " | " (map :content replies))]
+          (recur (inc round) next-content (conj history replies)))))))
+
+(defn moderate
+  "Moderator-driven turn-taking. `pick-fn :: history → next-speaker-id | nil`.
+   pick-fn returns the next id to ask, or nil to stop. Each chosen speaker
+   replies to the *last* entry in history. Returns Spin yielding history."
+  [room initial-msg {:keys [pick-fn max-rounds] :or {max-rounds 10}}]
+  (sp/spin
+    (loop [round 0
+           history [initial-msg]]
+      (if (>= round max-rounds)
+        history
+        (if-let [next-id (pick-fn history)]
+          (let [reply (sp/await (ask room next-id {:content (:content (peek history))}))]
+            (recur (inc round) (conj history reply)))
+          history)))))
+
+(defn align-on
+  "Habermas-Machine pattern (§8.3). Mediator drafts a statement; all
+   participants critique; mediator incorporates and re-drafts. Loop until
+   `accept?` is true for every critique (consensus) or max-rounds.
+
+   accept? :: Message → bool      (a critique counts as accepting)
+   Returns Spin yielding {:result :converged|::max-rounds :draft str :rounds n}."
+  [room mediator-id participants topic
+   {:keys [accept? max-rounds] :or {max-rounds 5}}]
+  (sp/spin
+    (loop [round 0
+           draft topic]
+      (if (>= round max-rounds)
+        {:result ::max-rounds :draft draft :rounds round}
+        (let [critiques   (sp/await (fan-out room participants {:content draft}))
+              all-accept? (every? accept? critiques)]
+          (if all-accept?
+            {:result :converged :draft draft :rounds round
+             :final-critiques critiques}
+            (let [feedback (str/join "\n"
+                             (map #(str "- " (name (:from %)) ": " (:content %))
+                                  critiques))
+                  refined  (sp/await
+                             (ask room mediator-id
+                                  {:content (str "Draft: " draft
+                                                 "\nCritiques:\n" feedback)}))]
+              (recur (inc round) (:content refined)))))))))
+
+;; ============================================================================
+;; Step 4 — simulate-reply: the theory-of-mind primitive (§6.5)
+;; ============================================================================
+
+(defn simulate-reply
+  "Fork the room, ask `other-id` a hypothetical message, capture their reply,
+   discard the fork. Parent untouched. The whole theory-of-mind affordance.
+
+   Cheap: O(1) fork + one LLM call. Composes with everything — an
+   iterative-refinement step can simulate the critic's response before
+   committing; a debate participant can imagine the panel's reaction before
+   speaking; a moderator can run three forked openings."
+  [room other-id hypothetical-msg]
+  (sp/spin
+    (let [fork  (fork-room room)
+          reply (sp/await (ask fork other-id hypothetical-msg))]
+      (discard fork)
+      reply)))
+
+(defn imagine-conversation
+  "Fork, run a workflow (a Spin), capture the imagined log, discard.
+   Returns {:outcome any :imagined-log [Message]}."
+  [room workflow-fn]
+  (sp/spin
+    (let [fork    (fork-room room)
+          outcome (sp/await (workflow-fn fork))
+          log     @(:log fork)]
+      (discard fork)
+      {:outcome outcome :imagined-log log})))
+
