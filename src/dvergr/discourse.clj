@@ -28,7 +28,8 @@
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.spin.sync :as sync]
-            [org.replikativ.spindel.spin.combinators :as comb]))
+            [org.replikativ.spindel.spin.combinators :as comb]
+            [is.simm.partial-cps.sequence :refer [anext]]))
 
 ;; ============================================================================
 ;; Records
@@ -37,10 +38,15 @@
 (defrecord Message     [id from to content ts in-reply-to metadata])
 
 (defrecord Participant
-  ;; on-message :: (fn [participant message] -> Spin[ReplySpec | nil])
+  ;; on-message :: (fn [participant envelope] -> Spin[ReplySpec | nil])
+  ;;   envelope is either a Message (from inbox) or a synthetic event:
+  ;;     {:type :tick}                          — periodic self-tick
+  ;;     {:type :source :name kw :msg evt-data} — external source event
   ;; factory    :: (fn [new-ctx] -> Participant) — for cloning into a fork
   ;; process    :: the spindel spin driving this participant (set by `join`)
-  [id inbox on-message factory process])
+  ;; tick-ms    :: nil or interval in ms (`with-cadence`); fires {:type :tick}
+  ;; sources    :: nil or [{:name kw :source PAsyncSeq}] (`with-sources`)
+  [id inbox on-message factory process tick-ms sources])
 
 (defrecord Room
   ;; participants : atom of {id → Participant or stub-map {:id :inbox}}
@@ -97,14 +103,18 @@
   "Construct a Participant.
 
    :id          — keyword identifier (unique per room)
-   :on-message  — (fn [p msg] -> Spin[ReplySpec | nil]) where ReplySpec is
+   :on-message  — (fn [p envelope] -> Spin[ReplySpec | nil]) where envelope is
+                  a Message (inbox) or {:type :tick} / {:type :source :name K
+                  :msg E} for driver-supplied events; ReplySpec is
                   {:to id :content str} or nil for no reply
    :factory     — (fn [new-ctx] -> Participant); enables fork-room cloning
-   :ctx         — execution context (default: *execution-context*)"
+   :ctx         — execution context (default: *execution-context*)
+
+   Drivers (tick / sources) are added with `with-cadence` / `with-sources`."
   [{:keys [id on-message factory ctx]}]
   (let [ctx   (or ctx ec/*execution-context*)
         inbox (sync/create-mailbox ctx)]
-    (->Participant id inbox on-message factory nil)))
+    (->Participant id inbox on-message factory nil nil nil)))
 
 ;; ============================================================================
 ;; Built-in participant helpers
@@ -141,27 +151,67 @@
 ;; Participant lifecycle in a room
 ;; ============================================================================
 
+(defn- emit-reply!
+  "Route a reply-spec from `p` into `room`. `in-reply-to` is the message id
+   when the envelope was a Message, nil otherwise (tick / source events)."
+  [room p reply-spec in-reply-to]
+  (when reply-spec
+    (route-and-log!
+      room
+      (message (:id p) (:to reply-spec) (:content reply-spec)
+               in-reply-to nil))))
+
+(defn- start-driver-pumps!
+  "Spawn one fire-and-forget spin per driver that pumps events into `inbox`
+   as synthetic envelopes ({:type :tick} or {:type :source :name K :msg E}).
+
+   Each driver has its OWN consumer loop — we deliberately do NOT race
+   them against the inbox in the participant-spin, because consuming
+   from stateful mailboxes inside `comb/race` is destructive: when
+   multiple arms have queued data, the race winner cancels the losers
+   AFTER their awaits have already taken from their queues, dropping
+   those values. Per-driver pumps with a single shared inbox sidestep
+   that whole class of bug."
+  [p]
+  (when-let [tick-ms (:tick-ms p)]
+    (sp/spawn!
+      (sp/spin
+        (loop []
+          (sp/await (comb/sleep tick-ms))
+          (sync/post! (:inbox p) {:type :tick})
+          (recur)))))
+  (doseq [{:keys [name source]} (:sources p)]
+    (sp/spawn!
+      (sp/spin
+        (loop []
+          (when-let [[v _] (sp/await (anext source))]
+            (sync/post! (:inbox p) {:type :source :name name :msg v})
+            (recur)))))))
+
 (defn- participant-spin
-  "Continuous-time loop: await inbox delta → run on-message → emit reply
-   if any → recur. The implementation of §5.1."
+  "Continuous-time loop: await next inbox event → run on-message → emit
+   reply if any → recur. The implementation of §5.1 + §5.5.
+
+   The inbox is the single event channel: real Messages flow in from
+   `route-and-log!`; driver envelopes ({:type :tick} / {:type :source ...})
+   are posted by per-driver pumps spawned in `join`. on-message
+   distinguishes them by checking `(instance? Message env)`."
   [p room]
   (sp/spin
     (loop []
-      (let [msg (sp/await (:inbox p))]
-        (let [reply-spec (sp/await ((:on-message p) p msg))]
-          (when reply-spec
-            (route-and-log!
-              room
-              (message (:id p) (:to reply-spec) (:content reply-spec)
-                       (:id msg) nil)))))
+      (let [env (sp/await (:inbox p))
+            in-reply-to (when (instance? Message env) (:id env))
+            reply-spec (sp/await ((:on-message p) p env))]
+        (emit-reply! room p reply-spec in-reply-to))
       (recur))))
 
 (defn join
-  "Register participant in room and start its spin. Returns the participant
-   with :process set."
+  "Register participant in room, start its spin, and spawn any driver
+   pumps (tick / sources). Returns the participant with :process set."
   [room p]
   (swap! (:participants room) assoc (:id p) p)
   (binding [ec/*execution-context* (:ctx room)]
+    (start-driver-pumps! p)
     (let [proc (participant-spin p room)]
       (sp/spawn! proc)
       (let [p' (assoc p :process proc)]
@@ -175,6 +225,33 @@
   [room participant-id]
   (swap! (:participants room) dissoc participant-id)
   nil)
+
+;; ============================================================================
+;; Drivers — §5.5 (multi-channel event sources alongside the inbox)
+;;
+;; The inbox channel is intrinsic to every participant. Additional drivers
+;; are attached via these helpers; the participant-spin races them. Note
+;; these set fields directly and do NOT wrap :factory — by design, a fork
+;; of the participant (e.g. via fork-room for ToM probes) starts WITHOUT
+;; drivers. External event subscriptions and tick cadences belong to the
+;; original participant's lifecycle; the fork is hypothetical.
+;; ============================================================================
+
+(defn with-cadence
+  "Attach a self-tick driver: the participant receives `{:type :tick}` every
+   `interval-ms`. Ticks fired while on-message is processing are dropped
+   (no queue). Returns a Participant with :tick-ms set."
+  [p interval-ms]
+  (assoc p :tick-ms interval-ms))
+
+(defn with-sources
+  "Attach external event sources: each `{:name kw :source PAsyncSeq}` is
+   raced alongside the inbox. When a source fires, on-message receives
+   `{:type :source :name kw :msg event}`. Source events that arrive while
+   on-message is processing queue in the source's underlying buffer
+   (typically a mailbox). Returns a Participant with :sources set."
+  [p sources]
+  (assoc p :sources (vec sources)))
 
 ;; ============================================================================
 ;; Combinators — the asymmetric algebra
