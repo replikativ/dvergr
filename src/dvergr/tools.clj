@@ -1680,10 +1680,18 @@ Note: changes take effect on the next agent restart or reload."
 ;; Proposal Tool
 ;; ---------------------------------------------------------------------------
 
-;; Lazy require proposals to avoid circular deps
-(defn- proposals-ns []
-  (require 'dvergr.agent.proposals)
-  (find-ns 'dvergr.agent.proposals))
+;; Lazy resolve to avoid circular deps with `dvergr.daemon` and to keep
+;; tools.clj agnostic of the proposals/personas namespaces at compile
+;; time (these are stable but the lazy edge mirrors how spawn_agent
+;; already resolves agent.task).
+(defn- proposals-propose! []
+  (requiring-resolve 'dvergr.proposals/propose!))
+
+(defn- llm-agent []
+  (requiring-resolve 'dvergr.discourse.llm/llm-agent))
+
+(defn- current-daemon []
+  (some-> (requiring-resolve 'dvergr.daemon/current-daemon) deref deref))
 
 (register!
   {:name "propose_change"
@@ -1723,39 +1731,40 @@ Note: changes take effect on the next agent restart or reload."
                                       :items {:type "string"}
                                       :description "Workflow phases: explore, plan, implement, verify, research"}}
                 :required ["task"]}
-   :execute (fn [{:keys [task profile budget phases]} {:keys [execution-ctx chat-ctx db-conn]}]
+   :execute (fn [{:keys [task profile budget _phases]} {:keys [execution-ctx db-conn]}]
               (try
-                (let [prop-ns (proposals-ns)
-                      propose! (ns-resolve prop-ns 'propose!)
-                      cfg-ns (agent-config-ns)
-                      make-agent (ns-resolve cfg-ns 'make-agent)
-
+                (let [propose!     (proposals-propose!)
                       profile-name (or profile "developer")
-                      system-prompt (or (load-agent-profile profile-name)
+                      prompt-text  (or (load-agent-profile profile-name)
                                        "You are a capable developer. Complete the given task thoroughly.")
+                      daemon       (current-daemon)
+                      room         (:discourse-room daemon)
+                      ctx          (or execution-ctx (:execution-ctx daemon))]
+                  (cond
+                    (nil? room)
+                    {:type :error
+                     :error "propose_change requires a running daemon (no discourse room found)."}
 
-                      agent-cfg (make-agent
-                                  {:name (str profile-name "-proposal")
-                                   :provider :fireworks
-                                   :model "accounts/fireworks/models/minimax-m2p5"
-                                   :isolation :sci
-                                   :system-prompt system-prompt})
+                    (nil? db-conn)
+                    {:type :error
+                     :error "propose_change requires a database connection (no db-conn in tool-ctx)."}
 
-                      ctx (or execution-ctx
-                               (try
-                                 (require 'org.replikativ.spindel.engine.core)
-                                 @(ns-resolve (find-ns 'org.replikativ.spindel.engine.core)
-                                              '*execution-context*)
-                                 (catch Exception _ nil)))]
-
-                  (if (and ctx db-conn)
-                    (let [proposal (binding [rtc/*execution-context* ctx]
-                                    @(propose! agent-cfg task
-                                               (cond-> {:budget-dollars (or budget 0.50)
-                                                        :parent-chat-ctx chat-ctx
-                                                        :conn db-conn}
-                                                 (seq phases)
-                                                 (assoc :workflow (mapv keyword phases)))))
+                    :else
+                    (let [make-worker (llm-agent)
+                          worker (binding [rtc/*execution-context* ctx]
+                                   (make-worker
+                                     {:id      (keyword (str profile-name "-proposal"))
+                                      :spec    {:provider      :fireworks
+                                                :model         "accounts/fireworks/models/minimax-m2p5"
+                                                :system-prompt prompt-text}
+                                      :budget  {:dollars (or budget 0.50)}
+                                      :ctx     ctx}))
+                          proposal (binding [rtc/*execution-context* ctx]
+                                     @(propose! {:room   room
+                                                 :worker worker
+                                                 :goal   task
+                                                 :conn   db-conn
+                                                 :budget-dollars (or budget 0.50)}))
                           pid (:proposal/id proposal)]
                       {:type :success
                        :content (str "Proposal created: " pid "\n"
@@ -1764,11 +1773,7 @@ Note: changes take effect on the next agent restart or reload."
                                      "Summary:\n" (:proposal/summary proposal))
                        :metadata {:proposal-id (str pid)
                                   :status (:proposal/status proposal)
-                                  :url (str "/proposals/" pid)}})
-                    {:type :error
-                     :error (str "propose_change requires execution context and db-conn."
-                                 (when-not ctx " No execution context available.")
-                                 (when-not db-conn " No database connection available."))}))
+                                  :url (str "/proposals/" pid)}})))
                 (catch Exception e
                   {:type :error
                    :error (str "propose_change failed: " (.getMessage e))})))})
