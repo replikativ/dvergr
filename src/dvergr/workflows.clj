@@ -1,265 +1,118 @@
 (ns dvergr.workflows
-  "Composable workflow patterns for multi-agent coordination.
+  "Pre-canned multi-agent workflow patterns on top of `dvergr.discourse`.
 
-   These patterns implement the designs from AGENTIC_WORKFLOWS_DESIGN.md
-   using dvergr primitives and spindel composition."
-  (:require [org.replikativ.spindel.core :refer [spin]]
-            [org.replikativ.spindel.core :refer [await]]
-            [dvergr.agent.task :as prim]
-            [dvergr.agent.prebuilt :as agents]))
+   Every workflow is a 3-8 line spin assembled from discourse primitives
+   (ask / fan-out / race / pipeline / iterative-refinement / debate /
+   align-on). The thin layer here adds role-conventional prompt framing
+   and structured return shapes.
+
+   Participants must already be joined in the room under the expected role
+   ids (`:researcher`, `:coder`, `:reviewer`, ...). Use any participant
+   constructor — `agent` (LLM), `scripted` (test), `human`."
+  (:require [clojure.string :as str]
+            [org.replikativ.spindel.core :as sp]
+            [org.replikativ.spindel.spin.combinators :as comb]
+            [dvergr.discourse :as d]))
 
 ;; ============================================================================
-;; Pattern 1: Sequential Pipeline
+;; Pattern 1 — Sequential research → implement → review
 ;; ============================================================================
 
 (defn research-implement-test
-  "Sequential pipeline: Research → Implement → Test.
-
-   Use when:
-   - Each stage depends on previous output
-   - Want to verify at each step
-   - Clear linear progression
-
-   Args:
-     topic - What to research and implement
-
-   Returns:
-     Spin resolving to {:research ... :code ... :tests ...}"
-  [topic & {:keys [researcher coder tester]
-            :or {researcher (agents/researcher)
-                 coder (agents/coder)
-                 tester (agents/reviewer)}}]  ; reviewer as tester
-  (spin
-    (let [;; Stage 1: Research
-          research (await (prim/spawn! researcher
-                            (str "Research " topic)))
-
-          ;; Stage 2: Implementation (depends on research)
-          code (await (prim/spawn! coder
-                        (str "Implement based on research:\n\n"
-                             (prim/extract-result research))))
-
-          ;; Stage 3: Testing (depends on code)
-          tests (await (prim/spawn! tester
-                         (str "Review and test implementation:\n\n"
-                              (prim/extract-result code))))]
-
-      {:research research
-       :code code
-       :tests tests
-       :status (if (prim/successful? tests) :success :needs-work)})))
+  "Pipeline: researcher → coder → reviewer. Each stage receives the previous
+   stage's content framed as task. Returns Spin[{:research :code :review}]."
+  ([room topic]
+   (research-implement-test room topic
+                            {:researcher :researcher
+                             :coder :coder
+                             :reviewer :reviewer}))
+  ([room topic {:keys [researcher coder reviewer]}]
+   (sp/spin
+     (let [research (sp/await (d/ask room researcher
+                                     {:content (str "Research: " topic)}))
+           code     (sp/await (d/ask room coder
+                                     {:content (str "Implement based on:\n"
+                                                    (:content research))}))
+           review   (sp/await (d/ask room reviewer
+                                     {:content (str "Review:\n"
+                                                    (:content code))}))]
+       {:research research :code code :review review}))))
 
 ;; ============================================================================
-;; Pattern 2: Parallel Fan-Out
+;; Pattern 2 — Parallel fan-out across topics or reviewers
 ;; ============================================================================
 
 (defn parallel-research
-  "Parallel fan-out: Multiple independent research tasks.
-
-   Use when:
-   - Tasks are independent
-   - Want results fast
-   - Can aggregate after
-
-   Args:
-     topics - Vector of topics to research
-     opts - {:researcher agent} optional custom researcher
-
-   Returns:
-     Spin resolving to {:topics [...] :results [...] :summary ...}"
-  [topics & {:keys [researcher]
-             :or {researcher (agents/researcher)}}]
-  (spin
-    (let [;; Spawn all in parallel
-          spins (mapv #(prim/spawn! researcher
-                         (str "Research: " %))
-                      topics)
-
-          ;; Await all results
-          results (await (prim/parallel spins))]
-
-      {:topics topics
-       :results results
-       :successful (filter prim/successful? results)
-       :failed (remove prim/successful? results)
-       :summary (str "Completed " (count (filter prim/successful? results))
-                     "/" (count results) " research tasks")})))
+  "Fan-out: dispatch each topic to one researcher in parallel.
+   `topic+researcher` is a vector of `[topic researcher-id]` pairs.
+   Returns Spin[Vector[Message]] preserving input order."
+  [room topic+researcher]
+  (sp/spin
+    (sp/await
+      (apply comb/parallel
+             (mapv (fn [[topic researcher-id]]
+                     (d/ask room researcher-id
+                            {:content (str "Research: " topic)}))
+                   topic+researcher)))))
 
 ;; ============================================================================
-;; Pattern 3: Iterative Refinement
+;; Pattern 3 — Iterative refinement (re-exported; the discourse primitive
+;; already implements producer↔critic + accept?)
 ;; ============================================================================
 
 (defn iterative-refinement
-  "Iterative refinement: Producer → Critic → Repeat until good.
-
-   Use when:
-   - Quality matters more than speed
-   - Objective criteria for 'good enough'
-   - Improvement possible via feedback
-
-   Args:
-     task - What to implement/produce
-     max-iterations - Stop after this many iterations
-     acceptable? - Predicate fn [critique-result] -> boolean
-     opts - {:producer agent :critic agent}
-
-   Returns:
-     Spin resolving to {:status :success/:max-iterations
-                        :output final-result
-                        :iterations count}"
-  [task max-iterations acceptable? & {:keys [producer critic]
-                                      :or {producer (agents/coder)
-                                           critic (agents/reviewer)}}]
-  (spin
-    (loop [iteration 0
-           current-output nil
-           feedback nil]
-
-      (if (>= iteration max-iterations)
-        {:status :max-iterations
-         :output current-output
-         :iterations iteration}
-
-        (let [;; Producer creates/refines
-              production (await (prim/spawn! producer
-                                  (if feedback
-                                    (str "Refine based on feedback:\n\n"
-                                         feedback "\n\n"
-                                         "Previous attempt:\n"
-                                         current-output)
-                                    (str "Initial implementation: " task))))
-
-              ;; Critic evaluates
-              critique (await (prim/spawn! critic
-                                (str "Review implementation:\n\n"
-                                     (prim/extract-result production))))]
-
-          ;; Check if acceptable
-          (if (acceptable? critique)
-            {:status :success
-             :output production
-             :iterations (inc iteration)
-             :final-critique critique}
-
-            ;; Continue refining
-            (recur (inc iteration)
-                   (prim/extract-result production)
-                   (prim/extract-result critique))))))))
+  "Producer drafts, critic reviews, loop until `accept?` fires or max-iter.
+   Thin wrapper around `dvergr.discourse/iterative-refinement` with the
+   producer/critic role convention."
+  ([room task] (iterative-refinement room task {}))
+  ([room task {:keys [producer critic accept? max-iter]
+               :or {producer :coder critic :reviewer
+                    accept? (fn [m] (re-find #"(?i)lgtm|approve" (:content m)))
+                    max-iter 5}}]
+   (d/iterative-refinement room producer critic
+                           {:content task}
+                           {:accept? accept? :max-iter max-iter})))
 
 ;; ============================================================================
-;; Pattern 4: Competitive Race
+;; Pattern 4 — Competitive race (first approach wins)
 ;; ============================================================================
 
 (defn competitive-race
-  "Competitive race: Multiple approaches, first to complete wins.
-
-   Use when:
-   - Time critical
-   - Multiple valid approaches
-   - Can validate winner quickly
-
-   Args:
-     task - What to implement
-     approaches - Vector of {:agent ... :prompt ...} maps
-     or
-     agents - Vector of agents (will use same task prompt)
-
-   Returns:
-     Spin resolving to {:winner agent-result :approach index}"
-  [task & {:keys [approaches agents]}]
-  {:pre [(or approaches agents)]}
-  (spin
-    (let [spins (if approaches
-                  ;; Custom prompt per approach
-                  (mapv #(prim/spawn! (:agent %)
-                           (str task "\n\nApproach: " (:prompt %)))
-                        approaches)
-
-                  ;; Same prompt for all agents
-                  (mapv #(prim/spawn! % task) agents))
-
-          ;; First to complete wins
-          winner (await (prim/race spins))]
-
-      {:winner winner
-       :approach (if approaches
-                   (nth approaches (.indexOf spins winner))
-                   (.indexOf (vec agents) (:agent winner)))})))
+  "Send the same task to multiple agents; first reply wins.
+   Returns Spin[Message]."
+  [room targets task]
+  (d/race room targets {:content task}))
 
 ;; ============================================================================
-;; Helper: Check Acceptance Criteria
-;; ============================================================================
-
-(defn review-accepts?
-  "Check if reviewer accepts the implementation.
-
-   Looks for 'Approve' or 'LGTM' or no critical issues in review."
-  [review-result]
-  (when (prim/successful? review-result)
-    (let [content (prim/extract-result review-result)
-          content-lower (clojure.string/lower-case (or content ""))]
-      (or (re-find #"approve" content-lower)
-          (re-find #"lgtm" content-lower)
-          (re-find #"ready to merge" content-lower)
-          (not (re-find #"critical" content-lower))))))
-
-;; ============================================================================
-;; Workflow Combinators
+;; Composition combinators
 ;; ============================================================================
 
 (defn then
-  "Sequential composition: workflow-a then workflow-b.
-
-   The second workflow receives the result of the first.
-
-   Example:
-     (then (research-implement-test \"JWT\")
-           (fn [result]
-             (review-workflow (:code result))))"
-  [workflow-a workflow-b-fn]
-  (spin
-    (let [result-a (await workflow-a)
-          result-b (await (workflow-b-fn result-a))]
-      {:first result-a
-       :second result-b})))
+  "Sequentially compose: `spin-a` then `(spin-b-fn result-a)`.
+   Returns Spin yielding {:first result-a :second result-b}."
+  [spin-a spin-b-fn]
+  (sp/spin
+    (let [a (sp/await spin-a)
+          b (sp/await (spin-b-fn a))]
+      {:first a :second b})))
 
 (defn and-parallel
-  "Parallel composition: Run multiple workflows concurrently.
+  "Run multiple workflows concurrently. Returns Spin[Vector] of all results."
+  [& spins]
+  (sp/spin (sp/await (apply comb/parallel spins))))
 
-   Example:
-     (and-parallel
-       (parallel-research [\"JWT\" \"OAuth\"])
-       (parallel-research [\"React\" \"Vue\"]))"
-  [& workflows]
-  (spin
-    (await (prim/parallel workflows))))
+;; ============================================================================
+;; Helpers
+;; ============================================================================
 
-(comment
-  ;; Usage examples
-  (require '[org.replikativ.spindel.engine.core :as rtc])
-
-  (def rt (rtc/create-runtime))
-
-  ;; Sequential pipeline
-  (binding [rtc/*execution-context* rt]
-    (def result (research-implement-test "JWT authentication")))
-
-  ;; Parallel research
-  (binding [rtc/*execution-context* rt]
-    (def research (parallel-research ["JWT libs" "OAuth patterns" "SAML"])))
-
-  ;; Iterative refinement
-  (binding [rtc/*execution-context* rt]
-    (def refined (iterative-refinement
-                   "Implement merge strategy for pure functions"
-                   3  ; max iterations
-                   review-accepts?)))
-
-  ;; Competitive race
-  (binding [rtc/*execution-context* rt]
-    (def winner (competitive-race
-                  "Implement quick sort"
-                  :approaches [{:agent (agents/coder :name "fast")
-                                :prompt "Optimize for speed"}
-                               {:agent (agents/coder :name "readable")
-                                :prompt "Optimize for clarity"}]))))
+(defn review-accepts?
+  "Predicate: does this review Message look like acceptance?
+   Matches 'approve', 'lgtm', 'ship it', 'ready to merge' (case-insensitive)."
+  [message]
+  (when-let [content (:content message)]
+    (let [lc (str/lower-case content)]
+      (boolean
+        (or (re-find #"approve" lc)
+            (re-find #"lgtm" lc)
+            (re-find #"ship it" lc)
+            (re-find #"ready to merge" lc))))))

@@ -4,7 +4,6 @@
    This namespace provides REPL-specific conveniences and is maintained
    for backward compatibility. New code should use dvergr.core directly."
   (:require [dvergr.core :as core]
-            [dvergr.workflows :as workflows]
             [clojure.string :as str]))
 
 ;; ============================================================================
