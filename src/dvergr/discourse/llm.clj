@@ -37,6 +37,7 @@
             [dvergr.discourse.generation :as gen]
             [dvergr.chat.context :as cc]
             [dvergr.chat.agent :as ca]
+            [dvergr.chat.compaction :as compaction]
             [dvergr.participant.context :as pctx]
             [dvergr.tools :as tools]))
 
@@ -103,7 +104,7 @@
   [{:keys [id spec tools db-conn budget compaction
            chat-ctx participant-context tool-ctx run-turn-fn ctx]
     :or   {budget      {:dollars 1.0 :max-turns 8}
-           compaction  {:auto? true}
+           compaction  {:auto? true :strategy :sync-before-turn}
            run-turn-fn default-run-turn}}]
   {:pre [(keyword? id) (map? spec)]}
   (let [;; :participant-context (preferred) takes precedence; falls back to
@@ -126,18 +127,24 @@
                       (tools/make-context
                         {:db-conn  db-conn
                          :chat-ctx chat-ctx}))
+        compaction-strategy (:strategy compaction :sync-before-turn)
+        race-compaction?    (= :race-with-turn compaction-strategy)
+        ;; In race mode, disable run-turn-fn's internal sync compaction —
+        ;; we drive it from the agent's spin-race below.
         turn-opts {:provider         (:provider spec)
                    :model            (:model spec)
                    :tools            tools
                    :tool-ctx         tool-ctx
-                   :auto-compact?    (:auto? compaction true)
+                   :auto-compact?    (and (:auto? compaction true)
+                                          (not race-compaction?))
                    :compaction-model (:model compaction)}]
     (let [;; Mutable state controlled by directives.
           turns-cap    (atom max-turns)         ; bump on :directive/raise-budget
           wrapping-up? (atom false)             ; flip on :directive/wrap-up
           cancelled?   (atom false)             ; flip on :directive/cancel
           spec-atom    (atom spec)              ; swap on :directive/switch-model
-          ]
+          ;; Race-arm state: at most one in-flight compaction handle.
+          compaction-h (atom nil)]
       (d/participant
         {:id  id
          :ctx ctx
@@ -184,28 +191,47 @@
                                    :content (:content msg)})
                  ;; Race each turn against the cancel flag. The future-handle
                  ;; bridges the blocking LLM call into spindel; we await done.
+                 ;;
+                 ;; In :race-with-turn mode, kick off a parallel future-handle
+                 ;; running compact! whenever (should-compact?) AND no
+                 ;; compaction is already in flight. The next turn picks up
+                 ;; the compacted chat-ctx state once it lands.
                  (loop [turn 0]
                    (if @cancelled?
                      nil
-                     (let [h (gen/future-handle
-                               ctx
-                               #(run-turn-fn chat-ctx
-                                             (assoc turn-opts
-                                                    :turn-number turn
-                                                    :spec @spec-atom)))
-                           result (sp/await (:done h))]
-                       (cond
-                         @cancelled? nil
+                     (do
+                       (when race-compaction?
+                         (when (or (nil? @compaction-h)
+                                   (some-> ^java.util.concurrent.Future @compaction-h
+                                           .isDone))
+                           (when (compaction/should-compact? chat-ctx)
+                             (reset! compaction-h
+                                     (future
+                                       (binding [ec/*execution-context* ctx]
+                                         (try
+                                           (compaction/maybe-compact!
+                                             chat-ctx
+                                             :model (:model compaction))
+                                           (catch Throwable _ nil))))))))
+                       (let [h (gen/future-handle
+                                 ctx
+                                 #(run-turn-fn chat-ctx
+                                               (assoc turn-opts
+                                                      :turn-number turn
+                                                      :spec @spec-atom)))
+                             result (sp/await (:done h))]
+                         (cond
+                           @cancelled? nil
 
-                         (gen/error-result? result) nil
+                           (gen/error-result? result) nil
 
-                         (= result :continue)
-                         (if (and (not @wrapping-up?)
-                                  (< (inc turn) @turns-cap))
-                           (recur (inc turn))
-                           nil)
+                           (= result :continue)
+                           (if (and (not @wrapping-up?)
+                                    (< (inc turn) @turns-cap))
+                             (recur (inc turn))
+                             nil)
 
-                         :else nil))))
+                           :else nil)))))
 
                  (when-let [reply (some-> (last-assistant-message chat-ctx)
                                           assistant-text)]
