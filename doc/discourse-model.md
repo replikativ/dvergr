@@ -260,6 +260,56 @@ The spin body, abstractly:
 
 `dvergr.agent.process` already runs this shape (`race [inbox control tick sources active-task-completion]`); the discourse substrate makes it the default participant shape with named wrappers.
 
+### 5.5a The bus is the routing substrate
+
+The Room sits on top of `dvergr.bus` — a small pub/sub kernel over `spindel.pubsub` keyed on two routing dimensions:
+
+```
+[:to   <participant-id>]   — direct routing to a participant
+[:type <tag>]              — capability routing by message tag
+```
+
+A single Bus uses a source mailbox → mult → two pubs (one per dimension), so every posted message lands on *all* matching subscriptions. Both inbox routing and capability routing are special cases of the same primitive; drivers (`{:type :tick}`, `{:type :source/<name>}`) are bus-posted typed messages that the participant receives via its inbox subscription.
+
+**Opinionated buffer policy** is the bus's compositional kernel. Per-namespace defaults in `dvergr.bus/*default-buffers*`:
+
+| Tag namespace | Default buffer | Programming-model commitment |
+|---|---|---|
+| `:message` | `fixed-buffer 64` | first-class content; backpressure under sustained load |
+| `:directive` | `fixed-buffer 16` | imperatives; serial; never lose |
+| `:escalation` | `fixed-buffer Long/MAX_VALUE` | must be answered or explicitly time out |
+| `:partial` | `sliding-buffer 1` | streams; freshness over completeness |
+| `:tick` | `sliding-buffer 1` | cadence; only the current pulse matters |
+| `:source` | `sliding-buffer 8` | external readings; recent N tunable per source |
+
+The escalation row is the strongest opinion: agents posting `{:type :escalation/budget …}` *can* assume some handler will answer, or the bus health-check will surface a stuck queue. The streaming row is the dual: per-token UI updates lose backlog on overflow because freshness is what UIs render.
+
+Participants subscribe dynamically with `(d/subscribe! room p [:type :escalation/budget])`. Every subscription pumps into the same per-participant merge mailbox the on-message handler awaits, so inbox + tag subs land at one linearization point.
+
+This makes the **compositional kernel** explicit: an agent escalates by *posting a tagged message* (no name of a handler), and whichever participant subscribed to that capability tag responds — possibly by posting a `:directive/raise-budget` back to the escalator's id. Neither party hardcodes the other.
+
+### 5.5b GenerationHandle: the F-side primitive
+
+The bialgebra's distributive law λ (§5.4a) is named in `dvergr.discourse.generation` as `GenerationHandle`:
+
+```clojure
+{:token-source  PAsyncSeq of partial-output deltas (or nil)
+ :tool-calls    mailbox/aseq of tool-call requests + results (or nil)
+ :done          Deferred resolved with the final result
+ :cancel!       0-arg fn to abort the generation early}
+```
+
+The G-coalgebra (participant spin-race body) awaits `:done` while racing against other arms (cancel, budget-threshold, inbox-interrupt). Adapters wrap different F shapes:
+
+- `sync-handle` — F runs inline (scripted bots, mocks)
+- `future-handle` — F runs on a Clojure future, result bridged via Deferred (current LLM call pattern)
+- `external-handle` — caller controls `:done` (human-in-loop, slow async LLM)
+- `streaming-handle` — F streams deltas via aseq (real SSE pump)
+
+Plus combinators `race-handles` and `fallback-handle` for first-arrival selection and error recovery.
+
+Swap adapters to change F's shape without touching the agent's G-side spin. This is the explicit λ: F-step's reactivity is enumerated and pluggable rather than baked into one closure.
+
 ### 5.6 Personas: long-running participants
 
 A persona is a participant with **persistent identity** — KB, beliefs, goals, history survive daemon restart and (under the cross-room extension, Open Q #3) can span rooms.
