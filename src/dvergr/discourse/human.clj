@@ -31,8 +31,16 @@
 
      ;; Now any agent that replies addressed to :user/christian, or
      ;; posts an unsolicited message :to :user/christian, lands in our
-     ;; on-receive."
+     ;; on-receive.
+
+   When you pass `:participant-context`, every inbox message is also
+   appended to that context's memory-signal via
+   `dvergr.participant.context/append-memory!`. The memory becomes a
+   substrate-forkable record of what the human has 'seen' — useful for
+   resumable sessions, ToM probes of the human's perspective, and
+   uniform persistence with LLM agents."
   (:require [dvergr.discourse :as d]
+            [dvergr.participant.context :as pctx]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]))
 
@@ -49,16 +57,23 @@
                     long-running work belongs in another thread.
 
    Optional keys:
-     :ctx         — execution context (default: `ec/*execution-context*`).
-                    Use this when constructing outside a binding —
-                    e.g. on app boot, before any spin body runs.
+     :ctx                 — execution context (default:
+                            `ec/*execution-context*`). Use this when
+                            constructing outside a binding — e.g. on
+                            app boot, before any spin body runs.
+     :participant-context — a `dvergr.participant.context/Participant
+                            Context` (role :human). When supplied,
+                            every inbox message is also appended to
+                            its memory-signal so the human's 'seen'
+                            history is a substrate-forkable record
+                            uniform with LLM agents'.
 
    Returns a Participant. The participant's `:factory` re-creates the
    same shape against a new ctx so `dvergr.discourse/fork-room` works
    (the fork's human always resolves to nil in `simulate-reply` because
    `on-receive` returns nil — there is no model of the human's reply at
    this layer)."
-  [{:keys [id ctx on-receive]}]
+  [{:keys [id ctx on-receive participant-context]}]
   {:pre [(some? id) (some? on-receive)]}
   (d/participant
     {:id  id
@@ -68,7 +83,14 @@
        (sp/spin
          (try (on-receive msg)
               (catch Throwable _ nil))
+         ;; Mirror the inbox into the participant-context's memory so
+         ;; the human's history is uniformly forkable with LLM agents'.
+         (when participant-context
+           (try (pctx/append-memory! participant-context msg)
+                (catch Throwable _ nil)))
          nil))
      :factory
      (fn [new-ctx]
-       (human-participant {:id id :ctx new-ctx :on-receive on-receive}))}))
+       (human-participant {:id id :ctx new-ctx
+                           :on-receive on-receive
+                           :participant-context participant-context}))}))
