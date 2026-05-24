@@ -11,10 +11,11 @@
 
      - `:participant-id`  — stable id, matches the discourse Participant.
      - `:role`            — :llm | :human | :hybrid | :scripted.
-     - `:spindel-ctx`     — the participant's private execution context
-                            (own signals, atoms, drain). Forked uniformly
-                            by `dvergr.discourse/fork-room {:isolation
-                            :ctx}` regardless of role.
+     - `:ctx`             — the participant's private spindel execution
+                            context (own signals, atoms, drain). Forked
+                            uniformly by `dvergr.discourse/fork-room
+                            {:isolation :ctx}` regardless of role. Same
+                            name as `Room.ctx`.
      - `:memory-signal`   — Deltaable vector of memory entries. For an
                             LLM agent these are chat messages; for a
                             human they're saved notes / received items;
@@ -56,7 +57,7 @@
 (defrecord ParticipantContext
            [participant-id
             role             ;; :llm | :human | :hybrid | :scripted
-            spindel-ctx
+            ctx              ;; spindel execution context
             memory-signal
             budget-signal
             status-signal
@@ -74,15 +75,15 @@
      :participant-id — stable id (uuid / keyword)
 
    Optional:
-     :spindel-ctx — own execution context; if not provided, a fresh one
-                    is created via `ctx/create-execution-context`.
-     :db-conn     — datahike conn for persistent memory (notes, prefs).
-                    Often yggdrasil-managed so substrate-fork branches
-                    it. nil ⇒ no durable persistence (signal-only).
-     :role-data   — initial role-data map (UI prefs, presence, …)."
-  [{:keys [participant-id spindel-ctx db-conn role-data]}]
+     :ctx       — own execution context; if not provided, a fresh one
+                  is created via `ctx/create-execution-context`.
+     :db-conn   — datahike conn for persistent memory (notes, prefs).
+                  Often yggdrasil-managed so substrate-fork branches it.
+                  nil ⇒ no durable persistence (signal-only).
+     :role-data — initial role-data map (UI prefs, presence, …)."
+  [{:keys [participant-id ctx db-conn role-data]}]
   {:pre [(some? participant-id)]}
-  (let [sctx (or spindel-ctx (ctx/create-execution-context))
+  (let [sctx (or ctx (ctx/create-execution-context))
         [memory-signal status-signal]
         (binding [rtc/*execution-context* sctx]
           [(sig/signal (d/deltaable-vector []))
@@ -138,7 +139,7 @@
   "Read the current memory vector. Role-uniform: LLM messages, human
    notes, hybrid mix."
   [pctx]
-  (binding [rtc/*execution-context* (:spindel-ctx pctx)]
+  (binding [rtc/*execution-context* (:ctx pctx)]
     @(:memory-signal pctx)))
 
 (defn append-memory!
@@ -156,19 +157,19 @@
     :llm (when-let [chat-ctx (get-in pctx [:role-data :chat-ctx])]
            (cc/add-message! chat-ctx entry))
     ;; default: signal-only append
-    (binding [rtc/*execution-context* (:spindel-ctx pctx)]
+    (binding [rtc/*execution-context* (:ctx pctx)]
       (swap! (:memory-signal pctx) conj entry))))
 
 (defn get-status
   "Read the participant's status signal (:active / :paused / …)."
   [pctx]
-  (binding [rtc/*execution-context* (:spindel-ctx pctx)]
+  (binding [rtc/*execution-context* (:ctx pctx)]
     @(:status-signal pctx)))
 
 (defn set-status!
   "Set the participant's status."
   [pctx new-status]
-  (binding [rtc/*execution-context* (:spindel-ctx pctx)]
+  (binding [rtc/*execution-context* (:ctx pctx)]
     (reset! (:status-signal pctx) new-status)))
 
 (defn get-role-data
@@ -195,7 +196,7 @@
   "Return (used / total) as a double, or 0.0 if no budget set / total 0."
   [pctx]
   (when-let [b (:budget-signal pctx)]
-    (binding [rtc/*execution-context* (:spindel-ctx pctx)]
+    (binding [rtc/*execution-context* (:ctx pctx)]
       (let [{:keys [total used]} @b]
         (if (and (number? total) (pos? total))
           (/ (double (or used 0)) total)
@@ -205,14 +206,14 @@
   "Return the set of budget threshold fractions already crossed."
   [pctx]
   (when-let [b (:budget-signal pctx)]
-    (binding [rtc/*execution-context* (:spindel-ctx pctx)]
+    (binding [rtc/*execution-context* (:ctx pctx)]
       (or (:crossed-thresholds @b) #{}))))
 
 (defn memory-size
   "Number of entries in the participant's memory signal."
   [pctx]
   (when-let [m (:memory-signal pctx)]
-    (binding [rtc/*execution-context* (:spindel-ctx pctx)]
+    (binding [rtc/*execution-context* (:ctx pctx)]
       (count @m))))
 
 (defn budget-update!
@@ -221,7 +222,7 @@
    No-op when the participant has no budget."
   [pctx f]
   (when-let [b (:budget-signal pctx)]
-    (binding [rtc/*execution-context* (:spindel-ctx pctx)]
+    (binding [rtc/*execution-context* (:ctx pctx)]
       (swap! b f))))
 
 ;; ===========================================================================
