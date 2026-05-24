@@ -75,10 +75,17 @@
 
 (defn- route-and-log!
   "Post msg to the room's bus. The bus's mult fans the message out to
-   every matching :to / :type subscription; its log captures history."
+   every matching :to / :type subscription; its log captures history.
+
+   `Message` records carry no :type — they default to :user/message so
+   capability subscriptions on `[:type :user/message]` route them. Plain
+   maps pass through unchanged so callers can tag freely."
   [room msg]
-  (bus/post! (:bus room) msg)
-  msg)
+  (let [msg' (if (and (instance? Message msg) (nil? (:type msg)))
+               (assoc msg :type :user/message)
+               msg)]
+    (bus/post! (:bus room) msg')
+    msg'))
 
 (defn post!
   "Route a Message into the room. Safe to call from any thread."
