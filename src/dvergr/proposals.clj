@@ -10,10 +10,11 @@
 
    Datahike persistence (schema in `dvergr.chat.schema/proposal-schema`)
    tracks the proposal's status across daemon restarts; the live fork
-   handle lives in an in-memory cache (`result-cache`) — lost on
-   restart, so only proposals from the current session can be
-   accept/reject'd. Future: pair `:proposal/fork-id` with substrate
-   fork recovery (Open Q #11 of discourse-model.md).
+   handle lives on the parent room's spindel execution-context under
+   `[:dvergr/proposals proposal-id]` — lost on restart, so only
+   proposals from the current session can be accept/reject'd. Future:
+   pair `:proposal/fork-id` with substrate fork recovery (Open Q #11
+   of discourse-model.md).
 
    Substrate-fork status: `d/fork-room` currently shares the parent's
    execution context — only the Room atoms (participants + log) are
@@ -41,25 +42,50 @@
             [taoensso.telemere :as tel]
             [org.replikativ.spindel.core :as sp :refer [spin await]]
             [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.engine.protocols :as rtp]
             [org.replikativ.spindel.spin.combinators :as comb]
             [dvergr.discourse :as d]))
 
 ;; ============================================================================
-;; In-memory fork cache
+;; Fork-handle storage (ctx-scoped)
 ;;
 ;; Proposals persist metadata (`:proposal/...`) to Datahike, but the live
-;; Room fork (needed for `merge-room`/`discard`) is held only in memory.
-;; Lost on daemon restart — pending proposals from prior sessions can
-;; only be inspected, not acted on. The cache maps proposal-id → handle.
+;; Room fork (needed for `merge-room`/`discard`) is held only in memory,
+;; on the *parent room's* spindel execution-context under
+;; `[:dvergr/proposals]`. That way forks inherit/branch the handle map
+;; naturally (the daemon's proposals don't leak into sidecar or test
+;; contexts), and a parent ctx that's torn down drops its proposal
+;; handles with it. Lost on daemon restart — pending proposals from
+;; prior sessions can only be inspected, not acted on.
 ;; ============================================================================
 
-(defonce ^:private result-cache (atom {}))
+(def ^:private handles-path [:dvergr/proposals])
+
+(defn- put-handle! [room proposal-id handle]
+  (rtp/swap-state! (:ctx room) handles-path
+                   (fn [m] (assoc (or m {}) proposal-id handle))))
+
+(defn- read-handle [room proposal-id]
+  (get (rtp/get-state (:ctx room) handles-path) proposal-id))
+
+(defn- drop-handle! [room proposal-id]
+  (rtp/swap-state! (:ctx room) handles-path
+                   (fn [m] (dissoc (or m {}) proposal-id))))
 
 (defn get-cached-handle
   "Return the live `{:fork :reply :room}` handle for a pending proposal,
-   or nil if the daemon was restarted since it was created."
-  [proposal-id]
-  (get @result-cache proposal-id))
+   or nil if the daemon was restarted since it was created.
+
+   Pass the same `room` that was passed to `propose!` so we know which
+   ctx the handle lives on."
+  [room proposal-id]
+  (read-handle room proposal-id))
+
+(defn forget-handles!
+  "Drop every live proposal handle on `room`'s context. Used by tests to
+   simulate a daemon restart without touching Datahike persistence."
+  [room]
+  (rtp/swap-state! (:ctx room) handles-path (constantly {})))
 
 ;; ============================================================================
 ;; Persistence
@@ -234,8 +260,8 @@
 
       ;; Cache the live fork for accept/reject, or auto-discard on failure.
       (if (= :pending status)
-        (swap! result-cache assoc proposal-id
-               {:fork fork :reply reply :room room})
+        (put-handle! room proposal-id
+                     {:fork fork :reply reply :room room})
         (d/discard fork))
 
       (tel/log! {:id   :proposal/created
@@ -260,15 +286,18 @@
   "Merge a pending proposal's fork into its parent room. Updates Datahike
    status to `:accepted` and drops the in-memory handle.
 
+   `room` is the parent room originally passed to `propose!` — it tells
+   us which execution context the live fork handle lives on.
+
    Returns `:accepted`, or an error map (`:no-live-context` if the daemon
    has restarted since the proposal was created, `:not-found` if the id
    is unknown)."
-  [conn proposal-id]
-  (if-let [{:keys [fork room]} (get @result-cache proposal-id)]
+  [room conn proposal-id]
+  (if-let [{:keys [fork]} (read-handle room proposal-id)]
     (do (binding [ec/*execution-context* (:ctx room)]
           (d/merge-room room fork))
         (update-status! conn proposal-id :accepted)
-        (swap! result-cache dissoc proposal-id)
+        (drop-handle! room proposal-id)
         (tel/log! {:id :proposal/accepted :data {:id proposal-id}}
                   "Proposal accepted")
         :accepted)
@@ -284,12 +313,14 @@
    after daemon restart), still flips the status so the proposal is
    removed from the pending queue.
 
+   `room` is the parent room originally passed to `propose!`.
+
    Returns `:rejected`, or `{:error :not-found}` if the id is unknown."
-  [conn proposal-id]
-  (if-let [{:keys [fork]} (get @result-cache proposal-id)]
+  [room conn proposal-id]
+  (if-let [{:keys [fork]} (read-handle room proposal-id)]
     (do (d/discard fork)
         (update-status! conn proposal-id :rejected)
-        (swap! result-cache dissoc proposal-id)
+        (drop-handle! room proposal-id)
         (tel/log! {:id :proposal/rejected :data {:id proposal-id}}
                   "Proposal rejected")
         :rejected)

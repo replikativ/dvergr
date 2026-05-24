@@ -69,7 +69,7 @@
         (is (some? from-db))
         (is (= :pending (:proposal/status from-db))))
       ;; Live fork cached
-      (is (some? (p/get-cached-handle (:proposal/id prop)))))))
+      (is (some? (p/get-cached-handle room (:proposal/id prop)))))))
 
 (deftest propose-test-fn-failure-auto-discards
   (testing "test-fn :pass? false → :failed status, fork discarded immediately"
@@ -83,7 +83,7 @@
       (is (= :failed (:proposal/status prop)))
       (is (re-find #"test fail" (:proposal/test-result prop)))
       ;; No live handle for a failed proposal
-      (is (nil? (p/get-cached-handle (:proposal/id prop)))))))
+      (is (nil? (p/get-cached-handle room (:proposal/id prop)))))))
 
 (deftest propose-test-fn-success-keeps-pending
   (testing "test-fn :pass? true → status stays :pending"
@@ -119,14 +119,14 @@
           parent-log-before (d/log room)]
       (is (zero? (count parent-log-before))
           "parent starts empty (worker only sees the fork)")
-      (let [result (p/accept-proposal! *conn* (:proposal/id prop))]
+      (let [result (p/accept-proposal! room *conn* (:proposal/id prop))]
         (is (= :accepted result))
         (is (pos? (count (d/log room)))
             "fork's messages flowed into the parent log after merge")
         (is (= :accepted (:proposal/status
                            (p/get-proposal *conn* (:proposal/id prop)))))
         ;; Cache cleared
-        (is (nil? (p/get-cached-handle (:proposal/id prop))))))))
+        (is (nil? (p/get-cached-handle room (:proposal/id prop))))))))
 
 (deftest reject-proposal-discards-fork
   (testing "Reject discards the fork; parent log untouched"
@@ -135,7 +135,7 @@
           prop   (run-propose {:room room :worker worker :conn *conn*
                                :goal "x"})]
       (is (zero? (count (d/log room))))
-      (is (= :rejected (p/reject-proposal! *conn* (:proposal/id prop))))
+      (is (= :rejected (p/reject-proposal! room *conn* (:proposal/id prop))))
       (is (zero? (count (d/log room)))
           "parent log stays empty — discard does not merge")
       (is (= :rejected (:proposal/status
@@ -143,7 +143,8 @@
 
 (deftest accept-unknown-id-returns-error
   (testing "Accepting a non-existent proposal returns {:error :not-found}"
-    (let [result (p/accept-proposal! *conn* (random-uuid))]
+    (let [room   (d/room :t)
+          result (p/accept-proposal! room *conn* (random-uuid))]
       (is (= :not-found (:error result))))))
 
 (deftest accept-without-live-context-returns-error
@@ -152,9 +153,10 @@
           worker (d/scripted :w ["draft"] (:ctx room))
           prop   (run-propose {:room room :worker worker :conn *conn*
                                :goal "x"})]
-      ;; Simulate daemon restart by clearing the (private) cache atom.
-      (reset! @(resolve 'dvergr.proposals/result-cache) {})
-      (let [result (p/accept-proposal! *conn* (:proposal/id prop))]
+      ;; Simulate daemon restart by clearing the live-handle table on
+      ;; the room's ctx (the Datahike row remains).
+      (p/forget-handles! room)
+      (let [result (p/accept-proposal! room *conn* (:proposal/id prop))]
         (is (= :no-live-context (:error result)))))))
 
 ;; ============================================================================
@@ -171,7 +173,7 @@
                                 :goal "second"})
           p3      (run-propose {:room room :worker worker :conn *conn*
                                 :goal "third"})
-          _       (p/reject-proposal! *conn* (:proposal/id p2))]
+          _       (p/reject-proposal! room *conn* (:proposal/id p2))]
       (is (= 3 (count (p/list-proposals *conn*))))
       (is (= 2 (count (p/list-proposals *conn* :status :pending))))
       (is (= 1 (count (p/list-proposals *conn* :status :rejected))))

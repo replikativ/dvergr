@@ -620,7 +620,8 @@
                                                 (sessions/get-pending-fork chat-id aid))]
                             (let [conn   (some-> (rtc/get-state [:external-refs "dvergr-chat-db"])
                                                  :conn)
-                                  result (proposals/accept-proposal! conn (:proposal-id pending))]
+                                  room   (:discourse-room daemon)
+                                  result (proposals/accept-proposal! room conn (:proposal-id pending))]
                               (sessions/clear-pending-fork! chat-id aid)
                               (if (= :accepted result)
                                 "Merged! Changes have been applied to the main context."
@@ -632,7 +633,8 @@
                                                 (sessions/get-pending-fork chat-id aid))]
                             (let [conn   (some-> (rtc/get-state [:external-refs "dvergr-chat-db"])
                                                  :conn)
-                                  result (proposals/reject-proposal! conn (:proposal-id pending))]
+                                  room   (:discourse-room daemon)
+                                  result (proposals/reject-proposal! room conn (:proposal-id pending))]
                               (sessions/clear-pending-fork! chat-id aid)
                               (if (= :rejected result)
                                 "Discarded. Work has been thrown away."
