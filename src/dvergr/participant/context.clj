@@ -183,6 +183,48 @@
   (update pctx :role-data assoc k v))
 
 ;; ===========================================================================
+;; Past-arc state accessors
+;;
+;; Read-only views over the participant's budget + memory. Watch-and-fire
+;; primitives (threshold-crossed deferreds, compaction triggers, cancel
+;; signals) live in `dvergr.discourse.generation` where they're constructed
+;; per-generation and raced against the generation-handle.
+;; ===========================================================================
+
+(defn budget-fraction-used
+  "Return (used / total) as a double, or 0.0 if no budget set / total 0."
+  [pctx]
+  (when-let [b (:budget-signal pctx)]
+    (binding [rtc/*execution-context* (:spindel-ctx pctx)]
+      (let [{:keys [total used]} @b]
+        (if (and (number? total) (pos? total))
+          (/ (double (or used 0)) total)
+          0.0)))))
+
+(defn crossed-thresholds
+  "Return the set of budget threshold fractions already crossed."
+  [pctx]
+  (when-let [b (:budget-signal pctx)]
+    (binding [rtc/*execution-context* (:spindel-ctx pctx)]
+      (or (:crossed-thresholds @b) #{}))))
+
+(defn memory-size
+  "Number of entries in the participant's memory signal."
+  [pctx]
+  (when-let [m (:memory-signal pctx)]
+    (binding [rtc/*execution-context* (:spindel-ctx pctx)]
+      (count @m))))
+
+(defn budget-update!
+  "Mutate the budget-signal via `f`. `f` receives the current
+   `{:total :used :by-type :crossed-thresholds}` and returns the new one.
+   No-op when the participant has no budget."
+  [pctx f]
+  (when-let [b (:budget-signal pctx)]
+    (binding [rtc/*execution-context* (:spindel-ctx pctx)]
+      (swap! b f))))
+
+;; ===========================================================================
 ;; Bridge: existing ChatContext interop
 ;; ===========================================================================
 
