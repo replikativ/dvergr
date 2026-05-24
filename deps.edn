@@ -103,6 +103,10 @@
   ;; MCP server for exposing dvergr capabilities to MCP-capable clients
   :mcp-server {:main-opts ["-m" "dvergr.mcp.server"]}
 
+  ;; CLI: TUI chat client for discourse rooms
+  :cli {:extra-deps {org.replikativ/spindel-tui {:local/root "../spindel-tui"}}
+        :main-opts  ["-m" "dvergr.cli.main"]}
+
   ;; Dashboard TUI (spindel-tui + nREPL)
   :dashboard {:extra-paths ["src-tui"]
               :extra-deps  {org.replikativ/spindel-tui {:local/root "../spindel-tui"}
