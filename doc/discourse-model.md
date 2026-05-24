@@ -154,6 +154,70 @@ Three reasons this is load-bearing:
 
 **Bisimulation by features (the sharper form, for open-weights participants).** Behavioural bisimulation is the default we just defined; it is checkable by running scripts against both participants and comparing outbox streams. For open-weights participants, **Geiger 2023's *causal abstraction* + DAS (Distributed Alignment Search)** [19] gives a strictly sharper notion: two participants are bisimilar *by features* iff their internal SAE activations are mapped by an alignment to a common abstract circuit. With open SAEs available today (Gemma Scope, Goodfire), this is *checkable* for open-weights participants — not just a definition. Behavioural bisimulation remains the default for closed-weights or scripted participants; feature bisimulation is the upgrade when both parties expose their internals. The two combine: behavioural for the algebra-as-tested, feature-level for the strongest soundness claims.
 
+### 5.4a Algebra meets coalgebra — the bialgebra picture
+
+The §5.4 coalgebra captures **one half** of what a participant is: how it *reacts to its environment*. The other half is how it *constructs its internal state from finite reasoning steps* — and that side is inductive, an **F-algebra**:
+
+|  | Categorical role | What it captures | In dvergr |
+|---|---|---|---|
+| **Algebra**  `F(S) → S` (induction) | Build state from finite structure | "Internal reasoning step": LLM turn, tool execution, plan refinement, summary, decision | `chat.agent/run-agent-turn!`, `dvergr.tools/execute`, persona system prompts |
+| **Coalgebra**  `S → G(S)` (coinduction) | Unfold state into the next observation | "Environment interaction": the inbox / tick / source / observation / introspection drivers of §5.5 | `participant-spin` race; `inbox` / `emit-reply!` |
+
+A participant is a **bialgebra**: simultaneously an F-algebra and a G-coalgebra. The two are glued by a **distributive law**
+
+```
+λ : F G ⇒ G F
+```
+
+— i.e., a coherent rule for swapping the order of "react to one event" with "do one reasoning step." `λ` is what lets the bialgebra compose: it tells us *which interleavings of reasoning and reaction are equivalent*, and which are observationally distinct.
+
+In dvergr today, `λ` is implicit in the **future-bridged deferred** inside `dvergr.discourse.llm/llm-agent`: blocking LLM turns run on `clojure.lang.Agent/soloExecutor`; their result lands on a spindel `Deferred`; the participant's `on-message` spin `await`s the deferred and only then reacts. Making `λ` explicit gives us composition rules — e.g., "a high-priority inbox event must be observable to the reasoning step at the next reasoning-step boundary" becomes a law about `λ`, not an ad-hoc cancel-token convention.
+
+**This is the load-bearing formalisation for *participant composition*.** Plotkin & Xie [16] give us the algebra laws (`pipeline` associativity, `fan-out` singleton, …) on the F-side. §5.4 gives us the coalgebra laws (fork-identity, idle quiescence) on the G-side. The bialgebra distributive law `λ` is what makes the two compose — it's the formal home for laws of the form *"how does a long-running reasoning step interact with a concurrent inbox event?"*. Today those interactions work by careful engineering (future + deferred + cancel-token); the distributive law gives the equational account.
+
+**Why humans and LLMs are the same type, not two types.** Both have an F-algebra (internal reasoning that constructs state from finite steps) and a G-coalgebra (the §5.5 driver protocol — same six channels, same Message envelopes). They differ *only in where the F-algebra lives*:
+
+| Participant strain | F-algebra (`F(S) → S`) | Visible to library? |
+|---|---|---|
+| LLM (closed weights) | transformer + tool-loop | Behaviourally |
+| LLM (open weights) | transformer + tool-loop | Behaviourally + feature-level (Geiger DAS, §5.4) |
+| Human | brain (memory, intuition, deliberation) | Behaviourally only — opaque |
+| Scripted bot | a vector of replies | Both — trivially |
+| Hybrid (autocomplete + human approval) | LLM suggests, human edits | Mixed — LLM side visible, human side opaque |
+
+The G-coalgebra is **identical across all strains**: every Participant joins a Room, has an inbox, has the same six driver channels (§5.5), participates in the same bisimulation tests (§5.4). This is why dvergr ships *one* `Participant` record and not separate `LLMAgent` / `HumanParticipant` / `ScriptedBot` types: the type structure is the bialgebra; the strain is just where `F` is evaluated. `dvergr.discourse.llm/llm-agent` is one constructor (F evaluated inside `on-message`, synchronously via the future-bridge); `dvergr.discourse.human/human-participant` is another (F evaluated externally — the human types into a UI which posts back into the Room via `d/post!`). Same bialgebra, different `F`-evaluator location.
+
+This also explains why the **synchronous-decider vs external-decider** axis is the right one — not human-vs-LLM. A slow LLM that thinks for an hour and emits asynchronously is on the external side; a fast scripted bot is on the synchronous side. The split is about *where the algebra runs*, not what it is.
+
+### 5.4b Theory of mind as a coinductive fixed point
+
+ToM — "Alice's state contains a model of Bob; Bob's model contains a model of Alice; Alice's model of Bob contains Bob's model of Alice; …" — is exactly the **coinductive fixed-point** structure that the G-coalgebra side already lives in. Formally, the state space of a participant satisfies
+
+```
+S  ≅  Memory × Π_{q ∈ Participants}  Model(S_q)
+```
+
+— each participant's state factors into its own memory *and* a (potentially recursive, potentially infinite-depth) family of models of the other participants. The fixed point is coinductive because the depth is unbounded; we only ever **finitely unfold** it during reasoning.
+
+Operationally, `dvergr.discourse/simulate-reply` (§6.5) is the unfolding-by-one-step primitive: fork the room, ask `other-id` for their reply to a hypothetical, observe, discard the fork. The participant ran ONE level of the fixed-point.  `imagine-conversation` is multi-step unfolding; `what-if` is multi-branch unfolding.
+
+LLMs and humans short-cut full unfolding most of the time — both do intuitive ToM without explicit rollouts. But when stakes are high, we want **explicit rollouts that actually run** in isolation — and this is exactly where today's `simulate-reply` falls short:
+
+> `fork-room` today **shares the parent's execution context** — only the room's `:participants` and `:log` atoms isolate. A coder's `simulate-reply` of the reviewer can commit chat-ctx signal updates, datahike transactions, or filesystem writes that leak into the parent. The ToM probe is *imagined* but not *isolated*.
+
+The fix is **yggdrasil-grounded substrate fork** (Open Q #11). `dvergr.discourse/fork-room` should optionally also:
+
+1. Branch each participant's chat-ctx (its private spindel ec + datahike + SCI sandbox) via yggdrasil.
+2. Branch the room-level datahike (if any) via yggdrasil.
+3. Branch any git worktrees the participants own.
+4. Share the parent's HLC for time-consistent observation across the multi-system fork.
+
+With substrate fork, `simulate-reply` becomes **sound**: the imagined rollout runs in a complete copy of the world, can commit memory, write files, mutate KB — and on `discard` (the default), all of it disappears. On `merge-room` (rare, but supported for cases like "after careful deliberation in private, the agent commits the lesson"), changes integrate atomically across all branched substrates via yggdrasil's protocol.
+
+This is the **resumable-runtime differentiator** §6.5 mentions: because spindel's execution context is a value AND yggdrasil's substrates are forkable, ToM rollouts aren't snapshots — they're **continuations**. We fork, run, observe, jump back, run from a different decision point, …. Claude Code subagents, opencode tasks, and OpenClaw workers can't do this — their forks are one-shot. Ours are *bidirectional in time*, and that is what makes the inference-as-particle-system reading of §10 work.
+
+**Why the algebra side matters for ToM.** A participant's `Model(S_q)` of another participant `q` is itself a (smaller, approximate) F-algebra. Today this lives in the system prompt ("imagine you are talking to a curmudgeonly reviewer"). The next refinement is for `dvergr.personas` to expose a participant's algebra-of-itself as a *callable* — so `simulate-reply` can run the *target*'s reasoning, not just our prompt-guided guess at it. With Geiger DAS on open-weights participants (§5.4 bisimulation by features), the algebra-of-other is even *checkable* against ground truth.
+
 ### 5.5 Drivers: inbox is not the only signal
 
 A participant's spin races over **six channels**, not just inbox:
