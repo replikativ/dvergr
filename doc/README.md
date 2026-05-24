@@ -7,6 +7,7 @@ New to dvergr? Start with **[Getting Started](getting-started.md)**.
 - **[Main README](../README.md)** — project overview + 60-second quickstart
 - **[Getting Started](getting-started.md)** — first-room tutorial: REPL + CLI paths, tagged messages, streaming
 - **[CLI Reference](cli.md)** — `dvergr-cli`: keys, persistence, providers, telemetry
+- **[Sidecar](sidecar.md)** — load dvergr as a sidecar in any Clojure REPL; one-line `spawn-agent!`, `ask`, programmable bus access
 
 ## 📚 Programming Model
 

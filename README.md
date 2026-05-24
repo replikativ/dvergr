@@ -73,6 +73,8 @@ fork-and-merge proposal pattern, see
 
 - **[Getting Started](doc/getting-started.md)** — first-room tutorial,
   REPL + CLI paths
+- **[Sidecar](doc/sidecar.md)** — `dvergr.sidecar/spawn-agent!`: load
+  dvergr into any Clojure REPL, drive agents as values
 - **[Programming Model](doc/programming-model.md)** — bus, tagged
   routing, GenerationHandle, the distributive law λ
 - **[CLI Reference](doc/cli.md)** — `dvergr-cli` keys, persistence,
