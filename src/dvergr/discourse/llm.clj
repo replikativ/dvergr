@@ -37,6 +37,7 @@
             [dvergr.discourse.generation :as gen]
             [dvergr.chat.context :as cc]
             [dvergr.chat.agent :as ca]
+            [dvergr.participant.context :as pctx]
             [dvergr.tools :as tools]))
 
 ;; ============================================================================
@@ -100,13 +101,16 @@
    :ctx         — discourse room's execution context
                   (default: `*execution-context*`)"
   [{:keys [id spec tools db-conn budget compaction
-           chat-ctx tool-ctx run-turn-fn ctx]
+           chat-ctx participant-context tool-ctx run-turn-fn ctx]
     :or   {budget      {:dollars 1.0 :max-turns 8}
            compaction  {:auto? true}
            run-turn-fn default-run-turn}}]
   {:pre [(keyword? id) (map? spec)]}
-  (let [ctx       (or ctx ec/*execution-context*)
-        chat-ctx  (or chat-ctx
+  (let [;; :participant-context (preferred) takes precedence; falls back to
+        ;; :chat-ctx; falls back to creating a fresh one.
+        chat-ctx  (or (when participant-context
+                        (pctx/->chat-context participant-context))
+                      chat-ctx
                       (let [c (cc/create-chat-context
                                 {:title          (str "agent " (name id))
                                  :budget-dollars (:dollars budget 1.0)
@@ -116,6 +120,7 @@
                         (when-let [sp (:system-prompt spec)]
                           (cc/add-message! c {:role :system :content sp}))
                         c))
+        ctx       (or ctx ec/*execution-context*)
         max-turns (:max-turns budget 8)
         tool-ctx  (or tool-ctx
                       (tools/make-context
