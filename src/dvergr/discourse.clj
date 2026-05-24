@@ -47,12 +47,14 @@
   ;;     {:type :tick}                          — periodic self-tick
   ;;     {:type :source :name kw :msg evt-data} — external source event
   ;; inbox-sub  :: dvergr.bus.Subscription on [:to id] (the default channel)
+  ;; inbox-mbx  :: the merge mailbox the participant-spin awaits (all subs
+  ;;               pump into it)
   ;; subs       :: atom of {topic → Subscription} for dynamic extra channels
   ;; factory    :: (fn [new-ctx] -> Participant) — for cloning into a fork
   ;; process    :: the spindel spin driving this participant (set by `join`)
   ;; tick-ms    :: nil or interval in ms (`with-cadence`); fires {:type :tick}
   ;; sources    :: nil or [{:name kw :source PAsyncSeq}] (`with-sources`)
-  [id inbox-sub subs on-message factory process tick-ms sources])
+  [id inbox-sub inbox-mbx subs on-message factory process tick-ms sources])
 
 (defrecord Room
   ;; participants : atom of {id → Participant}
@@ -131,7 +133,7 @@
    Drivers (tick / sources) are added with `with-cadence` / `with-sources`."
   [{:keys [id on-message factory ctx]}]
   (let [_ctx (or ctx ec/*execution-context*)]
-    (->Participant id nil (atom {}) on-message factory nil nil nil)))
+    (->Participant id nil nil (atom {}) on-message factory nil nil nil)))
 
 ;; ============================================================================
 ;; Built-in participant helpers
@@ -234,7 +236,8 @@
 
 (defn join
   "Register participant in room, subscribe its inbox + drivers on the bus,
-   and start its spin. Returns the participant with :inbox-sub and :process."
+   and start its spin. Returns the participant with :inbox-sub, :inbox-mbx
+   and :process set."
   [room p]
   (binding [ec/*execution-context* (:ctx room)]
     (let [inbox-sub (bus/subscribe! (:bus room) [:to (:id p)])
@@ -242,16 +245,53 @@
           ;; a single source. Each sub gets a small pump.
           merge-mbx (sync/create-mailbox (:ctx room))
           _ (drain-into! inbox-sub merge-mbx)
-          ;; Tick + sources will land via [:to id] anyway (the pumps post
+          ;; Tick + sources will land via [:to id] (their pumps post
           ;; with :to (:id p)), so no extra subs needed for them.
           _ (start-driver-pumps! room p)
           p' (-> p
-                 (assoc :inbox-sub inbox-sub))
+                 (assoc :inbox-sub inbox-sub
+                        :inbox-mbx merge-mbx))
           proc (participant-spin p' room merge-mbx)]
       (sp/spawn! proc)
       (let [p'' (assoc p' :process proc)]
         (swap! (:participants room) assoc (:id p) p'')
         p''))))
+
+;; ============================================================================
+;; Dynamic subscriptions — let participants listen to extra tagged channels
+;; ============================================================================
+
+(defn subscribe!
+  "Add an extra bus subscription on `topic` that pumps into `p`'s inbox
+   mailbox. Use inside on-message bodies (or after join) when a participant
+   needs to receive messages NOT addressed by `:to`, e.g. an auditor
+   watching `[:type :escalation/budget]` regardless of recipient.
+
+   Returns the Subscription. Idempotent on (already-subscribed topic).
+
+   Buffer defaults to dvergr.bus's policy table; pass an explicit buffer
+   via the 4-arg form."
+  ([room p topic]
+   (subscribe! room p topic nil))
+  ([room p topic buffer]
+   (or (get @(:subs p) topic)
+       (let [sub (binding [ec/*execution-context* (:ctx room)]
+                   (if buffer
+                     (bus/subscribe! (:bus room) topic buffer)
+                     (bus/subscribe! (:bus room) topic)))]
+         (binding [ec/*execution-context* (:ctx room)]
+           (drain-into! sub (:inbox-mbx p)))
+         (swap! (:subs p) assoc topic sub)
+         sub))))
+
+(defn unsubscribe!
+  "Remove a previously added subscription on `topic` for `p`. The drain
+   pump exits the next time the bus closes the subscription's aseq."
+  [_room p topic]
+  (when-let [sub (get @(:subs p) topic)]
+    (bus/unsubscribe! sub)
+    (swap! (:subs p) dissoc topic))
+  nil)
 
 (defn leave
   "Remove participant from room's routing table and unsubscribe its inbox.
