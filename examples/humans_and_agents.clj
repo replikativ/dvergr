@@ -42,7 +42,10 @@
             [dvergr.proposals :as proposals]
             [dvergr.chat.schema :as schema]
             [org.replikativ.spindel.core :as sp :refer [spin await]]
-            [org.replikativ.spindel.engine.core :as ec]))
+            [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.yggdrasil :as ygg]
+            [yggdrasil.adapters.datahike :as ygg-dh]
+            [yggdrasil.protocols :as ygg-proto]))
 
 ;; ===========================================================================
 ;; A tiny scripted "agent" — replays a sequence of replies in order.
@@ -200,8 +203,100 @@
     (d/close-room! room)
     (dh/release conn)))
 
+(defn demo-5-substrate-fork
+  "Substrate-isolated propose/accept: the worker transacts into a
+   yggdrasil-managed datahike. Until accept, parent's datahike is
+   unchanged — even though the worker's spin already ran the
+   transaction. Demonstrates ToM/coding-agent isolation: the worker's
+   side effects ARE real, they just happen in a branched copy of the
+   substrate."
+  []
+  (println "\n=== Demo 5: substrate-isolated propose → accept (yggdrasil) ===")
+  (let [;; A yggdrasil-managed datahike. In a real coding-agent run this
+        ;; would also pair with a git-managed worktree; we keep just the
+        ;; datahike here for a small self-contained demo.
+        worker-db-cfg {:store {:backend :memory :id (random-uuid)}
+                       :keep-history? true}
+        _ (dh/create-database worker-db-cfg)
+        worker-conn (dh/connect worker-db-cfg)
+        ;; Tiny schema so the worker's transact has somewhere to land.
+        _ (dh/transact worker-conn
+            [{:db/ident :kb/topic :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+             {:db/ident :kb/note  :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])
+        worker-system (ygg-dh/create worker-conn {:system-name "worker-kb"})
+
+        ;; Proposal-persistence DB (same as demos 3/4).
+        prop-cfg {:store {:backend :memory :id (random-uuid)}}
+        _ (dh/create-database prop-cfg)
+        prop-conn (dh/connect prop-cfg)
+        _ (schema/ensure-full-schema! prop-conn)
+
+        room (d/room :demo-5)
+        alice (binding [ec/*execution-context* (:ctx room)]
+                (human/human-participant
+                  {:id :alice :on-receive (println-receive "alice")}))
+        ;; A worker that, when asked, transacts to its KB then replies.
+        ;; The transact happens inside its participant spin — so inside
+        ;; whichever ctx the fork uses, with the yggdrasil-managed
+        ;; datahike branched automatically by spindel's PForkable
+        ;; extension. We define this as a fn so its factory can recurse.
+        make-worker (fn make-worker [ctx]
+                      (binding [ec/*execution-context* ctx]
+                        (d/participant
+                          {:id :indexer
+                           :ctx ctx
+                           :on-message
+                           (fn [_p msg]
+                             (spin
+                               ;; Resolve the yggdrasil-managed datahike
+                               ;; from the *current* ctx. In the fork,
+                               ;; this is the branched copy; in the
+                               ;; parent, the trunk.
+                               (let [sys (ygg/get-system "worker-kb")
+                                     conn (:conn sys)]
+                                 (dh/transact conn
+                                   [{:kb/topic "X" :kb/note (:content msg)}])
+                                 {:to (:from msg) :content "Indexed."})))
+                           :factory make-worker})))
+        worker (make-worker (:ctx room))]
+    (binding [ec/*execution-context* (:ctx room)]
+      ;; Register the worker's KB in the parent ctx. Forks inherit it
+      ;; lazily; on first write the OverlayBackend branches it via
+      ;; PForkable.
+      (ygg/register! worker-system))
+
+    (d/join room alice)
+
+    (binding [ec/*execution-context* (:ctx room)]
+      (let [proposal @(proposals/propose!
+                        {:room   room
+                         :worker worker
+                         :goal   "index this note"
+                         :conn   prop-conn
+                         :isolation :ctx})]   ; ← substrate-isolated fork
+        (println "(alice sees proposal:" (:proposal/summary proposal) ")")
+
+        ;; Before accept: parent's datahike is UNCHANGED.
+        (let [parent-conn (:conn (ygg/get-system "worker-kb"))
+              count-before (count (dh/q '[:find ?n :where [_ :kb/note ?n]]
+                                        @parent-conn))]
+          (println "(parent KB has" count-before "notes before accept — expect 0)"))
+
+        (proposals/accept-proposal! prop-conn (:proposal/id proposal))
+
+        ;; After accept: the worker's branch merged into parent. The
+        ;; worker's transact is now visible in parent's datahike.
+        (let [parent-conn (:conn (ygg/get-system "worker-kb"))
+              count-after (count (dh/q '[:find ?n :where [_ :kb/note ?n]]
+                                       @parent-conn))]
+          (println "(parent KB has" count-after "notes after accept — expect 1)"))))
+
+    (d/close-room! room)
+    (dh/release worker-conn)
+    (dh/release prop-conn)))
+
 (defn run
-  "Run all four demos sequentially. Invoke from `clojure -X` or REPL.
+  "Run all demos sequentially. Invoke from `clojure -X` or REPL.
 
        clojure -X:dev humans-and-agents/run"
   [& _]
@@ -209,4 +304,5 @@
   (demo-2-background-with-notification)
   (demo-3-propose-accept)
   (demo-4-propose-reject)
+  (demo-5-substrate-fork)
   (println "\nDone."))

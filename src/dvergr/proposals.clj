@@ -173,12 +173,21 @@
      :timeout-ms    — how long to wait for the worker's reply (default 60000)
      :from          — `:from` id on the goal message (default :proposer)"
   [{:keys [room worker goal conn test-fn budget-dollars on-propose
-           timeout-ms from]
+           timeout-ms from isolation]
     :or   {timeout-ms 60000
-           from       :proposer}}]
+           from       :proposer
+           isolation  :ctx}}]
   {:pre [(some? room) (some? worker) (string? goal) (some? conn)]}
   (spin
-    (let [fork  (d/fork-room room)
+    (let [;; Substrate-isolated by default: the worker's writes (chat-ctx
+          ;; datahike, KB additions, file edits via tools, ...) happen on
+          ;; branched yggdrasil systems inside the fork's ctx. On
+          ;; accept-proposal!, merge-room atomically merges them back; on
+          ;; reject, discard-from-parent! drops the branches. Pass
+          ;; `:isolation :none` to fall back to the old shared-ctx
+          ;; behaviour (useful for ToM-style proposals where the worker
+          ;; only emits a message and does not commit to any side effect).
+          fork  (d/fork-room room {:isolation isolation})
           ;; Re-create the worker via its :factory so a single worker
           ;; value can drive multiple propose! calls. Without this the
           ;; worker's participant-spin stays bound to the first fork it
@@ -188,13 +197,14 @@
                             (fac (:ctx fork))
                             worker)
           _     (d/join fork worker-instance)
-          reply (await
-                  (comb/timeout
-                    (d/ask fork (:id worker-instance)
-                           {:content goal
-                            :metadata {:from from}})
-                    timeout-ms
-                    ::timeout))
+          reply (binding [ec/*execution-context* (:ctx fork)]
+                  (await
+                    (comb/timeout
+                      (d/ask fork (:id worker-instance)
+                             {:content goal
+                              :metadata {:from from}})
+                      timeout-ms
+                      ::timeout)))
           timed-out? (= reply ::timeout)
           test-result (when (and test-fn (not timed-out?))
                         (try (test-fn)

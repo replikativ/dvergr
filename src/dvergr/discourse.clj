@@ -27,8 +27,10 @@
   (:require [clojure.string :as str]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.engine.context :as ctx]
             [org.replikativ.spindel.spin.sync :as sync]
             [org.replikativ.spindel.spin.combinators :as comb]
+            [org.replikativ.spindel.yggdrasil :as ygg]
             [is.simm.partial-cps.sequence :refer [anext]]))
 
 ;; ============================================================================
@@ -352,42 +354,100 @@
 ;; ============================================================================
 
 (defn fork-room
-  "Create a sibling room with cloned participants. The execution context is
-   SHARED with the parent — only the room atoms (participants, log) are
-   isolated. Each participant with a :factory is re-created (with its
-   current internal state captured) and joined as a fresh participant in
-   the fork, with its own mailbox routed only by the fork's :participants.
+  "Create a sibling room with cloned participants.
 
-   Sharing the ctx keeps awaits/deferreds/mailboxes coherent across the
-   fork boundary, which is what allows simulate-reply and imagine-conversation
-   to compose with the rest of the algebra. Substrate-level forking
-   (datahike branches, git worktrees, SCI fork) is deferred to spindel's
-   `:isolation :fork` extension (Open Q #11 of discourse-model.md)."
-  [room]
-  (let [new-id     (keyword (str (name (:id room))
-                                 "-fork-" (subs (str (random-uuid)) 0 8)))
-        parent-log @(:log room)
-        new-room   (->Room new-id (atom {}) (atom parent-log) (:ctx room)
-                           (count parent-log))]
-    (doseq [[_id p] @(:participants room)]
-      (when-let [fac (:factory p)]
-        (join new-room (fac (:ctx room)))))
-    new-room))
+   Two isolation modes:
+
+   `:none` (default) — share the parent's execution context. Participants
+   are re-created via their `:factory` and joined into the fork's own
+   `:participants` map, but they share the parent's spindel ec — so
+   mailboxes, deferreds, and signal subscriptions remain coherent
+   across the fork boundary. This is what makes `simulate-reply` and
+   `imagine-conversation` compose with the rest of the algebra: the
+   parent's spin can `await` the fork's `ask` because both speak the
+   same ctx.
+
+   `:ctx` — fork the spindel execution context via `ctx/fork-context`,
+   which automatically branches all yggdrasil systems registered as
+   `[:external-refs]` (datahike, git worktrees, btrfs subvolumes,
+   ZFS datasets, …) via spindel's PForkable extension. The fork
+   becomes substrate-isolated: an agent's writes to its chat-ctx
+   datahike, KB writes, file edits, etc. happen on branched copies
+   and are only visible inside the fork until `merge-room` atomically
+   merges them back via `spindel.yggdrasil/merge-to-parent!` (or
+   `discard` deletes the branches via `discard-from-parent!`).
+
+   Use `:ctx` when the fork must hold real side effects in isolation
+   (proposals, speculative coding-agent work). Use `:none` (default)
+   for message-only ToM probes where nothing in the fork commits.
+
+   `:ctx` requires that subsequent operations on the fork (e.g.
+   `(ask fork :agent …)` from outside the fork's body) bind
+   `*execution-context*` to the fork's ctx — see `with-fork-ctx`."
+  ([room] (fork-room room {}))
+  ([room {:keys [isolation] :or {isolation :none}}]
+   (let [new-id     (keyword (str (name (:id room))
+                                  "-fork-" (subs (str (random-uuid)) 0 8)))
+         parent-log @(:log room)
+         child-ctx  (case isolation
+                      :none (:ctx room)
+                      :ctx  (ctx/fork-context (:ctx room)))
+         new-room   (->Room new-id (atom {}) (atom parent-log) child-ctx
+                            (count parent-log))]
+     (doseq [[_id p] @(:participants room)]
+       (when-let [fac (:factory p)]
+         (binding [ec/*execution-context* child-ctx]
+           (join new-room (fac child-ctx)))))
+     new-room)))
+
+(defmacro with-fork-ctx
+  "Execute `body` with the fork's execution context bound. Required for
+   operations like `(ask fork :agent …)` initiated from OUTSIDE the
+   fork's participant spins when the fork was created with
+   `:isolation :ctx` — without this binding, the asker's mailbox would
+   be created in the wrong ctx and the await would silently miss the
+   reply. For `:isolation :none` (default), no-op-ish (the binding is
+   the same ctx anyway)."
+  [fork & body]
+  `(binding [ec/*execution-context* (:ctx ~fork)]
+     ~@body))
+
+(defn- ctx-was-forked?
+  "True if `fork`'s ctx is a child of some parent ctx — i.e. it was
+   created via `ctx/fork-context`. Determines whether merge/discard
+   should also merge/discard yggdrasil branches."
+  [fork]
+  (some? (:parent-ctx (:ctx fork))))
 
 (defn discard
-  "Discard a fork: deregister its participants. Their spins continue running
-   on the shared context, but no further messages are routed to them — they
-   block on their mailboxes indefinitely (harmless; cleaned up when the
-   shared context eventually stops)."
+  "Discard a fork: deregister its participants and, if the fork's ctx
+   was forked (`:isolation :ctx`), delete all branched yggdrasil systems
+   via `spindel.yggdrasil/discard-from-parent!`. Participant spins on a
+   shared ctx (`:isolation :none`) continue running indefinitely on
+   their mailboxes (harmless; cleaned up when the shared context
+   eventually stops)."
   [fork]
   (reset! (:participants fork) {})
+  (when (ctx-was-forked? fork)
+    (ygg/discard-from-parent! (:ctx fork)))
   fork)
 
 (defn merge-room
-  "Merge fork's NEW log entries (those added after the fork point) into
-   parent's log, then deregister fork's participants. Assumes parent's log
-   was not modified between fork and merge (the standard ToM/what-if
-   pattern)."
+  "Merge fork into parent.
+
+   1. Append the fork's new log entries (those added after the fork
+      point) to the parent's log.
+   2. If the fork's ctx was forked (`:isolation :ctx`), merge all
+      branched yggdrasil systems back into the parent via
+      `spindel.yggdrasil/merge-to-parent!` — datahike branches collapse,
+      git branches fast-forward or three-way merge, etc.
+   3. Deregister the fork's participants.
+
+   Assumes parent's log was not modified between fork and merge (the
+   standard ToM/what-if pattern). For ctx-forked merges, the
+   yggdrasil-level merge is atomic per-system via the workspace's
+   coordinated commit; cross-system atomicity is best-effort (per
+   workspace coordination)."
   [parent fork]
   (let [fork-log  @(:log fork)
         forked-at (or (:forked-at-len fork) 0)
@@ -395,6 +455,8 @@
                       (subvec fork-log forked-at))]
     (when (seq new-entries)
       (swap! (:log parent) into new-entries)))
+  (when (ctx-was-forked? fork)
+    (ygg/merge-to-parent! (:ctx fork)))
   (reset! (:participants fork) {})
   parent)
 
