@@ -8,11 +8,20 @@
      - dvergr.cli.streaming/make-run-turn-fn (LLM token → bus bridge)
 
    Run:
-     clj -M:cli                                ; default (Fireworks/kimi-k2p6)
-     clj -M:cli :model \"<model-id>\"           ; override
+     clj -M:cli                                ; default (claude-code if avail)
+     clj -M:cli :model \"<model-id>\"           ; override model
      clj -M:cli :system-prompt \"...\"          ; custom system prompt
-     clj -M:cli :budget-dollars 2.0            ; raise budget cap"
-  (:require [clojure.string :as str]
+     clj -M:cli :budget-dollars 2.0            ; raise budget cap
+     clj -M:cli :resume <session-id>           ; resume an EDN-snapshotted session
+
+   Keys:
+     Enter      send the input line to the active room's agent
+     Ctrl-N     create a new room (room-N) with the same defaults
+     Tab        cycle the active room
+     Ctrl-C / q quit (saves session snapshot first)"
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.string :as str]
             [is.simm.partial-cps.sequence :as aseq]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
@@ -32,6 +41,53 @@
   (:gen-class))
 
 (def ^:private USER-ID :you)
+
+;; ============================================================================
+;; Persistence — minimal EDN snapshot per session
+;; ============================================================================
+
+(defn- sessions-dir
+  []
+  (let [d (io/file (System/getProperty "user.home") ".dvergr-cli" "sessions")]
+    (.mkdirs d)
+    d))
+
+(defn- session-file
+  [session-id]
+  (io/file (sessions-dir) (str (name session-id) ".edn")))
+
+(defn- strip-binary-snapshot
+  "Strip non-serializable fields from a session snapshot (the
+   spindel-snapshot is binary and not EDN-safe)."
+  [s]
+  (-> s
+      (update :rooms
+              (fn [m]
+                (reduce-kv (fn [acc id v]
+                             (assoc acc id
+                                    (update v :chat dissoc :spindel-snapshot)))
+                           {} m)))))
+
+(defn- save-session!
+  "Snapshot every room's chat-ctx + view messages to ~/.dvergr-cli/sessions/<id>.edn."
+  [session-id rooms-meta signal-rooms]
+  (let [snapshot {:session-id session-id
+                  :saved-at  (System/currentTimeMillis)
+                  :rooms (reduce-kv
+                           (fn [m room-id {:keys [chat-ctx]}]
+                             (assoc m room-id
+                                    {:chat (cc/snapshot-chat chat-ctx)
+                                     :view (get signal-rooms room-id)}))
+                           {} rooms-meta)}]
+    (spit (session-file session-id)
+          (pr-str (strip-binary-snapshot snapshot)))
+    session-id))
+
+(defn- load-session
+  [session-id]
+  (let [f (session-file session-id)]
+    (when (.exists f)
+      (edn/read-string (slurp f)))))
 
 ;; ============================================================================
 ;; Defaults
@@ -158,7 +214,7 @@
 ;; ============================================================================
 
 (defn- on-key
-  [signal-map rooms-meta {:keys [key char]}]
+  [signal-map rooms-meta-atom config tui-ctx {:keys [key char]}]
   (let [active     @(:active-room signal-map)
         rooms      @(:rooms signal-map)
         cur-input  (get-in rooms [active :input] "")]
@@ -173,7 +229,7 @@
       (or (= :enter key) (= \return char) (= \newline char))
       (when-not (str/blank? cur-input)
         (let [content cur-input
-              room (get-in rooms-meta [active :room])]
+              room (get-in @rooms-meta-atom [active :room])]
           (swap! (:rooms signal-map) update active
                  (fn [r]
                    (-> r
@@ -194,11 +250,28 @@
       (swap! (:rooms signal-map) update-in [active :input]
              (fn [s] (if (seq s) (subs s 0 (dec (count s))) "")))
 
-      ;; Cycle active room
-      (= :ctrl-tab key)
-      (let [ids (vec (keys @(:rooms signal-map)))
-            idx (.indexOf ids active)
-            nxt (nth ids (mod (inc idx) (count ids)))]
+      ;; New room: Ctrl-N
+      (= :ctrl-n key)
+      (let [order (or (some-> signal-map :room-order deref)
+                      (vec (keys @(:rooms signal-map))))
+            n (count order)
+            new-id (keyword (str "room-" (inc n)))
+            rs (make-room new-id config tui-ctx)]
+        (swap! rooms-meta-atom assoc new-id rs)
+        (swap! (:rooms signal-map) assoc new-id
+               {:messages [] :draft "" :input ""})
+        (when (:room-order signal-map)
+          (swap! (:room-order signal-map) conj new-id))
+        ;; Spawn pumps for this new room.
+        ((requiring-resolve 'dvergr.cli.main/spawn-pumps!) rs signal-map)
+        (reset! (:active-room signal-map) new-id))
+
+      ;; Cycle active room (Tab without shift)
+      (or (= :ctrl-tab key) (= :tab key))
+      (let [order (or (some-> signal-map :room-order deref)
+                      (vec (keys @(:rooms signal-map))))
+            idx (.indexOf order active)
+            nxt (nth order (mod (inc idx) (count order)))]
         (reset! (:active-room signal-map) nxt))
 
       ;; Printable char
@@ -234,24 +307,61 @@
   (let [opts    (parse-args args)
         config  (merge (default-config) opts)
         tui-ctx (ctx/create-execution-context)
-        first-id :scratch
-        room-state (make-room first-id config tui-ctx)
-        rooms-meta {first-id room-state}
+        resume-id  (some-> (:resume opts) keyword)
+        snapshot   (when resume-id (load-session resume-id))
+        session-id (or resume-id (keyword (str "s-" (subs (str (random-uuid)) 0 8))))
+        ;; Construct rooms (either fresh single :scratch, or from snapshot).
+        rooms-list (if snapshot
+                     (vec (keys (:rooms snapshot)))
+                     [:scratch])
+        first-id   (first rooms-list)
+        rooms-meta (into {}
+                         (map (fn [rid]
+                                [rid (make-room rid config tui-ctx)])
+                              rooms-list))
+        rooms-meta-atom (atom rooms-meta)
+        ;; Replay snapshot messages into the chat contexts.
+        _ (when snapshot
+            (doseq [[rid {:keys [chat]}] (:rooms snapshot)]
+              (when-let [msgs (seq (:messages chat))]
+                (let [rs (get rooms-meta rid)]
+                  (binding [ec/*execution-context* (:ctx (:room rs))]
+                    (cc/replace-messages! (:chat-ctx rs) (vec msgs)))))))
+        ;; Initial view state.
+        initial-rooms
+        (reduce-kv
+          (fn [acc rid {:keys [chat]}]
+            (assoc acc rid {:messages (vec (:messages chat))
+                             :draft "" :input ""}))
+          {}
+          (if snapshot (:rooms snapshot)
+              (zipmap rooms-list (repeat {:chat {:messages []}}))))
         pumps-spawned? (atom false)]
+    (when snapshot
+      (println "Resumed session" (name session-id)
+               "with" (count rooms-list) "room(s)"))
     (try
       (tui/start!
         {:execution-context tui-ctx
-         :signals {:rooms        {first-id {:messages [] :draft "" :input ""}}
+         :signals {:rooms        initial-rooms
                    :active-room  first-id
+                   :room-order   rooms-list
                    :status       :idle
                    :budget-used  0
                    :budget-total (long (* (:budget-dollars config) 1000000))}
          :view (fn [signal-map width height]
                  (when (compare-and-set! pumps-spawned? false true)
-                   ;; Pumps need the live signal-map; spawn on first render.
-                   (spawn-pumps! room-state signal-map))
+                   ;; Pumps need the live signal-map; spawn for every room.
+                   (doseq [[_ rs] @rooms-meta-atom]
+                     (spawn-pumps! rs signal-map)))
                  (view/view signal-map width height))
          :on-key (fn [signal-map event]
-                   (on-key signal-map rooms-meta event))})
+                   (let [result (on-key signal-map rooms-meta-atom config tui-ctx event)]
+                     (when (= :quit result)
+                       (try
+                         (save-session! session-id @rooms-meta-atom @(:rooms signal-map))
+                         (catch Throwable _ nil)))
+                     result))})
       (finally
-        (println "session ended")))))
+        (println "session" (name session-id) "ended — saved to"
+                 (.getAbsolutePath (session-file session-id)))))))

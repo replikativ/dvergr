@@ -6,8 +6,13 @@
      :active-room   — atom of currently focused room-id
      :status        — atom :idle | :generating | :error
      :budget-used   — atom (microdollars used)
-     :budget-total  — atom (microdollars total)"
+     :budget-total  — atom (microdollars total)
+
+   Layout: a fixed-width left sidebar lists known rooms; the right
+   pane shows the active room's messages and input."
   (:require [clojure.string :as str]))
+
+(def ^:private SIDEBAR-WIDTH 16)
 
 (defn- fmt-budget
   [used total]
@@ -85,21 +90,59 @@
     (into [] (concat lines (repeat (- body-rows (count lines)) "")))
     (subvec lines (- (count lines) body-rows))))
 
+(defn- pad-right
+  [s n]
+  (if (>= (count s) n)
+    (subs s 0 n)
+    (str s (apply str (repeat (- n (count s)) " ")))))
+
+(defn- render-sidebar
+  [signals rows]
+  (let [active @(:active-room signals)
+        rooms  @(:rooms signals)
+        room-ids (or (some-> signals :room-order deref) (vec (keys rooms)))
+        header  (pad-right " rooms" SIDEBAR-WIDTH)
+        sep     (apply str (repeat SIDEBAR-WIDTH "─"))
+        room-lines
+        (mapv (fn [id]
+                (pad-right
+                  (str (if (= id active) " ▸ " "   ") (name id))
+                  SIDEBAR-WIDTH))
+              room-ids)
+        hint (pad-right " Ctrl-N: new" SIDEBAR-WIDTH)
+        ;; rows = header + content + bottom hint = 1 + (rows-2) + 1
+        body-rows (max 0 (- rows 3))
+        body (into (vec (take body-rows room-lines))
+                   (repeat (max 0 (- body-rows (count room-lines)))
+                           (pad-right "" SIDEBAR-WIDTH)))]
+    (into [header sep] (conj body hint))))
+
 (defn view
-  "Render signals into a seq of lines fitting (width × height)."
+  "Render signals into a seq of lines fitting (width × height).
+   Layout: sidebar (left, fixed) + main pane (right)."
   [signals width height]
   (let [active   @(:active-room signals)
         rooms    @(:rooms signals)
         messages (get-in rooms [active :messages] [])
         draft    (get-in rooms [active :draft] "")
-        ;; Top header (1 line) + body + footer (1 line)
+        ;; Sidebar takes SIDEBAR-WIDTH cols; +1 for separator.
+        sidebar-w (min SIDEBAR-WIDTH (max 0 (- width 20)))
+        sep-w     (if (pos? sidebar-w) 1 0)
+        main-w    (- width sidebar-w sep-w)
+        ;; Main: 1 header + body + 1 footer
         body-rows (max 1 (- height 2))
-        msg-lines (vec (mapcat #(render-message-line % width) messages))
-        ;; Streaming draft is shown as an in-flight assistant message
+        msg-lines (vec (mapcat #(render-message-line % main-w) messages))
         all-lines (if (str/blank? draft)
                     msg-lines
                     (into msg-lines
-                          (render-message-line {:role :assistant :content draft} width)))
-        body      (visible-tail all-lines body-rows)]
-    (into [(header signals width)]
-          (conj (vec body) (footer signals width)))))
+                          (render-message-line {:role :assistant :content draft} main-w)))
+        body      (visible-tail all-lines body-rows)
+        main      (into [(header signals main-w)]
+                        (conj (vec body) (footer signals main-w)))
+        sidebar   (when (pos? sidebar-w) (render-sidebar signals height))]
+    (if (zero? sidebar-w)
+      main
+      (mapv (fn [l-side l-main]
+              (str (or l-side (apply str (repeat sidebar-w " ")))
+                   "│" l-main))
+            sidebar main))))
