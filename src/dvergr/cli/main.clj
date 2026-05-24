@@ -26,7 +26,9 @@
             [dvergr.chat.context :as cc]
             [dvergr.participant.context :as pctx]
             [dvergr.cli.streaming :as cli-stream]
-            [dvergr.cli.view :as view])
+            [dvergr.cli.view :as view]
+            [dvergr.sandbox :as sandbox]
+            [dvergr.tools :as tools])
   (:gen-class))
 
 (def ^:private USER-ID :you)
@@ -35,14 +37,31 @@
 ;; Defaults
 ;; ============================================================================
 
-(def ^:private default-config
-  {:provider :fireworks
-   :model    "accounts/fireworks/models/kimi-k2p6"
-   :system-prompt
-   "You are a helpful coding assistant. Be concise. When you need to read files or run code, use the available tools."
-   :budget-dollars 1.0
-   :max-turns      8
-   :tools          #{"read_file" "glob" "grep" "code_query" "web_search"}})
+(defn- claude-cli-available?
+  []
+  (try
+    (let [p (.start (ProcessBuilder. ["claude" "--version"]))
+          ok (zero? (.waitFor p))]
+      ok)
+    (catch Exception _ false)))
+
+(defn- default-provider-model
+  []
+  (if (claude-cli-available?)
+    {:provider :claude-code :model "claude-code-sonnet"}
+    {:provider :fireworks   :model "accounts/fireworks/models/kimi-k2p6"}))
+
+(defn- default-config
+  []
+  (merge
+    (default-provider-model)
+    {:system-prompt
+     "You are a helpful coding assistant. Be concise. When you need to read files or run code, use the available tools."
+     :budget-dollars 1.0
+     :max-turns      8
+     :tools          #{"read_file" "glob" "grep" "code_query"
+                       "write_file" "edit_file"
+                       "clojure_eval" "shell"}}))
 
 ;; ============================================================================
 ;; Room construction
@@ -50,7 +69,7 @@
 
 (defn- make-room
   "Create a discourse room with a coder agent joined. Returns
-   {:id :room :agent :pctx :chat-ctx}."
+   {:id :room :agent :pctx :chat-ctx :tool-ctx :sci-ctx}."
   [room-id config tui-ctx]
   (binding [ec/*execution-context* tui-ctx]
     (let [room  (d/room room-id tui-ctx)
@@ -62,6 +81,18 @@
                              {:role :system
                               :content (:system-prompt config)})
           pc (pctx/from-chat-context room-id chat)
+          ;; Sandbox: each room gets its own SCI ctx forked off the base.
+          sci-ctx  (sandbox/fork-for-session tui-ctx)
+          ;; Resolve tool NAMES to the registered tool DEFs (a map).
+          ;; llm-agent + run-agent-turn! both expect map-shaped tools.
+          agent-tools (select-keys @tools/registry (:tools config))
+          tool-ctx (tools/make-context
+                     {:cwd           (System/getProperty "user.dir")
+                      :sci-ctx       sci-ctx
+                      :chat-ctx      chat
+                      :tools         agent-tools
+                      :isolation     :sci
+                      :execution-ctx tui-ctx})
           run-turn-fn (cli-stream/make-run-turn-fn
                         {:bus           (:bus room)
                          :assistant-id  room-id
@@ -72,13 +103,15 @@
                            :spec {:provider      (:provider config)
                                   :model         (:model config)
                                   :system-prompt (:system-prompt config)}
-                           :tools (:tools config)
+                           :tools agent-tools
+                           :tool-ctx tool-ctx
                            :participant-context pc
                            :budget {:dollars (:budget-dollars config)
                                     :max-turns (:max-turns config)}
                            :run-turn-fn run-turn-fn})]
                   (d/join room p))]
-      {:id room-id :room room :agent agent :pctx pc :chat-ctx chat})))
+      {:id room-id :room room :agent agent :pctx pc
+       :chat-ctx chat :tool-ctx tool-ctx :sci-ctx sci-ctx})))
 
 ;; ============================================================================
 ;; Bus pumps — translate room events into signal updates
@@ -199,7 +232,7 @@
 (defn -main
   [& args]
   (let [opts    (parse-args args)
-        config  (merge default-config opts)
+        config  (merge (default-config) opts)
         tui-ctx (ctx/create-execution-context)
         first-id :scratch
         room-state (make-room first-id config tui-ctx)
