@@ -25,6 +25,10 @@
      :tick       → sliding-buffer 1       (cadence; current pulse only — latest
                                             tick is the meaningful snapshot)
      :source     → sliding-buffer 8       (external readings; recent N tunable)
+     :telemetry  → sliding-buffer 32      (observation events — turn-complete,
+                                            tool-called, etc. UIs want recent
+                                            activity, not full backlog. Loggers
+                                            wanting every event override.)
 
    These are not law — `(subscribe! bus topic buf-override)` lets a caller
    pick any policy.
@@ -59,7 +63,8 @@
    "escalation" #(buf/fixed-buffer Long/MAX_VALUE)
    "partial"    #(buf/fixed-buffer 256)
    "tick"       #(buf/sliding-buffer 1)
-   "source"     #(buf/sliding-buffer 8)})
+   "source"     #(buf/sliding-buffer 8)
+   "telemetry"  #(buf/sliding-buffer 32)})
 
 (defn- buf-for-topic
   "Resolve a buffer for `topic`.

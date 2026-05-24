@@ -19,14 +19,50 @@
   (let [m->d (fn [m] (format "$%.4f" (/ m 1000000.0)))]
     (str (m->d used) " / " (m->d total))))
 
+(defn- fmt-elapsed
+  [ms]
+  (cond
+    (< ms 1000)   (str ms "ms")
+    (< ms 60000)  (format "%.1fs" (/ ms 1000.0))
+    :else         (format "%dm%ds" (quot ms 60000) (mod (quot ms 1000) 60))))
+
+(defn- fmt-cost-micros
+  [m]
+  (cond
+    (zero? m) "$0"
+    (< m 1000) (str m "μ$")
+    :else      (format "$%.4f" (/ m 1000000.0))))
+
+(defn- fmt-tokens
+  [by-type]
+  (let [in  (or (:input-tokens by-type) (:token-input by-type) 0)
+        out (or (:output-tokens by-type) (:token-output by-type) 0)]
+    (when (or (pos? in) (pos? out))
+      (str in "→" out "tok"))))
+
+(defn- last-turn-line
+  "Format the last :telemetry/turn-complete payload."
+  [tc]
+  (when (seq tc)
+    (let [p (:payload tc)
+          parts (->> [(some-> p :elapsed-ms fmt-elapsed)
+                      (fmt-tokens (:tokens-by-type p))
+                      (some-> p :cost-microdollars fmt-cost-micros)]
+                     (remove nil?)
+                     (remove #(= "$0" %)))]
+      (when (seq parts) (str "last " (str/join " " parts))))))
+
 (defn- header
   [signals width]
   (let [active     @(:active-room signals)
         rooms      @(:rooms signals)
-        room-names (->> rooms keys (map name) (str/join " · "))
         status     @(:status signals)
-        used       (some-> signals :budget-used deref)
-        total      (some-> signals :budget-total deref)
+        used       (or (get-in rooms [active :budget-used])
+                       (some-> signals :budget-used deref))
+        total      (or (get-in rooms [active :budget-total])
+                       (some-> signals :budget-total deref))
+        last-turn  (get-in rooms [active :last-turn])
+        in-tool    (get-in rooms [active :in-flight-tool])
         status-str (case status
                      :generating "● generating"
                      :error "✕ error"
@@ -34,8 +70,16 @@
                      (str status))
         left  (str " dvergr-cli · room: " (name active)
                    (when (> (count rooms) 1) (str " (of " (count rooms) ")")))
-        right (str (when (and used total) (str (fmt-budget used total) " · "))
-                   status-str " ")
+        ;; Compose right-hand chips, drop ones that don't apply
+        chips (->> [(when (and used total) (fmt-budget used total))
+                    (last-turn-line last-turn)
+                    (when in-tool (str "tool: " (name (:name in-tool))
+                                       " (" (fmt-elapsed (- (System/currentTimeMillis)
+                                                            (:started-at in-tool))) ")"))
+                    status-str]
+                   (remove nil?)
+                   (remove #(when (string? %) (str/blank? %))))
+        right (str (str/join " · " chips) " ")
         pad   (max 1 (- width (count left) (count right)))]
     (str left (apply str (repeat pad " ")) right)))
 

@@ -174,15 +174,24 @@
 ;; ============================================================================
 
 (defn- spawn-pumps!
-  [{:keys [room id]} signal-map]
+  [{:keys [room id chat-ctx]} signal-map]
   (binding [ec/*execution-context* (:ctx room)]
-    (let [inbox-sub (bus/subscribe! (:bus room) [:to USER-ID])
-          token-sub (bus/subscribe! (:bus room) [:type :partial/token])
+    (let [inbox-sub  (bus/subscribe! (:bus room) [:to USER-ID])
+          token-sub  (bus/subscribe! (:bus room) [:type :partial/token])
+          tt-started (bus/subscribe! (:bus room) [:type :telemetry/turn-started])
+          tt-complete (bus/subscribe! (:bus room) [:type :telemetry/turn-complete])
           update-room! (fn [f]
                          (swap! (:rooms signal-map)
-                                update id (fn [r] (f (or r {:messages [] :draft "" :input ""})))))]
+                                update id (fn [r] (f (or r {:messages [] :draft "" :input ""})))))
+          spawn (requiring-resolve 'org.replikativ.spindel.spin.sync/spawn!)]
+      ;; Initialise per-room budget from chat-ctx (one-shot).
+      (when chat-ctx
+        (try
+          (let [{:keys [total used]} (cc/get-budget chat-ctx)]
+            (update-room! #(assoc % :budget-total total :budget-used used)))
+          (catch Throwable _ nil)))
       ;; Inbox drain: finalized messages from the agent (or system messages)
-      ((requiring-resolve 'org.replikativ.spindel.spin.sync/spawn!)
+      (spawn
        (spin
          (loop [s (:aseq inbox-sub)]
            (when-let [r (await (aseq/anext s))]
@@ -199,7 +208,7 @@
                                   :from (:from msg)})))))
                (recur rest-s))))))
       ;; Token drain: stream into the room's :draft
-      ((requiring-resolve 'org.replikativ.spindel.spin.sync/spawn!)
+      (spawn
        (spin
          (loop [s (:aseq token-sub)]
            (when-let [r (await (aseq/anext s))]
@@ -207,6 +216,28 @@
                (when (= id (:from msg))
                  (update-room!
                    #(update % :draft (fn [d] (str d (:payload msg))))))
+               (recur rest-s))))))
+      ;; Telemetry: turn-started → set :generating
+      (spawn
+       (spin
+         (loop [s (:aseq tt-started)]
+           (when-let [r (await (aseq/anext s))]
+             (let [[_msg rest-s] r]
+               (reset! (:status signal-map) :generating)
+               (recur rest-s))))))
+      ;; Telemetry: turn-complete → update last-turn + budget delta
+      (spawn
+       (spin
+         (loop [s (:aseq tt-complete)]
+           (when-let [r (await (aseq/anext s))]
+             (let [[msg rest-s] r
+                   delta (or (get-in msg [:payload :cost-microdollars]) 0)]
+               (update-room!
+                 (fn [rm]
+                   (-> rm
+                       (assoc :last-turn msg)
+                       (update :budget-used (fnil + 0) delta))))
+               (reset! (:status signal-map) :idle)
                (recur rest-s)))))))))
 
 ;; ============================================================================
