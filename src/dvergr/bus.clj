@@ -17,9 +17,14 @@
      :message    → fixed-buffer 64        (first-class content; generous backpressure)
      :directive  → fixed-buffer 16        (imperatives; serial; never lose)
      :escalation → fixed-buffer ##Inf-ish (must be answered or explicitly time out)
-     :partial    → sliding-buffer 1       (streams; freshness over completeness)
-     :tick       → sliding-buffer 1       (cadence; current pulse only)
-     :source     → sliding-buffer 8       (external readings; recent N)
+     :partial    → fixed-buffer 256       (LLM tokens / stream chunks are discrete
+                                            data — losing one loses information.
+                                            UI consumers wanting \"current
+                                            accumulated state\" should override
+                                            with sliding-buffer 1 themselves.)
+     :tick       → sliding-buffer 1       (cadence; current pulse only — latest
+                                            tick is the meaningful snapshot)
+     :source     → sliding-buffer 8       (external readings; recent N tunable)
 
    These are not law — `(subscribe! bus topic buf-override)` lets a caller
    pick any policy.
@@ -52,7 +57,7 @@
   {"message"    #(buf/fixed-buffer 64)
    "directive"  #(buf/fixed-buffer 16)
    "escalation" #(buf/fixed-buffer Long/MAX_VALUE)
-   "partial"    #(buf/sliding-buffer 1)
+   "partial"    #(buf/fixed-buffer 256)
    "tick"       #(buf/sliding-buffer 1)
    "source"     #(buf/sliding-buffer 8)})
 

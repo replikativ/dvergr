@@ -127,7 +127,7 @@
       (is (= "FixedBuffer"   (sub-name [:type :user/message])))
       (is (= "FixedBuffer"   (sub-name [:type :directive/wrap-up])))
       (is (= "FixedBuffer"   (sub-name [:type :escalation/budget])))
-      (is (= "SlidingBuffer" (sub-name [:type :partial/token])))
+      (is (= "FixedBuffer"   (sub-name [:type :partial/token])))
       (is (= "SlidingBuffer" (sub-name [:type :tick])))
       (is (= "SlidingBuffer" (sub-name [:type :source/sensor]))))))
 

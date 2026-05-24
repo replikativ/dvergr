@@ -4,13 +4,14 @@
    One producer fires 50 tokens onto the bus. Two consumers tap the
    same `[:type :partial/token]` topic with DIFFERENT buffer policies:
 
-     UI consumer    — sliding-buffer 1   (only the latest matters)
-     audit consumer — fixed-buffer Inf   (must observe every token)
+     audit consumer — DEFAULT (fixed-buffer 256, the :partial namespace policy)
+     UI consumer    — OVERRIDDEN to sliding-buffer 1 (only latest matters)
 
-   The bus's per-subscription buffer means the same producer fans out to
-   both. The UI's sliding buffer drops backlog under bursty load; the
-   audit logger sees every event. Different SLAs, same stream — no
-   producer awareness of who is listening or with what policy.
+   Tokens are discrete data — losing one loses information — so the
+   default for `:partial` is fixed-buffer. UI consumers that only care
+   about \"current accumulated state\" opt INTO lossy semantics with a
+   per-subscription override. This way the producer can assume its
+   tokens will be observed somewhere; consumers pick their policy.
 
    Run:
      cd ../dvergr
@@ -41,11 +42,13 @@
 
 (defn spawn-ui-consumer!
   "UI consumer: simulate a slow re-render via Thread/sleep.
-   The default policy for :partial is sliding-buffer 1, so under burst
-   we expect to observe a SAMPLE of tokens, not all of them."
+   Explicitly OVERRIDES the :partial default (fixed-buffer 256) with
+   sliding-buffer 1 — UIs rendering current state don't need backlog;
+   under burst we expect to observe a SAMPLE of tokens, not all of them."
   [room got]
   (let [sub (binding [ec/*execution-context* (:ctx room)]
-              (bus/subscribe! (:bus room) [:type :partial/token]))]
+              (bus/subscribe! (:bus room) [:type :partial/token]
+                              (buf/sliding-buffer 1)))]
     (binding [ec/*execution-context* (:ctx room)]
       (sp/spawn!
         (spin
@@ -58,13 +61,13 @@
     sub))
 
 (defn spawn-audit-consumer!
-  "Audit consumer: must capture EVERY token. Override the default with
-   a large fixed buffer so backlog is preserved."
+  "Audit consumer: uses the :partial default (fixed-buffer 256), which
+   is the right policy for discrete tokens — every chunk is data and
+   must be observed losslessly."
   [room got]
   (let [sub (binding [ec/*execution-context* (:ctx room)]
               (bus/subscribe! (:bus room)
-                              [:type :partial/token]
-                              (buf/fixed-buffer 1024)))]
+                              [:type :partial/token]))]
     (binding [ec/*execution-context* (:ctx room)]
       (sp/spawn!
         (spin
@@ -98,8 +101,8 @@
     (println "  last 5:  " (vec (take-last 5 @audit-got)))
 
     (println)
-    (println "UI consumer saw"     (count @ui-got)    "tokens (sliding-1 default,")
-    (println "  i.e. lossy under burst — order preserved but gaps expected)")
+    (println "UI consumer saw"     (count @ui-got)    "tokens (sliding-1 override,")
+    (println "  i.e. lossy on purpose — UI only wants the latest)")
     (println "  what UI got:" @ui-got)
 
     (println)

@@ -278,11 +278,11 @@ A single Bus uses a source mailbox → mult → two pubs (one per dimension), so
 | `:message` | `fixed-buffer 64` | first-class content; backpressure under sustained load |
 | `:directive` | `fixed-buffer 16` | imperatives; serial; never lose |
 | `:escalation` | `fixed-buffer Long/MAX_VALUE` | must be answered or explicitly time out |
-| `:partial` | `sliding-buffer 1` | streams; freshness over completeness |
+| `:partial` | `fixed-buffer 256` | LLM tokens / stream chunks; discrete data — losing one loses information. UI consumers wanting "current accumulated state" override with sliding-buffer 1 themselves. |
 | `:tick` | `sliding-buffer 1` | cadence; only the current pulse matters |
 | `:source` | `sliding-buffer 8` | external readings; recent N tunable per source |
 
-The escalation row is the strongest opinion: agents posting `{:type :escalation/budget …}` *can* assume some handler will answer, or the bus health-check will surface a stuck queue. The streaming row is the dual: per-token UI updates lose backlog on overflow because freshness is what UIs render.
+The escalation row is the strongest opinion: agents posting `{:type :escalation/budget …}` *can* assume some handler will answer, or the bus health-check will surface a stuck queue. The streaming row is the next strongest: tokens are discrete data, losing them loses information, so the default protects the producer's intent. UI consumers wanting "always show the latest accumulated state" override with `sliding-buffer 1` per-subscription — the policy lets the *consumer* choose its semantics rather than baking lossiness into the producer.
 
 Participants subscribe dynamically with `(d/subscribe! room p [:type :escalation/budget])`. Every subscription pumps into the same per-participant merge mailbox the on-message handler awaits, so inbox + tag subs land at one linearization point.
 
