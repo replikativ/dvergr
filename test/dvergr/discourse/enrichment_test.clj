@@ -150,7 +150,7 @@
                         (d/with-cadence 60))))
         (Thread/sleep 150)
         (let [c @captured]
-          (is (= {:type :tick} c) "tick envelope passed through unmodified"))))))
+          (is (= :tick (:type c)) "tick envelope passed through unmodified"))))))
 
 ;; ============================================================================
 ;; with-intel-room-routing

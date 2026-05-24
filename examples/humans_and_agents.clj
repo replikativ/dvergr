@@ -170,7 +170,7 @@
         ;; Alice approves; the fork's log merges into the parent.
         (let [outcome (proposals/accept-proposal! conn (:proposal/id proposal))]
           (println "(accept outcome:" outcome ")")
-          (println "(parent room log size:" (count @(:log room)) ")"))))
+          (println "(parent room log size:" (count (d/log room)) ")"))))
     (d/close-room! room)
     (dh/release conn)))
 
@@ -199,7 +199,7 @@
         (let [outcome (proposals/reject-proposal! conn (:proposal/id proposal))]
           (println "(reject outcome:" outcome ")")
           (println "(parent room log size — should be unchanged:"
-                   (count @(:log room)) ")"))))
+                   (count (d/log room)) ")"))))
     (d/close-room! room)
     (dh/release conn)))
 

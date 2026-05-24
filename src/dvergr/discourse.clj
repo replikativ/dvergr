@@ -31,7 +31,8 @@
             [org.replikativ.spindel.spin.sync :as sync]
             [org.replikativ.spindel.spin.combinators :as comb]
             [org.replikativ.spindel.yggdrasil :as ygg]
-            [is.simm.partial-cps.sequence :refer [anext]]))
+            [is.simm.partial-cps.sequence :refer [anext]]
+            [dvergr.bus :as bus]))
 
 ;; ============================================================================
 ;; Records
@@ -41,21 +42,24 @@
 
 (defrecord Participant
   ;; on-message :: (fn [participant envelope] -> Spin[ReplySpec | nil])
-  ;;   envelope is either a Message (from inbox) or a synthetic event:
+  ;;   envelope is either a Message (from the :to inbox subscription) or a
+  ;;   synthetic event from an additional subscription:
   ;;     {:type :tick}                          — periodic self-tick
   ;;     {:type :source :name kw :msg evt-data} — external source event
+  ;; inbox-sub  :: dvergr.bus.Subscription on [:to id] (the default channel)
+  ;; subs       :: atom of {topic → Subscription} for dynamic extra channels
   ;; factory    :: (fn [new-ctx] -> Participant) — for cloning into a fork
   ;; process    :: the spindel spin driving this participant (set by `join`)
   ;; tick-ms    :: nil or interval in ms (`with-cadence`); fires {:type :tick}
   ;; sources    :: nil or [{:name kw :source PAsyncSeq}] (`with-sources`)
-  [id inbox on-message factory process tick-ms sources])
+  [id inbox-sub subs on-message factory process tick-ms sources])
 
 (defrecord Room
-  ;; participants : atom of {id → Participant or stub-map {:id :inbox}}
-  ;; log          : atom of [Message] — append-only, ordered by delivery
-  ;; ctx          : spindel ExecutionContext
-  ;; forked-at-len: index into log at fork time (nil/0 for root rooms)
-  [id participants log ctx forked-at-len])
+  ;; participants : atom of {id → Participant}
+  ;; bus          : dvergr.bus.Bus — the routing substrate
+  ;; ctx          : spindel ExecutionContext (== bus's ctx)
+  ;; forked-at-len: index into bus's log at fork time (nil/0 for root rooms)
+  [id participants bus ctx forked-at-len])
 
 (defn message
   "Construct a Message. Auto-fills id and ts."
@@ -66,29 +70,31 @@
               in-reply-to metadata)))
 
 ;; ============================================================================
-;; Delivery
+;; Delivery — backed by dvergr.bus
 ;; ============================================================================
 
 (defn- route-and-log!
-  "Append msg to log; deliver to addressee's mailbox if registered."
+  "Post msg to the room's bus. The bus's mult fans the message out to
+   every matching :to / :type subscription; its log captures history."
   [room msg]
-  (swap! (:log room) conj msg)
-  (when-let [target (get @(:participants room) (:to msg))]
-    (sync/post! (:inbox target) msg))
+  (bus/post! (:bus room) msg)
   msg)
 
 (defn post!
   "Route a Message into the room. Safe to call from any thread."
   [room msg]
-  (binding [ec/*execution-context* (:ctx room)]
-    (route-and-log! room msg)))
+  (route-and-log! room msg))
 
 (defn post-batch!
-  "Route msgs into the room atomically (one log mutation, ordered delivery)."
+  "Route msgs into the room in order."
   [room msgs]
-  (binding [ec/*execution-context* (:ctx room)]
-    (doseq [m msgs] (route-and-log! room m))
-    msgs))
+  (bus/post-many! (:bus room) msgs)
+  msgs)
+
+(defn log
+  "Return the room's full message log (vector). Mirrors `bus/log`."
+  [room]
+  (bus/log (:bus room)))
 
 ;; ============================================================================
 ;; Construction
@@ -96,10 +102,11 @@
 
 (defn room
   "Create a Room. With one arg, allocates a fresh ExecutionContext;
-   with two, uses the provided ctx (useful for nested rooms)."
+   with two, uses the provided ctx (useful for nested rooms / forks)."
   ([id] (room id (sp/create-execution-context)))
   ([id ctx]
-   (->Room id (atom {}) (atom []) ctx 0)))
+   (let [b (bus/create-bus {:ctx ctx})]
+     (->Room id (atom {}) b ctx 0))))
 
 (defn participant
   "Construct a Participant.
@@ -110,13 +117,14 @@
                   :msg E} for driver-supplied events; ReplySpec is
                   {:to id :content str} or nil for no reply
    :factory     — (fn [new-ctx] -> Participant); enables fork-room cloning
-   :ctx         — execution context (default: *execution-context*)
+   :ctx         — execution context (default: *execution-context*).
+                  The Participant's `:inbox-sub` is created at `join` time
+                  when the room's bus is in scope; until then it is nil.
 
    Drivers (tick / sources) are added with `with-cadence` / `with-sources`."
   [{:keys [id on-message factory ctx]}]
-  (let [ctx   (or ctx ec/*execution-context*)
-        inbox (sync/create-mailbox ctx)]
-    (->Participant id inbox on-message factory nil nil nil)))
+  (let [_ctx (or ctx ec/*execution-context*)]
+    (->Participant id nil (atom {}) on-message factory nil nil nil)))
 
 ;; ============================================================================
 ;; Built-in participant helpers
@@ -164,67 +172,88 @@
                in-reply-to nil))))
 
 (defn- start-driver-pumps!
-  "Spawn one fire-and-forget spin per driver that pumps events into `inbox`
-   as synthetic envelopes ({:type :tick} or {:type :source :name K :msg E}).
-
-   Each driver has its OWN consumer loop — we deliberately do NOT race
-   them against the inbox in the participant-spin, because consuming
-   from stateful mailboxes inside `comb/race` is destructive: when
-   multiple arms have queued data, the race winner cancels the losers
-   AFTER their awaits have already taken from their queues, dropping
-   those values. Per-driver pumps with a single shared inbox sidestep
-   that whole class of bug."
-  [p]
+  "Spawn pumps that post tick / source events onto the room's bus as
+   typed messages (`{:type :tick}` and `{:type :source :name K :msg E}`).
+   Subscriptions are wired by `join` so the participant receives them
+   alongside their inbox."
+  [room p]
   (when-let [tick-ms (:tick-ms p)]
     (sp/spawn!
       (sp/spin
         (loop []
           (sp/await (comb/sleep tick-ms))
-          (sync/post! (:inbox p) {:type :tick})
+          (bus/post! (:bus room)
+                     {:to (:id p) :type :tick})
           (recur)))))
   (doseq [{:keys [name source]} (:sources p)]
     (sp/spawn!
       (sp/spin
         (loop []
           (when-let [[v _] (sp/await (anext source))]
-            (sync/post! (:inbox p) {:type :source :name name :msg v})
-            (recur)))))))
+            (bus/post! (:bus room)
+                       {:to (:id p) :type :source :name name :msg v})
+            (recur))))))
+  nil)
+
+(defn- drain-into!
+  "Spawn a spin that drains `(:aseq sub)` and posts each item into `mbx`."
+  [sub mbx]
+  (sp/spawn!
+    (sp/spin
+      (loop [s (:aseq sub)]
+        (when-let [r (sp/await (anext s))]
+          (let [[m rest-s] r]
+            (sync/post! mbx m)
+            (recur rest-s)))))))
 
 (defn- participant-spin
-  "Continuous-time loop: await next inbox event → run on-message → emit
-   reply if any → recur. The implementation of §5.1 + §5.5.
+  "Continuous-time loop: drain inbox events → run on-message → emit reply.
 
-   The inbox is the single event channel: real Messages flow in from
-   `route-and-log!`; driver envelopes ({:type :tick} / {:type :source ...})
-   are posted by per-driver pumps spawned in `join`. on-message
-   distinguishes them by checking `(instance? Message env)`."
-  [p room]
+   The inbox is a mailbox merging the participant's `[:to id]` subscription
+   plus any extra subs in `(:subs p)`. Each subscription has its own pump
+   that forwards events into this single mailbox; the spin awaits the
+   mailbox uniformly.
+
+   This avoids `comb/race` over mailboxes (which drops queued items on
+   loser cancel) and provides a single linearization point for ordering."
+  [p room mbx]
   (sp/spin
     (loop []
-      (let [env (sp/await (:inbox p))
+      (let [env         (sp/await mbx)
             in-reply-to (when (instance? Message env) (:id env))
-            reply-spec (sp/await ((:on-message p) p env))]
+            reply-spec  (sp/await ((:on-message p) p env))]
         (emit-reply! room p reply-spec in-reply-to))
       (recur))))
 
 (defn join
-  "Register participant in room, start its spin, and spawn any driver
-   pumps (tick / sources). Returns the participant with :process set."
+  "Register participant in room, subscribe its inbox + drivers on the bus,
+   and start its spin. Returns the participant with :inbox-sub and :process."
   [room p]
-  (swap! (:participants room) assoc (:id p) p)
   (binding [ec/*execution-context* (:ctx room)]
-    (start-driver-pumps! p)
-    (let [proc (participant-spin p room)]
+    (let [inbox-sub (bus/subscribe! (:bus room) [:to (:id p)])
+          ;; Merge all subscriptions into one mailbox so the spin awaits
+          ;; a single source. Each sub gets a small pump.
+          merge-mbx (sync/create-mailbox (:ctx room))
+          _ (drain-into! inbox-sub merge-mbx)
+          ;; Tick + sources will land via [:to id] anyway (the pumps post
+          ;; with :to (:id p)), so no extra subs needed for them.
+          _ (start-driver-pumps! room p)
+          p' (-> p
+                 (assoc :inbox-sub inbox-sub))
+          proc (participant-spin p' room merge-mbx)]
       (sp/spawn! proc)
-      (let [p' (assoc p :process proc)]
-        (swap! (:participants room) assoc (:id p) p')
-        p'))))
+      (let [p'' (assoc p' :process proc)]
+        (swap! (:participants room) assoc (:id p) p'')
+        p''))))
 
 (defn leave
-  "Remove participant from room's routing table. The participant's spin
-   continues running in the background (no per-spin cancel in spindel
-   today); messages addressed to it after leaving are dropped."
+  "Remove participant from room's routing table and unsubscribe its inbox.
+   The participant's spin continues running (no per-spin cancel in spindel
+   today); messages addressed to it after leaving are not delivered."
   [room participant-id]
+  (when-let [p (get @(:participants room) participant-id)]
+    (when-let [sub (:inbox-sub p)]
+      (bus/unsubscribe! sub)))
   (swap! (:participants room) dissoc participant-id)
   nil)
 
@@ -291,21 +320,25 @@
 
 (defn ask
   "Send a message to target-id and await their reply. Returns Spin[Message].
-   The asker is a transient stub (id + mailbox only) — no spin spawned.
+   The asker is a transient bus subscription on [:to asker-id] — no spin
+   spawned beyond the await.
 
    `msg-spec` is `{:content str & opts}` where `:metadata` (optional) is
    attached to the dispatched Message — used by agent handlers that pull
    per-session state (chat-ctx, source provenance) from the envelope."
   [room target-id msg-spec]
   (sp/spin
-    (let [asker-id  (keyword (str "ask-" (random-uuid)))
-          asker-mbx (binding [ec/*execution-context* (:ctx room)]
-                      (sync/create-mailbox (:ctx room)))]
+    (let [asker-id (keyword (str "ask-" (random-uuid)))
+          asker-sub (binding [ec/*execution-context* (:ctx room)]
+                      (bus/subscribe! (:bus room) [:to asker-id]))]
+      ;; Register a stub so the participants map can be inspected if needed.
       (swap! (:participants room) assoc asker-id
-             {:id asker-id :inbox asker-mbx})
+             {:id asker-id :inbox-sub asker-sub})
       (post! room (message asker-id target-id (:content msg-spec) nil
                            (:metadata msg-spec)))
-      (let [reply (sp/await asker-mbx)]
+      ;; Take exactly one message off the asker's subscription.
+      (let [[reply _rest] (sp/await (anext (:aseq asker-sub)))]
+        (bus/unsubscribe! asker-sub)
         (swap! (:participants room) dissoc asker-id)
         reply))))
 
@@ -388,11 +421,17 @@
   ([room {:keys [isolation] :or {isolation :none}}]
    (let [new-id     (keyword (str (name (:id room))
                                   "-fork-" (subs (str (random-uuid)) 0 8)))
-         parent-log @(:log room)
+         parent-log (log room)
          child-ctx  (case isolation
                       :none (:ctx room)
                       :ctx  (ctx/fork-context (:ctx room)))
-         new-room   (->Room new-id (atom {}) (atom parent-log) child-ctx
+         child-bus  (binding [ec/*execution-context* child-ctx]
+                      (bus/create-bus {:ctx child-ctx}))
+         ;; Seed the fork's bus log with parent history so log-based
+         ;; consumers see a continuous record. Forks have their OWN bus
+         ;; so live messages do not leak between parent and fork.
+         _          (reset! (:log child-bus) parent-log)
+         new-room   (->Room new-id (atom {}) child-bus child-ctx
                             (count parent-log))]
      (doseq [[_id p] @(:participants room)]
        (when-let [fac (:factory p)]
@@ -449,12 +488,17 @@
    coordinated commit; cross-system atomicity is best-effort (per
    workspace coordination)."
   [parent fork]
-  (let [fork-log  @(:log fork)
+  (let [fork-log  (log fork)
         forked-at (or (:forked-at-len fork) 0)
         new-entries (when (> (count fork-log) forked-at)
                       (subvec fork-log forked-at))]
     (when (seq new-entries)
-      (swap! (:log parent) into new-entries)))
+      ;; Append fork-only messages directly to the parent's log. This is
+      ;; merge-as-history: subscribers in the parent didn't see the fork's
+      ;; exchange live (separate bus) and re-fanning would re-fire their
+      ;; handlers. The log captures the merged history; live observation
+      ;; is a separate concern for callers that need it.
+      (swap! (:log (:bus parent)) into new-entries)))
   (when (ctx-was-forked? fork)
     (ygg/merge-to-parent! (:ctx fork)))
   (reset! (:participants fork) {})
@@ -498,7 +542,7 @@
                     (ask fork (:id worker) {:content goal})
                     timeout-ms
                     ::timeout))
-          log   @(:log fork)]
+          log   (log fork)]
       (cond
         (= reply ::timeout)
         (do (discard fork)
@@ -631,6 +675,6 @@
   (sp/spin
     (let [fork    (fork-room room)
           outcome (sp/await (workflow-fn fork))
-          log     @(:log fork)]
+          log     (log fork)]
       (discard fork)
       {:outcome outcome :imagined-log log})))

@@ -87,7 +87,7 @@
       (d/join r (d/echo :bot)))
     (d/post! r (d/message :driver :bot "hello"))
     (Thread/sleep 200)
-    (let [log @(:log r)]
+    (let [log (d/log r)]
       (is (= 2 (count log)) "echo bot bounces once")
       (is (= "hello"        (:content (first log))))
       (is (= "echo: hello"  (:content (second log))))
@@ -210,10 +210,10 @@
       (d/join parent (d/scripted :s ["hi"])))
     (let [fork (d/fork-room parent)
           _    (await-spin fork #(d/ask % :s {:content "go"}))
-          before-merge (count @(:log parent))]
+          before-merge (count (d/log parent))]
       (is (= 0 before-merge) "parent log untouched before merge")
       (d/merge-room parent fork)
-      (is (= 2 (count @(:log parent)))
+      (is (= 2 (count (d/log parent)))
           "fork's new entries (ask + reply) flowed into parent"))))
 
 (deftest discard-stops-context
@@ -306,7 +306,7 @@
           (is (= "first" (:content imagined))
               "every simulation sees alice's CURRENT first reply")))
       ;; Parent log unchanged through all three simulations.
-      (is (zero? (count @(:log r)))
+      (is (zero? (count (d/log r)))
           "no entries written to parent room")
       ;; Now actually ask alice in the parent: still has 'first' available.
       (let [real-reply (await-spin r #(d/ask % :alice {:content "real"}))]
@@ -325,7 +325,7 @@
                    (sp/await (d/ask fork-room :alice {:content "go"}))))))]
       (is (= "A1" (:content outcome)))
       (is (= 2 (count imagined-log)) "ask + reply in fork log")
-      (is (zero? (count @(:log r))) "parent log untouched"))))
+      (is (zero? (count (d/log r))) "parent log untouched"))))
 
 ;; ============================================================================
 ;; Algebraic laws (selected; property-based variants are future work)
@@ -362,7 +362,7 @@
                                                    :timeout-ms 2000}))]
       (is (= :merged (:status outcome)))
       (is (= "Here is my research" (:content (:reply outcome))))
-      (is (= 2 (count @(:log r))) "fork's exchange flowed into parent"))))
+      (is (= 2 (count (d/log r))) "fork's exchange flowed into parent"))))
 
 (deftest hire-rejects-and-discards
   (testing "Worker reply fails accept-fn → fork discarded, parent untouched"
@@ -377,7 +377,7 @@
                               :timeout-ms 2000}))]
       (is (= :discarded (:status outcome)))
       (is (= "bad output" (:content (:reply outcome))))
-      (is (zero? (count @(:log r))) "discard left parent log empty"))))
+      (is (zero? (count (d/log r))) "discard left parent log empty"))))
 
 (deftest hire-isolates-multiple-workers
   (testing "Two hires in parallel each get their own fork; logs separate"
@@ -397,4 +397,4 @@
       (is (= #{"result-1" "result-2"}
              (set (map #(get-in % [:reply :content]) out))))
       ;; Both succeed → both merge. Parent log has both exchanges (4 entries)
-      (is (= 4 (count @(:log r)))))))
+      (is (= 4 (count (d/log r)))))))

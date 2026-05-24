@@ -116,12 +116,12 @@
           worker (d/scripted :w ["proposed change"] (:ctx room))
           prop   (run-propose {:room room :worker worker :conn *conn*
                                :goal "x"})
-          parent-log-before @(:log room)]
+          parent-log-before (d/log room)]
       (is (zero? (count parent-log-before))
           "parent starts empty (worker only sees the fork)")
       (let [result (p/accept-proposal! *conn* (:proposal/id prop))]
         (is (= :accepted result))
-        (is (pos? (count @(:log room)))
+        (is (pos? (count (d/log room)))
             "fork's messages flowed into the parent log after merge")
         (is (= :accepted (:proposal/status
                            (p/get-proposal *conn* (:proposal/id prop)))))
@@ -134,9 +134,9 @@
           worker (d/scripted :w ["draft"] (:ctx room))
           prop   (run-propose {:room room :worker worker :conn *conn*
                                :goal "x"})]
-      (is (zero? (count @(:log room))))
+      (is (zero? (count (d/log room))))
       (is (= :rejected (p/reject-proposal! *conn* (:proposal/id prop))))
-      (is (zero? (count @(:log room)))
+      (is (zero? (count (d/log room)))
           "parent log stays empty — discard does not merge")
       (is (= :rejected (:proposal/status
                          (p/get-proposal *conn* (:proposal/id prop))))))))
