@@ -34,6 +34,7 @@
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.spin.sync :as sync]
             [dvergr.discourse :as d]
+            [dvergr.discourse.generation :as gen]
             [dvergr.chat.context :as cc]
             [dvergr.chat.agent :as ca]
             [dvergr.tools :as tools]))
@@ -126,47 +127,84 @@
                    :tool-ctx         tool-ctx
                    :auto-compact?    (:auto? compaction true)
                    :compaction-model (:model compaction)}]
-    (d/participant
-      {:id  id
-       :ctx ctx
-       :on-message
-       (fn [_p msg]
-         (sp/spin
-           ;; 1. Append incoming as a user message in the agent's chat-ctx.
-           ;; We deliberately don't pass :author-id — chat-ctx's datahike
-           ;; schema would require a [:participant/id author-id] lookup that
-           ;; the transient ask-XXX stubs (and ad-hoc senders) can't satisfy.
-           ;; The discourse Message keeps the :from field for routing; the
-           ;; LLM context doesn't need author identity at this layer.
-           (cc/add-message! chat-ctx
-                            {:role    :user
-                             :content (:content msg)})
+    (let [;; Mutable state controlled by directives.
+          turns-cap    (atom max-turns)         ; bump on :directive/raise-budget
+          wrapping-up? (atom false)             ; flip on :directive/wrap-up
+          cancelled?   (atom false)             ; flip on :directive/cancel
+          spec-atom    (atom spec)              ; swap on :directive/switch-model
+          ]
+      (d/participant
+        {:id  id
+         :ctx ctx
+         :on-message
+         (fn [_p msg]
+           (sp/spin
+             (case (:type msg)
 
-           ;; 2. Run turns until :complete, :error, or max-turns reached.
-           ;;    Bridge each blocking turn through a future + deferred so
-           ;;    the spin executor isn't tied up.
-           (loop [turn 0]
-             (let [bridge (sync/create-deferred ctx)
-                   _ (future
-                       (try
-                         (sync/deliver!
-                           bridge
-                           (run-turn-fn chat-ctx
-                                        (assoc turn-opts :turn-number turn)))
-                         (catch Throwable t
-                           (sync/deliver! bridge {::error (.getMessage t)}))))
-                   result (sp/await bridge)]
-               (cond
-                 (= result :continue)
-                 (if (< (inc turn) max-turns) (recur (inc turn)) nil)
+               ;; --- directive: bump turn budget, plus optional :amount ---
+               :directive/raise-budget
+               (let [bump (or (get-in msg [:payload :turns]) 4)]
+                 (swap! turns-cap + bump)
+                 nil)
 
-                 ;; :complete, :error, ::error map, or anything else terminates
-                 :else nil)))
+               ;; --- directive: signal next reply should be short ---
+               :directive/wrap-up
+               (do (reset! wrapping-up? true) nil)
 
-           ;; 3. Return the last assistant message as the reply
-           (when-let [reply (some-> (last-assistant-message chat-ctx)
-                                    assistant-text)]
-             {:to (:from msg) :content reply})))
+               ;; --- directive: hard cancel current + future generations ---
+               :directive/cancel
+               (do (reset! cancelled? true) nil)
+
+               ;; --- directive: swap the model (or provider) live ---
+               :directive/switch-model
+               (do (swap! spec-atom merge (:payload msg)) nil)
+
+               ;; --- directive: inject a system message into chat-ctx ---
+               :directive/system-message
+               (do (cc/add-message! chat-ctx
+                                    {:role :system
+                                     :content (get-in msg [:payload :content])})
+                   nil)
+
+               ;; --- probe: read-only inspection of memory ---
+               :probe/memory
+               {:to (:from msg)
+                :type :probe/memory-response
+                :payload {:messages (cc/get-messages chat-ctx)}}
+
+               ;; --- default: user/agent content → run generation ---
+               (do
+                 (cc/add-message! chat-ctx
+                                  {:role    :user
+                                   :content (:content msg)})
+                 ;; Race each turn against the cancel flag. The future-handle
+                 ;; bridges the blocking LLM call into spindel; we await done.
+                 (loop [turn 0]
+                   (if @cancelled?
+                     nil
+                     (let [h (gen/future-handle
+                               ctx
+                               #(run-turn-fn chat-ctx
+                                             (assoc turn-opts
+                                                    :turn-number turn
+                                                    :spec @spec-atom)))
+                           result (sp/await (:done h))]
+                       (cond
+                         @cancelled? nil
+
+                         (gen/error-result? result) nil
+
+                         (= result :continue)
+                         (if (and (not @wrapping-up?)
+                                  (< (inc turn) @turns-cap))
+                           (recur (inc turn))
+                           nil)
+
+                         :else nil))))
+
+                 (when-let [reply (some-> (last-assistant-message chat-ctx)
+                                          assistant-text)]
+                   {:to (:from msg) :content reply})))))
 
        :factory
        (fn [new-ctx]
@@ -182,4 +220,4 @@
                      :budget      budget
                      :compaction  compaction
                      :run-turn-fn run-turn-fn
-                     :ctx         new-ctx}))})))
+                     :ctx         new-ctx}))}))))
