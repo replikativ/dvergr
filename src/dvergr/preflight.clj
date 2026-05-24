@@ -36,14 +36,14 @@
     (let [chat (ctx/create-chat-context {:budget-dollars 0.01 :with-sci? false})]
       ;; Test basic accounting
       (ctx/account-usage! chat :input-tokens 1000
-                         :model "claude-sonnet-4-5-20250514")
+                         :model "claude-sonnet-4-5")
       (let [budget (ctx/get-budget chat)]
         (when (not= 3000 (:used budget))
           (throw (ex-info "Budget calculation incorrect" {:expected 3000 :actual (:used budget)}))))
 
       ;; Test threshold crossing
       (let [result (ctx/account-usage! chat :input-tokens 667
-                                      :model "claude-sonnet-4-5-20250514")]
+                                      :model "claude-sonnet-4-5")]
         (when (not (:threshold-crossed? result))
           (throw (ex-info "Threshold not detected" {:result result})))
         (when (not= :info (:threshold-level result))
@@ -94,7 +94,7 @@
     (let [chat (ctx/create-chat-context {:budget-dollars 0.01 :with-sci? false})]
       ;; Cross 50% threshold
       (let [result (ctx/account-tokens! chat :input-tokens 1667
-                                       {:model "claude-sonnet-4-5-20250514"})]
+                                       {:model "claude-sonnet-4-5"})]
         (when-not (:threshold-crossed? result)
           (throw (ex-info "Threshold not crossed" {:result result})))
 
@@ -127,7 +127,7 @@
   "Verify model registry has expected models."
   []
   (println "  Checking model registry...")
-  (let [critical-models ["claude-sonnet-4-5-20250514"
+  (let [critical-models ["claude-sonnet-4-5"
                          "accounts/fireworks/models/kimi-k2p5"
                          "accounts/fireworks/models/qwen3-coder-480b-a35b-instruct"]
         missing (remove model-registry/get-model critical-models)]

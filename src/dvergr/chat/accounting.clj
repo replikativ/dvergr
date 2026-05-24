@@ -482,15 +482,15 @@
   ;; Example usage
 
   ;; Get pricing for a model
-  (get-model-pricing "claude-sonnet-4-5-20250514")
+  (get-model-pricing "claude-sonnet-4-5")
   ;; => {:input 3 :output 15 :cache-read 0 :cache-write 3}
 
   ;; Calculate cost
-  (calculate-cost :token-input 1000 {:model "claude-sonnet-4-5-20250514"})
+  (calculate-cost :token-input 1000 {:model "claude-sonnet-4-5"})
   ;; => 3000 (μ$, i.e. $0.003)
 
   ;; Estimate chat cost
-  (estimate-chat-cost "claude-sonnet-4-5-20250514" 5000 2000 :tools? true)
+  (estimate-chat-cost "claude-sonnet-4-5" 5000 2000 :tools? true)
   ;; => {:estimated-microdollars N :breakdown {...}}
 
   ;; Format budget

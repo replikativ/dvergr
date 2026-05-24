@@ -100,7 +100,7 @@
 
    Defaults:
      :id         :researcher
-     :model      claude-sonnet-4-5-20250514 (Anthropic)
+     :model      claude-sonnet-4-5 (Anthropic)
      :tools      read-only: read_file, glob, grep, code_query, web_search
      :isolation  :native (trusted — no code mutation)
    Override any of these in `opts` (same shape as `llm-agent`)."
@@ -111,7 +111,7 @@
                    :default-tools     #{:read-file :glob :grep
                                         :code-query :web-search}
                    :default-isolation :native
-                   :default-model     "claude-sonnet-4-5-20250514"
+                   :default-model     "claude-sonnet-4-5"
                    :default-provider  :anthropic}
                   opts)))
 
@@ -120,7 +120,7 @@
 
    Defaults:
      :id         :coder
-     :model      claude-sonnet-4-5-20250514 (Anthropic)
+     :model      claude-sonnet-4-5 (Anthropic)
      :tools      read/write/edit + clojure_eval + shell + code_query + glob
      :isolation  :sci (sandboxed Clojure eval — safe by default)"
   ([] (coder {}))
@@ -131,7 +131,7 @@
                                         :clojure-edit :shell :clojure-eval
                                         :code-query :glob}
                    :default-isolation :sci
-                   :default-model     "claude-sonnet-4-5-20250514"
+                   :default-model     "claude-sonnet-4-5"
                    :default-provider  :anthropic}
                   opts)))
 
@@ -140,7 +140,7 @@
 
    Defaults:
      :id         :reviewer
-     :model      claude-sonnet-4-5-20250514 (Anthropic)
+     :model      claude-sonnet-4-5 (Anthropic)
      :tools      read-only: read_file, glob, grep, code_query, shell
      :isolation  :native (trusted — no code mutation)"
   ([] (reviewer {}))
@@ -150,7 +150,7 @@
                    :default-tools     #{:read-file :glob :grep
                                         :code-query :shell}
                    :default-isolation :native
-                   :default-model     "claude-sonnet-4-5-20250514"
+                   :default-model     "claude-sonnet-4-5"
                    :default-provider  :anthropic}
                   opts)))
 
@@ -172,6 +172,6 @@
                   :prompt-file       prompt-filename
                   :default-tools     (or (:tools opts) :all)
                   :default-isolation (or (:isolation opts) :native)
-                  :default-model     "claude-sonnet-4-5-20250514"
+                  :default-model     "claude-sonnet-4-5"
                   :default-provider  :anthropic}
                  opts))

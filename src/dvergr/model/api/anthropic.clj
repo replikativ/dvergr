@@ -52,7 +52,7 @@
        :headers {"x-api-key" (:api-key config)
                  "anthropic-version" (or (:api-version config) "2023-06-01")
                  "content-type" "application/json"}
-       :body (cond-> {:model (:model opts "claude-sonnet-4-5-20250514")
+       :body (cond-> {:model (:model opts "claude-sonnet-4-5")
                       :max_tokens (:max-tokens opts 8192)
                       :stream true
                       :messages (format-messages msgs)}

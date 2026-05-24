@@ -7,9 +7,9 @@
   (testing "Token cost calculation with registered model"
     ;; Claude Sonnet 4.5: $3/MTok input = 3 microdollars per token
     (is (= 3000 (acct/calculate-cost :input-tokens 1000
-                                     {:model "claude-sonnet-4-5-20250514"})))
+                                     {:model "claude-sonnet-4-5"})))
     (is (= 15000 (acct/calculate-cost :output-tokens 1000
-                                      {:model "claude-sonnet-4-5-20250514"}))))
+                                      {:model "claude-sonnet-4-5"}))))
 
   (testing "Fallback for unknown model"
     ;; Should use fallback pricing

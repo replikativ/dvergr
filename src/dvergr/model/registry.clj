@@ -25,40 +25,89 @@
 ;; ============================================================================
 
 (def default-models
-  "Built-in model definitions."
-  {;; Anthropic Models
-   "claude-sonnet-4-5-20250514"
-   {:id "claude-sonnet-4-5-20250514"
+  "Built-in model definitions — current-generation only.
+
+   Hardcoded set is intentionally lean. To pick up new model releases
+   without recompiling, call `(registry/refresh-from-models-dev!)`,
+   which overlays current pricing/context from <https://models.dev>.
+
+   Pricing keys:
+     :input         — base input $/MTok
+     :output        — output $/MTok
+     :cache-read    — prompt-cache hit (0.1× input)
+     :cache-write   — 5-minute prompt-cache write (1.25× input)
+     :cache-write-1h— 1-hour prompt-cache write (2× input), where available
+
+   Snapshot date: 2026-05-24. See claude.com/pricing for live prices."
+  {;; ── Claude Opus 4.x ──────────────────────────────────────────────
+   "claude-opus-4-7"
+   {:id "claude-opus-4-7"
+    :name "Claude Opus 4.7"
+    :provider :anthropic
+    :api-type :anthropic-messages
+    :capabilities #{:tools :vision :thinking :streaming :system-prompt :cache-control}
+    :context 1000000
+    :max-output 8192
+    :pricing {:input 5.0 :output 25.0 :cache-read 0.50 :cache-write 6.25 :cache-write-1h 10.0}
+    :quirks {:thinking-budget? true}}
+
+   "claude-opus-4-6"
+   {:id "claude-opus-4-6"
+    :name "Claude Opus 4.6"
+    :provider :anthropic
+    :api-type :anthropic-messages
+    :capabilities #{:tools :vision :thinking :streaming :system-prompt :cache-control}
+    :context 1000000
+    :max-output 8192
+    :pricing {:input 5.0 :output 25.0 :cache-read 0.50 :cache-write 6.25 :cache-write-1h 10.0}
+    :quirks {:thinking-budget? true}}
+
+   "claude-opus-4-5"
+   {:id "claude-opus-4-5"
+    :name "Claude Opus 4.5"
+    :provider :anthropic
+    :api-type :anthropic-messages
+    :capabilities #{:tools :vision :thinking :streaming :system-prompt :cache-control}
+    :context 200000
+    :max-output 8192
+    :pricing {:input 5.0 :output 25.0 :cache-read 0.50 :cache-write 6.25 :cache-write-1h 10.0}
+    :quirks {:thinking-budget? true}}
+
+   ;; ── Claude Sonnet 4.x ────────────────────────────────────────────
+   "claude-sonnet-4-6"
+   {:id "claude-sonnet-4-6"
+    :name "Claude Sonnet 4.6"
+    :provider :anthropic
+    :api-type :anthropic-messages
+    :capabilities #{:tools :vision :thinking :streaming :system-prompt :cache-control}
+    :context 1000000
+    :max-output 8192
+    :pricing {:input 3.0 :output 15.0 :cache-read 0.30 :cache-write 3.75 :cache-write-1h 6.0}
+    :quirks {:thinking-budget? true}}
+
+   "claude-sonnet-4-5"
+   {:id "claude-sonnet-4-5"
     :name "Claude Sonnet 4.5"
     :provider :anthropic
     :api-type :anthropic-messages
     :capabilities #{:tools :vision :thinking :streaming :system-prompt :cache-control}
     :context 200000
     :max-output 8192
-    :pricing {:input 3.0 :output 15.0 :cache-read 0.30 :cache-write 3.75}
+    :pricing {:input 3.0 :output 15.0 :cache-read 0.30 :cache-write 3.75 :cache-write-1h 6.0}
     :quirks {:thinking-budget? true}}
 
-   "claude-opus-4-20250514"
-   {:id "claude-opus-4-20250514"
-    :name "Claude Opus 4"
-    :provider :anthropic
-    :api-type :anthropic-messages
-    :capabilities #{:tools :vision :thinking :streaming :system-prompt :cache-control}
-    :context 200000
-    :max-output 8192
-    :pricing {:input 15.0 :output 75.0 :cache-read 1.50 :cache-write 18.75}
-    :quirks {:thinking-budget? true}}
-
-   "claude-3-5-haiku-20241022"
-   {:id "claude-3-5-haiku-20241022"
-    :name "Claude 3.5 Haiku"
+   ;; ── Claude Haiku 4.x ─────────────────────────────────────────────
+   "claude-haiku-4-5"
+   {:id "claude-haiku-4-5"
+    :name "Claude Haiku 4.5"
     :provider :anthropic
     :api-type :anthropic-messages
     :capabilities #{:tools :vision :streaming :system-prompt :cache-control}
     :context 200000
     :max-output 8192
-    :pricing {:input 0.80 :output 4.0 :cache-read 0.08 :cache-write 1.0}
+    :pricing {:input 1.0 :output 5.0 :cache-read 0.10 :cache-write 1.25 :cache-write-1h 2.0}
     :quirks {}}
+
 
    ;; Claude Code CLI models (via subscription)
    "claude-code-sonnet"
@@ -289,13 +338,85 @@
   (reset! registry default-models))
 
 ;; ============================================================================
+;; Refresh from models.dev (opt-in, network)
+;; ============================================================================
+
+(def ^:private models-dev-url "https://models.dev/api.json")
+
+(defn- models-dev-fetch
+  "Fetch + parse models.dev/api.json. Returns nil on network failure."
+  []
+  (try
+    (let [json-read (requiring-resolve 'jsonista.core/read-value)
+          mapper-fn (requiring-resolve 'jsonista.core/object-mapper)
+          mapper    (mapper-fn {:decode-key-fn true})
+          s         (slurp models-dev-url)]
+      (json-read s mapper))
+    (catch Throwable t
+      (println "models.dev fetch failed:" (.getMessage t))
+      nil)))
+
+(defn- coerce-models-dev-model
+  "Translate one models.dev model entry into the dvergr registry shape."
+  [provider-id mid m]
+  (let [cost  (:cost m)
+        limit (:limit m)
+        caps  (cond-> #{:streaming}
+                (:tool_call m)       (conj :tools)
+                (:reasoning m)       (conj :thinking)
+                (some #(= "image" %) (get-in m [:modalities :input] []))
+                                     (conj :vision)
+                true                 (conj :system-prompt)
+                (some? (:cache_read cost)) (conj :cache-control))]
+    {:id (name mid)
+     :name (or (:name m) (name mid))
+     :provider provider-id
+     :api-type (case provider-id
+                 :anthropic :anthropic-messages
+                 :openai    :openai-chat
+                 :openai-chat)
+     :capabilities caps
+     :context (:context limit)
+     :max-output (:output limit)
+     :pricing (cond-> {:input  (:input cost)
+                       :output (:output cost)}
+                (:cache_read cost)  (assoc :cache-read (:cache_read cost))
+                (:cache_write cost) (assoc :cache-write (:cache_write cost)))}))
+
+(defn refresh-from-models-dev!
+  "Fetch <https://models.dev/api.json> and overlay all entries from the
+   given providers into the registry. Default: just :anthropic.
+
+   Hardcoded `default-models` is the offline fallback. Calling this
+   updates pricing + adds any newer models that have shipped since the
+   last release.
+
+   Returns the number of models registered (or nil on network failure)."
+  ([] (refresh-from-models-dev! #{:anthropic}))
+  ([providers]
+   (when-let [data (models-dev-fetch)]
+     (let [n (atom 0)]
+       (doseq [prov-key providers
+               :let [prov (get data prov-key)
+                     models (:models prov)]
+               :when (some? prov)
+               [mid m] models]
+         (let [entry (coerce-models-dev-model prov-key mid m)]
+           (swap! registry assoc (:id entry) entry)
+           (swap! n inc)))
+       @n))))
+
+;; ============================================================================
 ;; Aliases (convenience names)
 ;; ============================================================================
 
 (defonce ^{:doc "Atom holding model aliases."}
-  aliases (atom {"sonnet" "claude-sonnet-4-5-20250514"
-                 "opus" "claude-opus-4-20250514"
-                 "haiku" "claude-3-5-haiku-20241022"
+  aliases (atom {"sonnet" "claude-sonnet-4-6"
+                 "opus"   "claude-opus-4-7"
+                 "haiku"  "claude-haiku-4-5"
+                 "opus-4-6" "claude-opus-4-6"
+                 "opus-4-5" "claude-opus-4-5"
+                 "sonnet-4-5" "claude-sonnet-4-5"
                  "cc-sonnet" "claude-code-sonnet"
                  "cc-opus" "claude-code-opus"
                  "cc-haiku" "claude-code-haiku"}))

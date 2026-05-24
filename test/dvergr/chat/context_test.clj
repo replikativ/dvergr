@@ -20,7 +20,7 @@
     (let [chat (ctx/create-chat-context {:budget-dollars 0.01 :with-sci? false})]
       ;; Account for 1000 input tokens (Claude Sonnet: 3 microdollars per token)
       (ctx/account-usage! chat :input-tokens 1000
-                         :model "claude-sonnet-4-5-20250514")
+                         :model "claude-sonnet-4-5")
       (let [budget (ctx/get-budget chat)]
         (is (= 3000 (:used budget)))
         (is (= 1000 (get-in budget [:by-type :input-tokens]))))))
@@ -28,9 +28,9 @@
   (testing "Multiple accountings accumulate"
     (let [chat (ctx/create-chat-context {:budget-dollars 0.01 :with-sci? false})]
       (ctx/account-usage! chat :input-tokens 500
-                         :model "claude-sonnet-4-5-20250514")
+                         :model "claude-sonnet-4-5")
       (ctx/account-usage! chat :output-tokens 300
-                         :model "claude-sonnet-4-5-20250514")
+                         :model "claude-sonnet-4-5")
       (let [budget (ctx/get-budget chat)]
         ;; 500 * 3 + 300 * 15 = 1500 + 4500 = 6000
         (is (= 6000 (:used budget)))
@@ -42,7 +42,7 @@
     (let [chat (ctx/create-chat-context {:budget-dollars 0.01 :with-sci? false})]
       ;; Cross 50% (need 5000 microdollars, 1667 tokens @ $3/MTok)
       (let [result (ctx/account-usage! chat :input-tokens 1667
-                                      :model "claude-sonnet-4-5-20250514")]
+                                      :model "claude-sonnet-4-5")]
         (is (:threshold-crossed? result))
         (is (= :info (:threshold-level result)))
         (is (= "Budget: 50% used" (:threshold-message result)))
@@ -53,10 +53,10 @@
     (let [chat (ctx/create-chat-context {:budget-dollars 0.01 :with-sci? false})]
       ;; Cross 50%
       (ctx/account-usage! chat :input-tokens 1667
-                         :model "claude-sonnet-4-5-20250514")
+                         :model "claude-sonnet-4-5")
       ;; Cross 75%
       (let [result (ctx/account-usage! chat :input-tokens 833
-                                      :model "claude-sonnet-4-5-20250514")]
+                                      :model "claude-sonnet-4-5")]
         (is (:threshold-crossed? result))
         (is (= :notice (:threshold-level result))))
       ;; Check both thresholds recorded
@@ -68,10 +68,10 @@
     (let [chat (ctx/create-chat-context {:budget-dollars 0.01 :with-sci? false})]
       ;; Cross 50%
       (ctx/account-usage! chat :input-tokens 1667
-                         :model "claude-sonnet-4-5-20250514")
+                         :model "claude-sonnet-4-5")
       ;; Try to cross 50% again - should not trigger
       (let [result (ctx/account-usage! chat :input-tokens 50
-                                      :model "claude-sonnet-4-5-20250514")]
+                                      :model "claude-sonnet-4-5")]
         (is (not (:threshold-crossed? result)))))))
 
 (deftest budget-checking-test
@@ -79,7 +79,7 @@
     (let [chat (ctx/create-chat-context {:budget-dollars 1.0 :with-sci? false})]
       (is (= 1000000 (ctx/budget-remaining chat)))
       (ctx/account-usage! chat :input-tokens 1000
-                         :model "claude-sonnet-4-5-20250514")
+                         :model "claude-sonnet-4-5")
       (is (= 997000 (ctx/budget-remaining chat)))))
 
   (testing "Budget exceeded detection"
@@ -87,7 +87,7 @@
       (is (not (ctx/budget-exceeded? chat)))
       ;; Use more than budget (1000 microdollars)
       (ctx/account-usage! chat :input-tokens 500
-                         :model "claude-sonnet-4-5-20250514")  ; 1500 microdollars
+                         :model "claude-sonnet-4-5")  ; 1500 microdollars
       (is (ctx/budget-exceeded? chat)))))
 
 (deftest add-message-test

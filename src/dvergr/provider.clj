@@ -35,7 +35,7 @@
 
 (def models
   "Model configurations with pricing (per 1M tokens)"
-  {"claude-sonnet-4-5-20250514"   {:provider :anthropic :input 3.00  :output 15.00  :context 200000}
+  {"claude-sonnet-4-5"   {:provider :anthropic :input 3.00  :output 15.00  :context 200000}
    "claude-opus-4-5-20251101"     {:provider :anthropic :input 15.00 :output 75.00  :context 200000}
    "claude-3-5-haiku-20241022"    {:provider :anthropic :input 1.00  :output 5.00   :context 200000}
    "gpt-4o"                       {:provider :openai    :input 2.50  :output 10.00  :context 128000}
@@ -319,7 +319,7 @@
                    (when-let [sys (first (filter #(= "system" (:role %)) messages))]
                      (:content sys)))
         messages (filterv #(not= "system" (:role %)) messages)]
-    (cond-> {:model (:model opts "claude-sonnet-4-5-20250514")
+    (cond-> {:model (:model opts "claude-sonnet-4-5")
              :max_tokens (:max-tokens opts 8192)
              :stream true
              :messages messages}
@@ -487,7 +487,7 @@
   ;; Test Anthropic
   (chat :anthropic
         [{:role "user" :content "Say hello in 5 words"}]
-        {:model "claude-sonnet-4-5-20250514"
+        {:model "claude-sonnet-4-5"
          :on-text print})
 
   ;; Test OpenAI

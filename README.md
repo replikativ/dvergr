@@ -134,4 +134,4 @@ fork-and-merge proposal pattern, see
 
 ## License
 
-Copyright © 2024–2026 Christian Weilbach. Eclipse Public License 1.0.
+Copyright © 2026 Christian Weilbach. Apache License 2.0 — see [LICENSE](LICENSE).

@@ -589,7 +589,7 @@
 
   ;; Account token usage with cost tracking
   (account-usage! chat :input-tokens 1000
-                 :model "claude-sonnet-4-5-20250514")
+                 :model "claude-sonnet-4-5")
   ;; => {:cost-microdollars 3000}  ; $0.003
 
   ;; Add a user message

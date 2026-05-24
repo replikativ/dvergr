@@ -1484,7 +1484,7 @@ Note: changes take effect on the next agent restart or reload."
    Examples:
    {\"operation\": \"check\"}
    {\"operation\": \"breakdown\"}
-   {\"operation\": \"estimate\", \"model\": \"claude-sonnet-4-5-20250514\",
+   {\"operation\": \"estimate\", \"model\": \"claude-sonnet-4-5\",
     \"input_tokens\": 5000, \"output_tokens\": 2000}"
    :parameters {:type "object"
                 :properties {:operation {:type "string"
