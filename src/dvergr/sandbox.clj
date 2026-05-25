@@ -1621,6 +1621,31 @@
                          'patch   (fn [url & [opts]] (do-request (merge {:url url :method :patch} opts)))
                          'delete  (fn [url & [opts]] (do-request (merge {:url url :method :delete} opts)))})))
 
+(defn add-process-ns!
+  "Expose the deliberable-process surface to SCI.
+
+   Bound to a chat-ctx so the wrapper fns operate on the right registry.
+   Vár can call these from clojure_eval to see + steer her own long-
+   running work:
+
+     (require '[processes])
+     (processes/list)                       ; → vector of snapshots
+     (processes/snapshot some-pid)          ; → single snapshot
+     (processes/directive! pid {:type :abort :reason \"…\"})
+     (processes/directive! pid {:type :extend-budget :dollars 0.10})
+     (processes/directive! pid {:type :refocus :hint \"…\"})"
+  [sci-ctx chat-ctx]
+  (let [proc-ns   (find-ns 'dvergr.process)
+        list-fn   (var-get (ns-resolve proc-ns 'list-processes))
+        snap-fn   (var-get (ns-resolve proc-ns 'snapshot))
+        get-fn    (var-get (ns-resolve proc-ns 'get-process))
+        dir-fn    (var-get (ns-resolve proc-ns 'directive!))]
+    (sci/add-namespace! sci-ctx 'processes
+                        {'list       (fn [] (list-fn chat-ctx))
+                         'snapshot   (fn [pid] (when-let [p (get-fn chat-ctx pid)]
+                                                 (snap-fn p)))
+                         'directive! (fn [pid d] (dir-fn chat-ctx pid d))})))
+
 (declare add-scheduler-ns!)
 
 (defn setup-agent-namespaces!

@@ -19,6 +19,7 @@
             [dvergr.daemon :as daemon]
             [dvergr.registry :as registry]
             [dvergr.sessions :as sessions]
+            [dvergr.process :as proc]
             [dvergr.chat.context :as chat-ctx]
             [dvergr.stats :as stats]
             [org.replikativ.spindel.engine.core :as ec]
@@ -395,6 +396,67 @@
        (footer-line width)])))
 
 ;; ============================================================================
+;; Processes View
+;; ============================================================================
+
+(defn- processes-list
+  "Active processes for the currently-selected chat-ctx, sorted oldest
+   first. Returns [] if no chat-ctx is selected."
+  [signals]
+  (if-let [cctx @(:chat-ctx signals)]
+    (->> (proc/list-processes cctx)
+         (filter #(#{:running :awaiting-decision} (:status %)))
+         (sort-by :started-at))
+    []))
+
+(defn- format-elapsed [ms]
+  (cond
+    (< ms 1000)      (str ms "ms")
+    (< ms 60000)     (format "%.1fs" (/ ms 1000.0))
+    (< ms 3600000)   (format "%dm %02ds" (quot ms 60000) (mod (quot ms 1000) 60))
+    :else            (format "%dh %02dm" (quot ms 3600000) (mod (quot ms 60000) 60))))
+
+(defn- processes-view
+  "Render the active processes list."
+  [signals width _height]
+  (let [procs (processes-list signals)
+        sel @(:proc-idx signals)
+        inner-w (- width 4)
+        items (map-indexed
+                (fn [idx p]
+                  (let [status (:status p)
+                        elapsed (format-elapsed (:elapsed-ms p))
+                        sel? (= idx sel)
+                        prefix (if sel?
+                                 (s/render (s/style :fg s/cyan :bold true) "> ")
+                                 "  ")
+                        status-color (case status
+                                       :awaiting-decision s/yellow
+                                       :running           s/green
+                                       (s/ansi256 240))
+                        line (str prefix
+                                  (s/render (s/style :fg status-color :bold true)
+                                            (name status))
+                                  "  " (s/render (s/style :fg (s/ansi256 244)) elapsed)
+                                  "  " (:description p))]
+                    (box-line line inner-w)))
+                procs)]
+    (concat
+      [(header-line "Processes" width)]
+      (if (seq items)
+        items
+        [(box-line (s/render (s/style :fg (s/ansi256 240))
+                             "No active processes (select an agent + chat first)")
+                   inner-w)])
+      [(separator-line width)
+       (pad-line
+         (str "│ " (s/render (s/style :fg (s/ansi256 240))
+                             "Tab:view  j/k:nav  a:abort  c:continue  e:extend $0.10  Ctrl+C:quit")
+              (apply str (repeat (max 0 (- inner-w 70)) " ")) " │")
+         width)
+       (footer-line width)])))
+
+;; ============================================================================
 ;; Main View Dispatch
 ;; ============================================================================
 
@@ -404,9 +466,10 @@
   (let [mode @(:view-mode signals)]
     (map #(pad-line % width)
          (case mode
-           :agents   (agents-view signals width height)
-           :chat     (chat-view signals width height)
-           :sessions (sessions-view signals width height)
+           :agents    (agents-view signals width height)
+           :chat      (chat-view signals width height)
+           :sessions  (sessions-view signals width height)
+           :processes (processes-view signals width height)
            (agents-view signals width height)))))
 
 ;; ============================================================================
@@ -415,9 +478,10 @@
 
 (defn- next-view-mode [mode]
   (case mode
-    :agents   :chat
-    :chat     :sessions
-    :sessions :agents
+    :agents    :chat
+    :chat      :sessions
+    :sessions  :processes
+    :processes :agents
     :agents))
 
 (defn- dashboard-on-key
@@ -529,6 +593,38 @@
         :else
         (swap! (:input signals) #(ti/handle-key % event)))
 
+      ;; Processes view — list active processes, abort / continue / extend
+      ;; the focused one. Navigation: j/k, action keys mirror the help line.
+      (= mode :processes)
+      (let [cctx  @(:chat-ctx signals)
+            procs (when cctx
+                    (->> (proc/list-processes cctx)
+                         (filter #(#{:running :awaiting-decision} (:status %)))
+                         (sort-by :started-at)))
+            idx   @(:proc-idx signals)
+            focused (when (seq procs) (nth procs (min idx (dec (count procs))) nil))]
+        (cond
+          (or (= key "j") (= key :down))
+          (swap! (:proc-idx signals)
+                 #(min (max 0 (dec (count procs))) (inc %)))
+
+          (or (= key "k") (= key :up))
+          (swap! (:proc-idx signals) #(max 0 (dec %)))
+
+          (and focused (= key "a"))
+          (binding [ec/*execution-context* (:execution-ctx daemon)]
+            (proc/directive! cctx (:id focused)
+                             {:type :abort :reason "user aborted via TUI"}))
+
+          (and focused (= key "c"))
+          (binding [ec/*execution-context* (:execution-ctx daemon)]
+            (proc/directive! cctx (:id focused) {:type :continue}))
+
+          (and focused (= key "e"))
+          (binding [ec/*execution-context* (:execution-ctx daemon)]
+            (proc/directive! cctx (:id focused)
+                             {:type :extend-budget :dollars 0.10}))))
+
       ;; Sessions view - no special keys
       :else nil)))
 
@@ -564,6 +660,7 @@
                  :selected-idx   0
                  :selected-agent nil
                  :chat-ctx       nil
+                 :proc-idx       0
                  :input          (ti/text-input-state :prompt "" :placeholder "Message agent...")
                  :scroll         0
                  :status         :idle

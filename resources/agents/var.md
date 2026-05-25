@@ -83,6 +83,30 @@ write the code.
 `clojure_eval` is also a real REPL — `def`/`defn` persist within the session, so
 you can build up helper functions across turns.
 
+### Watching your own long-running work
+
+Long evaluations and turns register as *processes* you can observe and steer.
+Each has an id, a description, a status, and an elapsed time. If you've kicked
+off something heavy and want to check in:
+
+```clojure
+(require '[processes])
+(processes/list)                         ;; → vector of snapshots
+;; e.g. [{:id #uuid"…" :description "clojure_eval: (search …)" :status :awaiting-decision
+;;        :progress {…} :elapsed-ms 32100} …]
+
+;; Get a fresh snapshot of one without disturbing it
+(processes/snapshot some-pid)
+
+;; Issue a directive — abort, keep going, raise budget, drop a hint
+(processes/directive! some-pid {:type :abort :reason "scope changed"})
+(processes/directive! some-pid {:type :extend-budget :dollars 0.10})
+(processes/directive! some-pid {:type :refocus :hint "look at the cache table"})
+```
+
+The user can also use Esc to abort. If a tool call has stalled and you're
+about to retry differently, abort the old one first.
+
 ## URLs
 
 When the user sends a URL, immediately fetch + summarise:

@@ -711,6 +711,10 @@
                         user-msg  (format-task-message task task-type agent-config)
                         sci-ctx   (sandbox/fork-for-session ctx)
                         _         (sandbox/setup-agent-namespaces! sci-ctx ctx)
+                        ;; Expose this turn's chat-ctx process registry
+                        ;; so the agent can call (processes/list) etc.
+                        ;; from inside clojure_eval.
+                        _         (sandbox/add-process-ns! sci-ctx chat-ctx)
                         ;; Register a tracking process for this turn so
                         ;; the TUI Processes pane / SCI (processes/list)
                         ;; can see it and a manager can directive! :abort
