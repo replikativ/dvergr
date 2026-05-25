@@ -315,6 +315,7 @@
   []
   (select-keys @tools/registry
                ["clojure_eval"
+                "shell"
                 "knowledge_search" "knowledge_add"
                 "web_fetch" "youtube_transcript" "tweet_lookup"
                 "llm_call" "fulltext_search"]))
@@ -715,6 +716,9 @@
                         ;; so the agent can call (processes/list) etc.
                         ;; from inside clojure_eval.
                         _         (sandbox/add-process-ns! sci-ctx chat-ctx)
+                        ;; intake.bash — muschel-backed shell, same per-
+                        ;; chat-ctx session the `shell` tool uses.
+                        _         (sandbox/add-bash-ns! sci-ctx chat-ctx)
                         ;; Register a tracking process for this turn so
                         ;; the TUI Processes pane / SCI (processes/list)
                         ;; can see it and a manager can directive! :abort

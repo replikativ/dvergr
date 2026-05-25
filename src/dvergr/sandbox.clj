@@ -1621,6 +1621,26 @@
                          'patch   (fn [url & [opts]] (do-request (merge {:url url :method :patch} opts)))
                          'delete  (fn [url & [opts]] (do-request (merge {:url url :method :delete} opts)))})))
 
+(defn add-bash-ns!
+  "Expose intake.bash (muschel-backed shell) to SCI, bound to a chat-ctx.
+
+   Agents call:
+     (require '[intake.bash :as bash])
+     (bash/run \"git log --oneline -3\")
+     (bash/check \"rm -rf /\")  ; for sniffing what the permit would do
+
+   The `shell` JSON-schema tool wraps the same fn, so a worker can
+   pick whichever door fits the call site — direct tool for typical
+   ops, SCI fn for pipelines that mix bash and Clojure transforms."
+  [sci-ctx chat-ctx]
+  (require 'dvergr.intake.bash)
+  (let [run-fn   (var-get (ns-resolve 'dvergr.intake.bash 'run))
+        check-fn (var-get (ns-resolve 'dvergr.intake.bash 'check))]
+    (sci/add-namespace! sci-ctx 'intake.bash
+                        {'run   (fn [cmd & opts]
+                                  (apply run-fn chat-ctx cmd opts))
+                         'check check-fn})))
+
 (defn add-process-ns!
   "Expose the deliberable-process surface to SCI.
 

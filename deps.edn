@@ -33,6 +33,12 @@
         ;; Spindel — Reactive runtime with CoW forking
         org.replikativ/spindel     {:mvn/version "0.1.13"}
 
+        ;; muschel — bash → AST → safely runnable shell.
+        ;; Local path until released; muschel.session.spindel is fork-
+        ;; aware via spindel/fork-context so a forked chat-ctx gets an
+        ;; isolated muschel session (jobs, cd, env) for free.
+        org.replikativ/muschel     {:local/root "../muschel"}
+
         ;; rewrite-clj for structural editing
         rewrite-clj/rewrite-clj    {:mvn/version "1.1.48"}
 

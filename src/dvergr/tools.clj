@@ -506,6 +506,54 @@
                  :error "No evaluation context. Pass :sci-ctx or use :isolation :native."}))})
 
 (register!
+  {:name "shell"
+   :description "Run a bash command via muschel.
+
+   The natural surface for shell-domain work — git, ls, cat, grep, rg,
+   build commands, file inspection. For Clojure-domain work (datahike
+   queries, intake.web/search, signal manipulation) reach for
+   `clojure_eval` instead.
+
+   Capabilities + safety:
+   - Default permits auto-allow read-only commands (ls, cat, grep, git
+     status/log/diff, rg, etc.) and auto-deny destructive ones (sudo,
+     rm -rf, dd, reboot). Other commands pass through (run).
+   - Output is capped at 8000 chars per stream; :truncated? signals
+     when the cap fired.
+   - Session state (cwd, env vars, bg jobs) is per chat-ctx and
+     forks alongside it — a worker in a substrate-fork gets an
+     isolated session for free.
+
+   Example: {\"command\": \"git status --short\"}
+   Example: {\"command\": \"rg -l 'defn run-' src/\"}"
+   :parameters {:type "object"
+                :properties {:command {:type "string"
+                                       :description "Bash command(s) to run. Pipes / redirects / && / || all OK."}}
+                :required ["command"]}
+   :execute (fn [{:keys [command]} {:keys [chat-ctx]}]
+              (if-not chat-ctx
+                {:type :error
+                 :error "shell tool requires a chat-ctx in the tool-ctx."}
+                (let [r ((requiring-resolve 'dvergr.intake.bash/run)
+                         chat-ctx command)]
+                  (if (:error r)
+                    {:type :error
+                     :error (:error r)
+                     :content (str "shell error: " (:error r)
+                                   "\nexit: " (:exit r))}
+                    {:type :success
+                     :content (str (when (not-empty (:stdout r))
+                                     (:stdout r))
+                                   (when (not-empty (:stderr r))
+                                     (str (when (not-empty (:stdout r)) "\n\n")
+                                          "stderr:\n" (:stderr r)))
+                                   (when (not (zero? (or (:exit r) 0)))
+                                     (str "\n\n[exit " (:exit r) "]"))
+                                   (when (:truncated? r)
+                                     "\n\n[output truncated]"))
+                     :metadata r}))))})
+
+(register!
   {:name "clojure_edit"
    :description "Edit a Clojure form structurally by finding it by type and name.
 
