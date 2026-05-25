@@ -195,10 +195,10 @@
         full-config (assoc config :id schedule-id)
         exec-ctx (or (when daemon (:execution-ctx daemon))
                      rtc/*execution-context*)
-        db-conn (when daemon
-                  (some-> exec-ctx
-                          deref
-                          :db-conn))]
+        db-conn (when (and daemon exec-ctx)
+                  (binding [rtc/*execution-context* exec-ctx]
+                    (some-> (rtc/get-state [:external-refs "dvergr-chat-db"])
+                            :conn)))]
 
     ;; Persist to datahike if available
     (when db-conn
@@ -271,7 +271,9 @@
   "Restore active schedules from datahike after daemon restart."
   [daemon]
   (when-let [exec-ctx (:execution-ctx daemon)]
-    (when-let [db-conn (some-> exec-ctx deref :db-conn)]
+    (when-let [db-conn (binding [rtc/*execution-context* exec-ctx]
+                         (some-> (rtc/get-state [:external-refs "dvergr-chat-db"])
+                                 :conn))]
       (let [saved (load-active-schedules db-conn)]
         (doseq [s saved]
           (let [config (cond-> {:id          (:schedule/id s)

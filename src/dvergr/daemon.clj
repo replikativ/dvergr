@@ -208,6 +208,18 @@
 ;; Skills System
 ;; ============================================================================
 
+(defn- parse-inline-value
+  "Coerce a frontmatter inline value: `[a, b, c]` → [\"a\" \"b\" \"c\"];
+   otherwise return trimmed string."
+  [v]
+  (let [t (str/trim v)]
+    (if (and (str/starts-with? t "[") (str/ends-with? t "]"))
+      (let [inner (str/trim (subs t 1 (dec (count t))))]
+        (if (str/blank? inner)
+          []
+          (mapv str/trim (str/split inner #","))))
+      t)))
+
 (defn- parse-skill-frontmatter
   "Parse YAML-like frontmatter from a skill markdown file.
    Returns {:name \"...\" :description \"...\" :requires-tools [...] :content \"...\"}
@@ -228,11 +240,12 @@
                     (str/starts-with? line "  - ")
                     {:current-key current-key
                      :result      (update result current-key (fnil conj []) (str/trim (subs line 4)))}
-                    ;; Key: value pair (inline)
+                    ;; Key: value pair (inline) — supports `[a, b, c]` lists.
                     (re-matches #"^[a-zA-Z_-]+: .+" line)
-                    (let [[k v] (str/split line #": " 2)]
-                      {:current-key (keyword (str/replace k "_" "-"))
-                       :result      (assoc result (keyword (str/replace k "_" "-")) (str/trim v))})
+                    (let [[k v] (str/split line #": " 2)
+                          kw    (keyword (str/replace k "_" "-"))]
+                      {:current-key kw
+                       :result      (assoc result kw (parse-inline-value v))})
                     ;; Key: (list follows)
                     (re-matches #"^[a-zA-Z_-]+:$" line)
                     {:current-key (keyword (str/replace (subs line 0 (dec (count line))) "_" "-"))
