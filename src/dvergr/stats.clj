@@ -22,14 +22,35 @@
             [dvergr.model.registry :as model-registry]
             [dvergr.registry :as registry]
             [clojure.string :as str]
+            [org.replikativ.spindel.engine.core :as ec]
             [taoensso.telemere :as tel]))
 
 ;; ============================================================================
 ;; State
 ;; ============================================================================
 
-(defonce ^:private conn-a  (atom nil))  ; raw datahike.connector.Connection
-(defonce ^:private cache-a (atom {}))   ; {agent-id -> stat-map}
+(defonce ^:private conn-a (atom nil))  ; raw datahike.connector.Connection — process-singleton
+
+;; The per-agent stats cache lives on the current spindel execution-context
+;; under [:dvergr/stats agent-id]. That way a test/sidecar ctx gets its own
+;; cache and the daemon's stats don't leak across boundaries.
+(def ^:private cache-path [:dvergr/stats])
+
+(defn- current-ctx-or-nil []
+  (try (ec/current-execution-context)
+       (catch Throwable _ nil)))
+
+(defn- cache-get [agent-id]
+  (when (current-ctx-or-nil)
+    (get (ec/get-state cache-path) agent-id)))
+
+(defn- cache-update! [agent-id f & args]
+  (when (current-ctx-or-nil)
+    (ec/swap-state! cache-path
+                    (fn [m]
+                      (let [m (or m {})
+                            existing (get m agent-id)]
+                        (assoc m agent-id (apply f existing args)))))))
 
 (def ^:private cost-ttl-ms    (* 30 1000))   ; 30 s
 (def ^:private summary-ttl-ms (* 300 1000))  ; 5 min
@@ -112,27 +133,33 @@
 ;; ============================================================================
 
 (defn- refresh-cost!
-  "Synchronously update cost and last-active for agent-id in the cache."
-  [agent-id]
+  "Synchronously update cost and last-active for agent-id in the cache.
+   Uses `ctx` for ec-state writes (captured by the caller — callers run
+   from background futures whose JVM thread doesn't inherit the daemon's
+   dynamic ctx binding)."
+  [ctx agent-id]
   (when-let [conn @conn-a]
     (try
       (let [db      @conn
             prefix  (name agent-id)
             cost    (query-cost db prefix)
             last-at (query-last-active db prefix)]
-        (swap! cache-a update agent-id merge
-               {:cost-dollars        cost
-                :last-active         last-at
-                :last-active-str     (age-str last-at)
-                :cost-refreshed-at   (System/currentTimeMillis)}))
+        (binding [ec/*execution-context* ctx]
+          (cache-update! agent-id (fnil merge {})
+                         {:cost-dollars        cost
+                          :last-active         last-at
+                          :last-active-str     (age-str last-at)
+                          :cost-refreshed-at   (System/currentTimeMillis)})))
       (catch Exception e
         (tel/log! {:level :warn :id :stats/cost-error
                    :data {:agent-id agent-id :error (.getMessage e)}}
                   "Stats cost refresh failed")))))
 
 (defn- refresh-summary-async!
-  "Fire a background thread to update the LLM status summary for agent-id."
-  [agent-id]
+  "Fire a background thread to update the LLM status summary for agent-id.
+   Captures the caller's ctx and re-binds it inside the future, since the
+   future's pool thread doesn't inherit dynamic vars."
+  [ctx agent-id]
   (future
     (try
       (when-let [conn @conn-a]
@@ -149,9 +176,10 @@
                            {:max-tokens 200 :model summary-model})]
               (let [summary (str/trim (or (:text result) ""))]
                 (when (and (not (:error result)) (seq summary))
-                  (swap! cache-a update agent-id assoc
-                         :summary              summary
-                         :summary-refreshed-at (System/currentTimeMillis))))))))
+                  (binding [ec/*execution-context* ctx]
+                    (cache-update! agent-id (fnil assoc {})
+                                   :summary              summary
+                                   :summary-refreshed-at (System/currentTimeMillis)))))))))
       (catch Exception e
         (tel/log! {:level :warn :id :stats/summary-error
                    :data {:agent-id agent-id :error (.getMessage e)}}
@@ -168,9 +196,14 @@
      :cost-dollars     — total spend (nil if unknown)
      :last-active      — java.util.Date of last ledger entry (nil if unknown)
      :last-active-str  — human-readable age string (nil if unknown)
-     :summary          — 1-sentence LLM status (nil while pending/unavailable)"
+     :summary          — 1-sentence LLM status (nil while pending/unavailable)
+
+   Reads/writes the cache on the *current* execution context — callers
+   (web handlers, dashboards) must bind the daemon's ctx for stats to
+   persist meaningfully across requests."
   [agent-id]
-  (let [cached    (get @cache-a agent-id)
+  (let [ctx       (current-ctx-or-nil)
+        cached    (cache-get agent-id)
         now       (System/currentTimeMillis)
         cost-stale?    (or (nil? cached)
                            (> (- now (or (:cost-refreshed-at cached) 0))
@@ -178,16 +211,17 @@
         summary-stale? (or (nil? (:summary cached))
                            (> (- now (or (:summary-refreshed-at cached) 0))
                               summary-ttl-ms))]
-    (when cost-stale?
-      (future (refresh-cost! agent-id)))
-    (when summary-stale?
-      (refresh-summary-async! agent-id))
+    (when (and ctx cost-stale?)
+      (future (refresh-cost! ctx agent-id)))
+    (when (and ctx summary-stale?)
+      (refresh-summary-async! ctx agent-id))
     (or cached {:cost-dollars nil :last-active nil :last-active-str nil :summary nil})))
 
 (defn refresh-all!
   "Force-refresh stats for all registered agents. Blocks for cost queries,
    fires async for LLM summaries."
   []
-  (doseq [agent-id (registry/agent-ids)]
-    (refresh-cost! agent-id)
-    (refresh-summary-async! agent-id)))
+  (when-let [ctx (current-ctx-or-nil)]
+    (doseq [agent-id (registry/agent-ids)]
+      (refresh-cost! ctx agent-id)
+      (refresh-summary-async! ctx agent-id))))
