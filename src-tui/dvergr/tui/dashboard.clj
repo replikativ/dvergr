@@ -285,8 +285,9 @@
                        (try (md/render-inline content)
                             (catch Exception _ content))
                        content)
-            text-lines (cond->> (str/split-lines rendered)
-                         (str/blank? content) (constantly []))
+            text-lines (if (str/blank? content)
+                         []
+                         (str/split-lines rendered))
             wrapped    (mapcat #(wrap-text % (- inner-width 2)) text-lines)
             tu-lines   (when (= role :assistant)
                          (mapcat #(render-tool-use % inner-width)
