@@ -307,11 +307,63 @@
                     ygg-conn)
 
                   :else
-                  ;; Create local connection
+                  ;; Create local connection. Konserve requires :id on
+                  ;; every store config — derive it from chat-id for
+                  ;; both backends so the file path/memory pool is
+                  ;; stable across rebuilds.
                   (let [db-cfg (if db-path
-                                 {:store {:backend :file :path db-path}}
+                                 {:store {:backend :file :path db-path :id chat-id}}
                                  {:store {:backend :memory :id chat-id}})]
                     (schema/create-chat-db! db-cfg)))
+
+        ;; Check whether the chat row already exists (true after a
+        ;; restart when an upstream caller passes a deterministic
+        ;; chat-id). Drives both budget restoration and skipping the
+        ;; idempotent re-transact below.
+        existing-chat (try
+                        (dh/q '[:find (pull ?c [:chat/budget-total]) .
+                                :in $ ?cid
+                                :where [?c :chat/id ?cid]]
+                              @db-conn chat-id)
+                        (catch Exception _ nil))
+
+        ;; Reconstruct used + per-type usage from the ledger — that's
+        ;; where account-usage! actually writes (the :chat/budget-used
+        ;; attr exists in schema but isn't kept in sync; trust the
+        ;; ledger sum instead).
+        [restored-used restored-by-type]
+        (if existing-chat
+          (try
+            (let [cost-q (dh/q '[:find (sum ?c) .
+                                 :in $ ?cid
+                                 :where
+                                 [?l :ledger/context ?ctx]
+                                 [?ctx :chat/id ?cid]
+                                 [?l :ledger/cost-microdollars ?c]]
+                               @db-conn chat-id)
+                  by-type (dh/q '[:find ?rsrc (sum ?amt)
+                                  :in $ ?cid
+                                  :where
+                                  [?l :ledger/context ?ctx]
+                                  [?ctx :chat/id ?cid]
+                                  [?l :ledger/resource ?rsrc]
+                                  [?l :ledger/amount ?amt]]
+                                @db-conn chat-id)]
+              [(or cost-q 0)
+               (into {} (map (fn [[t amt]] [t amt])) by-type)])
+            (catch Exception _ [0 {}]))
+          [0 {}])
+
+        initial-budget
+        (if existing-chat
+          {:total (or (:chat/budget-total existing-chat) budget-microdollars)
+           :used  restored-used
+           :by-type restored-by-type
+           :crossed-thresholds #{}}
+          {:total budget-microdollars
+           :used 0
+           :by-type {}
+           :crossed-thresholds #{}})
 
         ;; Create SCI context if requested
         ;; When *execution-context* is bound, create spindel-backed SCI with
@@ -323,19 +375,18 @@
         [messages-signal budget-signal status-signal child-ctxs-atom]
         (binding [rtc/*execution-context* spindel-ctx]
           [(sig/signal (d/deltaable-vector []))
-           (sig/signal {:total budget-microdollars
-                        :used 0
-                        :by-type {}
-                        :crossed-thresholds #{}})
+           (sig/signal initial-budget)
            (sig/signal :active)
            (ratom/create-atom {})])  ; fork-safe child contexts map
 
-        ;; Create chat entity in datahike
-        chat-entity (schema/create-chat-entity
-                     {:id chat-id
-                      :title (or title "Untitled Chat")
-                      :budget budget-microdollars})
-        _ (dh/transact db-conn [chat-entity])]
+        ;; Create chat entity in datahike — only when fresh; on restore
+        ;; we don't want :chat/budget-total / :chat/budget-used clobbered.
+        _ (when-not existing-chat
+            (dh/transact db-conn
+              [(schema/create-chat-entity
+                 {:id chat-id
+                  :title (or title "Untitled Chat")
+                  :budget budget-microdollars})]))]
 
     (->ChatContext
      chat-id
