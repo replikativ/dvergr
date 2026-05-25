@@ -467,9 +467,14 @@
                   (reset! streaming "")
                   (reset! status :idle))))))))
 
-    ;; Start the TUI (blocks)
+    ;; Start the TUI (blocks). Share the daemon's execution-context so
+    ;; the view fn's `(registry/list-agents)`, `(sessions/list-sessions)`,
+    ;; `(stats/get-stats …)` etc. read from the same ctx the daemon
+    ;; writes to. Without this, the TUI runs on its own fresh ctx and
+    ;; every registry/sessions lookup returns empty.
     (tui/start!
-      {:signals {:view-mode      :agents
+      {:execution-context (:execution-ctx daemon)
+       :signals {:view-mode      :agents
                  :selected-idx   0
                  :selected-agent nil
                  :history        []

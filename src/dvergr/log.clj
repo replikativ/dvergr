@@ -52,7 +52,8 @@
 
    ;; Timbre (datahike, other libs): redirect into Telemere
    ;; Set min-level :info to drop the noisy DEBUG transact messages
-   (timbre/set-min-level! :info)
+   ;; (Timbre 4.10 calls it set-level!; v5 renamed to set-min-level!)
+   (timbre/set-level! :info)
    (timbre/merge-config!
      {:appenders
       {:println  {:enabled? false}

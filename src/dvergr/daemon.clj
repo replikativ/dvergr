@@ -838,7 +838,10 @@
             (spin
               (loop []
                 (when-not (contains? #{:stopping :stopped} @(:status daemon))
-                  (let [msg      (await (:inbox sys-p))
+                  ;; Joined participants have `:inbox-mbx` (merge mailbox of
+                  ;; all their bus subscriptions) — `:inbox` was the legacy
+                  ;; pre-discourse field and is nil today.
+                  (let [msg      (await (:inbox-mbx sys-p))
                         agent-id (:from msg)
                         text     (:content msg)]
                     (doseq [sink @(:response-sinks daemon)]
