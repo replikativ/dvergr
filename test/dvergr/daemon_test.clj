@@ -12,7 +12,8 @@
             [dvergr.sessions :as sessions]
             [dvergr.channels.core :as ch]
             [dvergr.tools :as tools]
-            [dvergr.mcp.server :as mcp]))
+            [dvergr.mcp.server :as mcp]
+            [org.replikativ.spindel.engine.core :as ec]))
 
 ;; ============================================================================
 ;; Fixtures
@@ -21,16 +22,16 @@
 (def ^:dynamic *shared-daemon* nil)
 
 (defn- snapshot-globals []
-  {:registry     @registry/registry
-   :sessions     @sessions/sessions
+  {:registry     (registry/snapshot)
+   :sessions     (sessions/snapshot)
    :channels     @ch/channels
    :tools        @tools/registry
    :mcp-tools    @mcp/tool-definitions
    :mcp-handlers @mcp/tool-handlers})
 
 (defn- restore-globals! [snap]
-  (reset! registry/registry     (:registry snap))
-  (reset! sessions/sessions     (:sessions snap))
+  (registry/restore!     (:registry snap))
+  (sessions/restore!            (:sessions snap))
   (reset! ch/channels           (:channels snap))
   (reset! tools/registry        (:tools snap))
   (reset! mcp/tool-definitions  (:mcp-tools snap))
@@ -64,15 +65,23 @@
 ;; :each — between tests, restore the global registry/sessions/etc.
 ;; AND the shared daemon's room participants + response sinks so
 ;; per-test agent creation doesn't leak across tests.
+;;
+;; ALSO bind the daemon's execution-context for the test body so that
+;; ctx-scoped state (sessions, stats, schedules, rooms-bus subscribers)
+;; reads/writes land on the same ctx the daemon writes to from its
+;; dispatch path.
 (use-fixtures :each
   (fn [f]
-    (let [g-snap (snapshot-globals)
-          d-snap (snapshot-daemon *shared-daemon*)]
-      (try
-        (f)
-        (finally
-          (restore-daemon! *shared-daemon* d-snap)
-          (restore-globals! g-snap))))))
+    (let [d *shared-daemon*
+          ctx (when d (:execution-ctx d))]
+      (binding [ec/*execution-context* (or ctx ec/*execution-context*)]
+        (let [g-snap (snapshot-globals)
+              d-snap (snapshot-daemon *shared-daemon*)]
+          (try
+            (f)
+            (finally
+              (restore-daemon! *shared-daemon* d-snap)
+              (restore-globals! g-snap))))))))
 
 ;; ============================================================================
 ;; Tests

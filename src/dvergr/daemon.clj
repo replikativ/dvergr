@@ -937,12 +937,12 @@
                            (:interval-ms safe-config)
                            (d/with-cadence (:interval-ms safe-config)))]
     (binding [rtc/*execution-context* exec-ctx]
-      (d/join room participant))
-    (registry/register! agent-id participant
-                        :tags        (or (:tags agent-config) #{})
-                        :description (or (:description agent-config) "")
-                        :config      safe-config)
-    (registry/update-status! agent-id :running)
+      (d/join room participant)
+      (registry/register! agent-id participant
+                          :tags        (or (:tags agent-config) #{})
+                          :description (or (:description agent-config) "")
+                          :config      safe-config)
+      (registry/update-status! agent-id :running))
     participant))
 
 (defn stop-agent!
@@ -1020,6 +1020,12 @@
      daemon - Daemon record
      msg    - Normalized Telegram message from channel"
   [daemon msg]
+  ;; Bind the daemon's execution context — telegram bridge / web handlers
+  ;; / tests may call dispatch! from threads that don't have it bound, and
+  ;; ctx-scoped state (sessions, registry, stats, rooms-bus subscribers)
+  ;; must land on the daemon's ctx for the routing to see/update it.
+  (binding [rtc/*execution-context* (or (:execution-ctx daemon)
+                                        rtc/*execution-context*)]
   (let [chat-id (:chat-id msg)
         text (:text msg)
         user-info (:from msg)
@@ -1070,7 +1076,7 @@
                        (d/message system-id default-agent-id text nil
                                   {:chat-id   chat-id
                                    :user-info user-info
-                                   :chat-ctx  (:chat-ctx session)}))))))))))
+                                   :chat-ctx  (:chat-ctx session)})))))))))))
 
 ;; ============================================================================
 ;; Daemon Lifecycle
@@ -1427,25 +1433,34 @@
 ;; ============================================================================
 
 (defn list-agents
-  "List all agents managed by the daemon."
-  [_daemon]
-  (registry/list-agents))
+  "List all agents managed by the daemon.
+
+   Self-binds the daemon's execution context so the ctx-scoped registry
+   reads land on the daemon's ctx regardless of caller binding."
+  [daemon]
+  (binding [rtc/*execution-context* (or (:execution-ctx daemon)
+                                        rtc/*execution-context*)]
+    (registry/list-agents)))
 
 (defn list-sessions
-  "List all active Telegram sessions."
-  [_daemon]
-  (sessions/list-sessions))
+  "List all active Telegram sessions on this daemon's ctx."
+  [daemon]
+  (binding [rtc/*execution-context* (or (:execution-ctx daemon)
+                                        rtc/*execution-context*)]
+    (sessions/list-sessions)))
 
 (defn daemon-status
   "Get daemon status summary."
   [daemon]
-  {:status @(:status daemon)
-   :agents (count (registry/agent-ids))
-   :sessions (sessions/session-count)
-   :telegram-connected? (some? (:telegram-ch daemon))
-   :http-running? (web-server/running?)
-   :http-port (web-server/server-port)
-   :schedules (count (scheduler/list-schedules))})
+  (binding [rtc/*execution-context* (or (:execution-ctx daemon)
+                                        rtc/*execution-context*)]
+    {:status @(:status daemon)
+     :agents (count (registry/agent-ids))
+     :sessions (sessions/session-count)
+     :telegram-connected? (some? (:telegram-ch daemon))
+     :http-running? (web-server/running?)
+     :http-port (web-server/server-port)
+     :schedules (count (scheduler/list-schedules))}))
 
 (comment
   ;; Example usage:

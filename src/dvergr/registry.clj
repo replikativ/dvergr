@@ -14,12 +14,41 @@
      (list-agents)             ;; => [{:id :coder :status :running ...}]
      (agents-by-tag :coding)   ;; => [:coder]
      (unregister! :coder)"
-  (:require [org.replikativ.spindel.distributed.core :as dist]))
+  (:require [org.replikativ.spindel.distributed.core :as dist]
+            [org.replikativ.spindel.engine.core :as ec]))
 
 ;; ============================================================================
-;; Registry State
+;; Registry State (ctx-scoped)
+;;
+;; Agent entries live on the current spindel execution-context under
+;; `[:dvergr/agents]`. The daemon's ctx holds the daemon's agents; a
+;; sidecar's ctx holds its own. Tests get fresh ctxs via the test
+;; fixture and never collide with the daemon's registrations.
+;;
+;; A `defonce`-backed `registry` atom is kept ONLY as a back-compat
+;; mirror for snapshot/restore-style test fixtures that still deref it
+;; directly. New code should use `register!`/`lookup`/etc., which go
+;; through ec-state.
 ;; ============================================================================
 
+(def ^:private path [:dvergr/agents])
+
+(defn- current-ctx-or-nil []
+  (try (ec/current-execution-context)
+       (catch Throwable _ nil)))
+
+(defn- all-entries []
+  (if (current-ctx-or-nil)
+    (or (ec/get-state path) {})
+    {}))
+
+(defn- swap-entries! [f & args]
+  (when (current-ctx-or-nil)
+    (ec/swap-state! path (fn [m] (apply f (or m {}) args)))))
+
+;; Back-compat: tests do `(all-entries)/registry` and `(reset! registry/registry x)`.
+;; Keep an empty defonce so symbol resolution still works; the public API
+;; below ignores it. Use `(snapshot)` / `(restore!)` in new tests.
 (defonce registry (atom {}))
 
 ;; ============================================================================
@@ -50,7 +79,7 @@
                :config (or config {})
                :created-at (java.util.Date.)
                :context-id ctx-id}]
-    (swap! registry assoc agent-id entry)
+    (swap-entries! assoc agent-id entry)
     entry))
 
 (defn unregister!
@@ -58,13 +87,13 @@
 
    Also unregisters its execution context from distributed addressing."
   [agent-id]
-  (when-let [entry (get @registry agent-id)]
+  (when-let [entry (get (all-entries) agent-id)]
     ;; Unregister from distributed context registry
     (when-let [ctx-id (:context-id entry)]
       (try
         (dist/unregister-context! ctx-id)
         (catch Exception _)))
-    (swap! registry dissoc agent-id)
+    (swap-entries! dissoc agent-id)
     :unregistered))
 
 ;; ============================================================================
@@ -77,7 +106,7 @@
    Returns map with :agent, :status, :tags, :description, :created-at, :context-id
    or nil if not found."
   [agent-id]
-  (get @registry agent-id))
+  (get (all-entries) agent-id))
 
 (defn get-agent
   "Get the agent record for an id, or nil."
@@ -97,7 +126,7 @@
 
    Returns vector of maps with :id, :status, :tags, :description, :created-at."
   [& {:keys [status tags]}]
-  (let [pairs (seq @registry)
+  (let [pairs (seq (all-entries))
         filtered (cond->> pairs
                    status (filter #(= status (:status (second %))))
                    tags   (filter #(every? (:tags (second %)) tags)))]
@@ -113,14 +142,14 @@
 (defn agents-by-tag
   "Get agent ids that have the specified tag."
   [tag]
-  (->> @registry
+  (->> (all-entries)
        (filter (fn [[_id entry]] (contains? (:tags entry) tag)))
        (mapv first)))
 
 (defn agent-ids
   "Get all registered agent ids."
   []
-  (vec (keys @registry)))
+  (vec (keys (all-entries))))
 
 ;; ============================================================================
 ;; Status Updates
@@ -129,21 +158,32 @@
 (defn update-status!
   "Update the registry status for an agent."
   [agent-id new-status]
-  (swap! registry update agent-id assoc :status new-status)
+  (swap-entries! update agent-id assoc :status new-status)
   new-status)
 
 (defn update-tags!
   "Update tags for an agent."
   [agent-id tags]
-  (swap! registry update agent-id assoc :tags tags)
+  (swap-entries! update agent-id assoc :tags tags)
   tags)
 
 ;; ============================================================================
-;; Cleanup
+;; Cleanup / test helpers
 ;; ============================================================================
 
 (defn clear!
-  "Clear the entire registry. Use with caution."
+  "Clear the registry on the current ctx. Use with caution."
   []
-  (reset! registry {})
+  (swap-entries! (constantly {}))
   :cleared)
+
+(defn snapshot
+  "Return the registry table on the current ctx — for tests."
+  []
+  (all-entries))
+
+(defn restore!
+  "Replace the registry table on the current ctx — for tests."
+  [m]
+  (swap-entries! (constantly (or m {})))
+  nil)

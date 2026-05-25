@@ -13,7 +13,17 @@
             [dvergr.sessions :as sessions]
             [dvergr.channels.core :as ch]
             [dvergr.tools :as tools]
-            [dvergr.mcp.server :as mcp]))
+            [dvergr.mcp.server :as mcp]
+            [org.replikativ.spindel.engine.core :as ec]))
+
+(defn- with-daemon-ctx
+  "Run thunk with the daemon's execution-context bound — needed for
+   ctx-scoped state lookups (sessions, registry, …) to see what the
+   daemon's dispatch path wrote."
+  [d thunk]
+  (binding [ec/*execution-context* (or (:execution-ctx d)
+                                       ec/*execution-context*)]
+    (thunk)))
 
 ;; ============================================================================
 ;; Fixtures
@@ -21,8 +31,8 @@
 
 (use-fixtures :each
   (fn [f]
-    (let [orig-registry @registry/registry
-          orig-sessions @sessions/sessions
+    (let [orig-registry (registry/snapshot)
+          orig-sessions (sessions/snapshot)
           orig-channels @ch/channels
           orig-tools @tools/registry
           orig-mcp-tools @mcp/tool-definitions
@@ -30,8 +40,8 @@
       (try
         (f)
         (finally
-          (reset! registry/registry orig-registry)
-          (reset! sessions/sessions orig-sessions)
+          (registry/restore! orig-registry)
+          (sessions/restore! orig-sessions)
           (reset! ch/channels orig-channels)
           (reset! tools/registry orig-tools)
           (reset! mcp/tool-definitions orig-mcp-tools)
@@ -124,10 +134,12 @@
                                               :model "test"
                                               :tags #{:worker}
                                               :description "Test worker"}}})]
-      (let [text (format-agent-list)]
-        (is (str/includes? text "worker"))
-        (is (str/includes? text "Test worker"))
-        (is (str/includes? text "#worker")))
+      (with-daemon-ctx d
+        (fn []
+          (let [text (format-agent-list)]
+            (is (str/includes? text "worker"))
+            (is (str/includes? text "Test worker"))
+            (is (str/includes? text "#worker")))))
       (daemon/stop! d))))
 
 ;; ============================================================================
@@ -161,15 +173,14 @@
                             :default-agent :var})]
       (daemon/register-response-sink! d
         (fn [_agent-id text] (swap! responses conj text)))
-
-      (daemon/dispatch! d {:chat-id 1001 :text "/agents"
-                           :from {:username "tester"}})
-      (Thread/sleep 100)
-
-      (is (= 1 (count @responses)))
-      (is (str/includes? (first @responses) "var"))
-      (is (str/includes? (first @responses) "Primary"))
-
+      (with-daemon-ctx d
+        (fn []
+          (daemon/dispatch! d {:chat-id 1001 :text "/agents"
+                               :from {:username "tester"}})
+          (Thread/sleep 100)
+          (is (= 1 (count @responses)))
+          (is (str/includes? (first @responses) "var"))
+          (is (str/includes? (first @responses) "Primary"))))
       (daemon/stop! d))))
 
 (deftest test-dispatch-unknown-agent
@@ -180,15 +191,14 @@
                             :default-agent :var})]
       (daemon/register-response-sink! d
         (fn [_agent-id text] (swap! responses conj text)))
-
-      (daemon/dispatch! d {:chat-id 1002 :text "/nonexistent do thing"
-                           :from {:username "tester"}})
-      (Thread/sleep 100)
-
-      (is (= 1 (count @responses)))
-      (is (str/includes? (first @responses) "Unknown agent"))
-      (is (str/includes? (first @responses) "nonexistent"))
-
+      (with-daemon-ctx d
+        (fn []
+          (daemon/dispatch! d {:chat-id 1002 :text "/nonexistent do thing"
+                               :from {:username "tester"}})
+          (Thread/sleep 100)
+          (is (= 1 (count @responses)))
+          (is (str/includes? (first @responses) "Unknown agent"))
+          (is (str/includes? (first @responses) "nonexistent"))))
       (daemon/stop! d))))
 
 (deftest test-dispatch-agent-addressing-updates-session
@@ -200,19 +210,19 @@
                                                   :model "test"
                                                   :tags #{:worker}}}
                             :default-agent :var})]
+      (with-daemon-ctx d
+        (fn []
+          ;; First dispatch creates session with var
+          (daemon/dispatch! d {:chat-id 2001 :text "hello"
+                               :from {:username "tester"}})
+          (Thread/sleep 100)
+          (is (= :var (:agent-id (sessions/get-session 2001))))
 
-      ;; First dispatch creates session with var
-      (daemon/dispatch! d {:chat-id 2001 :text "hello"
-                           :from {:username "tester"}})
-      (Thread/sleep 100)
-      (is (= :var (:agent-id (sessions/get-session 2001))))
-
-      ;; Addressing worker via /worker updates session
-      (daemon/dispatch! d {:chat-id 2001 :text "/worker do something"
-                           :from {:username "tester"}})
-      (Thread/sleep 100)
-      (is (= :worker (:agent-id (sessions/get-session 2001))))
-
+          ;; Addressing worker via /worker updates session
+          (daemon/dispatch! d {:chat-id 2001 :text "/worker do something"
+                               :from {:username "tester"}})
+          (Thread/sleep 100)
+          (is (= :worker (:agent-id (sessions/get-session 2001))))))
       (daemon/stop! d))))
 
 (deftest test-dispatch-plain-text-uses-session-agent
@@ -221,15 +231,15 @@
                                                   :model "test"
                                                   :tags #{:var}}}
                             :default-agent :var})]
-      ;; Dispatch plain text
-      (daemon/dispatch! d {:chat-id 3001 :text "hello there"
-                           :from {:username "tester"}})
-      (Thread/sleep 100)
-
-      ;; Session should exist with var
-      (is (some? (sessions/get-session 3001)))
-      (is (= :var (:agent-id (sessions/get-session 3001))))
-
+      (with-daemon-ctx d
+        (fn []
+          ;; Dispatch plain text
+          (daemon/dispatch! d {:chat-id 3001 :text "hello there"
+                               :from {:username "tester"}})
+          (Thread/sleep 100)
+          ;; Session should exist with var
+          (is (some? (sessions/get-session 3001)))
+          (is (= :var (:agent-id (sessions/get-session 3001))))))
       (daemon/stop! d))))
 
 (deftest test-daemon-profile-loading-at-creation
@@ -239,11 +249,13 @@
                                  :model "test"
                                  :profile :worker
                                  :tags #{:worker}}}})]
-      ;; Config now lives on the registry entry, not on the discourse Participant.
-      (let [sys-prompt (get-in (registry/lookup :worker) [:config :system-prompt])]
-        (is (some? sys-prompt) "System prompt should be loaded from profile")
-        (is (str/includes? (str sys-prompt) "Worker Agent")
-            "Should contain markdown profile content"))
+      (with-daemon-ctx d
+        (fn []
+          ;; Config now lives on the registry entry, not on the discourse Participant.
+          (let [sys-prompt (get-in (registry/lookup :worker) [:config :system-prompt])]
+            (is (some? sys-prompt) "System prompt should be loaded from profile")
+            (is (str/includes? (str sys-prompt) "Worker Agent")
+                "Should contain markdown profile content"))))
       (daemon/stop! d))))
 
 (deftest test-daemon-explicit-prompt-overrides-profile
@@ -254,8 +266,10 @@
                                  :profile :worker
                                  :system-prompt "Custom prompt"
                                  :tags #{:worker}}}})]
-      (let [sys-prompt (get-in (registry/lookup :worker) [:config :system-prompt])]
-        (is (= "Custom prompt" sys-prompt)))
+      (with-daemon-ctx d
+        (fn []
+          (let [sys-prompt (get-in (registry/lookup :worker) [:config :system-prompt])]
+            (is (= "Custom prompt" sys-prompt)))))
       (daemon/stop! d))))
 
 ;; ============================================================================

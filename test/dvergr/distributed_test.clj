@@ -20,13 +20,13 @@
 
 (use-fixtures :each
   (fn [f]
-    (let [orig-registry @registry/registry
-          orig-sessions @sessions/sessions]
+    (let [orig-registry (registry/snapshot)
+          orig-sessions (sessions/snapshot)]
       (try
         (f)
         (finally
-          (reset! registry/registry orig-registry)
-          (reset! sessions/sessions orig-sessions))))))
+          (registry/restore! orig-registry)
+          (sessions/restore! orig-sessions))))))
 
 ;; ============================================================================
 ;; Mock Agent for Registry

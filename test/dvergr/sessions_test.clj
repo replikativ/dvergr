@@ -1,19 +1,26 @@
 (ns dvergr.sessions-test
   "Tests for session management."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
-            [dvergr.sessions :as sessions]))
+            [dvergr.sessions :as sessions]
+            [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.engine.context :as ectx]))
 
 ;; ============================================================================
 ;; Fixtures
+;;
+;; Sessions live on the current spindel execution-context. Each test
+;; gets a fresh ctx so its session table is fully isolated — no global
+;; atom to snapshot/restore anymore.
 ;; ============================================================================
 
 (use-fixtures :each
   (fn [f]
-    (let [orig @sessions/sessions]
+    (let [ctx (ectx/create-execution-context)]
       (try
-        (f)
+        (binding [ec/*execution-context* ctx]
+          (f))
         (finally
-          (reset! sessions/sessions orig))))))
+          (ectx/stop-context! ctx))))))
 
 ;; ============================================================================
 ;; Chunking Tests

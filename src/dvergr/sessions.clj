@@ -14,13 +14,35 @@
   (:require [dvergr.registry :as registry]
             [dvergr.chat.context :as chat-ctx]
             [dvergr.channels.telegram :as tg]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [org.replikativ.spindel.engine.core :as ec]))
 
 ;; ============================================================================
 ;; Session State
+;;
+;; Sessions live on the current spindel execution-context under
+;; `[:dvergr/sessions]` as a map `[chat-id agent-id] -> session map`. The
+;; daemon binds its ctx around the telegram dispatch path, so all writes/
+;; reads from that path share the daemon's view. Tests and sidecars get
+;; their own ctxs and thus their own isolated session tables. Web/MCP
+;; handlers must bind the daemon's ctx to see the same sessions (separate
+;; follow-up).
 ;; ============================================================================
 
-(defonce sessions (atom {}))  ;; [chat-id agent-id] -> session map
+(def ^:private path [:dvergr/sessions])
+
+(defn- current-ctx-or-nil []
+  (try (ec/current-execution-context)
+       (catch Throwable _ nil)))
+
+(defn- all-sessions []
+  (if (current-ctx-or-nil)
+    (or (ec/get-state path) {})
+    {}))
+
+(defn- swap-sessions! [f & args]
+  (when (current-ctx-or-nil)
+    (ec/swap-state! path (fn [m] (apply f (or m {}) args)))))
 
 ;; ============================================================================
 ;; Telegram Message Chunking
@@ -74,20 +96,20 @@
                                  :budget-dollars 2.0})
                  :created-at  (java.util.Date.)
                  :last-active (java.util.Date.)}]
-    (swap! sessions assoc [chat-id agent-id] session)
+    (swap-sessions! assoc [chat-id agent-id] session)
     session))
 
 (defn get-session
   "Get session for a [chat-id agent-id] pair, or nil.
   When called with one arg, returns the most recently active session for chat-id."
   ([chat-id]
-   (->> @sessions
+   (->> (all-sessions)
         (filter (fn [[[cid _] _]] (= cid chat-id)))
         (sort-by (fn [[_ s]] (.getTime (or (:last-active s) (:created-at s)))) >)
         first
         second))
   ([chat-id agent-id]
-   (get @sessions [chat-id agent-id])))
+   (get (all-sessions) [chat-id agent-id])))
 
 (defn get-or-create-session!
   "Get existing session or create a new one for this chat-id + agent-id pair.
@@ -105,7 +127,7 @@
   (if-let [session (get-session chat-id agent-id)]
     (do
       ;; Update last-active timestamp
-      (swap! sessions assoc-in [[chat-id agent-id] :last-active] (java.util.Date.))
+      (swap-sessions! assoc-in [[chat-id agent-id] :last-active] (java.util.Date.))
       session)
     (create-session! chat-id agent-id user-info)))
 
@@ -120,21 +142,21 @@
                  look up the fork on accept-proposal! / reject-proposal!).
    summary     - human-readable description of what the worker did."
   [chat-id agent-id proposal-id summary]
-  (swap! sessions assoc-in [[chat-id agent-id] :pending-fork]
-         {:proposal-id proposal-id
-          :summary     summary
-          :created-at  (java.util.Date.)})
+  (swap-sessions! assoc-in [[chat-id agent-id] :pending-fork]
+                  {:proposal-id proposal-id
+                   :summary     summary
+                   :created-at  (java.util.Date.)})
   nil)
 
 (defn get-pending-fork
   "Get the pending fork for a [chat-id agent-id], or nil."
   [chat-id agent-id]
-  (get-in @sessions [[chat-id agent-id] :pending-fork]))
+  (get-in (all-sessions) [[chat-id agent-id] :pending-fork]))
 
 (defn clear-pending-fork!
   "Remove pending fork tracking (after merge! or discard!)."
   [chat-id agent-id]
-  (swap! sessions update [chat-id agent-id] dissoc :pending-fork)
+  (swap-sessions! update [chat-id agent-id] dissoc :pending-fork)
   nil)
 
 (defn describe-pending
@@ -155,7 +177,7 @@
       (try
         (chat-ctx/close-chat! (:chat-ctx session))
         (catch Exception _)))
-    (swap! sessions dissoc [chat-id agent-id])
+    (swap-sessions! dissoc [chat-id agent-id])
     :closed))
 
 ;; ============================================================================
@@ -169,12 +191,12 @@
   []
   (mapv (fn [[_key session]]
           (select-keys session [:chat-id :agent-id :user-info :created-at :last-active]))
-        @sessions))
+        (all-sessions)))
 
 (defn session-count
   "Get the number of active sessions."
   []
-  (count @sessions))
+  (count (all-sessions)))
 
 ;; ============================================================================
 ;; Markdown to Telegram HTML Conversion
@@ -355,7 +377,18 @@
 ;; ============================================================================
 
 (defn clear-all!
-  "Clear all sessions. Use with caution."
+  "Clear all sessions on the current ctx. Use with caution."
   []
-  (reset! sessions {})
+  (swap-sessions! (constantly {}))
   :cleared)
+
+(defn snapshot
+  "Return the current session table — for tests / debugging only."
+  []
+  (all-sessions))
+
+(defn restore!
+  "Replace the session table with the given map — for tests only."
+  [m]
+  (swap-sessions! (constantly (or m {})))
+  nil)

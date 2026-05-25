@@ -28,7 +28,7 @@
 
 (use-fixtures :each
   (fn [f]
-    (let [orig-registry @registry/registry
+    (let [orig-registry (registry/snapshot)
           orig-handlers @server/agent-handlers
           orig-server @server/server-state]
       (try
@@ -38,7 +38,7 @@
           (f))
         (finally
           (server/stop!)
-          (reset! registry/registry orig-registry)
+          (registry/restore! orig-registry)
           (reset! server/agent-handlers orig-handlers)
           (reset! server/server-state orig-server))))))
 

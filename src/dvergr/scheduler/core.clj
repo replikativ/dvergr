@@ -30,10 +30,32 @@
   (some-> (requiring-resolve 'dvergr.daemon/current-daemon) deref deref))
 
 ;; ============================================================================
-;; State
+;; State (ctx-scoped)
+;;
+;; Active schedules live on the current spindel execution-context under
+;; `[:dvergr/schedules]` as `{schedule-id -> {:spin spin :config map}}`.
+;; The daemon binds its ctx around create/cancel; the schedule-loop spin
+;; runs in that same ctx so `(get-active schedule-id)` finds itself.
+;; Tests and sidecars get isolated schedule tables for free.
 ;; ============================================================================
 
-(defonce active-schedules (atom {}))  ; {schedule-id -> {:spin spin :config map}}
+(def ^:private path [:dvergr/schedules])
+
+(defn- current-ctx-or-nil []
+  (try (rtc/current-execution-context)
+       (catch Throwable _ nil)))
+
+(defn- all-active []
+  (if (current-ctx-or-nil)
+    (or (rtc/get-state path) {})
+    {}))
+
+(defn- get-active [schedule-id]
+  (get (all-active) schedule-id))
+
+(defn- swap-active! [f & args]
+  (when (current-ctx-or-nil)
+    (rtc/swap-state! path (fn [m] (apply f (or m {}) args)))))
 
 ;; ============================================================================
 ;; Datahike Persistence
@@ -141,7 +163,7 @@
       (when db-conn
         (update-last-run! db-conn (:id config)))
       ;; Check if still active
-      (when (get @active-schedules (:id config))
+      (when (get-active (:id config))
         (recur)))))
 
 ;; ============================================================================
@@ -201,8 +223,8 @@
                      (.flush *err*))))))
 
     ;; Track in active-schedules (store db-conn for cancel-schedule! to deactivate)
-    (swap! active-schedules assoc schedule-id
-           {:spin nil :config full-config :db-conn db-conn})
+    (swap-active! assoc schedule-id
+                  {:spin nil :config full-config :db-conn db-conn})
 
     (println "[scheduler] Created schedule:" schedule-id
              "- every" (/ interval-ms 60000.0) "min →" (name agent-id))
@@ -211,10 +233,10 @@
 (defn cancel-schedule!
   "Cancel an active schedule and mark it inactive in datahike."
   [schedule-id]
-  (when-let [entry (get @active-schedules schedule-id)]
+  (when-let [entry (get-active schedule-id)]
     (when-let [db-conn (:db-conn entry)]
       (deactivate-schedule! db-conn schedule-id))
-    (swap! active-schedules dissoc schedule-id)
+    (swap-active! dissoc schedule-id)
     (println "[scheduler] Cancelled schedule:" schedule-id)
     :cancelled))
 
@@ -223,16 +245,27 @@
   []
   (mapv (fn [[id {:keys [config]}]]
           (assoc config :id id))
-        @active-schedules))
+        (all-active)))
 
 (defn cancel-all!
-  "Cancel all active schedules. Called during daemon shutdown."
+  "Cancel all active schedules on the current ctx. Called during daemon shutdown."
   []
-  (let [ids (keys @active-schedules)]
+  (let [ids (keys (all-active))]
     (doseq [id ids]
       (cancel-schedule! id))
     (println "[scheduler] Cancelled" (count ids) "schedule(s)")
     (count ids)))
+
+(defn snapshot
+  "Return the live schedule table — tests / debugging."
+  []
+  (all-active))
+
+(defn restore!
+  "Replace the schedule table on the current ctx — tests."
+  [m]
+  (swap-active! (constantly (or m {})))
+  nil)
 
 (defn restore-schedules!
   "Restore active schedules from datahike after daemon restart."

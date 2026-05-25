@@ -1,19 +1,25 @@
 (ns dvergr.registry-test
   "Tests for the agent registry."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
-            [dvergr.registry :as reg]))
+            [dvergr.registry :as reg]
+            [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.engine.context :as ectx]))
 
 ;; ============================================================================
 ;; Fixtures
+;;
+;; Registry entries live on the current spindel execution-context. Each
+;; test runs in a fresh ctx so registrations don't bleed across tests.
 ;; ============================================================================
 
 (use-fixtures :each
   (fn [f]
-    (let [orig @reg/registry]
+    (let [ctx (ectx/create-execution-context)]
       (try
-        (f)
+        (binding [ec/*execution-context* ctx]
+          (f))
         (finally
-          (reset! reg/registry orig))))))
+          (ectx/stop-context! ctx))))))
 
 ;; ============================================================================
 ;; Mock agent

@@ -3,23 +3,30 @@
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [dvergr.scheduler.core :as scheduler]
             [dvergr.registry :as registry]
-            [dvergr.tools :as tools]))
+            [dvergr.tools :as tools]
+            [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.engine.context :as ectx]))
 
 ;; ============================================================================
 ;; Fixtures
+;;
+;; Active schedules live on the current spindel execution-context — each
+;; test runs in its own fresh ctx so schedule tables don't bleed
+;; between tests. registry is still defonce; snapshot it the old way.
 ;; ============================================================================
 
 (use-fixtures :each
   (fn [f]
-    (let [orig-schedules @scheduler/active-schedules
-          orig-registry @registry/registry]
+    (let [ctx (ectx/create-execution-context)
+          orig-registry (registry/snapshot)]
       (try
-        (f)
+        (binding [ec/*execution-context* ctx]
+          (f))
         (finally
-          ;; Cancel any schedules created during test
-          (scheduler/cancel-all!)
-          (reset! scheduler/active-schedules orig-schedules)
-          (reset! registry/registry orig-registry))))))
+          (binding [ec/*execution-context* ctx]
+            (try (scheduler/cancel-all!) (catch Exception _)))
+          (ectx/stop-context! ctx)
+          (registry/restore! orig-registry))))))
 
 ;; ============================================================================
 ;; Tests
