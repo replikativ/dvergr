@@ -484,19 +484,30 @@
    The db-atom should be an atom containing the current db value,
    updated by the caller when db changes."
   [sci-ctx db-atom]
-  (let [;; Wrap functions to use db-atom
+  (let [;; Accept canonical calls (with explicit DB as first arg) AND
+        ;; the sugared form (auto-uses session db). LLMs default to the
+        ;; canonical shape from their training; auto-prepending @db-atom
+        ;; in that case dispatches the multimethod on the wrong arg
+        ;; (a DB value instead of the index keyword) and fails opaquely.
+        db? (fn [x] (instance? datahike.db.DB x))
         q-fn (fn [query & args]
-               (apply dh/q query @db-atom args))
-        pull-fn (fn [pattern eid]
-                  (dh/pull @db-atom pattern eid))
-        pull-many-fn (fn [pattern eids]
-                       (dh/pull-many @db-atom pattern eids))
-        entity-fn (fn [eid]
-                    (dh/entity @db-atom eid))
-        datoms-fn (fn [index & components]
-                    (apply dh/datoms @db-atom index components))
-        schema-fn (fn []
-                    (dh/schema @db-atom))
+               ;; (q query db & inputs) OR (q query & inputs) — auto-add db
+               ;; only when the first input isn't already one.
+               (if (and (seq args) (db? (first args)))
+                 (apply dh/q query args)
+                 (apply dh/q query @db-atom args)))
+        pull-fn (fn [a b & [c]]
+                  (if (db? a) (dh/pull a b c) (dh/pull @db-atom a b)))
+        pull-many-fn (fn [a b & [c]]
+                       (if (db? a) (dh/pull-many a b c) (dh/pull-many @db-atom a b)))
+        entity-fn (fn [a & [b]]
+                    (if (db? a) (dh/entity a b) (dh/entity @db-atom a)))
+        datoms-fn (fn [a & rest]
+                    (if (db? a)
+                      (apply dh/datoms a rest)
+                      (apply dh/datoms @db-atom a rest)))
+        schema-fn (fn ([] (dh/schema @db-atom))
+                      ([db] (dh/schema db)))
         db-fn (fn [] @db-atom)]
 
     (sci/add-namespace! sci-ctx 'dh

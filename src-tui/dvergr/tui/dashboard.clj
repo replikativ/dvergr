@@ -190,7 +190,30 @@
   [msg]
   (cond-> msg
     (and (nil? (:role msg))    (:message/role msg))    (assoc :role    (:message/role msg))
-    (and (nil? (:content msg)) (:message/content msg)) (assoc :content (:message/content msg))))
+    (and (nil? (:content msg)) (:message/content msg)) (assoc :content (:message/content msg))
+    (and (nil? (:tool-uses msg)) (:message/tool-uses msg))
+    (assoc :tool-uses (:message/tool-uses msg))))
+
+(defn- render-tool-use
+  "Render an assistant's tool *call* (the code/input the agent ran)."
+  [tu inner-width]
+  (let [tname (or (:tool-use/name tu) (:name tu))
+        input (or (:tool-use/input tu) (:input tu))
+        ;; For clojure_eval, the interesting payload is :code.
+        body  (cond
+                (and (map? input) (:tool-input.clojure-eval/code input))
+                (:tool-input.clojure-eval/code input)
+                (and (map? input) (:code input))   (:code input)
+                (map? input)                       (pr-str input)
+                :else                              (str input))
+        header (s/render (s/style :fg s/yellow :bold true)
+                         (str "  → " tname))
+        code-lines (mapcat (fn [l]
+                             (map #(s/render (s/style :fg (s/ansi256 244))
+                                             (str "    " %))
+                                  (wrap-text l (- inner-width 4))))
+                           (str/split-lines (str body)))]
+    (concat [header] code-lines)))
 
 (defn- render-message
   "Render a single history entry into lines.
@@ -232,20 +255,46 @@
                                (str/split-lines preview))]
       (concat [header] result-lines [""]))
 
-    ;; Default: plain chat message (:role :user / :assistant / :system)
-    (let [role     (:role msg)
-          content  (or (:content msg) "")
-          role-str (case role
-                     :user      (s/render (s/style :fg s/green :bold true) "You")
-                     :assistant (s/render (s/style :fg s/cyan :bold true) "Agent")
-                     (s/render (s/style :fg (s/ansi256 240)) (name (or role :unknown))))
-          rendered (if (= role :assistant)
-                     (try (md/render-inline content)
-                          (catch Exception _ content))
-                     content)
-          text-lines (str/split-lines rendered)
-          wrapped    (mapcat #(wrap-text % (- inner-width 2)) text-lines)]
-      (concat [(str role-str ":")] (map #(str "  " %) wrapped) [""])))))
+    ;; Tool result row (chat-ctx records each result as a separate
+    ;; `:role :tool-result` message — render distinctly so the user can
+    ;; see what came back from a previous `→ tool` call).
+    (if (= :tool-result (:role msg))
+      (let [content (or (:content msg) "")
+            ;; Cap at ~600 chars; full result is in the db if needed.
+            preview (if (> (count content) 600)
+                      (str (subs content 0 597) "...")
+                      content)
+            header  (s/render (s/style :fg s/magenta) "  ← result")
+            result-lines (mapcat (fn [l]
+                                   (map #(s/render (s/style :fg (s/ansi256 245))
+                                                   (str "    " %))
+                                        (wrap-text l (- inner-width 4))))
+                                 (str/split-lines preview))]
+        (concat [header] result-lines [""]))
+
+      ;; Default: plain chat message (:role :user / :assistant / :system).
+      ;; If the assistant carries :tool-uses, render the code it ran
+      ;; underneath the text content.
+      (let [role     (:role msg)
+            content  (or (:content msg) "")
+            role-str (case role
+                       :user      (s/render (s/style :fg s/green :bold true) "You")
+                       :assistant (s/render (s/style :fg s/cyan :bold true) "Agent")
+                       (s/render (s/style :fg (s/ansi256 240)) (name (or role :unknown))))
+            rendered (if (= role :assistant)
+                       (try (md/render-inline content)
+                            (catch Exception _ content))
+                       content)
+            text-lines (cond->> (str/split-lines rendered)
+                         (str/blank? content) (constantly []))
+            wrapped    (mapcat #(wrap-text % (- inner-width 2)) text-lines)
+            tu-lines   (when (= role :assistant)
+                         (mapcat #(render-tool-use % inner-width)
+                                 (:tool-uses msg)))]
+        (concat [(str role-str ":")]
+                (map #(str "  " %) wrapped)
+                tu-lines
+                [""]))))))
 
 (defn- chat-view
   "Render the chat view.
