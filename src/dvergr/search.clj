@@ -40,6 +40,30 @@
 ;; Lifecycle
 ;; ============================================================================
 
+(defn- open-or-create
+  "Try `(sc/open-branch …)` (or `create-index` if no branch yet). On
+   LockObtainFailedException — typically a stale lock from a prior
+   process that didn't shut down cleanly — delete the lock and retry
+   once. If a real running process holds the lock, it'll re-create it
+   on the next index write and the retry will fail again, surfacing
+   the underlying error."
+  [index-path]
+  (let [open-fn
+        (fn []
+          (let [branches (try (sc/discover-branches index-path) (catch Exception _ nil))]
+            (if (and branches (contains? branches "main"))
+              (sc/open-branch index-path "main" {:analyzer analyzer})
+              (sc/create-index index-path "main" {:analyzer analyzer}))))]
+    (try (open-fn)
+         (catch org.apache.lucene.store.LockObtainFailedException _
+           (let [lock-file (java.io.File. ^String index-path "main_write.lock")]
+             (when (.exists lock-file)
+               (tel/log! {:level :warn :id :search/stale-lock-cleared
+                          :data {:path (.getPath lock-file)}}
+                         "Stale Lucene lock — removing and retrying")
+               (.delete lock-file)))
+           (open-fn)))))
+
 (defn init!
   "Open or create the search index at `index-path`. Starts a background
    commit scheduler that flushes every 30 seconds.
@@ -47,10 +71,7 @@
    Safe to call repeatedly — no-ops if already initialized."
   [index-path]
   (when-not @writer-a
-    (let [branches (try (sc/discover-branches index-path) (catch Exception _ nil))
-          w (if (and branches (contains? branches "main"))
-              (sc/open-branch index-path "main" {:analyzer analyzer})
-              (sc/create-index index-path "main" {:analyzer analyzer}))
+    (let [w (open-or-create index-path)
           sched (Executors/newSingleThreadScheduledExecutor)]
       (reset! writer-a w)
       (reset! pending-count 0)

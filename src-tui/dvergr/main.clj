@@ -22,7 +22,19 @@
                      7888)]
 
     ;; 1. Start nREPL — announce port before log file takes over
-    (let [nrepl-server (start-nrepl! nrepl-port)]
+    (let [nrepl-server (start-nrepl! nrepl-port)
+          d-ref        (atom nil)
+          ;; Shutdown hook covers SIGTERM / hard kill / IDE stop — the
+          ;; try/finally below only runs on a clean :quit from the TUI.
+          ;; Without this, a hard exit leaves the Lucene write.lock on
+          ;; disk and the next `clj -M:dashboard` fails at start.
+          shutdown-hook
+          (Thread.
+            (fn []
+              (when-let [d @d-ref]
+                (try (daemon/stop! d) (catch Throwable _)))
+              (try (nrepl/stop-server nrepl-server) (catch Throwable _))))]
+      (.addShutdownHook (Runtime/getRuntime) shutdown-hook)
       (println (str "[main] Logging to " dvergr-log/default-log-file
                     "  (tail -f " dvergr-log/default-log-file ")"))
       (flush)
@@ -32,10 +44,14 @@
 
         ;; 3. Start daemon from config.local.edn
         (let [d (daemon/start-from-config!)]
+          (reset! d-ref d)
           (try
             ;; 4. Start TUI dashboard (blocks main thread)
             (dashboard/run d)
             (finally
-              (daemon/stop! d))))
+              (daemon/stop! d)
+              (reset! d-ref nil))))
         (finally
+          (try (.removeShutdownHook (Runtime/getRuntime) shutdown-hook)
+               (catch Throwable _))
           (nrepl/stop-server nrepl-server))))))

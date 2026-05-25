@@ -818,45 +818,29 @@
 ;; ============================================================================
 
 (defn- system-receiver
-  "Inert Participant that just collects messages on its inbox — never
-   replies. Joined into the daemon room at start time."
-  []
+  "Participant that drains every agent reply addressed to `:_system` and
+   fans the text to every registered response sink. The fan-out lives
+   directly inside `on-message` because dvergr.discourse/join already
+   spawns a single drain spin per participant — adding a second
+   watcher-spin on the same inbox-mbx would race for each message and
+   only ~half would reach the sinks.
+
+   Returns `(spin nil)` so the participant emits no reply of its own."
+  [daemon]
   (d/participant
     {:id system-id
-     :on-message (fn [_p _msg] (spin nil))}))
-
-(defn- start-system-watcher!
-  "Spawn a single spin that awaits the system participant's inbox and
-   fans each delivered reply to all response sinks. Stores the resulting
-   future in `(:system-watcher daemon)` for shutdown."
-  [daemon]
-  (let [exec-ctx  (:execution-ctx daemon)
-        room      (:discourse-room daemon)
-        sys-p     (get @(:participants room) system-id)]
-    (binding [rtc/*execution-context* exec-ctx]
-      (let [watcher-spin
-            (spin
-              (loop []
-                (when-not (contains? #{:stopping :stopped} @(:status daemon))
-                  ;; Joined participants have `:inbox-mbx` (merge mailbox of
-                  ;; all their bus subscriptions) — `:inbox` was the legacy
-                  ;; pre-discourse field and is nil today.
-                  (let [msg      (await (:inbox-mbx sys-p))
-                        agent-id (:from msg)
-                        text     (:content msg)]
-                    (doseq [sink @(:response-sinks daemon)]
-                      (try (sink agent-id text)
-                           (catch Exception e
-                             (tel/log! {:level :error :id :daemon/sink-error
-                                        :data {:agent-id agent-id
-                                               :error (.getMessage e)}}
-                                       "Sink error"))))
-                    (recur)))))]
-        (watcher-spin
-          (fn [_] (tel/log! {:id :daemon/watcher-exited} "System watcher exited"))
-          (fn [e] (tel/log! {:level :error :id :daemon/watcher-error
-                             :data {:error (str e)}} "System watcher error")))
-        (reset! (:system-watcher daemon) (future @watcher-spin))))))
+     :on-message
+     (fn [_p msg]
+       (let [agent-id (:from msg)
+             text     (:content msg)]
+         (doseq [sink @(:response-sinks daemon)]
+           (try (sink agent-id text)
+                (catch Exception e
+                  (tel/log! {:level :error :id :daemon/sink-error
+                             :data {:agent-id agent-id
+                                    :error (.getMessage e)}}
+                            "Sink error")))))
+       (spin nil))}))
 
 ;; ============================================================================
 ;; Agent Creation
@@ -1110,8 +1094,7 @@
         daemon         (->Daemon config exec-ctx discourse-room
                                  nil nil (atom nil) (atom []) status-a)]
     (binding [rtc/*execution-context* exec-ctx]
-      (d/join discourse-room (system-receiver)))
-    (start-system-watcher! daemon)
+      (d/join discourse-room (system-receiver daemon)))
 
     ;; Register execution context for distributed addressing
     (sdist/register-context! :default exec-ctx)
