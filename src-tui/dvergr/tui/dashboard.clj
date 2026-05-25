@@ -6,7 +6,10 @@
    - :chat     — Chat with a selected agent (scrollable, markdown)
    - :sessions — List active sessions
 
-   Signals drive the state; the daemon's response sink pushes to :history."
+   The session's chat-ctx :messages-signal is the single source of truth
+   for chat history — the view derefs it directly each render. The daemon
+   writes user/tool/assistant messages there during a turn; the response
+   sink only flips :status back to :idle to trigger a re-render."
   (:require [org.replikativ.spindel-tui.tui :as tui]
             [org.replikativ.spindel-tui.style.core :as s]
             [org.replikativ.spindel-tui.style.width :as w]
@@ -180,10 +183,21 @@
             (recur (str/trim (subs remaining break-at))
                    (conj lines (subs remaining 0 break-at)))))))))
 
+(defn- normalize-msg
+  "Normalize a message entry from either the chat-ctx (namespaced
+   `:message/*` keys) or in-flight TUI-side (un-namespaced) into a
+   single shape the renderer can dispatch on."
+  [msg]
+  (cond-> msg
+    (and (nil? (:role msg))    (:message/role msg))    (assoc :role    (:message/role msg))
+    (and (nil? (:content msg)) (:message/content msg)) (assoc :content (:message/content msg))))
+
 (defn- render-message
   "Render a single history entry into lines.
-   Handles :type :repl, :type :tool, and plain {:role ...} chat messages."
+   Handles :type :repl, :type :tool, and plain {:role ...} chat messages.
+   Accepts both raw and chat-ctx-normalized message shapes."
   [msg inner-width]
+  (let [msg (normalize-msg msg)]
   (case (:type msg)
     ;; REPL evaluation entry
     :repl
@@ -231,15 +245,19 @@
                      content)
           text-lines (str/split-lines rendered)
           wrapped    (mapcat #(wrap-text % (- inner-width 2)) text-lines)]
-      (concat [(str role-str ":")] (map #(str "  " %) wrapped) [""]))))
+      (concat [(str role-str ":")] (map #(str "  " %) wrapped) [""])))))
 
 (defn- chat-view
-  "Render the chat view."
+  "Render the chat view.
+
+   The chat-ctx's :messages-signal is the source of truth — derefed each
+   render via `chat-ctx/get-messages` (which binds the chat-ctx's own
+   spindel context internally)."
   [signals width height]
   (let [agent-id @(:selected-agent signals)
-        history @(:history signals)
+        cctx @(:chat-ctx signals)
+        history (if cctx (chat-ctx/get-messages cctx) [])
         input-state @(:input signals)
-        streaming @(:streaming signals)
         spinner-state @(:spinner signals)
         scroll @(:scroll signals)
         inner-w (- width 4)
@@ -248,13 +266,6 @@
 
         ;; Render all messages
         msg-lines (vec (mapcat #(render-message % inner-w) history))
-
-        ;; Add streaming indicator if active
-        msg-lines (if (and streaming (not (str/blank? streaming)))
-                    (conj msg-lines
-                          (str (s/render (s/style :fg s/cyan :bold true) "Agent") ":")
-                          (str "  " streaming))
-                    msg-lines)
 
         ;; Calculate visible area (leave room for header, input, help, footer)
         available-h (- height 7)
@@ -376,13 +387,19 @@
           (or (= key "k") (= key :up))
           (swap! (:selected-idx signals) #(max 0 (dec %)))
 
-          ;; Select agent and switch to chat
+          ;; Select agent and switch to chat. Eagerly create the
+          ;; session so its chat-ctx (with :messages-signal) exists
+          ;; before the user sends — the view derefs that signal as
+          ;; the source of truth for chat history.
           (= key "enter")
           (when (pos? agent-count)
             (let [idx @(:selected-idx signals)
-                  agent-id (:id (nth agents idx))]
+                  agent-id (:id (nth agents idx))
+                  session (sessions/get-or-create-session!
+                            :tui agent-id {:username "local"})]
               (reset! (:selected-agent signals) agent-id)
-              (reset! (:history signals) [])
+              (reset! (:chat-ctx signals) (:chat-ctx session))
+              (reset! (:status signals) :idle)
               (reset! (:scroll signals) 0)
               (reset! (:view-mode signals) :chat)))))
 
@@ -401,35 +418,37 @@
         (= key "ctrl+d")
         (swap! (:scroll signals) #(+ % 5))
 
-        ;; Send message or eval expression
+        ;; Send message or eval expression.
+        ;;
+        ;; All output (user msgs, REPL evals, assistant replies) flows
+        ;; through the session's chat-ctx — the view picks it up via
+        ;; (:messages-signal chat-ctx). The :status flip drives the
+        ;; spinner AND triggers a TUI re-render via signal-values.
         (= key "enter")
-        (let [val (ti/value @(:input signals))]
-          (when (and (not (str/blank? val))
-                     @(:selected-agent signals))
+        (let [val (ti/value @(:input signals))
+              cctx @(:chat-ctx signals)]
+          (when (and (not (str/blank? val)) cctx)
             (swap! (:input signals) ti/reset)
             (reset! (:scroll signals) 0)
             (case (detect-input-type val)
-              ;; REPL expression — eval locally, inject result into chat context
+              ;; REPL expression — eval locally and record the
+              ;; outcome as a :system message in chat-ctx so the
+              ;; agent can reference it on the next turn. (The
+              ;; chat-ctx schema only persists role+content, so we
+              ;; encode the eval transcript as text.)
               :repl
               (let [{:keys [result error output]} (eval-clojure val)
-                    repl-entry {:type   :repl
-                                :input  val
-                                :output (or result error)
-                                :stdout output
-                                :error? (boolean error)}
-                    repl-str   (str "REPL> " val "\n"
-                                    (when output (str output "\n"))
-                                    (if error (str "Error: " error) (str "=> " result)))]
-                (swap! (:history signals) conj repl-entry)
-                ;; Inject into session chat-ctx so the agent is aware of the eval
-                (when-let [session (sessions/get-session :tui)]
-                  (binding [ec/*execution-context* (:execution-ctx daemon)]
-                    (chat-ctx/add-message! (:chat-ctx session)
-                                           {:role :system :content repl-str}))))
+                    body (str "REPL> " val "\n"
+                              (when output (str output "\n"))
+                              (if error
+                                (str "Error: " error)
+                                (str "=> " result)))]
+                (chat-ctx/add-message! cctx {:role :system :content body}))
 
-              ;; Chat message — dispatch to agent
+              ;; Chat message — daemon writes user + assistant turns
+              ;; into the session's chat-ctx. We just flip the spinner
+              ;; and dispatch.
               (do
-                (swap! (:history signals) conj {:role :user :content val})
                 (reset! (:status signals) :running)
                 (daemon/dispatch! daemon
                   {:chat-id :tui
@@ -450,48 +469,38 @@
 (defn run
   "Start the TUI dashboard, blocking the current thread.
 
-   The daemon must already be started. The dashboard registers a response
-   sink to receive agent output."
-  [daemon]
-  (let [tui-ctx-atom (atom nil)]
-    ;; Register response sink that pushes to TUI signals
-    (daemon/register-response-sink! daemon
-      (fn [agent-id text]
-        (when-let [ctx-map @tui-ctx-atom]
-          (let [{:keys [history streaming status selected-agent tui-ctx]} ctx-map]
-            ;; Must bind TUI's execution context — SignalRef reads/writes are context-specific
-            (when tui-ctx
-              (binding [ec/*execution-context* tui-ctx]
-                (when (= agent-id @selected-agent)
-                  (swap! history conj {:role :assistant :content text})
-                  (reset! streaming "")
-                  (reset! status :idle))))))))
+   The daemon must already be started. We share the daemon's execution
+   context so registry/sessions/stats lookups read the same ctx the
+   daemon writes to.
 
-    ;; Start the TUI (blocks). Share the daemon's execution-context so
-    ;; the view fn's `(registry/list-agents)`, `(sessions/list-sessions)`,
-    ;; `(stats/get-stats …)` etc. read from the same ctx the daemon
-    ;; writes to. Without this, the TUI runs on its own fresh ctx and
-    ;; every registry/sessions lookup returns empty.
+   Re-render trigger: the chat-ctx's :messages-signal isn't in the TUI
+   signal-map, so changes there don't directly tick the render loop.
+   The :status signal is — flipping it back to :idle from the response
+   sink forces signal-values to differ, which makes the loop re-render
+   and pull fresh messages from chat-ctx."
+  [daemon]
+  (let [status-ref-atom (atom nil)]
+    ;; Response sink: just flip status → triggers re-render; the
+    ;; assistant's content is already in chat-ctx by the time we get here.
+    (daemon/register-response-sink! daemon
+      (fn [_agent-id _text]
+        (when-let [status-ref @status-ref-atom]
+          (binding [ec/*execution-context* (:execution-ctx daemon)]
+            (reset! status-ref :idle)))))
+
     (tui/start!
       {:execution-context (:execution-ctx daemon)
        :signals {:view-mode      :agents
                  :selected-idx   0
                  :selected-agent nil
-                 :history        []
+                 :chat-ctx       nil
                  :input          (ti/text-input-state :prompt "" :placeholder "Message agent...")
                  :scroll         0
                  :status         :idle
-                 :streaming      ""
                  :spinner        (spinner/spinner-state :dots :label "Thinking...")}
        :view (fn [signals width height]
-               ;; Capture signal refs + TUI execution context on first render
-               (when (nil? @tui-ctx-atom)
-                 (reset! tui-ctx-atom
-                         {:history        (:history signals)
-                          :streaming      (:streaming signals)
-                          :status         (:status signals)
-                          :selected-agent (:selected-agent signals)
-                          :tui-ctx        (:tui-ctx signals)}))  ; execution context for cross-thread updates
+               (when (nil? @status-ref-atom)
+                 (reset! status-ref-atom (:status signals)))
                ;; Tick spinner when running
                (when (= :running @(:status signals))
                  (swap! (:spinner signals) spinner/tick))
