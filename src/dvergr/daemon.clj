@@ -304,7 +304,10 @@
 ;; ============================================================================
 
 (defn- chat-tools
-  "Return tool map for chat mode: knowledge graph + URL ingestion + cheap LLM."
+  "Return tool map for chat mode: knowledge graph + URL ingestion + cheap LLM.
+
+   Web search isn't here as a tool — agents reach it via
+   (intake.web/search …) under clojure_eval."
   []
   (select-keys @tools/registry
                ["knowledge_search" "knowledge_add"
@@ -313,15 +316,15 @@
 
 (defn- huginn-tools
   "Return tool map for Huginn (code-first intake monitor).
-   Huginn uses clojure_eval + intake SCI namespaces for research,
-   knowledge tools for storage, llm_call for summarization,
-   web_fetch/web_search for direct research, and mail tools for inbox."
+   Huginn uses clojure_eval + intake SCI namespaces for research
+   (intake.web/search, intake.web/fetch, intake.hn/search, …),
+   knowledge tools for storage, llm_call for summarization, and
+   mail tools for inbox."
   []
   (select-keys @tools/registry
                ["clojure_eval"
                 "knowledge_search" "knowledge_add"
                 "llm_call"
-                "web_fetch" "web_search"
                 "mail_sync" "mail_inbox" "mail_read" "mail_search"
                 "propose_change" "fulltext_search"]))
 
@@ -417,11 +420,11 @@
       (and intake? (nil? task-type) (map? task) (:content task))
       (str (:content task)
            "\n\n---\n"
-           "This is an interactive research request. You MUST use your tools "
-           "(knowledge_search, web_search, web_fetch, etc.) to research this "
-           "thoroughly RIGHT NOW. Do NOT just acknowledge or say you'll work on it — "
-           "actually call the tools, gather information, and provide a detailed, "
-           "well-sourced answer with URLs.")
+           "This is an interactive research request. Do the research RIGHT NOW — "
+           "do not just acknowledge or describe what you would do. Run "
+           "clojure_eval with the intake namespaces ((intake.web/search …), "
+           "(intake.web/fetch …), (intake.hn/search …), etc.) plus knowledge_search "
+           "and produce a detailed, well-sourced answer with URLs.")
 
       (string? task) task
       :else (or (:content task) ""))))
@@ -786,9 +789,9 @@
                                     (chat-ctx/add-message! chat-ctx
                                       {:role :user
                                        :content (str "You did NOT use any tools. This is a research request — "
-                                                     "you MUST call tools like knowledge_search, web_search, "
-                                                     "or web_fetch to actually research this topic. "
-                                                     "Do not just describe what you would do — do it now.")})
+                                                     "run clojure_eval with (intake.web/search …), "
+                                                     "(intake.web/fetch …), or call knowledge_search to actually "
+                                                     "research the topic. Do not just describe what you would do — do it now.")})
                                     (recur (inc turn)))
 
                                 ;; Done — extract summary, maybe fire evaluator

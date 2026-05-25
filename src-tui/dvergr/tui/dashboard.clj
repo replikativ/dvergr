@@ -271,12 +271,20 @@
         available-h (- height 7)
         total-lines (count msg-lines)
 
-        ;; Auto-scroll to bottom unless user scrolled up
-        effective-scroll (if (zero? scroll)
-                           (max 0 (- total-lines available-h))
-                           scroll)
+        ;; `scroll` = lines back from the bottom. 0 → newest (autoscroll
+        ;; tail); page_up grows it (toward older history); page_down
+        ;; shrinks toward 0. Clamp on display so an over-pressed PageUp
+        ;; doesn't carry phantom value back through PageDown.
+        max-scroll (max 0 (- total-lines available-h))
+        effective-scroll (max 0 (min scroll max-scroll))
+        ;; Keep the signal in sync so on-key sees the clamped value —
+        ;; otherwise over-pressed PageUps build up as phantom history
+        ;; the user has to PageDown back through later.
+        _ (when (not= scroll effective-scroll)
+            (reset! (:scroll signals) effective-scroll))
+        offset (- max-scroll effective-scroll)
         visible-lines (->> msg-lines
-                           (drop effective-scroll)
+                           (drop offset)
                            (take available-h))
         padded-count (max 0 (- available-h (count visible-lines)))
 
@@ -405,18 +413,20 @@
 
       (= mode :chat)
       (cond
-        ;; Scroll
+        ;; Scroll. `scroll` = lines back from the bottom; page_up moves
+        ;; further into history, page_down moves toward newest. The view
+        ;; clamps to [0, max-scroll] on display.
         (= key "page_up")
-        (swap! (:scroll signals) #(max 0 (- % 10)))
+        (swap! (:scroll signals) + 10)
 
         (= key "page_down")
-        (swap! (:scroll signals) #(+ % 10))
+        (swap! (:scroll signals) #(max 0 (- % 10)))
 
         (= key "ctrl+u")
-        (swap! (:scroll signals) #(max 0 (- % 5)))
+        (swap! (:scroll signals) + 5)
 
         (= key "ctrl+d")
-        (swap! (:scroll signals) #(+ % 5))
+        (swap! (:scroll signals) #(max 0 (- % 5)))
 
         ;; Send message or eval expression.
         ;;

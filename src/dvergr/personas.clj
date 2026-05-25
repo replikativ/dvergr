@@ -101,7 +101,8 @@
    Defaults:
      :id         :researcher
      :model      claude-sonnet-4-5 (Anthropic)
-     :tools      read-only: read_file, glob, grep, code_query, web_search
+     :tools      read-only code-query tools + clojure_eval (for web
+                 search/fetch via intake.web/*)
      :isolation  :native (trusted — no code mutation)
    Override any of these in `opts` (same shape as `llm-agent`)."
   ([] (researcher {}))
@@ -109,7 +110,7 @@
    (build-persona {:id                :researcher
                    :prompt-file       "researcher.md"
                    :default-tools     #{:read-file :glob :grep
-                                        :code-query :web-search}
+                                        :code-query :clojure-eval}
                    :default-isolation :native
                    :default-model     "claude-sonnet-4-5"
                    :default-provider  :anthropic}

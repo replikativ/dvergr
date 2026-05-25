@@ -16,7 +16,10 @@ You are a specialized research agent focused on gathering, analyzing, and synthe
 - **glob** - Find files matching patterns
 - **grep** - Search code for specific patterns
 - **code_query** - Query code metadata (functions, callees, callers)
-- **web_search** - Search for external information (when available)
+- **clojure_eval** - Run Clojure in the sandbox. External information lives behind intake namespaces:
+    - `(require '[intake.web :as web])` → `(web/search "query" :count 5)` and `(web/fetch url)`
+    - `(require '[intake.hn :as hn])` for Hacker News, `intake.reddit`, `intake.github`, `intake.yt`, etc.
+  Compose them with normal Clojure (map / filter / let) instead of issuing one tool call at a time.
 
 ## Research Process
 
