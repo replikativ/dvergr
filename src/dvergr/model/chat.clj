@@ -277,11 +277,23 @@
       (let [{:keys [events close!]} (stream-chat provider model-def messages opts)
             on-text (:on-text opts)
             on-event (:on-event opts)
+            ;; :cancel? - optional 0-arity predicate. Polled before each
+            ;; SSE event; once true we close! the reader (kills the
+            ;; underlying socket — Anthropic/Fireworks stop generating
+            ;; billed tokens) and throw an explicit
+            ;; CancellationException so the turn-loop catcher can bail
+            ;; out instead of returning a half-baked response.
+            cancel? (:cancel? opts)
             api-type (p/api-type provider)]
         (try
           (let [final-state
                 (reduce
                   (fn [state event]
+                    (when (and cancel? (cancel?))
+                      (close!)
+                      (throw (java.util.concurrent.CancellationException.
+                               "LLM call cancelled")))
+
                     ;; Call event callback
                     (when on-event (on-event event))
 

@@ -277,7 +277,7 @@
    - :continue if more turns needed (tool calls made)
    - :complete if agent is done (no tool calls)
    - :error if something failed"
-  [chat-ctx {:keys [provider model tools tool-ctx on-text auto-compact? compaction-model turn-number]
+  [chat-ctx {:keys [provider model tools tool-ctx on-text auto-compact? compaction-model turn-number cancel?]
              :or {auto-compact? true}}]
   (try
     ;; Check for automatic compaction before turn
@@ -299,7 +299,9 @@
                               :turn turn-number}}
                       "LLM call starting")
 
-          ;; Call LLM using new model abstraction
+          ;; Call LLM using new model abstraction. :cancel? is polled
+          ;; per SSE event inside model-chat/chat so Esc closes the
+          ;; socket mid-stream and stops billed-token generation.
           response (model-chat/chat
                     api-messages
                     {:model model
@@ -307,7 +309,8 @@
                      :tools (if tools
                               (tools/tool-definitions tools)
                               (tools/tool-definitions))
-                     :on-text (or on-text (fn [_]))})
+                     :on-text (or on-text (fn [_]))
+                     :cancel? cancel?})
 
           ;; Extract from new response format
           {:keys [content tool-calls usage stop-reason]} response
@@ -361,17 +364,30 @@
                            :data {:tools (mapv :name tool-calls)
                                   :turn turn-number}}
                           "Executing tools")
-              ;; Use passed tool-ctx or create default
-              ctx (or tool-ctx
-                      (tools/make-context {:cwd (System/getProperty "user.dir")}))
+              ;; Use passed tool-ctx or create default. Thread cancel?
+              ;; through so individual tools (clojure_eval, future shell)
+              ;; can short-circuit; we also check between tools.
+              ctx (or (some-> tool-ctx (assoc :cancel? cancel?))
+                      (tools/make-context {:cwd (System/getProperty "user.dir")
+                                           :cancel? cancel?}))
 
-              ;; Execute tools with individual timing and create analytics entities
-              results (mapv (fn [{:keys [id name input] :as tc}]
+              ;; Execute tools sequentially. Reduce instead of mapv so a
+              ;; mid-batch cancel stops dispatching further calls — any
+              ;; remaining tools get a synthetic :cancelled result so the
+              ;; LLM history stays coherent (one result per tool_use_id).
+              results (reduce
+                        (fn [acc {:keys [id name input]}]
+                          (let [cancelled? (and cancel? (cancel?))]
+                            (if cancelled?
+                              (conj acc {:id id
+                                         :result {:type :error
+                                                  :content "[cancelled before execution]"
+                                                  :error "cancelled"}
+                                         :duration-ms 0})
                               (let [start-time (System/currentTimeMillis)
                                     result (tools/execute name input ctx)
                                     duration-ms (- (System/currentTimeMillis) start-time)
                                     error? (= :error (:type result))]
-                                ;; Persist tool-call analytics entity
                                 (when-let [conn (:db-conn chat-ctx)]
                                   (try
                                     (dh/transact conn
@@ -388,8 +404,9 @@
                                     (catch Exception e
                                       (tel/log! {:level :warn :id :agent/tool-call-persist-error :error e}
                                                 "Failed to persist tool-call analytics"))))
-                                {:id id :result result :duration-ms duration-ms}))
-                            tool-calls)
+                                (conj acc {:id id :result result :duration-ms duration-ms})))))
+                        []
+                        tool-calls)
 
               _ (tel/log! {:level :info :id :agent/tool-results
                            :data {:tools (mapv (fn [r]
@@ -414,6 +431,9 @@
         ;; No tool calls - done
         :complete))
 
+    (catch java.util.concurrent.CancellationException _
+      (tel/log! {:level :info :id :agent/turn-cancelled} "Agent turn cancelled")
+      :cancelled)
     (catch Exception e
       (tel/log! {:level :error :id :agent/turn-error :error e} "Agent turn error")
       :error)))

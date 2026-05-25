@@ -360,7 +360,7 @@
 
      (eval-code ctx \"(Thread/sleep 10000)\" :timeout-ms 1000)
      => {:success false :error {:message \"Timed out after 1000ms\" ...}}"
-  [sci-ctx code & {:keys [timeout-ms]}]
+  [sci-ctx code & {:keys [timeout-ms cancel?]}]
   (if timeout-ms
     ;; Timeout path: watchdog + future/deref outer fence.
     ;;
@@ -375,11 +375,36 @@
     ;;             Unblocks the caller even if the eval thread is stuck in a
     ;;             non-interruptible syscall (rare; eval thread leaks but caller
     ;;             gets a result).
+    ;;
+    ;; If a :cancel? 0-arity predicate is supplied, a tiny poller thread
+    ;; watches it and fires the same watchdog cancel! early — so user-
+    ;; initiated cancellation triggers the exact same path as a real
+    ;; timeout (interrupted eval, structured TimeoutException, no leaks).
     (let [stdout      (StringWriter.)
           stderr      (StringWriter.)
+          cancel-poll-stop (atom false)
+          cancel-fired (atom false)
           eval-future (future
                         ;; Watchdog starts here on the eval thread
-                        (let [{:keys [cancel! fired?]} (make-timeout timeout-ms)]
+                        (let [{:keys [cancel! fired?]} (make-timeout timeout-ms)
+                              eval-thread (Thread/currentThread)
+                              _ (when cancel?
+                                  (let [t (Thread.
+                                            #(loop []
+                                               (when-not @cancel-poll-stop
+                                                 (if (try (cancel?) (catch Throwable _ false))
+                                                   ;; Mirror watchdog semantics:
+                                                   ;; mark fired and interrupt the
+                                                   ;; eval thread so SCI's
+                                                   ;; interrupt-fn / responsive IO
+                                                   ;; sees it and unwinds the
+                                                   ;; computation cleanly.
+                                                   (do (reset! cancel-fired true)
+                                                       (.interrupt eval-thread))
+                                                   (do (Thread/sleep 100) (recur))))))]
+                                    (.setDaemon t true)
+                                    (.setName t "dvergr-eval-cancel-poll")
+                                    (.start t)))]
                           (try
                             (sci/binding [sci/out stdout sci/err stderr]
                               (let [result (sci/eval-string* sci-ctx code)]
@@ -401,7 +426,16 @@
                               ;; would surface to the agent as e.g. "sleep
                               ;; interrupted / InterruptedException" and the
                               ;; agent has to GUESS it was a timeout.
-                              (if (fired?)
+                              (cond
+                                @cancel-fired
+                                {:error   {:message "Evaluation cancelled by user"
+                                           :type    "CancellationException"
+                                           :data    {:cause :user-cancel}}
+                                 :stdout  (str stdout)
+                                 :stderr  (str stderr)
+                                 :success false}
+
+                                (fired?)
                                 {:error   {:message (str "Timed out after " timeout-ms "ms"
                                                          " — your code likely got stuck"
                                                          " (a (spin …) that never resolved,"
@@ -415,6 +449,8 @@
                                  :stdout  (str stdout)
                                  :stderr  (str stderr)
                                  :success false}
+
+                                :else
                                 {:error {:message (.getMessage e)
                                          :type     (str (class e))
                                          :data     (when (instance? clojure.lang.ExceptionInfo e)
@@ -426,10 +462,36 @@
                                  :success false}))
                             (finally
                               ;; Always cancel the watchdog when eval finishes
-                              (cancel!)))))]
-      ;; Outer fence: generous buffer beyond the inner watchdog
-      (let [result (deref eval-future (+ timeout-ms 5000) ::timed-out)]
-        (if (= result ::timed-out)
+                              (cancel!)
+                              (reset! cancel-poll-stop true)))))]
+      ;; Outer fence: poll the eval-future short-interval, so we ALSO
+      ;; honour user cancel even when the inner SCI interrupt-fn isn't
+      ;; reachable (spindel-backed SCI doesn't expose it for every
+      ;; fn-entry, and pure tight loops never cross the boundary). On
+      ;; cancel we future-cancel and return cleanly; the eval thread
+      ;; may leak (same caveat as a real outer-fence timeout) but the
+      ;; caller and the user get immediate feedback.
+      (let [outer-deadline (+ (System/currentTimeMillis) timeout-ms 5000)
+            result
+            (loop []
+              (let [r (deref eval-future 100 ::pending)]
+                (cond
+                  (not= r ::pending)              r
+                  (and cancel? (cancel?))         (do (reset! cancel-poll-stop true)
+                                                      (future-cancel eval-future)
+                                                      ::cancelled)
+                  (> (System/currentTimeMillis) outer-deadline) ::timed-out
+                  :else (recur))))]
+        (case result
+          ::cancelled
+          {:error  {:message "Evaluation cancelled by user"
+                    :type    "CancellationException"
+                    :data    {:cause :outer-fence-cancel}}
+           :stdout  (str stdout)
+           :stderr  (str stderr)
+           :success false}
+
+          ::timed-out
           {:error   {:message (str "Timed out after " timeout-ms "ms"
                                    " (the eval thread didn't respond to"
                                    " interruption — likely a non-interruptible"
@@ -441,6 +503,7 @@
            :stdout  (str stdout)
            :stderr  (str stderr)
            :success false}
+
           result)))
     ;; No timeout — direct eval on caller's thread
     (let [stdout (StringWriter.)

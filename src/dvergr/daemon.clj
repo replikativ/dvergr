@@ -519,16 +519,24 @@
 
 (defn- run-turn-async!
   "Run one chat-agent turn off the spindel executor; return a Deferred that
-   awaits to the turn result map: {:status :ok :result <:continue|:complete>}
-   or {:status :error :error e :message m}."
+   awaits to the turn result map: {:status :ok :result <:continue|:complete|:cancelled>}
+   or {:status :error :error e :message m}.
+
+   `:cancel?` is auto-injected — chat-agent/run-agent-turn! threads it
+   through model-chat/chat so Esc-driven cancellation aborts the SSE
+   stream mid-completion."
   [chat-ctx opts execution-ctx]
   (let [d (binding [rtc/*execution-context* execution-ctx]
-            (sync/deferred))]
+            (sync/deferred))
+        opts-with-cancel (assoc opts
+                                :cancel?
+                                (fn [] (binding [rtc/*execution-context* execution-ctx]
+                                         (= :cancelled (chat-ctx/get-status chat-ctx)))))]
     (future
       (binding [rtc/*execution-context* execution-ctx]
         (try
           (sync/deliver! d {:status :ok
-                            :result (chat-agent/run-agent-turn! chat-ctx opts)})
+                            :result (chat-agent/run-agent-turn! chat-ctx opts-with-cancel)})
           (catch Exception e
             (sync/deliver! d {:status :error :error e
                               :message (.getMessage e)})))))
@@ -733,6 +741,19 @@
                     ;; ---- Turn loop (inlined — await needs CPS) ----
                     (loop [turn 0]
                       (cond
+                        ;; Cooperative cancel — checked at each turn
+                        ;; boundary. The TUI's Esc handler flips status
+                        ;; to :cancelled; we persist a marker, reset
+                        ;; for the next message, and bail out of the
+                        ;; loop. Tier 2 (HTTP abort) also checks mid-
+                        ;; stream so the in-flight completion stops
+                        ;; generating billed tokens.
+                        (= :cancelled (chat-ctx/get-status chat-ctx))
+                        (do (chat-ctx/add-message! chat-ctx
+                              {:role :system :content "[cancelled by user]"})
+                            (chat-ctx/set-status! chat-ctx :active)
+                            (->reply "[cancelled by user]"))
+
                         (>= turn max-turns)
                         (let [summary (extract-last-assistant chat-ctx)]
                           (when (and intake? (= :tick task-type))
@@ -759,7 +780,16 @@
                                        :data {:agent-id aid :turn turn
                                               :result (:result r) :status (:status r)}}
                                       "Turn done")
-                            (if (or (= :error (:status r)) (= :complete (:result r)))
+                            (cond
+                              ;; Cancelled mid-stream — let the top-of-loop
+                              ;; cancel branch persist the marker on the
+                              ;; next iteration. Recur to get there.
+                              (= :cancelled (:result r))
+                              (recur (inc turn))
+
+                              ;; Errored or naturally done — fall through to
+                              ;; the existing finalization tree.
+                              (or (= :error (:status r)) (= :complete (:result r)))
                               (cond
                                 ;; knowledge_add enforcement for tick sweeps
                                 (and ka-required
@@ -812,6 +842,9 @@
                                         (fire-evaluator! participant summary
                                                          base-prompt agent-config ctx))))
                                   (->reply summary)))
+
+                              ;; :continue (tool calls executed, keep going)
+                              :else
                               (recur (inc turn))))))))))
               (catch Exception e
                 (tel/log! {:level :error :id :agent/think-error :error e

@@ -393,7 +393,7 @@
                 :properties {:code {:type "string"
                                     :description "Clojure code to evaluate"}}
                 :required ["code"]}
-   :execute (fn [{:keys [code]} {:keys [sci-ctx isolation eval-ns]}]
+   :execute (fn [{:keys [code]} {:keys [sci-ctx isolation eval-ns cancel?]}]
               ;; Native mode: use real Clojure eval
               (if (= :native isolation)
                 (native-eval code eval-ns)
@@ -408,7 +408,9 @@
                 ;; the timeout and returns an error result, freeing
                 ;; the dispatch thread.
                 (if sci-ctx
-                  (let [result (sandbox/eval-code sci-ctx code :timeout-ms 60000)]
+                  (let [result (sandbox/eval-code sci-ctx code
+                                                  :timeout-ms 60000
+                                                  :cancel? cancel?)]
                     (if (:success result)
                       {:type :success
                        :content (str "=> " (pr-str (:value result))

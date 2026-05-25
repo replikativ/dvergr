@@ -354,8 +354,8 @@
       [(box-line input-view inner-w)]
       [(separator-line width)
        (pad-line (str "│ " (s/render (s/style :fg (s/ansi256 240))
-                                     "Tab:view  Enter:send  PgUp/Dn:scroll  Ctrl+C:quit")
-                      (apply str (repeat (max 0 (- inner-w 50)) " ")) " │")
+                                     "Tab:view  Enter:send  Esc:cancel  PgUp/Dn:scroll  Ctrl+C:quit")
+                      (apply str (repeat (max 0 (- inner-w 62)) " ")) " │")
                  width)
        (footer-line width)])))
 
@@ -463,6 +463,16 @@
 
       (= mode :chat)
       (cond
+        ;; Cancel the current turn. The daemon turn loop polls
+        ;; (get-status chat-ctx) and bails on :cancelled; with Tier 2
+        ;; in place the in-flight LLM HTTP stream also gets closed so
+        ;; we stop being billed for tokens we'll throw away.
+        (and (= key "escape")
+             (= :running @(:status signals))
+             @(:chat-ctx signals))
+        (binding [ec/*execution-context* (:execution-ctx daemon)]
+          (chat-ctx/cancel-chat! @(:chat-ctx signals)))
+
         ;; Scroll. `scroll` = lines back from the bottom; page_up moves
         ;; further into history, page_down moves toward newest. The view
         ;; clamps to [0, max-scroll] on display.
