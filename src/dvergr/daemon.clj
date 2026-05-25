@@ -31,6 +31,7 @@
             [dvergr.registry :as registry]
             [dvergr.sessions :as sessions]
             [dvergr.chat.context :as chat-ctx]
+            [dvergr.process :as proc]
             [dvergr.tools :as tools]
             [dvergr.git :as git]
             [dvergr.web.server :as web-server]
@@ -710,6 +711,15 @@
                         user-msg  (format-task-message task task-type agent-config)
                         sci-ctx   (sandbox/fork-for-session ctx)
                         _         (sandbox/setup-agent-namespaces! sci-ctx ctx)
+                        ;; Register a tracking process for this turn so
+                        ;; the TUI Processes pane / SCI (processes/list)
+                        ;; can see it and a manager can directive! :abort
+                        ;; it. The actual cancel signal flows through
+                        ;; chat-ctx :status (existing path); we mirror
+                        ;; status onto the process for visibility, and
+                        ;; the TUI Esc handler will pick either path.
+                        turn-proc (proc/register! chat-ctx
+                                    {:description (str "Agent turn — " (name aid))})
                         tools-map (tools-fn)
                         system-prompt (inject-skills base-prompt (keys tools-map))
                         tool-ctx  (tools/make-context
@@ -741,17 +751,20 @@
                     ;; ---- Turn loop (inlined — await needs CPS) ----
                     (loop [turn 0]
                       (cond
-                        ;; Cooperative cancel — checked at each turn
-                        ;; boundary. The TUI's Esc handler flips status
-                        ;; to :cancelled; we persist a marker, reset
-                        ;; for the next message, and bail out of the
-                        ;; loop. Tier 2 (HTTP abort) also checks mid-
-                        ;; stream so the in-flight completion stops
-                        ;; generating billed tokens.
-                        (= :cancelled (chat-ctx/get-status chat-ctx))
+                        ;; Cooperative cancel at the turn boundary.
+                        ;; Two equivalent signals — both flip on user
+                        ;; cancel: chat-ctx :status :cancelled (legacy
+                        ;; path, used by cancel-chat!) and the turn
+                        ;; process :status :aborted (new path, used by
+                        ;; directive! and accessible to the agent itself
+                        ;; via SCI). Tier 2's HTTP abort fires mid-stream
+                        ;; so the LLM stops generating billed tokens.
+                        (or (= :cancelled (chat-ctx/get-status chat-ctx))
+                            (proc/aborted? turn-proc))
                         (do (chat-ctx/add-message! chat-ctx
                               {:role :system :content "[cancelled by user]"})
                             (chat-ctx/set-status! chat-ctx :active)
+                            (proc/complete! turn-proc)
                             (->reply "[cancelled by user]"))
 
                         (>= turn max-turns)
@@ -765,10 +778,12 @@
                                          (zero? (mod n eval-every-n)))
                                 (fire-evaluator! participant summary
                                                  base-prompt agent-config ctx))))
+                          (proc/complete! turn-proc)
                           (->reply summary))
 
                         (not (chat-ctx/check-budget! chat-ctx))
-                        (->reply "Budget limit reached.")
+                        (do (proc/complete! turn-proc)
+                            (->reply "Budget limit reached."))
 
                         :else
                         (do
@@ -841,6 +856,7 @@
                                                  (zero? (mod n eval-every-n)))
                                         (fire-evaluator! participant summary
                                                          base-prompt agent-config ctx))))
+                                  (proc/complete! turn-proc)
                                   (->reply summary)))
 
                               ;; :continue (tool calls executed, keep going)
@@ -849,6 +865,10 @@
               (catch Exception e
                 (tel/log! {:level :error :id :agent/think-error :error e
                            :data {:agent-id aid}} "Think error")
+                ;; turn-proc is in an inner let scope here so the catch
+                ;; can't reach it for completion. Stale :running entries
+                ;; get cleaned up by list-processes' terminal-state filter
+                ;; or on daemon restart. Not worth the restructuring.
                 (->reply (str "Sorry, I hit an error: " (.getMessage e)))))))))))
 
 ;; ============================================================================

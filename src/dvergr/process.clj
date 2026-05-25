@@ -132,7 +132,8 @@
      progress-signal     ;; signal of latest snapshot map
      directive-ref       ;; AtomicReference + latch — first-wins delivery
      directive-latch     ;; CountDownLatch — checkpoint! awaits, directive! signals
-     started-at])
+     started-at
+     tracked-only?])     ;; true → no body thread, work-owner polls aborted?
 
 (defn snapshot
   "Return the latest progress snapshot for a process — a pure read.
@@ -238,6 +239,12 @@
               final   (assoc canonical :effects-applied (or applied []))]
           (.set dref final)
           (.countDown latch)
+          ;; Tracked-only processes have no checkpoint! body that
+          ;; sees the latch — flip status directly so work-owners
+          ;; polling (aborted? proc) see the abort.
+          (when (and (:tracked-only? process) (= :abort (:type canonical)))
+            (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
+              (reset! (:status-signal process) :aborted)))
           :delivered)
         :already-decided))
     :no-such-process))
@@ -245,6 +252,69 @@
 ;; ============================================================================
 ;; ->process — wrap a spin body, register, fire
 ;; ============================================================================
+
+(defn register!
+  "Register a tracking-only Process — no body thread, no checkpoint
+   loop. Used when the actual work lives elsewhere (e.g. an inline
+   spindel spin loop that can't easily move into a JVM future).
+
+   The Process still exposes :status-signal, :progress-signal, and
+   the directive surface; the work owner is responsible for:
+     - polling (= :aborted @(:status-signal proc)) at safe points,
+     - calling (complete! proc) when done normally,
+     - calling (progress! proc state) to keep the manager informed.
+
+   directive! :abort on a tracked process flips :status-signal to
+   :aborted (idempotent first-wins) but doesn't throw anywhere — the
+   work-owner has to react."
+  [chat-ctx {:keys [id description grace-ms]
+             :or {grace-ms 5000}}]
+  {:pre [(string? description)]}
+  (let [pid (or id (random-uuid))
+        process
+        (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
+          (let [s (sig/signal :running)
+                p (sig/signal {})]
+            (map->Proc
+              {:id              pid
+               :chat-ctx        chat-ctx
+               :description     description
+               :grace-ms        grace-ms
+               :status-signal   s
+               :progress-signal p
+               :directive-ref   (AtomicReference. nil)
+               :directive-latch (CountDownLatch. 1)
+               :started-at      (System/currentTimeMillis)
+               :tracked-only?   true})))]
+    (swap-registry! chat-ctx assoc pid process)
+    process))
+
+(defn progress!
+  "Update the progress signal on a tracked process."
+  [process state]
+  (binding [ec/*execution-context* (:spindel-ctx (:chat-ctx process))]
+    (reset! (:progress-signal process) state))
+  state)
+
+(defn complete!
+  "Mark a tracked process as completed and remove from the registry's
+   active view. Called by the work-owner when the underlying work
+   finishes normally."
+  [process]
+  (let [cctx (:chat-ctx process)]
+    (binding [ec/*execution-context* (:spindel-ctx cctx)]
+      (reset! (:status-signal process) :completed))
+    ;; Stays in registry briefly so a manager can still snapshot. We
+    ;; don't trim here — list-processes filters terminal states later.
+    :completed))
+
+(defn aborted?
+  "True if a manager has aborted the process. Work-owners poll this
+   at safe points."
+  [process]
+  (= :aborted
+     (binding [ec/*execution-context* (:spindel-ctx (:chat-ctx process))]
+       @(:status-signal process))))
 
 (defn ->process
   "Wrap a spin body as a Process registered on chat-ctx. Starts the

@@ -6,6 +6,7 @@
             [clojure.edn :as edn]
             [datahike.api :as d]
             [dvergr.sandbox :as sandbox]
+            [dvergr.process :as proc]
             [dvergr.storage :as storage]
             [dvergr.tools.structural :as structural]
             [dvergr.tools.code-metadata :as code-meta]
@@ -393,34 +394,62 @@
                 :properties {:code {:type "string"
                                     :description "Clojure code to evaluate"}}
                 :required ["code"]}
-   :execute (fn [{:keys [code]} {:keys [sci-ctx isolation eval-ns cancel?]}]
+   :execute (fn [{:keys [code]} {:keys [sci-ctx isolation eval-ns chat-ctx cancel?]}]
               ;; Native mode: use real Clojure eval
-              (if (= :native isolation)
+              (cond
+                (= :native isolation)
                 (native-eval code eval-ns)
-                ;; SCI mode: use sandboxed eval.
-                ;;
-                ;; Hard timeout: a hung eval (e.g. `@(spin …)` on a spin
-                ;; that never resolves) parks a core.async dispatch
-                ;; thread forever. Core.async's dispatch pool is fixed
-                ;; (≈8 threads); a handful of hung evals deadlocks it
-                ;; and the entire agent system hangs. The watchdog in
-                ;; sandbox/eval-code interrupts the eval thread after
-                ;; the timeout and returns an error result, freeing
-                ;; the dispatch thread.
-                (if sci-ctx
-                  (let [result (sandbox/eval-code sci-ctx code
-                                                  :timeout-ms 60000
-                                                  :cancel? cancel?)]
-                    (if (:success result)
+
+                ;; SCI + chat-ctx: register the eval as a deliberable
+                ;; process. The agent / user can issue
+                ;;   (directive! cctx pid {:type :abort})
+                ;; and the existing sandbox cancel-poller catches it.
+                ;; Soft-checkpoint after 30s so a manager can choose
+                ;; "keep going" or "stop" on long evals.
+                (and sci-ctx chat-ctx)
+                (let [result-p (promise)
+                      desc     (str "clojure_eval: "
+                                    (let [c (clojure.string/trim code)]
+                                      (if (> (count c) 50)
+                                        (str (subs c 0 50) "…")
+                                        c)))]
+                  (proc/->process chat-ctx
+                                  {:description desc
+                                   :grace-ms 30000
+                                   :on-complete #(deliver result-p {:ok %})
+                                   :on-abort    #(deliver result-p {:aborted %})}
+                                  (fn []
+                                    (let [p proc/*current-process*
+                                          proc-aborted?
+                                          (fn []
+                                            (or (and cancel? (cancel?))
+                                                (try
+                                                  (binding [rtc/*execution-context*
+                                                            (:spindel-ctx chat-ctx)]
+                                                    (= :aborted @(:status-signal p)))
+                                                  (catch Throwable _ false))))]
+                                      (sandbox/eval-code sci-ctx code
+                                                         :timeout-ms 60000
+                                                         :cancel? proc-aborted?))))
+                  ;; Block on process completion / abort.
+                  (let [{:keys [ok aborted]} @result-p]
+                    (cond
+                      aborted
+                      {:type :error :error "cancelled"
+                       :content (str "Evaluation cancelled: " aborted)
+                       :metadata {:cancelled? true}}
+
+                      (:success ok)
                       {:type :success
-                       :content (str "=> " (pr-str (:value result))
-                                     (when (not-empty (:stdout result))
-                                       (str "\n\nOutput:\n" (:stdout result))))
-                       :metadata {:value (:value result)
-                                  :stdout (:stdout result)
-                                  :stderr (:stderr result)}}
-                      ;; Enhanced error output with SCI stacktrace
-                      (let [error (:error result)
+                       :content (str "=> " (pr-str (:value ok))
+                                     (when (not-empty (:stdout ok))
+                                       (str "\n\nOutput:\n" (:stdout ok))))
+                       :metadata {:value (:value ok)
+                                  :stdout (:stdout ok)
+                                  :stderr (:stderr ok)}}
+
+                      :else
+                      (let [error (:error ok)
                             stacktrace (:stacktrace error)
                             stacktrace-str (when (seq stacktrace)
                                              (str "\n\nStacktrace:\n"
@@ -435,11 +464,46 @@
                                        (when (:type error)
                                          (str "\nType: " (:type error)))
                                        stacktrace-str
-                                       (when (not-empty (:stdout result))
-                                         (str "\n\nPartial output:\n" (:stdout result))))
-                         :metadata error})))
-                  {:type :error
-                   :error "No evaluation context. Pass :sci-ctx or use :isolation :native."})))})
+                                       (when (not-empty (:stdout ok))
+                                         (str "\n\nPartial output:\n" (:stdout ok))))
+                         :metadata error}))))
+
+                ;; SCI without chat-ctx (e.g. one-shot REPL): legacy path,
+                ;; same cancel-poll plumbing but no process registration.
+                sci-ctx
+                (let [result (sandbox/eval-code sci-ctx code
+                                                :timeout-ms 60000
+                                                :cancel? cancel?)]
+                  (if (:success result)
+                    {:type :success
+                     :content (str "=> " (pr-str (:value result))
+                                   (when (not-empty (:stdout result))
+                                     (str "\n\nOutput:\n" (:stdout result))))
+                     :metadata {:value (:value result)
+                                :stdout (:stdout result)
+                                :stderr (:stderr result)}}
+                    (let [error (:error result)
+                          stacktrace (:stacktrace error)
+                          stacktrace-str (when (seq stacktrace)
+                                           (str "\n\nStacktrace:\n"
+                                                (clojure.string/join "\n"
+                                                  (map (fn [{:keys [ns name line]}]
+                                                         (str "  " (or ns "?") "/" (or name "?")
+                                                              (when line (str ":" line))))
+                                                       (take 10 stacktrace)))))]
+                      {:type :error
+                       :error (:message error)
+                       :content (str "Evaluation error: " (:message error)
+                                     (when (:type error)
+                                       (str "\nType: " (:type error)))
+                                     stacktrace-str
+                                     (when (not-empty (:stdout result))
+                                       (str "\n\nPartial output:\n" (:stdout result))))
+                       :metadata error})))
+
+                :else
+                {:type :error
+                 :error "No evaluation context. Pass :sci-ctx or use :isolation :native."}))})
 
 (register!
   {:name "clojure_edit"
