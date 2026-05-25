@@ -262,7 +262,13 @@
   [spindel-ctx]
   (let [macro-ns (spindel-sci-macro-ns)
         create-fn (ns-resolve macro-ns 'create-spin-macro-context)]
-    (create-fn {:runtime spindel-ctx})))
+    ;; Hand spindel the same make-resource-limits interrupt-fn the
+    ;; non-spindel base context uses. Without it the spindel-backed
+    ;; sandbox couldn't notice Thread.interrupt() at SCI fn-entry, so
+    ;; user-cancel only fired at the eval-code outer fence (~100ms
+    ;; minimum). With it, the interrupt unwinds at the next fn entry.
+    (create-fn {:runtime      spindel-ctx
+                :interrupt-fn (make-resource-limits)})))
 
 (defn add-spindel-extras-ns!
   "Expose spindel combinators, sync primitives, and signals to SCI.
