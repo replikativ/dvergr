@@ -313,7 +313,17 @@
         scroll @(:scroll signals)
         inner-w (- width 4)
         agent-name (if agent-id (name agent-id) "none")
-        title (str "Chat — " agent-name)
+        ;; How many processes are running/parked right now? Surface
+        ;; that as a small badge in the title so the user knows there's
+        ;; something to inspect in the Processes pane.
+        active-proc-count (when cctx
+                            (->> (proc/list-processes cctx)
+                                 (filter #(#{:running :awaiting-decision} (:status %)))
+                                 count))
+        title (str "Chat — " agent-name
+                   (when (and active-proc-count (pos? active-proc-count))
+                     (str "  •  " active-proc-count
+                          " proc" (when (> active-proc-count 1) "s"))))
 
         ;; Render all messages
         msg-lines (vec (mapcat #(render-message % inner-w) history))
@@ -399,13 +409,23 @@
 ;; Processes View
 ;; ============================================================================
 
+(def ^:private terminal-keep-ms
+  "How long terminated processes stay visible in the pane so the user
+   sees their abort/completion confirmed before the row disappears."
+  30000)
+
 (defn- processes-list
-  "Active processes for the currently-selected chat-ctx, sorted oldest
-   first. Returns [] if no chat-ctx is selected."
+  "Processes for the currently-selected chat-ctx, sorted oldest first.
+   Includes running, awaiting-decision, AND recently-terminated entries
+   (last 30s) so the user sees confirmation of their abort. Returns []
+   if no chat-ctx is selected."
   [signals]
   (if-let [cctx @(:chat-ctx signals)]
     (->> (proc/list-processes cctx)
-         (filter #(#{:running :awaiting-decision} (:status %)))
+         (filter (fn [p]
+                   (or (#{:running :awaiting-decision} (:status p))
+                       (and (:since-term-ms p)
+                            (< (:since-term-ms p) terminal-keep-ms)))))
          (sort-by :started-at))
     []))
 
@@ -417,7 +437,8 @@
     :else            (format "%dh %02dm" (quot ms 3600000) (mod (quot ms 60000) 60))))
 
 (defn- processes-view
-  "Render the active processes list."
+  "Render the active processes list. Recently-terminated rows stay
+   visible for ~30s so the user sees abort/completion confirmed."
   [signals width _height]
   (let [procs (processes-list signals)
         sel @(:proc-idx signals)
@@ -425,6 +446,7 @@
         items (map-indexed
                 (fn [idx p]
                   (let [status (:status p)
+                        terminal? (#{:completed :aborted} status)
                         elapsed (format-elapsed (:elapsed-ms p))
                         sel? (= idx sel)
                         prefix (if sel?
@@ -433,12 +455,23 @@
                         status-color (case status
                                        :awaiting-decision s/yellow
                                        :running           s/green
+                                       :aborted           s/red
+                                       :completed         (s/ansi256 247)
                                        (s/ansi256 240))
-                        line (str prefix
-                                  (s/render (s/style :fg status-color :bold true)
-                                            (name status))
-                                  "  " (s/render (s/style :fg (s/ansi256 244)) elapsed)
-                                  "  " (:description p))]
+                        ;; Terminated rows render dimmed; live rows full bold.
+                        status-str (s/render (s/style :fg status-color
+                                                      :bold (not terminal?))
+                                             (name status))
+                        elapsed-str (s/render
+                                      (s/style :fg (if terminal?
+                                                     (s/ansi256 240)
+                                                     (s/ansi256 244)))
+                                      elapsed)
+                        desc-style (if terminal?
+                                     (s/style :fg (s/ansi256 240) :italic true)
+                                     (s/style :fg s/white))
+                        desc-str (s/render desc-style (:description p))
+                        line (str prefix status-str "  " elapsed-str "  " desc-str)]
                     (box-line line inner-w)))
                 procs)]
     (concat

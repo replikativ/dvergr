@@ -133,19 +133,31 @@
      directive-ref       ;; AtomicReference + latch — first-wins delivery
      directive-latch     ;; CountDownLatch — checkpoint! awaits, directive! signals
      started-at
+     terminated-at-ref   ;; AtomicReference<long|nil> — set when status → terminal
      tracked-only?])     ;; true → no body thread, work-owner polls aborted?
+
+(defn- mark-terminated!
+  "Stamp the moment a process entered a terminal state, so the UI can
+   keep it visible briefly before trimming."
+  [process]
+  (let [^AtomicReference ar (:terminated-at-ref process)]
+    (when ar (.compareAndSet ar nil (System/currentTimeMillis)))))
 
 (defn snapshot
   "Return the latest progress snapshot for a process — a pure read.
    Does not disturb the parked spin."
   [process]
   (binding [ec/*execution-context* (:spindel-ctx (:chat-ctx process))]
-    {:id          (:id process)
-     :description (:description process)
-     :status      @(:status-signal process)
-     :progress    @(:progress-signal process)
-     :started-at  (:started-at process)
-     :elapsed-ms  (- (System/currentTimeMillis) (:started-at process))}))
+    (let [now (System/currentTimeMillis)
+          term-at (some-> (:terminated-at-ref process) .get)]
+      {:id             (:id process)
+       :description    (:description process)
+       :status         @(:status-signal process)
+       :progress       @(:progress-signal process)
+       :started-at     (:started-at process)
+       :elapsed-ms     (- (or term-at now) (:started-at process))
+       :terminated-at  term-at
+       :since-term-ms  (when term-at (- now term-at))})))
 
 (defn list-processes
   "All current processes on a chat-ctx, as snapshot maps. Recent
@@ -204,6 +216,7 @@
           (let [reason (or (:reason directive) "aborted by manager")]
             (binding [ec/*execution-context* chat-spc]
               (reset! (:status-signal process) :aborted))
+            (mark-terminated! process)
             (throw (CancellationException. reason)))
 
           :continue
@@ -244,7 +257,8 @@
           ;; polling (aborted? proc) see the abort.
           (when (and (:tracked-only? process) (= :abort (:type canonical)))
             (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
-              (reset! (:status-signal process) :aborted)))
+              (reset! (:status-signal process) :aborted))
+            (mark-terminated! process))
           :delivered)
         :already-decided))
     :no-such-process))
@@ -282,9 +296,10 @@
                :grace-ms        grace-ms
                :status-signal   s
                :progress-signal p
-               :directive-ref   (AtomicReference. nil)
-               :directive-latch (CountDownLatch. 1)
-               :started-at      (System/currentTimeMillis)
+               :directive-ref     (AtomicReference. nil)
+               :directive-latch   (CountDownLatch. 1)
+               :started-at        (System/currentTimeMillis)
+               :terminated-at-ref (AtomicReference. nil)
                :tracked-only?   true})))]
     (swap-registry! chat-ctx assoc pid process)
     process))
@@ -304,6 +319,7 @@
   (let [cctx (:chat-ctx process)]
     (binding [ec/*execution-context* (:spindel-ctx cctx)]
       (reset! (:status-signal process) :completed))
+    (mark-terminated! process)
     ;; Stays in registry briefly so a manager can still snapshot. We
     ;; don't trim here — list-processes filters terminal states later.
     :completed))
@@ -346,9 +362,10 @@
                :grace-ms        grace-ms
                :status-signal   s
                :progress-signal p
-               :directive-ref   (AtomicReference. nil)
-               :directive-latch (CountDownLatch. 1)
-               :started-at      (System/currentTimeMillis)})))]
+               :directive-ref     (AtomicReference. nil)
+               :directive-latch   (CountDownLatch. 1)
+               :started-at        (System/currentTimeMillis)
+               :terminated-at-ref (AtomicReference. nil)})))]
     (swap-registry! chat-ctx assoc pid process)
     (future
       (binding [*current-process*    process
@@ -356,14 +373,17 @@
         (try
           (let [result (body-fn)]
             (reset! (:status-signal process) :completed)
+            (mark-terminated! process)
             (when on-complete (on-complete result))
             result)
           (catch CancellationException e
             (reset! (:status-signal process) :aborted)
+            (mark-terminated! process)
             (when on-abort (on-abort (.getMessage e)))
             nil)
           (catch Throwable e
             (reset! (:status-signal process) :aborted)
+            (mark-terminated! process)
             (tel/log! {:level :error :id :process/error
                        :data {:process-id pid
                               :description description}
