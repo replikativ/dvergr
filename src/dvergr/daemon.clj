@@ -304,13 +304,17 @@
 ;; ============================================================================
 
 (defn- chat-tools
-  "Return tool map for chat mode: knowledge graph + URL ingestion + cheap LLM.
+  "Return tool map for chat mode: clojure_eval (the universal capability),
+   knowledge graph, URL ingestion, cheap LLM.
 
-   Web search isn't here as a tool — agents reach it via
-   (intake.web/search …) under clojure_eval."
+   The SCI-backed clojure_eval is what gives the secretary access to
+   intake.web/search, intake.web/fetch, intake.hn/*, intake.yt/*,
+   calendar/*, etc. — those aren't separate tools, they're functions in
+   the sandbox. Keep this set tight; everything else is a Clojure call."
   []
   (select-keys @tools/registry
-               ["knowledge_search" "knowledge_add"
+               ["clojure_eval"
+                "knowledge_search" "knowledge_add"
                 "web_fetch" "youtube_transcript" "tweet_lookup"
                 "llm_call" "fulltext_search"]))
 
