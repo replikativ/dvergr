@@ -73,27 +73,48 @@
 ;; Session CRUD
 ;; ============================================================================
 
+(defn- session-chat-uuid
+  "Deterministic UUID for the (chat-id, agent-id) pair so the chat
+   row in datahike is found again after a daemon restart and the
+   conversation history is restored.
+
+   The TUI uses `chat-id :tui`; Telegram uses an integer chat id —
+   `pr-str` round-trips both losslessly so the same pair always
+   maps to the same UUID."
+  [chat-id agent-id]
+  (java.util.UUID/nameUUIDFromBytes
+    (.getBytes ^String (pr-str [chat-id agent-id]) "UTF-8")))
+
 (defn create-session!
   "Create a new session for a [chat-id agent-id] pair.
 
    Each agent gets its own conversation history per Telegram chat.
+   The underlying chat-ctx uses a deterministic chat-id, so persisted
+   messages from previous daemon runs are re-loaded here and the
+   conversation continues seamlessly.
 
    Args:
-     chat-id    - Telegram chat ID (integer)
+     chat-id    - Telegram chat ID (integer) or :tui / :web / etc.
      agent-id   - Registry agent ID (:var, :sentinel, etc.)
      user-info  - Map with :username, :first_name etc from Telegram
 
    Returns the created session map."
   [chat-id agent-id user-info]
-  (let [session {:chat-id     chat-id
+  (let [stable-id (session-chat-uuid chat-id agent-id)
+        cctx (chat-ctx/create-chat-context
+               {:chat-id stable-id
+                :title (str (name agent-id) " with "
+                            (or (:first_name user-info)
+                                (:username user-info)
+                                (str "user-" chat-id)))
+                :budget-dollars 2.0})
+        existing (chat-ctx/load-messages (:db-conn cctx) stable-id)
+        _ (when (seq existing)
+            (chat-ctx/replace-messages! cctx existing))
+        session {:chat-id     chat-id
                  :agent-id    agent-id
                  :user-info   user-info
-                 :chat-ctx    (chat-ctx/create-chat-context
-                                {:title (str (name agent-id) " with "
-                                             (or (:first_name user-info)
-                                                 (:username user-info)
-                                                 (str "user-" chat-id)))
-                                 :budget-dollars 2.0})
+                 :chat-ctx    cctx
                  :created-at  (java.util.Date.)
                  :last-active (java.util.Date.)}]
     (swap-sessions! assoc [chat-id agent-id] session)

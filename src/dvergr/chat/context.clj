@@ -276,10 +276,10 @@
      - Persistent file-based storage
      - Automatic branching when agents fork
      - Database inspection after agent runs"
-  [{:keys [title budget-dollars budget db-path with-sci? db-conn]
+  [{:keys [chat-id title budget-dollars budget db-path with-sci? db-conn]
     :or {budget-dollars 1.0
          with-sci? true}}]
-  (let [chat-id (random-uuid)
+  (let [chat-id (or chat-id (random-uuid))
 
         ;; Convert budget to microdollars (numéraire)
         budget-microdollars (or budget
@@ -545,6 +545,36 @@
    :status (get-status chat-ctx)
    ;; Spindel context can be serialized too
    :spindel-snapshot (ctx/serialize-context (:spindel-ctx chat-ctx))})
+
+(defn load-messages
+  "Load persisted messages for `chat-id` from datahike, ordered by
+   :message/created-at. Returns a vector of entity maps in the same
+   shape `add-message!` writes — empty vector if the chat row is
+   absent or the connection is nil.
+
+   Used to re-hydrate a freshly-created ChatContext from durable state
+   after a daemon restart."
+  [db-conn chat-id]
+  (if (nil? db-conn)
+    []
+    (try
+      (let [db @db-conn
+            results (dh/q '[:find ?m ?ts
+                            :in $ ?cid
+                            :where
+                            [?c :chat/id ?cid]
+                            [?m :message/chat ?c]
+                            [?m :message/created-at ?ts]]
+                          db chat-id)
+            ordered (sort-by second results)]
+        (mapv (fn [[eid _]]
+                (dh/pull db '[*] eid))
+              ordered))
+      (catch Exception e
+        (tel/log! {:level :warn :id :chat-ctx/load-messages-error
+                   :data {:chat-id chat-id :error (.getMessage e)}}
+                  "Failed to load persisted messages")
+        []))))
 
 (defn restore-chat
   "Restore chat from a snapshot produced by snapshot-chat.
