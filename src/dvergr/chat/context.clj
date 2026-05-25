@@ -115,18 +115,30 @@
                   :by-type (update by-type resource-type (fnil + 0) amount)
                   :crossed-thresholds new-crossed}))))
 
-    ;; Persist ledger entry
+    ;; Persist ledger entry and keep :chat/budget-used in sync so
+    ;; analysis/queries.clj (and any other consumer of the
+    ;; :chat/budget-used attr) sees the real total. Single transact
+    ;; so the ledger row + the rolled-up counter land atomically.
     (when-let [conn (:db-conn chat-ctx)]
-      (dh/transact conn
-        [(cond-> {:ledger/id (random-uuid)
-                  :ledger/context [:chat/id (:chat-id chat-ctx)]
-                  :ledger/timestamp (java.util.Date.)
-                  :ledger/resource resource-type
-                  :ledger/amount (long amount)
-                  :ledger/cost-microdollars (long cost)}
-           model (assoc :ledger/model model)
-           provider (assoc :ledger/provider provider)
-           tool (assoc :ledger/tool tool))]))
+      (let [prior-used (or (dh/q '[:find ?u .
+                                   :in $ ?cid
+                                   :where
+                                   [?c :chat/id ?cid]
+                                   [?c :chat/budget-used ?u]]
+                                 @conn (:chat-id chat-ctx))
+                           0)]
+        (dh/transact conn
+          [(cond-> {:ledger/id (random-uuid)
+                    :ledger/context [:chat/id (:chat-id chat-ctx)]
+                    :ledger/timestamp (java.util.Date.)
+                    :ledger/resource resource-type
+                    :ledger/amount (long amount)
+                    :ledger/cost-microdollars (long cost)}
+             model (assoc :ledger/model model)
+             provider (assoc :ledger/provider provider)
+             tool (assoc :ledger/tool tool))
+           {:db/id [:chat/id (:chat-id chat-ctx)]
+            :chat/budget-used (long (+ prior-used cost))}])))
 
     ;; Return cost info
     (cond-> {:cost-microdollars cost}

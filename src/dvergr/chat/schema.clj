@@ -1177,15 +1177,16 @@
                        :account/amount amount
                        :account/timestamp (java.util.Date.)}
                 message-id (assoc :account/message [:message/id message-id])
-                metadata (assoc :account/metadata (pr-str metadata)))]
+                metadata (assoc :account/metadata (pr-str metadata)))
+        prior-used (or (d/q '[:find ?used .
+                              :in $ ?cid
+                              :where [?c :chat/id ?cid]
+                                     [?c :chat/budget-used ?used]]
+                            @conn chat-id)
+                       0)]
     (d/transact conn [entry
-                      ;; Also update chat's budget-used
                       {:db/id [:chat/id chat-id]
-                       :chat/budget-used (d/q '[:find ?used .
-                                                :in $ ?cid
-                                                :where [?c :chat/id ?cid]
-                                                [?c :chat/budget-used ?used]]
-                                              @conn chat-id)}])))
+                       :chat/budget-used (long (+ prior-used amount))}])))
 
 ;; ============================================================================
 ;; Knowledge Entity Helpers
