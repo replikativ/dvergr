@@ -692,7 +692,7 @@
 
    Available namespaces:
    - intake.hn      — hn/search, hn/top
-   - intake.web     — web/fetch
+   - intake.web     — web/fetch, web/search (Brave)
    - intake.yt      — yt/transcript (raw), yt/transcript-summary (fetch + LLM summarize)
    - intake.tw      — tw/lookup
    - intake.reddit  — reddit/search, reddit/top
@@ -723,6 +723,7 @@
   ;; Ensure all intake namespaces are loaded (idempotent)
   (require 'dvergr.intake.hn)
   (require 'dvergr.intake.web-fetch)
+  (require 'dvergr.intake.web-search)
   (require 'dvergr.intake.youtube)
   (require 'dvergr.intake.twitter)
   (require 'dvergr.intake.reddit)
@@ -749,7 +750,8 @@
                        'top    @(ns-resolve 'dvergr.intake.hn 'fetch-top)})
 
   (sci/add-namespace! sci-ctx 'intake.web
-                      {'fetch  @(ns-resolve 'dvergr.intake.web-fetch 'fetch-page)})
+                      {'fetch  @(ns-resolve 'dvergr.intake.web-fetch 'fetch-page)
+                       'search @(ns-resolve 'dvergr.intake.web-search 'search)})
 
   (let [raw-transcript @(ns-resolve 'dvergr.intake.youtube 'get-transcript)]
     (sci/add-namespace! sci-ctx 'intake.yt
