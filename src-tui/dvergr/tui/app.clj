@@ -1,7 +1,7 @@
-(ns dvergr.tui.dashboard
-  "TUI dashboard for the dvergr daemon.
+(ns dvergr.tui.app
+  "TUI app for the dvergr daemon.
 
-   Provides three views:
+   Three views:
    - :agents   — List registered agents with status indicators
    - :chat     — Chat with a selected agent (scrollable, markdown)
    - :sessions — List active sessions

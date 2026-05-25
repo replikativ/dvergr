@@ -107,13 +107,13 @@
   :cli {:extra-deps {org.replikativ/spindel-tui {:local/root "../spindel-tui"}}
         :main-opts  ["-m" "dvergr.cli.main"]}
 
-  ;; Dashboard TUI (spindel-tui + nREPL)
-  :dashboard {:extra-paths ["src-tui"]
-              :extra-deps  {org.replikativ/spindel-tui {:local/root "../spindel-tui"}
-                            nrepl/nrepl {:mvn/version "1.3.0"}}
-              ;; Suppress JVM module-system warnings from Lucene native access
-              :jvm-opts ["--enable-native-access=ALL-UNNAMED"]
-              :main-opts ["-m" "dvergr.main"]}
+  ;; TUI app (spindel-tui + nREPL)
+  :tui {:extra-paths ["src-tui"]
+        :extra-deps  {org.replikativ/spindel-tui {:local/root "../spindel-tui"}
+                      nrepl/nrepl {:mvn/version "1.3.0"}}
+        ;; Suppress JVM module-system warnings from Lucene native access
+        :jvm-opts ["--enable-native-access=ALL-UNNAMED"]
+        :main-opts ["-m" "dvergr.main"]}
 
   ;; Build uberjar for MCP server distribution
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.5"}}

@@ -306,25 +306,13 @@
 ;; Resource limits
 ;; ---------------------------------------------------------------------------
 
-(deftest test-resource-limits-op-count
-  (testing "infinite loop is interrupted by op-count limit"
-    (let [ctx (sandbox/create-base-ctx :resource-limits
-                                       (sandbox/make-resource-limits :max-ops 50000))]
-      (is (thrown-with-msg?
-            clojure.lang.ExceptionInfo
-            #"operation count exceeded"
-            (sci/eval-string* ctx "(loop [] (recur))"))))))
-
-(deftest test-resource-limits-time
-  (testing "long computation is interrupted by a resource limit"
-    ;; Loop with no allocation to avoid triggering memory limit first.
-    ;; The op-count limit (50k) fires faster than the 30s wall-time default.
-    (let [ctx (sandbox/create-base-ctx :resource-limits
-                                       (sandbox/make-resource-limits :max-ops 50000))]
-      (is (thrown-with-msg?
-            clojure.lang.ExceptionInfo
-            #"Resource limit"
-            (sci/eval-string* ctx "(loop [] (recur))"))))))
+;; Op-count and wall-time caps in make-resource-limits were dropped:
+;; they fired on legitimately long-running iterations (large folds,
+;; multi-step research) as easily as actual infinite loops, while
+;; per-token accounting + the eval-code outer-fence timeout already
+;; bound runaway evals at the right granularity. See dvergr.chat.accounting
+;; for the live budget surface. Tests covering those behaviours intentionally
+;; removed.
 
 (deftest test-resource-limits-disabled
   (testing "passing nil resource-limits creates an unrestricted context"

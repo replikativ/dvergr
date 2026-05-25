@@ -1,12 +1,12 @@
 (ns dvergr.main
-  "Entry point for the dvergr daemon with TUI dashboard.
+  "Entry point for the dvergr daemon with TUI app.
 
    Starts nREPL, the daemon (agents + channels), and the TUI.
 
-   Usage:  clj -M:dashboard"
+   Usage:  clj -M:tui"
   (:require [dvergr.daemon :as daemon]
             [dvergr.log :as dvergr-log]
-            [dvergr.tui.dashboard :as dashboard]
+            [dvergr.tui.app :as app]
             [nrepl.server :as nrepl]))
 
 (defn- start-nrepl!
@@ -27,7 +27,7 @@
           ;; Shutdown hook covers SIGTERM / hard kill / IDE stop — the
           ;; try/finally below only runs on a clean :quit from the TUI.
           ;; Without this, a hard exit leaves the Lucene write.lock on
-          ;; disk and the next `clj -M:dashboard` fails at start.
+          ;; disk and the next `clj -M:tui` fails at start.
           shutdown-hook
           (Thread.
             (fn []
@@ -46,8 +46,8 @@
         (let [d (daemon/start-from-config!)]
           (reset! d-ref d)
           (try
-            ;; 4. Start TUI dashboard (blocks main thread)
-            (dashboard/run d)
+            ;; 4. Start TUI app (blocks main thread)
+            (app/run d)
             (finally
               (daemon/stop! d)
               (reset! d-ref nil))))

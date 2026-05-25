@@ -52,32 +52,30 @@
 ;; ---------------------------------------------------------------------------
 
 (defn make-resource-limits
-  "Return an :interrupt-fn callback for sci/init that enforces CPU and memory bounds.
+  "Return an :interrupt-fn callback for sci/init.
 
-   SCI calls this fn at the start of every user-defined function body evaluation
-   (once per fn entry / loop iteration). Built-in calls (map, filter, +, etc.) do
-   not trigger it, but the watchdog thread covers those via Thread.interrupt().
+   SCI calls this at the start of every user-defined fn body. The
+   callback's job is twofold:
 
-   Checks on EVERY call (cheap, ~1ns):
-     - Thread.isInterrupted() — picks up signals from make-timeout watchdog threads
-       and external Thread.interrupt() calls. This is what turns a wall-clock timeout
-       into a thrown exception during SCI computation.
+     1. Pick up Thread.isInterrupted() so the host's outer Esc / watchdog
+        signal unwinds the eval cooperatively at the next fn boundary.
+     2. Enforce a single coarse bound — thread-allocated memory — so a
+        runaway allocation can't OOM the daemon. Sampled every 10k calls
+        to keep overhead negligible.
 
-   Checks every 10k ops (amortised overhead):
-     - Wall time: fallback for pure-compute cases without a running watchdog.
-     - Thread-allocated memory: via ThreadMXBean (always available on HotSpot/GraalVM).
+   Token / dollar / time budgets are tracked by dvergr.chat.accounting +
+   chat-ctx ledger at much finer granularity; per-call wall-time and
+   op-count caps in here used to fight with those, hitting legitimate
+   long iterations (large folds, multi-step research) as easily as
+   actual infinite loops. They're gone now. The 60s eval-code outer
+   fence + Esc cancellation cover the same threat with no false
+   positives.
 
    Options:
-     :max-ops    - max SCI fn-entry events before throwing (default: 5,000,000)
-     :max-ms     - wall-clock fallback limit in ms; only checked every 10k ops
-                   (default: 30,000). Prefer make-timeout for reliable wall-clock limits.
-     :max-bytes  - max bytes allocated by the current thread (default: 256 MiB)"
-  [& {:keys [max-ops max-ms max-bytes]
-      :or   {max-ops   5000000
-             max-ms    30000
-             max-bytes (* 256 1024 1024)}}]
+     :max-bytes - max bytes allocated by the current thread (default: 256 MiB)"
+  [& {:keys [max-bytes]
+      :or   {max-bytes (* 256 1024 1024)}}]
   (let [ops    (java.util.concurrent.atomic.AtomicLong. 0)
-        start  (System/currentTimeMillis)
         tmx    (ManagementFactory/getThreadMXBean)
         tid    (.getId (Thread/currentThread))
         mem0   (when (.isThreadAllocatedMemoryEnabled tmx)
@@ -87,24 +85,17 @@
       ;; Thread/interrupted also clears the flag so subsequent code runs cleanly.
       (when (.isInterrupted (Thread/currentThread))
         (Thread/interrupted)
-        (throw (ex-info "Resource limit: wall time exceeded"
-                        {:limit-ms max-ms
-                         :elapsed-ms (- (System/currentTimeMillis) start)})))
+        (throw (ex-info "Evaluation interrupted"
+                        {:cause :thread-interrupt})))
+      ;; Sample memory every 10k ops to amortise the ThreadMXBean call.
       (let [n (.incrementAndGet ops)]
-        (when (> n max-ops)
-          (throw (ex-info "Resource limit: operation count exceeded"
-                          {:limit max-ops :ops n})))
-        ;; Sample time + memory every 10k ops to amortise overhead
-        (when (zero? (mod n 10000))
-          (when (> (- (System/currentTimeMillis) start) max-ms)
-            (throw (ex-info "Resource limit: wall time exceeded"
-                            {:limit-ms max-ms
-                             :elapsed-ms (- (System/currentTimeMillis) start)})))
-          (when (and mem0 (.isThreadAllocatedMemoryEnabled tmx))
-            (let [delta (- (.getThreadAllocatedBytes tmx tid) mem0)]
-              (when (> delta max-bytes)
-                (throw (ex-info "Resource limit: memory exceeded"
-                                {:limit-bytes max-bytes :allocated-bytes delta}))))))))))
+        (when (and (zero? (mod n 10000))
+                   mem0
+                   (.isThreadAllocatedMemoryEnabled tmx))
+          (let [delta (- (.getThreadAllocatedBytes tmx tid) mem0)]
+            (when (> delta max-bytes)
+              (throw (ex-info "Resource limit: memory exceeded"
+                              {:limit-bytes max-bytes :allocated-bytes delta})))))))))
 
 (defn make-timeout
   "Start a watchdog daemon thread that interrupts the calling thread after timeout-ms.
