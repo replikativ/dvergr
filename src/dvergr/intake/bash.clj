@@ -181,13 +181,19 @@
 (defn get-or-create-session!
   "Return the chat-ctx's muschel session, creating it on first use.
 
+   The session is seeded with a *sanitised* env via make-sandboxed-env
+   so the agent never sees the daemon's API keys / tokens — even if
+   the agent runs `export` mid-session, the inherited base never had
+   secrets in it.
+
    Stored under [:dvergr/bash-session] in the chat-ctx's spindel-ctx
    state so it forks via CoW alongside everything else when the
    chat-ctx is forked."
   [chat-ctx]
   (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
     (or (ec/get-state session-path)
-        (let [s (ms/spindel-session-using (:spindel-ctx chat-ctx))]
+        (let [s (ms/spindel-session-using (:spindel-ctx chat-ctx)
+                                          (make-sandboxed-env {}))]
           (ec/swap-state! session-path (fn [existing] (or existing s)))
           (ec/get-state session-path)))))
 
@@ -250,17 +256,11 @@
     (let [sess  (get-or-create-session! chat-ctx)
           ast   (m/parse cmd)
           host  (or host (get-or-create-host! chat-ctx))
-          ;; Build a sanitised env each run so secrets stay out. The
-          ;; session's own env tracks shell-mutated state (cd, var
-          ;; assignments) — we merge that on top of the sanitised
-          ;; base so PATH / HOME / etc. always come from our curated
-          ;; allowlist, never from a poisoned session.
-          base-env  (make-sandboxed-env {})
-          sess-env  (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
+          ;; The session was seeded with make-sandboxed-env at creation
+          ;; time (see get-or-create-session!) so its env is already
+          ;; sanitised. Just snapshot it for this run.
+          env0      (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
                       (msession/-env sess))
-          env0      (cond-> base-env
-                      (:cwd sess-env)  (assoc :cwd (:cwd sess-env))
-                      (:vars sess-env) (update :vars merge (:vars sess-env)))
           permit-result (m/check {:ast ast
                                   :rulesets [m/default-rules]
                                   :prompter m/allow-all-prompter})]
