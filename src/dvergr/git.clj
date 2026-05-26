@@ -5,6 +5,7 @@
    Sessions can be nested via branch-from-branch pattern."
   (:require [yggdrasil.adapters.git :as git-adapter]
             [yggdrasil.protocols :as p]
+            [org.replikativ.spindel.yggdrasil :as ygg]
             [clojure.java.io :as io]
             [clojure.string :as str])
   (:import [java.io File]))
@@ -212,6 +213,28 @@
      (spit (str (worktree-path @ygit) \"/new-file.clj\") \"...\")"
   [git-sys]
   (p/working-path git-sys))
+
+(defn current-git-system
+  "Find the registered git system in the **current** execution context
+   (must be bound via `binding [ec/*execution-context* …]`).
+
+   When the context has been forked, the git system stored under the
+   same external-ref id will be the forked one — pointing at the
+   child's worktree — so its `working-path` returns the per-fork
+   workspace.
+
+   Returns the git system, or nil if no git system is registered."
+  []
+  (some->> (ygg/registered-systems)
+           vals
+           (filter #(= :git (p/system-type %)))
+           first))
+
+(defn current-worktree-path
+  "Working-tree filesystem path of the registered git system in the
+   current execution context. nil if no git system is registered."
+  []
+  (some-> (current-git-system) p/working-path))
 
 ;; ---------------------------------------------------------------------------
 ;; Utilities

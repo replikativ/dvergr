@@ -40,6 +40,7 @@
    of the commands themselves still need a git-worktree workspace
    to be truly contained (PR #8 — yggdrasil git-worktree wiring)."
   (:require [clojure.string :as str]
+            [dvergr.git :as dgit]
             [dvergr.process :as dproc]
             [muschel.budget :as mbudget]
             [muschel.builtins.posix :as posix]
@@ -100,10 +101,22 @@
   #{"git"})
 
 (defn default-workspace
-  "JVM cwd. Agents launched alongside a project see the project root.
-   Override via opts to `make-host` if you want per-chat isolation."
+  "Resolve the agent's workspace path.
+
+   Priority:
+   1. The registered yggdrasil git system's current working-tree
+      path. When the surrounding execution context has been forked,
+      this is the **forked** worktree, so each fork's bash session
+      sees its own isolated FS root automatically — the whole
+      isolation story flows through this one lookup.
+   2. JVM cwd as a fallback for when no git system is registered
+      (e.g. unit tests, bare REPL).
+
+   Callers can still pass `:workspace` explicitly to `make-host` to
+   override this."
   []
-  (System/getProperty "user.dir"))
+  (or (dgit/current-worktree-path)
+      (System/getProperty "user.dir")))
 
 ;; ---------------------------------------------------------------------------
 ;; Sanitised environment for the agent's shell
@@ -172,14 +185,20 @@
 ;; Per-chat-ctx host (forks with the chat-ctx)
 ;; ============================================================================
 
-(def ^:private session-path [:dvergr/bash-session])
-(def ^:private host-path    [:dvergr/bash-host])
+;; Host + session are cached in the chat-ctx's spindel state. The cache
+;; key is the workspace path — when a chat-ctx fork lands the
+;; execution context on a fresh git worktree, the new path becomes a
+;; cache miss and a host/session rooted at that worktree gets
+;; built. The parent's host stays alive under its own path, so future
+;; runs back in the parent context still resolve to its workspace.
+(defn- session-path [workspace] [:dvergr/bash-session workspace])
+(defn- host-path    [workspace] [:dvergr/bash-host workspace])
 
 (defn make-host
   "Build a BuiltinHost wrapping a DiskFS rooted at `:workspace`.
 
    Options:
-     :workspace          (default: JVM cwd)
+     :workspace          (default: `default-workspace`)
      :fallback-allowlist (default: default-fallback-allowlist)
      :builtins           (default: muschel.builtins.posix/standard)"
   [{:keys [workspace fallback-allowlist builtins]
@@ -193,34 +212,40 @@
               :fallback-allowlist fallback-allowlist})))
 
 (defn get-or-create-session!
-  "Return the chat-ctx's muschel session, creating it on first use.
+  "Return the chat-ctx's muschel session for the **current** workspace
+   (which depends on whether the surrounding execution context has
+   been forked), creating it on first use.
 
-   The session is seeded with a *sanitised* env via make-sandboxed-env
-   so the agent never sees the daemon's API keys / tokens — even if
-   the agent runs `export` mid-session, the inherited base never had
-   secrets in it.
+   Sessions are seeded with a sanitised env via make-sandboxed-env so
+   the agent never sees the daemon's API keys / tokens. The session's
+   env-atom CoW-forks alongside the chat-ctx, so worker-side `cd` and
+   `export` don't leak back into the parent's session — but only
+   within a single workspace; a fork onto a fresh worktree gets a
+   fresh session at that path.
 
-   Stored under [:dvergr/bash-session] in the chat-ctx's spindel-ctx
-   state so it forks via CoW alongside everything else when the
-   chat-ctx is forked."
+   Stored under `[:dvergr/bash-session WORKSPACE-PATH]`."
   [chat-ctx]
   (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
-    (or (ec/get-state session-path)
-        (let [s (ms/spindel-session-using (:spindel-ctx chat-ctx)
-                                          (make-sandboxed-env {}))]
-          (ec/swap-state! session-path (fn [existing] (or existing s)))
-          (ec/get-state session-path)))))
+    (let [ws (default-workspace)
+          path (session-path ws)]
+      (or (ec/get-state path)
+          (let [s (ms/spindel-session-using (:spindel-ctx chat-ctx)
+                                            (make-sandboxed-env {:cwd ws}))]
+            (ec/swap-state! path (fn [existing] (or existing s)))
+            (ec/get-state path))))))
 
 (defn get-or-create-host!
-  "Return the chat-ctx's BuiltinHost, creating it on first use.
-   Stored under [:dvergr/bash-host] alongside the session so both
-   travel together through fork-context."
+  "Return the chat-ctx's BuiltinHost for the current workspace,
+   creating it on first use. See `get-or-create-session!` for why
+   this is keyed by workspace path."
   [chat-ctx]
   (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
-    (or (ec/get-state host-path)
-        (let [h (make-host {})]
-          (ec/swap-state! host-path (fn [existing] (or existing h)))
-          (ec/get-state host-path)))))
+    (let [ws (default-workspace)
+          path (host-path ws)]
+      (or (ec/get-state path)
+          (let [h (make-host {:workspace ws})]
+            (ec/swap-state! path (fn [existing] (or existing h)))
+            (ec/get-state path))))))
 
 ;; ============================================================================
 ;; Public API
