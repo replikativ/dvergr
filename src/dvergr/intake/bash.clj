@@ -39,8 +39,10 @@
    — a worker's `cd` doesn't leak to the parent. Filesystem effects
    of the commands themselves still need a git-worktree workspace
    to be truly contained (PR #8 — yggdrasil git-worktree wiring)."
-  (:require [muschel.builtins.posix :as posix]
+  (:require [clojure.string :as str]
+            [muschel.builtins.posix :as posix]
             [muschel.core :as m]
+            [muschel.env :as menv]
             [muschel.fs.disk :as fs.disk]
             [muschel.host.builtin :as hb]
             [muschel.host.jvm :as host.jvm]
@@ -88,6 +90,69 @@
    Override via opts to `make-host` if you want per-chat isolation."
   []
   (System/getProperty "user.dir"))
+
+;; ---------------------------------------------------------------------------
+;; Sanitised environment for the agent's shell
+;;
+;; muschel.env/new-env slurps `System/getenv()` wholesale, which means an
+;; agent calling `env` or `printenv` sees every secret in the daemon
+;; process: OPENAI_API_KEY, GITHUB tokens, CLOJARS passwords, etc.
+;;
+;; We construct an explicit allowlist (vars the agent legitimately needs)
+;; plus a denylist of name-fragments that always strip (the secrets
+;; suffixes). Anything else from the host gets dropped.
+;; ---------------------------------------------------------------------------
+
+(def default-env-allow
+  "Vars copied from the daemon's environment into the agent's shell.
+   Curated to cover what real tools (git, npm, clj) reach for, without
+   exposing identity / credentials."
+  #{"PATH" "HOME" "USER" "LOGNAME" "SHELL" "LANG" "LC_ALL"
+    "TERM" "COLORTERM" "PAGER" "TZ"
+    "JAVA_HOME" "NODE_PATH" "GOPATH"
+    "GIT_AUTHOR_NAME" "GIT_AUTHOR_EMAIL"
+    "GIT_COMMITTER_NAME" "GIT_COMMITTER_EMAIL"
+    "GIT_EDITOR"})
+
+(def default-env-deny-substrings
+  "Lowercased substrings that mark a var as secret. Any var whose
+   name contains one of these is excluded even if it's on the allow
+   list — defence-in-depth so a misnamed var doesn't slip through."
+  #{"token" "secret" "key" "password" "pass" "auth"})
+
+(defn- secret-name? [^String n]
+  (let [lower (str/lower-case n)]
+    (some #(.contains lower ^String %) default-env-deny-substrings)))
+
+(defn- sanitise-env-map
+  "Return a {name → value} subset of `host-env` containing only the
+   allowlisted vars whose names don't trip the deny-substring list."
+  [host-env]
+  (into {}
+        (for [[k v] host-env
+              :when (and (default-env-allow k)
+                         (not (secret-name? k)))]
+          [k v])))
+
+(defn make-sandboxed-env
+  "Build a muschel env value with only the curated subset of the host
+   process environment. The agent sees PATH (so allowlisted system
+   binaries resolve), HOME, USER, locale + git author identity — but
+   no API keys, tokens, or other credentials.
+
+   Options:
+     :cwd       starting cwd (default: workspace / JVM cwd)
+     :extra     {name → value} to add (e.g. project-specific vars)"
+  [{:keys [cwd extra]}]
+  (let [host-env (into {} (System/getenv))
+        clean-env (sanitise-env-map host-env)
+        all-env (merge clean-env extra)
+        cwd' (or cwd (default-workspace))]
+    (-> (menv/empty-env)
+        (assoc :cwd cwd'
+               :prev-cwd cwd'
+               :vars (into {} (for [[k v] all-env]
+                                [k {:value v :exported? true :readonly? false}]))))))
 
 ;; ============================================================================
 ;; Per-chat-ctx host (forks with the chat-ctx)
@@ -185,8 +250,17 @@
     (let [sess  (get-or-create-session! chat-ctx)
           ast   (m/parse cmd)
           host  (or host (get-or-create-host! chat-ctx))
-          env0  (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
-                  (msession/-env sess))
+          ;; Build a sanitised env each run so secrets stay out. The
+          ;; session's own env tracks shell-mutated state (cd, var
+          ;; assignments) — we merge that on top of the sanitised
+          ;; base so PATH / HOME / etc. always come from our curated
+          ;; allowlist, never from a poisoned session.
+          base-env  (make-sandboxed-env {})
+          sess-env  (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
+                      (msession/-env sess))
+          env0      (cond-> base-env
+                      (:cwd sess-env)  (assoc :cwd (:cwd sess-env))
+                      (:vars sess-env) (update :vars merge (:vars sess-env)))
           permit-result (m/check {:ast ast
                                   :rulesets [m/default-rules]
                                   :prompter m/allow-all-prompter})]
