@@ -57,33 +57,45 @@
 
 (def default-fallback-allowlist
   "System binaries the BuiltinHost may delegate to. Everything else
-   refuses unless it's a Clojure builtin (touch / ls / sed / awk / …).
+   refuses unless it's a Clojure builtin (touch / ls / sed / awk /
+   jq / …).
 
-   Reach for this list when you want to expand what the agent can call.
-   Pair with a permit rule if you want to allow only a subset of a
-   tool's argv (e.g. `git push` allow / `git push --force` deny)."
-  #{"git"
-    "gh"
-    "clj"
-    "clojure"
-    "bb"
-    "lein"
-    "boot"
-    "npm"
-    "npx"
-    "yarn"
-    "pnpm"
-    "jq"
-    "make"
-    "cargo"
-    "rustc"
-    "go"
-    "python"
-    "python3"
-    "pip"
-    "pip3"
-    "uv"
-    "node"})
+   ## Why so minimal
+
+   Every entry here is a tool that runs OUTSIDE muschel's FS
+   containment. Once we hand control to `python3` / `node` / `clj`
+   / `npm` / `cargo` / etc., the tool's own stdlib can read+write
+   any path on real disk — defeating the entire sandbox. The
+   agent already has `clojure_eval` (in-process SCI sandbox) for
+   any scripting need; it doesn't need a second runtime that
+   escapes containment.
+
+   Default is therefore the smallest set that:
+     - is well-scoped (does only what it advertises)
+     - is what agents *cannot* reasonably reimplement in
+       clojure_eval (network protocols, git plumbing)
+
+   `git` qualifies — it has escape hatches (`git -C /etc ...`,
+   post-commit hooks, `git clone <url> /any/path`) but most uses
+   are bounded to the working tree, and the permit layer
+   already denies the obvious foot-guns (`git push --force`,
+   `git reset --hard`, `git clean -fd`).
+
+   `gh` is NOT here by default. The user explicitly authorising
+   GitHub interaction (PR creation, issue comments, releases)
+   is a per-project / per-chat decision, not a default — once an
+   agent has gh, it can speak in the user's name to the wider
+   world. Re-enable via `:fallback-allowlist` when you want PR
+   workflows specifically.
+
+   ## Extending per-project
+
+   Override via `:fallback-allowlist` on `make-host` if a specific
+   project legitimately needs a heavier tool (gh for PR creation,
+   pytest for a Python repo, cargo for a Rust crate). That choice
+   belongs to the human running dvergr — not to a default that
+   ships open."
+  #{"git"})
 
 (defn default-workspace
   "JVM cwd. Agents launched alongside a project see the project root.
