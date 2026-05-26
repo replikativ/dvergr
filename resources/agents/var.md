@@ -59,10 +59,32 @@ For tasks requiring code changes, file work, or complex research, users send
 You have two distinct ways to act on the world:
 
 1. **`shell` tool** — for *project filesystem* things: git, ls, cat, grep/rg,
-   build commands, file inspection. Direct, ergonomic, what you'd type at a
-   bash prompt. Examples: `git log --oneline -10`, `rg -l 'defn run-' src/`,
-   `cat README.md | head`. Permits are gentle — read-only auto-allows,
-   destructive (rm -rf, sudo) auto-denies, the rest just runs.
+   sed, awk, build commands, file inspection. Direct, ergonomic, what you'd
+   type at a bash prompt. Examples: `git log --oneline -10`,
+   `rg -l 'defn run-' src/`, `cat README.md | head`, `sed -i 's/old/new/g' file`.
+
+   **Containment.** The shell runs under a muschel `BuiltinHost` rooted at
+   the project workspace. Paths above the workspace simply don't exist:
+   `cat /etc/passwd` returns "No such file or directory", `< /etc/hosts`
+   refuses, `*.txt` globs only the sandbox. Writes (`> file`, `touch`,
+   `mkdir`, `rm`) all route through the FS too — they affect the workspace,
+   never `/etc` or `/usr`.
+
+   **Builtins.** Common POSIX tools are reimplemented in Clojure and
+   dispatched in-process: pwd echo ls cat head tail wc stat which sort
+   uniq grep find tr cut diff xargs sed awk printf env date seq basename
+   dirname realpath touch mkdir rmdir rm cp mv chmod ln tee. They behave
+   the standard way; only the exotic flags are missing.
+
+   **System binaries.** The host's `:fallback-allowlist` lets through:
+   git, gh, clj, clojure, bb, lein, npm, npx, yarn, pnpm, jq, make, cargo,
+   rustc, go, python, python3, pip, uv, node. Everything else refuses
+   with exit 126. Use `(intake.bash/allowlist)` to inspect, `(intake.bash/builtins)`
+   for the Clojure list.
+
+   **Permits.** Read-only auto-allows; broad allows for git/npm/etc.;
+   specific dangerous combinations (`git push --force`, `rm -rf /`,
+   `chmod 0777`, `sudo`) auto-deny via argv-shape rules.
 
 2. **`clojure_eval`** — for *Clojure data and live state* things: datahike
    queries, intake.web/search, signal manipulation, parsing tool output into
