@@ -40,6 +40,8 @@
    of the commands themselves still need a git-worktree workspace
    to be truly contained (PR #8 — yggdrasil git-worktree wiring)."
   (:require [clojure.string :as str]
+            [dvergr.process :as dproc]
+            [muschel.budget :as mbudget]
             [muschel.builtins.posix :as posix]
             [muschel.core :as m]
             [muschel.env :as menv]
@@ -229,11 +231,72 @@
 
    Returns muschel's check map; `(= :allow (:decision result))` is the
    typical green-light. Useful for `clojure_eval` agents that want to
-   inspect what a command would be allowed to do before committing."
-  [cmd]
-  (let [ast (m/parse cmd)]
-    (m/check {:ast ast :rulesets [m/default-rules]
-              :prompter m/allow-all-prompter})))
+   inspect what a command would be allowed to do before committing.
+
+   Opts:
+     :prompter  default `m/allow-all-prompter`; pass
+                `m/deny-all-prompter` to inspect what the safe-default
+                policy would reject."
+  ([cmd] (check cmd {}))
+  ([cmd {:keys [prompter] :or {prompter m/allow-all-prompter}}]
+   (let [ast (m/parse cmd)]
+     (m/check {:ast ast :rulesets [m/default-rules]
+               :prompter prompter}))))
+
+;; ---------------------------------------------------------------------------
+;; Interrupt + tracing helpers — bridge muschel's resource budgets and
+;; introspection hooks into dvergr's process/telemere surface.
+;; ---------------------------------------------------------------------------
+
+(def ^:const default-timeout-ms
+  "Per-call wall-clock ceiling. Most bash commands return in ms; a
+   build can take a minute. Anything past this almost certainly is
+   stuck in a loop or waiting on stdin. Override via `:timeout-ms`
+   for legitimately long commands."
+  60000)
+
+(defn- process-abort-interrupt-fn
+  "Build a muschel interrupt-fn that polls a dvergr.process for
+   abort status. Returns nil when no process is active."
+  [process]
+  (when process
+    (fn []
+      (when (dproc/aborted? process)
+        (throw (ex-info "muschel: process aborted"
+                        {:muschel/budget :process-aborted}))))))
+
+(defn- trace-bridge
+  "Build a muschel `:trace` map that mirrors every tool/fs/deny event
+   into telemere so the TUI + log surface can see what the agent
+   actually did."
+  []
+  {:on-tool (fn [e]
+              (tel/log! {:level :debug :id ::tool
+                         :data {:cmd (:name e) :argv (:argv e)
+                                :exit (:exit e)
+                                :stdout-bytes (:stdout-bytes e)
+                                :stderr-bytes (:stderr-bytes e)
+                                :duration-ms (:duration-ms e)}}))
+   :on-fs   (fn [e]
+              (tel/log! {:level :trace :id ::fs
+                         :data {:op (:op e) :path (:path e)
+                                :result (:result e)}}))
+   :on-deny (fn [e]
+              (tel/log! {:level :warn :id ::denied
+                         :data {:tool (:tool e) :argv (:argv e)
+                                :reason (:reason e)
+                                :rule-id (:rule-id e)}}))})
+
+(defn- trace-summary
+  "Compress muschel's full trace snapshot into a small map the agent
+   can read without flooding its context. Full trace stays accessible
+   via the returned `:trace-full` when callers opt in."
+  [trace]
+  (when trace
+    {:tool-count   (count (:tools trace))
+     :fs-reads     (count (:reads trace))
+     :fs-writes    (count (:writes trace))
+     :denied-count (count (:denied trace))}))
 
 (defn builtins
   "Return a sorted seq of builtin command names the agent's
@@ -252,59 +315,92 @@
   "Execute a bash source string against the chat-ctx's session.
 
    Options:
-     :chat-ctx     - explicit chat-ctx (otherwise resolved from
-                     *current-chat-ctx* binding, if you set one)
-     :host         - override the muschel host (default: BuiltinHost
-                     rooted at the workspace via get-or-create-host!)
-     :max-out      - cap stdout / stderr returned (default 8000 chars
-                     each — protects the agent context window)
+     :host         override the muschel host (default: BuiltinHost
+                   rooted at the workspace via get-or-create-host!)
+     :max-out      cap stdout / stderr returned (default 8000 chars
+                   each — protects the agent context window)
+     :prompter     muschel prompter for `:ask` permit decisions
+                   (default `m/allow-all-prompter`; pass
+                   `m/deny-all-prompter` for safer policy)
+     :timeout-ms   per-call wall-clock ceiling
+                   (default 60_000; agents shouldn't block longer)
+     :process      a `dvergr.process` to honour for cancellation;
+                   when aborted, the bash run interrupts at the next
+                   safe point. Defaults to
+                   `dvergr.process/*current-process*` when bound,
+                   so any agent turn wrapped as a process gets
+                   cancellation for free.
+     :trace-full?  include the full muschel trace snapshot (tools,
+                   fs ops, denied) in the return map. Default false
+                   — only a `:trace` summary is included.
 
    Returns:
-     {:stdout str :stderr str :exit int :cwd str :truncated? bool}
-     or {:error str :exit 126} on permit deny."
-  [chat-ctx cmd & {:keys [host max-out]
-                   :or {max-out 8000}}]
+     {:stdout str :stderr str :exit int :cwd str :truncated? bool
+      :trace {:tool-count :fs-reads :fs-writes :denied-count}}
+     or {:error str :exit 126 :permit ...} on permit deny."
+  [chat-ctx cmd & {:keys [host max-out prompter timeout-ms process trace-full?]
+                   :or {max-out      8000
+                        prompter     m/allow-all-prompter
+                        timeout-ms   default-timeout-ms
+                        process      dproc/*current-process*}}]
   (try
-    (let [sess  (get-or-create-session! chat-ctx)
-          ast   (m/parse cmd)
-          host  (or host (get-or-create-host! chat-ctx))
-          ;; The session was seeded with make-sandboxed-env at creation
-          ;; time (see get-or-create-session!) so its env is already
-          ;; sanitised. Just snapshot it for this run.
-          env0      (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
-                      (msession/-env sess))
-          permit-result (m/check {:ast ast
-                                  :rulesets [m/default-rules]
-                                  :prompter m/allow-all-prompter})]
-      (if (= :deny (:decision permit-result))
-        (let [denied (->> (:per-call permit-result)
-                          (filter #(= :deny (:decision %)))
-                          first)]
-          (tel/log! {:level :warn :id :bash/denied
-                     :data {:cmd cmd :reason (:reason denied)}}
-                    "Bash command denied")
-          {:error (str "permit denied: " (or (:reason denied) "no reason"))
-           :exit 126})
-        (let [{:keys [stdout stderr exit env]}
-              (m/run-and-capture env0 ast
-                                 {:session sess :host host
-                                  ;; agents don't write stdin; never
-                                  ;; inherit System/in (would block
-                                  ;; under nREPL / when daemonised).
-                                  :in (java.io.ByteArrayInputStream.
-                                        (.getBytes ""))})
-              clip (fn [s]
-                     (if (and s (> (count s) max-out))
-                       (str (subs s 0 max-out) "\n[...truncated]")
-                       (or s "")))]
-          {:stdout     (clip stdout)
-           :stderr     (clip stderr)
-           :exit       exit
-           :cwd        (some-> env :cwd)
-           :truncated? (or (and stdout (> (count stdout) max-out))
-                           (and stderr (> (count stderr) max-out)))})))
+    (let [sess (get-or-create-session! chat-ctx)
+          host (or host (get-or-create-host! chat-ctx))
+          ;; The session was seeded with a sanitised env at creation
+          ;; time (make-sandboxed-env), so the snapshot is already
+          ;; secret-free. Pass it as the explicit starting env so
+          ;; one-shot library use stays well-defined.
+          env0 (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
+                 (msession/-env sess))
+          interrupt-fn (mbudget/combine (process-abort-interrupt-fn process))
+          {:keys [stdout stderr exit env permit trace]}
+          (m/run-and-capture
+           env0 cmd
+           (cond-> {:session     sess
+                    :host        host
+                    ;; Agents don't write stdin; never inherit System/in
+                    ;; (would block under nREPL / when daemonised).
+                    :in          (java.io.ByteArrayInputStream. (.getBytes ""))
+                    :permit      {:rulesets [m/default-rules] :prompter prompter}
+                    :timeout-ms  timeout-ms
+                    :trace       (trace-bridge)}
+             interrupt-fn (assoc :interrupt-fn interrupt-fn)))
+          ;; muschel's run-and-capture doesn't propagate :denied-reason
+          ;; (it lives one level deeper, on the run result). Re-derive
+          ;; from :permit so we can build a useful error message.
+          denied-reason (when (and permit (= :deny (:decision permit)))
+                          (some->> permit :per-call
+                                   (filter #(= :deny (:decision %)))
+                                   first :reason))
+          clip (fn [s]
+                 (if (and s (> (count s) max-out))
+                   (str (subs s 0 max-out) "\n[...truncated]")
+                   (or s "")))]
+      (if denied-reason
+        (do (tel/log! {:level :warn :id ::denied
+                       :data {:cmd cmd :reason denied-reason}}
+                      "Bash command denied")
+            (cond-> {:error  (str "permit denied: " denied-reason)
+                     :exit   126
+                     :permit permit}
+              trace-full? (assoc :trace-full trace)))
+        (cond-> {:stdout     (clip stdout)
+                 :stderr     (clip stderr)
+                 :exit       exit
+                 :cwd        (some-> env :cwd)
+                 :truncated? (or (and stdout (> (count stdout) max-out))
+                                 (and stderr (> (count stderr) max-out)))
+                 :trace      (trace-summary trace)}
+          ;; Full permit result is huge (AST per call). Only include
+          ;; when explicitly requested.
+          trace-full? (assoc :trace-full trace :permit permit))))
     (catch Exception e
-      (tel/log! {:level :error :id :bash/error
-                 :data {:cmd cmd :error (.getMessage e)}}
-                "Bash run error")
-      {:error (.getMessage e) :exit 1})))
+      (let [budget? (mbudget/budget-exceeded? e)]
+        (tel/log! {:level (if budget? :warn :error)
+                   :id    (if budget? ::budget-exceeded ::error)
+                   :data  {:cmd cmd
+                           :reason (some-> e ex-data :muschel/budget)
+                           :error (.getMessage e)}}
+                  (if budget? "Bash budget exceeded" "Bash run error"))
+        {:error (.getMessage e)
+         :exit  (if budget? 124 1)}))))
