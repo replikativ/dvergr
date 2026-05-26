@@ -32,7 +32,9 @@
             [org.replikativ.spindel.spin.combinators :as comb]
             [org.replikativ.spindel.yggdrasil :as ygg]
             [is.simm.partial-cps.sequence :refer [anext]]
-            [dvergr.bus :as bus]))
+            [dvergr.bus :as bus]
+            [dvergr.git :as dgit]
+            [dvergr.peer-bus :as peer-bus]))
 
 ;; ============================================================================
 ;; Records
@@ -109,12 +111,25 @@
 ;; Construction
 ;; ============================================================================
 
+(defn- bus-with-peer-relay
+  "Build a bus that mirrors every message to the daemon-wide peer-bus
+   (when one is registered in the current ctx). Falls back to a plain
+   bus if not — keeps tests / library use happy without daemon
+   bootstrap."
+  [ctx room-id scope]
+  (let [peer (binding [ec/*execution-context* ctx] (peer-bus/current))]
+    (bus/create-bus
+     (cond-> {:ctx ctx}
+       peer (assoc :relay-to  peer
+                   :relay-tag {:dvergr/origin room-id
+                               :dvergr/scope  scope})))))
+
 (defn room
   "Create a Room. With one arg, allocates a fresh ExecutionContext;
    with two, uses the provided ctx (useful for nested rooms / forks)."
   ([id] (room id (sp/create-execution-context)))
   ([id ctx]
-   (let [b (bus/create-bus {:ctx ctx})]
+   (let [b (bus-with-peer-relay ctx id :room)]
      (->Room id (atom {}) b ctx 0))))
 
 (defn participant
@@ -472,8 +487,7 @@
          child-ctx  (case isolation
                       :none (:ctx room)
                       :ctx  (ctx/fork-context (:ctx room)))
-         child-bus  (binding [ec/*execution-context* child-ctx]
-                      (bus/create-bus {:ctx child-ctx}))
+         child-bus  (bus-with-peer-relay child-ctx new-id :fork)
          ;; Seed the fork's bus log with parent history so log-based
          ;; consumers see a continuous record. Forks have their OWN bus
          ;; so live messages do not leak between parent and fork.
@@ -484,6 +498,16 @@
        (when-let [fac (:factory p)]
          (binding [ec/*execution-context* child-ctx]
            (join new-room (fac child-ctx)))))
+     ;; Control-plane: announce the fork on the peer-bus so dashboards,
+     ;; audit logs, and oversight agents see it without subscribing to
+     ;; the fork's bus directly.
+     (binding [ec/*execution-context* child-ctx]
+       (peer-bus/post! {:type            :dvergr/fork-created
+                        :dvergr/origin   new-id
+                        :dvergr/parent   (:id room)
+                        :isolation       isolation
+                        :worktree-path   (when (= :ctx isolation)
+                                           (dgit/current-worktree-path))}))
      new-room)))
 
 (defmacro with-fork-ctx
@@ -511,11 +535,16 @@
    via `spindel.yggdrasil/discard-from-parent!`. Participant spins on a
    shared ctx (`:isolation :none`) continue running indefinitely on
    their mailboxes (harmless; cleaned up when the shared context
-   eventually stops)."
+   eventually stops).
+
+   Emits `:dvergr/fork-discarded` on the peer-bus."
   [fork]
   (reset! (:participants fork) {})
   (when (ctx-was-forked? fork)
     (ygg/discard-from-parent! (:ctx fork)))
+  (binding [ec/*execution-context* (:ctx fork)]
+    (peer-bus/post! {:type :dvergr/fork-discarded
+                     :dvergr/origin (:id fork)}))
   fork)
 
 (defn merge-room
@@ -549,7 +578,64 @@
   (when (ctx-was-forked? fork)
     (ygg/merge-to-parent! (:ctx fork)))
   (reset! (:participants fork) {})
+  (binding [ec/*execution-context* (:ctx fork)]
+    (peer-bus/post! {:type            :dvergr/fork-merged
+                     :dvergr/origin   (:id fork)
+                     :dvergr/parent   (:id parent)}))
   parent)
+
+;; ============================================================================
+;; PR-style merge review
+;; ============================================================================
+
+(defn propose-merge!
+  "Agent-side: signal that the fork-room's work is ready for the
+   manager's review. Posts two things:
+
+   1. A chat message on the fork's bus with `:dvergr/proposal`
+      metadata carrying a diff summary (commits + changed files +
+      `git diff --stat`). Participants subscribed to the fork can
+      ask follow-up questions in the usual way.
+
+   2. A `:dvergr/merge-proposed` event on the peer-bus so dashboards
+      and oversight agents see the proposal without joining the
+      fork's bus.
+
+   Options:
+     :from     participant id posting the proposal (default: :worker)
+     :note     human-readable rationale to attach to the message
+               (default: empty)
+
+   Returns the proposal payload."
+  [fork & {:keys [from note] :or {from :worker note ""}}]
+  (let [diff      (when (ctx-was-forked? fork)
+                    (dgit/diff-since-fork (:ctx fork)))
+        proposal  (cond-> {:fork-id (:id fork)
+                           :note    note}
+                    diff (assoc :diff diff))
+        msg       {:type            :proposal/merge
+                   :from            from
+                   :body            (str "Ready for review."
+                                         (when (seq note) (str " " note)))
+                   :dvergr/proposal proposal}]
+    (bus/post! (:bus fork) msg)
+    (binding [ec/*execution-context* (:ctx fork)]
+      (peer-bus/post! {:type            :dvergr/merge-proposed
+                       :dvergr/origin   (:id fork)
+                       :proposal        proposal}))
+    proposal))
+
+(defn pending-proposals
+  "Scan a room's log for `:dvergr/proposal`-tagged messages that
+   haven't been followed by a merge or discard. Useful for the TUI
+   pending-review badge and for agents that want to enumerate open
+   review threads.
+
+   Returns a vector of proposal payloads in log order."
+  [room]
+  (->> (log room)
+       (keep :dvergr/proposal)
+       vec))
 
 ;; ============================================================================
 ;; Hire — fork + spawn + send + merge|discard (the §5.8 primitive)

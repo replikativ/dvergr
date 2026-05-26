@@ -120,14 +120,47 @@
                 (swap! log-atom conj msg)
                 (recur rest-s)))))))))
 
+(defn- spawn-relay-drain!
+  "Spawn a spin that taps `source-mult` and re-posts every message to
+   `target-bus`, with `relay-tag` merged in. Used so a per-room bus can
+   mirror its traffic up to a daemon-wide peer-bus.
+
+   The relayed message gets two added fields by default:
+     :dvergr/origin   — the room id (or whatever the caller set in
+                         relay-tag's `:room`)
+     :dvergr/scope    — `:room` for normal rooms, `:fork` for forks,
+                         or whatever the caller set"
+  [ctx source-mult target-bus relay-tag]
+  (binding [ec/*execution-context* ctx]
+    (let [relay-tap (mult/tap source-mult (buf/fixed-buffer 1024))]
+      (sync/spawn!
+        (spin
+          (loop [s relay-tap]
+            (when-let [r (await (aseq/anext s))]
+              (let [[msg rest-s] r
+                    ;; The relay-tag is a plain map. We don't overwrite
+                    ;; keys the original message already has — the
+                    ;; origin's view of itself wins.
+                    tagged    (merge relay-tag msg)]
+                (binding [ec/*execution-context* (:ctx target-bus)]
+                  (sync/post! (:source-mbox target-bus) tagged))
+                (recur rest-s)))))))))
+
 (defn create-bus
   "Construct a Bus.
 
    Options:
-     :ctx  — existing execution context; default: a fresh one
-     :log? — keep a vector history of every message (default true)"
+     :ctx        — existing execution context; default: a fresh one
+     :log?       — keep a vector history of every message (default true)
+     :relay-to   — another Bus to mirror every message into (typically
+                    the daemon-wide peer-bus). Messages are re-posted
+                    verbatim with `:relay-tag` merged in *underneath*
+                    (so the original message's own fields win).
+     :relay-tag  — extras to merge into each relayed message — typically
+                    `{:dvergr/origin <room-id> :dvergr/scope :room}`
+                    or `:fork`. Required when `:relay-to` is set."
   ([] (create-bus {}))
-  ([{:keys [ctx log?] :or {log? true}}]
+  ([{:keys [ctx log? relay-to relay-tag] :or {log? true}}]
    (let [ctx (or ctx (ectx/create-execution-context))]
      (binding [ec/*execution-context* ctx]
        (let [source     (sync/create-mailbox ctx)
@@ -139,6 +172,8 @@
              log-atom   (atom [])]
          (when log?
            (spawn-log-drain! ctx m log-atom))
+         (when relay-to
+           (spawn-relay-drain! ctx m relay-to (or relay-tag {})))
          (->Bus ctx source m to-pub-v type-pub-v log-atom))))))
 
 ;; ============================================================================

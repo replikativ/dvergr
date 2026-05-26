@@ -192,6 +192,15 @@
                        :error e
                        :data {:error (.getMessage e)}}
                       "Could not register Datahike system"))))
+      ;; Daemon-wide peer-bus. Sits on the base-ctx; every room/fork
+      ;; bus relays into it (see dvergr.discourse/fork-room and the
+      ;; future Room constructor). Cross-cutting subscribers — TUI
+      ;; pending-review badge, audit, oversight agents — tap one
+      ;; place instead of N rooms.
+      (require 'dvergr.peer-bus)
+      ((resolve 'dvergr.peer-bus/create!) base-ctx)
+      (tel/log! {:id :daemon/peer-bus-registered}
+                "Registered daemon peer-bus")
       base-ctx)))
 
 ;; ============================================================================

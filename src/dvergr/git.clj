@@ -5,6 +5,7 @@
    Sessions can be nested via branch-from-branch pattern."
   (:require [yggdrasil.adapters.git :as git-adapter]
             [yggdrasil.protocols :as p]
+            [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.yggdrasil :as ygg]
             [clojure.java.io :as io]
             [clojure.string :as str])
@@ -235,6 +236,70 @@
    current execution context. nil if no git system is registered."
   []
   (some-> (current-git-system) p/working-path))
+
+(defn- git-in
+  "Run `git <args>` inside `dir`, return {:exit :out}. Best-effort —
+   never throws on git errors, the caller decides what to do."
+  [dir & args]
+  (let [pb (-> (ProcessBuilder. ^java.util.List
+                                (into ["git"] args))
+               (.directory (io/file dir))
+               (.redirectErrorStream true))
+        proc (.start pb)
+        out (slurp (.getInputStream proc))
+        exit (.waitFor proc)]
+    {:exit exit :out out}))
+
+(defn diff-since-fork
+  "Compute the diff that a fork-context's branch has accumulated over
+   its parent branch. Used by `dvergr.discourse/propose-merge!` to
+   build a payload the human (or another agent) can scan before
+   approving a merge.
+
+   `fork-ctx` is the spindel execution context returned by
+   `ctx/fork-context` (i.e. the `:child-ctx` of a yggdrasil
+   ForkHandle, or `(:ctx fork-room)` after `fork-room :isolation
+   :ctx`).
+
+   Returns a map:
+     {:branch         \"main-fork-…\"           ; fork's branch
+      :parent-branch  \"main\"                  ; parent's branch
+      :worktree-path  \"/tmp/.../worktrees/…\"  ; the fork's path
+      :commits        [{:sha … :subject …} …]   ; fork-only commits
+      :stat           \"…lines + / - per file…\" ; diff --stat output
+      :files          [\"side.txt\" \"x.clj\" …] ; changed file paths
+      :empty?         false}                    ; true when no diff"
+  [fork-ctx]
+  (let [in-ctx (fn [c] (binding [ec/*execution-context* c]
+                         (current-git-system)))
+        fork-sys (in-ctx fork-ctx)]
+    (when fork-sys
+      (let [fork-branch   (name (p/current-branch fork-sys))
+            parent-branch (let [parent-ctx (:parent-ctx fork-ctx)
+                                parent-sys (when parent-ctx (in-ctx parent-ctx))]
+                            (or (some-> parent-sys p/current-branch name)
+                                "main"))
+            worktree      (p/working-path fork-sys)
+            range         (str parent-branch ".." fork-branch)
+            commits-r     (git-in worktree "log" "--format=%h%x09%s" range)
+            commits       (when (zero? (:exit commits-r))
+                            (for [line (str/split-lines (:out commits-r))
+                                  :when (not (str/blank? line))
+                                  :let [[sha subject] (str/split line #"\t" 2)]]
+                              {:sha sha :subject subject}))
+            stat-r        (git-in worktree "diff" "--stat" range)
+            files-r       (git-in worktree "diff" "--name-only" range)
+            files         (when (zero? (:exit files-r))
+                            (->> (str/split-lines (:out files-r))
+                                 (remove str/blank?)
+                                 vec))]
+        {:branch        fork-branch
+         :parent-branch parent-branch
+         :worktree-path worktree
+         :commits       (vec commits)
+         :stat          (when (zero? (:exit stat-r)) (:out stat-r))
+         :files         files
+         :empty?        (empty? files)}))))
 
 ;; ---------------------------------------------------------------------------
 ;; Utilities
