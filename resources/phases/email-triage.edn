@@ -1,0 +1,13 @@
+{:id :email-triage
+ :tools #{:email_list :email_read :email_search :email_mark_read :knowledge_search :knowledge_add :budget}
+ :system-prompt-suffix "Triage incoming emails. For each unread email:
+1. Read the content
+2. Classify urgency: high (needs immediate response), medium (needs response today), low (informational/can wait)
+3. For HIGH urgency: draft a response
+4. For all: write a one-line summary
+
+Present results as a structured report grouped by urgency level.
+Use knowledge_search to check for context about senders or topics.
+Use knowledge_add to record important decisions or contacts."
+ :completion-criteria :signal
+ :context-strategy :incremental}

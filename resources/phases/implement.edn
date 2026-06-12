@@ -1,0 +1,5 @@
+{:id :implement
+ :tools #{:read_file :write_file :edit_file :clojure_edit :clojure_eval :clj_kondo :glob :grep :budget}
+ :system-prompt-suffix "Implement the plan. Write code, edit files, and use clj_kondo to lint your changes. Signal completion when done."
+ :completion-criteria :explicit
+ :context-strategy :incremental}

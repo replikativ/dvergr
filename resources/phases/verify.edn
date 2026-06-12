@@ -1,0 +1,6 @@
+{:id :verify
+ :tools #{:read_file :write_file :edit_file :clojure_eval :clj_kondo :run_tests :glob :grep :budget}
+ :system-prompt-suffix "Verify your implementation. Run tests and linting, fix any issues found. Iterate until all checks pass."
+ :completion-criteria :self-check
+ :self-check {:test-tool "clj_kondo" :max-retries 3}
+ :context-strategy :incremental}

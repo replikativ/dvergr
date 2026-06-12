@@ -1,0 +1,239 @@
+(ns dvergr.orchestration.stats
+  "Per-agent aggregate statistics: spend, last-active, 1-line LLM status summary.
+
+   Queries the datahike ledger for cost and last-active timestamp; calls
+   cheap-llm-call to generate a one-sentence status summary from the agent's
+   most recent assistant message.
+
+   All values are cached with short TTLs to avoid DB/LLM pressure on every
+   render:
+     cost / last-active — refreshed every 30 s
+     summary            — refreshed every 5 min (LLM call, async)
+
+   Usage:
+     (stats/init! datahike-conn)    ; call once at daemon startup
+     (stats/get-stats :huginn)      ; => {:cost-dollars 0.027
+                                    ;      :last-active #inst \"2026-02-22T...\"
+                                    ;      :last-active-str \"5m ago\"
+                                    ;      :summary \"Sweep stored 1 signal...\"}
+     (stats/refresh-all!)           ; force-refresh all agents"
+  (:require [datahike.api :as dh]
+            [dvergr.tools.llm-call :as llm]
+            [dvergr.model.registry :as model-registry]
+            [dvergr.actors :as actors]
+            [dvergr.room.registry :as rreg]
+            [clojure.string :as str]
+            [org.replikativ.spindel.engine.core :as ec]
+            [taoensso.telemere :as tel]))
+
+;; ============================================================================
+;; State
+;; ============================================================================
+
+;; RF5 S4: stats no longer hold a single chat-db conn — cost lives per-room and
+;; queries fan out over the registry. `init!` is kept as a no-op for the daemon
+;; call site until that boot block is cleaned up.
+
+;; The per-agent stats cache lives on the current spindel execution-context
+;; under [:dvergr/stats agent-id]. That way a test/sidecar ctx gets its own
+;; cache and the daemon's stats don't leak across boundaries.
+(def ^:private cache-path [:dvergr/stats])
+
+(defn- current-ctx-or-nil []
+  (try (ec/current-execution-context)
+       (catch Throwable _ nil)))
+
+(defn- cache-get [agent-id]
+  (when (current-ctx-or-nil)
+    (get (ec/get-state cache-path) agent-id)))
+
+(defn- cache-update! [agent-id f & args]
+  (when (current-ctx-or-nil)
+    (ec/swap-state! cache-path
+                    (fn [m]
+                      (let [m (or m {})
+                            existing (get m agent-id)]
+                        (assoc m agent-id (apply f existing args)))))))
+
+(def ^:private cost-ttl-ms    (* 30 1000))   ; 30 s
+(def ^:private summary-ttl-ms (* 300 1000))  ; 5 min
+
+(defn init!
+  "Deprecated no-op (RF5 S4): cost is per-room now and queries fan out over the
+   room registry. Retained so the daemon boot call site stays valid."
+  [_datahike-conn]
+  nil)
+
+;; ============================================================================
+;; Helpers
+;; ============================================================================
+
+(defn- age-str
+  "Human-readable age of a java.util.Date: '5m ago', '2h ago', '3d ago'."
+  [^java.util.Date ts]
+  (when ts
+    (let [ms (- (System/currentTimeMillis) (.getTime ts))]
+      (cond
+        (< ms 60000)    "just now"
+        (< ms 3600000)  (format "%dm ago"  (long (/ ms 60000)))
+        (< ms 86400000) (format "%dh ago"  (long (/ ms 3600000)))
+        :else           (format "%dd ago"  (long (/ ms 86400000)))))))
+
+;; ============================================================================
+;; Datahike Queries
+;; ============================================================================
+
+;; RF5 S4: the cost ledger lives in each ROOM's own msgs store now (not the
+;; legacy chat-db). Per-agent stats are therefore a FAN-OUT over every room's
+;; store — an agent's chats are titled "<agent>-<room>", so the same chat-title
+;; prefix match attributes its ledger across rooms. Needs a bound ctx (to list
+;; rooms via the root-anchored registry).
+
+(defn- room-dbs
+  "Deref'd datahike DBs of every registered room's own store. Bound-ctx required."
+  []
+  (->> (rreg/list-rooms) (keep #(some-> % :store :conn)) (mapv deref)))
+
+(defn- query-cost-db [db prefix]
+  (try
+    (let [res (dh/q '[:find (sum ?cost) :with ?e :in $ ?prefix
+                      :where [?e :ledger/context ?c] [?c :chat/title ?t]
+                      [?e :ledger/cost-microdollars ?cost]
+                      [(clojure.string/starts-with? ?t ?prefix)]]
+                    db prefix)]
+      (/ (double (or (ffirst res) 0)) 1000000.0))
+    (catch Exception _ 0.0)))
+
+(defn- query-cost
+  "Total spend (dollars) for chats titled with `prefix`, summed over all rooms."
+  [prefix]
+  (reduce + 0.0 (map #(query-cost-db % prefix) (room-dbs))))
+
+(defn- query-last-active-db [db prefix]
+  (try
+    (ffirst (dh/q '[:find (max ?ts) :in $ ?prefix
+                    :where [?e :ledger/context ?c] [?c :chat/title ?t]
+                    [?e :ledger/timestamp ?ts]
+                    [(clojure.string/starts-with? ?t ?prefix)]]
+                  db prefix))
+    (catch Exception _ nil)))
+
+(defn- query-last-active
+  "Most recent ledger timestamp for `prefix` chats across all rooms."
+  [prefix]
+  (->> (room-dbs)
+       (keep #(query-last-active-db % prefix))
+       (sort #(compare %2 %1))
+       first))
+
+(defn- query-recent-content-db [db prefix]
+  (try
+    (seq (dh/q '[:find ?content ?ts :in $ ?prefix
+                 :where [?c :chat/title ?t]
+                 [(clojure.string/starts-with? ?t ?prefix)]
+                 [?m :message/chat ?c] [?m :message/role :assistant]
+                 [?m :message/content ?content] [?m :message/created-at ?ts]]
+               db prefix))
+    (catch Exception _ nil)))
+
+(defn- query-recent-content
+  "Most recent assistant message body (≤800 chars) for `agent-id` across rooms."
+  [agent-id]
+  (let [prefix (name agent-id)
+        rows   (mapcat #(or (query-recent-content-db % prefix) []) (room-dbs))]
+    (when (seq rows)
+      (let [content (first (first (sort-by second #(compare %2 %1) rows)))]
+        (when (seq content)
+          (subs content 0 (min 800 (count content))))))))
+
+;; ============================================================================
+;; Refresh Logic
+;; ============================================================================
+
+(defn- refresh-cost!
+  "Synchronously update cost and last-active for agent-id in the cache. `ctx`
+   is captured by the caller (background futures don't inherit the daemon's
+   dynamic ctx); we bind it so the room fan-out + cache write both see it."
+  [ctx agent-id]
+  (try
+    (binding [ec/*execution-context* ctx]
+      (let [prefix  (name agent-id)
+            cost    (query-cost prefix)
+            last-at (query-last-active prefix)]
+        (cache-update! agent-id (fnil merge {})
+                       {:cost-dollars        cost
+                        :last-active         last-at
+                        :last-active-str     (age-str last-at)
+                        :cost-refreshed-at   (System/currentTimeMillis)})))
+    (catch Exception e
+      (tel/log! {:level :warn :id :stats/cost-error
+                 :data {:agent-id agent-id :error (.getMessage e)}}
+                "Stats cost refresh failed"))))
+
+(defn- refresh-summary-async!
+  "Fire a background thread to update the LLM status summary for agent-id.
+   Captures the caller's ctx and re-binds it inside the future, since the
+   future's pool thread doesn't inherit dynamic vars."
+  [ctx agent-id]
+  (future
+    (try
+      (binding [ec/*execution-context* ctx]
+        (when-let [content (query-recent-content agent-id)]
+          (let [summary-model (or (model-registry/get-default :summary-model)
+                                  "accounts/fireworks/models/llama-v3p2-3b-instruct")
+                result (llm/cheap-llm-call
+                        (str "Summarize in ONE concise sentence (max 15 words) "
+                             "what this AI agent accomplished in its most recent activity:")
+                        content
+                         ;; 200 tokens needed — Fireworks models use internal thinking tokens
+                        {:max-tokens 200 :model summary-model})
+                summary (str/trim (or (:text result) ""))]
+            (when (and (not (:error result)) (seq summary))
+              (cache-update! agent-id (fnil assoc {})
+                             :summary              summary
+                             :summary-refreshed-at (System/currentTimeMillis))))))
+      (catch Exception e
+        (tel/log! {:level :warn :id :stats/summary-error
+                   :data {:agent-id agent-id :error (.getMessage e)}}
+                  "Stats summary refresh failed")))))
+
+;; ============================================================================
+;; Public API
+;; ============================================================================
+
+(defn get-stats
+  "Return cached stats for agent-id, triggering async refreshes when stale.
+
+   Returns map:
+     :cost-dollars     — total spend (nil if unknown)
+     :last-active      — java.util.Date of last ledger entry (nil if unknown)
+     :last-active-str  — human-readable age string (nil if unknown)
+     :summary          — 1-sentence LLM status (nil while pending/unavailable)
+
+   Reads/writes the cache on the *current* execution context — callers
+   (web handlers, dashboards) must bind the daemon's ctx for stats to
+   persist meaningfully across requests."
+  [agent-id]
+  (let [ctx       (current-ctx-or-nil)
+        cached    (cache-get agent-id)
+        now       (System/currentTimeMillis)
+        cost-stale?    (or (nil? cached)
+                           (> (- now (or (:cost-refreshed-at cached) 0))
+                              cost-ttl-ms))
+        summary-stale? (or (nil? (:summary cached))
+                           (> (- now (or (:summary-refreshed-at cached) 0))
+                              summary-ttl-ms))]
+    (when (and ctx cost-stale?)
+      (future (refresh-cost! ctx agent-id)))
+    (when (and ctx summary-stale?)
+      (refresh-summary-async! ctx agent-id))
+    (or cached {:cost-dollars nil :last-active nil :last-active-str nil :summary nil})))
+
+(defn refresh-all!
+  "Force-refresh stats for all registered agents. Blocks for cost queries,
+   fires async for LLM summaries."
+  []
+  (when-let [ctx (current-ctx-or-nil)]
+    (doseq [agent-id (actors/online-ids)]
+      (refresh-cost! ctx agent-id)
+      (refresh-summary-async! ctx agent-id))))

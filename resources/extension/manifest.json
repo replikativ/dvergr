@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Dvergr Feed",
+  "version": "0.2.0",
+  "description": "Capture page data and send to dvergr for competitive intelligence.",
+  "permissions": ["activeTab", "storage", "scripting", "webNavigation"],
+  "host_permissions": ["*://*.linkedin.com/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "commands": {
+    "capture-page": {
+      "suggested_key": {
+        "default": "Alt+Shift+D",
+        "mac": "MacCtrl+Shift+D"
+      },
+      "description": "Capture current page and send to dvergr"
+    }
+  },
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

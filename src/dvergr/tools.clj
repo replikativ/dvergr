@@ -1,0 +1,1576 @@
+(ns dvergr.tools
+  "Tool registry and execution for the agent harness."
+  (:require [babashka.fs :as fs]
+            [clojure.string :as str]
+            [clojure.java.io :as io]
+            [clojure.edn :as edn]
+            [datahike.api :as d]
+            [dvergr.sandbox :as sandbox]
+            [dvergr.agent.process :as proc]
+            [dvergr.code.index :as idx]
+            [dvergr.tools.structural :as structural]
+            [dvergr.chat.compaction :as compaction]
+            [org.replikativ.spindel.engine.core :as rtc])
+  (:import [java.util.concurrent TimeUnit]))
+
+;; ---------------------------------------------------------------------------
+;; Tool Registry
+;; ---------------------------------------------------------------------------
+
+(def registry (atom {}))
+
+(defn coerce-tags
+  "Coerce a `tags` tool-input into a set of non-blank string tags, robust to the
+   ways an LLM/agent actually passes them. A BARE STRING is ONE tag (split on
+   commas/newlines if present) — never exploded into characters (`(set \"foo\")`
+   → `#{\\f \\o}` was a real KB-add crash, since `:entity/tags` is cardinality-many
+   string). A collection is mapped to trimmed strings. nil/empty → nil."
+  [tags]
+  (let [xs (cond
+             (nil? tags)    nil
+             (string? tags) (if (re-find #"[,\n]" tags)
+                              (clojure.string/split tags #"[,\n]+")
+                              [tags])
+             (coll? tags)   (map str tags)
+             :else          [(str tags)])]
+    (->> xs (map clojure.string/trim) (remove clojure.string/blank?) set not-empty)))
+
+(defn register!
+  "Register a tool in the registry."
+  [tool-def]
+  (swap! registry assoc (:name tool-def) tool-def))
+
+(defn get-tool [name]
+  (get @registry name))
+
+(defn all-tools []
+  (vals @registry))
+
+;; ---------------------------------------------------------------------------
+;; Curated toolsets — a "role" is just a named set of tool names (plain data).
+;;
+;; The design: a SMALL set of structured, model-trained tools for the things
+;; models do better with a dedicated tool (file read/create/edit) + a jailed
+;; `shell` (muschel) for shell-domain work (git, grep, rg, find, build), and
+;; `clojure_eval` as the rich escape hatch for EVERYTHING functional — web,
+;; datahike, knowledge, tasks, agents — via the SCI sandbox (or full Clojure
+;; under `:isolation :native`). Search/find/git deliberately go through `shell`,
+;; not separate grep/glob tools. The context block (personas/with-context-block)
+;; steers the model to `clojure_eval` for non-file/non-shell work.
+;; ---------------------------------------------------------------------------
+
+(def minimal-coding-tools
+  "Least-surface default for a coding agent: structured file ops + jailed shell
+   + clojure_eval (+ structural Clojure edit)."
+  #{:read-file :write-file :edit-file :clojure-edit :shell :clojure-eval})
+
+(def minimal-readonly-tools
+  "Least-surface default for read-only roles (researcher/reviewer): inspect +
+   program, no file mutation."
+  #{:read-file :shell :clojure-eval})
+
+(defn normalize-tools
+  "Normalize a tools spec to the name→tool-def map `tool-definitions` expects.
+   Accepts a map (passed through), or a set/seq of tool NAMES (keywords or
+   strings) resolved against the registry. Keyword names are munged to the
+   registry's underscore form (e.g. :read-file → \"read_file\"). Anything else
+   passes through unchanged. Single source of truth for the `llm-agent` :tools
+   contract — callers (personas, daemon) should not reach into the registry
+   themselves."
+  [tools]
+  (cond
+    (map? tools) tools
+    (or (set? tools) (sequential? tools))
+    (let [name-strs (map #(if (keyword? %) (str/replace (name %) "-" "_") (str %)) tools)]
+      (select-keys @registry name-strs))
+    :else tools))
+
+(defn tool-definitions
+  "Return tool definitions in the format expected by LLM APIs.
+   Returns both :input_schema (Anthropic) and :parameters (OpenAI).
+
+   If tools-map is provided, uses those tools. Otherwise uses all registered tools."
+  ([] (tool-definitions @registry))
+  ([tools-map]
+   (mapv (fn [{:keys [name description parameters]}]
+           {:name name
+            :description description
+            :input_schema parameters
+            :parameters parameters})
+         (vals tools-map))))
+
+;; ---------------------------------------------------------------------------
+;; Execution Context
+;; ---------------------------------------------------------------------------
+;;
+;; Least-privilege is expressed by the agent's `:tools` map alone (see `execute`):
+;; an agent is handed exactly the tools it may use, and that set is BOTH what the
+;; LLM is offered (`tool-definitions`) and what `execute` will run — no separate
+;; role lattice. A "role" is therefore just a reusable tool-set you name in agent
+;; config (plain data), should you want one.
+
+(defn- resolve-default-cwd
+  "Working directory for tool calls when none is supplied. Priority:
+
+     1. yggdrasil's registered git system's current worktree path
+        — when called inside a forked execution context, this is the
+        fork's worktree, so per-fork tool calls are anchored to it.
+     2. JVM cwd as a last-resort fallback.
+
+   Failures (no ctx bound, no git system) fall through silently."
+  []
+  (or (try
+        ((requiring-resolve 'dvergr.substrate.git/current-worktree-path))
+        (catch Throwable _ nil))
+      ;; no git system in scope → the isolated .dvergr/workspace clone, NEVER the
+      ;; host cwd (the dvergr source tree). See safe-workspace-root / security audit.
+      ((requiring-resolve 'dvergr.substrate.git/safe-workspace-root))))
+
+(defn make-context
+  "Create an execution context for tool calls.
+
+   Options:
+   - :cwd           - Working directory. If omitted, defaults to the
+                      current yggdrasil git system's worktree (per the
+                      bound execution context — picks up fork worktrees
+                      automatically), else JVM cwd.
+   - :sci-ctx       - SCI context for sandboxed eval
+   - :db-conn       - Datahike connection for queries
+   - :chat-ctx      - ChatContext for budget tracking
+   - :tools         - The agent's AUTHORITATIVE tool allowlist (name→tool-def).
+                      When present, only these tools execute (no global fallback);
+                      when absent, the global registry is used (unrestricted).
+   - :isolation     - Execution isolation mode (:native, :sci, :shared-sci)
+                      When :native, clojure_eval uses real Clojure eval instead of SCI
+   - :eval-ns       - Atom holding current namespace for native eval (default: user)
+   - :execution-ctx - Spindel execution context (for spawn_agent tool)"
+  [{:keys [cwd sci-ctx db-conn chat-ctx tools isolation eval-ns execution-ctx]}]
+  {:cwd (or cwd (resolve-default-cwd))
+   :sci-ctx sci-ctx
+   :db-conn db-conn
+   :chat-ctx chat-ctx
+   :tools tools  ; Authoritative tool allowlist (see execute); nil = unrestricted
+   :isolation isolation
+   :eval-ns (or eval-ns (atom (the-ns 'user)))
+   :execution-ctx execution-ctx
+   :abort (atom false)})
+
+(defn execute
+  "Execute a tool by name with given input and context.
+
+   Tool resolution doubles as the least-privilege boundary:
+   - if ctx[:tools] is present, it is the agent's AUTHORITATIVE allowlist — only
+     those tools execute (NO fallback to the global registry). An agent thus
+     cannot run a tool outside the set it was handed, even if a tool call for it
+     arrives (hallucinated name, forced call, prompt injection). This matches
+     what `tool-definitions` already offers the LLM (its `:tools`), closing the
+     gap where the offered set ≠ the executable set.
+   - if ctx[:tools] is absent, the global registry is used (unrestricted).
+
+   Tool outputs are automatically truncated to prevent context overflow.
+   Max output is ~15K tokens (~60K chars) with middle-preserving truncation."
+  [tool-name input ctx]
+  (let [local (:tools ctx)
+        tool  (if local (get local tool-name) (get-tool tool-name))]
+    (cond
+      tool
+      (try
+        (-> (if-let [exec-fn (:execute tool)]
+              (exec-fn input ctx)
+              (when-let [handler-fn (:handler tool)]
+                (handler-fn input)))
+            (compaction/truncate-tool-result))
+        (catch Exception e
+          {:type :error
+           :error (.getMessage e)
+           :exception (class e)}))
+
+      local
+      {:type :error
+       :error (str "Tool not available to this agent: " tool-name)}
+
+      :else
+      {:type :error
+       :error (str "Unknown tool: " tool-name)})))
+
+(defn execute-parallel
+  "Execute multiple tool calls in parallel."
+  [tool-calls ctx]
+  (let [futures (mapv (fn [{:keys [id name input]}]
+                        {:id id
+                         :future (future (execute name input ctx))})
+                      tool-calls)]
+    (mapv (fn [{:keys [id future]}]
+            {:id id
+             :result (deref future 60000 {:type :error :error "Timeout"})})
+          futures)))
+
+;; ---------------------------------------------------------------------------
+;; Code Indexing Hooks
+;; ---------------------------------------------------------------------------
+
+(defonce ^:private code-indices
+  ;; session-id → a live katzen code.index ACSet (in-memory, rebuilt from the
+  ;; files an agent writes/edits this session). Backs the code_query tool.
+  (atom {}))
+
+(defn- code-index-for
+  "The session's code index, created lazily on first use (nil if no session-id)."
+  [session-id]
+  (when session-id
+    (or (get @code-indices session-id)
+        (get (swap! code-indices update session-id #(or % (idx/create))) session-id))))
+
+(defn- index-file-if-clojure!
+  "(Re)index a Clojure source file into the session's in-memory code ACSet after
+   a write, so code_query can answer structural questions about it. Best-effort:
+   syntactic facts always, semantic refs when the ns is loadable. Never throws."
+  [file-path source session-id]
+  (when (and session-id source (re-find #"\.clj[sc]?$" (str file-path)))
+    (try
+      (when-let [ix (code-index-for session-id)]
+        (idx/index-file! ix (str file-path) source))
+      (catch Throwable _ nil))))
+
+;; ---------------------------------------------------------------------------
+;; Core Tools
+;; ---------------------------------------------------------------------------
+
+(register!
+ {:name "read_file"
+  :description "Read the contents of a file at the given path. Returns the file contents as a string."
+  :parameters {:type "object"
+               :properties {:path {:type "string"
+                                   :description "The absolute or relative path to the file"}}
+               :required ["path"]}
+  :execute (fn [{:keys [path]} {:keys [cwd]}]
+             (let [file (if (fs/absolute? path)
+                          (fs/file path)
+                          (fs/file cwd path))]
+               (if (fs/exists? file)
+                 (if (fs/directory? file)
+                   {:type :error
+                    :error (str "Path is a directory, not a file: " path)
+                    :suggestion "Use glob to list directory contents"}
+                   {:type :success
+                    :content (slurp file)
+                    :metadata {:path (str file)
+                               :size (fs/size file)}})
+                 {:type :error
+                  :error (str "File not found: " path)
+                  :suggestion "Check if the path is correct. Use glob to find files."})))})
+
+(register!
+ {:name "write_file"
+  :description "Write content to a file. Creates the file if it doesn't exist, overwrites if it does."
+  :parameters {:type "object"
+               :properties {:path {:type "string"
+                                   :description "The path to write to"}
+                            :content {:type "string"
+                                      :description "The content to write"}}
+               :required ["path" "content"]}
+  :execute (fn [{:keys [path content]} {:keys [cwd session-id]}]
+             (let [file (if (fs/absolute? path)
+                          (fs/file path)
+                          (fs/file cwd path))]
+               (fs/create-dirs (fs/parent file))
+               (spit file content)
+                ;; Auto-index if Clojure file
+               (index-file-if-clojure! file content session-id)
+               {:type :success
+                :content (str "Wrote " (count content) " bytes to " (str file))
+                :metadata {:path (str file)
+                           :bytes (count content)}}))})
+
+(register!
+ {:name "edit_file"
+  :description "Edit a file by replacing an exact string match with new content. The old_string must match exactly (including whitespace)."
+  :parameters {:type "object"
+               :properties {:path {:type "string"
+                                   :description "The path to the file"}
+                            :old_string {:type "string"
+                                         :description "The exact string to find and replace"}
+                            :new_string {:type "string"
+                                         :description "The replacement string"}}
+               :required ["path" "old_string" "new_string"]}
+  :execute (fn [{:keys [path old_string new_string]} {:keys [cwd session-id]}]
+             (let [file (if (fs/absolute? path)
+                          (fs/file path)
+                          (fs/file cwd path))]
+               (if (fs/exists? file)
+                 (let [content (slurp file)
+                       occurrences (count (re-seq (re-pattern (java.util.regex.Pattern/quote old_string)) content))]
+                   (cond
+                     (zero? occurrences)
+                     {:type :error
+                      :error "String not found in file"
+                      :suggestion "Make sure the old_string matches exactly, including whitespace and newlines"}
+
+                     (> occurrences 1)
+                     {:type :error
+                      :error (str "String found " occurrences " times, must be unique")
+                      :suggestion "Include more surrounding context to make the match unique"}
+
+                     :else
+                     (let [new-content (str/replace-first content old_string new_string)]
+                       (spit file new-content)
+                        ;; Auto-index if Clojure file
+                       (index-file-if-clojure! file new-content session-id)
+                       {:type :success
+                        :content (str "Replaced string in " path)
+                        :metadata {:path (str file)
+                                   :old-length (count old_string)
+                                   :new-length (count new_string)}})))
+                 {:type :error
+                  :error (str "File not found: " path)})))})
+
+(register!
+ {:name "glob"
+  :description "Find files matching a glob pattern. Returns a list of matching file paths."
+  :parameters {:type "object"
+               :properties {:pattern {:type "string"
+                                      :description "Glob pattern (e.g., '**/*.clj', 'src/*.md')"}}
+               :required ["pattern"]}
+  :execute (fn [{:keys [pattern]} {:keys [cwd]}]
+             (let [matches (fs/glob cwd pattern)]
+               {:type :success
+                :content (str/join "\n" (map str matches))
+                :metadata {:count (count matches)
+                           :pattern pattern}}))})
+
+;; NOTE: a raw `bash -c` `shell` tool used to be registered here. It's gone —
+;; the muschel-backed `shell` (registered further below) is the live one: jailed
+;; to the chat root, capability-gated (auto-allow read-only, auto-deny
+;; destructive). Full-system shell power is reachable by trusted agents via
+;; `:isolation :native` clojure_eval, not a second raw-bash tool.
+
+(register!
+ {:name "grep"
+  :description "Search for a pattern in files. Uses ripgrep-style regex."
+  :parameters {:type "object"
+               :properties {:pattern {:type "string"
+                                      :description "Regex pattern to search for"}
+                            :glob {:type "string"
+                                   :description "Optional glob pattern to filter files (e.g., '*.clj')"}
+                            :-i {:type "boolean"
+                                 :description "Case-insensitive search"}}
+               :required ["pattern"]}
+  :execute (fn [{:keys [pattern glob -i]} {:keys [cwd]}]
+             (let [cmd (cond-> ["grep" "-rn" "--color=never"]
+                         -i (conj "-i")
+                         true (conj pattern ".")
+                         glob (into ["--include" glob]))
+                   pb (ProcessBuilder. cmd)
+                   _ (.directory pb (io/file cwd))
+                   proc (.start pb)
+                   stdout (slurp (.getInputStream proc))
+                   _ (.waitFor proc)]
+               {:type :success
+                :content (if (str/blank? stdout)
+                           "No matches found"
+                           stdout)
+                :metadata {:pattern pattern
+                           :matches (count (str/split-lines stdout))}}))})
+
+(defn- native-eval
+  "Evaluate Clojure code natively (not in SCI sandbox).
+   Uses eval-ns atom from context to track namespace across evaluations."
+  [code eval-ns-atom]
+  (let [stdout (java.io.StringWriter.)
+        stderr (java.io.StringWriter.)]
+    (try
+      (let [form (binding [*ns* @eval-ns-atom]
+                   (read-string code))
+            result (binding [*ns* @eval-ns-atom
+                             *out* stdout
+                             *err* stderr]
+                     (let [r (eval form)]
+                       ;; Capture ns after eval (ns/in-ns modify *ns*)
+                       (reset! eval-ns-atom *ns*)
+                       r))]
+        {:type :success
+         :content (str "=> " (pr-str result)
+                       (when (pos? (.length (.getBuffer stdout)))
+                         (str "\n\nOutput:\n" (str stdout))))
+         :metadata {:value result
+                    :stdout (str stdout)
+                    :stderr (str stderr)}})
+      (catch Throwable e
+        {:type :error
+         :error (.getMessage e)
+         :content (str "Evaluation error: " (.getSimpleName (class e)) ": " (.getMessage e)
+                       (when (pos? (.length (.getBuffer stdout)))
+                         (str "\n\nPartial output:\n" (str stdout))))
+         :metadata {:exception (class e)
+                    :message (.getMessage e)}}))))
+
+(register!
+ {:name "clojure_eval"
+  :description "Evaluate Clojure code in the session's REPL environment.
+
+   Each session has its own REPL environment where:
+   - (def x 1) persists within the session
+   - You can define functions with defn
+   - You can require namespaces
+   - Changes don't affect other sessions
+
+   Execution budget: a 60-second hard timeout applies to each call. If
+   you exceed it the tool returns a TimeoutException with a hint about
+   likely causes (hung @spin, infinite loop, oversized inference). Keep
+   loops bounded; for inference use modest particle counts (e.g. 50–200)
+   and prefer loop/recur/dotimes over map/for/repeatedly for iterated
+   sample/observe.
+
+   Use this to:
+   - Test Clojure code snippets
+   - Perform calculations
+   - Define helper functions for your task
+   - Explore data structures
+
+   Example: (clojure_eval {:code \"(reduce + (range 10))\"})
+   Returns: => 45"
+  :parameters {:type "object"
+               :properties {:code {:type "string"
+                                   :description "Clojure code to evaluate"}}
+               :required ["code"]}
+  :execute (fn [{:keys [code]} {:keys [sci-ctx isolation eval-ns chat-ctx cancel?]}]
+              ;; Native mode: use real Clojure eval
+             (cond
+               (= :native isolation)
+               (native-eval code eval-ns)
+
+                ;; SCI + chat-ctx: register the eval as a deliberable
+                ;; process. The agent / user can issue
+                ;;   (directive! cctx pid {:type :abort})
+                ;; and the existing sandbox cancel-poller catches it.
+                ;; Soft-checkpoint after 30s so a manager can choose
+                ;; "keep going" or "stop" on long evals.
+               (and sci-ctx chat-ctx)
+               (let [result-p (promise)
+                     desc     (str "clojure_eval: "
+                                   (let [c (clojure.string/trim code)]
+                                     (if (> (count c) 50)
+                                       (str (subs c 0 50) "…")
+                                       c)))]
+                 (proc/->process chat-ctx
+                                 {:description desc
+                                  :grace-ms 30000
+                                  :on-complete #(deliver result-p {:ok %})
+                                  :on-abort    #(deliver result-p {:aborted %})}
+                                 (fn []
+                                   (let [p proc/*current-process*
+                                         proc-aborted?
+                                         (fn []
+                                           (or (and cancel? (cancel?))
+                                               (try
+                                                 (binding [rtc/*execution-context*
+                                                           (:spindel-ctx chat-ctx)]
+                                                   (= :aborted @(:status-signal p)))
+                                                 (catch Throwable _ false))))]
+                                     (sandbox/eval-code sci-ctx code
+                                                        :timeout-ms 60000
+                                                        :cancel? proc-aborted?))))
+                  ;; Block on process completion / abort.
+                 (let [{:keys [ok aborted]} @result-p]
+                   (cond
+                     aborted
+                     {:type :error :error "cancelled"
+                      :content (str "Evaluation cancelled: " aborted)
+                      :metadata {:cancelled? true}}
+
+                     (:success ok)
+                     {:type :success
+                      :content (str "=> " (pr-str (:value ok))
+                                    (when (not-empty (:stdout ok))
+                                      (str "\n\nOutput:\n" (:stdout ok))))
+                      :metadata {:value (:value ok)
+                                 :stdout (:stdout ok)
+                                 :stderr (:stderr ok)}}
+
+                     :else
+                     (let [error (:error ok)
+                           stacktrace (:stacktrace error)
+                           stacktrace-str (when (seq stacktrace)
+                                            (str "\n\nStacktrace:\n"
+                                                 (clojure.string/join "\n"
+                                                                      (map (fn [{:keys [ns name line]}]
+                                                                             (str "  " (or ns "?") "/" (or name "?")
+                                                                                  (when line (str ":" line))))
+                                                                           (take 10 stacktrace)))))]
+                       {:type :error
+                        :error (:message error)
+                        :content (str "Evaluation error: " (:message error)
+                                      (when (:type error)
+                                        (str "\nType: " (:type error)))
+                                      stacktrace-str
+                                      (when (not-empty (:stdout ok))
+                                        (str "\n\nPartial output:\n" (:stdout ok))))
+                        :metadata error}))))
+
+                ;; SCI without chat-ctx (e.g. one-shot REPL): legacy path,
+                ;; same cancel-poll plumbing but no process registration.
+               sci-ctx
+               (let [result (sandbox/eval-code sci-ctx code
+                                               :timeout-ms 60000
+                                               :cancel? cancel?)]
+                 (if (:success result)
+                   {:type :success
+                    :content (str "=> " (pr-str (:value result))
+                                  (when (not-empty (:stdout result))
+                                    (str "\n\nOutput:\n" (:stdout result))))
+                    :metadata {:value (:value result)
+                               :stdout (:stdout result)
+                               :stderr (:stderr result)}}
+                   (let [error (:error result)
+                         stacktrace (:stacktrace error)
+                         stacktrace-str (when (seq stacktrace)
+                                          (str "\n\nStacktrace:\n"
+                                               (clojure.string/join "\n"
+                                                                    (map (fn [{:keys [ns name line]}]
+                                                                           (str "  " (or ns "?") "/" (or name "?")
+                                                                                (when line (str ":" line))))
+                                                                         (take 10 stacktrace)))))]
+                     {:type :error
+                      :error (:message error)
+                      :content (str "Evaluation error: " (:message error)
+                                    (when (:type error)
+                                      (str "\nType: " (:type error)))
+                                    stacktrace-str
+                                    (when (not-empty (:stdout result))
+                                      (str "\n\nPartial output:\n" (:stdout result))))
+                      :metadata error})))
+
+               :else
+               {:type :error
+                :error "No evaluation context. Pass :sci-ctx or use :isolation :native."}))})
+
+(register!
+ {:name "shell"
+  :description "Run a bash command via muschel.
+
+   The natural surface for shell-domain work — git, ls, cat, grep, rg,
+   build commands, file inspection. For Clojure-domain work (datahike
+   queries, intake.web/search, signal manipulation) reach for
+   `clojure_eval` instead.
+
+   Capabilities + safety:
+   - Default permits auto-allow read-only commands (ls, cat, grep, git
+     status/log/diff, rg, etc.) and auto-deny destructive ones (sudo,
+     rm -rf, dd, reboot). Other commands pass through (run).
+   - Output is capped at 8000 chars per stream; :truncated? signals
+     when the cap fired.
+   - Session state (cwd, env vars, bg jobs) is per chat-ctx and
+     forks alongside it — a worker in a substrate-fork gets an
+     isolated session for free.
+
+   Example: {\"command\": \"git status --short\"}
+   Example: {\"command\": \"rg -l 'defn run-' src/\"}"
+  :parameters {:type "object"
+               :properties {:command {:type "string"
+                                      :description "Bash command(s) to run. Pipes / redirects / && / || all OK."}}
+               :required ["command"]}
+  :execute (fn [{:keys [command]} {:keys [chat-ctx]}]
+             (if-not chat-ctx
+               {:type :error
+                :error "shell tool requires a chat-ctx in the tool-ctx."}
+               (let [r ((requiring-resolve 'dvergr.intake.bash/run)
+                        chat-ctx command)]
+                 (if (:error r)
+                   {:type :error
+                    :error (:error r)
+                    :content (str "shell error: " (:error r)
+                                  "\nexit: " (:exit r))}
+                   {:type :success
+                    :content (str (when (not-empty (:stdout r))
+                                    (:stdout r))
+                                  (when (not-empty (:stderr r))
+                                    (str (when (not-empty (:stdout r)) "\n\n")
+                                         "stderr:\n" (:stderr r)))
+                                  (when (not (zero? (or (:exit r) 0)))
+                                    (str "\n\n[exit " (:exit r) "]"))
+                                  (when (:truncated? r)
+                                    "\n\n[output truncated]"))
+                    :metadata r}))))})
+
+(register!
+ {:name "clojure_edit"
+  :description "Edit a Clojure form structurally by finding it by type and name.
+
+   PREFER this over edit_file for Clojure code as it:
+   - Finds forms semantically (no exact string matching needed)
+   - Auto-validates Clojure syntax
+   - Safer for parentheses-heavy code
+
+   Operations:
+   - replace: Replace the entire form with new code
+   - insert_before: Insert new code before the form
+   - insert_after: Insert new code after the form
+
+   Example: Replace a function
+   {\"file_path\": \"src/core.clj\",
+    \"form_type\": \"defn\",
+    \"form_name\": \"greet\",
+    \"operation\": \"replace\",
+    \"new_source\": \"(defn greet [name] (str \\\"Hi, \\\" name))\"}
+
+   Example: Insert a helper before a function
+   {\"file_path\": \"src/core.clj\",
+    \"form_type\": \"defn\",
+    \"form_name\": \"main-fn\",
+    \"operation\": \"insert_before\",
+    \"new_source\": \"(defn helper [x] (* x 2))\"}"
+  :parameters {:type "object"
+               :properties {:file_path {:type "string"
+                                        :description "Path to the Clojure file"}
+                            :form_type {:type "string"
+                                        :description "Type of form: defn, def, ns, defmethod, etc."}
+                            :form_name {:type "string"
+                                        :description "Name of the form to find"}
+                            :operation {:type "string"
+                                        :enum ["replace" "insert_before" "insert_after"]
+                                        :description "What to do with the form"}
+                            :new_source {:type "string"
+                                         :description "New Clojure source code"}}
+               :required ["file_path" "form_type" "form_name" "operation" "new_source"]}
+  :execute (fn [{:keys [file_path form_type form_name operation new_source]} {:keys [cwd session-id]}]
+             (let [full-path (if (fs/absolute? file_path)
+                               file_path
+                               (str cwd "/" file_path))
+                   op-keyword (keyword operation)
+                   result (structural/edit-clojure-form full-path form_type form_name op-keyword new_source)]
+               (if (:success result)
+                 (do
+                   (spit full-path (:content result))
+                    ;; Auto-index (always Clojure file)
+                   (index-file-if-clojure! full-path (:content result) session-id)
+                   {:type :success
+                    :content (str "Successfully edited " form_type " " form_name
+                                  " in " full-path)
+                    :metadata {:file full-path
+                               :form-type form_type
+                               :form-name form_name}})
+                 {:type :error
+                  :error (:error result)})))})
+
+(register!
+ {:name "code_query"
+  :description "Query the structure of Clojure code you've written this session.
+
+   Backed by a categorical code index (a katzen ACSet over the clojure-code
+   schema): namespaces and defs keyed by qualified name, with their reference
+   graph. Code is automatically indexed when you write/edit Clojure files.
+
+   Available queries:
+   - find_function: Look up a function by name
+     Example: {\"operation\": \"find_function\", \"name\": \"greet\"}
+
+   - list_functions: List all functions (optionally filtered by namespace)
+     Example: {\"operation\": \"list_functions\"}
+     Example: {\"operation\": \"list_functions\", \"namespace\": \"sample.core\"}
+
+   - find_callers: Find what calls a function
+     Example: {\"operation\": \"find_callers\", \"name\": \"greet\"}
+
+   - find_callees: Find what a function calls
+     Example: {\"operation\": \"find_callees\", \"name\": \"calculate\"}
+
+   - search_by_doc: Search functions by docstring
+     Example: {\"operation\": \"search_by_doc\", \"term\": \"greeting\"}
+
+   Returns structured data about functions including:
+   - name, qualified-name
+   - file path and line number
+   - docstring
+   - argument lists
+   - call relationships"
+  :parameters {:type "object"
+               :properties {:operation {:type "string"
+                                        :enum ["find_function" "list_functions" "find_callers"
+                                               "find_callees" "search_by_doc"]
+                                        :description "The query operation to perform"}
+                            :name {:type "string"
+                                   :description "Function name (for find_function, find_callers, find_callees)"}
+                            :namespace {:type "string"
+                                        :description "Namespace symbol (for list_functions filter)"}
+                            :term {:type "string"
+                                   :description "Search term (for search_by_doc)"}}
+               :required ["operation"]}
+  :execute (fn [{:keys [operation name namespace term]} {:keys [session-id]}]
+             (if-let [ix (code-index-for session-id)]
+               (try
+                 (let [result (case operation
+                                "find_function"
+                                (->> (idx/resolve-name ix name)
+                                     (keep #(idx/def-info ix %)) vec)
+
+                                "list_functions"
+                                (idx/list-defs ix namespace #{:defn :defmacro :defmulti})
+
+                                "find_callers"
+                                (->> (idx/resolve-name ix name)
+                                     (mapcat #(idx/dependents ix %)) distinct sort vec)
+
+                                "find_callees"
+                                (->> (idx/resolve-name ix name)
+                                     (mapcat #(idx/references-of ix %)) distinct sort vec)
+
+                                "search_by_doc"
+                                (idx/search-by-doc ix term)
+
+                                {:error "Unknown operation"})]
+
+                   (if (or (nil? result) (and (coll? result) (empty? result)))
+                     {:type :success
+                      :content (str "No results found for " operation
+                                    (when name (str " with name '" name "'"))
+                                    (when term (str " matching '" term "'"))
+                                    "\n\nNote: Only Clojure files that have been written/edited are indexed.")}
+                     {:type :success
+                      :content (str "Query results:\n\n" (with-out-str (clojure.pprint/pprint result)))
+                      :metadata {:operation operation
+                                 :result-count (if (map? result) 1 (count result))}}))
+
+                 (catch Exception e
+                   {:type :error
+                    :error (str "Query error: " (.getMessage e))}))
+
+               {:type :success
+                :content "No code index yet for this session — write or edit a Clojure file first."}))}) \n
+
+;; ---------------------------------------------------------------------------
+;; Task Management Tools (Datahike-backed)
+;; ---------------------------------------------------------------------------
+
+(register!
+ {:name "task_create"
+  :description "Create a new task in the task tracker.
+
+   Tasks are stored in datahike and can be queried, updated, and completed.
+   When working in an isolated context, task changes are part of the fork
+   and will only persist if merged.
+
+   Required:
+   - title: Short task title
+
+   Optional:
+   - description: Detailed description
+   - priority: :low :medium :high :critical (default :medium)
+   - status: :pending :in-progress :completed :blocked (default :pending)
+   - assigned_to: Who should work on this
+   - tags: List of string tags for categorization
+
+   Returns the created task with its ID."
+  :parameters {:type "object"
+               :properties {:title {:type "string"
+                                    :description "Task title"}
+                            :description {:type "string"
+                                          :description "Detailed description"}
+                            :priority {:type "string"
+                                       :description "Priority: low, medium, high, critical"}
+                            :status {:type "string"
+                                     :description "Status: pending, in-progress, completed, blocked"}
+                            :assigned_to {:type "string"
+                                          :description "Who to assign this task to"}
+                            :tags {:type "array"
+                                   :items {:type "string"}
+                                   :description "Tags for categorization"}}
+               :required ["title"]}
+  :execute (fn [{:keys [title description priority status assigned_to tags]}
+                {:keys [db-conn]}]
+             (if db-conn
+               (try
+                 (let [task-id (random-uuid)
+                       task (cond-> {:task/id task-id
+                                     :task/title title
+                                     :task/status (keyword (or status "pending"))
+                                     :task/priority (keyword (or priority "medium"))
+                                     :task/created-at (java.util.Date.)
+                                     :task/created-by "agent"}
+                              description (assoc :task/description description)
+                              assigned_to (assoc :task/assigned-to assigned_to)
+                              (coerce-tags tags) (assoc :task/tags (coerce-tags tags)))]
+                   (d/transact db-conn [task])
+                   {:type :success
+                    :content (str "Created task: " title "\nID: " task-id)
+                    :metadata {:task-id (str task-id)
+                               :task task}})
+                 (catch Exception e
+                   {:type :error
+                    :error (str "Failed to create task: " (.getMessage e))}))
+               {:type :error
+                :error "No database connection available."}))})
+
+(register!
+ {:name "task_list"
+  :description "List tasks from the task tracker.
+
+   Query tasks with optional filters. Returns all matching tasks.
+
+   Filters (all optional):
+   - status: Filter by status (pending, in-progress, completed, blocked)
+   - priority: Filter by priority (low, medium, high, critical)
+   - assigned_to: Filter by assignee
+   - tag: Filter by tag
+
+   Returns list of tasks with their details."
+  :parameters {:type "object"
+               :properties {:status {:type "string"
+                                     :description "Filter by status"}
+                            :priority {:type "string"
+                                       :description "Filter by priority"}
+                            :assigned_to {:type "string"
+                                          :description "Filter by assignee"}
+                            :tag {:type "string"
+                                  :description "Filter by tag"}}
+               :required []}
+  :execute (fn [{:keys [status priority assigned_to tag]} {:keys [db-conn]}]
+             (if db-conn
+               (try
+                 (let [;; Build query dynamically based on filters
+                       base-query '[:find [(pull ?t [*]) ...]
+                                    :where [?t :task/id _]]
+                        ;; Add filters to where clause
+                       where-clauses (cond-> []
+                                       status (conj ['?t :task/status (keyword status)])
+                                       priority (conj ['?t :task/priority (keyword priority)])
+                                       assigned_to (conj ['?t :task/assigned-to assigned_to])
+                                       tag (conj ['?t :task/tags tag]))
+                       query (if (empty? where-clauses)
+                               base-query
+                               (update base-query 2 (fn [w] (vec (concat [w] where-clauses)))))
+                       results (d/q query @db-conn)
+                       formatted (map (fn [task]
+                                        (str "- [" (name (:task/status task)) "] "
+                                             (:task/title task)
+                                             (when (:task/assigned-to task)
+                                               (str " (@" (:task/assigned-to task) ")"))
+                                             (when (:task/priority task)
+                                               (str " [" (name (:task/priority task)) "]"))
+                                             "\n  ID: " (:task/id task)
+                                             (when (:task/description task)
+                                               (str "\n  " (:task/description task)))))
+                                      results)]
+                   {:type :success
+                    :content (if (empty? results)
+                               "No tasks found."
+                               (str "Tasks (" (count results) "):\n\n"
+                                    (str/join "\n\n" formatted)))
+                    :metadata {:count (count results)
+                               :tasks results}})
+                 (catch Exception e
+                   {:type :error
+                    :error (str "Query failed: " (.getMessage e))}))
+               {:type :error
+                :error "No database connection available."}))})
+
+(register!
+ {:name "task_update"
+  :description "Update a task's status or other fields.
+
+   Use this to mark tasks as in-progress, completed, or to update other fields.
+
+   Required:
+   - id: Task ID (UUID string)
+
+   Optional (at least one required):
+   - status: New status (pending, in-progress, completed, blocked)
+   - priority: New priority (low, medium, high, critical)
+   - assigned_to: New assignee
+   - description: Updated description
+
+   Returns the updated task."
+  :parameters {:type "object"
+               :properties {:id {:type "string"
+                                 :description "Task ID to update"}
+                            :status {:type "string"
+                                     :description "New status"}
+                            :priority {:type "string"
+                                       :description "New priority"}
+                            :assigned_to {:type "string"
+                                          :description "New assignee"}
+                            :description {:type "string"
+                                          :description "Updated description"}}
+               :required ["id"]}
+  :execute (fn [{:keys [id status priority assigned_to description]} {:keys [db-conn]}]
+             (if db-conn
+               (try
+                 (let [task-id (parse-uuid id)
+                        ;; Find existing task
+                       existing (d/q '[:find (pull ?t [*]) .
+                                       :in $ ?id
+                                       :where [?t :task/id ?id]]
+                                     @db-conn task-id)]
+                   (if existing
+                     (let [updates (cond-> {}
+                                     status (assoc :task/status (keyword status))
+                                     priority (assoc :task/priority (keyword priority))
+                                     assigned_to (assoc :task/assigned-to assigned_to)
+                                     description (assoc :task/description description)
+                                     (= status "completed") (assoc :task/completed-at (java.util.Date.)))
+                           tx-data [(merge {:task/id task-id} updates)]]
+                       (d/transact db-conn tx-data)
+                       {:type :success
+                        :content (str "Updated task: " (:task/title existing)
+                                      (when status (str "\n  Status: " status))
+                                      (when priority (str "\n  Priority: " priority)))
+                        :metadata {:task-id id
+                                   :updates updates}})
+                     {:type :error
+                      :error (str "Task not found: " id)}))
+                 (catch Exception e
+                   {:type :error
+                    :error (str "Update failed: " (.getMessage e))}))
+               {:type :error
+                :error "No database connection available."}))})
+
+;; ---------------------------------------------------------------------------
+;; Knowledge Graph Tools
+;; ---------------------------------------------------------------------------
+
+(register!
+ {:name "knowledge_search"
+  :description "Search the knowledge graph for entities mentioned in conversations.
+
+   The knowledge graph is built from [[Entity]] wiki-links extracted during
+   context compaction. Use this to find information about concepts, decisions,
+   and project knowledge accumulated over conversations.
+
+   Returns entities with their contexts, mention counts, and related entities.
+
+   Example: Find all knowledge about authentication
+   {\"query\": \"auth\"}
+
+   Example: List most mentioned entities
+   {\"operation\": \"top\", \"limit\": 10}"
+  :parameters {:type "object"
+               :properties {:query {:type "string"
+                                    :description "Search term to match in entity titles"}
+                            :operation {:type "string"
+                                        :enum ["search" "top" "get"]
+                                        :description "Operation: search (by query), top (most mentioned), get (exact title)"}
+                            :title {:type "string"
+                                    :description "Exact entity title (for get operation)"}
+                            :limit {:type "integer"
+                                    :description "Max results to return (default 10)"}}
+               :required []}
+  :execute (fn [{:keys [query operation title limit]} {:keys [db-conn kb-conn]}]
+              ;; RF4: read the room's own KB when present (room knowledge lives
+              ;; there); fall back to the chat DB for room-less use.
+             (let [db-conn (or kb-conn db-conn)]
+               (if db-conn
+                 (try
+                   (let [limit (or limit 10)
+                         results (case (or operation "search")
+                                   "search"
+                                   (when query
+                                     (let [pattern (re-pattern (str "(?i)" query))
+                                           all-entities (d/q '[:find [(pull ?e [*]) ...]
+                                                               :where [?e :entity/id _]]
+                                                             @db-conn)]
+                                       (->> all-entities
+                                            (filter #(re-find pattern (:entity/title %)))
+                                            (sort-by #(- (or (:entity/mention-count %) 0)))
+                                            (take limit))))
+
+                                   "top"
+                                   (->> (d/q '[:find [(pull ?e [*]) ...]
+                                               :where [?e :entity/id _]]
+                                             @db-conn)
+                                        (sort-by #(- (or (:entity/mention-count %) 0)))
+                                        (take limit))
+
+                                   "get"
+                                   (when title
+                                     [(d/q '[:find (pull ?e [*]) .
+                                             :in $ ?t
+                                             :where [?e :entity/title ?t]]
+                                           @db-conn title)]))]
+
+                     (if (seq results)
+                       {:type :success
+                        :content (str "Knowledge Graph Results (" (count results) "):\n\n"
+                                      (str/join "\n\n"
+                                                (map (fn [e]
+                                                       (str "[[" (:entity/title e) "]]\n"
+                                                            "  Mentions: " (:entity/mention-count e) "\n"
+                                                            (when (:entity/summary e)
+                                                              (str "  Summary: " (:entity/summary e) "\n"))
+                                                            (when (seq (:entity/contexts e))
+                                                              (str "  Contexts: " (str/join ", " (take 3 (:entity/contexts e)))
+                                                                   (when (> (count (:entity/contexts e)) 3)
+                                                                     " ...")))))
+                                                     results)))
+                        :metadata {:count (count results)
+                                   :entities results}}
+                       {:type :success
+                        :content "No entities found matching query."
+                        :metadata {:count 0}}))
+                   (catch Exception e
+                     {:type :error
+                      :error (str "Knowledge search failed: " (.getMessage e))}))
+                 {:type :error
+                  :error "No database connection available."})))})
+
+(register!
+ {:name "knowledge_add"
+  :description "Add or update an entity in the knowledge graph.
+
+   Use this to record knowledge, intake signals, decisions, or important findings.
+   Entities accumulate contexts over time — calling again with the same title adds context.
+
+   Examples:
+     ;; Intake signal
+     knowledge_add {:title \"HN: Datalog databases discussion\"
+                    :source \"hn\"
+                    :url \"https://news.ycombinator.com/item?id=12345\"
+                    :summary \"23-comment thread comparing Datalog databases; positive sentiment\"
+                    :relevance 4}
+
+     ;; Architectural decision
+     knowledge_add {:title \"Agent FRP Design\"
+                    :summary \"Agents use spindel mailboxes for message passing, not direct calls\"
+                    :context \"Decided 2026-02-22 when refactoring agent loop\"}"
+  :parameters {:type "object"
+               :properties {:title     {:type "string"
+                                        :description "Entity title — concise, searchable"}
+                            :summary   {:type "string"
+                                        :description "1-3 sentence summary of what this is"}
+                            :context   {:type "string"
+                                        :description "Additional context or details"}
+                            :source    {:type "string"
+                                        :description "Source: hn, lobsters, mail, internal"}
+                            :url       {:type "string"
+                                        :description "URL if available"}
+                            :relevance {:type "integer"
+                                        :description "Relevance score 1-5 (5=direct product mention)"}
+                            :entity_type {:type "string"
+                                          :description "Entity type: competitor, client, partner, project, technology, person, company"}
+                            :tags     {:type "array"
+                                       :items {:type "string"}
+                                       :description "Tags for categorization (e.g. [\"database\" \"clojure\"])"}}
+               :required ["title"]}
+  :execute (fn [{:keys [title summary context source url relevance entity_type tags]} {:keys [db-conn kb-conn chat-ctx]}]
+              ;; RF4: write into the room's own KB when present.
+             (let [db-conn (or kb-conn db-conn)]
+               (cond
+                 (str/blank? title)
+                 {:type :error
+                  :error "Required parameter 'title' is missing or blank. Call knowledge_add with at least {:title \"your title here\"}"}
+
+                 (not db-conn)
+                 {:type :error
+                  :error "No database connection available."}
+
+                 :else
+                 (try
+                   (let [;; Build context string from intake fields
+                         intake-ctx (when (or source url relevance)
+                                      (str/join " " (remove nil? [(when source (str "source:" source))
+                                                                  (when url (str "url:" url))
+                                                                  (when relevance (str "relevance:" relevance))])))
+                         full-context (str/join "\n" (remove str/blank? [intake-ctx context]))
+                         session-id (when chat-ctx (:chat-id chat-ctx))
+                        ;; Check if entity exists
+                         existing (d/q '[:find [?e ?mc]
+                                         :in $ ?t
+                                         :where
+                                         [?e :entity/title ?t]
+                                         [?e :entity/mention-count ?mc]]
+                                       @db-conn title)]
+                     (if (some? existing)
+                      ;; Update existing
+                       (let [[eid mc] existing
+                             etype (when entity_type (keyword entity_type))
+                             tx-data (cond-> {:db/id eid
+                                              :entity/mention-count (inc mc)
+                                              :entity/updated-at (java.util.Date.)}
+                                       (not (str/blank? full-context))
+                                       (update :entity/contexts (fnil conj []) full-context)
+                                       summary (assoc :entity/summary summary)
+                                       etype (assoc :entity/type etype)
+                                       url (assoc :entity/url url)
+                                       (coerce-tags tags) (assoc :entity/tags (coerce-tags tags))
+                                       session-id (update :entity/from-sessions
+                                                          (fnil conj []) session-id))]
+                         (d/transact db-conn [tx-data])
+                         {:type :success
+                          :content (str "Updated: [[" title "]] (mentions: " (inc mc) ")"
+                                        (when etype (str " type:" (name etype))))})
+
+                      ;; Create new
+                       (let [etype (when entity_type (keyword entity_type))
+                             entity (cond-> {:entity/id (random-uuid)
+                                             :entity/title title
+                                             :entity/contexts (if (not (str/blank? full-context))
+                                                                [full-context] [])
+                                             :entity/mention-count 1
+                                             :entity/created-at (java.util.Date.)
+                                             :entity/updated-at (java.util.Date.)}
+                                      summary (assoc :entity/summary summary)
+                                      etype (assoc :entity/type etype)
+                                      url (assoc :entity/url url)
+                                      (coerce-tags tags) (assoc :entity/tags (coerce-tags tags))
+                                      session-id (assoc :entity/from-sessions [session-id]))]
+                         (d/transact db-conn [entity])
+                         {:type :success
+                          :content (str "Stored: [[" title "]]"
+                                        (when etype (str " type:" (name etype)))
+                                        (when relevance (str " relevance:" relevance)))})))
+                   (catch Exception e
+                     {:type :error
+                      :error (str "Failed to add knowledge: " (.getMessage e))})))))})
+
+;; ---------------------------------------------------------------------------
+;; Agent Self-Improvement
+;; ---------------------------------------------------------------------------
+
+(register!
+ {:name "update_agent_profile"
+  :description "Rewrite an agent's system-prompt profile file (resources/agents/<name>.md).
+Use this to improve an agent's instructions based on observed performance.
+
+Only permitted for agents in resources/agents/. Pass the complete updated
+markdown content — the file will be overwritten in full.
+
+Example:
+  update_agent_profile {:agent-name \"huginn\"
+                        :content \"# Huginn ...\\n\\nImproved instructions...\"}
+
+Note: changes take effect on the next agent restart or reload."
+  :parameters {:type "object"
+               :properties {:agent-name {:type "string"
+                                         :description "Agent profile name, e.g. \"huginn\" (no path, no .md extension)"}
+                            :content    {:type "string"
+                                         :description "Full markdown content to write to the profile file"}}
+               :required ["agent-name" "content"]}
+  :execute (fn [{:keys [agent-name content]} _ctx]
+             (cond
+               (str/blank? agent-name)
+               {:type :error :error "agent-name is required"}
+
+               (str/blank? content)
+               {:type :error :error "content is required — pass the full profile markdown"}
+
+                ;; Safety: only allow simple names, no path traversal
+               (not (re-matches #"^[a-zA-Z0-9_-]+$" agent-name))
+               {:type :error :error (str "Invalid agent-name '" agent-name "'. Use only letters, digits, _ and -")}
+
+               :else
+               (try
+                  ;; The prompt is managed state — stored on the actor row
+                  ;; (:actor/system-prompt), not a file. Resolution is DB-first
+                  ;; with the built-in resource as fallback (dvergr.agent.persona).
+                 (if ((requiring-resolve 'dvergr.agent.persona/write-prompt!)
+                      (keyword agent-name) content)
+                   {:type :success
+                    :content (str "Updated system prompt for agent '" agent-name
+                                  "'. It takes effect on the agent's next room join.")}
+                   {:type :error
+                    :error (str "No such agent '" agent-name "' (or no chat DB).")})
+                 (catch Exception e
+                   {:type :error :error (str "Failed to write profile: " (.getMessage e))}))))})
+
+;; ---------------------------------------------------------------------------
+;; Code Linting Tools
+;; ---------------------------------------------------------------------------
+
+;; Lazy require clj-kondo
+(defn- clj-kondo-ns []
+  (require 'clj-kondo.core)
+  (find-ns 'clj-kondo.core))
+
+(register!
+ {:name "clj_kondo"
+  :description "Run clj-kondo static analysis on Clojure code.
+
+   clj-kondo is a linter for Clojure that catches errors, warnings, and style issues.
+   Use this to check code quality before committing or to find issues in existing code.
+
+   Options:
+   - lint: Paths to lint (files or directories, required)
+   - config: Optional config map (merged with project .clj-kondo/config.edn)
+
+   Returns findings (errors, warnings, info) and summary counts.
+
+   Example: Lint a file
+   {\"lint\": [\"src/myns/core.clj\"]}
+
+   Example: Lint entire src directory
+   {\"lint\": [\"src\"]}
+
+   Example: Lint with custom config
+   {\"lint\": [\"src\"], \"config\": {\":linters\": {\":unused-binding\": {\":level\": \":off\"}}}}"
+  :parameters {:type "object"
+               :properties {:lint {:type "array"
+                                   :items {:type "string"}
+                                   :description "Paths to lint (files or directories)"}
+                            :config {:type "object"
+                                     :description "Optional clj-kondo config map"}}
+               :required ["lint"]}
+  :execute (fn [{:keys [lint config]} {:keys [cwd]}]
+             (try
+               (let [kondo-ns (clj-kondo-ns)
+                     run! (ns-resolve kondo-ns 'run!)
+                      ;; Resolve paths relative to cwd
+                     paths (mapv (fn [p]
+                                   (if (fs/absolute? p)
+                                     p
+                                     (str cwd "/" p)))
+                                 lint)
+                     opts (cond-> {:lint paths}
+                            config (assoc :config config))
+                     result (run! opts)
+                     findings (:findings result)
+                     summary (:summary result)]
+                 {:type (if (zero? (or (:error summary) 0)) :success :error)
+                  :content (str "clj-kondo analysis:\n"
+                                "  Errors: " (:error summary 0) "\n"
+                                "  Warnings: " (:warning summary 0) "\n"
+                                "  Info: " (:info summary 0) "\n"
+                                "  Duration: " (:duration summary) "ms\n"
+                                (when (seq findings)
+                                  (str "\nFindings:\n"
+                                       (str/join "\n"
+                                                 (map (fn [{:keys [type level filename row col message]}]
+                                                        (str "  " (name level) ": " filename ":" row ":" col " - " message))
+                                                      findings)))))
+                  :metadata {:summary summary
+                             :findings findings
+                             :paths paths}})
+               (catch Exception e
+                 {:type :error
+                  :error (str "clj-kondo failed: " (.getMessage e))})))})
+
+;; ---------------------------------------------------------------------------
+;; Test Execution Tool
+;; ---------------------------------------------------------------------------
+
+;; Lazy require kaocha
+(defn- kaocha-ns []
+  (require 'kaocha.api)
+  (find-ns 'kaocha.api))
+
+(defn- format-test-output
+  "Format test results for display."
+  [result]
+  (let [pass (:pass result 0)
+        fail (:fail result 0)
+        error (:error result 0)
+        total (+ pass fail error)]
+    (str "Test Results:\n"
+         "  Total:   " total "\n"
+         "  Passed:  " pass "\n"
+         "  Failed:  " fail "\n"
+         "  Errors:  " error "\n"
+         "\n"
+         (if (zero? (+ fail error))
+           "✓ All tests passed"
+           (str "✗ " (+ fail error) " test(s) failed\n\n"
+                "Run with detailed reporter to see failure details")))))
+
+(register!
+ {:name "run_tests"
+  :description "Run Clojure tests using Kaocha in the current working directory.
+
+   This tool executes tests programmatically without requiring shell access.
+   Tests run in the agent's working directory (forked worktree context),
+   so agents can verify their code changes in isolation.
+
+   Options:
+   - focus: Run specific test namespace (e.g., 'dvergr.knowledge.links-test')
+   - pattern: Regex pattern to match test namespaces (e.g., 'knowledge')
+   - fail_fast: Stop on first failure (default false)
+
+   Returns structured test results including:
+   - Pass/fail/error counts
+   - Exit code (0 = all pass, 1 = failures)
+   - Summary output
+
+   Example: Run specific test namespace
+   {\"focus\": \"dvergr.knowledge.links-test\"}
+
+   Example: Run all tests matching pattern
+   {\"pattern\": \"knowledge\"}
+
+   Example: Run all tests
+   {}
+
+   Note: Tests execute in the tool's :cwd, which for agents is their
+   forked git worktree. This allows safe isolated testing."
+  :parameters {:type "object"
+               :properties {:focus {:type "string"
+                                    :description "Specific test namespace to run"}
+                            :pattern {:type "string"
+                                      :description "Regex pattern for test namespaces"}
+                            :fail_fast {:type "boolean"
+                                        :description "Stop on first failure (default false)"}}
+               :required []}
+  :execute (fn [{:keys [focus pattern fail_fast]} {:keys [cwd]}]
+             (try
+                ;; Lazy load kaocha
+               (let [kaocha-ns (kaocha-ns)
+                     kaocha-run! (ns-resolve kaocha-ns 'run)
+
+                      ;; Build kaocha config
+                     config (cond-> {:color? false
+                                     :fail-fast (boolean fail_fast)
+                                     :cwd (or cwd ".")}
+
+                               ;; Focus on specific test namespace
+                              focus
+                              (assoc :kaocha/tests
+                                     [{:kaocha.testable/id :unit
+                                       :kaocha.testable/type :kaocha.type/clojure.test
+                                       :kaocha/ns-patterns [(re-pattern (str focus "$"))]}])
+
+                               ;; Match pattern in test namespaces
+                              pattern
+                              (assoc :kaocha.filter/regex (re-pattern pattern)))
+
+                      ;; Run tests
+                     result (kaocha-run! config)
+
+                      ;; Extract summary
+                     pass (:kaocha.result/count result 0)
+                     fail (:kaocha.result/fail result 0)
+                     error (:kaocha.result/error result 0)
+                     exit-code (if (and (zero? fail) (zero? error)) 0 1)]
+
+                 {:type (if (zero? exit-code) :success :error)
+                  :content (format-test-output {:pass pass
+                                                :fail fail
+                                                :error error})
+                  :metadata {:passed pass
+                             :failed fail
+                             :errors error
+                             :exit-code exit-code
+                             :cwd (or cwd ".")}})
+
+               (catch Exception e
+                 {:type :error
+                  :error (str "Test execution failed: " (.getMessage e))
+                  :details (str "Cause: " (when-let [cause (.getCause e)]
+                                            (.getMessage cause)))})))})
+
+;; ---------------------------------------------------------------------------
+;; Budget Tool
+;; ---------------------------------------------------------------------------
+
+;; Lazy require accounting
+(defn- accounting-ns []
+  (require 'dvergr.chat.accounting)
+  (find-ns 'dvergr.chat.accounting))
+
+(register!
+ {:name "budget"
+  :description "Check your remaining budget and usage breakdown.
+
+   Use this to understand your resource constraints and plan accordingly.
+   Budget is tracked in microdollars (μ$) where 1 USD = 1,000,000 μ$.
+
+   Operations:
+   - check: Get current budget status (default)
+   - breakdown: Get detailed cost breakdown by resource type
+   - estimate: Estimate cost of a planned operation
+
+   The response includes:
+   - Monetary budget remaining
+   - Token usage (input/output)
+   - Which constraints are tight (approaching limits)
+   - Recommendations for budget-conscious operation
+
+   Examples:
+   {\"operation\": \"check\"}
+   {\"operation\": \"breakdown\"}
+   {\"operation\": \"estimate\", \"model\": \"claude-sonnet-4-5\",
+    \"input_tokens\": 5000, \"output_tokens\": 2000}"
+  :parameters {:type "object"
+               :properties {:operation {:type "string"
+                                        :enum ["check" "breakdown" "estimate"]
+                                        :description "Operation to perform (default: check)"}
+                            :model {:type "string"
+                                    :description "Model ID for cost estimation"}
+                            :input_tokens {:type "integer"
+                                           :description "Estimated input tokens (for estimate)"}
+                            :output_tokens {:type "integer"
+                                            :description "Estimated output tokens (for estimate)"}}
+               :required []}
+  :execute (fn [{:keys [operation model input_tokens output_tokens]}
+                {:keys [chat-ctx]}]
+             (if chat-ctx
+               (try
+                 (let [acc-ns (accounting-ns)
+                       budget-status (ns-resolve acc-ns 'budget-status)
+                       format-budget (ns-resolve acc-ns 'format-budget)
+                       format-detailed-budget (ns-resolve acc-ns 'format-detailed-budget)
+                       estimate-chat-cost (ns-resolve acc-ns 'estimate-chat-cost)
+                       MICRODOLLARS-PER-DOLLAR (ns-resolve acc-ns 'MICRODOLLARS-PER-DOLLAR)
+
+                        ;; Lazy require runtime for context binding
+                       _ (require 'org.replikativ.spindel.engine.core)
+                       rtc-ns (find-ns 'org.replikativ.spindel.engine.core)
+                       exec-ctx-var (ns-resolve rtc-ns '*execution-context*)
+
+                        ;; Get budget from chat context - need spindel context for signal read
+                       budget-signal (:budget-signal chat-ctx)
+                       spindel-ctx (:spindel-ctx chat-ctx)
+                       {:keys [total used by-type]} (if (and budget-signal spindel-ctx)
+                                                      (with-bindings {exec-ctx-var spindel-ctx}
+                                                        @budget-signal)
+                                                      {:total 0 :used 0 :by-type {}})
+                       status (budget-status total used)]
+
+                   (case (or operation "check")
+                     "check"
+                     {:type :success
+                      :content (format-budget status)
+                      :metadata {:status status}}
+
+                     "breakdown"
+                     {:type :success
+                      :content (format-detailed-budget status by-type)
+                      :metadata {:status status :by-type by-type}}
+
+                     "estimate"
+                     (if (and model input_tokens)
+                       (let [est (estimate-chat-cost model
+                                                     input_tokens
+                                                     (or output_tokens 500))]
+                         {:type :success
+                          :content (str "Estimated cost for " model ":\n"
+                                        "  Input tokens:  " input_tokens "\n"
+                                        "  Output tokens: " (or output_tokens 500) "\n"
+                                        "  Total cost:    $"
+                                        (format "%.6f"
+                                                (/ (:estimated-microdollars est)
+                                                   (double @MICRODOLLARS-PER-DOLLAR)))
+                                        "\n\n"
+                                        (if (> (:remaining status) (:estimated-microdollars est))
+                                          "✓ Within budget"
+                                          "⚠ Exceeds remaining budget!"))
+                          :metadata {:estimate est :status status}})
+                       {:type :error
+                        :error "Estimate requires 'model' and 'input_tokens' parameters"})
+
+                     {:type :error
+                      :error (str "Unknown operation: " operation)}))
+                 (catch Exception e
+                   {:type :error
+                    :error (str "Budget check failed: " (.getMessage e))}))
+                ;; No chat context - return mock response for testing
+               {:type :success
+                :content (str "Budget Status:\n"
+                              "  Total:     $1.0000\n"
+                              "  Used:      $0.0000\n"
+                              "  Remaining: $1.0000 (100%)\n\n"
+                              "Note: No chat context available. "
+                              "Using mock response for testing.")
+                :metadata {:mock? true}}))})
+
+;; ---------------------------------------------------------------------------
+;; Agent Spawning Tool
+;;
+;; spawn_agent delegates a one-shot task to a sub-agent that runs in a forked
+;; dvergr.discourse room — auto-merges on success.
+;; ---------------------------------------------------------------------------
+
+(defn- discourse-hire []
+  (requiring-resolve 'dvergr.discourse/hire))
+
+(defn- llm-agent []
+  (requiring-resolve 'dvergr.discourse.llm/llm-agent))
+
+(defn- current-daemon []
+  (some-> (requiring-resolve 'dvergr.orchestration.daemon/current-daemon) deref deref))
+
+(defn- load-agent-profile
+  "Persona markdown for `profile-name` — project-local `.dvergr/agents/<name>.md`
+   first, else built-in `resources/agents/<name>.md` (dvergr.agent.persona)."
+  [profile-name]
+  ((requiring-resolve 'dvergr.agent.persona/resolve-prompt) profile-name))
+
+(register!
+ {:name "spawn_agent"
+  :description "Spawn a sub-agent to handle a delegated task.
+
+   The sub-agent runs in a forked dvergr.discourse room (substrate-fork
+   coming with Open Q #11; today only the room log is isolated). The
+   reply is auto-merged into the parent room and returned as text.
+
+   Use this to delegate sub-tasks to specialized agents.
+
+   Parameters:
+   - task: The task description for the sub-agent (required)
+   - profile: Agent profile name — loads system prompt from resources/agents/<profile>.md
+              Available: 'worker' (default), 'developer' (dvergr self-programming), 'planner'
+   - budget: Budget in dollars for the sub-agent (default: 0.50)
+
+   Returns the sub-agent's final text response.
+
+   Example: Delegate research
+   {\"task\": \"Research Clojure transducers and write a summary\"}
+
+   Example: Delegate with developer profile
+   {\"task\": \"Add a new tool that counts lines of code\", \"profile\": \"developer\", \"budget\": 1.0}"
+  :parameters {:type "object"
+               :properties {:task {:type "string"
+                                   :description "Task description for the sub-agent"}
+                            :profile {:type "string"
+                                      :description "Agent profile: worker (default), developer, planner"}
+                            :budget {:type "number"
+                                     :description "Budget in dollars (default 0.50)"}}
+               :required ["task"]}
+  :execute (fn [{:keys [task profile budget]} {:keys [execution-ctx]}]
+             (try
+               (let [hire         (discourse-hire)
+                     make-worker  (llm-agent)
+                     daemon       (current-daemon)
+                     room         (:discourse-room daemon)
+                     ctx          (or execution-ctx (:execution-ctx daemon))
+                     profile-name (or profile "worker")
+                     prompt-text  (or (load-agent-profile profile-name)
+                                      "You are a capable AI worker. Complete the given task thoroughly.")]
+                 (cond
+                   (nil? room)
+                   {:type :error
+                    :error "spawn_agent requires a running daemon (no discourse room)."}
+
+                   (nil? ctx)
+                   {:type :error
+                    :error "No execution context available. spawn_agent requires a spindel runtime."}
+
+                   :else
+                   (let [worker (binding [rtc/*execution-context* ctx]
+                                  (make-worker
+                                   {:id     (keyword (str profile-name "-sub"))
+                                    :spec   {:provider      :fireworks
+                                               ;; a model that EXISTS in resources/models.edn (the qwen id
+                                               ;; was removed from Fireworks; get-model! threw → spawn_agent
+                                               ;; was broken on first use)
+                                             :model         "accounts/fireworks/models/minimax-m2p5"
+                                             :system-prompt prompt-text}
+                                    :budget {:dollars (or budget 0.50)}
+                                    :ctx    ctx}))
+                         outcome (binding [rtc/*execution-context* ctx]
+                                   @(hire room worker {:goal task}))
+                         reply   (:reply outcome)
+                         text    (str (:content reply))]
+                     {:type :success
+                      :content (str "Sub-agent (" profile-name ") result:\n\n" text)
+                      :metadata {:profile profile-name
+                                 :status  (:status outcome)
+                                 :agent   (:id worker)}})))
+               (catch Exception e
+                 {:type :error
+                  :error (str "spawn_agent failed: " (.getMessage e))})))})
+
+(comment
+  ;; Test tools
+  (def ctx (make-context {:cwd "/home/christian-weilbach/Development/dvergr"}))
+
+  (execute "read_file" {:path "deps.edn"} ctx)
+  (execute "glob" {:pattern "**/*.clj"} ctx)
+  (execute "shell" {:command "ls -la"} ctx)
+  (execute "grep" {:pattern "defn"} ctx)
+  (execute "clj_kondo" {:lint ["src/dvergr/core.clj"]} ctx)
+  (execute "budget" {:operation "check"} ctx))

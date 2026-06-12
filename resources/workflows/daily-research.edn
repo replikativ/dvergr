@@ -1,0 +1,6 @@
+{:id :daily-research
+ :description "Daily AI ecosystem intelligence gathering with knowledge curation"
+ :phases [:research-daily]
+ :triggers {:schedule {:interval-hours 24
+                       :agent-id :researcher
+                       :task "Run daily research sweep: survey HN, Lobsters, Reddit, GitHub, and Mastodon for AI/software developments. Check existing knowledge before adding. Update stale entries, create new ones for genuinely novel findings. Produce a concise digest of actionable insights."}}}
