@@ -8,10 +8,9 @@
    has no SMTP — a postal-based send can come later). briefkasten + clojure-mail
    are OPTIONAL deps (the :cli/:tui/:dev aliases), so everything here is lazy via
    requiring-resolve — this namespace loads fine without them."
-  (:require [yggdrasil.adapters.datahike :as dh-adapter]
-            [org.replikativ.spindel.yggdrasil :as ygg]
-            [org.replikativ.spindel.engine.core :as ec]
+  (:require [org.replikativ.spindel.engine.core :as ec]
             [dvergr.substrate.config :as config]
+            [dvergr.substrate.datahike :as sdh]
             [taoensso.telemere :as tel])
   (:import [java.util.concurrent Executors TimeUnit]))
 
@@ -42,7 +41,9 @@
    rooms register their kb/msgs/repo. Returns the account handle, or nil."
   [account-id]
   (when-let [acct (open-account! account-id)]
-    (ygg/register! (dh-adapter/create (:conn acct) {:system-name mail-system-name}))
+    ;; briefkasten owns this conn + its schema — register only.
+    (sdh/provision! {:conn (:conn acct) :schema? false
+                     :system-name mail-system-name})
     (tel/log! {:id :mail/attached :data {:account account-id}}
               "Mailbox attached to room execution context")
     acct))

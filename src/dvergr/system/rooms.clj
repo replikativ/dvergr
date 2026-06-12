@@ -25,7 +25,7 @@
             [dvergr.runtime.ctx :as rctx]
             [dvergr.substrate.git :as git]
             [dvergr.substrate.paths :as paths]
-            [yggdrasil.adapters.datahike :as dh-adapter]
+            [dvergr.substrate.datahike :as sdh]
             [org.replikativ.spindel.yggdrasil :as ygg]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.context :as sctx]))
@@ -96,17 +96,15 @@
    seed its single `:chat/*`+`:room/*` row so the DatahikeStore can scope messages
    by `:room/slug`→`:chat/id`. Idempotent."
   [path slug name]
-  (let [c (msgs-cfg path)]
-    (when-not (d/database-exists? c) (d/create-database c))
-    (let [conn (d/connect c)]
-      (d/transact conn cschema/full-schema)
-      ;; RF5: schedules are a per-room project artifact — install the (transparent)
-      ;; :schedule/* schema so the room's reactive scheduler (dvergr.rooms.scheduler)
-      ;; can store + fire them from this store.
-      (d/transact conn sched-schema/schema)
-      (d/transact conn [(merge (cschema/create-chat-entity
-                                {:id (msgs-chat-id slug) :title (or name slug)})
-                               {:room/slug slug :room/type :internal})]))))
+  ;; RF5: schedules are a per-room project artifact — the (transparent)
+  ;; :schedule/* schema rides along as :extra-schema so the room's reactive
+  ;; scheduler (dvergr.rooms.scheduler) can store + fire them from this store.
+  (sdh/provision! {:cfg (msgs-cfg path)
+                   :extra-schema sched-schema/schema
+                   :seed-tx [(merge (cschema/create-chat-entity
+                                     {:id (msgs-chat-id slug) :title (or name slug)})
+                                    {:room/slug slug :room/type :internal})]
+                   :register? false}))
 
 (defn register-room-systems!
   "Register a room's messages store + KB (DatahikeSystems) + repo (GitSystem) as
@@ -114,10 +112,12 @@
    fork/merge with it and resolve fork-aware via `ygg/system`. Requires a bound
    execution context. Used by `provision-room!`."
   [msgs-path kb-path repo-path]
-  (ygg/register! (dh-adapter/create (d/connect (msgs-cfg msgs-path))
-                                    {:system-name (msgs-system-name msgs-path)}))
-  (ygg/register! (dh-adapter/create (d/connect (kb-cfg kb-path))
-                                    {:system-name (kb-system-name kb-path)}))
+  ;; Schema was installed at creation (seed-msgs-store! / provision-room!) —
+  ;; registration is a boot concern, so :schema? false keeps it connect+register.
+  (sdh/provision! {:cfg (msgs-cfg msgs-path) :schema? false
+                   :system-name (msgs-system-name msgs-path)})
+  (sdh/provision! {:cfg (kb-cfg kb-path) :schema? false
+                   :system-name (kb-system-name kb-path)})
   (ygg/register! (git/create-git-system :repo-path repo-path
                                         :system-name (repo-system-name repo-path))))
 
@@ -127,16 +127,17 @@
   [{:system/keys [type scope]}]
   (try
     (case type
-      :msgs (ygg/register! (dh-adapter/create (d/connect (msgs-cfg scope))
-                                              {:system-name (msgs-system-name scope)}))
-      :kb   (ygg/register! (dh-adapter/create (d/connect (kb-cfg scope))
-                                              {:system-name (kb-system-name scope)}))
+      :msgs (sdh/provision! {:cfg (msgs-cfg scope) :schema? false
+                             :system-name (msgs-system-name scope)})
+      :kb   (sdh/provision! {:cfg (kb-cfg scope) :schema? false
+                             :system-name (kb-system-name scope)})
       :repo (ygg/register! (git/create-git-system :repo-path scope
                                                   :system-name (repo-system-name scope)))
       ;; agent-created data DBs (see create-room-db!) — re-register so they survive
-      ;; restart, same as the room's own KB/msgs.
-      :data (ygg/register! (dh-adapter/create (connect-data-store scope)
-                                              {:system-name (str "room-data-" (.getName (io/file scope)))}))
+      ;; restart, same as the room's own KB/msgs. Custom connect (schema-flexibility
+      ;; fallback), so pass the conn; never impose dvergr schema on agent stores.
+      :data (sdh/provision! {:conn (connect-data-store scope) :schema? false
+                             :system-name (str "room-data-" (.getName (io/file scope)))})
       nil)
     (catch Throwable _ nil)))
 
@@ -186,9 +187,10 @@
             kb-path   (scope-path (str (random-uuid)))
             msgs-path (scope-path (str (random-uuid)))
             _         (git/ensure-repo! repo-path)
-            _         (let [c (kb-cfg kb-path)]
-                        (when-not (d/database-exists? c) (d/create-database c))
-                        (d/transact (d/connect c) (kbs/knowledge-datahike-schema)))
+            ;; KB store carries ONLY the knowledge schema (not the chat schema).
+            _         (sdh/provision! {:cfg (kb-cfg kb-path) :schema? false
+                                       :extra-schema (kbs/knowledge-datahike-schema)
+                                       :register? false})
             _         (seed-msgs-store! msgs-path slug name)
             repo-id   (sdb/register-system! {:type :repo :name (str slug "-repo")
                                              :scope repo-path :owner-id owner-id})
@@ -306,10 +308,8 @@
   (or (room-db-conn room-id db-name)
       (let [path (scope-path (str (random-uuid)))
             cfg  (assoc (data-cfg path) :schema-flexibility schema-flexibility)]
-        (when-not (d/database-exists? cfg) (d/create-database cfg))
-        (let [conn (d/connect cfg)]
-          (when (seq schema) (d/transact conn schema))
-          (ygg/register! (dh-adapter/create conn {:system-name (data-system-name path)}))
+        (let [conn (sdh/provision! {:cfg cfg :schema? false :extra-schema schema
+                                    :system-name (data-system-name path)})]
           ;; The GLOBAL system-db grant must NOT be written from inside a transient
           ;; fork — discarding the fork would then leave a grant that hydrate-rooms!
           ;; resurrects (P2). In a transient fork, record the pending grant FORK-
