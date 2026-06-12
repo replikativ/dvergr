@@ -1,0 +1,182 @@
+[
+  {
+    "objectID": "index.html",
+    "href": "index.html",
+    "title": "dvergr — examples",
+    "section": "",
+    "text": "1 dvergr — examples",
+    "crumbs": [
+      "<span class='chapter-number'>1</span>  <span class='chapter-title'>dvergr — examples</span>"
+    ]
+  },
+  {
+    "objectID": "notebooks.getting_started.html",
+    "href": "notebooks.getting_started.html",
+    "title": "2  Getting started with dvergr",
+    "section": "",
+    "text": "A room\nauthors: Christian Weilbach\ndvergr is a Clojure framework for continuous-time collaborative multi-agent rooms. Agents are reactive processes; humans, LLMs, and scripts are participants of the same shape; everything composes through tagged messages on a small pub/sub kernel.\nThis notebook builds that kernel up from nothing — no LLM required. Each form runs live; the outputs you see are produced by evaluating the code.\nA Room is a continuous-time message namespace with its own execution context (:ctx — a forkable spindel runtime + a Datahike database). Every operation on a room runs inside that context; we bind it once per block with with-ctx (the dvergr.clients.client surface binds it for you — here we work with the raw algebra to see the kernel directly).",
+    "crumbs": [
+      "<span class='chapter-number'>2</span>  <span class='chapter-title'>Getting started with dvergr</span>"
+    ]
+  },
+  {
+    "objectID": "notebooks.getting_started.html#a-room",
+    "href": "notebooks.getting_started.html#a-room",
+    "title": "2  Getting started with dvergr",
+    "section": "",
+    "text": "(def room (d/room :hello))",
+    "crumbs": [
+      "<span class='chapter-number'>2</span>  <span class='chapter-title'>Getting started with dvergr</span>"
+    ]
+  },
+  {
+    "objectID": "notebooks.getting_started.html#a-participant",
+    "href": "notebooks.getting_started.html#a-participant",
+    "title": "2  Getting started with dvergr",
+    "section": "A participant",
+    "text": "A participant\nA Participant has an :id (its routing endpoint) and an :on-message that returns a spin yielding a reply-spec {:to … :content …} (or nil to stay silent). This one just echoes — swap it for dvergr.discourse.llm/llm-agent and the shape is identical.\n\n(defn echo-agent [id]\n  (d/participant\n   {:id id\n    :on-message (fn [_p msg]\n                  (spin {:to (:from msg) :content (str \"you said: \" (:content msg))}))}))\n\n\n(kind/hidden\n (with-room room\n   (d/join room (echo-agent :sage))\n   nil))",
+    "crumbs": [
+      "<span class='chapter-number'>2</span>  <span class='chapter-title'>Getting started with dvergr</span>"
+    ]
+  },
+  {
+    "objectID": "notebooks.getting_started.html#post-a-message",
+    "href": "notebooks.getting_started.html#post-a-message",
+    "title": "2  Getting started with dvergr",
+    "section": "Post a message",
+    "text": "Post a message\nd/message builds [from to content]; d/post! routes it. The agent’s spin runs asynchronously, so we let the engine settle before reading the log.\n\n(with-room room\n  (d/post! room (d/message :you :sage \"hello, dvergr\")))\n\n\n{:id #uuid \"3476b7ec-ecf4-47f9-aa76-5450446abbcd\",\n :from :you,\n :to :sage,\n :content \"hello, dvergr\",\n :ts 1781243838050,\n :in-reply-to nil,\n :metadata nil,\n :type :user/message}\n\n\n(settle)\n\n\nnil",
+    "crumbs": [
+      "<span class='chapter-number'>2</span>  <span class='chapter-title'>Getting started with dvergr</span>"
+    ]
+  },
+  {
+    "objectID": "notebooks.getting_started.html#read-the-log",
+    "href": "notebooks.getting_started.html#read-the-log",
+    "title": "2  Getting started with dvergr",
+    "section": "Read the log",
+    "text": "Read the log\nEvery post is recorded. The agent’s reply is addressed back to :you.\n\n(kind/table\n (mapv #(select-keys % [:from :to :content]) (d/log room)))\n\n\n\n\n\n\nfrom\nto\ncontent\n\n\n\n\nyou\nsage\nhello, dvergr\n\n\nsage\nyou\nyou said: hello, dvergr",
+    "crumbs": [
+      "<span class='chapter-number'>2</span>  <span class='chapter-title'>Getting started with dvergr</span>"
+    ]
+  },
+  {
+    "objectID": "notebooks.getting_started.html#tagged-routing-address-a-capability-not-a-name",
+    "href": "notebooks.getting_started.html#tagged-routing-address-a-capability-not-a-name",
+    "title": "2  Getting started with dvergr",
+    "section": "Tagged routing — address a capability, not a name",
+    "text": "Tagged routing — address a capability, not a name\nMessages carry a :type. A participant can subscribe to a tag in addition to its inbox, so it receives messages it was never directly addressed in. This is how cross-cutting concerns (auditors, budget policies) compose without the sender knowing who handles them.\n\n(def audit-log (atom []))\n\n\n(kind/hidden\n (with-room room\n   (let [auditor (d/join room (d/participant\n                               {:id :auditor\n                                :on-message (fn [_p msg]\n                                              (spin (swap! audit-log conj\n                                                           (select-keys msg [:type :from]))\n                                                    nil))}))]\n     ;; subscribe the auditor to ALL :metric/cost messages, regardless of :to\n     (d/subscribe! room auditor [:type :metric/cost]))\n   nil))\n\nA message tagged :metric/cost, addressed to nobody in particular, still reaches the auditor via its tag subscription:\n\n(with-room room\n  (d/post! room {:type :metric/cost :from :sage :payload {:usd 0.02}}))\n\n\n{:type :metric/cost, :from :sage, :payload {:usd 0.02}}\n\n\n(settle)\n\n\nnil\n\n\n(kind/table @audit-log)\n\n\n\n\n\n\ntype\nfrom\n\n\n\n\ncost\nsage\n\n\ncost\nsage\n\n\n\n\n\nThe auditor saw a message addressed to no one — pure tag routing.",
+    "crumbs": [
+      "<span class='chapter-number'>2</span>  <span class='chapter-title'>Getting started with dvergr</span>"
+    ]
+  },
+  {
+    "objectID": "notebooks.getting_started.html#where-to-go-next",
+    "href": "notebooks.getting_started.html#where-to-go-next",
+    "title": "2  Getting started with dvergr",
+    "section": "Where to go next",
+    "text": "Where to go next\n\nHumans + agents, fork & merge — humans as participants, background tasks, and the propose → accept/reject pattern (humans_and_agents).\nAuditor — capability subscriptions in depth (auditor).\nEscalation — budget escalation via tagged messages + a bus-level policy handler (escalation).\nStreaming — per-consumer buffer/SLA policy on a token stream (streaming).\nLLM agent — drive a real model with tools (llm_agent).\n\n\n(kind/hidden (d/close-room! room) nil)\n\n\nsource: notebooks/notebooks/getting_started.clj",
+    "crumbs": [
+      "<span class='chapter-number'>2</span>  <span class='chapter-title'>Getting started with dvergr</span>"
+    ]
+  },
+  {
+    "objectID": "notebooks.programming_model.html",
+    "href": "notebooks.programming_model.html",
+    "title": "3  The programming model — a compositional kernel",
+    "section": "",
+    "text": "1. Capability subscription — listen beyond your inbox\nEverything in dvergr composes through tagged messages on a small pub/sub kernel. A message’s :type is its illocutionary force — what the utterance does — and participants subscribe by the kinds of speech act they answer rather than by hardcoded sender→receiver wiring. (See discourse-theory.md for that framing.)\nThis notebook shows three faces of that one idea — each runs live, with no model. Every block binds the room’s execution context with with-room.\nA Participant always receives messages addressed to it ([:to id]). It can add a second subscription with d/subscribe! on a capability tag — and then it sees messages it was never addressed in. That is the basis for cross-cutting monitoring (auditors, budget policies) without coupling.\nEach worker escalates on every message; the auditor also gets one direct message to its inbox.\n:as-inbox true = addressed to the auditor; false = picked up via the tag subscription. The auditor observed escalations addressed to other agents.",
+    "crumbs": [
+      "<span class='chapter-number'>3</span>  <span class='chapter-title'>The programming model — a compositional kernel</span>"
+    ]
+  },
+  {
+    "objectID": "notebooks.programming_model.html#capability-subscription-listen-beyond-your-inbox",
+    "href": "notebooks.programming_model.html#capability-subscription-listen-beyond-your-inbox",
+    "title": "3  The programming model — a compositional kernel",
+    "section": "",
+    "text": "(def audit-room (d/room :audit-demo))\n\n\n(def seen (atom []))\n\n\n(kind/hidden\n (with-room audit-room\n   (let [auditor (d/join audit-room (aud/make-auditor seen))]\n     ;; the extra subscription: ALL :escalation/budget messages, regardless of :to\n     (d/subscribe! audit-room auditor [:type :escalation/budget])\n     (d/join audit-room (aud/make-noisy-agent :worker-a audit-room))\n     (d/join audit-room (aud/make-noisy-agent :worker-b audit-room)))\n   nil))\n\n\n\n(kind/hidden\n (with-room audit-room\n   (d/post! audit-room (d/message :user :worker-a \"do something\"))\n   (d/post! audit-room (d/message :user :worker-b \"do something else\"))\n   (d/post! audit-room (d/message :user :auditor  \"what have you seen?\"))\n   nil))\n\n\n(settle 300)\n\n\nnil\n\n\n\n(kind/table @seen)\n\n\n\n\n\n\ntype\nfrom\nto\nas-inbox\n\n\n\n\nmessage\nuser\nauditor\ntrue\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-a\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\nbudget\nworker-b\n\nfalse\n\n\n\n\n\n\n(let [escalations (count (filter #(= :escalation/budget (:type %)) @seen))\n      inboxed     (count (filter :as-inbox @seen))]\n  (kind/pprint {:escalations-observed escalations   ; via subscribe!, not addressed to :auditor\n                :inbox-messages        inboxed        ; addressed to :auditor\n                :total-seen            (count @seen)}))\n\n\n{:escalations-observed 124, :inbox-messages 1, :total-seen 125}\n\n\n(kind/hidden (with-room audit-room (d/close-room! audit-room) nil))",
+    "crumbs": [
+      "<span class='chapter-number'>3</span>  <span class='chapter-title'>The programming model — a compositional kernel</span>"
+    ]
+  },
+  {
+    "objectID": "notebooks.programming_model.html#escalation-post-a-tag-a-policy-answers",
+    "href": "notebooks.programming_model.html#escalation-post-a-tag-a-policy-answers",
+    "title": "3  The programming model — a compositional kernel",
+    "section": "2. Escalation — post a tag, a policy answers",
+    "text": "2. Escalation — post a tag, a policy answers\nThe same mechanism drives escalation. alice escalates by posting an :escalation/budget message — not by calling a named manager. A separate policy-bot, subscribed on that tag, replies with :directive/raise-budget addressed back to her. Neither hardcodes the other; they compose because the room is a tagged-message namespace.\n\n(def budget-room (d/room :budget-demo))\n\n\n(def budget (atom 50))          ; cents; each reply costs 40\n\n\n(def wrapping-up? (atom false))\n\n\n(kind/hidden\n (with-room budget-room\n   (d/join budget-room (esc/make-alice budget-room budget wrapping-up?))\n   (esc/spawn-policy-bot! budget-room)\n   nil))\n\n\n(kind/md (str \"Initial budget: **\" @budget \" cents**\"))\n\nInitial budget: 50 cents\nRound 1 — enough budget: alice answers, balance drops to 10.\n\n(kind/hidden\n (with-room budget-room\n   (d/post! budget-room (d/message :user :alice \"what is 2 + 2?\")) nil))\n\n\n(settle 200)\n\n\n\n\n\n\n\nTHREAD OUT\n\n\n\n  alice: replied to :user — spent 40 remaining 10\n\n\n\n\nnil\n\n\n(kind/md (str \"After round 1: **\" @budget \" cents**\"))\n\nAfter round 1: 10 cents\nRound 2 — the next reply would cost 40 but only 10 remain, so alice posts :escalation/budget instead. policy-bot raises it by 100, addressed back to her; the user retries and the answer goes through.\n\n(kind/hidden\n (with-room budget-room\n   (d/post! budget-room (d/message :user :alice \"what is 5 * 7?\")) nil))\n\n\n(settle 300)\n\n\n\n\n\n\n\nTHREAD OUT\n\n\n\n  alice: budget 10 below cost 40 — escalating\n  policy-bot: saw escalation from :alice with payload {:remaining 10, :requested 100}\n  alice: received raise-budget + 100 → 110\n\n\n\n\nnil\n\n\n(kind/hidden\n (with-room budget-room\n   (d/post! budget-room (d/message :user :alice \"what is 5 * 7?\")) nil))\n\n\n(settle 200)\n\n\n\n\n\n\n\nTHREAD OUT\n\n\n\n  alice: replied to :user — spent 40 remaining 70\n\n\n\n\nnil\n\n\n(kind/pprint {:alice-budget @budget\n              :wrapping-up? @wrapping-up?\n              :log-size     (count (d/log budget-room))})\n\n\n{:alice-budget 70, :wrapping-up? false, :log-size 7}\n\nThe log shows alice’s :escalation/budget and policy-bot’s :directive/raise-budget addressed back to her.\n\n(kind/table\n (map #(select-keys % [:from :to :type :content]) (d/log budget-room)))\n\n\n\n\n\n\nfrom\nto\ntype\ncontent\n\n\n\n\nuser\nalice\nmessage\nwhat is 2 + 2?\n\n\nalice\nuser\nmessage\nalice's reply (#40 spent)\n\n\nuser\nalice\nmessage\nwhat is 5 * 7?\n\n\nalice\n\nbudget\n\n\n\npolicy-bot\nalice\nraise-budget\n\n\n\nuser\nalice\nmessage\nwhat is 5 * 7?\n\n\nalice\nuser\nmessage\nalice's reply (#40 spent)\n\n\n\n\n\n\n(kind/hidden (with-room budget-room (d/close-room! budget-room) nil))",
+    "crumbs": [
+      "<span class='chapter-number'>3</span>  <span class='chapter-title'>The programming model — a compositional kernel</span>"
+    ]
+  },
+  {
+    "objectID": "notebooks.programming_model.html#buffer-policy-one-stream-per-consumer-slas",
+    "href": "notebooks.programming_model.html#buffer-policy-one-stream-per-consumer-slas",
+    "title": "3  The programming model — a compositional kernel",
+    "section": "3. Buffer policy — one stream, per-consumer SLAs",
+    "text": "3. Buffer policy — one stream, per-consumer SLAs\nTags also carry streams. One producer fires 50 :partial/token messages; two consumers tap the same [:type :partial/token] topic with different buffer policies:\n\naudit — the :partial default (fixed-buffer 256): tokens are discrete data, so the default is lossless.\nUI — overridden to sliding-buffer 1: a view that only wants the latest accumulated state opts into lossy semantics, per subscription.\n\nThe producer is unaware of either; each consumer picks its own SLA.\n\n(def stream-room (d/room :stream-demo))\n\n\n(def ui-got (atom []))\n\n\n(def audit-got (atom []))\n\n\n(def n 50)\n\nPubs start their pump on first subscription, so consumers come first. The UI consumer sleeps 5ms/token to simulate a slow re-render.\n\n(kind/hidden\n (do (stream/spawn-ui-consumer!    stream-room ui-got)\n     (stream/spawn-audit-consumer! stream-room audit-got)\n     (stream/spawn-token-producer! stream-room n)\n     nil))\n\n\n(settle (+ 200 (* 5 n)))\n\n\nnil\n\nAudit consumer — lossless, sees every token (count = n):\n\n(kind/pprint {:tokens-seen (count @audit-got)\n              :expected    n\n              :first-10    (vec (take 10 @audit-got))})\n\n\n{:tokens-seen 50, :expected 50, :first-10 [0 1 2 3 4 5 6 7 8 9]}\n\nUI consumer — lossy on purpose, sees only a sample (varies run-to-run):\n\n(kind/pprint {:tokens-seen (count @ui-got) :sample @ui-got})\n\n\n{:tokens-seen 1, :sample [49]}\n\nThe room log keeps everything regardless of per-consumer policy:\n\n(kind/pprint {:log-size (count (d/log stream-room)) :expected n})\n\n\n{:log-size 50, :expected 50}\n\n\n(kind/hidden (with-room stream-room (d/close-room! stream-room) nil))",
+    "crumbs": [
+      "<span class='chapter-number'>3</span>  <span class='chapter-title'>The programming model — a compositional kernel</span>"
+    ]
+  },
+  {
+    "objectID": "notebooks.programming_model.html#where-to-go-next",
+    "href": "notebooks.programming_model.html#where-to-go-next",
+    "title": "3  The programming model — a compositional kernel",
+    "section": "Where to go next",
+    "text": "Where to go next\n\nForks & proposals — fork a room, let a worker change a branched git + datahike, then merge! or discard atomically (forks_and_proposals).\nAgents & tools — a real LLM agent, the clojure_eval sandbox, the muschel shell, budgets, and context compaction (agents_and_tools).\n\nThe deeper algebra — ask / fan-out / race / quorum / pipeline and the theory-of-mind simulate-reply — is in programming-model.md and discourse-theory.md.\n\nsource: notebooks/notebooks/programming_model.clj",
+    "crumbs": [
+      "<span class='chapter-number'>3</span>  <span class='chapter-title'>The programming model — a compositional kernel</span>"
+    ]
+  },
+  {
+    "objectID": "notebooks.humans_and_agents.html",
+    "href": "notebooks.humans_and_agents.html",
+    "title": "4  Could not locate dvergr/discourse/proposals__init.class, dvergr/discourse/proposals.clj or dvergr/discourse/proposals.cljc on classpath.",
+    "section": "",
+    "text": "(ns notebooks.humans-and-agents\n  \"Live Clay notebook: humans + agents in a long-lived dvergr.discourse Room —\n   addressed routing, background tasks, and the fork→propose→merge/discard\n   lifecycle (the coding-agent isolation story).\n\n   Reuses `examples/humans_and_agents.clj`'s `scripted-agent` helper and drives\n   each demo inline (never calls the example's `run`/`-main`). All agents are\n   scripted mocks — no API keys, no network; swapping in a real LLM agent\n   doesn't change the primitives. Every demo binds the room's execution context\n   once with `with-room`.\"\n  (:refer-clojure :exclude [await])\n  (:require [notebooks.support :refer [settle]]\n            [datahike.api :as dh]\n            [dvergr.discourse :as d :refer [with-room]]\n            [dvergr.discourse.human :as human]\n            [dvergr.discourse.background :as bg]\n            [dvergr.discourse.proposals :as proposals]\n            [dvergr.chat.schema :as schema]\n            [org.replikativ.spindel.engine.core :as ec]\n            [org.replikativ.spindel.spin.cps :refer [spin]]\n            [org.replikativ.spindel.yggdrasil :as ygg]\n            [yggdrasil.adapters.datahike :as ygg-dh]\n            [scicloj.kindly.v4.kind :as kind]\n            [humans-and-agents :as ha]))\n\n\n\n\n\n\n\nImportant\n\n\n\n\n\n                                    clojure.core/eval    core.clj: 3232\n                                                  ...                 \n                notebooks.humans-and-agents/eval93271  REPL Input:     \nnotebooks.humans-and-agents/eval93271/loading--auto--  REPL Input:     \n                                                  ...                 \n                                 clojure.core/require    core.clj: 6066 (repeats 2 times)\n                                                  ...                 \n                               clojure.core/load-libs    core.clj: 6028\n                               clojure.core/load-libs    core.clj: 6044\n                                                  ...                 \n                                clojure.core/load-lib    core.clj: 5981\n                                clojure.core/load-lib    core.clj: 6002\n                             clojure.core/load-lib/fn    core.clj: 6003\n                                clojure.core/load-one    core.clj: 5961\n                                                  ...                 \n                                    clojure.core/load    core.clj: 6172\n                                    clojure.core/load    core.clj: 6188\n                                 clojure.core/load/fn    core.clj: 6189\n                                                  ...                 \njava.io.FileNotFoundException: Could not locate dvergr/discourse/proposals__init.class, dvergr/discourse/proposals.clj or dvergr/discourse/proposals.cljc on classpath.\n\n\n\n\n\n\nsource: notebooks/notebooks/humans_and_agents.clj",
+    "crumbs": [
+      "<span class='chapter-number'>4</span>  <span class='chapter-title'>Could not locate dvergr/discourse/proposals__init.class, dvergr/discourse/proposals.clj or dvergr/discourse/proposals.cljc on classpath.</span>"
+    ]
+  },
+  {
+    "objectID": "notebooks.agents_and_tools.html",
+    "href": "notebooks.agents_and_tools.html",
+    "title": "5  Agents and tools",
+    "section": "",
+    "text": "The tool surface: clojure_eval is the SCI sandbox\nThe previous notebooks built the kernel with scripted participants. The point of dvergr is that an LLM agent is a participant of the same shape — you swap the scripted :on-message for dvergr.discourse.llm/llm-agent and nothing else about the room model changes. The agent runs a full turn (model call + tool execution + budget accounting) and posts its reply back like any participant.\nAn agent’s main programming surface is clojure_eval — it evaluates Clojure in an isolated SCI context wired to the live dvergr world (rooms, knowledge, intake). It’s not a calculator bolted on; it’s the same medium the agent is built from, which is what lets an agent inspect and extend the running system. Around it sit the rest of the registry — structured read_file/write_file/edit_file, a test runner, and a jailed muschel shell (parsed + filesystem-sandboxed, not raw bash -c). An agent opts into tools by name via :tools.",
+    "crumbs": [
+      "<span class='chapter-number'>5</span>  <span class='chapter-title'>Agents and tools</span>"
+    ]
+  },
+  {
+    "objectID": "notebooks.agents_and_tools.html#build-a-room-with-a-coding-agent",
+    "href": "notebooks.agents_and_tools.html#build-a-room-with-a-coding-agent",
+    "title": "5  Agents and tools",
+    "section": "Build a room with a coding agent",
+    "text": "Build a room with a coding agent\nllm-agent takes an :id, a :spec (provider + model + system prompt), and a set of :tools (names from the dvergr.tools registry). Here the agent gets clojure_eval so it can compute the answer in the sandbox rather than guess it. ask posts a message and awaits exactly one reply (a Spin[Message]); with-room binds the room’s execution context.\n\n(kind/code\n (pr-str\n  '(do\n     (require '[dvergr.discourse :as d :refer [with-room]]\n              '[dvergr.discourse.llm :as llm]\n              '[dvergr.model.providers :as providers]\n              '[org.replikativ.spindel.spin.combinators :as comb])\n     (providers/ensure-initialized!)\n     (let [room (d/room :agent-demo)\n           spec {:provider :fireworks\n                 :model    \"accounts/fireworks/models/kimi-k2p6\"\n                 :system-prompt \"You are a terse Clojure assistant. Use clojure_eval to compute.\"}]\n       (with-room room\n         (d/join room (llm/llm-agent {:id :coder :spec spec :tools #{:clojure_eval}}))\n         (-&gt; (comb/timeout (d/ask room :coder\n                             {:content \"What is 17 * 23? Compute it with clojure_eval.\"})\n                           90000 {:content \"[timed out]\"})\n             deref :content))))))\n\n\n(do (require (quote [dvergr.discourse :as d :refer [with-room]]) (quote [dvergr.discourse.llm :as llm]) (quote [dvergr.model.providers :as providers]) (quote [org.replikativ.spindel.spin.combinators :as comb])) (providers/ensure-initialized!) (let [room (d/room :agent-demo) spec {:provider :fireworks, :model \"accounts/fireworks/models/kimi-k2p6\", :system-prompt \"You are a terse Clojure assistant. Use clojure_eval to compute.\"}] (with-room room (d/join room (llm/llm-agent {:id :coder, :spec spec, :tools #{:clojure_eval}})) (-&gt; (comb/timeout (d/ask room :coder {:content \"What is 17 * 23? Compute it with clojure_eval.\"}) 90000 {:content \"[timed out]\"}) deref :content))))",
+    "crumbs": [
+      "<span class='chapter-number'>5</span>  <span class='chapter-title'>Agents and tools</span>"
+    ]
+  },
+  {
+    "objectID": "notebooks.agents_and_tools.html#example-reply",
+    "href": "notebooks.agents_and_tools.html#example-reply",
+    "title": "5  Agents and tools",
+    "section": "Example reply",
+    "text": "Example reply\nThe agent receives the question, calls clojure_eval to evaluate (* 17 23) in the SCI sandbox, and replies with the computed result:\n\n(kind/md \"&gt; **391** — computed with `clojure_eval`, not guessed.\")\n\n\n391 — computed with clojure_eval, not guessed.\n\nA full model-plus-tool turn, driven through the same room / ask primitives as the scripted notebooks. (This block is a captured example — the notebook doesn’t call a model at render time; run the code above at a REPL to reproduce it.)",
+    "crumbs": [
+      "<span class='chapter-number'>5</span>  <span class='chapter-title'>Agents and tools</span>"
+    ]
+  },
+  {
+    "objectID": "notebooks.agents_and_tools.html#budgets-and-context-automatically",
+    "href": "notebooks.agents_and_tools.html#budgets-and-context-automatically",
+    "title": "5  Agents and tools",
+    "section": "Budgets and context, automatically",
+    "text": "Budgets and context, automatically\nTwo things happen around that turn without any extra code:\n\nBudget accounting. Every turn is metered in microdollars against the agent’s :budget (default a small dollar cap). When it crosses a checkpoint the agent can escalate :directive/raise-budget (the escalation pattern from programming_model) instead of running away — cost stays bounded, which is also the guardrail on recursive agent-spawning.\nContext management. Long runs auto-prune tool outputs and summarize older turns as the model’s window fills (dvergr.chat.compaction), so an agent can hold a long conversation without overflowing context.\n\nEverything composable about the kernel — tagged routing, forks, budgets, streaming — applies unchanged to LLM agents. To give this agent a sandboxed shell or file tools, add their names to :tools (e.g. #{:clojure_eval :shell :read_file}); the turn loop dispatches them the same way.\n\nsource: notebooks/notebooks/agents_and_tools.clj",
+    "crumbs": [
+      "<span class='chapter-number'>5</span>  <span class='chapter-title'>Agents and tools</span>"
+    ]
+  }
+]
