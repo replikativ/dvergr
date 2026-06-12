@@ -1,0 +1,6 @@
+{:id :research
+ :tools #{:read_file :glob :grep :web_search :web_fetch :knowledge_search :knowledge_add :budget
+          :clojure_eval}
+ :system-prompt-suffix "Research the topic thoroughly. Use web_search / web_fetch for the open web, and for ecosystem sources use clojure_eval with the integrated intake.* namespaces — e.g. (intake.hn/search \"...\"), (intake.reddit/search ...), (intake.github/trending), (intake.lobsters/top), (intake.devto/top). Run (sandbox/overview) to list every available source and its fns. Build knowledge with knowledge_add and summarize your findings clearly."
+ :completion-criteria :explicit
+ :context-strategy :incremental}

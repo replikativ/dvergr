@@ -1,0 +1,9 @@
+#kaocha/v1
+{:tests [{:id          :unit
+          :test-paths  ["test"]
+          ;; Skip ^:integration tests by default — they make real Fireworks
+          ;; API calls and hang (or burn budget) without FIREWORKS_API_KEY.
+          ;; Opt in explicitly: clojure -M:test --focus-meta :integration
+          :skip-meta   [:integration]}]
+ ;; A bit more output during long runs so we can tell which ns is in flight.
+ :reporter [kaocha.report/dots]}

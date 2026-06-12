@@ -1,0 +1,202 @@
+{:paths ["src" "resources"]
+
+ :deps {org.clojure/clojure       {:mvn/version "1.12.0"}
+
+        ;; HTTP client for provider APIs
+        hato/hato                  {:mvn/version "1.0.0"}
+
+        ;; JSON encoding/decoding
+        metosin/jsonista           {:mvn/version "0.3.8"}
+
+        ;; Schema validation
+        metosin/malli              {:mvn/version "0.16.4"}
+
+        ;; File system utilities
+        babashka/fs                {:mvn/version "0.5.21"}
+
+        ;; Time handling
+        clojure.java-time/clojure.java-time {:mvn/version "1.4.2"}
+
+        ;; ANSI colors for REPL output
+        io.aviso/pretty            {:mvn/version "1.4.4"}
+
+        ;; Async utilities
+        org.clojure/core.async     {:mvn/version "1.6.681"}
+
+        ;; SCI — Small Clojure Interpreter for sandboxing.
+        ;; Pinned to our fork (whilo/sci, branch resource-check) for the
+        ;; :interrupt-fn cancellation machinery (`sci/impl/interruptible.cljc`),
+        ;; still in PR review upstream (babashka/sci). The sandbox's
+        ;; resource-check / cancellation depends on it. Kept under the
+        ;; `org.babashka/sci` lib symbol so it OVERRIDES the transitive mvn
+        ;; sci (`:use-top`); other projects resolve dvergr as a git dep with
+        ;; no local checkout. For sci development, the `:local` alias overrides
+        ;; this back to `../sci`.
+        ;; NOTE(clojars): a git dep is not written into the published pom — a
+        ;; clojars artifact requires consumers to add this dep until the fork
+        ;; lands on Maven (upstream PR) or we publish it under our own group.
+        org.babashka/sci           {:git/url "https://github.com/whilo/sci"
+                                    :git/sha "24762a163ef5b25c692d0e5cd4ea63a5bd6b0a16"}
+
+        ;; partial-cps — CPS transform for SCI spin macro
+        is.simm/partial-cps        {:mvn/version "0.1.54"}
+
+        ;; Spindel — Reactive runtime with CoW forking
+        org.replikativ/spindel     {:mvn/version "0.1.23"}
+
+        ;; muschel — bash → AST → safely runnable shell.
+        ;; muschel.session.spindel is fork-aware via spindel/fork-context
+        ;; so a forked chat-ctx gets an isolated muschel session
+        ;; (jobs, cd, env) for free.
+        org.replikativ/muschel     {:mvn/version "0.2.16"}
+
+        ;; rewrite-clj for structural editing
+        rewrite-clj/rewrite-clj    {:mvn/version "1.1.48"}
+
+        ;; Datahike — persistent Datalog storage
+        org.replikativ/datahike    {:mvn/version "0.8.1689"}
+
+        ;; Yggdrasil — CoW branching for git and Datahike
+        ;; 0.2.27 carries composite Mergeable diff + conflicts (PR #3).
+        org.replikativ/yggdrasil   {:mvn/version "0.2.29"}
+
+        ;; Scriptum — CoW Lucene indices for fulltext search
+        org.replikativ/scriptum    {:mvn/version "0.1.27"}
+
+        ;; Briefkasten (local IMAP mirror) is OPTIONAL — it backs dvergr.intake.mail
+        ;; only, and pulls the jakarta-mail tree, so it lives in the
+        ;; :dev/:test/:cli/:tui aliases (with clojure-mail), not core.
+
+        ;; Kabel — WebSocket peer-to-peer transport. 0.3.98 pins javac --release 11
+        ;; (0.3.97 shipped Java-25 bytecode → UnsupportedClassVersionError on JDK <25).
+        org.replikativ/kabel       {:mvn/version "0.3.98"}
+        org.replikativ/hasch       {:mvn/version "0.4.98"}
+        org.replikativ/incognito   {:mvn/version "0.3.69"}
+        org.replikativ/konserve    {:mvn/version "0.9.347"}
+        org.replikativ/kabel-auth  {:mvn/version "0.1.19"}
+        org.replikativ/superv.async {:mvn/version "0.3.50"}
+
+        ;; Distributed-scope — remote function invocation over Kabel
+        is.simm/distributed-scope  {:mvn/version "0.1.2"}
+
+        ;; tools.analyzer for code indexing
+        org.clojure/tools.analyzer.jvm {:mvn/version "1.3.0"}
+
+        ;; Paren repair utilities (from clojure-mcp, EPL-2.0)
+        borkdude/edamame           {:mvn/version "1.5.35"}
+        org.clojars.oakes/parinfer {:mvn/version "0.4.0"}
+
+        ;; (dvergr.intake.mail's deps — clojure-mail + briefkasten — are OPTIONAL,
+        ;; in the :dev/:test/:cli/:tui aliases; see the note above. postal was a
+        ;; dead dep and has been dropped entirely.)
+
+        ;; HTTP-kit for Kabel WebSocket server + dvergr web dashboard
+        http-kit/http-kit          {:mvn/version "2.8.0"}
+
+        ;; Hiccup for HTML generation (dashboard + agent web UIs; also the SCI
+        ;; sandbox's dev ns, so it's core). NOTE: reitit (the spec-derived JSON
+        ;; HTTP API) is web-client-only → it lives in the :dev/:test/:cli/:tui
+        ;; aliases, not here, so library consumers don't pull its tree.
+        hiccup/hiccup              {:mvn/version "2.0.0"}
+
+        ;; Structured logging
+        com.taoensso/telemere      {:mvn/version "1.2.1"}
+
+        ;; katzen (Catlab/GATlab port) — the shared categorical schema
+        ;; substrate: the KB + Clojure-code ACSet schemas live in
+        ;; katzen.schema.* and dvergr binds them (dvergr.kb.schema,
+        ;; dvergr.code.index). katzen core is zero-dep; the datahike backend
+        ;; reuses dvergr's datahike.
+        org.replikativ/katzen      {:mvn/version "0.1.11"}}
+
+ :aliases
+ {:dev  {:extra-paths ["dev" "test" "src-clients"]
+         :extra-deps  {nrepl/nrepl          {:mvn/version "1.3.0"}
+                       cider/cider-nrepl    {:mvn/version "0.50.2"}
+                       clj-kondo/clj-kondo  {:mvn/version "2026.04.15"}
+                       metosin/reitit-ring {:mvn/version "0.7.2"} metosin/reitit-malli {:mvn/version "0.7.2"} metosin/reitit-middleware {:mvn/version "0.7.2"} metosin/reitit-swagger {:mvn/version "0.7.2"} io.github.nextjournal/markdown {:mvn/version "0.7.222"} ; web (reitit, sans swagger-ui — add reitit-swagger-ui for the /docs page)
+                       io.forward/clojure-mail {:mvn/version "1.0.8"} ; mail intake
+                       org.replikativ/briefkasten {:mvn/version "0.1.2"} ; briefkasten (mail)
+                       org.replikativ/spindel-tui {:mvn/version "0.1.10"}}}
+
+  ;; src-clients/ on the test path so dvergr.web.server-test still
+  ;; loads the namespaces it tests.
+  :test {:extra-paths ["test" "src-clients"]
+         :extra-deps  {lambdaisland/kaocha {:mvn/version "1.91.1392"}
+                       metosin/reitit-ring {:mvn/version "0.7.2"} metosin/reitit-malli {:mvn/version "0.7.2"} metosin/reitit-middleware {:mvn/version "0.7.2"} metosin/reitit-swagger {:mvn/version "0.7.2"} io.github.nextjournal/markdown {:mvn/version "0.7.222"} ; web (reitit, sans swagger-ui — add reitit-swagger-ui for the /docs page)
+                       io.forward/clojure-mail {:mvn/version "1.0.8"} ; mail intake
+                       org.replikativ/briefkasten {:mvn/version "0.1.2"} ; briefkasten (mail)
+                       org.replikativ/spindel-tui {:mvn/version "0.1.10"}}
+         :main-opts   ["-m" "kaocha.runner"]}
+
+  :repl {:main-opts ["-m" "nrepl.cmdline"
+                     "--middleware" "[cider.nrepl/cider-middleware]"
+                     "--interactive"]}
+
+  ;; Web dashboard + JSON API deps. These are NOT in :deps (the web layer is
+  ;; optional for library consumers), so a plain `-M:local` daemon boots HEADLESS.
+  ;; Combine this alias to get the dashboard, e.g. `-M:local:web` for a REPL or
+  ;; `-M:local:web:repl`. (:cli/:dev/:test already bundle these.)
+  :web {:extra-deps {metosin/reitit-ring        {:mvn/version "0.7.2"}
+                     metosin/reitit-malli       {:mvn/version "0.7.2"}
+                     metosin/reitit-middleware  {:mvn/version "0.7.2"}
+                     metosin/reitit-swagger     {:mvn/version "0.7.2"}
+                     io.github.nextjournal/markdown {:mvn/version "0.7.222"}}}
+
+  ;; Drop back to sibling repos when opening upstream PRs.
+  ;; Also includes muschel — `:deps` pins the published version, but
+  ;; if you need to develop muschel-side fixes in parallel, activate
+  ;; this alias to override.
+  :local {:extra-deps {org.babashka/sci           {:local/root "../sci"}
+                       org.replikativ/datahike    {:local/root "../datahike"}
+                       org.replikativ/scriptum    {:local/root "../scriptum"}
+                       org.replikativ/yggdrasil   {:local/root "../yggdrasil"}
+                       org.replikativ/spindel     {:local/root "../spindel"}
+                       org.replikativ/spindel-tui {:local/root "../spindel-tui"}
+                       org.replikativ/muschel     {:local/root "../muschel"}}}
+
+  ;; MCP server for exposing dvergr capabilities to MCP-capable clients
+  :mcp-server {:main-opts ["-m" "dvergr.mcp.server"]}
+
+  ;; CLI: the user-facing entry. Starts daemon + nREPL + TUI.
+  ;; Equivalent to running dvergr.cli.main/-main directly (see that ns
+  ;; for flags: -p/--port, --no-tui, --help). Headless mode is
+  ;; possible via --no-tui; otherwise the TUI launches automatically
+  ;; because spindel-tui is on the classpath via this alias.
+  :cli {:extra-paths ["src-clients"]
+        :extra-deps  {org.replikativ/spindel-tui {:mvn/version "0.1.10"}
+                      metosin/reitit-ring {:mvn/version "0.7.2"} metosin/reitit-malli {:mvn/version "0.7.2"} metosin/reitit-middleware {:mvn/version "0.7.2"} metosin/reitit-swagger {:mvn/version "0.7.2"} io.github.nextjournal/markdown {:mvn/version "0.7.222"} ; web (reitit, sans swagger-ui — add reitit-swagger-ui for the /docs page)
+                      io.forward/clojure-mail    {:mvn/version "1.0.8"}    ; mail intake
+                      org.replikativ/briefkasten {:mvn/version "0.1.2"} ; briefkasten (mail)
+                      nrepl/nrepl                {:mvn/version "1.3.0"}}
+        :jvm-opts    ["--enable-native-access=ALL-UNNAMED"]
+        :main-opts   ["-m" "dvergr.cli.main"]}
+
+  ;; Run a standalone example scenario (examples/ on the classpath).
+  ;;   clj -M:examples -m scenario-auditor
+  ;;   clj -X:examples humans-and-agents/run
+  :examples {:extra-paths ["examples"]}
+
+  ;; Clay notebooks — render the literate notebooks (which import examples/) to
+  ;; browsable HTML (dev-only, never shipped).
+  ;;   clj -M:clay -m notebooks.render        ; build docs/notebooks/*.html
+  :clay {:extra-paths ["notebooks" "examples"]
+         :extra-deps  {org.scicloj/clay   {:mvn/version "2.0.13"}
+                       org.scicloj/kindly {:mvn/version "4-beta23"}}}
+
+  ;; Formatting (cljfmt) — matches the replikativ convention (konserve/datahike).
+  ;;   clj -M:format   — check formatting (also run in CI)
+  ;;   clj -M:ffix     — fix formatting in place
+  :format {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
+           :main-opts  ["-m" "cljfmt.main" "check" "src" "src-clients" "test" "examples"]}
+  :ffix   {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
+           :main-opts  ["-m" "cljfmt.main" "fix" "src" "src-clients" "test" "examples"]}
+
+  ;; Build tooling: library jar, MCP uberjar, install, clojars deploy.
+  ;;   clj -T:build jar       — library jar + pom (org.replikativ/dvergr)
+  ;;   clj -T:build uber      — runnable MCP-server uberjar
+  ;;   clj -T:build install   — install the library jar to ~/.m2
+  ;;   clj -T:build deploy    — deploy to Clojars (needs CLOJARS_USERNAME/PASSWORD)
+  :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.5"}
+                 slipset/deps-deploy           {:mvn/version "0.2.2"}}
+          :ns-default build}}}

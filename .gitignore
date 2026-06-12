@@ -1,0 +1,61 @@
+# Clojure
+.cpcache/
+.nrepl-port
+.lsp/
+.clj-kondo/.cache/
+target/
+pom.xml
+*.jar
+*.class
+
+# Clay notebook build artifacts (rendered by notebooks.render → docs/, then
+# published to the gh-pages branch by CI). Not the markdown docs in doc/.
+/docs/
+.clay-temp/
+
+# REPL logs
+nrepl.log
+.nrepl.log
+repl.log
+
+# Dvergr project-local state (db, worktrees, search-index, simulations,
+# transcripts, log) — single root, see dvergr.substrate.paths.
+.dvergr/
+
+# Legacy state paths (pre-.dvergr consolidation)
+data/
+.worktrees/
+.git-worktrees/
+
+# Test data (optional - uncomment if you don't want to track)
+# test-data/
+
+# Editor files
+.DS_Store
+*~
+*.swp
+*.swo
+.#*
+\#*\#
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Internal working docs (design drafts, experiments, research)
+.internal/
+
+# Third-party tool container setup (openclaw) — not part of dvergr's public repo
+docker/openclaw/
+.datahike
+.datahike.bak-*
+
+# Local config — contains secrets, never commit
+config.local.edn
+
+# Related-work PDFs (large, fetchable from sources)
+doc/related-work/pdfs/
+
+# Claude Code local state (settings, locks)
+.claude/

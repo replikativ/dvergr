@@ -1,0 +1,221 @@
+version: 2.1
+
+# CI for dvergr — runs the test suite and builds the standalone harness uberjar
+# (daemon + nREPL + TUI + web + Telegram). On `main` it cuts a GitHub release with
+# the uberjar attached, and (optionally) deploys the library jar to Clojars.
+#
+# Ported from ../stratum. The base deps.edn uses published Maven versions
+# (spindel/datahike/yggdrasil/muschel/…) + the SCI git dep, so CI resolves without
+# the dev-only :local alias; the SCI git dep is bundled into the uberjar.
+
+commands:
+  install-clojure:
+    description: "Install the Clojure CLI"
+    steps:
+      - run:
+          name: Install Clojure CLI 1.12.0.1488
+          command: |
+            if ! command -v clojure &> /dev/null; then
+              curl -L -O https://download.clojure.org/install/linux-install-1.12.0.1488.sh
+              chmod +x linux-install-1.12.0.1488.sh
+              sudo ./linux-install-1.12.0.1488.sh
+              rm linux-install-1.12.0.1488.sh
+            fi
+
+executors:
+  clojure-java22:
+    docker:
+      - image: cimg/openjdk:22.0
+    working_directory: ~/repo
+    resource_class: large
+    environment:
+      JVM_OPTS: "-Xmx3200m"
+
+jobs:
+  setup:
+    executor: clojure-java22
+    steps:
+      - checkout
+      - install-clojure
+      - restore_cache:
+          keys:
+            - v1-deps-{{ checksum "deps.edn" }}
+            - v1-deps-
+      - run:
+          name: Download dependencies
+          command: |
+            clojure -P -M:test
+            clojure -P -M:cli
+            clojure -P -M:clay
+            clojure -P -T:build
+            clojure -P -M:format
+      - save_cache:
+          paths:
+            - ~/.m2
+            - ~/.gitlibs
+          key: v1-deps-{{ checksum "deps.edn" }}
+      - persist_to_workspace:
+          root: ~/
+          paths:
+            - repo
+
+  format:
+    executor: clojure-java22
+    steps:
+      - attach_workspace:
+          at: ~/
+      - install-clojure
+      - run:
+          name: Check formatting (cljfmt)
+          command: clojure -M:format
+
+  test:
+    executor: clojure-java22
+    steps:
+      - attach_workspace:
+          at: ~/
+      - install-clojure
+      - run:
+          name: Run tests (kaocha)
+          command: clojure -M:test
+
+  build-harness:
+    executor: clojure-java22
+    steps:
+      - attach_workspace:
+          at: ~/
+      - install-clojure
+      - run:
+          name: Build standalone harness uberjar
+          command: clojure -T:build harness
+      - store_artifacts:
+          path: target
+      - persist_to_workspace:
+          root: ~/
+          paths:
+            - repo/target
+
+  deploy:
+    executor: clojure-java22
+    steps:
+      - attach_workspace:
+          at: ~/
+      - install-clojure
+      - run:
+          name: Deploy library jar to Clojars
+          command: |
+            if [ "${CIRCLE_BRANCH}" = "main" ] && [ -n "${CLOJARS_USERNAME}" ]; then
+              clojure -T:build deploy
+            else
+              echo "Skipping Clojars deploy (not main, or no credentials)."
+            fi
+
+  release:
+    executor: clojure-java22
+    steps:
+      - attach_workspace:
+          at: ~/
+      - run:
+          name: Install GitHub CLI
+          command: |
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt update
+            sudo apt install gh -y
+      - run:
+          name: Create GitHub release with the harness uberjar
+          command: |
+            if [ "${CIRCLE_BRANCH}" = "main" ] && [ -n "${GITHUB_TOKEN}" ]; then
+              UBER_FILE=$(ls target/dvergr-*-harness.jar | head -1)
+              VERSION=$(basename "$UBER_FILE" | sed 's/dvergr-//' | sed 's/-harness.jar//')
+              if gh release view "v${VERSION}" >/dev/null 2>&1; then
+                echo "Release v${VERSION} already exists — skipping."
+              else
+                gh release create "v${VERSION}" "$UBER_FILE" \
+                  --title "dvergr v${VERSION}" \
+                  --notes "Standalone harness uberjar — daemon + nREPL + TUI + web + Telegram. Run: java -jar $(basename "$UBER_FILE")"
+              fi
+            else
+              echo "Skipping GitHub release (not main, or no GITHUB_TOKEN)."
+            fi
+
+  docs:
+    executor: clojure-java22
+    steps:
+      - attach_workspace:
+          at: ~/
+      - install-clojure
+      - run:
+          name: Install Quarto
+          command: |
+            QV=1.6.42
+            curl -fsSL -o /tmp/quarto.deb \
+              "https://github.com/quarto-dev/quarto-cli/releases/download/v${QV}/quarto-${QV}-linux-amd64.deb"
+            sudo dpkg -i /tmp/quarto.deb
+      - run:
+          name: Render the Clay notebook book → docs/
+          command: clojure -M:clay -m notebooks.render
+      - run:
+          name: Publish docs/ to the gh-pages branch
+          command: |
+            if [ "${CIRCLE_BRANCH}" != "main" ] || [ -z "${GITHUB_TOKEN}" ]; then
+              echo "Skipping Pages publish (not main, or no GITHUB_TOKEN)."; exit 0
+            fi
+            REPO="https://x-access-token:${GITHUB_TOKEN}@github.com/replikativ/dvergr.git"
+            rm -rf /tmp/gh-pages
+            git clone --branch gh-pages "$REPO" /tmp/gh-pages 2>/dev/null || {
+              git clone "$REPO" /tmp/gh-pages
+              ( cd /tmp/gh-pages && git checkout --orphan gh-pages && git rm -rf . >/dev/null 2>&1 || true )
+            }
+            find /tmp/gh-pages -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+            cp -r ~/repo/docs/. /tmp/gh-pages/
+            touch /tmp/gh-pages/.nojekyll
+            cd /tmp/gh-pages
+            git config user.email "ci@replikativ.io"
+            git config user.name  "CircleCI"
+            git add -A
+            git commit -m "docs: render Clay notebooks [skip ci]" || { echo "no doc changes"; exit 0; }
+            git push origin gh-pages
+
+workflows:
+  version: 2
+  test-build-release:
+    jobs:
+      - setup
+      - format:
+          requires:
+            - setup
+      - test:
+          requires:
+            - setup
+      - build-harness:
+          requires:
+            - setup
+      - docs:
+          context:
+            - github-token
+          filters:
+            branches:
+              only: main
+          requires:
+            - test
+            - format
+      - deploy:
+          context:
+            - clojars-deploy
+          filters:
+            branches:
+              only: main
+          requires:
+            - test
+            - format
+      - release:
+          context:
+            - github-token
+          filters:
+            branches:
+              only: main
+          requires:
+            - test
+            - format
+            - build-harness

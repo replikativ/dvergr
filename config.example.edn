@@ -1,0 +1,131 @@
+;; dvergr configuration example
+;; Copy to config.local.edn and fill in your secrets.
+;; config.local.edn is gitignored — never commit it.
+
+{;; ============================================================
+ ;; Telegram
+ ;; ============================================================
+ :telegram {:token "YOUR_TELEGRAM_BOT_TOKEN"}
+
+ ;; ============================================================
+ ;; GitHub metrics
+ ;; Can also be set via GITHUB_DVERGR_TOKEN env var.
+ ;; Needs repo scope for traffic data on replikativ org repos.
+ ;; ============================================================
+ :github {:token "ghp_YOUR_TOKEN_HERE"}
+
+ ;; ============================================================
+ ;; Slack (personal user token — xoxp-...)
+ ;; Create app at https://api.slack.com/apps → From a manifest
+ ;; User token scopes (manifest oauth_config.scopes.user):
+ ;;   channels:history  channels:read   groups:history  groups:read
+ ;;   im:history        im:read         mpim:history    mpim:read
+ ;;   search:read       reactions:read
+ ;; Note: use search:read (not search:messages) in the manifest.
+ ;; No features/bot_user block needed — user token only app.
+ ;; Can also be set via SLACK_USER_TOKEN env var.
+ ;; ============================================================
+ :slack {:token "xoxp-YOUR_USER_TOKEN_HERE"}
+
+ ;; ============================================================
+ ;; Mail accounts (briefkasten IMAP/SMTP)
+ ;; Each key is an account identifier used by intake tools.
+ ;; ============================================================
+ :mail
+ {:datahike-contact
+  {:email     "admin@datahike.io"
+   :imap      {:host "mail.example.com" :port 993
+               :user "admin@datahike.io" :pass "YOUR_PASSWORD"}
+   :smtp      {:host "mail.example.com" :port 587
+               :user "admin@datahike.io" :pass "YOUR_PASSWORD"}
+   ;; :data-path is OPTIONAL — omit it and the store defaults to
+   ;; .dvergr/mail/<account-id> (under DVERGR_HOME), which is portable. Only set an
+   ;; explicit absolute path if you want the mail store outside .dvergr/.
+   }}
+
+ ;; ============================================================
+ ;; Agents
+ ;; Each key becomes the agent's :id in the registry.
+ ;; Profile markdown loaded from resources/agents/<id>.md
+ ;; ============================================================
+ ;; The default config ships a single secretary agent (`var`). Add your own
+ ;; agents here — each key becomes the agent's :id, and an optional persona is
+ ;; loaded from `resources/agents/<id>.md` (or project-local `.dvergr/agents/`).
+ ;; Tags select tools: e.g. #{:intake} for a research monitor (add :interval-ms
+ ;; to make it sweep on a timer), #{:coding} for a coder, etc.
+ ;; Optional :allowed-domains #{"https://api.github.com" …} restricts that agent's
+ ;; sandbox `http` (and thus its intakes) to those URL prefixes — omit for open web.
+ ;; AGENTS — file-driven, no config key needed. Any `resources/agents/<id>.md`
+ ;; (or `~/.dvergr/agents/`, `./.dvergr/agents/`, or a room's sandbox repo) with
+ ;; `autostart: true` + `vetted: true` boots itself and joins its `rooms:`. The
+ ;; shipped `var.md` (Vár, the secretary) autostarts that way with its provider
+ ;; unpinned → env auto-select (anthropic → fireworks → openai → claude-code CLI).
+ ;;
+ ;; To OVERRIDE per deployment — pin a provider/model, or declare an agent you
+ ;; don't want as a committed file — add an optional `:agents` map, e.g.:
+ ;;   :agents {:my-bot {:provider :fireworks :model "…"}}
+
+ ;; ============================================================
+ ;; Secrets — boundary key injection (doc/boundary-secret-injection.md)
+ ;; An agent USES an API key without ever SEEING it: in the sandbox `(env/get
+ ;; "BRAVE_API_KEY")` returns an opaque placeholder, and the gated `http`
+ ;; primitive swaps in the REAL value (from the host env var named by `:env`)
+ ;; only at egress to an allowed domain + slot, then scrubs it from the response.
+ ;; So e.g. the `dvergr.intake.web-search` source works with NO key in the
+ ;; sandbox. Each entry binds an env var to its allowed destinations/locations:
+ ;; ============================================================
+ ;; Value source per entry: :env "VAR" (host env) | :value "…" (literal) |
+ ;; :config-path [:k :path] (reuse a value already in this file) |
+ ;; :basic-auth-config-paths [[user-path] [pass-path]] (HTTP Basic; pre-encodes
+ ;; base64(user:pass)). :name is what the intake passes to (env/get …). Scope each
+ ;; to its API domain + the slot it travels in (:header/:query/:body + header-names).
+ ;; :sandbox-env exposes NON-secret endpoints/identifiers verbatim.
+ ;; :secrets [{:name "BRAVE_API_KEY" :env "BRAVE_API_KEY"
+ ;;            :allowed-domains ["https://api.search.brave.com"]
+ ;;            :allowed-locations [:header :query] :header-names ["X-Subscription-Token"]}
+ ;;           {:name "GITHUB_TOKEN" :config-path [:github :token]
+ ;;            :allowed-domains ["https://api.github.com"]
+ ;;            :allowed-locations [:header] :header-names ["Authorization"]}
+ ;;           {:name "ZULIP_AUTH" :basic-auth-config-paths [[:zulip :email] [:zulip :api-key]]
+ ;;            :allowed-domains ["https://your-org.zulipchat.com"]
+ ;;            :allowed-locations [:header] :header-names ["Authorization"]}
+ ;;           {:name "FINNHUB_API_KEY" :env "FINNHUB_API_KEY"
+ ;;            :allowed-domains ["https://finnhub.io"] :allowed-locations [:query]}]
+ ;; :sandbox-env {"ZULIP_SITE" "https://your-org.zulipchat.com"}
+
+ ;; ============================================================
+ ;; Access control
+ ;; Telegram user objects: {:id 123456 :username "handle"}
+ ;; ============================================================
+ :allowed-users []
+
+ ;; Default agent for new Telegram sessions
+ :default-agent :var
+
+ ;; ============================================================
+ ;; HTTP server (optional)
+ ;; ============================================================
+ :http {:port 8080}
+
+ ;; ============================================================
+ ;; Sandbox stdlib source (optional) — every room workspace is `git clone`d from
+ ;; this. Defaults to https://github.com/replikativ/dvergr-sandbox, or the
+ ;; ../dvergr-sandbox sibling checkout when present (local stdlib development).
+ ;; Override here or via env DVERGR_SANDBOX_REPO.
+ ;; ============================================================
+ ;; :sandbox-repo "https://github.com/replikativ/dvergr-sandbox"
+
+ ;; ============================================================
+ ;; Mail (optional) — attach an IMAP mailbox to ONE room. The daemon pulls
+ ;; READ-ONLY on a timer (briefkasten); agents read it fork-aware via
+ ;; `dvergr.mail/*inbox*` + `dvergr.mail.inbox`. Local-only: fork/merge changes
+ ;; never touch the server. Needs the briefkasten dep (`:cli`/`:dev` aliases) and
+ ;; an account under `:mail` keyed by account-id:
+ ;; ============================================================
+ ;; :mail {:account          :datahike-contact     ; which account below to attach
+ ;;        :room             "inbox"               ; the room slug it attaches to
+ ;;        :sync-interval-ms 600000                ; IMAP pull cadence (10 min)
+ ;;        :datahike-contact {:email "me@example.com"
+ ;;                           :imap {:host "imap.example.com" :port 993
+ ;;                                  :user "me@example.com" :pass "app-password"}}}
+ }
