@@ -19,6 +19,7 @@
             [dvergr.agent.ops :as ops]
             [dvergr.web.dashboard :as web-dashboard]
             [dvergr.web.agents :as web-agents]
+            [dvergr.web.apps :as web-apps]
             [dvergr.web.ops :as web-ops]
             [dvergr.web.api :as web-api]))
 
@@ -172,6 +173,9 @@
       (cond
         api     api
         derived derived
+
+      ;; Room apps — static serving of <room worktree>/app (see dvergr.web.apps)
+        (str/starts-with? uri "/apps/")     (web-apps/handle req daemon)
 
       ;; API routes
         (= uri "/api/health")               (api-health req daemon)

@@ -597,7 +597,16 @@
         (if room (or (:title room) slug) slug)
         (when room
           [:span {:style "font-size:0.45em;color:#888;margin-left:12px;"}
-           "participants: " (str/join ", " (map name (keys @(:participants room))))])]
+           "participants: " (str/join ", " (map name (keys @(:participants room))))])
+        ;; The room's served app (worktree app/index.html) — see dvergr.web.apps.
+        (when (some-> ((requiring-resolve 'dvergr.system.db/room-by-slug) slug)
+                      :room/id
+                      ((requiring-resolve 'dvergr.web.apps/app-exists?)))
+          [:a {:href (str "/apps/" slug "/") :target "_blank"
+               :style "font-size:0.45em;color:#52b788;margin-left:12px;
+                        border:1px solid #2a4a3a;border-radius:5px;padding:2px 8px;
+                        text-decoration:none;"}
+           "▶ app"])]
        (when-let [fd (when room
                        ((requiring-resolve 'dvergr.rooms.forks/detail) room))]
          [:div.fork-banner
