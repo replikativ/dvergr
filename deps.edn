@@ -24,19 +24,7 @@
         org.clojure/core.async     {:mvn/version "1.6.681"}
 
         ;; SCI — Small Clojure Interpreter for sandboxing.
-        ;; Pinned to our fork (whilo/sci, branch resource-check) for the
-        ;; :interrupt-fn cancellation machinery (`sci/impl/interruptible.cljc`),
-        ;; still in PR review upstream (babashka/sci). The sandbox's
-        ;; resource-check / cancellation depends on it. Kept under the
-        ;; `org.babashka/sci` lib symbol so it OVERRIDES the transitive mvn
-        ;; sci (`:use-top`); other projects resolve dvergr as a git dep with
-        ;; no local checkout. For sci development, the `:local` alias overrides
-        ;; this back to `../sci`.
-        ;; NOTE(clojars): a git dep is not written into the published pom — a
-        ;; clojars artifact requires consumers to add this dep until the fork
-        ;; lands on Maven (upstream PR) or we publish it under our own group.
-        org.babashka/sci           {:git/url "https://github.com/whilo/sci"
-                                    :git/sha "24762a163ef5b25c692d0e5cd4ea63a5bd6b0a16"}
+        org.babashka/sci           {:mvn/version "0.13.52"}
 
         ;; partial-cps — CPS transform for SCI spin macro
         is.simm/partial-cps        {:mvn/version "0.1.54"}
