@@ -104,7 +104,10 @@
       (is (= "main" parent-branch)))
     (testing "fork's bash is on a different, fork-named branch"
       (is (not= parent-branch child-branch))
-      (is (str/starts-with? child-branch "main-fork-")))
+      ;; yggdrasil 0.3 names an overlay-fork branch `overlay-<uuid>` (the unified
+      ;; overlay naming). dvergr doesn't depend on the git branch name — forks are
+      ;; event-driven and the room slug is dvergr's own — so just assert a fresh fork.
+      (is (str/starts-with? child-branch "overlay-")))
     (testing "fork's bash cwd is the sandbox root (its own worktree, mounted at
               \"/\" via make-host's :mount-at; muschel ≥ 0.2.16 cwd is
               sandbox-relative, not a real host path — fork isolation at the FS
