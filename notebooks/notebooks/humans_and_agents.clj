@@ -14,10 +14,9 @@
             [dvergr.discourse :as d :refer [with-room]]
             [dvergr.discourse.human :as human]
             [dvergr.discourse.background :as bg]
-            [dvergr.discourse.proposals :as proposals]
-            [dvergr.chat.schema :as schema]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.spin.cps :refer [spin]]
+            [org.replikativ.spindel.spin.combinators :as comb]
             [org.replikativ.spindel.yggdrasil :as ygg]
             [yggdrasil.adapters.datahike :as ygg-dh]
             [scicloj.kindly.v4.kind :as kind]
@@ -34,9 +33,10 @@
 ;; 2. **Background tasks with notifications**
 ;;    (`dvergr.discourse.background/spawn-task!`) — fire-and-forget a goal, get a
 ;;    typed `:task-complete` notification back.
-;; 3. **Branch + merge via proposals** (`dvergr.discourse.proposals`) — fork the
-;;    room, let an agent work in isolation, then **accept** (merge) or **reject**
-;;    (discard) atomically.
+;; 3. **Branch + merge** (`dvergr.discourse/fork-room` + `propose-merge!` +
+;;    `merge-room` / `discard`) — fork the room, let an agent work in isolation,
+;;    raise a merge proposal, then **accept** (`merge-room`) or **reject**
+;;    (`discard`) atomically.
 ;; 4. **Substrate isolation** — the worker's side effects (a datahike write) are
 ;;    real, but happen in a *branched copy*; the parent is untouched until accept.
 ;;
@@ -114,61 +114,67 @@
 
 ;; ## Demo 3 — propose → accept (fork → merge)
 ;;
-;; Alice asks a coder for a feature; the coder works in a **forked** room and
-;; posts a proposal. Alice accepts, and the fork merges into the parent room's
-;; log. We use an in-memory datahike just to persist the proposal schema.
+;; Alice asks a coder for a feature; the coder works in a **forked** room
+;; (`fork-room`) and raises a merge proposal (`propose-merge!`). The open
+;; proposal shows up in `pending-proposals`. Alice accepts, and `merge-room`
+;; folds the fork's log back into the parent room. This is the log/bus-based
+;; model — no proposal schema, no datahike needed.
 
 (def demo3
-  (let [cfg {:store {:backend :memory :id (random-uuid)}}
-        _ (dh/create-database cfg)
-        conn (dh/connect cfg)
-        _ (schema/ensure-full-schema! conn)
-        room (d/room :nb-demo-3)]
+  (let [room (d/room :nb-demo-3)]
     (with-room room
       (let [alice (human/human-participant {:id :alice :on-receive (fn [_])})
-            ;; coder is NOT joined to the parent — propose! joins it into the
-            ;; fork only.
+            ;; coder is NOT joined to the parent — it works only inside the fork.
             coder (ha/scripted-agent :coder ["Proposed: add :feature/x with default {}"])
             _     (d/join room alice)
-            proposal @(proposals/propose! {:room   room
-                                           :worker coder
-                                           :goal   "design :feature/x"
-                                           :conn   conn})
-            outcome  (proposals/accept-proposal! room conn (:proposal/id proposal))
-            result   {:summary         (:proposal/summary proposal)
-                      :accept-outcome  outcome
+            ;; Fork the room; the coder works in isolation on the sibling.
+            fork  (d/fork-room room)
+            _     (d/join fork coder)
+            ;; The coder does its work; we capture its reply as the proposal note.
+            reply (-> (comb/timeout (d/ask fork :coder {:content "design :feature/x"})
+                                    2000 {:content "[timed out]"})
+                      deref)
+            ;; The coder signals the fork is ready for review.
+            proposal (d/propose-merge! fork :from :coder :note (:content reply))
+            ;; Let the bus route the reply + proposal into the fork's log.
+            _        (settle 150)
+            ;; The open proposal is enumerable on the fork's log.
+            pending  (d/pending-proposals fork)
+            ;; Alice ACCEPTS → merge the fork back into the parent room's log.
+            _        (d/merge-room room fork)
+            result   {:proposal-note   (:note proposal)
+                      :pending-before  (count pending)
                       :parent-log-size (count (d/log room))}]
         (d/close-room! room)
-        (dh/release conn)
         result))))
 
 (kind/pprint demo3)
 
 ;; ## Demo 4 — propose → reject (fork → discard)
 ;;
-;; Same setup, but alice rejects. The fork is discarded and the parent room's
-;; log is left unchanged.
+;; Same setup, but alice rejects. The fork is `discard`ed — its participants are
+;; dropped and nothing merges — so the parent room's log is left unchanged.
 
 (def demo4
-  (let [cfg {:store {:backend :memory :id (random-uuid)}}
-        _ (dh/create-database cfg)
-        conn (dh/connect cfg)
-        _ (schema/ensure-full-schema! conn)
-        room (d/room :nb-demo-4)]
+  (let [room (d/room :nb-demo-4)]
     (with-room room
       (let [coder (ha/scripted-agent :coder ["Proposed: rename :feature/x to :feature/y"])
             alice (human/human-participant {:id :alice :on-receive (fn [_])})
             _     (d/join room alice)
-            proposal @(proposals/propose! {:room   room
-                                           :worker coder
-                                           :goal   "what should :feature/x be named?"
-                                           :conn   conn})
-            outcome  (proposals/reject-proposal! room conn (:proposal/id proposal))
-            result   {:summary                   (:proposal/summary proposal)
-                      :reject-outcome            outcome
+            log-before (count (d/log room))
+            fork  (d/fork-room room)
+            _     (d/join fork coder)
+            reply (-> (comb/timeout (d/ask fork :coder
+                                           {:content "what should :feature/x be named?"})
+                                    2000 {:content "[timed out]"})
+                      deref)
+            proposal (d/propose-merge! fork :from :coder :note (:content reply))
+            ;; Alice REJECTS → discard the fork; the parent log is untouched.
+            _        (d/discard fork)
+            result   {:proposal-note             (:note proposal)
+                      :log-before                log-before
                       :parent-log-size-unchanged (count (d/log room))}]
         (d/close-room! room)
-        (dh/release conn)
         result))))
 
 (kind/pprint demo4)
@@ -187,7 +193,7 @@
 ;; on the yggdrasil substrate-merge implementation on the classpath: with the
 ;; published maven `org.replikativ/yggdrasil` the datahike branch-merge does not
 ;; yet surface the row (it stays `0`); a `:local` checkout completes the merge.
-;; The proposal is `:accepted` and the room **log** merges regardless.
+;; The room **log** merges regardless.
 
 (def demo5
   (let [;; A yggdrasil-managed datahike for the worker's knowledge base.
@@ -199,12 +205,6 @@
                        [{:db/ident :kb/topic :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
                         {:db/ident :kb/note  :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])
         worker-system (ygg-dh/create worker-conn {:system-name "nb-worker-kb"})
-
-        ;; Proposal-persistence DB (same as demos 3/4).
-        prop-cfg {:store {:backend :memory :id (random-uuid)}}
-        _ (dh/create-database prop-cfg)
-        prop-conn (dh/connect prop-cfg)
-        _ (schema/ensure-full-schema! prop-conn)
 
         room (d/room :nb-demo-5)
         ;; A worker that, when asked, transacts to its KB then replies. The
@@ -227,25 +227,35 @@
                           :factory make-worker})))]
     (with-room room
       (let [alice  (human/human-participant {:id :alice :on-receive (fn [_])})
-            worker (make-worker (:ctx room))
             _ (ygg/register! worker-system)
             _ (d/join room alice)
-            proposal @(proposals/propose! {:room      room
-                                           :worker    worker
-                                           :goal      "index this note"
-                                           :conn      prop-conn
-                                           :isolation :ctx})
+            ;; A substrate-isolated fork — `ctx/fork-context` branches every
+            ;; registered yggdrasil system (here the worker's datahike KB) via
+            ;; spindel's PForkable extension. Writes in the fork land on the
+            ;; BRANCHED copy, invisible to the parent until merge.
+            fork (d/fork-room room {:isolation :ctx})
+            ;; Join the worker into the fork, bound to the fork's ctx so it
+            ;; resolves the branched KB.
+            _ (d/with-fork-ctx fork (d/join fork (make-worker (:ctx fork))))
+            ;; The worker transacts a note — into the fork's branched KB.
+            _ (d/with-fork-ctx fork
+                (-> (comb/timeout (d/ask fork :indexer {:content "index this note"})
+                                  2000 {:content "[timed out]"})
+                    deref))
+            ;; The worker signals the fork is ready for review.
+            proposal (d/propose-merge! fork :from :indexer :note "note indexed in fork")
+            ;; Before accept: parent's KB is UNCHANGED — the write is isolated.
             count-before (count (dh/q '[:find ?n :where [_ :kb/note ?n]]
                                       @(:conn (ygg/get-system "nb-worker-kb"))))
-            _ (proposals/accept-proposal! room prop-conn (:proposal/id proposal))
+            ;; Accept → merge the fork's branched substrate back into the parent.
+            _ (d/merge-room room fork)
             count-after (count (dh/q '[:find ?n :where [_ :kb/note ?n]]
                                      @(:conn (ygg/get-system "nb-worker-kb"))))
-            result {:summary             (:proposal/summary proposal)
+            result {:proposal-note       (:note proposal)
                     :parent-notes-before count-before   ; expect 0 — fork isolated
-                    :parent-notes-after  count-after}]  ; expect 1 — merged on accept
+                    :parent-notes-after  count-after}]  ; 1 with :local ygg, else 0
         (d/close-room! room)
         (dh/release worker-conn)
-        (dh/release prop-conn)
         result))))
 
 (kind/pprint demo5)
