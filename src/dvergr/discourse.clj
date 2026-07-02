@@ -293,31 +293,52 @@
    subscription has its own pump that forwards events into this single
    mailbox; the spin awaits the mailbox uniformly.
 
+   DELIVER-ONCE: a participant's subscriptions form a UNION filter. A message
+   that matches SEVERAL of them — e.g. a broadcast (`[:to nil]`) that also
+   carries a `:type` the participant subscribed to, so it matches both
+   `[:to nil]` and `[:type …]` — is pumped into the mailbox once per matching
+   subscription. This loop dedups by message `:id` (stamped by `bus/post!`) over
+   a bounded recent window, so `on-message` runs EXACTLY ONCE per message. The
+   duplicates arrive in the same publish wave, so a modest window suffices; on
+   eviction the worst case is a rare double, never a dropped distinct message
+   (ids are random-uuids and don't collide).
+
    Exceptions inside on-message are caught and logged so a single bad
    turn doesn't kill the participant — without this, an LLM error or
    tool-call exception in one message handler permanently stopped the
    agent from receiving further messages in the room."
   [p room mbx]
   (sp/spin
-   (loop []
-     (let [env         (sp/await mbx)
-           in-reply-to (when (instance? Message env) (:id env))
-           reply-spec
-           (sp/await
-            (sp/spin
-             (try
-               (sp/await ((:on-message p) p env))
-               (catch Throwable t
-                 (binding [*out* *err*]
-                   (println "participant" (:id p)
-                            "on-message error:" (.getMessage t)))
-                 nil))))]
-       (try (emit-reply! room p reply-spec in-reply-to)
-            (catch Throwable t
-              (binding [*out* *err*]
-                (println "participant" (:id p)
-                         "emit-reply error:" (.getMessage t))))))
-     (recur))))
+   (loop [seen  #{}
+          order clojure.lang.PersistentQueue/EMPTY]
+     (let [env (sp/await mbx)
+           id  (:id env)]
+       (if (and id (contains? seen id))
+         ;; already handled via another matching subscription — skip the duplicate
+         (recur seen order)
+         (let [in-reply-to (when (instance? Message env) (:id env))
+               reply-spec
+               (sp/await
+                (sp/spin
+                 (try
+                   (sp/await ((:on-message p) p env))
+                   (catch Throwable t
+                     (binding [*out* *err*]
+                       (println "participant" (:id p)
+                                "on-message error:" (.getMessage t)))
+                     nil))))]
+           (try (emit-reply! room p reply-spec in-reply-to)
+                (catch Throwable t
+                  (binding [*out* *err*]
+                    (println "participant" (:id p)
+                             "emit-reply error:" (.getMessage t)))))
+           (if id
+             (let [order' (conj order id)
+                   seen'  (conj seen id)]
+               (if (> (count order') 512)
+                 (recur (disj seen' (peek order')) (pop order'))
+                 (recur seen' order')))
+             (recur seen order))))))))
 
 (defn conversation-id
   "The id of the CONVERSATION this room persists into. For a normal room that's

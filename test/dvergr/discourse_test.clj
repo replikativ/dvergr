@@ -94,6 +94,28 @@
       (is (= :driver (:from (first log))))
       (is (= :bot (:from (second log)))))))
 
+(deftest capability-and-broadcast-overlap-delivers-once
+  (testing "a message matching SEVERAL of a participant's subscriptions is
+            delivered ONCE — a broadcast (`:to nil`) carrying a subscribed
+            `:type` matches both the default `[:to nil]` inbox and the
+            `[:type …]` capability sub, but on-message must run once (dedup by id
+            in participant-spin), not once per matching subscription."
+    (let [r    (d/room :dedup)
+          seen (atom [])]
+      (binding [ec/*execution-context* (:ctx r)]
+        (let [aud (d/join r (d/participant
+                             {:id         :auditor
+                              :on-message (fn [_p m]
+                                            (sp/spin (swap! seen conj (:type m)) nil))}))]
+          ;; the extra capability subscription, in ADDITION to the default inbox
+          (d/subscribe! r aud [:type :escalation/budget])))
+      ;; a broadcast tagged event: matches [:to nil] AND [:type :escalation/budget]
+      (d/post! r {:type :escalation/budget :from :worker})
+      (Thread/sleep 200)
+      (is (= 1 (count @seen))
+          "the overlapping-subscription message is delivered exactly once")
+      (is (= [:escalation/budget] @seen)))))
+
 (deftest forked-participant-operates-on-its-joined-room
   (testing "a participant cloned into a fork sees the FORK as its room
             (discourse/join sets :room on the participant), not the parent it
