@@ -31,7 +31,7 @@
         ;; version. The `:local` alias's `../spindel` override carries it too.
 
         ;; Spindel — Reactive runtime with CoW forking
-        org.replikativ/spindel     {:mvn/version "0.1.24"}
+        org.replikativ/spindel     {:mvn/version "0.1.26"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context
@@ -47,7 +47,7 @@
 
         ;; Yggdrasil — CoW branching for git and Datahike
         ;; 0.2.27 carries composite Mergeable diff + conflicts (PR #3).
-        org.replikativ/yggdrasil   {:mvn/version "0.3.34"}
+        org.replikativ/yggdrasil   {:mvn/version "0.3.35"}
 
         ;; Scriptum — CoW Lucene indices for fulltext search
         org.replikativ/scriptum    {:mvn/version "0.1.27"}
@@ -106,7 +106,7 @@
                        metosin/reitit-ring {:mvn/version "0.7.2"} metosin/reitit-malli {:mvn/version "0.7.2"} metosin/reitit-middleware {:mvn/version "0.7.2"} metosin/reitit-swagger {:mvn/version "0.7.2"} io.github.nextjournal/markdown {:mvn/version "0.7.222"} ; web (reitit, sans swagger-ui — add reitit-swagger-ui for the /docs page)
                        io.forward/clojure-mail {:mvn/version "1.0.8"} ; mail intake
                        org.replikativ/briefkasten {:mvn/version "0.1.2"} ; briefkasten (mail)
-                       org.replikativ/spindel-tui {:mvn/version "0.1.10"}}}
+                       org.replikativ/spindel-tui {:mvn/version "0.1.12"}}}
 
   ;; src-clients/ on the test path so dvergr.web.server-test still
   ;; loads the namespaces it tests.
@@ -115,7 +115,7 @@
                        metosin/reitit-ring {:mvn/version "0.7.2"} metosin/reitit-malli {:mvn/version "0.7.2"} metosin/reitit-middleware {:mvn/version "0.7.2"} metosin/reitit-swagger {:mvn/version "0.7.2"} io.github.nextjournal/markdown {:mvn/version "0.7.222"} ; web (reitit, sans swagger-ui — add reitit-swagger-ui for the /docs page)
                        io.forward/clojure-mail {:mvn/version "1.0.8"} ; mail intake
                        org.replikativ/briefkasten {:mvn/version "0.1.2"} ; briefkasten (mail)
-                       org.replikativ/spindel-tui {:mvn/version "0.1.10"}}
+                       org.replikativ/spindel-tui {:mvn/version "0.1.12"}}
          :main-opts   ["-m" "kaocha.runner"]}
 
   :repl {:main-opts ["-m" "nrepl.cmdline"
@@ -153,7 +153,7 @@
   ;; possible via --no-tui; otherwise the TUI launches automatically
   ;; because spindel-tui is on the classpath via this alias.
   :cli {:extra-paths ["src-clients"]
-        :extra-deps  {org.replikativ/spindel-tui {:mvn/version "0.1.10"}
+        :extra-deps  {org.replikativ/spindel-tui {:mvn/version "0.1.12"}
                       metosin/reitit-ring {:mvn/version "0.7.2"} metosin/reitit-malli {:mvn/version "0.7.2"} metosin/reitit-middleware {:mvn/version "0.7.2"} metosin/reitit-swagger {:mvn/version "0.7.2"} io.github.nextjournal/markdown {:mvn/version "0.7.222"} ; web (reitit, sans swagger-ui — add reitit-swagger-ui for the /docs page)
                       io.forward/clojure-mail    {:mvn/version "1.0.8"}    ; mail intake
                       org.replikativ/briefkasten {:mvn/version "0.1.2"} ; briefkasten (mail)
