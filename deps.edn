@@ -47,7 +47,7 @@
 
         ;; Yggdrasil — CoW branching for git and Datahike
         ;; 0.2.27 carries composite Mergeable diff + conflicts (PR #3).
-        org.replikativ/yggdrasil   {:mvn/version "0.3.35"}
+        org.replikativ/yggdrasil   {:mvn/version "0.3.36"}
 
         ;; Scriptum — CoW Lucene indices for fulltext search
         org.replikativ/scriptum    {:mvn/version "0.1.27"}
