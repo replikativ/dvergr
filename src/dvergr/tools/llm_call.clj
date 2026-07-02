@@ -18,14 +18,14 @@
 (def ^:private default-model
   "Default cheap model for llm_call. Override with LLM_CALL_MODEL env var."
   (or (System/getenv "LLM_CALL_MODEL")
-      "accounts/fireworks/models/minimax-m2p5"))
+      "accounts/fireworks/models/minimax-m2p7"))
 
 (defn cheap-llm-call
   "Make a cheap one-shot LLM call synchronously.
    Returns {:text :usage :model} on success, {:error} on failure.
 
    opts:
-   - :model      — model ID override (default: minimax-m2p5)
+   - :model      — model ID override (default: minimax-m2p7)
    - :max-tokens — max output tokens (default: 500)
    - :system     — optional system prompt string"
   [prompt content opts]

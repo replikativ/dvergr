@@ -187,7 +187,7 @@
       (compaction/maybe-compact! chat-ctx
                                  :model (or compaction-model
                                             (model-registry/get-default :compaction-model)
-                                            "accounts/fireworks/models/minimax-m2p5")
+                                            "accounts/fireworks/models/minimax-m2p7")
                                  :provider (or provider :fireworks)))
 
     (let [;; Get active messages (filtered by compaction point)

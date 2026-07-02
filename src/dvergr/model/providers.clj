@@ -137,7 +137,7 @@
   "Best default model per provider for auto-config. Fireworks ids must exist in
    resources/models.edn; the others are passed through to the provider."
   {:anthropic   "claude-sonnet-4-6"
-   :fireworks   "accounts/fireworks/models/minimax-m2p5"
+   :fireworks   "accounts/fireworks/models/minimax-m2p7"
    :openai      "gpt-4o"
    :claude-code "claude-code-sonnet"})
 

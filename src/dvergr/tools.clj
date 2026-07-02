@@ -1547,7 +1547,7 @@ Note: changes take effect on the next agent restart or reload."
                                                ;; a model that EXISTS in resources/models.edn (the qwen id
                                                ;; was removed from Fireworks; get-model! threw → spawn_agent
                                                ;; was broken on first use)
-                                             :model         "accounts/fireworks/models/minimax-m2p5"
+                                             :model         "accounts/fireworks/models/minimax-m2p7"
                                              :system-prompt prompt-text}
                                     :budget {:dollars (or budget 0.50)}
                                     :ctx    ctx}))
