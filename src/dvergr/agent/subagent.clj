@@ -20,7 +20,8 @@
    (A dedicated system-db `:subagent/*` entity is the more robust cross-room /
    store-less option — a follow-up.)"
   (:require [dvergr.discourse :as d]
-            [org.replikativ.spindel.core :as sp]))
+            [org.replikativ.spindel.core :as sp]
+            [org.replikativ.spindel.spin.combinators :as comb]))
 
 (defn- track!
   "Post a `:dvergr/subagent` lifecycle event into `room`'s log (durable when the
@@ -31,13 +32,19 @@
 (defn- build-worker
   "Construct the ephemeral worker Participant. Accepts an explicit `:worker`
    (e.g. a scripted participant for tests) or a `:spec`
-   {:id :provider :model :system-prompt :tools} → a fresh `llm-agent`."
-  [{:keys [worker spec subagent-id]}]
+   {:id :provider :model :system-prompt :tools} → a fresh `llm-agent`.
+
+   `:ctx` (the caller's execution context) is REQUIRED for a real llm-agent: its
+   turn bridges the blocking LLM call through a future and must re-bind the ctx
+   when delivering back (without it: 'no execution context bound'). This mirrors
+   `dvergr.orchestration.daemon/create-agent!`, which passes `:ctx`."
+  [{:keys [worker spec subagent-id ctx]}]
   (or worker
       (let [llm-agent (requiring-resolve 'dvergr.discourse.llm/llm-agent)]
-        (llm-agent {:id    (or (:id spec) (keyword (str "sub-" subagent-id)))
-                    :spec  (select-keys spec [:provider :model :system-prompt])
-                    :tools (:tools spec)}))))
+        (llm-agent (cond-> {:id    (or (:id spec) (keyword (str "sub-" subagent-id)))
+                            :spec  (select-keys spec [:provider :model :system-prompt])
+                            :tools (:tools spec)}
+                     ctx (assoc :ctx ctx))))))
 
 (defn hire!
   "Delegate `goal` to an ephemeral subagent forked off `room`.
@@ -52,17 +59,25 @@
 
    Returns a Spin yielding {:status :result :subagent-id}."
   [room {:keys [goal accept-fn timeout-ms isolation] :as opts
-         :or   {timeout-ms 120000 isolation :ctx}}]
-  (let [sid    (random-uuid)
-        worker (build-worker (assoc opts :subagent-id sid))]
+         :or   {timeout-ms 120000 isolation :ctx accept-fn (constantly true)}}]
+  (let [sid (random-uuid)]
     (sp/spin
-     (track! room {:subagent/id sid :goal goal :worker (:id worker) :status :running})
-     (let [r (sp/await
-              (d/hire room worker (cond-> {:goal goal :isolation isolation :timeout-ms timeout-ms}
-                                    accept-fn (assoc :accept-fn accept-fn))))]
-       (track! room {:subagent/id sid :status (:status r)
-                     :result (some-> (:reply r) :content)})
-       {:status (:status r) :result (some-> (:reply r) :content) :subagent-id sid}))))
+     (track! room {:subagent/id sid :goal goal :status :running})
+     ;; Fork FIRST, then build the worker in the FORK's ctx — a real llm-agent
+     ;; re-binds its :ctx across the LLM-call future, so it must match the ctx the
+     ;; worker actually runs in (the fork's), not the parent's.
+     (let [fork   (d/fork-room room {:isolation isolation})
+           worker (build-worker (assoc opts :subagent-id sid :ctx (:ctx fork)))
+           _      (d/join fork worker)
+           reply  (sp/await (comb/timeout (d/ask fork (:id worker) {:content goal})
+                                          timeout-ms ::timeout))
+           status (cond (= reply ::timeout) :timeout
+                        (accept-fn reply)   :merged
+                        :else               :discarded)]
+       (if (= status :merged) (d/merge-room room fork) (d/discard fork))
+       (let [result (when (not= reply ::timeout) (:content reply))]
+         (track! room {:subagent/id sid :status status :result result})
+         {:status status :result result :subagent-id sid :fork-ref (:id fork)})))))
 
 (defn pending
   "The still-running subagents spawned in `room` — a scan of the durable
