@@ -858,21 +858,24 @@
    (doc/unified-fork-conversation.md, dvergr.rooms.forks/reconcile-merge!.)"
   ([parent fork] (merge-room parent fork {}))
   ([parent fork {:keys [merge-opts]}]
-   (if (and (ctx-was-forked? fork) (:store fork))
-    ;; `:ctx` fork with a branched conversation store — a BRANCH of the parent's
-    ;; conversation. The merge is native:
-    ;; merge-to-parent! collapses the fork's datahike (+ git) branch into the
-    ;; parent, bringing the fork's messages into the parent's conversation under
-    ;; the shared :chat/id (no in-memory carry). (doc/unified-fork-conversation.md)
+   ;; (1) SUBSTRATE merge — branched yggdrasil systems (CRDTs, datahike, git) fold
+   ;; back whenever the ctx was forked (`:isolation :ctx`), INDEPENDENT of any
+   ;; conversation store. These are orthogonal: a room can carry shared CRDTs with
+   ;; no message store (a subagent whose deliverable is CRDT edits + a summary), or
+   ;; a message store with no extra systems. A `:store` fork's datahike *message*
+   ;; branch also collapses here (bringing its messages into the parent's
+   ;; conversation under the shared :chat/id); its deferred data-DB grants commit on
+   ;; accept via :on-merge (store forks only). (doc/unified-fork-conversation.md)
+   (when (ctx-was-forked? fork)
      (try
        (drain-fork-turns! fork)                ; P4: stop in-flight turns before merge
-      ;; P2: the fork's deferred data-DB grants become durable room systems only on
-      ;; accept — replay them into the global system-db in the :on-merge callback.
-       (let [pending (binding [ec/*execution-context* (:ctx fork)]
-                       (ec/get-state [:dvergr/pending-grants]))]
+       (let [pending (when (:store fork)
+                       (binding [ec/*execution-context* (:ctx fork)]
+                         (ec/get-state [:dvergr/pending-grants])))]
          (ygg/merge-to-parent! (:ctx fork)
                                (merge (or merge-opts {})
-                                      {:on-merge (fn [_] (srooms/commit-fork-grants! pending))})))
+                                      (when (:store fork)
+                                        {:on-merge (fn [_] (srooms/commit-fork-grants! pending))}))))
        (catch Throwable e
          (tel/log! {:level :error :id :dvergr/merge-failed
                     :data {:fork (:id fork) :parent (:id parent) :error (str e)}}
@@ -880,10 +883,12 @@
          (binding [ec/*execution-context* (fork-home-ctx fork)]
            (peer-bus/post! {:type :dvergr/merge-failed :dvergr/origin (:id fork)
                             :dvergr/parent (:id parent) :error (str e)}))
-         (throw e)))
-    ;; Branchless fork (`:isolation :none`/ephemeral) — no datahike branch to
-    ;; merge, so absorb the fork's post-fork bus entries into the parent's log
-    ;; (merge-as-history; no re-firing of live handlers, separate buses).
+         (throw e))))
+   ;; (2) CONVERSATION merge — for STORE-LESS forks (`:isolation :none`, or a `:ctx`
+   ;; fork without a message store), absorb the fork's post-fork bus entries into the
+   ;; parent's log (merge-as-history; no re-firing of live handlers, separate buses).
+   ;; A `:store` fork's messages already arrived via the datahike collapse in (1).
+   (when-not (:store fork)
      (let [forked-at   (or (:forked-at-len fork) 0)
            fork-log    (log fork)
            new-entries (when (> (count fork-log) forked-at) (subvec fork-log forked-at))]
@@ -981,12 +986,13 @@
    on-message will receive the goal as the first message it sees. Pair
    with `dvergr.discourse.llm/llm-agent` for real LLM workers, or with
    `scripted`/`echo` for tests."
-  [room worker {:keys [goal accept-fn timeout-ms from]
+  [room worker {:keys [goal accept-fn timeout-ms from isolation]
                 :or   {accept-fn (constantly true)
                        timeout-ms 60000
-                       from :hire-caller}}]
+                       from :hire-caller
+                       isolation :none}}]
   (sp/spin
-   (let [fork  (fork-room room)
+   (let [fork  (fork-room room {:isolation isolation})
          _     (join fork worker)
          reply (sp/await
                 (comb/timeout
