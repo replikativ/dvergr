@@ -41,8 +41,10 @@
      (d/join audit-room (aud/make-noisy-agent :worker-b audit-room)))
    nil))
 
-;; Each worker escalates on every message; the auditor also gets one direct
-;; message to its inbox.
+;; Each worker escalates once — on the task addressed to it — and the auditor
+;; also gets one direct message to its inbox. So the auditor observes three
+;; events: two budget escalations it was NOT addressed on (via the tag
+;; subscription) + one inbox message.
 
 (kind/hidden
  (with-room audit-room

@@ -31,16 +31,20 @@
        nil))}))
 
 (defn make-noisy-agent
-  "Posts an escalation on every message it receives."
+  "Escalates on the task addressed to it — posts an :escalation/budget. The
+   `(= id (:to msg))` guard ignores the OTHER worker's escalation (escalations
+   carry no `:to`), so the two workers never cascade; the auditor observes each
+   worker's escalation via its tag subscription."
   [id room]
   (d/participant
    {:id id
     :on-message
     (fn [_p msg]
       (spin
-       (d/post! room {:type :escalation/budget
-                      :from id
-                      :payload {:reason :running-low}})
+       (when (= id (:to msg))
+         (d/post! room {:type :escalation/budget
+                        :from id
+                        :payload {:reason :running-low}}))
        nil))}))
 
 (defn -main
