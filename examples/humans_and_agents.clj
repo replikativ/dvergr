@@ -20,12 +20,12 @@
       message back in the human's inbox when done — Claude-Code-style
       'I ran it in the background, ping when ready'.
 
-   4. **Branching + merging via proposals** — `dvergr.discourse.proposals/propose!`
-      + `accept-proposal!` / `reject-proposal!`. Fork the room, let an
-      agent work in isolation, hand the human the result; accept merges
-      the fork, reject discards. This is the multi-shot 'agent
-      proposes, human approves' pattern that opencode / coding agents
-      run on every diff.
+   4. **Branching + merging** — `dvergr.discourse/fork-room` +
+      `propose-merge!` + `merge-room` / `discard`. Fork the room, let an
+      agent work in isolation, raise a merge proposal, hand the human the
+      result; `merge-room` folds the fork back, `discard` drops it. This
+      is the multi-shot 'agent proposes, human approves' pattern that
+      opencode / coding agents run on every diff.
 
    Run as an alias (`clojure -X:examples humans-and-agents/run`) or step
    through in a REPL. Uses scripted mock agents only — no API keys, no network.
@@ -39,9 +39,8 @@
             [dvergr.discourse :as d]
             [dvergr.discourse.human :as human]
             [dvergr.discourse.background :as bg]
-            [dvergr.discourse.proposals :as proposals]
-            [dvergr.chat.schema :as schema]
             [org.replikativ.spindel.core :as sp :refer [spin await]]
+            [org.replikativ.spindel.spin.combinators :as comb]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.yggdrasil :as ygg]
             [yggdrasil.adapters.datahike :as ygg-dh]
@@ -142,47 +141,40 @@
     (d/close-room! room)))
 
 (defn demo-3-propose-accept
-  "Alice asks coder for a feature; coder works in a forked room and posts
-   a proposal; alice accepts; the fork merges into the parent room's log."
+  "Alice asks coder for a feature; coder works in a forked room and raises a
+   merge proposal; alice accepts; `merge-room` folds the fork into the parent's
+   log."
   []
   (println "\n=== Demo 3: propose → accept (fork → merge) ===")
-  ;; In-memory datahike just for the proposal schema. In simmis this is
-  ;; the room DB; in dvergr CLI this might be ~/.dvergr/proposals.
-  (let [cfg {:store {:backend :memory :id (random-uuid)}}
-        _ (dh/create-database cfg)
-        conn (dh/connect cfg)
-        _ (schema/ensure-full-schema! conn)
-        room (d/room :demo-3)
+  (let [room (d/room :demo-3)
         alice (binding [ec/*execution-context* (:ctx room)]
                 (human/human-participant
                  {:id :alice :on-receive (println-receive "alice")}))
         coder (binding [ec/*execution-context* (:ctx room)]
                 (scripted-agent :coder ["Proposed: add :feature/x with default {}"]))]
     (d/join room alice)
-    ;; coder is NOT joined to the parent — propose! joins it into the fork only.
+    ;; coder is NOT joined to the parent — it works only inside the fork.
     (binding [ec/*execution-context* (:ctx room)]
-      (let [proposal @(proposals/propose!
-                       {:room   room
-                        :worker coder
-                        :goal   "design :feature/x"
-                        :conn   conn})]
-        (println "(alice sees proposal:" (:proposal/summary proposal) ")")
+      (let [fork  (d/fork-room room)
+            _     (d/join fork coder)
+            reply (-> (comb/timeout (d/ask fork :coder {:content "design :feature/x"})
+                                    5000 {:content "[timed out]"})
+                      deref)
+            proposal (d/propose-merge! fork :from :coder :note (:content reply))]
+        ;; Let the bus route the reply + proposal into the fork's log.
+        (Thread/sleep 150)
+        (println "(alice sees proposal:" (:note proposal) ")")
+        (println "(open proposals on fork:" (count (d/pending-proposals fork)) ")")
         ;; Alice approves; the fork's log merges into the parent.
-        (let [outcome (proposals/accept-proposal! room conn (:proposal/id proposal))]
-          (println "(accept outcome:" outcome ")")
-          (println "(parent room log size:" (count (d/log room)) ")"))))
-    (d/close-room! room)
-    (dh/release conn)))
+        (d/merge-room room fork)
+        (println "(merged — parent room log size:" (count (d/log room)) ")")))
+    (d/close-room! room)))
 
 (defn demo-4-propose-reject
-  "Same setup but alice rejects — fork is discarded, parent untouched."
+  "Same setup but alice rejects — `discard` drops the fork, parent untouched."
   []
   (println "\n=== Demo 4: propose → reject (fork → discard) ===")
-  (let [cfg {:store {:backend :memory :id (random-uuid)}}
-        _ (dh/create-database cfg)
-        conn (dh/connect cfg)
-        _ (schema/ensure-full-schema! conn)
-        room (d/room :demo-4)
+  (let [room (d/room :demo-4)
         alice (binding [ec/*execution-context* (:ctx room)]
                 (human/human-participant
                  {:id :alice :on-receive (println-receive "alice")}))
@@ -190,18 +182,20 @@
                 (scripted-agent :coder ["Proposed: rename :feature/x to :feature/y"]))]
     (d/join room alice)
     (binding [ec/*execution-context* (:ctx room)]
-      (let [proposal @(proposals/propose!
-                       {:room   room
-                        :worker coder
-                        :goal   "what should :feature/x be named?"
-                        :conn   conn})]
-        (println "(alice sees proposal:" (:proposal/summary proposal) ")")
-        (let [outcome (proposals/reject-proposal! room conn (:proposal/id proposal))]
-          (println "(reject outcome:" outcome ")")
-          (println "(parent room log size — should be unchanged:"
-                   (count (d/log room)) ")"))))
-    (d/close-room! room)
-    (dh/release conn)))
+      (let [log-before (count (d/log room))
+            fork  (d/fork-room room)
+            _     (d/join fork coder)
+            reply (-> (comb/timeout (d/ask fork :coder
+                                           {:content "what should :feature/x be named?"})
+                                    5000 {:content "[timed out]"})
+                      deref)
+            proposal (d/propose-merge! fork :from :coder :note (:content reply))]
+        (println "(alice sees proposal:" (:note proposal) ")")
+        ;; Alice rejects; the fork is discarded and nothing merges.
+        (d/discard fork)
+        (println "(discarded — parent room log size, should be unchanged:"
+                 (count (d/log room)) "was" log-before ")")))
+    (d/close-room! room)))
 
 (defn demo-5-substrate-fork
   "Substrate-isolated propose/accept: the worker transacts into a
@@ -224,12 +218,6 @@
                        [{:db/ident :kb/topic :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
                         {:db/ident :kb/note  :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])
         worker-system (ygg-dh/create worker-conn {:system-name "worker-kb"})
-
-        ;; Proposal-persistence DB (same as demos 3/4).
-        prop-cfg {:store {:backend :memory :id (random-uuid)}}
-        _ (dh/create-database prop-cfg)
-        prop-conn (dh/connect prop-cfg)
-        _ (schema/ensure-full-schema! prop-conn)
 
         room (d/room :demo-5)
         alice (binding [ec/*execution-context* (:ctx room)]
@@ -257,8 +245,7 @@
                                (dh/transact conn
                                             [{:kb/topic "X" :kb/note (:content msg)}])
                                {:to (:from msg) :content "Indexed."})))
-                          :factory make-worker})))
-        worker (make-worker (:ctx room))]
+                          :factory make-worker})))]
     (binding [ec/*execution-context* (:ctx room)]
       ;; Register the worker's KB in the parent ctx. Forks inherit it
       ;; lazily; on first write the OverlayBackend branches it via
@@ -268,13 +255,20 @@
     (d/join room alice)
 
     (binding [ec/*execution-context* (:ctx room)]
-      (let [proposal @(proposals/propose!
-                       {:room   room
-                        :worker worker
-                        :goal   "index this note"
-                        :conn   prop-conn
-                        :isolation :ctx})]   ; ← substrate-isolated fork
-        (println "(alice sees proposal:" (:proposal/summary proposal) ")")
+      ;; A substrate-isolated fork — fork-context branches every registered
+      ;; yggdrasil system (the worker's datahike KB) via PForkable.
+      (let [fork (d/fork-room room {:isolation :ctx})]
+        ;; Join the worker into the fork, bound to the fork's ctx so it
+        ;; resolves + writes the BRANCHED KB.
+        (d/with-fork-ctx fork (d/join fork (make-worker (:ctx fork))))
+        ;; The worker transacts a note — into the fork's branched KB.
+        (d/with-fork-ctx fork
+          (-> (comb/timeout (d/ask fork :indexer {:content "index this note"})
+                            5000 {:content "[timed out]"})
+              deref))
+        (let [proposal (d/propose-merge! fork :from :indexer
+                                         :note "note indexed in fork")]
+          (println "(alice sees proposal:" (:note proposal) ")"))
 
         ;; Before accept: parent's datahike is UNCHANGED.
         (let [parent-conn (:conn (ygg/get-system "worker-kb"))
@@ -282,18 +276,19 @@
                                         @parent-conn))]
           (println "(parent KB has" count-before "notes before accept — expect 0)"))
 
-        (proposals/accept-proposal! room prop-conn (:proposal/id proposal))
+        ;; Accept → merge the fork's branched substrate back into the parent.
+        (d/merge-room room fork)
 
-        ;; After accept: the worker's branch merged into parent. The
-        ;; worker's transact is now visible in parent's datahike.
+        ;; After accept: with a :local yggdrasil the worker's branch merged
+        ;; into parent and the transact is visible; with published maven ygg
+        ;; the datahike branch-merge stays 0 (see notebook prose).
         (let [parent-conn (:conn (ygg/get-system "worker-kb"))
               count-after (count (dh/q '[:find ?n :where [_ :kb/note ?n]]
                                        @parent-conn))]
           (println "(parent KB has" count-after "notes after accept — expect 1)"))))
 
     (d/close-room! room)
-    (dh/release worker-conn)
-    (dh/release prop-conn)))
+    (dh/release worker-conn)))
 
 (defn run
   "Run all demos sequentially. Invoke from `clojure -X` or REPL.
