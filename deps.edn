@@ -26,11 +26,12 @@
         ;; SCI — Small Clojure Interpreter for sandboxing.
         org.babashka/sci           {:mvn/version "0.13.52"}
 
-        ;; partial-cps — CPS transform for SCI spin macro
-        is.simm/partial-cps        {:mvn/version "0.1.54"}
+        ;; partial-cps (CPS transform for the SCI spin macro) comes TRANSITIVELY
+        ;; via spindel — not declared here, so spindel is the single source of its
+        ;; version. The `:local` alias's `../spindel` override carries it too.
 
         ;; Spindel — Reactive runtime with CoW forking
-        org.replikativ/spindel     {:mvn/version "0.1.23"}
+        org.replikativ/spindel     {:mvn/version "0.1.26"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context
@@ -42,11 +43,11 @@
         rewrite-clj/rewrite-clj    {:mvn/version "1.1.48"}
 
         ;; Datahike — persistent Datalog storage
-        org.replikativ/datahike    {:mvn/version "0.8.1689"}
+        org.replikativ/datahike    {:mvn/version "0.8.1708"}
 
         ;; Yggdrasil — CoW branching for git and Datahike
         ;; 0.2.27 carries composite Mergeable diff + conflicts (PR #3).
-        org.replikativ/yggdrasil   {:mvn/version "0.2.29"}
+        org.replikativ/yggdrasil   {:mvn/version "0.3.36"}
 
         ;; Scriptum — CoW Lucene indices for fulltext search
         org.replikativ/scriptum    {:mvn/version "0.1.27"}
@@ -58,9 +59,9 @@
         ;; Kabel — WebSocket peer-to-peer transport. 0.3.98 pins javac --release 11
         ;; (0.3.97 shipped Java-25 bytecode → UnsupportedClassVersionError on JDK <25).
         org.replikativ/kabel       {:mvn/version "0.3.98"}
-        org.replikativ/hasch       {:mvn/version "0.4.98"}
+        org.replikativ/hasch       {:mvn/version "0.4.99"}
         org.replikativ/incognito   {:mvn/version "0.3.69"}
-        org.replikativ/konserve    {:mvn/version "0.9.347"}
+        org.replikativ/konserve    {:mvn/version "0.9.350"}
         org.replikativ/kabel-auth  {:mvn/version "0.1.19"}
         org.replikativ/superv.async {:mvn/version "0.3.50"}
 
@@ -105,7 +106,7 @@
                        metosin/reitit-ring {:mvn/version "0.7.2"} metosin/reitit-malli {:mvn/version "0.7.2"} metosin/reitit-middleware {:mvn/version "0.7.2"} metosin/reitit-swagger {:mvn/version "0.7.2"} io.github.nextjournal/markdown {:mvn/version "0.7.222"} ; web (reitit, sans swagger-ui — add reitit-swagger-ui for the /docs page)
                        io.forward/clojure-mail {:mvn/version "1.0.8"} ; mail intake
                        org.replikativ/briefkasten {:mvn/version "0.1.2"} ; briefkasten (mail)
-                       org.replikativ/spindel-tui {:mvn/version "0.1.10"}}}
+                       org.replikativ/spindel-tui {:mvn/version "0.1.12"}}}
 
   ;; src-clients/ on the test path so dvergr.web.server-test still
   ;; loads the namespaces it tests.
@@ -114,7 +115,7 @@
                        metosin/reitit-ring {:mvn/version "0.7.2"} metosin/reitit-malli {:mvn/version "0.7.2"} metosin/reitit-middleware {:mvn/version "0.7.2"} metosin/reitit-swagger {:mvn/version "0.7.2"} io.github.nextjournal/markdown {:mvn/version "0.7.222"} ; web (reitit, sans swagger-ui — add reitit-swagger-ui for the /docs page)
                        io.forward/clojure-mail {:mvn/version "1.0.8"} ; mail intake
                        org.replikativ/briefkasten {:mvn/version "0.1.2"} ; briefkasten (mail)
-                       org.replikativ/spindel-tui {:mvn/version "0.1.10"}}
+                       org.replikativ/spindel-tui {:mvn/version "0.1.12"}}
          :main-opts   ["-m" "kaocha.runner"]}
 
   :repl {:main-opts ["-m" "nrepl.cmdline"
@@ -152,7 +153,7 @@
   ;; possible via --no-tui; otherwise the TUI launches automatically
   ;; because spindel-tui is on the classpath via this alias.
   :cli {:extra-paths ["src-clients"]
-        :extra-deps  {org.replikativ/spindel-tui {:mvn/version "0.1.10"}
+        :extra-deps  {org.replikativ/spindel-tui {:mvn/version "0.1.12"}
                       metosin/reitit-ring {:mvn/version "0.7.2"} metosin/reitit-malli {:mvn/version "0.7.2"} metosin/reitit-middleware {:mvn/version "0.7.2"} metosin/reitit-swagger {:mvn/version "0.7.2"} io.github.nextjournal/markdown {:mvn/version "0.7.222"} ; web (reitit, sans swagger-ui — add reitit-swagger-ui for the /docs page)
                       io.forward/clojure-mail    {:mvn/version "1.0.8"}    ; mail intake
                       org.replikativ/briefkasten {:mvn/version "0.1.2"} ; briefkasten (mail)

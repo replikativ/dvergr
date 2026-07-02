@@ -159,3 +159,19 @@
                                        (seq reason) (assoc :reasoning reason)))))))
       (reset! posted (count tool-msgs)))
     nil))
+
+(defn post-turn-error!
+  "Surface a FAILED agent turn as a visible, NON-triggering activity row (→ room
+   `:_activity`, `:role :tool`, like `post-turn-activity!`) — so the turn loop can
+   report the failure instead of falling through to re-post a STALE prior reply
+   (which the room's other agents would answer, looping — the \"repeating\" bug).
+   `err` is the throwable from the errored turn result. No-op when `room` is nil.
+   Returns nil."
+  [room agent-id err]
+  (when room
+    (binding [rtc/*execution-context* (:ctx room)]
+      (let [detail (or (some-> err ex-message) (some-> err str) "LLM error")]
+        (d/post! room (d/message agent-id activity-id
+                                 (str "⚠️ turn failed — " detail) nil
+                                 {:role :tool})))))
+  nil)

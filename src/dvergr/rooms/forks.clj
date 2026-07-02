@@ -86,9 +86,9 @@
 ;; ---------------------------------------------------------------------------
 ;; Unified diff + tier classification — the substrate the agent merge-reviewer
 ;; and the TUI/web review flow both read. The per-system merge-base diff/conflicts
-;; now live in the spindel bridge (`spindel.yggdrasil/workspace-diff` /
-;; `workspace-conflicts`), which resolves each sub-system on snapshot-ids over
-;; the one composite workspace. These are thin fork-shaped wrappers.
+;; now live in the spindel bridge (`spindel.yggdrasil/context-diff` /
+;; `context-conflicts`), which resolves each sub-system on snapshot-ids over
+;; the forked context's registered systems. These are thin fork-shaped wrappers.
 ;; ---------------------------------------------------------------------------
 
 (defn fork-diff
@@ -97,14 +97,14 @@
    nil for `:none` forks (no branched substrate)."
   [fork]
   (when (ctx-fork? fork)
-    (ygg/workspace-diff (:ctx fork))))
+    (ygg/context-diff (:ctx fork))))
 
 (defn fork-conflicts
   "Per-system conflicts of a `:ctx` fork vs its parent, each tagged `:system`.
    Often empty (datahike conflict detection is conservative today)."
   [fork]
   (when (ctx-fork? fork)
-    (ygg/workspace-conflicts (:ctx fork))))
+    (ygg/context-conflicts (:ctx fork))))
 
 (defn- delta-trivial?
   "Did the FORK contribute nothing meaningful in this system? Duck-typed over

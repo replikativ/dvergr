@@ -65,17 +65,8 @@
             :default-top-p       0.95
             :default-top-k       40}}
 
-  "accounts/fireworks/models/minimax-m2p5"
-  {:name "MiniMax M2.5"
-   :provider :fireworks
-   :api-type :openai-chat
-   :capabilities #{:tools :streaming}
-   :context 196608
-   :max-output 8192
-   :pricing {:input 0.30 :cache-read 0.03 :output 1.20}
-   :quirks {:default-temperature 1.0   ; MiniMax M2 recommended sampling
-            :default-top-p       0.95
-            :default-top-k       40}}
+  ;; MiniMax M2.5 removed 2026-07-02 — Fireworks now 404s it (deprecated).
+  ;; Use minimax-m2p7 (above). Re-probe the registry when models rotate.
 
   ;; ─── Qwen ──────────────────────────────────────────────────────────────────
 
@@ -134,7 +125,6 @@
   "kimi-k2p5"   "accounts/fireworks/models/kimi-k2p5"
   "glm"         "accounts/fireworks/models/glm-5p1"
   "minimax"     "accounts/fireworks/models/minimax-m2p7"
-  "minimax-m2p5" "accounts/fireworks/models/minimax-m2p5"
   "qwen"        "accounts/fireworks/models/qwen3p6-plus"
   "deepseek"    "accounts/fireworks/models/deepseek-v4-pro"
   "gpt-oss"     "accounts/fireworks/models/gpt-oss-20b"
