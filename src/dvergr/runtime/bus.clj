@@ -186,10 +186,19 @@
 
    A well-formed message has at least `:to` (direct routing) or
    `:type` (capability routing) — typically both. The bus does not
-   validate shape; conventions are an application concern."
+   validate shape; conventions are an application concern.
+
+   Every message is stamped with an `:id` (random-uuid) if it lacks one — done
+   HERE, before the mult fans it out, so a message reaching a participant via
+   several matching subscriptions carries the SAME id on each copy. That is what
+   lets `dvergr.discourse/participant-spin` dedup and deliver each message once
+   (a broadcast that also carries a subscribed `:type` matches both `[:to nil]`
+   and `[:type …]`)."
   [bus msg]
   (binding [ec/*execution-context* (:ctx bus)]
-    (sync/post! (:source-mbox bus) msg))
+    (sync/post! (:source-mbox bus)
+                (cond-> msg
+                  (and (map? msg) (nil? (:id msg))) (assoc :id (random-uuid)))))
   nil)
 
 (defn post-many!

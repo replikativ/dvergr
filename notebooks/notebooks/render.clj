@@ -17,8 +17,12 @@
 ;; Order = reading order in the rendered book's sidebar. Paths are relative to
 ;; :base-source-path. The notebook namespaces live under `notebooks/notebooks/`,
 ;; so the `:clay` alias's `"notebooks"` extra-path is the classpath root.
+;; index.clj is FIRST + rendered as the book's index.html landing page (via
+;; :first-as-index below) — otherwise Clay generates an empty index and the real
+;; notebooks start at sidebar entry #2.
 (def notebooks
-  ["getting_started.clj"
+  ["index.clj"
+   "getting_started.clj"
    "programming_model.clj"
    "humans_and_agents.clj"
    "agents_and_tools.clj"])
@@ -55,6 +59,7 @@
       :source-path      notebooks
       :base-target-path "docs"
       :book             {:title "dvergr — examples"}
+      :first-as-index   true
       :show             false
       :browse           false})
     (catch Throwable e
