@@ -287,7 +287,8 @@
                                                          (conj prompt/planning-mode-guideline)))
                                     :auto-compact?    (and (:auto? compaction true)
                                                            (not race-compaction?))
-                                    :compaction-model (:model compaction)}]
+                                    :compaction-model (:model compaction)}
+                         errored           (atom nil)]
                  ;; The just-arrived user message. ROOM path: append-inbound!
                  ;; (deduped against the bus fold by msg id, decorated with author
                  ;; + time). Room-less: add directly to the fallback ctx.
@@ -349,7 +350,8 @@
                              (cond
                                @cancelled? nil
 
-                               (gen/error-result? result) nil
+                               (gen/error-result? result)
+                               (do (reset! errored (:dvergr.discourse.generation/error result)) nil)
 
                            ;; LLM finished cleanly (no more tool calls).
                                (not= result :continue) nil
@@ -374,7 +376,11 @@
                                :else (recur (inc turn) wrap-up-allowed?))))))
 
                      (when room (turn/unregister-room-turn! (:id room) id))
-                     (when-let [last-asst (last-assistant-message chat-ctx)]
+                     ;; A FAILED turn produced no new reply — surface it as a NON-triggering
+                     ;; :_activity row and DON'T fall through to re-post the STALE last reply
+                     ;; (which the room's other agents answer, looping — the "repeating" bug).
+                     (when @errored (turn/post-turn-error! room id @errored))
+                     (when-let [last-asst (when-not @errored (last-assistant-message chat-ctx))]
                        (when-let [reply (assistant-text last-asst)]
                      ;; Carry this turn's interleaved-thinking trace into the room
                      ;; record (metadata → store → seeding) so reasoning models
