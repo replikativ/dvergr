@@ -136,7 +136,14 @@
   ;; Also includes muschel — `:deps` pins the published version, but
   ;; if you need to develop muschel-side fixes in parallel, activate
   ;; this alias to override.
-  :local {:extra-deps {org.babashka/sci           {:local/root "../sci"}
+  ;; datahike's pluggable secondary-index adapters (scriptum fulltext + proximum
+  ;; vector) live in a separate `src-secondary` root. The RELEASED jar ships them
+  ;; (config.edn build :src-dirs include src-secondary — verified in
+  ;; datahike-0.8.1708.jar), so the maven dep needs nothing extra. But a
+  ;; `:local/root "../datahike"` override uses datahike's DEFAULT :paths (which
+  ;; exclude src-secondary), so we add it here for the source-override dev path.
+  :local {:extra-paths ["../datahike/src-secondary"]
+          :extra-deps {org.babashka/sci           {:local/root "../sci"}
                        org.replikativ/datahike    {:local/root "../datahike"}
                        org.replikativ/scriptum    {:local/root "../scriptum"}
                        org.replikativ/yggdrasil   {:local/root "../yggdrasil"}

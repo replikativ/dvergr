@@ -87,7 +87,27 @@
                       (apply dh/datoms @db-atom a rest)))
         schema-fn (fn ([] (dh/schema @db-atom))
                     ([db] (dh/schema db)))
-        db-fn (fn [] @db-atom)]
+        db-fn (fn [] @db-atom)
+        ;; Fulltext memory search via datahike's native scriptum secondary index
+        ;; (dvergr.search.secondary/search). It's just a fn returning BM25-RANKED
+        ;; [[entity-id score] …], so the agent calls it INSIDE a datalog clause —
+        ;; fulltext ranking composed with structured constraints in one q:
+        ;;   (dh/q '[:find ?c ?score
+        ;;           :in $ ?ft
+        ;;           :where [(?ft :room/fulltext "gc reap") [[?e ?score]]]
+        ;;                  [?e :message/content ?c]]
+        ;;         (dh/db) dh/search)
+        ;; Resolve lazily + gracefully: the scriptum secondary-index adapter
+        ;; lives in datahike's src-secondary root, which a released build may
+        ;; not ship. The sandbox must still build; dh/search errors clearly only
+        ;; if actually called without support.
+        secondary  (try (requiring-resolve 'dvergr.search.secondary/search)
+                        (catch Throwable _ nil))
+        search-fn  (fn [ident query & [opts]]
+                     (if secondary
+                       (secondary @db-atom ident query (or opts {}))
+                       (throw (ex-info "fulltext search unavailable — datahike secondary index (:scriptum) not on classpath"
+                                       {:ident ident}))))]
 
     (sci/add-namespace! sci-ctx 'dh
                         {'q q-fn
@@ -96,6 +116,7 @@
                          'entity entity-fn
                          'datoms datoms-fn
                          'schema schema-fn
+                         'search search-fn
                          'db db-fn})))
 
 (defn add-inference-ns!

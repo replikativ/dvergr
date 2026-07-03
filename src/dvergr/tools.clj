@@ -960,17 +960,29 @@
                (if db-conn
                  (try
                    (let [limit (or limit 10)
+                         ;; Fulltext over the KB's scriptum secondary index
+                         ;; (title + summary + contexts), ranked; falls back to
+                         ;; the old title-regex when the index is unavailable or
+                         ;; not yet built, so recall never regresses.
+                         regex-search
+                         (fn [db]
+                           (let [pattern (re-pattern (str "(?i)" query))]
+                             (->> (d/q '[:find [(pull ?e [*]) ...]
+                                         :where [?e :entity/id _]] db)
+                                  (filter #(re-find pattern (:entity/title %)))
+                                  (sort-by #(- (or (:entity/mention-count %) 0)))
+                                  (take limit))))
                          results (case (or operation "search")
                                    "search"
                                    (when query
-                                     (let [pattern (re-pattern (str "(?i)" query))
-                                           all-entities (d/q '[:find [(pull ?e [*]) ...]
-                                                               :where [?e :entity/id _]]
-                                                             @db-conn)]
-                                       (->> all-entities
-                                            (filter #(re-find pattern (:entity/title %)))
-                                            (sort-by #(- (or (:entity/mention-count %) 0)))
-                                            (take limit))))
+                                     (let [db   @db-conn
+                                           ft   (requiring-resolve 'dvergr.search.secondary/search-eids)
+                                           ;; ranked by BM25 relevance (title/summary/contexts)
+                                           eids (try (ft db :room/kb-fulltext query {:limit limit})
+                                                     (catch Throwable _ nil))]
+                                       (if (seq eids)
+                                         (take limit (d/pull-many db '[*] eids)) ; keep relevance order
+                                         (regex-search db))))
 
                                    "top"
                                    (->> (d/q '[:find [(pull ?e [*]) ...]
