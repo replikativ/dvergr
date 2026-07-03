@@ -123,6 +123,21 @@
               (:message_id result)))
           chunks)))
 
+(defn get-file-bytes
+  "Download a Telegram file by file-id. Returns {:bytes byte[] :path s}
+   or nil on failure."
+  [token file-id]
+  (try
+    (when-let [file-path (:file_path (api-call token "getFile" {:file_id file-id}))]
+      (let [url (str "https://api.telegram.org/file/bot" token "/" file-path)
+            resp (hc/get url {:as :byte-array})]
+        (when (= 200 (:status resp))
+          {:bytes (:body resp) :path file-path})))
+    (catch Exception e
+      (tel/log! {:level :warn :id :telegram/file-download-failed
+                 :data {:file-id file-id :error (.getMessage e)}})
+      nil)))
+
 ;; ============================================================================
 ;; Message normalization
 ;; ============================================================================
@@ -145,15 +160,22 @@
     ;; Regular message
     (let [msg (or (:message update) (:edited_message update))]
       (when msg
-        {:channel    :telegram
-         :chat-id    (get-in msg [:chat :id])
-         :message-id (:message_id msg)
-         :from       (select-keys (:from msg) [:id :username :first_name :last_name])
-         :text       (:text msg)
-         :type       :message
-         :timestamp  (when-let [ts (:date msg)]
-                       (java.util.Date. (* ts 1000)))
-         :raw        update}))))
+        (cond-> {:channel    :telegram
+                 :chat-id    (get-in msg [:chat :id])
+                 :message-id (:message_id msg)
+                 :from       (select-keys (:from msg) [:id :username :first_name :last_name])
+                 :text       (:text msg)
+                 :type       :message
+                 :timestamp  (when-let [ts (:date msg)]
+                               (java.util.Date. (* ts 1000)))
+                 :raw        update}
+          ;; Voice notes / audio: carry the file reference so a caps-provided
+          ;; :transcribe-fn can turn them into text (handle-message).
+          (or (:voice msg) (:audio msg))
+          (assoc :voice (let [v (or (:voice msg) (:audio msg))]
+                          {:file-id   (:file_id v)
+                           :duration  (:duration v)
+                           :mime-type (:mime_type v)})))))))
 
 ;; ============================================================================
 ;; Long polling
@@ -539,10 +561,27 @@
    allowlist gate and the `/agents` / `/<agent>` grammar; everything else is
    posted into the per-chat Room as the user-actor. `caps` as in
    `make-daemon-adapter`."
-  [adapter msg {:keys [ctx send-fn ensure-room default-agent typing-fn daemon tool-exec?] :as _caps}]
+  [adapter msg {:keys [ctx send-fn ensure-room default-agent typing-fn daemon tool-exec?
+                       transcribe-fn token] :as _caps}]
   (binding [rtc/*execution-context* ctx]
     (let [chat-id   (:chat-id msg)
-          text      (:text msg)
+          ;; Voice notes: when the embedder provides :transcribe-fn (and the
+          ;; caps carry the bot :token for the file download), turn the audio
+          ;; into text and proceed exactly like a typed message — agents and
+          ;; mirrors see the transcript with a 🎤 marker.
+          text      (or (:text msg)
+                        (when-let [{:keys [file-id mime-type duration]} (:voice msg)]
+                          (when (and transcribe-fn token)
+                            (when-let [{:keys [bytes]} (get-file-bytes token file-id)]
+                              (when-let [t (try (transcribe-fn {:bytes bytes
+                                                                :mime mime-type
+                                                                :duration duration})
+                                                (catch Exception e
+                                                  (tel/log! {:level :warn
+                                                             :id :telegram/transcription-failed
+                                                             :data {:error (.getMessage e)}})
+                                                  nil))]
+                                (str "🎤 " t))))))
           user-info (:from msg)
           reply!    (fn [t] (send-fn chat-id t))
           working!  (fn [] (when typing-fn (try (typing-fn chat-id) (catch Throwable _ nil))))]
