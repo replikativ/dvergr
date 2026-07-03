@@ -317,16 +317,22 @@
          ;; already handled via another matching subscription — skip the duplicate
          (recur seen order)
          (let [in-reply-to (when (instance? Message env) (:id env))
+               ;; Await the on-message spin DIRECTLY, with the error isolation
+               ;; inline in THIS body. The previous shape awaited an anonymous
+               ;; wrapper spin that awaited the handler — the documented
+               ;; nested-spin-await anti-pattern ("hangs with non-trivial
+               ;; closures"), and one more GC-reapable suspended awaiter in the
+               ;; chain (see spindel fix/gc-reap-suspended-awaiter). partial-cps
+               ;; supports try/catch around await in-body, so the wrapper bought
+               ;; nothing but risk.
                reply-spec
-               (sp/await
-                (sp/spin
-                 (try
-                   (sp/await ((:on-message p) p env))
-                   (catch Throwable t
-                     (binding [*out* *err*]
-                       (println "participant" (:id p)
-                                "on-message error:" (.getMessage t)))
-                     nil))))]
+               (try
+                 (sp/await ((:on-message p) p env))
+                 (catch Throwable t
+                   (binding [*out* *err*]
+                     (println "participant" (:id p)
+                              "on-message error:" (.getMessage t)))
+                   nil))]
            (try (emit-reply! room p reply-spec in-reply-to)
                 (catch Throwable t
                   (binding [*out* *err*]
