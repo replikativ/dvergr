@@ -43,7 +43,10 @@
   (require 'dvergr.room.registry)
   (require 'dvergr.room.store)
   (require 'dvergr.rooms.forks)
+  (require 'dvergr.agent.subagent)
   (let [fork-diff*      @(ns-resolve 'dvergr.rooms.forks 'fork-diff)
+        subagent-hire*  @(ns-resolve 'dvergr.agent.subagent 'hire!)
+        subagent-pend*  @(ns-resolve 'dvergr.agent.subagent 'pending)
         fork-review*    @(ns-resolve 'dvergr.rooms.forks 'review)
         fork-classify*  @(ns-resolve 'dvergr.rooms.forks 'classify)
         post*           @(ns-resolve 'dvergr.discourse 'post!)
@@ -183,6 +186,20 @@
      'classify     fork-classify*
      'forks        forks-fn
      'participants participants-fn
-     'root         root-fn}))
+     'root         root-fn
+     ;; Subagent delegation — fork a subroom (`:ctx` substrate + shared CRDTs),
+     ;; host an ephemeral worker, delegate the goal, merge/discard. Returns a Spin:
+     ;; `(await (dvergr.room/hire "<room-ref>" {:goal … :spec {…}}))` in the
+     ;; foreground, or hold the spin and await it later (background). Durably
+     ;; tracked as a `:dvergr/subagent` lifecycle log; `pending-subagents` lists
+     ;; the still-running ones.
+     'hire         (fn [ref opts]
+                     (when-let [room (resolve-room ref)]
+                       (binding [rtc/*execution-context* (:ctx room)]
+                         (subagent-hire* room opts))))
+     'pending-subagents (fn [ref]
+                          (when-let [room (resolve-room ref)]
+                            (binding [rtc/*execution-context* (:ctx room)]
+                              (subagent-pend* room))))}))
 
 
