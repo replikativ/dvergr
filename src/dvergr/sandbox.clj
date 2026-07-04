@@ -118,10 +118,21 @@
    fence + Esc cancellation cover the same threat with no false
    positives.
 
+   This counts CUMULATIVE thread allocation (getThreadAllocatedBytes),
+   garbage included — NOT retained/peak memory, so it's a coarse
+   runaway backstop, not a real OOM gauge (the 60s timeout fence + JVM
+   heap are that). A legitimate data job — fetch + parse several XML/RSS
+   feeds, map/filter/build — churns gigabytes of short-lived allocation
+   while retaining almost nothing, so a low cap false-positives on real
+   intake work (it killed Vár's 5-feed scan at 256 MiB). The threshold
+   is set high enough that only genuinely unbounded allocation (which a
+   true infinite loop produces within the 60s window) trips it.
+
    Options:
-     :max-bytes - max bytes allocated by the current thread (default: 256 MiB)"
+     :max-bytes - max cumulative bytes allocated by the current thread
+                  (default: 4 GiB)"
   [& {:keys [max-bytes]
-      :or   {max-bytes (* 256 1024 1024)}}]
+      :or   {max-bytes (* 4 1024 1024 1024)}}]
   (let [ops    (java.util.concurrent.atomic.AtomicLong. 0)
         tmx    (ManagementFactory/getThreadMXBean)
         tid    (.getId (Thread/currentThread))
