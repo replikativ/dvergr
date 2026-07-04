@@ -95,10 +95,11 @@
    workspace's guidance — the AGENTS.md/CLAUDE.md convention. Kept small
    by design (the file is the summary; INTAKES.md et al. are read on
    demand). `max-chars` caps a runaway edit (default 8k)."
-  ([] (workspace-guide 8192))
-  ([max-chars]
+  ([] (workspace-guide (workspace-root) 8192))
+  ([root] (workspace-guide root 8192))
+  ([root max-chars]
    (try
-     (let [root (workspace-root)
+     (let [root (io/file root)
            f (io/file root "AGENTS.md")]
        (when (and (.isFile f) (under-root? root f))
          (let [s (slurp f)]

@@ -130,4 +130,18 @@
                            " — full Clojure eval at the system root (trusted)."
                            " — sandboxed Clojure eval (safe default)."))
       (seq nameset) (str "\n\n" tool-use-guideline)
-      eval?         (str "\n\n" @(requiring-resolve 'dvergr.sandbox/sandbox-prompt-pointer)))))
+      eval?         (str "\n\n" @(requiring-resolve 'dvergr.sandbox/sandbox-prompt-pointer))
+      ;; The workspace's own AGENTS.md (stdlib map + intake catalog +
+      ;; copy-a-source pattern) — the AGENTS.md/CLAUDE.md convention. Without
+      ;; it agents don't know the dvergr/intake/* library exists and reinvent
+      ;; it. Read from the same room worktree we resolved for skills; gated on
+      ;; eval? (only eval-capable agents have a workspace).
+      (and eval? room-dir)
+      (as-> prompt
+            (if-let [guide ((requiring-resolve 'dvergr.sandbox.workspace/workspace-guide)
+                            room-dir)]
+              (str prompt "\n\n## Your workspace guide (AGENTS.md)\n\n" guide
+                   "\n\nFor a data/intake task START HERE: read the closest "
+                   "`dvergr/intake/*` source (catalog in doc/INTAKES.md — e.g. "
+                   "`dvergr.intake.rss` for feeds) and COPY it, don't rebuild it.")
+              prompt)))))
