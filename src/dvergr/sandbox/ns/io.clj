@@ -231,21 +231,32 @@
         base-canonical (-> (java.io.File. (str base-path)) .getCanonicalFile)
         ;; Path-clamp every user path: canonical check + sensitive-path guard.
         sr             (fn [p] (let [ps (str p)] (sensitive-path-policy ps) (fs-safe-resolve base-canonical ps)))
+        ;; Relativize a resolved (absolute) path back to a workspace-relative
+        ;; string, so agents never see the real `.dvergr/systems/<uuid>/…`
+        ;; location — and get paths they can pass straight back to fs/slurp
+        ;; (which re-resolve via sr). The workspace root itself → ".".
+        base-str       (.getCanonicalPath base-canonical)
+        rel            (fn [p] (let [pc (.getCanonicalPath (java.io.File. (str p)))]
+                                 (cond
+                                   (= pc base-str) "."
+                                   (.startsWith pc (str base-str java.io.File/separator))
+                                   (subs pc (inc (count base-str)))
+                                   :else pc)))
         bb-parent      (r 'parent)
         bb-create-dirs (r 'create-dirs)
-        mkdir          (fn [p] (let [f (sr p)] (audit! audit-log :fs/mkdir {:path (str f)}) (str (bb-create-dirs f))))
+        mkdir          (fn [p] (let [f (sr p)] (audit! audit-log :fs/mkdir {:path (str f)}) (bb-create-dirs f) (rel f)))
         del            (fn [bb] (fn [p] (let [f (sr p)] (audit! audit-log :fs/delete {:path (str f)}) (bb f))))
         cpmv           (fn [op bb] (fn [a b & m] (let [fa (sr a) fb (sr b)]
                                                    (audit! audit-log op {:src (str fa) :dst (str fb)})
-                                                   (apply bb fa fb m) (str fb))))
+                                                   (apply bb fa fb m) (rel fb))))
         pred           (fn [bb] (fn [p] (bb (sr p))))]
     ;; The real babashka.fs SUBSET, every path clamped to base-path. Returns strings
     ;; (not Path objects) so SCI agents get serialisable values. Content read/write
     ;; is `slurp`/`spit` (below), as in real Clojure — NOT an fs fn.
     (sci/add-namespace! sci-ctx 'babashka.fs
                         {'list-dir           (fn [d & more] (audit! audit-log :fs/ls {:path (str (sr d))})
-                                               (mapv str (apply (r 'list-dir) (sr d) more)))
-                         'glob               (fn [d pat & more] (mapv str (apply (r 'glob) (sr d) pat more)))
+                                               (mapv rel (apply (r 'list-dir) (sr d) more)))
+                         'glob               (fn [d pat & more] (mapv rel (apply (r 'glob) (sr d) pat more)))
                          'exists?            (pred (r 'exists?))
                          'directory?         (pred (r 'directory?))
                          'regular-file?      (pred (r 'regular-file?))
@@ -260,10 +271,10 @@
                          'move               (cpmv :fs/move (r 'move))
                          'copy               (cpmv :fs/copy (r 'copy))
                          'copy-tree          (cpmv :fs/copy (r 'copy-tree))
-                         'parent             (fn [p] (some-> (bb-parent (sr p)) str))
+                         'parent             (fn [p] (some-> (bb-parent (sr p)) rel))
                          'file-name          (fn [p] (str ((r 'file-name) p)))
-                         'absolutize         (fn [p] (str (sr p)))
-                         'canonicalize       (fn [p] (str (sr p)))})
+                         'absolutize         (fn [p] (rel (sr p)))
+                         'canonicalize       (fn [p] (rel (sr p)))})
     ;; File CONTENT I/O under the clojure.core names the model reaches for, sandboxed.
     (sci/merge-opts sci-ctx
                     {:namespaces

@@ -618,8 +618,8 @@
                "(git/status)   (git/diff)"]
    "env"      ["read sandbox env vars (secrets redacted)"
                "(env/get \"PATH\")"]
-   "dvergr.scheduler" ["schedule recurring / one-off work — this IS your calendar"
-                       "(dvergr.scheduler/at \"2026-06-15T09:00\" :var \"Standup\") (dvergr.scheduler/list)"]
+   "dvergr.scheduler" ["schedule recurring / one-off work — this IS your calendar. Cadence forms: {:every :day :at \"07:00\"} (daily wall-clock), {:every :hour :n 4} (every 4h — :n multiplies :minute/:hour/:day/:week into an interval), {:every-ms N}, {:at \"ISO\" :once true}. Unknown keys are rejected."
+                       "(dvergr.scheduler/create {:agent-id :var :schedule {:every :hour :n 4} :code \"(require 'my.ns)(my.ns/run!)\" :description \"…\"})  (dvergr.scheduler/list)  (dvergr.scheduler/cancel id)"]
    "dvergr.tasks"    ["the shared task ledger — list/accept/complete work items"
                       "(dvergr.tasks/list)   (dvergr.tasks/complete! id)"]
    "dvergr.agents"   ["directory of agents (read-only): who exists / is online"
