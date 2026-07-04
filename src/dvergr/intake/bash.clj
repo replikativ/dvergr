@@ -302,16 +302,43 @@
    Options:
      :workspace          (default: `default-workspace`)
      :fallback-allowlist (default: default-fallback-allowlist)
-     :builtins           (default: muschel.builtins.posix/standard)"
-  [{:keys [workspace fallback-allowlist builtins]
+     :builtins           (default: muschel.builtins.posix/standard)
+     :mounts             map of absolute sandbox path → muschel FS,
+                         union-mounted over the workspace via
+                         muschel.fs.mount (requires muschel > 0.2.16).
+                         Embedders mount e.g. a drive at /drive so
+                         agents reach it with plain ls/cat/redirects."
+  [{:keys [workspace fallback-allowlist builtins mounts]
     :or {workspace          (default-workspace)
          fallback-allowlist default-fallback-allowlist
          builtins           posix/standard}}]
-  (let [fs (fs.disk/make workspace {:mount-at "/"})]
+  (let [fs (fs.disk/make workspace {:mount-at "/"})
+        fs (if (seq mounts)
+             ((requiring-resolve 'muschel.fs.mount/make) fs mounts)
+             fs)]
     (hb/make {:fs fs
               :fallback-host (git-guarded-host (host.jvm/make))
               :builtins builtins
               :fallback-allowlist fallback-allowlist})))
+
+(defonce ^{:doc "Embedder hook: (fn [chat-ctx] {\"/drive\" <muschel FS>, …})
+  or nil. Consulted once per host build (per workspace); errors are
+  swallowed to a warning — a broken mount provider must not take the
+  shell down with it."}
+  mounts-fn (atom nil))
+
+(defn set-mounts-fn!
+  "Install the embedder's mount provider (see `mounts-fn`)."
+  [f]
+  (reset! mounts-fn f))
+
+(defn- resolve-mounts [chat-ctx]
+  (when-let [f @mounts-fn]
+    (try (f chat-ctx)
+         (catch Throwable t
+           (tel/log! {:level :warn :id :bash/mounts-fn-failed
+                      :data {:error (.getMessage t)}})
+           nil))))
 
 (defn get-or-create-session!
   "Return the chat-ctx's muschel session for the **current** workspace
@@ -347,7 +374,8 @@
     (let [ws (default-workspace)
           path (host-path ws)]
       (or (ec/get-state path)
-          (let [h (make-host {:workspace ws})]
+          (let [h (make-host {:workspace ws
+                              :mounts (resolve-mounts chat-ctx)})]
             (ec/swap-state! path (fn [existing] (or existing h)))
             (ec/get-state path))))))
 
