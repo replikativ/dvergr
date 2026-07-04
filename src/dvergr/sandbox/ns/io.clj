@@ -514,8 +514,12 @@
     (sci/add-namespace! sci-ctx 'babashka.process
                         {'shell shell 'sh shell})
     ;; muschel-specific introspection (not part of babashka.process)
-    (sci/add-namespace! sci-ctx 'dvergr.shell
-                        {'run run 'check check-fn 'builtins builtins-fn 'allowlist allowlist-fn})))
+    (let [shell-ns {'run run 'check check-fn 'builtins builtins-fn 'allowlist allowlist-fn}]
+      (sci/add-namespace! sci-ctx 'dvergr.shell shell-ns)
+      ;; `bash` is the name the prompt teaches (`(bash/run "git status")`);
+      ;; without this alias agents hit "Could not find namespace: bash" and
+      ;; burn turns hunting for the shell — register the same surface under it.
+      (sci/add-namespace! sci-ctx 'bash shell-ns))))
 
 (defn add-process-ns!
   "Expose the deliberable-process surface to SCI.
