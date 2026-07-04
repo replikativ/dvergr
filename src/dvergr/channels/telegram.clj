@@ -175,7 +175,24 @@
           (assoc :voice (let [v (or (:voice msg) (:audio msg))]
                           {:file-id   (:file_id v)
                            :duration  (:duration v)
-                           :mime-type (:mime_type v)})))))))
+                           :mime-type (:mime_type v)}))
+
+          ;; Documents (files sent as attachments): caps :store-file-fn
+          ;; persists them (e.g. into the room's drive).
+          (:document msg)
+          (assoc :document (let [d (:document msg)]
+                             {:file-id   (:file_id d)
+                              :file-name (:file_name d)
+                              :mime-type (:mime_type d)
+                              :size      (:file_size d)})
+                 :caption (:caption msg))
+
+          ;; Photos: telegram sends an array of sizes; take the largest.
+          (:photo msg)
+          (assoc :photo (let [p (last (:photo msg))]
+                          {:file-id (:file_id p)
+                           :size    (:file_size p)})
+                 :caption (:caption msg)))))))
 
 ;; ============================================================================
 ;; Long polling
@@ -562,7 +579,7 @@
    posted into the per-chat Room as the user-actor. `caps` as in
    `make-daemon-adapter`."
   [adapter msg {:keys [ctx send-fn ensure-room default-agent typing-fn daemon tool-exec?
-                       transcribe-fn token] :as _caps}]
+                       transcribe-fn store-file-fn token] :as _caps}]
   (binding [rtc/*execution-context* ctx]
     (let [chat-id   (:chat-id msg)
           ;; Voice notes: when the embedder provides :transcribe-fn (and the
@@ -574,7 +591,8 @@
                            (when-let [{:keys [bytes]} (get-file-bytes token file-id)]
                              (try (transcribe-fn {:bytes bytes
                                                   :mime mime-type
-                                                  :duration duration})
+                                                  :duration duration
+                                                  :chat-id (:chat-id msg)})
                                   (catch Exception e
                                     (tel/log! {:level :warn
                                                :id :telegram/transcription-failed
@@ -585,8 +603,33 @@
           ;; the embedder wants attached to the room message.
           voice-text (when-let [t (if (map? voice-result) (:text voice-result) voice-result)]
                        (str "🎤 " t))
-          attachment (when (map? voice-result) (:attachment voice-result))
-          text      (or (:text msg) voice-text)
+          ;; Documents/photos: caps :store-file-fn persists the bytes
+          ;; (embedder decides where — e.g. the room drive) and returns
+          ;; {:note s :attachment {...}} (note = where it landed, shown
+          ;; to the room + agents).
+          file-result (when (and store-file-fn (or (:document msg) (:photo msg)))
+                        (let [{:keys [file-id file-name mime-type size]}
+                              (or (:document msg)
+                                  (assoc (:photo msg)
+                                         :file-name nil :mime-type "image/jpeg"))]
+                          (when-let [{:keys [bytes]} (get-file-bytes token file-id)]
+                            (try (store-file-fn {:bytes bytes
+                                                 :file-name file-name
+                                                 :mime mime-type
+                                                 :size (or size (count bytes))
+                                                 :chat-id (:chat-id msg)
+                                                 :photo? (some? (:photo msg))})
+                                 (catch Exception e
+                                   (tel/log! {:level :warn
+                                              :id :telegram/store-file-failed
+                                              :data {:error (.getMessage e)}})
+                                   nil)))))
+          file-text (when file-result
+                      (str "📎 " (:note file-result)
+                           (when-let [c (:caption msg)] (str "\n" c))))
+          attachment (or (when (map? voice-result) (:attachment voice-result))
+                         (:attachment file-result))
+          text      (or (:text msg) voice-text file-text)
           user-info (:from msg)
           reply!    (fn [t] (send-fn chat-id t))
           working!  (fn [] (when typing-fn (try (typing-fn chat-id) (catch Throwable _ nil))))]
