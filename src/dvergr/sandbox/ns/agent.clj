@@ -234,6 +234,11 @@
                          ;;   {:agent-id :me :schedule {:every :day :at \"07:00\"}
                          ;;    :code \"(require 'intake.news)(intake.news/scan!)\"
                          ;;    :description \"morning news scan\"})
+                         ;; Cadence forms: {:every :day :at \"07:00\"} (daily at
+                         ;; a wall-clock time), {:every :hour :n 4} (every 4h —
+                         ;; :n multiplies :minute/:hour/:day/:week into a fixed
+                         ;; interval), {:every-ms N}, {:at \"ISO\" :once true}.
+                         ;; Unknown keys are REJECTED (no silent wrong cadence).
                          'create   (fn [cfg] (sched-create (room!) cfg))
                          'cancel   (fn [id] (sched-cancel (room!) id))
                          'list     (fn [] (sched-list (room!)))})))

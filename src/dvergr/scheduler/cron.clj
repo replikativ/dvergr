@@ -174,15 +174,61 @@
       (java.util.Date/from (next-fire-time (entity->spec e) from-inst))
       nil)))
 
+(def ^:private unit-ms
+  "Fixed-length units a `:n` multiplier can expand into an interval."
+  {:minute 60000 :hour 3600000 :day 86400000 :week 604800000})
+
+(def ^:private known-spec-keys
+  "Every key a creation spec may carry. Anything else is a typo/hallucination
+   and is REJECTED loudly rather than silently dropped — a silent drop is how
+   `{:every :hour :n 4}` (pre-`:n`) became an unintended hourly schedule."
+  #{:every :n :every-ms :interval-ms :at :on :on-day :once :tz})
+
+(defn normalize-spec
+  "Validate a creation spec and expand the `:n` multiplier. Throws ex-info with
+   a corrective message on unknown keys or an unsupported `:n` combination, so
+   agents get a real error instead of a wrong schedule.
+
+   `:n` (a positive integer with `:every :minute|:hour|:day|:week`) means
+   'every N of that unit' and expands to an interval — e.g. {:every :hour :n 4}
+   → {:every-ms 14400000}. Use `{:every :day :at \"HH:MM\"}` (no `:n`) for a
+   wall-clock daily time; `:n` is for fixed intervals, so `:n`+`:at` and
+   `:n`+`:month` (variable length) are rejected."
+  [spec]
+  (let [unknown (remove known-spec-keys (keys spec))]
+    (when (seq unknown)
+      (throw (ex-info (str "Unknown schedule spec key(s): " (vec unknown)
+                           ". Valid keys: " (vec (sort known-spec-keys)))
+                      {:unknown (vec unknown) :spec spec})))
+    (when (:n spec)
+      (cond
+        (not (:every spec))
+        (throw (ex-info ":n requires :every, e.g. {:every :hour :n 4}" {:spec spec}))
+        (not (contains? unit-ms (:every spec)))
+        (throw (ex-info (str ":n supports :every :minute|:hour|:day|:week only (got "
+                             (:every spec) "); for calendar cadence use :on/:on-day")
+                        {:spec spec}))
+        (:at spec)
+        (throw (ex-info (str ":n and :at are ambiguous — use {:every :hour :n 4} "
+                             "for a fixed interval, or {:every :day :at \"07:00\"} "
+                             "for a daily wall-clock time")
+                        {:spec spec}))))
+    (if-let [n (:n spec)]
+      (-> spec (dissoc :every :n) (assoc :every-ms (* (long n) (unit-ms (:every spec)))))
+      spec)))
+
 (defn spec->attrs
   "Map a creation spec (the structured args the SCI helpers / config use) to the
    transparent `:schedule/*` rule attributes PLUS the initial materialized
    `:schedule/next-fire`, relative to `from` (java.util.Date). Recognizes:
      {:interval-ms N} | {:every-ms N}        → :interval
+     {:every :hour :n 4}                     → :interval (N × unit)
      {:at \"ISO\" :once true}                  → :once
-     {:every :day :at \"HH:MM\" :on :mon …}    → :recurring"
+     {:every :day :at \"HH:MM\" :on :mon …}    → :recurring
+   Rejects unknown keys (see `normalize-spec`)."
   [spec ^java.util.Date from]
-  (let [from-inst (.toInstant from)]
+  (let [spec (normalize-spec spec)
+        from-inst (.toInstant from)]
     (cond
       (or (:interval-ms spec) (:every-ms spec))
       (let [ms (or (:interval-ms spec) (:every-ms spec))]
