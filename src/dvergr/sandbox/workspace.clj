@@ -87,6 +87,24 @@
           (resolve-source (if (str/blank? sub) (io/file root) (io/file root sub)) lib))
         source-subdirs))
 
+(defn workspace-guide
+  "The workspace's own `AGENTS.md` — its self-description and stdlib map
+   (the intake catalog, the copy-a-source pattern, the conventions),
+   read from the ctx-bound worktree root, path-clamped, or nil. Meant to
+   be spliced into the agent's system prompt so it always sees its
+   workspace's guidance — the AGENTS.md/CLAUDE.md convention. Kept small
+   by design (the file is the summary; INTAKES.md et al. are read on
+   demand). `max-chars` caps a runaway edit (default 8k)."
+  ([] (workspace-guide 8192))
+  ([max-chars]
+   (try
+     (let [root (workspace-root)
+           f (io/file root "AGENTS.md")]
+       (when (and (.isFile f) (under-root? root f))
+         (let [s (slurp f)]
+           (if (> (count s) max-chars) (subs s 0 max-chars) s))))
+     (catch Throwable _ nil))))
+
 (defn load-fn
   "An SCI `:load-fn`. SCI calls this for `(require …)`/`(load …)`; we return the
    source for `lib` from the current workspace (or nil → SCI throws not-found).
