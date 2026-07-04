@@ -513,13 +513,12 @@
                          (->result (run (str/join " " (map str args))))))]
     (sci/add-namespace! sci-ctx 'babashka.process
                         {'shell shell 'sh shell})
-    ;; muschel-specific introspection (not part of babashka.process)
-    (let [shell-ns {'run run 'check check-fn 'builtins builtins-fn 'allowlist allowlist-fn}]
-      (sci/add-namespace! sci-ctx 'dvergr.shell shell-ns)
-      ;; `bash` is the name the prompt teaches (`(bash/run "git status")`);
-      ;; without this alias agents hit "Could not find namespace: bash" and
-      ;; burn turns hunting for the shell — register the same surface under it.
-      (sci/add-namespace! sci-ctx 'bash shell-ns))))
+    ;; muschel-specific introspection (not part of babashka.process). The
+    ;; canonical shell surface for RUNNING commands is `babashka.process/shell`
+    ;; (its real name — what the stdlib + prompt primitives table teach);
+    ;; `dvergr.shell` adds the dvergr-only introspection (check/builtins/allowlist).
+    (sci/add-namespace! sci-ctx 'dvergr.shell
+                        {'run run 'check check-fn 'builtins builtins-fn 'allowlist allowlist-fn})))
 
 (defn add-process-ns!
   "Expose the deliberable-process surface to SCI.
