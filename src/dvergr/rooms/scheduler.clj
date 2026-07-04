@@ -54,14 +54,46 @@
           @conn now)
     (catch Throwable _ [])))
 
+(defn- run-code-task!
+  "Evaluate a :schedule/code form in the agent's working-ctx sandbox and
+   post the outcome to the room as :_activity (transcript, no agent
+   turn). Errors are caught and reported the same way; a fire never
+   throws out of the scheduler."
+  [room aid s]
+  (let [outcome
+        (try
+          (let [cctx ((requiring-resolve 'dvergr.agent.room-context/ensure-ctx!)
+                      room aid {})
+                sci-ctx (:sci-ctx cctx)
+                fut (future
+                      ((requiring-resolve 'sci.core/eval-string*)
+                       sci-ctx (:schedule/code s)))
+                r (deref fut (* 5 60 1000) ::timeout)]
+            (if (= r ::timeout)
+              (do (future-cancel fut) "⏱ code task TIMED OUT (5min)")
+              (let [out (pr-str r)]
+                (str "⏱ " (or (:schedule/description s) "code task") " → "
+                     (subs out 0 (min 500 (count out)))))))
+          (catch Throwable t
+            (str "⏱ " (or (:schedule/description s) "code task")
+                 " FAILED: " (ex-message t))))]
+    (disc/post! room (disc/message :scheduler :_activity outcome nil
+                                   {:role :assistant
+                                    :source :scheduler
+                                    :schedule-id (:schedule/id s)}))))
+
 (defn- fire-one!
-  "Post one schedule's task into the room (addressed to its agent), then advance
-   the row: bump last-run, recompute next-fire (or deactivate a fired :once)."
+  "Fire one schedule: a :schedule/code task evals in the agent's sandbox
+   (deterministic, no LLM); otherwise the task message posts to the
+   agent as a prompt turn. Then advance the row: bump last-run,
+   recompute next-fire (or deactivate a fired :once)."
   [room conn ^java.util.Date now s]
   (let [aid (:schedule/agent-id s)]
-    (disc/post! room (disc/message :scheduler aid (:schedule/task s) nil
-                                   {:source :scheduler
-                                    :schedule-id (:schedule/id s)}))
+    (if (:schedule/code s)
+      (run-code-task! room aid s)
+      (disc/post! room (disc/message :scheduler aid (:schedule/task s) nil
+                                     {:source :scheduler
+                                      :schedule-id (:schedule/id s)})))
     (let [next-fire (cron/compute-next-fire (assoc s :schedule/last-run now) now)]
       (dh/transact conn [(cond-> {:schedule/id (:schedule/id s)
                                   :schedule/last-run now}

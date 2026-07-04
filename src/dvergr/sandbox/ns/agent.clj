@@ -226,6 +226,15 @@
                         {'every    every-fn
                          'at       at-fn
                          'interval interval-fn
+                         ;; CODE schedules — the durable-pipeline primitive:
+                         ;; the form evals in YOUR sandbox on each fire
+                         ;; (deterministic, no LLM turn). Put the fns in a
+                         ;; namespace in your workspace repo, then e.g.
+                         ;; (dvergr.scheduler/create
+                         ;;   {:agent-id :me :schedule {:every :day :at \"07:00\"}
+                         ;;    :code \"(require 'intake.news)(intake.news/scan!)\"
+                         ;;    :description \"morning news scan\"})
+                         'create   (fn [cfg] (sched-create (room!) cfg))
                          'cancel   (fn [id] (sched-cancel (room!) id))
                          'list     (fn [] (sched-list (room!)))})))
 
