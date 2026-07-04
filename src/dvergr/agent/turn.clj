@@ -69,6 +69,7 @@
         ;; agent's own work). The daemon path wired these per-turn; now every
         ;; working ctx gets them at creation.
         (ns-io/add-bash-ns!    sci cctx)
+        (ns-io/add-media-ns!   sci cctx)
         (ns-io/add-process-ns! sci cctx))
       cctx)))
 

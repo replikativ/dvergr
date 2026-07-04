@@ -441,6 +441,43 @@
                          'head    (fn [url & [opts]] (do-request (merge {:url url :method :head} opts)))
                          'delete  (fn [url & [opts]] (do-request (merge {:url url :method :delete} opts)))})))
 
+
+(defn add-media-ns!
+  "Expose document + vision processing to SCI, bound to a chat-ctx:
+
+     (doc/extract-text \"/drive/telegram/report.pdf\")  ; pdf/text → string
+     (vision/describe \"/drive/telegram/photo.jpg\")    ; image → description/OCR
+     (vision/describe path {:prompt \"read the receipt total\"})
+
+   Paths resolve through the chat-ctx's muschel FS — the same
+   filesystem the shell sees, so worktree files AND mounted drives
+   (e.g. /drive) both work. Bytes never enter the SCI sandbox; only
+   extracted text comes back."
+  [sci-ctx chat-ctx]
+  (let [read-bytes (fn [path]
+                     (let [host ((requiring-resolve 'dvergr.intake.bash/get-or-create-host!)
+                                 chat-ctx)
+                           fs (:fs host)]
+                       (or ((requiring-resolve 'muschel.fs/read-bytes) fs path)
+                           (throw (ex-info (str "no such file: " path) {:path path})))))
+        guess-mime (fn [path]
+                     (let [p (str path)]
+                       (cond
+                         (re-find #"(?i)\.pdf$" p) "application/pdf"
+                         (re-find #"(?i)\.(jpe?g)$" p) "image/jpeg"
+                         (re-find #"(?i)\.png$" p) "image/png"
+                         (re-find #"(?i)\.webp$" p) "image/webp"
+                         (re-find #"(?i)\.(md|txt|csv|json|xml|edn|clj|cljs|cljc)$" p) "text/plain"
+                         :else "application/octet-stream")))
+        extract (fn [path]
+                  ((requiring-resolve 'dvergr.media.doc/extract-text)
+                   (read-bytes path) (guess-mime path)))
+        describe (fn [path & [opts]]
+                   ((requiring-resolve 'dvergr.media.vision/describe)
+                    (read-bytes path) (guess-mime path) opts))]
+    (sci/add-namespace! sci-ctx 'doc {'extract-text extract})
+    (sci/add-namespace! sci-ctx 'vision {'describe describe})))
+
 (defn add-bash-ns!
   "Expose intake.bash (muschel-backed shell) to SCI, bound to a chat-ctx.
 
