@@ -84,7 +84,10 @@
      :tool-id-continuation? (registry/get-quirk (:id model-def) :tool-id-in-every-chunk?)
      ;; Kimi-thinking models leak raw tool-call tokens into content on Fireworks;
      ;; clean them in extract-response (Kimi only — see quirks/strip-kimi-tool-tokens).
-     :kimi-tool-leak? (boolean (registry/get-quirk (:id model-def) :kimi-tool-id-format?))})
+     :kimi-tool-leak? (boolean (registry/get-quirk (:id model-def) :kimi-tool-id-format?))
+     ;; GLM models leak their <arg_key>/<arg_value> tool envelope into content on
+     ;; Fireworks; recover the call + scrub the text in extract-response (GLM only).
+     :glm-tool-leak? (boolean (registry/get-quirk (:id model-def) :glm-tool-format?))})
 
   (accumulate-event [_ state event-type event-data model-def]
     ;; OpenAI doesn't have explicit event types - process based on content
@@ -171,22 +174,37 @@
 
   (extract-response [_ state]
     (let [completed (:completed state)
-          text-content (cond-> (->> completed
-                                    (filter #(= :text (:type %)))
-                                    (map :content)
-                                    (apply str))
+          raw-content (->> completed
+                           (filter #(= :text (:type %)))
+                           (map :content)
+                           (apply str))
+          text-content (cond-> raw-content
                          ;; Kimi-only: strip raw tool-call tokens Fireworks leaked
                          ;; into content (see quirks/strip-kimi-tool-tokens).
-                         (:kimi-tool-leak? state) quirks/strip-kimi-tool-tokens)
-          tool-calls (->> completed
+                         (:kimi-tool-leak? state) quirks/strip-kimi-tool-tokens
+                         ;; GLM-only: scrub the leaked <arg_key>/<arg_value> envelope.
+                         (:glm-tool-leak? state) quirks/strip-glm-tool-tokens)
+          structured (->> completed
                           (filter #(= :tool_use (:type %)))
                           (mapv (fn [tc]
                                   {:id (:id tc)
                                    :name (:name tc)
-                                   :input (:input tc)})))]
+                                   :input (:input tc)})))
+          ;; GLM leak RECOVERY: when Fireworks dumped the tool call into content
+          ;; instead of tool_calls, parse it back into an executable call so the
+          ;; turn continues (rather than dying on a garbage message). Only when
+          ;; nothing structured came through, to avoid double-firing.
+          recovered (when (and (:glm-tool-leak? state) (empty? structured))
+                      (some->> (quirks/parse-glm-tool-calls raw-content)
+                               (map-indexed (fn [i c]
+                                              {:id (str "glm-recovered-" i)
+                                               :name (:name c)
+                                               :input (:input c)}))
+                               vec))
+          tool-calls (or (seq structured) (seq recovered))]
       {:content text-content
        :reasoning (:reasoning state)
-       :tool-calls (when (seq tool-calls) tool-calls)
+       :tool-calls (when tool-calls (vec tool-calls))
        :usage (:usage state)
        :stop-reason (:stop-reason state)
        :model (:model state)

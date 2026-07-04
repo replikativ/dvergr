@@ -40,6 +40,21 @@
             :default-top-p 0.95}}
 
   ;; ─── GLM ───────────────────────────────────────────────────────────────────
+  ;; GLM's native tool format is an <arg_key>/<arg_value> XML envelope; Fireworks
+  ;; intermittently leaks it into `content` with empty tool_calls (stranded Vár's
+  ;; intake run on 5.1). `:glm-tool-format?` turns on recovery+scrub in the
+  ;; openai adapter (dvergr.model.quirks). 5.2 runs the structured path more
+  ;; reliably but the leak is intermittent, so the defense stays on for both.
+
+  "accounts/fireworks/models/glm-5p2"
+  {:name "GLM 5.2"
+   :provider :fireworks
+   :api-type :openai-chat
+   :capabilities #{:tools :streaming}
+   :context 202752
+   :max-output 8192
+   :pricing {:input 1.40 :cache-read 0.26 :output 4.40}
+   :quirks {:glm-tool-format? true}}
 
   "accounts/fireworks/models/glm-5p1"
   {:name "GLM 5.1"
@@ -49,7 +64,7 @@
    :context 202752
    :max-output 8192
    :pricing {:input 1.40 :cache-read 0.20 :output 4.40}
-   :quirks {}}
+   :quirks {:glm-tool-format? true}}
 
   ;; ─── MiniMax (cheap, tool-capable — the default for primary + compaction) ──
 
@@ -123,7 +138,7 @@
  :aliases
  {"kimi"        "accounts/fireworks/models/kimi-k2p6"
   "kimi-k2p5"   "accounts/fireworks/models/kimi-k2p5"
-  "glm"         "accounts/fireworks/models/glm-5p1"
+  "glm"         "accounts/fireworks/models/glm-5p2"
   "minimax"     "accounts/fireworks/models/minimax-m2p7"
   "qwen"        "accounts/fireworks/models/qwen3p6-plus"
   "deepseek"    "accounts/fireworks/models/deepseek-v4-pro"

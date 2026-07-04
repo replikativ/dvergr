@@ -79,3 +79,73 @@
                       (fn [orig-id]
                         (get id-mapping orig-id orig-id)))))
           messages)))
+
+;; ============================================================================
+;; GLM tool-call leak (Fireworks)
+;; ============================================================================
+;; GLM (Z.ai) models were trained to emit tool calls in an XML-style envelope:
+;;   <tool_call>{name} <arg_key>{k}</arg_key> <arg_value>{v}</arg_value> … </tool_call>
+;; Fireworks' OpenAI-compatible endpoint is meant to parse that into structured
+;; `tool_calls`, but — exactly like the Kimi leak above — it intermittently
+;; fails and dumps the RAW envelope into the assistant `content` with an empty
+;; `tool_calls` array (often prefixed with a `Tool calls: ["name"]` echo). The
+;; tool then never executes and the turn dies on a garbage message (this is what
+;; stranded Vár's intake run). GLM 5.2 runs the structured path more reliably,
+;; but the leak is intermittent, so we keep this defense gated on the
+;; `:glm-tool-format?` quirk. Two operations:
+;;   parse-glm-tool-calls — RECOVER the call(s) into executable tool_use blocks
+;;   strip-glm-tool-tokens — SCRUB the leaked envelope from displayed content
+
+(def ^:private glm-arg-pair-re
+  ;; <arg_key>K</arg_key> … <arg_value>V</arg_value>  (V may span lines / hold code)
+  #"(?s)<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>")
+
+(defn- glm-arg->value
+  "GLM arg values are strings on the wire; coerce a JSON scalar (number/bool/
+   null/quoted-string) but leave anything else (code, prose) as the raw string."
+  [^String v]
+  (let [t (str/trim v)]
+    (if (re-matches #"-?\d+(\.\d+)?|true|false|null|\".*\"" t)
+      (try ((requiring-resolve 'jsonista.core/read-value) t) (catch Exception _ v))
+      v)))
+
+(defn parse-glm-tool-calls
+  "Extract tool call(s) leaked into `content` as GLM's <arg_key>/<arg_value>
+   envelope. Returns [{:name str :input {kw val}} …] or nil when the pattern
+   isn't present. Handles both the `<tool_call>NAME …</tool_call>` form and the
+   Fireworks `Tool calls: [\"NAME\"] <arg_key>…` echo form. A single leaked
+   block (our observed case) yields one call; the arg pairs between successive
+   names are attributed to the preceding name."
+  [content]
+  (when (and content (re-find #"<arg_key>" (str content)))
+    (let [s (str content)
+          ;; Names appear either as <tool_call>NAME or in a Tool calls: ["A" "B"] echo.
+          names (or (seq (map second (re-seq #"<tool_call>\s*([A-Za-z0-9_.-]+)" s)))
+                    (some->> (re-find #"Tool calls:\s*\[([^\]]*)\]" s)
+                             second
+                             (re-seq #"\"([^\"]+)\"")
+                             (map second)
+                             seq))
+          pairs (map (fn [[_ k v]] [(keyword (str/trim k)) (glm-arg->value v)])
+                     (re-seq glm-arg-pair-re s))]
+      (when (and (seq names) (seq pairs))
+        ;; Single-call is the common leak; when multiple names appear we give
+        ;; every parsed pair to the first (safe: our tools take one arg-map).
+        [{:name (str/trim (first names))
+          :input (into {} pairs)}]))))
+
+(defn strip-glm-tool-tokens
+  "Remove GLM's leaked tool-call envelope from assistant text `content` — the
+   `Tool calls: [...]` echo plus every `<tool_call>…`, `<arg_key>…</arg_key>`,
+   `<arg_value>…</arg_value>` span — leaving genuine prose intact. Apply ONLY
+   for GLM models (the `:glm-tool-format?` quirk). nil → nil."
+  [content]
+  (when content
+    (-> (str content)
+        (str/replace #"(?m)^[ \t]*Tool calls:[ \t]*\[[^\]\n]*\][ \t]*\d*" "")
+        (str/replace #"(?s)<tool_call>.*?</tool_call>" "")
+        (str/replace glm-arg-pair-re "")
+        ;; any stray unpaired tags
+        (str/replace #"(?s)</?(tool_call|arg_key|arg_value)>" "")
+        str/trim
+        (as-> c (when (seq c) c)))))
