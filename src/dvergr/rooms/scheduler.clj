@@ -20,6 +20,7 @@
    keeps tracking but no-ops via its `:running?` flag (cleared on unregister).
    A negligible lingering no-op per deleted/discarded room until restart."
   (:require [datahike.api :as dh]
+            [sci.ctx-store :as sci-ctx-store]
             [dvergr.discourse :as disc]
             [dvergr.runtime.clock :as clock]
             [dvergr.runtime.ctx :as rctx]
@@ -65,15 +66,23 @@
           (let [cctx ((requiring-resolve 'dvergr.agent.room-context/ensure-ctx!)
                       room aid {})
                 sci-ctx (:sci-ctx cctx)
+                ;; The eval runs in a future (timeout fence). It needs BOTH
+                ;; contexts bound in that thread: spindel's *execution-context*
+                ;; (conveyed from fire-one!'s binding, so kb/*room* datahike
+                ;; systems resolve) AND SCI's ctx-store (so injected fns that
+                ;; re-enter the interpreter find it). eval-string* sets the SCI
+                ;; store only during eval, so a LAZY value in the result would
+                ;; trip get-ctx when realized later — pr-str INSIDE the store
+                ;; binding forces realization while it's still set.
                 fut (future
-                      ((requiring-resolve 'sci.core/eval-string*)
-                       sci-ctx (:schedule/code s)))
+                      (sci-ctx-store/with-ctx sci-ctx
+                        (pr-str ((requiring-resolve 'sci.core/eval-string*)
+                                 sci-ctx (:schedule/code s)))))
                 r (deref fut (* 5 60 1000) ::timeout)]
             (if (= r ::timeout)
               (do (future-cancel fut) "⏱ code task TIMED OUT (5min)")
-              (let [out (pr-str r)]
-                (str "⏱ " (or (:schedule/description s) "code task") " → "
-                     (subs out 0 (min 500 (count out)))))))
+              (str "⏱ " (or (:schedule/description s) "code task") " → "
+                   (subs r 0 (min 500 (count r))))))
           (catch Throwable t
             (str "⏱ " (or (:schedule/description s) "code task")
                  " FAILED: " (ex-message t))))]
