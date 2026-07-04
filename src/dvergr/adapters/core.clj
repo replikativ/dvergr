@@ -192,7 +192,7 @@
       routed agent — the agent's reply will route back through the egress.
 
    Returns the actor-id, or nil if the event was empty/unroutable."
-  [adapter {:keys [chat-id user text]}]
+  [adapter {:keys [chat-id user text attachment]}]
   (when (and chat-id (string? text) (not (str/blank? text)))
     (let [actor-id (when-let [f (:ensure-actor adapter)] (f user))
           actor-id (or actor-id :external)
@@ -213,7 +213,8 @@
         ;; :assistant). Agent replies carry no role metadata and store :assistant.
         (let [m (d/message actor-id
                            (or (:default-agent adapter) (d/room-target room))
-                           text nil {:role :user})]
+                           text nil (cond-> {:role :user}
+                                      attachment (assoc :attachment attachment)))]
           ;; Record so the mirror skips the venue's own inbound (no self-echo).
           (swap! (:injected adapter) conj (:id m))
           (d/post! room m)))

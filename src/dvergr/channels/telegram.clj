@@ -569,22 +569,34 @@
           ;; caps carry the bot :token for the file download), turn the audio
           ;; into text and proceed exactly like a typed message — agents and
           ;; mirrors see the transcript with a 🎤 marker.
-          text      (or (:text msg)
-                        (when-let [{:keys [file-id mime-type duration]} (:voice msg)]
-                          (when (and transcribe-fn token)
-                            (when-let [{:keys [bytes]} (get-file-bytes token file-id)]
-                              (when-let [t (try (transcribe-fn {:bytes bytes
-                                                                :mime mime-type
-                                                                :duration duration})
-                                                (catch Exception e
-                                                  (tel/log! {:level :warn
-                                                             :id :telegram/transcription-failed
-                                                             :data {:error (.getMessage e)}})
-                                                  nil))]
-                                (str "🎤 " t))))))
+          voice-result (when-let [{:keys [file-id mime-type duration]} (:voice msg)]
+                         (when (and transcribe-fn token)
+                           (when-let [{:keys [bytes]} (get-file-bytes token file-id)]
+                             (try (transcribe-fn {:bytes bytes
+                                                  :mime mime-type
+                                                  :duration duration})
+                                  (catch Exception e
+                                    (tel/log! {:level :warn
+                                               :id :telegram/transcription-failed
+                                               :data {:error (.getMessage e)}})
+                                    nil)))))
+          ;; transcribe-fn returns a transcript string, or a map
+          ;; {:text s :attachment {...}} carrying e.g. a stored-audio ref
+          ;; the embedder wants attached to the room message.
+          voice-text (when-let [t (if (map? voice-result) (:text voice-result) voice-result)]
+                       (str "🎤 " t))
+          attachment (when (map? voice-result) (:attachment voice-result))
+          text      (or (:text msg) voice-text)
           user-info (:from msg)
           reply!    (fn [t] (send-fn chat-id t))
           working!  (fn [] (when typing-fn (try (typing-fn chat-id) (catch Throwable _ nil))))]
+      ;; Echo the transcript back to the venue: unlike a typed message
+      ;; (which the sender already sees), the transcript is NEW info —
+      ;; confirmation of what the system heard. The room-side copy is
+      ;; suppressed by injected-message echo suppression, so send
+      ;; explicitly.
+      (when (and (:voice msg) text send-fn)
+        (try (reply! text) (catch Throwable _ nil)))
       (when (and chat-id text (not (str/blank? text)))
         (if-not (allowlist/allowed? user-info)
           (do (tel/log! {:level :warn :id :telegram/unauthorized
@@ -646,4 +658,5 @@
               :else
               (do (working!)
                   (adapters/inbound! adapter
-                                     {:chat-id chat-id :user user-info :text text})))))))))
+                                     (cond-> {:chat-id chat-id :user user-info :text text}
+                                       attachment (assoc :attachment attachment)))))))))))
