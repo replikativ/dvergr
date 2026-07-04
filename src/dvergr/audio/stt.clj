@@ -117,8 +117,10 @@
   [{:keys [bytes mime]}]
   (try
     (let [ext (cond (and mime (.contains ^String mime "ogg")) "ogg"
+                    (and mime (.contains ^String mime "webm")) "webm"
                     (and mime (.contains ^String mime "mp4")) "m4a"
                     (and mime (.contains ^String mime "mpeg")) "mp3"
+                    (and mime (.contains ^String mime "wav")) "wav"
                     :else "ogg")
           text (some #(try-backend % bytes mime ext) backends)]
       (if text
