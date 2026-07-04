@@ -30,7 +30,16 @@
        "- For multi-step tasks, call the tools for each step in sequence; don't "
        "stop after one step to describe the rest.\n"
        "- You already have the results of tools you called earlier in this "
-       "conversation — reuse them; do not re-fetch the same thing."))
+       "conversation — reuse them; do not re-fetch the same thing.\n\n"
+       "## Friction is signal\n\n"
+       "You are never capped — you know best how to get work done. In return, "
+       "when the harness fights you (a missing tool, an operation you can only "
+       "do through awkward workarounds, an error message that hides what you "
+       "need), do the work as best you can AND report the limitation: name it "
+       "explicitly in your reply, and if you have a knowledge base, add one "
+       "line to a [[Harness Limitations]] page (what was missing; what the "
+       "workaround cost you). Silent grinding hides exactly the information "
+       "your operators need to improve your tools."))
 
 (defn now-note
   "A per-turn system note stating TODAY'S DATE, so the model anchors 'today',
