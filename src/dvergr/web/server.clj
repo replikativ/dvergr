@@ -218,7 +218,7 @@
                               (:execution-ctx daemon) slug)))
 
       ;; Room page
-        (re-matches #"/rooms/(?!.+/post$).+" uri)
+        (re-matches #"/rooms/(?!.+/(?:post|voice)$).+" uri)
         (let [slug (subs uri (count "/rooms/"))]
           (html-response 200 (web-dashboard/room-page (:execution-ctx daemon) slug)))
 
