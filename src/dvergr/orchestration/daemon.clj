@@ -43,8 +43,8 @@
             [dvergr.system.rooms :as srooms]
             [dvergr.system.db :as sdb]
             [dvergr.system.mail :as mail]
-            [dvergr.drive.core :as drive]
             [dvergr.drive.blobs :as blobs]
+            [dvergr.drive.integration :as drive-integration]
             [dvergr.rooms.subsystems :as subsystems]
             [dvergr.runtime.clock :as clock]
             [dvergr.substrate.git :as git]
@@ -591,19 +591,14 @@
                         {:text t :attachment {:blob-id (:blob/id blob)
                                               :mime (or mime "audio/ogg")}})))
    ;; Documents / photos: land them in the room's drive under /drive/telegram/ so
-   ;; agents read them with plain ls/cat + the media fns. Returns {:note :attachment}.
-   :store-file-fn (fn [{:keys [bytes file-name mime chat-id photo?]}]
+   ;; agents read them with plain ls/cat + the media fns. Only resolving the
+   ;; chat's Room is Telegram-specific; storage is the shared drive-integration
+   ;; helper (web uploads, other channels use the same).
+   :store-file-fn (fn [{:keys [chat-id photo?] :as upload}]
                     (when-let [room (ensure-dm-room! daemon chat-id default-agent-id)]
-                      (when-let [rid (some-> (sdb/room-by-slug (:slug room)) :room/id)]
-                        (binding [rtc/*execution-context* (:ctx room)]
-                          (let [name (or file-name
-                                         (str (if photo? "photo-" "file-")
-                                              (subs (blobs/sha256-hex bytes) 0 8)))
-                                node (drive/store-in-room!
-                                      rid ["telegram"] name bytes
-                                      :mime mime :source (if photo? :photo :telegram))]
-                            {:note (str "/drive/telegram/" (:fs.node/name node))
-                             :attachment {:node-id (str (:fs.node/id node)) :mime mime}})))))
+                      (drive-integration/store-upload!
+                       room "telegram"
+                       (assoc upload :source (if photo? :photo :telegram)))))
    ;; Label each outbound message with its sender — through one bot every
    ;; actor's reply looks the same. Actor display name (:actor/name) if set,
    ;; else the id.

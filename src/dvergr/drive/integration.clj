@@ -7,7 +7,27 @@
             [dvergr.drive.fs :as dfs]
             [dvergr.drive.blobs :as blobs]
             [dvergr.intake.bash :as bash]
+            [dvergr.system.db :as sdb]
+            [org.replikativ.spindel.engine.core :as ec]
             [taoensso.telemere :as tel]))
+
+(defn store-upload!
+  "Store an uploaded file into `room`'s drive under `subdir`, returning
+   {:note \"/drive/<subdir>/<name>\" :attachment {:node-id … :mime …}} (the shape
+   channel handlers expect), or nil. Channel-agnostic — Telegram, the web upload
+   route, mail, etc. all call this; only resolving the target Room is
+   channel-specific. `room` is a discourse Room. Binds the room's ctx."
+  [room subdir {:keys [bytes file-name mime photo? source]}]
+  (when (and room (seq bytes))
+    (when-let [rid (some-> (sdb/room-by-slug (:slug room)) :room/id)]
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [name (or file-name
+                       (str (if photo? "photo-" "file-") (subs (blobs/sha256-hex bytes) 0 8)))
+              node (drive/store-in-room! rid [subdir] name bytes
+                                         :mime mime
+                                         :source (or source (if photo? :photo :upload)))]
+          {:note (str "/drive/" subdir "/" (:fs.node/name node))
+           :attachment {:node-id (str (:fs.node/id node)) :mime mime}})))))
 
 (defn install-mounts!
   "Install the bash mounts-fn so every room's shell sees its drive at /drive
