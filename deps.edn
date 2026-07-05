@@ -33,7 +33,7 @@
         ;; version. The `:local` alias's `../spindel` override carries it too.
 
         ;; Spindel — Reactive runtime with CoW forking
-        org.replikativ/spindel     {:mvn/version "0.1.28"}
+        org.replikativ/spindel     {:mvn/version "0.1.29"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context
