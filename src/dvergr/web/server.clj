@@ -227,31 +227,32 @@
       ;; posted as a 🎤-prefixed user message, same addressing as /post.
         (re-matches #"/rooms/.+/voice" uri)
         (let [slug (subs uri (count "/rooms/") (- (count uri) (count "/voice")))
-              bytes (.readAllBytes ^java.io.InputStream (:body req))
-              mime (get-in req [:headers "content-type"] "audio/webm")
-              text ((requiring-resolve 'dvergr.audio.stt/transcribe)
-                    {:bytes bytes :mime mime})]
-          (require 'dvergr.discourse 'dvergr.room.registry 'dvergr.room.store)
-          (let [post!   (requiring-resolve 'dvergr.discourse/post!)
-                message (requiring-resolve 'dvergr.discourse/message)
-                room    ((requiring-resolve 'dvergr.room.registry/lookup)
-                         ((requiring-resolve 'dvergr.room.store/slug->room-id) slug))
-                target  (when room
-                          ((requiring-resolve 'dvergr.discourse/room-target) room))]
-            (cond
-              (not room)
-              {:status 404 :headers {"Content-Type" "application/json"}
-               :body "{\"error\":\"room not found\"}"}
+              room ((requiring-resolve 'dvergr.room.registry/lookup)
+                    ((requiring-resolve 'dvergr.room.store/slug->room-id) slug))]
+          (cond
+            ;; Bodyless hit (browser GET, prefetch, crawler — the room-page
+            ;; regex excludes /voice so those land here): not a voice upload.
+            (or (not= :post (:request-method req)) (nil? (:body req)))
+            (json-response 405 {:error "POST raw audio bytes"})
 
-              (nil? text)
-              {:status 422 :headers {"Content-Type" "application/json"}
-               :body "{\"error\":\"no speech recognized\"}"}
+            ;; Resolve the room BEFORE transcribing — no paid STT call for
+            ;; a nonexistent slug.
+            (not room)
+            (json-response 404 {:error "room not found"})
 
-              :else
-              (do (post! room (message :web target (str "🎤 " text) nil
+            :else
+            (let [bytes (.readAllBytes ^java.io.InputStream (:body req))
+                  mime (get-in req [:headers "content-type"] "audio/webm")
+                  text ((requiring-resolve 'dvergr.audio.stt/transcribe)
+                        {:bytes bytes :mime mime})]
+              (if (nil? text)
+                (json-response 422 {:error "no speech recognized"})
+                (let [post!   (requiring-resolve 'dvergr.discourse/post!)
+                      message (requiring-resolve 'dvergr.discourse/message)
+                      target  ((requiring-resolve 'dvergr.discourse/room-target) room)]
+                  (post! room (message :web target (str "🎤 " text) nil
                                        {:role :user :source-user "web"}))
-                  {:status 200 :headers {"Content-Type" "application/json"}
-                   :body (str "{\"text\":" (pr-str text) "}")}))))
+                  (json-response 200 {:text text}))))))
 
       ;; Send a message to a room
         (re-matches #"/rooms/.+/post" uri)
