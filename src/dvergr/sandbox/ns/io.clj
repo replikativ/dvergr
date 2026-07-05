@@ -236,12 +236,17 @@
         ;; location — and get paths they can pass straight back to fs/slurp
         ;; (which re-resolve via sr). The workspace root itself → ".".
         base-str       (.getCanonicalPath base-canonical)
+        ;; Anything resolving OUTSIDE the workspace (fs/parent of the root,
+        ;; a symlink whose target escapes base) → nil, NEVER the raw host
+        ;; path — leaking `.dvergr/systems/<uuid>/…` is the bug this guards,
+        ;; and such a path can't be fed back through `sr` anyway. Callers
+        ;; drop nils (listings) or propagate them (parent of root → nil).
         rel            (fn [p] (let [pc (.getCanonicalPath (java.io.File. (str p)))]
                                  (cond
                                    (= pc base-str) "."
                                    (.startsWith pc (str base-str java.io.File/separator))
                                    (subs pc (inc (count base-str)))
-                                   :else pc)))
+                                   :else nil)))
         bb-parent      (r 'parent)
         bb-create-dirs (r 'create-dirs)
         mkdir          (fn [p] (let [f (sr p)] (audit! audit-log :fs/mkdir {:path (str f)}) (bb-create-dirs f) (rel f)))
@@ -255,8 +260,8 @@
     ;; is `slurp`/`spit` (below), as in real Clojure — NOT an fs fn.
     (sci/add-namespace! sci-ctx 'babashka.fs
                         {'list-dir           (fn [d & more] (audit! audit-log :fs/ls {:path (str (sr d))})
-                                               (mapv rel (apply (r 'list-dir) (sr d) more)))
-                         'glob               (fn [d pat & more] (mapv rel (apply (r 'glob) (sr d) pat more)))
+                                               (into [] (keep rel) (apply (r 'list-dir) (sr d) more)))
+                         'glob               (fn [d pat & more] (into [] (keep rel) (apply (r 'glob) (sr d) pat more)))
                          'exists?            (pred (r 'exists?))
                          'directory?         (pred (r 'directory?))
                          'regular-file?      (pred (r 'regular-file?))
