@@ -831,6 +831,8 @@
                                                   "🎤 recording — ^R to stop")
                          :transcribing (s/render (s/style :fg (s/ansi256 245))
                                                   "🎤 transcribing…")
+                         :failed       (s/render (s/style :fg (s/ansi256 209))
+                                                  (str "🎤 " (:msg r)))
                          nil))
         ;; `/`-popup: while the user types a command name, show the matching
         ;; commands (whole registry) above the input, selected one highlighted.
@@ -1384,22 +1386,32 @@
         ;; transcript through room-post!, exactly like typed input.
         (= key "ctrl+r")
         (when-let [rsig (:recording signals)]
-          (if-let [{:keys [handle]} @rsig]
-            ;; Recording → stop + transcribe + post.
-            (let [room (rreg/lookup @(:current-room signals))]
-              (reset! rsig {:state :transcribing})
-              (future
-                (let [bytes (rec/stop! handle)
-                      text  (when bytes (stt/transcribe {:bytes bytes :mime "audio/wav"}))]
-                  (when (and text room)
-                    (binding [ec/*execution-context* (:execution-ctx daemon)]
-                      (room-post! signals room (str "🎤 " text))))
-                  (reset! rsig nil))))
-            ;; Idle → start recording (only in a room; needs a recorder).
-            (when @(:current-room signals)
-              (if-let [handle (rec/start!)]
-                (reset! rsig {:handle handle :state :recording})
-                (reset! rsig nil)))))
+          (letfn [(flash! [msg]
+                    ;; Surface a transient failure, then self-clear — but only
+                    ;; if still showing it (don't wipe a new recording the user
+                    ;; may have started in the meantime).
+                    (reset! rsig {:state :failed :msg msg})
+                    (future (Thread/sleep 2500)
+                            (swap! rsig #(if (= :failed (:state %)) nil %))))]
+            (if-let [{:keys [handle]} @rsig]
+              ;; Recording → stop + transcribe + post.
+              (let [room (rreg/lookup @(:current-room signals))]
+                (reset! rsig {:state :transcribing})
+                (future
+                  (let [bytes (rec/stop! handle)
+                        text  (when bytes (stt/transcribe {:bytes bytes :mime "audio/wav"}))]
+                    (cond
+                      (and text room)
+                      (do (binding [ec/*execution-context* (:execution-ctx daemon)]
+                            (room-post! signals room (str "🎤 " text)))
+                          (reset! rsig nil))
+                      :else
+                      (flash! "no speech captured — check mic")))))
+              ;; Idle → start recording (only in a room; needs a recorder).
+              (when @(:current-room signals)
+                (if-let [handle (rec/start!)]
+                  (reset! rsig {:handle handle :state :recording})
+                  (flash! "no recorder (need pw-record or arecord)"))))))
 
         (= key "enter")
         (let [text (str/trim (ti/value @(:input signals)))]
