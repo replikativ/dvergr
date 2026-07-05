@@ -27,6 +27,7 @@
    `(c/spawn …)` covers the embed-one-agent-as-a-value case (no pre-existing
    daemon needed — `start!` boots a lite one)."
   (:require [clojure.java.shell]
+            [dvergr.audio.record :as rec]
             [dvergr.actors :as actors]
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.discourse :as d]
@@ -171,28 +172,19 @@
    Recording uses pw-record (PipeWire) or arecord (ALSA), whichever
    exists. Usage: (c/voice! room)"
   [room & {:keys [from] :or {from :repl}}]
-  (let [tmp (java.io.File/createTempFile "voice" ".wav")
-        recorder (cond
-                   (zero? (:exit (clojure.java.shell/sh "which" "pw-record")))
-                   ["pw-record" "--rate" "16000" "--channels" "1" (.getAbsolutePath tmp)]
-                   (zero? (:exit (clojure.java.shell/sh "which" "arecord")))
-                   ["arecord" "-q" "-f" "S16_LE" "-r" "16000" "-c" "1" (.getAbsolutePath tmp)]
-                   :else nil)]
-    (if-not recorder
-      (println "voice!: no recorder found (need pw-record or arecord)")
-      (let [proc (.start (ProcessBuilder. ^java.util.List recorder))]
-        (println "🎤 recording — press Enter to stop…")
-        (read-line)
-        (.destroy proc)
-        (.waitFor proc 2 java.util.concurrent.TimeUnit/SECONDS)
-        (let [bytes (java.nio.file.Files/readAllBytes (.toPath tmp))
-              text ((requiring-resolve 'dvergr.audio.stt/transcribe)
-                    {:bytes bytes :mime "audio/wav"})]
-          (.delete tmp)
-          (if text
-            (do (println (str "→ 🎤 " text))
-                (post! room from (in-room room (d/room-target room)) (str "🎤 " text)))
-            (do (println "voice!: no speech recognized") nil)))))))
+  (if-let [handle (rec/start!)]
+    (do
+      (println "🎤 recording — press Enter to stop…")
+      (read-line)
+      (let [bytes (rec/stop! handle)
+            text  (when bytes
+                    ((requiring-resolve 'dvergr.audio.stt/transcribe)
+                     {:bytes bytes :mime "audio/wav"}))]
+        (if text
+          (do (println (str "→ 🎤 " text))
+              (post! room from (in-room room (d/room-target room)) (str "🎤 " text)))
+          (do (println "voice!: no speech recognized") nil))))
+    (println "voice!: no recorder found (need pw-record or arecord)")))
 
 ;; ============================================================================
 ;; Reads / control (all take a Room)

@@ -32,6 +32,8 @@
             [org.replikativ.spindel.spin.cps :refer [spin]]
             [org.replikativ.spindel.effects.track :refer [track]]
             [org.replikativ.spindel.incremental.interval :as iv]
+            [dvergr.audio.record :as rec]
+            [dvergr.audio.stt :as stt]
             [dvergr.discourse :as d]
             [dvergr.discourse.commands :as commands]
             [dvergr.sandbox :as sandbox]
@@ -821,6 +823,15 @@
         thinking?    (when-let [st (:status signals)] (= :running @st))
         spinner-line (when (and thinking? (:spinner signals))
                        (spinner/view @(:spinner signals)))
+        ;; Voice capture status (^R) — shown above the input while recording
+        ;; or transcribing, so the user sees the mic is live.
+        rec-line     (when-let [r (some-> (:recording signals) deref)]
+                       (case (:state r)
+                         :recording    (s/render (s/style :fg (s/ansi256 203))
+                                                  "🎤 recording — ^R to stop")
+                         :transcribing (s/render (s/style :fg (s/ansi256 245))
+                                                  "🎤 transcribing…")
+                         nil))
         ;; `/`-popup: while the user types a command name, show the matching
         ;; commands (whole registry) above the input, selected one highlighted.
         menu        (command-menu (ti/value @(:input signals)))
@@ -848,14 +859,15 @@
      (repeat empty-count (box-line "" inner-w))
      (or menu-lines [])
      [(separator-line width)
-      (box-line (or spinner-line
+      (box-line (or rec-line
+                    spinner-line
                     (when menu "  ↑/↓ select · Tab complete · /help for all")
                     "") inner-w)
       (box-line input-line inner-w)
       (separator-line width)
       (pad-line (str "│ " (s/render (s/style :fg (s/ansi256 240))
-                                    "Enter:send  Esc:back  ↑/↓:scroll  ^T:trace  ^E:ctx  ^O:mouse  ^C:quit")
-                     (apply str (repeat (max 0 (- inner-w 70)) " ")) " │")
+                                    "Enter:send  Esc:back  ↑/↓:scroll  ^R:voice  ^T:trace  ^E:ctx  ^O:mouse  ^C:quit")
+                     (apply str (repeat (max 0 (- inner-w 80)) " ")) " │")
                 width)
       (footer-line width)])))
 
@@ -1366,6 +1378,29 @@
         (= key "ctrl+e")
         (when (:ctx-expanded? signals) (swap! (:ctx-expanded? signals) not))
 
+        ;; Ctrl+R — voice input. First press starts mic capture; second press
+        ;; stops, transcribes (off the UI thread via dvergr.audio.stt — the
+        ;; same STT path the web mic + REPL voice! use), and posts the 🎤
+        ;; transcript through room-post!, exactly like typed input.
+        (= key "ctrl+r")
+        (when-let [rsig (:recording signals)]
+          (if-let [{:keys [handle]} @rsig]
+            ;; Recording → stop + transcribe + post.
+            (let [room (rreg/lookup @(:current-room signals))]
+              (reset! rsig {:state :transcribing})
+              (future
+                (let [bytes (rec/stop! handle)
+                      text  (when bytes (stt/transcribe {:bytes bytes :mime "audio/wav"}))]
+                  (when (and text room)
+                    (binding [ec/*execution-context* (:execution-ctx daemon)]
+                      (room-post! signals room (str "🎤 " text))))
+                  (reset! rsig nil))))
+            ;; Idle → start recording (only in a room; needs a recorder).
+            (when @(:current-room signals)
+              (if-let [handle (rec/start!)]
+                (reset! rsig {:handle handle :state :recording})
+                (reset! rsig nil)))))
+
         (= key "enter")
         (let [text (str/trim (ti/value @(:input signals)))]
           (when (seq text)
@@ -1565,6 +1600,7 @@
                     :config-confirm   nil
                     :input          (ti/text-input-state :prompt "" :placeholder "Message agent...")
                     :scroll         0
+                    :recording      nil
                     :status         :idle
                     :spinner        (spinner/spinner-state :dots :label "Thinking...")}
           :render (fn [signals width height]
