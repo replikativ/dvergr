@@ -9,10 +9,10 @@
    - :openai     whisper-1 with a REAL key (fw_-prefixed LLM-compat
                  keys are skipped)
    - :native     in-process Moonshine v2 (pretrained-rstr on raster, no
-                 python) when on the classpath + DVERGR_ASR_MODEL_DIR
-                 (or SIMMIS_ASR_MODEL_DIR) set. NOTE: Moonshine is
-                 streaming-native (stream-init/stream-push!) — the
-                 designated engine for live transcription later.
+                 python) when on the classpath + DVERGR_ASR_MODEL_DIR set.
+                 NOTE: Moonshine is streaming-native (stream-init/
+                 stream-push!) — the designated engine for live
+                 transcription later.
    - :local      python faster-whisper via scripts/transcribe.py
                  (cwd-relative; DVERGR_WHISPER_SCRIPT overrides)
 
@@ -27,8 +27,7 @@
 (defonce ^:private native-model (atom nil))
 
 (defn- transcribe-native [^bytes bytes ext]
-  (when-let [model-dir (or (System/getenv "DVERGR_ASR_MODEL_DIR")
-                           (System/getenv "SIMMIS_ASR_MODEL_DIR"))]
+  (when-let [model-dir (System/getenv "DVERGR_ASR_MODEL_DIR")]
     (when-let [transcribe-fn (try (requiring-resolve 'pretrained.asr.moonshine/transcribe)
                                   (catch Throwable _ nil))]
       (let [tmp (java.io.File/createTempFile "voice" (str "." ext))]
@@ -55,7 +54,6 @@
                                     "python3" script
                                     (.getAbsolutePath tmp)
                                     (or (System/getenv "DVERGR_WHISPER_MODEL")
-                                        (System/getenv "SIMMIS_WHISPER_MODEL")
                                         "base"))]
         (if (zero? exit)
           (let [t (str/trim out)] (when (seq t) t))
