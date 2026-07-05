@@ -1405,8 +1405,10 @@
                       (do (binding [ec/*execution-context* (:execution-ctx daemon)]
                             (room-post! signals room (str "🎤 " text)))
                           (reset! rsig nil))
-                      :else
-                      (flash! "no speech captured — check mic")))))
+                      ;; Empty capture (bad mic / device) vs captured-but-silent
+                      ;; — distinct hints so the user knows which to chase.
+                      (nil? bytes) (flash! "no audio captured — check mic / DVERGR_RECORD_CMD")
+                      :else        (flash! "no speech recognized")))))
               ;; Idle → start recording (only in a room; needs a recorder).
               (when @(:current-room signals)
                 (if-let [handle (rec/start!)]

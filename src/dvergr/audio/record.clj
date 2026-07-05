@@ -29,7 +29,19 @@
 
 ;; ── Backend 1: configurable shell command ────────────────────────────────
 
-(defn- record-cmd [] (some-> (System/getenv "DVERGR_RECORD_CMD") str/trim not-empty))
+(defonce ^{:doc "Runtime override for the record command (see set-record-cmd!).
+  Takes precedence over DVERGR_RECORD_CMD — set it from the REPL to configure
+  capture without an env var / restart."}
+  cmd-override (atom nil))
+
+(defn set-record-cmd!
+  "Set (or clear, with nil) the record command at runtime. `%s` in `cmd` is
+   replaced with the output WAV path. Overrides DVERGR_RECORD_CMD."
+  [cmd]
+  (reset! cmd-override (some-> cmd str/trim not-empty)))
+
+(defn- record-cmd []
+  (or @cmd-override (some-> (System/getenv "DVERGR_RECORD_CMD") str/trim not-empty)))
 
 (defn- start-cmd! [cmd]
   (let [tmp (java.io.File/createTempFile "voice" ".wav")
