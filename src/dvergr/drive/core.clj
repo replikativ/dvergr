@@ -50,12 +50,23 @@
   [room-id]
   (srooms/room-db-conn room-id drive-db-name))
 
+(defonce ^{:doc "Host-pluggable room-id → drive tree conn resolver. Hosts with
+  their own drive topology (e.g. simmis: named drives in a registry, attached
+  to rooms via grants) install a resolver via `set-conn-resolver!` /
+  `integration/install! :drive-conn-fn`; nil (default) uses the room-owned
+  drive DB below. The resolver returns a datahike conn (schema: fs-node-schema)
+  or nil to fall through."}
+  conn-resolver (atom nil))
+
+(defn set-conn-resolver! [f] (reset! conn-resolver f))
+
 (defn ensure-room-drive!
-  "The room's drive tree conn, provisioning it on first need as a room-owned
-   datahike system (forks/merges with the room; grant persisted). Requires the
-   room's ctx bound (the caller runs in it)."
+  "The room's drive tree conn: the host resolver when installed, else the
+   room-owned datahike system (forks/merges with the room; grant persisted),
+   provisioned on first need. Requires the room's ctx bound."
   [room-id & {:keys [owner-id]}]
-  (or (room-drive-conn room-id)
+  (or (when-let [f @conn-resolver] (f room-id))
+      (room-drive-conn room-id)
       (srooms/create-room-db! room-id drive-db-name
                               :schema fs-node-schema :owner-id owner-id)))
 
@@ -129,6 +140,25 @@
     (d/transact conn [node])
     (log/log! {:level :info :id ::file-put
                :data {:name name :size (count bytes) :blob (:blob/id blob)}})
+    node))
+
+(defn link-blob!
+  "Upsert a file node pointing at an EXISTING CAS blob — the browser upload
+   path: bytes go to the blob store first, then the node transact references
+   the hash (no double transfer)."
+  [conn parent-id name blob-id mime size source]
+  (let [existing (child-by-name @conn parent-id name)
+        id (or (:fs.node/id existing) (random-uuid))
+        node (cond-> {:fs.node/id id
+                      :fs.node/name name
+                      :fs.node/kind :file
+                      :fs.node/blob (str blob-id)
+                      :fs.node/mime (or mime "application/octet-stream")
+                      :fs.node/size (long size)
+                      :fs.node/mtime (java.util.Date.)
+                      :fs.node/source (or source :upload)}
+               parent-id (assoc :fs.node/parent [:fs.node/id parent-id]))]
+    (d/transact conn [node])
     node))
 
 (defn stat
