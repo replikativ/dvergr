@@ -45,8 +45,19 @@
       (kstore/connect-store config opts)
       (kstore/create-store config opts))))
 
-(defonce ^:private store
-  (delay (connect-or-create! (resolve-config))))
+;; Config-keyed store cache (NOT a one-shot delay): a host calling
+;; set-store-config! after something already touched the store (boot
+;; ordering, another subsystem) must still get the reconfigured store —
+;; the cache invalidates when the resolved config changes.
+(defonce ^:private store-state (atom nil))
+
+(defn- the-store []
+  (let [cfg (resolve-config)
+        st  @store-state]
+    (if (= (:config st) cfg)
+      (:store st)
+      (:store (reset! store-state {:config cfg
+                                   :store (connect-or-create! cfg)})))))
 
 (defn sha256-hex [^bytes bs]
   (let [d (.digest (MessageDigest/getInstance "SHA-256") bs)]
@@ -57,7 +68,7 @@
    :blob/size n}. Idempotent (same content → same id, single copy)."
   [^bytes bytes mime]
   (let [id (sha256-hex bytes)]
-    (k/bassoc @store id bytes {:sync? true})
+    (k/bassoc (the-store) id bytes {:sync? true})
     (log/log! {:level :debug :id ::blob-stored
                :data {:blob id :size (count bytes) :mime mime}})
     {:blob/id id :blob/mime mime :blob/size (count bytes)}))
@@ -66,7 +77,7 @@
   "Fetch blob bytes by id, nil when absent."
   [id]
   (try
-    (k/bget @store id
+    (k/bget (the-store) id
             (fn [{:keys [input-stream]}]
               (.readAllBytes ^java.io.InputStream input-stream))
             {:sync? true})

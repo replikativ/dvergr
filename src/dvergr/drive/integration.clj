@@ -50,6 +50,8 @@
   [config]
   (when-let [bs (:blob-store config)]
     (blobs/set-store-config! bs))
+  (when-let [f (:drive-conn-fn config)]
+    (drive/set-conn-resolver! f))
   (install-mounts!)
   (tel/log! {:id ::drive-installed
              :data {:blob-store (get-in config [:blob-store :backend] :file)}}
