@@ -70,13 +70,50 @@
                 {:file (.getCanonicalPath f) :source (slurp f)})))
           (ns->rel-paths lib))))
 
+(def ^:private source-subdirs
+  "Per workspace root, the source-root candidates the load-fn searches, in
+   order. `\"\"` is the worktree root itself (a file written directly there);
+   `\"src\"` is the conventional Clojure source root (what `deps.edn` projects —
+   and agents following the convention — use). Without `\"src\"`, an agent that
+   wrote `src/my/ns.clj` (the natural layout) could not `(require 'my.ns)` and
+   was forced to inline its code into the caller — defeating the
+   write-a-namespace-then-require pipeline pattern the prompt teaches."
+  ["" "src"])
+
+(defn- resolve-in-root
+  "Resolve `lib` under `root`, trying each source-subdir (root, root/src)."
+  [root lib]
+  (some (fn [sub]
+          (resolve-source (if (str/blank? sub) (io/file root) (io/file root sub)) lib))
+        source-subdirs))
+
+(defn workspace-guide
+  "The workspace's own `AGENTS.md` — its self-description and stdlib map
+   (the intake catalog, the copy-a-source pattern, the conventions),
+   read from the ctx-bound worktree root, path-clamped, or nil. Meant to
+   be spliced into the agent's system prompt so it always sees its
+   workspace's guidance — the AGENTS.md/CLAUDE.md convention. Kept small
+   by design (the file is the summary; INTAKES.md et al. are read on
+   demand). `max-chars` caps a runaway edit (default 8k)."
+  ([] (workspace-guide (workspace-root) 8192))
+  ([root] (workspace-guide root 8192))
+  ([root max-chars]
+   (try
+     (let [root (io/file root)
+           f (io/file root "AGENTS.md")]
+       (when (and (.isFile f) (under-root? root f))
+         (let [s (slurp f)]
+           (if (> (count s) max-chars) (subs s 0 max-chars) s))))
+     (catch Throwable _ nil))))
+
 (defn load-fn
   "An SCI `:load-fn`. SCI calls this for `(require …)`/`(load …)`; we return the
    source for `lib` from the current workspace (or nil → SCI throws not-found).
-   Re-reads on every call, so `:reload` works for free."
+   Re-reads on every call, so `:reload` works for free. Each workspace root is
+   searched both at its top level and under `src/` (see `source-subdirs`)."
   [{:keys [namespace]}]
   ;; Try the room's own + attached repos first (when bound), then always fall
   ;; back to the base workspace (current worktree / shared `.dvergr/workspace`),
   ;; so a room's agents see their own code but shared library code still resolves.
-  (or (some #(resolve-source % namespace) *workspace-roots*)
-      (resolve-source (workspace-root) namespace)))
+  (or (some #(resolve-in-root % namespace) *workspace-roots*)
+      (resolve-in-root (workspace-root) namespace)))

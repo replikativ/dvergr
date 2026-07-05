@@ -26,7 +26,9 @@
 
    `(c/spawn …)` covers the embed-one-agent-as-a-value case (no pre-existing
    daemon needed — `start!` boots a lite one)."
-  (:require [dvergr.actors :as actors]
+  (:require [clojure.java.shell]
+            [dvergr.audio.record :as rec]
+            [dvergr.actors :as actors]
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.discourse :as d]
             [dvergr.discourse.personas :as personas]
@@ -160,6 +162,29 @@
            (let [m (d/message from to text nil {:role :user})]
              (d/post! room m)
              m)))
+
+(defn voice!
+  "Voice input from the terminal/REPL: record the microphone until you
+   press Enter, transcribe (dvergr.audio.stt), and post the 🎤-prefixed
+   transcript into `room` addressed like a normal user message. Returns
+   the posted Message, or nil when nothing was recognized.
+
+   Recording uses pw-record (PipeWire) or arecord (ALSA), whichever
+   exists. Usage: (c/voice! room)"
+  [room & {:keys [from] :or {from :repl}}]
+  (if-let [handle (rec/start!)]
+    (do
+      (println "🎤 recording — press Enter to stop…")
+      (read-line)
+      (let [bytes (rec/stop! handle)
+            text  (when bytes
+                    ((requiring-resolve 'dvergr.audio.stt/transcribe)
+                     {:bytes bytes :mime "audio/wav"}))]
+        (if text
+          (do (println (str "→ 🎤 " text))
+              (post! room from (in-room room (d/room-target room)) (str "🎤 " text)))
+          (do (println "voice!: no speech recognized") nil))))
+    (println "voice!: no recorder found (need pw-record or arecord)")))
 
 ;; ============================================================================
 ;; Reads / control (all take a Room)

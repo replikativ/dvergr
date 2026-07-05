@@ -43,15 +43,21 @@
 (defn create-schedule!
   "Create a schedule in `room`. `cfg`:
      :agent-id    keyword — a participant in this room to fire the task at
-     :task        string  — the message posted on each fire
+     :task        string  — the message posted on each fire (prompt turn), OR
+     :code        string  — a Clojure form evaluated in that agent's sandbox
+                            on each fire (deterministic; no LLM turn). The
+                            pattern for durable pipelines: put the fns in a
+                            namespace in the room workspace repo, schedule
+                            \"(require 'my.ns) (my.ns/run!)\".
      :interval-ms long    — simple fixed interval, OR
      :schedule    map      — a cron spec {:every :day :at \"09:00\"} | {:at ISO :once true} | …
      :description string  — optional label
 
    Writes the transparent `:schedule/*` row (+ materialized `:schedule/next-fire`)
    into the room's own store; the room's scheduler spin fires it. Returns the id."
-  [room {:keys [agent-id task interval-ms schedule description] :as cfg}]
-  {:pre [(keyword? agent-id) (string? task)
+  [room {:keys [agent-id task code interval-ms schedule description] :as cfg}]
+  {:pre [(keyword? agent-id)
+         (or (string? task) (string? code))
          (or (pos-int? interval-ms) (map? schedule))]}
   (let [conn (room-conn room)]
     (when-not conn
@@ -62,9 +68,10 @@
           spec (or schedule {:interval-ms interval-ms})
           row  (merge {:schedule/id        id
                        :schedule/agent-id  agent-id
-                       :schedule/task      task
                        :schedule/active?   true
                        :schedule/created-at now}
+                      (when task {:schedule/task task})
+                      (when code {:schedule/code code})
                       (when description {:schedule/description description})
                       (cron/spec->attrs spec now))]
       (d/transact conn [row])
@@ -85,6 +92,7 @@
   (cond-> {:id          (:schedule/id e)
            :agent-id    (:schedule/agent-id e)
            :task        (:schedule/task e)
+           :code        (:schedule/code e)
            :kind        (:schedule/kind e)
            :active?     (:schedule/active? e)
            :next-fire   (:schedule/next-fire e)

@@ -226,6 +226,20 @@
                         {'every    every-fn
                          'at       at-fn
                          'interval interval-fn
+                         ;; CODE schedules — the durable-pipeline primitive:
+                         ;; the form evals in YOUR sandbox on each fire
+                         ;; (deterministic, no LLM turn). Put the fns in a
+                         ;; namespace in your workspace repo, then e.g.
+                         ;; (dvergr.scheduler/create
+                         ;;   {:agent-id :me :schedule {:every :day :at \"07:00\"}
+                         ;;    :code \"(require 'intake.news)(intake.news/scan!)\"
+                         ;;    :description \"morning news scan\"})
+                         ;; Cadence forms: {:every :day :at \"07:00\"} (daily at
+                         ;; a wall-clock time), {:every :hour :n 4} (every 4h —
+                         ;; :n multiplies :minute/:hour/:day/:week into a fixed
+                         ;; interval), {:every-ms N}, {:at \"ISO\" :once true}.
+                         ;; Unknown keys are REJECTED (no silent wrong cadence).
+                         'create   (fn [cfg] (sched-create (room!) cfg))
                          'cancel   (fn [id] (sched-cancel (room!) id))
                          'list     (fn [] (sched-list (room!)))})))
 

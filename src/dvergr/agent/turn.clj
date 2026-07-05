@@ -49,7 +49,10 @@
                                  :with-sci?      true
                                  :title          (or title "agent")}
                           chat-id (assoc :chat-id chat-id)))
-                 (some? durable?) (assoc :durable? durable?))]
+                 (some? durable?) (assoc :durable? durable?)
+                 ;; the ctx knows its room: embedder hooks (e.g. the bash
+                 ;; mount provider) resolve room-scoped resources from it
+                 room-id (assoc :room-id room-id))]
       ;; create-chat-context forks a sci-ctx but does NOT inject the ctx-bound
       ;; namespaces — do it here so clojure_eval has the room/kb/intake nses
       ;; everywhere. `db-conn` is the room's OWN messages store (= `*room*`);
@@ -66,6 +69,7 @@
         ;; agent's own work). The daemon path wired these per-turn; now every
         ;; working ctx gets them at creation.
         (ns-io/add-bash-ns!    sci cctx)
+        (ns-io/add-media-ns!   sci cctx)
         (ns-io/add-process-ns! sci cctx))
       cctx)))
 

@@ -62,6 +62,10 @@ reactive runtime), [Datahike](https://github.com/replikativ/datahike)
   overflowing context
 - 💾 **Persistent + multi-frontend** — rooms, history, and knowledge persist in
   Datahike; drive the same daemon from the TUI, the web dashboard, Telegram, or nREPL
+- 🎙️ **Voice & vision** — speak to any frontend (web mic, Telegram voice notes,
+  REPL, TUI `^R`) through one speech-to-text path; hand agents images and PDFs, with
+  a defensive `vision/extract` that pulls schema-shaped JSON from invoices/receipts
+  ([media](doc/media.md))
 - 🔁 **Self-programming substrate** — agents operate in the same SCI/FRP world they're
   built from, so an agent *can* spawn agents and wire workflows in a fork, gated by your
   `merge` and bounded by budgets. *(An early capability we're exploring — not the default mode.)*
@@ -166,6 +170,10 @@ fork-and-merge proposal pattern, see
   the pub/sub bus, agents as reactive processes, ToM via substrate fork
 - **[Tools & the SCI sandbox](doc/tools-and-sandbox.md)** — the toolset, the
   workspace agents run code in, and its safety boundaries (incl. credential injection)
+- **[Media — voice, vision & files](doc/media.md)** — speech-to-text across
+  frontends, image describe/extract, documents, the `/drive` mount
+- **[Channels — Telegram](doc/channels.md)** · **[Scheduling](doc/scheduling.md)**
+  — bridging a chat surface into Rooms; per-room recurring / `:code` tasks
 - **[Doc index](doc/README.md)** — full table of contents
 
 ## Example notebooks

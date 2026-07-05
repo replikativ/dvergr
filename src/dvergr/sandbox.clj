@@ -7,6 +7,7 @@
    - Integration with yggdrasil for CoW branching
    - Integration with spindel for async execution (CPS works through SCI)"
   (:require [sci.core :as sci]
+            [sci.ctx-store :as sci-ctx-store]
             [sci.impl.utils :refer [clojure-core-ns]]
             [clojure.string :as str]
             [datahike.api :as dh]
@@ -118,10 +119,21 @@
    fence + Esc cancellation cover the same threat with no false
    positives.
 
+   This counts CUMULATIVE thread allocation (getThreadAllocatedBytes),
+   garbage included — NOT retained/peak memory, so it's a coarse
+   runaway backstop, not a real OOM gauge (the 60s timeout fence + JVM
+   heap are that). A legitimate data job — fetch + parse several XML/RSS
+   feeds, map/filter/build — churns gigabytes of short-lived allocation
+   while retaining almost nothing, so a low cap false-positives on real
+   intake work (it killed Vár's 5-feed scan at 256 MiB). The threshold
+   is set high enough that only genuinely unbounded allocation (which a
+   true infinite loop produces within the 60s window) trips it.
+
    Options:
-     :max-bytes - max bytes allocated by the current thread (default: 256 MiB)"
+     :max-bytes - max cumulative bytes allocated by the current thread
+                  (default: 4 GiB)"
   [& {:keys [max-bytes]
-      :or   {max-bytes (* 256 1024 1024)}}]
+      :or   {max-bytes (* 4 1024 1024 1024)}}]
   (let [ops    (java.util.concurrent.atomic.AtomicLong. 0)
         tmx    (ManagementFactory/getThreadMXBean)
         tid    (.getId (Thread/currentThread))
@@ -355,8 +367,15 @@
      => {:value 3 :stdout \"\" :stderr \"\" :success true}
 
      (eval-code ctx \"(Thread/sleep 10000)\" :timeout-ms 1000)
-     => {:success false :error {:message \"Timed out after 1000ms\" ...}}"
-  [sci-ctx code & {:keys [timeout-ms cancel?]}]
+     => {:success false :error {:message \"Timed out after 1000ms\" ...}}
+
+   The eval runs with SCI's ctx-store bound (injected fns that re-enter the
+   interpreter find it). eval-string* sets the store only during eval, so a
+   LAZY value in the result would trip get-ctx when realized later —
+   `:realize? true` pr-strs the value INSIDE the store binding, forcing
+   realization while it's still set, and returns the printed string as
+   :value."
+  [sci-ctx code & {:keys [timeout-ms cancel? realize?]}]
   (if timeout-ms
     ;; Timeout path: watchdog + future/deref outer fence.
     ;;
@@ -402,10 +421,12 @@
                                     (.setName t "dvergr-eval-cancel-poll")
                                     (.start t)))]
                           (try
-                            (sci/binding [sci/out stdout sci/err stderr]
-                              (let [result (sci/eval-string* sci-ctx code)]
-                                {:value result :stdout (str stdout) :stderr (str stderr)
-                                 :success true}))
+                            (sci-ctx-store/with-ctx sci-ctx
+                              (sci/binding [sci/out stdout sci/err stderr]
+                                (let [result (sci/eval-string* sci-ctx code)
+                                      result (if realize? (pr-str result) result)]
+                                  {:value result :stdout (str stdout) :stderr (str stderr)
+                                   :success true})))
                             (catch Throwable e
                               ;; Catch Throwable so JVM Errors (StackOverflowError,
                               ;; OutOfMemoryError) also produce a structured result
@@ -505,9 +526,11 @@
     (let [stdout (StringWriter.)
           stderr (StringWriter.)]
       (try
-        (sci/binding [sci/out stdout sci/err stderr]
-          (let [result (sci/eval-string* sci-ctx code)]
-            {:value result :stdout (str stdout) :stderr (str stderr) :success true}))
+        (sci-ctx-store/with-ctx sci-ctx
+          (sci/binding [sci/out stdout sci/err stderr]
+            (let [result (sci/eval-string* sci-ctx code)
+                  result (if realize? (pr-str result) result)]
+              {:value result :stdout (str stdout) :stderr (str stderr) :success true})))
         (catch Exception e
           {:error {:message (.getMessage e)
                    :type    (str (class e))
@@ -607,8 +630,8 @@
                "(git/status)   (git/diff)"]
    "env"      ["read sandbox env vars (secrets redacted)"
                "(env/get \"PATH\")"]
-   "dvergr.scheduler" ["schedule recurring / one-off work — this IS your calendar"
-                       "(dvergr.scheduler/at \"2026-06-15T09:00\" :var \"Standup\") (dvergr.scheduler/list)"]
+   "dvergr.scheduler" ["schedule recurring / one-off work — this IS your calendar. Cadence forms: {:every :day :at \"07:00\"} (daily wall-clock), {:every :hour :n 4} (every 4h — :n multiplies :minute/:hour/:day/:week into an interval), {:every-ms N}, {:at \"ISO\" :once true}. Unknown keys are rejected."
+                       "(dvergr.scheduler/create {:agent-id :var :schedule {:every :hour :n 4} :code \"(require 'my.ns)(my.ns/run!)\" :description \"…\"})  (dvergr.scheduler/list)  (dvergr.scheduler/cancel id)"]
    "dvergr.tasks"    ["the shared task ledger — list/accept/complete work items"
                       "(dvergr.tasks/list)   (dvergr.tasks/complete! id)"]
    "dvergr.agents"   ["directory of agents (read-only): who exists / is online"
@@ -696,11 +719,25 @@
        "`cheshire.core` (JSON), `clojure.data.xml` (hardened), `datahike.api`; plus dvergr's "
        "own — `dvergr.room` (your room's data + ops), `dvergr.mail`, `dvergr.intake.*` "
        "(read/extend the SOURCE), `dvergr.codec`, `dvergr.scheduler`/`dvergr.tasks`/"
-       "`dvergr.agents`/`dvergr.actors`/`dvergr.skills`, `llm`, `git`, `env`. Use full names "
+       "`dvergr.agents`/`dvergr.actors`/`dvergr.skills`, `llm`, `git`, `env`; and media: "
+       "`(doc/extract-text path)` (PDF/text → string) and `(vision/describe path)` "
+       "or `(vision/describe path {:prompt …})` (image → description/OCR) — paths "
+       "resolve through YOUR shell filesystem, so `/drive/...` works. Use full names "
        "or alias as in babashka — `(require '[babashka.fs :as fs])`. Prefer composing "
        "Clojure that calls these — chain + transform results in one eval, state "
        "persists across evals — over asking for separate tools. Your own `(defn …)` "
-       "persist too, so you can build helpers as you go.\n\n"
+       "persist across evals but NOT across restarts — anything worth keeping "
+       "goes in your workspace repo (your shell filesystem `/`): write a real "
+       "namespace under `src/`, `(require 'my.ns)` it (the repo is on your load "
+       "path), and commit with git. THE PIPELINE PATTERN: prototype in eval → "
+       "materialize into `src/my/ns.clj` → require + test → schedule it as a "
+       "CODE task `(dvergr.scheduler/create {:agent-id <you> :schedule "
+       "{:every :day :at \"07:00\"} :code \"(require 'my.ns)(my.ns/run!)\" "
+       ":description \"…\"})` — code schedules run WITHOUT an LLM turn and "
+       "post their result to the room; use prompt schedules (`scheduler/every` "
+       "with a task string) only when each run needs your judgment. To publish a STATIC SITE for "
+       "this room, write `app/index.html` (+ assets under `app/`) in your "
+       "workspace — served at `/apps/<room-slug>/`.\n\n"
        "**Your databases.** Your room owns its data — NOT a shared global DB. "
        "`dvergr.room/*kb*` is your knowledge base, `dvergr.room/*room*` your room's "
        "own datahike (messages/state); query them with ordinary datahike, e.g. "
@@ -716,7 +753,7 @@
        "`(dvergr.shell/builtins)` lists the muschel shell's built-in commands.\n\n"
        "**Your workspace is the room** — a persistent project with its OWN git repo "
        "(your code), knowledge base, and schedules. Read/write code with `fs`/`git`/"
-       "`bash` (changes live in the room's repo); recall/save facts with the "
+       "shell (changes live in the room's repo); recall/save facts with the "
        "knowledge tools; automate recurring work with `dvergr.scheduler` "
        "(`(dvergr.scheduler/interval ms :agent \"task\")`, `(dvergr.scheduler/at \"09:00\" …)`). "
        "For a substantial or risky change, FORK first: `(dvergr.room/fork! room)` "
@@ -724,10 +761,11 @@
        "it's good `(dvergr.room/merge! parent fork)` collapses your work back (the "
        "merge surfaces a git + database diff for review), or `(dvergr.room/discard! "
        "fork)` throws it away. This is your safe edit→test→merge loop.\n\n"
-       "**Shell:** `(bash/run \"…\")` is a muschel shell (the `shell` tool is the "
-       "same thing). Your workspace is the PROJECT mounted at `/`. **Use relative "
-       "paths** (`(bash/run \"ls\")`, `(bash/run \"cat src/foo.clj\")`) — absolute "
-       "system paths like `/etc` don't exist. Built-in POSIX tools include ls cat "
+       "**Shell:** `(require '[babashka.process :as p])` then `(p/shell \"…\")` — a "
+       "muschel shell (the `shell` tool is the same thing), returns "
+       "`{:exit :out :err}`. Your workspace is the PROJECT mounted at `/`. **Use "
+       "relative paths** (`(p/shell \"ls\")`, `(p/shell \"cat src/foo.clj\")`) — "
+       "absolute system paths like `/etc` don't exist. Built-in POSIX tools include ls cat "
        "grep sed awk find sort uniq cut tr jq xargs wc head tail diff git — no "
        "external binary needed. Destructive ops (rm -rf, sudo, git push --force) "
        "are blocked by design; that's expected, not a failure.\n\n"

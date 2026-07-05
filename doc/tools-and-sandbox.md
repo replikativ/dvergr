@@ -80,6 +80,12 @@ cancellable.
   - `room` (post to / read other rooms), `tasks`, `agents` (read-only directory),
     `actors` (spawn sub-agents / assign skills), `calendar`, `skills`.
   - `llm` — cheap one-shot LLM calls (`summarize`/`call`).
+  - `doc`, `vision` — media extraction: `doc/extract-text` (PDF/text → string),
+    `vision/describe` (image → OCR + description), `vision/extract` (image →
+    schema-constrained JSON with per-field verification). Read through the
+    chat-ctx's muschel FS, so `/drive` files work; see [media.md](media.md).
+  - `scheduler` — per-room recurring / one-shot tasks, incl. `:code` schedules
+    (see [scheduling.md](scheduling.md)).
   - `fs`, `git`, `bash`, `proc`, `http`, `env` — path-safe, audited I/O (see boundaries).
   - `spindel.comb` / `spindel.sig` / `sync` — reactive primitives; `spin`/`await`/`track`
     when the session is backed by a spindel execution context.
@@ -113,3 +119,18 @@ execution context, so when a room is forked (`:isolation :ctx`), `read_file`/`wr
 the **fork-local** Datahike conn — nothing reaches the parent until the fork is merged.
 This is how `spawn_agent` (auto-merge) and `propose_change` (held for review) keep
 sub-agent work isolated. See `doc/state-model.md` for the full value-semantics picture.
+
+## The `/drive` mount
+
+Beyond the worktree, the shell host can **union-mount** extra filesystems at
+absolute sandbox paths via `muschel.fs.mount`. The intended use is a **drive** at
+`/drive` — a place for files that aren't source code (channel uploads, generated
+artifacts, a content-addressed blob store): agents reach them with the same
+`ls`/`cat`/`grep`/redirect idioms as any other path, and the media fns
+(`doc/extract-text`, `vision/*`) read through the same FS.
+
+Mounts are supplied by the embedder through the `:mounts` option on
+`dvergr.intake.bash/make-host` (or the `set-mounts-fn!` hook, resolved per
+workspace). The standalone daemon ships no drive yet; simmis provides a
+datahike + CAS-backed one, and a built-in drive is on the roadmap — see
+[media.md](media.md#files-in--the-drive-mount).

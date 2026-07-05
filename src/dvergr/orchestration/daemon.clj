@@ -577,6 +577,13 @@
                                             (tg-send/tool-activity-html (turn-tool-lines daemon chat-id))))
    ;; Native "typing…" cue while the agent works.
    :typing-fn     (fn [chat-id] (tg/send-chat-action! token chat-id "typing"))
+   ;; Voice notes: transcribe via dvergr.audio.stt (same backend as the web mic
+   ;; and REPL voice!). requiring-resolve keeps audio an optional feature — the
+   ;; telegram handler skips voice when this cap is absent. Returns the
+   ;; transcript string (handle-inbound! adds the 🎤 marker).
+   :transcribe-fn (fn [{:keys [bytes mime]}]
+                    ((requiring-resolve 'dvergr.audio.stt/transcribe)
+                     {:bytes bytes :mime mime}))
    ;; Label each outbound message with its sender — through one bot every
    ;; actor's reply looks the same. Actor display name (:actor/name) if set,
    ;; else the id.

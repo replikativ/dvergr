@@ -16,7 +16,10 @@
   {:name "Kimi K2.6"
    :provider :fireworks
    :api-type :openai-chat
-   :capabilities #{:tools :streaming}
+   ;; :vision — verified deployed + accurate on this account (probe 2026-07-05);
+   ;; the dvergr.media.vision default. Reasoning model, so give vision/extract a
+   ;; generous max-tokens (it spends output budget thinking before the answer).
+   :capabilities #{:tools :vision :streaming}
    :context 262144
    :max-output 8192
    :pricing {:input 0.95 :cache-read 0.10 :output 4.00}
@@ -30,7 +33,8 @@
   {:name "Kimi K2.5"
    :provider :fireworks
    :api-type :openai-chat
-   :capabilities #{:tools :streaming}
+   ;; :vision — the fallback vision model (see the Vision section below).
+   :capabilities #{:tools :vision :streaming}
    :context 262144
    :max-output 8192
    :pricing {:input 0.60 :cache-read 0.10 :output 3.00}
@@ -40,6 +44,21 @@
             :default-top-p 0.95}}
 
   ;; ─── GLM ───────────────────────────────────────────────────────────────────
+  ;; GLM's native tool format is an <arg_key>/<arg_value> XML envelope; Fireworks
+  ;; intermittently leaks it into `content` with empty tool_calls (stranded Vár's
+  ;; intake run on 5.1). `:glm-tool-format?` turns on recovery+scrub in the
+  ;; openai adapter (dvergr.model.quirks). 5.2 runs the structured path more
+  ;; reliably but the leak is intermittent, so the defense stays on for both.
+
+  "accounts/fireworks/models/glm-5p2"
+  {:name "GLM 5.2"
+   :provider :fireworks
+   :api-type :openai-chat
+   :capabilities #{:tools :streaming}
+   :context 202752
+   :max-output 8192
+   :pricing {:input 1.40 :cache-read 0.26 :output 4.40}
+   :quirks {:glm-tool-format? true}}
 
   "accounts/fireworks/models/glm-5p1"
   {:name "GLM 5.1"
@@ -49,7 +68,7 @@
    :context 202752
    :max-output 8192
    :pricing {:input 1.40 :cache-read 0.20 :output 4.40}
-   :quirks {}}
+   :quirks {:glm-tool-format? true}}
 
   ;; ─── MiniMax (cheap, tool-capable — the default for primary + compaction) ──
 
@@ -118,12 +137,27 @@
    :pricing {:input 0.15 :output 0.60}
    :quirks {}}
 
+  ;; ─── Vision ──────────────────────────────────────────────────────────────
+  ;; Image → text for dvergr.media.vision (describe/extract: OCR, scene
+  ;; description, structured extraction; the jitsi frame pipeline uses the same
+  ;; path). OpenAI-compat chat endpoint takes image_url content parts. Override
+  ;; with DVERGR_VISION_MODEL.
+  ;;
+  ;; The vision DEFAULT is Kimi K2.6 (above, :vision-tagged): probed
+  ;; 2026-07-05, it's the only deployed model on this account that accepts
+  ;; image input, and it extracts business-document fields accurately. The
+  ;; dedicated Qwen-VL models (qwen3-vl-32b/30b-a3b, qwen2.5-vl-32b) return
+  ;; 404 "not deployed" here — re-probe and register them if the account adds
+  ;; them (they'd be cheaper: $0.50–0.90/M vs Kimi's $4/M output). GLM-5 and
+  ;; DeepSeek-V4 are deployed but text-only ("does not support image inputs").
+  ;; Kimi K2.5 (above) is the vision fallback.
+
   }
 
  :aliases
  {"kimi"        "accounts/fireworks/models/kimi-k2p6"
   "kimi-k2p5"   "accounts/fireworks/models/kimi-k2p5"
-  "glm"         "accounts/fireworks/models/glm-5p1"
+  "glm"         "accounts/fireworks/models/glm-5p2"
   "minimax"     "accounts/fireworks/models/minimax-m2p7"
   "qwen"        "accounts/fireworks/models/qwen3p6-plus"
   "deepseek"    "accounts/fireworks/models/deepseek-v4-pro"

@@ -30,6 +30,15 @@
     :db/cardinality :db.cardinality/one
     :db/doc         "Task message posted to the agent on each fire"}
 
+   {:db/ident       :schedule/code
+    :db/valueType   :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/doc         "Code task: a Clojure form evaluated in the agent's
+sandbox on each fire INSTEAD of posting a prompt turn — deterministic,
+no LLM cost. The durable-pipeline primitive: agents write a namespace
+into the room workspace repo and schedule (ns/fn!) invocations of it.
+Output/errors post to the room as :_activity."}
+
    {:db/ident       :schedule/active?
     :db/valueType   :db.type/boolean
     :db/cardinality :db.cardinality/one

@@ -4,6 +4,8 @@
 
         ;; HTTP client for provider APIs
         hato/hato                  {:mvn/version "1.0.0"}
+        ;; document processing (dvergr.media.doc — pdf text extraction)
+        org.apache.pdfbox/pdfbox   {:mvn/version "3.0.3"}
 
         ;; JSON encoding/decoding
         metosin/jsonista           {:mvn/version "0.3.8"}
@@ -31,13 +33,13 @@
         ;; version. The `:local` alias's `../spindel` override carries it too.
 
         ;; Spindel — Reactive runtime with CoW forking
-        org.replikativ/spindel     {:mvn/version "0.1.28"}
+        org.replikativ/spindel     {:mvn/version "0.1.29"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context
         ;; so a forked chat-ctx gets an isolated muschel session
         ;; (jobs, cd, env) for free.
-        org.replikativ/muschel     {:mvn/version "0.2.16"}
+        org.replikativ/muschel     {:mvn/version "0.2.17"}
 
         ;; rewrite-clj for structural editing
         rewrite-clj/rewrite-clj    {:mvn/version "1.1.48"}

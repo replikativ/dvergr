@@ -21,6 +21,9 @@ New to dvergr? Start with **[Getting Started](getting-started.md)**.
 ## 🔧 Reference
 
 - **[Tools & the SCI sandbox](tools-and-sandbox.md)** — the tool registry + the sandbox agents run code in, and its safety boundaries
+- **[Media — voice, vision & files](media.md)** — speech-to-text across every frontend, image describe/extract, document text, the `/drive` mount
+- **[Channels — Telegram](channels.md)** — bridging a chat surface into Rooms: setup, allowlist, voice/documents, slash commands
+- **[Scheduling](scheduling.md)** — per-room recurring / one-shot tasks, incl. deterministic `:code` schedules
 - **[Boundary secret injection](boundary-secret-injection.md)** — how an agent uses an API key it never sees (credential handling + the `:secrets` config)
 - **[Process model](process-model.md)** — the pausable/resumable Process abstraction
 

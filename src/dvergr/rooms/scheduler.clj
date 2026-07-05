@@ -20,10 +20,12 @@
    keeps tracking but no-ops via its `:running?` flag (cleared on unregister).
    A negligible lingering no-op per deleted/discarded room until restart."
   (:require [datahike.api :as dh]
+            [dvergr.agent.room-context :as room-context]
             [dvergr.discourse :as disc]
             [dvergr.runtime.clock :as clock]
             [dvergr.runtime.ctx :as rctx]
             [dvergr.room.registry :as rreg]
+            [dvergr.sandbox :as sandbox]
             [dvergr.scheduler.cron :as cron]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.spin.cps :refer [spin]]
@@ -54,14 +56,50 @@
           @conn now)
     (catch Throwable _ [])))
 
+(defn- run-code-task!
+  "Evaluate a :schedule/code form in the agent's working-ctx sandbox and
+   post the outcome to the room as :_activity (transcript, no agent
+   turn). Fire-and-forget: the eval runs OFF the scheduler spin (the
+   future conveys spindel's *execution-context*, so kb/*room* datahike
+   systems resolve) — a slow or hung task must never block the engine
+   drain thread. eval-code provides the watchdog-interrupt + outer
+   timeout fence and binds SCI's ctx-store (`:realize? true` forces the
+   result while it's bound). Errors are caught and reported the same
+   way; a fire never throws out of the scheduler."
+  [room aid s]
+  (future
+    (let [outcome
+          (try
+            (let [cctx (room-context/ensure-ctx! room aid {})
+                  {:keys [success value error]}
+                  (sandbox/eval-code
+                   (:sci-ctx cctx) (:schedule/code s)
+                   :timeout-ms (* 5 60 1000) :realize? true)]
+              (if success
+                (str "⏱ " (or (:schedule/description s) "code task") " → "
+                     (subs value 0 (min 500 (count value))))
+                (str "⏱ " (or (:schedule/description s) "code task")
+                     " FAILED: " (:message error))))
+            (catch Throwable t
+              (str "⏱ " (or (:schedule/description s) "code task")
+                   " FAILED: " (ex-message t))))]
+      (disc/post! room (disc/message :scheduler :_activity outcome nil
+                                     {:role :assistant
+                                      :source :scheduler
+                                      :schedule-id (:schedule/id s)})))))
+
 (defn- fire-one!
-  "Post one schedule's task into the room (addressed to its agent), then advance
-   the row: bump last-run, recompute next-fire (or deactivate a fired :once)."
+  "Fire one schedule: a :schedule/code task evals in the agent's sandbox
+   (deterministic, no LLM); otherwise the task message posts to the
+   agent as a prompt turn. Then advance the row: bump last-run,
+   recompute next-fire (or deactivate a fired :once)."
   [room conn ^java.util.Date now s]
   (let [aid (:schedule/agent-id s)]
-    (disc/post! room (disc/message :scheduler aid (:schedule/task s) nil
-                                   {:source :scheduler
-                                    :schedule-id (:schedule/id s)}))
+    (if (:schedule/code s)
+      (run-code-task! room aid s)
+      (disc/post! room (disc/message :scheduler aid (:schedule/task s) nil
+                                     {:source :scheduler
+                                      :schedule-id (:schedule/id s)})))
     (let [next-fire (cron/compute-next-fire (assoc s :schedule/last-run now) now)]
       (dh/transact conn [(cond-> {:schedule/id (:schedule/id s)
                                   :schedule/last-run now}

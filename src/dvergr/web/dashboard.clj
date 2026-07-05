@@ -675,7 +675,15 @@
            [:button {:type "submit"
                      :style "background:#52b788;color:#fff;border:none;
                                     padding:8px 18px;border-radius:6px;cursor:pointer;"}
-            "Send"]]))
+            "Send"]
+           ;; Voice input: toggle-record via MediaRecorder → POST raw audio
+           ;; to /rooms/<slug>/voice (dvergr.audio.stt) → the 3s htmx poll
+           ;; picks up the posted 🎤 message.
+           [:button#mic-btn {:type "button" :data-slug slug :title "Voice message"
+                             :style "background:#18181b;border:1px solid #333;
+                                     color:#e0e0e0;padding:8px 14px;border-radius:6px;
+                                     cursor:pointer;"}
+            "🎤"]]))
        [:div.footer "dvergr · room"]
         ;; Keep the chat pinned to the newest message — but only auto-scroll
         ;; when the user is already near the bottom, so reading history isn't
@@ -687,6 +695,30 @@
                        stick=(box.scrollHeight-box.scrollTop-box.clientHeight)<80;});
                      document.body.addEventListener('htmx:afterSwap',function(e){
                        if(e.target===box&&stick){box.scrollTop=box.scrollHeight;}});})();")]
+        ;; Voice input: toggle recording; on stop POST the webm/opus blob to
+        ;; /rooms/<slug>/voice. Errors surface on the button title/label.
+       [:script (hu/raw-string
+                 "(function(){var btn=document.getElementById('mic-btn');if(!btn)return;
+                     var rec=null,chunks=[];
+                     btn.addEventListener('click',function(){
+                       if(rec&&rec.state==='recording'){rec.stop();return;}
+                       navigator.mediaDevices.getUserMedia({audio:true}).then(function(stream){
+                         chunks=[];rec=new MediaRecorder(stream,{mimeType:'audio/webm'});
+                         rec.ondataavailable=function(e){chunks.push(e.data);};
+                         rec.onstop=function(){
+                           stream.getTracks().forEach(function(t){t.stop();});
+                           btn.textContent='…';btn.style.borderColor='#333';
+                           var blob=new Blob(chunks,{type:'audio/webm'});
+                           fetch('/rooms/'+btn.dataset.slug+'/voice',
+                                 {method:'POST',headers:{'Content-Type':'audio/webm'},body:blob})
+                             .then(function(r){return r.json();})
+                             .then(function(j){btn.textContent='🎤';
+                               if(j.error){btn.title=j.error;}})
+                             .catch(function(){btn.textContent='🎤';btn.title='upload failed';});};
+                         rec.start();
+                         btn.textContent='⏺';btn.style.borderColor='#b85252';
+                       }).catch(function(){btn.title='microphone unavailable';});
+                     });})();")]
         ;; Persist the Context panel's open/closed state across reloads (keyed
         ;; per room slug). The <details> is static, so this runs once on load.
        [:script (hu/raw-string

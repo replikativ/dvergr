@@ -30,7 +30,16 @@
        "- For multi-step tasks, call the tools for each step in sequence; don't "
        "stop after one step to describe the rest.\n"
        "- You already have the results of tools you called earlier in this "
-       "conversation — reuse them; do not re-fetch the same thing."))
+       "conversation — reuse them; do not re-fetch the same thing.\n\n"
+       "## Friction is signal\n\n"
+       "You are never capped — you know best how to get work done. In return, "
+       "when the harness fights you (a missing tool, an operation you can only "
+       "do through awkward workarounds, an error message that hides what you "
+       "need), do the work as best you can AND report the limitation: name it "
+       "explicitly in your reply, and if you have a knowledge base, add one "
+       "line to a [[Harness Limitations]] page (what was missing; what the "
+       "workaround cost you). Silent grinding hides exactly the information "
+       "your operators need to improve your tools."))
 
 (defn now-note
   "A per-turn system note stating TODAY'S DATE, so the model anchors 'today',
@@ -130,4 +139,18 @@
                            " — full Clojure eval at the system root (trusted)."
                            " — sandboxed Clojure eval (safe default)."))
       (seq nameset) (str "\n\n" tool-use-guideline)
-      eval?         (str "\n\n" @(requiring-resolve 'dvergr.sandbox/sandbox-prompt-pointer)))))
+      eval?         (str "\n\n" @(requiring-resolve 'dvergr.sandbox/sandbox-prompt-pointer))
+      ;; The workspace's own AGENTS.md (stdlib map + intake catalog +
+      ;; copy-a-source pattern) — the AGENTS.md/CLAUDE.md convention. Without
+      ;; it agents don't know the dvergr/intake/* library exists and reinvent
+      ;; it. Read from the same room worktree we resolved for skills; gated on
+      ;; eval? (only eval-capable agents have a workspace).
+      (and eval? room-dir)
+      (as-> prompt
+            (if-let [guide ((requiring-resolve 'dvergr.sandbox.workspace/workspace-guide)
+                            room-dir)]
+              (str prompt "\n\n## Your workspace guide (AGENTS.md)\n\n" guide
+                   "\n\nFor a data/intake task START HERE: read the closest "
+                   "`dvergr/intake/*` source (catalog in doc/INTAKES.md — e.g. "
+                   "`dvergr.intake.rss` for feeds) and COPY it, don't rebuild it.")
+              prompt)))))

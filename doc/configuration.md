@@ -50,8 +50,9 @@ Priority: `(paths/set-home! …)` → `$DVERGR_HOME` → `./.dvergr`. Layout:
                 :profile  "var"}}   ; optional; defaults to the agent id → resources/agents/<id>.md
  :default-agent :var
 
- ;; Channels (secrets fall back to env)
- :telegram      {:token "…"}                 ; or env TELEGRAM_BOT_TOKEN
+ ;; Channels (secrets fall back to env). See doc/channels.md.
+ :telegram      {:token "…"                   ; or env TELEGRAM_BOT_TOKEN
+                 :tool-commands? false}       ; allow /clojure_eval etc. from Telegram (default off)
  :allowed-users [{:id 12345 :username "…"}]   ; Telegram access control
  :notify-chat-ids [12345]                     ; route intake output to these chats
  :slack         {:token "xoxp-…"}             ; or env SLACK_USER_TOKEN
@@ -71,8 +72,18 @@ Priority: `(paths/set-home! …)` → `$DVERGR_HOME` → `./.dvergr`. Layout:
 ```
 
 ### Environment variables
-`DVERGR_CONFIG` (config path) · `DVERGR_HOME` (state root) ·
+
+**Core** — `DVERGR_CONFIG` (config path) · `DVERGR_HOME` (state root) ·
 `TELEGRAM_BOT_TOKEN` · `GITHUB_DVERGR_TOKEN` · `SLACK_USER_TOKEN`.
+
+**Models** — `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `GROQ_API_KEY` (providers &
+ASR) · `DVERGR_VISION_MODEL` (override the vision model). See
+[provider-setup.md](provider-setup.md).
+
+**Media / voice** (see [media.md](media.md)) — `DVERGR_RECORD_CMD` (mic-capture
+command, `%s` = output WAV) · `DVERGR_AUDIO_DEVICE` (pin the Java capture
+device) · `DVERGR_ASR_MODEL_DIR` / `DVERGR_WHISPER_MODEL` / `DVERGR_WHISPER_SCRIPT`
+(local/native STT backends).
 
 ## Agents — how config resolves at runtime
 

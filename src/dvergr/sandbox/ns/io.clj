@@ -231,21 +231,37 @@
         base-canonical (-> (java.io.File. (str base-path)) .getCanonicalFile)
         ;; Path-clamp every user path: canonical check + sensitive-path guard.
         sr             (fn [p] (let [ps (str p)] (sensitive-path-policy ps) (fs-safe-resolve base-canonical ps)))
+        ;; Relativize a resolved (absolute) path back to a workspace-relative
+        ;; string, so agents never see the real `.dvergr/systems/<uuid>/…`
+        ;; location — and get paths they can pass straight back to fs/slurp
+        ;; (which re-resolve via sr). The workspace root itself → ".".
+        base-str       (.getCanonicalPath base-canonical)
+        ;; Anything resolving OUTSIDE the workspace (fs/parent of the root,
+        ;; a symlink whose target escapes base) → nil, NEVER the raw host
+        ;; path — leaking `.dvergr/systems/<uuid>/…` is the bug this guards,
+        ;; and such a path can't be fed back through `sr` anyway. Callers
+        ;; drop nils (listings) or propagate them (parent of root → nil).
+        rel            (fn [p] (let [pc (.getCanonicalPath (java.io.File. (str p)))]
+                                 (cond
+                                   (= pc base-str) "."
+                                   (.startsWith pc (str base-str java.io.File/separator))
+                                   (subs pc (inc (count base-str)))
+                                   :else nil)))
         bb-parent      (r 'parent)
         bb-create-dirs (r 'create-dirs)
-        mkdir          (fn [p] (let [f (sr p)] (audit! audit-log :fs/mkdir {:path (str f)}) (str (bb-create-dirs f))))
+        mkdir          (fn [p] (let [f (sr p)] (audit! audit-log :fs/mkdir {:path (str f)}) (bb-create-dirs f) (rel f)))
         del            (fn [bb] (fn [p] (let [f (sr p)] (audit! audit-log :fs/delete {:path (str f)}) (bb f))))
         cpmv           (fn [op bb] (fn [a b & m] (let [fa (sr a) fb (sr b)]
                                                    (audit! audit-log op {:src (str fa) :dst (str fb)})
-                                                   (apply bb fa fb m) (str fb))))
+                                                   (apply bb fa fb m) (rel fb))))
         pred           (fn [bb] (fn [p] (bb (sr p))))]
     ;; The real babashka.fs SUBSET, every path clamped to base-path. Returns strings
     ;; (not Path objects) so SCI agents get serialisable values. Content read/write
     ;; is `slurp`/`spit` (below), as in real Clojure — NOT an fs fn.
     (sci/add-namespace! sci-ctx 'babashka.fs
                         {'list-dir           (fn [d & more] (audit! audit-log :fs/ls {:path (str (sr d))})
-                                               (mapv str (apply (r 'list-dir) (sr d) more)))
-                         'glob               (fn [d pat & more] (mapv str (apply (r 'glob) (sr d) pat more)))
+                                               (into [] (keep rel) (apply (r 'list-dir) (sr d) more)))
+                         'glob               (fn [d pat & more] (into [] (keep rel) (apply (r 'glob) (sr d) pat more)))
                          'exists?            (pred (r 'exists?))
                          'directory?         (pred (r 'directory?))
                          'regular-file?      (pred (r 'regular-file?))
@@ -260,10 +276,10 @@
                          'move               (cpmv :fs/move (r 'move))
                          'copy               (cpmv :fs/copy (r 'copy))
                          'copy-tree          (cpmv :fs/copy (r 'copy-tree))
-                         'parent             (fn [p] (some-> (bb-parent (sr p)) str))
+                         'parent             (fn [p] (some-> (bb-parent (sr p)) rel))
                          'file-name          (fn [p] (str ((r 'file-name) p)))
-                         'absolutize         (fn [p] (str (sr p)))
-                         'canonicalize       (fn [p] (str (sr p)))})
+                         'absolutize         (fn [p] (rel (sr p)))
+                         'canonicalize       (fn [p] (rel (sr p)))})
     ;; File CONTENT I/O under the clojure.core names the model reaches for, sandboxed.
     (sci/merge-opts sci-ctx
                     {:namespaces
@@ -441,6 +457,50 @@
                          'head    (fn [url & [opts]] (do-request (merge {:url url :method :head} opts)))
                          'delete  (fn [url & [opts]] (do-request (merge {:url url :method :delete} opts)))})))
 
+(defn add-media-ns!
+  "Expose document + vision processing to SCI, bound to a chat-ctx:
+
+     (doc/extract-text \"/drive/telegram/report.pdf\")  ; pdf/text → string
+     (vision/describe \"/drive/telegram/photo.jpg\")    ; image → description/OCR
+     (vision/describe path {:prompt \"read the receipt total\"})
+     ;; structured extraction for business docs (invoice → JSON):
+     (vision/extract \"/drive/inbox/invoice.jpg\"
+                     {:schema \"invoice_number, date (ISO), vendor, total (number)\"
+                      :verify-fields [:total]})
+
+   Paths resolve through the chat-ctx's muschel FS — the same
+   filesystem the shell sees, so worktree files AND mounted drives
+   (e.g. /drive) both work. Bytes never enter the SCI sandbox; only
+   extracted text / parsed data comes back."
+  [sci-ctx chat-ctx]
+  (let [read-bytes (fn [path]
+                     (let [host ((requiring-resolve 'dvergr.intake.bash/get-or-create-host!)
+                                 chat-ctx)
+                           fs (:fs host)]
+                       (or ((requiring-resolve 'muschel.fs/read-bytes) fs path)
+                           (throw (ex-info (str "no such file: " path) {:path path})))))
+        guess-mime (fn [path]
+                     (let [p (str path)]
+                       (cond
+                         (re-find #"(?i)\.pdf$" p) "application/pdf"
+                         (re-find #"(?i)\.(jpe?g)$" p) "image/jpeg"
+                         (re-find #"(?i)\.png$" p) "image/png"
+                         (re-find #"(?i)\.webp$" p) "image/webp"
+                         (re-find #"(?i)\.(md|txt|csv|json|xml|edn|clj|cljs|cljc)$" p) "text/plain"
+                         :else "application/octet-stream")))
+        extract (fn [path]
+                  ((requiring-resolve 'dvergr.media.doc/extract-text)
+                   (read-bytes path) (guess-mime path)))
+        describe (fn [path & [opts]]
+                   ((requiring-resolve 'dvergr.media.vision/describe)
+                    (read-bytes path) (guess-mime path) opts))
+        extract-data (fn [path opts]
+                       ((requiring-resolve 'dvergr.media.vision/extract)
+                        (read-bytes path) (guess-mime path) opts))]
+    (sci/add-namespace! sci-ctx 'doc {'extract-text extract})
+    (sci/add-namespace! sci-ctx 'vision {'describe describe
+                                         'extract extract-data})))
+
 (defn add-bash-ns!
   "Expose intake.bash (muschel-backed shell) to SCI, bound to a chat-ctx.
 
@@ -476,7 +536,10 @@
                          (->result (run (str/join " " (map str args))))))]
     (sci/add-namespace! sci-ctx 'babashka.process
                         {'shell shell 'sh shell})
-    ;; muschel-specific introspection (not part of babashka.process)
+    ;; muschel-specific introspection (not part of babashka.process). The
+    ;; canonical shell surface for RUNNING commands is `babashka.process/shell`
+    ;; (its real name — what the stdlib + prompt primitives table teach);
+    ;; `dvergr.shell` adds the dvergr-only introspection (check/builtins/allowlist).
     (sci/add-namespace! sci-ctx 'dvergr.shell
                         {'run run 'check check-fn 'builtins builtins-fn 'allowlist allowlist-fn})))
 

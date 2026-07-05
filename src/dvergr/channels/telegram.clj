@@ -123,6 +123,21 @@
               (:message_id result)))
           chunks)))
 
+(defn get-file-bytes
+  "Download a Telegram file by file-id. Returns {:bytes byte[] :path s}
+   or nil on failure."
+  [token file-id]
+  (try
+    (when-let [file-path (:file_path (api-call token "getFile" {:file_id file-id}))]
+      (let [url (str "https://api.telegram.org/file/bot" token "/" file-path)
+            resp (hc/get url {:as :byte-array})]
+        (when (= 200 (:status resp))
+          {:bytes (:body resp) :path file-path})))
+    (catch Exception e
+      (tel/log! {:level :warn :id :telegram/file-download-failed
+                 :data {:file-id file-id :error (.getMessage e)}})
+      nil)))
+
 ;; ============================================================================
 ;; Message normalization
 ;; ============================================================================
@@ -145,15 +160,39 @@
     ;; Regular message
     (let [msg (or (:message update) (:edited_message update))]
       (when msg
-        {:channel    :telegram
-         :chat-id    (get-in msg [:chat :id])
-         :message-id (:message_id msg)
-         :from       (select-keys (:from msg) [:id :username :first_name :last_name])
-         :text       (:text msg)
-         :type       :message
-         :timestamp  (when-let [ts (:date msg)]
-                       (java.util.Date. (* ts 1000)))
-         :raw        update}))))
+        (cond-> {:channel    :telegram
+                 :chat-id    (get-in msg [:chat :id])
+                 :message-id (:message_id msg)
+                 :from       (select-keys (:from msg) [:id :username :first_name :last_name])
+                 :text       (:text msg)
+                 :type       :message
+                 :timestamp  (when-let [ts (:date msg)]
+                               (java.util.Date. (* ts 1000)))
+                 :raw        update}
+          ;; Voice notes / audio: carry the file reference so a caps-provided
+          ;; :transcribe-fn can turn them into text (handle-message).
+          (or (:voice msg) (:audio msg))
+          (assoc :voice (let [v (or (:voice msg) (:audio msg))]
+                          {:file-id   (:file_id v)
+                           :duration  (:duration v)
+                           :mime-type (:mime_type v)}))
+
+          ;; Documents (files sent as attachments): caps :store-file-fn
+          ;; persists them (e.g. into the room's drive).
+          (:document msg)
+          (assoc :document (let [d (:document msg)]
+                             {:file-id   (:file_id d)
+                              :file-name (:file_name d)
+                              :mime-type (:mime_type d)
+                              :size      (:file_size d)})
+                 :caption (:caption msg))
+
+          ;; Photos: telegram sends an array of sizes; take the largest.
+          (:photo msg)
+          (assoc :photo (let [p (last (:photo msg))]
+                          {:file-id (:file_id p)
+                           :size    (:file_size p)})
+                 :caption (:caption msg)))))))
 
 ;; ============================================================================
 ;; Long polling
@@ -191,12 +230,17 @@
           (doseq [update updates]
             (when-let [msg (normalize-message update)]
               (when-let [on-msg (:on-message @(:state channel))]
-                (try
-                  (on-msg msg)
-                  (catch Exception e
-                    ;; An inbound message failed to route — visible, not lost.
-                    (tel/log! {:level :error :id :telegram/inbound-failed
-                               :data {:chat-id (:chat-id msg) :error (.getMessage e)}}))))))
+                ;; Off the poll thread: media messages block on file download
+                ;; + transcription (minutes worst-case), and one slow message
+                ;; must not stall inbound delivery for every other chat.
+                ;; Room-level ordering is preserved by the bus fold.
+                (future
+                  (try
+                    (on-msg msg)
+                    (catch Throwable e
+                      ;; An inbound message failed to route — visible, not lost.
+                      (tel/log! {:level :error :id :telegram/inbound-failed
+                                 :data {:chat-id (:chat-id msg) :error (.getMessage e)}})))))))
           (recur new-offset))))))
 
 ;; ============================================================================
@@ -539,27 +583,88 @@
    allowlist gate and the `/agents` / `/<agent>` grammar; everything else is
    posted into the per-chat Room as the user-actor. `caps` as in
    `make-daemon-adapter`."
-  [adapter msg {:keys [ctx send-fn ensure-room default-agent typing-fn daemon tool-exec?] :as _caps}]
+  [adapter msg {:keys [ctx send-fn ensure-room default-agent typing-fn daemon tool-exec?
+                       transcribe-fn store-file-fn token] :as _caps}]
   (binding [rtc/*execution-context* ctx]
     (let [chat-id   (:chat-id msg)
-          text      (:text msg)
           user-info (:from msg)
           reply!    (fn [t] (send-fn chat-id t))
           working!  (fn [] (when typing-fn (try (typing-fn chat-id) (catch Throwable _ nil))))]
-      (when (and chat-id text (not (str/blank? text)))
-        (if-not (allowlist/allowed? user-info)
-          (do (tel/log! {:level :warn :id :telegram/unauthorized
-                         :data {:user-id (:id user-info) :username (:username user-info)}}
-                        "Rejected unauthorized user")
-              (reply! "Access denied. You are not authorized to use this bot."))
-          (let [parsed (parse-command text)]
-            (cond
+      ;; Allowlist FIRST — before the file download / STT / store-file
+      ;; side effects below, so an unauthorized sender can't burn STT
+      ;; credits, persist files into the room drive, or get a transcript
+      ;; echoed back. Media-only messages are rejected too; anything we
+      ;; wouldn't process anyway (stickers etc.) stays silent as before.
+      (if-not (allowlist/allowed? user-info)
+        (when (and chat-id (or (:text msg) (:voice msg) (:document msg) (:photo msg)))
+          (tel/log! {:level :warn :id :telegram/unauthorized
+                     :data {:user-id (:id user-info) :username (:username user-info)}}
+                    "Rejected unauthorized user")
+          (reply! "Access denied. You are not authorized to use this bot."))
+        (let [;; Voice notes: when the embedder provides :transcribe-fn (and the
+              ;; caps carry the bot :token for the file download), turn the audio
+              ;; into text and proceed exactly like a typed message — agents and
+              ;; mirrors see the transcript with a 🎤 marker.
+              voice-result (when-let [{:keys [file-id mime-type duration]} (:voice msg)]
+                             (when (and transcribe-fn token)
+                               (when-let [{:keys [bytes]} (get-file-bytes token file-id)]
+                                 (try (transcribe-fn {:bytes bytes
+                                                      :mime mime-type
+                                                      :duration duration
+                                                      :chat-id (:chat-id msg)})
+                                      (catch Exception e
+                                        (tel/log! {:level :warn
+                                                   :id :telegram/transcription-failed
+                                                   :data {:error (.getMessage e)}})
+                                        nil)))))
+              ;; transcribe-fn returns a transcript string, or a map
+              ;; {:text s :attachment {...}} carrying e.g. a stored-audio ref
+              ;; the embedder wants attached to the room message.
+              voice-text (when-let [t (if (map? voice-result) (:text voice-result) voice-result)]
+                           (str "🎤 " t))
+              ;; Documents/photos: caps :store-file-fn persists the bytes
+              ;; (embedder decides where — e.g. the room drive) and returns
+              ;; {:note s :attachment {...}} (note = where it landed, shown
+              ;; to the room + agents).
+              file-result (when (and store-file-fn token (or (:document msg) (:photo msg)))
+                            (let [{:keys [file-id file-name mime-type size]}
+                                  (or (:document msg)
+                                      (assoc (:photo msg)
+                                             :file-name nil :mime-type "image/jpeg"))]
+                              (when-let [{:keys [bytes]} (get-file-bytes token file-id)]
+                                (try (store-file-fn {:bytes bytes
+                                                     :file-name file-name
+                                                     :mime mime-type
+                                                     :size (or size (count bytes))
+                                                     :chat-id (:chat-id msg)
+                                                     :photo? (some? (:photo msg))})
+                                     (catch Exception e
+                                       (tel/log! {:level :warn
+                                                  :id :telegram/store-file-failed
+                                                  :data {:error (.getMessage e)}})
+                                       nil)))))
+              file-text (when file-result
+                          (str "📎 " (:note file-result)
+                               (when-let [c (:caption msg)] (str "\n" c))))
+              attachment (or (when (map? voice-result) (:attachment voice-result))
+                             (:attachment file-result))
+              text      (or (:text msg) voice-text file-text)]
+          ;; Echo the transcript back to the venue: unlike a typed message
+          ;; (which the sender already sees), the transcript is NEW info —
+          ;; confirmation of what the system heard. The room-side copy is
+          ;; suppressed by injected-message echo suppression, so send
+          ;; explicitly.
+          (when (and (:voice msg) text send-fn)
+            (try (reply! text) (catch Throwable _ nil)))
+          (when (and chat-id text (not (str/blank? text)))
+            (let [parsed (parse-command text)]
+              (cond
               ;; Spec-derived ops commands (/stats /fork /system /invite …) run
               ;; against THIS chat's room and reply directly — never posted to the
               ;; room or routed to an agent. Checked first so /invite etc. aren't
               ;; mistaken for agent addressing.
-              (tc/command? text)
-              (reply! (tc/dispatch! text #(ensure-room chat-id default-agent)))
+                (tc/command? text)
+                (reply! (tc/dispatch! text #(ensure-room chat-id default-agent)))
 
               ;; Unified slash-command registry (dvergr.discourse.commands): the
               ;; SAME surface the TUI and web dispatch through — /sandbox, /plan,
@@ -568,43 +673,44 @@
               ;; their ops behaviour) and before agent addressing. Authz is the
               ;; bot allowlist already enforced above; executing tool-commands
               ;; add their own finer gate (step 3).
-              (commands/command-input? text)
-              (let [room      (ensure-room chat-id default-agent)
-                    notified? (volatile! false)
-                    notify!   (fn [t] (vreset! notified? true) (reply! t))
-                    result    (commands/execute!
-                               text
-                               {:room       room
-                                :agent-id   default-agent
-                                :daemon     daemon
-                                :exec-ctx   ctx
-                                :tool-exec? tool-exec?
-                                :notify!    notify!
+                (commands/command-input? text)
+                (let [room      (ensure-room chat-id default-agent)
+                      notified? (volatile! false)
+                      notify!   (fn [t] (vreset! notified? true) (reply! t))
+                      result    (commands/execute!
+                                 text
+                                 {:room       room
+                                  :agent-id   default-agent
+                                  :daemon     daemon
+                                  :exec-ctx   ctx
+                                  :tool-exec? tool-exec?
+                                  :notify!    notify!
                                  ;; A :prompt/:skill command posts a user turn.
-                                :post-user! (fn [t]
-                                              (working!)
-                                              (adapters/inbound!
-                                               adapter
-                                               {:chat-id chat-id :user user-info :text t}))})]
+                                  :post-user! (fn [t]
+                                                (working!)
+                                                (adapters/inbound!
+                                                 adapter
+                                                 {:chat-id chat-id :user user-info :text t}))})]
                 ;; notify! already replied for handler/builtin commands; only the
                 ;; bare :reply path (e.g. "unknown command") still needs sending.
-                (when (and (:reply result) (not @notified?))
-                  (reply! (:reply result))))
+                  (when (and (:reply result) (not @notified?))
+                    (reply! (:reply result))))
 
-              (= :list-agents (:command parsed))
-              (reply! (format-agent-list))
+                (= :list-agents (:command parsed))
+                (reply! (format-agent-list))
 
-              (:agent-id parsed)
-              (if (actors/online? (:agent-id parsed))
-                (let [target (:agent-id parsed)]
-                  (ensure-room chat-id target)   ; make sure target is joined
-                  (working!)
-                  (adapters/inbound! (assoc adapter :default-agent target)
-                                     {:chat-id chat-id :user user-info :text (:text parsed)}))
-                (reply! (str "Unknown agent: " (name (:agent-id parsed))
-                             "\n\nUse /agents to see available agents.")))
+                (:agent-id parsed)
+                (if (actors/online? (:agent-id parsed))
+                  (let [target (:agent-id parsed)]
+                    (ensure-room chat-id target)   ; make sure target is joined
+                    (working!)
+                    (adapters/inbound! (assoc adapter :default-agent target)
+                                       {:chat-id chat-id :user user-info :text (:text parsed)}))
+                  (reply! (str "Unknown agent: " (name (:agent-id parsed))
+                               "\n\nUse /agents to see available agents.")))
 
-              :else
-              (do (working!)
-                  (adapters/inbound! adapter
-                                     {:chat-id chat-id :user user-info :text text})))))))))
+                :else
+                (do (working!)
+                    (adapters/inbound! adapter
+                                       (cond-> {:chat-id chat-id :user user-info :text text}
+                                         attachment (assoc :attachment attachment))))))))))))
