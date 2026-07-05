@@ -28,10 +28,25 @@
 
 (defn- resolve-config []
   (or @store-config
-      {:backend :file :path (paths/dir "blobs") :opts {:sync? true}}))
+      (let [path (paths/dir "blobs")]
+        ;; konserve requires a UUID :id (stable store identity across restarts /
+        ;; backends). Derive it deterministically from the path.
+        {:backend :file
+         :path    path
+         :id      (java.util.UUID/nameUUIDFromBytes (.getBytes (str "dvergr-blobs:" path) "UTF-8"))
+         :opts    {:sync? true}})))
+
+(defn- connect-or-create!
+  "Connect to the store, creating it first if it doesn't exist yet (the generic
+   konserve `connect-store` only connects — `:file` throws when absent)."
+  [config]
+  (let [opts {:sync? true}]
+    (if (kstore/store-exists? config opts)
+      (kstore/connect-store config opts)
+      (kstore/create-store config opts))))
 
 (defonce ^:private store
-  (delay (kstore/connect-store (resolve-config) {:sync? true})))
+  (delay (connect-or-create! (resolve-config))))
 
 (defn sha256-hex [^bytes bs]
   (let [d (.digest (MessageDigest/getInstance "SHA-256") bs)]
