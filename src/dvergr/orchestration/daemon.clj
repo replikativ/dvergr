@@ -43,6 +43,9 @@
             [dvergr.system.rooms :as srooms]
             [dvergr.system.db :as sdb]
             [dvergr.system.mail :as mail]
+            [dvergr.drive.core :as drive]
+            [dvergr.drive.blobs :as blobs]
+            [dvergr.rooms.subsystems :as subsystems]
             [dvergr.runtime.clock :as clock]
             [dvergr.substrate.git :as git]
             ;; dvergr.web.server lives in src-clients/ and is loaded
@@ -577,13 +580,30 @@
                                             (tg-send/tool-activity-html (turn-tool-lines daemon chat-id))))
    ;; Native "typing…" cue while the agent works.
    :typing-fn     (fn [chat-id] (tg/send-chat-action! token chat-id "typing"))
-   ;; Voice notes: transcribe via dvergr.audio.stt (same backend as the web mic
-   ;; and REPL voice!). requiring-resolve keeps audio an optional feature — the
-   ;; telegram handler skips voice when this cap is absent. Returns the
-   ;; transcript string (handle-inbound! adds the 🎤 marker).
+   ;; Voice notes: keep the audio content-addressed (for later playback /
+   ;; re-processing) and transcribe via dvergr.audio.stt (same backend as the
+   ;; web mic + REPL voice!). Returns {:text :attachment} so the transcript flows
+   ;; as a 🎤 message with the audio blob referenced; nil when no speech.
    :transcribe-fn (fn [{:keys [bytes mime]}]
-                    ((requiring-resolve 'dvergr.audio.stt/transcribe)
-                     {:bytes bytes :mime mime}))
+                    (let [blob (blobs/store! bytes (or mime "audio/ogg"))]
+                      (when-let [t ((requiring-resolve 'dvergr.audio.stt/transcribe)
+                                    {:bytes bytes :mime mime})]
+                        {:text t :attachment {:blob-id (:blob/id blob)
+                                              :mime (or mime "audio/ogg")}})))
+   ;; Documents / photos: land them in the room's drive under /drive/telegram/ so
+   ;; agents read them with plain ls/cat + the media fns. Returns {:note :attachment}.
+   :store-file-fn (fn [{:keys [bytes file-name mime chat-id photo?]}]
+                    (when-let [room (ensure-dm-room! daemon chat-id default-agent-id)]
+                      (when-let [rid (some-> (sdb/room-by-slug (:slug room)) :room/id)]
+                        (binding [rtc/*execution-context* (:ctx room)]
+                          (let [name (or file-name
+                                         (str (if photo? "photo-" "file-")
+                                              (subs (blobs/sha256-hex bytes) 0 8)))
+                                node (drive/store-in-room!
+                                      rid ["telegram"] name bytes
+                                      :mime mime :source (if photo? :photo :telegram))]
+                            {:note (str "/drive/telegram/" (:fs.node/name node))
+                             :attachment {:node-id (str (:fs.node/id node)) :mime mime}})))))
    ;; Label each outbound message with its sender — through one bot every
    ;; actor's reply looks the same. Actor display name (:actor/name) if set,
    ;; else the id.
@@ -963,14 +983,16 @@
         ;; on the room-register hook + rebuilt by hydrate. No global schema
         ;; install or restore pass — the clock heartbeat below drives them all.
 
-        ;; Start the daemon's single reactive clock heartbeat — the one timer
-        ;; that drives all time-based reactivity (per-room schedulers, RF5).
+        ;; Bring up per-room subsystems in one call (the same entrypoint a custom
+        ;; host uses): the /drive mount + blob store, and the single reactive
+        ;; clock heartbeat that drives all time-based reactivity (per-room
+        ;; schedulers, RF5). Room subsystems self-attach on register via hooks
+        ;; armed by loading dvergr.rooms.subsystems.
         (try
-          (binding [rtc/*execution-context* exec-ctx]
-            (clock/start!))
+          (subsystems/start-room-subsystems! exec-ctx config)
           (catch Exception e
-            (tel/log! {:level :warn :id :daemon/clock-start-failed
-                       :data {:error (.getMessage e)}} "Clock heartbeat failed to start")))
+            (tel/log! {:level :warn :id :daemon/subsystems-start-failed
+                       :data {:error (.getMessage e)}} "Room subsystems failed to start")))
 
         ;; Optional mail: attach the configured mailbox to its room + start the
         ;; daemon-side READ-ONLY IMAP pull (local-only; fork/merge never touches the

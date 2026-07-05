@@ -1,20 +1,37 @@
 (ns dvergr.drive.blobs
-  "Content-addressed blob storage: a konserve file store keyed by the SHA-256
-   of the content. Bytes-by-hash — the drive tree (dvergr.drive.core) references
-   blobs by hash; metadata (name, mime, size) lives with the tree node. Global,
-   not per-room: CAS dedup is content-based, so identical bytes uploaded to
-   different rooms are stored once.
+  "Content-addressed blob storage: a konserve store keyed by the SHA-256 of the
+   content. Bytes-by-hash — the drive tree (dvergr.drive.core) references blobs
+   by hash; metadata (name, mime, size) lives with the tree node. Global, not
+   per-room: CAS dedup is content-based, so identical bytes uploaded to different
+   rooms are stored once.
 
-   First consumers: Telegram voice notes / documents, web uploads. Under
-   `.dvergr/blobs/`."
-  (:require [konserve.filestore :refer [connect-fs-store]]
+   Backend is konserve-config-driven via the generic `connect-store` lifecycle,
+   so the store is selected by its `:backend` and any konserve backend works by
+   config alone. Default: a filestore under `.dvergr/blobs`. Override with
+   `set-store-config!` (the daemon sets it from `config.local.edn :blob-store`)
+   — e.g. `{:backend :s3 :bucket \"…\" :region \"…\"}` or a `:tiered` store.
+
+   First consumers: Telegram voice notes / documents, web uploads."
+  (:require [konserve.store :as kstore]
             [konserve.core :as k]
             [dvergr.substrate.paths :as paths]
             [taoensso.telemere :as log])
   (:import [java.security MessageDigest]))
 
+(defonce ^:private store-config (atom nil))
+
+(defn set-store-config!
+  "Set the blob store's konserve config (a `{:backend …}` map) — overrides the
+   filestore default. Must be called before first blob access."
+  [config]
+  (reset! store-config config))
+
+(defn- resolve-config []
+  (or @store-config
+      {:backend :file :path (paths/dir "blobs") :opts {:sync? true}}))
+
 (defonce ^:private store
-  (delay (connect-fs-store (paths/dir "blobs") :opts {:sync? true})))
+  (delay (kstore/connect-store (resolve-config) {:sync? true})))
 
 (defn sha256-hex [^bytes bs]
   (let [d (.digest (MessageDigest/getInstance "SHA-256") bs)]
