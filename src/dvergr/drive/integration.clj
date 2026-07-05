@@ -13,7 +13,7 @@
 
 (defn store-upload!
   "Store an uploaded file into `room`'s drive under `subdir`, returning
-   {:note \"/drive/<subdir>/<name>\" :attachment {:node-id … :mime …}} (the shape
+   {:note \"/drive/<subdir>/<name>\" :attachment {:node-id … :blob-id … :mime …}} (the shape
    channel handlers expect), or nil. Channel-agnostic — Telegram, the web upload
    route, mail, etc. all call this; only resolving the target Room is
    channel-specific. `room` is a discourse Room. Binds the room's ctx."
@@ -27,7 +27,10 @@
                                          :mime mime
                                          :source (or source (if photo? :photo :upload)))]
           {:note (str "/drive/" subdir "/" (:fs.node/name node))
-           :attachment {:node-id (str (:fs.node/id node)) :mime mime}})))))
+           :attachment {:node-id (str (:fs.node/id node))
+                        ;; CAS id — hosts serve playback/download by blob hash
+                        :blob-id (:fs.node/blob node)
+                        :mime mime}})))))
 
 (defn install-mounts!
   "Install the bash mounts-fn so every room's shell sees its drive at /drive
