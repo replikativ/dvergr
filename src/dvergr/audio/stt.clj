@@ -6,8 +6,6 @@
 
    Backends, first success wins:
    - :groq       whisper-large-v3-turbo (GROQ_API_KEY)
-   - :fireworks  whisper-v3 — Fireworks DEPRECATED audio inference
-                 2026-06-10 (all keys 401); kept in case it returns
    - :openai     whisper-1 with a REAL key (fw_-prefixed LLM-compat
                  keys are skipped)
    - :native     in-process Moonshine v2 (pretrained-rstr on raster, no
@@ -25,12 +23,6 @@
             [clojure.java.shell]
             [clojure.string :as str]
             [taoensso.telemere :as tel]))
-
-(defn- fireworks-key []
-  (try
-    (get-in ((requiring-resolve 'dvergr.model.providers/get-provider) :fireworks)
-            [:config :api-key])
-    (catch Throwable _ nil)))
 
 (defonce ^:private native-model (atom nil))
 
@@ -78,10 +70,6 @@
     :url "https://api.groq.com/openai/v1/audio/transcriptions"
     :model "whisper-large-v3-turbo"
     :key-fn #(System/getenv "GROQ_API_KEY")}
-   {:name :fireworks
-    :url "https://audio-prod.api.fireworks.ai/v1/audio/transcriptions"
-    :model "whisper-v3"
-    :key-fn fireworks-key}
    {:name :openai
     :url "https://api.openai.com/v1/audio/transcriptions"
     :model "whisper-1"
@@ -122,7 +110,13 @@
                     (and mime (.contains ^String mime "mpeg")) "mp3"
                     (and mime (.contains ^String mime "wav")) "wav"
                     :else "ogg")
-          text (some #(try-backend % bytes mime ext) backends)]
+          ;; Whisper returns "" for silence/noise, and "" is truthy — coerce
+          ;; blank → nil so `some` falls through to the next backend and, if
+          ;; all are blank, the no-speech (nil) path is reached. A bare
+          ;; "🎤 " message must never be posted.
+          text (some #(let [t (try-backend % bytes mime ext)]
+                        (when-not (str/blank? t) t))
+                     backends)]
       (if text
         (do (tel/log! {:level :info :id ::transcribed
                        :data {:chars (count text)}})
