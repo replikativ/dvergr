@@ -64,6 +64,8 @@ OpenAI → the local `claude` CLI). See [provider-setup.md](provider-setup.md) a
 | **Ctrl-N** | Create a new room and switch to it |
 | **Tab** | Cycle the active room |
 | **Esc** | Cancel the current turn (interrupts the agent's generation) |
+| **Ctrl-R** | Voice input — press to start recording, again to stop; transcribes and posts as a `🎤` message ([setup](media.md#recording-repl--tui)) |
+| **Ctrl-T** / **Ctrl-E** | Toggle the trace view / per-agent context bars |
 | **Ctrl-C** / **q** (input empty) | Quit |
 | **Backspace** / printable chars | Edit input |
 

@@ -73,6 +73,17 @@ Opus/Sonnet/Haiku + Claude-Code models, defined in `model/registry.clj`).
 `(registry/refresh-from-models-dev! #{:anthropic …})` is an opt-in, network call
 that overlays live pricing/context from <https://models.dev>.
 
+**Vision models** carry `:vision` in `:capabilities`. `dvergr.media.vision`
+(image describe/extract) picks the registry's vision default, overridable with
+`DVERGR_VISION_MODEL`. The bundled default is what's deployed on the reference
+Fireworks account (probe-verified); a dedicated Qwen-VL is cheaper per token if
+your account has one — register it and point `DVERGR_VISION_MODEL` at it. See
+[media.md](media.md#vision--images-to-text-and-data).
+
+Some Fireworks models leak their tool-call envelope into content (Kimi, GLM);
+their `:quirks` (`:kimi-tool-id-format?`, `:glm-tool-format?`) turn on the
+recovery/scrub in the OpenAI adapter, so you rarely touch them by hand.
+
 ## How a model is selected
 
 Per request (`model/chat.clj`), resolution is:
