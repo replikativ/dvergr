@@ -658,13 +658,13 @@
             (try (reply! text) (catch Throwable _ nil)))
           (when (and chat-id text (not (str/blank? text)))
             (let [parsed (parse-command text)]
-            (cond
+              (cond
               ;; Spec-derived ops commands (/stats /fork /system /invite …) run
               ;; against THIS chat's room and reply directly — never posted to the
               ;; room or routed to an agent. Checked first so /invite etc. aren't
               ;; mistaken for agent addressing.
-              (tc/command? text)
-              (reply! (tc/dispatch! text #(ensure-room chat-id default-agent)))
+                (tc/command? text)
+                (reply! (tc/dispatch! text #(ensure-room chat-id default-agent)))
 
               ;; Unified slash-command registry (dvergr.discourse.commands): the
               ;; SAME surface the TUI and web dispatch through — /sandbox, /plan,
@@ -673,44 +673,44 @@
               ;; their ops behaviour) and before agent addressing. Authz is the
               ;; bot allowlist already enforced above; executing tool-commands
               ;; add their own finer gate (step 3).
-              (commands/command-input? text)
-              (let [room      (ensure-room chat-id default-agent)
-                    notified? (volatile! false)
-                    notify!   (fn [t] (vreset! notified? true) (reply! t))
-                    result    (commands/execute!
-                               text
-                               {:room       room
-                                :agent-id   default-agent
-                                :daemon     daemon
-                                :exec-ctx   ctx
-                                :tool-exec? tool-exec?
-                                :notify!    notify!
+                (commands/command-input? text)
+                (let [room      (ensure-room chat-id default-agent)
+                      notified? (volatile! false)
+                      notify!   (fn [t] (vreset! notified? true) (reply! t))
+                      result    (commands/execute!
+                                 text
+                                 {:room       room
+                                  :agent-id   default-agent
+                                  :daemon     daemon
+                                  :exec-ctx   ctx
+                                  :tool-exec? tool-exec?
+                                  :notify!    notify!
                                  ;; A :prompt/:skill command posts a user turn.
-                                :post-user! (fn [t]
-                                              (working!)
-                                              (adapters/inbound!
-                                               adapter
-                                               {:chat-id chat-id :user user-info :text t}))})]
+                                  :post-user! (fn [t]
+                                                (working!)
+                                                (adapters/inbound!
+                                                 adapter
+                                                 {:chat-id chat-id :user user-info :text t}))})]
                 ;; notify! already replied for handler/builtin commands; only the
                 ;; bare :reply path (e.g. "unknown command") still needs sending.
-                (when (and (:reply result) (not @notified?))
-                  (reply! (:reply result))))
+                  (when (and (:reply result) (not @notified?))
+                    (reply! (:reply result))))
 
-              (= :list-agents (:command parsed))
-              (reply! (format-agent-list))
+                (= :list-agents (:command parsed))
+                (reply! (format-agent-list))
 
-              (:agent-id parsed)
-              (if (actors/online? (:agent-id parsed))
-                (let [target (:agent-id parsed)]
-                  (ensure-room chat-id target)   ; make sure target is joined
-                  (working!)
-                  (adapters/inbound! (assoc adapter :default-agent target)
-                                     {:chat-id chat-id :user user-info :text (:text parsed)}))
-                (reply! (str "Unknown agent: " (name (:agent-id parsed))
-                             "\n\nUse /agents to see available agents.")))
+                (:agent-id parsed)
+                (if (actors/online? (:agent-id parsed))
+                  (let [target (:agent-id parsed)]
+                    (ensure-room chat-id target)   ; make sure target is joined
+                    (working!)
+                    (adapters/inbound! (assoc adapter :default-agent target)
+                                       {:chat-id chat-id :user user-info :text (:text parsed)}))
+                  (reply! (str "Unknown agent: " (name (:agent-id parsed))
+                               "\n\nUse /agents to see available agents.")))
 
-              :else
-              (do (working!)
-                  (adapters/inbound! adapter
-                                     (cond-> {:chat-id chat-id :user user-info :text text}
-                                       attachment (assoc :attachment attachment))))))))))))
+                :else
+                (do (working!)
+                    (adapters/inbound! adapter
+                                       (cond-> {:chat-id chat-id :user user-info :text text}
+                                         attachment (assoc :attachment attachment))))))))))))

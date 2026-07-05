@@ -457,7 +457,6 @@
                          'head    (fn [url & [opts]] (do-request (merge {:url url :method :head} opts)))
                          'delete  (fn [url & [opts]] (do-request (merge {:url url :method :delete} opts)))})))
 
-
 (defn add-media-ns!
   "Expose document + vision processing to SCI, bound to a chat-ctx:
 
