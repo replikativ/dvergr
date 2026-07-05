@@ -828,11 +828,11 @@
         rec-line     (when-let [r (some-> (:recording signals) deref)]
                        (case (:state r)
                          :recording    (s/render (s/style :fg (s/ansi256 203))
-                                                  "🎤 recording — ^R to stop")
+                                                 "🎤 recording — ^R to stop")
                          :transcribing (s/render (s/style :fg (s/ansi256 245))
-                                                  "🎤 transcribing…")
+                                                 "🎤 transcribing…")
                          :failed       (s/render (s/style :fg (s/ansi256 209))
-                                                  (str "🎤 " (:msg r)))
+                                                 (str "🎤 " (:msg r)))
                          nil))
         ;; `/`-popup: while the user types a command name, show the matching
         ;; commands (whole registry) above the input, selected one highlighted.
