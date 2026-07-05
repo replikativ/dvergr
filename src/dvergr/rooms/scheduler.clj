@@ -20,11 +20,12 @@
    keeps tracking but no-ops via its `:running?` flag (cleared on unregister).
    A negligible lingering no-op per deleted/discarded room until restart."
   (:require [datahike.api :as dh]
-            [sci.ctx-store :as sci-ctx-store]
+            [dvergr.agent.room-context :as room-context]
             [dvergr.discourse :as disc]
             [dvergr.runtime.clock :as clock]
             [dvergr.runtime.ctx :as rctx]
             [dvergr.room.registry :as rreg]
+            [dvergr.sandbox :as sandbox]
             [dvergr.scheduler.cron :as cron]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.spin.cps :refer [spin]]
@@ -58,38 +59,34 @@
 (defn- run-code-task!
   "Evaluate a :schedule/code form in the agent's working-ctx sandbox and
    post the outcome to the room as :_activity (transcript, no agent
-   turn). Errors are caught and reported the same way; a fire never
-   throws out of the scheduler."
+   turn). Fire-and-forget: the eval runs OFF the scheduler spin (the
+   future conveys spindel's *execution-context*, so kb/*room* datahike
+   systems resolve) — a slow or hung task must never block the engine
+   drain thread. eval-code provides the watchdog-interrupt + outer
+   timeout fence and binds SCI's ctx-store (`:realize? true` forces the
+   result while it's bound). Errors are caught and reported the same
+   way; a fire never throws out of the scheduler."
   [room aid s]
-  (let [outcome
-        (try
-          (let [cctx ((requiring-resolve 'dvergr.agent.room-context/ensure-ctx!)
-                      room aid {})
-                sci-ctx (:sci-ctx cctx)
-                ;; The eval runs in a future (timeout fence). It needs BOTH
-                ;; contexts bound in that thread: spindel's *execution-context*
-                ;; (conveyed from fire-one!'s binding, so kb/*room* datahike
-                ;; systems resolve) AND SCI's ctx-store (so injected fns that
-                ;; re-enter the interpreter find it). eval-string* sets the SCI
-                ;; store only during eval, so a LAZY value in the result would
-                ;; trip get-ctx when realized later — pr-str INSIDE the store
-                ;; binding forces realization while it's still set.
-                fut (future
-                      (sci-ctx-store/with-ctx sci-ctx
-                        (pr-str ((requiring-resolve 'sci.core/eval-string*)
-                                 sci-ctx (:schedule/code s)))))
-                r (deref fut (* 5 60 1000) ::timeout)]
-            (if (= r ::timeout)
-              (do (future-cancel fut) "⏱ code task TIMED OUT (5min)")
-              (str "⏱ " (or (:schedule/description s) "code task") " → "
-                   (subs r 0 (min 500 (count r))))))
-          (catch Throwable t
-            (str "⏱ " (or (:schedule/description s) "code task")
-                 " FAILED: " (ex-message t))))]
-    (disc/post! room (disc/message :scheduler :_activity outcome nil
-                                   {:role :assistant
-                                    :source :scheduler
-                                    :schedule-id (:schedule/id s)}))))
+  (future
+    (let [outcome
+          (try
+            (let [cctx (room-context/ensure-ctx! room aid {})
+                  {:keys [success value error]}
+                  (sandbox/eval-code
+                   (:sci-ctx cctx) (:schedule/code s)
+                   :timeout-ms (* 5 60 1000) :realize? true)]
+              (if success
+                (str "⏱ " (or (:schedule/description s) "code task") " → "
+                     (subs value 0 (min 500 (count value))))
+                (str "⏱ " (or (:schedule/description s) "code task")
+                     " FAILED: " (:message error))))
+            (catch Throwable t
+              (str "⏱ " (or (:schedule/description s) "code task")
+                   " FAILED: " (ex-message t))))]
+      (disc/post! room (disc/message :scheduler :_activity outcome nil
+                                     {:role :assistant
+                                      :source :scheduler
+                                      :schedule-id (:schedule/id s)})))))
 
 (defn- fire-one!
   "Fire one schedule: a :schedule/code task evals in the agent's sandbox

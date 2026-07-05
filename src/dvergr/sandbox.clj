@@ -7,6 +7,7 @@
    - Integration with yggdrasil for CoW branching
    - Integration with spindel for async execution (CPS works through SCI)"
   (:require [sci.core :as sci]
+            [sci.ctx-store :as sci-ctx-store]
             [sci.impl.utils :refer [clojure-core-ns]]
             [clojure.string :as str]
             [datahike.api :as dh]
@@ -366,8 +367,15 @@
      => {:value 3 :stdout \"\" :stderr \"\" :success true}
 
      (eval-code ctx \"(Thread/sleep 10000)\" :timeout-ms 1000)
-     => {:success false :error {:message \"Timed out after 1000ms\" ...}}"
-  [sci-ctx code & {:keys [timeout-ms cancel?]}]
+     => {:success false :error {:message \"Timed out after 1000ms\" ...}}
+
+   The eval runs with SCI's ctx-store bound (injected fns that re-enter the
+   interpreter find it). eval-string* sets the store only during eval, so a
+   LAZY value in the result would trip get-ctx when realized later —
+   `:realize? true` pr-strs the value INSIDE the store binding, forcing
+   realization while it's still set, and returns the printed string as
+   :value."
+  [sci-ctx code & {:keys [timeout-ms cancel? realize?]}]
   (if timeout-ms
     ;; Timeout path: watchdog + future/deref outer fence.
     ;;
@@ -413,10 +421,12 @@
                                     (.setName t "dvergr-eval-cancel-poll")
                                     (.start t)))]
                           (try
-                            (sci/binding [sci/out stdout sci/err stderr]
-                              (let [result (sci/eval-string* sci-ctx code)]
-                                {:value result :stdout (str stdout) :stderr (str stderr)
-                                 :success true}))
+                            (sci-ctx-store/with-ctx sci-ctx
+                              (sci/binding [sci/out stdout sci/err stderr]
+                                (let [result (sci/eval-string* sci-ctx code)
+                                      result (if realize? (pr-str result) result)]
+                                  {:value result :stdout (str stdout) :stderr (str stderr)
+                                   :success true})))
                             (catch Throwable e
                               ;; Catch Throwable so JVM Errors (StackOverflowError,
                               ;; OutOfMemoryError) also produce a structured result
@@ -516,9 +526,11 @@
     (let [stdout (StringWriter.)
           stderr (StringWriter.)]
       (try
-        (sci/binding [sci/out stdout sci/err stderr]
-          (let [result (sci/eval-string* sci-ctx code)]
-            {:value result :stdout (str stdout) :stderr (str stderr) :success true}))
+        (sci-ctx-store/with-ctx sci-ctx
+          (sci/binding [sci/out stdout sci/err stderr]
+            (let [result (sci/eval-string* sci-ctx code)
+                  result (if realize? (pr-str result) result)]
+              {:value result :stdout (str stdout) :stderr (str stderr) :success true})))
         (catch Exception e
           {:error {:message (.getMessage e)
                    :type    (str (class e))

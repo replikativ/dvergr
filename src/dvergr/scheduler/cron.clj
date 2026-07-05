@@ -192,16 +192,20 @@
    `:n` (a positive integer with `:every :minute|:hour|:day|:week`) means
    'every N of that unit' and expands to an interval — e.g. {:every :hour :n 4}
    → {:every-ms 14400000}. Use `{:every :day :at \"HH:MM\"}` (no `:n`) for a
-   wall-clock daily time; `:n` is for fixed intervals, so `:n`+`:at` and
-   `:n`+`:month` (variable length) are rejected."
+   wall-clock daily time; `:n` is for fixed intervals, so `:n`+`:at`,
+   `:n`+`:on`/`:on-day`, and `:n`+`:month` (variable length) are rejected.
+   `:n` and raw `:interval-ms`/`:every-ms` must be positive integers."
   [spec]
   (let [unknown (remove known-spec-keys (keys spec))]
     (when (seq unknown)
       (throw (ex-info (str "Unknown schedule spec key(s): " (vec unknown)
                            ". Valid keys: " (vec (sort known-spec-keys)))
                       {:unknown (vec unknown) :spec spec})))
-    (when (:n spec)
+    (when-let [n (:n spec)]
       (cond
+        (not (and (integer? n) (pos? n)))
+        (throw (ex-info (str ":n must be a positive integer (got " (pr-str n) ")")
+                        {:spec spec}))
         (not (:every spec))
         (throw (ex-info ":n requires :every, e.g. {:every :hour :n 4}" {:spec spec}))
         (not (contains? unit-ms (:every spec)))
@@ -212,7 +216,20 @@
         (throw (ex-info (str ":n and :at are ambiguous — use {:every :hour :n 4} "
                              "for a fixed interval, or {:every :day :at \"07:00\"} "
                              "for a daily wall-clock time")
+                        {:spec spec}))
+        (or (:on spec) (:on-day spec))
+        (throw (ex-info (str ":n and :on/:on-day don't combine — :n expands to a "
+                             "fixed interval, which cannot honour a calendar "
+                             "anchor. Use {:every :week :on :mon} for calendar "
+                             "cadence, or :n alone for fixed intervals.")
                         {:spec spec}))))
+    ;; Raw interval forms get the same positivity guard: 0 / negative ms
+    ;; would materialize a next-fire <= now that re-fires on every tick.
+    (doseq [k [:interval-ms :every-ms]]
+      (when-let [ms (get spec k)]
+        (when-not (and (integer? ms) (pos? ms))
+          (throw (ex-info (str k " must be a positive integer (got " (pr-str ms) ")")
+                          {:spec spec})))))
     (if-let [n (:n spec)]
       (-> spec (dissoc :every :n) (assoc :every-ms (* (long n) (unit-ms (:every spec)))))
       spec)))
