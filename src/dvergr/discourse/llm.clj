@@ -18,7 +18,7 @@
           :spec   {:provider :anthropic
                    :model    \"claude-sonnet-4-6\"
                    :system-prompt \"You are a research assistant.\"}
-          :tools  #{:clojure_eval}
+          :tools  :knowledge-worker         ; a named profile — or an explicit set
           :budget {:dollars 0.50}}))
 
    When the dollar budget hits zero, the agent loop escalates via
@@ -106,8 +106,10 @@
 
    :id          — keyword participant id (required)
    :spec        — {:provider :model :system-prompt} (required)
-   :tools       — set/vector of tool names from `dvergr.tools` registry, OR
-                  a map of name → tool-def (for pre-wrapped tools)
+   :tools       — a `dvergr.tools` profile keyword (:dev-toolbelt,
+                  :knowledge-worker), a set/vector of tool names, OR a map of
+                  name → tool-def (pre-wrapped). Default: :dev-toolbelt
+                  (`minimal-coding-tools`). Pass `#{}` for a no-tools agent.
    :db-conn     — datahike connection for chat persistence (optional)
    :budget      — {:dollars n :checkpoint-grace-ms n}
                   (default {:dollars 1.0 :checkpoint-grace-ms 60000}).
@@ -135,7 +137,12 @@
     :or   {budget      {:dollars 1.0}
            compaction  {:auto? true :strategy :sync-before-turn}
            run-turn-fn default-run-turn
-           room-safe?  true}}]
+           room-safe?  true
+           ;; Sane default toolbelt instead of the bare `#{:clojure_eval}` poverty
+           ;; trap — file ops + jailed shell + clojure_eval (web/data/knowledge via
+           ;; the SCI sandbox). Override with a `dvergr.tools` profile keyword
+           ;; (:dev-toolbelt / :knowledge-worker) or an explicit tool set.
+           tools       tools/minimal-coding-tools}}]
   {:pre [(keyword? id) (map? spec)]}
   (let [ctx       (or ctx ec/*execution-context*)
         ;; Room-less FALLBACK working ctx (sidecar / d/hire / tests). When the

@@ -69,16 +69,30 @@
    program, no file mutation."
   #{:read-file :shell :clojure-eval})
 
+(def tool-profiles
+  "Named, reusable tool-sets — grant one by name (`:tools :dev-toolbelt`) instead
+   of re-listing individual tools per agent. A 'role' is just one of these (plain
+   data). All reach the web / datahike / knowledge / tasks surface through
+   `clojure_eval`'s SCI sandbox; the named tools are the structured file/shell ops."
+  {:dev-toolbelt     minimal-coding-tools     ; read/write/edit/clojure-edit + shell + clojure_eval
+   :knowledge-worker minimal-readonly-tools   ; read + shell + clojure_eval (inspect + program, no mutation)
+   :readonly         minimal-readonly-tools})
+
 (defn normalize-tools
   "Normalize a tools spec to the name→tool-def map `tool-definitions` expects.
-   Accepts a map (passed through), or a set/seq of tool NAMES (keywords or
-   strings) resolved against the registry. Keyword names are munged to the
-   registry's underscore form (e.g. :read-file → \"read_file\"). Anything else
-   passes through unchanged. Single source of truth for the `llm-agent` :tools
-   contract — callers (personas, daemon) should not reach into the registry
-   themselves."
+   Accepts:
+   - a **profile keyword** (`:dev-toolbelt`, `:knowledge-worker`, …) resolved via
+     `tool-profiles`,
+   - a map (passed through),
+   - a set/seq of tool NAMES (keywords or strings) resolved against the registry
+     (keyword names munged to the registry's underscore form, e.g. :read-file →
+     \"read_file\").
+   Single source of truth for the `llm-agent` :tools contract — callers (personas,
+   daemon) should not reach into the registry themselves."
   [tools]
   (cond
+    (and (keyword? tools) (contains? tool-profiles tools))
+    (recur (get tool-profiles tools))
     (map? tools) tools
     (or (set? tools) (sequential? tools))
     (let [name-strs (map #(if (keyword? %) (str/replace (name %) "-" "_") (str %)) tools)]
