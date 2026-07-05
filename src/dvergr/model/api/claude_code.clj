@@ -193,7 +193,16 @@
              "--model" model
              "--max-turns" "0"
              "--no-session-persistence"
-             "--tools" ""]
+             ;; Isolate the subprocess from the host's Claude Code environment,
+             ;; or its leaked native tools shadow dvergr's text <tool_use>
+             ;; protocol and tool calls fail non-deterministically (dvergr #11):
+             ;;  - MCP: --strict-mcp-config + an empty config drops the user's
+             ;;    global MCP servers ("{}" alone is rejected — needs mcpServers).
+             ;;  - Built-ins: --tools "" is a no-op in print mode, so DENY the
+             ;;    built-in tools explicitly to force the model onto <tool_use>.
+             "--strict-mcp-config"
+             "--mcp-config" "{\"mcpServers\":{}}"
+             "--disallowedTools" "Bash Read Edit Write Glob Grep Task WebFetch WebSearch"]
       system (into ["--system-prompt" system])
       effort (into ["--effort" effort]))))
 
