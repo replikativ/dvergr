@@ -464,11 +464,15 @@
      (doc/extract-text \"/drive/telegram/report.pdf\")  ; pdf/text → string
      (vision/describe \"/drive/telegram/photo.jpg\")    ; image → description/OCR
      (vision/describe path {:prompt \"read the receipt total\"})
+     ;; structured extraction for business docs (invoice → JSON):
+     (vision/extract \"/drive/inbox/invoice.jpg\"
+                     {:schema \"invoice_number, date (ISO), vendor, total (number)\"
+                      :verify-fields [:total]})
 
    Paths resolve through the chat-ctx's muschel FS — the same
    filesystem the shell sees, so worktree files AND mounted drives
    (e.g. /drive) both work. Bytes never enter the SCI sandbox; only
-   extracted text comes back."
+   extracted text / parsed data comes back."
   [sci-ctx chat-ctx]
   (let [read-bytes (fn [path]
                      (let [host ((requiring-resolve 'dvergr.intake.bash/get-or-create-host!)
@@ -490,9 +494,13 @@
                    (read-bytes path) (guess-mime path)))
         describe (fn [path & [opts]]
                    ((requiring-resolve 'dvergr.media.vision/describe)
-                    (read-bytes path) (guess-mime path) opts))]
+                    (read-bytes path) (guess-mime path) opts))
+        extract-data (fn [path opts]
+                       ((requiring-resolve 'dvergr.media.vision/extract)
+                        (read-bytes path) (guess-mime path) opts))]
     (sci/add-namespace! sci-ctx 'doc {'extract-text extract})
-    (sci/add-namespace! sci-ctx 'vision {'describe describe})))
+    (sci/add-namespace! sci-ctx 'vision {'describe describe
+                                         'extract extract-data})))
 
 (defn add-bash-ns!
   "Expose intake.bash (muschel-backed shell) to SCI, bound to a chat-ctx.
