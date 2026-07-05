@@ -863,6 +863,23 @@
                       "Autostarting file-defined agent")
             (create-agent! daemon cfg)))))
 
+    ;; Restore ROOM-side membership. An agent added to a UI-created room is
+    ;; stored in that room's durable `:room/agent-ids`, but the loops above only
+    ;; re-join AGENT-side membership (each agent's config `:rooms`). Nothing
+    ;; re-reads `:room/agent-ids`, so a UI-created room shows "0 agents" after a
+    ;; restart even though the membership persisted. Now that every agent is
+    ;; online, re-join each room's durable members — `join-agent-to-room!` is
+    ;; idempotent, so this composes with the config/:rooms joins. (dvergr #12)
+    (binding [rtc/*execution-context* exec-ctx]
+      (doseq [{:room/keys [slug agent-ids]} (sdb/all-rooms)
+              :when (seq agent-ids)
+              :let  [room (rreg/lookup (rstore/slug->room-id slug))]
+              :when room
+              aid   agent-ids
+              :let  [cfg (agent-join-config daemon aid)]
+              :when cfg]
+        (join-agent-to-room! daemon (resolve-safe-config cfg) room)))
+
     ;; Boardroom-mirror sink: DROPPED (D/E/F 3b-1). Agent replies now live in
     ;; the room where the conversation happened; an agent that should post to
     ;; boardroom is a participant there and replies into it directly. DM
