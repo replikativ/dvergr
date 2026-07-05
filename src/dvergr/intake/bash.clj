@@ -47,6 +47,7 @@
             [muschel.core :as m]
             [muschel.env :as menv]
             [muschel.fs.disk :as fs.disk]
+            [muschel.fs.mount :as fs.mount]
             [muschel.host :as host]
             [muschel.host.builtin :as hb]
             [muschel.host.jvm :as host.jvm]
@@ -305,16 +306,16 @@
      :builtins           (default: muschel.builtins.posix/standard)
      :mounts             map of absolute sandbox path → muschel FS,
                          union-mounted over the workspace via
-                         muschel.fs.mount (requires muschel > 0.2.16).
-                         Embedders mount e.g. a drive at /drive so
-                         agents reach it with plain ls/cat/redirects."
+                         muschel.fs.mount. Embedders mount e.g. a drive
+                         at /drive so agents reach it with plain
+                         ls/cat/redirects."
   [{:keys [workspace fallback-allowlist builtins mounts]
     :or {workspace          (default-workspace)
          fallback-allowlist default-fallback-allowlist
          builtins           posix/standard}}]
   (let [fs (fs.disk/make workspace {:mount-at "/"})
         fs (if (seq mounts)
-             ((requiring-resolve 'muschel.fs.mount/make) fs mounts)
+             (fs.mount/make fs mounts)
              fs)]
     (hb/make {:fs fs
               :fallback-host (git-guarded-host (host.jvm/make))
