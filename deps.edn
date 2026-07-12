@@ -32,8 +32,23 @@
         ;; via spindel — not declared here, so spindel is the single source of its
         ;; version. The `:local` alias's `../spindel` override carries it too.
 
-        ;; Spindel — Reactive runtime with CoW forking
-        org.replikativ/spindel     {:mvn/version "0.1.29"}
+        ;; Spindel — Reactive runtime with CoW forking.
+        ;; 0.1.35 (#27 lost-wakeup redesign + follow-ups): continuation
+        ;; failures reject the owning spin (spawn!/supervisor observe
+        ;; them), one-shot waiter handoffs run as :cont-resume events
+        ;; with a transactional pop+enqueue, engine-wide fault hook
+        ;; (engine.fault/set-fault-reporter!). Forks inherit NO events —
+        ;; an event is delivered in exactly one world; in-flight mailbox
+        ;; claims are undone in the fork (spindel#30, fixes the
+        ;; duplicate room-log writes 0.1.31 caused in hire!). Node-record
+        ;; invariant enforced at field-write sites (spindel#31/#32).
+        ;; Pubsub buffers are atom-backed (spindel#34/#35): the JVM
+        ;; LinkedList buffers were a cross-thread data race that could
+        ;; silently lose one delivery in exactly OUR bus topology
+        ;; (mailbox→mult→tap→pub→topic-mult→tap) under load.
+        ;; Substrate for the durable-cursor bus pump + supervisor
+        ;; restart.
+        org.replikativ/spindel     {:mvn/version "0.1.35"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context
