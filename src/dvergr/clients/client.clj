@@ -244,9 +244,14 @@
   [log-atom pred]
   (let [p (promise), wid (random-uuid)
         try! (fn [snap e] (when-not (realized? p) (when-let [v (pred snap e)] (deliver p v))))]
+    ;; The bus log atom holds {:entries [...] :cursor n} (durable-cursor
+    ;; bus) — watch the :entries vector.
     (add-watch log-atom wid
-               (fn [_ _ old new] (try! new (when (> (count new) (count old)) (peek new)))))
-    (doseq [e @log-atom :while (not (realized? p))] (try! @log-atom e))
+               (fn [_ _ old new]
+                 (let [o (:entries old) n (:entries new)]
+                   (try! n (when (> (count n) (count o)) (peek n))))))
+    (doseq [e (:entries @log-atom) :while (not (realized? p))]
+      (try! (:entries @log-atom) e))
     (future (try @p (finally (remove-watch log-atom wid))))
     p))
 
@@ -271,7 +276,7 @@
           (when-not (realized? p)
             (let [idle (- (System/currentTimeMillis) @last-at)]
               (if (>= idle idle-ms)
-                (deliver p @log-atom)
+                (deliver p (:entries @log-atom))
                 (do (Thread/sleep (max 100 (- idle-ms idle))) (recur))))))
         (finally (remove-watch log-atom wid))))
     p))

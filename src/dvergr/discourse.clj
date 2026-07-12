@@ -70,9 +70,10 @@
   ;; bus           : dvergr.runtime.bus.Bus — the routing substrate
   ;; ctx           : spindel ExecutionContext (== bus's ctx)
   ;; forked-at-len : index into bus's log at fork time (nil/0 for root rooms)
-  ;; store         : nil or PRoomStore for durability. When non-nil, an
-  ;;                 internal spin mirrors every message posted to the
-  ;;                 bus into the store.
+  ;; store         : nil or PRoomStore for durability. When non-nil, the
+  ;;                 bus persists every message-shaped event inside
+  ;;                 post! — durability BEFORE visibility (the bus's
+  ;;                 :durable-append! hook, wired in make-room).
   ;; meta          : atom of arbitrary metadata (:telegram-chat-id,
   ;;                 :type :internal | :telegram-mirror, etc.)
            [id slug title parent-id participants bus ctx forked-at-len store meta])
@@ -156,15 +157,14 @@
    (when one is registered in the current ctx). Falls back to a plain
    bus if not — keeps tests / library use happy without daemon
    bootstrap."
-  [ctx room-id scope]
+  [ctx room-id scope & [{:keys [durable-append!]}]]
   (let [peer (binding [ec/*execution-context* ctx] (peer-bus/current))]
     (bus/create-bus
      (cond-> {:ctx ctx}
+       durable-append! (assoc :durable-append! durable-append!)
        peer (assoc :relay-to  peer
                    :relay-tag {:dvergr/origin room-id
                                :dvergr/scope  scope})))))
-
-(declare spawn-persistence-listener!)
 
 (defn make-room
   "Create a Room from an opts map. The unified Room constructor.
@@ -188,16 +188,29 @@
   (let [ctx   (or ctx (sp/create-execution-context))
         slug  (or slug (name id))
         title (or title slug)
-        b     (bus-with-peer-relay ctx id :room)
+        ;; Durability-first (durable-cursor bus): the bus persists each
+        ;; message-shaped event into the store INSIDE post!, before the
+        ;; message becomes visible anywhere. A store failure fails the
+        ;; post loudly — the inverse of the old persistence LISTENER,
+        ;; which observed the ephemeral pipeline downstream and could
+        ;; silently lose durability (or, if the pipeline lost the
+        ;; message, lose it entirely). The conversation id is resolved
+        ;; from :meta here (a fork persists under its chain root — same
+        ;; rule as `conversation-id`, computed pre-construction).
+        conv-id (or (:conversation-id meta) id)
+        durable-append! (when store
+                          (fn [msg]
+                            (when (rstore/message-shape? msg)
+                              (rstore/-store-message! store conv-id msg))))
+        b     (bus-with-peer-relay ctx id :room
+                                   (when durable-append!
+                                     {:durable-append! durable-append!}))
         room  (->Room id slug title parent-id (atom {}) b ctx 0 store (atom (or meta {})))]
     ;; Persist metadata on creation so the store has it for re-hydration.
     (when store
       (rstore/-store-room! store id (cond-> {:id id :slug slug :title title}
                                       parent-id (assoc :parent-id parent-id)
-                                      (seq meta) (assoc :meta meta)))
-      ;; Spawn the durability listener — every message-shaped event on
-      ;; the bus gets mirrored into the store.
-      (spawn-persistence-listener! room))
+                                      (seq meta) (assoc :meta meta))))
     ;; Auto-register so every Room is discoverable via the registry.
     (binding [ec/*execution-context* ctx]
       (rreg/register! room))
@@ -355,30 +368,6 @@
    (no out-of-band `append-log!`). See doc/unified-fork-conversation.md."
   [room]
   (or (some-> room :meta deref :conversation-id) (:id room)))
-
-(defn- spawn-persistence-listener!
-  "When the Room has a `:store`, mirror every message-shaped event on
-   the bus into the store. Idempotent at the store layer (re-stores on
-   the same `:message/id` are no-ops), so re-firing across drain cycles
-   is harmless."
-  [room]
-  (binding [ec/*execution-context* (:ctx room)]
-    (let [sub (bus/subscribe! (:bus room) [:type :user/message])]
-      (sp/spawn!
-       (sp/spin
-        (loop [s (:aseq sub)]
-          (when-let [r (sp/await (anext s))]
-            (let [[msg rest-s] r]
-              (try
-                (when (rstore/message-shape? msg)
-                  (rstore/-store-message! (:store room) (conversation-id room) msg))
-                (catch Throwable t
-                    ;; Durability boundary — a failure here means a message did
-                    ;; NOT persist to the room store. Must be visible, never lost.
-                  (tel/log! {:level :error :id :room/persist-failed
-                             :data {:room (:id room) :from (:from msg)
-                                    :error (.getMessage t)}})))
-              (recur rest-s)))))))))
 
 (defn on-each-message
   "Spawn a listener that calls `(f msg)` for EVERY conversational message posted
@@ -696,11 +685,6 @@
          _          (when (= :ctx isolation)
                       (binding [ec/*execution-context* child-ctx]
                         (ec/swap-state! [:dvergr/transient-fork?] (constantly true))))
-         child-bus  (bus-with-peer-relay child-ctx new-id :fork)
-         ;; Seed the fork's bus log with parent history so log-based
-         ;; consumers see a continuous record. Forks have their OWN bus
-         ;; so live messages do not leak between parent and fork.
-         _          (bus/seed-log! child-bus parent-log)
          ;; `:isolation :ctx` forks BRANCH the parent's conversation. The fork
          ;; gets its OWN store wrapping the fork ctx's BRANCHED chat-db conn
          ;; (NOT the parent's fixed-conn store), and persists under the parent's
@@ -717,6 +701,20 @@
                       (some-> (binding [ec/*execution-context* child-ctx]
                                 (srooms/msgs-conn-for-slug (:slug room)))
                               store-dh/make))
+         ;; Durability-first for the fork too: fork-local messages persist
+         ;; onto the BRANCH (under the root conversation id) inside post!,
+         ;; before visibility — replacing the fork's persistence listener.
+         child-bus  (bus-with-peer-relay child-ctx new-id :fork
+                                         (when fork-store
+                                           {:durable-append!
+                                            (fn [msg]
+                                              (when (rstore/message-shape? msg)
+                                                (rstore/-store-message! fork-store conv-id msg)))}))
+         ;; Seed the fork's bus log with parent history so log-based
+         ;; consumers see a continuous record (the cursor starts past it —
+         ;; history is never re-delivered). Forks have their OWN bus so
+         ;; live messages do not leak between parent and fork.
+         _          (bus/seed-log! child-bus parent-log)
          new-room   (->Room new-id new-slug
                             (str (:title room) " · fork " short-uuid)
                             (:id room)
@@ -728,9 +726,8 @@
                             (atom (assoc @(:meta room)
                                          :forked-from (:id room)
                                          :conversation-id conv-id)))]
-     ;; Persist fork-local messages onto the branch under the root conversation.
-     (when (and (= :ctx isolation) fork-store)
-       (spawn-persistence-listener! new-room))
+     ;; (Fork-local persistence rides the bus's durable-append! hook now —
+     ;; wired at child-bus construction above.)
      ;; Register the fork in the PARENT ctx — where the daemon UI reads the
      ;; registry. A `:ctx` fork's own child-ctx is invisible to the parent
      ;; (CoW), so registering there would hide the fork from the tree (and it

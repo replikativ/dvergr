@@ -7,8 +7,21 @@
      [:to   <participant-id>]  — direct routing to a participant
      [:type <tag>]             — capability routing by message tag
 
-   Both dimensions are pubs over the same source mailbox via an upstream
-   mult, so each message reaches every matching subscription.
+   Both dimensions are pubs over one upstream mult, so each message
+   reaches every matching subscription.
+
+   LOG-FIRST FAN-OUT (durable-cursor model): `post!` (1) durably
+   persists the message when the bus carries a `:durable-append!` hook
+   (rooms with a store — durability BEFORE visibility), (2) appends it
+   to the bus log — the fan-out source of truth, so log order == post
+   order — and (3) rings a doorbell. A SUPERVISED pump delivers log
+   entries into the mult and advances a cursor AFTER each handoff.
+   Losing the pump loses promptness, never data: the supervisor
+   restarts it and it resumes from the cursor, re-delivering at most
+   the one in-flight entry (participants dedup by message :id, so the
+   observed contract is effectively-once). This replaces the previous
+   ephemeral-first pipeline, whose losses were total and whose pump
+   was only recoverable by the out-of-band watchdog healing.
 
    The opinionated layer is `default-buffers` — a map from tag namespace
    (the `namespace` of `:type`) to a 0-arg buffer-builder. The defaults
@@ -46,6 +59,7 @@
             [org.replikativ.spindel.pubsub.mult :as mult]
             [org.replikativ.spindel.pubsub.pub :as pub]
             [org.replikativ.spindel.pubsub.buffer :as buf]
+            [org.replikativ.spindel.spin.supervisor :as supervisor]
             [taoensso.telemere :as tel]))
 
 ;; ============================================================================
@@ -96,30 +110,82 @@
 (defrecord Bus
            [;; spindel execution context
             ctx
-   ;; mailbox: every post! lands here; PAsyncSeq source for the mult
+   ;; mailbox feeding the mult — written ONLY by the fan-out pump
             source-mbox
-   ;; mult fanning out to the routing pubs + log
+   ;; mult fanning out to the routing pubs + relay
             source-mult
    ;; pub keyed by :to (direct-to-participant routing)
             to-pub
    ;; pub keyed by :type (capability routing)
             type-pub
-   ;; atom vector — history, updated by a tap on source-mult
-            log])
+   ;; atom of {:entries [msg…] :cursor n} — the LOG-FIRST fan-out model:
+   ;; post! appends here (upstream of delivery, so log order == post
+   ;; order and a message is on record before any consumer sees it);
+   ;; the pump delivers entries[cursor..] into the mult and advances.
+   ;; One atom for both so seed/append-as-history compose race-free
+   ;; with live posts (see append-log!).
+            log
+   ;; mailbox used as a data-free doorbell: post! rings it, the pump
+   ;; parks on it when the log is drained
+            hint-mbx
+   ;; optional (fn [msg]) called by post! BEFORE the message becomes
+   ;; visible — the durability-first hook (rooms pass a store append).
+   ;; A throw here fails the post loudly; nothing is half-delivered.
+            durable-append!
+   ;; the supervised fan-out pump (spin) — kept for introspection
+            pump])
 
-(defn- spawn-log-drain!
-  "Spawn a spin that consumes every message from the source-mult and
-   appends it to the log atom."
-  [ctx source-mult log-atom]
+(def ^:private history-key
+  "Metadata key marking log entries absorbed as HISTORY (fork seeding /
+   merge-as-history) — on record, never delivered to live handlers.
+   Metadata, not an entry field, so log readers see unpolluted messages."
+  ::history)
+
+(defn- spawn-fanout-pump!
+  "Spawn the supervised fan-out pump: delivers log entries[cursor..]
+   into `source-mbox` (feeding the existing mult topology) and advances
+   the cursor AFTER each handoff; parks on `hint-mbx` when drained.
+
+   Crash-only by construction: the cursor lives in the log-state atom,
+   so a pump that dies mid-stream is restarted by its supervisor and
+   resumes where it left off. The restart re-delivers at most the one
+   entry whose handoff was in flight (at-least-once); participants
+   dedup by message :id (see discourse/participant-spin), making the
+   observed contract effectively-once. Entries marked as history
+   (fork seeding / merge absorption) advance the cursor without
+   delivery.
+
+   The cursor advance uses a max-guard so it composes with seed-log!'s
+   cursor reset (which only ever moves it forward past history)."
+  [ctx log-state hint-mbx source-mbox]
   (binding [ec/*execution-context* ctx]
-    (let [log-tap (mult/tap source-mult (buf/fixed-buffer 1024))]
-      (sync/spawn!
-       (spin
-        (loop [s log-tap]
-          (when-let [r (await (aseq/anext s))]
-            (let [[msg rest-s] r]
-              (swap! log-atom conj msg)
-              (recur rest-s)))))))))
+    (let [pump-fn
+          (fn []
+            (spin
+             (loop []
+               (let [{:keys [entries cursor]} @log-state]
+                 (if (< cursor (count entries))
+                   (let [e (nth entries cursor)]
+                     (when-not (history-key (meta e))
+                       (sync/post! source-mbox e))
+                     (swap! log-state update :cursor
+                            (fn [c] (max c (inc cursor))))
+                     (recur))
+                   (do (await hint-mbx) ; doorbell; content ignored
+                       (recur)))))))
+          sup (supervisor/supervisor
+               [{:id :fanout-pump :start pump-fn}]
+               {:strategy :one-for-one
+                :max-restarts 5
+                :window-ms 60000
+                :on-fatal (fn [e]
+                            (tel/log! {:level :error :id ::pump-fatal
+                                       :msg "bus fan-out pump exceeded its restart budget"
+                                       :data {:error (str e)}}))})]
+      (sync/spawn! sup)
+      sup)))
+
+(declare post!)
 
 (defn- spawn-relay-drain!
   "Spawn a spin that taps `source-mult` and re-posts every message to
@@ -143,39 +209,57 @@
                     ;; keys the original message already has — the
                     ;; origin's view of itself wins.
                   tagged    (merge relay-tag msg)]
-              (binding [ec/*execution-context* (:ctx target-bus)]
-                (sync/post! (:source-mbox target-bus) tagged))
+              ;; Through the PUBLIC post! — under the log-first model the
+              ;; target's log is written at post time (there is no
+              ;; delivery-side log tap anymore), so poking its
+              ;; source-mbox directly would deliver without recording.
+              (post! target-bus tagged)
               (recur rest-s)))))))))
 
 (defn create-bus
   "Construct a Bus.
 
+   LOG-FIRST fan-out (the durable-cursor model): `post!` appends to the
+   bus log (and, for rooms with a store, durably persists FIRST via
+   `:durable-append!`), then rings a doorbell; a supervised pump
+   delivers log entries into the mult topology and advances a cursor.
+   Losing the pump loses promptness, never data — the supervisor
+   restarts it and it resumes from the cursor.
+
    Options:
-     :ctx        — existing execution context; default: a fresh one
-     :log?       — keep a vector history of every message (default true)
-     :relay-to   — another Bus to mirror every message into (typically
-                    the daemon-wide peer-bus). Messages are re-posted
-                    verbatim with `:relay-tag` merged in *underneath*
-                    (so the original message's own fields win).
-     :relay-tag  — extras to merge into each relayed message — typically
-                    `{:dvergr/origin <room-id> :dvergr/scope :room}`
-                    or `:fork`. Required when `:relay-to` is set."
+     :ctx             — existing execution context; default: a fresh one
+     :durable-append! — optional (fn [msg]); called by post! BEFORE the
+                        message becomes visible anywhere. Rooms pass a
+                        store append here (idempotent by :id at the
+                        store layer). A throw fails the post loudly.
+     :relay-to        — another Bus to mirror every message into
+                        (typically the daemon-wide peer-bus). Messages
+                        are re-posted verbatim with `:relay-tag` merged
+                        in *underneath* (the original's fields win).
+     :relay-tag       — extras to merge into each relayed message —
+                        typically `{:dvergr/origin <room-id>
+                        :dvergr/scope :room}` or `:fork`. Required when
+                        `:relay-to` is set.
+     :log?            — accepted for compatibility; the log is now the
+                        fan-out source of truth and always kept."
   ([] (create-bus {}))
-  ([{:keys [ctx log? relay-to relay-tag] :or {log? true}}]
-   (let [ctx (or ctx (ectx/create-execution-context))]
+  ([{:keys [ctx durable-append! relay-to relay-tag log?] :as _opts}]
+   (let [_ log? ;; vestigial — see docstring
+         ctx (or ctx (ectx/create-execution-context))]
      (binding [ec/*execution-context* ctx]
        (let [source     (sync/create-mailbox ctx)
+             hint-mbx   (sync/create-mailbox ctx)
              m          (mult/mult source)
              to-tap     (mult/tap m (buf/fixed-buffer 256))
              type-tap   (mult/tap m (buf/fixed-buffer 256))
              to-pub-v   (pub/pub to-tap :to)
              type-pub-v (pub/pub type-tap :type)
-             log-atom   (atom [])]
-         (when log?
-           (spawn-log-drain! ctx m log-atom))
+             log-state  (atom {:entries [] :cursor 0})]
          (when relay-to
            (spawn-relay-drain! ctx m relay-to (or relay-tag {})))
-         (->Bus ctx source m to-pub-v type-pub-v log-atom))))))
+         (let [pump (spawn-fanout-pump! ctx log-state hint-mbx source)]
+           (->Bus ctx source m to-pub-v type-pub-v
+                  log-state hint-mbx durable-append! pump)))))))
 
 ;; ============================================================================
 ;; Posting
@@ -195,17 +279,28 @@
    (a broadcast that also carries a subscribed `:type` matches both `[:to nil]`
    and `[:type …]`)."
   [bus msg]
-  (binding [ec/*execution-context* (:ctx bus)]
-    (sync/post! (:source-mbox bus)
-                (cond-> msg
-                  (and (map? msg) (nil? (:id msg))) (assoc :id (random-uuid)))))
+  (let [msg' (cond-> msg
+               (and (map? msg) (nil? (:id msg))) (assoc :id (random-uuid)))]
+    ;; 1. Durability FIRST. For a room with a store this persists the
+    ;;    message before it is visible anywhere — a store failure fails
+    ;;    the post loudly and nothing is half-delivered (this inverts
+    ;;    the old persistence-listener model, where a store failure
+    ;;    silently lost durability while the live message flowed).
+    (when-let [append! (:durable-append! bus)]
+      (append! msg'))
+    ;; 2. The log is the fan-out source of truth. Appending here (not
+    ;;    in a delivery tap) means log order == post order, and a
+    ;;    message is on record before any consumer runs.
+    (swap! (:log bus) update :entries conj msg')
+    ;; 3. Doorbell for the pump.
+    (binding [ec/*execution-context* (:ctx bus)]
+      (sync/post! (:hint-mbx bus) ::hint)))
   nil)
 
 (defn post-many!
-  "Post a sequence of messages in order under one ctx binding."
+  "Post a sequence of messages in order."
   [bus msgs]
-  (binding [ec/*execution-context* (:ctx bus)]
-    (doseq [m msgs] (sync/post! (:source-mbox bus) m)))
+  (doseq [m msgs] (post! bus m))
   nil)
 
 ;; ============================================================================
@@ -220,7 +315,8 @@
 ;; auto-printed at the REPL (e.g. the result of `subscribe!`). Print compact,
 ;; acyclic summaries instead.
 (defmethod print-method Bus [^Bus b ^java.io.Writer w]
-  (.write w (str "#Bus{:log " (count @(:log b)) "}")))
+  (let [{:keys [entries cursor]} @(:log b)]
+    (.write w (str "#Bus{:log " (count entries) " :cursor " cursor "}"))))
 
 (defmethod print-method Subscription [^Subscription s ^java.io.Writer w]
   (.write w (str "#Subscription{:topic " (pr-str (:topic s)) "}")))
@@ -266,28 +362,49 @@
 (defn log
   "Return the bus's full message log (vector)."
   [bus]
-  @(:log bus))
+  (:entries @(:log bus)))
+
+(defn log-cursor
+  "The fan-out cursor: entries below this index have been handed to the
+   delivery topology (or absorbed as history). Introspection/tests."
+  [bus]
+  (:cursor @(:log bus)))
 
 (defn clear-log!
-  "Reset the bus's log to empty."
+  "Reset the bus's log to empty (cursor included)."
   [bus]
-  (reset! (:log bus) [])
+  (reset! (:log bus) {:entries [] :cursor 0})
   nil)
 
 (defn seed-log!
   "Seed the bus's log with a prior history vector (e.g. a fork seeding the
    parent's log so log-based consumers see a continuous record). Replaces the
-   current log. This is the public op for the fork seam — callers should not
-   touch the `:log` atom directly."
+   current log; the cursor starts past the history so none of it is delivered
+   to live handlers. This is the public op for the fork seam — callers should
+   not touch the `:log` atom directly."
   [bus history]
-  (reset! (:log bus) (vec history))
+  (let [h (vec history)]
+    (reset! (:log bus) {:entries h :cursor (count h)}))
   nil)
 
 (defn append-log!
   "Append entries to the bus's log without re-posting them (merge-as-history:
    the parent absorbs a fork's exchange into its record without re-firing live
    handlers). The carry for a branchless (`:isolation :none`/ephemeral) fork on
-   merge — a `:ctx` fork merges its datahike branch natively instead."
+   merge — a `:ctx` fork merges its datahike branch natively instead.
+
+   Entries are marked as history via METADATA (invisible to log readers);
+   the pump advances past them without delivering. A single swap!, so this
+   composes race-free with concurrent live post!s — no cursor arithmetic
+   can skip a live entry."
   [bus entries]
-  (swap! (:log bus) into entries)
+  (swap! (:log bus) update :entries into
+         (map (fn [e] (if (instance? clojure.lang.IObj e)
+                        (vary-meta e assoc history-key true)
+                        e))
+              entries))
+  ;; Ring the doorbell so a parked pump advances its cursor past the
+  ;; absorbed history promptly (no delivery happens for marked entries).
+  (binding [ec/*execution-context* (:ctx bus)]
+    (sync/post! (:hint-mbx bus) ::hint))
   nil)
