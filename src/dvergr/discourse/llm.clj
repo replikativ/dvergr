@@ -370,14 +370,26 @@
                            ;; Budget exhausted on a :continue turn:
                            ;; escalate to manager via the Processes pane.
                                (cc/budget-exceeded? chat-ctx)
-                               (case (proc/budget-checkpoint! id chat-ctx grace-ms)
+                               (do
+                                 ;; make the pause VISIBLE where the humans are:
+                                 ;; a non-triggering room activity row telling
+                                 ;; them the budget ran out and how long they
+                                 ;; have to extend it (simmis room settings /
+                                 ;; processes/directive!).
+                                 (when room
+                                   (let [b (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
+                                             @(:budget-signal chat-ctx))
+                                         used  (/ (:used b) (double acct/MICRODOLLARS-PER-DOLLAR))
+                                         total (/ (:total b) (double acct/MICRODOLLARS-PER-DOLLAR))]
+                                     (turn/post-budget-warning! room id used total grace-ms)))
+                                 (case (proc/budget-checkpoint! id chat-ctx grace-ms)
                                  :extended (recur (inc turn) false)
                                  :abort    nil
                                  :wrap-up  (do
                                              (cc/add-message! chat-ctx
                                                               {:role    :system
                                                                :content wrap-up-prompt})
-                                             (recur (inc turn) true)))
+                                             (recur (inc turn) true))))
 
                            ;; Normal :continue, budget OK → next turn.
                                :else (recur (inc turn) wrap-up-allowed?))))))
