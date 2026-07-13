@@ -164,6 +164,23 @@
       (reset! posted (count tool-msgs)))
     nil))
 
+(defn post-budget-warning!
+  "Surface a budget checkpoint as a visible, NON-triggering activity row:
+   the agent has exhausted its dollar budget and pauses for `grace-ms`
+   awaiting an extension (raise the budget in the embedder's UI — e.g.
+   the simmis room settings — or via processes/directive!) before it
+   wraps up. No-op when `room` is nil. Returns nil."
+  [room agent-id used-dollars total-dollars grace-ms]
+  (when room
+    (binding [rtc/*execution-context* (:ctx room)]
+      (d/post! room (d/message agent-id activity-id
+                               (format "⚠️ budget exhausted — $%.2f of $%.2f used. Raise the room budget within %ds to let me continue; otherwise I will wrap up with what I have."
+                                       (double used-dollars) (double total-dollars)
+                                       (long (/ grace-ms 1000)))
+                               nil
+                               {:role :tool}))))
+  nil)
+
 (defn post-turn-error!
   "Surface a FAILED agent turn as a visible, NON-triggering activity row (→ room
    `:_activity`, `:role :tool`, like `post-turn-activity!`) — so the turn loop can
