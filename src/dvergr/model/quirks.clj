@@ -134,6 +134,28 @@
         [{:name (str/trim (first names))
           :input (into {} pairs)}]))))
 
+(defn sanitize-glm-structured-call
+  "GLM also leaks its envelope INTO the structured tool_call NAME field:
+   `clojure_eval<arg_key>code</arg_key><arg_value>…` (often truncated
+   mid-value when the emission was cut). Left alone, the call fails as
+   an unknown tool AND the invalid name poisons the history — the next
+   turn 400s. Split off the real name; parse complete arg pairs into
+   :input; an unterminated trailing <arg_value> contributes its partial
+   text so the tool fails informatively instead of the turn dying."
+  [{:keys [name input] :as call}]
+  (if (and name (str/includes? (str name) "<arg_key>"))
+    (let [n (str name)
+          real-name (str/trim (subs n 0 (str/index-of n "<arg_key>")))
+          pairs (map (fn [[_ k v]] [(keyword (str/trim k)) (glm-arg->value v)])
+                    (re-seq glm-arg-pair-re n))
+          partial-pair (when (empty? pairs)
+                         (when-let [[_ k v] (re-find #"(?s)<arg_key>(.*?)</arg_key>\s*<arg_value>(.*)\z" n)]
+                           [[(keyword (str/trim k)) v]]))]
+      (assoc call
+             :name real-name
+             :input (merge (into {} (concat pairs partial-pair)) input)))
+    call))
+
 (defn strip-glm-tool-tokens
   "Remove GLM's leaked tool-call envelope from assistant text `content` — the
    `Tool calls: [...]` echo plus every `<tool_call>…`, `<arg_key>…</arg_key>`,
