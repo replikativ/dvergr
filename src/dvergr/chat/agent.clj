@@ -96,8 +96,11 @@
                                                    {:id (:tool-use/id tu)
                                                     :type "function"
                                                     :function {:name (:tool-use/name tu)
+                                                               ;; nil input (no-arg tool call) must
+                                                               ;; replay as "{}" — "null" arguments
+                                                               ;; are a 400 on OpenAI-compat APIs.
                                                                :arguments (json/write-value-as-string
-                                                                           (strip-ns-keys (:tool-use/input tu)))}})
+                                                                           (or (strip-ns-keys (:tool-use/input tu)) {}))}})
                                                  tool-uses)}
                         (seq reasoning) (assoc :reasoning_content reasoning))
                       (cond-> {:role (name role)

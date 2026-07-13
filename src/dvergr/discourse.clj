@@ -501,13 +501,23 @@
   nil)
 
 (defn leave
-  "Remove participant from room's routing table and unsubscribe its inbox.
-   The participant's spin continues running (no per-spin cancel in spindel
-   today); messages addressed to it after leaving are not delivered."
+  "Remove participant from room's routing table and unsubscribe ALL of
+   its bus feeds: the direct inbox, the broadcast sub, and every dynamic
+   `:subs` entry (e.g. the llm-agent's [:type :user/message]). Leaving
+   only the inbox — the previous behavior — left the broadcast/type
+   subscriptions alive feeding the still-running participant spin: a
+   leave/re-join cycle then had TWO live agents answering every message
+   (observed live: duplicate replies 5s apart; one zombie accumulated
+   PER cycle). The deaf spin itself stays parked (no per-spin cancel
+   wired here yet) but receives nothing."
   [room participant-id]
   (when-let [p (get @(:participants room) participant-id)]
     (when-let [sub (:inbox-sub p)]
-      (bus/unsubscribe! sub)))
+      (bus/unsubscribe! sub))
+    (when-let [subs (:subs p)]
+      (doseq [[topic sub] @subs]
+        (bus/unsubscribe! sub)
+        (swap! subs dissoc topic))))
   (swap! (:participants room) dissoc participant-id)
   nil)
 
