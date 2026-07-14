@@ -153,6 +153,29 @@
                          (hash (select-keys % [:tool-use/name :tool-use/input])))
                      recent-tool-calls)))))
 
+(def fragment-nudge
+  "Corrective shown to a model that emitted code as its message instead of
+   calling a tool. Names the mistake and the fix, without scolding — and it is
+   idempotent: `nudged-for-fragment?` matches on this exact text so we say it at
+   most once per turn loop."
+  (str "Your last message was CODE, not a reply to the room. Nobody ran it and "
+       "nobody read it.\n\n"
+       "If you meant to execute it, call the `clojure_eval` tool with that code "
+       "as the `code` argument — code placed in the message body is never "
+       "executed.\n\n"
+       "If you meant to speak to the humans, write prose."))
+
+(defn- nudged-for-fragment?
+  "Have we already told this agent, in this turn loop, that it fumbled code into
+   the prose channel? A second identical nudge cannot help — if the model does
+   it twice, let the turn end rather than burning budget in a nudge loop."
+  [chat-ctx]
+  (->> (chat-ctx/get-messages chat-ctx)
+       (some (fn [m]
+               (and (#{:system "system"} (or (:role m) (:message/role m)))
+                    (= fragment-nudge (or (:content m) (:message/content m))))))
+       boolean))
+
 ;; ============================================================================
 ;; Agent Turn (Non-Reactive Core)
 ;; ============================================================================
@@ -358,8 +381,27 @@
                                     :turn-number turn-number}))
           :continue)
 
-        ;; No tool calls - done
-        :complete))
+        ;; No tool calls. Usually that means the agent is done — but a model can
+        ;; also fumble its code into the PROSE channel (stop_reason=stop, no
+        ;; tool_calls, content = a code fragment). Read literally, that ends the
+        ;; turn and posts the fragment to the room as if it were an answer: the
+        ;; agent appears to spill code and quit mid-task. It hasn't finished; it
+        ;; misaddressed a tool call. Name that once and let it try again — the
+        ;; turn loop is bounded by BUDGET, not by a turn cap, so one corrective
+        ;; turn costs a few cents and rescues the work.
+        (if (and (quirks/code-fragment? content)
+                 (not (nudged-for-fragment? chat-ctx)))
+          (do
+            (tel/log! {:level :warn :id :agent/code-in-prose-channel
+                       :data {:turn turn-number
+                              :preview (subs (str content) 0 (min 80 (count (str content))))}}
+                      "Model emitted code as content instead of a tool call — nudging")
+            (chat-ctx/add-message! chat-ctx
+                                   {:role :system
+                                    :content fragment-nudge
+                                    :important? true})
+            :continue)
+          :complete)))
 
     (catch java.util.concurrent.CancellationException _
       (tel/log! {:level :info :id :agent/turn-cancelled} "Agent turn cancelled")
