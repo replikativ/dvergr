@@ -348,9 +348,7 @@
                   :system-prompt system-prompt
                   :isolation     (or (:isolation safe-config) :sci)}
         :tools   tools-map
-        :budget  {:dollars             (or (:budget-dollars safe-config) 0.25)
-                  :checkpoint-grace-ms (or (:budget-checkpoint-grace-ms safe-config)
-                                           60000)}
+        :budget  {:dollars (or (:budget-dollars safe-config) 0.25)}
         :ctx     exec-ctx}))))
 
 (defn join-agent-to-room!
@@ -372,10 +370,9 @@
      :isolation                 - :sci (sandboxed Clojure eval)
      :tools                     - safe-tools (excludes shell, run_tests, telegram_*)
      :budget-dollars            - 0.25 per task
-     :budget-checkpoint-grace-ms - 60000 ms grace window when budget
-                                  is exhausted and the manager is
-                                  asked to extend (see
-                                  dvergr.agent.process/budget-checkpoint!)
+     (budget exhaustion no longer has a grace window: the turn ENDS, the
+      process is marked :awaiting-decision, and nothing further is spent —
+      see dvergr.agent.process/budget-exhausted!)
 
    To grant extra power, pass explicit overrides in agent-config:
      :isolation :native       — full JVM (trusted agents only, never Telegram)

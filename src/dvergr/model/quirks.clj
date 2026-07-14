@@ -134,6 +134,28 @@
         [{:name (str/trim (first names))
           :input (into {} pairs)}]))))
 
+(defn sanitize-glm-structured-call
+  "GLM also leaks its envelope INTO the structured tool_call NAME field:
+   `clojure_eval<arg_key>code</arg_key><arg_value>…` (often truncated
+   mid-value when the emission was cut). Left alone, the call fails as
+   an unknown tool AND the invalid name poisons the history — the next
+   turn 400s. Split off the real name; parse complete arg pairs into
+   :input; an unterminated trailing <arg_value> contributes its partial
+   text so the tool fails informatively instead of the turn dying."
+  [{:keys [name input] :as call}]
+  (if (and name (str/includes? (str name) "<arg_key>"))
+    (let [n (str name)
+          real-name (str/trim (subs n 0 (str/index-of n "<arg_key>")))
+          pairs (map (fn [[_ k v]] [(keyword (str/trim k)) (glm-arg->value v)])
+                     (re-seq glm-arg-pair-re n))
+          partial-pair (when (empty? pairs)
+                         (when-let [[_ k v] (re-find #"(?s)<arg_key>(.*?)</arg_key>\s*<arg_value>(.*)\z" n)]
+                           [[(keyword (str/trim k)) v]]))]
+      (assoc call
+             :name real-name
+             :input (merge (into {} (concat pairs partial-pair)) input)))
+    call))
+
 (defn strip-glm-tool-tokens
   "Remove GLM's leaked tool-call envelope from assistant text `content` — the
    `Tool calls: [...]` echo plus every `<tool_call>…`, `<arg_key>…</arg_key>`,
@@ -149,3 +171,69 @@
         (str/replace #"(?s)</?(tool_call|arg_key|arg_value)>" "")
         str/trim
         (as-> c (when (seq c) c)))))
+
+;; ---------------------------------------------------------------------------
+;; Code fumbled into the PROSE channel
+;;
+;; The leak above has a sibling that no recovery can catch: the model emits its
+;; code as plain content with NO envelope and stop_reason=stop. Nothing marks it
+;; as a tool call, so the agent loop reads "no tool calls" as "the agent has
+;; finished speaking", posts the fragment to the room, and ends the turn — the
+;; agent appears to spill code and quit mid-task. (Observed 2026-07-13: GLM
+;; miscounted a brace, its recovered call failed to parse, and it then re-emitted
+;; the repaired code as a message beginning with a stray `)`.)
+;;
+;; Detection is deliberately CONSERVATIVE. A reply may legitimately contain code
+;; — explaining a snippet is normal — so we flag only content that cannot be a
+;; deliberate message to a human:
+;;   - it opens with a CLOSING delimiter, or
+;;   - it closes more delimiters than it opens (a truncated / continued block), or
+;;   - it still carries a tool-call envelope after scrubbing.
+;; Balanced code in a reply is left alone.
+;; ---------------------------------------------------------------------------
+
+(defn- delimiter-balance
+  "Openers minus closers, ignoring delimiters inside strings, character literals
+   and line comments — those are text, not structure."
+  [^String s]
+  (loop [i 0, depth 0, in-str? false, in-cmt? false, escaped? false]
+    (if (>= i (count s))
+      depth
+      (let [c (.charAt s i)]
+        (cond
+          escaped?  (recur (inc i) depth in-str? in-cmt? false)
+          in-str?   (case c
+                      \\ (recur (inc i) depth true in-cmt? true)
+                      \" (recur (inc i) depth false in-cmt? false)
+                      (recur (inc i) depth true in-cmt? false))
+          in-cmt?   (recur (inc i) depth in-str? (not= c \newline) false)
+          :else     (case c
+                      \" (recur (inc i) depth true false false)
+                      \; (recur (inc i) depth false true false)
+                      (\( \[ \{) (recur (inc i) (inc depth) false false false)
+                      (\) \] \}) (recur (inc i) (dec depth) false false false)
+                      (recur (inc i) depth false false false)))))))
+
+(def ^:private emoticon-re
+  ;; :) ;) :-) =( 8] … — a smiley's paren is punctuation, not structure. Without
+  ;; this, "Sounds good :)" balances to -1 and reads as truncated code.
+  #"[:;=8][-o^]?[)\](\[]")
+
+(defn code-fragment?
+  "True when assistant `content` is code fumbled into the prose channel rather
+   than a message meant for a human. See the note above — conservative by
+   design: balanced code inside a reply is NOT a fragment, and neither is prose
+   that merely contains delimiters."
+  [content]
+  (let [s (str/trim (str content))
+        ;; balance over prose-stripped text: emoticons are not delimiters
+        structural (str/replace s emoticon-re "")]
+    (boolean
+     (and (seq s)
+          (or (contains? #{\) \] \}} (first s))
+               ;; more closers than openers — a truncated or continued block.
+               ;; Requires an opener to exist at all, so stray punctuation in
+               ;; prose can't trip it.
+              (and (re-find #"[(\[{]" structural)
+                   (neg? (delimiter-balance structural)))
+              (re-find #"<arg_key>|<tool_call>" s))))))

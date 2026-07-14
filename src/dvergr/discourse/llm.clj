@@ -21,14 +21,15 @@
           :tools  :knowledge-worker         ; a named profile — or an explicit set
           :budget {:dollars 0.50}}))
 
-   When the dollar budget hits zero, the agent loop escalates via
-   `dvergr.agent.process/register!` — the manager sees the agent as
-   :awaiting-decision in the Processes pane and can call
-   `(proc/directive! chat-ctx pid {:type :continue :effects [{:op :extend-budget :dollars 0.25}]})`
-   to keep it going, or `{:type :abort}` to stop it. If no directive
-   arrives within :checkpoint-grace-ms (default 60s), the loop runs a
-   single final turn with NO tools and a wrap-up system message, then
-   exits cleanly.
+   When the dollar budget hits zero the turn simply ENDS: the room gets a
+   non-triggering row saying so, the process is marked :awaiting-decision, and
+   nothing further is spent. Resumption is an ordinary inbound message — raise
+   the room's budget and speak, and the next turn re-enters with the chat-ctx
+   seeded from the room store.
+
+   It used to block for :checkpoint-grace-ms waiting on a manager directive.
+   That block ran on spindel's DRAIN thread and froze every room in the process;
+   see `dvergr.agent.process/budget-exhausted!` for the autopsy.
 
    Tests pass `:run-turn-fn` (a stub returning :continue/:complete and
    writing to chat-ctx directly) to avoid real LLM calls — see
@@ -56,6 +57,8 @@
             [dvergr.agent.process :as proc]
             [dvergr.room.store :as rstore]
             [dvergr.system.rooms :as srooms]
+            [dvergr.model.quirks :as quirks]
+            [taoensso.telemere :as tel]
             [dvergr.tools :as tools]))
 
 ;; ============================================================================
@@ -94,9 +97,6 @@
 ;; Wrap-up prompt for budget-checkpoint :wrap-up resolution
 ;; ============================================================================
 
-(def ^:private wrap-up-prompt
-  "Time to wrap up. Budget exhausted and no extension granted. Write a brief reply summarizing what you've done and what's unfinished. Don't call any more tools.")
-
 ;; ============================================================================
 ;; Public API
 ;; ============================================================================
@@ -111,12 +111,9 @@
                   name → tool-def (pre-wrapped). Default: :dev-toolbelt
                   (`minimal-coding-tools`). Pass `#{}` for a no-tools agent.
    :db-conn     — datahike connection for chat persistence (optional)
-   :budget      — {:dollars n :checkpoint-grace-ms n}
-                  (default {:dollars 1.0 :checkpoint-grace-ms 60000}).
-                  When the dollar budget runs out, the loop pauses and
-                  escalates via dvergr.agent.process; if no extension arrives
-                  within grace-ms, the agent gets one no-tools wrap-up
-                  turn and exits.
+   :budget      — {:dollars n} (default {:dollars 1.0}). When it runs out the
+                  turn ends and the process is marked :awaiting-decision; a
+                  human raises the budget and the next message resumes it.
    :compaction  — {:auto? bool :model str} (default {:auto? true})
    :chat-ctx    — pre-built ChatContext (optional). When provided, llm-agent
                   uses it as-is (no fresh creation, no system-prompt seeding).
@@ -164,7 +161,6 @@
                 (cc/add-message! c {:role :system :content sp}))
               c))
         ;; Grace window for the manager to extend the budget after exhaustion.
-        grace-ms  (long (or (:checkpoint-grace-ms budget) 60000))
         compaction-strategy (:strategy compaction :sync-before-turn)
         ;; In race mode, disable run-turn-fn's internal sync compaction — we
         ;; drive it from the agent's spin-race below.
@@ -318,13 +314,7 @@
                  ;; Loop state:
                  ;;   turn             — running turn counter (informational
                  ;;                       only; no upper bound)
-                 ;;   wrap-up-allowed? — true after a budget-checkpoint
-                 ;;                       resolved to :wrap-up. Next turn
-                 ;;                       runs with NO tools and must
-                 ;;                       produce the final reply; loop
-                 ;;                       exits after it.
-                     (loop [turn             0
-                            wrap-up-allowed? false]
+                     (loop [turn 0]
                        (if @cancelled?
                          nil
                          (do
@@ -347,9 +337,7 @@
                                                   (assoc turn-opts
                                                          :turn-number turn
                                                          :spec @spec-atom
-                                                      ;; Final-turn lock-out: no tools,
-                                                      ;; LLM must give a textual wrap-up.
-                                                         :tools (if wrap-up-allowed? {} tools))))
+                                                         :tools tools)))
                                  result (sp/await (:done h))]
                          ;; Mirror this turn's tool calls into the room as 🔧
                          ;; play-by-play rows (same as daemon agents).
@@ -363,24 +351,34 @@
                            ;; LLM finished cleanly (no more tool calls).
                                (not= result :continue) nil
 
-                           ;; The wrap-up slot was used — the loop made
-                           ;; its single no-tools turn, exit now.
-                               wrap-up-allowed? nil
-
-                           ;; Budget exhausted on a :continue turn:
-                           ;; escalate to manager via the Processes pane.
+                           ;; Budget exhausted → the turn ENDS here.
+                           ;;
+                           ;; It used to BLOCK for grace-ms waiting on a manager
+                           ;; directive — on the spin's DRAIN thread, freezing
+                           ;; every room in the process (see
+                           ;; `proc/budget-exhausted!` for the full autopsy).
+                           ;; Nothing is held now: we say so in the room, mark
+                           ;; the process :awaiting-decision, and stop.
+                           ;;
+                           ;; Resumption is an ordinary inbound message. A human
+                           ;; raises the room budget and speaks; the next turn
+                           ;; re-enters with the chat-ctx seeded from the store.
+                           ;; The durable room log IS the continuation — which is
+                           ;; the only kind spindel can actually have (it has no
+                           ;; durable conts, and a park would be lost on restart).
                                (cc/budget-exceeded? chat-ctx)
-                               (case (proc/budget-checkpoint! id chat-ctx grace-ms)
-                                 :extended (recur (inc turn) false)
-                                 :abort    nil
-                                 :wrap-up  (do
-                                             (cc/add-message! chat-ctx
-                                                              {:role    :system
-                                                               :content wrap-up-prompt})
-                                             (recur (inc turn) true)))
+                               (do
+                                 (when room
+                                   (let [b (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
+                                             @(:budget-signal chat-ctx))
+                                         used  (/ (:used b) (double acct/MICRODOLLARS-PER-DOLLAR))
+                                         total (/ (:total b) (double acct/MICRODOLLARS-PER-DOLLAR))]
+                                     (turn/post-budget-warning! room id used total)))
+                                 (proc/budget-exhausted! id chat-ctx)
+                                 nil)
 
                            ;; Normal :continue, budget OK → next turn.
-                               :else (recur (inc turn) wrap-up-allowed?))))))
+                               :else (recur (inc turn)))))))
 
                      (when room (turn/unregister-room-turn! (:id room) id))
                      ;; A FAILED turn produced no new reply — surface it as a NON-triggering
@@ -389,13 +387,28 @@
                      (when @errored (turn/post-turn-error! room id @errored))
                      (when-let [last-asst (when-not @errored (last-assistant-message chat-ctx))]
                        (when-let [reply (assistant-text last-asst)]
+                     ;; Last line of defence: a model that fumbled code into the
+                     ;; prose channel TWICE (agent.clj nudged it once) must still
+                     ;; not have that fragment posted as its reply — the room
+                     ;; would show code as an answer and other agents would reply
+                     ;; TO it. Surface it as a non-triggering activity row instead.
+                         (if (quirks/code-fragment? reply)
+                           (do (tel/log! {:level :warn :id ::reply-was-code-fragment
+                                          :data {:agent id}}
+                                         "Suppressed a code fragment posing as a reply")
+                               (when room
+                                 (turn/post-turn-error!
+                                  room id
+                                  (str "emitted code instead of a reply — the tool call "
+                                       "never reached the tool channel, so nothing ran")))
+                               nil)
                      ;; Carry this turn's interleaved-thinking trace into the room
                      ;; record (metadata → store → seeding) so reasoning models
                      ;; (MiniMax M2 / Kimi / DeepSeek) keep their <think> context
                      ;; across a rehydrate/restart, not just within a live session.
-                         (let [reasoning (or (:message/reasoning last-asst) (:reasoning last-asst))]
-                           (cond-> {:to (:from msg) :content reply}
-                             (seq reasoning) (assoc :metadata {:reasoning reasoning}))))))))))
+                           (let [reasoning (or (:message/reasoning last-asst) (:reasoning last-asst))]
+                             (cond-> {:to (:from msg) :content reply}
+                               (seq reasoning) (assoc :metadata {:reasoning reasoning})))))))))))
 
             :factory
             (fn [new-ctx]

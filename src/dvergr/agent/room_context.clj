@@ -30,6 +30,7 @@
             [dvergr.chat.context :as chat-ctx]
             [dvergr.chat.schema :as schema]
             [dvergr.room.registry :as rreg]
+            [dvergr.chat.accounting :as acct]
             [dvergr.runtime.bus :as bus]
             [dvergr.system.db :as sdb]
             [dvergr.system.rooms :as srooms]
@@ -143,6 +144,24 @@
                                    (display-name room (:from m)) (:ts m))))
               (recur rest-s))))))
       sub)))
+
+(defn raise-budget!
+  "Set the live budget :total on every cached agent ctx of `room-id` to
+   `dollars`. The embedder calls this when its room-budget setting
+   changes, so an agent paused at a budget checkpoint resolves
+   :extended and continues instead of wrapping up. Returns the number
+   of ctxs updated."
+  [room-id dollars]
+  (let [micro (long (* (double dollars)
+                       acct/MICRODOLLARS-PER-DOLLAR))]
+    (reduce (fn [n [[rid _] {:keys [chat-ctx]}]]
+              (if (and (= rid room-id) chat-ctx)
+                (do (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
+                      (swap! (:budget-signal chat-ctx) assoc :total micro))
+                    (inc n))
+                n))
+            0
+            @room-agent-ctxs)))
 
 (defn ensure-ctx!
   "Get-or-create the long-lived working chat-ctx for `agent-id` in `room`.

@@ -19,6 +19,14 @@
 
 (def registry (atom {}))
 
+(defonce eval-timeout-ms
+  ;; Hard per-call timeout for clojure_eval. 60s suits interactive
+  ;; probing; embedders doing heavy in-sandbox work (e.g. simmis agents
+  ;; chewing an 11MB PDF's text) reset! it higher — timeouts feed back
+  ;; as tool errors the model then retries with variations, burning
+  ;; budget on work that just needed more runway.
+  (atom 60000))
+
 (defn coerce-tags
   "Coerce a `tags` tool-input into a set of non-blank string tags, robust to the
    ways an LLM/agent actually passes them. A BARE STRING is ONE tag (split on
@@ -482,7 +490,7 @@
                                                    (= :aborted @(:status-signal p)))
                                                  (catch Throwable _ false))))]
                                      (sandbox/eval-code sci-ctx code
-                                                        :timeout-ms 60000
+                                                        :timeout-ms @eval-timeout-ms
                                                         :cancel? proc-aborted?))))
                   ;; Block on process completion / abort.
                  (let [{:keys [ok aborted]} @result-p]
@@ -525,7 +533,7 @@
                 ;; same cancel-poll plumbing but no process registration.
                sci-ctx
                (let [result (sandbox/eval-code sci-ctx code
-                                               :timeout-ms 60000
+                                               :timeout-ms @eval-timeout-ms
                                                :cancel? cancel?)]
                  (if (:success result)
                    {:type :success

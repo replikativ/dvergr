@@ -164,6 +164,27 @@
       (reset! posted (count tool-msgs)))
     nil))
 
+(defn post-budget-warning!
+  "Surface budget exhaustion as a visible, NON-triggering activity row: the
+   agent has hit its dollar ceiling and has STOPPED. Nothing is running, nothing
+   further is being spent, and nothing expires — raise the room's budget and
+   speak, and the agent picks up where it left off.
+
+   The old copy promised a countdown (\"raise it within 60s or I wrap up\").
+   That was untrue in two directions: the deadline forced a decision on a
+   stopwatch a human never agreed to, and letting it lapse SPENT MORE MONEY on a
+   wrap-up turn — after the ceiling had already been hit. No-op when `room` is
+   nil. Returns nil."
+  [room agent-id used-dollars total-dollars]
+  (when room
+    (binding [rtc/*execution-context* (:ctx room)]
+      (d/post! room (d/message agent-id activity-id
+                               (format "⚠️ budget exhausted — $%.2f of $%.2f used. I have stopped and am spending nothing. Raise the room budget and message me to continue."
+                                       (double used-dollars) (double total-dollars))
+                               nil
+                               {:role :tool}))))
+  nil)
+
 (defn post-turn-error!
   "Surface a FAILED agent turn as a visible, NON-triggering activity row (→ room
    `:_activity`, `:role :tool`, like `post-turn-activity!`) — so the turn loop can

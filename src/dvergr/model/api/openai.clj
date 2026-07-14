@@ -189,7 +189,14 @@
                           (mapv (fn [tc]
                                   {:id (:id tc)
                                    :name (:name tc)
-                                   :input (:input tc)})))
+                                   :input (:input tc)}))
+                          ;; GLM-only: the <arg_key> envelope sometimes leaks
+                          ;; INTO the structured name field — repair it or the
+                          ;; invalid name poisons the replayed history.
+                          ((fn [calls]
+                             (if (:glm-tool-leak? state)
+                               (mapv quirks/sanitize-glm-structured-call calls)
+                               calls))))
           ;; GLM leak RECOVERY: when Fireworks dumped the tool call into content
           ;; instead of tool_calls, parse it back into an executable call so the
           ;; turn continues (rather than dying on a garbage message). Only when

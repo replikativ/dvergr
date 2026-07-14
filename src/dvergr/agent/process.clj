@@ -324,66 +324,57 @@
     ;; don't trim here — list-processes filters terminal states later.
     :completed))
 
-(defn budget-checkpoint!
-  "Pause an agent's turn loop when the dollar budget is exhausted and
-   wait for the manager to extend or abort.
+(defn budget-exhausted!
+  "Record that an agent's turn loop has hit its dollar ceiling, and RETURN —
+   immediately.
 
-   Registers a tracking-only Process so the manager sees the agent as
-   :awaiting-decision in the Processes pane, snapshots the budget
-   breakdown into :progress-signal, then blocks up to `grace-ms` (in
-   milliseconds) for a directive via `(directive! …)`.
+   This function used to BLOCK on a CountDownLatch for `grace-ms`, waiting for a
+   manager directive. It was called from the turn loop, which runs inside the
+   participant spin — so the block landed on spindel's DRAIN thread, under the
+   `[:engine/draining?]` CAS. Every room in the process shares one execution
+   context (simmis `model/rooms.clj` → `ctx/server-context`), so one agent
+   running out of budget froze the entire server's event loop for the full
+   grace period. And since nothing ever called `directive!`, the latch was never
+   counted down: every budget exhaustion took the whole grace period, every
+   time.
 
-   Returns one of:
-     :extended — manager bumped :total via {:op :extend-budget …}
-     :abort    — manager sent {:type :abort}
-     :wrap-up  — grace expired with no directive, OR a :continue
-                 arrived without an :extend-budget effect
+   Worse, the block made its own remedy unreachable. The room row telling a
+   human to raise the budget within 60s cannot be delivered to anyone until the
+   drain loop resumes — i.e. until after the 60s have elapsed. And the in-band
+   `:directive/raise-budget` message cannot be received mid-turn by
+   construction, because `participant-spin` awaits `on-message` to completion.
+   A parked agent has no in-room channel. That is the whole argument for not
+   parking on a human.
 
-   The caller decides what each outcome does — typically:
-     :extended → recur the turn loop
-     :abort    → exit immediately, no further reply
-     :wrap-up  → inject a 'finish up, no tools' system message and run
-                 one final turn, then exit"
-  [agent-id chat-ctx grace-ms]
-  ;; Signal derefs MUST bind the chat-ctx's spindel-ctx — without it,
-  ;; @(:budget-signal …) returns cached/stale state instead of the
-  ;; freshly-extended value, and the :extended path never trips.
+   So: no latch, no stopwatch, no guess. We mark the process
+   `:awaiting-decision` (the Processes pane and the room row show it), and the
+   caller ENDS THE TURN. Nothing is held, nothing is spent, and the durable room
+   log is what resumes the agent — a human raises the budget and the next
+   message re-enters the loop with the chat-ctx seeded from the store.
+
+   A wrap-up turn is no longer implicit. It cost an unbudgeted LLM call, charged
+   *after* the ceiling was hit, triggered by nobody deciding anything. If a
+   summary is wanted it should be an explicit choice — which is what the
+   decision protocol makes it (see .internal/decision-protocol-assessment.md)."
+  [agent-id chat-ctx]
   (let [spc           (:spindel-ctx chat-ctx)
-        budget-before (binding [ec/*execution-context* spc]
+        budget        (binding [ec/*execution-context* spc]
                         @(:budget-signal chat-ctx))
-        used-dollars  (/ (:used budget-before)
-                         (double acct/MICRODOLLARS-PER-DOLLAR))
-        total-dollars (/ (:total budget-before)
-                         (double acct/MICRODOLLARS-PER-DOLLAR))
-        by-type       (:by-type budget-before)
+        used-dollars  (/ (:used budget) (double acct/MICRODOLLARS-PER-DOLLAR))
+        total-dollars (/ (:total budget) (double acct/MICRODOLLARS-PER-DOLLAR))
         proc          (register! chat-ctx
                                  {:description
-                                  (format "%s — budget exhausted ($%.3f / $%.3f). Extend or abort?"
-                                          (name agent-id)
-                                          used-dollars
-                                          total-dollars)
-                                  :grace-ms grace-ms})
-        ^AtomicReference dref (:directive-ref proc)
-        ^CountDownLatch  latch (:directive-latch proc)]
+                                  (format "%s — budget exhausted ($%.3f / $%.3f). Raise the budget to continue."
+                                          (name agent-id) used-dollars total-dollars)})]
     (binding [ec/*execution-context* spc]
       (reset! (:progress-signal proc)
-              {:budget                  budget-before
+              {:budget                  budget
                :used-dollars            used-dollars
                :total-dollars           total-dollars
-               :by-type                 by-type
+               :by-type                 (:by-type budget)
                :awaiting-decision-since (java.util.Date.)})
       (reset! (:status-signal proc) :awaiting-decision))
-    (.await latch grace-ms TimeUnit/MILLISECONDS)
-    (let [d            (or (.get dref) {:type :continue :effects-applied []})
-          budget-after (binding [ec/*execution-context* spc]
-                         @(:budget-signal chat-ctx))]
-      (binding [ec/*execution-context* spc]
-        (reset! (:status-signal proc) :running))
-      (complete! proc)
-      (cond
-        (= :abort (:type d))                              :abort
-        (> (:total budget-after) (:total budget-before))  :extended
-        :else                                             :wrap-up))))
+    :awaiting-decision))
 
 (defn aborted?
   "True if a manager has aborted the process. Work-owners poll this
