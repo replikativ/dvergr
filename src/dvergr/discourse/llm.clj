@@ -385,13 +385,13 @@
                                          total (/ (:total b) (double acct/MICRODOLLARS-PER-DOLLAR))]
                                      (turn/post-budget-warning! room id used total grace-ms)))
                                  (case (proc/budget-checkpoint! id chat-ctx grace-ms)
-                                 :extended (recur (inc turn) false)
-                                 :abort    nil
-                                 :wrap-up  (do
-                                             (cc/add-message! chat-ctx
-                                                              {:role    :system
-                                                               :content wrap-up-prompt})
-                                             (recur (inc turn) true))))
+                                   :extended (recur (inc turn) false)
+                                   :abort    nil
+                                   :wrap-up  (do
+                                               (cc/add-message! chat-ctx
+                                                                {:role    :system
+                                                                 :content wrap-up-prompt})
+                                               (recur (inc turn) true))))
 
                            ;; Normal :continue, budget OK → next turn.
                                :else (recur (inc turn) wrap-up-allowed?))))))
@@ -414,9 +414,9 @@
                                          "Suppressed a code fragment posing as a reply")
                                (when room
                                  (turn/post-turn-error!
-                                   room id
-                                   (str "emitted code instead of a reply — the tool call "
-                                        "never reached the tool channel, so nothing ran")))
+                                  room id
+                                  (str "emitted code instead of a reply — the tool call "
+                                       "never reached the tool channel, so nothing ran")))
                                nil)
                      ;; Carry this turn's interleaved-thinking trace into the room
                      ;; record (metadata → store → seeding) so reasoning models

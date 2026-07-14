@@ -147,7 +147,7 @@
     (let [n (str name)
           real-name (str/trim (subs n 0 (str/index-of n "<arg_key>")))
           pairs (map (fn [[_ k v]] [(keyword (str/trim k)) (glm-arg->value v)])
-                    (re-seq glm-arg-pair-re n))
+                     (re-seq glm-arg-pair-re n))
           partial-pair (when (empty? pairs)
                          (when-let [[_ k v] (re-find #"(?s)<arg_key>(.*?)</arg_key>\s*<arg_value>(.*)\z" n)]
                            [[(keyword (str/trim k)) v]]))]
@@ -229,11 +229,11 @@
         ;; balance over prose-stripped text: emoticons are not delimiters
         structural (str/replace s emoticon-re "")]
     (boolean
-      (and (seq s)
-           (or (contains? #{\) \] \}} (first s))
+     (and (seq s)
+          (or (contains? #{\) \] \}} (first s))
                ;; more closers than openers — a truncated or continued block.
                ;; Requires an opener to exist at all, so stray punctuation in
                ;; prose can't trip it.
-               (and (re-find #"[(\[{]" structural)
-                    (neg? (delimiter-balance structural)))
-               (re-find #"<arg_key>|<tool_call>" s))))))
+              (and (re-find #"[(\[{]" structural)
+                   (neg? (delimiter-balance structural)))
+              (re-find #"<arg_key>|<tool_call>" s))))))

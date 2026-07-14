@@ -47,9 +47,9 @@
             This is the false positive that would matter most: suppressing it
             would silently swallow the agent's most useful answers."
     (is (not (quirks/code-fragment?
-               "Here is how I fetched it:\n\n(http/get \"https://wttr.in\")\n\nThat returned +21°C.")))
+              "Here is how I fetched it:\n\n(http/get \"https://wttr.in\")\n\nThat returned +21°C.")))
     (is (not (quirks/code-fragment?
-               "```clojure\n(defn add [a b] (+ a b))\n```\nCall it as (add 1 2)."))))
+              "```clojure\n(defn add [a b] (+ a b))\n```\nCall it as (add 1 2)."))))
 
   (testing "emoticons are punctuation, not structure — `:)` balances to -1"
     (is (not (quirks/code-fragment? "Sounds good :) let me know")))
