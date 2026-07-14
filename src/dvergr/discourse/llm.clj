@@ -56,6 +56,8 @@
             [dvergr.agent.process :as proc]
             [dvergr.room.store :as rstore]
             [dvergr.system.rooms :as srooms]
+            [dvergr.model.quirks :as quirks]
+            [taoensso.telemere :as tel]
             [dvergr.tools :as tools]))
 
 ;; ============================================================================
@@ -401,13 +403,28 @@
                      (when @errored (turn/post-turn-error! room id @errored))
                      (when-let [last-asst (when-not @errored (last-assistant-message chat-ctx))]
                        (when-let [reply (assistant-text last-asst)]
+                     ;; Last line of defence: a model that fumbled code into the
+                     ;; prose channel TWICE (agent.clj nudged it once) must still
+                     ;; not have that fragment posted as its reply — the room
+                     ;; would show code as an answer and other agents would reply
+                     ;; TO it. Surface it as a non-triggering activity row instead.
+                         (if (quirks/code-fragment? reply)
+                           (do (tel/log! {:level :warn :id ::reply-was-code-fragment
+                                          :data {:agent id}}
+                                         "Suppressed a code fragment posing as a reply")
+                               (when room
+                                 (turn/post-turn-error!
+                                   room id
+                                   (str "emitted code instead of a reply — the tool call "
+                                        "never reached the tool channel, so nothing ran")))
+                               nil)
                      ;; Carry this turn's interleaved-thinking trace into the room
                      ;; record (metadata → store → seeding) so reasoning models
                      ;; (MiniMax M2 / Kimi / DeepSeek) keep their <think> context
                      ;; across a rehydrate/restart, not just within a live session.
-                         (let [reasoning (or (:message/reasoning last-asst) (:reasoning last-asst))]
-                           (cond-> {:to (:from msg) :content reply}
-                             (seq reasoning) (assoc :metadata {:reasoning reasoning}))))))))))
+                           (let [reasoning (or (:message/reasoning last-asst) (:reasoning last-asst))]
+                             (cond-> {:to (:from msg) :content reply}
+                               (seq reasoning) (assoc :metadata {:reasoning reasoning})))))))))))
 
             :factory
             (fn [new-ctx]
