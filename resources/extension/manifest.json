@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
-  "name": "Dvergr Feed",
-  "version": "0.2.0",
-  "description": "Capture page data and send to dvergr for competitive intelligence.",
+  "name": "simmis Web Intake",
+  "version": "0.3.0",
+  "description": "Capture the pages you browse into your private simmis archive — your agents mine them for contacts, events and trends.",
   "permissions": ["activeTab", "storage", "scripting", "webNavigation"],
-  "host_permissions": ["*://*.linkedin.com/*"],
+  "host_permissions": ["<all_urls>"],
   "action": {
     "default_popup": "popup.html",
     "default_icon": {
@@ -19,7 +19,7 @@
         "default": "Alt+Shift+D",
         "mac": "MacCtrl+Shift+D"
       },
-      "description": "Capture current page and send to dvergr"
+      "description": "Capture the current page into simmis"
     }
   },
   "background": {

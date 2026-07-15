@@ -1,39 +1,49 @@
-// Dvergr Feed — Background service worker
-// Handles manual capture (shortcut/click) and auto-capture on page load.
-// Receives extracted data from content script, POSTs to dvergr.
+// simmis Web Intake — background service worker
+// Auto-captures the DOM of pages on your ALLOWLIST (plus manual capture
+// anywhere via the shortcut), and POSTs each to your simmis /pages archive,
+// authenticated with your JWT. See doc/web-intake-design.md in simmis.
 
-const DEFAULT_URL = "http://localhost:17880";
+const DEFAULT_URL = "https://dev.simm.is";
 const MAX_CAPTURES = 50;
-const AUTO_CAPTURE_DELAY_MS = 5000; // Wait for SPA rendering
+const AUTO_CAPTURE_DELAY_MS = 5000; // wait for SPA rendering
 
-// Get dvergr base URL from storage
-async function getDvergrUrl() {
-  const { dvergrUrl } = await chrome.storage.local.get("dvergrUrl");
-  return dvergrUrl || DEFAULT_URL;
+// Default allowlist — editable in the popup. Deny-by-default: only these hosts
+// auto-capture. Manual capture (shortcut / icon) works anywhere.
+const DEFAULT_ALLOWLIST = ["linkedin.com", "news.ycombinator.com"];
+
+// Hard sensitive-domain denylist — NEVER auto-captured even if allowlisted.
+// Matched as substrings of the hostname. Not user-overridable.
+const SENSITIVE_DENY = [
+  "bank", "paypal.com", "stripe.com", "wise.com",
+  "mail.google.com", "outlook.", "mail.yahoo", "proton.me", "protonmail",
+  "accounts.google", "login.", "signin", "auth.",
+  "health", ".gov", "id.me"
+];
+
+async function cfg() {
+  const c = await chrome.storage.local.get(["simmisUrl", "simmisToken", "allowlist", "autoCapture"]);
+  return {
+    baseUrl: (c.simmisUrl || DEFAULT_URL).replace(/\/+$/, ""),
+    token: c.simmisToken || null,
+    allowlist: Array.isArray(c.allowlist) ? c.allowlist : DEFAULT_ALLOWLIST,
+    autoCapture: c.autoCapture !== false
+  };
 }
 
-// Check if auto-capture is enabled
-async function isAutoCapture() {
-  const { autoCapture } = await chrome.storage.local.get("autoCapture");
-  return autoCapture !== false; // Default: on
-}
+// ---------------------------------------------------------------------------
+// Capture history for the popup
+// ---------------------------------------------------------------------------
 
-// Store a capture in recent history
 async function storeCapture(capture) {
   const { recentCaptures = [] } = await chrome.storage.local.get("recentCaptures");
   recentCaptures.unshift({
-    url: capture.url,
-    title: capture.title,
-    timestamp: capture.timestamp,
-    status: capture.status || "pending",
+    url: capture.url, title: capture.title,
+    timestamp: capture.timestamp, status: capture.status || "pending",
     auto: capture.auto || false
   });
-  await chrome.storage.local.set({
-    recentCaptures: recentCaptures.slice(0, MAX_CAPTURES)
-  });
+  await chrome.storage.local.set({ recentCaptures: recentCaptures.slice(0, MAX_CAPTURES) });
 }
 
-// Update the status of the most recent capture
 async function updateLastCaptureStatus(status) {
   const { recentCaptures = [] } = await chrome.storage.local.get("recentCaptures");
   if (recentCaptures.length > 0) {
@@ -42,169 +52,114 @@ async function updateLastCaptureStatus(status) {
   }
 }
 
-// Send page data to dvergr
-async function sendToDvergr(data) {
-  const baseUrl = await getDvergrUrl();
-  const url = `${baseUrl}/api/intake/page`;
+// ---------------------------------------------------------------------------
+// Send to simmis — authenticated
+// ---------------------------------------------------------------------------
 
+async function sendToSimmis(data) {
+  const { baseUrl, token } = await cfg();
+  if (!token) {
+    await updateLastCaptureStatus("not-logged-in");
+    return { status: "not-logged-in" };
+  }
   try {
-    const response = await fetch(url, {
+    const resp = await fetch(`${baseUrl}/pages`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`
+      },
       body: JSON.stringify(data)
     });
-
-    if (response.ok) {
-      const result = await response.json();
-      await updateLastCaptureStatus(result.status || "received");
-      return result;
-    } else {
-      await updateLastCaptureStatus(`error-${response.status}`);
-      return { status: "error", error: `HTTP ${response.status}` };
+    if (resp.ok) {
+      await updateLastCaptureStatus("received");
+      return { status: "received" };
     }
+    // 401 → token expired; the popup prompts a re-login
+    const status = resp.status === 401 ? "auth-expired" : `error-${resp.status}`;
+    await updateLastCaptureStatus(status);
+    return { status };
   } catch (err) {
     await updateLastCaptureStatus("connection-error");
     return { status: "error", error: err.message };
   }
 }
 
-// Inject content script and capture page
-async function capturePage(tab, auto = false) {
+// ---------------------------------------------------------------------------
+// Capture
+// ---------------------------------------------------------------------------
+
+async function capturePage(tab) {
   if (!tab || !tab.id || !tab.url) return;
-
-  // Skip chrome:// and extension pages
-  if (tab.url.startsWith("chrome://") || tab.url.startsWith("chrome-extension://")) {
-    return;
-  }
-
+  if (tab.url.startsWith("chrome://") || tab.url.startsWith("chrome-extension://")) return;
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      files: ["content.js"]
-    });
-    // Data arrives via onMessage listener below
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
+    // data arrives via onMessage below
   } catch (err) {
     console.error("Failed to inject content script:", err);
   }
 }
 
-// ============================================================================
-// Auto-capture: fire on page load for matching domains
-// ============================================================================
-
-// Track recently auto-captured URLs to avoid duplicates on SPA navigations
-const recentAutoCaptures = new Map(); // url -> timestamp
-
-function shouldAutoCapture(url) {
-  // Only auto-capture linkedin.com for now
-  // (host_permissions already scoped to linkedin.com)
-  try {
-    const u = new URL(url);
-    if (!u.hostname.endsWith("linkedin.com")) return false;
-
-    // Deduplicate: skip if same URL captured in last 60s
-    const now = Date.now();
-    const lastCapture = recentAutoCaptures.get(url);
-    if (lastCapture && (now - lastCapture) < 60000) return false;
-
-    return true;
-  } catch {
-    return false;
-  }
+function hostname(url) {
+  try { return new URL(url).hostname; } catch { return ""; }
 }
 
-// Listen for completed navigations
-chrome.webNavigation.onCompleted.addListener(async (details) => {
-  // Only main frame, not iframes
-  if (details.frameId !== 0) return;
+function isSensitive(host) {
+  return SENSITIVE_DENY.some(s => host.includes(s));
+}
 
-  if (!await isAutoCapture()) return;
-  if (!shouldAutoCapture(details.url)) return;
+const recentAutoCaptures = new Map(); // url -> timestamp (dedup)
 
-  // Mark as captured immediately to prevent duplicate from other listener
-  recentAutoCaptures.set(details.url, Date.now());
+async function shouldAutoCapture(url) {
+  const { allowlist, autoCapture } = await cfg();
+  if (!autoCapture) return false;
+  const host = hostname(url);
+  if (!host || isSensitive(host)) return false;
+  if (!allowlist.some(d => host === d || host.endsWith("." + d) || host.includes(d))) return false;
+  const now = Date.now();
+  const last = recentAutoCaptures.get(url);
+  if (last && (now - last) < 60000) return false; // 60s dedup
+  return true;
+}
 
-  // Wait for SPA to finish rendering
-  setTimeout(async () => {
-    try {
-      const tab = await chrome.tabs.get(details.tabId);
-      if (!tab || tab.url !== details.url) return; // Tab navigated away
-
-      // Clean old entries
-      const cutoff = Date.now() - 120000;
-      for (const [url, ts] of recentAutoCaptures) {
-        if (ts < cutoff) recentAutoCaptures.delete(url);
-      }
-
-      await capturePage(tab, true);
-    } catch (err) {
-      // Tab may have been closed
-      console.error("Auto-capture failed:", err);
-    }
-  }, AUTO_CAPTURE_DELAY_MS);
-});
-
-// Also capture on SPA history changes (LinkedIn uses pushState)
-chrome.webNavigation.onHistoryStateUpdated.addListener(async (details) => {
-  if (details.frameId !== 0) return;
-  if (!await isAutoCapture()) return;
-  if (!shouldAutoCapture(details.url)) return;
-
-  // Mark immediately to dedup against onCompleted
-  recentAutoCaptures.set(details.url, Date.now());
-
+function scheduleAutoCapture(details) {
+  recentAutoCaptures.set(details.url, Date.now()); // mark now to dedup listeners
   setTimeout(async () => {
     try {
       const tab = await chrome.tabs.get(details.tabId);
       if (!tab || tab.url !== details.url) return;
-
       const cutoff = Date.now() - 120000;
-      for (const [url, ts] of recentAutoCaptures) {
-        if (ts < cutoff) recentAutoCaptures.delete(url);
-      }
-
-      await capturePage(tab, true);
-    } catch (err) {
-      console.error("Auto-capture (history) failed:", err);
-    }
+      for (const [u, ts] of recentAutoCaptures) if (ts < cutoff) recentAutoCaptures.delete(u);
+      await capturePage(tab);
+    } catch (err) { /* tab closed */ }
   }, AUTO_CAPTURE_DELAY_MS);
+}
+
+chrome.webNavigation.onCompleted.addListener(async (d) => {
+  if (d.frameId !== 0) return;
+  if (await shouldAutoCapture(d.url)) scheduleAutoCapture(d);
 });
 
-// ============================================================================
-// Manual capture: keyboard shortcut and icon click
-// ============================================================================
+chrome.webNavigation.onHistoryStateUpdated.addListener(async (d) => {
+  if (d.frameId !== 0) return;
+  if (await shouldAutoCapture(d.url)) scheduleAutoCapture(d);
+});
 
+// Manual capture — shortcut + icon click, works anywhere (not gated on allowlist)
 chrome.commands.onCommand.addListener(async (command) => {
   if (command === "capture-page") {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab) {
-      await capturePage(tab, false);
-    }
+    if (tab) await capturePage(tab);
   }
 });
+chrome.action.onClicked.addListener(async (tab) => { await capturePage(tab); });
 
-chrome.action.onClicked.addListener(async (tab) => {
-  await capturePage(tab, false);
-});
-
-// ============================================================================
-// Receive extracted data from content script
-// ============================================================================
-
+// Receive extracted data from the content script
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "page-data") {
-    const data = {
-      ...message.data,
-      source: "extension",
-      timestamp: new Date().toISOString()
-    };
-
+    const data = { ...message.data, source: "extension", timestamp: new Date().toISOString() };
     storeCapture(data);
-    sendToDvergr(data).then(result => {
-      sendResponse(result);
-    });
-
-    // Return true to indicate async response
-    return true;
+    sendToSimmis(data).then(result => sendResponse(result));
+    return true; // async response
   }
 });
