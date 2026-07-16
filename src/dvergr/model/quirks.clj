@@ -109,6 +109,36 @@
       (try ((requiring-resolve 'jsonista.core/read-value) t) (catch Exception _ v))
       v)))
 
+(defn clean-tool-name
+  "Strip a leaked GLM envelope (or any stray non-identifier tail) off a tool
+   name: `clojure_eval<arg_key>code…` → `clojure_eval`. A real tool name is an
+   identifier — cut at the first char that can't be part of one. Returns the
+   trimmed head, or the input unchanged when it is already clean/blank."
+  [name]
+  (if (string? name)
+    (let [head (re-find #"^[A-Za-z0-9_.:-]+" (str/trim name))]
+      (or head name))
+    name))
+
+(defn sanitize-tool-call
+  "Make a tool-call map API-safe before it is persisted OR replayed: strip any
+   leaked envelope off the name, and coerce a nil/blank argument map to `{}` —
+   `null` arguments and a non-identifier function name are each a hard 400 on
+   OpenAI-compatible endpoints, and once such a call lands in durable history
+   EVERY later turn 400s (a single bad emission bricks the conversation). Works
+   on the agent's `{:id :name :input}` shape; leaves a clean call untouched.
+   When the name carried an inline `<arg_key>…<arg_value>…` payload and no
+   structured input survived, recover the args from it."
+  [{:keys [name input] :as call}]
+  (let [envelope-pairs (when (and (string? name) (str/includes? name "<arg_key>"))
+                         (into {} (map (fn [[_ k v]] [(keyword (str/trim k)) (glm-arg->value v)])
+                                       (re-seq glm-arg-pair-re name))))
+        input' (cond
+                 (map? input)     input
+                 (seq envelope-pairs) envelope-pairs
+                 :else            {})]
+    (assoc call :name (clean-tool-name name) :input input')))
+
 (defn parse-glm-tool-calls
   "Extract tool call(s) leaked into `content` as GLM's <arg_key>/<arg_value>
    envelope. Returns [{:name str :input {kw val}} …] or nil when the pattern
@@ -131,7 +161,10 @@
       (when (and (seq names) (seq pairs))
         ;; Single-call is the common leak; when multiple names appear we give
         ;; every parsed pair to the first (safe: our tools take one arg-map).
-        [{:name (str/trim (first names))
+        ;; clean-tool-name strips the envelope from the Fireworks echo form
+        ;; `Tool calls: ["clojure_eval<arg_key>…"]`, whose quoted name captures
+        ;; the whole leaked payload.
+        [{:name (clean-tool-name (first names))
           :input (into {} pairs)}]))))
 
 (defn sanitize-glm-structured-call
