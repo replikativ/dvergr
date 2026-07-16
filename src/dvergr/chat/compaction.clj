@@ -109,7 +109,10 @@
                            "Showing first " (int (* 100 truncation-prefix-ratio))
                            "% and last " (int (* 100 (- 1.0 truncation-prefix-ratio)))
                            "% of " estimated " total tokens. "
-                           "If you need the full output, re-run the tool with more specific parameters.]\n\n")]
+                           "This clips only what is PRINTED — any value you computed is intact. "
+                           "Don't re-print it: in clojure_eval capture it with `def` and reduce it "
+                           "programmatically (filter/select/count/parse) so you return only the small "
+                           "result you need; for a file or URL, read/fetch a slice instead of the whole.]\n\n")]
            (str prefix marker suffix)))))))
 
 (defn truncate-tool-result
