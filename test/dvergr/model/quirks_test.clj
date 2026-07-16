@@ -96,3 +96,53 @@
   (testing "a well-formed call passes through untouched"
     (let [call {:name "shell" :input {:command "ls"}}]
       (is (= call (quirks/sanitize-glm-structured-call call))))))
+
+;; ---------------------------------------------------------------------------
+;; clean-tool-name / sanitize-tool-call — the durable-poison guard
+;;
+;; 2026-07-15 Playground incident: on turn 18 of a market-research chain GLM
+;; emitted a tool call whose NAME absorbed the arg envelope AND whose value was
+;; truncated mid-emission. The recovered call was persisted verbatim, and from
+;; then on EVERY turn replayed it and got `API error 400: … function
+;; 'clojure_eval<arg_key>…' … arguments … must decode to a JSON object, got
+;; NoneType`. A single bad emission bricked the room. These guard both ends.
+;; ---------------------------------------------------------------------------
+
+(def ^:private playground-poison-name
+  "Verbatim tool name from the Playground room DB, truncated exactly as stored
+   (no closing </arg_value> — the emission was cut mid-value)."
+  "clojure_eval<arg_key>code</arg_key><arg_value>;; Let's also search for Glean and a few other enterprise AI search companies\n(def search21 (fetch")
+
+(deftest clean-tool-name-strips-leaked-envelope
+  (is (= "clojure_eval" (quirks/clean-tool-name playground-poison-name)))
+  (is (= "clojure_eval" (quirks/clean-tool-name "clojure_eval")))
+  (is (= "functions.shell:0" (quirks/clean-tool-name "functions.shell:0")))
+  (is (nil? (quirks/clean-tool-name nil))))
+
+(deftest sanitize-tool-call-never-yields-invalid-name-or-nil-args
+  (testing "the exact truncated poison: name cleaned, args coerced to a map"
+    (let [fixed (quirks/sanitize-tool-call {:id "glm-recovered-0"
+                                            :name playground-poison-name
+                                            :input nil})]
+      (is (= "clojure_eval" (:name fixed)))
+      (is (map? (:input fixed)) "nil args must become {} — never null (a 400)")))
+
+  (testing "a complete envelope recovers its args from the name"
+    (let [fixed (quirks/sanitize-tool-call
+                 {:name "clojure_eval<arg_key>code</arg_key><arg_value>(+ 1 2)</arg_value>"
+                  :input nil})]
+      (is (= "clojure_eval" (:name fixed)))
+      (is (= "(+ 1 2)" (:code (:input fixed))))))
+
+  (testing "a well-formed call passes through untouched"
+    (let [call {:id "abc" :name "shell" :input {:command "ls"}}]
+      (is (= call (quirks/sanitize-tool-call call))))))
+
+(deftest parse-glm-tool-calls-cleans-echo-form-name
+  (testing "Fireworks echo `Tool calls: [\"name<arg_key>…\"]` — the quoted name
+            captures the whole leaked payload; recovery must still yield a clean name"
+    (let [content (str "Tool calls: [\"clojure_eval<arg_key>code</arg_key>"
+                       "<arg_value>(+ 1 2)</arg_value>\"] "
+                       "<arg_key>code</arg_key><arg_value>(+ 1 2)</arg_value>")
+          [call] (quirks/parse-glm-tool-calls content)]
+      (is (= "clojure_eval" (:name call))))))

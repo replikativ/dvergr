@@ -70,8 +70,11 @@
                                                      (mapv (fn [tu]
                                                              {:type "tool_use"
                                                               :id (:tool-use/id tu)
-                                                              :name (:tool-use/name tu)
-                                                              :input (strip-ns-keys (:tool-use/input tu))})
+                                                              ;; Guard replay of any pre-existing poisoned
+                                                              ;; history: clean a leaked-envelope name and
+                                                              ;; never send nil input.
+                                                              :name (quirks/clean-tool-name (:tool-use/name tu))
+                                                              :input (or (strip-ns-keys (:tool-use/input tu)) {})})
                                                            tool-uses)))}
                                    ;; Regular message
                                      {:role (name role)
@@ -95,10 +98,11 @@
                                :tool_calls (mapv (fn [tu]
                                                    {:id (:tool-use/id tu)
                                                     :type "function"
-                                                    :function {:name (:tool-use/name tu)
-                                                               ;; nil input (no-arg tool call) must
-                                                               ;; replay as "{}" — "null" arguments
-                                                               ;; are a 400 on OpenAI-compat APIs.
+                                                    ;; clean-tool-name guards replay of already-poisoned
+                                                    ;; history (a leaked `name<arg_key>…` is a hard 400);
+                                                    ;; nil input (no-arg tool call) must replay as "{}" —
+                                                    ;; "null" arguments are also a 400 on OpenAI-compat APIs.
+                                                    :function {:name (quirks/clean-tool-name (:tool-use/name tu))
                                                                :arguments (json/write-value-as-string
                                                                            (or (strip-ns-keys (:tool-use/input tu)) {}))}})
                                                  tool-uses)}
@@ -298,11 +302,19 @@
                                       ;; Interleaved-thinking trace, fed back to
                                       ;; the model next turn (see openai provider).
                                       :reasoning reasoning
+                                      ;; Sanitize BEFORE persisting: a leaked
+                                      ;; GLM envelope in the name or a nil
+                                      ;; argument map, once durable, makes every
+                                      ;; later turn replay an invalid tool_call
+                                      ;; and 400 forever (bricks the room). This
+                                      ;; is the load-bearing guard.
                                       :tool-uses (when (seq tool-calls)
                                                    (mapv (fn [tc]
-                                                           {:tool-use/id (:id tc)
-                                                            :tool-use/name (:name tc)
-                                                            :tool-use/input (:input tc)})
+                                                           (let [{:keys [id name input]}
+                                                                 (quirks/sanitize-tool-call tc)]
+                                                             {:tool-use/id id
+                                                              :tool-use/name name
+                                                              :tool-use/input input}))
                                                          tool-calls))
                                       :tokens (:output-tokens usage)
                                       :turn-number turn-number}))]
