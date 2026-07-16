@@ -200,6 +200,13 @@
    - :tools - Tool registry
    - :tool-ctx - Tool execution context
    - :on-text - Callback for text chunks
+   - :on-reply - (fn [reply-content] → {:content str :notes [str…]}) optional
+                 embedder hook run on the assistant's text reply BEFORE it is
+                 added to the chat-ctx. :content replaces the reply (e.g. rewrite
+                 references) so the agent's own next-turn copy carries it; each
+                 :note is injected as a {:role :system} message the agent reads
+                 next turn (same channel as budget alerts). Fail-safe: a throw or
+                 nil return leaves the reply untouched.
    - :auto-compact? - Enable automatic compaction (default true)
    - :compaction-model - Model for summarization
    - :turn-number - Current turn number (for message grouping)
@@ -209,7 +216,7 @@
    - :complete if agent is done (no tool calls)
    - :error if something failed"
   [chat-ctx {:keys [provider model tools tool-ctx on-text auto-compact? compaction-model turn-number cancel?
-                    system-suffix]
+                    system-suffix on-reply]
              :or {auto-compact? true}}]
   (try
     ;; Check for automatic compaction before turn
@@ -271,6 +278,25 @@
                               :tokens usage}}
                       "LLM response received")
 
+          ;; Product reference hook: let the embedder rewrite outbound
+          ;; references in the reply (e.g. bare [[Title]] → [[dh://…]]) so the
+          ;; agent's OWN next-turn copy — and the reply it posts — carry
+          ;; resolved links, and surface system notes for anything the embedder
+          ;; couldn't resolve. The notes are injected below exactly like a
+          ;; budget alert, so the agent sees the feedback next turn without a
+          ;; visible message or an extra turn. Fail-safe: a hook error (or a nil
+          ;; return) leaves the reply untouched — a product hook must never
+          ;; break a turn.
+          reply-hook  (when (and on-reply (string? content) (seq content))
+                        (try (on-reply content)
+                             (catch Throwable t
+                               (tel/log! {:level :warn :id :agent/on-reply-failed
+                                          :data {:error (.getMessage t)}}
+                                         "on-reply hook threw; using raw reply")
+                               nil)))
+          content     (or (:content reply-hook) content)
+          reply-notes (:notes reply-hook)
+
           ;; Account for token usage and capture threshold warnings
           input-result (when (:input-tokens usage)
                          (chat-ctx/account-tokens! chat-ctx
@@ -317,7 +343,13 @@
                                                               :tool-use/input input}))
                                                          tool-calls))
                                       :tokens (:output-tokens usage)
-                                      :turn-number turn-number}))]
+                                      :turn-number turn-number}))
+
+          ;; Surface embedder reply notes (e.g. unresolvable links) as system
+          ;; messages the agent reads next turn — same channel as budget alerts.
+          _ (doseq [note reply-notes
+                    :when (and (string? note) (seq note))]
+              (chat-ctx/add-message! chat-ctx {:role :system :content note}))]
 
       ;; Handle tool calls
       (if (seq tool-calls)

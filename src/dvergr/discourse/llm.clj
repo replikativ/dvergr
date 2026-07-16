@@ -127,10 +127,14 @@
                   Override for testing or to inject per-turn behaviour
                   (e.g. usage logging). Default calls
                   `dvergr.chat.agent/run-agent-turn!`.
+   :on-reply    — (fn [reply-content] → {:content str :notes [str…]}) optional
+                  embedder hook threaded to `run-agent-turn!` — rewrites the
+                  agent's outbound reply (e.g. resolve references) and returns
+                  system notes injected into the chat-ctx for the next turn.
    :ctx         — discourse room's execution context
                   (default: `*execution-context*`)"
   [{:keys [id spec tools db-conn budget compaction
-           chat-ctx participant-context tool-ctx run-turn-fn ctx room-safe?]
+           chat-ctx participant-context tool-ctx run-turn-fn ctx room-safe? on-reply]
     :or   {budget      {:dollars 1.0}
            compaction  {:auto? true :strategy :sync-before-turn}
            run-turn-fn default-run-turn
@@ -290,7 +294,11 @@
                                                          (conj prompt/planning-mode-guideline)))
                                     :auto-compact?    (and (:auto? compaction true)
                                                            (not race-compaction?))
-                                    :compaction-model (:model compaction)}
+                                    :compaction-model (:model compaction)
+                                ;; Product reference hook (see run-agent-turn!):
+                                ;; rewrites outbound refs in the reply + returns
+                                ;; system notes for unresolvable ones.
+                                    :on-reply         on-reply}
                          errored           (atom nil)]
                  ;; The just-arrived user message. ROOM path: append-inbound!
                  ;; (deduped against the bus fold by msg id, decorated with author
