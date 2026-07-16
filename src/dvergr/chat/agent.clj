@@ -423,7 +423,29 @@
                                                  (:error result)
                                                  (pr-str result))
                                     :turn-number turn-number}))
-          :continue)
+          ;; Loop bound: if the agent is repeating the SAME tool call with the
+          ;; same args and making no progress, stop the auto-continue cycle
+          ;; instead of spinning until budget runs out. History stays coherent
+          ;; (tool_uses + their results are both present); a nudge tells the
+          ;; model why it stopped, and the next human turn resumes it. This
+          ;; finally wires detect-doom-loop, which was dead code.
+          (if-let [looped (detect-doom-loop (chat-ctx/get-messages chat-ctx))]
+            (do
+              (tel/log! {:level :warn :id :agent/doom-loop
+                         :data {:tool (:tool-use/name looped) :turn turn-number}}
+                        "Repeated identical tool call with no progress — ending turn cycle")
+              (chat-ctx/add-message! chat-ctx
+                                     {:role :system
+                                      :important? true
+                                      :content (str "You have called `" (:tool-use/name looped)
+                                                    "` with identical arguments "
+                                                    doom-loop-threshold "+ times without making "
+                                                    "progress. Stop repeating it — either take a "
+                                                    "materially different approach, or reply to the "
+                                                    "room describing what you found and what is "
+                                                    "blocking you.")})
+              :complete)
+            :continue))
 
         ;; No tool calls. Usually that means the agent is done — but a model can
         ;; also fumble its code into the PROSE channel (stop_reason=stop, no
