@@ -436,6 +436,15 @@
    - You can require namespaces
    - Changes don't affect other sessions
 
+   LARGE DATA — hold and reduce, don't dump. The printed result is truncated
+   for context (~15K tokens), but that clips only what is PRINTED — the VALUE
+   persists in the session. So for a fetched page/feed or a big file, capture
+   it (`(def body (slurp url))`) and reduce it programmatically — `(count body)`,
+   `(re-seq re body)`, parse and select the few fields you need — returning only
+   the small result. Never print a whole page/feed/file; this is how you work
+   with data far larger than the output cap. Prefer this over the `shell` tool
+   (whose stdout is truncated) when a response might be large.
+
    Execution budget: a 60-second hard timeout applies to each call. If
    you exceed it the tool returns a TimeoutException with a hint about
    likely causes (hung @spin, infinite loop, oversized inference). Keep
@@ -579,8 +588,10 @@
    - Default permits auto-allow read-only commands (ls, cat, grep, git
      status/log/diff, rg, etc.) and auto-deny destructive ones (sudo,
      rm -rf, dd, reboot). Other commands pass through (run).
-   - Output is capped at 8000 chars per stream; :truncated? signals
-     when the cap fired.
+   - Output is capped at 30000 chars per stream; :truncated? signals
+     when the cap fired (the global tool-result truncation at ~60K chars
+     is the real backstop — this per-stream cap just avoids one runaway
+     stream from dominating).
    - Session state (cwd, env vars, bg jobs) is per chat-ctx and
      forks alongside it — a worker in a substrate-fork gets an
      isolated session for free.
@@ -596,7 +607,7 @@
                {:type :error
                 :error "shell tool requires a chat-ctx in the tool-ctx."}
                (let [r ((requiring-resolve 'dvergr.intake.bash/run)
-                        chat-ctx command)]
+                        chat-ctx command :max-out 30000)]
                  (if (:error r)
                    {:type :error
                     :error (:error r)
