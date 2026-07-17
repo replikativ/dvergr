@@ -134,20 +134,6 @@
 ;; Parties
 ;; ---------------------------------------------------------------------------
 
-(defn create-party!
-  "Upsert a party (human or agent). `m` carries `:party/*` keys; `:party/handle`
-   is the natural key. Returns the party's uuid."
-  [{:keys [party/handle party/type] :as m}]
-  (let [conn (get-conn)
-        id   (or (:party/id m) (java.util.UUID/randomUUID))
-        ent  (merge {:party/id id :party/type (or type :human)
-                     :party/created (now)} m {:party/id id})]
-    (d/transact conn [ent])
-    id))
-
-(defn party-by-handle [handle]
-  (d/q '[:find (pull ?e [*]) . :in $ ?h :where [?e :party/handle ?h]] @(get-conn) handle))
-
 ;; ---------------------------------------------------------------------------
 ;; Systems registry
 ;; ---------------------------------------------------------------------------

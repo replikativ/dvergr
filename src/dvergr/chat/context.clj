@@ -152,7 +152,7 @@
 
    Args:
      chat-ctx - ChatContext
-     message - Map with :role, :content, :author-id, :tokens, etc."
+     message - Map with :role, :content, :tokens, etc."
   [chat-ctx message]
   (let [msg-entity (schema/create-message-entity
                     (assoc message :chat-id (:chat-id chat-ctx)))]
