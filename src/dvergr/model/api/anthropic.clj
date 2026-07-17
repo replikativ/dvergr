@@ -164,7 +164,26 @@
   (format-messages [_ messages model]
     ;; Anthropic: tool results grouped into user messages with tool_result content blocks
     ;; Assistant messages with tool calls have content blocks [{:type "text"} {:type "tool_use"}]
-    (let [groups (partition-by #(= :tool-result (:message/role %)) messages)]
+    ;;
+    ;; Consecutive plain-text USER messages are merged into one: the API
+    ;; requires alternating roles, and a steered turn legitimately produces
+    ;; [user, user] history (the steer cancelled the call BEFORE any
+    ;; assistant message was committed, then folded a second user message).
+    (let [messages (reduce (fn [acc m]
+                             (let [prev (peek acc)]
+                               (if (and prev
+                                        (= :user (:message/role prev) (:message/role m))
+                                        (string? (:message/content prev))
+                                        (string? (:message/content m))
+                                        (empty? (:message/tool-uses prev))
+                                        (empty? (:message/tool-uses m)))
+                                 (conj (pop acc)
+                                       (update prev :message/content
+                                               #(str % "\n\n" (:message/content m))))
+                                 (conj acc m))))
+                           []
+                           messages)
+          groups (partition-by #(= :tool-result (:message/role %)) messages)]
       (vec (mapcat
             (fn [group]
               (if (= :tool-result (:message/role (first group)))
