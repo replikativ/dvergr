@@ -11,7 +11,6 @@
      summary            — refreshed every 5 min (LLM call, async)
 
    Usage:
-     (stats/init! datahike-conn)    ; call once at daemon startup
      (stats/get-stats :huginn)      ; => {:cost-dollars 0.027
                                     ;      :last-active #inst \"2026-02-22T...\"
                                     ;      :last-active-str \"5m ago\"
@@ -57,12 +56,6 @@
 
 (def ^:private cost-ttl-ms    (* 30 1000))   ; 30 s
 (def ^:private summary-ttl-ms (* 300 1000))  ; 5 min
-
-(defn init!
-  "Deprecated no-op (RF5 S4): cost is per-room now and queries fan out over the
-   room registry. Retained so the daemon boot call site stays valid."
-  [_datahike-conn]
-  nil)
 
 ;; ============================================================================
 ;; Helpers

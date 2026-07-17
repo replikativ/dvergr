@@ -54,7 +54,6 @@
             ;; without the web layer on the classpath.
             [dvergr.scheduler.core :as scheduler]
             [dvergr.security.allowlist :as allowlist]
-            [dvergr.orchestration.stats :as stats]
             [dvergr.rooms :as rooms]
             [dvergr.room.registry :as rreg]
             [dvergr.discourse.definitions :as defs]
