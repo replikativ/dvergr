@@ -20,6 +20,7 @@
             [dvergr.tools :as tools]
             [dvergr.sandbox.workspace :as workspace]
             [jsonista.core :as json]
+            [clojure.edn :as edn]
             [datahike.api :as dh]
             [taoensso.telemere :as tel]))
 
@@ -32,6 +33,20 @@
   [m]
   (when (map? m)
     (into {} (map (fn [[k v]] [(if (keyword? k) (keyword (name k)) k) v]) m))))
+
+(defn- tool-use-input->args
+  "Reconstruct a tool_use's argument map for API replay from its persisted
+   :tool-use/input entity. A raw-EDN fallback entity (`:tool-input.raw/content`,
+   written when a tool arg couldn't be typed) round-trips via its stored EDN;
+   any other entity has its datahike namespace prefixes stripped. Always returns
+   a map — never nil (`null` arguments are a hard 400 on OpenAI-compat APIs)."
+  [input]
+  (or (when (map? input)
+        (if-let [raw (get input :tool-input.raw/content)]
+          (try (let [v (edn/read-string raw)] (when (map? v) v))
+               (catch Exception _ nil))
+          (strip-ns-keys input)))
+      {}))
 
 (declare messages->api-format)
 
@@ -74,7 +89,7 @@
                                                               ;; history: clean a leaked-envelope name and
                                                               ;; never send nil input.
                                                               :name (quirks/clean-tool-name (:tool-use/name tu))
-                                                              :input (or (strip-ns-keys (:tool-use/input tu)) {})})
+                                                              :input (tool-use-input->args (:tool-use/input tu))})
                                                            tool-uses)))}
                                    ;; Regular message
                                      {:role (name role)
@@ -104,7 +119,7 @@
                                                     ;; "null" arguments are also a 400 on OpenAI-compat APIs.
                                                     :function {:name (quirks/clean-tool-name (:tool-use/name tu))
                                                                :arguments (json/write-value-as-string
-                                                                           (or (strip-ns-keys (:tool-use/input tu)) {}))}})
+                                                                           (tool-use-input->args (:tool-use/input tu)))}})
                                                  tool-uses)}
                         (seq reasoning) (assoc :reasoning_content reasoning))
                       (cond-> {:role (name role)

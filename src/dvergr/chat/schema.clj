@@ -910,10 +910,12 @@
 
    DEGRADES (never throws): if the tool is unregistered (a model can hallucinate
    a tool name, e.g. the sandbox ns \"intake.hn\" vs the real tool \"clojure_eval\"), the input isn't a
-   map, or schema conversion fails, the tool-use is recorded by NAME with no
-   structured input (`:tool-use/input` is an optional ref). Persisting an agent's
-   turn must not crash on a bad tool call — tool EXECUTION returns the
-   \"unknown tool\" / validation error the model then recovers from."
+   map, or schema conversion fails, the input is preserved as a raw-EDN fallback
+   entity (`:tool-input.raw/*`) rather than dropped — so the durable record keeps
+   the arguments (queryable later, and round-trippable on replay) and the write
+   is always transactable. Persisting an agent's turn must not crash on a bad
+   tool call — tool EXECUTION returns the \"unknown tool\" / validation error the
+   model then recovers from."
   [tool-use]
   (let [tool-name (:tool-use/name tool-use)
         input     (:tool-use/input tool-use)
@@ -924,17 +926,27 @@
                          (catch Throwable e
                            (tel/log! {:level :warn :id :schema/tool-input-unconvertible
                                       :data {:tool-name tool-name :error (.getMessage e)}}
-                                     "tool input could not be structured — storing tool-use without input")
+                                     "tool input could not be structured — falling back to raw EDN")
                            nil)))]
-    (if entity
+    (cond
+      entity
       (assoc tool-use :tool-use/input entity)
+
+      ;; No structured entity, but there IS an input: preserve it verbatim as raw
+      ;; EDN instead of dropping it. Always transactable (a string), and
+      ;; reconstructable on replay (see agent/tool-use-input->args).
+      (some? input)
       (do
         (when-not tool-def
           (tel/log! {:level :warn :id :schema/unregistered-tool-use
                      :data {:tool-name tool-name :available (keys registry)}}
                     (str "tool-use for unregistered tool '" tool-name
-                         "' persisted without structured input (likely a model hallucination)")))
-        (dissoc tool-use :tool-use/input)))))
+                         "' stored with raw-EDN input (likely a model hallucination)")))
+        (assoc tool-use :tool-use/input (tool-schema/raw-input->entity tool-name input)))
+
+      ;; No input at all — a legitimately arg-less call.
+      :else
+      (dissoc tool-use :tool-use/input))))
 
 (defn create-message-entity
   "Create a message entity map for transacting.

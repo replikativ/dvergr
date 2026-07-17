@@ -214,8 +214,12 @@
             (throw e))
           (count schema))))))
 
+;; Defined below; referenced by install-all-tool-schemas! (resolved at call time).
+(declare raw-input-schema)
+
 (defn install-all-tool-schemas!
-  "Install schemas for all tools in a registry.
+  "Install schemas for all tools in a registry, plus the raw-EDN fallback
+   attributes.
 
    Args:
      conn     - Datahike connection
@@ -224,6 +228,14 @@
    Returns:
      Map of tool-name -> count of attributes installed."
   [conn registry]
+  ;; Always install the raw-EDN fallback attributes. serialize-tool-use degrades
+  ;; a tool input it cannot type into :tool-input.raw/*, so persistence stays
+  ;; total — these MUST exist before any such write can land.
+  (try
+    (d/transact conn raw-input-schema)
+    (catch Exception e
+      (when-not (re-find #"already exists|already defined" (.getMessage e))
+        (throw e))))
   (->> registry
        (map (fn [[tool-name tool-def]]
               [tool-name (install-tool-schema! conn tool-def)]))
