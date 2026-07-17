@@ -327,11 +327,9 @@
           ;; Inject threshold warnings as system messages
           _ (doseq [result [input-result output-result]
                     :when (:threshold-crossed? result)]
-              (chat-ctx/add-message! chat-ctx
-                                     {:role :system
-                                      :content (str "⚠️ BUDGET ALERT: "
-                                                    (:threshold-message result))
-                                      :important? true}))
+              (chat-ctx/add-system-note! chat-ctx
+                                         (str "⚠️ BUDGET ALERT: " (:threshold-message result))
+                                         :important? true))
 
           ;; Add assistant message if there's content
           _ (when (or (seq content) (seq tool-calls))
@@ -364,7 +362,7 @@
           ;; messages the agent reads next turn — same channel as budget alerts.
           _ (doseq [note reply-notes
                     :when (and (string? note) (seq note))]
-              (chat-ctx/add-message! chat-ctx {:role :system :content note}))]
+              (chat-ctx/add-system-note! chat-ctx note))]
 
       ;; Handle tool calls
       (if (seq tool-calls)
@@ -449,16 +447,15 @@
               (tel/log! {:level :warn :id :agent/doom-loop
                          :data {:tool (:tool-use/name looped) :turn turn-number}}
                         "Repeated identical tool call with no progress — ending turn cycle")
-              (chat-ctx/add-message! chat-ctx
-                                     {:role :system
-                                      :important? true
-                                      :content (str "You have called `" (:tool-use/name looped)
-                                                    "` with identical arguments "
-                                                    doom-loop-threshold "+ times without making "
-                                                    "progress. Stop repeating it — either take a "
-                                                    "materially different approach, or reply to the "
-                                                    "room describing what you found and what is "
-                                                    "blocking you.")})
+              (chat-ctx/add-system-note! chat-ctx
+                                         (str "You have called `" (:tool-use/name looped)
+                                              "` with identical arguments "
+                                              doom-loop-threshold "+ times without making "
+                                              "progress. Stop repeating it — either take a "
+                                              "materially different approach, or reply to the "
+                                              "room describing what you found and what is "
+                                              "blocking you.")
+                                         :important? true)
               :complete)
             :continue))
 
@@ -477,10 +474,7 @@
                        :data {:turn turn-number
                               :preview (subs (str content) 0 (min 80 (count (str content))))}}
                       "Model emitted code as content instead of a tool call — nudging")
-            (chat-ctx/add-message! chat-ctx
-                                   {:role :system
-                                    :content fragment-nudge
-                                    :important? true})
+            (chat-ctx/add-system-note! chat-ctx fragment-nudge :important? true)
             :continue)
           :complete)))
 
