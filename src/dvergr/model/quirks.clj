@@ -109,6 +109,16 @@
       (try ((requiring-resolve 'jsonista.core/read-value) t) (catch Exception _ v))
       v)))
 
+(defn- envelope->args
+  "The one canonical reader of GLM's `<arg_key>K</arg_key><arg_value>V</arg_value>`
+   envelope: parse every complete pair out of a string into a `{keyword value}`
+   map (values JSON-scalar-coerced via `glm-arg->value`); `{}` when the envelope
+   isn't present. The sanitize/parse paths all share this instead of each
+   re-walking `glm-arg-pair-re`."
+  [s]
+  (into {} (map (fn [[_ k v]] [(keyword (str/trim k)) (glm-arg->value v)])
+                (re-seq glm-arg-pair-re (str s)))))
+
 (defn clean-tool-name
   "Strip a leaked GLM envelope (or any stray non-identifier tail) off a tool
    name: `clojure_eval<arg_key>code…` → `clojure_eval`. A real tool name is an
@@ -131,8 +141,7 @@
    structured input survived, recover the args from it."
   [{:keys [name input] :as call}]
   (let [envelope-pairs (when (and (string? name) (str/includes? name "<arg_key>"))
-                         (into {} (map (fn [[_ k v]] [(keyword (str/trim k)) (glm-arg->value v)])
-                                       (re-seq glm-arg-pair-re name))))
+                         (envelope->args name))
         input' (cond
                  (map? input)     input
                  (seq envelope-pairs) envelope-pairs
@@ -156,16 +165,15 @@
                              (re-seq #"\"([^\"]+)\"")
                              (map second)
                              seq))
-          pairs (map (fn [[_ k v]] [(keyword (str/trim k)) (glm-arg->value v)])
-                     (re-seq glm-arg-pair-re s))]
-      (when (and (seq names) (seq pairs))
+          args (envelope->args s)]
+      (when (and (seq names) (seq args))
         ;; Single-call is the common leak; when multiple names appear we give
         ;; every parsed pair to the first (safe: our tools take one arg-map).
         ;; clean-tool-name strips the envelope from the Fireworks echo form
         ;; `Tool calls: ["clojure_eval<arg_key>…"]`, whose quoted name captures
         ;; the whole leaked payload.
         [{:name (clean-tool-name (first names))
-          :input (into {} pairs)}]))))
+          :input args}]))))
 
 (defn sanitize-glm-structured-call
   "GLM also leaks its envelope INTO the structured tool_call NAME field:
@@ -179,14 +187,16 @@
   (if (and name (str/includes? (str name) "<arg_key>"))
     (let [n (str name)
           real-name (str/trim (subs n 0 (str/index-of n "<arg_key>")))
-          pairs (map (fn [[_ k v]] [(keyword (str/trim k)) (glm-arg->value v)])
-                     (re-seq glm-arg-pair-re n))
-          partial-pair (when (empty? pairs)
+          args (envelope->args n)
+          ;; An unterminated trailing <arg_value> yields no complete pair; keep
+          ;; its partial (raw, uncoerced) text so the tool fails informatively
+          ;; instead of the turn dying.
+          partial-pair (when (empty? args)
                          (when-let [[_ k v] (re-find #"(?s)<arg_key>(.*?)</arg_key>\s*<arg_value>(.*)\z" n)]
-                           [[(keyword (str/trim k)) v]]))]
+                           {(keyword (str/trim k)) v}))]
       (assoc call
              :name real-name
-             :input (merge (into {} (concat pairs partial-pair)) input)))
+             :input (merge args partial-pair input)))
     call))
 
 (defn strip-glm-tool-tokens

@@ -146,3 +146,17 @@
                        "<arg_key>code</arg_key><arg_value>(+ 1 2)</arg_value>")
           [call] (quirks/parse-glm-tool-calls content)]
       (is (= "clojure_eval" (:name call))))))
+
+(deftest all-envelope-consumers-share-one-reader
+  (testing "sanitize-tool-call, sanitize-glm-structured-call and parse-glm-tool-calls
+            recover the SAME multi-arg pairs from the SAME envelope (they route
+            through the single canonical envelope reader) — with JSON-scalar
+            coercion on values"
+    (let [env  "<arg_key>title</arg_key><arg_value>\"Founders\"</arg_value><arg_key>relevance</arg_key><arg_value>5</arg_value>"
+          want {:title "Founders" :relevance 5}]
+      (is (= want (:input (quirks/sanitize-tool-call
+                           {:name (str "knowledge_add" env) :input nil}))))
+      (is (= want (:input (quirks/sanitize-glm-structured-call
+                           {:name (str "knowledge_add" env) :input nil}))))
+      (is (= want (:input (first (quirks/parse-glm-tool-calls
+                                  (str "<tool_call>knowledge_add" env "</tool_call>")))))))))
