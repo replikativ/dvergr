@@ -194,6 +194,17 @@
 
     msg-entity))
 
+(defn add-system-note!
+  "Inject a system note the agent reads on its NEXT turn — the single seam for
+   out-of-band, model-directed feedback: budget alerts, embedder reply notes,
+   and correction nudges (code-in-prose, repeated-tool-call), with a
+   language-drift guard to come. It is an `:system` message; naming it gives
+   these one home and one place to evolve (dedup, or a queue drained at turn
+   start). `:important?` marks it protected from compaction pruning."
+  [chat-ctx content & {:keys [important?]}]
+  (add-message! chat-ctx (cond-> {:role :system :content content}
+                           important? (assoc :important? true))))
+
 (defn replace-messages!
   "Replace all messages in the chat context.
    Used by pruning to swap in pruned message versions without adding new messages.

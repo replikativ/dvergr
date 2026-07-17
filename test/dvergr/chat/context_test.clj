@@ -137,3 +137,17 @@
       (is (= :paused (ctx/get-status chat)))
       (ctx/set-status! chat :completed)
       (is (= :completed (ctx/get-status chat))))))
+
+(deftest add-system-note-test
+  (testing "add-system-note! is the single seam for out-of-band notes: an
+            :system message, optionally protected from pruning"
+    (let [chat (ctx/create-chat-context {:budget-dollars 1.0 :with-sci? false})]
+      (ctx/add-system-note! chat "plain")
+      (ctx/add-system-note! chat "urgent" :important? true)
+      (let [[m1 m2] (ctx/get-messages chat)]
+        (is (= :system (:message/role m1)))
+        (is (= "plain" (:message/content m1)))
+        (is (not (:message/important? m1)))
+        (is (= :system (:message/role m2)))
+        (is (= "urgent" (:message/content m2)))
+        (is (true? (:message/important? m2)))))))
