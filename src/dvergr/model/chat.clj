@@ -357,26 +357,3 @@
      opts     - Additional options (must include :model)"
   [messages tools opts]
   (chat messages (assoc opts :tools tools)))
-
-;; ============================================================================
-;; Cost Calculation
-;; ============================================================================
-
-(defn calculate-cost
-  "Calculate cost in dollars for a chat response.
-
-   Args:
-     model-id - Model ID
-     usage    - Usage map from response
-
-   Returns:
-     {:input-cost N :output-cost M :total-cost N+M}"
-  [model-id usage]
-  (let [{:keys [input-tokens output-tokens]} usage]
-    (if-let [pricing (registry/pricing-of model-id)]
-      (let [input-cost (* (or input-tokens 0) (/ (:input pricing) 1000000.0))
-            output-cost (* (or output-tokens 0) (/ (:output pricing) 1000000.0))]
-        {:input-cost input-cost
-         :output-cost output-cost
-         :total-cost (+ input-cost output-cost)})
-      {:error "Unknown model pricing"})))

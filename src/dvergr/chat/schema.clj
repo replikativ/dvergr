@@ -331,44 +331,6 @@
 ;; Accounting Schema (for budget tracking)
 ;; ============================================================================
 
-(def accounting-schema
-  "Schema for resource accounting entries."
-  [{:db/ident :account/id
-    :db/valueType :db.type/uuid
-    :db/unique :db.unique/identity
-    :db/cardinality :db.cardinality/one
-    :db/doc "Unique identifier for accounting entry"}
-
-   {:db/ident :account/chat
-    :db/valueType :db.type/ref
-    :db/cardinality :db.cardinality/one
-    :db/doc "Reference to chat this entry belongs to"}
-
-   {:db/ident :account/type
-    :db/valueType :db.type/keyword
-    :db/cardinality :db.cardinality/one
-    :db/doc "Resource type: :input-tokens :output-tokens :tool-call :api-call"}
-
-   {:db/ident :account/amount
-    :db/valueType :db.type/long
-    :db/cardinality :db.cardinality/one
-    :db/doc "Amount consumed"}
-
-   {:db/ident :account/message
-    :db/valueType :db.type/ref
-    :db/cardinality :db.cardinality/one
-    :db/doc "Optional reference to message that triggered this usage"}
-
-   {:db/ident :account/timestamp
-    :db/valueType :db.type/instant
-    :db/cardinality :db.cardinality/one
-    :db/doc "When this usage occurred"}
-
-   {:db/ident :account/metadata
-    :db/valueType :db.type/string
-    :db/cardinality :db.cardinality/one
-    :db/doc "Additional metadata as EDN (model, provider, etc.)"}])
-
 ;; ============================================================================
 ;; Task Schema (for agent task tracking)
 ;; ============================================================================
@@ -782,7 +744,6 @@
                participant-schema
                message-schema
                tool-call-schema
-               accounting-schema
                ledger-schema
                budget-schema
                knowledge-schema
@@ -1031,33 +992,6 @@
                                                        db (:tool-use/id tu))]]
                                      (or tc {:tool-call/name (:tool-use/name tu)
                                              :tool-call/status :unknown})))})))))
-
-(defn account-usage!
-  "Record a resource usage in the accounting table.
-
-   Args:
-     conn - Datahike connection
-     chat-id - UUID of the chat
-     type - Resource type keyword
-     amount - Amount consumed
-     opts - Optional :message-id, :metadata"
-  [conn chat-id type amount & {:keys [message-id metadata]}]
-  (let [entry (cond-> {:account/id (random-uuid)
-                       :account/chat [:chat/id chat-id]
-                       :account/type type
-                       :account/amount amount
-                       :account/timestamp (java.util.Date.)}
-                message-id (assoc :account/message [:message/id message-id])
-                metadata (assoc :account/metadata (pr-str metadata)))
-        prior-used (or (d/q '[:find ?used .
-                              :in $ ?cid
-                              :where [?c :chat/id ?cid]
-                              [?c :chat/budget-used ?used]]
-                            @conn chat-id)
-                       0)]
-    (d/transact conn [entry
-                      {:db/id [:chat/id chat-id]
-                       :chat/budget-used (long (+ prior-used amount))}])))
 
 ;; ============================================================================
 ;; Knowledge Entity Helpers

@@ -62,16 +62,19 @@
 ;; ============================================================================
 
 (defn get-model-pricing
-  "Get pricing for a model in microdollars per token.
-   Returns {:input μ$/token :output μ$/token :cache-read :cache-write}"
+  "Get pricing for a model in microdollars per token, as DOUBLES.
+
+   The registry rate is $/M tokens — which is NUMERICALLY the μ$/token rate
+   ($X per 10^6 tokens = X×10^6 μ$ per 10^6 tokens = X μ$/token) — so the
+   registry map is returned as-is, fraction intact. Rounding to a long
+   happens ONCE PER CALL in `calculate-cost`, never per token: the old
+   per-token `(long …)` truncation zeroed every sub-$1/M rate (Kimi K2.5
+   input $0.60/M ledgered as $0) and undercounted the rest (GLM 5.2 $1.40/M
+   by 29%).
+
+   Returns {:input μ$/token :output μ$/token :cache-read :cache-write}."
   [model-id]
-  (when-let [pricing (registry/pricing-of model-id)]
-    ;; Registry has $/M tokens, convert to μ$/token
-    (reduce-kv
-     (fn [m k v]
-       (assoc m k (long (* v MICRODOLLARS-PER-DOLLAR (/ 1 1000000.0)))))
-     {}
-     pricing)))
+  (registry/pricing-of model-id))
 
 (defn get-static-pricing
   "Get static pricing for non-LLM resources."
@@ -88,31 +91,36 @@
 
    Returns: Cost in microdollars (long)"
   [resource-type amount {:keys [model]}]
-  (case resource-type
-    ;; Token-based resources need model pricing
-    (:token-input :input-tokens)
-    (if-let [pricing (get-model-pricing model)]
-      (* amount (:input pricing 1))
-      ;; Fallback: assume $1/M tokens = 1 μ$/token
-      amount)
+  ;; Round to whole μ$ once per CALL (rates are fractional μ$/token doubles).
+  (letfn [(cost [rate] (Math/round (double (* amount rate))))]
+    (case resource-type
+      ;; Token-based resources need model pricing
+      (:token-input :input-tokens)
+      (if-let [pricing (get-model-pricing model)]
+        (cost (:input pricing 1))
+        ;; Fallback: assume $1/M tokens = 1 μ$/token.
+        ;; TODO(policy): replace the silent invented price with recorded-
+        ;; usage-at-0 + an explicit unpriced flag — pending decision, see
+        ;; simmis/.internal/identity-and-cost-convergence.md.
+        amount)
 
-    (:token-output :output-tokens)
-    (if-let [pricing (get-model-pricing model)]
-      (* amount (:output pricing 1))
-      amount)
+      (:token-output :output-tokens)
+      (if-let [pricing (get-model-pricing model)]
+        (cost (:output pricing 1))
+        amount)
 
-    :token-cache-read
-    (if-let [pricing (get-model-pricing model)]
-      (* amount (:cache-read pricing 0))
-      0)
+      :token-cache-read
+      (if-let [pricing (get-model-pricing model)]
+        (cost (:cache-read pricing 0))
+        0)
 
-    :token-cache-write
-    (if-let [pricing (get-model-pricing model)]
-      (* amount (:cache-write pricing 0))
-      0)
+      :token-cache-write
+      (if-let [pricing (get-model-pricing model)]
+        (cost (:cache-write pricing 0))
+        0)
 
-    ;; Static pricing for everything else
-    (long (* amount (get-static-pricing resource-type)))))
+      ;; Static pricing for everything else
+      (long (* amount (get-static-pricing resource-type))))))
 
 ;; ============================================================================
 ;; Budget Status
@@ -242,11 +250,23 @@
      amount        - Amount in natural units
      opts          - {:model :provider :tool :metadata}
 
+   The ONE ledger writer: the row and the `:chat/budget-used` rollup land in
+   a single transact (atomically), so every consumer of the rolled-up counter
+   sees the real total. `chat.context/account-usage!` (the turn path) and
+   simmis billing both route through here — no inline duplicates.
+
    Returns:
      {:ledger-id uuid :cost-microdollars N}"
   [conn chat-id resource-type amount & {:keys [model provider tool metadata]}]
   (let [cost (calculate-cost resource-type amount {:model model})
         ledger-id (random-uuid)
+        prior-used (or (d/q '[:find ?u .
+                              :in $ ?cid
+                              :where
+                              [?c :chat/id ?cid]
+                              [?c :chat/budget-used ?u]]
+                            @conn chat-id)
+                       0)
         entry (cond-> {:ledger/id ledger-id
                        :ledger/context [:chat/id chat-id]
                        :ledger/timestamp (java.util.Date.)
@@ -257,7 +277,9 @@
                 provider (assoc :ledger/provider provider)
                 tool (assoc :ledger/tool tool)
                 metadata (assoc :ledger/metadata (pr-str metadata)))]
-    (d/transact conn [entry])
+    (d/transact conn [entry
+                      {:db/id [:chat/id chat-id]
+                       :chat/budget-used (long (+ prior-used cost))}])
     {:ledger-id ledger-id
      :cost-microdollars cost}))
 

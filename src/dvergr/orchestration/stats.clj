@@ -87,7 +87,11 @@
   []
   (->> (rreg/list-rooms) (keep #(some-> % :store :conn)) (mapv deref)))
 
-(defn- query-cost-db [db prefix]
+(defn- query-cost-db
+  "Spend (dollars) in one room DB, or nil when the query FAILS — unknown is
+   not zero (a fabricated 0.0 reads as \"free\" on the dashboard; nil renders
+   as an em-dash via fmt-cost, same contract as rooms/stats)."
+  [db prefix]
   (try
     (let [res (dh/q '[:find (sum ?cost) :with ?e :in $ ?prefix
                       :where [?e :ledger/context ?c] [?c :chat/title ?t]
@@ -95,12 +99,17 @@
                       [(clojure.string/starts-with? ?t ?prefix)]]
                     db prefix)]
       (/ (double (or (ffirst res) 0)) 1000000.0))
-    (catch Exception _ 0.0)))
+    (catch Exception e
+      (tel/log! {:level :warn :id ::cost-query-failed
+                 :data {:prefix prefix :error (.getMessage e)}})
+      nil)))
 
 (defn- query-cost
-  "Total spend (dollars) for chats titled with `prefix`, summed over all rooms."
+  "Total spend (dollars) for chats titled with `prefix`, summed over all
+   rooms whose query succeeded; nil when EVERY room errored (unknown ≠ 0)."
   [prefix]
-  (reduce + 0.0 (map #(query-cost-db % prefix) (room-dbs))))
+  (let [costs (keep #(query-cost-db % prefix) (room-dbs))]
+    (when (seq costs) (reduce + 0.0 costs))))
 
 (defn- query-last-active-db [db prefix]
   (try
