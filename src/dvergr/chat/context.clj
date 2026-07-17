@@ -119,30 +119,14 @@
                       ::just-crossed threshold}))))
         threshold-info (::just-crossed new-state)]
 
-    ;; Persist ledger entry and keep :chat/budget-used in sync so
-    ;; analysis/queries.clj (and any other consumer of the
-    ;; :chat/budget-used attr) sees the real total. Single transact
-    ;; so the ledger row + the rolled-up counter land atomically.
+    ;; Persist via THE ledger writer (acct/record-usage!): the ledger row +
+    ;; the :chat/budget-used rollup land in one atomic transact there. This
+    ;; used to be an inline duplicate of that transact — which meant new
+    ;; ledger dimensions (e.g. the kontor commodity/settlement stamping)
+    ;; only reached the simmis billing path, never the room-turn rows.
     (when-let [conn (:db-conn chat-ctx)]
-      (let [prior-used (or (dh/q '[:find ?u .
-                                   :in $ ?cid
-                                   :where
-                                   [?c :chat/id ?cid]
-                                   [?c :chat/budget-used ?u]]
-                                 @conn (:chat-id chat-ctx))
-                           0)]
-        (dh/transact conn
-                     [(cond-> {:ledger/id (random-uuid)
-                               :ledger/context [:chat/id (:chat-id chat-ctx)]
-                               :ledger/timestamp (java.util.Date.)
-                               :ledger/resource resource-type
-                               :ledger/amount (long amount)
-                               :ledger/cost-microdollars (long cost)}
-                        model (assoc :ledger/model model)
-                        provider (assoc :ledger/provider provider)
-                        tool (assoc :ledger/tool tool))
-                      {:db/id [:chat/id (:chat-id chat-ctx)]
-                       :chat/budget-used (long (+ prior-used cost))}])))
+      (acct/record-usage! conn (:chat-id chat-ctx) resource-type amount
+                          :model model :provider provider :tool tool))
 
     ;; Return cost info
     (cond-> {:cost-microdollars cost}
@@ -366,10 +350,10 @@
                               @db-conn chat-id)
                         (catch Exception _ nil))
 
-        ;; Reconstruct used + per-type usage from the ledger — that's
-        ;; where account-usage! actually writes (the :chat/budget-used
-        ;; attr exists in schema but isn't kept in sync; trust the
-        ;; ledger sum instead).
+        ;; Reconstruct used + per-type usage from the LEDGER SUM — the
+        ;; ledger is the source of truth; :chat/budget-used is a derived
+        ;; rollup (record-usage! keeps it in sync in the same transact,
+        ;; but the sum is the authoritative restore).
         [restored-used restored-by-type]
         (if existing-chat
           (try

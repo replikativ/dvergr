@@ -164,14 +164,17 @@
 ;; ---------------------------------------------------------------------------
 
 (defn fmt-cost
-  "Dollar amount, precision scaled so tiny dev-costs stay legible."
+  "Dollar amount, precision scaled so tiny dev-costs stay legible.
+   nil (= the cost query FAILED) renders as an em-dash — unknown is not $0."
   [c]
-  (let [c (double (or c 0))]
-    (cond
-      (zero? c)  "$0.000"
-      (< c 0.01) (format "$%.4f" c)
-      (< c 1)    (format "$%.3f" c)
-      :else      (format "$%.2f" c))))
+  (if (nil? c)
+    "—"
+    (let [c (double c)]
+      (cond
+        (zero? c)  "$0.000"
+        (< c 0.01) (format "$%.4f" c)
+        (< c 1)    (format "$%.3f" c)
+        :else      (format "$%.2f" c)))))
 
 (defn fmt-tokens
   "Compact token count: 82345 → \"82k\", 1048576 → \"1.0M\"."
