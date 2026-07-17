@@ -44,9 +44,9 @@
            (catch Throwable t2
              (swap! dead-letters
                     (fn [dl] (vec (take-last dead-letter-cap
-                                            (conj dl {:ctx ctx
-                                                      :error (.getMessage t2)
-                                                      :tx-data tx-data})))))
+                                             (conj dl {:ctx ctx
+                                                       :error (.getMessage t2)
+                                                       :tx-data tx-data})))))
              (log/log! {:level :error :id :persist/dead-letter
                         :data {:op op :room-id room-id :msg-id msg-id
                                :error (.getMessage t2)
