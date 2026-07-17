@@ -342,15 +342,15 @@
                (try
                  (sp/await ((:on-message p) p env))
                  (catch Throwable t
-                   (binding [*out* *err*]
-                     (println "participant" (:id p)
-                              "on-message error:" (.getMessage t)))
+                   (tel/log! {:level :error :id ::on-message-error
+                              :data {:participant (:id p) :error (.getMessage t)}}
+                             "participant on-message error — turn dropped, participant continues")
                    nil))]
            (try (emit-reply! room p reply-spec in-reply-to)
                 (catch Throwable t
-                  (binding [*out* *err*]
-                    (println "participant" (:id p)
-                             "emit-reply error:" (.getMessage t)))))
+                  (tel/log! {:level :error :id ::emit-reply-error
+                             :data {:participant (:id p) :error (.getMessage t)}}
+                            "participant emit-reply error")))
            (if id
              (let [order' (conj order id)
                    seen'  (conj seen id)]
@@ -814,12 +814,24 @@
   [fork]
   (let [fid      (:id fork)
         cancel!  (requiring-resolve 'dvergr.agent.turn/cancel-room-turn!)
-        running? (requiring-resolve 'dvergr.agent.turn/room-turn-running?)]
+        running? (requiring-resolve 'dvergr.agent.turn/room-turn-running?)
+        watch!   (requiring-resolve 'dvergr.agent.turn/watch-room-turns!)
+        unwatch! (requiring-resolve 'dvergr.agent.turn/unwatch-room-turns!)
+        stopped  (promise)
+        wkey     (Object.)]
     (try (cancel! fid) (catch Throwable _))
-    (loop [n 0]
-      (when (and (< n 50) (try (running? fid) (catch Throwable _ false)))
-        (Thread/sleep 100)
-        (recur (inc n))))))
+    ;; Block on the turn registry's own lifecycle watch (fires on the
+    ;; empty↔non-empty transition) instead of poll-sleeping — one bounded
+    ;; wait, delivered the moment the turn actually unregisters. Register
+    ;; the watch BEFORE the running? check so the transition can't slip
+    ;; between check and wait.
+    (try
+      (watch! wkey (fn [rid turn-running?]
+                     (when (and (= rid fid) (not turn-running?))
+                       (deliver stopped true))))
+      (when (try (running? fid) (catch Throwable _ false))
+        (deref stopped 5000 ::timeout))
+      (finally (try (unwatch! wkey) (catch Throwable _))))))
 
 (defn discard
   "Discard a fork: deregister its participants, drop it from the

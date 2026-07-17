@@ -4,6 +4,7 @@
    Separates model metadata from provider implementation logic.
    Models can be loaded from EDN for runtime configuration."
   (:require [clojure.edn :as edn]
+            [taoensso.telemere :as tel]
             [clojure.java.io :as io]))
 
 ;; ============================================================================
@@ -363,7 +364,8 @@
           s         (slurp models-dev-url)]
       (json-read s mapper))
     (catch Throwable t
-      (println "models.dev fetch failed:" (.getMessage t))
+      (tel/log! {:level :warn :id ::models-dev-fetch-failed :data {:error (.getMessage t)}}
+                "models.dev fetch failed")
       nil)))
 
 (defn- coerce-models-dev-model

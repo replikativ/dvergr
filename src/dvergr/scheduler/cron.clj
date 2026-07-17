@@ -11,7 +11,7 @@
 
   All times are timezone-aware (default: system timezone)."
   (:require [clojure.string])
-  (:import [java.time ZonedDateTime ZoneId LocalTime Duration
+  (:import [java.time ZonedDateTime ZoneId LocalTime
             DayOfWeek Instant]
            [java.time.temporal ChronoUnit TemporalAdjusters]))
 
@@ -117,16 +117,6 @@
 
          :else
          (throw (ex-info "Invalid schedule spec" {:spec spec})))))))
-
-(defn ms-until
-  "Milliseconds from now until an Instant."
-  [^Instant target]
-  (max 0 (.toMillis (Duration/between (Instant/now) target))))
-
-(defn next-fire-ms
-  "Milliseconds until next fire for a schedule spec."
-  [spec]
-  (ms-until (next-fire-time spec)))
 
 ;; =============================================================================
 ;; Transparent schedule entities  ↔  spec maps  (RF5)
@@ -269,18 +259,3 @@
       :else
       (throw (ex-info "Invalid schedule spec" {:spec spec})))))
 
-;; =============================================================================
-;; Schedule Sequence (for chime-like patterns)
-;; =============================================================================
-
-(defn fire-seq
-  "Lazy sequence of fire times (Instants) for a recurring schedule.
-  Returns nil for :once specs after the first fire."
-  [spec]
-  (if (:once spec)
-    [(next-fire-time spec)]
-    (lazy-seq
-     (let [next-t (next-fire-time spec)]
-       (cons next-t
-             (lazy-seq
-              (fire-seq (assoc spec :_after next-t))))))))

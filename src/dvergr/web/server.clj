@@ -21,7 +21,8 @@
             [dvergr.web.agents :as web-agents]
             [dvergr.web.apps :as web-apps]
             [dvergr.web.ops :as web-ops]
-            [dvergr.web.api :as web-api]))
+            [dvergr.web.api :as web-api]
+            [taoensso.telemere :as tel]))
 
 ;; ============================================================================
 ;; State
@@ -338,9 +339,9 @@
    Returns the server state map."
   [daemon & {:keys [port ip] :or {port 17880 ip "127.0.0.1"}}]
   (when @server-state
-    (println "[web] Server already running on port" (:port @server-state))
+    (tel/log! {:level :warn :id ::already-running :data {:port (:port @server-state)}})
     (throw (ex-info "Server already running" {:port (:port @server-state)})))
-  (println "[web] Starting HTTP server on" (str ip ":" port) "...")
+  (tel/log! {:level :info :id ::starting :data {:ip ip :port port}} "Starting HTTP server")
   (let [stop-fn (http/run-server
                  (fn [req] (root-handler daemon req))
                  {:port port
@@ -352,17 +353,17 @@
                           :ip ip
                           :daemon daemon
                           :started-at (System/currentTimeMillis)})
-    (println "[web] HTTP server started at" (str "http://" ip ":" port))
+    (tel/log! {:level :info :id ::started :data {:url (str "http://" ip ":" port)}} "HTTP server started")
     @server-state))
 
 (defn stop!
   "Stop the HTTP server."
   []
   (when-let [state @server-state]
-    (println "[web] Stopping HTTP server...")
+    (tel/log! {:level :info :id ::stopping} "Stopping HTTP server")
     ((:stop-fn state))
     (reset! server-state nil)
-    (println "[web] HTTP server stopped.")
+    (tel/log! {:level :info :id ::stopped} "HTTP server stopped")
     :stopped))
 
 (defn running?

@@ -1,16 +1,14 @@
 (ns dvergr.chat.agent
-  "Reactive agent loop using spindel.
+  "The non-reactive agent-turn core.
 
-   Each agent turn is a spin that:
-   1. Reads messages from the chat context (reactive)
-   2. Checks for compaction needs
-   3. Calls the LLM
-   4. Executes any tool calls
-   5. Updates messages signal (triggers dependents)"
-  (:refer-clojure :exclude [await])
-  (:require [org.replikativ.spindel.engine.core :as rtc]
-            [org.replikativ.spindel.core :refer [spin track await]]
-            [dvergr.chat.context :as chat-ctx]
+   `run-agent-turn!` executes exactly ONE LLM round-trip against a ChatContext:
+   maybe-compact, format messages per provider, call the model, run the
+   on-reply hook, account tokens, persist the assistant message + sanitized
+   tool-uses, execute tool calls, persist tool results, and return
+   :continue | :complete | :cancelled | :error. The LOOPING around this core
+   is the driver's job — production rooms drive it from
+   `dvergr.discourse.llm` (the participant on-message turn loop)."
+  (:require [dvergr.chat.context :as chat-ctx]
             [dvergr.chat.compaction :as compaction]
             [dvergr.model.chat :as model-chat]
             [dvergr.model.provider :as model-provider]
@@ -484,151 +482,3 @@
     (catch Exception e
       (tel/log! {:level :error :id :agent/turn-error :error e} "Agent turn error")
       :error)))
-
-;; ============================================================================
-;; Reactive Agent Loop
-;; ============================================================================
-
-(defn create-agent-spin
-  "Create a reactive spin that runs agent turns until completion.
-
-   The spin tracks the messages signal and re-executes when messages change.
-   This allows external processes to inject messages and have the agent respond.
-
-   Args:
-     chat-ctx - ChatContext
-     opts - Map with :provider, :model, :on-text"
-  [chat-ctx {:keys [provider model on-text]
-             :or {provider :anthropic
-                  model "claude-sonnet-4-20250514"}}]
-  (let [spindel-ctx (:spindel-ctx chat-ctx)]
-    (binding [rtc/*execution-context* spindel-ctx]
-      (spin
-        ;; Track messages to make this reactive
-       (let [messages (:new (track (:messages-signal chat-ctx)))
-             status (:new (track (:status-signal chat-ctx)))]
-
-          ;; Only run if active and has messages
-         (when (and (= status :active)
-                    (seq messages)
-                     ;; Only run if last message is from user or tool
-                    (#{:user :tool-result} (:message/role (last messages))))
-
-            ;; Check budget first
-           (if (chat-ctx/check-budget! chat-ctx)
-              ;; Run the turn
-             (let [result (run-agent-turn! chat-ctx
-                                           {:provider provider
-                                            :model model
-                                            :on-text on-text})]
-                ;; Return the result for inspection
-               {:turn-result result
-                :message-count (count messages)})
-
-              ;; Budget exceeded
-             {:turn-result :budget-exceeded
-              :message-count (count messages)})))))))
-
-;; ============================================================================
-;; Simple Run Function
-;; ============================================================================
-
-(defn run-chat
-  "Run an agent chat to completion.
-
-   Creates a ChatContext, adds the task as first message, then runs
-   agent turns until natural termination:
-   - Budget exhausted (primary control)
-   - Task complete (no more tool calls)
-   - Error occurs
-
-   Use FRP combinators for additional constraints:
-   - (timeout (run-chat ...) ms fallback) - deadline
-
-   Returns:
-   - :complete on success
-   - :budget-exceeded if out of tokens
-   - :error on failure"
-  [task & {:keys [provider model budget on-text]
-           :or {provider :anthropic
-                model "claude-sonnet-4-20250514"
-                budget 50000}}]
-  (let [;; Create chat context
-        chat-ctx (chat-ctx/create-chat-context
-                  {:title (subs task 0 (min 50 (count task)))
-                   :budget budget
-                   :with-sci? true})
-
-        ;; Add system prompt
-        _ (chat-ctx/add-message! chat-ctx
-                                 {:role :system
-                                  :content "You are a helpful coding assistant."})
-
-        ;; Add user task
-        _ (chat-ctx/add-message! chat-ctx
-                                 {:role :user
-                                  :content task})]
-
-    (println "Starting chat:" (:chat-id chat-ctx))
-    (println "Task:" task)
-
-    ;; Run turns until natural termination
-    (loop [turn 0]
-      (let [status (chat-ctx/get-status chat-ctx)]
-        (cond
-          ;; Status changed (completed, cancelled, error)
-          (not= status :active)
-          {:status status
-           :turns turn
-           :chat-id (:chat-id chat-ctx)
-           :budget (chat-ctx/get-budget chat-ctx)}
-
-          ;; Budget exceeded (primary control)
-          (chat-ctx/budget-exceeded? chat-ctx)
-          (do
-            (chat-ctx/set-status! chat-ctx :budget-exceeded)
-            {:status :budget-exceeded
-             :turns turn
-             :chat-id (:chat-id chat-ctx)
-             :budget (chat-ctx/get-budget chat-ctx)})
-
-          ;; Run a turn
-          :else
-          (let [result (run-agent-turn! chat-ctx
-                                        {:provider provider
-                                         :model model
-                                         :on-text on-text
-                                         :turn-number (inc turn)})]
-            (case result
-              :continue (recur (inc turn))
-              :complete (do
-                          (chat-ctx/set-status! chat-ctx :completed)
-                          {:status :complete
-                           :turns (inc turn)
-                           :chat-id (:chat-id chat-ctx)
-                           :budget (chat-ctx/get-budget chat-ctx)
-                           :messages (chat-ctx/get-messages chat-ctx)})
-              :error {:status :error
-                      :turns (inc turn)
-                      :chat-id (:chat-id chat-ctx)
-                      :budget (chat-ctx/get-budget chat-ctx)})))))))
-
-(comment
-  ;; Test the agent with chat context
-  (require '[dvergr.chat.agent :as agent] :reload)
-
-  ;; Simple test
-  (def result (agent/run-chat "Say hello and tell me what 2+2 equals"
-                              :provider :anthropic
-                              :model "claude-sonnet-4-20250514"))
-
-  ;; Check result
-  (:status result)
-  (:turns result)
-  (count (:messages result))
-
-  ;; Print messages
-  (doseq [msg (:messages result)]
-    (println "---")
-    (println (:message/role msg))
-    (println (subs (:message/content msg) 0 (min 200 (count (:message/content msg)))))))
