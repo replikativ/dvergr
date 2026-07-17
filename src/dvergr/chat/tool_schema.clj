@@ -23,6 +23,7 @@
        :tool-input.clj-kondo.config/linters (ref to component)
        ..."
   (:require [clojure.string :as str]
+            [clojure.edn :as edn]
             [datahike.api :as d]))
 
 ;; ============================================================================
@@ -236,8 +237,38 @@
 ;; Forward declaration for mutual recursion
 (declare convert-input)
 
+(defn- parse-embedded-coll
+  "An LLM sometimes emits an array/object arg as a STRING holding its JSON/EDN
+   form (e.g. tags as \"[\\\"a\\\" \\\"b\\\"]\"). Parse it back to a collection;
+   nil if the string is not a collection literal. Never iterates a string into
+   characters."
+  [s]
+  (let [t (str/trim s)]
+    (when (or (str/starts-with? t "[") (str/starts-with? t "{"))
+      (try (let [v (edn/read-string t)]
+             (when (coll? v) v))
+           (catch Exception _ nil)))))
+
+(defn- coerce-to-seq
+  "Normalize an array-valued arg into a sequence WITHOUT exploding a string
+   into characters — the char-explosion bug (`(vec \"[…]\")` → chars) that
+   detonated at transact time. Accepts a real sequence, a JSON/EDN-string
+   array, or a lone scalar (a one-element array)."
+  [value]
+  (cond
+    (sequential? value) value
+    (nil? value)        []
+    (string? value)     (or (parse-embedded-coll value) [value])
+    (coll? value)       (vec value)
+    :else               [value]))
+
 (defn- convert-value
-  "Convert a value for Datahike storage based on schema type."
+  "Convert a value for Datahike storage based on schema type. TOTAL over
+   malformed model output: returns a value that satisfies the attribute's
+   declared Datahike type, or throws `::uncoercible` so the caller
+   (serialize-tool-use) degrades to persisting the tool-use without structured
+   input — never a value that passes construction but fails the message
+   transact (the char-exploded-array storm)."
   [tool-name path param-name value param-schema]
   (let [json-type (get param-schema :type "string")]
     (case json-type
@@ -245,32 +276,48 @@
       "string"
       (str value)
 
-      "integer"
-      (if (string? value)
-        (Long/parseLong value)
-        (long value))  ;; LLMs may return numeric args as strings
+      "integer"  ;; LLMs may return numeric args as strings
+      (cond
+        (integer? value) (long value)
+        (number? value)  (long value)
+        (string? value)  (try (Long/parseLong (str/trim value))
+                              (catch Exception _
+                                (throw (ex-info "uncoercible integer"
+                                                {::uncoercible true :param param-name :value value}))))
+        :else (throw (ex-info "uncoercible integer"
+                              {::uncoercible true :param param-name :value value})))
 
       "number"
-      (if (string? value)
-        (Double/parseDouble value)
-        (double value))
+      (cond
+        (number? value)  (double value)
+        (string? value)  (try (Double/parseDouble (str/trim value))
+                              (catch Exception _
+                                (throw (ex-info "uncoercible number"
+                                                {::uncoercible true :param param-name :value value}))))
+        :else (throw (ex-info "uncoercible number"
+                              {::uncoercible true :param param-name :value value})))
 
-      "boolean"
-      (boolean value)
+      "boolean"  ;; (boolean \"false\") is truthy — coerce the string honestly
+      (cond
+        (boolean? value) value
+        (string? value)  (contains? #{"true" "1" "yes" "y" "t"} (str/lower-case (str/trim value)))
+        :else            (boolean value))
 
       ;; Arrays
       "array"
       (let [items (get param-schema :items {})
-            items-type (get items :type "string")]
+            items-type (get items :type "string")
+            xs (coerce-to-seq value)]
         (if (= items-type "object")
           ;; Array of objects - convert each
           (mapv #(convert-input tool-name
                                 (conj (vec path) param-name)
                                 %
                                 items)
-                value)
-          ;; Array of primitives - use as-is
-          (vec value)))
+                xs)
+          ;; Array of primitives - coerce EACH element to the declared item
+          ;; type (never `(vec value)`, which char-explodes a string arg)
+          (mapv #(convert-value tool-name path param-name % items) xs)))
 
       ;; Nested objects
       "object"

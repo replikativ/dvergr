@@ -9,7 +9,8 @@
             [hato.client :as hc]
             [jsonista.core :as json]
             [clojure.java.io :as io]
-            [clojure.string :as str])
+            [clojure.string :as str]
+            [taoensso.telemere :as log])
   (:import [java.io BufferedReader]
            [java.net SocketTimeoutException]
            [java.io IOException]))
@@ -201,9 +202,12 @@
             (:success result)
             (let [delay-ms (calculate-backoff attempt nil)]
               (when (> attempt 0)
-                (binding [*out* *err*]
-                  (println (str "Retry " (inc attempt) "/" (:max-retries retry-config)
-                                " after " delay-ms "ms: " (.getMessage (:error result))))))
+                (log/log! {:level :warn :id :model/chat-retry
+                           :data {:attempt (inc attempt)
+                                  :max-retries (:max-retries retry-config)
+                                  :delay-ms delay-ms
+                                  :error (.getMessage (:error result))}}
+                          "Retrying model chat after retryable error"))
               (Thread/sleep (long delay-ms))
               (recur (inc attempt) (:error result)))))))))
 
