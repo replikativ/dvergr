@@ -235,8 +235,7 @@
     ;; Kimi K2 quirk: rewrite tool IDs to functions.{name}:{idx}
     (let [messages (if (registry/has-quirk? model :kimi-tool-id-format?)
                      (quirks/rewrite-kimi-tool-ids messages)
-                     messages)
-]
+                     messages)]
       (mapv (fn [msg]
               (let [role (:message/role msg)]
                 (if (= role :tool-result)
