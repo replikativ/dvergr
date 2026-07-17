@@ -94,3 +94,18 @@
         (is (= orig (json/read-value (get-in (first calls) [:function :arguments])
                                      (json/object-mapper {:decode-key-fn true}))))
         (is (= "{}" (get-in (second calls) [:function :arguments])))))))
+
+(deftest anthropic-merges-consecutive-user-messages
+  (testing "a steered turn's [user, user] history formats as ONE user message
+            (Anthropic requires alternating roles); block-content users are
+            left alone"
+    (let [anth (anthropic/->AnthropicProvider {:api-key "test"})
+          out  (p/format-messages
+                anth
+                [{:message/role :user :message/content "do A"}
+                 {:message/role :user :message/content "actually, do B"}
+                 {:message/role :assistant :message/content "ok"}]
+                "claude-x")]
+      (is (= 2 (count out)))
+      (is (= "user" (:role (first out))))
+      (is (= "do A\n\nactually, do B" (:content (first out)))))))
