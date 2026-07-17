@@ -9,6 +9,7 @@
    `dvergr.room.store`)."
   (:require [datahike.api :as dh]
             [dvergr.chat.schema :as schema]
+            [dvergr.chat.persist :as persist]
             [dvergr.room.store :as store]
             [taoensso.telemere :as tel]))
 
@@ -157,16 +158,17 @@
       (if-let [ent (room-by-slug conn slug)]
         (let [chat-id (:chat/id ent)
               entity  (message->entity chat-id msg)]
-          (try
-            (dh/transact conn [entity
-                               {:db/id [:chat/id chat-id]
-                                :chat/updated-at (java.util.Date.)}])
-            (catch Throwable t
-              (tel/log! {:level :warn :id :room-store/datahike-store-message-failed
-                         :data {:room-id room-id :msg-id (:id msg)
-                                :error (.getMessage t)}}))))
-        (tel/log! {:level :warn :id :room-store/datahike-missing-room
-                   :data {:room-id room-id :msg-id (:id msg)}}))))
+          ;; One durability policy (surface + retry-once + dead-letter) instead
+          ;; of the old catch-and-silently-drop — a lost message is now visible
+          ;; and recoverable, not swallowed at :warn.
+          (persist/persist-tx! conn
+                               [entity
+                                {:db/id [:chat/id chat-id]
+                                 :chat/updated-at (java.util.Date.)}]
+                               {:op :store-message :room-id room-id :msg-id (:id msg)}))
+        (tel/log! {:level :error :id :room-store/datahike-missing-room
+                   :data {:room-id room-id :msg-id (:id msg)}}
+                  "message for unknown room — not persisted (dropped)"))))
 
   (-list-messages [_ room-id {:keys [limit since]}]
     (let [slug (store/room-id->slug room-id)]

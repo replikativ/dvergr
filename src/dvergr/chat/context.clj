@@ -25,6 +25,7 @@
             [org.replikativ.spindel.core :as d]
             [dvergr.chat.schema :as schema]
             [dvergr.chat.accounting :as acct]
+            [dvergr.chat.persist :as persist]
             [dvergr.sandbox :as sandbox]
             [taoensso.telemere :as tel]
             [datahike.api :as dh]))
@@ -183,7 +184,8 @@
     ;; budget is reconstructed from the ledger on restore.
     (when-let [conn (:db-conn chat-ctx)]
       (when-not (false? (:durable? chat-ctx))
-        (dh/transact conn [msg-entity])))
+        (persist/persist-tx! conn [msg-entity]
+                             {:op :add-message :msg-id (:message/id msg-entity)})))
 
     ;; Account tokens if provided
     (when-let [tokens (:tokens message)]
