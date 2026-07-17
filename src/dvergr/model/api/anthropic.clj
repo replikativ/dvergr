@@ -1,6 +1,8 @@
 (ns dvergr.model.api.anthropic
   "Anthropic Messages API implementation."
   (:require [dvergr.model.provider :as p]
+            [dvergr.model.quirks :as quirks]
+            [dvergr.chat.tool-schema :as tool-schema]
             [jsonista.core :as json]))
 
 ;; ============================================================================
@@ -162,10 +164,7 @@
   (format-messages [_ messages model]
     ;; Anthropic: tool results grouped into user messages with tool_result content blocks
     ;; Assistant messages with tool calls have content blocks [{:type "text"} {:type "tool_use"}]
-    (let [strip-ns (fn [m]
-                     (when (map? m)
-                       (into {} (map (fn [[k v]] [(if (keyword? k) (keyword (name k)) k) v]) m))))
-          groups (partition-by #(= :tool-result (:message/role %)) messages)]
+    (let [groups (partition-by #(= :tool-result (:message/role %)) messages)]
       (vec (mapcat
             (fn [group]
               (if (= :tool-result (:message/role (first group)))
@@ -186,11 +185,17 @@
                                             (when-let [text (:message/content msg)]
                                               (when (seq text)
                                                 [{:type "text" :text text}]))
+                                            ;; Replay guards: clean-tool-name strips a
+                                            ;; leaked envelope off a poisoned durable name
+                                            ;; (a non-identifier name is a hard 400);
+                                            ;; input-entity->args round-trips a raw-EDN
+                                            ;; fallback entity and NEVER yields nil
+                                            ;; ("input": null is also a 400).
                                             (mapv (fn [tu]
                                                     {:type "tool_use"
                                                      :id (:tool-use/id tu)
-                                                     :name (:tool-use/name tu)
-                                                     :input (strip-ns (:tool-use/input tu))})
+                                                     :name (quirks/clean-tool-name (:tool-use/name tu))
+                                                     :input (tool-schema/input-entity->args (:tool-use/input tu))})
                                                   tool-uses)))}
                             {:role (name role)
                              :content (:message/content msg)})))

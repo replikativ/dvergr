@@ -466,6 +466,30 @@
   {:tool-input.raw/tool-name tool-name
    :tool-input.raw/content (pr-str input)})
 
+(defn- strip-ns-keys
+  "Strip namespace prefixes from map keys (datahike stores tool-input params
+   as ns-qualified attrs; the API wants the bare param names)."
+  [m]
+  (when (map? m)
+    (into {} (map (fn [[k v]] [(if (keyword? k) (keyword (name k)) k) v]) m))))
+
+(defn input-entity->args
+  "The inverse of persisting a tool input: reconstruct a tool_use's argument
+   map for API replay from its stored :tool-use/input entity. A raw-EDN
+   fallback entity (`raw-input->entity`, written when the input couldn't be
+   typed) round-trips via its stored EDN; a structured entity has its datahike
+   namespace prefixes stripped. Always returns a map — never nil (`null`
+   arguments are a hard 400 on OpenAI-compatible endpoints, and once replayed
+   from durable history they 400 EVERY later turn). This is the ONE args
+   reconstruction all provider MessageFormatters share."
+  [input]
+  (or (when (map? input)
+        (if-let [raw (get input :tool-input.raw/content)]
+          (try (let [v (edn/read-string raw)] (when (map? v) v))
+               (catch Exception _ nil))
+          (-> input (dissoc :db/id) strip-ns-keys)))
+      {}))
+
 ;; ============================================================================
 ;; Utility
 ;; ============================================================================

@@ -5,6 +5,7 @@
   (:require [dvergr.model.provider :as p]
             [dvergr.model.registry :as registry]
             [dvergr.model.quirks :as quirks]
+            [dvergr.chat.tool-schema :as tool-schema]
             [jsonista.core :as json]
             [clojure.string :as str]))
 
@@ -235,9 +236,7 @@
     (let [messages (if (registry/has-quirk? model :kimi-tool-id-format?)
                      (quirks/rewrite-kimi-tool-ids messages)
                      messages)
-          strip-ns (fn [m]
-                     (when (map? m)
-                       (into {} (map (fn [[k v]] [(if (keyword? k) (keyword (name k)) k) v]) m))))]
+]
       (mapv (fn [msg]
               (let [role (:message/role msg)]
                 (if (= role :tool-result)
@@ -253,11 +252,16 @@
                       (cond-> {:role "assistant"
                                :content (:message/content msg)
                                :tool_calls (mapv (fn [tu]
+                                                   ;; Replay guards: clean-tool-name strips a
+                                                   ;; leaked envelope off a poisoned durable name;
+                                                   ;; input-entity->args round-trips a raw-EDN
+                                                   ;; fallback entity and never yields nil —
+                                                   ;; "arguments": "null" is a hard 400.
                                                    {:id (:tool-use/id tu)
                                                     :type "function"
-                                                    :function {:name (:tool-use/name tu)
+                                                    :function {:name (quirks/clean-tool-name (:tool-use/name tu))
                                                                :arguments (json/write-value-as-string
-                                                                           (strip-ns (:tool-use/input tu)))}})
+                                                                           (tool-schema/input-entity->args (:tool-use/input tu)))}})
                                                  tool-uses)}
                         (seq reasoning) (assoc :reasoning_content reasoning))
                       (cond-> {:role (name role)
