@@ -28,6 +28,9 @@
      :daemon       the daemon map (for built-ins that need it)
      :exec-ctx     the spindel execution context
      :available-tools  tool names available here (for skill eligibility)
+     :room-dir     (optional) a room's sandbox-repo path — when given, that
+                   room's own skills (`:room` scope) participate in the
+                   registry too, per `skills/eligible-skills`
      :post-user!   (fn [text]) — post `text` as a user message → triggers a turn
      :notify!      (fn [text]) — post `text` as a no-turn activity/system line
      :switch-room! (fn [room])  — focus a (possibly new) room in the frontend
@@ -146,38 +149,44 @@
 
 (defn- file-commands
   "Skills whose frontmatter opts them into the slash surface — `kind: prompt`
-   or `kind: handler`, or an explicit `command:` name. Returned as command maps."
-  [available-tools]
-  (->> (skills/eligible-skills available-tools)
-       (keep (fn [s]
-               (let [kind (some-> (:kind s) name keyword)]
-                 (when (or (#{:prompt :handler} kind) (:command s))
-                   {:name          (str (or (:command s) (:name s)))
-                    :description   (:description s)
-                    :kind          (or kind :prompt)
-                    :argument-hint (:argument-hint s)
-                    :agent         (some-> (:agent s) name keyword)
-                    :isolation     (some-> (:isolation s) name keyword)
-                    :vetted        (boolean (:vetted s))
-                    :template      (:content s)}))))))
+   or `kind: handler`, or an explicit `command:` name. Returned as command maps.
+   Optional `room-dir` adds the room's own skills (see `skills/eligible-skills`)."
+  ([available-tools] (file-commands available-tools nil))
+  ([available-tools room-dir]
+   (->> (skills/eligible-skills available-tools room-dir)
+        (keep (fn [s]
+                (let [kind (some-> (:kind s) name keyword)]
+                  (when (or (#{:prompt :handler} kind) (:command s))
+                    {:name          (str (or (:command s) (:name s)))
+                     :description   (:description s)
+                     :kind          (or kind :prompt)
+                     :argument-hint (:argument-hint s)
+                     :agent         (some-> (:agent s) name keyword)
+                     :isolation     (some-> (:isolation s) name keyword)
+                     :vetted        (boolean (:vetted s))
+                     :template      (:content s)})))))))
 
 (defn- skill-commands
-  "Every eligible skill as `/skill:<name>` (codex/pi pattern)."
-  [available-tools]
-  (->> (skills/eligible-skills available-tools)
-       (map (fn [s]
-              {:name          (str "skill:" (:name s))
-               :description   (str "skill — " (:description s))
-               :kind          :skill
-               :argument-hint "[task]"
-               :skill         s}))))
+  "Every eligible skill as `/skill:<name>` (codex/pi pattern). Optional
+   `room-dir` adds the room's own skills (see `skills/eligible-skills`)."
+  ([available-tools] (skill-commands available-tools nil))
+  ([available-tools room-dir]
+   (->> (skills/eligible-skills available-tools room-dir)
+        (map (fn [s]
+               {:name          (str "skill:" (:name s))
+                :description   (str "skill — " (:description s))
+                :kind          :skill
+                :argument-hint "[task]"
+                :skill         s})))))
 
 (defn all-commands
-  "The merged, deduped command list visible in `ctx` (built-ins win on name)."
-  [{:keys [available-tools] :as _ctx}]
+  "The merged, deduped command list visible in `ctx` (built-ins win on name).
+   Optional `:room-dir` in `ctx` includes skills that room itself defines, at
+   the room scope (see `skills/eligible-skills`)."
+  [{:keys [available-tools room-dir] :as _ctx}]
   (let [bs (vals @builtins)
-        fc (file-commands available-tools)
-        sk (skill-commands available-tools)
+        fc (file-commands available-tools room-dir)
+        sk (skill-commands available-tools room-dir)
         by-name (reduce (fn [m c] (assoc m (:name c) c))
                         {} (concat sk fc bs))]   ; builtins last → win
     (->> (vals by-name) (sort-by :name) vec)))

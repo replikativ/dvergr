@@ -91,6 +91,18 @@ content"
   (is (not (skills/eligible? {:vetted true :requires-env ["DEFINITELY_NOT_A_REAL_ENV_VAR_FOR_TESTS"]}
                              ["any-tool"]))))
 
+(deftest eligible?-accepts-injected-env-lookup
+  ;; An embedder (e.g. simmis) may keep secrets outside System/getenv; the
+  ;; optional env-lookup arg lets eligibility consult that source instead.
+  ;; Synthetic key (not a real requires_env used by any shipped skill, e.g.
+  ;; SLACK_TOKEN) so the default-lookup assertion can't flake on a machine
+  ;; that happens to have that var exported.
+  (let [skill {:vetted true :requires-env ["DEFINITELY_NOT_A_REAL_ENV_VAR_FOR_TESTS_2"]}]
+    (is (not (skills/eligible? skill ["any-tool"]))
+        "ineligible under the default (System/getenv) lookup")
+    (is (skills/eligible? skill ["any-tool"] {"DEFINITELY_NOT_A_REAL_ENV_VAR_FOR_TESTS_2" "xyz"})
+        "eligible once env-lookup (here, a map used as a fn) has the key")))
+
 ;; ============================================================================
 ;; Priority + ranking
 ;; ============================================================================

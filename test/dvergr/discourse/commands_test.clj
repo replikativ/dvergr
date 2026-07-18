@@ -76,6 +76,36 @@
     (cmd/execute! "/build" {:available-tools [] :room room :notify! identity})
     (is (= :build (cmd/room-mode :test-room)))))
 
+(deftest all-commands-and-execute-see-room-scope-skills-with-room-dir
+  (testing "a vetted room-scope skill is invisible to the registry without
+            :room-dir, and participates (incl. via execute!) once it's supplied"
+    (let [dir (java.io.File/createTempFile "cmd-room" "")
+          _   (.delete dir)
+          sk  (java.io.File. dir "skills")]
+      (.mkdirs sk)
+      (spit (java.io.File. sk "roomskill.md")
+            (str "---\nkind: skill\nname: roomskill\nprovides: [:roomskill]\n"
+                 "vetted: true\n---\nDo the room thing."))
+      (try
+        (let [without (set (map :name (cmd/all-commands {:available-tools []})))
+              with    (set (map :name (cmd/all-commands {:available-tools []
+                                                         :room-dir (.getPath dir)})))]
+          (is (not (contains? without "skill:roomskill"))
+              "without :room-dir, the room skill is invisible")
+          (is (contains? with "skill:roomskill")
+              "with :room-dir, the room skill appears as /skill:roomskill"))
+        (let [posted (atom nil)
+              r (cmd/execute! "/skill:roomskill go"
+                              {:available-tools []
+                               :room-dir (.getPath dir)
+                               :post-user! #(reset! posted %)})]
+          (is (:handled? r))
+          (is (re-find #"Do the room thing" @posted)
+              "execute! resolves the room-scope skill once ctx carries :room-dir"))
+        (finally
+          (.delete (java.io.File. sk "roomskill.md"))
+          (.delete sk) (.delete dir))))))
+
 (deftest execute-prompt-command-posts-user-message
   ;; register a throwaway :prompt-style builtin to exercise the template path
   (let [posted (atom nil)]
