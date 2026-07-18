@@ -1,6 +1,8 @@
 (ns dvergr.model.api.anthropic
   "Anthropic Messages API implementation."
   (:require [dvergr.model.provider :as p]
+            [dvergr.model.quirks :as quirks]
+            [dvergr.chat.tool-schema :as tool-schema]
             [jsonista.core :as json]))
 
 ;; ============================================================================
@@ -162,9 +164,25 @@
   (format-messages [_ messages model]
     ;; Anthropic: tool results grouped into user messages with tool_result content blocks
     ;; Assistant messages with tool calls have content blocks [{:type "text"} {:type "tool_use"}]
-    (let [strip-ns (fn [m]
-                     (when (map? m)
-                       (into {} (map (fn [[k v]] [(if (keyword? k) (keyword (name k)) k) v]) m))))
+    ;;
+    ;; Consecutive plain-text USER messages are merged into one: the API
+    ;; requires alternating roles, and a steered turn legitimately produces
+    ;; [user, user] history (the steer cancelled the call BEFORE any
+    ;; assistant message was committed, then folded a second user message).
+    (let [messages (reduce (fn [acc m]
+                             (let [prev (peek acc)]
+                               (if (and prev
+                                        (= :user (:message/role prev) (:message/role m))
+                                        (string? (:message/content prev))
+                                        (string? (:message/content m))
+                                        (empty? (:message/tool-uses prev))
+                                        (empty? (:message/tool-uses m)))
+                                 (conj (pop acc)
+                                       (update prev :message/content
+                                               #(str % "\n\n" (:message/content m))))
+                                 (conj acc m))))
+                           []
+                           messages)
           groups (partition-by #(= :tool-result (:message/role %)) messages)]
       (vec (mapcat
             (fn [group]
@@ -186,11 +204,17 @@
                                             (when-let [text (:message/content msg)]
                                               (when (seq text)
                                                 [{:type "text" :text text}]))
+                                            ;; Replay guards: clean-tool-name strips a
+                                            ;; leaked envelope off a poisoned durable name
+                                            ;; (a non-identifier name is a hard 400);
+                                            ;; input-entity->args round-trips a raw-EDN
+                                            ;; fallback entity and NEVER yields nil
+                                            ;; ("input": null is also a 400).
                                             (mapv (fn [tu]
                                                     {:type "tool_use"
                                                      :id (:tool-use/id tu)
-                                                     :name (:tool-use/name tu)
-                                                     :input (strip-ns (:tool-use/input tu))})
+                                                     :name (quirks/clean-tool-name (:tool-use/name tu))
+                                                     :input (tool-schema/input-entity->args (:tool-use/input tu))})
                                                   tool-uses)))}
                             {:role (name role)
                              :content (:message/content msg)})))

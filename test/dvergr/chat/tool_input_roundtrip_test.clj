@@ -8,7 +8,10 @@
             [datahike.api :as d]
             [dvergr.chat.schema :as sch]
             [dvergr.chat.tool-schema :as ts]
-            [dvergr.chat.agent :as agent]))
+            [dvergr.model.api.anthropic :as anthropic]
+            [dvergr.model.api.openai :as openai]
+            [dvergr.model.provider :as p]
+            [jsonista.core :as json]))
 
 (defn- fresh-conn []
   (let [cfg {:store {:backend :memory :id (random-uuid)}
@@ -21,15 +24,15 @@
   (testing "raw-EDN fallback entity round-trips to the original argument map"
     (let [orig {:tags ["a" "b"] :relevance 5}
           raw  (ts/raw-input->entity "mystery_tool" orig)]
-      (is (= orig (#'agent/tool-use-input->args raw)))))
+      (is (= orig (ts/input-entity->args raw)))))
   (testing "a structured entity has its datahike namespace prefixes stripped"
     (is (= {:tags ["a"] :title "x"}
-           (#'agent/tool-use-input->args
+           (ts/input-entity->args
             {:tool-input.knowledge-add/tags ["a"]
              :tool-input.knowledge-add/title "x"}))))
   (testing "nil / non-map input never replays as null (a hard 400)"
-    (is (= {} (#'agent/tool-use-input->args nil)))
-    (is (= {} (#'agent/tool-use-input->args "not-a-map")))))
+    (is (= {} (ts/input-entity->args nil)))
+    (is (= {} (ts/input-entity->args "not-a-map")))))
 
 (deftest raw-fallback-schema-is-installed
   (testing "ensure-full-schema! installs the :tool-input.raw/* fallback attrs"
@@ -60,4 +63,49 @@
                         (d/db conn) msg-id)
             pulled (d/pull (d/db conn) '[*] eid)
             tu     (first (:message/tool-uses pulled))]
-        (is (= orig (#'agent/tool-use-input->args (:tool-use/input tu))))))))
+        (is (= orig (ts/input-entity->args (:tool-use/input tu))))))))
+
+(deftest provider-formatters-replay-guards
+  (testing "the LIVE provider formatters share the one args reconstruction:
+            a raw-EDN fallback entity round-trips, a poisoned name is cleaned,
+            and input is never null — through the ACTUAL MessageFormatter path
+            (the guards used to live only in the deleted legacy formatter)"
+    (let [orig     {:tags ["a" "b"] :relevance 5}
+          raw-ent  (ts/raw-input->entity "knowledge_add" orig)
+          messages [{:message/role :assistant
+                     :message/content "calling tools"
+                     :message/tool-uses
+                     [{:tool-use/id "tu1"
+                       :tool-use/name "knowledge_add<arg_key>leak</arg_key>"
+                       :tool-use/input raw-ent}
+                      {:tool-use/id "tu2"
+                       :tool-use/name "shell"
+                       :tool-use/input nil}]}]
+          anth     (anthropic/->AnthropicProvider {:api-key "test"})
+          oai      (openai/->OpenAIProvider {:api-key "test"})]
+      (let [[msg]  (p/format-messages anth messages "claude-x")
+            blocks (filterv #(= "tool_use" (:type %)) (:content msg))]
+        (is (= "knowledge_add" (:name (first blocks))))
+        (is (= orig (:input (first blocks))))
+        (is (= {} (:input (second blocks)))))
+      (let [[msg] (p/format-messages oai messages "gpt-x")
+            calls (:tool_calls msg)]
+        (is (= "knowledge_add" (get-in (first calls) [:function :name])))
+        (is (= orig (json/read-value (get-in (first calls) [:function :arguments])
+                                     (json/object-mapper {:decode-key-fn true}))))
+        (is (= "{}" (get-in (second calls) [:function :arguments])))))))
+
+(deftest anthropic-merges-consecutive-user-messages
+  (testing "a steered turn's [user, user] history formats as ONE user message
+            (Anthropic requires alternating roles); block-content users are
+            left alone"
+    (let [anth (anthropic/->AnthropicProvider {:api-key "test"})
+          out  (p/format-messages
+                anth
+                [{:message/role :user :message/content "do A"}
+                 {:message/role :user :message/content "actually, do B"}
+                 {:message/role :assistant :message/content "ok"}]
+                "claude-x")]
+      (is (= 2 (count out)))
+      (is (= "user" (:role (first out))))
+      (is (= "do A\n\nactually, do B" (:content (first out)))))))

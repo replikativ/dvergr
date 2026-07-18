@@ -92,48 +92,6 @@
     :db/doc "AI-generated summary of chat (created on completion)"}])
 
 ;; ============================================================================
-;; Participant Schema
-;; ============================================================================
-
-(def participant-schema
-  "Schema for chat participants (humans and agents)."
-  [{:db/ident :participant/id
-    :db/valueType :db.type/uuid
-    :db/unique :db.unique/identity
-    :db/cardinality :db.cardinality/one
-    :db/doc "Unique identifier for participant"}
-
-   {:db/ident :participant/name
-    :db/valueType :db.type/string
-    :db/cardinality :db.cardinality/one
-    :db/doc "Display name"}
-
-   {:db/ident :participant/type
-    :db/valueType :db.type/keyword
-    :db/cardinality :db.cardinality/one
-    :db/doc "Participant type: :human :privileged-agent :sci-agent :podman-agent"}
-
-   {:db/ident :participant/permissions
-    :db/valueType :db.type/keyword
-    :db/cardinality :db.cardinality/many
-    :db/doc "Set of permissions: :spawn-chat :stop-chat :write-file :shell :wiki-edit :wiki-propose"}
-
-   {:db/ident :participant/budget
-    :db/valueType :db.type/long
-    :db/cardinality :db.cardinality/one
-    :db/doc "Per-participant budget limit (optional)"}
-
-   {:db/ident :participant/model
-    :db/valueType :db.type/string
-    :db/cardinality :db.cardinality/one
-    :db/doc "LLM model for agent participants (e.g., 'claude-sonnet-4-20250514')"}
-
-   {:db/ident :participant/provider
-    :db/valueType :db.type/keyword
-    :db/cardinality :db.cardinality/one
-    :db/doc "LLM provider for agent participants: :anthropic :openai :fireworks"}])
-
-;; ============================================================================
 ;; Message Schema
 ;; ============================================================================
 
@@ -150,12 +108,6 @@
     :db/valueType :db.type/ref
     :db/cardinality :db.cardinality/one
     :db/doc "Reference to chat this message belongs to"}
-
-   ;; Author
-   {:db/ident :message/author
-    :db/valueType :db.type/ref
-    :db/cardinality :db.cardinality/one
-    :db/doc "Reference to participant who sent this message"}
 
    {:db/ident :message/role
     :db/valueType :db.type/keyword
@@ -330,44 +282,6 @@
 ;; ============================================================================
 ;; Accounting Schema (for budget tracking)
 ;; ============================================================================
-
-(def accounting-schema
-  "Schema for resource accounting entries."
-  [{:db/ident :account/id
-    :db/valueType :db.type/uuid
-    :db/unique :db.unique/identity
-    :db/cardinality :db.cardinality/one
-    :db/doc "Unique identifier for accounting entry"}
-
-   {:db/ident :account/chat
-    :db/valueType :db.type/ref
-    :db/cardinality :db.cardinality/one
-    :db/doc "Reference to chat this entry belongs to"}
-
-   {:db/ident :account/type
-    :db/valueType :db.type/keyword
-    :db/cardinality :db.cardinality/one
-    :db/doc "Resource type: :input-tokens :output-tokens :tool-call :api-call"}
-
-   {:db/ident :account/amount
-    :db/valueType :db.type/long
-    :db/cardinality :db.cardinality/one
-    :db/doc "Amount consumed"}
-
-   {:db/ident :account/message
-    :db/valueType :db.type/ref
-    :db/cardinality :db.cardinality/one
-    :db/doc "Optional reference to message that triggered this usage"}
-
-   {:db/ident :account/timestamp
-    :db/valueType :db.type/instant
-    :db/cardinality :db.cardinality/one
-    :db/doc "When this usage occurred"}
-
-   {:db/ident :account/metadata
-    :db/valueType :db.type/string
-    :db/cardinality :db.cardinality/one
-    :db/doc "Additional metadata as EDN (model, provider, etc.)"}])
 
 ;; ============================================================================
 ;; Task Schema (for agent task tracking)
@@ -779,10 +693,8 @@
    review rides bus messages via `discourse/propose-merge!`). `:room/*`/
    `:task/*` follow in their own S3/S4 slices."
   (vec (concat chat-schema
-               participant-schema
                message-schema
                tool-call-schema
-               accounting-schema
                ledger-schema
                budget-schema
                knowledge-schema
@@ -865,8 +777,8 @@
   "Create a chat entity map for transacting.
 
    Args:
-     opts - Map with :id, :title, :admin-id, :budget, etc."
-  [{:keys [id title description admin-id budget parent-id]}]
+     opts - Map with :id, :title, :budget, etc."
+  [{:keys [id title description budget parent-id]}]
   (cond-> {:chat/id (or id (random-uuid))
            :chat/title (or title "Untitled Chat")
            :chat/status :active
@@ -875,22 +787,7 @@
            :chat/created-at (java.util.Date.)
            :chat/updated-at (java.util.Date.)}
     description (assoc :chat/description description)
-    admin-id (assoc :chat/admin [:participant/id admin-id])
     parent-id (assoc :chat/parent-id parent-id)))
-
-(defn create-participant-entity
-  "Create a participant entity map for transacting.
-
-   Args:
-     opts - Map with :name, :type, :permissions, :model, :provider, etc."
-  [{:keys [name type permissions model provider budget]}]
-  (cond-> {:participant/id (random-uuid)
-           :participant/name name
-           :participant/type (or type :sci-agent)}
-    (seq permissions) (assoc :participant/permissions (set permissions))
-    model (assoc :participant/model model)
-    provider (assoc :participant/provider provider)
-    budget (assoc :participant/budget budget)))
 
 (defn- get-tool-registry
   "Dynamically get the tool registry to avoid circular deps.
@@ -952,18 +849,17 @@
   "Create a message entity map for transacting.
 
    Args:
-     opts - Map with :chat-id, :author-id, :role, :content, :tokens, :tool-uses, etc.
+     opts - Map with :chat-id, :role, :content, :tokens, :tool-uses, etc.
 
    Tool-uses are stored as component entities with input serialized to EDN.
    The :message/tool-uses key references the tool-use entities."
-  [{:keys [chat-id author-id role content reasoning tokens important? compacted? reply-to-id tool-uses tool-use-id turn-number]}]
+  [{:keys [chat-id role content reasoning tokens important? compacted? reply-to-id tool-uses tool-use-id turn-number]}]
   (cond-> {:message/id (random-uuid)
            :message/chat [:chat/id chat-id]
            :message/role (or role :user)
            :message/content content
            :message/created-at (java.util.Date.)
            :message/compacted? false}
-    author-id (assoc :message/author [:participant/id author-id])
     (seq reasoning) (assoc :message/reasoning reasoning)
     tokens (assoc :message/tokens (long tokens))
     important? (assoc :message/important? true)
@@ -1031,33 +927,6 @@
                                                        db (:tool-use/id tu))]]
                                      (or tc {:tool-call/name (:tool-use/name tu)
                                              :tool-call/status :unknown})))})))))
-
-(defn account-usage!
-  "Record a resource usage in the accounting table.
-
-   Args:
-     conn - Datahike connection
-     chat-id - UUID of the chat
-     type - Resource type keyword
-     amount - Amount consumed
-     opts - Optional :message-id, :metadata"
-  [conn chat-id type amount & {:keys [message-id metadata]}]
-  (let [entry (cond-> {:account/id (random-uuid)
-                       :account/chat [:chat/id chat-id]
-                       :account/type type
-                       :account/amount amount
-                       :account/timestamp (java.util.Date.)}
-                message-id (assoc :account/message [:message/id message-id])
-                metadata (assoc :account/metadata (pr-str metadata)))
-        prior-used (or (d/q '[:find ?used .
-                              :in $ ?cid
-                              :where [?c :chat/id ?cid]
-                              [?c :chat/budget-used ?used]]
-                            @conn chat-id)
-                       0)]
-    (d/transact conn [entry
-                      {:db/id [:chat/id chat-id]
-                       :chat/budget-used (long (+ prior-used amount))}])))
 
 ;; ============================================================================
 ;; Knowledge Entity Helpers
@@ -1171,38 +1040,15 @@
   (def cfg {:store {:backend :mem :id "test-chat"}})
   (def conn (create-chat-db! cfg))
 
-  ;; Create a human participant
-  (def human (create-participant-entity
-              {:name "User"
-               :type :human
-               :permissions #{:spawn-chat :stop-chat}}))
-  (d/transact conn [human])
-
-  ;; Create an agent participant
-  (def agent (create-participant-entity
-              {:name "Claude"
-               :type :privileged-agent
-               :model "claude-sonnet-4-20250514"
-               :provider :anthropic
-               :permissions #{:spawn-chat :write-file :shell}}))
-  (d/transact conn [agent])
-
   ;; Create a chat
   (def chat (create-chat-entity
              {:title "Implement authentication"
-              :admin-id (:participant/id human)
               :budget 10000}))
   (d/transact conn [chat])
-
-  ;; Add participants to chat
-  (d/transact conn [{:db/id [:chat/id (:chat/id chat)]
-                     :chat/participants [[:participant/id (:participant/id human)]
-                                         [:participant/id (:participant/id agent)]]}])
 
   ;; Create a message
   (def msg (create-message-entity
             {:chat-id (:chat/id chat)
-             :author-id (:participant/id human)
              :role :user
              :content "Please implement JWT authentication for the API."
              :tokens 15}))

@@ -9,6 +9,8 @@
    Tool calling is implemented by embedding tool definitions in the system prompt
    and parsing structured <tool_call> blocks from the response text."
   (:require [dvergr.model.provider :as p]
+            [dvergr.model.quirks :as quirks]
+            [dvergr.chat.tool-schema :as tool-schema]
             [jsonista.core :as json]
             [clojure.string :as str]
             [taoensso.telemere :as tel])
@@ -365,8 +367,8 @@
                                               (map (fn [tu]
                                                      (str "<tool_use>\n"
                                                           (json/write-value-as-string
-                                                           {:name (:tool-use/name tu)
-                                                            :input (:tool-use/input tu)})
+                                                           {:name (quirks/clean-tool-name (:tool-use/name tu))
+                                                            :input (tool-schema/input-entity->args (:tool-use/input tu))})
                                                           "\n</tool_use>"))
                                                    tool-uses)))]
                   {:role "assistant"

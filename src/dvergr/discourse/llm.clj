@@ -58,6 +58,7 @@
             [dvergr.room.store :as rstore]
             [dvergr.system.rooms :as srooms]
             [dvergr.model.quirks :as quirks]
+            [org.replikativ.spindel.spin.sync :as ssync]
             [taoensso.telemere :as tel]
             [dvergr.tools :as tools]))
 
@@ -100,6 +101,35 @@
 ;; ============================================================================
 ;; Public API
 ;; ============================================================================
+
+;; ============================================================================
+;; Directive effects — ONE implementation for both entry points
+;; ============================================================================
+;; A directive can arrive while the agent is IDLE (handled by the on-message
+;; `case`) or WHILE A TURN IS RUNNING (handled by the turn's inbox arbiter,
+;; below). Both paths apply these same fns, so idle and mid-turn behavior
+;; cannot drift apart.
+
+(defn- apply-raise-budget!
+  "Bump the chat-ctx dollar budget by the directive's :dollars (default 0.25)."
+  [chat-ctx msg]
+  (let [dollars (or (get-in msg [:payload :dollars]) 0.25)
+        micro   (long (* dollars acct/MICRODOLLARS-PER-DOLLAR))]
+    (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
+      (swap! (:budget-signal chat-ctx)
+             (fn [b] (update b :total + micro))))))
+
+(defn- apply-system-message!
+  "Inject the directive's content as a system note the agent reads next turn."
+  [chat-ctx msg]
+  (cc/add-system-note! chat-ctx (get-in msg [:payload :content])))
+
+(defn- probe-memory-reply
+  "Read-only memory probe response (reply-spec shape)."
+  [chat-ctx msg]
+  {:to (:from msg)
+   :type :probe/memory-response
+   :payload {:messages (cc/get-messages chat-ctx)}})
 
 (defn llm-agent
   "Construct a discourse Participant backed by an LLM.
@@ -202,12 +232,7 @@
                ;; this (via Processes pane + processes/directive!),
                ;; but message-channel still works.
                    :directive/raise-budget
-                   (let [dollars  (or (get-in msg [:payload :dollars]) 0.25)
-                         micro    (long (* dollars acct/MICRODOLLARS-PER-DOLLAR))]
-                     (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
-                       (swap! (:budget-signal chat-ctx)
-                              (fn [b] (update b :total + micro))))
-                     nil)
+                   (do (apply-raise-budget! chat-ctx msg) nil)
 
                ;; --- directive: hard cancel current + future generations ---
                    :directive/cancel
@@ -219,16 +244,18 @@
 
                ;; --- directive: inject a system message into chat-ctx ---
                    :directive/system-message
-                   (do (cc/add-message! chat-ctx
-                                        {:role :system
-                                         :content (get-in msg [:payload :content])})
-                       nil)
+                   (do (apply-system-message! chat-ctx msg) nil)
 
                ;; --- probe: read-only inspection of memory ---
                    :probe/memory
-                   {:to (:from msg)
-                    :type :probe/memory-response
-                    :payload {:messages (cc/get-messages chat-ctx)}}
+                   (probe-memory-reply chat-ctx msg)
+
+               ;; --- internal: a cancelled LLM call settling AFTER its turn
+               ;; ended (the turn's inbox bridge, below). Nothing to do — the
+               ;; live turn consumed its own ::llm-done by call-id; this one
+               ;; is stale by definition. Never treat it as room content. ---
+                   ::llm-done
+                   nil
 
                ;; --- default: user/agent content → run generation ---
                    (let [posted   (atom 0)        ; 🔧 activity watermark (dedup)
@@ -304,29 +331,57 @@
                      ;; runs (the store-seeded prior reply, or nil) — the exit
                      ;; path uses it to tell a genuinely NEW reply from stale
                      ;; seeded history.
-                         pre-turn-last-asst (last-assistant-message chat-ctx)]
-                 ;; The just-arrived user message. ROOM path: append-inbound!
-                 ;; (deduped against the bus fold by msg id, decorated with author
-                 ;; + time). Room-less: add directly to the fallback ctx.
-                     (if room
-                       (room-context/append-inbound! (:id room) id (:id msg)
-                                                     :user (:content msg)
-                                                     (room-context/display-name room (:from msg))
-                                                     (:ts msg))
-                       (cc/add-message! chat-ctx {:role :user :content (:content msg)}))
+                         pre-turn-last-asst (last-assistant-message chat-ctx)
+                     ;; Inbound fold: ROOM path append-inbound! (deduped
+                     ;; against the bus fold by msg id, decorated with author
+                     ;; + time); room-less adds directly to the fallback ctx.
+                     ;; Used for the triggering message AND for steer folds.
+                         fold-inbound!
+                         (fn [m]
+                           (if room
+                             (room-context/append-inbound! (:id room) id (:id m)
+                                                           :user (:content m)
+                                                           (room-context/display-name room (:from m))
+                                                           (:ts m))
+                             (cc/add-message! chat-ctx {:role :user :content (:content m)})))]
+                 ;; The just-arrived user message (and any message that STEERS a
+                 ;; running turn, below) folds in via fold-inbound! from the let.
+                     (fold-inbound! msg)
                  ;; Publish the live chat-ctx so a frontend (TUI/web) can
                  ;; Esc-cancel this turn (turn/cancel-room-turn! flips its status).
                      (when room (turn/register-room-turn! (:id room) id chat-ctx))
-                 ;; Race each turn against the cancel flag. The future-handle
-                 ;; bridges the blocking LLM call into spindel; we await done.
+                 ;; ONE CONTROL PLANE (steerable turn). Every influence on a
+                 ;; running turn arrives as a message on the participant's own
+                 ;; inbox — INCLUDING the LLM call's completion, which a bridge
+                 ;; spin posts back as ::llm-done. While a turn runs,
+                 ;; participant-spin is suspended awaiting this whole handler,
+                 ;; so the arbiter below is the inbox's ONLY consumer: steering
+                 ;; is loss-free by construction (single-consumer FIFO — no
+                 ;; race, no consumed-but-lost message).
+                 ;;
+                 ;;   content            → STEER: cooperatively cancel the
+                 ;;                        in-flight call (status :cancelled →
+                 ;;                        the SSE poll aborts; model.chat
+                 ;;                        throws CancellationException BEFORE
+                 ;;                        anything is persisted), await its
+                 ;;                        settle, fold the message in, and
+                 ;;                        continue with a fresh call.
+                 ;;   :directive/cancel  → settle, then END the turn (the
+                 ;;                        durable room log + a later message
+                 ;;                        is the resumption — spindel has no
+                 ;;                        durable continuations to park on).
+                 ;;   :directive/switch-model → swap spec, settle, restart the
+                 ;;                        call under the new model.
+                 ;;   raise-budget / system-message / probe → applied inline
+                 ;;                        via the SAME helpers as the idle
+                 ;;                        path; never preempt.
+                 ;;   ::llm-done (stale call-id) → a cancelled call settling
+                 ;;                        late; dropped.
                  ;;
                  ;; In :race-with-turn mode, kick off a parallel future-handle
                  ;; running compact! whenever (should-compact?) AND no
                  ;; compaction is already in flight. The next turn picks up
                  ;; the compacted chat-ctx state once it lands.
-                 ;; Loop state:
-                 ;;   turn             — running turn counter (informational
-                 ;;                       only; no upper bound)
                      (loop [turn 0]
                        (if @cancelled?
                          nil
@@ -351,47 +406,123 @@
                                                          :turn-number turn
                                                          :spec @spec-atom
                                                          :tools tools)))
-                                 result (sp/await (:done h))]
+                                 call-id (random-uuid)
+                                 mbx     (:inbox-mbx p)
+                                 ;; Bridge the call's completion into the SAME
+                                 ;; inbox steering messages arrive on. (:done h)
+                                 ;; is a Deferred — multi-reader — so the settle
+                                 ;; awaits below can read it too.
+                                 _ (when mbx
+                                     (binding [ec/*execution-context* turn-ctx]
+                                       (ssync/spawn!
+                                        (sp/spin
+                                         (let [r (sp/await (:done h))]
+                                           (mbx {:type ::llm-done
+                                                 :call-id call-id
+                                                 :result r}))))))
+                                 decision
+                                 (if mbx
+                                   ;; Arbiter: single consumer of the inbox for
+                                   ;; the duration of this call. Awaits the
+                                   ;; Mailbox DIRECTLY (its 2-arity carries the
+                                   ;; cancel-token — never via anext/aseq).
+                                   (loop []
+                                     (let [m (sp/await mbx)]
+                                       (cond
+                                         (and (= ::llm-done (:type m))
+                                              (= call-id (:call-id m)))
+                                         {:tag :llm-done :result (:result m)}
+
+                                         ;; a cancelled earlier call settling late
+                                         (= ::llm-done (:type m))
+                                         (recur)
+
+                                         :else
+                                         (case (:type m)
+                                           :directive/raise-budget
+                                           (do (apply-raise-budget! chat-ctx m) (recur))
+
+                                           :directive/system-message
+                                           (do (apply-system-message! chat-ctx m) (recur))
+
+                                           :probe/memory
+                                           (do (when room
+                                                 (d/post! room (assoc (probe-memory-reply chat-ctx m)
+                                                                      :from id)))
+                                               (recur))
+
+                                           :directive/cancel
+                                           {:tag :cancel}
+
+                                           :directive/switch-model
+                                           (do (swap! spec-atom merge (:payload m))
+                                               {:tag :switch})
+
+                                           ;; default: room content → steer
+                                           {:tag :steer :msg m}))))
+                                   ;; No inbox (room-less participant that was
+                                   ;; never joined): plain await, no steering.
+                                   {:tag :llm-done :result (sp/await (:done h))})]
                          ;; Mirror this turn's tool calls into the room as 🔧
                          ;; play-by-play rows (same as daemon agents).
                              (when room (turn/post-turn-activity! room id chat-ctx posted))
-                             (cond
-                               @cancelled? nil
-
-                               (gen/error-result? result)
-                               (do (reset! errored (:dvergr.discourse.generation/error result)) nil)
-
-                           ;; LLM finished cleanly (no more tool calls).
-                               (not= result :continue) nil
-
-                           ;; Budget exhausted → the turn ENDS here.
-                           ;;
-                           ;; It used to BLOCK for grace-ms waiting on a manager
-                           ;; directive — on the spin's DRAIN thread, freezing
-                           ;; every room in the process (see
-                           ;; `proc/budget-exhausted!` for the full autopsy).
-                           ;; Nothing is held now: we say so in the room, mark
-                           ;; the process :awaiting-decision, and stop.
-                           ;;
-                           ;; Resumption is an ordinary inbound message. A human
-                           ;; raises the room budget and speaks; the next turn
-                           ;; re-enters with the chat-ctx seeded from the store.
-                           ;; The durable room log IS the continuation — which is
-                           ;; the only kind spindel can actually have (it has no
-                           ;; durable conts, and a park would be lost on restart).
-                               (cc/budget-exceeded? chat-ctx)
+                             (if (not= :llm-done (:tag decision))
+                               ;; Preempted: cancel the in-flight call through
+                               ;; the SAME path as Esc (status :cancelled → the
+                               ;; SSE :cancel? poll → CancellationException
+                               ;; before anything is persisted; between tools
+                               ;; the reduce synthesizes :cancelled results so
+                               ;; every committed tool_use keeps a paired
+                               ;; result). Then AWAIT THE SETTLE — never a hard
+                               ;; future-cancel — so history is coherent before
+                               ;; the next step.
                                (do
-                                 (when room
-                                   (let [b (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
-                                             @(:budget-signal chat-ctx))
-                                         used  (/ (:used b) (double acct/MICRODOLLARS-PER-DOLLAR))
-                                         total (/ (:total b) (double acct/MICRODOLLARS-PER-DOLLAR))]
-                                     (turn/post-budget-warning! room id used total)))
-                                 (proc/budget-exhausted! id chat-ctx)
-                                 nil)
+                                 (cc/set-status! chat-ctx :cancelled)
+                                 (sp/await (:done h))
+                                 (cc/set-status! chat-ctx :active)
+                                 (case (:tag decision)
+                                   :cancel (do (reset! cancelled? true) nil)
+                                   :switch (recur turn)
+                                   :steer  (do (fold-inbound! (:msg decision))
+                                               (recur (inc turn)))))
+                               (let [result (:result decision)]
+                                 (cond
+                                   @cancelled? nil
 
-                           ;; Normal :continue, budget OK → next turn.
-                               :else (recur (inc turn)))))))
+                                   (gen/error-result? result)
+                                   (do (reset! errored (:dvergr.discourse.generation/error result)) nil)
+
+                               ;; LLM finished cleanly (no more tool calls).
+                                   (not= result :continue) nil
+
+                               ;; Budget exhausted → the turn ENDS here.
+                               ;;
+                               ;; It used to BLOCK for grace-ms waiting on a manager
+                               ;; directive — on the spin's DRAIN thread, freezing
+                               ;; every room in the process (see
+                               ;; `proc/budget-exhausted!` for the full autopsy).
+                               ;; Nothing is held now: we say so in the room, mark
+                               ;; the process :awaiting-decision, and stop.
+                               ;;
+                               ;; Resumption is an ordinary inbound message. A human
+                               ;; raises the room budget and speaks; the next turn
+                               ;; re-enters with the chat-ctx seeded from the store.
+                               ;; The durable room log IS the continuation — which is
+                               ;; the only kind spindel can actually have (it has no
+                               ;; durable conts, and a park would be lost on restart).
+                                   (cc/budget-exceeded? chat-ctx)
+                                   (do
+                                     (when room
+                                       (let [b (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
+                                                 @(:budget-signal chat-ctx))
+                                             used  (/ (:used b) (double acct/MICRODOLLARS-PER-DOLLAR))
+                                             total (/ (:total b) (double acct/MICRODOLLARS-PER-DOLLAR))]
+                                         (turn/post-budget-warning! room id used total)))
+                                     (proc/budget-exhausted! id chat-ctx)
+                                     nil)
+
+                               ;; Normal :continue, budget OK → next turn.
+                                   :else (recur (inc turn)))))))))
 
                      (when room (turn/unregister-room-turn! (:id room) id))
                      ;; A FAILED turn produced no new reply — surface it as a NON-triggering

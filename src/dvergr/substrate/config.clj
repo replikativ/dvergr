@@ -14,7 +14,8 @@
      (cfg/mail-account :datahike-contact)  ; get mail account config"
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
-            [dvergr.substrate.paths :as paths]))
+            [dvergr.substrate.paths :as paths]
+            [taoensso.telemere :as tel]))
 
 (def ^:private config-atom (atom nil))
 
@@ -31,10 +32,10 @@
   (if-let [path (config-path)]
     (let [cfg (edn/read-string (slurp path))]
       (reset! config-atom cfg)
-      (println "[config] Loaded from" path)
+      (tel/log! {:level :info :id ::loaded :data {:path (str path)}} "Config loaded")
       cfg)
     (do
-      (println "[config] No config.local.edn found — using empty config")
+      (tel/log! {:level :warn :id ::missing} "No config.local.edn found — using empty config")
       (reset! config-atom {})
       {})))
 

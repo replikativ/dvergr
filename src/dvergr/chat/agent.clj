@@ -1,16 +1,14 @@
 (ns dvergr.chat.agent
-  "Reactive agent loop using spindel.
+  "The non-reactive agent-turn core.
 
-   Each agent turn is a spin that:
-   1. Reads messages from the chat context (reactive)
-   2. Checks for compaction needs
-   3. Calls the LLM
-   4. Executes any tool calls
-   5. Updates messages signal (triggers dependents)"
-  (:refer-clojure :exclude [await])
-  (:require [org.replikativ.spindel.engine.core :as rtc]
-            [org.replikativ.spindel.core :refer [spin track await]]
-            [dvergr.chat.context :as chat-ctx]
+   `run-agent-turn!` executes exactly ONE LLM round-trip against a ChatContext:
+   maybe-compact, format messages per provider, call the model, run the
+   on-reply hook, account tokens, persist the assistant message + sanitized
+   tool-uses, execute tool calls, persist tool results, and return
+   :continue | :complete | :cancelled | :error. The LOOPING around this core
+   is the driver's job — production rooms drive it from
+   `dvergr.discourse.llm` (the participant on-message turn loop)."
+  (:require [dvergr.chat.context :as chat-ctx]
             [dvergr.chat.compaction :as compaction]
             [dvergr.model.chat :as model-chat]
             [dvergr.model.provider :as model-provider]
@@ -19,8 +17,6 @@
             [dvergr.model.quirks :as quirks]
             [dvergr.tools :as tools]
             [dvergr.sandbox.workspace :as workspace]
-            [jsonista.core :as json]
-            [clojure.edn :as edn]
             [datahike.api :as dh]
             [taoensso.telemere :as tel]))
 
@@ -28,120 +24,22 @@
 ;; Convert ChatContext messages to API format
 ;; ============================================================================
 
-(defn- strip-ns-keys
-  "Strip namespace prefixes from map keys (datahike stores with ns-qualified attrs)."
-  [m]
-  (when (map? m)
-    (into {} (map (fn [[k v]] [(if (keyword? k) (keyword (name k)) k) v]) m))))
-
-(defn- tool-use-input->args
-  "Reconstruct a tool_use's argument map for API replay from its persisted
-   :tool-use/input entity. A raw-EDN fallback entity (`:tool-input.raw/content`,
-   written when a tool arg couldn't be typed) round-trips via its stored EDN;
-   any other entity has its datahike namespace prefixes stripped. Always returns
-   a map — never nil (`null` arguments are a hard 400 on OpenAI-compat APIs)."
-  [input]
-  (or (when (map? input)
-        (if-let [raw (get input :tool-input.raw/content)]
-          (try (let [v (edn/read-string raw)] (when (map? v) v))
-               (catch Exception _ nil))
-          (strip-ns-keys input)))
-      {}))
-
-(declare messages->api-format)
-
-(defn- messages->api-format-legacy
-  "Legacy case-based message formatting. Used as fallback when provider
-   does not implement MessageFormatter protocol."
-  [messages provider model]
-  (let [messages (if (model-registry/has-quirk? model :kimi-tool-id-format?)
-                   (quirks/rewrite-kimi-tool-ids messages)
-                   messages)]
-    (case provider
-      :anthropic
-    ;; Anthropic needs tool results as content blocks in user messages
-      (let [;; Group consecutive tool-results together
-            groups (partition-by #(= :tool-result (:message/role %)) messages)]
-        (vec (mapcat (fn [group]
-                       (if (= :tool-result (:message/role (first group)))
-                       ;; Tool results -> single user message with tool_result blocks
-                         [{:role "user"
-                           :content (mapv (fn [msg]
-                                            {:type "tool_result"
-                                             :tool_use_id (:message/tool-use-id msg)
-                                             :content (:message/content msg)})
-                                          group)}]
-                       ;; Regular messages
-                         (mapv (fn [msg]
-                                 (let [role (:message/role msg)
-                                       tool-uses (:message/tool-uses msg)]
-                                   (if (and (= role :assistant) (seq tool-uses))
-                                   ;; Assistant with tool uses -> content blocks
-                                     {:role "assistant"
-                                      :content (vec (concat
-                                                     (when-let [text (:message/content msg)]
-                                                       (when (seq text)
-                                                         [{:type "text" :text text}]))
-                                                     (mapv (fn [tu]
-                                                             {:type "tool_use"
-                                                              :id (:tool-use/id tu)
-                                                              ;; Guard replay of any pre-existing poisoned
-                                                              ;; history: clean a leaked-envelope name and
-                                                              ;; never send nil input.
-                                                              :name (quirks/clean-tool-name (:tool-use/name tu))
-                                                              :input (tool-use-input->args (:tool-use/input tu))})
-                                                           tool-uses)))}
-                                   ;; Regular message
-                                     {:role (name role)
-                                      :content (:message/content msg)})))
-                               group)))
-                     groups)))
-
-    ;; OpenAI/others: tool results are separate messages
-      (mapv (fn [msg]
-              (let [role (:message/role msg)]
-                (if (= role :tool-result)
-                  {:role "tool"
-                   :tool_call_id (:message/tool-use-id msg)
-                   :content (:message/content msg)}
-                  (let [tool-uses (:message/tool-uses msg)
-                        reasoning (:message/reasoning msg)]
-                    (if (and (= role :assistant) (seq tool-uses))
-                    ;; Assistant with tool calls
-                      (cond-> {:role "assistant"
-                               :content (:message/content msg)
-                               :tool_calls (mapv (fn [tu]
-                                                   {:id (:tool-use/id tu)
-                                                    :type "function"
-                                                    ;; clean-tool-name guards replay of already-poisoned
-                                                    ;; history (a leaked `name<arg_key>…` is a hard 400);
-                                                    ;; nil input (no-arg tool call) must replay as "{}" —
-                                                    ;; "null" arguments are also a 400 on OpenAI-compat APIs.
-                                                    :function {:name (quirks/clean-tool-name (:tool-use/name tu))
-                                                               :arguments (json/write-value-as-string
-                                                                           (tool-use-input->args (:tool-use/input tu)))}})
-                                                 tool-uses)}
-                        (seq reasoning) (assoc :reasoning_content reasoning))
-                      (cond-> {:role (name role)
-                               :content (:message/content msg)}
-                        (and (= role :assistant) (seq reasoning))
-                        (assoc :reasoning_content reasoning)))))))
-            messages))))
-
 (defn messages->api-format
-  "Convert chat context messages to API message format.
+  "Convert chat-ctx messages to the provider's API format via its
+   MessageFormatter protocol implementation — the ONE formatting path.
 
-   Dispatches to the provider's MessageFormatter implementation when available,
-   which handles tool call conventions, result formatting, and model quirks
-   (e.g., Kimi K2 tool ID rewriting).
-
-   Falls back to legacy case-based formatting for providers without MessageFormatter."
+   Throws loudly for an unregistered provider or one without a formatter:
+   the LLM call itself requires a registered instance (model.chat resolves
+   via get-provider!), so a silent fallback formatter could only produce
+   messages for a call that cannot happen — while drifting out of sync with
+   the real per-provider formatting (tool-call conventions, replay guards,
+   model quirks)."
   [messages provider model]
-  (if-let [provider-instance (model-providers/get-provider provider)]
-    (if (model-provider/implements-message-formatter? provider-instance)
-      (model-provider/format-messages provider-instance messages model)
-      (messages->api-format-legacy messages provider model))
-    (messages->api-format-legacy messages provider model)))
+  (let [instance (model-providers/get-provider! provider)]
+    (when-not (model-provider/implements-message-formatter? instance)
+      (throw (ex-info "Provider has no MessageFormatter implementation"
+                      {:provider provider :model model})))
+    (model-provider/format-messages instance messages model)))
 
 ;; ============================================================================
 ;; Doom Loop Detection
@@ -484,151 +382,3 @@
     (catch Exception e
       (tel/log! {:level :error :id :agent/turn-error :error e} "Agent turn error")
       :error)))
-
-;; ============================================================================
-;; Reactive Agent Loop
-;; ============================================================================
-
-(defn create-agent-spin
-  "Create a reactive spin that runs agent turns until completion.
-
-   The spin tracks the messages signal and re-executes when messages change.
-   This allows external processes to inject messages and have the agent respond.
-
-   Args:
-     chat-ctx - ChatContext
-     opts - Map with :provider, :model, :on-text"
-  [chat-ctx {:keys [provider model on-text]
-             :or {provider :anthropic
-                  model "claude-sonnet-4-20250514"}}]
-  (let [spindel-ctx (:spindel-ctx chat-ctx)]
-    (binding [rtc/*execution-context* spindel-ctx]
-      (spin
-        ;; Track messages to make this reactive
-       (let [messages (:new (track (:messages-signal chat-ctx)))
-             status (:new (track (:status-signal chat-ctx)))]
-
-          ;; Only run if active and has messages
-         (when (and (= status :active)
-                    (seq messages)
-                     ;; Only run if last message is from user or tool
-                    (#{:user :tool-result} (:message/role (last messages))))
-
-            ;; Check budget first
-           (if (chat-ctx/check-budget! chat-ctx)
-              ;; Run the turn
-             (let [result (run-agent-turn! chat-ctx
-                                           {:provider provider
-                                            :model model
-                                            :on-text on-text})]
-                ;; Return the result for inspection
-               {:turn-result result
-                :message-count (count messages)})
-
-              ;; Budget exceeded
-             {:turn-result :budget-exceeded
-              :message-count (count messages)})))))))
-
-;; ============================================================================
-;; Simple Run Function
-;; ============================================================================
-
-(defn run-chat
-  "Run an agent chat to completion.
-
-   Creates a ChatContext, adds the task as first message, then runs
-   agent turns until natural termination:
-   - Budget exhausted (primary control)
-   - Task complete (no more tool calls)
-   - Error occurs
-
-   Use FRP combinators for additional constraints:
-   - (timeout (run-chat ...) ms fallback) - deadline
-
-   Returns:
-   - :complete on success
-   - :budget-exceeded if out of tokens
-   - :error on failure"
-  [task & {:keys [provider model budget on-text]
-           :or {provider :anthropic
-                model "claude-sonnet-4-20250514"
-                budget 50000}}]
-  (let [;; Create chat context
-        chat-ctx (chat-ctx/create-chat-context
-                  {:title (subs task 0 (min 50 (count task)))
-                   :budget budget
-                   :with-sci? true})
-
-        ;; Add system prompt
-        _ (chat-ctx/add-message! chat-ctx
-                                 {:role :system
-                                  :content "You are a helpful coding assistant."})
-
-        ;; Add user task
-        _ (chat-ctx/add-message! chat-ctx
-                                 {:role :user
-                                  :content task})]
-
-    (println "Starting chat:" (:chat-id chat-ctx))
-    (println "Task:" task)
-
-    ;; Run turns until natural termination
-    (loop [turn 0]
-      (let [status (chat-ctx/get-status chat-ctx)]
-        (cond
-          ;; Status changed (completed, cancelled, error)
-          (not= status :active)
-          {:status status
-           :turns turn
-           :chat-id (:chat-id chat-ctx)
-           :budget (chat-ctx/get-budget chat-ctx)}
-
-          ;; Budget exceeded (primary control)
-          (chat-ctx/budget-exceeded? chat-ctx)
-          (do
-            (chat-ctx/set-status! chat-ctx :budget-exceeded)
-            {:status :budget-exceeded
-             :turns turn
-             :chat-id (:chat-id chat-ctx)
-             :budget (chat-ctx/get-budget chat-ctx)})
-
-          ;; Run a turn
-          :else
-          (let [result (run-agent-turn! chat-ctx
-                                        {:provider provider
-                                         :model model
-                                         :on-text on-text
-                                         :turn-number (inc turn)})]
-            (case result
-              :continue (recur (inc turn))
-              :complete (do
-                          (chat-ctx/set-status! chat-ctx :completed)
-                          {:status :complete
-                           :turns (inc turn)
-                           :chat-id (:chat-id chat-ctx)
-                           :budget (chat-ctx/get-budget chat-ctx)
-                           :messages (chat-ctx/get-messages chat-ctx)})
-              :error {:status :error
-                      :turns (inc turn)
-                      :chat-id (:chat-id chat-ctx)
-                      :budget (chat-ctx/get-budget chat-ctx)})))))))
-
-(comment
-  ;; Test the agent with chat context
-  (require '[dvergr.chat.agent :as agent] :reload)
-
-  ;; Simple test
-  (def result (agent/run-chat "Say hello and tell me what 2+2 equals"
-                              :provider :anthropic
-                              :model "claude-sonnet-4-20250514"))
-
-  ;; Check result
-  (:status result)
-  (:turns result)
-  (count (:messages result))
-
-  ;; Print messages
-  (doseq [msg (:messages result)]
-    (println "---")
-    (println (:message/role msg))
-    (println (subs (:message/content msg) 0 (min 200 (count (:message/content msg)))))))

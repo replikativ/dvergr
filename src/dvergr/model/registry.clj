@@ -4,6 +4,7 @@
    Separates model metadata from provider implementation logic.
    Models can be loaded from EDN for runtime configuration."
   (:require [clojure.edn :as edn]
+            [taoensso.telemere :as tel]
             [clojure.java.io :as io]))
 
 ;; ============================================================================
@@ -258,25 +259,6 @@
   [model-id]
   (:pricing (get-model model-id)))
 
-(defn estimate-cost
-  "Estimate cost for a request given input/output token counts.
-   Returns cost in dollars."
-  [model-id input-tokens output-tokens & {:keys [cache-read-tokens cache-write-tokens]
-                                          :or {cache-read-tokens 0
-                                               cache-write-tokens 0}}]
-  (if-let [pricing (pricing-of model-id)]
-    (let [{:keys [input output cache-read cache-write]
-           :or {cache-read 0 cache-write 0}} pricing]
-      (+ (* input (/ input-tokens 1000000.0))
-         (* output (/ output-tokens 1000000.0))
-         (* (or cache-read 0) (/ cache-read-tokens 1000000.0))
-         (* (or cache-write 0) (/ cache-write-tokens 1000000.0))))
-    0))
-
-;; ============================================================================
-;; Context/Output Limits
-;; ============================================================================
-
 (defn context-window
   "Get the context window size for a model."
   [model-id]
@@ -363,7 +345,8 @@
           s         (slurp models-dev-url)]
       (json-read s mapper))
     (catch Throwable t
-      (println "models.dev fetch failed:" (.getMessage t))
+      (tel/log! {:level :warn :id ::models-dev-fetch-failed :data {:error (.getMessage t)}}
+                "models.dev fetch failed")
       nil)))
 
 (defn- coerce-models-dev-model
