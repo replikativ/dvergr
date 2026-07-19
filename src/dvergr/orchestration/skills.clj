@@ -74,7 +74,8 @@
    sandbox-repo path) adds the room's `skills/` as the highest-precedence
    layer. Each value includes:
      :name :description :provides :requires-tools :requires-env
-     :vetted :vetted-at :vetted-by :source :content :file :scope"
+     :vetted :vetted-at :vetted-by :disabled (present only when the
+     frontmatter carries the line) :source :content :file :scope"
   ([] (defs/load-kind "skills"))
   ([room-dir] (defs/load-kind "skills" room-dir)))
 
@@ -98,16 +99,18 @@
 
 (defn eligible?
   "Is the skill safe + loadable to inject for an agent with these tools? Eligible
-   iff it is **vetted** AND (set requires_tools) ⊆ (set available-tool-names) AND
-   every requires_env key resolves truthy through `env-lookup` (default: consults
-   `System/getenv`).
+   iff it is **vetted** AND **not disabled** AND (set requires_tools) ⊆ (set
+   available-tool-names) AND every requires_env key resolves truthy through
+   `env-lookup` (default: consults `System/getenv`).
 
    The vetting gate keeps unreviewed / externally-
    lifted skills (`vetted: false`, e.g. `lifted/*`) out of agent prompts until a
    human or trusted reviewer promotes them — they stay loadable/listable, just
    not auto-injected. Optional `env-lookup` (fn [env-key] -> value-or-nil) lets
    an embedder consult its own env source (e.g. a config map) instead of the
-   process environment."
+   process environment. `disabled: true` is the embedder's off-switch (e.g. a
+   room owner deactivating a skill) — orthogonal to vetting, which it never
+   touches."
   ([skill available-tool-names] (eligible? skill available-tool-names #(System/getenv (name %))))
   ([skill available-tool-names env-lookup]
    (let [needed-tools (set (or (:requires-tools skill) []))
@@ -117,7 +120,8 @@
          missing-env  (->> needed-env
                            (remove env-lookup)
                            set)]
-     (and (:vetted skill) (empty? missing-tools) (empty? missing-env)))))
+     (and (:vetted skill) (not (:disabled skill))
+          (empty? missing-tools) (empty? missing-env)))))
 
 (defn eligible-skills
   "All skills eligible for the given tool set, sorted by name. Optional
@@ -183,11 +187,14 @@
          (doseq [s (->> (load-all room-dir) vals (remove #(eligible? % available-tool-names env-lookup)))]
            (tel/log! {:id :skills/ineligible
                       :data {:file (:file s)
+                             :disabled (boolean (:disabled s))
                              :missing (clojure.set/difference
                                        (set (:requires-tools s))
                                        (set (map name available-tool-names)))
                              :missing-env (set (remove env-lookup (:requires-env s)))}}
-                     "Skill not loaded — tools unavailable"))
+                     (if (:disabled s)
+                       "Skill not loaded — disabled"
+                       "Skill not loaded — tools unavailable")))
          (str system-prompt section))
        system-prompt))))
 

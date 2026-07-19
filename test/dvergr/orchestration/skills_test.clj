@@ -86,6 +86,17 @@ content"
   (is (not (skills/eligible? {:vetted false :requires-tools []} []))
       "vetted:false → not eligible"))
 
+(deftest eligible?-gates-on-disabled
+  ;; disabled: true is the owner's off-switch — it makes a skill ineligible
+  ;; WITHOUT touching vetting (reactivation needs no re-approval). Absent or
+  ;; false = active, so every existing skill file is unaffected.
+  (is (not (skills/eligible? {:vetted true :disabled true} []))
+      "disabled:true → not eligible even when vetted + satisfied")
+  (is (skills/eligible? {:vetted true :disabled false} [])
+      "disabled:false → active")
+  (is (skills/eligible? {:vetted true} [])
+      "absent → active (backwards compatible)"))
+
 (deftest eligible?-respects-env
   ;; Env vars vary by machine; assert behavior with a known-missing one
   (is (not (skills/eligible? {:vetted true :requires-env ["DEFINITELY_NOT_A_REAL_ENV_VAR_FOR_TESTS"]}
