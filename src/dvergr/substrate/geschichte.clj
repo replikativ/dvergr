@@ -148,9 +148,33 @@
                       argv)
      {:stdout "" :stderr "fatal: not a Geschichte repository\n" :exit 128})))
 
+(def review-excluded-prefixes
+  "Worktree prefixes kept OUT of fork/merge review.
+
+   These paths are versioned like everything else — this is not `.gitignore`,
+   which means \"never tracked\". They are excluded from the REVIEW because a
+   merge review is a judgement about code, and user media is neither reviewable
+   as a diff nor mergeable as text: a room member uploading a voice note should
+   not be able to put a binary conflict in front of whoever approves the fork.
+
+   Consumer-side convention for now. The honest home for this is geschichte
+   itself (repo-config-backed exclusion honoured by `repo/changes`, `status` and
+   `git diff`), so that the CLI and the review agree — until then `git status`
+   inside the sandbox will still show these paths."
+  ["media/"])
+
+(defn- reviewable?
+  "Is this change part of the code review, or user data riding along?"
+  [{:keys [path]}]
+  (let [p (str/replace (str path) #"^/+" "")]
+    (not-any? #(str/starts-with? p %) review-excluded-prefixes)))
+
 (defn diff-since-fork
   "Review payload for a forked virtual workspace. Includes committed and dirty
-  paths; unlike the old implementation it has no host worktree path."
+  paths; unlike the old implementation it has no host worktree path.
+
+  Excludes `review-excluded-prefixes` — media travels with the fork, it just
+  does not show up as something to review."
   [fork-ctx]
   (let [in-ctx (fn [ctx]
                  (binding [ec/*execution-context* ctx] (current-system)))
@@ -161,9 +185,10 @@
             parent-conn (some-> parent-system gy/connection)
             base (some-> parent-conn repo/head-commit :geschichte.commit/id)
             head (some-> conn repo/head-commit :geschichte.commit/id)
-            changes (if base
-                      (repo/changes conn base :worktree)
-                      (repo/changes conn :empty :worktree))
+            changes (filterv reviewable?
+                             (if base
+                               (repo/changes conn base :worktree)
+                               (repo/changes conn :empty :worktree)))
             files (mapv :path changes)
             commits (when (and base head (not= base head))
                       (->> (repo/log conn {:limit 100})
