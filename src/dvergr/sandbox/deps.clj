@@ -240,53 +240,148 @@
 ;; Namespace denylist (sensitive host internals)
 ;; ============================================================================
 
-(def default-namespace-denylist
-  "Namespaces the sandbox MUST NOT mirror into the agent's SCI ctx,
-   even when they're on the host classpath. The curated SCI surface
-   (dvergr.sandbox/add-*-ns! family) is the agent's authorized view
-   of dvergr internals; reaching for the raw host equivalents would
-   leak the daemon's authority into the sandbox."
-  ["^dvergr\\.daemon($|\\..*)"
-   "^dvergr\\.config($|\\..*)"
-   "^dvergr\\.cli($|\\..*)"
-   "^dvergr\\.web($|\\..*)"
-   "^dvergr\\.actors($|\\..*)"
-   "^dvergr\\.skills($|\\..*)"
-   "^dvergr\\.rooms($|\\..*)"
-   "^dvergr\\.discourse($|\\..*)"
-   "^dvergr\\.sandbox($|\\..*)"
-   "^dvergr\\.tools($|\\..*)"
-   "^dvergr\\.registry($|\\..*)"
-   ;; clojure.repl and clojure.repl.deps are intentionally custom-wrapped
-   ;; in dvergr.sandbox; mirroring the host versions would bypass our gates.
+;; ---------------------------------------------------------------------------
+;; Host-namespace mirror policy
+;;
+;; The sandbox has three trust layers, and all three are ALLOWLISTS:
+;;
+;;   1. `dvergr.sandbox/base-classes` — the JVM-escape barrier.
+;;   2. The curated SCI surface (`dvergr.sandbox/add-*-ns!`) — the agent's
+;;      authorized view of dvergr internals, injected directly.
+;;   3. This policy — what `(require …)` may pull in from the HOST classpath.
+;;
+;; Layer 3 used to be a denylist, which is the wrong polarity for a trust
+;; boundary: every namespace nobody thought to name was reachable, and
+;; `ensure-mirrored!` copies EVERY public var of whatever it mirrors. That made
+;; the host application's credentials and connections reachable from agent code
+;; — and agents read untrusted input (mail, web, chat), so prompt injection was
+;; sufficient to reach them.
+;;
+;; The fall-through to host mirroring exists for ONE reason (see `make-load-fn`):
+;; libraries the agent pulled in with `add-libs`. That is the boundary we encode
+;; — a curated set of pure libraries, plus whatever an APPROVED `add-libs!` call
+;; brought in. `add-libs!` is already manager-gated, so provenance inherits an
+;; existing trust decision instead of inventing a new one.
+;; ---------------------------------------------------------------------------
+
+(def default-namespace-allowlist
+  "Namespace prefixes `(require …)` MAY mirror from the host classpath.
+
+   Deliberately narrow: pure data/format/util libraries with no ambient
+   authority. Anything that hands out a connection, a credential, a host file
+   handle or a process is NOT here — the agent reaches those (when it should at
+   all) through the curated SCI surface, which scopes them to its own room.
+
+   Notably absent, on purpose:
+     - `clojure.java.*`   — host filesystem and processes; the agent gets
+                            muschel's virtual FS instead.
+     - `datahike.*`       — `dvergr.sandbox.ns.datahike` injects the data-ops
+                            while keeping create/connect/delete room-guarded;
+                            mirroring the raw API would undo that.
+     - `konserve.*` / `kabel.*` — the store and wire layers underneath it."
+  ["^cheshire($|\\..*)"
+   "^hiccup($|\\..*)"
+   "^babashka($|\\..*)"
+   "^medley($|\\..*)"
+   "^camel-snake-kebab($|\\..*)"
+   "^clj-yaml($|\\..*)"
+   "^clojure\\.data($|\\..*)"
+   "^clojure\\.math$"
+   "^clojure\\.zip$"
+   "^clojure\\.pprint$"
+   "^clojure\\.test($|\\..*)"
+   "^clojure\\.string$"
+   "^clojure\\.set$"
+   "^clojure\\.walk$"
+   "^clojure\\.edn$"])
+
+(def hard-namespace-denylist
+  "Never mirrored — not by the allowlist, not by `add-libs` provenance, not by a
+   caller-supplied allowlist. These are the namespaces that can dismantle the
+   sandbox itself or the guarantees built on top of it.
+
+   `datahike.tx-preds` is the subtle one: the accounting governor is a per-STORE
+   transaction predicate enforced inside datahike's writer, which is what makes
+   it hold even for a raw `d/transact` on a conn the agent legitimately owns.
+   Mirroring this namespace exposes `unregister-tx-pred!` — one call and the
+   guarantee is gone. Denying it is what makes governance meaningful."
+  ["^sci($|\\..*)"
+   "^datahike\\.tx-preds($|\\..*)"
+   "^dvergr($|\\..*)"
+   "^is\\.simm($|\\..*)"
+   "^org\\.replikativ\\.spindel($|\\..*)"
+   "^org\\.replikativ\\.yggdrasil($|\\..*)"
+   "^kontor($|\\..*)"
+   "^konserve($|\\..*)"
+   "^kabel($|\\..*)"
    "^clojure\\.repl$"
    "^clojure\\.repl\\..*"
-   ;; tools.deps is the dep-resolution machinery; nothing good comes
-   ;; from giving an agent direct handle on it.
    "^clojure\\.tools\\.deps.*"
-   ;; sci's own internals — keep the sandbox from peeking at its host.
-   "^sci\\..*"
-   ;; spindel + yggdrasil — the substrate that backs forks. Manager
-   ;; controls those; agents should not.
-   "^org\\.replikativ\\.spindel($|\\..*)"
-   "^org\\.replikativ\\.yggdrasil($|\\..*)"])
+   "^clojure\\.java\\..*"])
 
-(def ^:private NS-DENYLIST-KEY [:dvergr/deps-policy :ns-denylist])
+(def ^:private NS-ALLOWLIST-KEY [:dvergr/deps-policy :ns-allowlist])
+(def ^:private NS-PROVENANCE-KEY [:dvergr/deps-policy :ns-added-prefixes])
 
-(defn set-namespace-denylist!
-  "Override the default namespace denylist with regex patterns."
+(defn set-namespace-allowlist!
+  "Override the default mirror allowlist with regex patterns. The hard denylist
+   still applies on top — a caller cannot widen the boundary past it."
   [patterns]
-  (ec/swap-state! NS-DENYLIST-KEY (constantly (vec patterns))))
+  (ec/swap-state! NS-ALLOWLIST-KEY (constantly (vec patterns))))
+
+(defn- matches-any? [patterns s]
+  (boolean
+   (some (fn [p] (try (re-find (re-pattern p) s)
+                      (catch Throwable _ nil)))
+         patterns)))
+
+(defn allow-added-lib-namespaces!
+  "Record that an APPROVED `add-libs!` brought `lib-coords` onto the classpath,
+   so the agent may then require what it just asked for. Each coord's own
+   namespace root becomes mirrorable (`org.clojure/data.csv` → `clojure.data.csv`
+   is NOT inferable, so we allow the artifact id and the group's last segment,
+   which covers the common conventions and nothing broader)."
+  [lib-coords]
+  (let [prefixes (into #{}
+                       (mapcat (fn [coord]
+                                 (let [s (str coord)
+                                       [grp art] (if (re-find #"/" s)
+                                                   (str/split s #"/" 2)
+                                                   [s s])]
+                                   [(str "^" (java.util.regex.Pattern/quote art) "($|\\..*)")
+                                    (str "^" (java.util.regex.Pattern/quote
+                                              (last (str/split grp #"\.")))
+                                         "($|\\..*)")])))
+                       lib-coords)]
+    (ec/swap-state! NS-PROVENANCE-KEY #(into (or % #{}) prefixes))
+    prefixes))
+
+(defn- policy-state
+  "Read a policy key, falling back to `default` when no execution context is
+   bound. `ec/get-state` resolves through the ambient context and THROWS without
+   one — a security predicate must not depend on that, so an unreadable policy
+   degrades to the built-in default (which denies) rather than to an exception
+   the caller might mistake for a load failure."
+  [k default]
+  (or (try (ec/get-state k) (catch Throwable _ nil))
+      default))
+
+(defn namespace-mirrorable?
+  "May `ns-sym` be mirrored from the host classpath into an SCI ctx?
+
+   Deny by default. Allowed only when it matches the allowlist or a prefix an
+   approved `add-libs!` recorded — and never when it matches the hard denylist."
+  [ns-sym]
+  (let [s (str ns-sym)]
+    (and (not (matches-any? hard-namespace-denylist s))
+         (or (matches-any? (policy-state NS-ALLOWLIST-KEY default-namespace-allowlist) s)
+             (matches-any? (policy-state NS-PROVENANCE-KEY #{}) s)))))
 
 (defn namespace-denied?
-  "Is `ns-sym` blocked from being mirrored into an SCI ctx?"
+  "Inverse of `namespace-mirrorable?`. Kept because the mirror path reads as a
+   denial; note the policy is now deny-by-default, so an unknown namespace is
+   denied rather than allowed."
   [ns-sym]
-  (let [patterns (or (ec/get-state NS-DENYLIST-KEY) default-namespace-denylist)
-        s        (str ns-sym)]
-    (boolean
-     (some (fn [p] (try (re-find (re-pattern p) s)
-                        (catch Throwable _ nil)))
-           patterns))))
+  (not (namespace-mirrorable? ns-sym)))
 
 ;; ============================================================================
 ;; Mirror host namespace into SCI
@@ -330,10 +425,12 @@
   (require 'sci.core)
   (let [add-namespace! @(resolve 'sci.core/add-namespace!)]
     (cond
-      (namespace-denied? ns-sym)
+      (not (namespace-mirrorable? ns-sym))
       (do (tel/log! {:id :sandbox.deps/ns-denied
                      :data {:ns ns-sym}}
-                    "Namespace mirror denied by denylist")
+                    (str "Namespace mirror denied — not on the sandbox allowlist. "
+                         "If an agent legitimately needs it, add it via an approved "
+                         "add-libs! (provenance) or widen set-namespace-allowlist!."))
           false)
 
       :else
@@ -442,6 +539,10 @@
 
       :else
       (let [pre-ns (set (all-ns))]
+        ;; Every coord passed the gate, so the agent is now entitled to require
+        ;; what it just asked for: record the provenance BEFORE loading, since
+        ;; `mirror-namespaces-into-sci!` below consults the mirror policy.
+        (allow-added-lib-namespaces! coords)
         ;; clojure.repl.deps/add-libs guards on `clojure.core/*repl*`
         ;; being bound to true. We're a server-side call, not a REPL,
         ;; but the gate has already enforced human approval — so bind
