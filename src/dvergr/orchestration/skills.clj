@@ -74,7 +74,8 @@
    sandbox-repo path) adds the room's `skills/` as the highest-precedence
    layer. Each value includes:
      :name :description :provides :requires-tools :requires-env
-     :vetted :vetted-at :vetted-by :source :content :file :scope"
+     :vetted :vetted-at :vetted-by :disabled (present only when the
+     frontmatter carries the line) :source :content :file :scope"
   ([] (defs/load-kind "skills"))
   ([room-dir] (defs/load-kind "skills" room-dir)))
 
@@ -98,31 +99,42 @@
 
 (defn eligible?
   "Is the skill safe + loadable to inject for an agent with these tools? Eligible
-   iff it is **vetted** AND (set requires_tools) ⊆ (set available-tool-names) AND
-   every requires_env key is present in System/getenv.
+   iff it is **vetted** AND **not disabled** AND (set requires_tools) ⊆ (set
+   available-tool-names) AND every requires_env key resolves truthy through
+   `env-lookup` (default: consults `System/getenv`).
 
    The vetting gate keeps unreviewed / externally-
    lifted skills (`vetted: false`, e.g. `lifted/*`) out of agent prompts until a
    human or trusted reviewer promotes them — they stay loadable/listable, just
-   not auto-injected."
-  [skill available-tool-names]
-  (let [needed-tools (set (or (:requires-tools skill) []))
-        missing-tools (clojure.set/difference needed-tools
-                                              (set (map name available-tool-names)))
-        needed-env   (set (or (:requires-env skill) []))
-        missing-env  (->> needed-env
-                          (remove #(System/getenv (name %)))
-                          set)]
-    (and (:vetted skill) (empty? missing-tools) (empty? missing-env))))
+   not auto-injected. Optional `env-lookup` (fn [env-key] -> value-or-nil) lets
+   an embedder consult its own env source (e.g. a config map) instead of the
+   process environment. `disabled: true` is the embedder's off-switch (e.g. a
+   room owner deactivating a skill) — orthogonal to vetting, which it never
+   touches."
+  ([skill available-tool-names] (eligible? skill available-tool-names #(System/getenv (name %))))
+  ([skill available-tool-names env-lookup]
+   (let [needed-tools (set (or (:requires-tools skill) []))
+         missing-tools (clojure.set/difference needed-tools
+                                               (set (map name available-tool-names)))
+         needed-env   (set (or (:requires-env skill) []))
+         missing-env  (->> needed-env
+                           (remove env-lookup)
+                           set)]
+     (and (:vetted skill) (not (:disabled skill))
+          (empty? missing-tools) (empty? missing-env)))))
 
 (defn eligible-skills
   "All skills eligible for the given tool set, sorted by name. Optional
-   `room-dir` adds the room's own skills (highest precedence)."
+   `room-dir` adds the room's own skills (highest precedence). Optional
+   `env-lookup` (fn [env-key] -> value-or-nil) is passed through to `eligible?`
+   in place of the default `System/getenv` lookup."
   ([available-tool-names] (eligible-skills available-tool-names nil))
   ([available-tool-names room-dir]
+   (eligible-skills available-tool-names room-dir #(System/getenv (name %))))
+  ([available-tool-names room-dir env-lookup]
    (->> (load-all room-dir)
         vals
-        (filter #(eligible? % available-tool-names))
+        (filter #(eligible? % available-tool-names env-lookup))
         (sort-by :name))))
 
 ;; ============================================================================
@@ -160,20 +172,29 @@
 (defn inject-skills
   "Append the eligible-skill index to a system prompt. Optional `room-dir`
    includes the room's own skills (highest precedence) so an agent acting in a
-   room sees skills that room defines. Phase B/C bridge — keeps the tool-driven
-   eligibility filter; later phases also gate on `:vetted` and per-actor skills."
+   room sees skills that room defines. Optional `env-lookup` (fn [env-key] ->
+   value-or-nil) is passed through to eligibility checks in place of the
+   default `System/getenv` lookup — see `eligible?`. Phase B/C bridge — keeps
+   the tool-driven eligibility filter; later phases also gate on `:vetted` and
+   per-actor skills."
   ([system-prompt available-tool-names] (inject-skills system-prompt available-tool-names nil))
   ([system-prompt available-tool-names room-dir]
-   (let [eligible (eligible-skills available-tool-names room-dir)]
+   (inject-skills system-prompt available-tool-names room-dir #(System/getenv (name %))))
+  ([system-prompt available-tool-names room-dir env-lookup]
+   (let [eligible (eligible-skills available-tool-names room-dir env-lookup)]
      (if-let [section (skill-prompt-section eligible)]
        (do
-         (doseq [s (->> (load-all room-dir) vals (remove #(eligible? % available-tool-names)))]
+         (doseq [s (->> (load-all room-dir) vals (remove #(eligible? % available-tool-names env-lookup)))]
            (tel/log! {:id :skills/ineligible
                       :data {:file (:file s)
+                             :disabled (boolean (:disabled s))
                              :missing (clojure.set/difference
                                        (set (:requires-tools s))
-                                       (set (map name available-tool-names)))}}
-                     "Skill not loaded — tools unavailable"))
+                                       (set (map name available-tool-names)))
+                             :missing-env (set (remove env-lookup (:requires-env s)))}}
+                     (if (:disabled s)
+                       "Skill not loaded — disabled"
+                       "Skill not loaded — tools unavailable")))
          (str system-prompt section))
        system-prompt))))
 

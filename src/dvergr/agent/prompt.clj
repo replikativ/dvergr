@@ -118,10 +118,13 @@
    `tools` may be a tool map (name→def, string keys) OR a set/vector of names.
    `isolation` is optional (`:native` / `:sci`); omit it to leave the proven
    daemon prompt byte-identical. `:room-dir` (optional) is a room's sandbox-repo
-   path — when given, skills the room itself defines are injected too. The
-   dynamic planning-mode guideline is appended elsewhere (per turn). sandbox
-   pointer via requiring-resolve to avoid a cycle."
-  [base-prompt {:keys [tools isolation room-dir]}]
+   path — when given, skills the room itself defines are injected too.
+   `:env-lookup` (optional, fn [env-key] -> value-or-nil) is threaded through to
+   `skills/inject-skills`, defaulting to a `System/getenv` lookup when omitted,
+   so an embedder can gate skill eligibility on its own env source. The dynamic
+   planning-mode guideline is appended elsewhere (per turn). sandbox pointer
+   via requiring-resolve to avoid a cycle."
+  [base-prompt {:keys [tools isolation room-dir env-lookup]}]
   (let [names   (mapv tool-name-str (if (map? tools) (keys tools) (or tools [])))
         nameset (set names)
         eval?   (contains? nameset "clojure_eval")
@@ -133,7 +136,7 @@
                           (catch Throwable _ nil)))]
     (cond-> (skills/inject-skills
              (str discourse-preamble "\n\n---\n\n" base-prompt)
-             names room-dir)
+             names room-dir (or env-lookup #(System/getenv (name %))))
       isolation     (str "\n\n## Runtime\n\nIsolation: " (name isolation)
                          (if (= :native (keyword isolation))
                            " — full Clojure eval at the system root (trusted)."

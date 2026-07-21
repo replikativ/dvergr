@@ -327,6 +327,11 @@
                                 ;; system notes for unresolvable ones.
                                     :on-reply         on-reply}
                          errored           (atom nil)
+                     ;; #38: the last assistant message BEFORE this invocation
+                     ;; runs (the store-seeded prior reply, or nil) — the exit
+                     ;; path uses it to tell a genuinely NEW reply from stale
+                     ;; seeded history.
+                         pre-turn-last-asst (last-assistant-message chat-ctx)
                      ;; Inbound fold: ROOM path append-inbound! (deduped
                      ;; against the bus fold by msg id, decorated with author
                      ;; + time); room-less adds directly to the fallback ctx.
@@ -524,7 +529,20 @@
                      ;; :_activity row and DON'T fall through to re-post the STALE last reply
                      ;; (which the room's other agents answer, looping — the "repeating" bug).
                      (when @errored (turn/post-turn-error! room id @errored))
-                     (when-let [last-asst (when-not @errored (last-assistant-message chat-ctx))]
+                     ;; #38: the SILENT-failure shape — the turn ended with no
+                     ;; error tag AND no new assistant message (e.g. provider
+                     ;; resolution failed before any generation). The last
+                     ;; assistant message is then the store-SEEDED prior reply;
+                     ;; posting it is the repeating bug. Surface it instead.
+                     ;; A deliberate cancel stays quiet.
+                     (when (and (not @errored) (not @cancelled?)
+                                (= pre-turn-last-asst (last-assistant-message chat-ctx)))
+                       (turn/post-turn-error!
+                        room id
+                        "turn ended without producing a reply — likely a provider/model resolution failure"))
+                     (when-let [last-asst (when-not @errored
+                                            (let [la (last-assistant-message chat-ctx)]
+                                              (when (not= la pre-turn-last-asst) la)))]
                        (when-let [reply (assistant-text last-asst)]
                      ;; Last line of defence: a model that fumbled code into the
                      ;; prose channel TWICE (agent.clj nudged it once) must still

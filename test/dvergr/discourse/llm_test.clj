@@ -100,6 +100,28 @@
       (let [reply (await-spin r #(d/ask % :flaky {:content "go"}))]
         (is (= "partial work" (:content reply)))))))
 
+(deftest silent-failure-does-not-repost-stale-reply
+  (testing "a turn that ends with NO error tag and NO new assistant message
+            (e.g. provider resolution failed before any generation) must NOT
+            re-post the seeded prior reply — #38, the 'repeating' bug"
+    (let [r (d/room :t)
+          ;; ask 1 answers normally; ask 2's turn completes SILENTLY (no
+          ;; message added, no error tag) — the shape a missing provider makes.
+          script (atom [[:complete "First answer."]
+                        [:complete nil]])]
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent
+                   {:id :quiet
+                    :spec {:provider :mock :model "mock"}
+                    :run-turn-fn (make-mock-turn-fn script)})))
+      (let [first-reply (await-spin r #(d/ask % :quiet {:content "go"}))]
+        (is (= "First answer." (:content first-reply))))
+      (let [second-reply (await-spin r #(d/ask % :quiet {:content "again"}) 1500)]
+        (is (= ::timeout second-reply)
+            (str "the stale prior reply must not be re-posted; got: "
+                 (pr-str (:content second-reply))))
+        (is (empty? @script) "both script entries consumed")))))
+
 (deftest agent-composes-with-iterative-refinement
   (testing "Two llm-agents (coder + reviewer) drive iterative-refinement"
     (let [r (d/room :t)
