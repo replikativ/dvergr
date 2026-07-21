@@ -30,6 +30,32 @@
   (:import [java.io StringWriter]
            [java.lang.management ManagementFactory]))
 
+;; ---------------------------------------------------------------------------
+;; Consumer namespace-injector registry
+;;
+;; dvergr is a generic agent harness — it must not depend on any domain kernel.
+;; A consumer (e.g. an accounting kernel) registers an injector fn here at
+;; startup; the sandbox setup runs every registered injector so its surface is
+;; available in `clojure_eval`, WITHOUT dvergr knowing what it is. Each injector
+;; is `(fn [sci-ctx opts])`, opts = {:room-id :room-conn :kb-conn}.
+;; ---------------------------------------------------------------------------
+
+(defonce ^:private ns-injectors* (atom []))
+
+(defn register-ns-injector!
+  "Register an SCI namespace-injector `f` — `(fn [sci-ctx opts])`, opts =
+   {:room-id :room-conn :kb-conn} — run for every agent sandbox after the
+   built-in surface. Lets a consumer expose extra namespaces (a domain kernel)
+   in `clojure_eval` without dvergr depending on it. Idempotent per identical fn.
+   Returns `f`."
+  [f]
+  (swap! ns-injectors* (fn [v] (if (some #{f} v) v (conj v f))))
+  f)
+
+(defn unregister-ns-injector! [f] (swap! ns-injectors* (fn [v] (vec (remove #{f} v)))) nil)
+
+(defn registered-ns-injectors [] @ns-injectors*)
+
 ;; Lazy-load spindel SCI macro support to avoid compile-time dep
 (defn- spindel-sci-macro-ns []
   (require 'org.replikativ.spindel.sci.macro)
@@ -883,6 +909,13 @@
     (ns-dev/add-clojure-repl-ns! sci-ctx)
     (ns-dev/add-clojure-repl-deps-ns! sci-ctx)
     (ns-dev/add-hiccup-ns! sci-ctx)
+    ;; Consumer-registered injectors (register-ns-injector!) — domain kernels
+    ;; expose their surface here without dvergr depending on them. Run before
+    ;; reflection so overview sees them; a failing injector never breaks setup.
+    (doseq [f (registered-ns-injectors)]
+      (try (f sci-ctx {:room-id room-id :room-conn room-conn :kb-conn kb-conn})
+           (catch Throwable e
+             (binding [*out* *err*] (println "ns-injector failed:" (.getMessage e))))))
     ;; Self-reflection LAST, so (sandbox/overview) sees every ns injected above.
     (add-reflection-ns! sci-ctx)
     audit-log))
