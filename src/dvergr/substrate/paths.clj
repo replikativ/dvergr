@@ -59,6 +59,7 @@
 (defn db-dir           "Chat/KB/code Datahike file store (datahike makes it)." [] (path "db"))
 (defn worktrees-dir    "Git worktrees container (git makes <branch> under it)." [] (dir "worktrees"))
 (defn workspace-dir    "Agent code workspace — a dedicated git repo, the SCI sandbox's load root." [] (dir "workspace"))
+(defn workspace-store  "Fallback Geschichte repository store (Datahike creates it)." [] (path "geschichte-workspace"))
 (defn system-db-dir    "System DB store: registry of parties/systems/rooms/grants (datahike makes it)." [] (path "system-db"))
 (defn systems-dir      "Per-system store container (each KB/repo scope gets a child under it)." [] (dir "systems"))
 (defn transcripts-dir  "Intake transcript cache (files under it)." [] (dir "transcripts"))

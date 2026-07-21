@@ -10,6 +10,7 @@
             [dvergr.code.index :as idx]
             [dvergr.tools.structural :as structural]
             [dvergr.chat.compaction :as compaction]
+            [muschel.fs :as mfs]
             [org.replikativ.spindel.engine.core :as rtc])
   (:import [java.util.concurrent TimeUnit]))
 
@@ -131,6 +132,15 @@
 ;; role lattice. A "role" is therefore just a reusable tool-set you name in agent
 ;; config (plain data), should you want one.
 
+(defn- resolve-default-workspace []
+  (try
+    (when-let [workspace ((requiring-resolve
+                           'dvergr.substrate.geschichte/current-workspace))]
+      {:workspace workspace
+       :filesystem ((requiring-resolve 'dvergr.substrate.geschichte/filesystem)
+                    workspace)})
+    (catch Throwable _ nil)))
+
 (defn- resolve-default-cwd
   "Working directory for tool calls when none is supplied. Priority:
 
@@ -141,7 +151,8 @@
 
    Failures (no ctx bound, no git system) fall through silently."
   []
-  (or (try
+  (or (when (resolve-default-workspace) "/")
+      (try
         ((requiring-resolve 'dvergr.substrate.git/current-worktree-path))
         (catch Throwable _ nil))
       ;; no git system in scope → the isolated .dvergr/workspace clone, NEVER the
@@ -166,16 +177,72 @@
                       When :native, clojure_eval uses real Clojure eval instead of SCI
    - :eval-ns       - Atom holding current namespace for native eval (default: user)
    - :execution-ctx - Spindel execution context (for spawn_agent tool)"
-  [{:keys [cwd sci-ctx db-conn chat-ctx tools isolation eval-ns execution-ctx]}]
-  {:cwd (or cwd (resolve-default-cwd))
-   :sci-ctx sci-ctx
-   :db-conn db-conn
-   :chat-ctx chat-ctx
-   :tools tools  ; Authoritative tool allowlist (see execute); nil = unrestricted
-   :isolation isolation
-   :eval-ns (or eval-ns (atom (the-ns 'user)))
-   :execution-ctx execution-ctx
-   :abort (atom false)})
+  [{:keys [cwd workspace filesystem sci-ctx db-conn chat-ctx tools isolation
+           eval-ns execution-ctx] :as options}]
+  (let [virtual (when-not (or workspace filesystem)
+                  (resolve-default-workspace))]
+    (merge options
+           {:cwd (or cwd (when (or filesystem virtual) "/") (resolve-default-cwd))
+            :workspace (or workspace (:workspace virtual))
+            :filesystem (or filesystem (:filesystem virtual))
+            :sci-ctx sci-ctx
+            :db-conn db-conn
+            :chat-ctx chat-ctx
+            :tools tools  ; Authoritative tool allowlist (see execute); nil = unrestricted
+            :isolation isolation
+            :eval-ns (or eval-ns (atom (the-ns 'user)))
+            :execution-ctx execution-ctx
+            :abort (or (:abort options) (atom false))})))
+
+(defn- tool-path [{:keys [filesystem cwd]} path]
+  (if filesystem
+    (or (mfs/resolve filesystem
+                     (if (str/starts-with? (str path) "/")
+                       path
+                       (str (str/replace (or cwd "/") #"/$" "") "/" path)))
+        (throw (ex-info "Path escapes the virtual workspace" {:path path})))
+    (str (if (fs/absolute? path) (fs/file path) (fs/file cwd path)))))
+
+(defn- workspace-read [ctx path]
+  (let [path (tool-path ctx path)]
+    (if-let [filesystem (:filesystem ctx)]
+      (mfs/read-file filesystem path)
+      (slurp path))))
+
+(defn- workspace-write! [ctx path content]
+  (let [path (tool-path ctx path)]
+    (if-let [filesystem (:filesystem ctx)]
+      (do
+        (loop [parent (subs path 0 (max 1 (.lastIndexOf ^String path "/")))
+               pending []]
+          (if (or (= parent "/") (mfs/exists? filesystem parent))
+            (doseq [directory (reverse pending)] (mfs/mkdir filesystem directory))
+            (recur (subs parent 0 (max 1 (.lastIndexOf ^String parent "/")))
+                   (conj pending parent))))
+        (mfs/write-string! filesystem path (str content) false))
+      (do (fs/create-dirs (fs/parent path)) (spit path content)))
+    path))
+
+(defn- virtual-walk [filesystem root]
+  (letfn [(walk [path]
+            (cons path
+                  (when (= :dir (:type (mfs/stat filesystem path)))
+                    (mapcat #(walk (str (str/replace path #"/$" "") "/" (:name %)))
+                            (mfs/list-dir filesystem path)))))]
+    (walk root)))
+
+(defn- workspace-glob [{:keys [filesystem cwd]} pattern]
+  (if filesystem
+    (let [root (tool-path {:filesystem filesystem :cwd cwd} ".")
+          prefix (str (str/replace root #"/$" "") "/")
+          matcher (.getPathMatcher (java.nio.file.FileSystems/getDefault)
+                                   (str "glob:" pattern))]
+      (->> (virtual-walk filesystem root)
+           (remove #{root})
+           (map #(if (str/starts-with? % prefix) (subs % (count prefix)) %))
+           (filter #(.matches matcher (java.nio.file.Paths/get % (make-array String 0))))
+           vec))
+    (fs/glob cwd pattern)))
 
 (defn execute
   "Execute a tool by name with given input and context.
@@ -265,19 +332,22 @@
                :properties {:path {:type "string"
                                    :description "The absolute or relative path to the file"}}
                :required ["path"]}
-  :execute (fn [{:keys [path]} {:keys [cwd]}]
-             (let [file (if (fs/absolute? path)
-                          (fs/file path)
-                          (fs/file cwd path))]
-               (if (fs/exists? file)
-                 (if (fs/directory? file)
+  :execute (fn [{:keys [path]} ctx]
+             (let [file (tool-path ctx path)
+                   stat (if-let [filesystem (:filesystem ctx)]
+                          (mfs/stat filesystem file)
+                          (when (fs/exists? file)
+                            {:type (if (fs/directory? file) :dir :file)
+                             :size (fs/size file)}))]
+               (if stat
+                 (if (= :dir (:type stat))
                    {:type :error
                     :error (str "Path is a directory, not a file: " path)
                     :suggestion "Use glob to list directory contents"}
                    {:type :success
-                    :content (slurp file)
+                    :content (workspace-read ctx path)
                     :metadata {:path (str file)
-                               :size (fs/size file)}})
+                               :size (:size stat)}})
                  {:type :error
                   :error (str "File not found: " path)
                   :suggestion "Check if the path is correct. Use glob to find files."})))})
@@ -291,12 +361,8 @@
                             :content {:type "string"
                                       :description "The content to write"}}
                :required ["path" "content"]}
-  :execute (fn [{:keys [path content]} {:keys [cwd session-id]}]
-             (let [file (if (fs/absolute? path)
-                          (fs/file path)
-                          (fs/file cwd path))]
-               (fs/create-dirs (fs/parent file))
-               (spit file content)
+  :execute (fn [{:keys [path content]} {:keys [session-id] :as ctx}]
+             (let [file (workspace-write! ctx path content)]
                 ;; Auto-index if Clojure file
                (index-file-if-clojure! file content session-id)
                {:type :success
@@ -315,12 +381,13 @@
                             :new_string {:type "string"
                                          :description "The replacement string"}}
                :required ["path" "old_string" "new_string"]}
-  :execute (fn [{:keys [path old_string new_string]} {:keys [cwd session-id]}]
-             (let [file (if (fs/absolute? path)
-                          (fs/file path)
-                          (fs/file cwd path))]
-               (if (fs/exists? file)
-                 (let [content (slurp file)
+  :execute (fn [{:keys [path old_string new_string]} {:keys [session-id] :as ctx}]
+             (let [file (tool-path ctx path)
+                   exists? (if-let [filesystem (:filesystem ctx)]
+                             (mfs/exists? filesystem file)
+                             (fs/exists? file))]
+               (if exists?
+                 (let [content (workspace-read ctx path)
                        occurrences (count (re-seq (re-pattern (java.util.regex.Pattern/quote old_string)) content))]
                    (cond
                      (zero? occurrences)
@@ -335,7 +402,7 @@
 
                      :else
                      (let [new-content (str/replace-first content old_string new_string)]
-                       (spit file new-content)
+                       (workspace-write! ctx path new-content)
                         ;; Auto-index if Clojure file
                        (index-file-if-clojure! file new-content session-id)
                        {:type :success
@@ -353,8 +420,8 @@
                :properties {:pattern {:type "string"
                                       :description "Glob pattern (e.g., '**/*.clj', 'src/*.md')"}}
                :required ["pattern"]}
-  :execute (fn [{:keys [pattern]} {:keys [cwd]}]
-             (let [matches (fs/glob cwd pattern)]
+  :execute (fn [{:keys [pattern]} ctx]
+             (let [matches (workspace-glob ctx pattern)]
                {:type :success
                 :content (str/join "\n" (map str matches))
                 :metadata {:count (count matches)
@@ -377,22 +444,37 @@
                             :-i {:type "boolean"
                                  :description "Case-insensitive search"}}
                :required ["pattern"]}
-  :execute (fn [{:keys [pattern glob -i]} {:keys [cwd]}]
-             (let [cmd (cond-> ["grep" "-rn" "--color=never"]
-                         -i (conj "-i")
-                         true (conj pattern ".")
-                         glob (into ["--include" glob]))
-                   pb (ProcessBuilder. cmd)
-                   _ (.directory pb (io/file cwd))
-                   proc (.start pb)
-                   stdout (slurp (.getInputStream proc))
-                   _ (.waitFor proc)]
-               {:type :success
-                :content (if (str/blank? stdout)
-                           "No matches found"
-                           stdout)
-                :metadata {:pattern pattern
-                           :matches (count (str/split-lines stdout))}}))})
+  :execute (fn [{:keys [pattern glob -i]} {:keys [cwd filesystem] :as ctx}]
+             (if filesystem
+               (let [flags (if -i java.util.regex.Pattern/CASE_INSENSITIVE 0)
+                     re (java.util.regex.Pattern/compile pattern flags)
+                     paths (workspace-glob ctx (or glob "**"))
+                     lines (for [path paths
+                                 :when (= :file (:type (mfs/stat filesystem
+                                                                 (tool-path ctx path))))
+                                 [line-number line] (map-indexed vector
+                                                                 (str/split-lines
+                                                                  (workspace-read ctx path)))
+                                 :when (.find (.matcher re line))]
+                             (str path ":" (inc line-number) ":" line))]
+                 {:type :success
+                  :content (if (seq lines) (str/join "\n" lines) "No matches found")
+                  :metadata {:pattern pattern :matches (count lines)}})
+               (let [cmd (cond-> ["grep" "-rn" "--color=never"]
+                           -i (conj "-i")
+                           true (conj pattern ".")
+                           glob (into ["--include" glob]))
+                     pb (ProcessBuilder. cmd)
+                     _ (.directory pb (io/file cwd))
+                     proc (.start pb)
+                     stdout (slurp (.getInputStream proc))
+                     _ (.waitFor proc)]
+                 {:type :success
+                  :content (if (str/blank? stdout)
+                             "No matches found"
+                             stdout)
+                  :metadata {:pattern pattern
+                             :matches (count (str/split-lines stdout))}})))})
 
 (defn- native-eval
   "Evaluate Clojure code natively (not in SCI sandbox).
@@ -665,15 +747,20 @@
                             :new_source {:type "string"
                                          :description "New Clojure source code"}}
                :required ["file_path" "form_type" "form_name" "operation" "new_source"]}
-  :execute (fn [{:keys [file_path form_type form_name operation new_source]} {:keys [cwd session-id]}]
-             (let [full-path (if (fs/absolute? file_path)
-                               file_path
-                               (str cwd "/" file_path))
+  :execute (fn [{:keys [file_path form_type form_name operation new_source]}
+                {:keys [session-id] :as ctx}]
+             (let [full-path (tool-path ctx file_path)
                    op-keyword (keyword operation)
-                   result (structural/edit-clojure-form full-path form_type form_name op-keyword new_source)]
+                   result (if (:filesystem ctx)
+                            (if-let [source (workspace-read ctx file_path)]
+                              (structural/edit-clojure-source source form_type form_name
+                                                              op-keyword new_source)
+                              {:success false :error (str "File not found: " file_path)})
+                            (structural/edit-clojure-form full-path form_type form_name
+                                                          op-keyword new_source))]
                (if (:success result)
                  (do
-                   (spit full-path (:content result))
+                   (workspace-write! ctx file_path (:content result))
                     ;; Auto-index (always Clojure file)
                    (index-file-if-clojure! full-path (:content result) session-id)
                    {:type :success

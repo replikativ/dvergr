@@ -58,7 +58,7 @@
         ;; `all`/`read` see skills the room itself defines (highest precedence)
         ;; and `author!`/`promote!` write into the room's own repo.
         room-dir    (fn [] (try ((requiring-resolve
-                                  'dvergr.substrate.git/current-worktree-path))
+                                  'dvergr.sandbox.workspace/workspace-root))
                                 (catch Throwable _ nil)))]
     (sci/add-namespace! sci-ctx 'dvergr.skills
                         {'all       (fn [] (load-all* (room-dir)))
@@ -89,8 +89,8 @@
                                         (throw (ex-info "skills/lift! needs a room sandbox repo (no room ctx bound)" {}))))
                          ;; Promote a room skill to vetted (reviewer action).
                          'promote!  (fn [skill-name by date]
-                                      (if-let [path (:path (get (load-all* (room-dir)) (str skill-name)))]
-                                        (do (promote* path (str by) (str date)) true)
+                                      (if-let [definition (get (load-all* (room-dir)) (str skill-name))]
+                                        (do (promote* definition (str by) (str date)) true)
                                         (throw (ex-info (str "no such skill to promote: " skill-name) {}))))})))
 
 (defn add-actors-ns!
@@ -242,5 +242,4 @@
                          'create   (fn [cfg] (sched-create (room!) cfg))
                          'cancel   (fn [id] (sched-cancel (room!) id))
                          'list     (fn [] (sched-list (room!)))})))
-
 

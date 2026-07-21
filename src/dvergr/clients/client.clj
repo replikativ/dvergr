@@ -77,7 +77,8 @@
    peer-bus + git — and register it as current-daemon so every `c/*` fn drives it.
    Idempotent. Returns :attached | :booted-lite.
 
-   Lite options: :worktrees-dir (default .dvergr/worktrees)."
+   `:worktrees-dir` is accepted as a legacy no-op; workspaces are virtual
+   Datahike branches."
   [& {:keys [worktrees-dir]
       :or {worktrees-dir ".dvergr/worktrees"}}]
   (if @daemon/current-daemon
@@ -222,7 +223,7 @@
   "The git diff this fork has accumulated over its parent — {:branch :parent-branch
    :commits :stat}."
   [fork]
-  ((requiring-resolve 'dvergr.substrate.git/diff-since-fork) (:ctx fork)))
+  ((requiring-resolve 'dvergr.substrate.geschichte/diff-since-fork) (:ctx fork)))
 
 (defn merge!
   "Merge the fork into its parent (derived from the fork's :parent-id) — land it."

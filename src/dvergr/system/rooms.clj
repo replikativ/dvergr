@@ -24,7 +24,8 @@
             [dvergr.search.secondary :as search-secondary]
             [dvergr.scheduler.schema :as sched-schema]
             [dvergr.runtime.ctx :as rctx]
-            [dvergr.substrate.git :as git]
+            [dvergr.substrate.geschichte :as geschichte]
+            [geschichte.workspace :as gworkspace]
             [dvergr.substrate.paths :as paths]
             [dvergr.substrate.datahike :as sdh]
             [org.replikativ.spindel.yggdrasil :as ygg]
@@ -52,15 +53,40 @@
 
 (defn- scope-path [scope] (str (io/file (paths/systems-dir) scope)))
 
+(defn store-id
+  "Konserve store id for a room store `path`. Deterministic in the path, so the
+   id is stable across restarts and derivable without touching the store.
+
+   Public because it is the konserve-sync SCOPE: a consumer that collapses its
+   own per-room database onto the room store (simmis binds
+   `:room/content-db-scope` to it) must name the same store the writer uses, and
+   must not re-derive the formula on its own."
+  [path]
+  (java.util.UUID/nameUUIDFromBytes (.getBytes ^String path)))
+
 (defn- store-cfg [path]
   ;; keep-history? true so the store can branch with its room (fork/merge).
-  {:store {:backend :file :path path
-           :id (java.util.UUID/nameUUIDFromBytes (.getBytes ^String path))}
+  {:store {:backend :file :path path :id (store-id path)}
    :keep-history? true
    :schema-flexibility :write})
 
 (def ^:private kb-cfg store-cfg)
-(def ^:private msgs-cfg store-cfg)
+
+(defn- msgs-cfg
+  "The ROOM store — the survivor of the per-room store collapse, so it is where the
+   kontor book comes to live. That requires `:crypto-hash? true`, and datahike fixes
+   it at CREATION: `ensure-stored-config-consistency` adopts/consistency-checks the
+   STORED config on connect, so an existing store can never adopt it — enabling it
+   later means re-creating rooms. datahike also rejects `:crypto-hash?` together with
+   `:commit-graph? false` (the audit chain verifies the persisted commit chain), so
+   both flags go on together.
+
+   Only this store gets them. Crypto-hash makes each index-node address a content
+   hash, which disables locality squuids and address reuse, so the KB and agent
+   `:data` stores keep the cheaper layout — they hold no sealed financial records."
+  [path]
+  (assoc (store-cfg path) :crypto-hash? true :commit-graph? true))
+
 (def ^:private data-cfg store-cfg)
 
 (defn- connect-data-store
@@ -123,8 +149,8 @@
                    :system-name (msgs-system-name msgs-path)})
   (sdh/provision! {:cfg (kb-cfg kb-path) :schema? false
                    :system-name (kb-system-name kb-path)})
-  (ygg/register! (git/create-git-system :repo-path repo-path
-                                        :system-name (repo-system-name repo-path))))
+  (ygg/register! (geschichte/create-system :scope repo-path
+                                           :system-name (repo-system-name repo-path))))
 
 (defn- register-system-into-current!
   "Register one registry system (`{:system/type :system/scope}`) into the bound
@@ -136,8 +162,8 @@
                              :system-name (msgs-system-name scope)})
       :kb   (sdh/provision! {:cfg (kb-cfg scope) :schema? false
                              :system-name (kb-system-name scope)})
-      :repo (ygg/register! (git/create-git-system :repo-path scope
-                                                  :system-name (repo-system-name scope)))
+      :repo (ygg/register! (geschichte/create-system :scope scope
+                                                     :system-name (repo-system-name scope)))
       ;; agent-created data DBs (see create-room-db!) — re-register so they survive
       ;; restart, same as the room's own KB/msgs. Custom connect (schema-flexibility
       ;; fallback), so pass the conn; never impose dvergr schema on agent stores.
@@ -191,7 +217,7 @@
       (let [repo-path (scope-path (str (random-uuid)))
             kb-path   (scope-path (str (random-uuid)))
             msgs-path (scope-path (str (random-uuid)))
-            _         (git/ensure-repo! repo-path)
+            _         (geschichte/ensure-repository! repo-path)
             ;; KB store carries ONLY the knowledge schema (not the chat schema).
             _         (sdh/provision! {:cfg (kb-cfg kb-path) :schema? false
                                        :extra-schema (kbs/knowledge-datahike-schema)
@@ -250,13 +276,25 @@
   [room-id]
   (resolve-type room-id :msgs))
 
+(defn room-msgs-path
+  "Filesystem path of a room's OWN (writable) messages store, or nil."
+  [room-id]
+  (some->> (room-msgs room-id)
+           (filter #(#{:owner :read-write} (:permission %)))
+           first :path))
+
+(defn room-msgs-store-id
+  "Konserve store id of a room's OWN messages store — the sync scope a consumer
+   binds to when it collapses its per-room database onto the room store. nil if
+   the room isn't provisioned."
+  [room-id]
+  (some-> (room-msgs-path room-id) store-id))
+
 (defn room-msgs-conn
   "Fork-aware conn to a room's OWN messages store — where the room store writes
    conversation. nil if the room isn't provisioned / not registered in this ctx."
   [room-id]
-  (some->> (room-msgs room-id)
-           (filter #(#{:owner :read-write} (:permission %)))
-           first :path msgs-system-name ygg/system :conn))
+  (some-> (room-msgs-path room-id) msgs-system-name ygg/system :conn))
 
 (defn msgs-conn-for-slug
   "Fork-aware conn to the OWN messages store of the system-DB room with `slug`,
@@ -336,25 +374,27 @@
           conn))))
 
 (defn gc-orphan-fork-branches!
-  "Boot-time GC for abandoned fork worktrees/branches (P3). Fork rooms are in-memory
-   only — none survive a daemon restart — so on boot EVERY fork branch (`*-fork-*`,
-   from spindel's `<branch>-<fork-id>` naming) is an orphan with no live handle.
-   Prune them per room repo via the yggdrasil git adapter, reclaiming the leaked
-   worktree dirs + branches. Returns the total count pruned. Best-effort per room.
-   (Datahike fork-branch GC is a separate follow-up; git worktrees are the big leak.)
-   Must run under a bound ctx whose rooms are hydrated."
+  "Boot-time GC for abandoned virtual Geschichte workspace branches. Room forks
+  are in-memory and do not survive restart, so every non-canonical Datahike
+  workspace branch is orphaned after hydration."
   []
-  (let [prune (requiring-resolve 'yggdrasil.adapters.git/prune-orphan-branches!)
-        fork? (fn [b] (re-find #"-fork-" (str b)))]
-    (reduce
-     (fn [n {:room/keys [id]}]
-       (binding [ec/*execution-context* (or (room-ctx-for id) (ec/current-execution-context))]
-         (+ n (reduce (fn [m {:keys [path]}]
-                        (if-let [sys (ygg/system (repo-system-name path))]
-                          (+ m (count (try (prune sys fork?) (catch Throwable _ nil))))
-                          m))
-                      0 (room-repos id)))))
-     0 (sdb/all-rooms))))
+  (reduce
+   (fn [n {:room/keys [id]}]
+     (binding [ec/*execution-context* (or (room-ctx-for id)
+                                          (ec/current-execution-context))]
+       (+ n
+          (reduce
+           (fn [m {:keys [path]}]
+             (if-let [system (ygg/system (repo-system-name path))]
+               (let [conn (geschichte/gy-connection system)
+                     branches (gworkspace/list conn)]
+                 (doseq [branch branches]
+                   (try (gworkspace/remove! conn branch)
+                        (catch Throwable _ nil)))
+                 (+ m (count branches)))
+               m))
+           0 (room-repos id)))))
+   0 (sdb/all-rooms)))
 
 (defn gc-stores!
   "Reclaim unreachable storage across EVERY persistent store: the system-db plus
@@ -446,12 +486,20 @@
               (room-msgs room-id)))))
 
 (defn room-load-roots
-  "Ordered repo WORKTREES (fork-aware) for the SCI load-fn — own first, attached
-   after. Bind `dvergr.sandbox.workspace/*workspace-roots*` to this for a turn."
+  "Ordered virtual Geschichte roots for the SCI load-fn — own first, attached
+  after. Each descriptor is fork-aware and contains a Muschel FS, not a host
+  filesystem path."
   [room-id]
   (->> (room-repos room-id)
        (keep (fn [{:keys [path]}]
-               (some-> (ygg/system (repo-system-name path)) git/worktree-path)))
+               (when-let [system (ygg/system (repo-system-name path))]
+                 (let [conn (geschichte/gy-connection system)]
+                   {:id (geschichte/gy-workspace-id system)
+                    :root "/"
+                    :fs (geschichte/filesystem
+                         {:system system :conn conn
+                          :id (geschichte/gy-workspace-id system)
+                          :repository {:conn conn :config (:config @conn)}})}))))
        vec))
 
 (defn roots-for-slug
@@ -468,13 +516,18 @@
     (room-kb-conn (:room/id r))))
 
 (defn room-mount-spec
-  "muschel composite-fs mount data for a room: `[[mount-path worktree read-only?] …]`,
-   own repo first; `:read` grants mounted read-only. Fork-aware worktrees via ygg."
+  "Virtual Geschichte mount data for attached room repositories."
   [room-id]
   (->> (room-repos room-id)
        (keep (fn [{:keys [slug path permission]}]
-               (when-let [wt (some-> (ygg/system (repo-system-name path)) git/worktree-path)]
-                 [(str "/" slug) wt (= permission :read)])))
+               (when-let [system (ygg/system (repo-system-name path))]
+                 [(str "/" slug)
+                  (geschichte/filesystem
+                   (let [conn (geschichte/gy-connection system)]
+                     {:system system :conn conn
+                      :id (geschichte/gy-workspace-id system)
+                      :repository {:conn conn :config (:config @conn)}}))
+                  (= permission :read)])))
        vec))
 
 (defn- delete-tree! [path]
@@ -497,6 +550,7 @@
       (doseq [{:system/keys [type scope]} owned]
         (case type
           :repo (do (ygg/unregister! (repo-system-name scope))
+                    (geschichte/delete-repository! scope)
                     (delete-tree! scope))
           :kb   (do (ygg/unregister! (kb-system-name scope))
                     (try (when (d/database-exists? (kb-cfg scope))

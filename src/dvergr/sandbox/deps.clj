@@ -31,7 +31,9 @@
    (a vector of regex patterns); install via `set-allowlist!`."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
+            [clojure.string :as str]
             [dvergr.sandbox.workspace :as workspace]
+            [muschel.fs :as mfs]
             [dvergr.runtime.peer-bus :as peer-bus]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
@@ -465,9 +467,14 @@
    parsed EDN map, or nil if the file is missing / unreadable."
   [worktree]
   (try
-    (let [f (io/file worktree "deps.edn")]
-      (when (and (.exists f) (.canRead f))
-        (edn/read-string (slurp f))))
+    (if (workspace/virtual-root? worktree)
+      (some-> (mfs/read-file (:fs worktree)
+                             (str (str/replace (:root worktree) #"/$" "")
+                                  "/deps.edn"))
+              edn/read-string)
+      (let [f (io/file worktree "deps.edn")]
+        (when (and (.exists f) (.canRead f))
+          (edn/read-string (slurp f)))))
     (catch Throwable t
       (tel/log! {:level :warn :id :sandbox.deps/deps-edn-read-failed
                  :data {:worktree worktree :error (.getMessage t)}})
@@ -499,9 +506,7 @@
    ({:status :loaded :coords ... :namespaces ...}), or
    {:status :no-changes :reason ...} when there's nothing to do."
   [sci-ctx]
-  (require 'dvergr.substrate.git)
-  (let [worktree (or ((requiring-resolve 'dvergr.substrate.git/current-worktree-path))
-                     (System/getProperty "user.dir"))
+  (let [worktree (workspace/workspace-root)
         deps-map (read-deps-edn worktree)]
     (cond
       (nil? deps-map)
@@ -524,4 +529,3 @@
                               :candidate-count (count candidates)}}
                       "sync-deps reading worktree deps.edn")
             (add-libs! sci-ctx candidates)))))))
-

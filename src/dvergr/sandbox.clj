@@ -846,6 +846,12 @@
   [sci-ctx spindel-ctx & {:keys [base-path proc-allow allowed-http-domains room-conn kb-conn room-id]
                           :or   {proc-allow #{}}}]
   (let [audit-log  (make-audit-log)
+        workspace  (binding [rtc/*execution-context* spindel-ctx]
+                     (try ((requiring-resolve 'dvergr.substrate.geschichte/current-workspace))
+                          (catch Throwable _ nil)))
+        filesystem (when workspace
+                     ((requiring-resolve 'dvergr.substrate.geschichte/filesystem)
+                      workspace))
         ;; The agent's PROJECT is its room's OWN git repo (a per-room yggdrasil git
         ;; system), not the daemon's cwd. Default `fs`/`git`/`proc` (and so the
         ;; `require` workspace) to that worktree — resolved fork-aware under the
@@ -855,9 +861,7 @@
         ;; ctxs: sidecar/tests, or the bare root room) we fall back to the isolated
         ;; `.dvergr/workspace` clone — NEVER the host cwd / dvergr source tree.
         cwd        (or base-path
-                       (binding [rtc/*execution-context* spindel-ctx]
-                         (try ((requiring-resolve 'dvergr.substrate.git/current-worktree-path))
-                              (catch Throwable _ nil)))
+                       (when workspace "/")
                        ((requiring-resolve 'dvergr.substrate.git/safe-workspace-root)))]
     (binding [rtc/*execution-context* spindel-ctx]
       ;; The agent's DATA lives in ITS room (fork-aware) — `*room*` = the room's own
@@ -883,9 +887,11 @@
     (ns-data/add-spindel-extras-ns! sci-ctx spindel-ctx)
     (ns-codec/add-codec-namespaces! sci-ctx)   ; cheshire.core / clojure.data.xml / dvergr.codec
     (ns-intake/add-intake-namespaces! sci-ctx)
-    (ns-io/add-fs-ns!   sci-ctx :base-path cwd :audit-log audit-log)
+    (ns-io/add-fs-ns!   sci-ctx :base-path cwd :filesystem filesystem
+                        :audit-log audit-log)
     ;; (proc folded into the muschel-backed babashka.process — add-bash-ns! in turn.clj)
-    (ns-io/add-git-ns!  sci-ctx :base-path cwd :audit-log audit-log)
+    (ns-io/add-git-ns!  sci-ctx :base-path cwd :workspace workspace
+                        :audit-log audit-log)
     (ns-kb/add-llm-ns!  sci-ctx)
     ;; Boundary secret injection (doc/boundary-secret-injection.md): build the
     ;; host-side secret registry from config `:secrets` (resolved against the host

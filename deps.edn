@@ -56,11 +56,16 @@
         ;; (jobs, cd, env) for free.
         org.replikativ/muschel     {:mvn/version "0.2.17"}
 
+        ;; Geschichte — authoritative virtual filesystem + Git compatibility.
+        ;; Released coordinate — 0.1.10 carries code-search (#6) + the native-release
+        ;; CI fix (#5); no local root needed.
+        org.replikativ/geschichte  {:mvn/version "0.1.10"}
+
         ;; rewrite-clj for structural editing
         rewrite-clj/rewrite-clj    {:mvn/version "1.1.48"}
 
         ;; Datahike — persistent Datalog storage
-        org.replikativ/datahike    {:mvn/version "0.8.1708"}
+        org.replikativ/datahike    {:mvn/version "0.8.1744"}
 
         ;; Yggdrasil — CoW branching for git and Datahike
         ;; 0.2.27 carries composite Mergeable diff + conflicts (PR #3).
@@ -76,9 +81,9 @@
         ;; Kabel — WebSocket peer-to-peer transport. 0.3.98 pins javac --release 11
         ;; (0.3.97 shipped Java-25 bytecode → UnsupportedClassVersionError on JDK <25).
         org.replikativ/kabel       {:mvn/version "0.3.98"}
-        org.replikativ/hasch       {:mvn/version "0.4.99"}
+        org.replikativ/hasch       {:mvn/version "0.4.101"}
         org.replikativ/incognito   {:mvn/version "0.3.69"}
-        org.replikativ/konserve    {:mvn/version "0.9.350"}
+        org.replikativ/konserve    {:mvn/version "0.9.363"}
         org.replikativ/kabel-auth  {:mvn/version "0.1.19"}
         org.replikativ/superv.async {:mvn/version "0.3.50"}
 

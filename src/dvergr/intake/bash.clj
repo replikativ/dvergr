@@ -41,6 +41,7 @@
    to be truly contained (PR #8 — yggdrasil git-worktree wiring)."
   (:require [clojure.string :as str]
             [dvergr.substrate.git :as dgit]
+            [dvergr.substrate.geschichte :as geschichte]
             [dvergr.agent.process :as dproc]
             [muschel.budget :as mbudget]
             [muschel.builtins.posix :as posix]
@@ -100,7 +101,7 @@
    pytest for a Python repo, cargo for a Rust crate). That choice
    belongs to the human running dvergr — not to a default that
    ships open."
-  #{"git"})
+  #{})
 
 ;; ---------------------------------------------------------------------------
 ;; git is the one allowlisted real-process fallback, and it runs UNJAILED (it
@@ -155,25 +156,18 @@
    "GIT_TERMINAL_PROMPT" "0"})
 
 (defn default-workspace
-  "Resolve the agent's workspace path.
+  "Resolve the agent's workspace.
 
    Priority:
-   1. The registered yggdrasil git system's current working-tree
-      path. When the surrounding execution context has been forked,
-      this is the **forked** worktree, so each fork's bash session
-      sees its own isolated FS root automatically — the whole
-      isolation story flows through this one lookup.
-   2. JVM cwd as a fallback for when no git system is registered
-      (e.g. unit tests, bare REPL).
+   1. The bound Geschichte workspace descriptor. A fork resolves to its own
+      Datahike branch while retaining the same logical Git branch name.
+   2. The isolated legacy workspace path for room-less tests/REPL use.
 
    Callers can still pass `:workspace` explicitly to `make-host` to
    override this."
   []
-  ;; current-worktree-path → current-execution-context THROWS when no ctx is bound
-  ;; (not nil), so guard it — else the documented fallback is unreachable.
-  (or (try (dgit/current-worktree-path) (catch Throwable _ nil))
-      ;; No git system in scope → the isolated `.dvergr/workspace` clone, NEVER the
-      ;; host JVM cwd (the dvergr source tree). The shell must not escape the sandbox.
+  (or (try (geschichte/current-workspace) (catch Throwable _ nil))
+      ;; Never use the daemon source checkout as a fallback.
       (dgit/safe-workspace-root)))
 
 ;; ---------------------------------------------------------------------------
@@ -251,11 +245,8 @@
 ;; ============================================================================
 
 ;; Host + session are cached in the chat-ctx's spindel state. The cache
-;; key is the workspace path — when a chat-ctx fork lands the
-;; execution context on a fresh git worktree, the new path becomes a
-;; cache miss and a host/session rooted at that worktree gets
-;; built. The parent's host stays alive under its own path, so future
-;; runs back in the parent context still resolve to its workspace.
+;; key is the Geschichte workspace id (or legacy fallback path). A fork's new
+;; Datahike branch gets its own host/session while the parent's remains cached.
 (defn- session-path [workspace] [:dvergr/bash-session workspace])
 (defn- host-path    [workspace] [:dvergr/bash-host workspace])
 
@@ -291,8 +282,9 @@
         (host/-spawn inner opts)))))
 
 (defn make-host
-  "Build a BuiltinHost wrapping a DiskFS rooted at `:workspace`. The real-process
-   fallback host is git-guarded (see `git-guarded-host`).
+  "Build a BuiltinHost rooted in a Geschichte workspace. A string `:workspace`
+  remains as a transitional test/runner projection, but the normal room path is
+  a virtual workspace descriptor and exposes no physical path.
 
    `:mount-at \"/\"` makes the workspace dir ITSELF the sandbox root (so sandbox
    `/` ↔ the worktree), rather than muschel's default `/home/agent` + `/tmp`
@@ -313,14 +305,22 @@
     :or {workspace          (default-workspace)
          fallback-allowlist default-fallback-allowlist
          builtins           posix/standard}}]
-  (let [fs (fs.disk/make workspace {:mount-at "/"})
-        fs (if (seq mounts)
-             (fs.mount/make fs mounts)
-             fs)]
-    (hb/make {:fs fs
-              :fallback-host (git-guarded-host (host.jvm/make))
+  (let [filesystem (if (map? workspace)
+                     (geschichte/filesystem workspace)
+                     (fs.disk/make workspace {:mount-at "/"}))
+        filesystem (if (seq mounts)
+                     (if (instance? muschel.fs.mount.MountFS filesystem)
+                       (do (doseq [[path child] mounts]
+                             (fs.mount/mount! filesystem path child
+                                              {:allow-nested? true}))
+                           filesystem)
+                       (fs.mount/make filesystem mounts))
+                     filesystem)]
+    (hb/make {:fs filesystem
+              :fallback-host (host.jvm/make)
               :builtins builtins
-              :fallback-allowlist fallback-allowlist})))
+              :fallback-allowlist fallback-allowlist
+              :geschichte (when (map? workspace) true)})))
 
 (defonce ^{:doc "Embedder hook: (fn [chat-ctx] {\"/drive\" <muschel FS>, …})
   or nil. Consulted once per host build (per workspace); errors are
@@ -350,14 +350,14 @@
    the agent never sees the daemon's API keys / tokens. The session's
    env-atom CoW-forks alongside the chat-ctx, so worker-side `cd` and
    `export` don't leak back into the parent's session — but only
-   within a single workspace; a fork onto a fresh worktree gets a
-   fresh session at that path.
+   within a single workspace; a fork gets a fresh session for its branch.
 
-   Stored under `[:dvergr/bash-session WORKSPACE-PATH]`."
+   Stored under `[:dvergr/bash-session WORKSPACE-ID]`."
   [chat-ctx]
   (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
     (let [ws (default-workspace)
-          path (session-path ws)]
+          key (if (map? ws) (:id ws) ws)
+          path (session-path key)]
       (or (ec/get-state path)
           ;; cwd is the SANDBOX root "/" (= the worktree via make-host's
           ;; :mount-at "/"); `ws` (the real path) stays only as the cache key.
@@ -373,7 +373,8 @@
   [chat-ctx]
   (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
     (let [ws (default-workspace)
-          path (host-path ws)]
+          key (if (map? ws) (:id ws) ws)
+          path (host-path key)]
       (or (ec/get-state path)
           (let [h (make-host {:workspace ws
                               :mounts (resolve-mounts chat-ctx)})]

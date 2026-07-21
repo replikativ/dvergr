@@ -47,7 +47,7 @@
             [dvergr.drive.integration :as drive-integration]
             [dvergr.rooms.subsystems :as subsystems]
             [dvergr.runtime.clock :as clock]
-            [dvergr.substrate.git :as git]
+            [dvergr.substrate.geschichte :as geschichte]
             ;; dvergr.web.server lives in src-clients/ and is loaded
             ;; opt-in via the :cli/:tui aliases. Use `web-server-fn`
             ;; below to resolve it lazily so the core daemon can boot
@@ -132,39 +132,34 @@
 ;; ============================================================================
 
 (defn create-shared-context
-  "Create a shared execution context with optional git + datahike systems
-   registered for fork-isolated agent work and persistent chat DB.
+  "Create a shared execution context with optional Geschichte + Datahike
+   systems registered for fork-isolated agent work and persistent chat data.
 
    Options:
-     :with-git?       — register git system for isolated agent worktrees
+     :with-git?       — register the Geschichte workspace system (legacy option
+                        name retained for callers)
                         (default true)
      :with-datahike?  — register Datahike system for the chat DB
                         (default true)
-     :repo-path       — git repo path (default cwd)
-     :worktrees-dir   — where to create worktrees (default: per-repo, derived by
-                        create-git-system so multiple repos in one composite
-                        don't collide on `<dir>/<branch>` when forked)
+     :repo-path       — Geschichte Datahike store path
+     :worktrees-dir   — ignored legacy option; virtual workspaces are Datahike
+                        branches and have no worktree directory
      :db-path         — datahike file-store path (default .dvergr/db)"
   [& {:keys [with-git? with-datahike? repo-path worktrees-dir db-path]
       :or {with-git?      true
            with-datahike? true
-           ;; The agent code workspace (.dvergr/workspace), NOT dvergr's own
-           ;; source tree — the sandbox forks this, not user.dir. Pass an
-           ;; explicit :repo-path to point a room at a user project instead.
-           ;; worktrees-dir left nil ⇒ create-git-system derives a PER-REPO dir.
-           repo-path      (paths/workspace-dir)}}]
+           ;; The authoritative agent workspace store, never dvergr's checkout.
+           repo-path      (paths/workspace-store)}}]
   (let [base-ctx (ctx/create-execution-context)]
     (binding [rtc/*execution-context* base-ctx]
       (when with-git?
         (try
-          ;; create-git-system auto-initialises the default .dvergr/workspace repo.
-          (ygg/register! (git/create-git-system
-                          :repo-path repo-path
-                          :worktrees-dir worktrees-dir))
+          ;; create-system initializes/imports the sandbox seed when necessary.
+          (ygg/register! (geschichte/create-system :scope repo-path))
           (catch Exception e
             (tel/log! {:level :warn :id :daemon/git-init-failed
                        :data {:error (.getMessage e)}}
-                      "Could not register git system"))))
+                      "Could not register Geschichte workspace system"))))
       ;; RF5 S4.3: the shared "dvergr-chat-db" datahike is GONE. The room registry
       ;; + identity live in the global system-db (dvergr.system.db); each room's
       ;; conversation + cost ledger live in its OWN per-room messages store. The
@@ -720,7 +715,7 @@
   ;; composite (forked + collided on the shared worktrees-dir). Room-less sandboxes
   ;; (sidecar/REPL) fall back to the `.dvergr/workspace` directory directly
   ;; (workspace-root), so we just keep that dir present.
-  (git/ensure-workspace-repo!)
+  (geschichte/ensure-repository! (paths/workspace-store))
   (let [exec-ctx       (create-shared-context :with-git? false
                                               :with-datahike? true
                                               :db-path (:db-path config))

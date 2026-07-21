@@ -3,10 +3,65 @@
    2026-06 security audit. (Replaces the original sandbox_shell_test.clj, which
    tested the pre-refactor fs/proc API and was stale since the project's first
    commit.)"
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [sci.core :as sci]
             [dvergr.sandbox.ns.io :as io]
-            [dvergr.intake.bash :as bash]))
+            [dvergr.intake.bash :as bash]
+            [dvergr.tools :as tools]
+            [muschel.fs :as mfs]
+            [muschel.fs.geschichte :as gfs]))
+
+(deftest structured-tools-use-the-virtual-workspace
+  (let [{:keys [conn close!] :as repository}
+        (gfs/memory-repository! {:name "structured-tools"})
+        filesystem (gfs/make-root repository)
+        ctx (tools/make-context {:cwd "/" :filesystem filesystem})]
+    (try
+      (is (= :success (:type (tools/execute "write_file"
+                                            {:path "src/demo.clj"
+                                             :content "(ns demo)\n(defn answer [] 41)\n"}
+                                            ctx))))
+      (is (= :success (:type (tools/execute "edit_file"
+                                            {:path "src/demo.clj"
+                                             :old_string "41" :new_string "42"}
+                                            ctx))))
+      (is (= :success (:type (tools/execute "clojure_edit"
+                                            {:file_path "src/demo.clj"
+                                             :form_type "defn" :form_name "answer"
+                                             :operation "replace"
+                                             :new_source "(defn answer [] :virtual)"}
+                                            ctx))))
+      (is (str/includes? (:content (tools/execute "read_file"
+                                                  {:path "src/demo.clj"} ctx))
+                         ":virtual"))
+      (is (= :file (:type (mfs/stat filesystem "/src/demo.clj"))))
+      (is (= :error (:type (tools/execute "read_file"
+                                          {:path "../../etc/passwd"} ctx))))
+      (finally (close!)))))
+
+(deftest sci-files-and-git-share-a-virtual-geschichte-workspace
+  (let [{:keys [conn close!] :as repository}
+        (gfs/memory-repository! {:name "sci-virtual"})
+        workspace {:conn conn :id [(get-in @conn [:config :store :id]) :db]
+                   :repository repository}
+        filesystem (gfs/make-root repository)
+        ctx (sci/init {})]
+    (try
+      (io/add-fs-ns! ctx :filesystem filesystem)
+      (io/add-git-ns! ctx :workspace workspace)
+      (is (= "src/demo.clj"
+             (sci/eval-string* ctx
+                               "(spit \"src/demo.clj\" \"(ns demo)\\n\")")))
+      (is (= "(ns demo)\n" (sci/eval-string* ctx "(slurp \"src/demo.clj\")")))
+      (is (= ["src/demo.clj"]
+             (sci/eval-string* ctx
+                               "(require '[babashka.fs :as fs]) (fs/glob \"**/*.clj\")")))
+      (is (= ["src/demo.clj"]
+             (:untracked (sci/eval-string* ctx "(git/status)"))))
+      (is (= :ok (sci/eval-string* ctx "(git/add \".\")")))
+      (is (string? (sci/eval-string* ctx "(git/commit \"SCI virtual\")")))
+      (finally (close!)))))
 
 (deftest sensitive-path-policy-blocks-secrets
   (testing "known-sensitive OS paths are rejected"

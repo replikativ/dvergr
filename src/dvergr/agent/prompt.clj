@@ -132,7 +132,7 @@
         ;; (nil at the daemon root / no room ctx → global skills only), so an
         ;; agent assembled within a room sees that room's own skills.
         room-dir (or room-dir
-                     (try ((requiring-resolve 'dvergr.substrate.git/current-worktree-path))
+                     (try ((requiring-resolve 'dvergr.sandbox.workspace/workspace-root))
                           (catch Throwable _ nil)))]
     (cond-> (skills/inject-skills
              (str discourse-preamble "\n\n---\n\n" base-prompt)

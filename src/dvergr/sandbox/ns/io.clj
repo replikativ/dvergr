@@ -6,7 +6,8 @@
   (:require [sci.core :as sci]
             [clojure.string :as str]
             [jsonista.core :as j]
-            [babashka.fs :as fs])
+            [babashka.fs :as fs]
+            [muschel.fs :as mfs])
   (:import [java.io File]))
 
 (declare fs-safe-resolve git-run* parse-porcelain-status parse-git-log)
@@ -199,7 +200,7 @@
         (throw (ex-info "HTTP request to internal/loopback address blocked (SSRF)"
                         {:url url :resolved (.getHostAddress addr)}))))))
 
-(defn add-fs-ns!
+(defn- add-physical-fs-ns!
   "Expose rich filesystem operations as 'fs namespace in SCI.
 
    Backed by babashka.fs. All user-supplied paths are canonicalised via
@@ -291,6 +292,153 @@
                                      (when-let [par (bb-parent f)] (bb-create-dirs par))
                                      (apply clojure.core/spit f content opts) (str f)))}}})))
 
+(defn- virtual-path [filesystem path]
+  (let [path (str path)]
+    (sensitive-path-policy path)
+    (or (mfs/resolve filesystem path)
+        (throw (ex-info "Invalid virtual filesystem path" {:path path})))))
+
+(defn- virtual-parent [path]
+  (let [i (.lastIndexOf ^String path "/")]
+    (cond (<= i 0) "/" :else (subs path 0 i))))
+
+(defn- virtual-mkdirs! [filesystem path]
+  (loop [path path pending []]
+    (if (mfs/exists? filesystem path)
+      (doseq [directory (reverse pending)]
+        (mfs/mkdir filesystem directory))
+      (recur (virtual-parent path) (conj pending path))))
+  path)
+
+(defn- virtual-walk [filesystem root]
+  (letfn [(walk [path]
+            (let [stat (mfs/stat filesystem path)]
+              (cons path
+                    (when (= :dir (:type stat))
+                      (mapcat #(walk (str (str/replace path #"/$" "")
+                                          "/" (:name %)))
+                              (mfs/list-dir filesystem path))))))]
+    (walk root)))
+
+(defn- virtual-write-bytes! [filesystem path bytes]
+  (when-let [sink (mfs/-open-sink filesystem path false)]
+    (if (instance? java.io.OutputStream sink)
+      (do (.write ^java.io.OutputStream sink ^bytes bytes)
+          (.close ^java.io.OutputStream sink)
+          true)
+      (throw (ex-info "Virtual filesystem sink does not accept binary content"
+                      {:path path})))))
+
+(defn- glob-regex [pattern]
+  (-> pattern
+      (str/replace "." "\\.")
+      (str/replace "**/" "\u0001")
+      (str/replace "**" "\u0002")
+      (str/replace "*" "\u0003")
+      (str/replace "?" "\u0004")
+      (str/replace "\u0001" "(?:.*/)?")
+      (str/replace "\u0002" ".*")
+      (str/replace "\u0003" "[^/]*")
+      (str/replace "\u0004" "[^/]")))
+
+(defn- add-virtual-fs-ns! [sci-ctx filesystem audit-log]
+  (let [resolve! #(virtual-path filesystem %)
+        relative #(str/replace % #"^/+" "")
+        stat-map (fn [path]
+                   (when-let [stat (mfs/stat filesystem path)]
+                     (assoc stat :path (relative path))))
+        delete-tree! (fn delete-tree! [path]
+                       (doseq [child (reverse (virtual-walk filesystem path))]
+                         (mfs/delete filesystem child))
+                       true)
+        copy-tree! (fn copy-tree! [source target]
+                     (let [stat (mfs/stat filesystem source)]
+                       (case (:type stat)
+                         :dir (do (virtual-mkdirs! filesystem target)
+                                  (doseq [entry (mfs/list-dir filesystem source)]
+                                    (copy-tree!
+                                     (str (str/replace source #"/$" "") "/" (:name entry))
+                                     (str (str/replace target #"/$" "") "/" (:name entry)))))
+                         :file (do (virtual-mkdirs! filesystem (virtual-parent target))
+                                   (virtual-write-bytes!
+                                    filesystem target
+                                    (mfs/read-bytes filesystem source)))
+                         nil)
+                       target))]
+    (letfn [(glob-paths [directory pattern]
+              (let [root (resolve! directory)
+                    matcher (re-pattern (str "^" (glob-regex (str pattern)) "$"))
+                    prefix (str (str/replace root #"/$" "") "/")]
+                (->> (virtual-walk filesystem root)
+                     (remove #{root})
+                     (map #(if (str/starts-with? % prefix)
+                             (subs % (count prefix)) %))
+                     (filter #(re-matches matcher %))
+                     vec)))]
+      (sci/add-namespace!
+       sci-ctx 'babashka.fs
+       {'list-dir (fn [directory & _]
+                    (let [path (resolve! directory)]
+                      (audit! audit-log :fs/ls {:path path})
+                      (mapv #(relative (str (str/replace path #"/$" "")
+                                            "/" (:name %)))
+                            (or (mfs/list-dir filesystem path) []))))
+        'glob (fn
+                ([pattern] (glob-paths "." pattern))
+                ([directory pattern & _] (glob-paths directory pattern)))
+        'exists? #(mfs/exists? filesystem (resolve! %))
+        'directory? #(= :dir (:type (mfs/stat filesystem (resolve! %))))
+        'regular-file? #(= :file (:type (mfs/stat filesystem (resolve! %))))
+        'sym-link? #(= :symlink (:type (mfs/stat filesystem (resolve! %))))
+        'size #(some-> (mfs/stat filesystem (resolve! %)) :size)
+        'last-modified-time #(str (or (:mtime-ms (mfs/stat filesystem (resolve! %))) 0))
+        'create-dir (fn [path] (let [path (resolve! path)] (mfs/mkdir filesystem path) (relative path)))
+        'create-dirs (fn [path] (relative (virtual-mkdirs! filesystem (resolve! path))))
+        'delete (fn [path] (mfs/delete filesystem (resolve! path)))
+        'delete-if-exists (fn [path] (let [path (resolve! path)]
+                                       (if (mfs/exists? filesystem path)
+                                         (mfs/delete filesystem path) false)))
+        'delete-tree (fn [path] (delete-tree! (resolve! path)))
+        'move (fn [source target & _]
+                (let [source (resolve! source) target (resolve! target)]
+                  (audit! audit-log :fs/move {:src source :dst target})
+                  (mfs/rename filesystem source target)
+                  (relative target)))
+        'copy (fn [source target & _]
+                (relative (copy-tree! (resolve! source) (resolve! target))))
+        'copy-tree (fn [source target & _]
+                     (relative (copy-tree! (resolve! source) (resolve! target))))
+        'parent (fn [path] (let [path (resolve! path)]
+                             (when-not (= path "/") (relative (virtual-parent path)))))
+        'file-name #(last (str/split (str %) #"/"))
+        'absolutize #(relative (resolve! %))
+        'canonicalize #(relative (resolve! %))
+        'stat #(stat-map (resolve! %))})
+      (sci/merge-opts
+       sci-ctx
+       {:namespaces
+        {'clojure.core
+         {'slurp (fn [path & _]
+                   (let [path (resolve! path)]
+                     (audit! audit-log :fs/read {:path path})
+                     (or (mfs/read-file filesystem path)
+                         (throw (ex-info "No such virtual file" {:path path})))))
+          'spit (fn [path content & options]
+                  (let [path (resolve! path)
+                        append? (boolean (:append (first options)))]
+                    (audit! audit-log :fs/write {:path path})
+                    (virtual-mkdirs! filesystem (virtual-parent path))
+                    (mfs/write-string! filesystem path (str content) append?)
+                    (relative path)))}}}))))
+
+(defn add-fs-ns!
+  "Expose a filesystem namespace backed by Muschel when `:filesystem` is
+  supplied; otherwise retain the transitional physical adapter."
+  [sci-ctx & {:keys [filesystem] :as options}]
+  (if filesystem
+    (add-virtual-fs-ns! sci-ctx filesystem (:audit-log options))
+    (apply add-physical-fs-ns! sci-ctx (mapcat identity options))))
+
 (defn add-git-ns!
   "Expose structured git operations as 'git namespace in SCI.
 
@@ -318,9 +466,17 @@
 
      (git/commit \"Add feature\")
      ;; => \"[main abc1234] Add feature\""
-  [sci-ctx & {:keys [base-path audit-log]
+  [sci-ctx & {:keys [base-path audit-log workspace]
               :or   {base-path ((requiring-resolve 'dvergr.substrate.git/safe-workspace-root))}}]
-  (let [run!      (fn [& args] (apply git-run* base-path args))
+  (let [run!      (if workspace
+                    (fn [& args]
+                      (let [result ((requiring-resolve
+                                     'dvergr.substrate.geschichte/execute-git)
+                                    workspace (vec args))]
+                        (if (zero? (:exit result))
+                          (:stdout result)
+                          (throw (ex-info (str/trim (:stderr result)) result)))))
+                    (fn [& args] (apply git-run* base-path args)))
 
         status-fn (fn []
                     (parse-porcelain-status
@@ -639,5 +795,3 @@
                   :message (str/trim (str msg))
                   :author  (str/trim (str author))
                   :date    (str/trim (str date))})))))
-
-
