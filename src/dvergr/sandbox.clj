@@ -681,8 +681,27 @@
   (->> (:namespaces @(:env sci-ctx))
        (filter (fn [[ns-sym _]] (interesting-ns? ns-sym)))
        (keep (fn [[ns-sym vars]]
-               (let [fns (->> (keys vars) (filter symbol?) (map str) sort vec)]
-                 (when (seq fns) {:ns (str ns-sym) :fns fns}))))
+               (let [fns  (->> (keys vars) (filter symbol?) (map str) sort vec)
+                     ;; Signatures too, not just names. `sci/copy-var` carries a
+                     ;; var's :doc and :arglists across (45 core vars already do),
+                     ;; but this fn used to take `(keys vars)` and throw the
+                     ;; VALUES away — so every one of those docstrings rendered
+                     ;; as nothing and an agent had no way to learn an arity
+                     ;; except by calling and reading the error. Keeping the
+                     ;; values is what makes documenting anything worthwhile.
+                     sigs (into (sorted-map)
+                                (keep (fn [[sym v]]
+                                        (when (symbol? sym)
+                                          (let [m (meta v)]
+                                            (when (or (:doc m) (:arglists m))
+                                              [(str sym)
+                                               (cond-> {}
+                                                 (:arglists m) (assoc :arglists (:arglists m))
+                                                 (:doc m) (assoc :doc (first (str/split-lines (str (:doc m))))))])))))
+                                vars)]
+                 (when (seq fns)
+                   (cond-> {:ns (str ns-sym) :fns fns}
+                     (seq sigs) (assoc :sigs sigs))))))
        (sort-by :ns)
        vec))
 
@@ -733,7 +752,16 @@
       (let [[purpose eg] (ns-guide n)]
         (str "`" n "`" (when purpose (str " — " purpose)) "\n"
              (when eg (str "e.g. " eg "\n"))
-             "fns: " (str/join " " (:fns entry)))))))
+             ;; Signatures when the vars carry them, names otherwise. An agent
+             ;; that can read an arity does not have to discover it by calling.
+             (if-let [sigs (seq (:sigs entry))]
+               (str/join "\n"
+                         (for [[sym {:keys [arglists doc]}] sigs]
+                           (str "  (" sym (when (seq arglists)
+                                            (str " " (str/join " | "
+                                                               (map #(str/join " " %) arglists))))
+                                ")" (when doc (str "  — " doc)))))
+               (str "fns: " (str/join " " (:fns entry)))))))))
 
 (def sandbox-prompt-pointer
   "System-prompt block teaching the agent how to use its `clojure_eval` sandbox
