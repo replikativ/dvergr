@@ -15,6 +15,26 @@
             [org.replikativ.spindel.yggdrasil :as ygg]
             [dvergr.chat.schema :as cschema]))
 
+(def diff-buf-size
+  "Content-only child diffs buffered into the ancestor, cutting stored-object
+   growth. Create-time-fixed and irreversible, so it applies to NEW stores only.
+   Lives here rather than next to a store config because EVERY dvergr store uses
+   the same value and `system.rooms` <-> `substrate.geschichte` cannot require
+   each other.
+
+   128, not the 256 the datahike-saas-starter uses: measured on a room-shaped
+   store over 2000 message transactions, 256 is past the knee — MORE disk than
+   128 (78 vs 57 MB) and slower (p50 13.4 vs 10.9 ms, p99 31.7 vs 17.1 ms). The
+   budget counts ENTRIES, not bytes, so datom-sized elements want a smaller
+   buffer than a blob-shaped workload.
+
+     diff-buf   disk     objects   p50      p99
+     0          320 MB   35355     25.1 ms  40.2 ms
+     32          57 MB   14210     10.8 ms  18.4 ms
+     128         57 MB   12697     10.9 ms  17.1 ms   <- knee
+     256         78 MB   12436     13.4 ms  31.7 ms"
+  128)
+
 (defn connect!
   "Connect to `cfg`, creating the database first when it doesn't exist.
    Plain create+connect — no schema, no registration. Returns the conn."

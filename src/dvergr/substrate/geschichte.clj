@@ -6,6 +6,7 @@
   trusted bootstrap import from `../dvergr-sandbox`; production bootstrap uses
   Geschichte smart HTTP directly."
   (:require [clojure.java.io :as io]
+            [dvergr.substrate.datahike :as sdh]
             [clojure.string :as str]
             [datahike.api :as d]
             [dvergr.substrate.paths :as paths]
@@ -46,11 +47,34 @@
              :path path
              :id (java.util.UUID/nameUUIDFromBytes
                   (.getBytes (str "dvergr-geschichte:" scope-path) "UTF-8"))}
-     :index-config {:diff-buf-size 256}
-     :fuse-index-roots? true
+     ;; 128, not 256 — measured knee on a room-shaped store; see
+     ;; `dvergr.substrate.datahike/diff-buf-size` for the table.
+     :index-config {:diff-buf-size sdh/diff-buf-size}
      :schema-flexibility :write
-     :keep-history? true
-     :commit-graph? true}))
+     ;; `:crypto-hash?` matches every other room store, so ONE mechanism
+     ;; (`datahike.audit/verify-chain`) verifies books, wiki, chat AND code.
+     ;; Geschichte needs it: its own hashing covers CONTENT only —
+     ;; `:geschichte.content/id` is a hash of the bytes, verified on read — while
+     ;; `:geschichte.commit/id` is a random uuid and refs are ordinary datoms. So
+     ;; repointing a path at other content, or rewriting commit parentage, is
+     ;; invisible to geschichte and visible only to datahike's merkle.
+     ;;
+     ;; It costs `:fuse-index-roots?`, which datahike disables under crypto-hash
+     ;; (measured: 296 -> 840 objects over 60 commits). Accepted because the
+     ;; object count matters most for a full-store sync handshake, and the
+     ;; roadmap is windowed partial loading rather than full handshakes.
+     :crypto-hash? true
+     :commit-graph? true
+     ;; The ONE flag that differs from the datom stores, and the reason is that
+     ;; Geschichte already implements history at a higher layer: its commit graph
+     ;; IS the version history, so datahike's temporal index is redundant here.
+     ;; Keeping it would be actively harmful — under `:keep-history? true` a
+     ;; retracted store-ref survives in the temporal AEVT and keeps its blob
+     ;; whitelisted forever, so deleted files and media could NEVER be reclaimed
+     ;; (measured: 10 MB retracted -> 10 MB retained; with history off the same
+     ;; test freed 10.57 MB -> 0.017 MB). Repos hold media; unbounded growth is
+     ;; not a trade worth making for a redundant index.
+     :keep-history? false}))
 
 (defn- fallback-workspace! [conn source error]
   (tel/log! {:level :warn :id :workspace/seed-clone-failed

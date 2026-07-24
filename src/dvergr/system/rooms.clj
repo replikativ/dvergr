@@ -64,28 +64,46 @@
   [path]
   (java.util.UUID/nameUUIDFromBytes (.getBytes ^String path)))
 
-(defn- store-cfg [path]
-  ;; keep-history? true so the store can branch with its room (fork/merge).
+(defn- store-cfg
+  "ONE config for every datom store a room owns — messages, KB, agent `:data`.
+   Uniform on purpose: any of them may grow to hold any combination of a room's
+   content, so none of them may be missing a create-time-fixed flag that a later
+   use would need.
+
+   `:crypto-hash? true` makes every index-node address a content hash and every
+   commit-id a UUID-5 over the merkle roots, so `datahike.audit/verify-chain`
+   can verify the store end to end. That is what makes a room's books — and its
+   wiki, chat and code — tamper-evident under one mechanism.
+
+   datahike REQUIRES `:commit-graph? true` alongside it (the audit chain verifies
+   the persisted commit chain), and the commit graph is also what
+   `datahike.versioning/branch-history` walks, so fork/merge ancestry comes from
+   here. (There is no `:branch-history?` option in datahike — a config carrying
+   one is silently ignoring it.)
+
+   `:keep-history? true` is for the PRODUCT's history: wiki edits, chat, ledger
+   rows. It is NOT needed for branching, contrary to what this comment used to
+   claim — `d/branch!` needs commit records, not temporal indices.
+
+   All of these are fixed at CREATION: `ensure-stored-config-consistency`
+   consistency-checks the STORED config on connect, so an existing store can
+   never adopt one. Changing anything here means re-creating rooms."
+  [path]
   {:store {:backend :file :path path :id (store-id path)}
    :keep-history? true
+   :crypto-hash? true
+   :commit-graph? true
+   :index-config {:diff-buf-size sdh/diff-buf-size}
    :schema-flexibility :write})
 
 (def ^:private kb-cfg store-cfg)
 
-(defn- msgs-cfg
-  "The ROOM store — the survivor of the per-room store collapse, so it is where the
-   kontor book comes to live. That requires `:crypto-hash? true`, and datahike fixes
-   it at CREATION: `ensure-stored-config-consistency` adopts/consistency-checks the
-   STORED config on connect, so an existing store can never adopt it — enabling it
-   later means re-creating rooms. datahike also rejects `:crypto-hash?` together with
-   `:commit-graph? false` (the audit chain verifies the persisted commit chain), so
-   both flags go on together.
-
-   Only this store gets them. Crypto-hash makes each index-node address a content
-   hash, which disables locality squuids and address reuse, so the KB and agent
-   `:data` stores keep the cheaper layout — they hold no sealed financial records."
-  [path]
-  (assoc (store-cfg path) :crypto-hash? true :commit-graph? true))
+(def ^:private msgs-cfg
+  "The room's messages store. Was the only store carrying `:crypto-hash?` +
+   `:commit-graph?`, back when it alone was expected to hold the kontor book;
+   those flags are now in `store-cfg` for every datom store, so this is a plain
+   alias kept for call-site readability."
+  store-cfg)
 
 (def ^:private data-cfg store-cfg)
 
