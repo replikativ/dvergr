@@ -321,12 +321,27 @@
   (when-let [r (sdb/room-by-slug slug)]
     (room-msgs-conn (:room/id r))))
 
-(defn room-kb-conn
-  "Fork-aware conn to a room's OWN (writable) KB — where `knowledge_add` writes."
+(defn writable-kbs
+  "The room's writable KBs, `:owner` first — every one `knowledge_add` MAY
+   target, not just the one it does by default."
   [room-id]
-  (some->> (room-kbs room-id)
-           (filter #(#{:owner :read-write} (:permission %)))
-           first :path kb-system-name ygg/system :conn))
+  (filterv #(#{:owner :read-write} (:permission %)) (room-kbs room-id)))
+
+(defn room-kb-conn
+  "Fork-aware conn to a room's writable KB — where `knowledge_add` writes.
+
+   With no `slug`, the default is the highest-precedence writable KB, which is
+   the room's own. That default is the reason a room's wiki could be invisible
+   to its agent: a room whose knowledge actually lives in an ATTACHED KB still
+   wrote into its own empty one, and nothing said so. Passing a slug names the
+   target explicitly; `writable-kbs` lists what is nameable."
+  ([room-id] (room-kb-conn room-id nil))
+  ([room-id slug]
+   (let [kbs (writable-kbs room-id)]
+     (some-> (if slug
+               (first (filter #(= slug (:slug %)) kbs))
+               (first kbs))
+             :path kb-system-name ygg/system :conn))))
 
 (defn room-kb-conns
   "All KB conns a room may READ (own + attached), each `{:conn :permission :slug}` —

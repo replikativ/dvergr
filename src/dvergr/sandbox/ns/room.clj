@@ -82,9 +82,25 @@
         gc!            (fn gc!
                          ([] (gc! {}))
                          ([opts] (safe #(binding [ec/*execution-context* ctx] (ygg/gc! opts)))))
+        ;; Which KBs this room may WRITE, and which one `*kb*` is. A room's own
+        ;; KB is the default, but a room whose knowledge lives in an ATTACHED KB
+        ;; would otherwise write into its own empty one with nothing saying so —
+        ;; the agent could not even name the alternatives. These make the choice
+        ;; visible and addressable.
+        kbs (fn [] (safe #(binding [ec/*execution-context* ctx]
+                            (let [ws (srooms/writable-kbs room-id)]
+                              (into [] (map-indexed
+                                        (fn [i {:keys [slug permission]}]
+                                          {:name slug :permission permission
+                                           :default? (zero? i)}))
+                                    ws)))))
+        kb  (fn [slug] (safe #(binding [ec/*execution-context* ctx]
+                                (srooms/room-kb-conn room-id slug))))
         room-map (merge (ns-kb/room-ops-map ctx)        ; create!/fork!/merge!/post!/messages/…
                         {'*room*          room-conn      ; the room's own datahike (messages store)
-                         '*kb*            kb-conn         ; the room's knowledge base
+                         '*kb*            kb-conn         ; the DEFAULT writable KB (see kbs)
+                         'kbs             kbs             ; [{:name :permission :default?}] — writable KBs
+                         'kb              kb              ; fork-aware conn to a writable KB by name
                          'databases       databases       ; [{:name :type :permission}] — your DBs
                          'db              db              ; fork-aware conn to one by name
                          'kb-find         kb-find
