@@ -183,7 +183,15 @@
      (scheduler/list)"
   [sci-ctx]
   (require 'dvergr.scheduler.core)
-  (let [sched-create  @(ns-resolve 'dvergr.scheduler.core 'create-schedule!)
+  (let [documented
+        ;; `dvergr.sandbox` already reports `:arglists`/`:doc` off each injected
+        ;; value, and `dev/doc` prints them — but a raw `(fn …)` carries no
+        ;; metadata, so everything below contributed nothing and the docstring
+        ;; on THIS function never reached the sandbox. An agent's only way to
+        ;; learn a signature was to call it and read the error.
+        (fn [sym arglists doc f]
+          (vary-meta f merge {:name sym :arglists arglists :doc doc}))
+        sched-create  @(ns-resolve 'dvergr.scheduler.core 'create-schedule!)
         sched-cancel  @(ns-resolve 'dvergr.scheduler.core 'cancel-schedule!)
         sched-list    @(ns-resolve 'dvergr.scheduler.core 'list-schedules)
         current-room  @(ns-resolve 'dvergr.scheduler.core 'current-room)
@@ -192,17 +200,42 @@
                             (throw (ex-info "No current room — schedules are per-room" {}))))
 
         every-fn (fn [period & args]
-                   (let [[opts agent-id task]
-                         (cond
-                           (and (keyword? (first args)) (string? (second args)))
-                           [{:every period :on (first args) :at (second args)}
-                            (nth args 2) (nth args 3)]
-                           (string? (first args))
-                           [{:every period :at (first args)} (second args) (nth args 2)]
-                           (keyword? (first args))
-                           [{:every period} (first args) (second args)]
-                           :else
-                           (throw (ex-info "Invalid schedule args" {:period period :args args})))]
+                   ;; Dispatch on ARITY, not on the types of the first two args.
+                   ;;
+                   ;; The type-based cond could not tell `(every :day :var "task")`
+                   ;; from `(every :week :monday "14:00" :agent "task")` — both open
+                   ;; (keyword, string) — so the 4-arg branch swallowed the 2-arg
+                   ;; form and then ran `(nth args 2)` off the end. That surfaced as
+                   ;; a bare IndexOutOfBoundsException with a nil message, and with
+                   ;; no arglists to consult an agent reasonably concluded the
+                   ;; function was broken. It was not: both documented forms work.
+                   ;; The 2-arg form was genuinely unreachable, and is now reachable.
+                   (let [n (count args)
+                         wrong (fn []
+                                 (throw (ex-info
+                                         (str "scheduler/every: cannot read these "
+                                              n " argument(s) after the period. Expected one of:\n"
+                                              "  (every period agent-id task)\n"
+                                              "  (every period \"HH:MM\" agent-id task)\n"
+                                              "  (every period :day-of-week \"HH:MM\" agent-id task)\n"
+                                              "where agent-id is a keyword and task a string.")
+                                         {:period period :args (vec args)})))
+                         [opts agent-id task]
+                         (case n
+                           2 [{:every period} (first args) (second args)]
+                           3 [{:every period :at (first args)} (second args) (nth args 2)]
+                           4 [{:every period :on (first args) :at (second args)}
+                              (nth args 2) (nth args 3)]
+                           (wrong))]
+                     ;; Check the SHAPE, not just the count. Arity alone still lets
+                     ;; `(every :day "07:00" :var)` through as agent-id "07:00" and
+                     ;; task :var, which only fails later against create-schedule!'s
+                     ;; `(keyword? agent-id)` precondition — an AssertionError naming
+                     ;; neither the caller nor what it should have passed.
+                     (when-not (and (keyword? agent-id) (string? task)
+                                    (or (not (:at opts)) (string? (:at opts)))
+                                    (or (not (:on opts)) (keyword? (:on opts))))
+                       (wrong))
                      (sched-create (room!)
                                    {:agent-id agent-id
                                     :task task
@@ -223,9 +256,26 @@
                                      :interval-ms ms
                                      :description (str "Every " (/ ms 60000.0) " minutes")}))]
     (sci/add-namespace! sci-ctx 'dvergr.scheduler
-                        {'every    every-fn
-                         'at       at-fn
-                         'interval interval-fn
+                        {'every
+                         (documented 'every
+                                     '([period agent-id task]
+                                       [period at agent-id task]
+                                       [period day-of-week at agent-id task])
+                                     (str "Recurring schedule in THIS room. `period` is :day/:week/…, "
+                                          "`at` is \"HH:MM\" wall-clock, `day-of-week` a keyword like "
+                                          ":monday. e.g. (every :day \"09:00\" :huginn \"Morning sweep\").")
+                                     every-fn)
+                         'at
+                         (documented 'at
+                                     '([iso-datetime agent-id task])
+                                     (str "One-shot at a FULL ISO datetime — \"2026-04-01T09:00\", not "
+                                          "\"09:00\". For a daily wall-clock time use `every` instead.")
+                                     at-fn)
+                         'interval
+                         (documented 'interval
+                                     '([ms agent-id task])
+                                     "Repeat every `ms` milliseconds."
+                                     interval-fn)
                          ;; CODE schedules — the durable-pipeline primitive:
                          ;; the form evals in YOUR sandbox on each fire
                          ;; (deterministic, no LLM turn). Put the fns in a
@@ -239,8 +289,23 @@
                          ;; :n multiplies :minute/:hour/:day/:week into a fixed
                          ;; interval), {:every-ms N}, {:at \"ISO\" :once true}.
                          ;; Unknown keys are REJECTED (no silent wrong cadence).
-                         'create   (fn [cfg] (sched-create (room!) cfg))
-                         'cancel   (fn [id] (sched-cancel (room!) id))
-                         'list     (fn [] (sched-list (room!)))})))
+                         'create
+                         (documented 'create
+                                     '([cfg])
+                                     (str "Richest form. cfg = {:agent-id kw :task \"…\" | :code \"…\" "
+                                          ":schedule {…} | :interval-ms N :description \"…\"}. `:code` "
+                                          "evals in your sandbox on each fire with no LLM turn. "
+                                          "Unknown keys are REJECTED.")
+                                     (fn [cfg] (sched-create (room!) cfg)))
+                         'cancel
+                         (documented 'cancel
+                                     '([schedule-id])
+                                     "Deactivate a schedule BY ID — the uuid itself, not the map `list` returns."
+                                     (fn [id] (sched-cancel (room!) id)))
+                         'list
+                         (documented 'list
+                                     '([])
+                                     "Active schedules in this room, as maps carrying :id :kind :next-fire …"
+                                     (fn [] (sched-list (room!))))})))
 
 
