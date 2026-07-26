@@ -54,7 +54,11 @@
         ;; muschel.session.spindel is fork-aware via spindel/fork-context
         ;; so a forked chat-ctx gets an isolated muschel session
         ;; (jobs, cd, env) for free.
-        org.replikativ/muschel     {:mvn/version "0.2.17"}
+        ;; 0.2.18 is the release that carries the Geschichte-workspace mount
+        ;; API this branch's agent workspaces are built on (isolated worktrees,
+        ;; checkout semantics delegated to Geschichte, Git served from a virtual
+        ;; GeschichteFS base) — so no local root is needed to build it.
+        org.replikativ/muschel     {:mvn/version "0.2.18"}
 
         ;; Geschichte — authoritative virtual filesystem + Git compatibility.
         ;; Released coordinate — 0.1.10 carries code-search (#6) + the native-release
