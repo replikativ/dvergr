@@ -2,7 +2,8 @@
   "Unit tests for the unified file-driven definition loader (skills + agents)."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
-            [dvergr.discourse.definitions :as defs]))
+            [dvergr.discourse.definitions :as defs]
+            [muschel.fs.geschichte :as gfs]))
 
 (deftest parse-frontmatter-basics
   (testing "frontmatter is parsed and the body is returned separately"
@@ -121,6 +122,23 @@
         (finally
           (let [sk (java.io.File. dir "skills")]
             (.delete (java.io.File. sk "demo.md")) (.delete sk) (.delete dir)))))))
+
+(deftest virtual-author-then-promote-roundtrip
+  (let [{:keys [close!] :as repository}
+        (gfs/memory-repository! {:name "definitions"})
+        root {:fs (gfs/make-root repository) :root "/"}]
+    (try
+      (defs/author! "skills" root "nested/demo"
+        {:description "virtual" :provides [:demo]} "the body")
+      (let [definition (get (defs/load-kind "skills" root) "nested/demo")]
+        (is (= :room (:scope definition)))
+        (is (= false (:vetted definition)))
+        (is (= "the body" (:content definition)))
+        (defs/promote! definition "reviewer" "2026-07-18")
+        (let [promoted (get (defs/load-kind "skills" root) "nested/demo")]
+          (is (= true (:vetted promoted)))
+          (is (= "reviewer" (:vetted-by promoted)))))
+      (finally (close!)))))
 
 (deftest room-scope-overlays-globals
   (testing "a room-dir adds the room's own definitions as the highest-precedence

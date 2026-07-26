@@ -16,7 +16,8 @@
    where <kind> ∈ {\"skills\", \"agents\"}. Files are the source of truth; a
    KB-derived index (Phase 3) is a queryable projection, never authoritative."
   (:require [clojure.java.io :as io]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [muschel.fs :as mfs]))
 
 ;; ============================================================================
 ;; Frontmatter parser
@@ -135,6 +136,34 @@
       (str/replace #"\.md$" "")
       (str/replace #"/SKILL$" "")))
 
+(defn- virtual-definition-files [{:keys [fs root]} kind]
+  (let [base (str (str/replace root #"/$" "") "/" kind)]
+    (letfn [(walk [path]
+              (mapcat (fn [{:keys [name type]}]
+                        (let [child (str (str/replace path #"/$" "") "/" name)]
+                          (case type
+                            :dir (walk child)
+                            :file (when (str/ends-with? name ".md") [child])
+                            nil)))
+                      (or (mfs/list-dir fs path) [])))]
+      (for [path (walk base)
+            :let [rel (subs path (inc (count base)))
+                  name (-> rel
+                           (str/replace #"\.md$" "")
+                           (str/replace #"/SKILL$" ""))]]
+        {:name name
+         :content (mfs/read-file fs path)
+         :file (last (str/split path #"/"))
+         :path (str "geschichte:" path)
+         :storage {:fs fs :path path}}))))
+
+(defn- virtual-mkdirs! [fs path]
+  (loop [path path pending []]
+    (if (or (= path "/") (mfs/exists? fs path))
+      (doseq [directory (reverse pending)] (mfs/mkdir fs directory))
+      (let [i (.lastIndexOf ^String path "/")]
+        (recur (if (<= i 0) "/" (subs path 0 i)) (conj pending path))))))
+
 (defn- builtin-files
   "Built-in definitions under the `<kind>` classpath resource, as
    `[{:name :content :file :path}]`. Jar-safe (handles `file:` dev dirs and
@@ -204,22 +233,34 @@
                                                :name (or (:name parsed) name)
                                                :file file :path path :scope :builtin))))
                       {} (builtin-files kind))
+         virtual-room? (and (map? room-dir) (satisfies? mfs/FS (:fs room-dir)))
          scopes (cond-> (roots kind)
-                  (and room-dir (.isDirectory (io/file room-dir kind)))
-                  (conj [:room (io/file room-dir kind)]))]
-     (reduce
-      (fn [acc [scope root]]
-        (reduce
-         (fn [a ^java.io.File f]
-           (let [name'  (relative-name root f)
-                 parsed (parse-frontmatter (slurp f))]
-             (assoc a name'
-                    (assoc parsed
-                           :name (or (:name parsed) name')
-                           :file (.getName f) :path (.getPath f) :scope scope))))
-         acc (list-md-files root)))
-      seed
-      scopes))))
+                  (and room-dir (not virtual-room?)
+                       (.isDirectory (io/file room-dir kind)))
+                  (conj [:room (io/file room-dir kind)]))
+         loaded (reduce
+                 (fn [acc [scope root]]
+                   (reduce
+                    (fn [a ^java.io.File f]
+                      (let [name'  (relative-name root f)
+                            parsed (parse-frontmatter (slurp f))]
+                        (assoc a name'
+                               (assoc parsed
+                                      :name (or (:name parsed) name')
+                                      :file (.getName f) :path (.getPath f) :scope scope))))
+                    acc (list-md-files root)))
+                 seed
+                 scopes)]
+     (if virtual-room?
+       (reduce (fn [acc {:keys [name content file path storage]}]
+                 (let [parsed (parse-frontmatter content)]
+                   (assoc acc name
+                          (assoc parsed :name (or (:name parsed) name)
+                                 :file file :path path :storage storage
+                                 :scope :room))))
+               loaded
+               (virtual-definition-files room-dir kind))
+       loaded))))
 
 (defn load-one
   "The single parsed definition named `name` within `kind`, honoring the scope
@@ -302,14 +343,22 @@
    gate keeps them out of prompts / autostart until promoted. `dir` is typically
    a room's sandbox-repo path. Returns the file path (string)."
   [kind dir name frontmatter body]
-  (let [d (io/file dir kind)
-        _ (.mkdirs d)
-        f (io/file d (str name ".md"))
-        fm (merge {:kind ({"agents" :agent "skills" :skill} kind (keyword kind))
+  (let [fm (merge {:kind ({"agents" :agent "skills" :skill} kind (keyword kind))
                    :name name :vetted false}
-                  frontmatter)]
-    (spit f (str (render-frontmatter fm) "\n" (or body "")))
-    (.getPath f)))
+                  frontmatter)
+        content (str (render-frontmatter fm) "\n" (or body ""))]
+    (if (and (map? dir) (satisfies? mfs/FS (:fs dir)))
+      (let [base (str (str/replace (:root dir) #"/$" "") "/" kind)
+            path (str base "/" name ".md")]
+        (virtual-mkdirs! (:fs dir)
+                         (subs path 0 (.lastIndexOf ^String path "/")))
+        (mfs/write-string! (:fs dir) path content false)
+        (str "geschichte:" path))
+      (let [d (io/file dir kind)
+            _ (.mkdirs d)
+            f (io/file d (str name ".md"))]
+        (spit f content)
+        (.getPath f)))))
 
 (defn promote!
   "Mark the definition file at `path` vetted — flip `vetted: false` → `true` and
@@ -317,15 +366,19 @@
    The reviewer action that lets an agent-authored or externally-lifted
    definition become eligible. `date` is an ISO yyyy-mm-dd string (pass it in;
    no clock is read here). Returns the new file text."
-  [path by date]
-  (let [text  (slurp path)
+  [path-or-definition by date]
+  (let [storage (when (map? path-or-definition) (:storage path-or-definition))
+        path (if storage (:path storage) path-or-definition)
+        text  (if storage (mfs/read-file (:fs storage) path) (slurp path))
         text' (-> text
                   (str/replace #"(?m)^vetted:\s*false\s*$" "vetted: true")
                   (cond->
                    (not (re-find #"(?m)^vetted_by:" text))
                     (str/replace #"(?m)^(vetted:\s*true\s*)$"
                                  (str "$1\nvetted_by: " by "\nvetted_at: " date))))]
-    (spit path text')
+    (if storage
+      (mfs/write-string! (:fs storage) path text' false)
+      (spit path text'))
     text'))
 
 (defn autostart-agents

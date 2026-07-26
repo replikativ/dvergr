@@ -112,6 +112,27 @@
       {:success false
        :error (str "Error editing form: " (.getMessage e))})))
 
+(defn edit-clojure-source
+  "The storage-independent form of `edit-clojure-form`. Edits an in-memory
+  source string so callers backed by virtual/versioned filesystems do not need
+  to materialize a temporary native file."
+  [source form-type form-name operation new-source]
+  (try
+    (let [zloc (z/of-string source)
+          found (find-top-level-form zloc form-type form-name)]
+      (if-not found
+        {:success false
+         :error (str "Form not found: " form-type " " form-name)}
+        {:success true
+         :content (case operation
+                    :replace (replace-form found new-source)
+                    :insert-before (insert-before-form found new-source)
+                    :insert-after (insert-after-form found new-source))
+         :old-form (z/string found)}))
+    (catch Exception e
+      {:success false
+       :error (str "Error editing form: " (.getMessage e))})))
+
 ;; ---------------------------------------------------------------------------
 ;; Validation
 ;; ---------------------------------------------------------------------------

@@ -11,7 +11,7 @@
      conversation-log append, and there is no git history to browse."
   (:require [dvergr.room.registry :as rreg]
             [dvergr.discourse :as d]
-            [dvergr.substrate.git :as git]
+            [dvergr.substrate.geschichte :as git]
             [clojure.string :as str]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.yggdrasil :as ygg]))

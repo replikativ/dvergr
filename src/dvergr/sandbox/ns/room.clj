@@ -32,24 +32,52 @@
    store; `kb-conn` = its knowledge base. Any of `room-conn`/`kb-conn`/`room-id`
    may be nil (room-less ctx) — the helpers degrade gracefully."
   [sci-ctx room-conn kb-conn room-id ctx]
-  (let [kb-find        (fn [title]
-                         (safe #(when kb-conn
-                                  (d/q '[:find (pull ?e [*]) . :in $ ?t
-                                         :where [?e :entity/title ?t]] @kb-conn title))))
+  (let [;; EVERY readable KB, not just `*kb*`. A room's knowledge is spread over
+        ;; its own KB plus whatever is granted to it, and the two are written
+        ;; through different bindings of the same katzen schema — dvergr's
+        ;; `:entity/title` and a product's `:S.Page/title`. Reading one store
+        ;; through one binding is why an agent could write knowledge and then
+        ;; fail to find it: it was searching a different store.
+        ;;
+        ;; Results carry `:kb` so the agent knows WHERE a hit lives and can
+        ;; address that KB by name (see `kbs` / `kb`).
+        title-attrs    [:entity/title :S.Page/title]
+        readable       (fn []
+                         (if room-id
+                           (binding [ec/*execution-context* ctx]
+                             (srooms/room-kb-conns room-id))
+                           (when kb-conn [{:conn kb-conn :slug "kb"}])))
+        titled         (fn [db]
+                         ;; [{:title … :summary …}] across whichever binding the
+                         ;; store actually uses; a store carrying both yields both.
+                         (into []
+                               (mapcat (fn [a]
+                                         (map (fn [[t summ]] {:title t :summary summ})
+                                              (d/q '[:find ?t ?summ :in $ ?a
+                                                     :where [?e ?a ?t]
+                                                     [(get-else $ ?e :entity/summary "") ?summ]]
+                                                   db a))))
+                               title-attrs))
+        each-kb        (fn [f]
+                         (into [] (mapcat (fn [{:keys [conn slug]}]
+                                            (map #(assoc % :kb slug) (f @conn))))
+                               (readable)))
+        kb-find        (fn [title]
+                         (safe #(first (each-kb (fn [db]
+                                                  (filter (comp #{title} :title)
+                                                          (titled db)))))))
         kb-by-type     (fn [t]
-                         (safe #(when kb-conn
-                                  (d/q '[:find [(pull ?e [:entity/title :entity/summary :entity/type]) ...]
-                                         :in $ ?ty :where [?e :entity/type ?ty]]
-                                       @kb-conn (keyword t)))))
+                         (safe #(each-kb (fn [db]
+                                           (d/q '[:find [(pull ?e [:entity/title :entity/summary :entity/type]) ...]
+                                                  :in $ ?ty :where [?e :entity/type ?ty]]
+                                                db (keyword t))))))
         kb-search      (fn [term]
-                         (safe #(when kb-conn
-                                  (let [lc (str/lower-case (str term))]
-                                    (->> (d/q '[:find [(pull ?e [:entity/title :entity/summary]) ...]
-                                                :where [?e :entity/title _]] @kb-conn)
-                                         (filter (fn [e] (str/includes?
-                                                          (str/lower-case (str (:entity/title e) " " (:entity/summary e)))
-                                                          lc)))
-                                         (take 25) vec)))))
+                         (safe #(let [lc (str/lower-case (str term))]
+                                  (->> (each-kb titled)
+                                       (filter (fn [e] (str/includes?
+                                                        (str/lower-case (str (:title e) " " (:summary e)))
+                                                        lc)))
+                                       (take 25) vec))))
         msg-time       (fn [m] (or (some-> ^java.util.Date (:message/created-at m) .getTime) 0))
         recent-msgs    (fn [n]
                          (safe #(when room-conn
@@ -82,9 +110,25 @@
         gc!            (fn gc!
                          ([] (gc! {}))
                          ([opts] (safe #(binding [ec/*execution-context* ctx] (ygg/gc! opts)))))
+        ;; Which KBs this room may WRITE, and which one `*kb*` is. A room's own
+        ;; KB is the default, but a room whose knowledge lives in an ATTACHED KB
+        ;; would otherwise write into its own empty one with nothing saying so —
+        ;; the agent could not even name the alternatives. These make the choice
+        ;; visible and addressable.
+        kbs (fn [] (safe #(binding [ec/*execution-context* ctx]
+                            (let [ws (srooms/writable-kbs room-id)]
+                              (into [] (map-indexed
+                                        (fn [i {:keys [slug permission]}]
+                                          {:name slug :permission permission
+                                           :default? (zero? i)}))
+                                    ws)))))
+        kb  (fn [slug] (safe #(binding [ec/*execution-context* ctx]
+                                (srooms/room-kb-conn room-id slug))))
         room-map (merge (ns-kb/room-ops-map ctx)        ; create!/fork!/merge!/post!/messages/…
                         {'*room*          room-conn      ; the room's own datahike (messages store)
-                         '*kb*            kb-conn         ; the room's knowledge base
+                         '*kb*            kb-conn         ; the DEFAULT writable KB (see kbs)
+                         'kbs             kbs             ; [{:name :permission :default?}] — writable KBs
+                         'kb              kb              ; fork-aware conn to a writable KB by name
                          'databases       databases       ; [{:name :type :permission}] — your DBs
                          'db              db              ; fork-aware conn to one by name
                          'kb-find         kb-find

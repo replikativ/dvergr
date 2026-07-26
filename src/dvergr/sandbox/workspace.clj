@@ -10,7 +10,8 @@
    loading source here does not widen it."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
-            [dvergr.substrate.paths :as paths]))
+            [dvergr.substrate.paths :as paths]
+            [muschel.fs :as mfs]))
 
 (def ^:dynamic *workspace-dir*
   "Explicit override for the directory the sandbox loads code from (mainly for
@@ -19,18 +20,24 @@
    `.dvergr/workspace`."
   nil)
 
-(defn- current-worktree
-  "Worktree path of the git system registered in the bound execution context, or
-   nil. Resolved lazily to avoid a hard dep on the yggdrasil/git stack."
+(defn- current-virtual-workspace
+  "Virtual Geschichte workspace registered in the bound execution context."
   []
-  (try ((requiring-resolve 'dvergr.substrate.git/current-worktree-path))
+  (try ((requiring-resolve 'dvergr.substrate.geschichte/current-workspace))
        (catch Throwable _ nil)))
 
 (defn workspace-root
-  "The single primary workspace root: the explicit override, else the current
-   ctx's (per-fork) worktree, else the shared `.dvergr/workspace`."
-  ^java.io.File []
-  (io/file (or *workspace-dir* (current-worktree) (paths/workspace-dir))))
+  "The primary workspace root. Geschichte workspaces return a virtual root
+  descriptor; explicit test overrides and the transitional fallback remain
+  physical paths."
+  []
+  (or (some-> *workspace-dir* io/file)
+      (when-let [workspace (current-virtual-workspace)]
+        {:id (:id workspace)
+         :root "/"
+         :fs ((requiring-resolve 'dvergr.substrate.geschichte/filesystem)
+              workspace)})
+      (io/file (paths/workspace-dir))))
 
 (def ^:dynamic *workspace-roots*
   "Ordered override list of roots the load-fn searches — a room's own repo first,
@@ -51,6 +58,9 @@
     (or (= fp rp)
         (str/starts-with? fp (str rp java.io.File/separator)))))
 
+(defn virtual-root? [root]
+  (and (map? root) (satisfies? mfs/FS (:fs root))))
+
 (defn- ns->rel-paths
   "Candidate workspace-relative file paths for a namespace symbol
    (mirrors Clojure's namespace→file munging): `my-app.core` → my_app/core.clj."
@@ -63,12 +73,19 @@
    string), or nil if absent. Path-clamped — only files genuinely inside `root`
    are read."
   [root lib]
-  (let [root (io/file root)]
+  (if (virtual-root? root)
     (some (fn [rel]
-            (let [f (io/file root rel)]
-              (when (and (.isFile f) (under-root? root f))
-                {:file (.getCanonicalPath f) :source (slurp f)})))
-          (ns->rel-paths lib))))
+            (let [path (str (str/replace (:root root) #"/$" "") "/" rel)]
+              (when (= :file (:type (mfs/stat (:fs root) path)))
+                {:file (str "geschichte:" (:id root) ":" path)
+                 :source (mfs/read-file (:fs root) path)})))
+          (ns->rel-paths lib))
+    (let [root (io/file root)]
+      (some (fn [rel]
+              (let [f (io/file root rel)]
+                (when (and (.isFile f) (under-root? root f))
+                  {:file (.getCanonicalPath f) :source (slurp f)})))
+            (ns->rel-paths lib)))))
 
 (def ^:private source-subdirs
   "Per workspace root, the source-root candidates the load-fn searches, in
@@ -84,7 +101,12 @@
   "Resolve `lib` under `root`, trying each source-subdir (root, root/src)."
   [root lib]
   (some (fn [sub]
-          (resolve-source (if (str/blank? sub) (io/file root) (io/file root sub)) lib))
+          (resolve-source
+           (cond
+             (str/blank? sub) root
+             (virtual-root? root) (update root :root #(str % "/" sub))
+             :else (io/file root sub))
+           lib))
         source-subdirs))
 
 (defn workspace-guide
@@ -99,11 +121,15 @@
   ([root] (workspace-guide root 8192))
   ([root max-chars]
    (try
-     (let [root (io/file root)
-           f (io/file root "AGENTS.md")]
-       (when (and (.isFile f) (under-root? root f))
-         (let [s (slurp f)]
-           (if (> (count s) max-chars) (subs s 0 max-chars) s))))
+     (let [s (if (virtual-root? root)
+               (mfs/read-file (:fs root)
+                              (str (str/replace (:root root) #"/$" "")
+                                   "/AGENTS.md"))
+               (let [root (io/file root)
+                     f (io/file root "AGENTS.md")]
+                 (when (and (.isFile f) (under-root? root f))
+                   (slurp f))))]
+       (when s (if (> (count s) max-chars) (subs s 0 max-chars) s)))
      (catch Throwable _ nil))))
 
 (defn load-fn

@@ -4,43 +4,44 @@
    cover the pure parts: canonicalized containment, dotfile/symlink rejection,
    method/uri gating."
   (:require [clojure.test :refer [deftest is testing]]
-            [clojure.java.io :as io]
-            [dvergr.web.apps :as apps])
-  (:import [java.nio.file Files]
-           [java.nio.file.attribute FileAttribute]))
+            [dvergr.web.apps :as apps]
+            [muschel.fs :as mfs]
+            [muschel.fs.geschichte :as gfs]))
 
-(def ^:private safe-file @#'apps/safe-file)
+(def ^:private safe-path @#'apps/safe-path)
 (def ^:private content-type @#'apps/content-type)
 
 (defn- tmp-app-root []
-  (let [dir (.toFile (Files/createTempDirectory "dvergr-app-test" (make-array FileAttribute 0)))]
-    (spit (io/file dir "index.html") "<h1>hi</h1>")
-    (.mkdirs (io/file dir "js"))
-    (spit (io/file dir "js" "app.js") "1")
-    dir))
+  (let [{:keys [close!] :as repository} (gfs/memory-repository! {:name "app-test"})
+        fs (gfs/make-root repository)]
+    (mfs/mkdir fs "/app")
+    (mfs/write-string! fs "/app/index.html" "<h1>hi</h1>" false)
+    (mfs/mkdir fs "/app/js")
+    (mfs/write-string! fs "/app/js/app.js" "1" false)
+    {:root {:fs fs :root "/app"} :close! close!}))
 
 (deftest safe-file-containment
-  (let [root (tmp-app-root)]
-    (testing "normal paths resolve"
-      (is (.isFile (safe-file root "index.html")))
-      (is (.isFile (safe-file root "js/app.js"))))
-    (testing "leading slashes are stripped, not treated as absolute"
-      (is (.isFile (safe-file root "/index.html"))))
-    (testing "raw traversal is rejected by canonicalization"
-      (is (nil? (safe-file root "../../../etc/passwd")))
-      (is (nil? (safe-file root "js/../../outside.txt"))))
-    (testing "dotfiles and dot-dirs are rejected in any segment"
-      (is (nil? (safe-file root ".git/config")))
-      (is (nil? (safe-file root "js/.hidden")))
-      (is (nil? (safe-file root "..")))) ; pure dot segment
-    (testing "symlink pointing outside the root is rejected"
-      (let [link (io/file root "leak.txt")]
-        (Files/createSymbolicLink (.toPath link) (.toPath (io/file "/etc/hostname"))
-                                  (make-array FileAttribute 0))
-        (is (nil? (safe-file root "leak.txt")))))
-    (testing "nil/missing root yields nil"
-      (is (nil? (safe-file nil "index.html")))
-      (is (nil? (safe-file (io/file root "nonexistent-dir") "index.html"))))))
+  (let [{:keys [root close!]} (tmp-app-root)]
+    (try
+      (testing "normal paths resolve"
+        (is (= "/app/index.html" (safe-path root "index.html")))
+        (is (= "/app/js/app.js" (safe-path root "js/app.js"))))
+      (testing "leading slashes are stripped, not treated as absolute"
+        (is (= "/app/index.html" (safe-path root "/index.html"))))
+      (testing "raw traversal is rejected by canonicalization"
+        (is (nil? (safe-path root "../../../etc/passwd")))
+        (is (nil? (safe-path root "js/../../outside.txt"))))
+      (testing "dotfiles and dot-dirs are rejected in any segment"
+        (is (nil? (safe-path root ".git/config")))
+        (is (nil? (safe-path root "js/.hidden")))
+        (is (nil? (safe-path root ".."))))
+      (testing "symlink pointing outside the root is rejected"
+        (mfs/symlink (:fs root) "/outside" "/app/leak.txt")
+        (is (nil? (safe-path root "leak.txt"))))
+      (testing "nil/missing root yields nil"
+        (is (nil? (safe-path nil "index.html")))
+        (is (nil? (safe-path (assoc root :root "/missing") "index.html"))))
+      (finally (close!)))))
 
 (deftest content-types
   (is (= "text/html; charset=utf-8" (content-type "index.html")))

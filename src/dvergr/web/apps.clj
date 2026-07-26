@@ -13,11 +13,11 @@
    GET-only, path-canonicalized to the app root (symlink escape included), no
    dotfiles. The daemon web binds loopback by default; publishing to third
    parties is a separate, explicit step (auth boundary TBD)."
-  (:require [clojure.java.io :as io]
-            [clojure.string :as str]
-            [dvergr.substrate.git :as git]
+  (:require [clojure.string :as str]
+            [dvergr.substrate.geschichte :as geschichte]
             [dvergr.system.db :as sdb]
             [dvergr.system.rooms :as srooms]
+            [muschel.fs :as mfs]
             [org.replikativ.spindel.engine.core :as ec]))
 
 (def ^:private content-types
@@ -48,34 +48,33 @@
        "application/octet-stream"))
 
 (defn app-root
-  "The room's app directory — `<current worktree>/app` resolved fork-aware
-   under the room's OWN execution context. nil when the room has no ctx/repo."
+  "The room's virtual `app/` directory, resolved fork-aware under the room's
+  own execution context. nil when the room has no Geschichte workspace."
   [room-id]
   (when-let [room-ctx (srooms/room-ctx-for room-id)]
     (binding [ec/*execution-context* room-ctx]
-      (when-let [wt (git/current-worktree-path)]
-        (io/file wt "app")))))
+      (when-let [workspace (geschichte/current-workspace)]
+        {:fs (geschichte/filesystem workspace) :root "/app"}))))
 
 (defn app-exists?
   "True when the room has an app/index.html to serve (used by the room page
    to decide whether to show the app link)."
   [room-id]
-  (boolean (some-> (app-root room-id) (io/file "index.html") .isFile)))
+  (when-let [{:keys [fs root]} (app-root room-id)]
+    (= :file (:type (mfs/stat fs (str root "/index.html"))))))
 
-(defn- safe-file
-  "Resolve `rel` under `root`, canonicalized — nil unless the canonical result
-   stays inside the canonical root (rejects .., absolute paths, symlink escape)
-   and no path segment is a dotfile."
-  [^java.io.File root rel]
-  (when (and root (.isDirectory root))
+(defn- safe-path
+  "Resolve `rel` inside a virtual app root. Geschichte/Muschel perform the
+  canonical traversal and symlink containment check; dotfiles stay private."
+  [{:keys [fs root]} rel]
+  (when (and fs root (= :dir (:type (mfs/stat fs root))))
     (let [rel (str/replace (or rel "") #"^/+" "")]
       (when-not (some #(str/starts-with? % ".") (str/split rel #"/"))
-        (let [f (io/file root rel)
-              canon (.getCanonicalPath f)
-              root-canon (.getCanonicalPath root)]
-          (when (or (= canon root-canon)
-                    (str/starts-with? canon (str root-canon java.io.File/separator)))
-            f))))))
+        (let [path (mfs/resolve fs (str root "/" rel))]
+          (when (and path
+                     (not= :symlink (:type (mfs/stat fs path)))
+                     (or (= path root) (str/starts-with? path (str root "/"))))
+            path))))))
 
 (defn- not-found [slug]
   {:status 404
@@ -116,11 +115,12 @@
                   root (some-> room :room/id app-root)
                   rel  (if (str/blank? path) "index.html" path)
                   rel  (if (str/ends-with? rel "/") (str rel "index.html") rel)
-                  f    (safe-file root rel)]
-              (if (and f (.isFile f))
+                  path (when root (safe-path root rel))]
+              (if (and path (= :file (:type (mfs/stat (:fs root) path))))
                 {:status 200
-                 :headers {"Content-Type" (content-type (.getName f))
+                 :headers {"Content-Type" (content-type path)
                            ;; live-iterate loop: agents rewrite files, humans reload
                            "Cache-Control" "no-cache"}
-                 :body f}
+                 :body (java.io.ByteArrayInputStream.
+                        ^bytes (mfs/read-bytes (:fs root) path))}
                 (not-found slug)))))))))

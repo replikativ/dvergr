@@ -33,7 +33,7 @@
             [org.replikativ.spindel.yggdrasil :as ygg]
             [is.simm.partial-cps.sequence :refer [anext]]
             [dvergr.runtime.bus :as bus]
-            [dvergr.substrate.git :as dgit]
+            [dvergr.substrate.geschichte :as geschichte]
             [dvergr.runtime.peer-bus :as peer-bus]
             [dvergr.room.store :as rstore]
             [dvergr.room.store.datahike :as store-dh]
@@ -757,8 +757,8 @@
                         :dvergr/origin   new-id
                         :dvergr/parent   (:id room)
                         :isolation       isolation
-                        :worktree-path   (when (= :ctx isolation)
-                                           (dgit/current-worktree-path))}))
+                        :workspace-id    (when (= :ctx isolation)
+                                           (:id (geschichte/current-workspace)))}))
      new-room)))
 
 (defmacro with-fork-ctx
@@ -957,7 +957,7 @@
    Returns the proposal payload."
   [fork & {:keys [from note] :or {from :worker note ""}}]
   (let [diff      (when (ctx-was-forked? fork)
-                    (dgit/diff-since-fork (:ctx fork)))
+                    (geschichte/diff-since-fork (:ctx fork)))
         proposal  (cond-> {:fork-id (:id fork)
                            :note    note}
                     diff (assoc :diff diff))

@@ -6,9 +6,7 @@
    - merge-room emits :dvergr/fork-merged
    - discard emits :dvergr/fork-discarded
    - pending-proposals scans a room's log"
-  (:require [clojure.java.io :as io]
-            [clojure.string :as str]
-            [clojure.test :refer [deftest is testing use-fixtures]]
+  (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [dvergr.runtime.bus :as bus]
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.discourse :as d]
@@ -27,27 +25,14 @@
     (.waitFor proc)
     {:out (slurp (.getInputStream proc))}))
 
-(defn- init-sandbox-repo! [path]
-  (run-shell "rm" "-rf" path)
-  (.mkdirs (io/file path))
-  (run-shell "bash" "-c"
-             (str "cd " path
-                  " && git init -q -b main"
-                  " && git config user.email t@e.com"
-                  " && git config user.name t"
-                  " && echo seed > README.md"
-                  " && git add . && git commit -q -m seed")))
-
 (def ^:dynamic *sandbox-dir* nil)
 (def ^:dynamic *base-ctx* nil)
 
 (defn- with-sandbox [test-fn]
   (let [dir (str "/tmp/dvergr-pb-" (System/nanoTime))]
     (try
-      (init-sandbox-repo! dir)
       (let [ctx (daemon/create-shared-context
-                 :repo-path dir
-                 :worktrees-dir (str dir "/.worktrees")
+                 :repo-path (str dir "/repository")
                  :with-git? true
                  :with-datahike? false)]
         (binding [*sandbox-dir* dir
@@ -94,8 +79,7 @@
         (is (= 1 (count evts)) "exactly one fork-created event")
         (is (= (:id fork) (:dvergr/origin (first evts))))
         (is (= :parent (:dvergr/parent (first evts))))
-        (is (str/starts-with? (:worktree-path (first evts))
-                              (str *sandbox-dir* "/.worktrees/")))))))
+        (is (vector? (:workspace-id (first evts))))))))
 
 (deftest propose-merge!-emits-event-and-tagged-message
   (binding [ec/*execution-context* *base-ctx*]
