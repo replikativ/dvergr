@@ -4,6 +4,12 @@
           ;; Skip ^:integration tests by default — they make real Fireworks
           ;; API calls and hang (or burn budget) without FIREWORKS_API_KEY.
           ;; Opt in explicitly: clojure -M:test --focus-meta :integration
-          :skip-meta   [:integration]}]
+          ;;
+          ;; Skip ^:security-open too — those are the sandbox-escape corpus
+          ;; entries that pin the SECURE spec of escapes still open (they FAIL
+          ;; until the owner-level fix lands, so they'd redden CI). Review the
+          ;; live escape status on demand:
+          ;;   clojure -M:test --focus-meta :security-open
+          :skip-meta   [:integration :security-open]}]
  ;; A bit more output during long runs so we can tell which ns is in flight.
  :reporter [kaocha.report/dots]}

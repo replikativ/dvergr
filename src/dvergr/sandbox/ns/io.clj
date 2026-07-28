@@ -20,12 +20,17 @@
 
 (defn sensitive-path-policy
   "Throw if path matches known-sensitive OS path patterns.
-   Call this synchronously before opening a file."
+   Call this synchronously before opening a file.
+
+   The pattern MUST stay on one line. A Clojure regex literal is NOT
+   whitespace-insensitive (no `(?x)`), so a newline+indentation inside the
+   alternation becomes part of an alternative: when this was wrapped across
+   three lines, `/etc/sudoers` and `~/.gcloud/` silently required a leading
+   `\\n<spaces>` to match and so were never blocked at all — a dead branch that
+   read as covered. Keep it flat."
   [path]
   (when (and path
-             (re-find #"(?i)(\.ssh[/\\]|\.gnupg[/\\]|/etc/shadow|/etc/passwd|
-                             /etc/sudoers|/proc/|/sys/|\.aws[/\\]|\.azure[/\\]|
-                             \.gcloud[/\\]|/run/secrets|\.env$|\.env\.)"
+             (re-find #"(?i)(\.ssh[/\\]|\.gnupg[/\\]|/etc/shadow|/etc/passwd|/etc/sudoers|/proc/|/sys/|\.aws[/\\]|\.azure[/\\]|\.gcloud[/\\]|/run/secrets|\.env$|\.env\.)"
                       path))
     (throw (ex-info "Access denied: sensitive path" {:path path}))))
 
@@ -262,7 +267,16 @@
     (sci/add-namespace! sci-ctx 'babashka.fs
                         {'list-dir           (fn [d & more] (audit! audit-log :fs/ls {:path (str (sr d))})
                                                (into [] (keep rel) (apply (r 'list-dir) (sr d) more)))
-                         'glob               (fn [d pat & more] (into [] (keep rel) (apply (r 'glob) (sr d) pat more)))
+                         ;; 1-arg is pattern-only (root = workspace root) — the
+                         ;; form an LLM reaches for, `(fs/glob "**/*.clj")`.
+                         ;; babashka.fs/glob is root-first, so the raw 1-arg call
+                         ;; is an arity error; SCI ≤0.13 silently nil-padded it
+                         ;; and ≥0.14 (correctly) rejects it, so spell the arity
+                         ;; out rather than rely on that leniency. (The virtual
+                         ;; adapter below already carries the same 1-arg form.)
+                         'glob               (fn
+                                               ([pat] (into [] (keep rel) ((r 'glob) (sr ".") pat)))
+                                               ([d pat & more] (into [] (keep rel) (apply (r 'glob) (sr d) pat more))))
                          'exists?            (pred (r 'exists?))
                          'directory?         (pred (r 'directory?))
                          'regular-file?      (pred (r 'regular-file?))
