@@ -61,9 +61,10 @@
         org.replikativ/muschel     {:mvn/version "0.2.19"}
 
         ;; Geschichte — authoritative virtual filesystem + Git compatibility.
-        ;; Released coordinate — 0.1.10 carries code-search (#6) + the native-release
-        ;; CI fix (#5); no local root needed.
-        org.replikativ/geschichte  {:mvn/version "0.1.10"}
+        ;; 0.1.12 is the release where the Yggdrasil adapter MOVED OUT (#8), so
+        ;; there is exactly one GeschichteSystem record on the classpath — the
+        ;; one in yggdrasil.adapters.geschichte. No local root needed.
+        org.replikativ/geschichte  {:mvn/version "0.1.12"}
 
         ;; rewrite-clj for structural editing
         rewrite-clj/rewrite-clj    {:mvn/version "1.1.48"}
@@ -72,8 +73,11 @@
         org.replikativ/datahike    {:mvn/version "0.8.1744"}
 
         ;; Yggdrasil — CoW branching for git and Datahike
-        ;; 0.2.27 carries composite Mergeable diff + conflicts (PR #3).
-        org.replikativ/yggdrasil   {:mvn/version "0.3.36"}
+        ;; 0.3.38 adopts the Geschichte adapter (yggdrasil.adapters.geschichte,
+        ;; PR #16) and gives it the p/Mergeable it never had, so a room repo can
+        ;; finally produce a FILE diff instead of a datom count over
+        ;; Geschichte's internal schema.
+        org.replikativ/yggdrasil   {:mvn/version "0.3.38"}
 
         ;; Scriptum — CoW Lucene indices for fulltext search
         org.replikativ/scriptum    {:mvn/version "0.1.27"}

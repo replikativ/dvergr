@@ -5,8 +5,8 @@
             [datahike.api :as d]
             [dvergr.substrate.geschichte :as g]
             [geschichte.repo :as repo]
-            [geschichte.yggdrasil :as gy]
-            [muschel.fs :as fs]))
+            [muschel.fs :as fs]
+            [yggdrasil.adapters.geschichte :as gy]))
 
 (defn- temp-dir [prefix]
   (.toFile (java.nio.file.Files/createTempDirectory
