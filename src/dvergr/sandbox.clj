@@ -612,8 +612,12 @@
   [s]
   (or (#{"user" "h" "intake.bash"} s)
       ;; clojure.data.xml is a library WE mount (the hardened parser) — keep it
-      ;; visible even though it's clojure-prefixed.
-      (and (not (#{"clojure.data.xml"} s))
+      ;; visible even though it's clojure-prefixed. clojure.test is kept for a
+      ;; different reason: unlike clojure.string, whether a test RUNNER exists
+      ;; in a sandbox is not something an agent can assume. Hiding it is why
+      ;; agents reached for kaocha (denied by the mirror allowlist) instead of
+      ;; the runner they already had.
+      (and (not (#{"clojure.data.xml" "clojure.test"} s))
            (some #(str/starts-with? s %) hidden-ns-prefixes))))
 
 (defn- interesting-ns?
@@ -665,12 +669,15 @@
    "dvergr.actors"   ["mutate the roster — spawn sub-agents / humans, assign skills"
                       "(dvergr.actors/spawn-agent! {:prompt \"…\" :budget 0.10})"]
    "dvergr.skills"   ["reusable skills you can find + dispatch"
-                      "(dvergr.skills/find \"draft a brief\")"]})
+                      "(dvergr.skills/find \"draft a brief\")"]
+   "clojure.test"    ["THE test runner in this sandbox — the real clojure.test. There is no kaocha/lein here (and mirroring one is denied), so this is the way to test your code. Failures print expected/actual to your stdout."
+                      "(require '[clojure.test :refer [deftest is]]) (deftest t (is (= 4 (+ 2 2)))) (clojure.test/run-tests)  ;=> {:test 1 :pass 1 :fail 0 …}"]})
 
 (def ^:private guide-order
   ["babashka.fs" "babashka.http-client" "babashka.process" "cheshire.core" "clojure.data.xml"
    "datahike.api" "dvergr.room" "dvergr.mail" "dvergr.intake" "dvergr.codec" "git" "env" "llm"
-   "dvergr.scheduler" "dvergr.tasks" "dvergr.agents" "dvergr.actors" "dvergr.skills"])
+   "dvergr.scheduler" "dvergr.tasks" "dvergr.agents" "dvergr.actors" "dvergr.skills"
+   "clojure.test"])
 
 (defn ns-overview-data
   "Introspect the SCI ctx's injected namespaces → sorted seq of
