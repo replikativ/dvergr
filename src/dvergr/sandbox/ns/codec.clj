@@ -8,7 +8,8 @@
                           `parse-str` here forbids DOCTYPE → no XXE / billion-laughs / SSRF.
      dvergr.codec       — base64 / url / html helpers (no babashka equivalent; ours)."
   (:require [clojure.string :as str]
-            [sci.core :as sci])
+            [sci.core :as sci]
+            [dvergr.sandbox.ns.doc :as doc])
   (:import [javax.xml.parsers SAXParserFactory]
            [javax.xml XMLConstants]
            [org.xml.sax InputSource]
@@ -123,10 +124,17 @@
                        'text      xml-text})
   ;; dvergr.codec — base64 / url / html (no babashka equivalent)
   (sci/add-namespace! sci-ctx 'dvergr.codec
-                      {'base64-encode   b64-encode
-                       'base64-decode   b64-decode-str
-                       'url-encode      url-encode
-                       'url-decode      url-decode
-                       'decode-entities html-decode-entities
-                       'strip-tags      html-strip-tags})
+                      (doc/with-docs
+                        {'base64-encode   b64-encode
+                         'base64-decode   b64-decode-str
+                         'url-encode      url-encode
+                         'url-decode      url-decode
+                         'decode-entities html-decode-entities
+                         'strip-tags      html-strip-tags}
+                        '{base64-encode   [([s]) "Base64-encode a string."]
+                          base64-decode   [([s]) "Decode a base64 string back to a string."]
+                          url-encode      [([s]) "Percent-encode a string for use in a URL query/path segment."]
+                          url-decode      [([s]) "Reverse percent-encoding."]
+                          decode-entities [([html]) "Turn HTML entities (&amp;, &#39;, …) into the characters they denote."]
+                          strip-tags      [([html]) "Strip HTML tags, leaving the text — handy for turning a fetched page into something summarizable."]}))
   sci-ctx)

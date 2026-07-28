@@ -7,7 +7,8 @@
             [clojure.string :as str]
             [jsonista.core :as j]
             [babashka.fs :as fs]
-            [muschel.fs :as mfs])
+            [muschel.fs :as mfs]
+            [dvergr.sandbox.ns.doc :as doc])
   (:import [java.io File]))
 
 (declare fs-safe-resolve git-run* parse-porcelain-status parse-git-log)
@@ -518,11 +519,17 @@
                       (str/trim (apply run! args))))]
 
     (sci/add-namespace! sci-ctx 'git
-                        {'status status-fn
-                         'log    log-fn
-                         'diff   diff-fn
-                         'add    add-fn
-                         'commit commit-fn})))
+                        (doc/with-docs
+                          {'status status-fn
+                           'log    log-fn
+                           'diff   diff-fn
+                           'add    add-fn
+                           'commit commit-fn}
+                          '{status [([]) "Working-tree status of YOUR room's repo, PARSED into a map (not porcelain text) — branch plus changed paths."]
+                            log    [([] [opts]) "Recent commits as maps of :hash/:subject/:author/:date. `opts` takes :n (default 10)."]
+                            diff   [([] [& args]) "Unified diff text. No args = unstaged changes; extra args pass through to `git diff` (e.g. \"--staged\", a path)."]
+                            add    [([& paths]) "Stage paths for commit. Audited. Returns :ok."]
+                            commit [([message] [message opts]) "Commit staged changes with `message`, returning the trimmed git output. `opts` takes :author. Audited."]}))))
 
 (defn add-env-ns!
   "Expose config-scoped key access as the 'env namespace in SCI. Resolves ONLY from
@@ -560,9 +567,13 @@
         keys-fn (fn [] (vec (distinct (concat (map str (keys @config-atom))
                                               (keys (or secrets {}))))))]
     (sci/add-namespace! sci-ctx 'env
-                        {'get  get-fn
-                         'set  set-fn
-                         'keys keys-fn})))
+                        (doc/with-docs
+                          {'get  get-fn
+                           'set  set-fn
+                           'keys keys-fn}
+                          '{get  [([key] [key default]) "Read a config key granted to YOU. This is NOT the host process environment — System/getenv is unreachable, so the daemon's own secrets are not visible here. A key configured as an injected secret returns an opaque PLACEHOLDER, never the real value; HTTP egress substitutes the real one at the destination."]
+                            set  [([key value]) "Set a config key for this sandbox session. Returns :ok."]
+                            keys [([]) "Every config key readable here, including the names of injected secrets (whose values stay placeholders)."]}))))
 
 (defn add-http-ns!
   "Expose HTTP client as 'http namespace in SCI.

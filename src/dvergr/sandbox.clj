@@ -22,6 +22,7 @@
             [dvergr.sandbox.ns.kb :as ns-kb]
             [dvergr.sandbox.ns.room :as ns-room]
             [dvergr.sandbox.ns.mail :as ns-mail]
+            [dvergr.sandbox.ns.doc :as ns-doc]
             [dvergr.sandbox.ns.datahike :as ns-datahike]
             [dvergr.sandbox.workspace :as workspace]
             [dvergr.sandbox.ns.agent :as ns-agent]
@@ -843,10 +844,15 @@
    it sees every namespace injected by `setup-agent-namespaces!`)."
   [sci-ctx]
   (sci/add-namespace! sci-ctx 'sandbox
-                      {'namespaces (fn [] (ns-overview-data sci-ctx))
-                       'overview   (fn [] (ns-overview-md sci-ctx))
-                       'help       (fn [] (ns-overview-md sci-ctx))
-                       'doc        (fn [ns-name] (ns-doc-md sci-ctx ns-name))}))
+                      (ns-doc/with-docs
+                        {'namespaces (fn [] (ns-overview-data sci-ctx))
+                         'overview   (fn [] (ns-overview-md sci-ctx))
+                         'help       (fn [] (ns-overview-md sci-ctx))
+                         'doc        (fn [ns-name] (ns-doc-md sci-ctx ns-name))}
+                        '{namespaces [([]) "What is loaded, as DATA: a seq of {:ns \"dvergr.room\" :fns [\"kb-search\" …]}. Derived from the live context, so it never drifts from what was actually injected."]
+                          overview   [([]) "The same inventory as readable markdown — what each namespace is for plus one real call. Start here when you do not know what you can do."]
+                          help       [([]) "Alias for `overview`."]
+                          doc        [([ns-name]) "Markdown for ONE namespace: its purpose, an example, and its fns with signatures — e.g. (sandbox/doc 'dvergr.room). For a single fn use (clojure.repl/doc dvergr.room/kb-search)."]})))
 
 (defn lock-interop!
   "Remove `:allow :all` from a sandbox context's class config, so JVM interop is

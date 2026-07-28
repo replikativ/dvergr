@@ -19,6 +19,7 @@
             [clojure.string :as str]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.yggdrasil :as ygg]
+            [dvergr.sandbox.ns.doc :as doc]
             [sci.core :as sci]))
 
 (defn- safe [f] (try (f) (catch Throwable t {:error (.getMessage t)})))
@@ -125,17 +126,36 @@
         kb  (fn [slug] (safe #(binding [ec/*execution-context* ctx]
                                 (srooms/room-kb-conn room-id slug))))
         room-map (merge (ns-kb/room-ops-map ctx)        ; create!/fork!/merge!/post!/messages/…
-                        {'*room*          room-conn      ; the room's own datahike (messages store)
-                         '*kb*            kb-conn         ; the DEFAULT writable KB (see kbs)
-                         'kbs             kbs             ; [{:name :permission :default?}] — writable KBs
-                         'kb              kb              ; fork-aware conn to a writable KB by name
-                         'databases       databases       ; [{:name :type :permission}] — your DBs
-                         'db              db              ; fork-aware conn to one by name
-                         'kb-find         kb-find
-                         'kb-by-type      kb-by-type
-                         'kb-search       kb-search
-                         'recent-messages recent-msgs
-                         'search-messages search-msgs
-                         'schedules       schedules
-                         'gc!             gc!})]
+                        ;; Docs live HERE rather than only in these trailing
+                        ;; comments: the comments never reached the sandbox, so
+                        ;; `(clojure.repl/doc dvergr.room/kb-search)` answered
+                        ;; "arity unknown — injected as a bare fn". See
+                        ;; `dvergr.sandbox.ns.doc`. `*room*`/`*kb*` are conns
+                        ;; (or nil) — values with no signature to state — so
+                        ;; they carry no entry and are described in ns-guide.
+                        (doc/with-docs
+                          {'*room*          room-conn      ; the room's own datahike (messages store)
+                           '*kb*            kb-conn         ; the DEFAULT writable KB (see kbs)
+                           'kbs             kbs             ; [{:name :permission :default?}] — writable KBs
+                           'kb              kb              ; fork-aware conn to a writable KB by name
+                           'databases       databases       ; [{:name :type :permission}] — your DBs
+                           'db              db              ; fork-aware conn to one by name
+                           'kb-find         kb-find
+                           'kb-by-type      kb-by-type
+                           'kb-search       kb-search
+                           'recent-messages recent-msgs
+                           'search-messages search-msgs
+                           'schedules       schedules
+                           'gc!             gc!}
+                          '{kbs             [([]) "The knowledge bases you may WRITE, as [{:name :permission :default?}]. Your own KB is usually the default, but a room whose knowledge lives in an ATTACHED KB would otherwise write into its own empty one — check here before saving if it matters where."]
+                            kb              [([slug]) "Fork-aware conn to one WRITABLE knowledge base by name (see `kbs`)."]
+                            databases       [([]) "Every database available to this room, as [{:name :type :permission}] — the discovery entry point before `db`."]
+                            db              [([db-name]) "Fork-aware conn to one of your databases by name (see `databases`). Query it with the real datahike API: (d/q '[…] @conn)."]
+                            kb-find         [([title]) "The single KB entity with this exact title, or nil. Searches EVERY readable KB — your own plus whatever is granted to the room — across both title bindings, and the result carries :kb so you know where it lives."]
+                            kb-by-type      [([type]) "KB entities of a given :entity/type (pass the type as a string or keyword), pulled with title/summary/type, tagged with :kb."]
+                            kb-search       [([term]) "Substring search over title+summary across EVERY readable KB (max 25 hits), each tagged with :kb. Reach for this before researching something afresh."]
+                            recent-messages [([] [n]) "The n most recent messages in THIS room (default 20), newest first."]
+                            search-messages [([term]) "Messages in THIS room whose content contains `term` (max 50)."]
+                            schedules       [([]) "The schedules registered on THIS room — what runs, and when."]
+                            gc!             [([] [opts]) "Reclaim unreachable storage for this room/fork — datahike index blobs and git objects. Default collects orphan garbage only and KEEPS all history; pass {:remove-before <Date>} to collapse history older than that."]}))]
     (sci/add-namespace! sci-ctx 'dvergr.room room-map)))

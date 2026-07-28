@@ -5,7 +5,8 @@
    datahike + spindel directly."
   (:require [sci.core :as sci]
             [datahike.api :as dh]
-            [org.replikativ.spindel.engine.core :as rtc]))
+            [org.replikativ.spindel.engine.core :as rtc]
+            [dvergr.sandbox.ns.doc :as doc]))
 
 (defn add-llm-ns!
   "Expose cheap one-shot LLM calls as 'llm namespace in SCI.
@@ -25,8 +26,11 @@
                        (call-fn "Summarize the key points concisely:"
                                 content (or opts {})))]
     (sci/add-namespace! sci-ctx 'llm
-                        {'call      call-fn
-                         'summarize summarize-fn})))
+                        (doc/with-docs
+                          {'call      call-fn
+                           'summarize summarize-fn}
+                          '{call      [([system-prompt content] [system-prompt content opts]) "One-shot call to a CHEAP model — for mechanical language work (extract, classify, rewrite) inside a larger job, not for reasoning you should do yourself. `opts` takes :max-tokens. Not budget-tracked at this level."]
+                            summarize [([content] [content opts]) "Summarize text with the cheap model. `opts` takes :max-tokens, e.g. (llm/summarize page {:max-tokens 300})."]}))))
 
 ;; (RF5: the calendar folded into the per-room scheduler — see `scheduler/*` +
 ;; `dvergr.room/schedules`. The standalone calendar subsystem is gone.)
@@ -168,38 +172,60 @@
                       (binding [rtc/*execution-context* spindel-ctx]
                         (or (rreg-lookup* :daemon)
                             (rtc/get-state [:dvergr/discourse-root]))))]
-    {'create!      create-fn
-     'list         list-fn
-     'get          get-fn
-     'post!        post-fn
-     'messages     messages-fn
-     'children     children-fn
-     'set-parent!  set-parent-fn
-     'join!        join-fn
-     'leave!       leave-fn
-     'delete!      delete-fn
-     'fork!        fork-fn
-     'merge!       merge-fn
-     'discard!     discard-fn
-     'diff         diff-fn
-     'review       review-fn
-     'classify     fork-classify*
-     'forks        forks-fn
-     'participants participants-fn
-     'root         root-fn
+    (doc/with-docs
+      {'create!      create-fn
+       'list         list-fn
+       'get          get-fn
+       'post!        post-fn
+       'messages     messages-fn
+       'children     children-fn
+       'set-parent!  set-parent-fn
+       'join!        join-fn
+       'leave!       leave-fn
+       'delete!      delete-fn
+       'fork!        fork-fn
+       'merge!       merge-fn
+       'discard!     discard-fn
+       'diff         diff-fn
+       'review       review-fn
+       'classify     fork-classify*
+       'forks        forks-fn
+       'participants participants-fn
+       'root         root-fn
      ;; Subagent delegation — fork a subroom (`:ctx` substrate + shared CRDTs),
      ;; host an ephemeral worker, delegate the goal, merge/discard. Returns a Spin:
      ;; `(await (dvergr.room/hire "<room-ref>" {:goal … :spec {…}}))` in the
      ;; foreground, or hold the spin and await it later (background). Durably
      ;; tracked as a `:dvergr/subagent` lifecycle log; `pending-subagents` lists
      ;; the still-running ones.
-     'hire         (fn [ref opts]
-                     (when-let [room (resolve-room ref)]
-                       (binding [rtc/*execution-context* (:ctx room)]
-                         (subagent-hire* room opts))))
-     'pending-subagents (fn [ref]
-                          (when-let [room (resolve-room ref)]
-                            (binding [rtc/*execution-context* (:ctx room)]
-                              (subagent-pend* room))))}))
+       'hire         (fn [ref opts]
+                       (when-let [room (resolve-room ref)]
+                         (binding [rtc/*execution-context* (:ctx room)]
+                           (subagent-hire* room opts))))
+       'pending-subagents (fn [ref]
+                            (when-let [room (resolve-room ref)]
+                              (binding [rtc/*execution-context* (:ctx room)]
+                                (subagent-pend* room))))}
+      '{create!      [([opts]) "Create a persistent room. `opts` takes :slug :title :agents. Rooms are the unit of work: each has its own git repo, knowledge base and schedules."]
+        list         [([]) "Every room you can see, as maps."]
+        get          [([ref]) "One room by slug or id, or nil."]
+        post!        [([ref content]) "Post a message into a room — how you talk to the people and agents in it. `ref` is a slug or id."]
+        messages     [([ref] [ref opts]) "Recent messages in a room, newest first."]
+        children     [([ref]) "Rooms whose parent is this one."]
+        set-parent!  [([child parent]) "Re-parent a room, building the room tree."]
+        join!        [([ref] [ref who]) "Join a room so you receive its messages."]
+        leave!       [([ref] [ref who]) "Stop receiving a room's messages."]
+        delete!      [([ref]) "Delete a room. Destructive — prefer discard! on a fork, or archiving."]
+        fork!        [([ref]) "Branch a room into an ISOLATED copy — its own git repo AND database — so you can experiment freely. This is the safe way to attempt a substantial or risky change: fork, work, then merge! or discard!."]
+        merge!       [([parent fork]) "Collapse a fork's work back into its parent, surfacing a git + database diff for review. The other half of the fork→test→merge loop."]
+        discard!     [([fork]) "Throw a fork away, keeping the parent untouched."]
+        diff         [([fork]) "What a fork CHANGED versus its parent — code and data — so you can judge it before merging."]
+        review       [([fork]) "An agent review of a fork's changes: the fork tiering + review pipeline, not just a raw diff."]
+        classify     [([fork]) "How mergeable a fork is (its tier) — used to route it as a task vs a proposal."]
+        forks        [([ref]) "Every fork of a room."]
+        participants [([ref]) "Who is in a room — agents and humans."]
+        root         [([]) "The root room of the tree."]
+        hire         [([ref opts]) "Delegate a goal to an EPHEMERAL sub-agent in a forked subroom (`:ctx` substrate + shared CRDTs), then merge or discard it. `opts` takes :goal and :spec. Returns a SPIN — (await (dvergr.room/hire …)) to run it in the foreground, or hold the spin and await it later to run it in the background. Tracked durably as a :dvergr/subagent lifecycle log."]
+        pending-subagents [([ref]) "Sub-agents hired from this room that are still running."]})))
 
 
