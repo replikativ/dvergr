@@ -841,6 +841,33 @@
                        'help       (fn [] (ns-overview-md sci-ctx))
                        'doc        (fn [ns-name] (ns-doc-md sci-ctx ns-name))}))
 
+(defn lock-interop!
+  "Remove `:allow :all` from a sandbox context's class config, so JVM interop is
+   gated by the class allowlist instead of wide open.
+
+   THIS IS THE JVM-ESCAPE BARRIER. Without it, SCI ≥0.14 (ADR 0007) will still
+   let an agent reach a host shell, because the agent context is spindel-backed
+   and `spindel.sci.core/common-classes` sets `:allow :all` — correct for the
+   TRUSTED frontend it was written for, fatal for an UNTRUSTED agent sandbox.
+   Under `:allow :all` every instance method on every class is permitted, so:
+
+     (-> (atom 1) .getClass .getClassLoader (.loadClass \"java.lang.Runtime\"))
+
+   loads Runtime and reflective `.invoke` runs `exec` — a full RCE, verified.
+   Removing `:allow :all` makes interop fall back to per-class registration:
+   `.getClass` on a registered class is fine, but `.getClassLoader` on the
+   unregistered `java.lang.Class` throws \"not allowed\", and the escape dies
+   there. The curated classes the engine and agents actually use (Atom, Spin,
+   Thunk, IFn, String, java.time, …) stay registered, so defn/records/try-catch/
+   sync/spin keep working — the class allowlist is the boundary, as SCI intends.
+
+   `dissoc` produces a fresh `:class->opts` map; SCI's per-site interop cache is
+   keyed on that map's identity (ADR 0007 decision 2), so already-analysed code
+   re-resolves under the tightened config on its next call — no stale `:allow`."
+  [sci-ctx]
+  (swap! (:env sci-ctx) update :class->opts dissoc :allow)
+  sci-ctx)
+
 (defn setup-agent-namespaces!
   "Wire execution-context-aware namespaces into a SCI context.
 
@@ -955,6 +982,8 @@
              (binding [*out* *err*] (println "ns-injector failed:" (.getMessage e))))))
     ;; Self-reflection LAST, so (sandbox/overview) sees every ns injected above.
     (add-reflection-ns! sci-ctx)
+    ;; SECURITY, last of all: lock JVM interop to the class allowlist.
+    (lock-interop! sci-ctx)
     audit-log))
 
 ;; ---------------------------------------------------------------------------

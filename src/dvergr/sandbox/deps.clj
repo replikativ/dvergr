@@ -305,7 +305,19 @@
    it hold even for a raw `d/transact` on a conn the agent legitimately owns.
    Mirroring this namespace exposes `unregister-tx-pred!` — one call and the
    guarantee is gone. Denying it is what makes governance meaningful."
-  ["^sci($|\\..*)"
+  [;; The allowlist admits `^babashka` for the pure, curated ones — `babashka.fs`
+   ;; (a pre-registered PATH-CLAMPED shim), `babashka.json`, … — but that prefix
+   ;; also matches the host-process API, which the allowlist's own docstring says
+   ;; must NOT be reachable. `babashka.fs` is safe because it is already
+   ;; registered, so the mirror never fires for it; `babashka.process` and
+   ;; `babashka.tasks` are NOT pre-registered (agents get gated `proc/*`
+   ;; instead), so an innocuous `(require 'babashka.process)` would mirror the
+   ;; RAW host API and hand back `sh`/`process` — a host shell as the daemon
+   ;; user. Hard-deny the process surfaces while keeping the prefix open for the
+   ;; data ones.
+   "^babashka\\.process($|\\..*)"
+   "^babashka\\.tasks($|\\..*)"
+   "^sci($|\\..*)"
    "^datahike\\.tx-preds($|\\..*)"
    "^dvergr($|\\..*)"
    "^is\\.simm($|\\..*)"
