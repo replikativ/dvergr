@@ -414,6 +414,15 @@
                         :name sym})))
              (deref v))])))
 
+(defn- registered?
+  "Is `ns-sym` already present in this SCI context's namespace map?
+
+   True for both the curated shims dvergr installs (`babashka.fs`, the muschel
+   filesystem, …) and anything mirrored earlier in the session. Used to decide
+   whether a `:reload` may reach the host — see `make-load-fn`."
+  [sci-ctx ns-sym]
+  (contains? (:namespaces @(:env sci-ctx)) ns-sym))
+
 (defn ensure-mirrored!
   "Try to load `ns-sym` on the host and mirror its publics into
    `sci-ctx`. Returns true if mirrored (or already present),
@@ -492,7 +501,7 @@
    On host failure (no JAR / no source), return nil; SCI's default
    error path takes over."
   [sci-ctx]
-  (fn [{:keys [namespace libname] :as req}]
+  (fn [{:keys [namespace libname reload] :as req}]
     ;; Try the agent's OWN workspace files FIRST (a room repo source), so
     ;; `(require '[my.ns])` of code the agent just wrote resolves. This load-fn
     ;; REPLACES the workspace load-fn set at ctx build (SCI keeps one), so it must
@@ -501,6 +510,32 @@
     ;; (for add-libs'd deps) only when the workspace doesn't have it.
     (or (workspace/load-fn req)
         (let [ns-sym (or namespace libname)]
+          ;; NEVER mirror over a namespace the ctx already has. SCI documents
+          ;; that a registered namespace short-circuits `:load-fn` — "unless
+          ;; `:reload` or `:reload-all` are used" — and it passes `reload` in
+          ;; so a host can act on that. babashka's own load-fn destructures it
+          ;; for exactly this reason ("pod namespaces go before namespaces from
+          ;; source, unless reload is used"). This one did not, and because
+          ;; `sci/add-namespace!` MERGES, one `:reload` replaced a curated shim
+          ;; with the real host namespace:
+          ;;
+          ;;   (babashka.fs/exists? "/etc/passwd")  ;=> Access denied  <- clamped
+          ;;   (require 'babashka.fs :reload)       ;      mirrored, 90 publics
+          ;;   (babashka.fs/exists? "/etc/passwd")  ;=> true           <- clamp gone
+          ;;
+          ;; and with `babashka.process` the same line yielded a host shell as
+          ;; the daemon user. The allowlist was never the hole — `^babashka` is
+          ;; there so agents CAN require `babashka.fs`, and it keeps working;
+          ;; what was missing is that a shim, once installed, is the answer.
+          ;;
+          ;; Refused loudly rather than by returning nil: "could not find
+          ;; namespace" about a namespace plainly present would send the agent
+          ;; hunting for the wrong problem.
+          (when (and reload (registered? sci-ctx ns-sym))
+            (throw (ex-info (str "Refusing to reload `" ns-sym "` — this sandbox provides it, "
+                                 "and reloading would replace the sandbox version with the host's. "
+                                 "It is already available; require it without :reload.")
+                            {:type :dvergr/reload-refused :ns ns-sym})))
           (when (ensure-mirrored! sci-ctx ns-sym)
             ;; Returning a map without :handled true causes SCI to fall
             ;; through to `handle-require-libspec-env`, which reads the
