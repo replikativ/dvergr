@@ -138,6 +138,57 @@
    {:tool :bash :pattern {:kind :argv-vec :vec ["git" git-local-subcommands]}
     :action :allow :origin :default}])
 
+(def workspace-delete-rules
+  "Re-allow recursive `rm` inside the workspace; keep it denied on system paths.
+
+   muschel's default ruleset denies `rm` with any recursive flag OUTRIGHT,
+   regardless of target. That is the right default for a LIBRARY — muschel
+   cannot assume its embedder's workspace is recoverable. dvergr's is: the agent
+   works in a geschichte-backed fork with commit history, so `rm -rf build/` is a
+   working-tree change it can undo (checkout, or discard the fork), and the FS is
+   jailed so the path cannot reach the host anyway.
+
+   The blanket deny also bought nothing measurable. `babashka.fs/delete-tree` is
+   part of the sandbox's fs surface and performs the SAME recursive deletion with
+   no permit layer in front of it — verified: `rm -rf scratch` returned
+   \"permit denied: recursive delete\" while `(babashka.fs/delete-tree \"scratch\")`
+   removed the identical tree in the same session. So the rule did not prevent
+   recursive deletion; it pushed the agent from the audited shell onto an
+   unaudited door, and made an ordinary chore (`rm -rf node_modules`) feel
+   forbidden. Worse than allowing it.
+
+   Order matters — rules are LAST-MATCH-WINS and these are applied after the
+   defaults, so the system-path deny is re-asserted AFTER the allow. Wiping the
+   workspace root is still refused: inside muschel the workspace is mounted at
+   `/`, so `rm -rf /` means \"delete everything I have\" — recoverable, but
+   essentially always a mistake, and refusing costs nothing legitimate.
+
+   The re-assertion has to be spelled out here rather than left to muschel's own
+   critical-path rule, because relaxing the blanket deny is what puts that rule
+   on the critical path for the first time. It was an `:argv-shape` with `:**`
+   in the MIDDLE — which matches nothing, so it had never fired; the blanket
+   deny in front of it caught every `rm -rf` first. Lifting the blanket exposed
+   it: `rm -rf /etc` came back exit 0 in the first cut of this change, caught by
+   `dvergr.intake.workspace-delete-test`. Fixed upstream (muschel#12) with a
+   position-independent `:argv-any`, which is what \"a protected path ANYWHERE
+   in the args\" needs — `rm -rf /etc`, `rm -r -f /etc` and `rm -v -r /etc` put
+   the target in different slots. `:argv-any` also fails CLOSED on non-literal
+   args (`$TARGET`, unexpanded globs), so a deny refuses rather than guessing
+   what they expand to. Needs muschel >= 0.2.19."
+  [{:tool :bash
+    :pattern {:kind :argv-flags
+              :head ["rm"]
+              :any-of #{"-r" "-R" "--recursive"}}
+    :action :allow :origin :default
+    :reason "workspace is versioned + jailed; recursive delete is recoverable"}
+   {:tool :bash
+    :pattern {:kind :argv-any
+              :head ["rm"]
+              :any #{"/" "/*" "/home" "/usr" "/etc" "/var" "/bin" "/lib"
+                     "/root" "/boot" "/sys" "/proc" "/dev"}}
+    :action :deny :origin :default
+    :reason "would delete a critical path / the whole workspace"}])
+
 (def ^:private git-identity-defaults
   "Commit identity for the agent (so it can commit without the disallowed
    `git config`). A host GIT_AUTHOR_*/GIT_COMMITTER_* overrides these."
@@ -520,7 +571,8 @@
                     ;; Agents don't write stdin; never inherit System/in
                     ;; (would block under nREPL / when daemonised).
                     :in          (java.io.ByteArrayInputStream. (.getBytes ""))
-                    :permit      {:rulesets [m/default-rules git-sandbox-rules] :prompter prompter}
+                    :permit      {:rulesets [m/default-rules git-sandbox-rules workspace-delete-rules]
+                                  :prompter prompter}
                     :timeout-ms  timeout-ms
                     :trace       (trace-bridge)}
              interrupt-fn (assoc :interrupt-fn interrupt-fn)))

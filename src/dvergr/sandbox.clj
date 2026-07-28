@@ -22,6 +22,7 @@
             [dvergr.sandbox.ns.kb :as ns-kb]
             [dvergr.sandbox.ns.room :as ns-room]
             [dvergr.sandbox.ns.mail :as ns-mail]
+            [dvergr.sandbox.ns.doc :as ns-doc]
             [dvergr.sandbox.ns.datahike :as ns-datahike]
             [dvergr.sandbox.workspace :as workspace]
             [dvergr.sandbox.ns.agent :as ns-agent]
@@ -612,8 +613,12 @@
   [s]
   (or (#{"user" "h" "intake.bash"} s)
       ;; clojure.data.xml is a library WE mount (the hardened parser) — keep it
-      ;; visible even though it's clojure-prefixed.
-      (and (not (#{"clojure.data.xml"} s))
+      ;; visible even though it's clojure-prefixed. clojure.test is kept for a
+      ;; different reason: unlike clojure.string, whether a test RUNNER exists
+      ;; in a sandbox is not something an agent can assume. Hiding it is why
+      ;; agents reached for kaocha (denied by the mirror allowlist) instead of
+      ;; the runner they already had.
+      (and (not (#{"clojure.data.xml" "clojure.test"} s))
            (some #(str/starts-with? s %) hidden-ns-prefixes))))
 
 (defn- interesting-ns?
@@ -665,12 +670,15 @@
    "dvergr.actors"   ["mutate the roster — spawn sub-agents / humans, assign skills"
                       "(dvergr.actors/spawn-agent! {:prompt \"…\" :budget 0.10})"]
    "dvergr.skills"   ["reusable skills you can find + dispatch"
-                      "(dvergr.skills/find \"draft a brief\")"]})
+                      "(dvergr.skills/find \"draft a brief\")"]
+   "clojure.test"    ["how you test IN here — the real clojure.test, run inside clojure_eval; failures print expected/actual to your stdout. This is the ONLY runner available to you, by design: kaocha/lein/clj are not reachable (handing control to a second runtime would let it read+write outside the sandbox), so requiring kaocha fails and the shell has no `clj`. To exercise code that lives in a FILE, load it — (load-string (slurp \"src/foo.clj\")) — then deftest against it here."
+                      "(require '[clojure.test :refer [deftest is]]) (deftest t (is (= 4 (+ 2 2)))) (clojure.test/run-tests)  ;=> {:test 1 :pass 1 :fail 0 …}"]})
 
 (def ^:private guide-order
   ["babashka.fs" "babashka.http-client" "babashka.process" "cheshire.core" "clojure.data.xml"
    "datahike.api" "dvergr.room" "dvergr.mail" "dvergr.intake" "dvergr.codec" "git" "env" "llm"
-   "dvergr.scheduler" "dvergr.tasks" "dvergr.agents" "dvergr.actors" "dvergr.skills"])
+   "dvergr.scheduler" "dvergr.tasks" "dvergr.agents" "dvergr.actors" "dvergr.skills"
+   "clojure.test"])
 
 (defn ns-overview-data
   "Introspect the SCI ctx's injected namespaces → sorted seq of
@@ -824,8 +832,13 @@
        "relative paths** (`(p/shell \"ls\")`, `(p/shell \"cat src/foo.clj\")`) — "
        "absolute system paths like `/etc` don't exist. Built-in POSIX tools include ls cat "
        "grep sed awk find sort uniq cut tr jq xargs wc head tail diff git — no "
-       "external binary needed. Destructive ops (rm -rf, sudo, git push --force) "
-       "are blocked by design; that's expected, not a failure.\n\n"
+       "external binary needed, and `sed -i` edits in place. These are IN-PROCESS "
+       "implementations, not the system binaries: `git` is backed by your room's "
+       "geschichte workspace, and there is deliberately no `clj`/`python3`/`node` "
+       "(a second runtime could read and write outside the sandbox — use "
+       "clojure_eval for scripting). Destructive ops (rm -rf, sudo, git push --force) "
+       "are blocked by design; that's expected, not a failure. `(dvergr.shell/builtins)` "
+       "lists what this session actually has, if you are unsure.\n\n"
        "**Knowledge:** recall with `knowledge_search`/`(search/find …)` BEFORE "
        "researching, and save findings with `knowledge_add` so they persist past "
        "this session (sandbox `(defn …)` do not)."))
@@ -836,10 +849,15 @@
    it sees every namespace injected by `setup-agent-namespaces!`)."
   [sci-ctx]
   (sci/add-namespace! sci-ctx 'sandbox
-                      {'namespaces (fn [] (ns-overview-data sci-ctx))
-                       'overview   (fn [] (ns-overview-md sci-ctx))
-                       'help       (fn [] (ns-overview-md sci-ctx))
-                       'doc        (fn [ns-name] (ns-doc-md sci-ctx ns-name))}))
+                      (ns-doc/with-docs
+                        {'namespaces (fn [] (ns-overview-data sci-ctx))
+                         'overview   (fn [] (ns-overview-md sci-ctx))
+                         'help       (fn [] (ns-overview-md sci-ctx))
+                         'doc        (fn [ns-name] (ns-doc-md sci-ctx ns-name))}
+                        '{namespaces [([]) "What is loaded, as DATA: a seq of {:ns \"dvergr.room\" :fns [\"kb-search\" …]}. Derived from the live context, so it never drifts from what was actually injected."]
+                          overview   [([]) "The same inventory as readable markdown — what each namespace is for plus one real call. Start here when you do not know what you can do."]
+                          help       [([]) "Alias for `overview`."]
+                          doc        [([ns-name]) "Markdown for ONE namespace: its purpose, an example, and its fns with signatures — e.g. (sandbox/doc 'dvergr.room). For a single fn use (clojure.repl/doc dvergr.room/kb-search)."]})))
 
 (defn lock-interop!
   "Remove `:allow :all` from a sandbox context's class config, so JVM interop is

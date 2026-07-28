@@ -1,8 +1,14 @@
 (ns dvergr.sandbox.ns.agent
   "SCI injectors — agent identity + work: agents (self/inbox), actors (durable
    identity), skills, tasks, scheduler. Split out of dvergr.sandbox (Phase 4).
-   Subsystems reached via inline require + ns-resolve."
-  (:require [sci.core :as sci]))
+   Subsystems reached via inline require + ns-resolve.
+
+   Each `sci/add-namespace!` map is wrapped in `doc/with-docs` so the injected
+   closures carry `:doc`/`:arglists` — without it `(clojure.repl/doc …)` and
+   `(find-doc …)` answer nothing for them inside the sandbox. See
+   `dvergr.sandbox.ns.doc`."
+  (:require [sci.core :as sci]
+            [dvergr.sandbox.ns.doc :as doc]))
 
 (defn add-agents-ns!
   "Expose the agent registry as 'agents namespace in SCI.
@@ -27,10 +33,15 @@
         online?-fn   (fn [id] (online?* id))
         by-tag-fn    (fn [tag] (filterv #(contains? (:tags %) tag) (online-actors*)))]
     (sci/add-namespace! sci-ctx 'dvergr.agents
-                        {'list    list-fn
-                         'lookup  lookup-fn
-                         'online? online?-fn
-                         'by-tag  by-tag-fn})))
+                        (doc/with-docs
+                          {'list    list-fn
+                           'lookup  lookup-fn
+                           'online? online?-fn
+                           'by-tag  by-tag-fn}
+                          '{list    [([]) "Every agent currently ONLINE in this daemon, as a vector of entries. Ground-truth for who can actually take work right now — a profile mentioning an agent does not mean it is running."]
+                            lookup  [([id]) "The full entry for one agent id (e.g. :skald), or nil if it is not online."]
+                            online? [([id]) "Whether an agent id is running right now. Check before dispatching work to it."]
+                            by-tag  [([tag]) "Online agents whose :tags contain `tag` (e.g. :coding) — a vector, possibly empty."]}))))
 
 (defn add-skills-ns!
   "Expose the skill registry + dispatch as 'skills namespace in SCI.
@@ -61,37 +72,48 @@
                                   'dvergr.sandbox.workspace/workspace-root))
                                 (catch Throwable _ nil)))]
     (sci/add-namespace! sci-ctx 'dvergr.skills
-                        {'all       (fn [] (load-all* (room-dir)))
+                        (doc/with-docs
+                          {'all       (fn [] (load-all* (room-dir)))
                          ;; Progressive disclosure: the system prompt shows a
                          ;; brief index; pull a skill's FULL instructions here.
-                         'read      (fn [skill-name] (read-skill* skill-name (room-dir)))
-                         'find      (fn [provides-tag]
-                                      (vec (list-fn :provides provides-tag)))
-                         'providers (fn [skill] (find-prov conn skill))
-                         'rank      (fn [skill] (rank-prov conn skill))
-                         'dispatch  (fn [skill] (dispatch conn skill))
-                         'dispatch! (fn [skill opts]
-                                      (dispatch!* conn skill opts))
+                           'read      (fn [skill-name] (read-skill* skill-name (room-dir)))
+                           'find      (fn [provides-tag]
+                                        (vec (list-fn :provides provides-tag)))
+                           'providers (fn [skill] (find-prov conn skill))
+                           'rank      (fn [skill] (rank-prov conn skill))
+                           'dispatch  (fn [skill] (dispatch conn skill))
+                           'dispatch! (fn [skill opts]
+                                        (dispatch!* conn skill opts))
                          ;; Authoring lifecycle (writes into THIS room's repo —
                          ;; versioned + forkable + mergeable). Agent-authored
                          ;; skills land `vetted: false`, so the vetting gate keeps
                          ;; them out of prompts until a reviewer promotes them.
-                         'author!   (fn [skill-name frontmatter body]
-                                      (if-let [dir (room-dir)]
-                                        (author* "skills" dir (str skill-name) frontmatter (str body))
-                                        (throw (ex-info "skills/author! needs a room sandbox repo (no room ctx bound)" {}))))
+                           'author!   (fn [skill-name frontmatter body]
+                                        (if-let [dir (room-dir)]
+                                          (author* "skills" dir (str skill-name) frontmatter (str body))
+                                          (throw (ex-info "skills/author! needs a room sandbox repo (no room ctx bound)" {}))))
                          ;; Lift external content (an openclaw/Claude skill, a URL
                          ;; you fetched) into the room as an UNVETTED skill.
-                         'lift!     (fn [skill-name source body]
-                                      (if-let [dir (room-dir)]
-                                        (author* "skills" dir (str skill-name)
-                                                 {:source (str source) :vetted false} (str body))
-                                        (throw (ex-info "skills/lift! needs a room sandbox repo (no room ctx bound)" {}))))
+                           'lift!     (fn [skill-name source body]
+                                        (if-let [dir (room-dir)]
+                                          (author* "skills" dir (str skill-name)
+                                                   {:source (str source) :vetted false} (str body))
+                                          (throw (ex-info "skills/lift! needs a room sandbox repo (no room ctx bound)" {}))))
                          ;; Promote a room skill to vetted (reviewer action).
-                         'promote!  (fn [skill-name by date]
-                                      (if-let [definition (get (load-all* (room-dir)) (str skill-name))]
-                                        (do (promote* definition (str by) (str date)) true)
-                                        (throw (ex-info (str "no such skill to promote: " skill-name) {}))))})))
+                           'promote!  (fn [skill-name by date]
+                                        (if-let [definition (get (load-all* (room-dir)) (str skill-name))]
+                                          (do (promote* definition (str by) (str date)) true)
+                                          (throw (ex-info (str "no such skill to promote: " skill-name) {}))))}
+                          '{all       [([]) "Every skill visible here — on disk plus any this room defines (the room's own take precedence). A map of skill-name → definition."]
+                            read      [([skill-name]) "The FULL instructions for one skill. The system prompt carries only a brief index; pull the body with this before following a skill."]
+                            find      [([provides-tag]) "Skill definitions that provide `provides-tag` (e.g. :research) — a vector, possibly empty."]
+                            providers [([skill]) "Actor-ids that declare they can perform `skill`, whether or not they are online."]
+                            rank      [([skill]) "Providers of `skill` ranked by suitability, ONLINE ones only."]
+                            dispatch  [([skill]) "The single best online provider for `skill` (an actor map), or nil if nobody can take it."]
+                            dispatch! [([skill opts]) "Actually hand `skill` to its best provider. `opts` carries the payload for the receiving actor."]
+                            author!   [([skill-name frontmatter body]) "Write a NEW skill into this room's repo (versioned, forkable, mergeable). Lands `vetted: false`, so it stays out of prompts until a reviewer promotes it. Needs a room ctx."]
+                            lift!     [([skill-name source body]) "Import external content (another agent's skill, a fetched URL) into the room as an UNVETTED skill, recording `source`. Needs a room ctx."]
+                            promote!  [([skill-name by date]) "Mark a room skill vetted — a REVIEWER action; this is what lets it appear in prompts. Throws if there is no such skill."]}))))
 
 (defn add-actors-ns!
   "Expose the durable actor table as 'actors namespace in SCI.
@@ -130,15 +152,25 @@
         add-skill-fn    @(ns-resolve 'dvergr.actors 'add-skill!)
         remove-skill-fn @(ns-resolve 'dvergr.actors 'remove-skill!)]
     (sci/add-namespace! sci-ctx 'dvergr.actors
-                        {'list          (fn [& kvs] (apply list-fn conn kvs))
-                         'lookup        (fn [id]      (lookup-fn conn id))
-                         'online?       (fn [id]      (online?-fn id))
-                         'spawn-agent!  (fn [opts]    (spawn-agent-fn conn opts))
-                         'spawn-human!  (fn [opts]    (spawn-human-fn conn opts))
-                         'dismiss!      (fn [id]      (dismiss-fn conn id))
-                         'update!       (fn [id patch] (update-fn conn id patch))
-                         'add-skill!    (fn [id skill] (add-skill-fn conn id skill))
-                         'remove-skill! (fn [id skill] (remove-skill-fn conn id skill))})))
+                        (doc/with-docs
+                          {'list          (fn [& kvs] (apply list-fn conn kvs))
+                           'lookup        (fn [id]      (lookup-fn conn id))
+                           'online?       (fn [id]      (online?-fn id))
+                           'spawn-agent!  (fn [opts]    (spawn-agent-fn conn opts))
+                           'spawn-human!  (fn [opts]    (spawn-human-fn conn opts))
+                           'dismiss!      (fn [id]      (dismiss-fn conn id))
+                           'update!       (fn [id patch] (update-fn conn id patch))
+                           'add-skill!    (fn [id skill] (add-skill-fn conn id skill))
+                           'remove-skill! (fn [id skill] (remove-skill-fn conn id skill))}
+                          '{list          [([] [& {:keys [kind status]}]) "Every DURABLE actor the system knows — including offline and retired ones (contrast dvergr.agents/list, which is who is alive now). Filter with :kind (:agent/:human) and :status (e.g. :online, :retired)."]
+                            lookup        [([id]) "The durable row for one actor id, or nil. Persisted state, not runtime state."]
+                            online?       [([id]) "Runtime check — is this actor actually running now?"]
+                            spawn-agent!  [([opts]) "Create a NEW agent, persisted to Datahike. `opts` takes :id :name :profile-ref :skills :config (provider/model). This grows the roster; prefer an existing agent when one fits."]
+                            spawn-human!  [([opts]) "Register a HUMAN participant as an actor, so work can be assigned to and tracked for them."]
+                            dismiss!      [([id]) "Retire an actor — flags :status :retired rather than deleting, so its history survives."]
+                            update!       [([id patch]) "Merge `patch` into an actor's durable row (e.g. {:skills #{:prose :writing}})."]
+                            add-skill!    [([id skill]) "Declare that an actor can perform `skill` — this is what makes it show up in dvergr.skills/providers."]
+                            remove-skill! [([id skill]) "Withdraw a skill declaration from an actor."]}))))
 
 (defn add-tasks-ns!
   "Expose the task ledger as 'tasks namespace in SCI.
@@ -163,11 +195,17 @@
         complete-fn @(ns-resolve 'dvergr.orchestration.tasks 'complete!)
         ignore-fn   @(ns-resolve 'dvergr.orchestration.tasks 'ignore!)]
     (sci/add-namespace! sci-ctx 'dvergr.tasks
-                        {'list      (fn [& kvs] (apply list-fn conn kvs))
-                         'lookup    (fn [id]    (lookup-fn conn id))
-                         'accept!   (fn [id]    (accept-fn conn id))
-                         'complete! (fn [id r]  (complete-fn conn id r))
-                         'ignore!   (fn [id]    (ignore-fn conn id))})))
+                        (doc/with-docs
+                          {'list      (fn [& kvs] (apply list-fn conn kvs))
+                           'lookup    (fn [id]    (lookup-fn conn id))
+                           'accept!   (fn [id]    (accept-fn conn id))
+                           'complete! (fn [id r]  (complete-fn conn id r))
+                           'ignore!   (fn [id]    (ignore-fn conn id))}
+                          '{list      [([] [& {:keys [actor-id status]}]) "The shared task ledger — persistent rows for work dispatched to non-agent actors (humans). Filter with :actor-id and :status (e.g. :pending). Agents themselves just react to inbox messages and need no task row."]
+                            lookup    [([id]) "One task by its uuid, or nil."]
+                            accept!   [([id]) "Claim a task — marks it accepted so nobody else picks it up."]
+                            complete! [([id result]) "Finish a task, recording `result` (a string describing what was done/found)."]
+                            ignore!   [([id]) "Decline a task, leaving it for someone else."]}))))
 
 (defn add-scheduler-ns!
   "Expose scheduling as 'scheduler namespace in SCI.

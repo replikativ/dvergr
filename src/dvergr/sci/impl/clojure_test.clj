@@ -283,7 +283,53 @@
 
 (def testing-contexts (sci/new-dynamic-var '*testing-contexts* (list) {:ns tns})) ; bound to hierarchy of "testing" strings
 
-(def test-out (sci/new-dynamic-var '*test-out* *out* {:ns tns}))         ; PrintWriter for test reporting output
+(defn- sandbox-following-writer
+  "A PrintWriter that writes to the CURRENT sandbox `*out*`, falling back to
+   `fallback` when there is none.
+
+   `*test-out*` used to be initialised to the bare `*out*` of whatever thread
+   happened to load THIS namespace — the host JVM's stdout. Every reporting fn
+   goes through `with-test-out-internal`, which binds `*out*` to `@test-out`, so
+   all of clojure.test's output (`FAIL in … / expected: … / actual: …`) was
+   written to the SERVER CONSOLE instead of the sandbox. An agent running tests
+   got a correct summary (`{:test 3 :pass 2 :fail 1}`) and no way to see WHICH
+   test failed or why — which reads as broken tooling and sends agents looking
+   for another runner (kaocha), which the mirror allowlist rightly denies.
+
+   `sci/eval-code` evaluates inside `(sci/binding [sci/out <StringWriter>] …)`,
+   and host code can read that binding via `@sci/out`. So resolving the target
+   at WRITE time makes reporting land wherever the sandbox's stdout currently
+   points, per-eval and per-thread, with no change to eval-code.
+
+   `fallback` is captured at construction (not read dynamically) on purpose:
+   `with-test-out-internal` binds `*out*` to this very writer, so reading `*out*`
+   at write time to fall back would make it write to itself — an immediate
+   StackOverflowError. Capturing it also preserves the previous behaviour
+   exactly for non-sandbox callers (dvergr's own test suite)."
+  [^java.io.Writer fallback]
+  (let [target (fn ^java.io.Writer []
+                 (let [o @sci/out]
+                   (if (instance? java.io.Writer o) o fallback)))]
+    (java.io.PrintWriter.
+     (proxy [java.io.Writer] []
+       (write
+         ([x]
+          (let [^java.io.Writer w (target)]
+            (cond (integer? x) (.write w ^int x)
+                  (string? x)  (.write w ^String x)
+                  :else        (.write w ^chars x))))
+         ([x off len]
+          (let [^java.io.Writer w (target)]
+            (if (string? x)
+              (.write w ^String x ^int off ^int len)
+              (.write w ^chars x ^int off ^int len)))))
+       (flush [] (.flush ^java.io.Writer (target)))
+       ;; Never close the target — it is the sandbox's capture buffer or the
+       ;; host stdout, both owned by someone else.
+       (close [] nil))
+     true)))                                                    ; autoflush
+
+(def test-out (sci/new-dynamic-var '*test-out* (sandbox-following-writer *out*) {:ns tns})) ; follows the sandbox *out*; see above
 
 (defmacro with-test-out-internal
   "Runs body with *out* bound to the value of *test-out*."

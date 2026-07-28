@@ -177,6 +177,58 @@
           (is (str/includes? (str (:err r)) "not allowed")
               "the block must be sci's instance-member gate (ADR 0007)"))))))
 
+(defn- with-shell-sandbox
+  "Like `with-sandbox`, but ALSO wires the muschel-backed shell.
+
+   `babashka.process` is registered by `add-bash-ns!`, which production calls
+   from `dvergr.agent.turn` per chat-context — NOT from `setup-agent-namespaces!`.
+   So the plain harness has no `babashka.process` at all, and a test written on
+   it cannot tell \"the shell is denied\" from \"the shell was never mounted\".
+   That blind spot is why the corpus asserted the mirror is CLOSED without ever
+   asserting the capability it was closed alongside still WORKS — half of this
+   corpus's stated contract, untested. `add-bash-ns!` needs only `:spindel-ctx`
+   off the chat-ctx for session/host creation, so a stub suffices."
+  [f]
+  (let [ec      (ctx/create-execution-context)
+        sci-ctx (sandbox/fork-for-session ec)]
+    (try
+      (sandbox/setup-agent-namespaces! sci-ctx ec)
+      (io/add-bash-ns! sci-ctx {:spindel-ctx ec})
+      (f sci-ctx ec)
+      (finally (ctx/stop-context! ec)))))
+
+(deftest muschel-shell-still-works-while-the-mirror-stays-denied
+  ;; THE CAPABILITY HALF. `babashka.process` was added to the hard denylist to
+  ;; close `(require 'babashka.process :reload)` → host shell. The sandbox's OWN
+  ;; muschel-backed `babashka.process/shell` must survive that: the denylist
+  ;; governs the MIRROR path, while a registered namespace resolves from the ctx
+  ;; and never consults it. If this goes red, the escape was closed by breaking
+  ;; the feature — exactly the trade this corpus exists to prevent.
+  (with-shell-sandbox
+    (fn [sci ec]
+      (testing "the agent-facing shell runs"
+        (let [r (eval-in sci ec
+                         "(require '[babashka.process :as p])
+                          (:out (p/shell \"echo corpus-shell-ok\"))")]
+          (is (:ok r) (str "p/shell must work: " (pr-str (:err r))))
+          (is (str/includes? (str (:ok r)) "corpus-shell-ok")
+              "…and actually return the command's stdout")))
+
+      (testing ":reload of it is STILL refused, now that it is registered"
+        ;; With the ns registered the refusal comes from the `:reload` guard
+        ;; rather than a bare \"could not find namespace\" — the guard is the
+        ;; part that matters, since a merge would replace the jailed shim.
+        (let [r (eval-in sci ec "(require 'babashka.process :reload)")]
+          (is (:err r) "must not mirror the host namespace over the shim")
+          (is (str/includes? (str (:err r)) "Refusing to reload")
+              "and must say why")))
+
+      (testing "the shim still works AFTER the reload attempt"
+        (let [r (eval-in sci ec
+                         "(:out (babashka.process/shell \"echo still-here\"))")]
+          (is (str/includes? (str (:ok r)) "still-here")
+              "the reload attempt must not have damaged the shim"))))))
+
 (deftest host-shell-namespace-must-not-mirror
   ;; MECHANISM: the deps :load-fn mirror — `clojure.java.shell` is not on the
   ;; denylist, so `(require 'clojure.java.shell)` mirrors the host ns and

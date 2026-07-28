@@ -372,16 +372,27 @@
 
 (register!
  {:name "edit_file"
-  :description "Edit a file by replacing an exact string match with new content. The old_string must match exactly (including whitespace)."
+  :description "Edit a file by replacing an exact string match with new content. The old_string must match exactly (including whitespace).
+
+   By default the match must be UNIQUE — if old_string occurs more than once the
+   edit is refused, so you cannot change the wrong occurrence by accident. When
+   you genuinely mean every occurrence (renaming a local, updating a repeated
+   literal), pass replace_all true instead of issuing one call per occurrence
+   with hand-built surrounding context.
+
+   For CLOJURE code prefer `clojure_edit`, which finds a form by type+name and
+   needs no string matching at all."
   :parameters {:type "object"
                :properties {:path {:type "string"
                                    :description "The path to the file"}
                             :old_string {:type "string"
                                          :description "The exact string to find and replace"}
                             :new_string {:type "string"
-                                         :description "The replacement string"}}
+                                         :description "The replacement string"}
+                            :replace_all {:type "boolean"
+                                          :description "Replace EVERY occurrence (default false, which requires the match to be unique)"}}
                :required ["path" "old_string" "new_string"]}
-  :execute (fn [{:keys [path old_string new_string]} {:keys [session-id] :as ctx}]
+  :execute (fn [{:keys [path old_string new_string replace_all]} {:keys [session-id] :as ctx}]
              (let [file (tool-path ctx path)
                    exists? (if-let [filesystem (:filesystem ctx)]
                              (mfs/exists? filesystem file)
@@ -395,19 +406,26 @@
                       :error "String not found in file"
                       :suggestion "Make sure the old_string matches exactly, including whitespace and newlines"}
 
-                     (> occurrences 1)
+                     (and (> occurrences 1) (not replace_all))
                      {:type :error
                       :error (str "String found " occurrences " times, must be unique")
-                      :suggestion "Include more surrounding context to make the match unique"}
+                      :suggestion (str "Include more surrounding context to make the match "
+                                       "unique, or pass replace_all true to change all "
+                                       occurrences " occurrences")}
 
                      :else
-                     (let [new-content (str/replace-first content old_string new_string)]
+                     (let [new-content (if replace_all
+                                         (str/replace content old_string new_string)
+                                         (str/replace-first content old_string new_string))]
                        (workspace-write! ctx path new-content)
                         ;; Auto-index if Clojure file
                        (index-file-if-clojure! file new-content session-id)
                        {:type :success
-                        :content (str "Replaced string in " path)
+                        :content (str "Replaced " (if replace_all occurrences 1)
+                                      " occurrence" (when (and replace_all (> occurrences 1)) "s")
+                                      " in " path)
                         :metadata {:path (str file)
+                                   :replacements (if replace_all occurrences 1)
                                    :old-length (count old_string)
                                    :new-length (count new_string)}})))
                  {:type :error
@@ -1377,16 +1395,13 @@ Note: changes take effect on the next agent restart or reload."
 ;; Test Execution Tool
 ;; ---------------------------------------------------------------------------
 
-;; Lazy require kaocha
-(defn- kaocha-ns []
-  (require 'kaocha.api)
-  (find-ns 'kaocha.api))
-
 (defn- format-test-output
-  "Format test results for display."
-  [result]
-  (let [pass (:pass result 0)
-        fail (:fail result 0)
+  "Format test results for display. `report` is clojure.test's captured output —
+   the FAIL/expected/actual lines — which is the part an agent actually needs to
+   act on, so it is included verbatim rather than summarised away."
+  [result report]
+  (let [pass  (:pass result 0)
+        fail  (:fail result 0)
         error (:error result 0)
         total (+ pass fail error)]
     (str "Test Results:\n"
@@ -1398,91 +1413,73 @@ Note: changes take effect on the next agent restart or reload."
          (if (zero? (+ fail error))
            "✓ All tests passed"
            (str "✗ " (+ fail error) " test(s) failed\n\n"
-                "Run with detailed reporter to see failure details")))))
+                (str/trim (str report)))))))
 
 (register!
  {:name "run_tests"
-  :description "Run Clojure tests using Kaocha in the current working directory.
+  :description "Run clojure.test across the namespaces defined in YOUR sandbox.
 
-   This tool executes tests programmatically without requiring shell access.
-   Tests run in the agent's working directory (forked worktree context),
-   so agents can verify their code changes in isolation.
+   Runs inside your SCI session, so it sees exactly the namespaces you have
+   defined or loaded this session — nothing on the daemon's classpath. To test
+   code that lives in a file, load it first, then run:
+     clojure_eval: (load-string (slurp \"src/foo.clj\"))
+     run_tests:    {\"pattern\": \"foo\"}
 
-   Options:
-   - focus: Run specific test namespace (e.g., 'dvergr.knowledge.links-test')
-   - pattern: Regex pattern to match test namespaces (e.g., 'knowledge')
-   - fail_fast: Stop on first failure (default false)
+   Options (all optional):
+   - focus:   one test namespace, e.g. 'my.thing-test'
+   - pattern: regex over namespace names, e.g. 'knowledge'
+   - (neither): every test namespace in the session
 
-   Returns structured test results including:
-   - Pass/fail/error counts
-   - Exit code (0 = all pass, 1 = failures)
-   - Summary output
+   Returns pass/fail/error counts AND, on failure, clojure.test's
+   expected/actual report so you can see WHICH assertion failed and why.
 
-   Example: Run specific test namespace
-   {\"focus\": \"dvergr.knowledge.links-test\"}
-
-   Example: Run all tests matching pattern
-   {\"pattern\": \"knowledge\"}
-
-   Example: Run all tests
-   {}
-
-   Note: Tests execute in the tool's :cwd, which for agents is their
-   forked git worktree. This allows safe isolated testing."
+   Note: this is not kaocha and does not run the project's test files from
+   disk. A second runtime (clj/lein) is deliberately unavailable — it could
+   read and write outside the sandbox — so in-session clojure.test is the
+   supported way to test here."
   :parameters {:type "object"
                :properties {:focus {:type "string"
                                     :description "Specific test namespace to run"}
                             :pattern {:type "string"
-                                      :description "Regex pattern for test namespaces"}
-                            :fail_fast {:type "boolean"
-                                        :description "Stop on first failure (default false)"}}
+                                      :description "Regex pattern for test namespaces"}}
                :required []}
-  :execute (fn [{:keys [focus pattern fail_fast]} {:keys [cwd]}]
-             (try
-                ;; Lazy load kaocha
-               (let [kaocha-ns (kaocha-ns)
-                     kaocha-run! (ns-resolve kaocha-ns 'run)
-
-                      ;; Build kaocha config
-                     config (cond-> {:color? false
-                                     :fail-fast (boolean fail_fast)
-                                     :cwd (or cwd ".")}
-
-                               ;; Focus on specific test namespace
-                              focus
-                              (assoc :kaocha/tests
-                                     [{:kaocha.testable/id :unit
-                                       :kaocha.testable/type :kaocha.type/clojure.test
-                                       :kaocha/ns-patterns [(re-pattern (str focus "$"))]}])
-
-                               ;; Match pattern in test namespaces
-                              pattern
-                              (assoc :kaocha.filter/regex (re-pattern pattern)))
-
-                      ;; Run tests
-                     result (kaocha-run! config)
-
-                      ;; Extract summary
-                     pass (:kaocha.result/count result 0)
-                     fail (:kaocha.result/fail result 0)
-                     error (:kaocha.result/error result 0)
-                     exit-code (if (and (zero? fail) (zero? error)) 0 1)]
-
-                 {:type (if (zero? exit-code) :success :error)
-                  :content (format-test-output {:pass pass
-                                                :fail fail
-                                                :error error})
-                  :metadata {:passed pass
-                             :failed fail
-                             :errors error
-                             :exit-code exit-code
-                             :cwd (or cwd ".")}})
-
-               (catch Exception e
-                 {:type :error
-                  :error (str "Test execution failed: " (.getMessage e))
-                  :details (str "Cause: " (when-let [cause (.getCause e)]
-                                            (.getMessage cause)))})))})
+  ;; Runs clojure.test INSIDE the agent's SCI context.
+  ;;
+  ;; This used to `ns-resolve` kaocha.api and run it in the HOST jvm. Three
+  ;; things were wrong with that: kaocha is only in dvergr's :test alias, so at
+  ;; runtime the resolve threw "Could not locate kaocha/api" and the tool ALWAYS
+  ;; failed; `:cwd` was passed as a kaocha config key, which chdirs nothing, so
+  ;; the advertised "runs in your forked worktree in isolation" was untrue; and
+  ;; had it worked it would have loaded and executed host test namespaces from
+  ;; the daemon's classpath on agent request — outside the sandbox entirely.
+  ;;
+  ;; The sandbox already has a ctx-aware clojure.test (run-tests / run-all-tests
+  ;; enumerate vars in THIS context), so running there is both correct and
+  ;; actually isolated. `:sci-ctx` is the same handle clojure_eval receives.
+  :execute (fn [{:keys [focus pattern]} {:keys [sci-ctx]}]
+             (if-not sci-ctx
+               {:type :error
+                :error "No sandbox context available to run tests in."}
+               (let [form (cond
+                            focus   (str "(clojure.test/run-tests '" focus ")")
+                            pattern (str "(clojure.test/run-all-tests #\""
+                                         (str/replace pattern "\"" "\\\"") "\")")
+                            :else   "(clojure.test/run-all-tests)")
+                     r    (sandbox/eval-code sci-ctx form)]
+                 (if-not (:success r)
+                   {:type :error
+                    :error (str "Test run failed: " (get-in r [:error :message]))}
+                   (let [{:keys [test pass fail error]
+                          :or   {test 0 pass 0 fail 0 error 0}} (:value r)
+                         broken? (pos? (+ fail error))]
+                     {:type (if broken? :error :success)
+                      :content (format-test-output {:pass pass :fail fail :error error}
+                                                   (:stdout r))
+                      :metadata {:tests    test
+                                 :passed   pass
+                                 :failed   fail
+                                 :errors   error
+                                 :exit-code (if broken? 1 0)}})))))})
 
 ;; ---------------------------------------------------------------------------
 ;; Budget Tool
