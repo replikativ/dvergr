@@ -671,7 +671,7 @@
                       "(dvergr.actors/spawn-agent! {:prompt \"…\" :budget 0.10})"]
    "dvergr.skills"   ["reusable skills you can find + dispatch"
                       "(dvergr.skills/find \"draft a brief\")"]
-   "clojure.test"    ["THE test runner in this sandbox — the real clojure.test. There is no kaocha/lein here (and mirroring one is denied), so this is the way to test your code. Failures print expected/actual to your stdout."
+   "clojure.test"    ["how you test IN here — the real clojure.test, run inside clojure_eval; failures print expected/actual to your stdout. This is the ONLY runner available to you, by design: kaocha/lein/clj are not reachable (handing control to a second runtime would let it read+write outside the sandbox), so requiring kaocha fails and the shell has no `clj`. To exercise code that lives in a FILE, load it — (load-string (slurp \"src/foo.clj\")) — then deftest against it here."
                       "(require '[clojure.test :refer [deftest is]]) (deftest t (is (= 4 (+ 2 2)))) (clojure.test/run-tests)  ;=> {:test 1 :pass 1 :fail 0 …}"]})
 
 (def ^:private guide-order
@@ -832,8 +832,13 @@
        "relative paths** (`(p/shell \"ls\")`, `(p/shell \"cat src/foo.clj\")`) — "
        "absolute system paths like `/etc` don't exist. Built-in POSIX tools include ls cat "
        "grep sed awk find sort uniq cut tr jq xargs wc head tail diff git — no "
-       "external binary needed. Destructive ops (rm -rf, sudo, git push --force) "
-       "are blocked by design; that's expected, not a failure.\n\n"
+       "external binary needed, and `sed -i` edits in place. These are IN-PROCESS "
+       "implementations, not the system binaries: `git` is backed by your room's "
+       "geschichte workspace, and there is deliberately no `clj`/`python3`/`node` "
+       "(a second runtime could read and write outside the sandbox — use "
+       "clojure_eval for scripting). Destructive ops (rm -rf, sudo, git push --force) "
+       "are blocked by design; that's expected, not a failure. `(dvergr.shell/builtins)` "
+       "lists what this session actually has, if you are unsure.\n\n"
        "**Knowledge:** recall with `knowledge_search`/`(search/find …)` BEFORE "
        "researching, and save findings with `knowledge_add` so they persist past "
        "this session (sandbox `(defn …)` do not)."))

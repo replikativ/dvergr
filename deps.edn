@@ -58,7 +58,7 @@
         ;; API this branch's agent workspaces are built on (isolated worktrees,
         ;; checkout semantics delegated to Geschichte, Git served from a virtual
         ;; GeschichteFS base) — so no local root is needed to build it.
-        org.replikativ/muschel     {:mvn/version "0.2.18"}
+        org.replikativ/muschel     {:mvn/version "0.2.19"}
 
         ;; Geschichte — authoritative virtual filesystem + Git compatibility.
         ;; Released coordinate — 0.1.10 carries code-search (#6) + the native-release
