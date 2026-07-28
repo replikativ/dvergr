@@ -14,11 +14,11 @@
             [geschichte.git.http :as git-http]
             [geschichte.git.local :as git-local]
             [geschichte.repo :as repo]
-            [geschichte.yggdrasil :as gy]
             [muschel.fs.geschichte :as mgeschichte]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.yggdrasil :as ygg]
             [taoensso.telemere :as tel]
+            [yggdrasil.adapters.geschichte :as gy]
             [yggdrasil.protocols :as p]))
 
 (def sandbox-repo-url
