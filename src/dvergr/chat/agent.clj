@@ -18,6 +18,7 @@
             [dvergr.tools :as tools]
             [dvergr.sandbox.workspace :as workspace]
             [datahike.api :as dh]
+            [clojure.string :as str]
             [taoensso.telemere :as tel]))
 
 ;; ============================================================================
@@ -69,6 +70,62 @@
       (first (filter #(= repeated-hash
                          (hash (select-keys % [:tool-use/name :tool-use/input])))
                      recent-tool-calls)))))
+
+(def ^:const silent-tool-run-threshold
+  "Consecutive tool-only turns — no prose to the room — before we intervene.
+
+   Twelve, not three. A long tool run is ordinary work: reading a dozen pages
+   before answering is exactly what these agents are for, and cutting that
+   short would be worse than the bug. What is not ordinary is never speaking."
+  12)
+
+(defn- said-something?
+  "Did this assistant turn actually address the room? Whitespace does not
+   count — a model that emits `\n` has not reported anything."
+  [m]
+  (not (str/blank? (str (or (:message/content m) (:content m))))))
+
+(defn- called-a-tool? [m]
+  (seq (or (:message/tool-uses m) (:tool-uses m))))
+
+(defn detect-silent-tool-run
+  "Detect an agent that keeps working and never reports.
+
+   `detect-doom-loop` fingerprints `[:tool-use/name :tool-use/input]`, so it
+   sees an agent REPEATING itself. It cannot see one that varies its calls and
+   simply never concludes — which is the shape that actually bit us: turns
+   0->15 on dev.simm.is, every one a `clojure_eval`, `content-len 0` on all of
+   them, then the cycle restarted and did it again. Nothing objected, because
+   nothing was repeated and the dollar budget had not run out.
+
+   Counts CONSECUTIVE tool-only assistant turns from the newest end. Speaking
+   resets the count: an agent that reports progress is working, however many
+   tools it uses. Returns `{:turns n}` past the threshold, else nil.
+
+   A turn with neither tools nor prose is not counted — that is a different
+   failure, and folding it in here would fire this bound on the wrong evidence."
+  [messages]
+  ;; Walk back until the agent SPOKE, then count the tool turns in between.
+  ;; Stopping on "not a tool turn" instead would let a model reset the bound by
+  ;; emitting a newline: that turn says nothing, so it must not count as a
+  ;; report, and it has no tools, so it must not count as work either.
+  (let [streak (->> (reverse messages)
+                    (filter #(= :assistant (or (:message/role %) (:role %))))
+                    (take-while #(not (said-something? %)))
+                    (filter called-a-tool?)
+                    count)]
+    (when (>= streak silent-tool-run-threshold)
+      {:turns streak})))
+
+(defn silent-run-nudge
+  "Corrective for an agent that has worked `n` turns without saying anything."
+  [n]
+  (str "You have made " n " tool calls in a row without saying anything to the "
+       "room. Nobody can see tool calls — from where the humans sit, nothing "
+       "has happened since they asked.\n\n"
+       "Reply now, in prose, with what you have found so far and what you are "
+       "still trying to do. If you are stuck, say what is blocking you. You can "
+       "keep working after you have reported."))
 
 (def fragment-nudge
   "Corrective shown to a model that emitted code as its message instead of
@@ -334,12 +391,13 @@
                                                  (:error result)
                                                  (pr-str result))
                                     :turn-number turn-number}))
-          ;; Loop bound: if the agent is repeating the SAME tool call with the
-          ;; same args and making no progress, stop the auto-continue cycle
-          ;; instead of spinning until budget runs out. History stays coherent
-          ;; (tool_uses + their results are both present); a nudge tells the
-          ;; model why it stopped, and the next human turn resumes it. This
-          ;; finally wires detect-doom-loop, which was dead code.
+          ;; Two bounds, in order of severity.
+          ;;
+          ;; STOP if the agent is repeating the SAME tool call with the same
+          ;; args and making no progress, rather than spinning until budget
+          ;; runs out. History stays coherent (tool_uses + their results are
+          ;; both present); a nudge tells the model why it stopped, and the
+          ;; next human turn resumes it.
           (if-let [looped (detect-doom-loop (chat-ctx/get-messages chat-ctx))]
             (do
               (tel/log! {:level :warn :id :agent/doom-loop
@@ -355,7 +413,21 @@
                                               "blocking you.")
                                          :important? true)
               :complete)
-            :continue))
+            ;; NUDGE if it has worked a long time and said nothing. Checked
+            ;; second because it is the weaker signal: this agent is not
+            ;; necessarily stuck, it may be mid-way through something real, so
+            ;; it keeps going — it just has to tell the room first. Said once
+            ;; per streak, since replying is what resets the streak.
+            (if-let [silent (detect-silent-tool-run (chat-ctx/get-messages chat-ctx))]
+              (do
+                (tel/log! {:level :warn :id :agent/silent-tool-run
+                           :data {:turns (:turns silent) :turn turn-number}}
+                          "Agent has run many tool calls without replying — nudging")
+                (chat-ctx/add-system-note! chat-ctx
+                                           (silent-run-nudge (:turns silent))
+                                           :important? true)
+                :continue)
+              :continue)))
 
         ;; No tool calls. Usually that means the agent is done — but a model can
         ;; also fumble its code into the PROSE channel (stop_reason=stop, no
