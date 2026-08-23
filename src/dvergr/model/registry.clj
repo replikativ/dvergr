@@ -39,7 +39,9 @@
      :cache-write   — 5-minute prompt-cache write (1.25× input)
      :cache-write-1h— 1-hour prompt-cache write (2× input), where available
 
-   Snapshot date: 2026-05-24. See claude.com/pricing for live prices."
+   Snapshot date: 2026-08-22. Anthropic prices: claude.com/pricing.
+   OpenAI prices/limits: models.dev (the same source
+   `refresh-from-models-dev!` reads live)."
   {;; ── Claude Opus 4.x ──────────────────────────────────────────────
    "claude-opus-4-7"
    {:id "claude-opus-4-7"
@@ -141,6 +143,72 @@
     :context 200000
     :max-output 32000
     :pricing {:input 0 :output 0}
+    :quirks {}}
+
+   ;; ── OpenAI GPT-5.6 ───────────────────────────────────────────────
+   ;; The whole 5.6 line carries :chat-tools-need-effort-none? — on
+   ;; /v1/chat/completions these models refuse function tools unless
+   ;; reasoning_effort is "none" ("To use function tools, use /v1/responses
+   ;; or set reasoning_effort to 'none'"). The openai adapter sends it for
+   ;; them whenever tools are present, which trades server-side reasoning
+   ;; for tool use. An agent that needs BOTH wants the Responses API, which
+   ;; this provider does not speak yet — pick gpt-5.5 until it does.
+   "gpt-5.6-sol"
+   {:id "gpt-5.6-sol"
+    :name "GPT-5.6 Sol"
+    :provider :openai
+    :api-type :openai-chat
+    :capabilities #{:tools :vision :thinking :streaming :system-prompt :cache-control}
+    :context 1050000
+    :max-output 128000
+    :pricing {:input 5.0 :output 30.0 :cache-read 0.50 :cache-write 6.25}
+    :quirks {:chat-tools-need-effort-none? true}}
+
+   "gpt-5.6-terra"
+   {:id "gpt-5.6-terra"
+    :name "GPT-5.6 Terra"
+    :provider :openai
+    :api-type :openai-chat
+    :capabilities #{:tools :vision :thinking :streaming :system-prompt :cache-control}
+    :context 1050000
+    :max-output 128000
+    :pricing {:input 2.0 :output 12.0 :cache-read 0.20 :cache-write 2.50}
+    :quirks {:chat-tools-need-effort-none? true}}
+
+   "gpt-5.6-luna"
+   {:id "gpt-5.6-luna"
+    :name "GPT-5.6 Luna"
+    :provider :openai
+    :api-type :openai-chat
+    :capabilities #{:tools :vision :thinking :streaming :system-prompt :cache-control}
+    :context 1050000
+    :max-output 128000
+    :pricing {:input 0.20 :output 1.20 :cache-read 0.02 :cache-write 0.25}
+    :quirks {:chat-tools-need-effort-none? true}}
+
+   ;; ── OpenAI GPT-5.5 / 5.4 ─────────────────────────────────────────
+   ;; Tools AND reasoning on chat/completions, no quirk needed. This is why
+   ;; gpt-5.5 is the OpenAI default in `providers/preferred-default-model`.
+   "gpt-5.5"
+   {:id "gpt-5.5"
+    :name "GPT-5.5"
+    :provider :openai
+    :api-type :openai-chat
+    :capabilities #{:tools :vision :thinking :streaming :system-prompt :cache-control}
+    :context 1050000
+    :max-output 128000
+    :pricing {:input 5.0 :output 30.0 :cache-read 0.50}
+    :quirks {}}
+
+   "gpt-5.4-mini"
+   {:id "gpt-5.4-mini"
+    :name "GPT-5.4 mini"
+    :provider :openai
+    :api-type :openai-chat
+    :capabilities #{:tools :vision :thinking :streaming :system-prompt :cache-control}
+    :context 400000
+    :max-output 128000
+    :pricing {:input 0.75 :output 4.50 :cache-read 0.075}
     :quirks {}}
 
    ;; Native Codex Responses models (via an existing ChatGPT subscription). These ids are
@@ -443,7 +511,7 @@
    last release.
 
    Returns the number of models registered (or nil on network failure)."
-  ([] (refresh-from-models-dev! #{:anthropic}))
+  ([] (refresh-from-models-dev! #{:anthropic :openai}))
   ([providers]
    (when-let [data (models-dev-fetch)]
      (let [n (atom 0)]
@@ -453,7 +521,14 @@
                :when (some? prov)
                [mid m] models]
          (let [entry (coerce-models-dev-model prov-key mid m)]
-           (swap! registry assoc (:id entry) entry)
+           ;; QUIRKS SURVIVE THE OVERLAY. models.dev carries pricing and
+           ;; limits, not the per-model API workarounds we discovered by
+           ;; being 400'd — dropping them here would silently re-break tool
+           ;; calls on the GPT-5.6 line the moment someone refreshed prices.
+           (swap! registry update (:id entry)
+                  (fn [existing]
+                    (cond-> entry
+                      (seq (:quirks existing)) (assoc :quirks (:quirks existing)))))
            (swap! n inc)))
        @n))))
 
@@ -465,6 +540,11 @@
   aliases (atom {"sonnet" "claude-sonnet-4-6"
                  "opus"   "claude-opus-4-7"
                  "haiku"  "claude-haiku-4-5"
+                 "gpt"      "gpt-5.5"
+                 "gpt-mini" "gpt-5.4-mini"
+                 "sol"      "gpt-5.6-sol"
+                 "terra"    "gpt-5.6-terra"
+                 "luna"     "gpt-5.6-luna"
                  "opus-4-6" "claude-opus-4-6"
                  "opus-4-5" "claude-opus-4-5"
                  "sonnet-4-5" "claude-sonnet-4-5"

@@ -57,7 +57,17 @@
   (api-type [_] :openai-chat)
 
   (build-request [_ messages opts]
-    (let [tools (:tools opts)]
+    (let [tools (:tools opts)
+          ;; GPT-5.6: /v1/chat/completions refuses function tools unless
+          ;; reasoning_effort is "none" — "To use function tools, use
+          ;; /v1/responses or set reasoning_effort to 'none'". Sending it
+          ;; buys tool use at the cost of server-side reasoning; a model
+          ;; that needs both belongs on the Responses API, which this
+          ;; provider does not speak. Only for models carrying the quirk:
+          ;; gpt-5.5 and older take tools and reasoning together, and
+          ;; forcing "none" there would quietly make them dumber.
+          effort-none? (and (seq tools)
+                            (registry/get-quirk (:model opts) :chat-tools-need-effort-none?))]
       {:url (str (or (:base-url config) "https://api.openai.com/v1") "/chat/completions")
        :headers (merge {"Content-Type" "application/json"}
                        (:extra-headers config))
@@ -73,7 +83,8 @@
                (:top-p opts) (assoc :top_p (:top-p opts))
                ;; Top-k if specified — a Fireworks extension param (MiniMax M2: 40)
                (:top-k opts) (assoc :top_k (:top-k opts))
-               (seq tools) (assoc :tools (p/format-tools _ tools)))}))
+               (seq tools) (assoc :tools (p/format-tools _ tools))
+               effort-none? (assoc :reasoning_effort "none"))}))
 
   (create-accumulator [_ model-def]
     {:current-blocks {}
