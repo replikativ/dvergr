@@ -17,9 +17,10 @@
 (defn- format-message
   "Format a single message for OpenAI API.
    Preserves tool_calls on assistant messages and tool_call_id on tool messages."
-  [msg]
+  [msg instruction-role]
   (let [role (:role msg)
-        role-str (if (keyword? role) (name role) role)]
+        role-str (if (keyword? role) (name role) role)
+        role-str (if (= "system" role-str) instruction-role role-str)]
     (cond-> {:role role-str
              :content (:content msg)}
       ;; Preserve tool_calls on assistant messages
@@ -29,20 +30,32 @@
       ;; Preserve interleaved-thinking state fed back to the model
       (:reasoning_content msg) (assoc :reasoning_content (:reasoning_content msg)))))
 
-(defn- with-system
-  "Prepend a system message from the `:system` opt when one isn't already present
-   in the list. Parity with the Anthropic provider (which reads `:system` from
-   opts); OpenAI-compatible APIs take the system prompt as the first message."
-  [messages system]
+(defn- with-instructions
+  "Prepend product instructions from `:system` when the message list does not
+   already contain an instruction message. Native o1-and-newer OpenAI models use
+   `developer`; compatible endpoints retain the broadly supported `system` role."
+  [messages system instruction-role]
   (if (and system (not (str/blank? system))
-           (not (some #(let [r (:role %)] (= "system" (if (keyword? r) (name r) r))) messages)))
-    (into [{:role "system" :content system}] (vec messages))
+           (not (some #(let [r (:role %)
+                             r (if (keyword? r) (name r) r)]
+                         (#{"system" "developer"} r))
+                      messages)))
+    (into [{:role instruction-role :content system}] (vec messages))
     (vec messages)))
 
 (defn- format-messages
   "Format messages for OpenAI API."
-  [messages]
-  (mapv format-message messages))
+  [messages instruction-role]
+  (mapv #(format-message % instruction-role) messages))
+
+(defn- product-instruction-role
+  "Wire role for product instructions. This is model metadata, not an ID guess,
+   and is native-only because compatible services need not implement OpenAI's
+   o1-and-newer developer-message contract."
+  [config model]
+  (if (:native-openai? config)
+    (name (registry/instruction-role model))
+    "system"))
 
 ;; ============================================================================
 ;; Provider Record
@@ -58,6 +71,7 @@
 
   (build-request [_ messages opts]
     (let [tools (:tools opts)
+          instruction-role (product-instruction-role config (:model opts))
           ;; GPT-5.6: /v1/chat/completions refuses function tools unless
           ;; reasoning_effort is "none" — "To use function tools, use
           ;; /v1/responses or set reasoning_effort to 'none'". Sending it
@@ -79,7 +93,9 @@
                       :max_completion_tokens (:max-tokens opts 8192)
                       :stream true
                       :stream_options {:include_usage true}
-                      :messages (format-messages (with-system messages (:system opts)))}
+                      :messages (format-messages
+                                 (with-instructions messages (:system opts) instruction-role)
+                                 instruction-role)}
                ;; Temperature if specified (some models like Kimi K2.5 require specific values)
                (:temperature opts) (assoc :temperature (:temperature opts))
                ;; Top-p if specified (Kimi / MiniMax M2 use 0.95)
@@ -248,7 +264,8 @@
   (format-messages [_ messages model]
     ;; OpenAI/Fireworks: tool results as separate "tool" messages with tool_call_id
     ;; Kimi K2 quirk: rewrite tool IDs to functions.{name}:{idx}
-    (let [messages (if (registry/has-quirk? model :kimi-tool-id-format?)
+    (let [instruction-role (product-instruction-role config model)
+          messages (if (registry/has-quirk? model :kimi-tool-id-format?)
                      (quirks/rewrite-kimi-tool-ids messages)
                      messages)]
       (mapv (fn [msg]
@@ -278,7 +295,9 @@
                                                                            (tool-schema/input-entity->args (:tool-use/input tu)))}})
                                                  tool-uses)}
                         (seq reasoning) (assoc :reasoning_content reasoning))
-                      (cond-> {:role (name role)
+                      (cond-> {:role (if (= role :system)
+                                       instruction-role
+                                       (name role))
                                :content (:message/content msg)}
                         (and (= role :assistant) (seq reasoning))
                         (assoc :reasoning_content reasoning)))))))

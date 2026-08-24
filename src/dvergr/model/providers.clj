@@ -155,9 +155,10 @@
    resources/models.edn; the others are passed through to the provider."
   {:anthropic   "claude-sonnet-4-6"
    :fireworks   "accounts/fireworks/models/minimax-m2p7"
-   ;; gpt-5.5, not the newer 5.6 line: 5.6 gives up reasoning the moment a
-   ;; turn carries tools (registry quirk :chat-tools-need-effort-none?), and
-   ;; every agent turn here carries tools.
+   ;; GPT-5.5 is documented independently with medium reasoning by default and
+   ;; supports function calling on Chat Completions. Unlike GPT-5.6, it does not
+   ;; carry :chat-tools-need-effort-none?; that absence is not itself evidence
+   ;; of reasoning behavior — the explicit registry default is.
    :openai      "gpt-5.5"
    :claude-code "claude-code-sonnet"
    :codex-subscription "codex-subscription"
