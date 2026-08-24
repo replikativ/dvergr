@@ -83,57 +83,59 @@
 (defn init-defaults!
   "Initialize default providers from environment variables.
    Only registers providers that have API keys available."
-  []
-  ;; Anthropic
-  (when-let [provider (anthropic/create-if-available {})]
-    (register! :anthropic provider)
-    (tel/log! {:id :providers/registered :data {:provider :anthropic}} "Registered provider"))
+  ([]
+   (init-defaults! #(System/getenv %)))
+  ([env-lookup]
+   ;; Anthropic
+   (when-let [provider (anthropic/create-if-available {})]
+     (register! :anthropic provider)
+     (tel/log! {:id :providers/registered :data {:provider :anthropic}} "Registered provider"))
 
-  ;; OpenAI
-  (when-let [provider (openai/create-if-available {})]
-    (register! :openai provider)
-    (tel/log! {:id :providers/registered :data {:provider :openai}} "Registered provider"))
+   ;; OpenAI
+   (when-let [provider (openai/create-if-available {} env-lookup)]
+     (register! :openai provider)
+     (tel/log! {:id :providers/registered :data {:provider :openai}} "Registered provider"))
 
-  ;; Fireworks
-  (when-let [provider (openai/create-fireworks-if-available {})]
-    (register! :fireworks provider)
-    (tel/log! {:id :providers/registered :data {:provider :fireworks}} "Registered provider"))
+   ;; Fireworks
+   (when-let [provider (openai/create-fireworks-if-available {} env-lookup)]
+     (register! :fireworks provider)
+     (tel/log! {:id :providers/registered :data {:provider :fireworks}} "Registered provider"))
 
-  ;; Claude Code CLI
-  (when-let [provider (claude-code/create-if-available {})]
-    (register! :claude-code provider)
-    (tel/log! {:id :providers/registered :data {:provider :claude-code}} "Registered provider"))
+   ;; Claude Code CLI
+   (when-let [provider (claude-code/create-if-available {})]
+     (register! :claude-code provider)
+     (tel/log! {:id :providers/registered :data {:provider :claude-code}} "Registered provider"))
 
-  ;; Native OpenAI Codex Responses transport via a file-backed ChatGPT login.
-  (when-let [provider (codex-subscription/create-if-available {})]
-    (register! :codex-subscription provider)
-    (tel/log! {:id :providers/registered :data {:provider :codex-subscription}}
-              "Registered provider"))
+   ;; Native OpenAI Codex Responses transport via a file-backed ChatGPT login.
+   (when-let [provider (codex-subscription/create-if-available {})]
+     (register! :codex-subscription provider)
+     (tel/log! {:id :providers/registered :data {:provider :codex-subscription}}
+               "Registered provider"))
 
-  ;; Compatibility path for keyring-only logins or upstream wire changes.
-  (when-let [provider (codex-subscription/create-cli-if-available {})]
-    (register! :codex-subscription-cli provider)
-    (tel/log! {:id :providers/registered :data {:provider :codex-subscription-cli}}
-              "Registered provider"))
+   ;; Compatibility path for keyring-only logins or upstream wire changes.
+   (when-let [provider (codex-subscription/create-cli-if-available {})]
+     (register! :codex-subscription-cli provider)
+     (tel/log! {:id :providers/registered :data {:provider :codex-subscription-cli}}
+               "Registered provider"))
 
-  ;; Load extra models from resources/models.edn
-  (try
-    (when-let [n (registry/load-models-resource!)]
-      (tel/log! {:id :providers/models-loaded :data {:count n}} "Loaded models"))
-    (catch Exception e
-      (tel/log! {:level :warn :id :providers/models-load-failed :data {:error (.getMessage e)}}
-                "Failed to load models.edn")))
+   ;; Load extra models from resources/models.edn
+   (try
+     (when-let [n (registry/load-models-resource!)]
+       (tel/log! {:id :providers/models-loaded :data {:count n}} "Loaded models"))
+     (catch Exception e
+       (tel/log! {:level :warn :id :providers/models-load-failed :data {:error (.getMessage e)}}
+                 "Failed to load models.edn")))
 
-  ;; Loud boot warning when NOTHING registered — the common fresh-machine failure
-  ;; is a missing API key, which otherwise only surfaces later as every turn
-  ;; failing with a confusing model/provider error.
-  (when (empty? @providers)
-    (tel/log! {:level :warn :id :providers/none-registered :data {}}
-              (str "No LLM providers registered — set ANTHROPIC_API_KEY, "
-                   "OPENAI_API_KEY, or FIREWORKS_API_KEY, or sign in with "
-                   "the Claude Code or Codex CLI.")))
+   ;; Loud boot warning when NOTHING registered — the common fresh-machine failure
+   ;; is a missing API key, which otherwise only surfaces later as every turn
+   ;; failing with a confusing model/provider error.
+   (when (empty? @providers)
+     (tel/log! {:level :warn :id :providers/none-registered :data {}}
+               (str "No LLM providers registered — set ANTHROPIC_API_KEY, "
+                    "OPENAI_API_KEY, or FIREWORKS_API_KEY, or sign in with "
+                    "the Claude Code or Codex CLI.")))
 
-  (tel/log! {:id :providers/init-complete :data {:count (count @providers)}} "Providers ready"))
+   (tel/log! {:id :providers/init-complete :data {:count (count @providers)}} "Providers ready")))
 
 (defn clear-all!
   "Clear all registered providers."
@@ -142,9 +144,11 @@
 
 (defn ensure-initialized!
   "Ensure providers are initialized. Safe to call multiple times."
-  []
-  (when (empty? @providers)
-    (init-defaults!)))
+  ([]
+   (ensure-initialized! #(System/getenv %)))
+  ([env-lookup]
+   (when (empty? @providers)
+     (init-defaults! env-lookup))))
 
 (def ^:private preferred-default-model
   "Best default model per provider for auto-config. Fireworks ids must exist in
@@ -172,11 +176,13 @@
    encodes \"what this machine can actually run\". Lets a coder default to
    Anthropic where ANTHROPIC_API_KEY is set and Fireworks where it isn't, with no
    hardcoded provider in the persona."
-  []
-  (ensure-initialized!)
-  (let [available (set (keys @providers))]
-    (when-let [p (some available provider-preference)]
-      {:provider p :model (preferred-default-model p)})))
+  ([]
+   (default-spec #(System/getenv %)))
+  ([env-lookup]
+   (ensure-initialized! env-lookup)
+   (let [available (set (keys @providers))]
+     (when-let [p (some available provider-preference)]
+       {:provider p :model (preferred-default-model p)}))))
 
 ;; ============================================================================
 ;; Custom Provider Registration

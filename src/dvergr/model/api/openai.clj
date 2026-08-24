@@ -65,8 +65,11 @@
           ;; that needs both belongs on the Responses API, which this
           ;; provider does not speak. Only for models carrying the quirk:
           ;; gpt-5.5 and older take tools and reasoning together, and
-          ;; forcing "none" there would quietly make them dumber.
-          effort-none? (and (seq tools)
+          ;; forcing "none" there would quietly make them dumber. Compatible
+          ;; endpoints do not get the native workaround merely because they
+          ;; share this adapter.
+          effort-none? (and (:native-openai? config)
+                            (seq tools)
                             (registry/get-quirk (:model opts) :chat-tools-need-effort-none?))]
       {:url (str (or (:base-url config) "https://api.openai.com/v1") "/chat/completions")
        :headers (merge {"Content-Type" "application/json"}
@@ -285,6 +288,12 @@
 ;; Constructors
 ;; ============================================================================
 
+(def ^:private default-openai-base-url "https://api.openai.com/v1")
+(def ^:private default-fireworks-base-url "https://api.fireworks.ai/inference/v1")
+
+(defn- system-env [env-key]
+  (System/getenv env-key))
+
 (defn create
   "Create an OpenAI provider instance.
 
@@ -293,29 +302,44 @@
    - :base-url      - API base URL (default: https://api.openai.com/v1)
    - :provider-id   - Override provider ID (default: :openai)
    - :extra-headers - Additional HTTP headers"
-  [config]
-  (let [api-key (or (:api-key config)
-                    (System/getenv "OPENAI_API_KEY"))]
-    (when-not (or api-key (:credentials config))
-      (throw (ex-info "OpenAI API key required" {:env "OPENAI_API_KEY"})))
-    (let [base-url (or (:base-url config)
-                       (System/getenv "OPENAI_BASE_URL")
-                       "https://api.openai.com/v1")
-          credentials (or (:credentials config)
-                          (gateway/static-credentials
-                           :openai-api-key
-                           {"Authorization" (str "Bearer " api-key)}
-                           #{(gateway/request-origin base-url)}))]
-      (->OpenAIProvider (-> config
-                            (dissoc :api-key)
-                            (assoc :base-url base-url
-                                   :credentials credentials))))))
+  ([config]
+   (create config system-env))
+  ([config env-lookup]
+   (let [api-key (or (:api-key config)
+                     (env-lookup "OPENAI_API_KEY"))
+         custom-base-url (or (:base-url config)
+                             (env-lookup "OPENAI_BASE_URL"))
+         base-url (or custom-base-url default-openai-base-url)
+         provider-id (or (:provider-id config) :openai)
+         credentials (or (:credentials config)
+                         (when api-key
+                           (gateway/static-credentials
+                            :openai-api-key
+                            {"Authorization" (str "Bearer " api-key)}
+                            #{(gateway/request-origin base-url)})))]
+     (when-not credentials
+       (throw (ex-info "OpenAI API key required" {:env "OPENAI_API_KEY"})))
+     (->OpenAIProvider
+      (-> config
+          (dissoc :api-key)
+          (assoc :base-url base-url
+                 :provider-id provider-id
+                 ;; A supplied base URL is an OpenAI-compatible endpoint, even if
+                 ;; it happens to equal a known provider URL. Provider identity and
+                 ;; native request capabilities are configuration, not URL guesses.
+                 :native-openai? (and (= :openai provider-id)
+                                      (nil? custom-base-url))
+                 :credentials credentials))))))
 
 (defn create-if-available
   "Create OpenAI provider if API key is available, otherwise nil."
-  [config]
-  (when (or (:api-key config) (System/getenv "OPENAI_API_KEY"))
-    (create config)))
+  ([config]
+   (create-if-available config system-env))
+  ([config env-lookup]
+   (when (or (:credentials config)
+             (:api-key config)
+             (env-lookup "OPENAI_API_KEY"))
+     (create config env-lookup))))
 
 ;; ============================================================================
 ;; Fireworks Provider (OpenAI-compatible)
@@ -328,29 +352,37 @@
    - :api-key       - Fireworks API key (or from env)
    - :base-url      - API base URL (default: Fireworks endpoint)
    - :extra-headers - Additional HTTP headers"
-  [config]
-  (let [api-key (or (:api-key config)
-                    (System/getenv "FIREWORKS_API_KEY"))
-        base-url (or (:base-url config)
-                     (System/getenv "FIREWORKS_BASE_URL")
-                     "https://api.fireworks.ai/inference/v1")]
-    (when-not (or api-key (:credentials config))
-      (throw (ex-info "Fireworks API key required"
-                      {:env "FIREWORKS_API_KEY"})))
-    (let [credentials (or (:credentials config)
-                          (gateway/static-credentials
-                           :fireworks-api-key
-                           {"Authorization" (str "Bearer " api-key)}
-                           #{(gateway/request-origin base-url)}))]
-      (->OpenAIProvider (-> config
-                            (dissoc :api-key)
-                            (assoc :credentials credentials
-                                   :base-url base-url
-                                   :provider-id :fireworks))))))
+  ([config]
+   (create-fireworks config system-env))
+  ([config env-lookup]
+   (let [api-key (or (:api-key config)
+                     (env-lookup "FIREWORKS_API_KEY"))
+         base-url (or (:base-url config)
+                      (env-lookup "FIREWORKS_BASE_URL")
+                      default-fireworks-base-url)
+         credentials (or (:credentials config)
+                         (when api-key
+                           (gateway/static-credentials
+                            :fireworks-api-key
+                            {"Authorization" (str "Bearer " api-key)}
+                            #{(gateway/request-origin base-url)})))]
+     (when-not credentials
+       (throw (ex-info "Fireworks API key required"
+                       {:env "FIREWORKS_API_KEY"})))
+     (->OpenAIProvider
+      (-> config
+          (dissoc :api-key)
+          (assoc :credentials credentials
+                 :base-url base-url
+                 :provider-id :fireworks
+                 :native-openai? false))))))
 
 (defn create-fireworks-if-available
   "Create Fireworks provider if API key is available, otherwise nil."
-  [config]
-  (when (or (:api-key config)
-            (System/getenv "FIREWORKS_API_KEY"))
-    (create-fireworks config)))
+  ([config]
+   (create-fireworks-if-available config system-env))
+  ([config env-lookup]
+   (when (or (:credentials config)
+             (:api-key config)
+             (env-lookup "FIREWORKS_API_KEY"))
+     (create-fireworks config env-lookup))))
