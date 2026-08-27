@@ -7,6 +7,7 @@
             [datahike.api :as dh]
             [dvergr.chat.schema :as schema]
             [dvergr.room.store :as store]
+            [dvergr.room.store.contract :as contract]
             [dvergr.room.store.datahike :as dhs]))
 
 (defn- mem-store []
@@ -17,6 +18,10 @@
     (let [conn (dh/connect cfg)]
       (schema/ensure-full-schema! conn)
       [conn (dhs/make conn)])))
+
+(deftest message-envelope-contract
+  (let [[_conn st] (mem-store)]
+    (contract/assert-message-envelope! st :envelope-datahike)))
 
 (deftest tool-uses-round-trip
   (testing "the room store persists and returns structured :tool-uses"
