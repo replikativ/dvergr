@@ -271,27 +271,43 @@
 
 (defn join-agent!
   "Join `agent-id` to `room-ref` (a Room, room-id keyword, or slug):
-   - Persists the agent in the system-db registry (`:room/agent-ids`).
+   - Persists a first-class room assignment in the system-db and maintains
+     `:room/agent-ids` as a compatibility projection.
    - If the agent is running AND the discourse Room is registered, clones its
      Participant via `:factory` and joins it so it actually receives messages.
 
-   Returns {:joined? true :discourse-joined? <bool>} for inspection."
-  [room-ref agent-id]
-  (let [slug (->slug room-ref)
-        agent-id (if (keyword? agent-id) agent-id (keyword agent-id))]
-    (when slug (sdb/add-room-agent! slug agent-id))
-    (let [room (when slug (rreg/lookup (rstore/slug->room-id slug)))
-          d-joined? (discourse-join! room agent-id)]
-      {:joined? true :discourse-joined? d-joined? :agent-id agent-id
-       :room (:id room)})))
+   Optional assignment opts are `:role`, `:response-policy` and `:config`.
+   Returns the durable assignment alongside the runtime join result."
+  ([room-ref agent-id]
+   (join-agent! room-ref agent-id {}))
+  ([room-ref agent-id assignment-opts]
+   (let [slug (->slug room-ref)
+         agent-id (if (keyword? agent-id) agent-id (keyword agent-id))
+         assignment (when slug
+                      (try
+                        (sdb/assign-room-actor! slug agent-id assignment-opts)
+                        (catch clojure.lang.ExceptionInfo e
+                          ;; Historical callers could record a not-yet-running
+                          ;; agent id before its actor row existed. Preserve that
+                          ;; boot ordering as a compatibility membership; it is
+                          ;; exposed as `:assignment/legacy?` until materialized.
+                          (if (= "Cannot assign an unknown actor" (.getMessage e))
+                            (do (sdb/add-room-agent! slug agent-id)
+                                (sdb/assignment-for slug agent-id))
+                            (throw e)))))
+         room (when slug (rreg/lookup (rstore/slug->room-id slug)))
+         d-joined? (discourse-join! room agent-id)]
+     {:joined? true :discourse-joined? d-joined? :agent-id agent-id
+      :assignment assignment :room (:id room)})))
 
 (defn leave-agent!
-  "Remove `agent-id` from `room-ref`'s registry membership (`:room/agent-ids`).
+  "Remove `agent-id` from `room-ref`'s assignment and compatibility membership.
    (Discourse-level leave is not automatic — the Participant stays joined until
    the daemon restarts.)"
   [room-ref agent-id]
   (when-let [slug (->slug room-ref)]
-    (sdb/remove-room-agent! slug (if (keyword? agent-id) agent-id (keyword agent-id)))))
+    (sdb/unassign-room-actor!
+     slug (if (keyword? agent-id) agent-id (keyword agent-id)))))
 
 (defn set-parent!
   "Set the parent of `child-ref` to `parent-ref` (Rooms, room-ids, or slugs) in
