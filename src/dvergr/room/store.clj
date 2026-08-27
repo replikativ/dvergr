@@ -50,8 +50,10 @@
   (-store-message! [this room-id message]
     "Persist a single Message. `message` is a discourse.Message record
      (with :id :from :to :content :ts :in-reply-to :metadata) OR a
-     map with the same keys. Implementations must be idempotent on
-     :id — re-stores are no-ops.")
+     map with the same keys. :from and non-nil :to are canonical keyword actor
+     ids; :in-reply-to is a stable message UUID and :metadata is structured
+     EDN. Implementations replay these envelope fields losslessly and must be
+     first-write-wins idempotent on :id — re-stores are no-ops.")
 
   (-list-messages [this room-id {:keys [limit since]}]
     "Return messages in chronological order. :limit caps result size

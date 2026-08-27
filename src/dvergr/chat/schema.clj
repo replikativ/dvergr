@@ -114,6 +114,20 @@
     :db/cardinality :db.cardinality/one
     :db/doc "Message role: :user :assistant :system :tool-result"}
 
+   ;; Discourse envelope identity. Actor ids are keywords throughout dvergr;
+   ;; keeping them as values (rather than refs into the system DB) is what lets
+   ;; per-room stores remain independent and later join through distributed
+   ;; index space.
+   {:db/ident :message/from
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/doc "Canonical actor id that authored the message"}
+
+   {:db/ident :message/to
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/doc "Canonical addressed actor id; absent means room broadcast"}
+
    ;; Content
    {:db/ident :message/content
     :db/valueType :db.type/string
@@ -133,6 +147,19 @@
     :db/valueType :db.type/ref
     :db/cardinality :db.cardinality/one
     :db/doc "Optional reference to message this is a reply to"}
+
+   {:db/ident :message/in-reply-to
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/doc "Stable parent message id from the discourse envelope. Unlike the
+             legacy ref, this survives out-of-order import and replay."}
+
+   {:db/ident :message/metadata
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/doc "EDN extension map from the discourse envelope. Query-critical
+             fields have dedicated attributes; this preserves attachment,
+             provenance and adapter extensions losslessly across replay."}
 
    ;; Mentions/References
    {:db/ident :message/mentions

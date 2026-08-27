@@ -7,7 +7,8 @@
    The store maps a Room's keyword id ↔ a Datahike :chat/id UUID via
    the :room/slug attribute (`slug->room-id`/`room-id->slug` in
    `dvergr.room.store`)."
-  (:require [datahike.api :as dh]
+  (:require [clojure.edn :as edn]
+            [datahike.api :as dh]
             [dvergr.chat.schema :as schema]
             [dvergr.chat.persist :as persist]
             [dvergr.room.store :as store]
@@ -16,6 +17,31 @@
 ;; =============================================================================
 ;; Helpers
 ;; =============================================================================
+
+(defn- metadata->edn
+  "Encode envelope extensions only when they are readable EDN. A bad adapter
+   value must not make an otherwise valid message impossible to persist."
+  [metadata]
+  (when (seq metadata)
+    (let [encoded (pr-str metadata)]
+      (try
+        ;; Validate now so replay cannot discover an unreadable #object later.
+        (edn/read-string encoded)
+        encoded
+        (catch Throwable t
+          (tel/log! {:level :warn :id :room-store/unreadable-message-metadata
+                     :data {:error (.getMessage t)}}
+                    "message metadata is not EDN — structured fields still persist")
+          nil)))))
+
+(defn- edn->metadata [encoded]
+  (when encoded
+    (try
+      (edn/read-string encoded)
+      (catch Throwable t
+        (tel/log! {:level :warn :id :room-store/unreadable-stored-metadata
+                   :data {:error (.getMessage t)}})
+        nil))))
 
 (defn- room-by-slug
   [conn slug]
@@ -80,6 +106,7 @@
         msg-id       (:id msg)
         ts           (some-> (:ts msg) (java.util.Date.))
         metadata     (:metadata msg)
+        metadata-edn (metadata->edn metadata)
         role         (store/infer-role msg)
         source-user  (or (:source-user metadata)
                          (some-> (:from msg) name)
@@ -90,6 +117,10 @@
              :message/content    content
              :message/created-at (or ts (java.util.Date.))
              :message/source-user source-user}
+      (keyword? (:from msg)) (assoc :message/from (:from msg))
+      (keyword? (:to msg)) (assoc :message/to (:to msg))
+      (uuid? (:in-reply-to msg)) (assoc :message/in-reply-to (:in-reply-to msg))
+      metadata-edn (assoc :message/metadata metadata-edn)
       (:source-username metadata) (assoc :message/source-username (:source-username metadata))
       (:source-user-id  metadata) (assoc :message/source-user-id  (long (:source-user-id metadata)))
       ;; Structured tool-uses (already serialized component maps from the
@@ -156,16 +187,23 @@
   (-store-message! [_ room-id msg]
     (let [slug (store/room-id->slug room-id)]
       (if-let [ent (room-by-slug conn slug)]
-        (let [chat-id (:chat/id ent)
-              entity  (message->entity chat-id msg)]
-          ;; One durability policy (surface + retry-once + dead-letter) instead
-          ;; of the old catch-and-silently-drop — a lost message is now visible
-          ;; and recoverable, not swallowed at :warn.
-          (persist/persist-tx! conn
-                               [entity
-                                {:db/id [:chat/id chat-id]
-                                 :chat/updated-at (java.util.Date.)}]
-                               {:op :store-message :room-id room-id :msg-id (:id msg)}))
+        ;; PRoomStore promises first-write-wins idempotence. A lookup-identity
+        ;; upsert alone would silently overwrite content when an adapter retries
+        ;; the same id with a changed envelope.
+        (when-not (dh/q '[:find ?m .
+                          :in $ ?mid
+                          :where [?m :message/id ?mid]]
+                        @conn (:id msg))
+          (let [chat-id (:chat/id ent)
+                entity  (message->entity chat-id msg)]
+            ;; One durability policy (surface + retry-once + dead-letter) instead
+            ;; of the old catch-and-silently-drop — a lost message is now visible
+            ;; and recoverable, not swallowed at :warn.
+            (persist/persist-tx! conn
+                                 [entity
+                                  {:db/id [:chat/id chat-id]
+                                   :chat/updated-at (java.util.Date.)}]
+                                 {:op :store-message :room-id room-id :msg-id (:id msg)})))
         (tel/log! {:level :error :id :room-store/datahike-missing-room
                    :data {:room-id room-id :msg-id (:id msg)}}
                   "message for unknown room — not persisted (dropped)"))))
@@ -176,7 +214,9 @@
         (let [chat-id (:chat/id ent)
               base    (dh/q '[:find [(pull ?m [:message/id :message/role :message/content
                                                :message/created-at :message/source-user
-                                               :message/source-username :message/reasoning
+                                               :message/source-username :message/source-user-id
+                                               :message/from :message/to :message/in-reply-to
+                                               :message/metadata :message/reasoning
                                                {:message/tool-uses
                                                 [:tool-use/id :tool-use/name
                                                  {:tool-use/input [*]}]}]) ...]
@@ -196,22 +236,32 @@
           ;; see {:id :from :to :content :ts :role :metadata} regardless of
           ;; which store backs the room.
           (mapv (fn [m]
-                  (cond-> {:id        (:message/id m)
-                           :from      (some-> (:message/source-user m) keyword)
-                           :to        nil
-                           :content   (:message/content m)
-                           :ts        (some-> (:message/created-at m) .getTime)
-                           :role      (:message/role m)
-                           :metadata  {:source-user     (:message/source-user m)
-                                       :source-username (:message/source-username m)}}
+                  (let [stored-metadata (or (edn->metadata (:message/metadata m)) {})
+                        metadata (cond-> stored-metadata
+                                   (:message/source-user m)
+                                   (assoc :source-user (:message/source-user m))
+                                   (:message/source-username m)
+                                   (assoc :source-username (:message/source-username m))
+                                   (:message/source-user-id m)
+                                   (assoc :source-user-id (:message/source-user-id m)))]
+                    (cond-> {:id        (:message/id m)
+                             :from      (or (:message/from m)
+                                            (some-> (:message/source-user m) keyword))
+                             :to        (:message/to m)
+                             :content   (:message/content m)
+                             :ts        (some-> (:message/created-at m) .getTime)
+                             :role      (:message/role m)
+                             :metadata  metadata}
+                      (:message/in-reply-to m)
+                      (assoc :in-reply-to (:message/in-reply-to m))
                     ;; Surface structured tool-uses so rich frontends render an
                     ;; agent's tool activity inline (same as the chat-ctx view).
-                    (seq (:message/tool-uses m))
-                    (assoc :tool-uses (:message/tool-uses m))
+                      (seq (:message/tool-uses m))
+                      (assoc :tool-uses (:message/tool-uses m))
                     ;; Surface the interleaved-thinking trace so seeding can feed
                     ;; it back to reasoning models (MiniMax M2 / Kimi / DeepSeek).
-                    (seq (:message/reasoning m))
-                    (assoc :reasoning (:message/reasoning m))))
+                      (seq (:message/reasoning m))
+                      (assoc :reasoning (:message/reasoning m)))))
                 (vec (take-last (or limit 100) filtered))))))))
 
 (defn make
