@@ -37,7 +37,9 @@
                (let [v (or existing [])]
                  (if (some #(= (:id %) msg-id) v)
                    v
-                   (conj v msg)))))
+                   (do
+                     (store/validate-message-metadata! (:metadata msg))
+                     (conj v msg))))))
       (swap! state update-in [:rooms room-id]
              (fn [m] (when m (assoc m :updated-at (java.util.Date.)))))))
 

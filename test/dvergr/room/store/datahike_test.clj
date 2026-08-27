@@ -23,6 +23,137 @@
   (let [[_conn st] (mem-store)]
     (contract/assert-message-envelope! st :envelope-datahike)))
 
+(deftest metadata-is-typed-and-queryable
+  (testing "durable metadata is datoms, with UUID blobs marked as store refs"
+    (let [[conn st] (mem-store)
+          room-id :typed-metadata
+          message-id (random-uuid)
+          blob-id (random-uuid)]
+      (store/-store-room! st room-id {:slug (name room-id) :title "T"})
+      (store/-store-message!
+       st room-id
+       {:id message-id :from :party/alice :to :agent/reviewer
+        :content "review" :ts 1787860800123
+        :metadata {:role :user
+                   :mentions #{"reviewer"}
+                   :audience #{:agent/reviewer}
+                   :attachment {:blob-id blob-id :mime "audio/ogg"}
+                   :provenance {:mode :live :source :screen}}})
+      (let [stored (dh/pull @conn
+                            [:message/audience :message/mention-handles
+                             :message/attachment-store-ref :message/attachment-mime
+                             :message/provenance-mode :message/provenance-source]
+                            [:message/id message-id])]
+        (is (= #{:agent/reviewer} (set (:message/audience stored))))
+        (is (= #{"reviewer"} (set (:message/mention-handles stored))))
+        (is (= blob-id (:message/attachment-store-ref stored)))
+        (is (= {:message/attachment-mime "audio/ogg"
+                :message/provenance-mode :live
+                :message/provenance-source :screen}
+               (select-keys stored [:message/attachment-mime
+                                    :message/provenance-mode
+                                    :message/provenance-source]))))
+      (is (nil? (dh/q '[:find ?a .
+                        :where [?a :db/ident :message/metadata]]
+                      @conn))
+          "the opaque EDN attribute is absent from fresh schema"))))
+
+(deftest unknown-metadata-must-extend-the-schema
+  (testing "unknown extensions fail instead of silently becoming opaque data"
+    (let [[_conn st] (mem-store)
+          room-id :unknown-metadata]
+      (store/-store-room! st room-id {:slug (name room-id) :title "T"})
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"Unknown durable message"
+           (store/-store-message!
+            st room-id
+            {:id (random-uuid) :from :alice :content "hi"
+             :metadata {:role :user :unmodelled/value 1}}))))))
+
+(deftest foreign-content-addressed-blob-id-round-trip
+  (testing "non-UUID IDs from a separately configured blob CAS remain strings"
+    (let [[conn st] (mem-store)
+          room-id :foreign-blob
+          message-id (random-uuid)
+          blob-id "sha256:9e107d9d372bb6826bd81d3542a419d6"]
+      (store/-store-room! st room-id {:slug (name room-id) :title "T"})
+      (store/-store-message!
+       st room-id
+       {:id message-id :from :party/alice :content "file"
+        :metadata {:role :user
+                   :attachment {:blob-id blob-id
+                                :node-id "drive-node-1"
+                                :name "proposal.pdf"
+                                :size 4096}}})
+      (let [stored (dh/pull @conn
+                            [:message/attachment-store-ref
+                             :message/attachment-blob-id]
+                            [:message/id message-id])
+            replayed (first (store/-list-messages st room-id {}))]
+        (is (= {:message/attachment-blob-id blob-id} stored))
+        (is (= {:blob-id blob-id
+                :node-id "drive-node-1"
+                :name "proposal.pdf"
+                :size 4096}
+               (get-in replayed [:metadata :attachment])))))))
+
+(deftest notification-metadata-round-trip
+  (testing "background notification correlation fields remain queryable"
+    (let [[conn st] (mem-store)
+          room-id :notification
+          message-id (random-uuid)
+          task-id (random-uuid)]
+      (store/-store-room! st room-id {:slug (name room-id) :title "T"})
+      (store/-store-message!
+       st room-id
+       {:id message-id :from :agent/planner :to :party/alice :content "done"
+        :metadata {:role :assistant
+                   :from :background
+                   :notification/type :task-complete
+                   :notification/agent :agent/planner
+                   :notification/task task-id
+                   :notification/elapsed 1234}})
+      (is (= {:message/context-from :background
+              :message/notification-type :task-complete
+              :message/notification-agent :agent/planner
+              :message/notification-task task-id
+              :message/notification-elapsed 1234}
+             (dh/pull @conn
+                      [:message/context-from :message/notification-type
+                       :message/notification-agent :message/notification-task
+                       :message/notification-elapsed]
+                      [:message/id message-id])))
+      (is (= {:role :assistant
+              :source-user "planner"
+              :from :background
+              :notification/type :task-complete
+              :notification/agent :agent/planner
+              :notification/task task-id
+              :notification/elapsed 1234}
+             (:metadata (first (store/-list-messages st room-id {}))))))))
+
+(deftest scheduler-metadata-round-trip
+  (testing "scheduled messages retain their typed origin and correlation id"
+    (let [[conn st] (mem-store)
+          room-id :scheduled-message
+          message-id (random-uuid)
+          schedule-id (random-uuid)]
+      (store/-store-room! st room-id {:slug (name room-id) :title "T"})
+      (store/-store-message!
+       st room-id
+       {:id message-id :from :scheduler :to :agent/planner :content "run"
+        :metadata {:source :scheduler :schedule-id schedule-id}})
+      (is (= {:message/source :scheduler
+              :message/schedule-id schedule-id}
+             (dh/pull @conn [:message/source :message/schedule-id]
+                      [:message/id message-id])))
+      (is (= {:role :assistant
+              :source-user "scheduler"
+              :source :scheduler
+              :schedule-id schedule-id}
+             (:metadata (first (store/-list-messages st room-id {}))))))))
+
 (deftest tool-uses-round-trip
   (testing "the room store persists and returns structured :tool-uses"
     (let [[_conn st] (mem-store)

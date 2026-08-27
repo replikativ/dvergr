@@ -70,7 +70,7 @@
         rewrite-clj/rewrite-clj    {:mvn/version "1.1.48"}
 
         ;; Datahike — persistent Datalog storage
-        org.replikativ/datahike    {:mvn/version "0.8.1744"}
+        org.replikativ/datahike    {:mvn/version "0.8.1819"}
 
         ;; Yggdrasil — CoW branching for git and Datahike
         ;; 0.3.38 adopts the Geschichte adapter (yggdrasil.adapters.geschichte,
@@ -80,7 +80,7 @@
         org.replikativ/yggdrasil   {:mvn/version "0.3.38"}
 
         ;; Scriptum — CoW Lucene indices for fulltext search
-        org.replikativ/scriptum    {:mvn/version "0.1.27"}
+        org.replikativ/scriptum    {:mvn/version "0.1.30"}
 
         ;; Briefkasten (local IMAP mirror) is OPTIONAL — it backs dvergr.intake.mail
         ;; only, and pulls the jakarta-mail tree, so it lives in the
@@ -89,11 +89,13 @@
         ;; Kabel — WebSocket peer-to-peer transport. 0.3.98 pins javac --release 11
         ;; (0.3.97 shipped Java-25 bytecode → UnsupportedClassVersionError on JDK <25).
         org.replikativ/kabel       {:mvn/version "0.3.98"}
+        ;; Compatibility alignment: Yggdrasil 0.3.38 still loads
+        ;; hasch.benc.HashRef, which was removed in Hasch 0.4.102. Drop this
+        ;; override when Yggdrasil moves to the new reference representation.
         org.replikativ/hasch       {:mvn/version "0.4.101"}
-        org.replikativ/incognito   {:mvn/version "0.3.69"}
-        org.replikativ/konserve    {:mvn/version "0.9.363"}
-        org.replikativ/kabel-auth  {:mvn/version "0.1.19"}
-        org.replikativ/superv.async {:mvn/version "0.3.50"}
+        ;; Dvergr's drive blob store uses Konserve directly. Keep this aligned
+        ;; with Datahike rather than relying on Datahike's transitive API.
+        org.replikativ/konserve    {:mvn/version "0.9.385"}
 
         ;; Distributed-scope — remote function invocation over Kabel
         is.simm/distributed-scope  {:mvn/version "0.1.2"}
