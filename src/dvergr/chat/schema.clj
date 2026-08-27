@@ -154,12 +154,80 @@
     :db/doc "Stable parent message id from the discourse envelope. Unlike the
              legacy ref, this survives out-of-order import and replay."}
 
-   {:db/ident :message/metadata
+   ;; Structured envelope metadata. These are ordinary datoms on the message:
+   ;; clients can query/sync them independently and never need to parse an
+   ;; opaque EDN string. Actor ids remain keyword values for the same reason as
+   ;; :message/from/:message/to: room stores do not depend on system-db refs.
+   {:db/ident :message/audience
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/many
+    :db/doc "Canonical actor ids intended to observe or act on this message"}
+
+   {:db/ident :message/mention-handles
     :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/many
+    :db/doc "Presentation handles explicitly mentioned in the message"}
+
+   {:db/ident :message/metadata-kind
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :message/context-from
+    :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/one
-    :db/doc "EDN extension map from the discourse envelope. Query-critical
-             fields have dedicated attributes; this preserves attachment,
-             provenance and adapter extensions losslessly across replay."}
+    :db/doc "Logical initiator carried by delegated/background work"}
+
+   ;; Attachments may name an object through Datahike's GC-aware store-ref, or
+   ;; carry a foreign CAS id (the current dvergr drive uses SHA-256 strings in a
+   ;; separately configured blob store). A message uses at most one form.
+   {:db/ident :message/attachment-store-ref
+    :db/valueType :db.type/store-ref
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :message/attachment-blob-id
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :message/attachment-node-id
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :message/attachment-mime
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :message/attachment-name
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :message/attachment-size
+    :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :message/provenance-mode
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :message/provenance-source
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+
+   ;; Background-task notification envelope.
+   {:db/ident :message/notification-type
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :message/notification-agent
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :message/notification-task
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :message/notification-elapsed
+    :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
 
    ;; Mentions/References
    {:db/ident :message/mentions

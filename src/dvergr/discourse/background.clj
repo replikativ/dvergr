@@ -80,7 +80,9 @@
      :timeout-ms   — give up if the agent doesn't reply in this window.
                      Posts a :task-failed notification with content
                      '[timed out]'. Default 300000 (5 min).
-     :metadata     — extra metadata merged into the notification.
+     :metadata     — extra typed durable metadata merged into the notification;
+                     keys must belong to
+                     `dvergr.room.store/durable-message-metadata-keys`.
 
    Returns a TASK HANDLE map (the spawned spin is held alive by spindel's spawn
    keep-alive until its body resolves, so the task survives GC while suspended):

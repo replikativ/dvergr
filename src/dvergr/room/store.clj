@@ -51,9 +51,12 @@
     "Persist a single Message. `message` is a discourse.Message record
      (with :id :from :to :content :ts :in-reply-to :metadata) OR a
      map with the same keys. :from and non-nil :to are canonical keyword actor
-     ids; :in-reply-to is a stable message UUID and :metadata is structured
-     EDN. Implementations replay these envelope fields losslessly and must be
-     first-write-wins idempotent on :id — re-stores are no-ops.")
+     ids; :in-reply-to is a stable message UUID and :metadata uses dvergr's
+     typed durable vocabulary (role/source, audience/mentions, attachment,
+     provenance, notification, tool-use and reasoning fields). Implementations
+     replay these envelope fields losslessly and must be first-write-wins
+     idempotent on :id — re-stores are no-ops. Unknown durable metadata is an
+     error: extend the typed schema rather than adding an opaque encoding.")
 
   (-list-messages [this room-id {:keys [limit since]}]
     "Return messages in chronological order. :limit caps result size
@@ -63,6 +66,53 @@
 ;; =============================================================================
 ;; Helpers
 ;; =============================================================================
+
+(def durable-message-metadata-keys
+  "The top-level metadata keys that every PRoomStore implementation accepts.
+   New durable extensions must add typed storage in persistent implementations
+   before being added here."
+  #{:role :source-user :source-username :source-user-id
+    :audience :mentions :attachment :provenance
+    :tool-uses :reasoning :kind :from
+    :notification/type :notification/agent :notification/task
+    :notification/elapsed})
+
+(def ^:private attachment-metadata-keys #{:blob-id :node-id :mime :name :size})
+(def ^:private provenance-metadata-keys #{:mode :source})
+
+(defn- reject-unknown-metadata! [kind allowed value]
+  (let [unknown (seq (remove allowed (keys (or value {}))))]
+    (when unknown
+      (throw (ex-info (str "Unknown durable message " kind " keys")
+                      {:type :room-store/unknown-message-metadata
+                       :kind kind
+                       :unknown (set unknown)
+                       :allowed allowed})))))
+
+(defn validate-message-metadata!
+  "Validate the typed durable message metadata vocabulary and return `metadata`.
+   Kept at the protocol boundary so ephemeral and persistent stores reject the
+   same accidental, unmodelled extensions."
+  [metadata]
+  (when metadata
+    (when-not (map? metadata)
+      (throw (ex-info "Durable message metadata must be a map"
+                      {:type :room-store/invalid-message-metadata
+                       :value metadata})))
+    (reject-unknown-metadata! :metadata durable-message-metadata-keys metadata)
+    (when-let [attachment (:attachment metadata)]
+      (when-not (map? attachment)
+        (throw (ex-info "Message attachment metadata must be a map"
+                        {:type :room-store/invalid-message-metadata
+                         :attachment attachment})))
+      (reject-unknown-metadata! :attachment attachment-metadata-keys attachment))
+    (when-let [provenance (:provenance metadata)]
+      (when-not (map? provenance)
+        (throw (ex-info "Message provenance metadata must be a map"
+                        {:type :room-store/invalid-message-metadata
+                         :provenance provenance})))
+      (reject-unknown-metadata! :provenance provenance-metadata-keys provenance)))
+  metadata)
 
 (defn message-shape?
   "True if `msg` looks like a Message (has the required keys). Used by

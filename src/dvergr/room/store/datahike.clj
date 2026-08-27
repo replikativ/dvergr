@@ -7,8 +7,7 @@
    The store maps a Room's keyword id ↔ a Datahike :chat/id UUID via
    the :room/slug attribute (`slug->room-id`/`room-id->slug` in
    `dvergr.room.store`)."
-  (:require [clojure.edn :as edn]
-            [datahike.api :as dh]
+  (:require [datahike.api :as dh]
             [dvergr.chat.schema :as schema]
             [dvergr.chat.persist :as persist]
             [dvergr.room.store :as store]
@@ -17,31 +16,6 @@
 ;; =============================================================================
 ;; Helpers
 ;; =============================================================================
-
-(defn- metadata->edn
-  "Encode envelope extensions only when they are readable EDN. A bad adapter
-   value must not make an otherwise valid message impossible to persist."
-  [metadata]
-  (when (seq metadata)
-    (let [encoded (pr-str metadata)]
-      (try
-        ;; Validate now so replay cannot discover an unreadable #object later.
-        (edn/read-string encoded)
-        encoded
-        (catch Throwable t
-          (tel/log! {:level :warn :id :room-store/unreadable-message-metadata
-                     :data {:error (.getMessage t)}}
-                    "message metadata is not EDN — structured fields still persist")
-          nil)))))
-
-(defn- edn->metadata [encoded]
-  (when encoded
-    (try
-      (edn/read-string encoded)
-      (catch Throwable t
-        (tel/log! {:level :warn :id :room-store/unreadable-stored-metadata
-                   :data {:error (.getMessage t)}})
-        nil))))
 
 (defn- room-by-slug
   [conn slug]
@@ -105,8 +79,10 @@
   (let [content      (str (:content msg))
         msg-id       (:id msg)
         ts           (some-> (:ts msg) (java.util.Date.))
-        metadata     (:metadata msg)
-        metadata-edn (metadata->edn metadata)
+        metadata     (store/validate-message-metadata! (:metadata msg))
+        attachment   (:attachment metadata)
+        provenance   (:provenance metadata)
+        blob-id      (:blob-id attachment)
         role         (store/infer-role msg)
         source-user  (or (:source-user metadata)
                          (some-> (:from msg) name)
@@ -120,9 +96,31 @@
       (keyword? (:from msg)) (assoc :message/from (:from msg))
       (keyword? (:to msg)) (assoc :message/to (:to msg))
       (uuid? (:in-reply-to msg)) (assoc :message/in-reply-to (:in-reply-to msg))
-      metadata-edn (assoc :message/metadata metadata-edn)
       (:source-username metadata) (assoc :message/source-username (:source-username metadata))
       (:source-user-id  metadata) (assoc :message/source-user-id  (long (:source-user-id metadata)))
+      (seq (:audience metadata)) (assoc :message/audience (set (:audience metadata)))
+      (seq (:mentions metadata)) (assoc :message/mention-handles
+                                        (set (map str (:mentions metadata))))
+      (:kind metadata) (assoc :message/metadata-kind (:kind metadata))
+      (:from metadata) (assoc :message/context-from (:from metadata))
+      (uuid? blob-id) (assoc :message/attachment-store-ref blob-id)
+      (and blob-id (not (uuid? blob-id)))
+      (assoc :message/attachment-blob-id (str blob-id))
+      (:node-id attachment) (assoc :message/attachment-node-id
+                                   (str (:node-id attachment)))
+      (:mime attachment) (assoc :message/attachment-mime (:mime attachment))
+      (:name attachment) (assoc :message/attachment-name (:name attachment))
+      (:size attachment) (assoc :message/attachment-size (long (:size attachment)))
+      (:mode provenance) (assoc :message/provenance-mode (:mode provenance))
+      (:source provenance) (assoc :message/provenance-source (:source provenance))
+      (:notification/type metadata)
+      (assoc :message/notification-type (:notification/type metadata))
+      (:notification/agent metadata)
+      (assoc :message/notification-agent (:notification/agent metadata))
+      (:notification/task metadata)
+      (assoc :message/notification-task (:notification/task metadata))
+      (:notification/elapsed metadata)
+      (assoc :message/notification-elapsed (long (:notification/elapsed metadata)))
       ;; Structured tool-uses (already serialized component maps from the
       ;; chat-ctx in-memory signal — :tool-use/id is plain string, not
       ;; unique, so re-transacting creates fresh components). This is how a
@@ -216,7 +214,21 @@
                                                :message/created-at :message/source-user
                                                :message/source-username :message/source-user-id
                                                :message/from :message/to :message/in-reply-to
-                                               :message/metadata :message/reasoning
+                                               :message/reasoning
+                                               :message/audience :message/mention-handles
+                                               :message/metadata-kind :message/context-from
+                                               :message/attachment-store-ref
+                                               :message/attachment-blob-id
+                                               :message/attachment-node-id
+                                               :message/attachment-mime
+                                               :message/attachment-name
+                                               :message/attachment-size
+                                               :message/provenance-mode
+                                               :message/provenance-source
+                                               :message/notification-type
+                                               :message/notification-agent
+                                               :message/notification-task
+                                               :message/notification-elapsed
                                                {:message/tool-uses
                                                 [:tool-use/id :tool-use/name
                                                  {:tool-use/input [*]}]}]) ...]
@@ -236,14 +248,58 @@
           ;; see {:id :from :to :content :ts :role :metadata} regardless of
           ;; which store backs the room.
           (mapv (fn [m]
-                  (let [stored-metadata (or (edn->metadata (:message/metadata m)) {})
-                        metadata (cond-> stored-metadata
+                  (let [attachment (cond-> {}
+                                     (or (:message/attachment-store-ref m)
+                                         (:message/attachment-blob-id m))
+                                     (assoc :blob-id
+                                            (or (:message/attachment-store-ref m)
+                                                (:message/attachment-blob-id m)))
+                                     (:message/attachment-node-id m)
+                                     (assoc :node-id (:message/attachment-node-id m))
+                                     (:message/attachment-mime m)
+                                     (assoc :mime (:message/attachment-mime m))
+                                     (:message/attachment-name m)
+                                     (assoc :name (:message/attachment-name m))
+                                     (:message/attachment-size m)
+                                     (assoc :size (:message/attachment-size m)))
+                        provenance (cond-> {}
+                                     (:message/provenance-mode m)
+                                     (assoc :mode (:message/provenance-mode m))
+                                     (:message/provenance-source m)
+                                     (assoc :source (:message/provenance-source m)))
+                        metadata (cond-> {:role (:message/role m)}
                                    (:message/source-user m)
                                    (assoc :source-user (:message/source-user m))
                                    (:message/source-username m)
                                    (assoc :source-username (:message/source-username m))
                                    (:message/source-user-id m)
-                                   (assoc :source-user-id (:message/source-user-id m)))]
+                                   (assoc :source-user-id (:message/source-user-id m))
+                                   (seq (:message/audience m))
+                                   (assoc :audience (set (:message/audience m)))
+                                   (seq (:message/mention-handles m))
+                                   (assoc :mentions (set (:message/mention-handles m)))
+                                   (seq attachment) (assoc :attachment attachment)
+                                   (seq provenance) (assoc :provenance provenance)
+                                   (:message/metadata-kind m)
+                                   (assoc :kind (:message/metadata-kind m))
+                                   (:message/context-from m)
+                                   (assoc :from (:message/context-from m))
+                                   (:message/notification-type m)
+                                   (assoc :notification/type
+                                          (:message/notification-type m))
+                                   (:message/notification-agent m)
+                                   (assoc :notification/agent
+                                          (:message/notification-agent m))
+                                   (:message/notification-task m)
+                                   (assoc :notification/task
+                                          (:message/notification-task m))
+                                   (:message/notification-elapsed m)
+                                   (assoc :notification/elapsed
+                                          (:message/notification-elapsed m))
+                                   (seq (:message/tool-uses m))
+                                   (assoc :tool-uses (:message/tool-uses m))
+                                   (seq (:message/reasoning m))
+                                   (assoc :reasoning (:message/reasoning m)))]
                     (cond-> {:id        (:message/id m)
                              :from      (or (:message/from m)
                                             (some-> (:message/source-user m) keyword))
