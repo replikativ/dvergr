@@ -177,6 +177,16 @@
     :db/cardinality :db.cardinality/one
     :db/doc "Logical initiator carried by delegated/background work"}
 
+   {:db/ident :message/source
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/doc "Subsystem that originated the message, such as :scheduler"}
+
+   {:db/ident :message/schedule-id
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/doc "Schedule whose firing produced this message"}
+
    ;; Attachments may name an object through Datahike's GC-aware store-ref, or
    ;; carry a foreign CAS id (the current dvergr drive uses SHA-256 strings in a
    ;; separately configured blob store). A message uses at most one form.

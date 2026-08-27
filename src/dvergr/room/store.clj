@@ -73,7 +73,7 @@
    before being added here."
   #{:role :source-user :source-username :source-user-id
     :audience :mentions :attachment :provenance
-    :tool-uses :reasoning :kind :from
+    :tool-uses :reasoning :kind :from :source :schedule-id
     :notification/type :notification/agent :notification/task
     :notification/elapsed})
 

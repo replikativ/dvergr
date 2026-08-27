@@ -133,6 +133,27 @@
               :notification/elapsed 1234}
              (:metadata (first (store/-list-messages st room-id {}))))))))
 
+(deftest scheduler-metadata-round-trip
+  (testing "scheduled messages retain their typed origin and correlation id"
+    (let [[conn st] (mem-store)
+          room-id :scheduled-message
+          message-id (random-uuid)
+          schedule-id (random-uuid)]
+      (store/-store-room! st room-id {:slug (name room-id) :title "T"})
+      (store/-store-message!
+       st room-id
+       {:id message-id :from :scheduler :to :agent/planner :content "run"
+        :metadata {:source :scheduler :schedule-id schedule-id}})
+      (is (= {:message/source :scheduler
+              :message/schedule-id schedule-id}
+             (dh/pull @conn [:message/source :message/schedule-id]
+                      [:message/id message-id])))
+      (is (= {:role :assistant
+              :source-user "scheduler"
+              :source :scheduler
+              :schedule-id schedule-id}
+             (:metadata (first (store/-list-messages st room-id {}))))))))
+
 (deftest tool-uses-round-trip
   (testing "the room store persists and returns structured :tool-uses"
     (let [[_conn st] (mem-store)

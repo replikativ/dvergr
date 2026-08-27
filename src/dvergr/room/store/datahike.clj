@@ -103,6 +103,8 @@
                                         (set (map str (:mentions metadata))))
       (:kind metadata) (assoc :message/metadata-kind (:kind metadata))
       (:from metadata) (assoc :message/context-from (:from metadata))
+      (:source metadata) (assoc :message/source (:source metadata))
+      (:schedule-id metadata) (assoc :message/schedule-id (:schedule-id metadata))
       (uuid? blob-id) (assoc :message/attachment-store-ref blob-id)
       (and blob-id (not (uuid? blob-id)))
       (assoc :message/attachment-blob-id (str blob-id))
@@ -217,6 +219,7 @@
                                                :message/reasoning
                                                :message/audience :message/mention-handles
                                                :message/metadata-kind :message/context-from
+                                               :message/source :message/schedule-id
                                                :message/attachment-store-ref
                                                :message/attachment-blob-id
                                                :message/attachment-node-id
@@ -284,6 +287,10 @@
                                    (assoc :kind (:message/metadata-kind m))
                                    (:message/context-from m)
                                    (assoc :from (:message/context-from m))
+                                   (:message/source m)
+                                   (assoc :source (:message/source m))
+                                   (:message/schedule-id m)
+                                   (assoc :schedule-id (:message/schedule-id m))
                                    (:message/notification-type m)
                                    (assoc :notification/type
                                           (:message/notification-type m))
