@@ -9,6 +9,7 @@
    - `:system/*`  — the registry of attachable yggdrasil systems (KBs, repos, …),
                     each carrying its own store *scope*.
    - `:room/*`    — rooms as top-level projects (own message-DB scope + owner).
+   - `:assignment/*` — actor roles and response policies within rooms.
    - `:grant/*`   — room↔system attachment edges, each with a permission.
 
    A room defaults to owning its own KB + repo (a `:grant` with `:owner`).
@@ -16,9 +17,12 @@
    on the fly — the durable record lives here; the live runtime attach/detach
    happens on the room's yggdrasil composite (spindel `register!` / `detach!`).
    Generalises simmis's `is.simm.model.system-db` from `:kb/*` to any `:system/*`."
-  (:require [datahike.api :as d]
+  (:require [clojure.edn :as edn]
+            [datahike.api :as d]
             [dvergr.chat.schema :as cschema]
-            [dvergr.substrate.paths :as paths]))
+            [dvergr.substrate.paths :as paths])
+  (:import [java.nio.charset StandardCharsets]
+           [java.util UUID]))
 
 ;; ---------------------------------------------------------------------------
 ;; Schema
@@ -81,6 +85,12 @@
 ;; S5 reconciles the two.
 (def actor-schema cschema/actor-schema)
 
+;; --- Assignments: room-specific actor role + response policy ---
+;; This is the canonical participation relation. `:room/agent-ids` remains as a
+;; compatibility projection for existing room hydration and clients while they
+;; move to assignments.
+(def assignment-schema cschema/assignment-schema)
+
 ;; --- Pricing: the global model price list ---
 ;; RF5 S3: pricing is truly-global, read-mostly config (a model's price is the
 ;; same in every room), so it belongs in system-db. The live price source today
@@ -117,7 +127,8 @@
       (let [c (cfg)]
         (when-not (d/database-exists? c) (d/create-database c))
         (let [conn (d/connect c)]
-          (d/transact conn (vec (concat schema actor-schema pricing-schema task-schema)))
+          (d/transact conn (vec (concat schema actor-schema assignment-schema
+                                        pricing-schema task-schema)))
           (reset! conn-atom conn)))))
 
 (defn reset-conn!
@@ -203,15 +214,192 @@
        @(get-conn) (long telegram-chat-id)))
 
 (defn add-room-agent!
-  "Add `agent-id` (keyword) to a room's `:room/agent-ids` set (by slug)."
+  "Add `agent-id` to the legacy `:room/agent-ids` compatibility projection.
+   New code should call `assign-room-actor!`, which writes both models."
   [slug agent-id]
   (d/transact (get-conn) [{:room/slug slug :room/agent-ids agent-id}]))
 
 (defn remove-room-agent!
-  "Remove `agent-id` from a room's `:room/agent-ids` set (by slug)."
+  "Remove `agent-id` from the legacy `:room/agent-ids` compatibility projection.
+   New code should call `unassign-room-actor!`, which retracts both models."
   [slug agent-id]
   (when-let [eid (d/q '[:find ?e . :in $ ?s :where [?e :room/slug ?s]] @(get-conn) slug)]
     (d/transact (get-conn) [[:db/retract eid :room/agent-ids agent-id]])))
+
+;; ---------------------------------------------------------------------------
+;; Room assignments
+;; ---------------------------------------------------------------------------
+
+(def assignment-roles
+  "Roles understood by the generic room assignment contract."
+  #{:lead :specialist :reviewer :observer})
+
+(def response-policies
+  "Automatic response policies. `:manual` actors remain addressable but are
+   never awakened merely because a message was posted."
+  #{:always :mention :manual})
+
+(defn- assignment-id
+  [room-id actor-id]
+  (UUID/nameUUIDFromBytes
+   (.getBytes (str "dvergr/assignment:" room-id ":" actor-id)
+              StandardCharsets/UTF_8)))
+
+(defn- read-config [config]
+  (cond
+    (map? config) config
+    (string? config) (let [parsed (edn/read-string config)]
+                       (if (map? parsed)
+                         parsed
+                         (throw (ex-info "Assignment config EDN must decode to a map"
+                                         {:config config :decoded parsed}))))
+    (nil? config) {}
+    :else (throw (ex-info "Assignment config must be a map or EDN map string"
+                          {:config config}))))
+
+(defn- normalize-assignment [assignment]
+  (when assignment
+    {:assignment/id (:assignment/id assignment)
+     :assignment/room-id (get-in assignment [:assignment/room :room/id])
+     :assignment/room-slug (get-in assignment [:assignment/room :room/slug])
+     :assignment/actor-id (get-in assignment [:assignment/actor :actor/id])
+     :assignment/actor-name (get-in assignment [:assignment/actor :actor/name])
+     :assignment/actor-kind (get-in assignment [:assignment/actor :actor/kind])
+     :assignment/role (:assignment/role assignment)
+     :assignment/response-policy (:assignment/response-policy assignment)
+     :assignment/config (read-config (:assignment/config assignment))
+     :assignment/created-at (:assignment/created-at assignment)
+     :assignment/updated-at (:assignment/updated-at assignment)}))
+
+(def ^:private assignment-pull
+  [:assignment/id :assignment/role :assignment/response-policy
+   :assignment/config :assignment/created-at :assignment/updated-at
+   {:assignment/room [:room/id :room/slug]}
+   {:assignment/actor [:actor/id :actor/name :actor/kind]}])
+
+(defn- persisted-room-assignments [conn slug]
+  (->> (d/q '[:find [(pull ?assignment ?pull) ...]
+              :in $ ?slug ?pull
+              :where
+              [?room :room/slug ?slug]
+              [?assignment :assignment/room ?room]]
+            @conn slug assignment-pull)
+       (map normalize-assignment)))
+
+(defn room-assignments
+  "Return every actor assignment for room `slug`, sorted by actor id.
+
+   A pre-assignment `:room/agent-ids` member is returned as a read-only
+   `:assignment/legacy? true` default (`:specialist`/`:always`). This keeps
+   existing rooms dispatch-compatible without an eager migration. The first
+   assignment edit materializes the canonical row."
+  [slug]
+  (let [conn (get-conn)
+        room (room-by-slug slug)
+        persisted (persisted-room-assignments conn slug)
+        by-actor (into {} (map (juxt :assignment/actor-id identity)) persisted)
+        legacy (for [actor-id (:room/agent-ids room)
+                     :when (not (contains? by-actor actor-id))
+                     :let [actor (d/q '[:find (pull ?actor [:actor/id :actor/name :actor/kind]) .
+                                        :in $ ?id
+                                        :where [?actor :actor/id ?id]]
+                                      @conn actor-id)]]
+                 {:assignment/id (assignment-id (:room/id room) actor-id)
+                  :assignment/room-id (:room/id room)
+                  :assignment/room-slug slug
+                  :assignment/actor-id actor-id
+                  :assignment/actor-name (:actor/name actor)
+                  :assignment/actor-kind (:actor/kind actor)
+                  :assignment/role :specialist
+                  :assignment/response-policy :always
+                  :assignment/config {}
+                  :assignment/legacy? true})]
+    (->> (concat persisted legacy)
+         (sort-by (comp str :assignment/actor-id))
+         vec)))
+
+(defn assignment-for
+  "The canonical or compatibility assignment for `[room-slug actor-id]`."
+  [slug actor-id]
+  (some #(when (= actor-id (:assignment/actor-id %)) %)
+        (room-assignments slug)))
+
+(defn assign-room-actor!
+  "Create or update one room assignment and maintain `:room/agent-ids` as a
+   compatibility projection. `opts` may contain `:role`, `:response-policy`
+   and `:config`; omitted values preserve an existing canonical assignment or
+   default to `:specialist`, `:always` and `{}`.
+
+   The room and actor must already exist. Returns the normalized assignment."
+  [slug actor-id {:keys [role response-policy config] :as opts}]
+  (let [conn (get-conn)
+        room (room-by-slug slug)
+        actor (d/q '[:find (pull ?actor [:actor/id]) .
+                     :in $ ?id
+                     :where [?actor :actor/id ?id]]
+                   @conn actor-id)]
+    (when-not room
+      (throw (ex-info "Cannot assign an actor to an unknown room"
+                      {:room-slug slug :actor-id actor-id})))
+    (when-not actor
+      (throw (ex-info "Cannot assign an unknown actor"
+                      {:room-slug slug :actor-id actor-id})))
+    (let [existing (some #(when (and (= actor-id (:assignment/actor-id %))
+                                     (not (:assignment/legacy? %))) %)
+                         (persisted-room-assignments conn slug))
+          role (or role (:assignment/role existing) :specialist)
+          response-policy (or response-policy
+                              (:assignment/response-policy existing)
+                              :always)
+          config (if (contains? opts :config)
+                   (read-config config)
+                   (or (:assignment/config existing) {}))
+          timestamp (now)
+          id (assignment-id (:room/id room) actor-id)]
+      (when-not (contains? assignment-roles role)
+        (throw (ex-info "Unknown room assignment role"
+                        {:role role :allowed assignment-roles})))
+      (when-not (contains? response-policies response-policy)
+        (throw (ex-info "Unknown room response policy"
+                        {:response-policy response-policy
+                         :allowed response-policies})))
+      (d/transact conn
+                  [(cond-> {:assignment/id id
+                            :assignment/room [:room/id (:room/id room)]
+                            :assignment/actor [:actor/id actor-id]
+                            :assignment/role role
+                            :assignment/response-policy response-policy
+                            :assignment/config (pr-str config)
+                            :assignment/updated-at timestamp}
+                     (nil? existing) (assoc :assignment/created-at timestamp))
+                   {:room/slug slug :room/agent-ids actor-id}])
+      (assignment-for slug actor-id))))
+
+(defn unassign-room-actor!
+  "Remove the canonical assignment and its legacy room membership projection.
+   Idempotent; returns true when either representation existed."
+  [slug actor-id]
+  (let [conn (get-conn)
+        room (room-by-slug slug)
+        assignment (assignment-for slug actor-id)
+        room-eid (when room
+                   (d/q '[:find ?room . :in $ ?id :where [?room :room/id ?id]]
+                        @conn (:room/id room)))
+        actor-eid (d/q '[:find ?actor . :in $ ?id :where [?actor :actor/id ?id]]
+                       @conn actor-id)
+        assignment-eid (when (and room-eid actor-eid)
+                         (d/q '[:find ?assignment .
+                                :in $ ?room ?actor
+                                :where
+                                [?assignment :assignment/room ?room]
+                                [?assignment :assignment/actor ?actor]]
+                              @conn room-eid actor-eid))
+        tx (cond-> []
+             assignment-eid (conj [:db/retractEntity assignment-eid])
+             (and room-eid assignment)
+             (conj [:db/retract room-eid :room/agent-ids actor-id]))]
+    (when (seq tx) (d/transact conn tx))
+    (boolean assignment)))
 
 (defn set-room-parent!
   "Set a room's parent (by slugs)."

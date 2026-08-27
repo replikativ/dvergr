@@ -644,6 +644,56 @@
     :db/doc "EDN-encoded map {skill-kw → int-priority}; overrides kind default"}])
 
 ;; ============================================================================
+;; Room Assignment Schema (actor participation + dispatch policy)
+;; ============================================================================
+
+(def assignment-schema
+  "A durable actor assignment to a room. Assignment is intentionally richer
+   than presence: it records why an actor is in the room and when an inbound
+   message should wake it. Runtime presence and run state are projections over
+   this relation, not fields on it.
+
+   `:assignment/config` is EDN so clients can add actor- or role-specific
+   settings without creating a second application-owned assignment record."
+  [{:db/ident :assignment/id
+    :db/valueType :db.type/uuid
+    :db/unique :db.unique/identity
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :assignment/room
+    :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/one
+    :db/doc "Assigned room, identified by :room/id"}
+
+   {:db/ident :assignment/actor
+    :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/one
+    :db/doc "Assigned actor, identified by :actor/id"}
+
+   {:db/ident :assignment/role
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/doc ":lead | :specialist | :reviewer | :observer"}
+
+   {:db/ident :assignment/response-policy
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/doc ":always | :mention | :manual"}
+
+   {:db/ident :assignment/config
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/doc "EDN-encoded assignment-specific configuration"}
+
+   {:db/ident :assignment/created-at
+    :db/valueType :db.type/instant
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :assignment/updated-at
+    :db/valueType :db.type/instant
+    :db/cardinality :db.cardinality/one}])
+
+;; ============================================================================
 ;; Task Schema (skill dispatches to humans / externals)
 ;; ============================================================================
 
@@ -728,6 +778,7 @@
                task-schema
                room-schema
                actor-schema
+               assignment-schema
                task-dispatch-schema)))
 
 ;; ============================================================================
