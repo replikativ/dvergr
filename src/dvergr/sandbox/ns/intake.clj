@@ -11,15 +11,38 @@
    here — currently just `intake.mail` (briefkasten + javax.mail are too heavy)."
   (:require [sci.core :as sci]))
 
+(def ^:private native-mail-vars
+  {'inbox  'list-inbox
+   'search 'search-mail
+   'read   'read-message
+   'sync!  'sync-inbox!})
+
+(defn- resolve-mail-bindings [mail-ns]
+  ;; Resolve against one Namespace snapshot. In a cold/concurrent process an
+  ;; optional `require` can fail in one sandbox setup while another setup sees
+  ;; the library as loaded; a second symbol-based ns-resolve then throws when
+  ;; the partially loaded namespace has already disappeared. Resolve all Vars
+  ;; first, then snapshot their callable roots for SCI.
+  (when mail-ns
+    (let [bindings (into {}
+                         (map (fn [[sandbox-name host-name]]
+                                [sandbox-name (ns-resolve mail-ns host-name)]))
+                         native-mail-vars)]
+      (when (every? var? (vals bindings))
+        (update-vals bindings deref)))))
+
+(defn- load-mail-bindings []
+  (try
+    (require 'dvergr.intake.mail)
+    (resolve-mail-bindings (find-ns 'dvergr.intake.mail))
+    (catch Throwable _
+      nil)))
+
 (defn add-intake-namespaces!
   "Mount the few NATIVE-only intake namespaces. Everything else is sandbox source."
   [sci-ctx]
   ;; intake.mail — OPTIONAL: its clojure-mail/postal/briefkasten deps live in the
   ;; :cli/:tui/:dev aliases, not core. Mounted only when present.
-  (when (try (require 'dvergr.intake.mail) true (catch Throwable _ false))
-    (sci/add-namespace! sci-ctx 'intake.mail
-                        {'inbox  @(ns-resolve 'dvergr.intake.mail 'list-inbox)
-                         'search @(ns-resolve 'dvergr.intake.mail 'search-mail)
-                         'read   @(ns-resolve 'dvergr.intake.mail 'read-message)
-                         'sync!  @(ns-resolve 'dvergr.intake.mail 'sync-inbox!)}))
+  (when-let [bindings (load-mail-bindings)]
+    (sci/add-namespace! sci-ctx 'intake.mail bindings))
   sci-ctx)
