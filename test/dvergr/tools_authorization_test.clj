@@ -27,8 +27,8 @@
           result (tools/execute
                   "effect" {}
                   {:tools {"effect" (tool (constantly {:decision :denied
-                                                        :sources #{:simmis-rebac}
-                                                        :reason "room access revoked"})
+                                                       :sources #{:simmis-rebac}
+                                                       :reason "room access revoked"})
                                           called)}})]
       (is (zero? @called))
       (is (= :error (:type result)))
@@ -57,9 +57,9 @@
   (let [result (tools/execute
                 "effect" {}
                 {:tools {"effect" {:name "effect"
-                                    :authorize (constantly {:decision :authorized
-                                                            :sources #{:simmis-rebac}})
-                                    :execute (fn [& _] (throw (ex-info "effect failed" {})))}}})]
+                                   :authorize (constantly {:decision :authorized
+                                                           :sources #{:simmis-rebac}})
+                                   :execute (fn [& _] (throw (ex-info "effect failed" {})))}}})]
     (is (= :error (:type result)))
     (is (= {:decision :authorized
             :sources #{:agent-tool-grant :simmis-rebac}}
