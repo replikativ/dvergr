@@ -2,16 +2,22 @@
   "Minimal durable Run lifecycle for causally bounded room execution.
 
    A Run is durable identity and correlation data. Live execution and
-   cancellation handles remain private in this namespace and are never returned
+  cancellation handles remain private in this namespace and are never returned
    by snapshots, lifecycle events, or the Room store."
   (:require [dvergr.chat.context :as chat-ctx]
             [dvergr.room.store :as store]
+            [org.replikativ.spindel.engine.core :as ec]
             [taoensso.telemere :as tel]))
 
 (def ^:private finish-statuses #{:waiting :completed :failed :cancelled})
 (defonce ^:private active (atom {}))
 (defonce ^:private subscribers (atom {}))
 (def ^:private lifecycle-lock (Object.))
+
+(def provenance-keys
+  "Run fields an interpreter may add without changing core causal identity."
+  #{:run/roster :run/agent-version :run/program-kind
+    :run/interpreter-version :run/agent-def-hash})
 
 (defn- store-room-id [room]
   (or (some-> room :meta deref :conversation-id)
@@ -66,6 +72,31 @@
     (swap! subscribers dissoc key))
   nil)
 
+(defn- admission-path [room-id]
+  [:dvergr/run-admissions room-id])
+
+(defn open-room-admission!
+  "Open Run admission for a newly constructed Room in its Spindel context."
+  [room-id execution-ctx]
+  (locking lifecycle-lock
+    (binding [ec/*execution-context* execution-ctx]
+      (ec/swap-state! (admission-path room-id) (constantly :open))))
+  nil)
+
+(defn close-room-admission!
+  "Atomically close fork-local Run admission for `room` and return the fixed set
+   admitted before the fence. Teardown drains exactly this set."
+  [room]
+  (let [room-id (:id room)]
+    (locking lifecycle-lock
+      (binding [ec/*execution-context* (:ctx room)]
+        (ec/swap-state! (admission-path room-id) (constantly :closed)))
+      (->> (vals @active)
+           (keep (fn [entry]
+                   (when (= room-id (get-in entry [:run :run/room]))
+                     (get-in entry [:run :run/id]))))
+           set))))
+
 (defn start!
   "Persist and publish one live Run before execution begins.
 
@@ -74,33 +105,55 @@
    never inferred from causal message succession. Returns the public Run map."
   ([room actor trigger live-chat-ctx]
    (start! room actor trigger live-chat-ctx {}))
-  ([room actor trigger live-chat-ctx {:keys [id kind parent now]
+  ([room actor trigger live-chat-ctx {:keys [id kind parent now provenance]
                                       :or {kind :agent-turn}}]
+   (when-let [unknown (seq (remove provenance-keys (keys provenance)))]
+     (throw (ex-info "Run provenance may not override causal identity"
+                     {:type ::invalid-provenance
+                      :unknown (set unknown)
+                      :allowed provenance-keys})))
    (let [now        (or now (java.util.Date.))
          trigger-id (if (map? trigger) (:id trigger) trigger)
          run        (store/validate-run!
-                     (cond-> {:run/id         (or id (random-uuid))
-                              :run/kind       kind
-                              :run/room       (:id room)
-                              :run/actor      actor
-                              :run/trigger    trigger-id
-                              :run/status     :running
-                              :run/created-at now
-                              :run/started-at now
-                              :run/updated-at now}
-                       parent (assoc :run/parent parent)))
+                     (merge
+                      (cond-> {:run/id         (or id (random-uuid))
+                               :run/kind       kind
+                               :run/room       (:id room)
+                               :run/actor      actor
+                               :run/trigger    trigger-id
+                               :run/status     :running
+                               :run/created-at now
+                               :run/started-at now
+                               :run/updated-at now}
+                        parent (assoc :run/parent parent))
+                      provenance))
          entry      {:run run
                      :chat-ctx live-chat-ctx
+                     ;; Explicitly process-local control state. Durable meaning
+                     ;; is the Room-store Run projection; this live owner map
+                     ;; and its token are never copied or restored as workflow
+                     ;; state.
                      :cancelled? (atom false)
                      :store (:store room)
                      :store-room-id (store-room-id room)}]
-     (when-let [room-store (:store entry)]
-       (when-not (store/-store-run! room-store (:store-room-id entry) run)
-         (throw (ex-info "Run admission failed: start was not durable"
-                         {:type ::start-not-durable
-                          :run/id (:run/id run)
-                          :run/room (:id room)}))))
      (locking lifecycle-lock
+       (when (and (:ctx room)
+                  (= :closed
+                     (binding [ec/*execution-context* (:ctx room)]
+                       (ec/get-state (admission-path (:id room))))))
+         (throw (ex-info "Run admission is closed for Room teardown"
+                         {:type ::room-admission-closed
+                          :run/id (:run/id run)
+                          :run/room (:id room)})))
+       ;; Persistence is inside the same admission critical section as the
+       ;; fence check: teardown can see either no Run or the fully admitted Run,
+       ;; never a durable-but-unowned half-admission.
+       (when-let [room-store (:store entry)]
+         (when-not (store/-store-run! room-store (:store-room-id entry) run)
+           (throw (ex-info "Run admission failed: start was not durable"
+                           {:type ::start-not-durable
+                            :run/id (:run/id run)
+                            :run/room (:id room)}))))
        (swap! active assoc (:run/id run) entry)
        (notify! {:type :run/started :run run}))
      run)))
@@ -137,35 +190,46 @@
 
 (defn cancel-requested?
   "True when targeted cancellation has been requested for this live Run. The
-   private token disappears with the live entry; durable cancellation is the
-   executor's later `:cancelled` acknowledgement."
+  private token disappears with the live entry; durable cancellation is the
+  executor's later `:cancelled` acknowledgement."
   [run-id]
   (boolean (some-> (get @active run-id) :cancelled? deref)))
+
+(defn- request-cancel!
+  [run-id expected-room]
+  (let [entry
+        (locking lifecycle-lock
+          (when-let [entry (get @active run-id)]
+            (when (or (nil? expected-room)
+                      (= expected-room (get-in entry [:run :run/room])))
+              (if @(:cancelled? entry)
+                entry
+                (let [_ (reset! (:cancelled? entry) true)
+                      entry' (assoc-in entry [:run :run/status] :cancelling)]
+                  (swap! active assoc run-id entry')
+                  (notify! {:type :run/cancel-requested :run (public-entry entry')})
+                  entry')))))]
+    (boolean entry)))
 
 (defn cancel-run!
   "Request cooperative cancellation of exactly one live Run. Returns true when
    found/signalled, false for an unknown or already-finished Run. Durable status
-   becomes `:cancelled` only when the executor acknowledges via `finish!`."
+  becomes `:cancelled` only when the executor acknowledges via `finish!`."
   [run-id]
-  (let [entry
-        (locking lifecycle-lock
-          (when-let [entry (get @active run-id)]
-            (if (cancel-requested? run-id)
-              entry
-              (let [_ (reset! (:cancelled? entry) true)
-                    entry' (assoc-in entry [:run :run/status] :cancelling)]
-                (swap! active assoc run-id entry')
-                (notify! {:type :run/cancel-requested :run (public-entry entry')})
-                entry'))))]
-    (if entry
-      true
-      false)))
+  (request-cancel! run-id nil))
+
+(defn cancel-room-run!
+  "Request cancellation only when `run-id` is live in `room-id`. This is the
+   capability-scoped boundary for room SCI; UUID knowledge alone grants no
+   cross-Room control. Trusted host/admin code may use `cancel-run!`."
+  [room-id run-id]
+  (request-cancel! run-id room-id))
 
 (defn cancel-room-runs!
   "Request cancellation of every live Run in `room-id`; return the count."
   [room-id]
   (let [ids (mapv :run/id (active-runs room-id))]
-    (doseq [run-id ids] (cancel-run! run-id))
+    (doseq [run-id ids] (cancel-room-run! room-id run-id))
     (count ids)))
 
 (defn register-live!

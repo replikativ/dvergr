@@ -173,6 +173,8 @@ fork-and-merge proposal pattern, see
   routing, GenerationHandle, the distributive law λ
 - **[Runs](doc/runs.md)** — durable agent-turn identity, activity/output
   correlation, lifecycle observation, and targeted cancellation
+- **[Agent programs](doc/agent-programs.md)** — immutable specialized-agent
+  rosters, Run-backed hiring, Spindel composition, and fork-safe state placement
 - **[CLI Reference](doc/cli.md)** — `dvergr-cli` keys, persistence,
   provider config
 - **[Architecture](doc/architecture.md)** — the formal model: rooms,

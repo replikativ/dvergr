@@ -39,6 +39,19 @@ policy) without touching the agent loop.
 Nothing in the model is special-cased to LLMs; humans, scripts, monitors, and
 future agent types all live as participants.
 
+## Agent programs in the REPL
+
+The room SCI surface also exposes `dvergr.agent`: immutable, versioned
+AgentDefs and Rosters are ordinary workflow data, while `hire!` is the explicit
+effect that starts a durable Run and returns an opaque handle whose result is an
+explicit native Spindel Spin. This is the first executable layer for agents
+constructing specialized teams and parallel workflows for themselves without a
+hidden mutable roster.
+
+See [Agent programs in the room REPL](agent-programs.md) for the API, a
+provider-free runnable example, and the state/fork contract. The native LLM/tool
+interpreter is deliberately a follow-up on the same boundary.
+
 ## The Room + Bus
 
 A `Room` is a substrate where participants exchange messages. Under the

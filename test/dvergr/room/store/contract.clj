@@ -68,12 +68,18 @@
           parent-id (random-uuid)
           started (java.util.Date. 1787860800000)
           ended (java.util.Date. 1787860801000)
+          definition-hash (random-uuid)
           running {:run/id run-id
                    :run/kind :agent-turn
                    :run/room room-id
                    :run/actor :agent/researcher
                    :run/trigger trigger-id
                    :run/parent parent-id
+                   :run/roster :research-team
+                   :run/agent-version 3
+                   :run/program-kind :llm
+                   :run/interpreter-version 2
+                   :run/agent-def-hash definition-hash
                    :run/status :running
                    :run/created-at started
                    :run/started-at started

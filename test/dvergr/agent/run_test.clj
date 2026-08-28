@@ -133,6 +133,32 @@
         (run/finish! (:run/id explicit) :completed)
         (d/close-room! room)))))
 
+(deftest provenance-cannot-override-core-run-identity
+  (let [[room _st] (run-room :provenance-boundary)
+        trigger (d/message :alice :agent "work")]
+    (try
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"may not override causal identity"
+           (run/start! room :agent trigger (live-ctx)
+                       {:provenance {:run/room :other-room}})))
+      (is (empty? (run/active-runs (:id room))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest closing-admission-is-a-run-start-fence
+  (let [[room _st] (run-room :admission-fence)
+        trigger (d/message :alice :agent "too late")]
+    (try
+      (is (empty? (run/close-room-admission! room)))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"admission is closed"
+           (run/start! room :agent trigger (live-ctx))))
+      (is (empty? (run/active-runs (:id room))))
+      (finally
+        (d/close-room! room)))))
+
 (deftest lifecycle-publication-requires-durable-receipts
   (let [base (memory/make)
         receipts? (atom false)

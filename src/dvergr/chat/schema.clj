@@ -528,6 +528,34 @@
     :db/index true
     :db/doc "Explicit structural parent that spawned/contains this run"}
 
+   {:db/ident :run/roster
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true
+    :db/doc "Logical immutable Roster identity, when supplied"}
+
+   {:db/ident :run/agent-version
+    :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one
+    :db/doc "Exact AgentDef version resolved for this execution"}
+
+   {:db/ident :run/program-kind
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true
+    :db/doc "Interpreter kind selected from the AgentDef program"}
+
+   {:db/ident :run/interpreter-version
+    :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one
+    :db/doc "Version of Dvergr's interpreter contract"}
+
+   {:db/ident :run/agent-def-hash
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/index true
+    :db/doc "Content address of the exact portable AgentDef value"}
+
    {:db/ident :run/status
     :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/one

@@ -24,7 +24,8 @@
    spin; select an inference kernel via `kernel-infer` from
    `org.replikativ.spindel.inference.inference`. No discourse-specific
    inference primitive is needed."
-  (:require [clojure.string :as str]
+  (:require [clojure.set :as set]
+            [clojure.string :as str]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.context :as ctx]
@@ -36,6 +37,7 @@
             [dvergr.runtime.bus :as bus]
             [dvergr.substrate.geschichte :as geschichte]
             [dvergr.runtime.peer-bus :as peer-bus]
+            [dvergr.agent.run :as agent-run]
             [dvergr.room.store :as rstore]
             [dvergr.room.store.datahike :as store-dh]
             [dvergr.room.registry :as rreg]
@@ -280,6 +282,7 @@
                                    (when durable-append!
                                      {:durable-append! durable-append!}))
         room  (->Room id slug title parent-id (atom {}) b ctx 0 store (atom (or meta {})))]
+    (agent-run/open-room-admission! id ctx)
     ;; Persist metadata on creation so the store has it for re-hydration.
     (when store
       (rstore/-store-room! store id (cond-> {:id id :slug slug :title title}
@@ -746,6 +749,37 @@
   [room]
   (or (some-> room :ctx :parent-ctx) (:ctx room)))
 
+(defn- drain-room-runs!
+  "Request cancellation of every live Run owned by `room` and wait up to five
+   seconds for their executors to acknowledge a terminal state. The lifecycle
+   watch is installed before cancellation so the final transition cannot race
+   the wait. This covers LLM turns and directly interpreted agent programs."
+  [room]
+  (let [room-id (:id room)
+        admitted (agent-run/close-room-admission! room)
+        stopped (promise)
+        watch-key (Object.)]
+    (try
+      (agent-run/watch-runs!
+       watch-key
+       (fn [_]
+         (let [live-ids (into #{} (map :run/id) (agent-run/active-runs room-id))]
+           (when (empty? (set/intersection admitted live-ids))
+             (deliver stopped true)))))
+      (doseq [run-id admitted]
+        (agent-run/cancel-room-run! room-id run-id))
+      (when (seq admitted)
+        (deref stopped 5000 ::timeout))
+      (let [live-ids (into #{} (map :run/id) (agent-run/active-runs room-id))
+            remaining (set/intersection admitted live-ids)]
+        (when (seq remaining)
+          (throw (ex-info "Room teardown timed out waiting for live Runs"
+                          {:type ::run-drain-timeout
+                           :room-id room-id
+                           :run-ids remaining}))))
+      (finally
+        (agent-run/unwatch-runs! watch-key)))))
+
 (defn close-room!
   "Tear down a room: leave every participant, unregister the Room, and close
    its execution context. Any in-flight drain completes before this returns.
@@ -759,6 +793,7 @@
    No-op on already-closed rooms."
   [room]
   (when room
+    (drain-room-runs! room)
     (leave-all! room)
     (binding [ec/*execution-context* (room-home-ctx room)]
       (rreg/unregister! (:id room)))
@@ -959,6 +994,7 @@
                             (atom (assoc @(:meta room)
                                          :forked-from (:id room)
                                          :conversation-id conv-id)))]
+     (agent-run/open-room-admission! new-id child-ctx)
      ;; (Fork-local persistence rides the bus's durable-append! hook now —
      ;; wired at child-bus construction above.)
      ;; Register the fork in the PARENT ctx — where the daemon UI reads the
@@ -1030,32 +1066,6 @@
   [fork]
   (room-home-ctx fork))
 
-(defn- drain-fork-turns!
-  "Cancel any in-flight agent turn in `fork` and wait (bounded, ~5s) for it to
-   stop, so merge/discard doesn't yank the fork's worktree + branched conns out
-   from under a running turn (security audit P4). Best-effort."
-  [fork]
-  (let [fid      (:id fork)
-        cancel!  (requiring-resolve 'dvergr.agent.turn/cancel-room-turn!)
-        running? (requiring-resolve 'dvergr.agent.turn/room-turn-running?)
-        watch!   (requiring-resolve 'dvergr.agent.turn/watch-room-turns!)
-        unwatch! (requiring-resolve 'dvergr.agent.turn/unwatch-room-turns!)
-        stopped  (promise)
-        wkey     (Object.)]
-    (try (cancel! fid) (catch Throwable _))
-    ;; Block on the turn registry's own lifecycle watch (fires on the
-    ;; empty↔non-empty transition) instead of poll-sleeping — one bounded
-    ;; wait, delivered the moment the turn actually unregisters. Register
-    ;; the watch BEFORE the running? check so the transition can't slip
-    ;; between check and wait.
-    (try
-      (watch! wkey (fn [rid turn-running?]
-                     (when (and (= rid fid) (not turn-running?))
-                       (deliver stopped true))))
-      (when (try (running? fid) (catch Throwable _ false))
-        (deref stopped 5000 ::timeout))
-      (finally (try (unwatch! wkey) (catch Throwable _))))))
-
 (defn discard
   "Discard a fork: deregister its participants, drop it from the
    registry, and if the fork's ctx was forked (`:isolation :ctx`),
@@ -1070,9 +1080,9 @@
   ;; Idempotence: once unregistered, the fork is a zombie — re-discarding would
   ;; double-delete the yggdrasil branch (which errors). Guard on registry.
   (when (binding [ec/*execution-context* (fork-home-ctx fork)] (rreg/lookup (:id fork)))
+    (drain-room-runs! fork)                    ; stop work before removing its substrate
     (leave-all! fork)
     (when (ctx-was-forked? fork)
-      (drain-fork-turns! fork)                 ; P4: stop in-flight turns first
       ;; P2: read the fork's deferred data-DB grants (fork-local ctx-state) and
       ;; delete the stores it created — they were never granted, so on discard they
       ;; must not linger. :on-discard fires inside discard-from-parent!.
@@ -1104,6 +1114,7 @@
    (doc/unified-fork-conversation.md, dvergr.rooms.forks/reconcile-merge!.)"
   ([parent fork] (merge-room parent fork {}))
   ([parent fork {:keys [merge-opts]}]
+   (drain-room-runs! fork)                     ; stop work before merging its substrate
    ;; (1) SUBSTRATE merge — branched yggdrasil systems (CRDTs, datahike, git) fold
    ;; back whenever the ctx was forked (`:isolation :ctx`), INDEPENDENT of any
    ;; conversation store. These are orthogonal: a room can carry shared CRDTs with
@@ -1114,7 +1125,6 @@
    ;; accept via :on-merge (store forks only). (doc/unified-fork-conversation.md)
    (when (ctx-was-forked? fork)
      (try
-       (drain-fork-turns! fork)                ; P4: stop in-flight turns before merge
        (let [pending (when (:store fork)
                        (binding [ec/*execution-context* (:ctx fork)]
                          (ec/get-state [:dvergr/pending-grants])))]
