@@ -14,6 +14,7 @@
             [org.replikativ.spindel.engine.core :as rtc]
             [dvergr.discourse :as d]
             [dvergr.chat.context :as chat-ctx]
+            [dvergr.agent.run :as run]
             [dvergr.sandbox :as sandbox]
             [dvergr.sandbox.ns.io :as ns-io]
             ;; loaded so add-process-ns! can (find-ns 'dvergr.agent.process)
@@ -81,23 +82,23 @@
 (def activity-id :_activity)
 
 ;; ----------------------------------------------------------------------------
-;; Room-turn registry — publishes the LIVE chat-ctx keyed by [room-id agent-id]
-;; for the duration of a turn. Esc-cancel looks it up and flips its status to
-;; :cancelled — the turn loop bails at the next boundary AND the :cancel?
-;; predicate aborts the in-flight SSE stream.
+;; Compatibility projection over the Run registry. New callers use
+;; dvergr.agent.run directly; TUI/web room-wide turn controls keep their existing
+;; API while gaining targeted Run cancellation underneath.
 ;; ----------------------------------------------------------------------------
-(defonce ^:private room-turns (atom {}))
+(defonce ^:private room-turn-watch-keys (atom {}))
 
 (defn register-room-turn! [room-id agent-id chat-ctx]
-  (swap! room-turns assoc-in [room-id agent-id] chat-ctx))
+  (run/register-live! room-id agent-id chat-ctx))
 
-(defn unregister-room-turn! [room-id agent-id]
-  (swap! room-turns update room-id dissoc agent-id))
+(defn unregister-room-turn!
+  ([run-id] (run/unregister-live! run-id))
+  ([room-id agent-id] (run/unregister-live! room-id agent-id)))
 
 (defn room-turn-running?
   "True if any agent currently has an in-flight turn in `room-id`."
   [room-id]
-  (boolean (seq (get @room-turns room-id))))
+  (boolean (seq (run/active-runs room-id))))
 
 (defn watch-room-turns!
   "Subscribe `f` — a fn of `[room-id running?]` — to be called whenever a room's
@@ -106,39 +107,77 @@
    silent (`[SKIP]`) turn — which posts no message — still clears the spinner.
    `key` identifies the watch (idempotent; remove via `unwatch-room-turns!`)."
   [key f]
-  (add-watch room-turns key
-             (fn [_ _ old new]
-               (doseq [rid (into (set (keys old)) (set (keys new)))]
-                 (let [was (boolean (seq (get old rid)))
-                       now (boolean (seq (get new rid)))]
-                   (when (not= was now)
-                     (try (f rid now) (catch Throwable _ nil))))))))
+  (let [run-key [::room-turn-watch key]
+        previous (atom nil)]
+    (swap! room-turn-watch-keys assoc key run-key)
+    (run/watch-runs!
+     run-key
+     (fn [_event]
+       (let [now (->> (run/active-runs)
+                      (group-by :run/room)
+                      (map (fn [[rid runs]] [rid (boolean (seq runs))]))
+                      (into {}))]
+         (if-let [old @previous]
+           (doseq [rid (into (set (keys old)) (set (keys now)))]
+             (let [was (boolean (get old rid))
+                   running? (boolean (get now rid))]
+               (when (not= was running?)
+                 (try (f rid running?) (catch Throwable _ nil)))))
+           nil)
+         (reset! previous now))))
+    key))
 
-(defn unwatch-room-turns! [key] (remove-watch room-turns key))
+(defn unwatch-room-turns! [key]
+  (when-let [run-key (get @room-turn-watch-keys key)]
+    (run/unwatch-runs! run-key)
+    (swap! room-turn-watch-keys dissoc key))
+  nil)
 
 (defn cancel-room-turn!
-  "Cancel every in-flight agent turn in `room-id` — sets each live turn's
-   chat-ctx status to :cancelled (cooperative bail + SSE abort). Returns the
-   number of turns signalled. The 2-arity `_daemon` arg is kept for the existing
-   `daemon/cancel-room-turn!` call signature (TUI passes the daemon)."
+  "Cancel every in-flight agent turn in `room-id` through its private Run token
+   (cooperative bail + SSE abort). Returns the number of turns signalled. The
+   2-arity `_daemon` arg is kept for the existing daemon/TUI call signature."
   ([room-id] (cancel-room-turn! nil room-id))
   ([_daemon room-id]
-   (let [ctxs (vals (get @room-turns room-id))]
-     (doseq [cctx ctxs]
-       (try (chat-ctx/cancel-chat! cctx) (catch Throwable _ nil)))
-     (count ctxs))))
+   (run/cancel-room-runs! room-id)))
+
+(def active-runs run/active-runs)
+(def watch-runs! run/watch-runs!)
+(def unwatch-runs! run/unwatch-runs!)
+(def cancel-run! run/cancel-run!)
+(def cancel-requested? run/cancel-requested?)
 
 (defn cancel?-fn
-  "Build the `:cancel?` predicate for `run-agent-turn!` — true once the chat-ctx's
-   status flips to :cancelled (Esc-cancel), so the in-flight SSE aborts mid-stream.
-   `run-agent-turn!` threads it through `model-chat/chat`."
-  [chat-ctx execution-ctx]
-  (fn [] (binding [rtc/*execution-context* execution-ctx]
-           (= :cancelled (chat-ctx/get-status chat-ctx)))))
+  "Build the `:cancel?` predicate for `run-agent-turn!`. Chat-wide shutdown and
+   an optional Run-local predicate both abort the in-flight SSE; targeted Run
+   cancellation never mutates the reusable ChatContext."
+  ([chat-ctx execution-ctx]
+   (cancel?-fn chat-ctx execution-ctx nil))
+  ([chat-ctx execution-ctx run-cancelled?]
+   (fn []
+     (or (boolean (and run-cancelled? (run-cancelled?)))
+         (binding [rtc/*execution-context* execution-ctx]
+           (= :cancelled (chat-ctx/get-status chat-ctx)))))))
 
 ;; ----------------------------------------------------------------------------
 ;; Tool-activity play-by-play
 ;; ----------------------------------------------------------------------------
+(defn tool-activity-count
+  "Number of assistant messages in `chat-ctx` that already contain tool uses.
+   A new Run initializes its watermark here so rehydrated historical activity is
+   never reposted or attributed to the new Run."
+  [chat-ctx]
+  (->> (chat-ctx/get-messages chat-ctx)
+       (filter #(= :assistant (or (:role %) (:message/role %))))
+       (filter #(seq (or (:message/tool-uses %) (:tool-uses %))))
+       count))
+
+(defn- activity-message [agent-id content run-id trigger metadata]
+  (let [metadata (cond-> metadata run-id (assoc :run-id run-id))]
+    (if trigger
+      (d/reply agent-id activity-id content trigger metadata)
+      (d/message agent-id activity-id content nil metadata))))
+
 (defn post-turn-activity!
   "Post an agent's tool-call activity into `room` so rich frontends render the
    play-by-play. Each tool-bearing assistant message (read from `chat-ctx`)
@@ -146,23 +185,26 @@
    structured `:tool-uses` (and `:reasoning` if present). `posted` is an atom of
    how many tool-bearing messages were already emitted, so repeated calls across
    the turn loop don't duplicate. Returns nil."
-  [room agent-id chat-ctx posted]
-  (let [tool-msgs (->> (chat-ctx/get-messages chat-ctx)
-                       (filter #(= :assistant (or (:role %) (:message/role %))))
-                       (filter #(seq (or (:message/tool-uses %) (:tool-uses %))))
-                       vec)]
-    (when (> (count tool-msgs) @posted)
-      (binding [rtc/*execution-context* (:ctx room)]
-        (doseq [m (subvec tool-msgs @posted)]
-          (let [uses    (vec (or (:message/tool-uses m) (:tool-uses m)))
-                names   (keep #(or (:tool-use/name %) (:name %)) uses)
-                summary (str "🔧 " (str/join ", " names))
-                reason  (or (:message/reasoning m) (:reasoning m))]
-            (d/post! room (d/message agent-id activity-id summary nil
-                                     (cond-> {:role :tool :tool-uses uses}
-                                       (seq reason) (assoc :reasoning reason)))))))
-      (reset! posted (count tool-msgs)))
-    nil))
+  ([room agent-id chat-ctx posted]
+   (post-turn-activity! room agent-id chat-ctx posted nil nil))
+  ([room agent-id chat-ctx posted run-id trigger]
+   (let [tool-msgs (->> (chat-ctx/get-messages chat-ctx)
+                        (filter #(= :assistant (or (:role %) (:message/role %))))
+                        (filter #(seq (or (:message/tool-uses %) (:tool-uses %))))
+                        vec)]
+     (when (> (count tool-msgs) @posted)
+       (binding [rtc/*execution-context* (:ctx room)]
+         (doseq [m (subvec tool-msgs @posted)]
+           (let [uses    (vec (or (:message/tool-uses m) (:tool-uses m)))
+                 names   (keep #(or (:tool-use/name %) (:name %)) uses)
+                 summary (str "🔧 " (str/join ", " names))
+                 reason  (or (:message/reasoning m) (:reasoning m))]
+             (d/post! room (activity-message
+                            agent-id summary run-id trigger
+                            (cond-> {:role :tool :tool-uses uses}
+                              (seq reason) (assoc :reasoning reason)))))))
+       (reset! posted (count tool-msgs)))
+     nil)))
 
 (defn post-budget-warning!
   "Surface budget exhaustion as a visible, NON-triggering activity row: the
@@ -175,15 +217,18 @@
    stopwatch a human never agreed to, and letting it lapse SPENT MORE MONEY on a
    wrap-up turn — after the ceiling had already been hit. No-op when `room` is
    nil. Returns nil."
-  [room agent-id used-dollars total-dollars]
-  (when room
-    (binding [rtc/*execution-context* (:ctx room)]
-      (d/post! room (d/message agent-id activity-id
-                               (format "⚠️ budget exhausted — $%.2f of $%.2f used. I have stopped and am spending nothing. Raise the room budget and message me to continue."
-                                       (double used-dollars) (double total-dollars))
-                               nil
-                               {:role :tool}))))
-  nil)
+  ([room agent-id used-dollars total-dollars]
+   (post-budget-warning! room agent-id used-dollars total-dollars nil nil))
+  ([room agent-id used-dollars total-dollars run-id trigger]
+   (when room
+     (binding [rtc/*execution-context* (:ctx room)]
+       (d/post! room
+                (activity-message
+                 agent-id
+                 (format "⚠️ budget exhausted — $%.2f of $%.2f used. I have stopped and am spending nothing. Raise the room budget and message me to continue."
+                         (double used-dollars) (double total-dollars))
+                 run-id trigger {:role :tool}))))
+   nil))
 
 (defn post-turn-error!
   "Surface a FAILED agent turn as a visible, NON-triggering activity row (→ room
@@ -192,11 +237,13 @@
    (which the room's other agents would answer, looping — the \"repeating\" bug).
    `err` is the throwable from the errored turn result. No-op when `room` is nil.
    Returns nil."
-  [room agent-id err]
-  (when room
-    (binding [rtc/*execution-context* (:ctx room)]
-      (let [detail (or (some-> err ex-message) (some-> err str) "LLM error")]
-        (d/post! room (d/message agent-id activity-id
-                                 (str "⚠️ turn failed — " detail) nil
-                                 {:role :tool})))))
-  nil)
+  ([room agent-id err]
+   (post-turn-error! room agent-id err nil nil))
+  ([room agent-id err run-id trigger]
+   (when room
+     (binding [rtc/*execution-context* (:ctx room)]
+       (let [detail (or (some-> err ex-message) (some-> err str) "LLM error")]
+         (d/post! room
+                  (activity-message agent-id (str "⚠️ turn failed — " detail)
+                                    run-id trigger {:role :tool})))))
+   nil))

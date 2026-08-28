@@ -23,6 +23,10 @@
   (let [[_conn st] (mem-store)]
     (contract/assert-message-envelope! st :envelope-datahike)))
 
+(deftest run-lifecycle-contract
+  (let [[_conn st] (mem-store)]
+    (contract/assert-run-lifecycle! st :runs-datahike)))
+
 (deftest thread-filter-bounds-the-datahike-pull
   (testing "the indexed root predicate runs before message bodies are pulled"
     (let [[_conn st] (mem-store)

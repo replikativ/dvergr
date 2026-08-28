@@ -176,15 +176,16 @@
 (def ^:private unregister-room-turn! turn/unregister-room-turn!)
 
 (deftest daemon-room-turn-registry-cancels
-  (testing "the room-turn registry exposes a live chat-ctx that cancel flips
-            to :cancelled (the handle the TUI Esc uses)"
+  (testing "the room-turn registry targets the live Run without poisoning the
+            reusable chat context"
     (let [c (cctx/create-chat-context {:budget-dollars 0.01 :with-sci? false})]
       (try
         (is (not (daemon/room-turn-running? :r1)))
-        (register-room-turn! :r1 :bot c)
-        (is (daemon/room-turn-running? :r1))
-        (is (= 1 (daemon/cancel-room-turn! nil :r1)) "one turn signalled")
-        (is (= :cancelled (cctx/get-status c)) "chat-ctx status flipped")
+        (let [run-id (register-room-turn! :r1 :bot c)]
+          (is (daemon/room-turn-running? :r1))
+          (is (= 1 (daemon/cancel-room-turn! nil :r1)) "one turn signalled")
+          (is (turn/cancel-requested? run-id))
+          (is (= :active (cctx/get-status c)) "chat context remains reusable"))
         (finally
           (unregister-room-turn! :r1 :bot)
           (is (not (daemon/room-turn-running? :r1)) "unregister clears it")
@@ -204,9 +205,9 @@
                  :on-key (fn [sm ev] (dashboard-on-key {:execution-ctx c} sm ev (atom nil)))
                  :size   {:width 80 :height 30}})]
       (try
-        (register-room-turn! :dm-esc :bot turn)
-        ((:send-key hh) {:key "escape"})
-        (is (= :cancelled (cctx/get-status turn)) "Esc cancelled the turn")
+        (let [run-id (register-room-turn! :dm-esc :bot turn)]
+          ((:send-key hh) {:key "escape"})
+          (is (turn/cancel-requested? run-id) "Esc cancelled the Run"))
         (is (= :room ((:get hh) :view-mode)) "stayed in the room while cancelling")
         (unregister-room-turn! :dm-esc :bot)
         ((:send-key hh) {:key "escape"})

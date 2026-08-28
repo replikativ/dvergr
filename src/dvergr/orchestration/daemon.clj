@@ -98,6 +98,10 @@
 (def ^:private activity-id     turn/activity-id)
 (def room-turn-running?        turn/room-turn-running?)
 (def cancel-room-turn!         turn/cancel-room-turn!)
+(def active-runs               turn/active-runs)
+(def watch-runs!               turn/watch-runs!)
+(def unwatch-runs!             turn/unwatch-runs!)
+(def cancel-run!               turn/cancel-run!)
 
 ;; ============================================================================
 ;; Safety

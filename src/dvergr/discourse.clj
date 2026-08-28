@@ -352,19 +352,54 @@
 ;; Participant lifecycle in a room
 ;; ============================================================================
 
+(def ^:private reply-emitted-key ::reply-emitted)
+(def ^:private reply-emit-failed-key ::reply-emit-failed)
+
+(defn after-reply-emission
+  "Attach process-local lifecycle callbacks to a ReplySpec. `on-emitted` runs
+   only after the reply is durably posted to the Room; `on-failed` receives a
+   posting error. The callbacks are control data and never enter the Message."
+  [reply-spec on-emitted on-failed]
+  (cond-> reply-spec
+    on-emitted (assoc reply-emitted-key on-emitted)
+    on-failed (assoc reply-emit-failed-key on-failed)))
+
 (defn- emit-reply!
   "Route a reply-spec from `p` into `room`, preserving the triggering Message's
    immediate-parent and thread-root identities. Non-message events start a new
    thread if they produce conversational output."
   [room p reply-spec parent-message]
   (when reply-spec
-    (route-and-log!
-     room
-     (if parent-message
-       (reply (:id p) (:to reply-spec) (:content reply-spec)
-              parent-message (:metadata reply-spec))
-       (message (:id p) (:to reply-spec) (:content reply-spec)
-                nil (:metadata reply-spec))))))
+    (let [on-emitted (get reply-spec reply-emitted-key)
+          on-failed  (get reply-spec reply-emit-failed-key)
+          emitted
+          (try
+            (route-and-log!
+             room
+             (if parent-message
+               (reply (:id p) (:to reply-spec) (:content reply-spec)
+                      parent-message (:metadata reply-spec))
+               (message (:id p) (:to reply-spec) (:content reply-spec)
+                        nil (:metadata reply-spec))))
+            (catch Throwable t
+              (when on-failed
+                (try (on-failed t)
+                     (catch Throwable callback-error
+                       (tel/log! {:level :error :id ::reply-failure-callback-error
+                                  :data {:participant (:id p)
+                                         :error (.getMessage callback-error)}}
+                                 "reply failure callback failed"))))
+              (throw t)))]
+      (when on-emitted
+        (try (on-emitted emitted)
+             (catch Throwable t
+               ;; The reply is already durable. Do not misreport this as an
+               ;; emission failure; the lifecycle owner retained its retryable
+               ;; active projection when its terminal write failed.
+               (tel/log! {:level :error :id ::reply-emitted-callback-error
+                          :data {:participant (:id p) :error (.getMessage t)}}
+                         "reply emitted but its lifecycle callback failed"))))
+      emitted)))
 
 (defn- drain-into!
   "Spawn a spin that drains `(:aseq sub)` and posts each item into `mbx`.

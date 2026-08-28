@@ -461,10 +461,14 @@ This is the immediate dependency for Simmis's room UI.
 
 ### Stage 2: lightweight execution correlation
 
-1. Allocate an execution ID for each agent turn.
-2. Correlate trigger, thread, tool activity, final response, failure, and cancel.
-3. Key live control by execution ID while preserving room-level convenience APIs.
-4. Do not introduce a universal workflow-run aggregate in this stage.
+Implemented for `:agent-turn` Runs; see [runs.md](runs.md):
+
+1. Allocate a Run ID before each agent turn and persist its precise trigger.
+2. Correlate tool activity and output messages by typed Run ID; derive Thread
+   membership through the trigger rather than duplicating it on the Run.
+3. Key live control by Run ID while preserving room-level convenience APIs.
+4. Expose an initial-snapshot lifecycle subscription and targeted cancellation.
+5. Do not introduce a universal workflow-run aggregate in this stage.
 
 ### Stage 3: durable delegated tasks
 

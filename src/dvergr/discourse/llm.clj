@@ -47,6 +47,7 @@
             [dvergr.discourse.generation :as gen]
             [dvergr.chat.context :as cc]
             [dvergr.chat.agent :as ca]
+            [dvergr.agent.run :as run]
             [dvergr.agent.turn :as turn]
             [dvergr.agent.room-context :as room-context]
             [dvergr.agent.prompt :as prompt]
@@ -277,7 +278,7 @@
                    nil
 
                ;; --- default: user/agent content → run generation ---
-                   (let [posted   (atom 0)        ; 🔧 activity watermark (dedup)
+                   (let [posted   (atom (turn/tool-activity-count chat-ctx))
                          ;; The active arbiter temporarily owns content for other
                          ;; threads, then hands it back to the participant's FIFO
                          ;; inbox after this execution. The Room log is already the
@@ -323,6 +324,8 @@
                                       ;; RF5: the Room itself, so room-scoped tools
                                       ;; (schedule_*) write into THIS room's store.
                                           (assoc :room room)))
+                         run-ref           (when room (run/start! room id msg chat-ctx))
+                         run-id            (:run/id run-ref)
                          turn-opts {:provider         (:provider spec)
                                 ;; Per-room /model override (commands registry)
                                 ;; wins over the spec's model, matching the daemon.
@@ -332,7 +335,9 @@
                                     :tools            tools
                                     :tool-ctx         tool-ctx
                                 ;; SSE-abort predicate (Esc-cancel flips status).
-                                    :cancel?          (turn/cancel?-fn chat-ctx turn-ctx)
+                                    :cancel?          (turn/cancel?-fn
+                                                       chat-ctx turn-ctx
+                                                       #(run/cancel-requested? run-id))
                                 ;; TRANSIENT per-turn system note(s) — applied to
                                 ;; THIS call only, never persisted (run-agent-turn!
                                 ;; appends to the first system message): always the
@@ -352,6 +357,8 @@
                                 ;; system notes for unresolvable ones.
                                     :on-reply         on-reply}
                          errored           (atom nil)
+                         waiting?          (atom false)
+                         finish-after-reply? (atom false)
                      ;; #38: the last assistant message BEFORE this invocation
                      ;; runs (the store-seeded prior reply, or nil) — the exit
                      ;; path uses it to tell a genuinely NEW reply from stale
@@ -371,10 +378,8 @@
                              (cc/add-message! chat-ctx {:role :user :content (:content m)})))]
                  ;; The just-arrived user message (and any message that STEERS a
                  ;; running turn, below) folds in via fold-inbound! from the let.
-                     (fold-inbound! msg)
-                 ;; Publish the live chat-ctx so a frontend (TUI/web) can
-                 ;; Esc-cancel this turn (turn/cancel-room-turn! flips its status).
-                     (when room (turn/register-room-turn! (:id room) id chat-ctx))
+                     (try
+                       (fold-inbound! msg)
                  ;; ONE CONTROL PLANE (steerable turn). Every influence on a
                  ;; running turn arrives as a message on the participant's own
                  ;; inbox — INCLUDING the LLM call's completion, which a bridge
@@ -409,83 +414,84 @@
                  ;; running compact! whenever (should-compact?) AND no
                  ;; compaction is already in flight. The next turn picks up
                  ;; the compacted chat-ctx state once it lands.
-                     (loop [turn 0]
-                       (if @cancelled?
-                         nil
-                         (do
-                           (when race-compaction?
-                             (when (or (nil? @compaction-h)
-                                       (some-> ^java.util.concurrent.Future @compaction-h
-                                               .isDone))
-                               (when (compaction/should-compact? chat-ctx)
-                                 (reset! compaction-h
-                                         (future
-                                           (binding [ec/*execution-context* turn-ctx]
-                                             (try
-                                               (compaction/maybe-compact!
-                                                chat-ctx
-                                                :model (:model compaction))
-                                               (catch Throwable _ nil))))))))
-                           (let [h (gen/future-handle
-                                    turn-ctx
-                                    #(run-turn-fn chat-ctx
-                                                  (assoc turn-opts
-                                                         :turn-number turn
-                                                         :spec @spec-atom
-                                                         :tools tools)))
-                                 call-id (random-uuid)
-                                 mbx     (:inbox-mbx p)
+                       (loop [turn 0]
+                         (if (or @cancelled? (run/cancel-requested? run-id))
+                           nil
+                           (do
+                             (when race-compaction?
+                               (when (or (nil? @compaction-h)
+                                         (some-> ^java.util.concurrent.Future @compaction-h
+                                                 .isDone))
+                                 (when (compaction/should-compact? chat-ctx)
+                                   (reset! compaction-h
+                                           (future
+                                             (binding [ec/*execution-context* turn-ctx]
+                                               (try
+                                                 (compaction/maybe-compact!
+                                                  chat-ctx
+                                                  :model (:model compaction))
+                                                 (catch Throwable _ nil))))))))
+                             (let [h (gen/future-handle
+                                      turn-ctx
+                                      #(run-turn-fn chat-ctx
+                                                    (assoc turn-opts
+                                                           :turn-number turn
+                                                           :spec @spec-atom
+                                                           :tools tools
+                                                           :run-id run-id)))
+                                   call-id (random-uuid)
+                                   mbx     (:inbox-mbx p)
                                  ;; Bridge the call's completion into the SAME
                                  ;; inbox steering messages arrive on. (:done h)
                                  ;; is a Deferred — multi-reader — so the settle
                                  ;; awaits below can read it too.
-                                 _ (when mbx
-                                     (binding [ec/*execution-context* turn-ctx]
-                                       (ssync/spawn!
-                                        (sp/spin
-                                         (let [r (sp/await (:done h))]
-                                           (mbx {:type ::llm-done
-                                                 :call-id call-id
-                                                 :result r}))))))
-                                 decision
-                                 (if mbx
+                                   _ (when mbx
+                                       (binding [ec/*execution-context* turn-ctx]
+                                         (ssync/spawn!
+                                          (sp/spin
+                                           (let [r (sp/await (:done h))]
+                                             (mbx {:type ::llm-done
+                                                   :call-id call-id
+                                                   :result r}))))))
+                                   decision
+                                   (if mbx
                                    ;; Arbiter: single consumer of the inbox for
                                    ;; the duration of this call. Awaits the
                                    ;; Mailbox DIRECTLY (its 2-arity carries the
                                    ;; cancel-token — never via anext/aseq).
-                                   (loop []
-                                     (let [m (if-let [deferred (d/take-deferred-inbox! p)]
-                                               deferred
-                                               (sp/await mbx))]
-                                       (cond
-                                         (and (= ::llm-done (:type m))
-                                              (= call-id (:call-id m)))
-                                         {:tag :llm-done :result (:result m)}
+                                     (loop []
+                                       (let [m (if-let [deferred (d/take-deferred-inbox! p)]
+                                                 deferred
+                                                 (sp/await mbx))]
+                                         (cond
+                                           (and (= ::llm-done (:type m))
+                                                (= call-id (:call-id m)))
+                                           {:tag :llm-done :result (:result m)}
 
                                          ;; a cancelled earlier call settling late
-                                         (= ::llm-done (:type m))
-                                         (recur)
+                                           (= ::llm-done (:type m))
+                                           (recur)
 
-                                         :else
-                                         (case (:type m)
-                                           :directive/raise-budget
-                                           (do (apply-raise-budget! chat-ctx m) (recur))
+                                           :else
+                                           (case (:type m)
+                                             :directive/raise-budget
+                                             (do (apply-raise-budget! chat-ctx m) (recur))
 
-                                           :directive/system-message
-                                           (do (apply-system-message! chat-ctx m) (recur))
+                                             :directive/system-message
+                                             (do (apply-system-message! chat-ctx m) (recur))
 
-                                           :probe/memory
-                                           (do (when room
-                                                 (d/post! room (assoc (probe-memory-reply chat-ctx m)
-                                                                      :from id)))
-                                               (recur))
+                                             :probe/memory
+                                             (do (when room
+                                                   (d/post! room (assoc (probe-memory-reply chat-ctx m)
+                                                                        :from id)))
+                                                 (recur))
 
-                                           :directive/cancel
-                                           {:tag :cancel}
+                                             :directive/cancel
+                                             {:tag :cancel}
 
-                                           :directive/switch-model
-                                           (do (swap! spec-atom merge (:payload m))
-                                               {:tag :switch})
+                                             :directive/switch-model
+                                             (do (swap! spec-atom merge (:payload m))
+                                                 {:tag :switch})
 
                                            ;; Default: classify conversational
                                            ;; content at the thread-aware attention
@@ -493,41 +499,42 @@
                                            ;; can deliver the same id more than once;
                                            ;; ignore the duplicate while this inner
                                            ;; arbiter owns the participant inbox.
-                                           (let [mid (:id m)]
-                                             (if (and mid
-                                                      (contains? @seen-inflight-ids mid))
-                                               (recur)
-                                               (do
-                                                 (when mid
-                                                   (swap! seen-inflight-ids conj mid))
-                                                 (let [attention
-                                                       (attention-policy
-                                                        {:active-message msg
-                                                         :incoming-message m
-                                                         :participant p
-                                                         :room room})]
-                                                   (case attention
-                                                     :steer {:tag :steer :msg m}
-                                                     :observe (recur)
-                                                     :queue (do
-                                                              (swap! queued-other-threads conj m)
-                                                              (recur))
-                                                     (do
-                                                       (tel/log!
-                                                        {:level :warn
-                                                         :id ::invalid-attention-decision
-                                                         :data {:agent id
-                                                                :decision attention}}
-                                                        "Invalid attention decision; queued conservatively")
-                                                       (swap! queued-other-threads conj m)
-                                                       (recur)))))))))))
+                                             (let [mid (:id m)]
+                                               (if (and mid
+                                                        (contains? @seen-inflight-ids mid))
+                                                 (recur)
+                                                 (do
+                                                   (when mid
+                                                     (swap! seen-inflight-ids conj mid))
+                                                   (let [attention
+                                                         (attention-policy
+                                                          {:active-message msg
+                                                           :incoming-message m
+                                                           :participant p
+                                                           :room room})]
+                                                     (case attention
+                                                       :steer {:tag :steer :msg m}
+                                                       :observe (recur)
+                                                       :queue (do
+                                                                (swap! queued-other-threads conj m)
+                                                                (recur))
+                                                       (do
+                                                         (tel/log!
+                                                          {:level :warn
+                                                           :id ::invalid-attention-decision
+                                                           :data {:agent id
+                                                                  :decision attention}}
+                                                          "Invalid attention decision; queued conservatively")
+                                                         (swap! queued-other-threads conj m)
+                                                         (recur)))))))))))
                                    ;; No inbox (room-less participant that was
                                    ;; never joined): plain await, no steering.
-                                   {:tag :llm-done :result (sp/await (:done h))})]
+                                     {:tag :llm-done :result (sp/await (:done h))})]
                          ;; Mirror this turn's tool calls into the room as 🔧
                          ;; play-by-play rows (same as daemon agents).
-                             (when room (turn/post-turn-activity! room id chat-ctx posted))
-                             (if (not= :llm-done (:tag decision))
+                               (when room
+                                 (turn/post-turn-activity! room id chat-ctx posted run-id msg))
+                               (if (not= :llm-done (:tag decision))
                                ;; Preempted: cancel the in-flight call through
                                ;; the SAME path as Esc (status :cancelled → the
                                ;; SSE :cancel? poll → CancellationException
@@ -537,24 +544,24 @@
                                ;; result). Then AWAIT THE SETTLE — never a hard
                                ;; future-cancel — so history is coherent before
                                ;; the next step.
-                               (do
-                                 (cc/set-status! chat-ctx :cancelled)
-                                 (sp/await (:done h))
-                                 (cc/set-status! chat-ctx :active)
-                                 (case (:tag decision)
-                                   :cancel (do (reset! cancelled? true) nil)
-                                   :switch (recur turn)
-                                   :steer  (do (fold-inbound! (:msg decision))
-                                               (recur (inc turn)))))
-                               (let [result (:result decision)]
-                                 (cond
-                                   @cancelled? nil
+                                 (do
+                                   (cc/set-status! chat-ctx :cancelled)
+                                   (sp/await (:done h))
+                                   (cc/set-status! chat-ctx :active)
+                                   (case (:tag decision)
+                                     :cancel (do (reset! cancelled? true) nil)
+                                     :switch (recur turn)
+                                     :steer  (do (fold-inbound! (:msg decision))
+                                                 (recur (inc turn)))))
+                                 (let [result (:result decision)]
+                                   (cond
+                                     (or @cancelled? (run/cancel-requested? run-id)) nil
 
-                                   (gen/error-result? result)
-                                   (do (reset! errored (:dvergr.discourse.generation/error result)) nil)
+                                     (gen/error-result? result)
+                                     (do (reset! errored (:dvergr.discourse.generation/error result)) nil)
 
                                ;; LLM finished cleanly (no more tool calls).
-                                   (not= result :continue) nil
+                                     (not= result :continue) nil
 
                                ;; Budget exhausted → the turn ENDS here.
                                ;;
@@ -571,68 +578,105 @@
                                ;; The durable room log IS the continuation — which is
                                ;; the only kind spindel can actually have (it has no
                                ;; durable conts, and a park would be lost on restart).
-                                   (cc/budget-exceeded? chat-ctx)
-                                   (do
-                                     (when room
-                                       (let [b (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
-                                                 @(:budget-signal chat-ctx))
-                                             used  (/ (:used b) (double acct/MICRODOLLARS-PER-DOLLAR))
-                                             total (/ (:total b) (double acct/MICRODOLLARS-PER-DOLLAR))]
-                                         (turn/post-budget-warning! room id used total)))
-                                     (proc/budget-exhausted! id chat-ctx)
-                                     nil)
+                                     (cc/budget-exceeded? chat-ctx)
+                                     (do
+                                       (when room
+                                         (let [b (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
+                                                   @(:budget-signal chat-ctx))
+                                               used  (/ (:used b) (double acct/MICRODOLLARS-PER-DOLLAR))
+                                               total (/ (:total b) (double acct/MICRODOLLARS-PER-DOLLAR))]
+                                           (turn/post-budget-warning! room id used total run-id msg)))
+                                       (reset! waiting? true)
+                                       (proc/budget-exhausted! id chat-ctx)
+                                       nil)
 
                                ;; Normal :continue, budget OK → next turn.
-                                   :else (recur (inc turn)))))))))
+                                     :else (recur (inc turn)))))))))
 
-                     (when room (turn/unregister-room-turn! (:id room) id))
                      ;; The outer participant loop can now start queued work. Put
                      ;; consumed messages in the participant-owned priority FIFO,
                      ;; not at the live mailbox tail: a newer arrival during this
                      ;; hand-back window must not overtake older topics.
-                     (doseq [queued @queued-other-threads]
-                       (d/defer-inbox! p queued))
+                       (doseq [queued @queued-other-threads]
+                         (d/defer-inbox! p queued))
                      ;; A FAILED turn produced no new reply — surface it as a NON-triggering
                      ;; :_activity row and DON'T fall through to re-post the STALE last reply
                      ;; (which the room's other agents answer, looping — the "repeating" bug).
-                     (when @errored (turn/post-turn-error! room id @errored))
+                       (when @errored (turn/post-turn-error! room id @errored run-id msg))
                      ;; #38: the SILENT-failure shape — the turn ended with no
                      ;; error tag AND no new assistant message (e.g. provider
                      ;; resolution failed before any generation). The last
                      ;; assistant message is then the store-SEEDED prior reply;
                      ;; posting it is the repeating bug. Surface it instead.
                      ;; A deliberate cancel stays quiet.
-                     (when (and (not @errored) (not @cancelled?)
-                                (= pre-turn-last-asst (last-assistant-message chat-ctx)))
-                       (turn/post-turn-error!
-                        room id
-                        "turn ended without producing a reply — likely a provider/model resolution failure"))
-                     (when-let [last-asst (when-not @errored
-                                            (let [la (last-assistant-message chat-ctx)]
-                                              (when (not= la pre-turn-last-asst) la)))]
-                       (when-let [reply (assistant-text last-asst)]
+                       (when (and (not @errored) (not @cancelled?)
+                                  (not (run/cancel-requested? run-id))
+                                  (not= :cancelled (cc/get-status chat-ctx))
+                                  (= pre-turn-last-asst (last-assistant-message chat-ctx)))
+                         (let [error "turn ended without producing a reply — likely a provider/model resolution failure"]
+                           (reset! errored error)
+                           (turn/post-turn-error! room id error run-id msg)))
+                       (when-let [last-asst (when-not @errored
+                                              (let [la (last-assistant-message chat-ctx)]
+                                                (when (not= la pre-turn-last-asst) la)))]
+                         (when-let [reply (assistant-text last-asst)]
                      ;; Last line of defence: a model that fumbled code into the
                      ;; prose channel TWICE (agent.clj nudged it once) must still
                      ;; not have that fragment posted as its reply — the room
                      ;; would show code as an answer and other agents would reply
                      ;; TO it. Surface it as a non-triggering activity row instead.
-                         (if (quirks/code-fragment? reply)
-                           (do (tel/log! {:level :warn :id ::reply-was-code-fragment
-                                          :data {:agent id}}
-                                         "Suppressed a code fragment posing as a reply")
-                               (when room
-                                 (turn/post-turn-error!
-                                  room id
-                                  (str "emitted code instead of a reply — the tool call "
-                                       "never reached the tool channel, so nothing ran")))
-                               nil)
+                           (if (quirks/code-fragment? reply)
+                             (do (tel/log! {:level :warn :id ::reply-was-code-fragment
+                                            :data {:agent id}}
+                                           "Suppressed a code fragment posing as a reply")
+                                 (when room
+                                   (let [error (str "emitted code instead of a reply — the tool call "
+                                                    "never reached the tool channel, so nothing ran")]
+                                     (reset! errored error)
+                                     (turn/post-turn-error! room id error run-id msg)))
+                                 nil)
                      ;; Carry this turn's interleaved-thinking trace into the room
                      ;; record (metadata → store → seeding) so reasoning models
                      ;; (MiniMax M2 / Kimi / DeepSeek) keep their <think> context
                      ;; across a rehydrate/restart, not just within a live session.
-                           (let [reasoning (or (:message/reasoning last-asst) (:reasoning last-asst))]
-                             (cond-> {:to (:from msg) :content reply}
-                               (seq reasoning) (assoc :metadata {:reasoning reasoning})))))))))))
+                             (let [reasoning (or (:message/reasoning last-asst) (:reasoning last-asst))
+                                   reply-spec
+                                   (cond-> {:to (:from msg) :content reply
+                                            :metadata {:run-id run-id}}
+                                     (seq reasoning) (assoc-in [:metadata :reasoning] reasoning))]
+                               (if-not run-id
+                                 reply-spec
+                                 (do
+                                   ;; The outer participant owns Room emission.
+                                   ;; Completion is acknowledged only after its
+                                   ;; durability-first post succeeds.
+                                   (reset! finish-after-reply? true)
+                                   (d/after-reply-emission
+                                    reply-spec
+                                    (fn [_emitted]
+                                      (run/finish! run-id :completed))
+                                    (fn [error]
+                                      (run/finish! run-id :failed
+                                                   {:reason :reply-emission-failed
+                                                    :error error})))))))))
+                       (catch Throwable t
+                         (reset! errored t)
+                         (throw t))
+                       (finally
+                         (when (and run-id (not @finish-after-reply?))
+                           (let [cancelled-run? (or @cancelled?
+                                                    (run/cancel-requested? run-id)
+                                                    (= :cancelled (cc/get-status chat-ctx)))
+                                 status (cond
+                                          cancelled-run? :cancelled
+                                          @errored :failed
+                                          @waiting? :waiting
+                                          :else :completed)]
+                             (run/finish! run-id status
+                                          (cond-> {}
+                                            cancelled-run? (assoc :reason :cancel-requested)
+                                            @waiting? (assoc :reason :budget-exhausted)
+                                            @errored (assoc :reason :error :error @errored))))))))))))
 
             :factory
             (fn [new-ctx]

@@ -7,6 +7,9 @@
 (deftest message-envelope-contract
   (contract/assert-message-envelope! (memory/make) :envelope-memory))
 
+(deftest run-lifecycle-contract
+  (contract/assert-run-lifecycle! (memory/make) :runs-memory))
+
 (deftest rejects-unmodelled-durable-metadata
   (let [st (memory/make)]
     (store/-store-room! st :strict-memory {:slug "strict-memory"})

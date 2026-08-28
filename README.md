@@ -171,6 +171,8 @@ fork-and-merge proposal pattern, see
   REPL + CLI paths
 - **[Programming Model](doc/programming-model.md)** — bus, tagged
   routing, GenerationHandle, the distributive law λ
+- **[Runs](doc/runs.md)** — durable agent-turn identity, activity/output
+  correlation, lifecycle observation, and targeted cancellation
 - **[CLI Reference](doc/cli.md)** — `dvergr-cli` keys, persistence,
   provider config
 - **[Architecture](doc/architecture.md)** — the formal model: rooms,

@@ -57,3 +57,37 @@
                (set (map :id (store/-list-messages
                               st room-id {:thread-root-id parent-id}))))
             "thread query excludes another top-level topic before limiting")))))
+
+(defn assert-run-lifecycle!
+  "Exercise durable Run creation, update, lookup, filtering, and identity safety."
+  [st room-id]
+  (testing "run lifecycle round-trips"
+    (store/-store-room! st room-id {:slug (name room-id) :title "Runs"})
+    (let [run-id (random-uuid)
+          trigger-id (random-uuid)
+          parent-id (random-uuid)
+          started (java.util.Date. 1787860800000)
+          ended (java.util.Date. 1787860801000)
+          running {:run/id run-id
+                   :run/kind :agent-turn
+                   :run/room room-id
+                   :run/actor :agent/researcher
+                   :run/trigger trigger-id
+                   :run/parent parent-id
+                   :run/status :running
+                   :run/created-at started
+                   :run/started-at started
+                   :run/updated-at started}
+          completed (assoc running
+                           :run/status :completed
+                           :run/updated-at ended
+                           :run/ended-at ended)]
+      (is (= running (store/-store-run! st room-id running)))
+      (is (= running (store/-load-run st room-id run-id)))
+      (is (= completed (store/-store-run! st room-id completed)))
+      (is (= [completed] (store/-list-runs st room-id {:actor :agent/researcher})))
+      (is (empty? (store/-list-runs st room-id {:status :failed})))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"immutable"
+           (store/-store-run! st room-id (assoc completed :run/trigger (random-uuid))))))))
