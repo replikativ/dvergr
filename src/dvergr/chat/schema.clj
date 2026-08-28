@@ -359,10 +359,40 @@
     :db/cardinality :db.cardinality/one
     :db/doc "Execution lifecycle: :pending :running :completed :error :skipped"}
 
-   {:db/ident :tool-call/approval
+   {:db/ident :tool-call/authorization-decision
     :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/one
-    :db/doc "Approval state: :auto-approved :pending-approval :approved :rejected :cached"}
+    :db/doc "Admission outcome, normally :authorized or :denied"}
+
+   {:db/ident :tool-call/authorization-source
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/many
+    :db/doc "Independent policy gates contributing to the decision"}
+
+   {:db/ident :tool-call/authorization-subject-type
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :tool-call/authorization-subject-id
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :tool-call/authorization-action
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :tool-call/authorization-resource-type
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :tool-call/authorization-resource-id
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :tool-call/authorization-grant-id
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/doc "Optional stable EACL/capability/resource grant identifier"}
 
    {:db/ident :tool-call/tool-use-id
     :db/valueType :db.type/string
@@ -1169,7 +1199,9 @@
                           db message-id)]
     (when (seq tool-use-ids)
       (vec (for [tuid tool-use-ids]
-             (d/q '[:find (pull ?tc [:tool-call/name :tool-call/status :tool-call/approval
+             (d/q '[:find (pull ?tc [:tool-call/name :tool-call/status
+                                     :tool-call/authorization-decision
+                                     :tool-call/authorization-source
                                      :tool-call/duration-ms :tool-call/error?
                                      :tool-call/started-at]) .
                     :in $ ?tuid

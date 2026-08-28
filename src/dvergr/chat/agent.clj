@@ -298,18 +298,28 @@
                                    error? (= :error (:type result))]
                                (when-let [conn (:db-conn chat-ctx)]
                                  (try
-                                   (dh/transact conn
-                                                [(cond-> {:tool-call/id (java.util.UUID/randomUUID)
-                                                          :tool-call/name name
-                                                          :tool-call/input (pr-str input)
-                                                          :tool-call/result (pr-str (select-keys result [:type :content :error]))
-                                                          :tool-call/duration-ms duration-ms
-                                                          :tool-call/error? error?
-                                                          :tool-call/status (if error? :error :completed)
-                                                          :tool-call/approval :auto-approved
-                                                          :tool-call/tool-use-id id
-                                                          :tool-call/started-at (java.util.Date.)}
-                                                   run-id (assoc :tool-call/run-id run-id))])
+                                   (let [{:keys [decision sources subject-type subject-id action
+                                                 resource-type resource-id grant-id]}
+                                         (:authorization result)]
+                                     (dh/transact conn
+                                                  [(cond-> {:tool-call/id (java.util.UUID/randomUUID)
+                                                            :tool-call/name name
+                                                            :tool-call/input (pr-str input)
+                                                            :tool-call/result (pr-str (select-keys result [:type :content :error]))
+                                                            :tool-call/duration-ms duration-ms
+                                                            :tool-call/error? error?
+                                                            :tool-call/status (if error? :error :completed)
+                                                            :tool-call/authorization-decision decision
+                                                            :tool-call/authorization-source sources
+                                                            :tool-call/tool-use-id id
+                                                            :tool-call/started-at (java.util.Date.)}
+                                                     subject-type (assoc :tool-call/authorization-subject-type subject-type)
+                                                     subject-id (assoc :tool-call/authorization-subject-id (str subject-id))
+                                                     action (assoc :tool-call/authorization-action action)
+                                                     resource-type (assoc :tool-call/authorization-resource-type resource-type)
+                                                     resource-id (assoc :tool-call/authorization-resource-id (str resource-id))
+                                                     grant-id (assoc :tool-call/authorization-grant-id (str grant-id))
+                                                     run-id (assoc :tool-call/run-id run-id))]))
                                    (catch Exception e
                                      (tel/log! {:level :warn :id :agent/tool-call-persist-error :error e}
                                                "Failed to persist tool-call analytics"))))
