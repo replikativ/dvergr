@@ -49,19 +49,26 @@
 
   (-store-message! [this room-id message]
     "Persist a single Message. `message` is a discourse.Message record
-     (with :id :from :to :content :ts :in-reply-to :metadata) OR a
+     (with :id :from :to :content :ts :in-reply-to :thread-root-id :metadata) OR a
      map with the same keys. :from and non-nil :to are canonical keyword actor
-     ids; :in-reply-to is a stable message UUID and :metadata uses dvergr's
+     ids; :in-reply-to is the stable immediate-parent UUID,
+     :thread-root-id is the stable topical-root UUID, and :metadata uses dvergr's
      typed durable vocabulary (role/source, audience/mentions, attachment,
      provenance, notification, tool-use and reasoning fields). Implementations
      replay these envelope fields losslessly and must be first-write-wins
      idempotent on :id — re-stores are no-ops. Unknown durable metadata is an
      error: extend the typed schema rather than adding an opaque encoding.")
 
-  (-list-messages [this room-id {:keys [limit since]}]
+  (-message-thread-root [this room-id message-id]
+    "Return one message's stable topical-root UUID inside `room-id`, or nil.
+     This bounded lookup lets the authoritative Room derive and validate a
+     reply's thread without trusting a client-supplied ancestor.")
+
+  (-list-messages [this room-id {:keys [limit since thread-root-id]}]
     "Return messages in chronological order. :limit caps result size
      (default impl-specific); :since is an instant — only messages
-     after that ts are returned."))
+     after that ts are returned; :thread-root-id restricts the result to one
+     topical projection before the limit is applied."))
 
 ;; =============================================================================
 ;; Helpers
@@ -113,6 +120,28 @@
                          :provenance provenance})))
       (reject-unknown-metadata! :provenance provenance-metadata-keys provenance)))
   metadata)
+
+(defn normalize-message-thread
+  "Return `msg` with a typed durable `:thread-root-id`.
+
+   Top-level messages self-root. Legacy replies without an explicit root treat
+   their immediate parent as the root; live nested replies preserve the actual
+   root through `dvergr.discourse/reply`, while out-of-order importers should
+   supply it explicitly. A top-level message claiming another root is invalid:
+   joining a thread requires an immediate causal parent."
+  [msg]
+  (let [id     (:id msg)
+        parent (:in-reply-to msg)
+        root   (or (:thread-root-id msg) parent id)]
+    (when-not (uuid? root)
+      (throw (ex-info "Durable message thread root must be a UUID"
+                      {:type :room-store/invalid-thread-root
+                       :message-id id :thread-root-id root})))
+    (when (and (nil? parent) (not= id root))
+      (throw (ex-info "A top-level message must be its own thread root"
+                      {:type :room-store/invalid-thread-root
+                       :message-id id :thread-root-id root})))
+    (assoc msg :thread-root-id root)))
 
 (defn message-shape?
   "True if `msg` looks like a Message (has the required keys). Used by

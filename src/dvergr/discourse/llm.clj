@@ -259,6 +259,12 @@
 
                ;; --- default: user/agent content → run generation ---
                    (let [posted   (atom 0)        ; 🔧 activity watermark (dedup)
+                         ;; The active arbiter temporarily owns content for other
+                         ;; threads, then hands it back to the participant's FIFO
+                         ;; inbox after this execution. The Room log is already the
+                         ;; durable source; these are only live coordination handles.
+                         queued-other-threads (atom [])
+                         seen-inflight-ids    (atom (cond-> #{} (:id msg) (conj (:id msg))))
                      ;; SCI sandbox: the chat-ctx's own, set up ONCE by
                      ;; turn/new-working-ctx (room fold AND room-less fallback alike)
                      ;; with the agent namespaces injected — so clojure_eval has
@@ -359,13 +365,15 @@
                  ;; is loss-free by construction (single-consumer FIFO — no
                  ;; race, no consumed-but-lost message).
                  ;;
-                 ;;   content            → STEER: cooperatively cancel the
+                 ;;   same-thread content → STEER: cooperatively cancel the
                  ;;                        in-flight call (status :cancelled →
                  ;;                        the SSE poll aborts; model.chat
                  ;;                        throws CancellationException BEFORE
                  ;;                        anything is persisted), await its
                  ;;                        settle, fold the message in, and
                  ;;                        continue with a fresh call.
+                 ;;   other-thread content → QUEUE: retain FIFO order and start
+                 ;;                        a separate execution after this one.
                  ;;   :directive/cancel  → settle, then END the turn (the
                  ;;                        durable room log + a later message
                  ;;                        is the resumption — spindel has no
@@ -458,8 +466,24 @@
                                            (do (swap! spec-atom merge (:payload m))
                                                {:tag :switch})
 
-                                           ;; default: room content → steer
-                                           {:tag :steer :msg m}))))
+                                           ;; Default: classify conversational
+                                           ;; content at the thread-aware attention
+                                           ;; boundary. Overlapping subscriptions
+                                           ;; can deliver the same id more than once;
+                                           ;; ignore the duplicate while this inner
+                                           ;; arbiter owns the participant inbox.
+                                           (let [mid (:id m)]
+                                             (if (and mid
+                                                      (contains? @seen-inflight-ids mid))
+                                               (recur)
+                                               (do
+                                                 (when mid
+                                                   (swap! seen-inflight-ids conj mid))
+                                                 (if (d/same-thread? msg m)
+                                                   {:tag :steer :msg m}
+                                                   (do
+                                                     (swap! queued-other-threads conj m)
+                                                     (recur))))))))))
                                    ;; No inbox (room-less participant that was
                                    ;; never joined): plain await, no steering.
                                    {:tag :llm-done :result (sp/await (:done h))})]
@@ -525,6 +549,13 @@
                                    :else (recur (inc turn)))))))))
 
                      (when room (turn/unregister-room-turn! (:id room) id))
+                     ;; The outer participant loop can now start the queued
+                     ;; thread(s). Re-enqueue rather than repost: the message is
+                     ;; already durable/visible, and reposting would duplicate the
+                     ;; room chronology. Mailbox insertion preserves arrival order.
+                     (when-let [mbx (:inbox-mbx p)]
+                       (doseq [queued @queued-other-threads]
+                         (mbx queued)))
                      ;; A FAILED turn produced no new reply — surface it as a NON-triggering
                      ;; :_activity row and DON'T fall through to re-post the STALE last reply
                      ;; (which the room's other agents answer, looping — the "repeating" bug).

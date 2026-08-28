@@ -81,6 +81,37 @@
 ;; Substrate — Step 1
 ;; ============================================================================
 
+(deftest message-thread-topology
+  (testing "top-level messages self-root and nested replies preserve the root"
+    (let [root  (d/message :alice :bot "proposal")
+          child (d/reply :bot :alice "question" root)
+          leaf  (d/reply :alice :bot "answer" child)
+          other (d/message :alice :bot "another topic")
+          room  (d/room :thread-projection)]
+      (is (= (:id root) (:thread-root-id root)))
+      (is (= (:id root) (:in-reply-to child)))
+      (is (= (:id child) (:in-reply-to leaf)))
+      (is (= (:id root) (:thread-root-id child) (:thread-root-id leaf)))
+      (is (d/same-thread? root leaf))
+      (is (not (d/same-thread? root other)))
+      (doseq [m [root child leaf other]] (d/post! room m))
+      (is (= ["proposal" "question" "answer"]
+             (mapv :content (d/messages room {:thread-root-id (:id root)})))))))
+
+(deftest room-derives-authoritative-root-from-immediate-parent
+  (testing "a thin client names only the parent; Room derives the ancestor root"
+    (let [room   (d/room :authoritative-thread-root)
+          root   (d/message :alice :bot "root")
+          child  (d/reply :bot :alice "child" root)
+          ;; The legacy constructor cannot know the ancestor and provisionally
+          ;; uses `child` as root. post! must correct it from room history.
+          nested (d/message :alice :bot "nested" (:id child))]
+      (is (= (:id child) (:thread-root-id nested)))
+      (doseq [m [root child nested]] (d/post! room m))
+      (let [posted-nested (last (d/log room))]
+        (is (= (:id child) (:in-reply-to posted-nested)))
+        (is (= (:id root) (:thread-root-id posted-nested)))))))
+
 (deftest single-echo-bot-cycle
   (let [r (d/room :t)]
     (binding [ec/*execution-context* (:ctx r)]

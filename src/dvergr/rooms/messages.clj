@@ -58,8 +58,11 @@
   [m]
   {:id        (:id m)
    :from      (:from m)
+   :to        (:to m)
    :content   (:content m)
    :ts        (:ts m)
+   :in-reply-to (:in-reply-to m)
+   :thread-root-id (d/thread-root-id m)
    :role      (store/infer-role m)
    :tool-uses (or (:tool-uses m) (:tool-uses (:metadata m)))
    :reasoning (or (:reasoning m) (:reasoning (:metadata m)) (:message/reasoning m))})

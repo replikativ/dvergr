@@ -76,7 +76,8 @@
   "Convert a discourse.Message (or message-shaped map) to a Datahike
    message entity tied to the given chat-id."
   [chat-id msg]
-  (let [content      (str (:content msg))
+  (let [msg          (store/normalize-message-thread msg)
+        content      (str (:content msg))
         msg-id       (:id msg)
         ts           (some-> (:ts msg) (java.util.Date.))
         metadata     (store/validate-message-metadata! (:metadata msg))
@@ -96,6 +97,7 @@
       (keyword? (:from msg)) (assoc :message/from (:from msg))
       (keyword? (:to msg)) (assoc :message/to (:to msg))
       (uuid? (:in-reply-to msg)) (assoc :message/in-reply-to (:in-reply-to msg))
+      (uuid? (:thread-root-id msg)) (assoc :message/thread-root-id (:thread-root-id msg))
       (:source-username metadata) (assoc :message/source-username (:source-username metadata))
       (:source-user-id  metadata) (assoc :message/source-user-id  (long (:source-user-id metadata)))
       (seq (:audience metadata)) (assoc :message/audience (set (:audience metadata)))
@@ -208,7 +210,25 @@
                    :data {:room-id room-id :msg-id (:id msg)}}
                   "message for unknown room — not persisted (dropped)"))))
 
-  (-list-messages [_ room-id {:keys [limit since]}]
+  (-message-thread-root [_ room-id message-id]
+    (let [slug (store/room-id->slug room-id)]
+      (when-let [room (room-by-slug conn slug)]
+        (let [message (dh/q '[:find (pull ?m [:message/id :message/in-reply-to
+                                              :message/thread-root-id]) .
+                              :in $ ?cid ?mid
+                              :where
+                              [?c :chat/id ?cid]
+                              [?m :message/chat ?c]
+                              [?m :message/id ?mid]]
+                            @conn (:chat/id room) message-id)]
+          ;; Legacy rows predate the typed root. Immediate parent is the best
+          ;; bounded compatibility root; new nested replies always have the
+          ;; explicit ancestor root.
+          (or (:message/thread-root-id message)
+              (:message/in-reply-to message)
+              (:message/id message))))))
+
+  (-list-messages [_ room-id {:keys [limit since thread-root-id]}]
     (let [slug (store/room-id->slug room-id)]
       (when-let [ent (room-by-slug conn slug)]
         (let [chat-id (:chat/id ent)
@@ -216,6 +236,7 @@
                                                :message/created-at :message/source-user
                                                :message/source-username :message/source-user-id
                                                :message/from :message/to :message/in-reply-to
+                                               :message/thread-root-id
                                                :message/reasoning
                                                :message/audience :message/mention-handles
                                                :message/metadata-kind :message/context-from
@@ -241,12 +262,17 @@
                             @conn chat-id)
               sorted  (sort-by #(.getTime (or (:message/created-at %)
                                               (java.util.Date. 0))) base)
-              filtered (if since
+              filtered (cond->> sorted
+                         since
                          (filter #(when-let [t (:message/created-at %)]
                                     (> (.getTime ^java.util.Date t)
-                                       (.getTime ^java.util.Date since)))
-                                 sorted)
-                         sorted)]
+                                       (.getTime ^java.util.Date since))))
+
+                         thread-root-id
+                         (filter #(= thread-root-id
+                                     (or (:message/thread-root-id %)
+                                         (:message/in-reply-to %)
+                                         (:message/id %)))))]
           ;; Normalize to unified Message shape — consumers (TUI, sandbox)
           ;; see {:id :from :to :content :ts :role :metadata} regardless of
           ;; which store backs the room.
@@ -307,24 +333,27 @@
                                    (assoc :tool-uses (:message/tool-uses m))
                                    (seq (:message/reasoning m))
                                    (assoc :reasoning (:message/reasoning m)))]
-                    (cond-> {:id        (:message/id m)
-                             :from      (or (:message/from m)
-                                            (some-> (:message/source-user m) keyword))
-                             :to        (:message/to m)
-                             :content   (:message/content m)
-                             :ts        (some-> (:message/created-at m) .getTime)
-                             :role      (:message/role m)
-                             :metadata  metadata}
-                      (:message/in-reply-to m)
-                      (assoc :in-reply-to (:message/in-reply-to m))
+                    (store/normalize-message-thread
+                     (cond-> {:id        (:message/id m)
+                              :from      (or (:message/from m)
+                                             (some-> (:message/source-user m) keyword))
+                              :to        (:message/to m)
+                              :content   (:message/content m)
+                              :ts        (some-> (:message/created-at m) .getTime)
+                              :role      (:message/role m)
+                              :metadata  metadata}
+                       (:message/in-reply-to m)
+                       (assoc :in-reply-to (:message/in-reply-to m))
+                       (:message/thread-root-id m)
+                       (assoc :thread-root-id (:message/thread-root-id m))
                     ;; Surface structured tool-uses so rich frontends render an
                     ;; agent's tool activity inline (same as the chat-ctx view).
-                      (seq (:message/tool-uses m))
-                      (assoc :tool-uses (:message/tool-uses m))
+                       (seq (:message/tool-uses m))
+                       (assoc :tool-uses (:message/tool-uses m))
                     ;; Surface the interleaved-thinking trace so seeding can feed
                     ;; it back to reasoning models (MiniMax M2 / Kimi / DeepSeek).
-                      (seq (:message/reasoning m))
-                      (assoc :reasoning (:message/reasoning m)))))
+                       (seq (:message/reasoning m))
+                       (assoc :reasoning (:message/reasoning m))))))
                 (vec (take-last (or limit 100) filtered))))))))
 
 (defn make
