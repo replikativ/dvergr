@@ -52,8 +52,9 @@ reactive runtime), [Datahike](https://github.com/replikativ/datahike)
 - 🔐 **Boundary credential handling** — intakes that need an API key get a *placeholder*
   in the sandbox; the gated HTTP egress swaps in the real key only at the bound domain
   and scrubs it from the response, so **the agent uses keys it never sees** ([design](doc/boundary-secret-injection.md))
-- 🔌 **Multiple LLM providers** — Anthropic (incl. the local `claude` CLI, zero-key),
-  OpenAI, Fireworks, or any OpenAI-compatible endpoint — swappable per agent
+- 🔌 **Multiple LLM providers** — Anthropic API/Claude Code, a native Codex
+  subscription transport, OpenAI API, Fireworks, or any OpenAI-compatible
+  endpoint — swappable per agent
 - 🪙 **Budgets & accounting** — every turn is metered in microdollars against a
   per-agent budget; an agent hits a checkpoint and can escalate `:directive/raise-budget`
   for more, with all spend recorded in a ledger — so cost stays bounded
@@ -94,18 +95,24 @@ Pick a provider by exporting its API key (or set it in `config.local.edn`):
 # no key needed with a Claude Code subscription)
 export ANTHROPIC_API_KEY=sk-ant-...
 
-# OpenAI, or any OpenAI-compatible endpoint
+# OpenAI API (usage-based; distinct from a ChatGPT/Codex subscription)
 export OPENAI_API_KEY=sk-...
-export OPENAI_BASE_URL=https://api.openai.com/v1     # optional; override for compatibles
+# export OPENAI_BASE_URL=https://api.openai.com/v1  # optional override
 
 # Fireworks (OpenAI-compatible; the bundled model registry is Fireworks)
 export FIREWORKS_API_KEY=fw-...
+# export FIREWORKS_BASE_URL=https://api.fireworks.ai/inference/v1
+
+# OpenAI Codex subscription — no API key; choose Sign in with ChatGPT
+codex login
 ```
 
 > The shipped default config leaves the agent's provider **unpinned**, so it
-> auto-selects the best provider you have a key for (preference: Anthropic →
-> Fireworks → OpenAI → the local `claude` CLI) and its default model. **Set any
-> one of the keys above and it works** — you don't have to match a specific
+> auto-selects the best provider available (preference: Anthropic →
+> Fireworks → OpenAI → native Codex subscription → isolated Codex CLI →
+> the local `claude` CLI) and its
+> default model. **Set one of the keys above or log into a supported CLI and it
+> works** — you don't have to match a specific
 > provider. Pin `:provider`/`:model` in `config.local.edn` to force one. If no
 > provider key is set at all, the daemon still boots but logs a warning and agent
 > turns fail at call time.
@@ -213,11 +220,18 @@ The standalone, runnable scenarios these import live in [`examples/`](examples/)
 ```clojure
 (require '[dvergr.model.providers :as providers])
 
-;; Auto-registers from env: ANTHROPIC_API_KEY, OPENAI_API_KEY, FIREWORKS_API_KEY
+;; Auto-registers API keys, Claude Code, and a logged-in Codex subscription.
 (providers/ensure-initialized!)
+
+;; Verify what this process can use and what an unpinned agent will select.
+(vec (providers/list-providers))
+(providers/default-spec)
 
 ;; Anthropic via the local `claude` CLI (no API key needed)
 ;; Auto-detected if `claude` is on PATH.
+
+;; OpenAI via a Codex/ChatGPT subscription (no API key needed).
+;; Run `codex login` once, then select :codex-subscription / "codex-subscription".
 
 ;; Any OpenAI-compatible provider
 (providers/register-openai-compatible!

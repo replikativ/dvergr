@@ -59,11 +59,18 @@
  ;; (or `~/.dvergr/agents/`, `./.dvergr/agents/`, or a room's sandbox repo) with
  ;; `autostart: true` + `vetted: true` boots itself and joins its `rooms:`. The
  ;; shipped `var.md` (Vár, the secretary) autostarts that way with its provider
- ;; unpinned → env auto-select (anthropic → fireworks → openai → claude-code CLI).
+ ;; unpinned → auto-select (anthropic → fireworks → openai → codex
+ ;; subscription native → codex CLI compatibility → claude-code CLI).
  ;;
  ;; To OVERRIDE per deployment — pin a provider/model, or declare an agent you
  ;; don't want as a committed file — add an optional `:agents` map, e.g.:
  ;;   :agents {:my-bot {:provider :fireworks :model "…"}}
+ ;; Codex subscription native transport (after `codex login`):
+ ;;   :agents {:my-bot {:provider :codex-subscription
+ ;;                     :model "codex-subscription"}}
+ ;; Explicit isolated CLI compatibility path:
+ ;;   :agents {:my-bot {:provider :codex-subscription-cli
+ ;;                     :model "codex-subscription-cli"}}
 
  ;; ============================================================
  ;; Secrets — boundary key injection (doc/boundary-secret-injection.md)

@@ -141,6 +141,64 @@
     :context 200000
     :max-output 32000
     :pricing {:input 0 :output 0}
+    :quirks {}}
+
+   ;; Native Codex Responses models (via an existing ChatGPT subscription). These ids are
+   ;; deliberately distinct from the OpenAI API models so both providers can be
+   ;; configured at once.
+   "codex-subscription"
+   {:id "codex-subscription"
+    :name "Codex GPT-5.6 Sol (subscription default)"
+    :provider :codex-subscription
+    :api-type :openai-responses
+    :capabilities #{:tools :system-prompt :thinking :streaming}
+    :context 272000
+    :max-output 128000
+    :pricing {:input 0 :output 0}
+    :quirks {}}
+
+   "codex-subscription-sol"
+   {:id "codex-subscription-sol"
+    :name "Codex GPT-5.6 Sol (subscription)"
+    :provider :codex-subscription
+    :api-type :openai-responses
+    :capabilities #{:tools :system-prompt :thinking :streaming}
+    :context 272000
+    :max-output 128000
+    :pricing {:input 0 :output 0}
+    :quirks {}}
+
+   "codex-subscription-terra"
+   {:id "codex-subscription-terra"
+    :name "Codex GPT-5.6 Terra (subscription)"
+    :provider :codex-subscription
+    :api-type :openai-responses
+    :capabilities #{:tools :system-prompt :thinking :streaming}
+    :context 272000
+    :max-output 128000
+    :pricing {:input 0 :output 0}
+    :quirks {}}
+
+   "codex-subscription-luna"
+   {:id "codex-subscription-luna"
+    :name "Codex GPT-5.6 Luna (subscription)"
+    :provider :codex-subscription
+    :api-type :openai-responses
+    :capabilities #{:tools :system-prompt :thinking :streaming}
+    :context 272000
+    :max-output 128000
+    :pricing {:input 0 :output 0}
+    :quirks {}}
+
+   "codex-subscription-cli"
+   {:id "codex-subscription-cli"
+    :name "Codex subscription (CLI fallback)"
+    :provider :codex-subscription-cli
+    :api-type :codex-cli
+    :capabilities #{:tools :system-prompt :thinking :streaming}
+    :context 272000
+    :max-output 128000
+    :pricing {:input 0 :output 0}
     :quirks {}}})
 
 ;; ============================================================================
@@ -412,7 +470,11 @@
                  "sonnet-4-5" "claude-sonnet-4-5"
                  "cc-sonnet" "claude-code-sonnet"
                  "cc-opus" "claude-code-opus"
-                 "cc-haiku" "claude-code-haiku"}))
+                 "cc-haiku" "claude-code-haiku"
+                 "codex" "codex-subscription"
+                 "codex-sol" "codex-subscription-sol"
+                 "codex-terra" "codex-subscription-terra"
+                 "codex-luna" "codex-subscription-luna"}))
 
 (defn register-alias!
   "Register an alias for a model ID."

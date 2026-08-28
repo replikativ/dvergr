@@ -328,7 +328,8 @@
     ;; llm-agent now, so a daemon agent is just a plain llm-agent.
     ;; When an agent pins NEITHER provider nor model, fall back to the env-aware
     ;; default (providers/default-spec) — best AVAILABLE registered provider by
-    ;; preference (anthropic→fireworks→openai→claude-code) + its default model — so
+    ;; preference (anthropic→fireworks→openai→codex-subscription→claude-code)
+    ;; + its default model — so
     ;; a fresh install works with WHICHEVER provider key is set, not only Fireworks.
     ;; The :fireworks/minimax literals remain only as a last resort when no provider
     ;; is registered at all (the agent then fails at call time; boot already warns).

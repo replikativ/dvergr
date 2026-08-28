@@ -1,6 +1,7 @@
 (ns dvergr.model.api.anthropic
   "Anthropic Messages API implementation."
   (:require [dvergr.model.provider :as p]
+            [dvergr.model.gateway :as gateway]
             [dvergr.model.quirks :as quirks]
             [dvergr.chat.tool-schema :as tool-schema]
             [jsonista.core :as json]))
@@ -50,9 +51,9 @@
           msgs (remove-system-messages messages)
           tools (:tools opts)]
       {:url (str (or (:base-url config) "https://api.anthropic.com/v1") "/messages")
-       :headers {"x-api-key" (:api-key config)
-                 "anthropic-version" (or (:api-version config) "2023-06-01")
+       :headers {"anthropic-version" (or (:api-version config) "2023-06-01")
                  "content-type" "application/json"}
+       :credentials (:credentials config)
        :body (cond-> {:model (:model opts "claude-sonnet-4-5")
                       :max_tokens (:max-tokens opts 8192)
                       :stream true
@@ -244,9 +245,17 @@
   [config]
   (let [api-key (or (:api-key config)
                     (System/getenv "ANTHROPIC_API_KEY"))]
-    (when-not api-key
+    (when-not (or api-key (:credentials config))
       (throw (ex-info "Anthropic API key required" {:env "ANTHROPIC_API_KEY"})))
-    (->AnthropicProvider (assoc config :api-key api-key))))
+    (let [base-url (or (:base-url config) "https://api.anthropic.com/v1")
+          credentials (or (:credentials config)
+                          (gateway/static-credentials
+                           :anthropic-api-key
+                           {"x-api-key" api-key}
+                           #{(gateway/request-origin base-url)}))]
+      (->AnthropicProvider (-> config
+                               (dissoc :api-key)
+                               (assoc :credentials credentials))))))
 
 (defn create-if-available
   "Create Anthropic provider if API key is available, otherwise nil."

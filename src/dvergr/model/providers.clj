@@ -6,6 +6,7 @@
             [dvergr.model.api.anthropic :as anthropic]
             [dvergr.model.api.openai :as openai]
             [dvergr.model.api.claude-code :as claude-code]
+            [dvergr.model.api.codex-subscription :as codex-subscription]
             [taoensso.telemere :as tel]))
 
 ;; ============================================================================
@@ -103,6 +104,18 @@
     (register! :claude-code provider)
     (tel/log! {:id :providers/registered :data {:provider :claude-code}} "Registered provider"))
 
+  ;; Native OpenAI Codex Responses transport via a file-backed ChatGPT login.
+  (when-let [provider (codex-subscription/create-if-available {})]
+    (register! :codex-subscription provider)
+    (tel/log! {:id :providers/registered :data {:provider :codex-subscription}}
+              "Registered provider"))
+
+  ;; Compatibility path for keyring-only logins or upstream wire changes.
+  (when-let [provider (codex-subscription/create-cli-if-available {})]
+    (register! :codex-subscription-cli provider)
+    (tel/log! {:id :providers/registered :data {:provider :codex-subscription-cli}}
+              "Registered provider"))
+
   ;; Load extra models from resources/models.edn
   (try
     (when-let [n (registry/load-models-resource!)]
@@ -116,9 +129,9 @@
   ;; failing with a confusing model/provider error.
   (when (empty? @providers)
     (tel/log! {:level :warn :id :providers/none-registered :data {}}
-              (str "No LLM providers registered — set an API key. The default "
-                   "config uses Fireworks: export FIREWORKS_API_KEY=… "
-                   "(also accepts OPENAI_API_KEY / ANTHROPIC_API_KEY).")))
+              (str "No LLM providers registered — set ANTHROPIC_API_KEY, "
+                   "OPENAI_API_KEY, or FIREWORKS_API_KEY, or sign in with "
+                   "the Claude Code or Codex CLI.")))
 
   (tel/log! {:id :providers/init-complete :data {:count (count @providers)}} "Providers ready"))
 
@@ -139,11 +152,14 @@
   {:anthropic   "claude-sonnet-4-6"
    :fireworks   "accounts/fireworks/models/minimax-m2p7"
    :openai      "gpt-4o"
-   :claude-code "claude-code-sonnet"})
+   :claude-code "claude-code-sonnet"
+   :codex-subscription "codex-subscription"
+   :codex-subscription-cli "codex-subscription-cli"})
 
 (def ^:private provider-preference
   "Order in which to pick a default provider when one isn't specified."
-  [:anthropic :fireworks :openai :claude-code])
+  [:anthropic :fireworks :openai :codex-subscription
+   :codex-subscription-cli :claude-code])
 
 (defn default-spec
   "`{:provider :model}` for the best AVAILABLE (registered) provider, by
@@ -182,6 +198,16 @@
   "Register a Claude Code CLI provider."
   [config]
   (register! :claude-code (claude-code/create config)))
+
+(defn register-codex-subscription!
+  "Register the native Codex Responses provider backed by a ChatGPT subscription."
+  [config]
+  (register! :codex-subscription (codex-subscription/create config)))
+
+(defn register-codex-subscription-cli!
+  "Register the isolated Codex CLI compatibility provider."
+  [config]
+  (register! :codex-subscription-cli (codex-subscription/create-cli config)))
 
 (defn register-openai-compatible!
   "Register a custom OpenAI-compatible provider.

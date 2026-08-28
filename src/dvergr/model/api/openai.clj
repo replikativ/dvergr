@@ -3,6 +3,7 @@
 
    Also used by OpenAI-compatible providers like Fireworks, Together, etc."
   (:require [dvergr.model.provider :as p]
+            [dvergr.model.gateway :as gateway]
             [dvergr.model.registry :as registry]
             [dvergr.model.quirks :as quirks]
             [dvergr.chat.tool-schema :as tool-schema]
@@ -58,9 +59,9 @@
   (build-request [_ messages opts]
     (let [tools (:tools opts)]
       {:url (str (or (:base-url config) "https://api.openai.com/v1") "/chat/completions")
-       :headers (merge {"Authorization" (str "Bearer " (:api-key config))
-                        "Content-Type" "application/json"}
+       :headers (merge {"Content-Type" "application/json"}
                        (:extra-headers config))
+       :credentials (:credentials config)
        :body (cond-> {:model (:model opts "gpt-4o")
                       :max_completion_tokens (:max-tokens opts 8192)
                       :stream true
@@ -284,9 +285,20 @@
   [config]
   (let [api-key (or (:api-key config)
                     (System/getenv "OPENAI_API_KEY"))]
-    (when-not api-key
+    (when-not (or api-key (:credentials config))
       (throw (ex-info "OpenAI API key required" {:env "OPENAI_API_KEY"})))
-    (->OpenAIProvider (assoc config :api-key api-key))))
+    (let [base-url (or (:base-url config)
+                       (System/getenv "OPENAI_BASE_URL")
+                       "https://api.openai.com/v1")
+          credentials (or (:credentials config)
+                          (gateway/static-credentials
+                           :openai-api-key
+                           {"Authorization" (str "Bearer " api-key)}
+                           #{(gateway/request-origin base-url)}))]
+      (->OpenAIProvider (-> config
+                            (dissoc :api-key)
+                            (assoc :base-url base-url
+                                   :credentials credentials))))))
 
 (defn create-if-available
   "Create OpenAI provider if API key is available, otherwise nil."
@@ -307,23 +319,27 @@
    - :extra-headers - Additional HTTP headers"
   [config]
   (let [api-key (or (:api-key config)
-                    (System/getenv "FIREWORKS_API_KEY")
-                    (System/getenv "OPENAI_API_KEY"))
+                    (System/getenv "FIREWORKS_API_KEY"))
         base-url (or (:base-url config)
-                     (System/getenv "OPENAI_BASE_URL")
+                     (System/getenv "FIREWORKS_BASE_URL")
                      "https://api.fireworks.ai/inference/v1")]
-    (when-not api-key
+    (when-not (or api-key (:credentials config))
       (throw (ex-info "Fireworks API key required"
-                      {:env ["FIREWORKS_API_KEY" "OPENAI_API_KEY"]})))
-    (->OpenAIProvider (assoc config
-                             :api-key api-key
-                             :base-url base-url
-                             :provider-id :fireworks))))
+                      {:env "FIREWORKS_API_KEY"})))
+    (let [credentials (or (:credentials config)
+                          (gateway/static-credentials
+                           :fireworks-api-key
+                           {"Authorization" (str "Bearer " api-key)}
+                           #{(gateway/request-origin base-url)}))]
+      (->OpenAIProvider (-> config
+                            (dissoc :api-key)
+                            (assoc :credentials credentials
+                                   :base-url base-url
+                                   :provider-id :fireworks))))))
 
 (defn create-fireworks-if-available
   "Create Fireworks provider if API key is available, otherwise nil."
   [config]
   (when (or (:api-key config)
-            (System/getenv "FIREWORKS_API_KEY")
-            (System/getenv "OPENAI_API_KEY"))
+            (System/getenv "FIREWORKS_API_KEY"))
     (create-fireworks config)))

@@ -43,7 +43,8 @@ workspace + Datahike message/knowledge stores); a thin global **system-db**
   each room's workspace; only `intake/bash` (the muschel shell) and `intake/mail` remain
   in-tree.
 - **L5 — agent execution**: the turn loop (`chat/agent`), context compaction, model
-  abstraction (`model/*` + provider impls for Anthropic/OpenAI/Claude-Code), the
+  abstraction (`model/*` + provider impls for Anthropic/OpenAI, native Codex
+  subscription, and CLI compatibility paths), the
   LLM-backed participant factory (`discourse/llm`), the shared turn mechanics
   (`agent/turn`), the system-prompt assembler (`agent/prompt`), and process
   checkpoint/resume (`agent/process`).
@@ -225,7 +226,7 @@ graph TD
 | `sandbox` + `sandbox/{deps,workspace}` + `sandbox/ns/*` | L4 | SCI runtime (ctx/eval/limits); gated add-libs; the workspace load-root; the injected namespaces (`io`/`data`/`datahike`/`agent`/`kb`/`room`/`mail`/`codec`/`dev`/`intake`) |
 | `intake/{bash,mail}` | L4 | the only in-tree intakes — muschel-jailed shell + briefkasten mail (all other data sources live in the dvergr-sandbox stdlib repo) |
 | `channels/{core,telegram,telegram_commands,telegram_send}` | L4/L6 | channel framework; Telegram Bot API (polling/old dispatch); `dvergr.ops` slash-command binding; outbound Markdown→HTML rendering + chunking |
-| `model/{provider,providers,registry,chat,quirks}` + `model/api/{anthropic,openai,claude_code}` | L5 | provider protocol + registry + metadata; streaming chat over SSE; provider quirks; the three provider impls |
+| `model/{provider,providers,registry,chat,quirks,gateway}` + `model/api/{anthropic,openai,claude_code,codex_subscription,codex_auth}` | L5 | provider protocol + registry + metadata; origin-confined credential injection; HTTP/SSE, native Codex subscription, and CLI compatibility transports; provider quirks |
 | `agent/{turn,prompt,process,tool_commands,persona,ops,fields}` | L5/L6 | shared turn mechanics; system-prompt assembler; checkpoint/resume process; tool commands; persona resolution; agent-management ops + field spec |
 | `orchestration/{daemon,skills,tasks,stats}` | L6 | the runtime daemon (lifecycle/registry/turn loop/sessions/Telegram); skill registry; task ledger; stats cache |
 | `actors` + `actors/transport` | L6 | durable actor identity table; PActorTransport impls |

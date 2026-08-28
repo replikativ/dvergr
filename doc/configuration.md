@@ -76,8 +76,9 @@ Priority: `(paths/set-home! …)` → `$DVERGR_HOME` → `./.dvergr`. Layout:
 **Core** — `DVERGR_CONFIG` (config path) · `DVERGR_HOME` (state root) ·
 `TELEGRAM_BOT_TOKEN` · `GITHUB_DVERGR_TOKEN` · `SLACK_USER_TOKEN`.
 
-**Models** — `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `GROQ_API_KEY` (providers &
-ASR) · `DVERGR_VISION_MODEL` (override the vision model). See
+**Models** — `ANTHROPIC_API_KEY` · `OPENAI_API_KEY` / `OPENAI_BASE_URL` ·
+`FIREWORKS_API_KEY` / `FIREWORKS_BASE_URL` · `CODEX_HOME` (providers) ·
+`GROQ_API_KEY` (ASR) · `DVERGR_VISION_MODEL` (override the vision model). See
 [provider-setup.md](provider-setup.md).
 
 **Media / voice** (see [media.md](media.md)) — `DVERGR_RECORD_CMD` (mic-capture
