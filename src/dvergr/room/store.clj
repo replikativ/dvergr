@@ -98,13 +98,13 @@
     :run/status :run/created-at :run/started-at :run/updated-at :run/ended-at
     :run/reason :run/error
     :run/roster :run/agent-version :run/program-kind
-    :run/interpreter-version :run/agent-def-hash})
+    :run/interpreter-version :run/agent-def-hash :run/chat-id})
 
 (def immutable-run-keys
   [:run/id :run/kind :run/room :run/actor :run/trigger :run/parent
    :run/created-at :run/started-at
    :run/roster :run/agent-version :run/program-kind
-   :run/interpreter-version :run/agent-def-hash])
+   :run/interpreter-version :run/agent-def-hash :run/chat-id])
 
 (defn validate-run!
   "Validate the minimal durable Run contract and return `run`."
@@ -148,6 +148,9 @@
   (when (and (:run/agent-def-hash run) (not (uuid? (:run/agent-def-hash run))))
     (throw (ex-info ":run/agent-def-hash must be a UUID"
                     {:type :room-store/invalid-run :key :run/agent-def-hash :run run})))
+  (when (and (:run/chat-id run) (not (uuid? (:run/chat-id run))))
+    (throw (ex-info ":run/chat-id must be a UUID"
+                    {:type :room-store/invalid-run :key :run/chat-id :run run})))
   (doseq [k [:run/created-at :run/started-at :run/updated-at]
           :when (not (instance? java.util.Date (get run k)))]
     (throw (ex-info (str k " must be an instant")

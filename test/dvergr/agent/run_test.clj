@@ -191,3 +191,25 @@
       (finally
         (run/unwatch-runs! watch-key)
         (d/close-room! room)))))
+
+(deftest retained-finish-keeps-the-drain-lease-until-publication
+  (let [[room st] (run-room :retained-finish)
+        started (run/start! room :agent (d/message :alice :agent "work") nil)
+        run-id (:run/id started)
+        cancelled (atom 0)]
+    (try
+      (run/register-cancel-hook! run-id :probe #(swap! cancelled inc))
+      (let [finished (run/retain-finished! run-id :completed)]
+        (is (= :completed (:run/status finished)))
+        (is (= :completed (:run/status (store/-load-run st :retained-finish run-id))))
+        (is (= [run-id] (mapv :run/id (run/active-runs :retained-finish)))
+            "durable completion still owns its execution lease")
+        (is (true? (run/cancel-run! run-id)))
+        (is (zero? @cancelled)
+            "teardown waits for publication instead of cancelling a finisher")
+        (is (= :completed (:run/status (first (run/active-runs :retained-finish)))))
+        (is (= finished (run/release-finished! run-id)))
+        (is (empty? (run/active-runs :retained-finish))))
+      (finally
+        (run/finish! run-id :failed)
+        (d/close-room! room)))))

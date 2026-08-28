@@ -1,9 +1,8 @@
 # Agent programs in the room REPL
 
-Status: first provider-free slice implemented. The data model and Run boundary
-are intentional; the built-in interpreter currently supports only deterministic
-`:echo` and `:scripted` programs while the native LLM/tool interpreter is being
-lifted onto the same contract.
+Status: deterministic and native LLM/tool interpreters implemented. The data
+model and Run boundary are intentional; simulation, replay, resource splitting,
+and durable continuation are later interpreters over the same contract.
 
 Dvergr agents can construct specialized workers and compose their executions
 from the SCI REPL. The initial surface separates four concepts:
@@ -17,6 +16,32 @@ from the SCI REPL. The initial surface separates four concepts:
 
 An actor is durable identity; an AgentDef describes behavior; a Run is one
 performance. They must not collapse into one mutable "agent object."
+
+## Reactive process semantics
+
+The primitive is a reactive process, not a chat turn. A model API exchange is a
+discrete integration step inside one interpreter; a Run may instead be a single
+calculation, a queued dialogue, a continuously updated monitor, a fork/join
+workflow, or a probabilistic search. Room messages are the durable event source,
+thread views select conversational context, and the Run is the causal/resource
+lifetime that owns effects.
+
+The current surface deliberately reuses Spindel's algebra:
+
+| Composition | Conversational interpretation |
+|---|---|
+| `await` / join | depend on one or several completed computations |
+| parallel Spins | gather independent evidence concurrently |
+| `race` | take the first satisfactory branch and cancel losers |
+| signals / reactive atoms | accumulate beliefs, memory, or workflow state with fork semantics |
+| context fork | explore a copy-on-write alternative or particle |
+| cancellation | withdraw attention and terminate owned effects |
+
+Queueing, merging observations, switch-to-latest steering, approval gates, and
+long-lived output/effect streams should be derived attention combinators over
+the same substrate. They must not be encoded as special cases of a global turn
+loop. `:llm` is the first convenient process interpreter, not the definition of
+an agent.
 
 ## Construct and compose
 
@@ -45,26 +70,128 @@ Inside a room-bound agent sandbox:
 
 `roster`, `make-agent`, and `revise-agent` have no bang because they are pure:
 each returns a new value and leaves its input unchanged. `hire!` has a bang
-because it immediately posts the precise trigger, admits a durable
-`:agent-task` Run, and starts its Spin in the current Room. Admission is
-synchronous and durability-first: once `hire!` returns, `observe` and `cancel!`
-can address the Run without a startup race.
+because it admits a durable `:agent-task` Run, posts the precise trigger, and
+starts its Spin in the current Room. Admission is synchronous and
+durability-first: once `hire!` returns, `observe` and `cancel!` can address the
+Run without a startup race. If trigger persistence or spawning fails, the
+already-admitted Run is durably failed.
 
-Use `await` on `(agent/result-spin handle)` inside `spin`. The opaque handle does
-not pretend to implement Spindel's graph protocol; exposing the native Spin
-preserves structured cancellation and dependency tracking in the owning fork.
-Dereference is available at a REPL or test boundary, but workflow
-code should stay compositional. A top-level blocking `await` shim is not
-required.
+Use `await` on `(agent/result-spin handle)` inside `spin`. This is a passive
+observer: several branches may await one Run, and cancelling one observation
+does not cancel the shared work. Use `(agent/owned-result-spin handle)` for a
+race arm whose loss should cancel the hired Run. The opaque handle does not
+pretend to implement Spindel's graph protocol; the explicit distinction keeps
+ownership and dependency tracking visible in the owning fork. Dereference is
+available at a REPL or test boundary, but workflow code should stay
+compositional. A top-level blocking `await` shim is not required.
 
 The handle supports:
 
 ```clojure
 (agent/run-id handle)        ; durable UUID
-(agent/result-spin handle)   ; fresh native observer Spin for await/race/parallel
+(agent/result-spin handle)   ; passive observer Spin; safe to share
+(agent/owned-result-spin handle) ; owning race arm; losing cancels the Run
 (agent/observe handle)       ; durable Run projection
 (agent/cancel! handle)       ; targeted cooperative cancellation
 ```
+
+## Native model and tool programs
+
+An `:llm` program lifts Dvergr's existing single-exchange model/tool core directly behind
+the same Run boundary:
+
+```clojure
+(let [team (agent/make-agent
+            (agent/roster {:id :research})
+            {:id :analyst
+             :prompt "Investigate the task and report evidence with caveats."
+             :tools #{:clojure_eval :knowledge_search}
+             :model-policy {:provider :codex-subscription
+                            :model "codex-subscription-sol"}
+             :program {:kind :llm
+                       :max-model-steps 32
+                       :budget-dollars 0.50}})
+      work (agent/hire! team :analyst {:task "Test the strongest contrary case"})]
+  @(spin (await (agent/result-spin work))))
+```
+
+Every hire receives a fresh ChatContext in the Room's Spindel execution context.
+Parallel hires therefore have independent dialogue and budget state while seeing
+the same fork-local Geschichte/Datahike substrate. The AgentDef tool set is both
+the schema shown to the model and the authoritative execution allowlist. An
+omitted tool set means no tools.
+
+An LLM Run records a deterministic `:run/chat-id`. With a Datahike-backed Room,
+that ID addresses the persistent model/tool trace; an ephemeral Room owns and
+closes the per-Run chat database when the worker has physically terminated.
+Automatic reconstruction of an interrupted live exchange is not implemented yet:
+the durable trace supports inspection and a later explicit retry/resume policy,
+not resurrection of native streams after process loss.
+
+Blocking provider I/O runs off Spindel's drain thread. Dvergr owns prompt and
+context assembly, compaction, tool dispatch, SCI isolation, cancellation,
+activity messages, and Run settlement; providers—including Codex and Claude
+subscription transports—only supply model responses.
+
+`:max-model-steps` bounds automatic model/effect integration (default 32,
+maximum 256). A step is one provider exchange, not a conversational turn and
+not Dvergr's scheduling clock. Reactive attention may queue, merge, observe,
+fork, or switch work around these discrete transport boundaries.
+`:budget-dollars` is a per-execution spending ceiling (default $1), not a Kontor
+resource allocation. When it is exceeded after a tool-bearing model step, the Run
+settles as `:waiting` with reason `:budget-exhausted`; no process remains active.
+A true resumable continuation and affine resource settlement are separate later
+contracts.
+
+An LLM-created sandbox can still build and revise arbitrary immutable rosters,
+but its `hire!` authority currently accepts only provider-free `:echo` and
+`:scripted` children. This prevents a child from minting new provider spend,
+tools, or recursive LLM work before Kontor can split a resource vector from the
+parent Run. A top-level Room REPL has no such program-kind ceiling.
+
+## Evaluation ladder
+
+The API and the instructions that teach it are evaluated together at three
+levels:
+
+1. Deterministic law/contract tests exercise fork ownership, parallel join,
+   race cancellation, admission, drain, authority, and durability without a
+   provider.
+2. Stub-model interpreter tests exercise prompt/context assembly, exact tool
+   schemas, model-step continuation, activity correlation, budgets, and cleanup.
+3. Opt-in model benchmarks give the same room-REPL tasks to Codex, Claude Code,
+   API models, and local models. They record whether generated SCI compiles,
+   whether the causal result/effects are correct, leaked Runs/resources, model
+   steps, wall time, task version, and model. Token/cost receipts and a stable
+   hash of the assembled system prompt remain benchmark-reporting follow-ups.
+
+The initial model-facing task set should include pure roster specialization,
+parallel research/review and reduction, race-with-loser-cancellation, explicit
+structural child Runs, delegation-ceiling recognition, and creation of a nested
+durable Room. Later attention combinators add queue/observe/steer/switch tests.
+Passing only one model is not sufficient evidence that the programming surface
+is clear.
+
+The first opt-in comprehension probe is `dvergr.agent.program-bench/run-v1!`
+on the `:dev` classpath. It runs through the production prompt, provider, tool,
+SCI, Spindel, and Run paths while retaining every generated `clojure_eval` call
+in its report:
+
+```clojure
+(require '[dvergr.agent.program-bench :as bench])
+(bench/run-v1! :codex-subscription "codex-subscription-sol")
+(bench/run-v1! :claude-code "claude-code-sonnet")
+```
+
+It is an explicit REPL benchmark rather than a CI test because it is
+nondeterministic, needs local subscription authentication, and consumes model
+resources. Its language and lifecycle contracts are duplicated as
+provider-free deterministic tests. In the 2026-08-28 probe, Codex Sol and Claude
+Code Sonnet each discovered the API, created and joined two child Runs, and
+returned the expected value with two `clojure_eval` calls. Earlier attempts
+exposed two real harness defects: the native interpreter omitted the shared
+sandbox prelude, and Claude Code's own native tools shadowed Dvergr's supplied
+tool protocol.
 
 An explicit `:parent-run` on `hire!` records structural spawning. Causal
 succession remains derivable through the new Run's trigger message and that
@@ -121,14 +248,14 @@ Using it from a child or sibling fork fails explicitly: observe the durable Run
 facts there, or start a branch-local Run. A future cross-context result bridge
 must copy values deliberately rather than sharing continuations across forks.
 
-## Current boundary and next interpreter
+## Current boundary and next interpreters
 
 The deterministic interpreter proves the bounded programming contract without an LLM:
 parallel composition, targeted cancellation, exact trigger/output correlation,
 and room-scoped execution all run through the same SCI surface an agent uses.
 
-The next interpreter should lift Dvergr's existing agent-turn core rather than
-wrap another harness. It must preserve:
+The native `:llm` interpreter now lifts Dvergr's existing single-exchange core rather
+than wrapping another harness. It preserves:
 
 - Dvergr-owned ChatContext assembly and compaction;
 - the room-bound SCI sandbox and forked Geschichte/Datahike workspace;
@@ -136,10 +263,10 @@ wrap another harness. It must preserve:
 - native API, Codex subscription, Claude Code subscription, and local providers;
 - Run-correlated activity/output and resource accounting;
 - blocking provider I/O off the Spindel drain thread;
-- pure scope attenuation before execution.
+- delegation attenuation before child execution.
 
-`:roster/scope` is currently portable policy data, not an enforced resource
-grant. Until a Kontor-backed split/settlement interpreter lands, the
-provider-free program kinds are deliberately the only accepted kinds. This keeps
-the public boundary honest: declaring a budget or authority in data must not
-pretend to enforce it.
+`:roster/scope` is still portable policy data, not an enforced resource grant.
+The native interpreter enforces its concrete tool allowlist, model-step bound, and
+ChatContext spending ceiling, but does not pretend those are an affine resource
+split. A Kontor-backed admission/settlement interpreter should make declared
+resource vectors executable before scopes can delegate assets to child Runs.

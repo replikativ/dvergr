@@ -586,6 +586,12 @@
     :db/index true
     :db/doc "Content address of the exact portable AgentDef value"}
 
+   {:db/ident :run/chat-id
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/index true
+    :db/doc "Durable ChatContext trace identity owned by this Run"}
+
    {:db/ident :run/status
     :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/one

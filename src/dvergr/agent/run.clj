@@ -17,7 +17,7 @@
 (def provenance-keys
   "Run fields an interpreter may add without changing core causal identity."
   #{:run/roster :run/agent-version :run/program-kind
-    :run/interpreter-version :run/agent-def-hash})
+    :run/interpreter-version :run/agent-def-hash :run/chat-id})
 
 (defn- store-room-id [room]
   (or (some-> room :meta deref :conversation-id)
@@ -134,6 +134,10 @@
                      ;; and its token are never copied or restored as workflow
                      ;; state.
                      :cancelled? (atom false)
+                     ;; Process-local callbacks let an interpreter abort native
+                     ;; workers as soon as cancellation is requested. They are
+                     ;; control capabilities, never durable Run state.
+                     :cancel-hooks {}
                      :store (:store room)
                      :store-room-id (store-room-id room)}]
      (locking lifecycle-lock
@@ -188,6 +192,56 @@
          (notify! {:type :run/finished :run run})
          run)))))
 
+(defn retain-finished!
+  "Durably write a final/waiting Run projection while retaining its live
+   execution lease. Interpreters use this before publishing fork-local result
+   state; `release-finished!` then removes the lease and emits `:run/finished`.
+
+   This two-phase boundary prevents Room teardown from closing the execution
+   context between durable terminal persistence and Deferred publication."
+  ([run-id status] (retain-finished! run-id status {}))
+  ([run-id status {:keys [reason error now]}]
+   (when-not (contains? finish-statuses status)
+     (throw (ex-info "Invalid run finish status"
+                     {:type ::invalid-finish-status :status status :run-id run-id})))
+   (locking lifecycle-lock
+     (when-let [entry (get @active run-id)]
+       ;; Exactly one settlement path owns result publication. A graph callback
+       ;; racing the normal Spin sees this retained terminal state and yields.
+       (when-not (contains? finish-statuses (get-in entry [:run :run/status]))
+         (let [now (or now (java.util.Date.))
+               run (cond-> (assoc (:run entry)
+                                  :run/status status
+                                  :run/updated-at now)
+                     (contains? store/terminal-run-statuses status)
+                     (assoc :run/ended-at now)
+                     reason (assoc :run/reason reason)
+                     error (assoc :run/error (or (ex-message error) (str error))))]
+           (when-let [room-store (:store entry)]
+             (when-not (store/-store-run! room-store (:store-room-id entry) run)
+               (throw (ex-info "Run finish was not durable"
+                               {:type ::finish-not-durable
+                                :run/id run-id
+                                :run/status status}))))
+           (swap! active assoc-in [run-id :run] run)
+           run))))))
+
+(defn release-finished!
+  "Release a Run whose terminal projection was written by `retain-finished!`.
+   Emits the lifecycle finish event only as the execution lease disappears."
+  [run-id]
+  (locking lifecycle-lock
+    (when-let [entry (get @active run-id)]
+      (let [run (:run entry)]
+        (when-not (contains? finish-statuses (:run/status run))
+          (throw (ex-info "Cannot release a non-finished Run"
+                          {:type ::run-not-finished
+                           :run/id run-id
+                           :run/status (:run/status run)})))
+        (swap! active dissoc run-id)
+        (notify! {:type :run/finished :run run})
+        run))))
+
 (defn cancel-requested?
   "True when targeted cancellation has been requested for this live Run. The
   private token disappears with the live entry; durable cancellation is the
@@ -202,14 +256,53 @@
           (when-let [entry (get @active run-id)]
             (when (or (nil? expected-room)
                       (= expected-room (get-in entry [:run :run/room])))
-              (if @(:cancelled? entry)
+              (if (or @(:cancelled? entry)
+                      ;; A two-phase finisher retains its execution lease only
+                      ;; to publish fork-local state. Teardown must wait for that
+                      ;; lease, not turn the already-durable outcome back into
+                      ;; `:cancelling` or interrupt its publication.
+                      (contains? finish-statuses
+                                 (get-in entry [:run :run/status])))
                 entry
                 (let [_ (reset! (:cancelled? entry) true)
                       entry' (assoc-in entry [:run :run/status] :cancelling)]
                   (swap! active assoc run-id entry')
                   (notify! {:type :run/cancel-requested :run (public-entry entry')})
                   entry')))))]
+    ;; Never invoke interpreter code under lifecycle-lock: a hook may settle the
+    ;; Run, which takes the same lock. Repeated requests re-invoke idempotent
+    ;; hooks so a worker registered concurrently with the first request is not
+    ;; missed.
+    (doseq [hook (if (contains? finish-statuses
+                                (get-in entry [:run :run/status]))
+                   []
+                   (vals (:cancel-hooks entry)))]
+      (try
+        (hook)
+        (catch Throwable t
+          (tel/log! {:level :warn :id ::cancel-hook-failed
+                     :data {:run-id run-id :error (.getMessage t)}}
+                    "Run cancellation hook failed"))))
     (boolean entry)))
+
+(defn register-cancel-hook!
+  "Register process-local `f` for targeted cancellation of a live Run. If a
+   cancellation request already won the race, invoke `f` immediately. Returns
+   true when the Run is still live, false after settlement."
+  [run-id key f]
+  (let [cancelled?
+        (locking lifecycle-lock
+          (when-let [entry (get @active run-id)]
+            (swap! active assoc-in [run-id :cancel-hooks key] f)
+            @(:cancelled? entry)))]
+    (when cancelled? (f))
+    (some? cancelled?)))
+
+(defn unregister-cancel-hook! [run-id key]
+  (locking lifecycle-lock
+    (when (get @active run-id)
+      (swap! active update-in [run-id :cancel-hooks] dissoc key)))
+  nil)
 
 (defn cancel-run!
   "Request cooperative cancellation of exactly one live Run. Returns true when

@@ -237,6 +237,21 @@ The standalone, runnable scenarios these import live in [`examples/`](examples/)
 ;; OpenAI via a Codex/ChatGPT subscription (no API key needed).
 ;; Run `codex login` once, then select :codex-subscription / "codex-subscription".
 
+;; Use that subscription from a bounded, Dvergr-native AgentDef program.
+(require '[dvergr.agent.roster :as roster]
+         '[dvergr.agent.program :as program])
+(def team
+  (roster/make-agent
+   (roster/make-roster)
+   {:id :researcher
+    :prompt "Investigate carefully and report evidence."
+    :tools #{:clojure_eval}
+    :model-policy {:provider :codex-subscription
+                   :model "codex-subscription-sol"}
+    :program {:kind :llm :budget-dollars 0.25}}))
+;; Inside a Room execution context:
+;; @(program/hire! room team :researcher {:task "test this hypothesis"})
+
 ;; Any OpenAI-compatible provider
 (providers/register-openai-compatible!
   :groq

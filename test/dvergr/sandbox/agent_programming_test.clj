@@ -6,6 +6,8 @@
             [dvergr.room.store.memory :as memory]
             [dvergr.sandbox :as sandbox]
             [dvergr.sandbox.ns.agent :as agent-ns]
+            [dvergr.sandbox.ns.kb :as kb-ns]
+            [dvergr.sandbox.ns.room :as room-ns]
             [org.replikativ.spindel.engine.context :as context]
             [org.replikativ.spindel.engine.core :as ec]))
 
@@ -17,7 +19,12 @@
       ;; Keep this acceptance test focused on the new surface. Production calls
       ;; the same injector from setup-agent-namespaces!; doc-coverage exercises
       ;; that full wiring and catches any omission there.
-      (agent-ns/add-programming-ns! sci-ctx (:id room) (:ctx room))
+      (agent-ns/add-programming-ns! sci-ctx (:id room) (:ctx room) nil)
+      (testing "progressive help contains an executable composition example"
+        (let [guide (sandbox/ns-doc-md sci-ctx 'dvergr.agent)]
+          (is (re-find #":scripted :reply" guide))
+          (is (re-find #"result-spin" guide))
+          (is (re-find #"await" guide))))
       (let [result
             (binding [ec/*execution-context* (:ctx room)]
               (sandbox/eval-code
@@ -59,7 +66,7 @@
   (let [ctx     (context/create-execution-context)
         sci-ctx (sandbox/fork-for-session ctx)]
     (try
-      (agent-ns/add-programming-ns! sci-ctx nil ctx)
+      (agent-ns/add-programming-ns! sci-ctx nil ctx nil)
       (let [pure (sandbox/eval-code
                   sci-ctx
                   (str "(require '[dvergr.agent :as agent]) "
@@ -77,5 +84,103 @@
         (is (= 1 (:value pure)))
         (is (false? (:success effect)))
         (is (re-find #"room-scoped" (get-in effect [:error :message]))))
+      (finally
+        (context/stop-context! ctx)))))
+
+(deftest delegation-ceiling-allows-pure-children-but-rejects-paid-children
+  (let [room    (d/make-room {:id :sci-agent-delegation-ceiling
+                              :store (memory/make)})
+        sci-ctx (sandbox/fork-for-session (:ctx room))]
+    (try
+      (agent-ns/add-programming-ns!
+       sci-ctx (:id room) (:ctx room)
+       {:program-kinds #{:echo :scripted}})
+      (let [prefix (str
+                    "(require '[dvergr.agent :as agent] "
+                    "         '[org.replikativ.spindel.spin.cps :refer [spin]] "
+                    "         '[org.replikativ.spindel.effects.await :refer [await]]) "
+                    "(def team (-> (agent/roster) "
+                    "              (agent/make-agent {:id :pure :program {:kind :echo}}) "
+                    "              (agent/make-agent {:id :paid :program {:kind :llm} "
+                    "                                 :model-policy {:provider :test :model \"stub\"}}))) ")
+            pure (binding [ec/*execution-context* (:ctx room)]
+                   (sandbox/eval-code
+                    sci-ctx
+                    (str prefix
+                         "@(spin (-> (await (agent/result-spin "
+                         "                    (agent/hire! team :pure {:task :ok}))) "
+                         "            :run/value))")))
+            paid (binding [ec/*execution-context* (:ctx room)]
+                   (sandbox/eval-code
+                    sci-ctx
+                    (str prefix
+                         "(agent/hire! team :paid {:task :forbidden})")))]
+        (is (= :ok (:value pure)))
+        (is (false? (:success paid)))
+        (is (re-find #"delegation ceiling" (get-in paid [:error :message])))
+        (is (empty? (run/active-runs (:id room)))
+            "rejected authority never admits a Run"))
+      (finally
+        (d/close-room! room)))))
+
+(deftest ambient-parent-run-is-the-default-structural-parent
+  (let [room      (d/make-room {:id :sci-agent-ambient-parent
+                                :store (memory/make)})
+        sci-ctx   (sandbox/fork-for-session (:ctx room))
+        parent-id (random-uuid)]
+    (try
+      (agent-ns/add-programming-ns!
+       sci-ctx (:id room) (:ctx room)
+       {:program-kinds #{:echo :scripted}
+        :parent-run parent-id})
+      (let [result
+            (binding [ec/*execution-context* (:ctx room)]
+              (sandbox/eval-code
+               sci-ctx
+               (str
+                "(require '[dvergr.agent :as agent] "
+                "         '[org.replikativ.spindel.spin.cps :refer [spin]] "
+                "         '[org.replikativ.spindel.effects.await :refer [await]]) "
+                "(let [team (agent/make-agent (agent/roster) "
+                "                             {:id :child :program {:kind :echo}}) "
+                "      child (agent/hire! team :child {:task :work})] "
+                "  @(spin (await (agent/result-spin child))) "
+                "  (:run/parent (agent/observe child)))")))]
+        (is (:success result) (pr-str (:error result)))
+        (is (= parent-id (:value result))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest legacy-room-hire-cannot-bypass-agent-program-ceiling
+  (let [room    (d/make-room {:id :sci-legacy-hire-ceiling
+                              :store (memory/make)})
+        sci-ctx (sandbox/fork-for-session (:ctx room))]
+    (try
+      (room-ns/add-room-ns!
+       sci-ctx nil nil (:id room) (:ctx room)
+       {:program-kinds #{:echo :scripted}})
+      (let [result
+            (binding [ec/*execution-context* (:ctx room)]
+              (sandbox/eval-code
+               sci-ctx
+               "(require '[dvergr.room :as room]) (room/hire :sci-legacy-hire-ceiling {:goal :forbidden})"))]
+        (is (false? (:success result)))
+        (is (re-find #"delegation ceiling" (get-in result [:error :message])))
+        (is (empty? (run/active-runs (:id room)))
+            "the legacy path is rejected before it reaches a model provider"))
+      (finally
+        (d/close-room! room)))))
+
+(deftest nested-sci-cannot-bypass-authority-through-cheap-llm-calls
+  (let [ctx     (context/create-execution-context)
+        sci-ctx (sandbox/fork-for-session ctx)]
+    (try
+      (kb-ns/add-llm-ns! sci-ctx {:provider-effects? false})
+      (doseq [form ["(require '[llm]) (llm/call \"classify\" \"input\")"
+                    "(require '[llm]) (llm/summarize \"input\")"]]
+        (let [result (sandbox/eval-code sci-ctx form)]
+          (is (false? (:success result)))
+          (is (re-find #"provider effects.*delegation ceiling"
+                       (get-in result [:error :message])))))
       (finally
         (context/stop-context! ctx)))))

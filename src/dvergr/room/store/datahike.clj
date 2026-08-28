@@ -166,7 +166,7 @@
 (def ^:private run-pull-pattern
   '[:run/id :run/kind :run/room :run/actor :run/trigger :run/parent
     :run/roster :run/agent-version :run/program-kind :run/interpreter-version
-    :run/agent-def-hash
+    :run/agent-def-hash :run/chat-id
     :run/status :run/created-at :run/started-at :run/updated-at :run/ended-at
     :run/reason :run/error])
 
@@ -188,6 +188,7 @@
     (:run/interpreter-version run)
     (assoc :run/interpreter-version (:run/interpreter-version run))
     (:run/agent-def-hash run) (assoc :run/agent-def-hash (:run/agent-def-hash run))
+    (:run/chat-id run) (assoc :run/chat-id (:run/chat-id run))
     (:run/ended-at run) (assoc :run/ended-at (:run/ended-at run))
     (:run/reason run)   (assoc :run/reason (:run/reason run))
     (:run/error run)    (assoc :run/error (str (:run/error run)))))
