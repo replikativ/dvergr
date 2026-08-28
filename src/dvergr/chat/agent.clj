@@ -129,7 +129,7 @@
    - :complete if agent is done (no tool calls)
    - :error if something failed"
   [chat-ctx {:keys [provider model tools tool-ctx on-text auto-compact? compaction-model turn-number cancel?
-                    system-suffix on-reply]
+                    system-suffix on-reply run-id]
              :or {auto-compact? true}}]
   (try
     ;; Check for automatic compaction before turn
@@ -299,16 +299,17 @@
                                (when-let [conn (:db-conn chat-ctx)]
                                  (try
                                    (dh/transact conn
-                                                [{:tool-call/id (java.util.UUID/randomUUID)
-                                                  :tool-call/name name
-                                                  :tool-call/input (pr-str input)
-                                                  :tool-call/result (pr-str (select-keys result [:type :content :error]))
-                                                  :tool-call/duration-ms duration-ms
-                                                  :tool-call/error? error?
-                                                  :tool-call/status (if error? :error :completed)
-                                                  :tool-call/approval :auto-approved
-                                                  :tool-call/tool-use-id id
-                                                  :tool-call/started-at (java.util.Date.)}])
+                                                [(cond-> {:tool-call/id (java.util.UUID/randomUUID)
+                                                          :tool-call/name name
+                                                          :tool-call/input (pr-str input)
+                                                          :tool-call/result (pr-str (select-keys result [:type :content :error]))
+                                                          :tool-call/duration-ms duration-ms
+                                                          :tool-call/error? error?
+                                                          :tool-call/status (if error? :error :completed)
+                                                          :tool-call/approval :auto-approved
+                                                          :tool-call/tool-use-id id
+                                                          :tool-call/started-at (java.util.Date.)}
+                                                   run-id (assoc :tool-call/run-id run-id))])
                                    (catch Exception e
                                      (tel/log! {:level :warn :id :agent/tool-call-persist-error :error e}
                                                "Failed to persist tool-call analytics"))))

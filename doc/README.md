@@ -16,6 +16,7 @@ New to dvergr? Start with **[Getting Started](getting-started.md)**.
 - **[Rooms & Agents](rooms-and-agents.md)** — the core model: Rooms + Participants on a Bus, addressing (DM vs broadcast), forks
 - **[Programming Model](programming-model.md)** — the compositional kernel: tagged messages, capability routing, dynamic subscriptions, escalation
 - **[Recursive work orchestration](orchestration.md)** — Rooms, threads, tasks, executions, recursive Workrooms, and provider-neutral collaboration
+- **[Runs](runs.md)** — durable execution identity, lifecycle subscription, correlation, and targeted cancellation
 - **[Discourse Theory](discourse-theory.md)** — why "discourse": speech acts, theory of mind, and the Rational-Speech-Acts/FRP lineage (short, optional)
 - **[Architecture](architecture.md)** — the L0–L7 layer map, subsystem graph, inbound message flow, per-file table
 - **[State Model](state-model.md)** — the three-tier copy-on-write state + workspace model

@@ -32,6 +32,7 @@
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.discourse :as d]
             [dvergr.discourse.personas :as personas]
+            [dvergr.agent.run :as run]
             [dvergr.room.registry :as rreg]
             [dvergr.ops :as ops]
             [dvergr.orchestration.skills :as skills]
@@ -125,6 +126,21 @@
    id→Room step; every other fn takes the Room."
   [id-or-slug]
   (with-ctx (fn [_ _ _] (rreg/lookup (if (string? id-or-slug) (keyword id-or-slug) id-or-slug)))))
+
+(defn active-runs
+  "Live Run snapshots. With a Room handle, restrict to that Room."
+  ([] (run/active-runs))
+  ([room] (run/active-runs (:id room))))
+
+(defn runs
+  "Recent durable Runs for a Room, newest first."
+  ([room] (run/runs room))
+  ([room opts] (run/runs room opts)))
+
+(defn cancel-run!
+  "Cooperatively cancel one live Run by UUID."
+  [run-id]
+  (run/cancel-run! run-id))
 
 (defn spawn
   "Create a room with one agent joined; return the Room. The agent is room-safe by

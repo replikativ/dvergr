@@ -161,6 +161,12 @@
     :db/doc "Stable root message id for the thread projection inside a room.
              Top-level messages self-root; replies preserve their ancestor root."}
 
+   {:db/ident :message/run-id
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/index true
+    :db/doc "Run that causally produced this output or activity message"}
+
    ;; Structured envelope metadata. These are ordinary datoms on the message:
    ;; clients can query/sync them independently and never need to parse an
    ;; opaque EDN string. Actor ids remain keyword values for the same reason as
@@ -364,6 +370,12 @@
     :db/index true
     :db/doc "Links to the tool-use/id in the assistant message (for joining)"}
 
+   {:db/ident :tool-call/run-id
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/index true
+    :db/doc "Run that performed this tool call"}
+
    {:db/ident :tool-call/result-message
     :db/valueType :db.type/ref
     :db/cardinality :db.cardinality/one
@@ -470,6 +482,81 @@
     :db/valueType :db.type/string
     :db/cardinality :db.cardinality/many
     :db/doc "Tags for categorizing tasks"}])
+
+;; ============================================================================
+;; Run Schema
+;; ============================================================================
+
+(def run-schema
+  "Durable lifecycle for one causally bounded program execution in a room."
+  [{:db/ident :run/id
+    :db/valueType :db.type/uuid
+    :db/unique :db.unique/identity
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :run/chat
+    :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/one
+    :db/index true
+    :db/doc "Room-store chat entity that owns the run"}
+
+   {:db/ident :run/kind
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :run/room
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true
+    :db/doc "Runtime Room identity; may name a fork of :run/chat"}
+
+   {:db/ident :run/actor
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :run/trigger
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/index true
+    :db/doc "Precise message that caused the run; its thread is canonical"}
+
+   {:db/ident :run/parent
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/index true
+    :db/doc "Explicit structural parent that spawned/contains this run"}
+
+   {:db/ident :run/status
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :run/created-at
+    :db/valueType :db.type/instant
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :run/started-at
+    :db/valueType :db.type/instant
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :run/updated-at
+    :db/valueType :db.type/instant
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :run/ended-at
+    :db/valueType :db.type/instant
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :run/reason
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :run/error
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}])
 
 ;; ============================================================================
 ;; Full Schema
@@ -856,6 +943,7 @@
    `:task/*` follow in their own S3/S4 slices."
   (vec (concat chat-schema
                message-schema
+               run-schema
                tool-call-schema
                ledger-schema
                budget-schema

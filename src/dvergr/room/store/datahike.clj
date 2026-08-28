@@ -98,6 +98,7 @@
       (keyword? (:to msg)) (assoc :message/to (:to msg))
       (uuid? (:in-reply-to msg)) (assoc :message/in-reply-to (:in-reply-to msg))
       (uuid? (:thread-root-id msg)) (assoc :message/thread-root-id (:thread-root-id msg))
+      (uuid? (:run-id metadata)) (assoc :message/run-id (:run-id metadata))
       (:source-username metadata) (assoc :message/source-username (:source-username metadata))
       (:source-user-id  metadata) (assoc :message/source-user-id  (long (:source-user-id metadata)))
       (seq (:audience metadata)) (assoc :message/audience (set (:audience metadata)))
@@ -141,7 +142,7 @@
     :message/created-at :message/source-user
     :message/source-username :message/source-user-id
     :message/from :message/to :message/in-reply-to
-    :message/thread-root-id
+    :message/thread-root-id :message/run-id
     :message/reasoning
     :message/audience :message/mention-handles
     :message/metadata-kind :message/context-from
@@ -161,6 +162,27 @@
     {:message/tool-uses
      [:tool-use/id :tool-use/name
       {:tool-use/input [*]}]}])
+
+(def ^:private run-pull-pattern
+  '[:run/id :run/kind :run/room :run/actor :run/trigger :run/parent
+    :run/status :run/created-at :run/started-at :run/updated-at :run/ended-at
+    :run/reason :run/error])
+
+(defn- run->entity [chat-id run]
+  (cond-> {:run/id         (:run/id run)
+           :run/chat       [:chat/id chat-id]
+           :run/kind       (:run/kind run)
+           :run/room       (:run/room run)
+           :run/actor      (:run/actor run)
+           :run/trigger    (:run/trigger run)
+           :run/status     (:run/status run)
+           :run/created-at (:run/created-at run)
+           :run/started-at (:run/started-at run)
+           :run/updated-at (:run/updated-at run)}
+    (:run/parent run)   (assoc :run/parent (:run/parent run))
+    (:run/ended-at run) (assoc :run/ended-at (:run/ended-at run))
+    (:run/reason run)   (assoc :run/reason (:run/reason run))
+    (:run/error run)    (assoc :run/error (str (:run/error run)))))
 
 ;; =============================================================================
 ;; Store impl
@@ -197,8 +219,16 @@
                               :where [?c :chat/id ?cid]
                               [?m :message/chat ?c]
                               [?m :message/id ?mid]]
+                            @conn chat-id)
+              run-ids (dh/q '[:find [?rid ...]
+                              :in $ ?cid
+                              :where
+                              [?c :chat/id ?cid]
+                              [?r :run/chat ?c]
+                              [?r :run/id ?rid]]
                             @conn chat-id)]
           (dh/transact conn (-> (mapv (fn [mid] [:db/retractEntity [:message/id mid]]) msg-ids)
+                                (into (map (fn [rid] [:db/retractEntity [:run/id rid]]) run-ids))
                                 (conj [:db/retractEntity [:chat/id chat-id]])))))))
 
   (-list-rooms [_]
@@ -373,8 +403,54 @@
                     ;; Surface the interleaved-thinking trace so seeding can feed
                     ;; it back to reasoning models (MiniMax M2 / Kimi / DeepSeek).
                        (seq (:message/reasoning m))
-                       (assoc :reasoning (:message/reasoning m))))))
-                (vec (take-last (or limit 100) filtered))))))))
+                       (assoc :reasoning (:message/reasoning m))
+                       (:message/run-id m)
+                       (assoc-in [:metadata :run-id] (:message/run-id m))))))
+                (vec (take-last (or limit 100) filtered)))))))
+
+  (-store-run! [this room-id run]
+    (let [slug (store/room-id->slug room-id)]
+      (when-let [ent (room-by-slug conn slug)]
+        (let [run (->> run
+                       store/validate-run!
+                       (store/validate-run-update!
+                        (store/-load-run this room-id (:run/id run))))]
+          (when (persist/persist-tx!
+                 conn
+                 [(run->entity (:chat/id ent) run)
+                  {:db/id [:chat/id (:chat/id ent)]
+                   :chat/updated-at (java.util.Date.)}]
+                 {:op :store-run :room-id room-id :run-id (:run/id run)})
+            run)))))
+
+  (-load-run [_ room-id run-id]
+    (let [slug (store/room-id->slug room-id)]
+      (when-let [ent (room-by-slug conn slug)]
+        (dh/q '[:find (pull ?r pattern) .
+                :in $ ?chat-id ?run-id pattern
+                :where
+                [?c :chat/id ?chat-id]
+                [?r :run/chat ?c]
+                [?r :run/id ?run-id]]
+              @conn (:chat/id ent) run-id run-pull-pattern))))
+
+  (-list-runs [_ room-id {:keys [limit status actor]}]
+    (let [slug (store/room-id->slug room-id)]
+      (if-let [ent (room-by-slug conn slug)]
+        (->> (dh/q '[:find [(pull ?r pattern) ...]
+                     :in $ ?chat-id pattern
+                     :where
+                     [?c :chat/id ?chat-id]
+                     [?r :run/chat ?c]]
+                   @conn (:chat/id ent) run-pull-pattern)
+             (filter #(if status (= status (:run/status %)) true))
+             (filter #(if actor (= actor (:run/actor %)) true))
+             (sort-by (juxt #(some-> ^java.util.Date (:run/started-at %) .getTime)
+                            #(str (:run/id %)))
+                      #(compare %2 %1))
+             (take (or limit 100))
+             vec)
+        []))))
 
 (defn make
   "Create a DatahikeStore. `conn` must be an existing Datahike

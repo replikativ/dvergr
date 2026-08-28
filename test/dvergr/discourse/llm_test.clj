@@ -6,7 +6,10 @@
             [org.replikativ.spindel.engine.core :as ec]
             [dvergr.discourse :as d]
             [dvergr.discourse.llm :as llm]
-            [dvergr.chat.context :as cc]))
+            [dvergr.chat.context :as cc]
+            [dvergr.agent.run :as run]
+            [dvergr.room.store :as store]
+            [dvergr.room.store.memory :as memory]))
 
 ;; ============================================================================
 ;; Mock turn-fn — scripts the LLM responses
@@ -44,6 +47,39 @@
         (sp/spin (deliver p (sp/await (spin-fn room))))))
      (deref p wait-ms ::timeout))))
 
+(defn- await-condition [pred wait-ms]
+  (let [deadline (+ (System/currentTimeMillis) wait-ms)]
+    (loop []
+      (cond
+        (pred) true
+        (>= (System/currentTimeMillis) deadline) false
+        :else (do (Thread/sleep 5) (recur))))))
+
+(defn- fail-output-store [delegate actor]
+  (reify store/PRoomStore
+    (-store-room! [_ room-id metadata]
+      (store/-store-room! delegate room-id metadata))
+    (-load-room [_ id-or-slug]
+      (store/-load-room delegate id-or-slug))
+    (-delete-room! [_ room-id]
+      (store/-delete-room! delegate room-id))
+    (-list-rooms [_]
+      (store/-list-rooms delegate))
+    (-store-message! [_ room-id message]
+      (if (= actor (:from message))
+        (throw (ex-info "scripted output persistence failure" {:message message}))
+        (store/-store-message! delegate room-id message)))
+    (-message-thread-root [_ room-id message-id]
+      (store/-message-thread-root delegate room-id message-id))
+    (-list-messages [_ room-id opts]
+      (store/-list-messages delegate room-id opts))
+    (-store-run! [_ room-id run]
+      (store/-store-run! delegate room-id run))
+    (-load-run [_ room-id run-id]
+      (store/-load-run delegate room-id run-id))
+    (-list-runs [_ room-id opts]
+      (store/-list-runs delegate room-id opts))))
+
 ;; ============================================================================
 ;; Tests
 ;; ============================================================================
@@ -63,6 +99,148 @@
         (is (= "Hello, I'm ready to help." (:content reply)))
         (is (= :researcher (:from reply)))
         (is (empty? @script) "script fully consumed")))))
+
+(deftest agent-turn-persists-and-correlates-one-run
+  (testing "one inbound trigger owns all model rounds, activity, and final output"
+    (let [st (memory/make)
+          r (d/make-room {:id :run-correlated :store st})
+          calls (atom 0)
+          turn-fn (fn [chat-ctx _opts]
+                    (if (= 1 (swap! calls inc))
+                      (do
+                        (cc/add-message! chat-ctx
+                                         {:role :assistant
+                                          :content "checking"
+                                          :tool-uses [{:tool-use/id "t1"
+                                                       :tool-use/name "search"
+                                                       :tool-use/input {:q "x"}}]})
+                        :continue)
+                      (do
+                        (cc/add-message! chat-ctx {:role :assistant :content "done"})
+                        :complete)))]
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent {:id :researcher
+                                  :spec {:provider :mock :model "mock"}
+                                  :run-turn-fn turn-fn})))
+      (try
+        (let [reply (await-spin r #(d/ask % :researcher {:content "go"}))
+              second-reply (await-spin r #(d/ask % :researcher {:content "again"}))
+              runs (run/runs r)
+              stored (d/messages r {:limit 20})
+              activities (filterv #(= :_activity (:to %)) stored)
+              activity (first activities)
+              run-row (first (filter #(= (:in-reply-to reply) (:run/trigger %)) runs))
+              run-id (:run/id run-row)]
+          (is (= 3 @calls))
+          (is (= 2 (count runs)))
+          (is (= :completed (:run/status run-row)))
+          (is (= (:in-reply-to reply) (:run/trigger run-row)))
+          (is (= run-id (get-in reply [:metadata :run-id])))
+          (is (not= run-id (get-in second-reply [:metadata :run-id])))
+          (is (= run-id (get-in activity [:metadata :run-id])))
+          (is (= 1 (count activities))
+              "a new run does not replay historical tool activity")
+          (is (= (:thread-root-id reply) (:thread-root-id activity))
+              "tool activity projects into the trigger's dedicated thread")
+          (is (empty? (run/active-runs :run-correlated))))
+        (finally
+          (d/close-room! r))))))
+
+(deftest targeted-cancel-does-not-cancel-the-next-run
+  (testing "a Run-local cancellation token expires with that Run"
+    (let [st (memory/make)
+          r (d/make-room {:id :run-cancel-reuse :store st})
+          first-started (promise)
+          calls (atom 0)
+          turn-fn
+          (fn [chat-ctx {:keys [cancel?]}]
+            (if (= 1 (swap! calls inc))
+              (do
+                (deliver first-started true)
+                (loop []
+                  (when-not (cancel?)
+                    (Thread/sleep 5)
+                    (recur)))
+                :complete)
+              (do
+                (cc/add-message! chat-ctx {:role :assistant :content "second completed"})
+                :complete)))]
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent {:id :worker
+                                  :spec {:provider :mock :model "mock"}
+                                  :run-turn-fn turn-fn})))
+      (try
+        (d/post! r (d/message :alice :worker "cancel this run"))
+        (is (= true (deref first-started 2000 ::timeout)))
+        (let [run-id (:run/id (first (run/active-runs :run-cancel-reuse)))]
+          (is (uuid? run-id))
+          (is (run/cancel-run! run-id))
+          (is (await-condition
+               #(= :cancelled (:run/status (run/run r run-id)))
+               3000)))
+        (let [reply (await-spin r #(d/ask % :worker {:content "next run"}) 3000)]
+          (is (= "second completed" (:content reply)))
+          (is (= :completed
+                 (:run/status (run/run r (get-in reply [:metadata :run-id])))))
+          (is (= #{:cancelled :completed}
+                 (set (map :run/status (run/runs r)))))
+          (is (empty? (run/active-runs :run-cancel-reuse))))
+        (finally
+          (d/close-room! r))))))
+
+(deftest run-finish-is-observed-after-durable-output
+  (testing "a finished event is a safe frontier for querying correlated output"
+    (let [st (memory/make)
+          r (d/make-room {:id :run-output-frontier :store st})
+          observed (promise)
+          watch-key (random-uuid)
+          turn-fn (fn [chat-ctx _opts]
+                    (cc/add-message! chat-ctx {:role :assistant :content "durable output"})
+                    :complete)]
+      (try
+        (run/watch-runs!
+         watch-key
+         (fn [{:keys [type run]}]
+           (when (and (= :run/finished type)
+                      (= :run-output-frontier (:run/room run)))
+             (deliver observed
+                      (boolean
+                       (some #(and (= (:run/id run) (get-in % [:metadata :run-id]))
+                                   (= :worker (:from %)))
+                             (d/messages r {:limit 20})))))))
+        (binding [ec/*execution-context* (:ctx r)]
+          (d/join r (llm/llm-agent {:id :worker
+                                    :spec {:provider :mock :model "mock"}
+                                    :run-turn-fn turn-fn})))
+        (let [reply (await-spin r #(d/ask % :worker {:content "go"}) 3000)]
+          (is (= "durable output" (:content reply)))
+          (is (= true (deref observed 2000 ::timeout))))
+        (finally
+          (run/unwatch-runs! watch-key)
+          (d/close-room! r))))))
+
+(deftest reply-emission-failure-fails-the-run
+  (testing "completion is not recorded when the correlated output cannot persist"
+    (let [base (memory/make)
+          st (fail-output-store base :worker)
+          r (d/make-room {:id :run-output-failure :store st})
+          turn-fn (fn [chat-ctx _opts]
+                    (cc/add-message! chat-ctx {:role :assistant :content "lost output"})
+                    :complete)]
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent {:id :worker
+                                  :spec {:provider :mock :model "mock"}
+                                  :run-turn-fn turn-fn})))
+      (try
+        (d/post! r (d/message :alice :worker "go"))
+        (is (await-condition #(= :failed (:run/status (first (run/runs r)))) 3000))
+        (let [failed (first (run/runs r))]
+          (is (= :reply-emission-failed (:run/reason failed)))
+          (is (empty? (filter #(= (:run/id failed) (get-in % [:metadata :run-id]))
+                              (d/messages r {:limit 20}))))
+          (is (empty? (run/active-runs :run-output-failure))))
+        (finally
+          (d/close-room! r))))))
 
 (deftest multi-turn-loop-continues-until-complete
   (testing "Agent loops :continue → :continue → :complete; reply is the last"

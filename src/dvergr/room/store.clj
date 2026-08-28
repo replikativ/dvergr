@@ -68,11 +68,80 @@
     "Return messages in chronological order. :limit caps result size
      (default impl-specific); :since is an instant — only messages
      after that ts are returned; :thread-root-id restricts the result to one
-     topical projection before the limit is applied."))
+     topical projection before the limit is applied.")
+
+  (-store-run! [this room-id run]
+    "Create or update a durable Run projection owned by `room-id`. Run identity,
+     kind, room, actor, trigger, parent, and start timestamps are immutable by
+     contract; lifecycle updates change status and terminal fields.")
+
+  (-load-run [this room-id run-id]
+    "Return one durable Run by UUID when it belongs to `room-id`, else nil.")
+
+  (-list-runs [this room-id {:keys [limit status actor]}]
+    "Return recent Runs, newest first. Optional :status and :actor filters are
+     applied before :limit."))
 
 ;; =============================================================================
 ;; Helpers
 ;; =============================================================================
+
+(def durable-run-statuses
+  "Lifecycle states stored in a Room. `:cancelling` is deliberately live-only:
+   durable cancellation is acknowledged by the terminal `:cancelled` state."
+  #{:running :waiting :completed :failed :cancelled})
+
+(def terminal-run-statuses #{:completed :failed :cancelled})
+
+(def immutable-run-keys
+  [:run/id :run/kind :run/room :run/actor :run/trigger :run/parent
+   :run/created-at :run/started-at])
+
+(defn validate-run!
+  "Validate the minimal durable Run contract and return `run`."
+  [run]
+  (doseq [k [:run/id :run/trigger]]
+    (when-not (uuid? (get run k))
+      (throw (ex-info (str k " must be a UUID")
+                      {:type :room-store/invalid-run :key k :run run}))))
+  (when-not (keyword? (:run/room run))
+    (throw (ex-info ":run/room must be a keyword"
+                    {:type :room-store/invalid-run :key :run/room :run run})))
+  (when-not (keyword? (:run/actor run))
+    (throw (ex-info ":run/actor must be a keyword"
+                    {:type :room-store/invalid-run :key :run/actor :run run})))
+  (when-not (keyword? (:run/kind run))
+    (throw (ex-info ":run/kind must be a keyword"
+                    {:type :room-store/invalid-run :key :run/kind :run run})))
+  (when-not (contains? durable-run-statuses (:run/status run))
+    (throw (ex-info "Invalid durable run status"
+                    {:type :room-store/invalid-run-status
+                     :status (:run/status run) :run run})))
+  (when (and (:run/parent run) (not (uuid? (:run/parent run))))
+    (throw (ex-info ":run/parent must be a UUID"
+                    {:type :room-store/invalid-run :key :run/parent :run run})))
+  (doseq [k [:run/created-at :run/started-at :run/updated-at]
+          :when (not (instance? java.util.Date (get run k)))]
+    (throw (ex-info (str k " must be an instant")
+                    {:type :room-store/invalid-run :key k :run run})))
+  (when (and (contains? terminal-run-statuses (:run/status run))
+             (not (instance? java.util.Date (:run/ended-at run))))
+    (throw (ex-info "A terminal run requires :run/ended-at"
+                    {:type :room-store/invalid-run :key :run/ended-at :run run})))
+  run)
+
+(defn validate-run-update!
+  "Reject an update that changes the causal identity of an existing Run."
+  [existing run]
+  (when (and existing
+             (not= (select-keys existing immutable-run-keys)
+                   (select-keys run immutable-run-keys)))
+    (throw (ex-info "Durable run identity fields are immutable"
+                    {:type :room-store/immutable-run-update
+                     :run-id (:run/id run)
+                     :existing (select-keys existing immutable-run-keys)
+                     :update (select-keys run immutable-run-keys)})))
+  run)
 
 (def durable-message-metadata-keys
   "The top-level metadata keys that every PRoomStore implementation accepts.
@@ -82,7 +151,7 @@
     :audience :mentions :attachment :provenance
     :tool-uses :reasoning :kind :from :source :schedule-id
     :notification/type :notification/agent :notification/task
-    :notification/elapsed})
+    :notification/elapsed :run-id})
 
 (def ^:private attachment-metadata-keys #{:blob-id :node-id :mime :name :size})
 (def ^:private provenance-metadata-keys #{:mode :source})
@@ -119,6 +188,10 @@
                         {:type :room-store/invalid-message-metadata
                          :provenance provenance})))
       (reject-unknown-metadata! :provenance provenance-metadata-keys provenance)))
+  (when (and (:run-id metadata) (not (uuid? (:run-id metadata))))
+    (throw (ex-info "Message :run-id metadata must be a UUID"
+                    {:type :room-store/invalid-message-metadata
+                     :run-id (:run-id metadata)})))
   metadata)
 
 (defn normalize-message-thread

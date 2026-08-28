@@ -7,7 +7,8 @@
 (defrecord MemoryStore [state]
   ;; state atom shape:
   ;;   {:rooms     {room-id metadata}
-  ;;    :messages  {room-id [msg ...] (chronological)}}
+  ;;    :messages  {room-id [msg ...] (chronological)}
+  ;;    :runs      {room-id {run-id run}}}
   store/PRoomStore
 
   (-store-room! [_ room-id metadata]
@@ -23,7 +24,8 @@
     (swap! state (fn [s]
                    (-> s
                        (update :rooms    dissoc room-id)
-                       (update :messages dissoc room-id)))))
+                       (update :messages dissoc room-id)
+                       (update :runs     dissoc room-id)))))
 
   (-list-rooms [_]
     (->> (vals (:rooms @state))
@@ -59,9 +61,30 @@
                      thread-root-id
                      (filter #(= thread-root-id (:thread-root-id %))))
           n (or limit (count filtered))]
-      (vec (take-last n filtered)))))
+      (vec (take-last n filtered))))
+
+  (-store-run! [_ room-id run]
+    (let [run (->> run
+                   store/validate-run!
+                   (store/validate-run-update!
+                    (get-in @state [:runs room-id (:run/id run)])))]
+      (swap! state assoc-in [:runs room-id (:run/id run)] run)
+      run))
+
+  (-load-run [_ room-id run-id]
+    (get-in @state [:runs room-id run-id]))
+
+  (-list-runs [_ room-id {:keys [limit status actor]}]
+    (->> (vals (get-in @state [:runs room-id] {}))
+         (filter #(if status (= status (:run/status %)) true))
+         (filter #(if actor (= actor (:run/actor %)) true))
+         (sort-by (juxt #(some-> ^java.util.Date (:run/started-at %) .getTime)
+                        #(str (:run/id %)))
+                  #(compare %2 %1))
+         (take (or limit 100))
+         vec)))
 
 (defn make
   "Create a fresh in-memory store."
   []
-  (->MemoryStore (atom {:rooms {} :messages {}})))
+  (->MemoryStore (atom {:rooms {} :messages {} :runs {}})))

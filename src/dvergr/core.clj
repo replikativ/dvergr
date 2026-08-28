@@ -21,6 +21,7 @@
   (:require [dvergr.discourse]
             [dvergr.discourse.llm]
             [dvergr.discourse.generation]
+            [dvergr.agent.run]
             [dvergr.runtime.bus]
             [dvergr.participant.context]
             [dvergr.discourse.personas]))
@@ -67,6 +68,17 @@
 ;; ============================================================================
 
 (def llm-agent               @#'dvergr.discourse.llm/llm-agent)
+
+;; ============================================================================
+;; Durable Run lifecycle
+;; ============================================================================
+
+(def active-runs             @#'dvergr.agent.run/active-runs)
+(def watch-runs!             @#'dvergr.agent.run/watch-runs!)
+(def unwatch-runs!           @#'dvergr.agent.run/unwatch-runs!)
+(def cancel-run!             @#'dvergr.agent.run/cancel-run!)
+(def runs                    @#'dvergr.agent.run/runs)
+(def run                     @#'dvergr.agent.run/run)
 
 ;; ============================================================================
 ;; Personas (pre-built llm-agent factories)
