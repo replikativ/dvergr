@@ -5,9 +5,11 @@
   (:require [clojure.test :refer [deftest is testing]]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.spin.core :as spin-core]
             [org.replikativ.spindel.spin.sync :as sync]
             [org.replikativ.spindel.spin.combinators :as comb]
-            [dvergr.discourse :as d]))
+            [dvergr.discourse :as d]
+            [dvergr.room.registry :as rreg]))
 
 ;; ============================================================================
 ;; Test fixtures — wrappers for chaos / latency testing.
@@ -174,6 +176,96 @@
       (is (= 1 (count @seen))
           "the overlapping-subscription message is delivered exactly once")
       (is (= [:escalation/budget] @seen)))))
+
+(deftest leave-releases-the-whole-participant-lifecycle
+  (testing "process, active handler, pumps, subscriptions, and continuations"
+    (let [room         (d/room :participant-lifecycle)
+          entered      (promise)
+          after-await  (atom 0)
+          gate         (binding [ec/*execution-context* (:ctx room)]
+                         (sync/create-deferred (:ctx room)))
+          joined       (binding [ec/*execution-context* (:ctx room)]
+                         (d/join
+                          room
+                          (d/participant
+                           {:id :worker
+                            :ctx (:ctx room)
+                            :on-message
+                            (fn [_ _]
+                              (sp/spin
+                               (deliver entered true)
+                               (sp/await gate)
+                               (swap! after-await inc)))})))]
+      (try
+        (is (re-find #"#Participant\{:id :worker" (pr-str joined))
+            "a joined participant is safe to inspect at the REPL")
+        (d/post! room (d/message :human :worker "wait"))
+        (is (= true (deref entered 2000 ::timeout)))
+        (let [active @(:active joined)
+              owned  (into [(:process joined) active]
+                           (vals @(:pumps joined)))
+              ids    (mapv spin-core/spin-id owned)]
+          (is (= 4 (count owned)) "process + handler + two subscription pumps")
+          (is (some pos?
+                    (binding [ec/*execution-context* (:ctx room)]
+                      (mapv #(count (ec/get-state [:await-conts %])) ids)))
+              "the scenario really suspended participant-owned work")
+
+          (d/leave room :worker)
+          ;; A completion racing in after leave must not revive the detached
+          ;; handler or run anything after its await point.
+          (binding [ec/*execution-context* (:ctx room)]
+            (gate :late))
+          (Thread/sleep 50)
+
+          (is (zero? @after-await))
+          (is (not (contains? @(:participants room) :worker)))
+          (is (= {} @(:pumps joined)))
+          (is (= {} @(:subs joined)))
+          (is (not (identical? active @(:active joined))))
+          (binding [ec/*execution-context* (:ctx room)]
+            (is (every? some? (mapv ec/spin-current-result ids)))
+            (is (every? ec/spin-is-cancelled? (take 2 ids))
+                "the process and active handler are explicitly cancelled")
+            (is (every? zero?
+                        (mapv #(count (ec/get-state [:await-conts %])) ids))))
+          (is (nil? (d/leave room :worker)) "leave is idempotent"))
+        (finally
+          (d/close-room! room))))))
+
+(deftest close-room-respects-fork-runtime-ownership
+  (testing "closing a shared-context fork cannot stop its parent root"
+    (let [parent       (d/room :close-ownership)
+          parent-agent (binding [ec/*execution-context* (:ctx parent)]
+                         (d/join parent (d/echo :echo)))
+          fork         (d/fork-room parent {:isolation :none})
+          fork-agent   (get @(:participants fork) :echo)
+          fork-owned   (conj (vec (vals @(:pumps fork-agent)))
+                             (:process fork-agent))
+          parent-owned (conj (vec (vals @(:pumps parent-agent)))
+                             (:process parent-agent))]
+      (d/close-room! fork)
+      (is @(:running (:ctx parent)))
+      (is (binding [ec/*execution-context* (:ctx parent)]
+            (some? (rreg/lookup (:id parent)))))
+      (is (binding [ec/*execution-context* (:ctx parent)]
+            (nil? (rreg/lookup (:id fork)))))
+      (is (empty? @(:participants fork)))
+      (let [fork-terminal
+            (binding [ec/*execution-context* (:ctx parent)]
+              (mapv #(some? (ec/spin-current-result (spin-core/spin-id %)))
+                    fork-owned))]
+        (is (every? true? fork-terminal)))
+
+      (d/close-room! parent)
+      (is (false? @(:running (:ctx parent))))
+      (is (empty? @(:participants parent)))
+      (binding [ec/*execution-context* (:ctx parent)]
+        (is (nil? (rreg/lookup (:id parent))))
+        (is (every? true?
+                    (mapv #(some? (ec/spin-current-result (spin-core/spin-id %)))
+                          parent-owned))))
+      (is (nil? (d/close-room! parent)) "close is idempotent"))))
 
 (deftest forked-participant-operates-on-its-joined-room
   (testing "a participant cloned into a fork sees the FORK as its room
