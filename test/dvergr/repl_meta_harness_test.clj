@@ -1,69 +1,60 @@
-(ns dvergr.benchmarks.repl-harness
-  "Deterministic checks of the agent-facing meta-harness programming surface.
+(ns dvergr.repl-meta-harness-test
+  "End-to-end contract for the agent-facing REPL meta-harness surface.
 
-   This namespace deliberately does not call an LLM. `run!` executes the real
+   The test deliberately does not call an LLM. It executes the real
    `clojure_eval` tool against the same room-bound SCI and ChatContext used by an
-   agent turn. The sandboxed program constructs a nested persistent room, then a
-   second evaluation proves that both REPL definitions and room state survived.
-   Finally the host checks the live registry and durable system database.
-
-   The benchmark creates a real room. Use an isolated daemon for repeatable runs,
-   or pass a unique `:child-slug` when deliberately exercising a live daemon."
-  (:refer-clojure :exclude [run!])
-  (:require [dvergr.agent.turn :as turn]
+   agent turn. Sandboxed Clojure constructs a nested persistent room, a second
+   evaluation proves REPL state survived, and the host verifies the live room
+   registry and durable Datahike row."
+  (:require [clojure.test :refer [deftest is testing]]
+            [dvergr.agent.turn :as turn]
+            [dvergr.discourse.definitions :as definitions]
+            [dvergr.orchestration.daemon :as daemon]
             [dvergr.room.registry :as room-registry]
             [dvergr.room.store :as room-store]
             [dvergr.rooms :as rooms]
+            [dvergr.substrate.config :as config]
+            [dvergr.substrate.paths :as paths]
             [dvergr.system.db :as system-db]
             [dvergr.system.rooms :as system-rooms]
             [dvergr.tools :as tools]
             [org.replikativ.spindel.engine.core :as ec]))
 
-(defn- elapsed-ms [start-ns end-ns]
-  (/ (double (- end-ns start-ns)) 1000000.0))
-
 (defn- require-room! [execution-ctx slug]
   (or (binding [ec/*execution-context* execution-ctx]
         (room-registry/lookup slug))
-      (throw (ex-info "Benchmark parent room is not registered"
+      (throw (ex-info "Contract parent room is not registered"
                       {:parent-slug slug}))))
 
 (defn- eval! [room tool-ctx code]
   (binding [ec/*execution-context* (:ctx room)]
     (tools/execute "clojure_eval" {:code code} tool-ctx)))
 
-(defn run!
-  "Exercise the production REPL-to-meta-harness path against `daemon`.
+(defn run-against-daemon!
+  "Exercise the REPL contract against `daemon` without calling a provider.
 
-   Options:
-   - `:parent-slug` - existing parent room (default `\"boardroom\"`)
-   - `:child-slug`  - new room slug; must not already exist
-   - `:title`       - child title
-
-   Returns timings, both tool results, observable state, and a `:passed?` flag.
-   No model provider is resolved or invoked. The child is retained so callers
-   can inspect durability and UI visibility after the run."
+   The child is retained for inspection. Pass a unique `:child-slug` when using
+   this deliberately against a live development daemon."
   ([daemon]
-   (run! daemon {}))
+   (run-against-daemon! daemon {}))
   ([daemon {:keys [parent-slug child-slug title]
             :or {parent-slug "boardroom"}}]
    (let [execution-ctx (:execution-ctx daemon)
-         child-slug   (or child-slug (str "repl-benchmark-" (random-uuid)))
-         title        (or title (str "REPL benchmark " child-slug))
+         child-slug   (or child-slug (str "repl-contract-" (random-uuid)))
+         title        (or title (str "REPL contract " child-slug))
          parent       (require-room! execution-ctx parent-slug)
          child-id     (room-store/slug->room-id child-slug)]
      (when (binding [ec/*execution-context* execution-ctx]
              (room-registry/lookup child-id))
-       (throw (ex-info "Benchmark child room already exists"
+       (throw (ex-info "Contract child room already exists"
                        {:child-slug child-slug})))
      (let [parent-row (binding [ec/*execution-context* execution-ctx]
                         (system-db/room-by-slug parent-slug))
            parent-uuid (:room/id parent-row)
-           t0 (System/nanoTime)
            chat-ctx
            (turn/new-working-ctx
             {:execution-ctx (:ctx parent)
-             :title         (str "repl-harness-benchmark-" child-slug)
+             :title         (str "repl-meta-harness-contract-" child-slug)
              :db-conn       (some-> parent :store :conn)
              :kb-conn       (binding [ec/*execution-context* (:ctx parent)]
                               (system-rooms/room-kb-conn parent-uuid))
@@ -77,22 +68,19 @@
                :execution-ctx (:ctx parent)
                :isolation     :sci
                :tools         {"clojure_eval" (tools/get-tool "clojure_eval")}}))
-           t1 (System/nanoTime)
            create-code
            (str "(require '[dvergr.room :as room]) "
-                "(def benchmark-child "
+                "(def contract-child "
                 "(room/create! {:slug " (pr-str child-slug)
                 " :title " (pr-str title) " :agents #{}})) "
-                "{:child (select-keys benchmark-child [:slug :title :agents])}")
+                "{:child (select-keys contract-child [:slug :title :agents])}")
            create-result (eval! parent tool-ctx create-code)
-           t2 (System/nanoTime)
            inspect-code
-           (str "{:session-child-slug (:slug benchmark-child) "
+           (str "{:session-child-slug (:slug contract-child) "
                 ":visible? (some? (dvergr.room/get " (pr-str child-slug) ")) "
                 ":children (set (map :slug "
                 "(dvergr.room/children " (pr-str parent-slug) ")))}")
            inspect-result (eval! parent tool-ctx inspect-code)
-           t3 (System/nanoTime)
            create-value (get-in create-result [:metadata :value])
            inspect-value (get-in inspect-result [:metadata :value])
            live-child (binding [ec/*execution-context* execution-ctx]
@@ -110,15 +98,9 @@
             :host-sees-nesting      (= (room-store/slug->room-id parent-slug)
                                        (:parent-id live-child))
             :datahike-sees-child    (= child-slug (:room/slug durable-child))
-            :datahike-sees-nesting  (= parent-slug (:room/parent-slug durable-child))}
-           t4 (System/nanoTime)]
+            :datahike-sees-nesting  (= parent-slug (:room/parent-slug durable-child))}]
        {:passed? (every? true? (vals checks))
         :checks checks
-        :timings-ms {:sandbox-setup (elapsed-ms t0 t1)
-                     :create        (elapsed-ms t1 t2)
-                     :inspect       (elapsed-ms t2 t3)
-                     :host-verify   (elapsed-ms t3 t4)
-                     :total         (elapsed-ms t0 t4)}
         :parent-slug parent-slug
         :child-slug child-slug
         :create-result create-result
@@ -126,3 +108,45 @@
         :live-room (select-keys live-child [:id :slug :title :parent-id])
         :durable-room (select-keys durable-child
                                    [:room/id :room/slug :room/name :room/parent-slug])}))))
+
+(defn run-contract!
+  "Run the contract in an isolated, provider-free daemon.
+
+   Public so a developer can invoke it directly at a REPL. The daemon is always
+   stopped and dvergr's original state root is restored."
+  []
+  (when @daemon/current-daemon
+    (throw (ex-info "Stop the current daemon before running the isolated contract"
+                    {})))
+  (let [original-home (paths/home)
+        contract-home (str (System/getProperty "java.io.tmpdir")
+                           "/dvergr-repl-contract-" (random-uuid))
+        instance (atom nil)]
+    (try
+      (paths/set-home! contract-home)
+      (system-db/reset-conn!)
+      ;; No file-autostarted agent means no provider discovery. Empty config also
+      ;; keeps local secrets and user configuration out of this deterministic run.
+      (with-redefs [definitions/autostart-agents (constantly {})
+                    config/config (constantly {})
+                    config/secret-specs (constantly [])
+                    config/sandbox-env (constantly {})]
+        (let [d (daemon/start! {:agents {}
+                                :db-path (str contract-home "/daemon-db")
+                                :gc {:interval-ms 3600000}})]
+          (reset! instance d)
+          (assoc (run-against-daemon!
+                  d {:child-slug "nested-room-contract"
+                     :title "Nested room contract"})
+                 :state-root contract-home)))
+      (finally
+        (when-let [d @instance]
+          (try (daemon/stop! d) (catch Throwable _)))
+        (system-db/reset-conn!)
+        (paths/set-home! original-home)))))
+
+(deftest agent-facing-repl-constructs-a-durable-nested-room
+  (let [result (run-contract!)]
+    (testing "every layer observes the room created from clojure_eval"
+      (is (:passed? result) (pr-str (:checks result)))
+      (is (every? true? (vals (:checks result)))))))
