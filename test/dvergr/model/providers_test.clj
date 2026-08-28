@@ -2,7 +2,9 @@
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [dvergr.model.api.anthropic :as anthropic]
             [dvergr.model.api.claude-code :as claude-code]
+            [dvergr.model.api.codex-subscription :as codex-subscription]
             [dvergr.model.api.openai :as openai]
+            [dvergr.model.gateway :as gateway]
             [dvergr.model.provider :as provider]
             [dvergr.model.providers :as providers]
             [dvergr.model.registry :as registry]))
@@ -30,6 +32,8 @@
   ;; key and local Claude CLI; only OpenAI and Fireworks are under test here.
   (with-redefs [anthropic/create-if-available (constantly nil)
                 claude-code/create-if-available (constantly nil)
+                codex-subscription/create-if-available (constantly nil)
+                codex-subscription/create-cli-if-available (constantly nil)
                 registry/load-models-resource! (constantly nil)]
     (providers/init-defaults! env)
     (f)))
@@ -42,7 +46,12 @@
     :tools [test-tool]}))
 
 (defn- bearer [request]
-  (get-in request [:headers "Authorization"]))
+  (let [seen (atom nil)]
+    (binding [gateway/*request-fn* (fn [authorized]
+                                     (reset! seen authorized)
+                                     {:status 200})]
+      (gateway/request! request))
+    (get-in @seen [:headers "Authorization"])))
 
 (defn- assert-default-provider [env expected]
   (let [{:keys [provider]} (providers/default-spec env)]

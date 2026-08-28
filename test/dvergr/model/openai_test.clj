@@ -3,10 +3,10 @@
             [clojure.test :refer [deftest is testing use-fixtures]]
             [dvergr.model.api.openai :as openai]
             [dvergr.model.chat :as model-chat]
+            [dvergr.model.gateway :as gateway]
             [dvergr.model.provider :as provider]
             [dvergr.model.providers :as providers]
             [dvergr.model.registry :as registry]
-            [hato.client :as hc]
             [jsonista.core :as json])
   (:import [java.io ByteArrayInputStream]))
 
@@ -196,9 +196,9 @@
                          :total_tokens 49}}]
         openai-provider (native-provider)]
     (providers/register! :openai openai-provider)
-    (with-redefs [hc/request (fn [request]
-                               (reset! captured request)
-                               {:status 200 :headers {} :body (sse-body events)})]
+    (binding [gateway/*request-fn* (fn [request]
+                                     (reset! captured request)
+                                     {:status 200 :headers {} :body (sse-body events)})]
       (let [response (model-chat/chat
                       [{:role :system :content "Product policy"}
                        {:role :user :content "Find Toronto"}]
