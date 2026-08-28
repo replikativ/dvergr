@@ -93,13 +93,27 @@
 
 (def terminal-run-statuses #{:completed :failed :cancelled})
 
+(def durable-run-keys
+  #{:run/id :run/kind :run/room :run/actor :run/trigger :run/parent
+    :run/status :run/created-at :run/started-at :run/updated-at :run/ended-at
+    :run/reason :run/error
+    :run/roster :run/agent-version :run/program-kind
+    :run/interpreter-version :run/agent-def-hash})
+
 (def immutable-run-keys
   [:run/id :run/kind :run/room :run/actor :run/trigger :run/parent
-   :run/created-at :run/started-at])
+   :run/created-at :run/started-at
+   :run/roster :run/agent-version :run/program-kind
+   :run/interpreter-version :run/agent-def-hash])
 
 (defn validate-run!
   "Validate the minimal durable Run contract and return `run`."
   [run]
+  (when-let [unknown (seq (remove durable-run-keys (keys run)))]
+    (throw (ex-info "Unknown durable Run keys"
+                    {:type :room-store/unknown-run-keys
+                     :unknown (set unknown)
+                     :allowed durable-run-keys})))
   (doseq [k [:run/id :run/trigger]]
     (when-not (uuid? (get run k))
       (throw (ex-info (str k " must be a UUID")
@@ -120,6 +134,20 @@
   (when (and (:run/parent run) (not (uuid? (:run/parent run))))
     (throw (ex-info ":run/parent must be a UUID"
                     {:type :room-store/invalid-run :key :run/parent :run run})))
+  (when (and (:run/roster run) (not (keyword? (:run/roster run))))
+    (throw (ex-info ":run/roster must be a keyword"
+                    {:type :room-store/invalid-run :key :run/roster :run run})))
+  (doseq [k [:run/agent-version :run/interpreter-version]
+          :let [v (get run k)]
+          :when (and (some? v) (not (and (integer? v) (pos? v))))]
+    (throw (ex-info (str k " must be a positive integer")
+                    {:type :room-store/invalid-run :key k :run run})))
+  (when (and (:run/program-kind run) (not (keyword? (:run/program-kind run))))
+    (throw (ex-info ":run/program-kind must be a keyword"
+                    {:type :room-store/invalid-run :key :run/program-kind :run run})))
+  (when (and (:run/agent-def-hash run) (not (uuid? (:run/agent-def-hash run))))
+    (throw (ex-info ":run/agent-def-hash must be a UUID"
+                    {:type :room-store/invalid-run :key :run/agent-def-hash :run run})))
   (doseq [k [:run/created-at :run/started-at :run/updated-at]
           :when (not (instance? java.util.Date (get run k)))]
     (throw (ex-info (str k " must be an instant")

@@ -8,7 +8,97 @@
    `(find-doc …)` answer nothing for them inside the sandbox. See
    `dvergr.sandbox.ns.doc`."
   (:require [sci.core :as sci]
-            [dvergr.sandbox.ns.doc :as doc]))
+            [dvergr.sandbox.ns.doc :as doc]
+            [org.replikativ.spindel.engine.core :as ec]))
+
+(defn add-programming-ns!
+  "Expose immutable AgentDefs and Run-backed hiring as `dvergr.agent` in SCI.
+
+   The namespace deliberately has no hidden current roster. `roster`,
+   `make-agent`, and `revise-agent` return ordinary immutable values, so a
+   Spindel computation can branch with a different team without coordinating a
+   mutable registry. `hire!` is the explicit effect boundary: it resolves this
+   sandbox's Room, starts a durable Run in the Room's execution context, and
+   returns an opaque RunHandle whose native observer Spin is explicit.
+
+   Usage:
+     (require '[dvergr.agent :as agent]
+              '[org.replikativ.spindel.spin.cps :refer [spin]]
+              '[org.replikativ.spindel.effects.await :refer [await]])
+     (let [team (-> (agent/roster)
+                    (agent/make-agent
+                     {:id :analyst
+                      :skills #{:research}
+                      :program {:kind :echo}}))]
+       @(spin (-> (await (agent/result-spin
+                          (agent/hire! team :analyst {:task :inspect})))
+                  :run/value)))"
+  [sci-ctx room-id spindel-ctx]
+  (let [make-roster*   (requiring-resolve 'dvergr.agent.roster/make-roster)
+        make-agent*    (requiring-resolve 'dvergr.agent.roster/make-agent)
+        revise-agent*  (requiring-resolve 'dvergr.agent.roster/revise-agent)
+        lookup-agent*  (requiring-resolve 'dvergr.agent.roster/agent)
+        agent-ref*     (requiring-resolve 'dvergr.agent.roster/agent-ref)
+        agents*        (requiring-resolve 'dvergr.agent.roster/agents)
+        select-agents* (requiring-resolve 'dvergr.agent.roster/select-agents)
+        hire*          (requiring-resolve 'dvergr.agent.program/hire!)
+        observe*       (requiring-resolve 'dvergr.agent.program/observe)
+        cancel*        (requiring-resolve 'dvergr.agent.program/cancel!)
+        run-id*        (requiring-resolve 'dvergr.agent.program/run-id)
+        result-spin*   (requiring-resolve 'dvergr.agent.program/result-spin)
+        room-lookup*   (requiring-resolve 'dvergr.room.registry/lookup)
+        current-room   (fn []
+                         (when room-id
+                           (binding [ec/*execution-context* spindel-ctx]
+                             (room-lookup* room-id))))
+        room!          (fn []
+                         (or (current-room)
+                             (throw (ex-info
+                                     "No current Room — agent execution is room-scoped"
+                                     {:type ::no-current-room
+                                      :room-id room-id}))))
+        hire-fn        (fn [roster agent-ref opts]
+                         (let [room (room!)]
+                           (binding [ec/*execution-context* (:ctx room)]
+                             (hire* room roster agent-ref opts))))
+        observe-fn     (fn [handle-or-id]
+                         (let [room (room!)]
+                           (binding [ec/*execution-context* (:ctx room)]
+                             (observe* room handle-or-id))))
+        cancel-fn      (fn [handle-or-id]
+                         ;; Run cancellation tokens are process-local. Binding
+                         ;; the Room ctx keeps this boundary consistent with
+                         ;; hire/observe and ready for a Spindel-local registry.
+                         (let [room (room!)]
+                           (binding [ec/*execution-context* (:ctx room)]
+                             (cancel* room handle-or-id))))]
+    (sci/add-namespace!
+     sci-ctx 'dvergr.agent
+     (doc/with-docs
+       {'roster       make-roster*
+        'make-agent   make-agent*
+        'revise-agent revise-agent*
+        'lookup       lookup-agent*
+        'ref          agent-ref*
+        'list         agents*
+        'select       select-agents*
+        'hire!        hire-fn
+        'observe      observe-fn
+        'cancel!      cancel-fn
+        'run-id       run-id*
+        'result-spin  result-spin*}
+       '{roster       [([] [opts]) "Create an immutable Roster value. Options may include portable :id, :defaults, :scope, and :metadata data."]
+         make-agent   [([roster spec]) "Return a NEW Roster containing the portable AgentDef `spec`; no agent is started and the input roster is unchanged."]
+         revise-agent [([roster id patch]) "Return a NEW Roster with AgentDef `id` revised and its version incremented."]
+         lookup       [([roster id-or-ref]) "Resolve an AgentDef by keyword id or versioned AgentRef. A stale versioned ref is an error."]
+         ref          [([agent-def]) "Return the stable {:agent/id :agent/version} reference for an AgentDef."]
+         list         [([roster]) "All AgentDefs in a Roster, deterministically ordered by id."]
+         select       [([roster selector]) "Select AgentDefs by :id, :status, :skill/:skills, and exact portable :where data."]
+         hire!        [([roster agent-ref opts]) "Durably admit and start one AgentDef execution in the current Room. Returns an opaque RunHandle; opts requires :task and may include :from and :parent-run."]
+         observe      [([handle-or-run-id]) "Read the current Room's durable Run projection for a RunHandle or UUID."]
+         cancel!      [([handle-or-run-id]) "Request cooperative cancellation of exactly one live Run. Returns true when the Run was found."]
+         run-id       [([handle]) "Return the durable Run UUID represented by a RunHandle."]
+         result-spin  [([handle]) "Return a fresh native Spindel observer Spin for a RunHandle. Use (await (result-spin handle)) inside a workflow Spin."]}))))
 
 (defn add-agents-ns!
   "Expose the agent registry as 'agents namespace in SCI.
@@ -345,4 +435,3 @@
                                      '([])
                                      "Active schedules in this room, as maps carrying :id :kind :next-fire …"
                                      (fn [] (sched-list (room!))))})))
-

@@ -665,10 +665,12 @@
                        "(dvergr.scheduler/create {:agent-id :var :schedule {:every :hour :n 4} :code \"(require 'my.ns)(my.ns/run!)\" :description \"…\"})  (dvergr.scheduler/list)  (dvergr.scheduler/cancel id)"]
    "dvergr.tasks"    ["the shared task ledger — list/accept/complete work items"
                       "(dvergr.tasks/list)   (dvergr.tasks/complete! id)"]
+   "dvergr.agent"    ["program specialized agents as immutable rosters; hire! starts a durable Run with an explicit result Spin"
+                      "(let [team (dvergr.agent/make-agent (dvergr.agent/roster) {:id :analyst :program {:kind :echo}})] (dvergr.agent/hire! team :analyst {:task :inspect}))"]
    "dvergr.agents"   ["directory of agents (read-only): who exists / is online"
                       "(dvergr.agents/list)   (dvergr.agents/online? :var)"]
-   "dvergr.actors"   ["mutate the roster — spawn sub-agents / humans, assign skills"
-                      "(dvergr.actors/spawn-agent! {:prompt \"…\" :budget 0.10})"]
+   "dvergr.actors"   ["durable participant identities — register/retire agents or humans and assign skills"
+                      "(dvergr.actors/spawn-agent! {:id :scribe :name \"Scribe\" :profile-ref \"scribe.md\" :skills #{:writing} :config {}})"]
    "dvergr.skills"   ["reusable skills you can find + dispatch"
                       "(dvergr.skills/find \"draft a brief\")"]
    "clojure.test"    ["how you test IN here — the real clojure.test, run inside clojure_eval; failures print expected/actual to your stdout. This is the ONLY runner available to you, by design: kaocha/lein/clj are not reachable (handing control to a second runtime would let it read+write outside the sandbox), so requiring kaocha fails and the shell has no `clj`. To exercise code that lives in a FILE, load it — (load-string (slurp \"src/foo.clj\")) — then deftest against it here."
@@ -677,7 +679,7 @@
 (def ^:private guide-order
   ["babashka.fs" "babashka.http-client" "babashka.process" "cheshire.core" "clojure.data.xml"
    "datahike.api" "dvergr.room" "dvergr.mail" "dvergr.intake" "dvergr.codec" "git" "env" "llm"
-   "dvergr.scheduler" "dvergr.tasks" "dvergr.agents" "dvergr.actors" "dvergr.skills"
+   "dvergr.scheduler" "dvergr.tasks" "dvergr.agent" "dvergr.agents" "dvergr.actors" "dvergr.skills"
    "clojure.test"])
 
 (defn ns-overview-data
@@ -960,6 +962,10 @@
         (ns-agent/add-skills-ns! sci-ctx sys-conn)
         (ns-agent/add-tasks-ns! sci-ctx sys-conn)))
     (ns-agent/add-agents-ns! sci-ctx)
+    ;; Pure AgentDef/Roster construction plus the explicit, Run-backed `hire!`
+    ;; effect. No roster is kept in a host atom: callers thread the immutable
+    ;; value, and live execution state belongs to the Room's Spindel context.
+    (ns-agent/add-programming-ns! sci-ctx room-id spindel-ctx)
     (ns-data/add-spindel-extras-ns! sci-ctx spindel-ctx)
     (ns-codec/add-codec-namespaces! sci-ctx)   ; cheshire.core / clojure.data.xml / dvergr.codec
     (ns-intake/add-intake-namespaces! sci-ctx)

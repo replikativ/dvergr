@@ -47,15 +47,17 @@ Use the following concepts distinctly:
 | **Thread** | Lightweight topical conversation rooted at a message. It shares the room substrate. |
 | **Task** | Durable intention or delegated responsibility to produce an outcome. |
 | **Workroom** | Scoped child room for complex collaborative work, optionally with a forked substrate. |
-| **Agent execution** | One bounded invocation/attempt by one agent in response to a trigger. |
-| **Workflow run** | One invocation of an explicit reusable workflow. |
-| **Simulation run** | One bounded inference or what-if experiment. |
+| **Run** | Durable identity and shared lifecycle for one causally bounded execution in a Room. |
+| **Agent execution** | A Run performed by one agent in response to a trigger (`:agent-turn` or task-scoped `:agent-task`). |
+| **Workflow run** | A `:workflow` Run: one invocation of an explicit reusable workflow. |
+| **Simulation run** | A `:simulation` Run: one bounded inference or what-if experiment. |
 | **Activity** | An observation about execution: tool action, edit, test, approval, error, or progress. |
 | **Process** | A live execution mechanism and control handle. It is transient unless separately persisted. |
 
 A thread answers “what are we discussing?” A task answers “what outcome is owed?”
-An execution answers “what did this agent do this time?” A run is reserved for an
-explicit program or simulation whose invocation has its own lifecycle.
+An execution answers “what computation happened this time?” Run kinds preserve
+the distinction between agent turns, reusable workflows, and simulations while
+sharing identity, lifecycle, correlation, and control machinery.
 
 ## The semantic graph
 
@@ -478,6 +480,11 @@ Implemented for `:agent-turn` Runs; see [runs.md](runs.md):
 3. Implement provider-neutral `delegate!`, `message!`, `follow-up!`, `interrupt!`,
    `await!`, and `snapshot` behavior using Spindel coordination primitives.
 4. Add permission narrowing and concurrency limits.
+
+The provider-free functional-programming precursor is implemented now: immutable
+AgentDefs/Rosters compose in room SCI, and `hire!` starts a Run-backed Spindel
+computation. See [agent-programs.md](agent-programs.md). Its `:roster/scope` is
+data only until this stage supplies enforceable attenuation/accounting.
 
 ### Stage 4: recursive workrooms
 

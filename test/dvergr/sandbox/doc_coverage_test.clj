@@ -26,7 +26,7 @@
 (def ^:private agent-facing-namespaces
   "dvergr's own vocabulary — the namespaces an agent is pointed at that we
    inject ourselves (so metadata is our job, not `sci/copy-var`'s)."
-  '#{dvergr.room dvergr.agents dvergr.actors dvergr.skills dvergr.tasks
+  '#{dvergr.room dvergr.agent dvergr.agents dvergr.actors dvergr.skills dvergr.tasks
      dvergr.scheduler dvergr.codec dvergr.mail git env llm sandbox})
 
 (defn- undocumented-fns
