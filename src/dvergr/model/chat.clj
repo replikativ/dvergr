@@ -4,6 +4,7 @@
    This is the main entry point for sending chat requests to any provider.
    Uses the provider abstraction to handle provider-specific details."
   (:require [dvergr.model.provider :as p]
+            [dvergr.model.gateway :as gateway]
             [dvergr.model.providers :as providers]
             [dvergr.model.registry :as registry]
             [hato.client :as hc]
@@ -124,14 +125,15 @@
 
 (defn- make-request
   "Make HTTP request with error handling. Returns response or throws."
-  [url headers body]
-  (let [response (hc/request {:method :post
-                              :url url
-                              :headers headers
-                              :body (json/write-value-as-string body)
-                              :as :stream
-                              :http-client (get-http-client)
-                              :throw-exceptions false})]
+  [url headers body credentials]
+  (let [response (gateway/request! {:method :post
+                                    :url url
+                                    :headers headers
+                                    :credentials credentials
+                                    :body (json/write-value-as-string body)
+                                    :as :stream
+                                    :http-client (get-http-client)
+                                    :throw-exceptions false})]
     (if (>= (:status response) 400)
       (throw (wrap-api-error response))
       response)))
@@ -144,10 +146,10 @@
   "Internal implementation of streaming chat with a provider."
   [provider model-def messages opts]
   (let [;; Build request using provider
-        {:keys [url headers body]} (p/build-request provider messages opts)
+        {:keys [url headers body credentials]} (p/build-request provider messages opts)
 
         ;; Make HTTP request
-        response (make-request url headers body)
+        response (make-request url headers body credentials)
         reader (BufferedReader. (io/reader (:body response)))]
 
     {:events (sse-seq reader)
@@ -161,6 +163,7 @@
   (case (p/api-type provider)
     :anthropic-messages (:type event)
     :openai-chat "chunk"  ; OpenAI doesn't have explicit types
+    :openai-responses (:type event)
     "chunk"))
 
 (defn stream-chat
@@ -317,6 +320,11 @@
                        :openai-chat
                        (doseq [choice (:choices event)]
                          (when-let [text (get-in choice [:delta :content])]
+                           (on-text text)))
+
+                       :openai-responses
+                       (when (= "response.output_text.delta" (:type event))
+                         (when-let [text (:delta event)]
                            (on-text text)))
 
                        nil))
