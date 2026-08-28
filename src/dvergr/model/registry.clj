@@ -39,15 +39,12 @@
      :cache-write   — 5-minute prompt-cache write (1.25× input)
      :cache-write-1h— 1-hour prompt-cache write (2× input), where available
 
-   Snapshot date: 2026-08-22. Anthropic prices: claude.com/pricing. OpenAI
-   identities, limits, reasoning levels, and capabilities are checked against
-   <https://developers.openai.com/api/docs/models>; the static OpenAI rate fields
-   below are a <https://models.dev> snapshot. In particular, gpt-5.6-sol
-   intentionally remains at that snapshot's base rate here. Promotional and
-   context/service-tier accounting belongs in the billing change; OpenAI's
-   `GET /models/{model}` response does not contain a rate card.
+   Anthropic prices: claude.com/pricing. OpenAI identities, limits, reasoning
+   levels, capabilities, and rate fields checked 2026-08-28 against OpenAI model
+   documentation and <https://models.dev/api.json>.
+   Base rates exclude long-context, service-tier, and account-specific billing.
 
-   `refresh-from-models-dev!` reads the same third-party source live."
+   `refresh-from-models-dev!` reads models.dev live."
   {;; ── Claude Opus 4.x ──────────────────────────────────────────────
    "claude-opus-4-7"
    {:id "claude-opus-4-7"
@@ -170,7 +167,7 @@
     :reasoning-efforts ["none" "low" "medium" "high" "xhigh" "max"]
     :default-reasoning-effort "medium"
     :instruction-role :developer
-    :pricing {:input 5.0 :output 30.0 :cache-read 0.50 :cache-write 6.25}
+    :pricing {:input 4.0 :output 20.0 :cache-read 0.40 :cache-write 5.0}
     :quirks {:chat-tools-need-effort-none? true}}
 
    "gpt-5.6-terra"

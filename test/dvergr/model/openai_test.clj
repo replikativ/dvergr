@@ -70,9 +70,9 @@
           (is (= efforts (registry/reasoning-efforts id)))
           (is (= default (registry/default-reasoning-effort id)))
           (is (= :developer (registry/instruction-role id))))))
-    (is (= {:input 5.0 :output 30.0 :cache-read 0.50 :cache-write 6.25}
+    (is (= {:input 4.0 :output 20.0 :cache-read 0.40 :cache-write 5.0}
            (registry/pricing-of "gpt-5.6-sol"))
-        "DVG-02 must not silently replace the static models.dev Sol rate")
+        "GPT-5.6 Sol pricing must match the current documented base rate")
     (doseq [id ["gpt-5.6-sol" "gpt-5.6-terra" "gpt-5.6-luna"]]
       (is (true? (registry/get-quirk id :chat-tools-need-effort-none?))))
     (is (nil? (registry/get-quirk "gpt-5.5" :chat-tools-need-effort-none?))
