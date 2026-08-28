@@ -19,19 +19,47 @@ provider libraries automatically.
 
 ## Provider setup
 
-dvergr supports three provider classes out of the box:
+dvergr supports API, OpenAI-compatible, and subscription providers out of the
+box:
 
 ```clojure
 (require '[dvergr.model.providers :as providers])
 
 ;; Reads ANTHROPIC_API_KEY, OPENAI_API_KEY, FIREWORKS_API_KEY from env
-;; and auto-detects the local `claude` CLI if present.
+;; and auto-detects Claude Code plus a logged-in Codex subscription.
 (providers/ensure-initialized!)
 ```
 
 If you have a Claude Code subscription, the `claude-code` provider is
 the easiest way to get started — no API key needed. It uses `claude -p`
 under the hood.
+
+For an OpenAI Codex subscription, install Codex and run `codex login` with
+**Sign in with ChatGPT** once. Dvergr then reads the file-backed login through its trusted
+credential gateway and talks directly to the Codex Responses endpoint; the
+Codex agent harness is not involved. Select provider `:codex-subscription` and
+model `"codex-subscription"` (Sol by default).
+
+Verify the active provider from the REPL before constructing an agent:
+
+```clojure
+(require '[dvergr.model.chat :as chat])
+
+(vec (providers/list-providers))
+;; A file-backed ChatGPT login includes :codex-subscription.
+
+(providers/default-spec)
+;; => {:provider :codex-subscription, :model "codex-subscription"}
+
+(chat/quick-chat "Reply with DVERGR_OK" "codex")
+;; => "DVERGR_OK"
+```
+
+If only `:codex-subscription-cli` appears, use model
+`"codex-subscription-cli"`. This runs a locked-down, ephemeral `codex exec`
+process for each model turn while dvergr still owns history, tools, sandboxing,
+and persistence. See [Provider & model setup](provider-setup.md) for all provider
+paths and troubleshooting.
 
 ## Path A — try the CLI
 
@@ -200,7 +228,9 @@ Add the `:web` alias for the dashboard, e.g. `clojure -M:repl:web` or
 **Agent doesn't reply** — make sure the provider is configured.
 `(providers/ensure-initialized!)` must run before the first
 `llm-agent` is constructed. The `claude-code` provider needs the
-`claude` CLI on PATH.
+`claude` CLI on PATH. The native `codex-subscription` provider needs a
+file-backed ChatGPT login from `codex login`. Keyring-only Codex logins use the
+registered `:codex-subscription-cli` compatibility provider instead.
 
 **"namespace 'dvergr.X' not found"** — check `(:provider config)`
 matches a registered provider. List models with
