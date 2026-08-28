@@ -154,6 +154,13 @@
     :db/doc "Stable parent message id from the discourse envelope. Unlike the
              legacy ref, this survives out-of-order import and replay."}
 
+   {:db/ident :message/thread-root-id
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/index true
+    :db/doc "Stable root message id for the thread projection inside a room.
+             Top-level messages self-root; replies preserve their ancestor root."}
+
    ;; Structured envelope metadata. These are ordinary datoms on the message:
    ;; clients can query/sync them independently and never need to parse an
    ;; opaque EDN string. Actor ids remain keyword values for the same reason as

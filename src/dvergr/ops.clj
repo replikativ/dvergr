@@ -83,11 +83,14 @@
   (in-ctx daemon (room-data (if (record? x) x (rreg/lookup x)))))
 
 (defn- msg-data [m]
-  {:from    (some-> (:from m) name)
-   :to      (some-> (:to m) name)
-   :role    (:role m)
-   :ts      (:ts m)
-   :content (:content m)})
+  {:id             (some-> (:id m) str)
+   :from           (some-> (:from m) name)
+   :to             (some-> (:to m) name)
+   :role           (:role m)
+   :ts             (:ts m)
+   :in-reply-to    (some-> (:in-reply-to m) str)
+   :thread-root-id (some-> (d/thread-root-id m) str)
+   :content        (:content m)})
 
 ;; ============================================================================
 ;; Reusable malli arg fragments — referenced from the specification below.

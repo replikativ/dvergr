@@ -31,7 +31,8 @@
          vec))
 
   (-store-message! [_ room-id msg]
-    (let [msg-id (:id msg)]
+    (let [msg    (store/normalize-message-thread msg)
+          msg-id (:id msg)]
       (swap! state update-in [:messages room-id]
              (fn [existing]
                (let [v (or existing [])]
@@ -43,14 +44,20 @@
       (swap! state update-in [:rooms room-id]
              (fn [m] (when m (assoc m :updated-at (java.util.Date.)))))))
 
-  (-list-messages [_ room-id {:keys [limit since]}]
+  (-message-thread-root [_ room-id message-id]
+    (some #(when (= message-id (:id %)) (:thread-root-id %))
+          (get-in @state [:messages room-id] [])))
+
+  (-list-messages [_ room-id {:keys [limit since thread-root-id]}]
     (let [all (get-in @state [:messages room-id] [])
-          filtered (if since
+          filtered (cond->> all
+                     since
                      (filter #(let [t (:ts %)]
                                 (and t (> (.getTime ^java.util.Date (java.util.Date. ^long t))
-                                          (.getTime ^java.util.Date since))))
-                             all)
-                     all)
+                                          (.getTime ^java.util.Date since)))))
+
+                     thread-root-id
+                     (filter #(= thread-root-id (:thread-root-id %))))
           n (or limit (count filtered))]
       (vec (take-last n filtered)))))
 

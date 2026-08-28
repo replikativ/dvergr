@@ -218,8 +218,8 @@
 (defn- reply-step [text]
   (fn [chat-ctx _] (cc/add-message! chat-ctx {:role :assistant :content text}) :complete))
 
-(deftest steer-mid-turn
-  (testing "a content message arriving DURING a turn cancels the in-flight call,
+(deftest same-thread-message-steers-mid-turn
+  (testing "same-thread content arriving DURING a turn cancels the in-flight call,
             folds in, and the next call answers — nothing lost, nothing stale"
     (let [r        (d/room :steer-room)
           entered  (promise)
@@ -234,11 +234,89 @@
       ;; ask drives the triggering message and awaits the FINAL reply
       (let [reply-f (future (await-spin r #(d/ask % :steer-worker {:content "go"}) 10000))]
         (is (true? (deref entered 3000 ::timeout)) "call 1 in flight")
-        ;; steer while call 1 runs
-        (d/post! r (d/message :tester :steer-worker "actually, do B instead"))
+        ;; Reply inside the active topic: this is steering, not a new job.
+        (let [trigger (some #(when (= "go" (:content %)) %) (d/log r))]
+          (is trigger "the triggering message is visible in the room log")
+          (d/post! r (d/reply :tester :steer-worker
+                              "actually, do B instead" trigger)))
         (let [reply @reply-f]
           (is (= "steered answer" (:content reply)))
           (is (= 2 (count @calls)) "call 1 cancelled, call 2 answered"))))))
+
+(deftest different-thread-messages-queue-globally-fifo
+  (testing "multiple topics do not cancel the active execution or reorder at hand-back"
+    (let [r       (d/room :thread-queue-room)
+          entered (promise)
+          gate    (promise)
+          steps   (atom [(fn [chat-ctx opts]
+                           (deliver entered true)
+                           ((gated-reply-step gate "first answer") chat-ctx opts))
+                         (reply-step "second answer")
+                         (reply-step "third answer")
+                         (reply-step "fourth answer")])
+          calls   (atom [])]
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent {:id :thread-worker
+                                  :spec {:provider :mock :model "mock"}
+                                  :budget {:dollars 10.0}
+                                  :run-turn-fn (make-queued-turn-fn steps calls)})))
+      (let [first-reply-f
+            (future (await-spin r #(d/ask % :thread-worker {:content "topic A"}) 10000))]
+        (is (true? (deref entered 3000 ::timeout)) "topic A call is in flight")
+        ;; Top-level Messages self-root, so each is a distinct thread.
+        (d/post! r (d/message :tester :thread-worker "topic B"))
+        (d/post! r (d/message :tester :thread-worker "topic C"))
+        (Thread/sleep 150)
+        (is (= 1 (count @calls)) "other topics did not preempt topic A")
+        (deliver gate true)
+        ;; Arrive at the completion/hand-back boundary. Even if this reaches the
+        ;; live mailbox before the outer participant resumes, it is newer than B
+        ;; and C and therefore must run after both.
+        (d/post! r (d/message :tester :thread-worker "topic D"))
+        (is (= "first answer" (:content @first-reply-f)))
+        (let [deadline (+ (System/currentTimeMillis) 5000)]
+          (while (and (< (System/currentTimeMillis) deadline)
+                      (< (count (filter #(= :thread-worker (:from %)) (d/log r))) 4))
+            (Thread/sleep 10)))
+        (is (= 4 (count @calls)) "all queued topics start after topic A")
+        (let [responses (filter #(= :thread-worker (:from %)) (d/log r))]
+          (is (= ["first answer" "second answer" "third answer" "fourth answer"]
+                 (mapv :content responses))))))))
+
+(deftest attention-policy-can-queue-same-thread-peer-chatter
+  (testing "thread membership does not permanently imply interruption"
+    (let [r       (d/room :peer-attention-room)
+          entered (promise)
+          gate    (promise)
+          steps   (atom [(fn [chat-ctx opts]
+                           (deliver entered true)
+                           ((gated-reply-step gate "primary answer") chat-ctx opts))
+                         (reply-step "peer follow-up answer")])
+          calls   (atom [])
+          policy  (fn [{:keys [active-message incoming-message] :as context}]
+                    (if (and (d/same-thread? active-message incoming-message)
+                             (= :peer (:from incoming-message)))
+                      :queue
+                      (llm/default-attention-policy context)))]
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent {:id :policy-worker
+                                  :spec {:provider :mock :model "mock"}
+                                  :budget {:dollars 10.0}
+                                  :attention-policy policy
+                                  :run-turn-fn (make-queued-turn-fn steps calls)})))
+      (let [reply-f (future (await-spin r #(d/ask % :policy-worker {:content "root"}) 10000))]
+        (is (true? (deref entered 3000 ::timeout)) "root call is in flight")
+        (let [trigger (some #(when (= "root" (:content %)) %) (d/log r))]
+          (d/post! r (d/reply :peer :policy-worker "peer note" trigger)))
+        (Thread/sleep 150)
+        (is (= 1 (count @calls)) "peer note did not preempt the root call")
+        (deliver gate true)
+        (is (= "primary answer" (:content @reply-f)))
+        (let [deadline (+ (System/currentTimeMillis) 3000)]
+          (while (and (< (System/currentTimeMillis) deadline)
+                      (< (count @calls) 2))
+            (Thread/sleep 10)))
+        (is (= 2 (count @calls)) "peer note became a later execution")))))
 
 (deftest cancel-directive-mid-turn
   (testing ":directive/cancel PREEMPTS a running turn (it used to queue behind it)"

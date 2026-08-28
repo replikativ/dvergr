@@ -76,7 +76,8 @@
   "Convert a discourse.Message (or message-shaped map) to a Datahike
    message entity tied to the given chat-id."
   [chat-id msg]
-  (let [content      (str (:content msg))
+  (let [msg          (store/normalize-message-thread msg)
+        content      (str (:content msg))
         msg-id       (:id msg)
         ts           (some-> (:ts msg) (java.util.Date.))
         metadata     (store/validate-message-metadata! (:metadata msg))
@@ -96,6 +97,7 @@
       (keyword? (:from msg)) (assoc :message/from (:from msg))
       (keyword? (:to msg)) (assoc :message/to (:to msg))
       (uuid? (:in-reply-to msg)) (assoc :message/in-reply-to (:in-reply-to msg))
+      (uuid? (:thread-root-id msg)) (assoc :message/thread-root-id (:thread-root-id msg))
       (:source-username metadata) (assoc :message/source-username (:source-username metadata))
       (:source-user-id  metadata) (assoc :message/source-user-id  (long (:source-user-id metadata)))
       (seq (:audience metadata)) (assoc :message/audience (set (:audience metadata)))
@@ -133,6 +135,32 @@
       ;; Interleaved-thinking trace from a reasoning-model reply, so it survives
       ;; rehydration and is fed back to the model (see room-context seeding).
       (seq (:reasoning metadata))  (assoc :message/reasoning (:reasoning metadata)))))
+
+(def ^:private message-pull-pattern
+  '[:message/id :message/role :message/content
+    :message/created-at :message/source-user
+    :message/source-username :message/source-user-id
+    :message/from :message/to :message/in-reply-to
+    :message/thread-root-id
+    :message/reasoning
+    :message/audience :message/mention-handles
+    :message/metadata-kind :message/context-from
+    :message/source :message/schedule-id
+    :message/attachment-store-ref
+    :message/attachment-blob-id
+    :message/attachment-node-id
+    :message/attachment-mime
+    :message/attachment-name
+    :message/attachment-size
+    :message/provenance-mode
+    :message/provenance-source
+    :message/notification-type
+    :message/notification-agent
+    :message/notification-task
+    :message/notification-elapsed
+    {:message/tool-uses
+     [:tool-use/id :tool-use/name
+      {:tool-use/input [*]}]}])
 
 ;; =============================================================================
 ;; Store impl
@@ -208,37 +236,55 @@
                    :data {:room-id room-id :msg-id (:id msg)}}
                   "message for unknown room — not persisted (dropped)"))))
 
-  (-list-messages [_ room-id {:keys [limit since]}]
+  (-message-thread-root [_ room-id message-id]
+    (let [slug (store/room-id->slug room-id)]
+      (when-let [room (room-by-slug conn slug)]
+        (let [message (dh/q '[:find (pull ?m [:message/id :message/in-reply-to
+                                              :message/thread-root-id]) .
+                              :in $ ?cid ?mid
+                              :where
+                              [?c :chat/id ?cid]
+                              [?m :message/chat ?c]
+                              [?m :message/id ?mid]]
+                            @conn (:chat/id room) message-id)]
+          ;; Legacy rows predate the typed root. Immediate parent is the best
+          ;; bounded compatibility root; new nested replies always have the
+          ;; explicit ancestor root.
+          (or (:message/thread-root-id message)
+              (:message/in-reply-to message)
+              (:message/id message))))))
+
+  (-list-messages [_ room-id {:keys [limit since thread-root-id]}]
     (let [slug (store/room-id->slug room-id)]
       (when-let [ent (room-by-slug conn slug)]
         (let [chat-id (:chat/id ent)
-              base    (dh/q '[:find [(pull ?m [:message/id :message/role :message/content
-                                               :message/created-at :message/source-user
-                                               :message/source-username :message/source-user-id
-                                               :message/from :message/to :message/in-reply-to
-                                               :message/reasoning
-                                               :message/audience :message/mention-handles
-                                               :message/metadata-kind :message/context-from
-                                               :message/source :message/schedule-id
-                                               :message/attachment-store-ref
-                                               :message/attachment-blob-id
-                                               :message/attachment-node-id
-                                               :message/attachment-mime
-                                               :message/attachment-name
-                                               :message/attachment-size
-                                               :message/provenance-mode
-                                               :message/provenance-source
-                                               :message/notification-type
-                                               :message/notification-agent
-                                               :message/notification-task
-                                               :message/notification-elapsed
-                                               {:message/tool-uses
-                                                [:tool-use/id :tool-use/name
-                                                 {:tool-use/input [*]}]}]) ...]
-                              :in $ ?cid
-                              :where [?c :chat/id ?cid]
-                              [?m :message/chat ?c]]
-                            @conn chat-id)
+              ;; Resolve matching entity ids in Datalog before pulling message
+              ;; bodies. In particular, the indexed thread root now bounds the
+              ;; amount of data crossing the store boundary instead of loading
+              ;; the whole Room and filtering it in Clojure. The two legacy
+              ;; branches retain compatibility only for rows written before the
+              ;; typed root existed.
+              message-ids
+              (if thread-root-id
+                (dh/q '[:find [?m ...]
+                        :in $ ?cid ?root
+                        :where
+                        [?c :chat/id ?cid]
+                        [?m :message/chat ?c]
+                        (or-join [?m ?root]
+                                 [?m :message/thread-root-id ?root]
+                                 (and [?m :message/id ?root]
+                                      (not [?m :message/thread-root-id _]))
+                                 (and [?m :message/in-reply-to ?root]
+                                      (not [?m :message/thread-root-id _])))]
+                      @conn chat-id thread-root-id)
+                (dh/q '[:find [?m ...]
+                        :in $ ?cid
+                        :where
+                        [?c :chat/id ?cid]
+                        [?m :message/chat ?c]]
+                      @conn chat-id))
+              base    (dh/pull-many @conn message-pull-pattern message-ids)
               sorted  (sort-by #(.getTime (or (:message/created-at %)
                                               (java.util.Date. 0))) base)
               filtered (if since
@@ -307,24 +353,27 @@
                                    (assoc :tool-uses (:message/tool-uses m))
                                    (seq (:message/reasoning m))
                                    (assoc :reasoning (:message/reasoning m)))]
-                    (cond-> {:id        (:message/id m)
-                             :from      (or (:message/from m)
-                                            (some-> (:message/source-user m) keyword))
-                             :to        (:message/to m)
-                             :content   (:message/content m)
-                             :ts        (some-> (:message/created-at m) .getTime)
-                             :role      (:message/role m)
-                             :metadata  metadata}
-                      (:message/in-reply-to m)
-                      (assoc :in-reply-to (:message/in-reply-to m))
+                    (store/normalize-message-thread
+                     (cond-> {:id        (:message/id m)
+                              :from      (or (:message/from m)
+                                             (some-> (:message/source-user m) keyword))
+                              :to        (:message/to m)
+                              :content   (:message/content m)
+                              :ts        (some-> (:message/created-at m) .getTime)
+                              :role      (:message/role m)
+                              :metadata  metadata}
+                       (:message/in-reply-to m)
+                       (assoc :in-reply-to (:message/in-reply-to m))
+                       (:message/thread-root-id m)
+                       (assoc :thread-root-id (:message/thread-root-id m))
                     ;; Surface structured tool-uses so rich frontends render an
                     ;; agent's tool activity inline (same as the chat-ctx view).
-                      (seq (:message/tool-uses m))
-                      (assoc :tool-uses (:message/tool-uses m))
+                       (seq (:message/tool-uses m))
+                       (assoc :tool-uses (:message/tool-uses m))
                     ;; Surface the interleaved-thinking trace so seeding can feed
                     ;; it back to reasoning models (MiniMax M2 / Kimi / DeepSeek).
-                      (seq (:message/reasoning m))
-                      (assoc :reasoning (:message/reasoning m)))))
+                       (seq (:message/reasoning m))
+                       (assoc :reasoning (:message/reasoning m))))))
                 (vec (take-last (or limit 100) filtered))))))))
 
 (defn make

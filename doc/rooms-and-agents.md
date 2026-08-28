@@ -51,6 +51,45 @@ broadcast subscriptions and starts their process. Leaving (`leave`) just
 unsubscribes them. Persistent rooms also mirror every message into a store, so
 history survives restarts.
 
+## Threads: topical projections inside a Room
+
+A Room still owns one chronological message log, participant set, policy, and
+substrate. A **Thread** is a lightweight topical projection over that log, not a
+child Room or database. Every message carries two independent causal fields:
+
+- `:in-reply-to` names its immediate parent;
+- `:thread-root-id` names the stable root of the topic.
+
+Top-level messages self-root. Use `reply` for nested replies so the root is
+preserved automatically:
+
+```clojure
+(require '[dvergr.core :as d])
+
+(def room (d/room :planning))
+(def root (d/message :you :researcher "Compare the pricing options"))
+(d/post! room root)
+
+(def follow-up
+  (d/reply :you :researcher "Include self-hosting" root))
+(d/post! room follow-up)
+
+;; The thread is queried from the Room; there is no Thread registry.
+(d/messages room {:thread-root-id (:id root)})
+```
+
+Thread identity also informs the attention boundary for an LLM agent. The default
+policy lets a direct same-thread message steer its active execution, while a
+direct message rooted elsewhere queues a separate execution without cancellation
+or topic mixing. `llm-agent` accepts an `:attention-policy` returning `:steer`,
+`:queue`, or `:observe`, so deployments can distinguish direct human correction
+from peer-agent chatter using their authoritative actor and addressing data.
+Tool activity and telemetry remain non-waking observations.
+
+When a topic needs separate participants, permissions, budget, or a branched
+workspace, promote the work to a child **Workroom**. That is an actual Room; an
+ordinary Thread deliberately is not.
+
 ## Forks: speculative work, then merge or discard
 
 A room can be **forked** copy-on-write for hypothetical or risky work:
@@ -70,6 +109,7 @@ reply, and discards, all without disturbing the real conversation.
 
 ## In one breath
 
-Rooms are venues; participants are reactive processes; the bus routes between
-them; addressing is "one agent = DM, otherwise broadcast"; and forking gives any
-room value semantics so speculation is free and reversible.
+Rooms are venues; Threads are topical projections; participants are reactive
+processes; the bus routes between them; addressing is "one agent = DM, otherwise
+broadcast"; and forking gives any Room value semantics so speculation is free
+and reversible.

@@ -45,7 +45,12 @@
 ;; Records
 ;; ============================================================================
 
-(defrecord Message     [id from to content ts in-reply-to metadata])
+(defrecord Message
+  ;; `in-reply-to` is the immediate conversational parent. `thread-root-id` is
+  ;; the stable root of the topic projection inside the Room. Keeping both is
+  ;; what lets clients render either a reply tree or a flat thread without
+  ;; recursively loading parents.
+           [id from to content ts in-reply-to thread-root-id metadata])
 
 (defrecord Participant
   ;; on-message :: (fn [participant envelope] -> Spin[ReplySpec | nil])
@@ -55,10 +60,14 @@
   ;; inbox-sub  :: dvergr.runtime.bus.Subscription on [:to id] (the default channel)
   ;; inbox-mbx  :: the merge mailbox the participant-spin awaits (all subs
   ;;               pump into it)
+  ;; deferred-inbox :: atom of PersistentQueue — messages consumed by an active
+  ;;                   handler but deferred to later executions. It has priority
+  ;;                   over inbox-mbx so hand-back cannot reorder older work
+  ;;                   behind a concurrently arriving message.
   ;; subs       :: atom of {topic → Subscription} for dynamic extra channels
   ;; factory    :: (fn [new-ctx] -> Participant) — for cloning into a fork
   ;; process    :: the spindel spin driving this participant (set by `join`)
-           [id inbox-sub inbox-mbx subs on-message factory process])
+           [id inbox-sub inbox-mbx deferred-inbox subs on-message factory process])
 
 (defrecord Room
   ;; id            : keyword — stable identity (e.g. :daemon, :boardroom)
@@ -90,16 +99,48 @@
                  "}")))
 
 (defn message
-  "Construct a Message. Auto-fills id and ts."
-  ([from to content] (message from to content nil nil))
-  ([from to content in-reply-to] (message from to content in-reply-to nil))
+  "Construct a Message. Auto-fills id, timestamp, and thread root.
+
+   A top-level message is its own thread root. The legacy arities accepting only
+   an `in-reply-to` UUID conservatively treat that parent as the root; callers
+   constructing nested replies should use `reply` or the explicit six-argument
+   arity so the ancestor root is preserved."
+  ([from to content] (message from to content nil nil nil))
+  ([from to content in-reply-to]
+   (message from to content in-reply-to in-reply-to nil))
   ([from to content in-reply-to metadata]
-   (->Message (random-uuid) from to content (System/currentTimeMillis)
-              in-reply-to metadata)))
+   (message from to content in-reply-to in-reply-to metadata))
+  ([from to content in-reply-to thread-root-id metadata]
+   (let [id (random-uuid)]
+     (->Message id from to content (System/currentTimeMillis)
+                in-reply-to (or thread-root-id id) metadata))))
+
+(defn thread-root-id
+  "Return the stable topical root of `msg`, tolerating legacy envelopes.
+
+   New Message values always carry `:thread-root-id`. The fallbacks keep old
+   persisted/imported envelopes readable while their stores are migrated."
+  [msg]
+  (or (:thread-root-id msg) (:in-reply-to msg) (:id msg)))
+
+(defn same-thread?
+  "True when two message envelopes belong to the same Room thread."
+  [a b]
+  (let [aroot (thread-root-id a)
+        broot (thread-root-id b)]
+    (and (some? aroot) (= aroot broot))))
+
+(defn reply
+  "Construct a reply to `parent`, preserving its root and immediate parent id."
+  ([from to content parent] (reply from to content parent nil))
+  ([from to content parent metadata]
+   (message from to content (:id parent) (thread-root-id parent) metadata)))
 
 ;; ============================================================================
 ;; Delivery — backed by dvergr.runtime.bus
 ;; ============================================================================
+
+(declare conversation-id)
 
 (defn- route-and-log!
   "Post msg to the room's bus. The bus's mult fans the message out to
@@ -109,7 +150,25 @@
    capability subscriptions on `[:type :user/message]` route them. Plain
    maps pass through unchanged so callers can tag freely."
   [room msg]
-  (let [msg' (if (and (instance? Message msg) (nil? (:type msg)))
+  (let [;; Thread membership is authoritative at the Room boundary. Clients need
+        ;; only name the immediate parent; if it is available in the live log or
+        ;; durable store, derive its ancestor root and override any stale/client-
+        ;; supplied value. Out-of-order import may retain an explicit root until
+        ;; the parent arrives.
+        msg (if (instance? Message msg)
+              (if-let [parent-id (:in-reply-to msg)]
+                (let [live-parent (some #(when (= parent-id (:id %)) %)
+                                        (rseq (vec (bus/log (:bus room)))))
+                      root (or (some-> live-parent thread-root-id)
+                               (when-let [store (:store room)]
+                                 (rstore/-message-thread-root
+                                  store (conversation-id room) parent-id)))]
+                  (if root
+                    (assoc msg :thread-root-id root)
+                    msg))
+                (assoc msg :thread-root-id (:id msg)))
+              msg)
+        msg' (if (and (instance? Message msg) (nil? (:type msg)))
                (assoc msg :type :user/message)
                msg)]
     (bus/post! (:bus room) msg')
@@ -240,7 +299,8 @@
                   when the room's bus is in scope; until then it is nil."
   [{:keys [id on-message factory ctx]}]
   (let [_ctx (or ctx ec/*execution-context*)]
-    (->Participant id nil nil (atom {}) on-message factory nil)))
+    (->Participant id nil nil (atom clojure.lang.PersistentQueue/EMPTY)
+                   (atom {}) on-message factory nil)))
 
 ;; ============================================================================
 ;; Built-in participant helpers
@@ -278,14 +338,18 @@
 ;; ============================================================================
 
 (defn- emit-reply!
-  "Route a reply-spec from `p` into `room`. `in-reply-to` is the message id
-   when the envelope was a Message, nil otherwise (tick / source events)."
-  [room p reply-spec in-reply-to]
+  "Route a reply-spec from `p` into `room`, preserving the triggering Message's
+   immediate-parent and thread-root identities. Non-message events start a new
+   thread if they produce conversational output."
+  [room p reply-spec parent-message]
   (when reply-spec
     (route-and-log!
      room
-     (message (:id p) (:to reply-spec) (:content reply-spec)
-              in-reply-to (:metadata reply-spec)))))
+     (if parent-message
+       (reply (:id p) (:to reply-spec) (:content reply-spec)
+              parent-message (:metadata reply-spec))
+       (message (:id p) (:to reply-spec) (:content reply-spec)
+                nil (:metadata reply-spec))))))
 
 (defn- drain-into!
   "Spawn a spin that drains `(:aseq sub)` and posts each item into `mbx`."
@@ -297,6 +361,29 @@
         (let [[m rest-s] r]
           (sync/post! mbx m)
           (recur rest-s)))))))
+
+(defn defer-inbox!
+  "Append `msg` to a participant's deferred FIFO.
+
+   Active handlers use this when they must consume the live mailbox to arbitrate
+   control messages but discover ordinary work that belongs to a later
+   execution. The participant loop always drains this FIFO before awaiting the
+   live mailbox, preserving global arrival order across the hand-back boundary."
+  [participant msg]
+  (swap! (:deferred-inbox participant) conj msg)
+  nil)
+
+(defn take-deferred-inbox!
+  "Atomically remove and return the oldest deferred message, or nil."
+  [participant]
+  (let [queue-atom (:deferred-inbox participant)]
+    (loop []
+      (let [queue @queue-atom]
+        (when (seq queue)
+          (let [msg (peek queue)]
+            (if (compare-and-set! queue-atom queue (pop queue))
+              msg
+              (recur))))))))
 
 (defn- participant-spin
   "Continuous-time loop: drain inbox events → run on-message → emit reply.
@@ -324,12 +411,14 @@
   (sp/spin
    (loop [seen  #{}
           order clojure.lang.PersistentQueue/EMPTY]
-     (let [env (sp/await mbx)
+     (let [env (if-let [deferred (take-deferred-inbox! p)]
+                 deferred
+                 (sp/await mbx))
            id  (:id env)]
        (if (and id (contains? seen id))
          ;; already handled via another matching subscription — skip the duplicate
          (recur seen order)
-         (let [in-reply-to (when (instance? Message env) (:id env))
+         (let [parent-message (when (instance? Message env) env)
                ;; Await the on-message spin DIRECTLY, with the error isolation
                ;; inline in THIS body. The previous shape awaited an anonymous
                ;; wrapper spin that awaited the handler — the documented
@@ -346,7 +435,7 @@
                               :data {:participant (:id p) :error (.getMessage t)}}
                              "participant on-message error — turn dropped, participant continues")
                    nil))]
-           (try (emit-reply! room p reply-spec in-reply-to)
+           (try (emit-reply! room p reply-spec parent-message)
                 (catch Throwable t
                   (tel/log! {:level :error :id ::emit-reply-error
                              :data {:participant (:id p) :error (.getMessage t)}}
@@ -398,7 +487,8 @@
 
    Opts:
      :limit  — cap result size (default 100)
-     :since  — only messages after this java.util.Date"
+     :since  — only messages after this java.util.Date
+     :thread-root-id — restrict to one topical projection inside the Room"
   ([room] (messages room {}))
   ([room {:keys [limit since] :as opts}]
    (if-let [store (:store room)]
@@ -409,6 +499,9 @@
                                    #(when-let [t (:ts %)]
                                       (> (.getTime ^java.util.Date (java.util.Date. ^long t))
                                          (.getTime ^java.util.Date since)))
+                                   identity))
+                         (filter (if-let [root (:thread-root-id opts)]
+                                   #(= root (thread-root-id %))
                                    identity)))]
        (vec (take-last (or limit 100) filtered))))))
 

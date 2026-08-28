@@ -23,6 +23,33 @@
   (let [[_conn st] (mem-store)]
     (contract/assert-message-envelope! st :envelope-datahike)))
 
+(deftest thread-filter-bounds-the-datahike-pull
+  (testing "the indexed root predicate runs before message bodies are pulled"
+    (let [[_conn st] (mem-store)
+          room-id :bounded-thread-query
+          root-id (random-uuid)
+          child-id (random-uuid)
+          other-id (random-uuid)
+          pulled-entity-ids (atom nil)
+          original-pull-many dh/pull-many]
+      (store/-store-room! st room-id {:slug (name room-id) :title "T"})
+      (doseq [message [{:id root-id :from :alice :content "root"
+                        :thread-root-id root-id}
+                       {:id child-id :from :bob :content "reply"
+                        :in-reply-to root-id :thread-root-id root-id}
+                       {:id other-id :from :alice :content "other"
+                        :thread-root-id other-id}]]
+        (store/-store-message! st room-id message))
+      (with-redefs [dh/pull-many
+                    (fn [db pattern entity-ids]
+                      (reset! pulled-entity-ids (vec entity-ids))
+                      (original-pull-many db pattern entity-ids))]
+        (is (= #{root-id child-id}
+               (set (map :id (store/-list-messages
+                              st room-id {:thread-root-id root-id}))))))
+      (is (= 2 (count @pulled-entity-ids))
+          "the unrelated topic never crosses the pull boundary"))))
+
 (deftest metadata-is-typed-and-queryable
   (testing "durable metadata is datoms, with UUID blobs marked as store refs"
     (let [[conn st] (mem-store)
