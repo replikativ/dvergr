@@ -566,6 +566,33 @@
       (finally
         (d/close-room! room)))))
 
+(deftest nested-structured-race-settles-the-losing-run
+  (let [room (test-room :program-nested-race)
+        team (-> (roster/make-roster)
+                 (roster/make-agent
+                  {:id :fast
+                   :program {:kind :scripted :delay-ms 10 :reply :fast}})
+                 (roster/make-agent
+                  {:id :slow
+                   :program {:kind :scripted :delay-ms 5000 :reply :slow}}))]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [fast (program/hire! room team :fast {:task :solve})
+              slow (program/hire! room team :slow {:task :solve})]
+          (is (= :fast
+                 (:run/value
+                  @(sp/spin
+                    (sp/await
+                     (comb/race (program/owned-result-spin fast)
+                                (program/owned-result-spin slow)))))))
+          (is (wait-until #(= :cancelled
+                              (:run/status (program/observe room slow)))
+                          1000))
+          (is (= :completed (:run/status (program/observe room fast))))
+          (is (empty? (run/active-runs (:id room))))))
+      (finally
+        (d/close-room! room)))))
+
 (deftest passive-result-observers-do-not-own-the-shared-run
   (let [room (test-room :program-passive-observers)
         team (roster/make-agent

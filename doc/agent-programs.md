@@ -159,11 +159,13 @@ levels:
    provider.
 2. Stub-model interpreter tests exercise prompt/context assembly, exact tool
    schemas, model-step continuation, activity correlation, budgets, and cleanup.
-3. Opt-in model benchmarks give the same room-REPL tasks to Codex, Claude Code,
-   API models, and local models. They record whether generated SCI compiles,
-   whether the causal result/effects are correct, leaked Runs/resources, model
-   steps, wall time, task version, and model. Token/cost receipts and a stable
-   hash of the assembled system prompt remain benchmark-reporting follow-ups.
+3. Opt-in model environments give the same room-REPL tasks to Codex, Claude
+   Code, API models, and local models. A trusted host verifier scores the exact
+   result plus durable Room/Run facts; model prose is never the reward source.
+   Reports retain individual checks, binary reward, generated SCI, leaked
+   Runs/resources, model steps, wall time, task version, and model. Token/cost
+   receipts and a stable hash of the assembled system prompt remain reporting
+   follow-ups.
 
 The initial model-facing task set should include pure roster specialization,
 parallel research/review and reduction, race-with-loser-cancellation, explicit
@@ -172,15 +174,19 @@ durable Room. Later attention combinators add queue/observe/steer/switch tests.
 Passing only one model is not sufficient evidence that the programming surface
 is clear.
 
-The first opt-in comprehension probe is `dvergr.agent.program-bench/run-v1!`
-on the `:dev` classpath. It runs through the production prompt, provider, tool,
-SCI, Spindel, and Run paths while retaining every generated `clojure_eval` call
-in its report:
+The first opt-in environments live in `dvergr.agent.program-bench` on the
+`:dev` classpath. They run through the production prompt, provider, tool, SCI,
+Spindel, and Run paths while retaining every generated `clojure_eval` call in
+their reports:
 
 ```clojure
 (require '[dvergr.agent.program-bench :as bench])
 (bench/run-v1! :codex-subscription "codex-subscription-sol")
-(bench/run-v1! :claude-code "claude-code-sonnet")
+(bench/run-race-v1! :claude-code "claude-code-sonnet")
+
+;; The generic entry point makes the task/version explicit.
+(bench/run-environment! :programming/race-v1
+                        :codex-subscription "codex-subscription-sol")
 ```
 
 It is an explicit REPL benchmark rather than a CI test because it is
@@ -191,7 +197,24 @@ Code Sonnet each discovered the API, created and joined two child Runs, and
 returned the expected value with two `clojure_eval` calls. Earlier attempts
 exposed two real harness defects: the native interpreter omitted the shared
 sandbox prelude, and Claude Code's own native tools shadowed Dvergr's supplied
-tool protocol.
+tool protocol. The first race probe exposed a missing `:delay-ms` contract in
+progressive help and a deeper cancellation bug: a cancelled nested graph could
+also cancel/reap its own durable settlement Spin. Settlement now runs as a
+detached process-local watcher after executor and native-supervisor quiescence,
+and the exact SCI program is covered provider-free.
+
+On 2026-08-28, after that correction, Codex Sol solved
+`:programming/race-v1` in three model exchanges and Claude Code in five. Every
+verifier check passed: exact `:fast` result, completed winner, durably cancelled
+loser, structural parentage, completed root, and zero active Runs.
+
+This is only the seed of a training environment, not yet a reinforcement
+learning system. The intended general contract is: initialize a forked Room and
+resource authority; run an AgentDef/workflow; verify durable effects and
+artifacts with trusted code; settle a reward/resource vector; retain the trace
+for replay, comparison, or learning. A durable environment definition should
+eventually reference versioned verifier code stored with the room repository,
+while Kontor receipts supply resource-aware objectives and constraints.
 
 An explicit `:parent-run` on `hire!` records structural spawning. Causal
 succession remains derivable through the new Run's trigger message and that

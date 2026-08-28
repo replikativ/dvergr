@@ -622,6 +622,13 @@
               (recur (ex-cause error)))))
       (run/cancel-requested? run-id)))
 
+(defn- graph-cancelled-error? [t]
+  (loop [error t]
+    (when error
+      (or (= spin-core/spin-cancelled (:type (ex-data error)))
+          (= "Spin cancelled" (ex-message error))
+          (recur (ex-cause error))))))
+
 (defn- publish-result-and-release-spin
   "Retry terminal persistence without losing the computed result. The Run keeps
    its live execution lease and its completion remains unresolved until the
@@ -652,23 +659,65 @@
          :else nil)))
    result))
 
-(defn- settle-after-supervisor!
-  "Settle a graph-cancelled execution only after the stable supervisor reports
-   every native worker and owned cleanup quiescent."
-  [room id supervisor completion result]
+(defn- publish-result-and-release!
+  "Blocking counterpart for the process-local settlement watcher.
+
+   This must not construct a Spin: it runs specifically after its owning graph
+   was cancelled, and re-entering the same execution context through another
+   graph node can inherit/reuse cancellation bookkeeping. The watcher already
+   runs off the drain thread, so a short blocking durability backoff is safe."
+  [id completion result finish-opts]
+  (loop []
+    (let [retained (try
+                     (run/retain-finished! id (:run/status result) finish-opts)
+                     (catch Throwable t t))]
+      (cond
+        (instance? Throwable retained)
+        (do
+          (Thread/sleep 25)
+          (recur))
+
+        retained
+        (try
+          (completion result)
+          (finally
+            (run/release-finished! id)))
+
+        :else nil)))
+  result)
+
+(defn- settle-external!
+  "Settle from a process-local watcher only after the orchestration Spin has a
+   cached terminal result and the stable supervisor reports every native worker
+   and owned cleanup quiescent."
+  [room id supervisor execution completion result]
   (future
-    (await-supervisor! supervisor)
-    (let [cleanup-error (:cleanup-error @(:state supervisor))
-          result (if cleanup-error
-                   {:run/id id :run/status :failed
-                    :run/error (ex-message cleanup-error)}
-                   result)
-          finish-opts (if (= :cancelled (:run/status result))
-                        {:reason :structured-cancellation}
-                        {:reason (if cleanup-error :cleanup-error :execution-error)
-                         :error (or cleanup-error (:run/error result))})]
-      (binding [ec/*execution-context* (:ctx room)]
-        @(publish-result-and-release-spin id completion result finish-opts)))))
+    ;; `future` conveys dynamic bindings. A cancellation hook normally launches
+    ;; this watcher from the losing observer Spin, so retaining its *spin-id*
+    ;; would make the supposedly external durability path a child of the very
+    ;; graph being reaped. Keep the Room memory context but detach graph identity.
+    (binding [ec/*execution-context* (:ctx room)
+              ec/*spin-id* nil]
+      ;; Keep the durable cancellation token/live lease until the executor has
+      ;; acknowledged termination. Direct cancellation relies on that token at
+      ;; its next cooperative checkpoint; releasing it merely because a pure
+      ;; program has no native workers would let the body continue to effects.
+      (let [execution-id (spin-core/spin-id execution)]
+        (loop []
+          (when-not (ec/spin-current-result execution-id)
+            (Thread/sleep 5)
+            (recur))))
+      (await-supervisor! supervisor)
+      (let [cleanup-error (:cleanup-error @(:state supervisor))
+            result (if cleanup-error
+                     {:run/id id :run/status :failed
+                      :run/error (ex-message cleanup-error)}
+                     result)
+            finish-opts (if (= :cancelled (:run/status result))
+                          {:reason :structured-cancellation}
+                          {:reason (if cleanup-error :cleanup-error :execution-error)
+                           :error (or cleanup-error (:run/error result))})]
+        (publish-result-and-release! id completion result finish-opts)))))
 
 (defn- execution-spin
   [room agent task trigger id chat-id completion supervisor]
@@ -711,22 +760,37 @@
                                 :status status
                                 :agent/id (:agent/id agent)}))))
            (catch Throwable t
-             ;; Ordinary exceptions still own their Spin and can quiesce here.
-             ;; A graph-level cancellation that bypasses this body is handled by
-             ;; the spawn on-error callback below.
-             (sp/await (seal-supervisor! supervisor))
-             (let [cleanup-error (:cleanup-error @(:state supervisor))
-                   error (or cleanup-error t)]
-               (if (and (nil? cleanup-error) (cancelled-error? t id))
-                 {:result {:run/id id :run/status :cancelled}
-                  :finish-opts {:reason :cancel-requested}}
-                 {:result {:run/id id
-                           :run/status :failed
-                           :run/error (ex-message error)}
-                  :finish-opts {:reason (if cleanup-error
-                                          :cleanup-error
-                                          :program-error)
-                                :error error}}))))
+             (let [cancelled? (cancelled-error? t id)
+                   graph-cancelled? (graph-cancelled-error? t)
+                   quiesced (seal-supervisor! supervisor)]
+               (if graph-cancelled?
+                 ;; Cancellation is sticky on a Spin. Awaiting `quiesced` from
+                 ;; this catch would immediately throw cancellation again,
+                 ;; before the body reaches its local reject callback. Under a
+                 ;; nested race that can strand the durable Run at
+                 ;; :cancelling even though the native worker already stopped.
+                 ;; Reject without another breakpoint; the spawn callback below
+                 ;; waits on the stable supervisor from outside the cancelled
+                 ;; graph, then settles the Run durability-first.
+                 (throw t)
+                 (do
+                   ;; Ordinary failures still own a live, non-cancelled Spin and
+                   ;; can await cleanup compositionally. A direct Run
+                   ;; cancellation is in this branch too: its execution graph is
+                   ;; still valid, so it returns an ordinary cancelled result.
+                   (sp/await quiesced)
+                   (let [cleanup-error (:cleanup-error @(:state supervisor))
+                         error (or cleanup-error t)]
+                     (if (and cancelled? (nil? cleanup-error))
+                       {:result {:run/id id :run/status :cancelled}
+                        :finish-opts {:reason :cancel-requested}}
+                       {:result {:run/id id
+                                 :run/status :failed
+                                 :run/error (ex-message error)}
+                        :finish-opts {:reason (if cleanup-error
+                                                :cleanup-error
+                                                :program-error)
+                                      :error error}})))))))
          result (:result outcome)]
      ;; Completion is a Spindel Deferred allocated in this Room's execution
      ;; context, not a JVM promise or host atom. Its value therefore follows
@@ -789,14 +853,38 @@
             execution (execution-spin room agent task trigger id chat-id
                                       completion supervisor)
             owner-fork-id (:fork-id (ec/current-execution-context))
-            handle    (RunHandle. id (:id room) owner-fork-id execution completion)]
+            handle    (RunHandle. id (:id room) owner-fork-id execution completion)
+            settlement-started? (atom false)
+            settle! (fn [result]
+                      (when (compare-and-set! settlement-started? false true)
+                        (settle-external! room id supervisor execution
+                                          completion result)))
+            cancel! (fn []
+                      (cancel-supervisor! supervisor)
+                      ;; Cancellation closes admission to further native work.
+                      ;; Cleanup may still be registered by an already-running
+                      ;; initialization worker while the phase is :pending; the
+                      ;; supervisor starts it after that worker terminates.
+                      (seal-supervisor! supervisor)
+                      ;; Run cancellation is an execution boundary in its own
+                      ;; right, not merely a hint to the current graph. Start a
+                      ;; process-local settlement watcher now. A nested parent
+                      ;; may reap the spawned Spin's callback continuation while
+                      ;; cancelling its race arm; the execution result plus the
+                      ;; stable supervisor are the physical-quiescence fence.
+                      (settle! {:run/id id :run/status :cancelled}))]
+        ;; Replace the early sticky worker hook with the complete cancellation
+        ;; boundary. register-cancel-hook! immediately invokes it if cancellation
+        ;; won between durable admission and construction of this execution.
+        (run/register-cancel-hook! id ::native-worker cancel!)
         (sp/spawn!
          execution
          {:on-error
           (fn [t]
-            ;; Graph-level cancellation (parent/race) can abort before the Spin
-            ;; body catches. Settle the durable lifecycle from the callback;
-            ;; finish! is idempotent if the body already did so.
+            ;; Graph-level cancellation is settled outside the cancelled Spin:
+            ;; this callback may safely block on stable supervisor quiescence,
+            ;; while the cancelled body may not cross another await breakpoint.
+            ;; finish! is idempotent if another terminal path already won.
             (let [result (if (cancelled-error? t id)
                            {:run/id id :run/status :cancelled}
                            {:run/id id :run/status :failed
@@ -805,7 +893,7 @@
                 (run/cancel-room-run! (:id room) id))
               (cancel-supervisor! supervisor)
               (seal-supervisor! supervisor)
-              (settle-after-supervisor! room id supervisor completion result)))})
+              (settle! result)))})
         handle)
       (catch Throwable t
         (run/finish! id :failed {:reason :spawn-failed :error t})

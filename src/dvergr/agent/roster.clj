@@ -199,6 +199,14 @@
 (defn make-agent
   "Return a new Roster containing `spec` as a portable AgentDef.
 
+   Exact deterministic program shapes are:
+     {:kind :echo :delay-ms milliseconds}
+     {:kind :scripted :delay-ms milliseconds :reply value}
+
+   An LLM program uses {:kind :llm :max-model-steps n :budget-dollars n}
+   together with AgentDef :model-policy and :tools. `:delay-ms` is optional;
+   unknown program keys are rejected before a Run is admitted.
+
    Adding an identical definition is idempotent. Reusing an id with different
    data is rejected; use `revise-agent` so old Run references retain meaning."
   [roster spec]
