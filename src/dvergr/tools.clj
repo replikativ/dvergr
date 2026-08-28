@@ -263,16 +263,44 @@
         tool  (if local (get local tool-name) (get-tool tool-name))]
     (cond
       tool
-      (try
-        (-> (if-let [exec-fn (:execute tool)]
-              (exec-fn input ctx)
-              (when-let [handler-fn (:handler tool)]
-                (handler-fn input)))
-            (compaction/truncate-tool-result))
-        (catch Exception e
+      (let [default-decision {:decision :authorized
+                              :sources #{(if local :agent-tool-grant
+                                             :runtime-registry)}}
+            decision (if-let [authorize (:authorize tool)]
+                       (try
+                         (let [answer (authorize input ctx)]
+                           (if (contains? #{:authorized :denied :requires-decision}
+                                          (:decision answer))
+                             (update answer :sources
+                                     #(into (:sources default-decision) (or % #{})))
+                             {:decision :denied
+                              :sources #{:agent-tool-grant :authorization-error}
+                              :reason "Authorizer returned no valid decision"}))
+                         (catch Exception e
+                           {:decision :denied
+                            :sources #{:agent-tool-grant :authorization-error}
+                            :reason (.getMessage e)}))
+                       default-decision)]
+        (if (= :authorized (:decision decision))
+          (try
+            ;; The runtime, not the tool implementation, owns this field: an
+            ;; untrusted/custom tool cannot claim broader authority by putting
+            ;; a fabricated receipt in its result.
+            (assoc (-> (if-let [exec-fn (:execute tool)]
+                         (exec-fn input ctx)
+                         (when-let [handler-fn (:handler tool)]
+                           (handler-fn input)))
+                       (compaction/truncate-tool-result))
+                   :authorization decision)
+            (catch Exception e
+              {:type :error
+               :error (.getMessage e)
+               :exception (class e)
+               :authorization decision}))
           {:type :error
-           :error (.getMessage e)
-           :exception (class e)}))
+           :error (or (:reason decision)
+                      (str "Tool call not authorized: " tool-name))
+           :authorization decision}))
 
       local
       {:type :error
