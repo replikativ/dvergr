@@ -28,6 +28,7 @@
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.context :as ctx]
+            [org.replikativ.spindel.spin.core :as spin-core]
             [org.replikativ.spindel.spin.sync :as sync]
             [org.replikativ.spindel.spin.combinators :as comb]
             [org.replikativ.spindel.yggdrasil :as ygg]
@@ -65,9 +66,13 @@
   ;;                   over inbox-mbx so hand-back cannot reorder older work
   ;;                   behind a concurrently arriving message.
   ;; subs       :: atom of {topic → Subscription} for dynamic extra channels
+  ;; pumps      :: atom of {lifecycle-key → Spin}; live subscription drains
+  ;;               owned by this participant and cancelled with its process
+  ;; active     :: atom of nil | Spin | ::participant-closed; the handler Spin
+  ;;               currently awaited by the participant process
   ;; factory    :: (fn [new-ctx] -> Participant) — for cloning into a fork
   ;; process    :: the spindel spin driving this participant (set by `join`)
-           [id inbox-sub inbox-mbx deferred-inbox subs on-message factory process])
+           [id inbox-sub inbox-mbx deferred-inbox subs pumps active on-message factory process])
 
 (defrecord Room
   ;; id            : keyword — stable identity (e.g. :daemon, :boardroom)
@@ -96,6 +101,16 @@
                  ", :participants " (count @(:participants r))
                  (when (:parent-id r) (str ", :parent " (pr-str (:parent-id r))))
                  (when (:store r) ", :store true")
+                 "}")))
+
+;; Spin implements IDeref, so the default record printer would dereference the
+;; participant process and pumps outside their execution context. Besides being
+;; noisy, that makes merely inspecting `(join room agent)` fail at the REPL.
+(defmethod print-method Participant [^Participant p ^java.io.Writer w]
+  (.write w (str "#Participant{:id " (pr-str (:id p))
+                 ", :subscriptions " (+ (if (:inbox-sub p) 1 0)
+                                        (count (some-> p :subs deref)))
+                 (when (:process p) ", :process true")
                  "}")))
 
 (defn message
@@ -300,7 +315,7 @@
   [{:keys [id on-message factory ctx]}]
   (let [_ctx (or ctx ec/*execution-context*)]
     (->Participant id nil nil (atom clojure.lang.PersistentQueue/EMPTY)
-                   (atom {}) on-message factory nil)))
+                   (atom {}) (atom {}) (atom nil) on-message factory nil)))
 
 ;; ============================================================================
 ;; Built-in participant helpers
@@ -352,15 +367,38 @@
                 nil (:metadata reply-spec))))))
 
 (defn- drain-into!
-  "Spawn a spin that drains `(:aseq sub)` and posts each item into `mbx`."
+  "Spawn a spin that drains `(:aseq sub)` and posts each item into `mbx`.
+   Returns the Spin so its participant owner can cancel it deterministically."
   [sub mbx]
-  (sp/spawn!
-   (sp/spin
-    (loop [s (:aseq sub)]
-      (when-let [r (sp/await (anext s))]
-        (let [[m rest-s] r]
-          (sync/post! mbx m)
-          (recur rest-s)))))))
+  (let [pump (sp/spin
+              (loop [s (:aseq sub)]
+                (when-let [r (sp/await (anext s))]
+                  (let [[m rest-s] r]
+                    (sync/post! mbx m)
+                    (recur rest-s)))))]
+    (sp/spawn! pump
+               {:on-error
+                (fn [error]
+                  (when-not (= spin-core/spin-cancelled (:type (ex-data error)))
+                    (tel/log! {:level :error :id ::subscription-pump-error
+                               :data {:topic (:topic sub)
+                                      :error (.getMessage ^Throwable error)}}
+                              "participant subscription pump failed")))})
+    pump))
+
+(defn- cleanup-owned-spin!
+  "Cancel `spin` when live and detach its continuations and dependencies.
+
+   Spindel cancellation marks a Spin terminal, while graph cleanup releases the
+   engine-side await registrations immediately instead of waiting for GC."
+  [room spin]
+  (when spin
+    (binding [ec/*execution-context* (:ctx room)]
+      (let [spin-id (spin-core/spin-id spin)]
+        (when-not (ec/spin-current-result spin-id)
+          (spin-core/cancel-spin! spin))
+        (ec/graph-clear-deps! spin-id))))
+  nil)
 
 (defn defer-inbox!
   "Append `msg` to a participant's deferred FIFO.
@@ -427,14 +465,22 @@
                ;; chain (see spindel fix/gc-reap-suspended-awaiter). partial-cps
                ;; supports try/catch around await in-body, so the wrapper bought
                ;; nothing but risk.
+               handler ((:on-message p) p env)
+               ;; `leave` swaps this atom to ::participant-closed before
+               ;; teardown. CAS prevents a concurrently entering handler from
+               ;; escaping the participant's lifecycle boundary.
+               handler-owned? (compare-and-set! (:active p) nil handler)
                reply-spec
-               (try
-                 (sp/await ((:on-message p) p env))
-                 (catch Throwable t
-                   (tel/log! {:level :error :id ::on-message-error
-                              :data {:participant (:id p) :error (.getMessage t)}}
-                             "participant on-message error — turn dropped, participant continues")
-                   nil))]
+               (when handler-owned?
+                 (try
+                   (sp/await handler)
+                   (catch Throwable t
+                     (tel/log! {:level :error :id ::on-message-error
+                                :data {:participant (:id p) :error (.getMessage t)}}
+                               "participant on-message error — turn dropped, participant continues")
+                     nil)
+                   (finally
+                     (compare-and-set! (:active p) handler nil))))]
            (try (emit-reply! room p reply-spec parent-message)
                 (catch Throwable t
                   (tel/log! {:level :error :id ::emit-reply-error
@@ -536,11 +582,14 @@
   (binding [ec/*execution-context* (:ctx room)]
     (let [inbox-sub     (bus/subscribe! (:bus room) [:to (:id p)])
           broadcast-sub (bus/subscribe! (:bus room) [:to nil])
+          ;; A Participant may be explicitly left and then joined again. Re-open
+          ;; its active-handler slot before the new process can receive work.
+          _ (reset! (:active p) nil)
           ;; Merge all subscriptions into one mailbox so the spin awaits
           ;; a single source. Each sub gets a small pump.
           merge-mbx (sync/create-mailbox (:ctx room))
-          _ (drain-into! inbox-sub     merge-mbx)
-          _ (drain-into! broadcast-sub merge-mbx)
+          inbox-pump (drain-into! inbox-sub merge-mbx)
+          broadcast-pump (drain-into! broadcast-sub merge-mbx)
           p' (-> p
                  (assoc :inbox-sub inbox-sub
                         :inbox-mbx merge-mbx
@@ -552,7 +601,15 @@
                         :room room)
                  (update :subs (fn [s] (swap! s assoc [:to nil] broadcast-sub) s)))
           proc (participant-spin p' room merge-mbx)]
-      (sp/spawn! proc)
+      (swap! (:pumps p') assoc ::direct inbox-pump [:to nil] broadcast-pump)
+      (sp/spawn! proc
+                 {:on-error
+                  (fn [error]
+                    (when-not (= spin-core/spin-cancelled (:type (ex-data error)))
+                      (tel/log! {:level :error :id ::participant-process-error
+                                 :data {:participant (:id p')
+                                        :error (.getMessage ^Throwable error)}}
+                                "participant process failed")))})
       (let [p'' (assoc p' :process proc)]
         (swap! (:participants room) assoc (:id p) p'')
         p''))))
@@ -578,18 +635,22 @@
        (let [sub (binding [ec/*execution-context* (:ctx room)]
                    (if buffer
                      (bus/subscribe! (:bus room) topic buffer)
-                     (bus/subscribe! (:bus room) topic)))]
-         (binding [ec/*execution-context* (:ctx room)]
-           (drain-into! sub (:inbox-mbx p)))
+                     (bus/subscribe! (:bus room) topic)))
+             pump (binding [ec/*execution-context* (:ctx room)]
+                    (drain-into! sub (:inbox-mbx p)))]
          (swap! (:subs p) assoc topic sub)
+         (swap! (:pumps p) assoc topic pump)
          sub))))
 
 (defn unsubscribe!
   "Remove a previously added subscription on `topic` for `p`. The drain
    pump exits the next time the bus closes the subscription's aseq."
-  [_room p topic]
+  [room p topic]
   (when-let [sub (get @(:subs p) topic)]
     (bus/unsubscribe! sub)
+    (when-let [pump (get @(:pumps p) topic)]
+      (cleanup-owned-spin! room pump)
+      (swap! (:pumps p) dissoc topic))
     (swap! (:subs p) dissoc topic))
   nil)
 
@@ -601,43 +662,77 @@
    subscriptions alive feeding the still-running participant spin: a
    leave/re-join cycle then had TWO live agents answering every message
    (observed live: duplicate replies 5s apart; one zombie accumulated
-   PER cycle). The deaf spin itself stays parked (no per-spin cancel
-   wired here yet) but receives nothing."
+   PER cycle).
+
+   Teardown is deterministic: the participant process, active handler, and
+   every subscription pump are cancelled and detached from the engine; their
+   bus subscriptions are closed. Calling leave repeatedly is safe."
   [room participant-id]
   (when-let [p (get @(:participants room) participant-id)]
+    ;; Close the handler slot first. A concurrent participant slice can install
+    ;; a handler only via CAS from nil, so no new handler escapes this boundary.
+    (let [active-spin (when-let [active (:active p)]
+                        (let [[before _after]
+                              (swap-vals! active (constantly ::participant-closed))]
+                          (when-not (= ::participant-closed before) before)))]
+      (cleanup-owned-spin! room (:process p))
+      (cleanup-owned-spin! room active-spin))
+    ;; Closing subscriptions releases their sequence waits; engine cleanup below
+    ;; removes any pump continuation that has not observed closure yet.
     (when-let [sub (:inbox-sub p)]
       (bus/unsubscribe! sub))
     (when-let [subs (:subs p)]
       (doseq [[topic sub] @subs]
         (bus/unsubscribe! sub)
-        (swap! subs dissoc topic))))
+        (swap! subs dissoc topic)))
+    (when-let [pumps (:pumps p)]
+      (doseq [pump (vals @pumps)]
+        (cleanup-owned-spin! room pump))
+      (reset! pumps {}))
+    (when-let [deferred-inbox (:deferred-inbox p)]
+      (reset! deferred-inbox clojure.lang.PersistentQueue/EMPTY)))
   (swap! (:participants room) dissoc participant-id)
   nil)
 
+(defn- leave-all!
+  "Cancel and remove every participant currently registered in `room`."
+  [room]
+  (doseq [participant-id (keys @(:participants room))]
+    (leave room participant-id))
+  nil)
+
+(defn- fork-room?
+  "True for rooms produced by `fork-room`; nested non-fork rooms do not count."
+  [room]
+  (boolean (some-> room :meta deref :forked-from)))
+
+(defn- room-home-ctx
+  "Context holding `room`'s registry entry. Isolated forks register in parent."
+  [room]
+  (or (some-> room :ctx :parent-ctx) (:ctx room)))
+
 (defn close-room!
-  "Tear down a room: deregister every participant and stop the room's
-   execution context. The context's drain thread (a virtual thread on
-   JDK 21+, see spindel.engine.context) exits and any in-flight drain
-   completes before this returns.
+  "Tear down a room: leave every participant, unregister the Room, and close
+   its execution context. Any in-flight drain completes before this returns.
 
    Use this when a room's lifecycle is bounded — tests, the daemon's
    shutdown path, an MCP session ending — so the room doesn't depend on
-   GC running before the JVM reclaims its resources. Closing a fork is
-   a no-op for the context (forks share the parent's drain); only the
-   participants atom is cleared.
+   GC running before the JVM reclaims its resources. Closing a fork leaves its
+   participants and unregisters it, but never closes the root context: `:none`
+   forks share the exact parent context and `:ctx` forks share its executor.
 
    No-op on already-closed rooms."
   [room]
   (when room
-    (reset! (:participants room) {})
-    (let [ctx (:ctx room)]
-      ;; stop-context! only does work on root contexts; forks share the
-      ;; parent's drain thread and treat this as a no-op.
-      (when ctx
-        (when-let [stop! (try (requiring-resolve
-                               'org.replikativ.spindel.engine.context/stop-context!)
-                              (catch Exception _ nil))]
-          (stop! ctx)))))
+    (leave-all! room)
+    (binding [ec/*execution-context* (room-home-ctx room)]
+      (rreg/unregister! (:id room)))
+    ;; A branchless fork carries the exact root ctx, so Spindel cannot infer from
+    ;; the context alone that closing it here would kill the parent. The durable
+    ;; room marker is the ownership boundary.
+    (when-not (fork-room? room)
+      (when-let [room-ctx (:ctx room)]
+        (ctx/close-context! room-ctx))))
   nil)
 
 ;; ============================================================================
@@ -898,7 +993,7 @@
    the parent). For `:none` forks (no distinct parent ctx) this is the fork's
    own ctx."
   [fork]
-  (or (:parent-ctx (:ctx fork)) (:ctx fork)))
+  (room-home-ctx fork))
 
 (defn- drain-fork-turns!
   "Cancel any in-flight agent turn in `fork` and wait (bounded, ~5s) for it to
@@ -930,10 +1025,8 @@
   "Discard a fork: deregister its participants, drop it from the
    registry, and if the fork's ctx was forked (`:isolation :ctx`),
    delete all branched yggdrasil systems via
-   `spindel.yggdrasil/discard-from-parent!`. Participant spins on a
-   shared ctx (`:isolation :none`) continue running indefinitely on
-   their mailboxes (harmless; cleaned up when the shared context
-   eventually stops).
+   `spindel.yggdrasil/discard-from-parent!`. Participant processes and
+   subscription pumps are cancelled in both isolation modes.
 
    Emits `:dvergr/fork-discarded` on the peer-bus. Idempotent — a second
    discard of the same fork is a no-op (the branched systems are deleted only
@@ -942,7 +1035,7 @@
   ;; Idempotence: once unregistered, the fork is a zombie — re-discarding would
   ;; double-delete the yggdrasil branch (which errors). Guard on registry.
   (when (binding [ec/*execution-context* (fork-home-ctx fork)] (rreg/lookup (:id fork)))
-    (reset! (:participants fork) {})
+    (leave-all! fork)
     (when (ctx-was-forked? fork)
       (drain-fork-turns! fork)                 ; P4: stop in-flight turns first
       ;; P2: read the fork's deferred data-DB grants (fork-local ctx-state) and
@@ -1017,7 +1110,7 @@
   ;; is a datahike collapse / log append, not a bus post.
    (try ((requiring-resolve 'dvergr.rooms.messages/refresh!) parent)
         (catch Throwable _ nil))
-   (reset! (:participants fork) {})
+   (leave-all! fork)
    (binding [ec/*execution-context* (fork-home-ctx fork)]
      (rreg/unregister! (:id fork))
      (peer-bus/post! {:type            :dvergr/fork-merged
