@@ -112,6 +112,34 @@
         (is (= (:id child) (:in-reply-to posted-nested)))
         (is (= (:id root) (:thread-root-id posted-nested)))))))
 
+(deftest deferred-inbox-precedes-new-live-arrivals
+  (testing "active handlers hand consumed work back in global FIFO order"
+    (let [room (d/room :deferred-inbox-order)
+          seen (atom [])
+          participant
+          (d/participant
+           {:id :worker
+            :ctx (:ctx room)
+            :on-message (fn [_ msg]
+                          (sp/spin
+                           (swap! seen conj (:content msg))
+                           nil))})
+          older-a (d/message :user :worker "older A")
+          older-b (d/message :user :worker "older B")]
+      ;; These values model messages already consumed by an active arbiter.
+      (d/defer-inbox! participant older-a)
+      (d/defer-inbox! participant older-b)
+      (binding [ec/*execution-context* (:ctx room)]
+        (d/join room participant))
+      ;; A concurrent arrival is already waiting in the live mailbox. It must
+      ;; not overtake either consumed-but-deferred message.
+      (d/post! room (d/message :user :worker "newer live"))
+      (let [deadline (+ (System/currentTimeMillis) 2000)]
+        (while (and (< (System/currentTimeMillis) deadline)
+                    (< (count @seen) 3))
+          (Thread/sleep 5)))
+      (is (= ["older A" "older B" "newer live"] @seen)))))
+
 (deftest single-echo-bot-cycle
   (let [r (d/room :t)]
     (binding [ec/*execution-context* (:ctx r)]

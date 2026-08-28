@@ -123,7 +123,10 @@ Dvergr's current behavior has a useful foundation:
 - an addressed message during an active turn currently steers it;
 - non-addressed messages update room awareness without preempting the turn.
 
-Make the target semantics explicit:
+Make the target semantics explicit. These are defaults, classified by an
+attention policy rather than permanently equating thread membership with
+interruption. The policy receives the active and incoming envelopes plus Room and
+Participant, so deployments can use authoritative sender identity and addressing:
 
 | Incoming fact | Active execution behavior |
 |---|---|

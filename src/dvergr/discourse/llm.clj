@@ -131,6 +131,18 @@
    :type :probe/memory-response
    :payload {:messages (cc/get-messages chat-ctx)}})
 
+(defn default-attention-policy
+  "Classify conversational input arriving during an active generation.
+
+   The policy receives {:active-message :incoming-message :participant :room}
+   and returns :steer, :queue, or :observe. The default preserves the current
+   direct-conversation behavior: same-thread input steers, while another thread
+   queues a separate execution. Products with durable actor identity can refine
+   this by sender/addressing (for example, human correction versus peer-agent
+   chatter) without changing the Room/thread contract."
+  [{:keys [active-message incoming-message]}]
+  (if (d/same-thread? active-message incoming-message) :steer :queue))
+
 (defn llm-agent
   "Construct a discourse Participant backed by an LLM.
 
@@ -161,13 +173,20 @@
                   embedder hook threaded to `run-agent-turn!` — rewrites the
                   agent's outbound reply (e.g. resolve references) and returns
                   system notes injected into the chat-ctx for the next turn.
+   :attention-policy — (fn [{:active-message :incoming-message :participant
+                             :room}] → :steer | :queue | :observe).
+                  Defaults to same-thread steer and different-thread queue.
+                  Override to distinguish human correction from peer chatter
+                  using the deployment's authoritative actor identity.
    :ctx         — discourse room's execution context
                   (default: `*execution-context*`)"
   [{:keys [id spec tools db-conn budget compaction
-           chat-ctx participant-context tool-ctx run-turn-fn ctx room-safe? on-reply]
+           chat-ctx participant-context tool-ctx run-turn-fn ctx room-safe? on-reply
+           attention-policy]
     :or   {budget      {:dollars 1.0}
            compaction  {:auto? true :strategy :sync-before-turn}
            run-turn-fn default-run-turn
+           attention-policy default-attention-policy
            room-safe?  true
            ;; Sane default toolbelt instead of the bare `#{:clojure_eval}` poverty
            ;; trap — file ops + jailed shell + clojure_eval (web/data/knowledge via
@@ -435,7 +454,9 @@
                                    ;; Mailbox DIRECTLY (its 2-arity carries the
                                    ;; cancel-token — never via anext/aseq).
                                    (loop []
-                                     (let [m (sp/await mbx)]
+                                     (let [m (if-let [deferred (d/take-deferred-inbox! p)]
+                                               deferred
+                                               (sp/await mbx))]
                                        (cond
                                          (and (= ::llm-done (:type m))
                                               (= call-id (:call-id m)))
@@ -479,11 +500,27 @@
                                                (do
                                                  (when mid
                                                    (swap! seen-inflight-ids conj mid))
-                                                 (if (d/same-thread? msg m)
-                                                   {:tag :steer :msg m}
-                                                   (do
-                                                     (swap! queued-other-threads conj m)
-                                                     (recur))))))))))
+                                                 (let [attention
+                                                       (attention-policy
+                                                        {:active-message msg
+                                                         :incoming-message m
+                                                         :participant p
+                                                         :room room})]
+                                                   (case attention
+                                                     :steer {:tag :steer :msg m}
+                                                     :observe (recur)
+                                                     :queue (do
+                                                              (swap! queued-other-threads conj m)
+                                                              (recur))
+                                                     (do
+                                                       (tel/log!
+                                                        {:level :warn
+                                                         :id ::invalid-attention-decision
+                                                         :data {:agent id
+                                                                :decision attention}}
+                                                        "Invalid attention decision; queued conservatively")
+                                                       (swap! queued-other-threads conj m)
+                                                       (recur)))))))))))
                                    ;; No inbox (room-less participant that was
                                    ;; never joined): plain await, no steering.
                                    {:tag :llm-done :result (sp/await (:done h))})]
@@ -549,13 +586,12 @@
                                    :else (recur (inc turn)))))))))
 
                      (when room (turn/unregister-room-turn! (:id room) id))
-                     ;; The outer participant loop can now start the queued
-                     ;; thread(s). Re-enqueue rather than repost: the message is
-                     ;; already durable/visible, and reposting would duplicate the
-                     ;; room chronology. Mailbox insertion preserves arrival order.
-                     (when-let [mbx (:inbox-mbx p)]
-                       (doseq [queued @queued-other-threads]
-                         (mbx queued)))
+                     ;; The outer participant loop can now start queued work. Put
+                     ;; consumed messages in the participant-owned priority FIFO,
+                     ;; not at the live mailbox tail: a newer arrival during this
+                     ;; hand-back window must not overtake older topics.
+                     (doseq [queued @queued-other-threads]
+                       (d/defer-inbox! p queued))
                      ;; A FAILED turn produced no new reply — surface it as a NON-triggering
                      ;; :_activity row and DON'T fall through to re-post the STALE last reply
                      ;; (which the room's other agents answer, looping — the "repeating" bug).
@@ -612,6 +648,7 @@
                           :budget      budget
                           :compaction  compaction
                           :run-turn-fn run-turn-fn
+                          :attention-policy attention-policy
                           :ctx         new-ctx}))})]
       ;; Room-safe by DEFAULT: self-filter (never answer your own messages —
       ;; the echo-loop guard), silence ([SKIP] → no post), plain-reply. The

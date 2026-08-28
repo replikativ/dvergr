@@ -136,6 +136,32 @@
       ;; rehydration and is fed back to the model (see room-context seeding).
       (seq (:reasoning metadata))  (assoc :message/reasoning (:reasoning metadata)))))
 
+(def ^:private message-pull-pattern
+  '[:message/id :message/role :message/content
+    :message/created-at :message/source-user
+    :message/source-username :message/source-user-id
+    :message/from :message/to :message/in-reply-to
+    :message/thread-root-id
+    :message/reasoning
+    :message/audience :message/mention-handles
+    :message/metadata-kind :message/context-from
+    :message/source :message/schedule-id
+    :message/attachment-store-ref
+    :message/attachment-blob-id
+    :message/attachment-node-id
+    :message/attachment-mime
+    :message/attachment-name
+    :message/attachment-size
+    :message/provenance-mode
+    :message/provenance-source
+    :message/notification-type
+    :message/notification-agent
+    :message/notification-task
+    :message/notification-elapsed
+    {:message/tool-uses
+     [:tool-use/id :tool-use/name
+      {:tool-use/input [*]}]}])
+
 ;; =============================================================================
 ;; Store impl
 ;; =============================================================================
@@ -232,47 +258,41 @@
     (let [slug (store/room-id->slug room-id)]
       (when-let [ent (room-by-slug conn slug)]
         (let [chat-id (:chat/id ent)
-              base    (dh/q '[:find [(pull ?m [:message/id :message/role :message/content
-                                               :message/created-at :message/source-user
-                                               :message/source-username :message/source-user-id
-                                               :message/from :message/to :message/in-reply-to
-                                               :message/thread-root-id
-                                               :message/reasoning
-                                               :message/audience :message/mention-handles
-                                               :message/metadata-kind :message/context-from
-                                               :message/source :message/schedule-id
-                                               :message/attachment-store-ref
-                                               :message/attachment-blob-id
-                                               :message/attachment-node-id
-                                               :message/attachment-mime
-                                               :message/attachment-name
-                                               :message/attachment-size
-                                               :message/provenance-mode
-                                               :message/provenance-source
-                                               :message/notification-type
-                                               :message/notification-agent
-                                               :message/notification-task
-                                               :message/notification-elapsed
-                                               {:message/tool-uses
-                                                [:tool-use/id :tool-use/name
-                                                 {:tool-use/input [*]}]}]) ...]
-                              :in $ ?cid
-                              :where [?c :chat/id ?cid]
-                              [?m :message/chat ?c]]
-                            @conn chat-id)
+              ;; Resolve matching entity ids in Datalog before pulling message
+              ;; bodies. In particular, the indexed thread root now bounds the
+              ;; amount of data crossing the store boundary instead of loading
+              ;; the whole Room and filtering it in Clojure. The two legacy
+              ;; branches retain compatibility only for rows written before the
+              ;; typed root existed.
+              message-ids
+              (if thread-root-id
+                (dh/q '[:find [?m ...]
+                        :in $ ?cid ?root
+                        :where
+                        [?c :chat/id ?cid]
+                        [?m :message/chat ?c]
+                        (or-join [?m ?root]
+                                 [?m :message/thread-root-id ?root]
+                                 (and [?m :message/id ?root]
+                                      (not [?m :message/thread-root-id _]))
+                                 (and [?m :message/in-reply-to ?root]
+                                      (not [?m :message/thread-root-id _])))]
+                      @conn chat-id thread-root-id)
+                (dh/q '[:find [?m ...]
+                        :in $ ?cid
+                        :where
+                        [?c :chat/id ?cid]
+                        [?m :message/chat ?c]]
+                      @conn chat-id))
+              base    (dh/pull-many @conn message-pull-pattern message-ids)
               sorted  (sort-by #(.getTime (or (:message/created-at %)
                                               (java.util.Date. 0))) base)
-              filtered (cond->> sorted
-                         since
+              filtered (if since
                          (filter #(when-let [t (:message/created-at %)]
                                     (> (.getTime ^java.util.Date t)
-                                       (.getTime ^java.util.Date since))))
-
-                         thread-root-id
-                         (filter #(= thread-root-id
-                                     (or (:message/thread-root-id %)
-                                         (:message/in-reply-to %)
-                                         (:message/id %)))))]
+                                       (.getTime ^java.util.Date since)))
+                                 sorted)
+                         sorted)]
           ;; Normalize to unified Message shape — consumers (TUI, sandbox)
           ;; see {:id :from :to :content :ts :role :metadata} regardless of
           ;; which store backs the room.

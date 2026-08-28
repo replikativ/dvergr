@@ -60,10 +60,14 @@
   ;; inbox-sub  :: dvergr.runtime.bus.Subscription on [:to id] (the default channel)
   ;; inbox-mbx  :: the merge mailbox the participant-spin awaits (all subs
   ;;               pump into it)
+  ;; deferred-inbox :: atom of PersistentQueue — messages consumed by an active
+  ;;                   handler but deferred to later executions. It has priority
+  ;;                   over inbox-mbx so hand-back cannot reorder older work
+  ;;                   behind a concurrently arriving message.
   ;; subs       :: atom of {topic → Subscription} for dynamic extra channels
   ;; factory    :: (fn [new-ctx] -> Participant) — for cloning into a fork
   ;; process    :: the spindel spin driving this participant (set by `join`)
-           [id inbox-sub inbox-mbx subs on-message factory process])
+           [id inbox-sub inbox-mbx deferred-inbox subs on-message factory process])
 
 (defrecord Room
   ;; id            : keyword — stable identity (e.g. :daemon, :boardroom)
@@ -295,7 +299,8 @@
                   when the room's bus is in scope; until then it is nil."
   [{:keys [id on-message factory ctx]}]
   (let [_ctx (or ctx ec/*execution-context*)]
-    (->Participant id nil nil (atom {}) on-message factory nil)))
+    (->Participant id nil nil (atom clojure.lang.PersistentQueue/EMPTY)
+                   (atom {}) on-message factory nil)))
 
 ;; ============================================================================
 ;; Built-in participant helpers
@@ -357,6 +362,29 @@
           (sync/post! mbx m)
           (recur rest-s)))))))
 
+(defn defer-inbox!
+  "Append `msg` to a participant's deferred FIFO.
+
+   Active handlers use this when they must consume the live mailbox to arbitrate
+   control messages but discover ordinary work that belongs to a later
+   execution. The participant loop always drains this FIFO before awaiting the
+   live mailbox, preserving global arrival order across the hand-back boundary."
+  [participant msg]
+  (swap! (:deferred-inbox participant) conj msg)
+  nil)
+
+(defn take-deferred-inbox!
+  "Atomically remove and return the oldest deferred message, or nil."
+  [participant]
+  (let [queue-atom (:deferred-inbox participant)]
+    (loop []
+      (let [queue @queue-atom]
+        (when (seq queue)
+          (let [msg (peek queue)]
+            (if (compare-and-set! queue-atom queue (pop queue))
+              msg
+              (recur))))))))
+
 (defn- participant-spin
   "Continuous-time loop: drain inbox events → run on-message → emit reply.
 
@@ -383,7 +411,9 @@
   (sp/spin
    (loop [seen  #{}
           order clojure.lang.PersistentQueue/EMPTY]
-     (let [env (sp/await mbx)
+     (let [env (if-let [deferred (take-deferred-inbox! p)]
+                 deferred
+                 (sp/await mbx))
            id  (:id env)]
        (if (and id (contains? seen id))
          ;; already handled via another matching subscription — skip the duplicate
