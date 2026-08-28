@@ -6,10 +6,19 @@
             [dvergr.room.store.memory :as memory]
             [dvergr.sandbox :as sandbox]
             [dvergr.sandbox.ns.agent :as agent-ns]
+            [dvergr.sandbox.ns.data :as data-ns]
             [dvergr.sandbox.ns.kb :as kb-ns]
             [dvergr.sandbox.ns.room :as room-ns]
             [org.replikativ.spindel.engine.context :as context]
             [org.replikativ.spindel.engine.core :as ec]))
+
+(defn- wait-until [pred timeout-ms]
+  (let [deadline (+ (System/nanoTime) (* timeout-ms 1000000))]
+    (loop []
+      (cond
+        (pred) true
+        (< (System/nanoTime) deadline) (do (Thread/sleep 5) (recur))
+        :else false))))
 
 (deftest immutable-rosters-launch-composable-room-runs-from-sci
   (let [room    (d/make-room {:id :sci-agent-programming
@@ -20,11 +29,18 @@
       ;; the same injector from setup-agent-namespaces!; doc-coverage exercises
       ;; that full wiring and catches any omission there.
       (agent-ns/add-programming-ns! sci-ctx (:id room) (:ctx room) nil)
+      (data-ns/add-spindel-extras-ns! sci-ctx (:ctx room))
       (testing "progressive help contains an executable composition example"
         (let [guide (sandbox/ns-doc-md sci-ctx 'dvergr.agent)]
-          (is (re-find #":scripted :reply" guide))
+          (is (re-find #":scripted.*:reply" guide))
+          (is (re-find #":delay-ms" guide))
           (is (re-find #"result-spin" guide))
-          (is (re-find #"await" guide))))
+          (is (re-find #"owned-result-spin" guide))
+          (is (re-find #"comb/race" guide))
+          (is (re-find #"await" guide)))
+        (let [guide (sandbox/ns-doc-md sci-ctx 'spindel.comb)]
+          (is (re-find #"cancel losing branches" guide))
+          (is (re-find #"owned-result-spin" guide))))
       (let [result
             (binding [ec/*execution-context* (:ctx room)]
               (sandbox/eval-code
@@ -59,6 +75,39 @@
           (is (uuid? (get-in result [:value :analyst-run])))
           (is (= :completed (get-in result [:value :analyst-status])))
           (is (empty? (run/active-runs (:id room))))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest room-sci-race-cancels-and-settles-its-owned-loser
+  (let [room (d/make-room {:id :sci-agent-owned-race
+                           :store (memory/make)})
+        sci-ctx (sandbox/fork-for-session (:ctx room))]
+    (try
+      (agent-ns/add-programming-ns! sci-ctx (:id room) (:ctx room) nil)
+      (data-ns/add-spindel-extras-ns! sci-ctx (:ctx room))
+      (let [result
+            (binding [ec/*execution-context* (:ctx room)]
+              (sandbox/eval-code
+               sci-ctx
+               (str
+                "(require '[dvergr.agent :as agent] "
+                "         '[org.replikativ.spindel.spin.cps :refer [spin]] "
+                "         '[org.replikativ.spindel.effects.await :refer [await]] "
+                "         '[spindel.comb :as comb]) "
+                "(let [team (-> (agent/roster) "
+                "               (agent/make-agent {:id :fast :program {:kind :scripted :delay-ms 10 :reply :fast}}) "
+                "               (agent/make-agent {:id :slow :program {:kind :scripted :delay-ms 5000 :reply :slow}})) "
+                "      a (agent/hire! team :fast {:task :solve}) "
+                "      b (agent/hire! team :slow {:task :solve})] "
+                "  @(spin (-> (await (comb/race (agent/owned-result-spin a) "
+                "                                (agent/owned-result-spin b))) "
+                "             :run/value)))")))]
+        (is (:success result) (pr-str (:error result)))
+        (is (= :fast (:value result)))
+        (is (wait-until #(empty? (run/active-runs (:id room))) 1000))
+        (let [by-actor (into {} (map (juxt :run/actor identity)) (run/runs room))]
+          (is (= :completed (get-in by-actor [:fast :run/status])))
+          (is (= :cancelled (get-in by-actor [:slow :run/status])))))
       (finally
         (d/close-room! room)))))
 

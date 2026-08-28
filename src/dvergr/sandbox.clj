@@ -665,8 +665,8 @@
                        "(dvergr.scheduler/create {:agent-id :var :schedule {:every :hour :n 4} :code \"(require 'my.ns)(my.ns/run!)\" :description \"…\"})  (dvergr.scheduler/list)  (dvergr.scheduler/cancel id)"]
    "dvergr.tasks"    ["the shared task ledger — list/accept/complete work items"
                       "(dvergr.tasks/list)   (dvergr.tasks/complete! id)"]
-   "dvergr.agent"    ["program specialized agents as immutable rosters; hire! starts a durable Run with an explicit result Spin"
-                      "(let [team (-> (dvergr.agent/roster) (dvergr.agent/make-agent {:id :a :program {:kind :scripted :reply \"evidence\"}}) (dvergr.agent/make-agent {:id :b :program {:kind :echo}})) a (dvergr.agent/hire! team :a {:task :inspect}) b (dvergr.agent/hire! team :b {:task {:claim 42}})] @(spin [(-> (await (dvergr.agent/result-spin a)) :run/value) (-> (await (dvergr.agent/result-spin b)) :run/value)]))"]
+   "dvergr.agent"    ["program specialized agents as immutable rosters; exact programs are {:kind :echo :delay-ms n}, {:kind :scripted :delay-ms n :reply value}, or {:kind :llm ...}; hire! starts a durable Run with an explicit result Spin"
+                      "join with result-spin; for a first-result race that really cancels losing Runs: (let [team (-> (dvergr.agent/roster) (dvergr.agent/make-agent {:id :fast :program {:kind :scripted :delay-ms 10 :reply :fast}}) (dvergr.agent/make-agent {:id :slow :program {:kind :scripted :delay-ms 5000 :reply :slow}})) a (dvergr.agent/hire! team :fast {:task :solve}) b (dvergr.agent/hire! team :slow {:task :solve})] @(spin (-> (await (spindel.comb/race (dvergr.agent/owned-result-spin a) (dvergr.agent/owned-result-spin b))) :run/value)))"]
    "dvergr.agents"   ["directory of agents (read-only): who exists / is online"
                       "(dvergr.agents/list)   (dvergr.agents/online? :var)"]
    "dvergr.actors"   ["durable participant identities — register/retire agents or humans and assign skills"

@@ -23,7 +23,12 @@
    the authority map supplies `:parent-run`, `hire!` uses it as the structural
    parent unless the caller explicitly supplies one.
 
-   Usage:
+   Program data:
+     {:kind :echo :delay-ms 10}
+     {:kind :scripted :delay-ms 10 :reply value}
+     {:kind :llm :max-model-steps 32 :budget-dollars 0.5}
+
+   Join usage:
      (require '[dvergr.agent :as agent]
               '[org.replikativ.spindel.spin.cps :refer [spin]]
               '[org.replikativ.spindel.effects.await :refer [await]])
@@ -34,7 +39,16 @@
                       :program {:kind :echo}}))]
        @(spin (-> (await (agent/result-spin
                           (agent/hire! team :analyst {:task :inspect})))
-                  :run/value)))"
+                  :run/value)))
+
+   Ownership-aware race (the losing Run is cancelled):
+     (require '[spindel.comb :as comb])
+     (let [a (agent/hire! team :fast {:task :solve})
+           b (agent/hire! team :slow {:task :solve})]
+       @(spin
+          (-> (await (comb/race (agent/owned-result-spin a)
+                                (agent/owned-result-spin b)))
+              :run/value)))"
   [sci-ctx room-id spindel-ctx agent-program-ceiling]
   (let [make-roster*   (requiring-resolve 'dvergr.agent.roster/make-roster)
         make-agent*    (requiring-resolve 'dvergr.agent.roster/make-agent)
@@ -108,7 +122,7 @@
         'result-spin  result-spin*
         'owned-result-spin owned-result-spin*}
        '{roster       [([] [opts]) "Create an immutable Roster value. Options may include portable :id, :defaults, :scope, and :metadata data."]
-         make-agent   [([roster spec]) "Return a NEW Roster containing `spec`; use {:id :a :program {:kind :echo}}, {:kind :scripted :reply value}, or {:kind :llm} plus :model-policy and :tools. Pure: input unchanged."]
+         make-agent   [([roster spec]) "Return a NEW Roster containing `spec`. Programs are {:kind :echo :delay-ms n}, {:kind :scripted :delay-ms n :reply value}, or {:kind :llm :max-model-steps n :budget-dollars n} plus :model-policy and :tools. Pure: input unchanged."]
          revise-agent [([roster id patch]) "Return a NEW Roster with AgentDef `id` revised and its version incremented."]
          lookup       [([roster id-or-ref]) "Resolve an AgentDef by keyword id or versioned AgentRef. A stale versioned ref is an error."]
          ref          [([agent-def]) "Return the stable {:agent/id :agent/version} reference for an AgentDef."]

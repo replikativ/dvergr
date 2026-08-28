@@ -3,6 +3,7 @@
    and probabilistic inference. Split out of dvergr.sandbox (Phase 4)."
   (:require [sci.core :as sci]
             [datahike.api :as dh]
+            [dvergr.sandbox.ns.doc :as doc]
             [org.replikativ.spindel.engine.core :as rtc]
             [org.replikativ.spindel.core :as sync]))
 
@@ -29,10 +30,15 @@
                            'post!     (fn [mb v] (mb v))})
       ;; Combinators
       (sci/add-namespace! sci-ctx 'spindel.comb
-                          {'parallel @(ns-resolve comb-ns 'parallel)
-                           'race     @(ns-resolve comb-ns 'race)
-                           'timeout  @(ns-resolve comb-ns 'timeout)
-                           'sleep    @(ns-resolve comb-ns 'sleep)})
+                          (doc/with-docs
+                            {'parallel @(ns-resolve comb-ns 'parallel)
+                             'race     @(ns-resolve comb-ns 'race)
+                             'timeout  @(ns-resolve comb-ns 'timeout)
+                             'sleep    @(ns-resolve comb-ns 'sleep)}
+                            '{parallel [([& spins]) "Run Spins concurrently and produce their values in input order. Cancelling the composition cancels its branches."]
+                              race     [([& spins]) "Produce the first Spin value and cancel losing branches. For hired Runs, pass dvergr.agent/owned-result-spin when branch cancellation must cancel the Run; passive result-spin deliberately leaves shared work alive."]
+                              timeout  [([spin timeout-ms] [spin timeout-ms timeout-value]) "Race a Spin against a timer and cancel the timed-out branch."]
+                              sleep    [([milliseconds]) "Return a Spin that completes after the given duration without blocking the engine thread."]}))
       ;; Signals — signal is a macro; wrap as a function using the underlying record
       (let [signal-ref-ctor (ns-resolve sig-ns '->SignalRef)
             addr-ns (do (require 'org.replikativ.spindel.engine.addressing)
@@ -252,4 +258,3 @@
                        'predict            @(resolve 'org.replikativ.spindel.inference.inference/predict)
                        'pimh-infer         @(resolve 'org.replikativ.spindel.inference.inference/pimh-infer)
                        'pgibbs-infer       @(resolve 'org.replikativ.spindel.inference.inference/pgibbs-infer)}))
-
