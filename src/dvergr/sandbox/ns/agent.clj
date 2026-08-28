@@ -19,7 +19,9 @@
    Spindel computation can branch with a different team without coordinating a
    mutable registry. `hire!` is the explicit effect boundary: it resolves this
    sandbox's Room, starts a durable Run in the Room's execution context, and
-   returns an opaque RunHandle whose native observer Spin is explicit.
+   returns an opaque RunHandle whose native observer Spin is explicit. When
+   the authority map supplies `:parent-run`, `hire!` uses it as the structural
+   parent unless the caller explicitly supplies one.
 
    Usage:
      (require '[dvergr.agent :as agent]
@@ -33,7 +35,7 @@
        @(spin (-> (await (agent/result-spin
                           (agent/hire! team :analyst {:task :inspect})))
                   :run/value)))"
-  [sci-ctx room-id spindel-ctx]
+  [sci-ctx room-id spindel-ctx agent-program-ceiling]
   (let [make-roster*   (requiring-resolve 'dvergr.agent.roster/make-roster)
         make-agent*    (requiring-resolve 'dvergr.agent.roster/make-agent)
         revise-agent*  (requiring-resolve 'dvergr.agent.roster/revise-agent)
@@ -46,6 +48,7 @@
         cancel*        (requiring-resolve 'dvergr.agent.program/cancel!)
         run-id*        (requiring-resolve 'dvergr.agent.program/run-id)
         result-spin*   (requiring-resolve 'dvergr.agent.program/result-spin)
+        owned-result-spin* (requiring-resolve 'dvergr.agent.program/owned-result-spin)
         room-lookup*   (requiring-resolve 'dvergr.room.registry/lookup)
         current-room   (fn []
                          (when room-id
@@ -58,9 +61,25 @@
                                      {:type ::no-current-room
                                       :room-id room-id}))))
         hire-fn        (fn [roster agent-ref opts]
-                         (let [room (room!)]
+                         (let [room (room!)
+                               definition (lookup-agent* roster agent-ref)
+                               kind (get-in definition [:agent/program :kind])
+                               allowed-kinds (:program-kinds agent-program-ceiling)]
+                           (when (and allowed-kinds
+                                      (not (contains? allowed-kinds kind)))
+                             (throw (ex-info
+                                     "Child program exceeds this sandbox's delegation ceiling"
+                                     {:type ::program-ceiling-exceeded
+                                      :agent-ref agent-ref
+                                      :program-kind kind
+                                      :allowed-program-kinds allowed-kinds})))
                            (binding [ec/*execution-context* (:ctx room)]
-                             (hire* room roster agent-ref opts))))
+                             (hire* room roster agent-ref
+                                    (if (and (:parent-run agent-program-ceiling)
+                                             (not (contains? opts :parent-run)))
+                                      (assoc opts :parent-run
+                                             (:parent-run agent-program-ceiling))
+                                      opts)))))
         observe-fn     (fn [handle-or-id]
                          (let [room (room!)]
                            (binding [ec/*execution-context* (:ctx room)]
@@ -86,19 +105,21 @@
         'observe      observe-fn
         'cancel!      cancel-fn
         'run-id       run-id*
-        'result-spin  result-spin*}
+        'result-spin  result-spin*
+        'owned-result-spin owned-result-spin*}
        '{roster       [([] [opts]) "Create an immutable Roster value. Options may include portable :id, :defaults, :scope, and :metadata data."]
-         make-agent   [([roster spec]) "Return a NEW Roster containing the portable AgentDef `spec`; no agent is started and the input roster is unchanged."]
+         make-agent   [([roster spec]) "Return a NEW Roster containing `spec`; use {:id :a :program {:kind :echo}}, {:kind :scripted :reply value}, or {:kind :llm} plus :model-policy and :tools. Pure: input unchanged."]
          revise-agent [([roster id patch]) "Return a NEW Roster with AgentDef `id` revised and its version incremented."]
          lookup       [([roster id-or-ref]) "Resolve an AgentDef by keyword id or versioned AgentRef. A stale versioned ref is an error."]
          ref          [([agent-def]) "Return the stable {:agent/id :agent/version} reference for an AgentDef."]
          list         [([roster]) "All AgentDefs in a Roster, deterministically ordered by id."]
          select       [([roster selector]) "Select AgentDefs by :id, :status, :skill/:skills, and exact portable :where data."]
-         hire!        [([roster agent-ref opts]) "Durably admit and start one AgentDef execution in the current Room. Returns an opaque RunHandle; opts requires :task and may include :from and :parent-run."]
+         hire!        [([roster agent-ref opts]) "Durably start one AgentDef in the current Room: (hire! team :a {:task value}). Returns a RunHandle; opts may also include :from and structural :parent-run."]
          observe      [([handle-or-run-id]) "Read the current Room's durable Run projection for a RunHandle or UUID."]
          cancel!      [([handle-or-run-id]) "Request cooperative cancellation of exactly one live Run. Returns true when the Run was found."]
          run-id       [([handle]) "Return the durable Run UUID represented by a RunHandle."]
-         result-spin  [([handle]) "Return a fresh native Spindel observer Spin for a RunHandle. Use (await (result-spin handle)) inside a workflow Spin."]}))))
+         result-spin  [([handle]) "Return a passive Spindel observer Spin for a RunHandle. Multiple observers may await it; cancelling an observer does not cancel the Run."]
+         owned-result-spin [([handle]) "Return an ownership-coupled result Spin. Cancelling this observer also cancels the underlying Run; use only when the observer owns that child execution."]}))))
 
 (defn add-agents-ns!
   "Expose the agent registry as 'agents namespace in SCI.

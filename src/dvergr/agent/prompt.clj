@@ -41,6 +41,29 @@
        "workaround cost you). Silent grinding hides exactly the information "
        "your operators need to improve your tools."))
 
+(def workflow-tool-use-guideline
+  "Operational guideline for bounded, private workflow/model-step execution.
+   Unlike the participant guideline, this does not claim unlimited authority:
+   a workflow inherits explicit tools, budgets, and delegation limits from its
+   parent Run."
+  (str "## Acting\n\n"
+       "You act ONLY by calling tools — describing an action does not perform "
+       "it. This model step ENDS when you reply with text and no tool call, so:\n"
+       "- To do or continue ANY work, call the tool in THIS message. Never end "
+       "a message by announcing what you'll do next ('Now let me…', 'Next "
+       "I'll…') — either call the tool now, or give your final answer if the "
+       "task is fully done.\n"
+       "- For multi-step tasks, call the tools for each step in sequence; don't "
+       "stop after one step to describe the rest.\n"
+       "- You already have the results of tools you called earlier in this "
+       "execution — reuse them; do not re-fetch the same thing.\n\n"
+       "## Bounded authority\n\n"
+       "This workflow is intentionally bounded by the tools, model-step limit, "
+       "budget, and delegation authority supplied by its parent Run. Work within "
+       "those bounds. If a bound prevents completion, preserve the useful partial "
+       "result and report the precise missing capability or exhausted resource; "
+       "do not claim authority or resources you were not given."))
+
 (defn now-note
   "A per-turn system note stating TODAY'S DATE, so the model anchors 'today',
    'this week', 'recent', deadlines and current-event questions to reality
@@ -116,6 +139,10 @@
      + sandbox pointer    ── when `clojure_eval` is among the tools
 
    `tools` may be a tool map (name→def, string keys) OR a set/vector of names.
+   `:profile :workflow` selects a private, bounded execution prompt: it omits
+   shared-room discourse/`[SKIP]` and states that tools, model steps, budget,
+   and delegation authority come from the parent Run. The default participant
+   profile retains the established prompt bytes.
    `isolation` is optional (`:native` / `:sci`); omit it to leave the proven
    daemon prompt byte-identical. `:room-dir` (optional) is a room's sandbox-repo
    path — when given, skills the room itself defines are injected too.
@@ -124,10 +151,11 @@
    so an embedder can gate skill eligibility on its own env source. The dynamic
    planning-mode guideline is appended elsewhere (per turn). sandbox pointer
    via requiring-resolve to avoid a cycle."
-  [base-prompt {:keys [tools isolation room-dir env-lookup]}]
+  [base-prompt {:keys [tools isolation room-dir env-lookup profile]}]
   (let [names   (mapv tool-name-str (if (map? tools) (keys tools) (or tools [])))
         nameset (set names)
         eval?   (contains? nameset "clojure_eval")
+        workflow? (= :workflow profile)
         ;; When not pinned, resolve the current room's sandbox-repo best-effort
         ;; (nil at the daemon root / no room ctx → global skills only), so an
         ;; agent assembled within a room sees that room's own skills.
@@ -135,13 +163,17 @@
                      (try ((requiring-resolve 'dvergr.sandbox.workspace/workspace-root))
                           (catch Throwable _ nil)))]
     (cond-> (skills/inject-skills
-             (str discourse-preamble "\n\n---\n\n" base-prompt)
+             (if workflow?
+               base-prompt
+               (str discourse-preamble "\n\n---\n\n" base-prompt))
              names room-dir (or env-lookup #(System/getenv (name %))))
       isolation     (str "\n\n## Runtime\n\nIsolation: " (name isolation)
                          (if (= :native (keyword isolation))
                            " — full Clojure eval at the system root (trusted)."
                            " — sandboxed Clojure eval (safe default)."))
-      (seq nameset) (str "\n\n" tool-use-guideline)
+      (seq nameset) (str "\n\n" (if workflow?
+                                  workflow-tool-use-guideline
+                                  tool-use-guideline))
       eval?         (str "\n\n" @(requiring-resolve 'dvergr.sandbox/sandbox-prompt-pointer))
       ;; The workspace's own AGENTS.md (stdlib map + intake catalog +
       ;; copy-a-source pattern) — the AGENTS.md/CLAUDE.md convention. Without

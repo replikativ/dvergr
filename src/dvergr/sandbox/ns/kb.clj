@@ -17,11 +17,18 @@
      (llm/summarize transcript {:max-tokens 300})
      (llm/call \"Extract product names:\" content)
 
-   Returns {:text :usage :model} or {:error}.
-   No SCI-level budget tracking — account at the tool level."
-  [sci-ctx]
+   Returns {:text :usage :model} or {:error}. Top-level sandboxes retain the
+   historical unbounded surface. A nested authority with
+   `:provider-effects? false` removes this provider-spend bypass."
+  [sci-ctx & [agent-program-ceiling]]
   (require 'dvergr.tools.llm-call)
-  (let [call-fn      @(ns-resolve 'dvergr.tools.llm-call 'cheap-llm-call)
+  (let [raw-call-fn  @(ns-resolve 'dvergr.tools.llm-call 'cheap-llm-call)
+        call-fn      (fn [& args]
+                       (when (false? (:provider-effects? agent-program-ceiling))
+                         (throw (ex-info
+                                 "LLM provider effects exceed this sandbox's delegation ceiling"
+                                 {:type ::provider-effects-disallowed})))
+                       (apply raw-call-fn args))
         summarize-fn (fn [content & [opts]]
                        (call-fn "Summarize the key points concisely:"
                                 content (or opts {})))]
@@ -29,7 +36,7 @@
                         (doc/with-docs
                           {'call      call-fn
                            'summarize summarize-fn}
-                          '{call      [([system-prompt content] [system-prompt content opts]) "One-shot call to a CHEAP model — for mechanical language work (extract, classify, rewrite) inside a larger job, not for reasoning you should do yourself. `opts` takes :max-tokens. Not budget-tracked at this level."]
+                          '{call      [([system-prompt content] [system-prompt content opts]) "One-shot call to a CHEAP model — for mechanical language work (extract, classify, rewrite) inside a larger job, not for reasoning you should do yourself. `opts` takes :max-tokens. Available only when this sandbox has provider-effect authority."]
                             summarize [([content] [content opts]) "Summarize text with the cheap model. `opts` takes :max-tokens, e.g. (llm/summarize page {:max-tokens 300})."]}))))
 
 ;; (RF5: the calendar folded into the per-room scheduler — see `scheduler/*` +
@@ -41,7 +48,7 @@
    `review`/`classify`/`forks`/`participants`/`root` — for the `dvergr.room` SCI
    namespace (mounted, merged with the DB surface, by `dvergr.sandbox.ns.room`).
    Persistent rooms + forks are behind one surface — same for agents, TUI, web."
-  [spindel-ctx]
+  [spindel-ctx & [agent-program-ceiling]]
   (require 'dvergr.discourse)
   (require 'dvergr.rooms)
   (require 'dvergr.room.registry)
@@ -199,9 +206,17 @@
      ;; tracked as a `:dvergr/subagent` lifecycle log; `pending-subagents` lists
      ;; the still-running ones.
        'hire         (fn [ref opts]
-                       (when-let [room (resolve-room ref)]
-                         (binding [rtc/*execution-context* (:ctx room)]
-                           (subagent-hire* room opts))))
+                       (let [allowed-kinds (:program-kinds agent-program-ceiling)]
+                         (when (and allowed-kinds
+                                    (not (contains? allowed-kinds :llm)))
+                           (throw (ex-info
+                                   "Legacy sub-agent hire exceeds this sandbox's delegation ceiling"
+                                   {:type ::program-ceiling-exceeded
+                                    :program-kind :llm
+                                    :allowed-program-kinds allowed-kinds})))
+                         (when-let [room (resolve-room ref)]
+                           (binding [rtc/*execution-context* (:ctx room)]
+                             (subagent-hire* room opts)))))
        'pending-subagents (fn [ref]
                             (when-let [room (resolve-room ref)]
                               (binding [rtc/*execution-context* (:ctx room)]
@@ -227,5 +242,3 @@
         root         [([]) "The root room of the tree."]
         hire         [([ref opts]) "Delegate a goal to an EPHEMERAL sub-agent in a forked subroom (`:ctx` substrate + shared CRDTs), then merge or discard it. `opts` takes :goal and :spec. Returns a SPIN — (await (dvergr.room/hire …)) to run it in the foreground, or hold the spin and await it later to run it in the background. Tracked durably as a :dvergr/subagent lifecycle log."]
         pending-subagents [([ref]) "Sub-agents hired from this room that are still running."]})))
-
-

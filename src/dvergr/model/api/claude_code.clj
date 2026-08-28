@@ -14,7 +14,8 @@
             [jsonista.core :as json]
             [clojure.string :as str]
             [taoensso.telemere :as tel])
-  (:import [java.io BufferedReader InputStreamReader]))
+  (:import [java.io BufferedReader Closeable InputStreamReader]
+           [java.util.concurrent CancellationException TimeUnit]))
 
 ;; ============================================================================
 ;; Message Formatting
@@ -197,20 +198,51 @@
              "--no-session-persistence"
              ;; Isolate the subprocess from the host's Claude Code environment,
              ;; or its leaked native tools shadow dvergr's text <tool_use>
-             ;; protocol and tool calls fail non-deterministically (dvergr #11):
+             ;; protocol and tool calls fail non-deterministically (dvergr #11).
+             ;; `--safe-mode` drops user/project customizations while retaining
+             ;; subscription auth; current Claude Code versions honor an empty
+             ;; `--tools` list as the authoritative way to disable built-ins.
+             "--safe-mode"
+             "--disable-slash-commands"
+             "--tools" ""
+             ;; Defense in depth for older CLI versions where an empty tools
+             ;; list was ineffective:
              ;;  - MCP: --strict-mcp-config + an empty config drops the user's
              ;;    global MCP servers ("{}" alone is rejected — needs mcpServers).
-             ;;  - Built-ins: --tools "" is a no-op in print mode, so DENY the
-             ;;    built-in tools explicitly to force the model onto <tool_use>.
              "--strict-mcp-config"
              "--mcp-config" "{\"mcpServers\":{}}"
-             "--disallowedTools" "Bash Read Edit Write Glob Grep Task WebFetch WebSearch"]
+             "--disallowedTools"
+             "Bash Read Edit Write Glob Grep Task WebFetch WebSearch ToolSearch Skill Workflow ListAgents ReportFindings ScheduleWakeup"]
       system (into ["--system-prompt" system])
       effort (into ["--effort" effort]))))
 
 ;; ============================================================================
 ;; Streaming Event Processing
 ;; ============================================================================
+
+(def ^:private cancel-poll-ms 10)
+(def ^:private process-exit-grace-ms 100)
+
+(defn- start-process [cmd]
+  (.start (doto (ProcessBuilder. ^java.util.List cmd)
+            (.redirectErrorStream false))))
+
+(defn- close-quietly! [resource]
+  (when (instance? Closeable resource)
+    (try
+      (.close ^Closeable resource)
+      (catch Exception _))))
+
+(defn- terminate-process!
+  "Terminate process, escalating promptly when a graceful destroy is ignored."
+  [^Process process]
+  (when process
+    (locking process
+      (when (.isAlive process)
+        (.destroy process)
+        (when-not (.waitFor process process-exit-grace-ms TimeUnit/MILLISECONDS)
+          (.destroyForcibly process)
+          (.waitFor process process-exit-grace-ms TimeUnit/MILLISECONDS))))))
 
 (defn- parse-json-line [line]
   (when (and (string? line) (not (str/blank? line)))
@@ -255,51 +287,108 @@
                            (assoc opts :system effective-system)
                            opts)
         cmd (build-command opts-with-system)
-        pb (ProcessBuilder. ^java.util.List cmd)
-        _ (.redirectErrorStream pb false)
-        process (.start pb)
+        process (start-process cmd)
         stdin (.getOutputStream process)
-        _ (.write stdin (.getBytes prompt "UTF-8"))
-        _ (.close stdin)
         stdout-reader (BufferedReader. (InputStreamReader. (.getInputStream process) "UTF-8"))
-        on-text (:on-text opts)
-        result-event (loop [line (.readLine stdout-reader)
-                            result nil]
-                       (if (nil? line)
-                         result
-                         (let [event (parse-json-line line)]
-                           (when event
-                             (when on-text
-                               (when-let [text (extract-text-delta event)]
-                                 (on-text text))))
-                           (recur (.readLine stdout-reader)
-                                  (if (and event (= "result" (:type event)))
-                                    event
-                                    result)))))
         stderr-reader (BufferedReader. (InputStreamReader. (.getErrorStream process) "UTF-8"))
-        stderr (slurp stderr-reader)
-        exit-code (.waitFor process)]
-    (.close stdout-reader)
-    (.close stderr-reader)
-    (if (and result-event (or (zero? exit-code) result-event))
-      (let [model-usage (:modelUsage result-event)
-            model-key (first (keys model-usage))
-            raw-content (or (:result result-event) "")
-            ;; Parse tool calls from response text
-            {:keys [text tool-calls]} (if (seq tools)
-                                        (parse-tool-calls raw-content)
-                                        {:text raw-content :tool-calls nil})]
-        {:content text
-         :tool-calls tool-calls
-         :usage (parse-result-usage result-event)
-         :stop-reason (if (seq tool-calls) :tool-use :end-turn)
-         :model (when model-key (name model-key))
-         :id (:session_id result-event)
-         :cost-usd (:total_cost_usd result-event)})
-      (throw (ex-info (str "claude CLI failed (exit " exit-code ")")
-                      {:exit-code exit-code
-                       :stderr stderr
-                       :result result-event})))))
+        on-text (:on-text opts)
+        ;; Claude can fill the OS stderr pipe before producing stdout. Drain it
+        ;; from process start so neither stream can block the other.
+        stderr-future (future (slurp stderr-reader))
+        cancelled? (atom false)
+        monitor-done? (atom false)
+        cancel? (:cancel? opts)
+        cancel-monitor
+        (when cancel?
+          (future
+            (try
+              (loop []
+                (when (and (not @monitor-done?) (.isAlive process))
+                  (if (cancel?)
+                    (do
+                      (reset! cancelled? true)
+                      (terminate-process! process))
+                    (do
+                      (Thread/sleep cancel-poll-ms)
+                      (recur)))))
+              (catch InterruptedException _)
+              (catch Exception e
+                (tel/log! {:level :warn :id :claude-code/cancel-monitor-error
+                           :data {:error (.getMessage e)}}
+                          "Claude Code cancellation monitor failed")))))]
+    (try
+      ;; Check once synchronously so an already-cancelled request cannot feed
+      ;; the subprocess before the monitor's first poll.
+      (when (and cancel? (cancel?))
+        (reset! cancelled? true)
+        (terminate-process! process)
+        (throw (CancellationException. "LLM call cancelled")))
+      (try
+        (.write stdin (.getBytes prompt "UTF-8"))
+        (.close stdin)
+        (catch java.io.IOException e
+          ;; A CLI that rejects its invocation may close stdin immediately.
+          ;; Preserve its exit code and stderr instead of masking them with a
+          ;; broken-pipe exception. An alive process still indicates a real I/O
+          ;; failure (or a cancellation race handled by the outer catch).
+          (when (.isAlive process)
+            (throw e))))
+      (let [result-event (loop [line (.readLine stdout-reader)
+                                result nil]
+                           (if (nil? line)
+                             result
+                             (let [event (parse-json-line line)]
+                               (when event
+                                 (when on-text
+                                   (when-let [text (extract-text-delta event)]
+                                     (on-text text))))
+                               (recur (.readLine stdout-reader)
+                                      (if (and event (= "result" (:type event)))
+                                        event
+                                        result)))))
+            exit-code (.waitFor process)
+            stderr @stderr-future]
+        (when @cancelled?
+          (throw (CancellationException. "LLM call cancelled")))
+        (if (and result-event (or (zero? exit-code) result-event))
+          (let [model-usage (:modelUsage result-event)
+                model-key (first (keys model-usage))
+                raw-content (or (:result result-event) "")
+                ;; Parse tool calls from response text
+                {:keys [text tool-calls]} (if (seq tools)
+                                            (parse-tool-calls raw-content)
+                                            {:text raw-content :tool-calls nil})]
+            {:content text
+             :tool-calls tool-calls
+             :usage (parse-result-usage result-event)
+             :stop-reason (if (seq tool-calls) :tool-use :end-turn)
+             :model (when model-key (name model-key))
+             :id (:session_id result-event)
+             :cost-usd (:total_cost_usd result-event)})
+          (throw (ex-info (str "claude CLI failed (exit " exit-code ")")
+                          {:exit-code exit-code
+                           :stderr stderr
+                           :result result-event}))))
+      (catch Throwable t
+        ;; The monitor can destroy the process between any two stream
+        ;; operations. Cancellation remains the public outcome regardless of
+        ;; which blocked I/O operation observes process death first.
+        (if (and @cancelled? (not (instance? CancellationException t)))
+          (throw (doto (CancellationException. "LLM call cancelled")
+                   (.initCause t)))
+          (throw t)))
+      (finally
+        (reset! monitor-done? true)
+        ;; Closing all streams plus process termination releases reader futures
+        ;; on success, cancellation, callback failure, and malformed output.
+        (close-quietly! stdin)
+        (close-quietly! stdout-reader)
+        (close-quietly! stderr-reader)
+        (terminate-process! process)
+        (when cancel-monitor
+          (future-cancel cancel-monitor))
+        (when-not (realized? stderr-future)
+          (future-cancel stderr-future))))))
 
 ;; ============================================================================
 ;; Provider Record

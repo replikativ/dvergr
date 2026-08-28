@@ -1,19 +1,31 @@
 (ns dvergr.agent.program
   "Run-backed execution of portable AgentDefs.
 
-   This is deliberately a thin first interpreter. Roster construction is pure;
-   `hire!` is the effect boundary that posts the precise task trigger, admits a
-   durable Run, and starts a Spindel Spin. Live results are cached by Spindel,
-   while Room messages and Run lifecycle remain the durable source of truth."
+   Roster construction is pure; `hire!` is the effect boundary that admits a
+   durable Run, posts its precise task trigger, and starts a Spindel Spin.
+   Workflow results live in the fork-aware execution graph, while Room messages
+   and Run lifecycle remain the durable source of truth."
   (:require [dvergr.agent.roster :as roster]
+            [dvergr.agent.prompt :as prompt]
+            [dvergr.agent.room-context :as room-context]
             [dvergr.agent.run :as run]
+            [dvergr.agent.turn :as turn]
+            [dvergr.chat.agent :as chat-agent]
+            [dvergr.chat.context :as chat-context]
             [dvergr.discourse :as d]
+            [dvergr.model.providers :as providers]
+            [dvergr.system.rooms :as system-rooms]
+            [dvergr.tools :as tools]
             [hasch.core :as hasch]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.atom :as ratom]
             [org.replikativ.spindel.spin.combinators :as comb]
             [org.replikativ.spindel.spin.core :as spin-core]
-            [org.replikativ.spindel.spin.sync :as sync]))
+            [org.replikativ.spindel.spin.sync :as sync])
+  (:import [java.nio.charset StandardCharsets]
+           [java.util UUID]
+           [java.util.concurrent Callable CountDownLatch FutureTask]))
 
 (def run-sink
   "Reserved non-subscribed Room address for private Run inputs and outputs.
@@ -21,7 +33,183 @@
    to a Participant is a separate, explicit speech act."
   :_runs)
 
-(def interpreter-version 1)
+(def interpreter-version 2)
+
+(def ^:private default-max-model-steps 32)
+
+(defn- program-result
+  ([status value] {::status status ::value value})
+  ([status value reason] {::status status ::value value ::reason reason}))
+
+(defn- run-chat-id [run-id]
+  (UUID/nameUUIDFromBytes
+   (.getBytes (str "dvergr-agent-run|" run-id) StandardCharsets/UTF_8)))
+
+(declare start-worker!)
+
+(defn- make-supervisor [execution-ctx]
+  {:execution-ctx execution-ctx
+   :state (atom {:cancelled? false
+                 :sealed? false
+                 :workers {}
+                 :cleanup nil
+                 :cleanup-phase :pending
+                 :cleanup-error nil
+                 :quiesced? false})
+   :quiesced (sync/deferred)
+   :quiesced-latch (CountDownLatch. 1)})
+
+(defn- advance-supervisor!
+  "Advance cleanup/quiescence after an atomic supervisor transition. Cleanup
+   starts only after every normal worker has acknowledged termination."
+  [supervisor]
+  (let [action
+        (locking supervisor
+          (let [{:keys [sealed? workers cleanup cleanup-phase quiesced?] :as state}
+                @(:state supervisor)
+                normal-live? (some #(= :normal (:kind %)) (vals workers))]
+            (cond
+              (and sealed? (not normal-live?) (= :pending cleanup-phase) cleanup)
+              (do (swap! (:state supervisor) assoc :cleanup-phase :running)
+                  [:cleanup cleanup])
+
+              (and sealed? (not normal-live?) (= :pending cleanup-phase))
+              (do (swap! (:state supervisor) assoc :cleanup-phase :done)
+                  :advance)
+
+              (and sealed? (= :done cleanup-phase) (empty? workers) (not quiesced?))
+              (let [state' (assoc state :quiesced? true)]
+                (reset! (:state supervisor) state')
+                [:quiesced state'])
+
+              :else nil)))]
+    (cond
+      (= :advance action)
+      (advance-supervisor! supervisor)
+
+      (= :cleanup (first action))
+      (start-worker! supervisor (second action) :cleanup)
+
+      (= :quiesced (first action))
+      (try
+        ;; Deferred publication is context access. The stable latch is released
+        ;; only afterwards, so Room drain can treat it as a true quiescence ack.
+        (binding [ec/*execution-context* (:execution-ctx supervisor)]
+          ((:quiesced supervisor) (second action)))
+        (finally
+          (.countDown ^CountDownLatch (:quiesced-latch supervisor)))))
+    nil))
+
+(defn- worker-finished! [supervisor worker-id kind result]
+  (locking supervisor
+    (swap! (:state supervisor)
+           (fn [state]
+             (cond-> (update state :workers dissoc worker-id)
+               (= :cleanup kind)
+               (assoc :cleanup-phase :done
+                      :cleanup-error (when (and (map? result)
+                                                (contains? result ::worker-error))
+                                       (::worker-error result)))))))
+  (advance-supervisor! supervisor))
+
+(defn- start-worker!
+  "Register and start blocking/native work under the process-local supervisor.
+   Cancellation is sticky: registration and the cancellation check share the
+   supervisor lock, closing the cancel-before-start and between-step races."
+  ([supervisor f] (start-worker! supervisor f :normal))
+  ([supervisor f kind]
+   (let [done       (sync/deferred)
+         worker-id  (random-uuid)
+         phase      (atom :new)
+         result     (atom nil)
+         callable   (reify Callable
+                      (call [_]
+                        (when (compare-and-set! phase :new :running)
+                          (binding [ec/*execution-context* (:execution-ctx supervisor)]
+                            (try
+                              (reset! result (f))
+                              (catch Throwable t
+                                (reset! result {::worker-error t}))
+                              (finally
+                                (reset! phase :terminated)
+                               ;; Publish the per-worker result before removing
+                               ;; its live lease from the stable supervisor.
+                                (try
+                                  (done @result)
+                                  (finally
+                                    (worker-finished! supervisor worker-id kind
+                                                      @result)))))))))
+         task       (proxy [FutureTask] [callable]
+                      (done []
+                       ;; Cancellation before the executor begins means the
+                       ;; Callable's finally cannot acknowledge termination.
+                       ;; Win that one state transition here. If it was already
+                       ;; running, its finally is the only acknowledgement.
+                        (when (and (.isCancelled this)
+                                   (compare-and-set! phase :new :terminated))
+                          (let [value (or @result ::worker-cancelled)]
+                            (binding [ec/*execution-context* (:execution-ctx supervisor)]
+                              (try
+                                (done value)
+                                (finally
+                                  (worker-finished! supervisor worker-id kind
+                                                    value))))))))
+         worker     {:id worker-id :task task :done done :kind kind}
+         cancel-now?
+         (locking supervisor
+           (let [{:keys [sealed? cancelled?]} @(:state supervisor)]
+             (when (and sealed? (= :normal kind))
+               (throw (ex-info "Cannot start work after supervisor seal"
+                               {:type ::supervisor-sealed})))
+             (swap! (:state supervisor) assoc-in [:workers worker-id] worker)
+             (and cancelled? (= :normal kind))))]
+     (if cancel-now?
+      ;; Do not even enqueue work when cancellation preceded registration.
+       (.cancel task false)
+       (try
+         (.execute clojure.lang.Agent/soloExecutor task)
+         (catch Throwable t
+          ;; Make executor rejection flow through the same acknowledgement path.
+           (reset! result {::worker-error t})
+           (.cancel task false))))
+     worker)))
+
+(defn- cancel-supervisor! [supervisor]
+  (let [tasks
+        (locking supervisor
+          (swap! (:state supervisor) assoc :cancelled? true)
+          (->> (get @(:state supervisor) :workers)
+               vals
+               (filter #(= :normal (:kind %)))
+               (map :task)
+               vec))]
+    (doseq [^FutureTask task tasks]
+      (.cancel task true)))
+  nil)
+
+(defn- register-cleanup! [supervisor cleanup]
+  (locking supervisor
+    (when-not (= :pending (:cleanup-phase @(:state supervisor)))
+      (throw (ex-info "Cleanup registered after supervisor cleanup began"
+                      {:type ::late-cleanup-registration})))
+    (swap! (:state supervisor) assoc :cleanup cleanup))
+  nil)
+
+(defn- seal-supervisor! [supervisor]
+  (locking supervisor
+    (swap! (:state supervisor) assoc :sealed? true))
+  (advance-supervisor! supervisor)
+  (:quiesced supervisor))
+
+(defn- worker-result-spin [worker]
+  (sp/spin (sp/await (:done worker))))
+
+(defn- worker-error? [value]
+  (and (map? value) (contains? value ::worker-error)))
+
+(defn- await-supervisor! [supervisor]
+  (.await ^CountDownLatch (:quiesced-latch supervisor))
+  nil)
 
 (deftype RunHandle [id room-id owner-fork-id execution completion]
   clojure.lang.ILookup
@@ -80,19 +268,28 @@
   (:run/id handle))
 
 (defn result-spin
-  "A native Spindel observer Spin for `handle`'s completion. Await this inside
+  "A passive Spindel observer Spin for `handle`'s completion. Await this inside
    workflow Spins. Each call returns a fresh graph node over a fork-aware
-   Deferred, so combinators never invoke the already-running execution again.
-  The observer owns that execution during its initial pre-await window."
+   Deferred; cancelling one observer never cancels the shared execution or a
+   peer observer. Use `owned-result-spin` when structured cancellation should
+   propagate from a race arm to the hired Run."
+  [^RunHandle handle]
+  (ensure-owner-context! handle)
+  (let [completion (.-completion handle)]
+    (sp/spin (sp/await completion))))
+
+(defn owned-result-spin
+  "An owning Spindel observer for a RunHandle. If a combinator cancels this
+   observer (for example, as the losing arm of `race`), cancellation propagates
+   to the hired Run. Prefer passive `result-spin` for ordinary or shared reads."
   [^RunHandle handle]
   (ensure-owner-context! handle)
   (let [execution (.-execution handle)
-        completion (.-completion handle)
         id (:run/id handle)
         room-id (:run/room handle)
         observer (sp/spin
                   (try
-                    (sp/await completion)
+                    (sp/await (.-completion handle))
                     (catch Throwable t
                       (when (= spin-core/spin-cancelled (:type (ex-data t)))
                         (run/cancel-room-run! room-id id))
@@ -118,8 +315,8 @@
          (sp/await (comb/sleep slice))
          (recur (- remaining slice)))))))
 
-(defn- execute-program
-  "Interpret the provider-free program vocabulary. Returns Spin[value]."
+(defn- execute-deterministic-program
+  "Interpret the deterministic program vocabulary. Returns Spin[ProgramResult]."
   [run-id agent task]
   (let [{:keys [kind delay-ms reply result] :as program} (:agent/program agent)]
     (sp/spin
@@ -127,11 +324,13 @@
      (when (run/cancel-requested? run-id)
        (cancelled! run-id))
      (case kind
-       :scripted (cond
-                   (contains? program :result) result
-                   (contains? program :reply) reply
-                   :else nil)
-       :echo task
+       :scripted (program-result
+                  :completed
+                  (cond
+                    (contains? program :result) result
+                    (contains? program :reply) reply
+                    :else nil))
+       :echo (program-result :completed task)
        (throw (ex-info "No interpreter for AgentDef program kind"
                        {:type ::unknown-program-kind
                         :kind kind
@@ -140,16 +339,208 @@
 (defn- result-content [value]
   (if (string? value) value (pr-str value)))
 
+(defn- last-assistant-content [chat-ctx]
+  (some->> (chat-context/get-messages chat-ctx)
+           reverse
+           (some (fn [message]
+                   (when (= :assistant
+                            (or (:message/role message) (:role message)))
+                     (or (:message/content message) (:content message)))))))
+
+(defn- resolve-model-spec [agent]
+  (providers/ensure-initialized!)
+  (or (:agent/model-policy agent)
+      (providers/default-spec)
+      (throw (ex-info "No LLM provider is available for AgentDef"
+                      {:type ::no-provider
+                       :agent/id (:agent/id agent)}))))
+
+(defn- new-llm-context [room run-id agent budget-dollars chat-id]
+  (let [system-id (room-context/room-system-id room)
+        borrowed-db (some-> room :store :conn)
+        chat-ctx (turn/new-working-ctx
+                  {:execution-ctx (:ctx room)
+                   :chat-id chat-id
+                   :title (str "agent-task " (name (:agent/id agent)))
+                   :budget-dollars budget-dollars
+                   :db-conn borrowed-db
+                   :kb-conn (when system-id (system-rooms/room-kb-conn system-id))
+                   :room-id system-id
+                   :room-runtime-id (:id room)
+                   ;; Until Kontor can split a resource vector, a paid child may
+                   ;; only delegate provider-free work. Pure roster construction
+                   ;; remains available inside SCI.
+                   :agent-program-ceiling {:program-kinds #{:echo :scripted}
+                                           :provider-effects? false
+                                           :parent-run run-id}})]
+    {:chat-ctx chat-ctx
+     :owned-db? (nil? borrowed-db)}))
+
+(defn- llm-tool-context [room chat-ctx agent]
+  (let [system-id (room-context/room-system-id room)
+        tool-map (tools/normalize-tools (or (:agent/tools agent) #{}))]
+    {:tool-map tool-map
+     :tool-ctx
+     (-> (tools/make-context
+          {:db-conn (:db-conn chat-ctx)
+           :chat-ctx chat-ctx
+           :sci-ctx (:sci-ctx chat-ctx)
+           :tools tool-map
+           :isolation :sci
+           :execution-ctx (:ctx room)})
+         (assoc :workspace-roots
+                (when system-id (system-rooms/room-load-roots system-id)))
+         (assoc :kb-conn
+                (when system-id (system-rooms/room-kb-conn system-id)))
+         (assoc :room room))}))
+
+(defn- execute-llm-program
+  "Run a bounded Dvergr-native model/tool loop. Each blocking model round-trip
+   runs under a supervised worker; this Spin retains orchestration, activity
+   correlation, cleanup, and cancellation in the Room's execution graph."
+  [room run-id chat-id agent task trigger supervisor]
+  (let [{:keys [max-model-steps budget-dollars auto-compact? compaction-model]
+         :or {max-model-steps default-max-model-steps
+              budget-dollars 1.0
+              auto-compact? true}} (:agent/program agent)]
+    (sp/spin
+     ;; Context/schema/SCI construction and credential discovery may block.
+     ;; Build the whole runtime bundle under the same supervised worker as
+     ;; provider calls, before exposing it to the orchestration Spin.
+     (let [init-worker
+           (start-worker!
+            supervisor
+            (fn []
+              (let [{:keys [chat-ctx owned-db?]}
+                    (new-llm-context room run-id agent budget-dollars chat-id)
+                    _ (when owned-db?
+                        (register-cleanup!
+                         supervisor #(chat-context/close-chat! chat-ctx)))
+                    {:keys [tool-map tool-ctx]}
+                    (llm-tool-context room chat-ctx agent)
+                    model-spec (resolve-model-spec agent)
+                    instructions
+                    (prompt/assemble-system-prompt
+                     (str "You are a model inside the Dvergr harness. Dvergr owns "
+                          "tools and the sandbox. Call only tools explicitly supplied "
+                          "in this request; when none are supplied, answer directly. "
+                          "Never request shell, grep, file, web, or other native "
+                          "Codex tools unless Dvergr explicitly supplied that exact tool."
+                          (when-let [agent-prompt (:agent/prompt agent)]
+                            (str "\n\n" agent-prompt)))
+                     {:tools tool-map :isolation :sci :profile :workflow})]
+                (chat-context/add-message!
+                 chat-ctx {:role :system :content instructions})
+                (chat-context/add-message!
+                 chat-ctx {:role :user :content (result-content task)})
+                {:chat-ctx chat-ctx
+                 :tool-map tool-map
+                 :tool-ctx tool-ctx
+                 :model-spec model-spec})))
+           initialized (sp/await (worker-result-spin init-worker))]
+       (when (or (= ::worker-cancelled initialized)
+                 (run/cancel-requested? run-id))
+         (cancelled! run-id))
+       (when (worker-error? initialized)
+         (throw (ex-info "LLM runtime initialization failed"
+                         {:type ::runtime-initialization-failed
+                          :agent/id (:agent/id agent)}
+                         (::worker-error initialized))))
+       (let [{:keys [chat-ctx tool-map tool-ctx model-spec]} initialized
+             posted (ratom/create-atom 0)]
+         (loop [model-step 0]
+           (when (run/cancel-requested? run-id)
+             (cancelled! run-id))
+           (let [call
+                 (start-worker!
+                  supervisor
+                  (fn []
+                    (chat-agent/run-agent-turn!
+                     chat-ctx
+                     {:provider (:provider model-spec)
+                      :model (:model model-spec)
+                        ;; The SAME normalized map defines both the model schema
+                        ;; and execute-side authority. Empty means no tools.
+                      :tools tool-map
+                      :tool-ctx tool-ctx
+                      :cancel? (turn/cancel?-fn
+                                chat-ctx (:ctx room)
+                                (fn [] (run/cancel-requested? run-id)))
+                      :auto-compact? auto-compact?
+                      :compaction-model compaction-model
+                      ;; The existing single-exchange core still calls this
+                      ;; trace field `turn-number`; semantically it is a model
+                      ;; integration step, not a conversational turn.
+                      :turn-number model-step
+                      :run-id run-id})))
+                 outcome (sp/await (worker-result-spin call))]
+             (turn/post-turn-activity! room (:agent/id agent) chat-ctx posted
+                                       run-id trigger)
+             (cond
+               (or (= ::worker-cancelled outcome)
+                   (run/cancel-requested? run-id))
+               (cancelled! run-id)
+
+               (worker-error? outcome)
+               (throw (ex-info "LLM model step failed"
+                               {:type ::llm-model-step-failed
+                                :agent/id (:agent/id agent)
+                                :model-step model-step}
+                               (::worker-error outcome)))
+
+               (= :cancelled outcome)
+               (cancelled! run-id)
+
+               (= :error outcome)
+               (throw (ex-info "LLM model step failed"
+                               {:type ::llm-model-step-failed
+                                :agent/id (:agent/id agent)
+                                :model-step model-step}))
+
+               (= :complete outcome)
+               (if-let [value (last-assistant-content chat-ctx)]
+                 (program-result :completed value)
+                 (throw (ex-info "LLM program completed without an assistant result"
+                                 {:type ::missing-llm-result
+                                  :agent/id (:agent/id agent)})))
+
+               (not= :continue outcome)
+               (throw (ex-info "Unknown LLM model-step outcome"
+                               {:type ::unknown-model-step-outcome
+                                :outcome outcome
+                                :model-step model-step}))
+
+               (chat-context/budget-exceeded? chat-ctx)
+               (program-result :waiting nil :budget-exhausted)
+
+               (>= (inc model-step) max-model-steps)
+               (throw (ex-info "LLM program exceeded its model-step bound"
+                               {:type ::model-step-limit-exceeded
+                                :agent/id (:agent/id agent)
+                                :max-model-steps max-model-steps}))
+
+               :else
+               (recur (inc model-step))))))))))
+
+(defn- execute-program
+  [room run-id chat-id agent task trigger supervisor]
+  (case (get-in agent [:agent/program :kind])
+    :llm (execute-llm-program room run-id chat-id agent task trigger supervisor)
+    (execute-deterministic-program run-id agent task)))
+
 (def ^:private hire-option-keys #{:task :from :parent-run})
 
 (defn- validate-program!
-  [{:keys [kind delay-ms] :as program} agent-ref]
+  [{:keys [kind delay-ms max-model-steps budget-dollars auto-compact? compaction-model]
+    :as program} agent-ref agent]
   (let [allowed (case kind
                   :scripted #{:kind :delay-ms :reply :result}
                   :echo #{:kind :delay-ms}
+                  :llm #{:kind :max-model-steps :budget-dollars
+                         :auto-compact? :compaction-model}
                   nil)]
     (when-not allowed
-      (throw (ex-info "hire! currently requires a provider-free program"
+      (throw (ex-info "hire! does not have an interpreter for this program"
                       {:type ::unsupported-program
                        :agent-ref agent-ref
                        :kind kind})))
@@ -164,6 +555,34 @@
                (not (and (integer? delay-ms) (<= 0 delay-ms 600000))))
       (throw (ex-info "Program :delay-ms must be an integer from 0 to 600000"
                       {:type ::invalid-delay :delay-ms delay-ms})))
+    (when (and (= :llm kind)
+               (not (and (integer? (or max-model-steps default-max-model-steps))
+                         (<= 1 (or max-model-steps default-max-model-steps) 256))))
+      (throw (ex-info "LLM program :max-model-steps must be an integer from 1 to 256"
+                      {:type ::invalid-max-model-steps
+                       :max-model-steps max-model-steps})))
+    (when (and (= :llm kind)
+               (not (and (number? (or budget-dollars 1.0))
+                         (pos? (double (or budget-dollars 1.0))))))
+      (throw (ex-info "LLM program :budget-dollars must be positive"
+                      {:type ::invalid-budget :budget-dollars budget-dollars})))
+    (when (and (= :llm kind) (some? auto-compact?) (not (boolean? auto-compact?)))
+      (throw (ex-info "LLM program :auto-compact? must be boolean"
+                      {:type ::invalid-auto-compact :auto-compact? auto-compact?})))
+    (when (and (= :llm kind) compaction-model (not (string? compaction-model)))
+      (throw (ex-info "LLM program :compaction-model must be a string"
+                      {:type ::invalid-compaction-model :compaction-model compaction-model})))
+    (when (= :llm kind)
+      (let [policy (:agent/model-policy agent)]
+        (when (and policy
+                   (not (and (= #{:provider :model} (set (keys policy)))
+                             (keyword? (:provider policy))
+                             (string? (:model policy))
+                             (seq (:model policy)))))
+          (throw (ex-info "LLM AgentDef :model-policy must be {:provider keyword :model string}"
+                          {:type ::invalid-model-policy
+                           :agent-ref agent-ref
+                           :model-policy policy})))))
     program))
 
 (defn- validate-hire!
@@ -188,51 +607,137 @@
   (let [agent (or (roster/agent roster agent-ref)
                   (throw (ex-info "Unknown AgentRef"
                                   {:type ::unknown-agent :agent-ref agent-ref})))]
-    (validate-program! (:agent/program agent) agent-ref)
+    (validate-program! (:agent/program agent) agent-ref agent)
     agent))
 
 (defn- cancelled-error? [t run-id]
-  (or (= ::cancelled (:type (ex-data t)))
-      (= spin-core/spin-cancelled (:type (ex-data t)))
+  (or (loop [error t]
+        (when error
+          (or (= ::cancelled (:type (ex-data error)))
+              (= spin-core/spin-cancelled (:type (ex-data error)))
+              ;; Some Spindel graph boundaries preserve the cancellation
+              ;; message while wrapping its ex-data. Follow the cause chain so
+              ;; a structured race cannot be misclassified as program failure.
+              (= "Spin cancelled" (ex-message error))
+              (recur (ex-cause error)))))
       (run/cancel-requested? run-id)))
 
-(defn- execution-spin
-  [room agent task trigger id completion]
+(defn- publish-result-and-release-spin
+  "Retry terminal persistence without losing the computed result. The Run keeps
+   its live execution lease and its completion remains unresolved until the
+   durable projection succeeds. This makes a transient store outage visible as
+   a still-active Run and gives it a real recovery path instead of silently
+   leaving a durable `:running` projection behind."
+  [id completion result finish-opts]
   (sp/spin
-   (let [result
+   (loop []
+     (let [retained (try
+                      (run/retain-finished! id (:run/status result) finish-opts)
+                      (catch Throwable t t))]
+       (cond
+         (instance? Throwable retained)
+         (do
+           ;; Store calls are normally immediate. Only the backoff is async, so
+           ;; an unavailable durable store never parks Spindel's drain thread.
+           (sp/await (comb/sleep 25))
+           (recur))
+
+         retained
          (try
-           (let [value (sp/await (execute-program id agent task))]
+           (completion result)
+           (finally
+             (run/release-finished! id)))
+
+         ;; Another exactly-once settlement path already retained/released it.
+         :else nil)))
+   result))
+
+(defn- settle-after-supervisor!
+  "Settle a graph-cancelled execution only after the stable supervisor reports
+   every native worker and owned cleanup quiescent."
+  [room id supervisor completion result]
+  (future
+    (await-supervisor! supervisor)
+    (let [cleanup-error (:cleanup-error @(:state supervisor))
+          result (if cleanup-error
+                   {:run/id id :run/status :failed
+                    :run/error (ex-message cleanup-error)}
+                   result)
+          finish-opts (if (= :cancelled (:run/status result))
+                        {:reason :structured-cancellation}
+                        {:reason (if cleanup-error :cleanup-error :execution-error)
+                         :error (or cleanup-error (:run/error result))})]
+      (binding [ec/*execution-context* (:ctx room)]
+        @(publish-result-and-release-spin id completion result finish-opts)))))
+
+(defn- execution-spin
+  [room agent task trigger id chat-id completion supervisor]
+  (sp/spin
+   (let [outcome
+         (try
+           (let [{status ::status value ::value reason ::reason}
+                 (sp/await (execute-program room id chat-id agent task trigger supervisor))
+                 ;; Seal admits no further provider work, runs owned cleanup
+                 ;; after all workers terminate, and publishes one stable
+                 ;; quiescence acknowledgement.
+                 _ (sp/await (seal-supervisor! supervisor))
+                 cleanup-error (:cleanup-error @(:state supervisor))]
+             (when cleanup-error
+               (throw (ex-info "Agent program cleanup failed"
+                               {:type ::cleanup-failed}
+                               cleanup-error)))
              (when (run/cancel-requested? id)
                (cancelled! id))
-             (let [output (d/reply (:agent/id agent) run-sink
-                                   (result-content value) trigger
-                                   {:role :assistant :run-id id})]
-               ;; Room posting is durability-first. Completion is acknowledged
-               ;; only after the correlated private output exists.
-               (d/post! room output)
-               (run/finish! id :completed)
-               {:run/id id
-                :run/status :completed
-                :run/value value
-                :run/output output}))
+             (case status
+               :completed
+               (let [output (d/reply (:agent/id agent) run-sink
+                                     (result-content value) trigger
+                                     {:role :assistant :run-id id})]
+                 ;; Room posting is durability-first. Completion is acknowledged
+                 ;; only after the correlated private output exists.
+                 (d/post! room output)
+                 {:result {:run/id id
+                           :run/status :completed
+                           :run/value value
+                           :run/output output}
+                  :finish-opts {}})
+
+               :waiting
+               {:result {:run/id id :run/status :waiting :run/reason reason}
+                :finish-opts {:reason reason}}
+
+               (throw (ex-info "Interpreter returned an unknown program status"
+                               {:type ::unknown-program-status
+                                :status status
+                                :agent/id (:agent/id agent)}))))
            (catch Throwable t
-             (if (cancelled-error? t id)
-               (do
-                 (run/finish! id :cancelled {:reason :cancel-requested})
-                 {:run/id id :run/status :cancelled})
-               (do
-                 (run/finish! id :failed {:reason :program-error :error t})
-                 {:run/id id
-                  :run/status :failed
-                  :run/error (ex-message t)}))))]
+             ;; Ordinary exceptions still own their Spin and can quiesce here.
+             ;; A graph-level cancellation that bypasses this body is handled by
+             ;; the spawn on-error callback below.
+             (sp/await (seal-supervisor! supervisor))
+             (let [cleanup-error (:cleanup-error @(:state supervisor))
+                   error (or cleanup-error t)]
+               (if (and (nil? cleanup-error) (cancelled-error? t id))
+                 {:result {:run/id id :run/status :cancelled}
+                  :finish-opts {:reason :cancel-requested}}
+                 {:result {:run/id id
+                           :run/status :failed
+                           :run/error (ex-message error)}
+                  :finish-opts {:reason (if cleanup-error
+                                          :cleanup-error
+                                          :program-error)
+                                :error error}}))))
+         result (:result outcome)]
      ;; Completion is a Spindel Deferred allocated in this Room's execution
      ;; context, not a JVM promise or host atom. Its value therefore follows
-     ;; Spindel's copy-on-write state semantics.
-     (completion result)
-     result)))
+     ;; Spindel's copy-on-write state semantics. The durable terminal projection
+     ;; retains its live lease until this publication has completed.
+     (sp/await
+      (publish-result-and-release-spin id completion result
+                                       (:finish-opts outcome))))))
 
 (defn hire!
-  "Start one provider-free AgentDef execution and return an opaque RunHandle.
+  "Start one AgentDef execution and return an opaque RunHandle.
 
    `agent-ref` is a keyword id or versioned ref resolved against immutable
    `roster`. Options:
@@ -240,8 +745,9 @@
    - `:task`       portable task value (required)
    - `:from`       triggering actor, default `:repl`
    - `:parent-run` explicit structural parent Run UUID
-   The built-in first-pass program kinds are `:scripted` and `:echo`. Real LLM,
-   tool, simulation, and replay interpreters will implement the same boundary."
+   Built-in program kinds are deterministic `:scripted` / `:echo` and the
+   bounded Dvergr-native `:llm` model/tool loop. Simulation and replay
+   interpreters implement the same boundary."
   [room roster agent-ref {:keys [task from parent-run]
                           :or {from :repl}
                           :as raw-opts}]
@@ -249,6 +755,8 @@
         agent     (validate-hire! roster agent-ref opts)
         actor     (:agent/id agent)
         id        (random-uuid)
+        chat-id   (run-chat-id id)
+        supervisor (make-supervisor (:ctx room))
         ;; Private Run facts are still Room messages, but never addressed to an
         ;; installed Participant: direct interpretation and participant routing
         ;; must not execute the same task twice.
@@ -257,6 +765,8 @@
                             :run/program-kind (get-in agent [:agent/program :kind])
                             :run/interpreter-version interpreter-version
                             :run/agent-def-hash (hasch/uuid agent)}
+                     (= :llm (get-in agent [:agent/program :kind]))
+                     (assoc :run/chat-id chat-id)
                      (:roster/id roster) (assoc :run/roster (:roster/id roster)))]
     ;; Reserve durable Run ownership before any trigger effect. Teardown either
     ;; fences us out here or includes this Run in its fixed drain set; it can
@@ -264,6 +774,8 @@
     (run/start! room actor trigger nil
                 (cond-> {:id id :kind :agent-task :provenance provenance}
                   parent-run (assoc :parent parent-run)))
+    (run/register-cancel-hook! id ::native-worker
+                               #(cancel-supervisor! supervisor))
     (try
       ;; The precise trigger must exist before execution begins. A failed post
       ;; terminalizes the already-admitted Run instead of leaving a :running
@@ -274,7 +786,8 @@
         (throw t)))
     (try
       (let [completion (sync/deferred)
-            execution (execution-spin room agent task trigger id completion)
+            execution (execution-spin room agent task trigger id chat-id
+                                      completion supervisor)
             owner-fork-id (:fork-id (ec/current-execution-context))
             handle    (RunHandle. id (:id room) owner-fork-id execution completion)]
         (sp/spawn!
@@ -288,12 +801,11 @@
                            {:run/id id :run/status :cancelled}
                            {:run/id id :run/status :failed
                             :run/error (ex-message t)})]
-              (try
-                (if (= :cancelled (:run/status result))
-                  (run/finish! id :cancelled {:reason :structured-cancellation})
-                  (run/finish! id :failed {:reason :execution-error :error t}))
-                (catch Throwable _ nil))
-              (completion result)))})
+              (when (= :cancelled (:run/status result))
+                (run/cancel-room-run! (:id room) id))
+              (cancel-supervisor! supervisor)
+              (seal-supervisor! supervisor)
+              (settle-after-supervisor! room id supervisor completion result)))})
         handle)
       (catch Throwable t
         (run/finish! id :failed {:reason :spawn-failed :error t})

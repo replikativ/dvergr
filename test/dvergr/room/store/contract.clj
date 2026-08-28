@@ -69,6 +69,7 @@
           started (java.util.Date. 1787860800000)
           ended (java.util.Date. 1787860801000)
           definition-hash (random-uuid)
+          chat-id (random-uuid)
           running {:run/id run-id
                    :run/kind :agent-turn
                    :run/room room-id
@@ -80,6 +81,7 @@
                    :run/program-kind :llm
                    :run/interpreter-version 2
                    :run/agent-def-hash definition-hash
+                   :run/chat-id chat-id
                    :run/status :running
                    :run/created-at started
                    :run/started-at started
@@ -96,4 +98,8 @@
       (is (thrown-with-msg?
            clojure.lang.ExceptionInfo
            #"immutable"
-           (store/-store-run! st room-id (assoc completed :run/trigger (random-uuid))))))))
+           (store/-store-run! st room-id (assoc completed :run/trigger (random-uuid)))))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #":run/chat-id must be a UUID"
+           (store/-store-run! st room-id (assoc completed :run/chat-id :not-a-uuid)))))))

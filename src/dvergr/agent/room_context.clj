@@ -43,7 +43,7 @@
 ;; [room-id agent-id] → {:chat-ctx ChatContext :seen java.util.Set :sub Subscription}
 (defonce ^:private room-agent-ctxs (atom {}))
 
-(defn- provisioned-uuid
+(defn room-system-id
   "The system-db room UUID for `room`, or — for a FORK — its nearest provisioned
    ancestor's. A fork isn't a system-db room; it shares its parent's yggdrasil
    systems (branched under the fork ctx), so the parent's UUID is what the system
@@ -180,7 +180,7 @@
                 ;; in-memory keyword `room-id`. Threads to the sandbox so `dvergr.room`
                 ;; + the guarded `d/connect`/`list-databases` resolve THIS room's
                 ;; fork-aware databases.
-                room-uuid (provisioned-uuid room)
+                room-uuid (room-system-id room)
                 cctx (turn/new-working-ctx
                       {:execution-ctx  (:ctx room)
                        :chat-id        (stable-chat-id room-id agent-id)
@@ -198,6 +198,11 @@
                         ;; system-db for knowledge; this is how the room KB gets in.
                        :kb-conn        (some-> room-uuid srooms/room-kb-conn)
                        :room-id        room-uuid
+                       ;; Room registry identity is distinct from the system-db
+                       ;; UUID above. SCI's agent-programming surface needs the
+                       ;; former so a hired agent can recursively hire into this
+                       ;; exact live Room, including an ephemeral fork.
+                       :room-runtime-id room-id
                         ;; Per-agent network egress scope: an actor's optional
                         ;; `:config {:allowed-domains #{"https://…"}}` restricts the
                         ;; sandbox `http` primitive (nil/empty ⇒ open).

@@ -666,7 +666,7 @@
    "dvergr.tasks"    ["the shared task ledger — list/accept/complete work items"
                       "(dvergr.tasks/list)   (dvergr.tasks/complete! id)"]
    "dvergr.agent"    ["program specialized agents as immutable rosters; hire! starts a durable Run with an explicit result Spin"
-                      "(let [team (dvergr.agent/make-agent (dvergr.agent/roster) {:id :analyst :program {:kind :echo}})] (dvergr.agent/hire! team :analyst {:task :inspect}))"]
+                      "(let [team (-> (dvergr.agent/roster) (dvergr.agent/make-agent {:id :a :program {:kind :scripted :reply \"evidence\"}}) (dvergr.agent/make-agent {:id :b :program {:kind :echo}})) a (dvergr.agent/hire! team :a {:task :inspect}) b (dvergr.agent/hire! team :b {:task {:claim 42}})] @(spin [(-> (await (dvergr.agent/result-spin a)) :run/value) (-> (await (dvergr.agent/result-spin b)) :run/value)]))"]
    "dvergr.agents"   ["directory of agents (read-only): who exists / is online"
                       "(dvergr.agents/list)   (dvergr.agents/online? :var)"]
    "dvergr.actors"   ["durable participant identities — register/retire agents or humans and assign skills"
@@ -802,6 +802,15 @@
        "with a task string) only when each run needs your judgment. To publish a STATIC SITE for "
        "this room, write `app/index.html` (+ assets under `app/`) in your "
        "workspace — served at `/apps/<room-slug>/`.\n\n"
+       "**Reactive agent programs.** `dvergr.agent` provides immutable rosters "
+       "and Run-backed execution. Use the exact Spindel namespaces: "
+       "`(require '[dvergr.agent :as agent] "
+       "'[org.replikativ.spindel.spin.cps :refer [spin]] "
+       "'[org.replikativ.spindel.effects.await :refer [await]])`. "
+       "`agent/roster`, `agent/make-agent`, and `agent/revise-agent` return new "
+       "values; only `agent/hire!` starts an effect. Compose `(agent/result-spin "
+       "handle)` with `await`, parallel Spins, or `race`; inspect exact signatures "
+       "with `(sandbox/doc 'dvergr.agent)`.\n\n"
        "**Your databases.** Your room owns its data — NOT a shared global DB. "
        "`dvergr.room/*kb*` is your knowledge base, `dvergr.room/*room*` your room's "
        "own datahike (messages/state); query them with ordinary datahike, e.g. "
@@ -921,7 +930,8 @@
 
    Returns the audit-log atom — a vector of IO events ({:op :t :data}) accumulated
    during the agent's execution.  Attach to the agent result for post-hoc analysis."
-  [sci-ctx spindel-ctx & {:keys [base-path proc-allow allowed-http-domains room-conn kb-conn room-id]
+  [sci-ctx spindel-ctx & {:keys [base-path proc-allow allowed-http-domains room-conn kb-conn room-id
+                                 room-runtime-id agent-program-ceiling]
                           :or   {proc-allow #{}}}]
   (let [audit-log  (make-audit-log)
         workspace  (binding [rtc/*execution-context* spindel-ctx]
@@ -954,7 +964,8 @@
         ;; room's DB surface (*room*/*kb*/databases/db + queries). The KB is reached
         ;; via `dvergr.room/*kb*` + `kb-find`/`kb-search` + `d` — no separate `entity`
         ;; namespace (dropped as redundant; a global entity CRM can return later).
-        (ns-room/add-room-ns! sci-ctx room-conn kb-conn room-id spindel-ctx)
+        (ns-room/add-room-ns! sci-ctx room-conn kb-conn room-id spindel-ctx
+                              agent-program-ceiling)
         ;; dvergr.mail/*inbox* — the room's attached mailbox conn (fork-aware),
         ;; nil when no mailbox attached. Read helpers are seed source (dvergr/mail/).
         (ns-mail/add-mail-ns! sci-ctx)
@@ -965,7 +976,8 @@
     ;; Pure AgentDef/Roster construction plus the explicit, Run-backed `hire!`
     ;; effect. No roster is kept in a host atom: callers thread the immutable
     ;; value, and live execution state belongs to the Room's Spindel context.
-    (ns-agent/add-programming-ns! sci-ctx room-id spindel-ctx)
+    (ns-agent/add-programming-ns! sci-ctx (or room-runtime-id room-id) spindel-ctx
+                                  agent-program-ceiling)
     (ns-data/add-spindel-extras-ns! sci-ctx spindel-ctx)
     (ns-codec/add-codec-namespaces! sci-ctx)   ; cheshire.core / clojure.data.xml / dvergr.codec
     (ns-intake/add-intake-namespaces! sci-ctx)
@@ -974,7 +986,7 @@
     ;; (proc folded into the muschel-backed babashka.process — add-bash-ns! in turn.clj)
     (ns-io/add-git-ns!  sci-ctx :base-path cwd :workspace workspace
                         :audit-log audit-log)
-    (ns-kb/add-llm-ns!  sci-ctx)
+    (ns-kb/add-llm-ns!  sci-ctx agent-program-ceiling)
     ;; Boundary secret injection (doc/boundary-secret-injection.md): build the
     ;; host-side secret registry from config `:secrets` (resolved against the host
     ;; env), and share it between `env` (returns placeholders) and `http`
