@@ -12,7 +12,8 @@
             [dvergr.discourse :as d]
             [dvergr.intake.bash :as b]
             [dvergr.runtime.peer-bus :as peer-bus]
-            [org.replikativ.spindel.engine.core :as ec]))
+            [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.yggdrasil :as ygg]))
 
 ;; ============================================================================
 ;; Sandbox fixture (reuses pattern from bash_isolation_test)
@@ -74,6 +75,12 @@
   (binding [ec/*execution-context* *base-ctx*]
     (let [parent (d/room :parent *base-ctx*)
           fork   (d/fork-room parent {:isolation :ctx})]
+      (is (= {:fork/purpose :workroom
+              :fork/owner (:id fork)
+              :fork/status :open}
+             (select-keys (d/fork-descriptor fork)
+                          [:fork/purpose :fork/owner :fork/status]))
+          "the Room projects the canonical world descriptor")
       (Thread/sleep 50)                                ; let drain catch up
       (let [evts (peer-events-of-type :dvergr/fork-created)]
         (is (= 1 (count evts)) "exactly one fork-created event")
@@ -102,9 +109,11 @@
 (deftest merge-room-emits-fork-merged
   (binding [ec/*execution-context* *base-ctx*]
     (let [parent (d/room :p *base-ctx*)
-          fork   (d/fork-room parent {:isolation :ctx})]
+          fork   (d/fork-room parent {:isolation :ctx})
+          handle (d/fork-handle fork)]
       (bash (:ctx fork) "echo m > m.txt && git add . && git commit -q -m wip")
       (d/merge-room parent fork)
+      (is (= :merged (:status (ygg/fork-disposition handle))))
       (Thread/sleep 50)
       (let [evts (peer-events-of-type :dvergr/fork-merged)]
         (is (= 1 (count evts)))
@@ -113,8 +122,10 @@
 (deftest discard-emits-fork-discarded
   (binding [ec/*execution-context* *base-ctx*]
     (let [parent (d/room :p *base-ctx*)
-          fork   (d/fork-room parent {:isolation :ctx})]
+          fork   (d/fork-room parent {:isolation :ctx})
+          handle (d/fork-handle fork)]
       (d/discard fork)
+      (is (= :discarded (:status (ygg/fork-disposition handle))))
       (Thread/sleep 50)
       (let [evts (peer-events-of-type :dvergr/fork-discarded)]
         (is (= 1 (count evts)))

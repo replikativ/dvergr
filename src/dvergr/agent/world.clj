@@ -22,6 +22,8 @@
                      :policy policy
                      :allowed settlement-policies})))
   (let [work (d/fork-room parent {:isolation :ctx
+                                  :fork-opts {:purpose :run
+                                              :owner run-id}
                                   ;; A Run world is an internal transaction, not
                                   ;; a child conversation. Nested agents enter
                                   ;; only through explicit hire/tool effects.

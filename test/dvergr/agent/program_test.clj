@@ -128,9 +128,15 @@
           (is (= :review (:run/settlement-status result)))
           (is (= :review (:run/settlement-status durable)))
           (is (= (:run/id durable) (some-> fork :meta deref :run-id)))
+          (is (= {:fork/purpose :run
+                  :fork/owner (:run/id durable)
+                  :fork/status :open}
+                 (select-keys (d/fork-descriptor fork)
+                              [:fork/purpose :fork/owner :fork/status])))
           (let [action (binding [ec/*execution-context* (:ctx room)]
                          (forks/merge! fork))]
             (is (:ok? action) (pr-str action)))
+          (is (= :merged (:fork/status (d/fork-descriptor fork))))
           (is (= :merged (:run/settlement-status
                           (program/observe room handle))))))
       (testing "discard removes a successful work plane"

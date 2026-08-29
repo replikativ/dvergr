@@ -18,6 +18,7 @@ New to dvergr? Start with **[Getting Started](getting-started.md)**.
 - **[Recursive work orchestration](orchestration.md)** — Rooms, threads, tasks, executions, recursive Workrooms, and provider-neutral collaboration
 - **[Runs](runs.md)** — durable execution identity, lifecycle subscription, correlation, and targeted cancellation
 - **[Agent programs](agent-programs.md)** — immutable specialized-agent rosters, Run-backed hiring, Spindel composition, and fork-safe state placement
+- **[Forks, worlds, and settlement](fork-and-world-model.md)** — the cross-project Yggdrasil/Spindel/Dvergr/Simmis fork contract, ownership laws, and use-case coverage
 - **[Discourse Theory](discourse-theory.md)** — why "discourse": speech acts, theory of mind, and the Rational-Speech-Acts/FRP lineage (short, optional)
 - **[Architecture](architecture.md)** — the L0–L7 layer map, subsystem graph, inbound message flow, per-file table
 - **[State Model](state-model.md)** — the three-tier copy-on-write state + workspace model

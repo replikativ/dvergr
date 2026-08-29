@@ -10,7 +10,7 @@
    Algebra (combinators returning Spins):
      ask, fan-out, race, quorum, pipeline
 
-   Fork (yggdrasil substrate fork via spindel/fork-context):
+   Fork (one canonical spindel.yggdrasil/ForkHandle):
      fork-room, merge-room, discard
 
    Patterns (decomposing to the algebra):
@@ -92,7 +92,11 @@
   ;;                 :durable-append! hook, wired in make-room).
   ;; meta          : atom of arbitrary metadata (:telegram-chat-id,
   ;;                 :type :internal | :telegram-mirror, etc.)
-           [id slug title parent-id participants bus ctx forked-at-len store meta])
+  ;; fork-handle   : nil or atom containing the process-local canonical
+  ;;                 spindel.yggdrasil/ForkHandle for an isolated fork. Durable
+  ;;                 identity is exposed through fork-descriptor; the live
+  ;;                 settlement capability is deliberately never persisted.
+           [id slug title parent-id participants bus ctx forked-at-len store meta fork-handle])
 
 ;; A Room's bus + participants reference back to the Room, so the default record
 ;; printer recurses forever and StackOverflows at the REPL (e.g. when `(d/room …)`
@@ -281,7 +285,7 @@
         b     (bus-with-peer-relay ctx id :room
                                    (when durable-append!
                                      {:durable-append! durable-append!}))
-        room  (->Room id slug title parent-id (atom {}) b ctx 0 store (atom (or meta {})))]
+        room  (->Room id slug title parent-id (atom {}) b ctx 0 store (atom (or meta {})) nil)]
     (agent-run/open-room-admission! id ctx)
     ;; Persist metadata on creation so the store has it for re-hydration.
     (when store
@@ -918,15 +922,13 @@
    parent's spin can `await` the fork's `ask` because both speak the
    same ctx.
 
-   `:ctx` — fork the spindel execution context via `ctx/fork-context`,
-   which automatically branches all yggdrasil systems registered as
-   `[:external-refs]` (datahike, git worktrees, btrfs subvolumes,
-   ZFS datasets, …) via spindel's PForkable extension. The fork
+   `:ctx` — create the canonical `spindel.yggdrasil/ForkHandle`, which forks
+   the execution context and automatically branches all registered yggdrasil
+   systems (datahike, git worktrees, btrfs subvolumes, ZFS datasets, …). The fork
    becomes substrate-isolated: an agent's writes to its chat-ctx
    datahike, KB writes, file edits, etc. happen on branched copies
-   and are only visible inside the fork until `merge-room` atomically
-   merges them back via `spindel.yggdrasil/merge-to-parent!` (or
-   `discard` deletes the branches via `discard-from-parent!`).
+   and are only visible inside the fork until `merge-room` merges them back via
+   that handle (or `discard` deletes the branches).
 
    Use `:ctx` when the fork must hold real side effects in isolation
    (proposals, speculative coding-agent work). Use `:none` (default)
@@ -941,7 +943,7 @@
    `(ask fork :agent …)` from outside the fork's body) bind
    `*execution-context*` to the fork's ctx — see `with-fork-ctx`."
   ([room] (fork-room room {}))
-  ([room {:keys [isolation clone-participants?]
+  ([room {:keys [isolation clone-participants? fork-opts]
           :or {isolation :none clone-participants? true}}]
    (let [short-uuid (subs (str (random-uuid)) 0 8)
          new-slug   (str (:slug room) "/fork-" short-uuid)
@@ -950,9 +952,14 @@
          ;; peer-bus events).
          new-id     (rstore/slug->room-id new-slug)
          parent-log (log room)
+         fork-handle (when (= :ctx isolation)
+                       (binding [ec/*execution-context* (:ctx room)]
+                         (ygg/fork! (merge {:purpose :workroom
+                                            :owner new-id}
+                                           fork-opts))))
          child-ctx  (case isolation
                       :none (:ctx room)
-                      :ctx  (ctx/fork-context (:ctx room)))
+                      :ctx  (:child-ctx fork-handle))
          ;; Mark a `:ctx` fork TRANSIENT so create-room-db! defers the GLOBAL
          ;; system-db grant (reconciled on merge / dropped on discard) — a fork's
          ;; agent-created DB must not resurrect on restart (P2).
@@ -999,7 +1006,8 @@
                             fork-store
                             (atom (assoc @(:meta room)
                                          :forked-from (:id room)
-                                         :conversation-id conv-id)))]
+                                         :conversation-id conv-id))
+                            (when fork-handle (atom fork-handle)))]
      (agent-run/open-room-admission! new-id child-ctx)
      ;; (Fork-local persistence rides the bus's durable-append! hook now —
      ;; wired at child-bus construction above.)
@@ -1026,6 +1034,17 @@
                         :workspace-id    (when (= :ctx isolation)
                                            (:id (geschichte/current-workspace)))}))
      new-room)))
+
+(defn fork-handle
+  "Return an isolated Room fork's process-local canonical ForkHandle, or nil.
+   The handle owns settlement authority and must never be stored durably."
+  [room]
+  (some-> room :fork-handle deref))
+
+(defn fork-descriptor
+  "Return the portable world descriptor for an isolated Room fork, or nil."
+  [room]
+  (some-> (fork-handle room) ygg/fork-descriptor))
 
 (defmacro with-fork-ctx
   "Execute `body` with the fork's execution context bound. Required for
@@ -1059,8 +1078,8 @@
 
 (defn- ctx-was-forked?
   "True if `fork`'s ctx is a child of some parent ctx — i.e. it was
-   created via `ctx/fork-context`. Determines whether merge/discard
-   should also merge/discard yggdrasil branches."
+   created by the canonical ForkHandle (or the legacy direct context path).
+   Determines whether settlement includes Yggdrasil branches."
   [fork]
   (some? (:parent-ctx (:ctx fork))))
 
@@ -1075,10 +1094,10 @@
 
 (defn discard
   "Discard a fork: deregister its participants, drop it from the
-   registry, and if the fork's ctx was forked (`:isolation :ctx`),
-   delete all branched yggdrasil systems via
-   `spindel.yggdrasil/discard-from-parent!`. Participant processes and
-   subscription pumps are cancelled in both isolation modes.
+   registry, and if the fork's ctx was forked (`:isolation :ctx`), settle its
+   canonical ForkHandle by discarding every branched Yggdrasil system.
+   Participant processes and subscription pumps are cancelled in both
+   isolation modes.
 
    Emits `:dvergr/fork-discarded` on the peer-bus. Idempotent — a second
    discard of the same fork is a no-op (the branched systems are deleted only
@@ -1094,9 +1113,13 @@
       ;; delete the stores it created — they were never granted, so on discard they
       ;; must not linger. :on-discard fires inside discard-from-parent!.
       (let [pending (binding [ec/*execution-context* (:ctx fork)]
-                      (ec/get-state [:dvergr/pending-grants]))]
-        (ygg/discard-from-parent! (:ctx fork)
-                                  {:on-discard (fn [_] (srooms/drop-fork-grants! pending))})))
+                      (ec/get-state [:dvergr/pending-grants]))
+            opts {:on-discard (fn [_] (srooms/drop-fork-grants! pending))}]
+        (if-let [handle (fork-handle fork)]
+          (ygg/discard-fork! handle opts)
+          ;; Compatibility for Room values constructed before ForkHandle became
+          ;; canonical. New forks never take this path.
+          (ygg/discard-from-parent! (:ctx fork) opts))))
     (binding [ec/*execution-context* (fork-home-ctx fork)]
       (rreg/unregister! (:id fork))
       (peer-bus/post! {:type :dvergr/fork-discarded
@@ -1108,10 +1131,9 @@
 
    1. Append the fork's new log entries (those added after the fork
       point) to the parent's log.
-   2. If the fork's ctx was forked (`:isolation :ctx`), merge all
-      branched yggdrasil systems back into the parent via
-      `spindel.yggdrasil/merge-to-parent!` — datahike branches collapse,
-      git branches fast-forward or three-way merge, etc.
+   2. If the fork's ctx was forked (`:isolation :ctx`), settle its canonical
+      ForkHandle by merging all branched Yggdrasil systems into the parent —
+      datahike branches collapse, git branches fast-forward or three-way merge.
    3. Deregister the fork's participants.
 
    Concurrent sibling forks UNION (identity-keyed datahike merge); a genuine
@@ -1135,10 +1157,13 @@
        (let [pending (when (:store fork)
                        (binding [ec/*execution-context* (:ctx fork)]
                          (ec/get-state [:dvergr/pending-grants])))]
-         (ygg/merge-to-parent! (:ctx fork)
-                               (merge (or merge-opts {})
-                                      (when (:store fork)
-                                        {:on-merge (fn [_] (srooms/commit-fork-grants! pending))}))))
+         (let [opts (merge (or merge-opts {})
+                           (when (:store fork)
+                             {:on-merge (fn [_] (srooms/commit-fork-grants! pending))}))]
+           (if-let [handle (fork-handle fork)]
+             (ygg/merge-fork! handle opts)
+             ;; Compatibility for pre-ForkHandle Room values only.
+             (ygg/merge-to-parent! (:ctx fork) opts))))
        (catch Throwable e
          (tel/log! {:level :error :id :dvergr/merge-failed
                     :data {:fork (:id fork) :parent (:id parent) :error (str e)}}
