@@ -57,7 +57,7 @@
         agent-ref*     (requiring-resolve 'dvergr.agent.roster/agent-ref)
         agents*        (requiring-resolve 'dvergr.agent.roster/agents)
         select-agents* (requiring-resolve 'dvergr.agent.roster/select-agents)
-        hire*          (requiring-resolve 'dvergr.agent.program/hire!)
+        hire-in*       (requiring-resolve 'dvergr.agent.program/hire-in!)
         observe*       (requiring-resolve 'dvergr.agent.program/observe)
         cancel*        (requiring-resolve 'dvergr.agent.program/cancel!)
         run-id*        (requiring-resolve 'dvergr.agent.program/run-id)
@@ -74,8 +74,20 @@
                                      "No current Room — agent execution is room-scoped"
                                      {:type ::no-current-room
                                       :room-id room-id}))))
+        control-room!  (fn [work-room]
+                         (loop [candidate work-room]
+                           (if (some-> candidate :meta deref :run-world?)
+                             (if-let [parent (room-lookup* (:parent-id candidate))]
+                               (recur parent)
+                               (throw (ex-info
+                                       "Run world has no registered control ancestor"
+                                       {:type ::missing-control-room
+                                        :room-id (:id candidate)
+                                        :parent-id (:parent-id candidate)})))
+                             candidate)))
         hire-fn        (fn [roster agent-ref opts]
-                         (let [room (room!)
+                         (let [work-room (room!)
+                               control-room (control-room! work-room)
                                definition (lookup-agent* roster agent-ref)
                                kind (get-in definition [:agent/program :kind])
                                allowed-kinds (:program-kinds agent-program-ceiling)]
@@ -87,24 +99,26 @@
                                       :agent-ref agent-ref
                                       :program-kind kind
                                       :allowed-program-kinds allowed-kinds})))
-                           (binding [ec/*execution-context* (:ctx room)]
-                             (hire* room roster agent-ref
-                                    (if (and (:parent-run agent-program-ceiling)
-                                             (not (contains? opts :parent-run)))
-                                      (assoc opts :parent-run
-                                             (:parent-run agent-program-ceiling))
-                                      opts)))))
+                           (binding [ec/*execution-context* (:ctx work-room)]
+                             (hire-in* control-room work-room roster agent-ref
+                                       (if (and (:parent-run agent-program-ceiling)
+                                                (not (contains? opts :parent-run)))
+                                         (assoc opts :parent-run
+                                                (:parent-run agent-program-ceiling))
+                                         opts)))))
         observe-fn     (fn [handle-or-id]
-                         (let [room (room!)]
-                           (binding [ec/*execution-context* (:ctx room)]
-                             (observe* room handle-or-id))))
+                         (let [work-room (room!)
+                               control-room (control-room! work-room)]
+                           (binding [ec/*execution-context* (:ctx work-room)]
+                             (observe* control-room handle-or-id))))
         cancel-fn      (fn [handle-or-id]
                          ;; Run cancellation tokens are process-local. Binding
                          ;; the Room ctx keeps this boundary consistent with
                          ;; hire/observe and ready for a Spindel-local registry.
-                         (let [room (room!)]
-                           (binding [ec/*execution-context* (:ctx room)]
-                             (cancel* room handle-or-id))))]
+                         (let [work-room (room!)
+                               control-room (control-room! work-room)]
+                           (binding [ec/*execution-context* (:ctx work-room)]
+                             (cancel* control-room handle-or-id))))]
     (sci/add-namespace!
      sci-ctx 'dvergr.agent
      (doc/with-docs

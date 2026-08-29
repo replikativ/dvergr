@@ -171,7 +171,7 @@ room messages, not live tokens.)
 
 The killer feature: **fork** a room with `:isolation :ctx`, let a worker do
 something inside it (write files, change state in a branched datahike, etc.),
-inspect the result, then **merge** or **discard** atomically.
+inspect the result, then **merge** or **discard** through its affine handle.
 
 ```clojure
 ;; Fork the room. :ctx creates one Spindel ForkHandle over the execution
@@ -196,13 +196,15 @@ inspect the result, then **merge** or **discard** atomically.
 (d/discard fork)
 ```
 
-Agents reach the same lifecycle through tools: `spawn_agent` (delegate a task to a
-sub-agent in a fork, auto-merged) and `propose_change` (same, held for human
-review). The shared fork ops live in `dvergr.rooms.forks`.
+Agents reach the same lifecycle through two equivalent surfaces. SCI programs
+construct immutable Rosters and compose `dvergr.agent/hire!` result Spins;
+models may use the thinner `spawn_agent` (automatic settlement) and
+`propose_change` (retain for review) tool adapters. Both adapters create the same
+durable Run and isolated Spindel world—there is no separate sub-agent runtime.
 
 The fork uses **yggdrasil** — a copy-on-write protocol across git, datahike,
 btrfs, ZFS, and IPFS. The worker's writes go onto branched copies; on
-accept, all branches merge atomically through one workspace commit.
+accept, the registered systems settle through the canonical fork handle.
 
 ## Next steps
 

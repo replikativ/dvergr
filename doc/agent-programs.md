@@ -164,11 +164,25 @@ merge conflicts retain it for review. A later merge/discard through
 settlement runs only after the executor and native-worker supervisor have
 physically quiesced, outside the Spindel drain graph that used the fork.
 
+Recursive execution separates the durable control Room from the immediate world
+parent. If root Run `A` hires child `B`, `B` is recorded beside `A` in the root
+Room but its world is `fork(A-world)`, so automatic settlement changes `A-world`
+rather than trunk. `hire-in!` is the host boundary carrying those two Rooms;
+the SCI `hire!` closure and model-tool adapters resolve them automatically.
+
 An LLM-created sandbox can still build and revise arbitrary immutable rosters,
 but its `hire!` authority currently accepts only provider-free `:echo` and
 `:scripted` children. This prevents a child from minting new provider spend,
 tools, or recursive LLM work before Kontor can split a resource vector from the
 parent Run. A top-level Room REPL has no such program-kind ceiling.
+
+The `spawn_agent` and `propose_change` model tools are convenience adapters over
+this same boundary. They construct a portable one-agent Roster, call `hire!`,
+carry the current Run as explicit structural parent, and select `:automatic` or
+`:review` settlement. The native-tool and SCI paths receive the same delegation
+ceiling, so changing interface cannot mint provider authority. A trusted
+top-level Participant/tool context may delegate an LLM child; a paid AgentDef
+Run must first receive an eventual Kontor-backed provider allocation.
 
 ## Evaluation ladder
 

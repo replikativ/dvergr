@@ -29,7 +29,7 @@ reactive runtime), [Datahike](https://github.com/replikativ/datahike)
 - 🏷️ **Tagged routing** — agents escalate `:escalation/budget`, policy-bots
   subscribe by capability tag; neither hardcodes the other
 - 🌿 **Substrate forks** — a "what would the coder write?" probe runs on a
-  branched git worktree + datahike, then merges or discards atomically
+  branched git worktree + datahike, then settles through one affine world handle
 - 🧩 **Compositional kernel** — five primitives (tagged message, capability sub,
   dynamic subscribe, fork-room, GenerationHandle) cover the whole programming surface
 
@@ -214,9 +214,11 @@ The standalone, runnable scenarios these import live in [`examples/`](examples/)
 | `dvergr.runtime.bus` | Pub/sub routing kernel + opinionated buffer policy table |
 | `dvergr.discourse.llm` | `llm-agent` — directive-aware participant |
 | `dvergr.discourse.generation` | `GenerationHandle` + sync/future/external/streaming adapters |
+| `dvergr.agent.roster` | immutable, versioned AgentDefs and Rosters |
+| `dvergr.agent.program` | Run-backed interpreters and native Spindel result composition |
 | `dvergr.participant.context` | `ParticipantContext` — uniform memory+budget across LLM/human/hybrid |
 | `dvergr.discourse.personas` | `researcher`, `coder`, `reviewer` — pre-built agents |
-| `dvergr.rooms.forks` | `fork!` / `review` / `merge!` / `discard!` — the fork→review→merge lifecycle behind `spawn_agent`/`propose_change` |
+| `dvergr.rooms.forks` | review and settlement of canonical Run worlds retained by `propose_change` |
 | `dvergr.cli.main` | `-main` of the TUI chat client |
 
 ## Provider setup

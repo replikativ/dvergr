@@ -36,7 +36,7 @@
 ;; 3. **Branch + merge** (`dvergr.discourse/fork-room` + `propose-merge!` +
 ;;    `merge-room` / `discard`) — fork the room, let an agent work in isolation,
 ;;    raise a merge proposal, then **accept** (`merge-room`) or **reject**
-;;    (`discard`) atomically.
+;;    (`discard`) through the fork's affine settlement handle.
 ;; 4. **Substrate isolation** — the worker's side effects (a datahike write) are
 ;;    real, but happen in a *branched copy*; the parent is untouched until accept.
 ;;

@@ -35,9 +35,18 @@
    to a Participant is a separate, explicit speech act."
   :_runs)
 
-(def interpreter-version 2)
+(def interpreter-version 3)
 
 (def ^:private default-max-model-steps 32)
+
+(defn- child-program-authority
+  "Authority made available to code and tools running inside one paid LLM Run.
+   Keep this one value shared by the SCI and native-tool surfaces so a model
+   cannot bypass delegation attenuation by choosing a different interface."
+  [run-id]
+  {:program-kinds #{:echo :scripted}
+   :provider-effects? false
+   :parent-run run-id})
 
 (defn- program-result
   ([status value] {::status status ::value value})
@@ -380,13 +389,11 @@
                    ;; Until Kontor can split a resource vector, a paid child may
                    ;; only delegate provider-free work. Pure roster construction
                    ;; remains available inside SCI.
-                   :agent-program-ceiling {:program-kinds #{:echo :scripted}
-                                           :provider-effects? false
-                                           :parent-run run-id}})]
+                   :agent-program-ceiling (child-program-authority run-id)})]
     {:chat-ctx chat-ctx
      :owned-db? (nil? trace-db)}))
 
-(defn- llm-tool-context [control-room room chat-ctx agent]
+(defn- llm-tool-context [control-room room chat-ctx agent run-id]
   (let [system-id (room-context/room-system-id room)
         tool-map (tools/normalize-tools (or (:agent/tools agent) #{}))
         ;; Ordinary room/task effects target the branched work store. A
@@ -403,7 +410,15 @@
            :sci-ctx (:sci-ctx chat-ctx)
            :tools tool-map
            :isolation :sci
-           :execution-ctx (:ctx room)})
+           :execution-ctx (:ctx room)
+           :control-room control-room
+           ;; Delegation tools are adapters over the same Run interpreter as
+           ;; the SCI API. Carry structural parentage and the identical
+           ;; attenuation policy across this boundary explicitly.
+           :run-id run-id
+           :agent-program-ceiling (child-program-authority run-id)
+           :actor (:agent/id agent)
+           :model-policy (:agent/model-policy agent)})
          (assoc :workspace-roots
                 (when system-id (system-rooms/room-load-roots system-id)))
          (assoc :kb-conn
@@ -434,7 +449,7 @@
                         (register-cleanup!
                          supervisor #(chat-context/close-chat! chat-ctx)))
                     {:keys [tool-map tool-ctx]}
-                    (llm-tool-context control-room work-room chat-ctx agent)
+                    (llm-tool-context control-room work-room chat-ctx agent run-id)
                     model-spec (resolve-model-spec agent)
                     instructions
                     (prompt/assemble-system-prompt
@@ -836,8 +851,13 @@
      (deliver outcome-promise outcome)
      result)))
 
-(defn hire!
-  "Start one AgentDef execution and return an opaque RunHandle.
+(defn hire-in!
+  "Start one AgentDef execution with separate control and work parents.
+
+   `control-room` owns durable Run/message facts. `world-parent` is the
+   immediate Spindel/Yggdrasil world that the child forks and later settles
+   into. They are identical for a top-level hire and intentionally differ for
+   recursive hires inside an already-isolated Run world.
 
    `agent-ref` is a keyword id or versioned ref resolved against immutable
    `roster`. Options:
@@ -849,17 +869,18 @@
    Built-in program kinds are deterministic `:scripted` / `:echo` and the
    bounded Dvergr-native `:llm` model/tool loop. Simulation and replay
    interpreters implement the same boundary."
-  [room roster agent-ref {:keys [task from parent-run settlement]
-                          :or {from :repl settlement :automatic}
-                          :as raw-opts}]
+  [control-room world-parent roster agent-ref
+   {:keys [task from parent-run settlement]
+    :or {from :repl settlement :automatic}
+    :as raw-opts}]
   (let [opts      (assoc raw-opts :from from)
         agent     (validate-hire! roster agent-ref opts)
         actor     (:agent/id agent)
         id        (random-uuid)
         chat-id   (run-chat-id id)
-        run-world (world/open! room id settlement)
+        run-world (world/open! world-parent id settlement)
         work-room (:work run-world)
-        supervisor (make-supervisor (:ctx room) (:ctx work-room))
+        supervisor (make-supervisor (:ctx world-parent) (:ctx work-room))
         ;; Private Run facts are still Room messages, but never addressed to an
         ;; installed Participant: direct interpretation and participant routing
         ;; must not execute the same task twice.
@@ -879,7 +900,7 @@
     ;; fences us out here or includes this Run in its fixed drain set; it can
     ;; never miss an orphan trigger between posting and admission.
     (try
-      (run/start! room actor trigger nil
+      (run/start! control-room actor trigger nil
                   (cond-> {:id id :kind :agent-task :provenance provenance}
                     parent-run (assoc :parent parent-run)))
       (catch Throwable t
@@ -891,7 +912,7 @@
       ;; The precise trigger must exist before execution begins. A failed post
       ;; terminalizes the already-admitted Run instead of leaving a :running
       ;; record or an unowned message behind.
-      (d/post! room trigger)
+      (d/post! control-room trigger)
       (catch Throwable t
         (let [{:keys [status reason]} (world/settle! run-world :failed)]
           (run/finish! id :failed {:reason :trigger-emission-failed
@@ -902,11 +923,11 @@
     (try
       (let [completion (sync/deferred)
             outcome-promise (promise)
-            worker-execution (execution-spin room work-room agent task trigger id chat-id
+            worker-execution (execution-spin control-room work-room agent task trigger id chat-id
                                              supervisor outcome-promise)
             execution (sp/spin (sp/await completion))
             owner-fork-id (:fork-id (ec/current-execution-context))
-            handle    (RunHandle. id (:id room) owner-fork-id execution completion
+            handle    (RunHandle. id (:id control-room) owner-fork-id execution completion
                                   worker-execution)
             cancel! (fn []
                       (cancel-supervisor! supervisor)
@@ -934,7 +955,7 @@
                            {:run/id id :run/status :failed
                             :run/error (ex-message t)})]
               (when (= :cancelled (:run/status result))
-                (run/cancel-room-run! (:id room) id))
+                (run/cancel-room-run! (:id control-room) id))
               (cancel-supervisor! supervisor)
               (seal-supervisor! supervisor)
               (deliver outcome-promise
@@ -943,7 +964,7 @@
                         (if (= :cancelled (:run/status result))
                           {:reason :structured-cancellation}
                           {:reason :execution-error :error t})})))})
-        (finalize-execution-external! room run-world id supervisor worker-execution
+        (finalize-execution-external! world-parent run-world id supervisor worker-execution
                                       completion outcome-promise)
         handle)
       (catch Throwable t
@@ -952,6 +973,13 @@
                                    :settlement-status status
                                    :settlement-reason reason}))
         (throw t)))))
+
+(defn hire!
+  "Start a top-level AgentDef execution in `room` and return an opaque
+   RunHandle. Recursive runtimes use `hire-in!` so durable control facts remain
+   in the root Room while the child world forks its immediate parent."
+  [room roster agent-ref opts]
+  (hire-in! room room roster agent-ref opts))
 
 (defn observe
   "Read the durable Run projection for `handle` or UUID."

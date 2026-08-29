@@ -98,8 +98,8 @@ A room can be **forked** copy-on-write for hypothetical or risky work:
   parent's history. With `:isolation :ctx`, it also forks the execution
   context — branching the Datahike DB, git worktrees, and other substrate — so
   the fork's side effects stay isolated until you decide their fate.
-- `merge-room` collapses the fork's branch back into the parent atomically
-  (Datahike branches merge, git branches fast-forward / three-way merge).
+- `merge-room` settles the fork's registered systems into the parent through a
+  prechecked, journalable boundary (Datahike and git retain their native merge semantics).
 - `discard` throws the fork away, deleting its branches; the parent is untouched.
 
 This is the backbone of the proposal/review lifecycle (an agent works in a fork,

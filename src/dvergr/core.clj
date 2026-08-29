@@ -57,7 +57,6 @@
 (def fork-room               @#'dvergr.discourse/fork-room)
 (def merge-room              @#'dvergr.discourse/merge-room)
 (def discard                 @#'dvergr.discourse/discard)
-(def hire                    @#'dvergr.discourse/hire)
 (def subscribe!              @#'dvergr.discourse/subscribe!)
 (def unsubscribe!            @#'dvergr.discourse/unsubscribe!)
 (def scripted                @#'dvergr.discourse/scripted)

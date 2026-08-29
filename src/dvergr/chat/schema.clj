@@ -3,14 +3,12 @@
 
    Adapted from simmis schema with agent-specific extensions:
    - Budget tracking for resource accounting
-   - Parent/child hierarchy for sub-chats
    - Participant permissions for tiered agents
    - Message importance for context compaction
 
    Architecture:
    - Each chat maps to a SpindelContext (for reactive state)
    - Each chat has its own datahike (for durable storage)
-   - Sub-chats fork parent's SpindelContext (O(1) CoW)
    - Messages are synced: spindel signal ↔ datahike"
   (:require [datahike.api :as d]
             [taoensso.telemere :as tel]
@@ -39,12 +37,6 @@
     :db/valueType :db.type/string
     :db/cardinality :db.cardinality/one
     :db/doc "Optional description of chat purpose/task"}
-
-   ;; Hierarchy
-   {:db/ident :chat/parent-id
-    :db/valueType :db.type/uuid
-    :db/cardinality :db.cardinality/one
-    :db/doc "Parent chat UUID if this is a sub-chat (nil for root chats)"}
 
    ;; Participants
    {:db/ident :chat/admin
@@ -1120,7 +1112,7 @@
 
    Args:
      opts - Map with :id, :title, :budget, etc."
-  [{:keys [id title description budget parent-id]}]
+  [{:keys [id title description budget]}]
   (cond-> {:chat/id (or id (random-uuid))
            :chat/title (or title "Untitled Chat")
            :chat/status :active
@@ -1128,8 +1120,7 @@
            :chat/budget-used 0
            :chat/created-at (java.util.Date.)
            :chat/updated-at (java.util.Date.)}
-    description (assoc :chat/description description)
-    parent-id (assoc :chat/parent-id parent-id)))
+    description (assoc :chat/description description)))
 
 (defn- get-tool-registry
   "Dynamically get the tool registry to avoid circular deps.
