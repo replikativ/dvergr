@@ -227,6 +227,21 @@
     :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/one}
 
+   ;; One primary semantic object named by the speech act. This remains generic:
+   ;; an application can render a Proposal, task, artifact or approval without
+   ;; making Dvergr own any of those domain models.
+   {:db/ident :message/object-kind
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true
+    :db/doc "Application object kind named by this message"}
+
+   {:db/ident :message/object-id
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/index true
+    :db/doc "Stable application object identity named by this message"}
+
    ;; Background-task notification envelope.
    {:db/ident :message/notification-type
     :db/valueType :db.type/keyword

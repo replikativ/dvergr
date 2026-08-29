@@ -24,15 +24,12 @@
 ;; surfaced at :error.
 (defonce dead-letters (atom []))
 
-(defn persist-tx!
-  "Transact `tx-data` on `conn` under the ONE message-durability policy: attempt
-   once, retry once on failure, and on a second failure surface at :error and
-   dead-letter the payload rather than dropping it silently or throwing into the
-   caller. Never throws; returns true on success, false on give-up. `ctx` is a
-   small diagnostics map, e.g. {:op :store-message :room-id … :msg-id …}."
-  ([conn tx-data] (persist-tx! conn tx-data {}))
+(defn persist-tx-result!
+  "Apply the shared retry/dead-letter policy, returning the Datahike report on
+   success and false after terminal failure."
+  ([conn tx-data] (persist-tx-result! conn tx-data {}))
   ([conn tx-data {:keys [op room-id msg-id] :as ctx}]
-   (letfn [(attempt [] (d/transact conn tx-data) true)]
+   (letfn [(attempt [] (d/transact conn tx-data))]
      (try
        (attempt)
        (catch Throwable t1
@@ -53,3 +50,10 @@
                                :dead-letter-count (count @dead-letters)}}
                        "message persist failed twice — DEAD-LETTERED (message not durable)")
              false)))))))
+
+(defn persist-tx!
+  "Transact under the shared retry/dead-letter policy. Never throws; returns
+   true on success and false after terminal failure."
+  ([conn tx-data] (persist-tx! conn tx-data {}))
+  ([conn tx-data ctx]
+   (boolean (persist-tx-result! conn tx-data ctx))))

@@ -38,7 +38,34 @@
                               (bus/post! b2 {:to :x :content "lost?"})))
         (is (empty? (bus/log b2)) "nothing on the log")
         (Thread/sleep 150)
-        (is (empty? @got2) "nothing delivered")))))
+        (is (empty? @got2) "nothing delivered"))
+      (testing "legacy boolean failure also fails closed"
+        (let [b3 (bus/create-bus {:durable-append! (constantly false)})]
+          (is (thrown-with-msg? Exception #"Durable bus append failed"
+                                (bus/post! b3 {:to :x :content "lost?"})))
+          (is (empty? (bus/log b3))))))))
+
+(deftest durable-duplicate-is-not-visible-twice
+  (testing "first-write-wins covers the live log and subscribers"
+    (let [seen (atom #{})
+          append! (fn [message]
+                    (locking seen
+                      (if (contains? @seen (:id message))
+                        :duplicate
+                        (do (swap! seen conj (:id message)) :inserted))))
+          b (bus/create-bus {:durable-append! append!})
+          got (atom [])
+          sub (bus/subscribe! b [:to :x])
+          id (random-uuid)
+          message {:id id :to :x :content "canonical"}]
+      (drain-into! b sub got :content)
+      (bus/post! b message)
+      (bus/post! b message)
+      (is (wait-until #(= ["canonical"] @got) 3000))
+      (Thread/sleep 100)
+      (is (= ["canonical"] @got)
+          "projectors and external relays see only the winning post")
+      (is (= [message] (bus/log b))))))
 
 (deftest cursor-resume-redelivers-in-flight-at-least-once
   (testing "rewinding the cursor by one (simulating a pump crash after

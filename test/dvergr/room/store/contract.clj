@@ -14,6 +14,7 @@
           ts 1787860800123
           metadata {:role :user
                     :source-user "Alice"
+                    :object {:kind :proposal :id (random-uuid)}
                     :attachment {:blob-id (random-uuid) :mime "audio/ogg"}
                     :audience #{:agent/reviewer}
                     :provenance {:mode :live :source :screen}}
@@ -35,12 +36,14 @@
       (store/-store-room! st room-id {:slug (name room-id) :title "Contract"})
       ;; Imports and distributed replay may see a reply before its parent. The
       ;; stable UUID field must not require the target entity to exist yet.
-      (store/-store-message! st room-id child)
-      (store/-store-message! st room-id grandchild)
-      (store/-store-message! st room-id parent)
-      (store/-store-message! st room-id other)
+      (is (= :inserted (store/-store-message! st room-id child)))
+      (is (= :inserted (store/-store-message! st room-id grandchild)))
+      (is (= :inserted (store/-store-message! st room-id parent)))
+      (is (= :inserted (store/-store-message! st room-id other)))
       ;; A retry carrying mutated data must not rewrite durable history.
-      (store/-store-message! st room-id (assoc child :content "mutated retry"))
+      (is (= :duplicate
+             (store/-store-message! st room-id
+                                    (assoc child :content "mutated retry"))))
       (let [messages (store/-list-messages st room-id {})
             replayed (some #(when (= child-id (:id %)) %) messages)
             replayed-grandchild (some #(when (= grandchild-id (:id %)) %) messages)
