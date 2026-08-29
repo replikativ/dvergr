@@ -14,6 +14,7 @@
           ts 1787860800123
           metadata {:role :user
                     :source-user "Alice"
+                    :object {:kind :proposal :id (random-uuid)}
                     :attachment {:blob-id (random-uuid) :mime "audio/ogg"}
                     :audience #{:agent/reviewer}
                     :provenance {:mode :live :source :screen}}

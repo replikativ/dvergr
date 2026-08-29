@@ -189,12 +189,14 @@
    before being added here."
   #{:role :source-user :source-username :source-user-id
     :audience :mentions :attachment :provenance
+    :object
     :tool-uses :reasoning :kind :from :source :schedule-id
     :notification/type :notification/agent :notification/task
     :notification/elapsed :run-id})
 
 (def ^:private attachment-metadata-keys #{:blob-id :node-id :mime :name :size})
 (def ^:private provenance-metadata-keys #{:mode :source})
+(def ^:private object-metadata-keys #{:kind :id})
 
 (defn- reject-unknown-metadata! [kind allowed value]
   (let [unknown (seq (remove allowed (keys (or value {}))))]
@@ -227,7 +229,21 @@
         (throw (ex-info "Message provenance metadata must be a map"
                         {:type :room-store/invalid-message-metadata
                          :provenance provenance})))
-      (reject-unknown-metadata! :provenance provenance-metadata-keys provenance)))
+      (reject-unknown-metadata! :provenance provenance-metadata-keys provenance))
+    (when-let [object (:object metadata)]
+      (when-not (map? object)
+        (throw (ex-info "Message object reference must be a map"
+                        {:type :room-store/invalid-message-metadata
+                         :object object})))
+      (reject-unknown-metadata! :object object-metadata-keys object)
+      (when-not (keyword? (:kind object))
+        (throw (ex-info "Message object :kind must be a keyword"
+                        {:type :room-store/invalid-message-metadata
+                         :object object})))
+      (when-not (uuid? (:id object))
+        (throw (ex-info "Message object :id must be a UUID"
+                        {:type :room-store/invalid-message-metadata
+                         :object object})))))
   (when (and (:run-id metadata) (not (uuid? (:run-id metadata))))
     (throw (ex-info "Message :run-id metadata must be a UUID"
                     {:type :room-store/invalid-message-metadata

@@ -83,6 +83,7 @@
         metadata     (store/validate-message-metadata! (:metadata msg))
         attachment   (:attachment metadata)
         provenance   (:provenance metadata)
+        object       (:object metadata)
         blob-id      (:blob-id attachment)
         role         (store/infer-role msg)
         source-user  (or (:source-user metadata)
@@ -118,6 +119,8 @@
       (:size attachment) (assoc :message/attachment-size (long (:size attachment)))
       (:mode provenance) (assoc :message/provenance-mode (:mode provenance))
       (:source provenance) (assoc :message/provenance-source (:source provenance))
+      (:kind object) (assoc :message/object-kind (:kind object))
+      (:id object) (assoc :message/object-id (:id object))
       (:notification/type metadata)
       (assoc :message/notification-type (:notification/type metadata))
       (:notification/agent metadata)
@@ -155,6 +158,7 @@
     :message/attachment-size
     :message/provenance-mode
     :message/provenance-source
+    :message/object-kind :message/object-id
     :message/notification-type
     :message/notification-agent
     :message/notification-task
@@ -365,6 +369,11 @@
                                      (assoc :mode (:message/provenance-mode m))
                                      (:message/provenance-source m)
                                      (assoc :source (:message/provenance-source m)))
+                        object (cond-> {}
+                                 (:message/object-kind m)
+                                 (assoc :kind (:message/object-kind m))
+                                 (:message/object-id m)
+                                 (assoc :id (:message/object-id m)))
                         metadata (cond-> {:role (:message/role m)}
                                    (:message/source-user m)
                                    (assoc :source-user (:message/source-user m))
@@ -378,6 +387,7 @@
                                    (assoc :mentions (set (:message/mention-handles m)))
                                    (seq attachment) (assoc :attachment attachment)
                                    (seq provenance) (assoc :provenance provenance)
+                                   (seq object) (assoc :object object)
                                    (:message/metadata-kind m)
                                    (assoc :kind (:message/metadata-kind m))
                                    (:message/context-from m)

@@ -20,3 +20,16 @@
           st :strict-memory
           {:id (random-uuid) :from :alice :content "hi"
            :metadata {:unmodelled/value 1}})))))
+
+(deftest rejects-malformed-durable-object-references
+  (let [st (memory/make)]
+    (store/-store-room! st :object-memory {:slug "object-memory"})
+    (doseq [[object message]
+            [[{:kind "proposal" :id (random-uuid)} "kind"]
+             [{:kind :proposal :id "not-a-uuid"} "id"]
+             [{:kind :proposal :id (random-uuid) :title "hidden"} "keys"]]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (store/-store-message!
+                    st :object-memory
+                    {:id (random-uuid) :from :alice :content message
+                     :metadata {:object object}}))))))

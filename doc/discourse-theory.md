@@ -20,6 +20,14 @@ speech act they answer** (capability routing), so a room is organised around *wh
 responds to what kind of move* — not by hardcoded sender→receiver wiring. Adding
 a new kind of interaction is adding a new tag, not rewiring the graph.
 
+An utterance may also name one primary application object through durable
+metadata such as `{:object {:kind :proposal :id #uuid "…"}}`. The speech-act
+type still says what the message *does*; the object says what it is *about*.
+Dvergr validates and stores that reference as typed, indexed datoms while
+remaining ignorant of the referenced domain model. Applications can therefore
+render the same proposal, task, artifact or approval in chat and in their own
+projections without encoding identity in prose.
+
 ## Theory of mind: RSA, made reactive
 
 The deepest hook is **theory of mind**. In the Rational Speech Acts model

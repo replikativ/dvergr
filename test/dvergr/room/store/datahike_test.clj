@@ -59,7 +59,8 @@
     (let [[conn st] (mem-store)
           room-id :typed-metadata
           message-id (random-uuid)
-          blob-id (random-uuid)]
+          blob-id (random-uuid)
+          object-id (random-uuid)]
       (store/-store-room! st room-id {:slug (name room-id) :title "T"})
       (store/-store-message!
        st room-id
@@ -68,22 +69,37 @@
         :metadata {:role :user
                    :mentions #{"reviewer"}
                    :audience #{:agent/reviewer}
+                   :object {:kind :proposal :id object-id}
                    :attachment {:blob-id blob-id :mime "audio/ogg"}
                    :provenance {:mode :live :source :screen}}})
       (let [stored (dh/pull @conn
                             [:message/audience :message/mention-handles
                              :message/attachment-store-ref :message/attachment-mime
-                             :message/provenance-mode :message/provenance-source]
+                             :message/provenance-mode :message/provenance-source
+                             :message/object-kind :message/object-id]
                             [:message/id message-id])]
         (is (= #{:agent/reviewer} (set (:message/audience stored))))
         (is (= #{"reviewer"} (set (:message/mention-handles stored))))
         (is (= blob-id (:message/attachment-store-ref stored)))
         (is (= {:message/attachment-mime "audio/ogg"
                 :message/provenance-mode :live
-                :message/provenance-source :screen}
+                :message/provenance-source :screen
+                :message/object-kind :proposal
+                :message/object-id object-id}
                (select-keys stored [:message/attachment-mime
                                     :message/provenance-mode
-                                    :message/provenance-source]))))
+                                    :message/provenance-source
+                                    :message/object-kind
+                                    :message/object-id]))))
+      (is (= message-id
+             (dh/q '[:find ?message-id .
+                     :in $ ?kind ?object-id
+                     :where
+                     [?message :message/object-kind ?kind]
+                     [?message :message/object-id ?object-id]
+                     [?message :message/id ?message-id]]
+                   @conn :proposal object-id))
+          "applications can resolve the speech act from its typed object")
       (is (nil? (dh/q '[:find ?a .
                         :where [?a :db/ident :message/metadata]]
                       @conn))
