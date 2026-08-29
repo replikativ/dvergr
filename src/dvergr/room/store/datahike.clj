@@ -140,6 +140,18 @@
       ;; rehydration and is fed back to the model (see room-context seeding).
       (seq (:reasoning metadata))  (assoc :message/reasoning (:reasoning metadata)))))
 
+(defn- store-message-if-absent
+  "Transaction function implementing PRoomStore first-write-wins atomically.
+
+   Datahike invokes this with the serialized transaction snapshot. A concurrent
+   retry therefore either creates the message or observes the winner and emits
+   no datoms; it can never upsert over an immutable envelope after an unlocked
+   pre-read. The room timestamp belongs to the same decision."
+  [db entity room-touch]
+  (if (dh/entity db [:message/id (:message/id entity)])
+    []
+    [entity room-touch]))
+
 (def ^:private message-pull-pattern
   '[:message/id :message/role :message/content
     :message/created-at :message/source-user
@@ -268,23 +280,19 @@
   (-store-message! [_ room-id msg]
     (let [slug (store/room-id->slug room-id)]
       (if-let [ent (room-by-slug conn slug)]
-        ;; PRoomStore promises first-write-wins idempotence. A lookup-identity
-        ;; upsert alone would silently overwrite content when an adapter retries
-        ;; the same id with a changed envelope.
-        (when-not (dh/q '[:find ?m .
-                          :in $ ?mid
-                          :where [?m :message/id ?mid]]
-                        @conn (:id msg))
-          (let [chat-id (:chat/id ent)
-                entity  (message->entity chat-id msg)]
-            ;; One durability policy (surface + retry-once + dead-letter) instead
-            ;; of the old catch-and-silently-drop — a lost message is now visible
-            ;; and recoverable, not swallowed at :warn.
-            (persist/persist-tx! conn
-                                 [entity
-                                  {:db/id [:chat/id chat-id]
-                                   :chat/updated-at (java.util.Date.)}]
-                                 {:op :store-message :room-id room-id :msg-id (:id msg)})))
+        (let [chat-id (:chat/id ent)
+              entity  (message->entity chat-id msg)]
+          ;; One durability policy (surface + retry-once + dead-letter) instead
+          ;; of the old catch-and-silently-drop — a lost message is now visible
+          ;; and recoverable, not swallowed at :warn. The transaction function
+          ;; makes the idempotence decision inside Datahike's write serialization.
+          (persist/persist-tx!
+           conn
+           [[:db.fn/call store-message-if-absent
+             entity
+             {:db/id [:chat/id chat-id]
+              :chat/updated-at (java.util.Date.)}]]
+           {:op :store-message :room-id room-id :msg-id (:id msg)}))
         (tel/log! {:level :error :id :room-store/datahike-missing-room
                    :data {:room-id room-id :msg-id (:id msg)}}
                   "message for unknown room — not persisted (dropped)"))))

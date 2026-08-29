@@ -25,7 +25,9 @@
   (let [st (memory/make)]
     (store/-store-room! st :object-memory {:slug "object-memory"})
     (doseq [[object message]
-            [[{:kind "proposal" :id (random-uuid)} "kind"]
+            [[false "false"]
+             [nil "nil"]
+             [{:kind "proposal" :id (random-uuid)} "kind"]
              [{:kind :proposal :id "not-a-uuid"} "id"]
              [{:kind :proposal :id (random-uuid) :title "hidden"} "keys"]]]
       (is (thrown? clojure.lang.ExceptionInfo

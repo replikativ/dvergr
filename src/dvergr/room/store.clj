@@ -230,20 +230,21 @@
                         {:type :room-store/invalid-message-metadata
                          :provenance provenance})))
       (reject-unknown-metadata! :provenance provenance-metadata-keys provenance))
-    (when-let [object (:object metadata)]
-      (when-not (map? object)
-        (throw (ex-info "Message object reference must be a map"
-                        {:type :room-store/invalid-message-metadata
-                         :object object})))
-      (reject-unknown-metadata! :object object-metadata-keys object)
-      (when-not (keyword? (:kind object))
-        (throw (ex-info "Message object :kind must be a keyword"
-                        {:type :room-store/invalid-message-metadata
-                         :object object})))
-      (when-not (uuid? (:id object))
-        (throw (ex-info "Message object :id must be a UUID"
-                        {:type :room-store/invalid-message-metadata
-                         :object object})))))
+    (when (contains? metadata :object)
+      (let [object (:object metadata)]
+        (when-not (map? object)
+          (throw (ex-info "Message object reference must be a map"
+                          {:type :room-store/invalid-message-metadata
+                           :object object})))
+        (reject-unknown-metadata! :object object-metadata-keys object)
+        (when-not (keyword? (:kind object))
+          (throw (ex-info "Message object :kind must be a keyword"
+                          {:type :room-store/invalid-message-metadata
+                           :object object})))
+        (when-not (uuid? (:id object))
+          (throw (ex-info "Message object :id must be a UUID"
+                          {:type :room-store/invalid-message-metadata
+                           :object object}))))))
   (when (and (:run-id metadata) (not (uuid? (:run-id metadata))))
     (throw (ex-info "Message :run-id metadata must be a UUID"
                     {:type :room-store/invalid-message-metadata

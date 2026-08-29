@@ -23,6 +23,43 @@
   (let [[_conn st] (mem-store)]
     (contract/assert-message-envelope! st :envelope-datahike)))
 
+(deftest concurrent-message-writes-are-atomically-first-write-wins
+  (testing "the first committed immutable envelope cannot be overwritten"
+    (let [[_conn st] (mem-store)
+          room-id :concurrent-envelope
+          message-id (random-uuid)
+          ready (java.util.concurrent.CountDownLatch. 2)
+          completed (atom [])
+          transact! dh/transact]
+      (store/-store-room! st room-id {:slug (name room-id) :title "T"})
+      (with-redefs [dh/transact
+                    (fn [conn tx-data]
+                      ;; Force both callers past the old unlocked existence read
+                      ;; before either transaction runs. The transaction function
+                      ;; must still let exactly one immutable envelope win.
+                      (.countDown ready)
+                      (when-not (.await ready 10
+                                        java.util.concurrent.TimeUnit/SECONDS)
+                        (throw (ex-info "concurrent writers did not rendezvous" {})))
+                      (let [content (get-in tx-data [0 2 :message/content])
+                            result (transact! conn tx-data)]
+                        (swap! completed conj content)
+                        result))]
+        (let [first-write (future
+                            (store/-store-message!
+                             st room-id
+                             {:id message-id :from :alice :content "first"}))
+              second-write (future
+                             (store/-store-message!
+                              st room-id
+                              {:id message-id :from :bob :content "second"}))]
+          (is (not= ::timeout (deref first-write 10000 ::timeout)))
+          (is (not= ::timeout (deref second-write 10000 ::timeout)))))
+      (let [stored (first (store/-list-messages st room-id {}))]
+        (is (= 1 (count (store/-list-messages st room-id {}))))
+        (is (= (first @completed) (:content stored))
+            "the later transaction observes the winner instead of upserting")))))
+
 (deftest run-lifecycle-contract
   (let [[_conn st] (mem-store)]
     (contract/assert-run-lifecycle! st :runs-datahike)))
