@@ -286,16 +286,23 @@
           ;; of the old catch-and-silently-drop — a lost message is now visible
           ;; and recoverable, not swallowed at :warn. The transaction function
           ;; makes the idempotence decision inside Datahike's write serialization.
-          (persist/persist-tx!
-           conn
-           [[:db.fn/call store-message-if-absent
-             entity
-             {:db/id [:chat/id chat-id]
-              :chat/updated-at (java.util.Date.)}]]
-           {:op :store-message :room-id room-id :msg-id (:id msg)}))
-        (tel/log! {:level :error :id :room-store/datahike-missing-room
-                   :data {:room-id room-id :msg-id (:id msg)}}
-                  "message for unknown room — not persisted (dropped)"))))
+          (let [report
+                (persist/persist-tx-result!
+                 conn
+                 [[:db.fn/call store-message-if-absent
+                   entity
+                   {:db/id [:chat/id chat-id]
+                    :chat/updated-at (java.util.Date.)}]]
+                 {:op :store-message :room-id room-id :msg-id (:id msg)})]
+            (cond
+              (false? report) :failed
+              (seq (:tx-data report)) :inserted
+              :else :duplicate)))
+        (do
+          (tel/log! {:level :error :id :room-store/datahike-missing-room
+                     :data {:room-id room-id :msg-id (:id msg)}}
+                    "message for unknown room — not persisted (dropped)")
+          :failed))))
 
   (-message-thread-root [_ room-id message-id]
     (let [slug (store/room-id->slug room-id)]

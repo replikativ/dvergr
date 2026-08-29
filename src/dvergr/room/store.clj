@@ -57,7 +57,9 @@
      provenance, notification, tool-use and reasoning fields). Implementations
      replay these envelope fields losslessly and must be first-write-wins
      idempotent on :id — re-stores are no-ops. Unknown durable metadata is an
-     error: extend the typed schema rather than adding an opaque encoding.")
+     error: extend the typed schema rather than adding an opaque encoding.
+     Returns :inserted when this call won the immutable identity, :duplicate
+     when the id already existed, and :failed when durability was unavailable.")
 
   (-message-thread-root [this room-id message-id]
     "Return one message's stable topical-root UUID inside `room-id`, or nil.

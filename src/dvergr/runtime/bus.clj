@@ -286,15 +286,24 @@
     ;;    the post loudly and nothing is half-delivered (this inverts
     ;;    the old persistence-listener model, where a store failure
     ;;    silently lost durability while the live message flowed).
-    (when-let [append! (:durable-append! bus)]
-      (append! msg'))
-    ;; 2. The log is the fan-out source of truth. Appending here (not
-    ;;    in a delivery tap) means log order == post order, and a
-    ;;    message is on record before any consumer runs.
-    (swap! (:log bus) update :entries conj msg')
-    ;; 3. Doorbell for the pump.
-    (binding [ec/*execution-context* (:ctx bus)]
-      (sync/post! (:hint-mbx bus) ::hint)))
+    (let [durability (when-let [append! (:durable-append! bus)]
+                       (append! msg'))]
+      (when (= :failed durability)
+        (throw (ex-info "Durable bus append failed"
+                        {:type :bus/durable-append-failed
+                         :message-id (:id msg')})))
+      ;; A duplicate immutable envelope was already made visible by the call
+      ;; that won persistence. Suppress every repeated live effect as well as
+      ;; the durable duplicate. Nil preserves compatibility with custom append
+      ;; hooks that predate insertion-status returns.
+      (when-not (= :duplicate durability)
+        ;; 2. The log is the fan-out source of truth. Appending here (not
+        ;;    in a delivery tap) means log order == post order, and a
+        ;;    message is on record before any consumer runs.
+        (swap! (:log bus) update :entries conj msg')
+        ;; 3. Doorbell for the pump.
+        (binding [ec/*execution-context* (:ctx bus)]
+          (sync/post! (:hint-mbx bus) ::hint)))))
   nil)
 
 (defn post-many!

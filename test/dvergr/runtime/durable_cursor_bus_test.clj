@@ -40,6 +40,28 @@
         (Thread/sleep 150)
         (is (empty? @got2) "nothing delivered")))))
 
+(deftest durable-duplicate-is-not-visible-twice
+  (testing "first-write-wins covers the live log and subscribers"
+    (let [seen (atom #{})
+          append! (fn [message]
+                    (locking seen
+                      (if (contains? @seen (:id message))
+                        :duplicate
+                        (do (swap! seen conj (:id message)) :inserted))))
+          b (bus/create-bus {:durable-append! append!})
+          got (atom [])
+          sub (bus/subscribe! b [:to :x])
+          id (random-uuid)
+          message {:id id :to :x :content "canonical"}]
+      (drain-into! b sub got :content)
+      (bus/post! b message)
+      (bus/post! b message)
+      (is (wait-until #(= ["canonical"] @got) 3000))
+      (Thread/sleep 100)
+      (is (= ["canonical"] @got)
+          "projectors and external relays see only the winning post")
+      (is (= [message] (bus/log b))))))
+
 (deftest cursor-resume-redelivers-in-flight-at-least-once
   (testing "rewinding the cursor by one (simulating a pump crash after
           handoff but before advance) re-delivers exactly that entry —

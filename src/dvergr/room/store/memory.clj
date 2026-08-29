@@ -34,17 +34,25 @@
 
   (-store-message! [_ room-id msg]
     (let [msg    (store/normalize-message-thread msg)
-          msg-id (:id msg)]
-      (swap! state update-in [:messages room-id]
-             (fn [existing]
-               (let [v (or existing [])]
-                 (if (some #(= (:id %) msg-id) v)
-                   v
-                   (do
-                     (store/validate-message-metadata! (:metadata msg))
-                     (conj v msg))))))
-      (swap! state update-in [:rooms room-id]
-             (fn [m] (when m (assoc m :updated-at (java.util.Date.)))))))
+          msg-id (:id msg)
+          _ (store/validate-message-metadata! (:metadata msg))
+          [before _]
+          (swap-vals! state
+                      (fn [s]
+                        (if (some #(= (:id %) msg-id)
+                                  (get-in s [:messages room-id] []))
+                          s
+                          (-> s
+                              (update-in [:messages room-id] (fnil conj []) msg)
+                              (update-in [:rooms room-id]
+                                         (fn [m]
+                                           (when m
+                                             (assoc m :updated-at
+                                                    (java.util.Date.)))))))))]
+      (if (some #(= (:id %) msg-id)
+                (get-in before [:messages room-id] []))
+        :duplicate
+        :inserted)))
 
   (-message-thread-root [_ room-id message-id]
     (some #(when (= message-id (:id %)) (:thread-root-id %))
