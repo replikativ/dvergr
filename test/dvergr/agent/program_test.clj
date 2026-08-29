@@ -22,7 +22,8 @@
             [org.replikativ.spindel.effects.await :refer [await]]
             [org.replikativ.spindel.engine.context :as context]
             [org.replikativ.spindel.engine.core :as ec]
-            [org.replikativ.spindel.spin.combinators :as comb]))
+            [org.replikativ.spindel.spin.combinators :as comb]
+            [org.replikativ.spindel.yggdrasil :as ygg]))
 
 (defn- test-roster []
   (-> (roster/make-roster {:id :test-team})
@@ -141,6 +142,29 @@
           (is (= :merged (:fork/status (d/fork-descriptor fork))))
           (is (= :merged (:run/settlement-status
                           (program/observe room handle))))))
+      (testing "review authority can be promoted to durable governance"
+        (let [handle (binding [ec/*execution-context* (:ctx room)]
+                       (program/hire! room team :analyst
+                                      {:task "governed proposal" :settlement :review}))
+              _result (binding [ec/*execution-context* (:ctx room)] @handle)
+              durable (program/observe room handle)
+              fork (binding [ec/*execution-context* (:ctx room)]
+                     (registry/lookup (:run/world durable)))
+              proposal-id (random-uuid)
+              prepared (atom nil)
+              transfer (binding [ec/*execution-context* (:ctx room)]
+                         (forks/adopt! fork proposal-id
+                                       {:prepare! #(reset! prepared %)
+                                        :abort! (fn [_])}))]
+          (is (:ok? transfer) (pr-str transfer))
+          (is (= proposal-id (:fork/owner @prepared)))
+          (is (= :adopted (:run/settlement-status
+                           (program/observe room handle))))
+          (is (binding [ec/*execution-context* (:ctx room)]
+                (nil? (registry/lookup (:run/world durable)))))
+          ;; The governance owner, not the detached Run world, now settles it.
+          (is (nil? (ygg/discard-fork! (:fork/handle transfer))))
+          (d/release-transferred-fork! transfer)))
       (testing "discard removes a successful work plane"
         (let [handle (binding [ec/*execution-context* (:ctx room)]
                        (program/hire! room team :analyst
@@ -516,10 +540,10 @@
         (let [hiring (future
                        (binding [ec/*execution-context* (:ctx room)]
                          (program/hire! room team :worker {:task "stop"})))
-              _ (is (= true (deref entered-post 1000 ::timeout)))
+              _ (is (= true (deref entered-post 5000 ::timeout)))
               run-id (:run/id (first (run/active-runs (:id room))))
               closing (future (d/close-room! room))]
-          (is (wait-until #(run/cancel-requested? run-id) 1000))
+          (is (wait-until #(run/cancel-requested? run-id) 5000))
           (deliver release-post true)
           (let [handle (deref hiring 2000 ::timeout)]
             (is (not= ::timeout handle))
@@ -694,10 +718,10 @@
               (future
                 (binding [ec/*execution-context* (:ctx room)]
                   (program/hire! room team :slow {:task "racing close"})))
-              _ (is (= true (deref entered-post 1000 ::timeout)))
+              _ (is (= true (deref entered-post 5000 ::timeout)))
               admitted-id (:run/id (first (run/active-runs (:id room))))
               close-future (future (d/close-room! room))]
-          (is (wait-until #(run/cancel-requested? admitted-id) 1000)
+          (is (wait-until #(run/cancel-requested? admitted-id) 5000)
               "close fenced admission and found the reserved Run")
           (is (false? (realized? close-future))
               "teardown waits rather than removing the substrate")

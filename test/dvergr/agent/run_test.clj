@@ -159,6 +159,42 @@
       (finally
         (d/close-room! room)))))
 
+(deftest recovery-reopens-only-the-exact-room-fence
+  (let [[room _st] (run-room :admission-recovery)
+        meta (:meta room)
+        old-token (random-uuid)
+        newer-token (random-uuid)
+        trigger (d/message :alice :agent "work")]
+    (try
+      (run/close-room-admission! room)
+      (swap! meta assoc :test/fence {:token newer-token})
+      (is (nil?
+           (run/recover-room-admission!
+            room
+            (fn []
+              (locking meta
+                (when (= old-token (get-in @meta [:test/fence :token]))
+                  (swap! meta dissoc :test/fence)
+                  true))))))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"admission is closed"
+           (run/start! room :agent trigger (live-ctx)))
+          "stale recovery cannot reopen admission beneath a newer fence")
+      (is (true?
+           (run/recover-room-admission!
+            room
+            (fn []
+              (locking meta
+                (when (= newer-token (get-in @meta [:test/fence :token]))
+                  (swap! meta dissoc :test/fence)
+                  true))))))
+      (let [started (run/start! room :agent trigger (live-ctx))]
+        (is (nil? (:test/fence @meta)))
+        (run/finish! (:run/id started) :completed))
+      (finally
+        (d/close-room! room)))))
+
 (deftest lifecycle-publication-requires-durable-receipts
   (let [base (memory/make)
         receipts? (atom false)
