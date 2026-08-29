@@ -1133,28 +1133,6 @@
    - Diffing between session states")
 
 ;; ---------------------------------------------------------------------------
-;; Future: Agent Forking
-;; ---------------------------------------------------------------------------
-
-(comment
-  "Agents can fork their own contexts for sub-agents.
-
-   Design:
-   - Parent agent has SCI context A
-   - Spawns sub-agent with (fork-context A) -> context B
-   - Sub-agent works in isolation
-   - Parent can merge results back
-
-   Interface:
-   (fork-context parent-ctx)
-   (merge-context! parent-ctx child-ctx)
-
-   This enables:
-   - Speculative execution
-   - Parallel problem solving
-   - Hierarchical agent organization")
-
-;; ---------------------------------------------------------------------------
 ;; REPL Testing
 ;; ---------------------------------------------------------------------------
 

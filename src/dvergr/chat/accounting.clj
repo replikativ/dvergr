@@ -51,11 +51,11 @@
    ;; Compute time
    :compute-ms       0         ; Free (already paid in LLM calls)
 
-   ;; Budget transfers (pass-through: 1 microdollar per microdollar)
+   ;; Budget transfers (pass-through: 1 microdollar per microdollar).
+   ;; Child Run allocations will move to Kontor's resource vector rather than
+   ;; being represented as synthetic chat usage.
    :budget-allocation 1
-   :budget-return     1
-   :sub-chat-allocation 1
-   :sub-chat-return   1})
+   :budget-return     1})
 
 ;; ============================================================================
 ;; Pricing Functions

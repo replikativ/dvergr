@@ -29,8 +29,8 @@ human, or a scripted bot. (`ask` lives in the discourse algebra — `dvergr.core
 in favor of `post!` + observe.)
 
 A **substrate fork**, `(d/fork-room room {:isolation :ctx})`, branches the room's
-git worktree and datahike together; the fork's side effects stay isolated until
-you `merge` or `discard` them atomically.
+registered systems together; the fork's side effects stay isolated until you
+`merge` or `discard` them through its affine handle.
 
 A **GenerationHandle** — `{:token-source :tool-calls :done :cancel!}` — is the
 decision-side (F) primitive: it lets you swap *deciders* (which LLM, or a scripted
@@ -232,9 +232,9 @@ the compacted state. Saves ~2-3s on the boundary turn.
 ## Substrate forks (yggdrasil)
 
 `fork-room {:isolation :ctx}` branches every yggdrasil system in the
-parent ctx — datahike connection, git worktree, KB conn, etc. The
-worker inside the fork sees a forked DB; on `merge-room`, all branches
-merge atomically through one workspace commit.
+parent ctx — datahike connection, git worktree, KB conn, etc. The worker inside
+the fork sees a forked DB; `merge-room` settles each registered system through
+the canonical recoverable settlement boundary.
 
 ```clojure
 (let [fork (d/fork-room room {:isolation :ctx})]
@@ -246,11 +246,11 @@ merge atomically through one workspace commit.
     (d/discard fork)))
 ```
 
-This fork → review → merge/discard lifecycle is shared in `dvergr.rooms.forks`
-(`fork!` / `review` / `merge!` / `discard!`). Agents reach it through tools rather
-than calling it directly: `spawn_agent` delegates a goal to a sub-agent in a fork
-and auto-merges, while `propose_change` does the same but holds the fork for human
-review.
+Bounded agent programs normally use `dvergr.agent/hire!`: it opens the canonical
+world, admits a durable Run, and returns a native result Spin for composition.
+`spawn_agent` and `propose_change` are model-tool adapters over that exact
+interpreter, selecting `:automatic` and `:review` settlement respectively. They
+do not create Participants, lifecycle logs, or forks of their own.
 
 The theory-of-mind view of a substrate fork: `(simulate-reply parent
 target msg)` runs a fork where only the target's behavior matters, then
@@ -266,7 +266,8 @@ discards — the parent's state is provably untouched.
 | Wait for one reply | `(d/ask room target msg)` |
 | Fork the room for a what-if probe | `(d/fork-room room)` (shared ctx, ToM-style) |
 | Fork with full git+DB isolation | `(d/fork-room room {:isolation :ctx})` |
-| Delegate a goal to a sub-agent in a fork (auto-merge or held for review) | the `spawn_agent` / `propose_change` tools (`dvergr.rooms.forks`) |
+| Construct and compose delegated work | immutable `dvergr.agent` Rosters + `hire!` / `result-spin` |
+| Delegate from a model tool call | `spawn_agent` or `propose_change`, thin adapters over `dvergr.agent/hire!` |
 | Swap an LLM's decision shape | `(llm-agent {:run-turn-fn ...})` using a GenerationHandle adapter |
 | Observe cost / budget | read the chat-ctx `:budget-signal` (a tracked signal), or `dvergr.rooms.stats` |
 

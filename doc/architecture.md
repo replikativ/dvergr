@@ -57,7 +57,7 @@ workspace + Datahike message/knowledge stores); a thin global **system-db**
 
 **Key cross-cutting threads.** Spindel's ExecutionContext is the spine: rooms,
 schedules, the peer-bus, and stats all live as ctx-local state under `[:dvergr/*]`
-paths. CoW forking — of rooms, sub-chats, and git worktrees — underpins the
+paths. Canonical Spindel world forks over registered Yggdrasil systems underpin the
 fork/review/merge lifecycle (`rooms/forks` + the `spawn_agent`/`propose_change` tools).
 
 The largest remaining structural debt:

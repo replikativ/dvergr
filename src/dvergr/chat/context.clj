@@ -6,8 +6,6 @@
    2. Datahike - for durable persistence (uses Yggdrasil-registered db if available)
    3. SCI context - for sandboxed agent computation
 
-   Sub-chats use OverlayBackend for O(1) forking with CoW semantics.
-
    Budget tracking uses microdollars (μ$) as the numéraire:
    1 USD = 1,000,000 μ$
 
@@ -21,7 +19,6 @@
             [org.replikativ.spindel.yggdrasil :as ygg]
             [org.replikativ.spindel.engine.context :as ctx]
             [org.replikativ.spindel.signal :as sig]
-            [org.replikativ.spindel.atom :as ratom]
             [org.replikativ.spindel.core :as d]
             [dvergr.chat.schema :as schema]
             [dvergr.chat.accounting :as acct]
@@ -52,12 +49,7 @@
 
      ;; SCI (optional - for agent computation)
             sci-ctx           ; SCI context for sandboxed eval
-
-     ;; Hierarchy
-            parent-ctx        ; Parent ChatContext if this is a sub-chat
-            child-ctxs        ; Spindel Atom of child ChatContexts (fork-safe)
             ])
-
 ;; ============================================================================
 ;; Signal Accessors (must be called with spindel context bound)
 ;; ============================================================================
@@ -394,13 +386,12 @@
         sci-ctx (when with-sci?
                   (sandbox/fork-for-session rtc/*execution-context*))
 
-        ;; Create signals and atoms within spindel context
-        [messages-signal budget-signal status-signal child-ctxs-atom]
+        ;; Create signals within the owning execution context.
+        [messages-signal budget-signal status-signal]
         (binding [rtc/*execution-context* spindel-ctx]
           [(sig/signal (d/deltaable-vector []))
            (sig/signal initial-budget)
-           (sig/signal :active)
-           (ratom/create-atom {})])  ; fork-safe child contexts map
+           (sig/signal :active)])
 
         ;; Create chat entity in datahike — only when fresh; on restore
         ;; we don't want :chat/budget-total / :chat/budget-used clobbered.
@@ -419,148 +410,7 @@
      budget-signal
      status-signal
      db-conn
-     sci-ctx
-     nil                ; parent-ctx
-     child-ctxs-atom))) ; spindel atom for child contexts
-
-;; ============================================================================
-;; Sub-Chat Forking
-;; ============================================================================
-
-(defn fork-sub-chat
-  "Fork a sub-chat from parent chat.
-
-   Uses spindel's OverlayBackend for O(1) CoW forking.
-   Sub-chat gets allocated budget from parent.
-
-   Args:
-     parent-ctx - Parent ChatContext
-     opts - Map with:
-       :title - Sub-chat title
-       :budget-dollars - Budget to allocate in dollars
-       :budget - Budget in microdollars (legacy)"
-  [parent-ctx {:keys [title budget-dollars budget]}]
-  (let [chat-id (random-uuid)
-        parent-remaining (budget-remaining parent-ctx)
-
-        ;; Convert to microdollars if needed
-        requested-budget (or budget
-                             (when budget-dollars
-                               (long (* budget-dollars acct/MICRODOLLARS-PER-DOLLAR)))
-                             100000)  ; Default $0.10
-
-        ;; Validate parent has budget remaining
-        _ (when (<= parent-remaining 0)
-            (throw (ex-info "Parent has no budget remaining"
-                            {:parent-id (:chat-id parent-ctx)
-                             :parent-remaining parent-remaining})))
-
-        ;; Validate requested budget doesn't exceed parent's remaining
-        _ (when (> requested-budget parent-remaining)
-            (throw (ex-info "Requested budget exceeds parent's remaining budget"
-                            {:parent-id (:chat-id parent-ctx)
-                             :requested requested-budget
-                             :parent-remaining parent-remaining})))
-
-        ;; Allocate the requested amount (now validated to be <= parent-remaining)
-        allocated-budget requested-budget
-
-        ;; Deduct from parent (no cost, just transfer)
-        _ (account-usage! parent-ctx :sub-chat-allocation allocated-budget)
-
-        ;; Fork spindel context (O(1) with OverlayBackend)
-        forked-spindel (ctx/fork-context (:spindel-ctx parent-ctx))
-
-        ;; Create sub-chat's own datahike (could also use overlay in future)
-        db-cfg {:store {:backend :memory :id chat-id}}
-        db-conn (schema/create-chat-db! db-cfg)
-
-        ;; Fork SCI context if parent has one — use current execution context
-        ;; for spindel-backed SCI with full FRP support
-        sci-ctx (when (:sci-ctx parent-ctx)
-                  (sandbox/fork-for-session rtc/*execution-context*))
-
-        ;; Create signals and atoms in forked context
-        [messages-signal budget-signal status-signal child-ctxs-atom]
-        (binding [rtc/*execution-context* forked-spindel]
-          [(sig/signal (d/deltaable-vector []))
-           (sig/signal {:total allocated-budget
-                        :used 0
-                        :by-type {}
-                        :crossed-thresholds #{}})
-           (sig/signal :active)
-           (ratom/create-atom {})])
-
-        ;; Create chat entity
-        chat-entity (schema/create-chat-entity
-                     {:id chat-id
-                      :title (or title "Sub-chat")
-                      :budget allocated-budget
-                      :parent-id (:chat-id parent-ctx)})
-        _ (dh/transact db-conn [chat-entity])
-
-        sub-ctx (->ChatContext
-                 chat-id
-                 (or title "Sub-chat")
-                 forked-spindel
-                 messages-signal
-                 budget-signal
-                 status-signal
-                 db-conn
-                 sci-ctx
-                 parent-ctx
-                 child-ctxs-atom)]
-
-    ;; Register sub-chat with parent (in parent's spindel context)
-    (binding [rtc/*execution-context* (:spindel-ctx parent-ctx)]
-      (swap! (:child-ctxs parent-ctx) assoc chat-id sub-ctx))
-
-    sub-ctx))
-
-;; ============================================================================
-;; Sub-Chat Completion
-;; ============================================================================
-
-(defn complete-sub-chat!
-  "Complete a sub-chat and propagate summary to parent.
-
-   Args:
-     sub-ctx - Sub-chat ChatContext
-     opts - Map with:
-       :summary - Summary text (or will be generated)
-       :merge-unused-budget? - Return unused budget to parent (default true)"
-  [sub-ctx {:keys [summary merge-unused-budget?]
-            :or {merge-unused-budget? true}}]
-  (let [parent-ctx (:parent-ctx sub-ctx)]
-    ;; Set status
-    (set-status! sub-ctx :completed)
-
-    ;; Store summary
-    (when summary
-      (dh/transact (:db-conn sub-ctx)
-                   [{:db/id [:chat/id (:chat-id sub-ctx)]
-                     :chat/summary summary}]))
-
-    ;; Return unused budget to parent
-    (when (and merge-unused-budget? parent-ctx)
-      (let [unused (budget-remaining sub-ctx)]
-        (when (pos? unused)
-          ;; Add back to parent (negative accounting)
-          (account-tokens! parent-ctx :sub-chat-return (- unused)))))
-
-    ;; Add summary message to parent
-    (when (and parent-ctx summary)
-      (add-message! parent-ctx
-                    {:role :system
-                     :content (str "Sub-chat completed: " summary)
-                     :important? true}))
-
-    ;; Unregister from parent (in parent's spindel context)
-    (when parent-ctx
-      (binding [rtc/*execution-context* (:spindel-ctx parent-ctx)]
-        (swap! (:child-ctxs parent-ctx) dissoc (:chat-id sub-ctx))))
-
-    :completed))
+     sci-ctx)))
 
 ;; ============================================================================
 ;; Chat Lifecycle
@@ -578,28 +428,17 @@
     (set-status! chat-ctx :active)))
 
 (defn cancel-chat!
-  "Cancel a chat and all sub-chats."
+  "Cancel a chat. Owned child computations are cancelled through their Runs."
   [chat-ctx]
-  (set-status! chat-ctx :cancelled)
-  ;; Cancel all children (in this chat's spindel context)
-  (binding [rtc/*execution-context* (:spindel-ctx chat-ctx)]
-    (doseq [[_ child-ctx] @(:child-ctxs chat-ctx)]
-      (cancel-chat! child-ctx))))
+  (set-status! chat-ctx :cancelled))
 
 (defn close-chat!
   "Close chat and release resources."
   [chat-ctx]
   (binding [rtc/*execution-context* (:spindel-ctx chat-ctx)]
-    ;; Close children first
-    (doseq [[_ child-ctx] @(:child-ctxs chat-ctx)]
-      (close-chat! child-ctx))
-
     ;; Close datahike connection
     (when-let [conn (:db-conn chat-ctx)]
-      (dh/release conn))
-
-    ;; Clear references
-    (reset! (:child-ctxs chat-ctx) {}))
+      (dh/release conn)))
 
   :closed)
 
@@ -706,20 +545,8 @@
   (get-budget chat)             ; => {:total 1000000 :used 3000 :by-type {...}}
   (budget-remaining-dollars chat)  ; => 0.997
 
-  ;; Fork a sub-chat for research with $0.20 budget
-  (def research-chat (fork-sub-chat chat
-                                    {:title "Research JWT patterns"
-                                     :budget-dollars 0.20}))
-
-  ;; Sub-chat tracks its own budget
-  (budget-remaining-dollars research-chat)  ; => 0.20
-
-  ;; Complete sub-chat
-  (complete-sub-chat! research-chat
-                      {:summary "JWT best practices: use RS256, short expiry, refresh tokens"})
-
-  ;; Parent now has summary message
-  (last (get-messages chat))
+  ;; Bounded child work is a Run in a canonical world. Compose its result Spin
+  ;; through dvergr.agent instead of creating a second ChatContext hierarchy.
 
   ;; Cleanup
   (close-chat! chat))

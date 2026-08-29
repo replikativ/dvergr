@@ -5,6 +5,7 @@
             [dvergr.agent.roster :as roster]
             [dvergr.agent.run :as run]
             [dvergr.agent.turn :as turn]
+            [dvergr.agent.world :as world]
             [dvergr.chat.agent :as chat-agent]
             [dvergr.chat.context :as chat-context]
             [dvergr.chat.schema :as chat-schema]
@@ -16,6 +17,7 @@
             [dvergr.room.store :as room-store]
             [dvergr.room.store.memory :as memory]
             [dvergr.room.store.datahike :as datahike-store]
+            [dvergr.tools :as tools]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.effects.await :refer [await]]
             [org.replikativ.spindel.engine.context :as context]
@@ -166,6 +168,37 @@
       (finally
         (d/close-room! room)))))
 
+(deftest recursive-hire-separates-control-room-from-immediate-world-parent
+  (let [control-room (test-room :program-recursive-control)
+        parent-run (random-uuid)
+        parent-world (binding [ec/*execution-context* (:ctx control-room)]
+                       (world/open! control-room parent-run :review))
+        work-parent (:work parent-world)
+        team (test-roster)]
+    (try
+      (let [handle (binding [ec/*execution-context* (:ctx work-parent)]
+                     (program/hire-in! control-room work-parent team :analyst
+                                       {:task "nested"
+                                        :parent-run parent-run
+                                        :settlement :review}))
+            result (binding [ec/*execution-context* (:ctx work-parent)] @handle)
+            durable (program/observe control-room handle)
+            child-world (binding [ec/*execution-context* (:ctx work-parent)]
+                          (registry/lookup (:run/world durable)))]
+        (is (= :completed (:run/status result)))
+        (is (= parent-run (:run/parent durable)))
+        (is (= (:id control-room) (:run/room handle)))
+        (is (= (:id work-parent) (:parent-id child-world))
+            "the nested world settles only into its immediate parent")
+        (is (= (:run/id durable)
+               (:fork/owner (d/fork-descriptor child-world))))
+        (binding [ec/*execution-context* (:ctx work-parent)]
+          (d/discard child-world)))
+      (finally
+        (binding [ec/*execution-context* (:ctx control-room)]
+          (d/discard work-parent))
+        (d/close-room! control-room)))))
+
 (deftest llm-program-lifts-the-native-turn-loop
   (let [room (test-room :program-llm)
         team (roster/make-agent
@@ -262,6 +295,43 @@
                    (set (map :run/value [@a @b]))))
             (is (= 2 (count (set (map first @seen))))
                 "each particle gets a fresh ChatContext"))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest delegation-tools-are-thin-run-interpreter-adapters
+  (let [room (test-room :program-tool-delegation)
+        parent-run (random-uuid)]
+    (try
+      (with-redefs [providers/ensure-initialized! (constantly nil)
+                    chat-agent/run-agent-turn!
+                    (fn [chat-ctx _]
+                      (chat-context/add-message!
+                       chat-ctx {:role :assistant :content "delegated evidence"})
+                      :complete)]
+        (doseq [[tool-name expected-settlement]
+                [["spawn_agent" :merged]
+                 ["propose_change" :review]]]
+          (let [result (binding [ec/*execution-context* (:ctx room)]
+                         (tools/execute
+                          tool-name {:task "inspect" :profile "worker"}
+                          {:room room
+                           :execution-ctx (:ctx room)
+                           :run-id parent-run
+                           :model-policy {:provider :test :model "stub"}}))
+                run-id (get-in result [:metadata :run-id])
+                durable (run/run room run-id)]
+            (is (= :success (:type result)) (pr-str result))
+            (is (uuid? run-id))
+            (is (= :agent-task (:run/kind durable)))
+            (is (= parent-run (:run/parent durable)))
+            (is (= "delegate" (namespace (:run/actor durable))))
+            (is (= :llm (:run/program-kind durable)))
+            (is (= expected-settlement (:run/settlement-status durable)))
+            ;; Assert the user-facing adapter as well as the durable projection.
+            (is (re-find #"delegated evidence" (:content result)))
+            (when (= :review expected-settlement)
+              (binding [ec/*execution-context* (:ctx room)]
+                (d/discard (registry/lookup (:run/world durable))))))))
       (finally
         (d/close-room! room)))))
 

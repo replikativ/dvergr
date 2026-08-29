@@ -176,7 +176,10 @@
    - :isolation     - Execution isolation mode (:native, :sci, :shared-sci)
                       When :native, clojure_eval uses real Clojure eval instead of SCI
    - :eval-ns       - Atom holding current namespace for native eval (default: user)
-   - :execution-ctx - Spindel execution context (for spawn_agent tool)"
+   - :execution-ctx - Spindel execution context (for delegation tools)
+   - :control-room  - durable Run/message owner when :room is a nested work world
+   - :run-id       - current durable Run UUID, used as structural parent
+   - :agent-program-ceiling - attenuated child-program/effect authority"
   [{:keys [cwd workspace filesystem sci-ctx db-conn chat-ctx tools isolation
            eval-ns execution-ctx] :as options}]
   (let [virtual (when-not (or workspace filesystem)
@@ -1625,17 +1628,12 @@ Note: changes take effect on the next agent restart or reload."
                 :metadata {:mock? true}}))})
 
 ;; ---------------------------------------------------------------------------
-;; Agent Spawning Tool
+;; Agent delegation tools
 ;;
-;; spawn_agent delegates a one-shot task to a sub-agent that runs in a forked
-;; dvergr.discourse room — auto-merges on success.
+;; Thin adapters over the immutable Roster + Run interpreter exposed as
+;; `dvergr.agent` in SCI. No second participant loop, lifecycle log, fork type,
+;; or settlement mechanism belongs here.
 ;; ---------------------------------------------------------------------------
-
-(defn- discourse-hire []
-  (requiring-resolve 'dvergr.discourse/hire))
-
-(defn- llm-agent []
-  (requiring-resolve 'dvergr.discourse.llm/llm-agent))
 
 (defn- current-daemon []
   (some-> (requiring-resolve 'dvergr.orchestration.daemon/current-daemon) deref deref))
@@ -1646,80 +1644,118 @@ Note: changes take effect on the next agent restart or reload."
   [profile-name]
   ((requiring-resolve 'dvergr.agent.persona/resolve-prompt) profile-name))
 
+(defn- delegation-tools [profile-name]
+  (if (= "developer" profile-name)
+    minimal-coding-tools
+    minimal-readonly-tools))
+
+(defn- enforce-delegation-authority! [ceiling program-kind]
+  (when-let [allowed (:program-kinds ceiling)]
+    (when-not (contains? allowed program-kind)
+      (throw (ex-info "Child program exceeds this execution's delegation authority"
+                      {:type ::program-ceiling-exceeded
+                       :program-kind program-kind
+                       :allowed-program-kinds allowed}))))
+  (when (and (= :llm program-kind)
+             (false? (:provider-effects? ceiling)))
+    (throw (ex-info "Child model spend requires delegated provider-effect authority"
+                    {:type ::provider-effects-disallowed}))))
+
+(defn- delegate-agent!
+  [{:keys [task profile budget]}
+   {:keys [room control-room execution-ctx run-id actor agent-program-ceiling model-policy]}
+   settlement]
+  (let [daemon       (current-daemon)
+        room         (or room (:discourse-room daemon))
+        control-room (or control-room room (:discourse-room daemon))
+        ctx          (or execution-ctx (:ctx room) (:execution-ctx daemon))
+        profile-name (or profile "worker")
+        prompt-text  (or (load-agent-profile profile-name)
+                         "You are a capable AI worker. Complete the given task thoroughly.")
+        program-kind :llm]
+    (when-not (and room control-room)
+      (throw (ex-info "Agent delegation requires a current discourse Room"
+                      {:type ::no-delegation-room})))
+    (when-not ctx
+      (throw (ex-info "Agent delegation requires a Spindel execution context"
+                      {:type ::no-delegation-context})))
+    (enforce-delegation-authority! agent-program-ceiling program-kind)
+    (let [model-policy (or model-policy
+                           ((requiring-resolve 'dvergr.model.providers/default-spec))
+                           (throw (ex-info "No LLM provider is available for delegated work"
+                                           {:type ::no-delegation-provider})))
+          agent-id     (keyword "delegate"
+                                (str (str/replace profile-name #"[^A-Za-z0-9_.-]" "-")
+                                     "-" (random-uuid)))
+          make-roster  (requiring-resolve 'dvergr.agent.roster/make-roster)
+          make-agent   (requiring-resolve 'dvergr.agent.roster/make-agent)
+          hire-in!     (requiring-resolve 'dvergr.agent.program/hire-in!)
+          cancel!      (requiring-resolve 'dvergr.agent.program/cancel!)
+          roster       (make-agent
+                        (make-roster {:id :tool-delegation})
+                        {:id agent-id
+                         :name profile-name
+                         :prompt prompt-text
+                         :tools (delegation-tools profile-name)
+                         :model-policy model-policy
+                         :metadata {:profile profile-name :adapter :model-tool}
+                         :program {:kind :llm
+                                   :budget-dollars (or budget 0.50)}})
+          handle       (binding [rtc/*execution-context* ctx]
+                         (hire-in! control-room room roster agent-id
+                                   (cond-> {:task task
+                                            :from (or actor :spawn-agent)
+                                            :settlement settlement}
+                                     run-id (assoc :parent-run run-id))))]
+      (try
+        (let [result (binding [rtc/*execution-context* ctx] @handle)]
+          {:type :success
+           :content (if (= :completed (:run/status result))
+                      (str "Sub-agent (" profile-name ") result:\n\n"
+                           (:run/value result))
+                      (str "Sub-agent (" profile-name ") ended with status "
+                           (name (:run/status result))))
+           :metadata {:profile profile-name
+                      :status (:run/status result)
+                      :run-id (:run/id result)
+                      :world (:run/world result)
+                      :settlement (:run/settlement-status result)}})
+        (catch InterruptedException e
+          (binding [rtc/*execution-context* ctx]
+            (cancel! control-room handle))
+          (.interrupt (Thread/currentThread))
+          (throw e))))))
+
+(defn- delegation-tool [name settlement description]
+  {:name name
+   :description description
+   :parameters {:type "object"
+                :properties {:task {:type "string"
+                                    :description "Task description for the sub-agent"}
+                             :profile {:type "string"
+                                       :description "Agent profile: worker (default), developer, planner"}
+                             :budget {:type "number"
+                                      :description "Child model budget in dollars (default 0.50)"}}
+                :required ["task"]}
+   :execute (fn [input ctx]
+              (try
+                (delegate-agent! input ctx settlement)
+                (catch Exception e
+                  {:type :error
+                   :error (str name " failed: " (.getMessage e))
+                   :metadata (select-keys (ex-data e)
+                                          [:type :program-kind
+                                           :allowed-program-kinds])})))})
+
 (register!
- {:name "spawn_agent"
-  :description "Spawn a sub-agent to handle a delegated task.
+ (delegation-tool
+  "spawn_agent" :automatic
+  "Delegate a bounded task to a specialized AgentDef. The child is a durable, structurally parented Run in its own Spindel/Yggdrasil world; successful effects merge automatically. This is a convenience adapter over dvergr.agent/hire!, not a separate scheduler. Paid recursive delegation requires explicit provider-effect authority."))
 
-   The sub-agent runs in a forked dvergr.discourse room (substrate-fork
-   coming with Open Q #11; today only the room log is isolated). The
-   reply is auto-merged into the parent room and returned as text.
-
-   Use this to delegate sub-tasks to specialized agents.
-
-   Parameters:
-   - task: The task description for the sub-agent (required)
-   - profile: Agent profile name — loads system prompt from resources/agents/<profile>.md
-              Available: 'worker' (default), 'developer' (dvergr self-programming), 'planner'
-   - budget: Budget in dollars for the sub-agent (default: 0.50)
-
-   Returns the sub-agent's final text response.
-
-   Example: Delegate research
-   {\"task\": \"Research Clojure transducers and write a summary\"}
-
-   Example: Delegate with developer profile
-   {\"task\": \"Add a new tool that counts lines of code\", \"profile\": \"developer\", \"budget\": 1.0}"
-  :parameters {:type "object"
-               :properties {:task {:type "string"
-                                   :description "Task description for the sub-agent"}
-                            :profile {:type "string"
-                                      :description "Agent profile: worker (default), developer, planner"}
-                            :budget {:type "number"
-                                     :description "Budget in dollars (default 0.50)"}}
-               :required ["task"]}
-  :execute (fn [{:keys [task profile budget]} {:keys [execution-ctx]}]
-             (try
-               (let [hire         (discourse-hire)
-                     make-worker  (llm-agent)
-                     daemon       (current-daemon)
-                     room         (:discourse-room daemon)
-                     ctx          (or execution-ctx (:execution-ctx daemon))
-                     profile-name (or profile "worker")
-                     prompt-text  (or (load-agent-profile profile-name)
-                                      "You are a capable AI worker. Complete the given task thoroughly.")]
-                 (cond
-                   (nil? room)
-                   {:type :error
-                    :error "spawn_agent requires a running daemon (no discourse room)."}
-
-                   (nil? ctx)
-                   {:type :error
-                    :error "No execution context available. spawn_agent requires a spindel runtime."}
-
-                   :else
-                   (let [worker (binding [rtc/*execution-context* ctx]
-                                  (make-worker
-                                   {:id     (keyword (str profile-name "-sub"))
-                                    :spec   {:provider      :fireworks
-                                               ;; a model that EXISTS in resources/models.edn (the qwen id
-                                               ;; was removed from Fireworks; get-model! threw → spawn_agent
-                                               ;; was broken on first use)
-                                             :model         "accounts/fireworks/models/minimax-m2p7"
-                                             :system-prompt prompt-text}
-                                    :budget {:dollars (or budget 0.50)}
-                                    :ctx    ctx}))
-                         outcome (binding [rtc/*execution-context* ctx]
-                                   @(hire room worker {:goal task}))
-                         reply   (:reply outcome)
-                         text    (str (:content reply))]
-                     {:type :success
-                      :content (str "Sub-agent (" profile-name ") result:\n\n" text)
-                      :metadata {:profile profile-name
-                                 :status  (:status outcome)
-                                 :agent   (:id worker)}})))
-               (catch Exception e
-                 {:type :error
-                  :error (str "spawn_agent failed: " (.getMessage e))})))})
+(register!
+ (delegation-tool
+  "propose_change" :review
+  "Delegate a bounded task to a specialized AgentDef and retain its isolated Run world for review instead of merging it. Returns the Run and world identities used by the canonical proposal flow. Paid recursive delegation requires explicit provider-effect authority."))
 
 (comment
   ;; Test tools

@@ -196,7 +196,7 @@
            tools       tools/minimal-coding-tools}}]
   {:pre [(keyword? id) (map? spec)]}
   (let [ctx       (or ctx ec/*execution-context*)
-        ;; Room-less FALLBACK working ctx (sidecar / d/hire / tests). When the
+        ;; Room-less FALLBACK working ctx (sidecar / tests). When the
         ;; agent is joined to a ROOM, the per-[room,agent] room-context ctx is
         ;; used instead — seeded from the room store, kept current by a bus fold,
         ;; stable id (budget + persistence across restart/fork) — resolved per
@@ -326,6 +326,20 @@
                                           (assoc :room room)))
                          run-ref           (when room (run/start! room id msg chat-ctx))
                          run-id            (:run/id run-ref)
+                         ;; Convenience delegation tools still target the same
+                         ;; Run interpreter. Give them the current structural
+                         ;; parent and world instead of making them rediscover
+                         ;; daemon-global state. Long-lived Participants are a
+                         ;; trusted/root surface and therefore carry no nested
+                         ;; AgentDef ceiling unless their caller supplied one.
+                         tool-ctx          (cond-> (assoc tool-ctx
+                                                          :execution-ctx turn-ctx
+                                                          :control-room room
+                                                          :actor id
+                                                          :model-policy
+                                                          (select-keys spec
+                                                                       [:provider :model]))
+                                             run-id (assoc :run-id run-id))
                          turn-opts {:provider         (:provider spec)
                                 ;; Per-room /model override (commands registry)
                                 ;; wins over the spec's model, matching the daemon.

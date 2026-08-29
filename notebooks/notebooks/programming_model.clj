@@ -168,7 +168,7 @@
 ;; ## Where to go next
 ;;
 ;; - **Forks & proposals** — fork a room, let a worker change a branched git +
-;;   datahike, then `merge!` or `discard` atomically (`forks_and_proposals`).
+;;   datahike, then `merge!` or `discard` through one affine handle (`forks_and_proposals`).
 ;; - **Agents & tools** — a real LLM agent, the `clojure_eval` sandbox, the
 ;;   muschel shell, budgets, and context compaction (`agents_and_tools`).
 ;;

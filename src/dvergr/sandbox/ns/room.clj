@@ -32,8 +32,8 @@
    back-compat with existing agent profiles. `room-conn` = the room's messages
    store; `kb-conn` = its knowledge base. Any of `room-conn`/`kb-conn`/`room-id`
    may be nil (room-less ctx) — the helpers degrade gracefully.
-   `agent-program-ceiling` is the ambient child-program authority; it also
-   constrains the legacy `dvergr.room/hire` path."
+   `agent-program-ceiling` is forwarded to the room-bound SCI setup; bounded
+   delegation itself lives only in the `dvergr.agent` namespace."
   [sci-ctx room-conn kb-conn room-id ctx & [agent-program-ceiling]]
   (let [;; EVERY readable KB, not just `*kb*`. A room's knowledge is spread over
         ;; its own KB plus whatever is granted to it, and the two are written

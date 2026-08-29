@@ -228,9 +228,11 @@ A lead Run works in world `A`. Hiring a researcher creates `B = fork(A)`; that
 researcher may create `C = fork(B)`. Accepted `C` work merges into `B`, and
 accepted `B` work merges into `A`. Trunk is never an implicit target.
 
-Needs: canonical nested ownership exists in Spindel; Dvergr must route every
-recursive hire through it and replace the legacy subagent path. Resource-vector
-splitting remains future work.
+The canonical nested ownership path now exists: SCI `dvergr.agent/hire!` and the
+`spawn_agent` / `propose_change` tool adapters all use Run worlds. Recursive
+`hire-in!` keeps durable facts in the root control Room while forking and settling
+against the immediate work-world parent. Paid recursive LLM delegation remains
+attenuated until resource-vector splitting exists.
 
 ### Simmis proposal
 
@@ -356,8 +358,10 @@ it:
    state).
 6. **Done in this pass:** route `dvergr.rooms.forks` review and settlement through
    that handle.
-7. Migrate or remove `chat.context/fork-sub-chat` and
-   `dvergr.agent.subagent/hire!`.
+7. **Done:** removed `dvergr.agent.subagent/hire!`, `dvergr.room/hire`,
+   `dvergr.discourse/hire`, and the independent `chat.context/fork-sub-chat`
+   hierarchy. All bounded delegation and executable branching is Run-backed;
+   conversational branches remain message/thread projections.
 8. Implement durable transfer/adoption and settlement journaling for Simmis.
 9. Replace boot-time blanket orphan cleanup with descriptor/owner-aware GC.
 10. Build SMC, MCTS, resource-aware campaigns, and training environments on the

@@ -144,9 +144,10 @@
 ;; Unit Tests — spawn_agent tool registration
 ;; ============================================================================
 
-(deftest test-spawn-agent-registered
-  (testing "spawn_agent tool is registered"
-    (is (some? (tools/get-tool "spawn_agent"))))
+(deftest test-delegation-tools-registered
+  (testing "automatic and review adapters are registered"
+    (is (some? (tools/get-tool "spawn_agent")))
+    (is (some? (tools/get-tool "propose_change"))))
 
   (testing "spawn_agent has correct parameters"
     (let [tool (tools/get-tool "spawn_agent")
@@ -155,7 +156,17 @@
       (is (= ["task"] (:required params)))
       (is (contains? props :task))
       (is (contains? props :profile))
-      (is (contains? props :budget)))))
+      (is (contains? props :budget))))
+
+  (testing "the tool adapter cannot bypass the SCI delegation ceiling"
+    (let [result (tools/execute
+                  "spawn_agent" {:task "spend recursively"}
+                  {:room {}
+                   :execution-ctx :present
+                   :agent-program-ceiling {:program-kinds #{:echo :scripted}
+                                           :provider-effects? false}})]
+      (is (= :error (:type result)))
+      (is (str/includes? (:error result) "delegation authority")))))
 
 ;; ============================================================================
 ;; Daemon Tests — dispatch routing
@@ -174,70 +185,3 @@
     (is (= "Custom prompt"
            (daemon/resolve-system-prompt {:id :worker :profile :worker
                                           :system-prompt "Custom prompt"})))))
-
-;; ============================================================================
-;; Integration Tests — require FIREWORKS_API_KEY
-;;
-;; These exercise end-to-end delegation against the live Fireworks API; the
-;; legacy versions used dvergr.agent.task primitives, the current versions
-;; use dvergr.discourse + dvergr.discourse.llm/llm-agent + dvergr.discourse/hire.
-;; Skipped by default; opt in with kaocha --focus-meta :integration.
-;; ============================================================================
-
-(deftest ^:integration test-single-agent-eval
-  (testing "Single agent completes a clojure_eval task via discourse"
-    (require 'dvergr.discourse 'dvergr.discourse.llm
-             'org.replikativ.spindel.engine.context
-             'org.replikativ.spindel.engine.core)
-    (let [d         (resolve 'dvergr.discourse/room)
-          hire      (resolve 'dvergr.discourse/hire)
-          llm-agent (resolve 'dvergr.discourse.llm/llm-agent)
-          create-ctx (resolve 'org.replikativ.spindel.engine.context/create-execution-context)
-          ctx       (create-ctx)
-          room      (binding [org.replikativ.spindel.engine.core/*execution-context* ctx]
-                      (d :integration-test ctx))
-          worker    (binding [org.replikativ.spindel.engine.core/*execution-context* ctx]
-                      (llm-agent
-                       {:id     :test-eval
-                        :spec   {:provider      :fireworks
-                                 :model         "accounts/fireworks/models/minimax-m2p5"
-                                 :system-prompt "Use clojure_eval. Be concise."}
-                        :tools  #{"clojure_eval"}
-                        :budget {:dollars 0.10}
-                        :ctx    ctx}))
-          outcome   (binding [org.replikativ.spindel.engine.core/*execution-context* ctx]
-                      @(hire room worker
-                             {:goal "Evaluate (reduce + (range 100)) with clojure_eval. State the number."
-                              :timeout-ms 120000}))]
-      (is (= :merged (:status outcome)) "Hire should resolve as :merged")
-      (is (str/includes? (str (:content (:reply outcome))) "4950")
-          "Reply should contain 4950"))))
-
-(deftest ^:integration test-nested-spawn-agent
-  (testing "Orchestrator delegates via the spawn_agent tool"
-    (require 'dvergr.discourse 'dvergr.discourse.llm
-             'org.replikativ.spindel.engine.context
-             'org.replikativ.spindel.engine.core)
-    (let [d            (resolve 'dvergr.discourse/room)
-          hire         (resolve 'dvergr.discourse/hire)
-          llm-agent    (resolve 'dvergr.discourse.llm/llm-agent)
-          create-ctx   (resolve 'org.replikativ.spindel.engine.context/create-execution-context)
-          ctx          (create-ctx)
-          room         (binding [org.replikativ.spindel.engine.core/*execution-context* ctx]
-                         (d :integration-test ctx))
-          orchestrator (binding [org.replikativ.spindel.engine.core/*execution-context* ctx]
-                         (llm-agent
-                          {:id     :orchestrator
-                           :spec   {:provider      :fireworks
-                                    :model         "accounts/fireworks/models/minimax-m2p5"
-                                    :system-prompt "You MUST use spawn_agent to delegate. Never do work yourself."}
-                           :tools  #{"spawn_agent"}
-                           :budget {:dollars 0.50}
-                           :ctx    ctx}))
-          outcome      (binding [org.replikativ.spindel.engine.core/*execution-context* ctx]
-                         @(hire room orchestrator
-                                {:goal "Use spawn_agent to have a worker evaluate (+ 21 21) and report the answer."
-                                 :timeout-ms 120000}))]
-      (is (= :merged (:status outcome)))
-      (is (str/includes? (str (:content (:reply outcome))) "42")
-          "Final result should contain 42"))))

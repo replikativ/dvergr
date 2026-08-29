@@ -54,10 +54,7 @@
   (require 'dvergr.room.registry)
   (require 'dvergr.room.store)
   (require 'dvergr.rooms.forks)
-  (require 'dvergr.agent.subagent)
   (let [fork-diff*      @(ns-resolve 'dvergr.rooms.forks 'fork-diff)
-        subagent-hire*  @(ns-resolve 'dvergr.agent.subagent 'hire!)
-        subagent-pend*  @(ns-resolve 'dvergr.agent.subagent 'pending)
         fork-review*    @(ns-resolve 'dvergr.rooms.forks 'review)
         fork-classify*  @(ns-resolve 'dvergr.rooms.forks 'classify)
         post*           @(ns-resolve 'dvergr.discourse 'post!)
@@ -198,29 +195,7 @@
        'classify     fork-classify*
        'forks        forks-fn
        'participants participants-fn
-       'root         root-fn
-     ;; Subagent delegation — fork a subroom (`:ctx` substrate + shared CRDTs),
-     ;; host an ephemeral worker, delegate the goal, merge/discard. Returns a Spin:
-     ;; `(await (dvergr.room/hire "<room-ref>" {:goal … :spec {…}}))` in the
-     ;; foreground, or hold the spin and await it later (background). Durably
-     ;; tracked as a `:dvergr/subagent` lifecycle log; `pending-subagents` lists
-     ;; the still-running ones.
-       'hire         (fn [ref opts]
-                       (let [allowed-kinds (:program-kinds agent-program-ceiling)]
-                         (when (and allowed-kinds
-                                    (not (contains? allowed-kinds :llm)))
-                           (throw (ex-info
-                                   "Legacy sub-agent hire exceeds this sandbox's delegation ceiling"
-                                   {:type ::program-ceiling-exceeded
-                                    :program-kind :llm
-                                    :allowed-program-kinds allowed-kinds})))
-                         (when-let [room (resolve-room ref)]
-                           (binding [rtc/*execution-context* (:ctx room)]
-                             (subagent-hire* room opts)))))
-       'pending-subagents (fn [ref]
-                            (when-let [room (resolve-room ref)]
-                              (binding [rtc/*execution-context* (:ctx room)]
-                                (subagent-pend* room))))}
+       'root         root-fn}
       '{create!      [([opts]) "Create a persistent room. `opts` takes :slug :title :agents. Rooms are the unit of work: each has its own git repo, knowledge base and schedules."]
         list         [([]) "Every room you can see, as maps."]
         get          [([ref]) "One room by slug or id, or nil."]
@@ -239,6 +214,4 @@
         classify     [([fork]) "How mergeable a fork is (its tier) — used to route it as a task vs a proposal."]
         forks        [([ref]) "Every fork of a room."]
         participants [([ref]) "Who is in a room — agents and humans."]
-        root         [([]) "The root room of the tree."]
-        hire         [([ref opts]) "Delegate a goal to an EPHEMERAL sub-agent in a forked subroom (`:ctx` substrate + shared CRDTs), then merge or discard it. `opts` takes :goal and :spec. Returns a SPIN — (await (dvergr.room/hire …)) to run it in the foreground, or hold the spin and await it later to run it in the background. Tracked durably as a :dvergr/subagent lifecycle log."]
-        pending-subagents [([ref]) "Sub-agents hired from this room that are still running."]})))
+        root         [([]) "The root room of the tree. Delegate work through dvergr.agent/hire! so it remains Run-backed and Spindel-composable."]})))

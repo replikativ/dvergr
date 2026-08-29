@@ -200,7 +200,7 @@
       (finally
         (d/close-room! room)))))
 
-(deftest legacy-room-hire-cannot-bypass-agent-program-ceiling
+(deftest legacy-room-hire-is-not-an-alternate-delegation-path
   (let [room    (d/make-room {:id :sci-legacy-hire-ceiling
                               :store (memory/make)})
         sci-ctx (sandbox/fork-for-session (:ctx room))]
@@ -214,9 +214,10 @@
                sci-ctx
                "(require '[dvergr.room :as room]) (room/hire :sci-legacy-hire-ceiling {:goal :forbidden})"))]
         (is (false? (:success result)))
-        (is (re-find #"delegation ceiling" (get-in result [:error :message])))
+        (is (re-find #"(?:Could not|Unable to) resolve symbol:?.*room/hire"
+                     (get-in result [:error :message])))
         (is (empty? (run/active-runs (:id room)))
-            "the legacy path is rejected before it reaches a model provider"))
+            "the removed API cannot start an untracked execution"))
       (finally
         (d/close-room! room)))))
 

@@ -33,9 +33,9 @@ returns `{:type :success/:error :content "..." :metadata {...}}`.
   fulltext search over a native Datahike `:scriptum` secondary index is planned; for
   now agents query Datahike directly in the sandbox.)
 - **Tasks** — `task_create`, `task_list`, `task_update` (Datahike-backed `:task/*`).
-- **Agent / orchestration** — `spawn_agent` (delegate a one-shot task to a sub-agent in a
-  forked room, auto-merges), `propose_change` (same but held for human review at
-  `/proposals`), `update_agent_profile` (rewrites an agent's system prompt → actor row),
+- **Agent / orchestration** — `spawn_agent` (Run-backed delegation with automatic
+  settlement), `propose_change` (the same interpreter with its world retained for
+  review), `update_agent_profile` (rewrites an agent's system prompt → actor row),
   `budget` (remaining μ$ / cost estimate).
 - **Data sources (intake)** — the `dvergr.intake.*` modules: HN, Reddit, Lobsters,
   Bluesky, Mastodon, dev.to, web fetch/search, YouTube transcripts, Twitter, GitHub,
@@ -117,8 +117,9 @@ Tool I/O is anchored to the surrounding room's workspace, not the daemon root. T
 execution context, so when a room is forked (`:isolation :ctx`), `read_file`/`write_file`/
 `run_tests`/`bash` all see the fork's worktree automatically. Likewise `dh` writes go to
 the **fork-local** Datahike conn — nothing reaches the parent until the fork is merged.
-This is how `spawn_agent` (auto-merge) and `propose_change` (held for review) keep
-sub-agent work isolated. See `doc/state-model.md` for the full value-semantics picture.
+`spawn_agent` and `propose_change` construct ordinary AgentDefs and call the same
+Run-backed `hire!` exposed in SCI. Their tool I/O therefore resolves in the child
+world automatically. See `doc/state-model.md` for the full value-semantics picture.
 
 ## The `/drive` mount
 

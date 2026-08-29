@@ -3,7 +3,8 @@
 
    A persona is a role — researcher, coder, reviewer — packaged as a
    factory that returns an `llm-agent` Participant ready to `d/join`
-   into a room or pass to `d/hire`.
+   into a long-lived discourse. Bounded work uses immutable AgentDefs through
+   the Run-backed `dvergr.agent/hire!` interpreter.
 
    Prompts live in `agents/*.md` (resources or working-directory
    relative). Personas are the lowest-friction way to spin up a
@@ -19,8 +20,8 @@
      (binding [ec/*execution-context* (:ctx room)]
        (d/join room (personas/researcher)))
 
-     ;; Hire a coder for a one-shot job
-     (d/hire room (personas/coder {:id :impl}) {:goal \"implement X\"})
+     ;; One-shot work is composed through dvergr.agent/hire!; personas remain
+     ;; convenient long-lived Participant factories.
 
    Each factory accepts overrides matching `llm-agent` options
    (`:id :model :provider :tools :budget :chat-ctx :ctx :run-turn-fn`)

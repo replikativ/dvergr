@@ -107,25 +107,6 @@
       (let [msg (first (ctx/get-messages chat))]
         (is (:message/important? msg))))))
 
-(deftest sub-chat-forking-test
-  (testing "Fork sub-chat with budget allocation"
-    (let [parent (ctx/create-chat-context {:budget-dollars 1.0 :with-sci? false})
-          child (ctx/fork-sub-chat parent {:title "Sub-task"
-                                           :budget-dollars 0.2})]
-      (is (some? child))
-      (is (= "Sub-task" (:title child)))
-      ;; Child gets allocated budget
-      (is (= 200000 (:total (ctx/get-budget child))))
-      ;; Parent's used increases (allocation)
-      (is (= 200000 (:used (ctx/get-budget parent))))))
-
-  (testing "Sub-chat can't exceed parent budget"
-    (let [parent (ctx/create-chat-context {:budget-dollars 0.01 :with-sci? false})]
-      ;; Try to allocate more than parent has
-      (is (thrown? Exception
-                   (ctx/fork-sub-chat parent {:title "Greedy"
-                                              :budget-dollars 1.0}))))))
-
 (deftest status-management-test
   (testing "Initial status is active"
     (let [chat (ctx/create-chat-context {:budget-dollars 1.0 :with-sci? false})]
