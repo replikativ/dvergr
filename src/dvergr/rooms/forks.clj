@@ -10,6 +10,7 @@
    - `:isolation :none` — shares the parent context; \"merge\" is just a
      conversation-log append, and there is no git history to browse."
   (:require [dvergr.room.registry :as rreg]
+            [dvergr.agent.run :as agent-run]
             [dvergr.discourse :as d]
             [dvergr.substrate.geschichte :as git]
             [clojure.string :as str]
@@ -151,8 +152,11 @@
   [fork]
   (try
     (if-let [parent (rreg/lookup (:parent-id fork))]
-      (do (d/merge-room parent fork)
-          {:ok? true :parent-slug (:slug parent) :parent-id (:id parent)})
+      (let [run-id (some-> fork :meta deref :run-id)]
+        (d/merge-room parent fork)
+        (when run-id
+          (agent-run/update-durable-settlement! parent run-id :merged :review-approved))
+        {:ok? true :parent-slug (:slug parent) :parent-id (:id parent)})
       {:ok? false :error "fork has no live parent in the registry"})
     (catch Throwable t {:ok? false :error (.getMessage t)})))
 
@@ -324,5 +328,12 @@
   "Discard a fork (`discourse/discard`) — deletes its branches. Returns
    {:ok? true} or {:ok? false :error ...}."
   [fork]
-  (try (d/discard fork) {:ok? true}
-       (catch Throwable t {:ok? false :error (.getMessage t)})))
+  (try
+    (let [parent (rreg/lookup (:parent-id fork))
+          run-id (some-> fork :meta deref :run-id)]
+      (d/discard fork)
+      (when (and parent run-id)
+        (agent-run/update-durable-settlement! parent run-id :discarded
+                                              :review-rejected))
+      {:ok? true})
+    (catch Throwable t {:ok? false :error (.getMessage t)})))

@@ -592,6 +592,33 @@
     :db/index true
     :db/doc "Durable ChatContext trace identity owned by this Run"}
 
+   {:db/ident :run/world
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true
+    :db/doc "Runtime identity of the isolated work plane"}
+
+   {:db/ident :run/isolation
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/doc "Isolation mechanism used by the work plane"}
+
+   {:db/ident :run/settlement-policy
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true
+    :db/doc "Requested post-execution policy: automatic, review, or discard"}
+
+   {:db/ident :run/settlement-status
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true
+    :db/doc "Work-plane outcome, independent from execution status"}
+
+   {:db/ident :run/settlement-reason
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+
    {:db/ident :run/status
     :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/one
