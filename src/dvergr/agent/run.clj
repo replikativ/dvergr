@@ -85,6 +85,21 @@
       (ec/swap-state! (admission-path room-id) (constantly :open))))
   nil)
 
+(defn initialize-unpublished-room-admission!
+  "Initialize admission for a fresh Room before it is published.
+
+   This deliberately does not acquire `lifecycle-lock`: callers may be holding
+   a parent Room's metadata lock while constructing the child. It is only safe
+   for a unique Room ID that is not registered, shared, or running yet."
+  [room-id execution-ctx]
+  (when (some #(= room-id (get-in % [:run :run/room])) (vals @active))
+    (throw (ex-info "Cannot initialize admission for a Room with active Runs"
+                    {:type ::room-already-active
+                     :room-id room-id})))
+  (binding [ec/*execution-context* execution-ctx]
+    (ec/swap-state! (admission-path room-id) (constantly :open)))
+  nil)
+
 (defn close-room-admission!
   "Atomically close fork-local Run admission for `room` and return the fixed set
    admitted before the fence. Teardown drains exactly this set."
@@ -98,6 +113,39 @@
                    (when (= room-id (get-in entry [:run :run/room]))
                      (get-in entry [:run :run/id]))))
            set))))
+
+(defn fence-room-admission!
+  "Close Run admission and invoke `install-fence!` with the fixed admitted Run
+   IDs and their public snapshots while holding the lifecycle frontier.
+
+   `install-fence!` may acquire a Room lifecycle lock. This establishes the
+   only nested order as Run lifecycle -> Room lifecycle; it must not publish
+   Run events or invoke lifecycle subscribers."
+  [room install-fence!]
+  (let [room-id (:id room)]
+    (locking lifecycle-lock
+      (binding [ec/*execution-context* (:ctx room)]
+        (ec/swap-state! (admission-path room-id) (constantly :closed)))
+      (let [entries (->> (vals @active)
+                         (filter #(= room-id (get-in % [:run :run/room]))))
+            admitted (into #{} (map #(get-in % [:run :run/id])) entries)
+            runs (ordered-runs entries)]
+        (install-fence! admitted runs)
+        admitted))))
+
+(defn recover-room-admission!
+  "Atomically reopen a fenced Room when `recover-fence!` confirms and removes
+   the exact Room lifecycle fence being recovered.
+
+   The callback runs under the Run lifecycle lock and may acquire Room metadata,
+   preserving the sole nested order Run lifecycle -> Room metadata. It must
+   return truthy only when it removed the expected fence generation."
+  [room recover-fence!]
+  (locking lifecycle-lock
+    (when (recover-fence!)
+      (binding [ec/*execution-context* (:ctx room)]
+        (ec/swap-state! (admission-path (:id room)) (constantly :open)))
+      true)))
 
 (defn start!
   "Persist and publish one live Run before execution begins.

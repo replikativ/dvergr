@@ -239,10 +239,30 @@ attenuated until resource-vector splitting exists.
 A standalone Run completes in review mode. Promotion transfers its open fork to
 a durable ForkSet and persists the descriptor as a GC root. The Run becomes a
 contributor and loses settlement authority. Review may survive restart and
-eventually settle selected systems.
+settles the adopted world as one affine unit.
 
-Needs: transfer/adopt, portable descriptor, durable GC ownership, and a
-settlement journal.
+The live bridge is `dvergr.rooms.forks/adopt!`. Its `:prepare!` callback must
+persist the prospective descriptor/owner before Spindel transfers authority.
+Successful transfer detaches the transient Room and returns the adopter's sole
+process-local `ForkHandle`; preparation failure leaves the review world open.
+If the affine CAS loses a race after preparation, the required `:abort!`
+compensates the prepared durable row. The handle is never persisted.
+The prepared descriptor includes `:dvergr/room-id`,
+`:dvergr/parent-room-id`, and (for a nested isolated world)
+`:dvergr/parent-fork-id`. The durable owner must retain that ancestry until the
+child settles; Dvergr's shared topology is its immediate in-process projection.
+
+This bridge is deliberately whole-world only. Simmis must not accept or dismiss
+descriptor-named systems independently through raw branches. Per-scope review
+first requires an affine partition/split primitive that consumes the original
+handle and returns disjoint system capabilities; each partition can then be
+settled exactly once without bypassing Spindel's lifecycle.
+
+Simmis still needs to supply the durable half: store the descriptor as a GC
+root, index its systems into the existing ForkSet, and journal per-system
+settlement. After restart it reopens the named Datahike/Geschichte branches
+under that durable ownership claim; it does not deserialize the old Spindel
+reactive context.
 
 ### Multi-agent campaign
 
@@ -362,7 +382,9 @@ it:
    `dvergr.discourse/hire`, and the independent `chat.context/fork-sub-chat`
    hierarchy. All bounded delegation and executable branching is Run-backed;
    conversational branches remain message/thread projections.
-8. Implement durable transfer/adoption and settlement journaling for Simmis.
+8. **Partial:** Dvergr now exposes durability-first affine adoption. Implement
+   the Simmis GC root, whole-world ForkSet projection, and recoverable settlement
+   journal. Add affine world partitioning before exposing per-scope settlement.
 9. Replace boot-time blanket orphan cleanup with descriptor/owner-aware GC.
 10. Build SMC, MCTS, resource-aware campaigns, and training environments on the
     same world policy.

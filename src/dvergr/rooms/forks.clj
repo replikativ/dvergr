@@ -337,3 +337,34 @@
                                               :review-rejected))
       {:ok? true})
     (catch Throwable t {:ok? false :error (.getMessage t)})))
+
+(defn adopt!
+  "Promote a retained isolated fork into an external durable owner.
+
+   `opts` is passed to `discourse/transfer-fork!` and must contain durable
+   `:prepare!` and compensating `:abort!` callbacks. The returned ForkHandle is live
+   process-local authority for the adopter. When this is a Run world, its
+   durable projection is correlated as `:adopted`; a projection failure is
+   reported without hiding the already-transferred capability.
+
+   Adoption transfers the whole world. Per-system decisions require a future
+   affine partition primitive; callers must not settle descriptor systems by
+   bypassing the returned handle."
+  [fork new-owner opts]
+  (try
+    (let [parent (rreg/lookup (:parent-id fork))
+          run-id (some-> fork :meta deref :run-id)
+          transfer (d/transfer-fork! fork new-owner opts)
+          projection-error
+          (when (and parent run-id)
+            (try
+              (agent-run/update-durable-settlement! parent run-id :adopted
+                                                    :governance-transfer)
+              nil
+              (catch Throwable error error)))]
+      (cond-> (assoc transfer :ok? true)
+        projection-error
+        (assoc :warning "Fork transferred, but the Run settlement projection was not updated"
+               :projection-error (ex-message projection-error))))
+    (catch Throwable error
+      {:ok? false :error (ex-message error)})))

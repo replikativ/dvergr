@@ -267,6 +267,47 @@
                           parent-owned))))
       (is (nil? (d/close-room! parent)) "close is idempotent"))))
 
+(deftest concurrent-close-contender-does-not-corrupt-owner-fence
+  (let [room (d/room :concurrent-close-fence)
+        entered (promise)
+        release (promise)]
+    (try
+      (d/on-each-message room
+                         (fn [_]
+                           (deliver entered true)
+                           @release))
+      (d/post! room (d/message :human nil "hold close drain"))
+      (is (= true (deref entered 2000 ::timeout)))
+      (let [owner (future (d/close-room! room))
+            deadline (+ (System/currentTimeMillis) 2000)
+            owner-fence
+            (loop []
+              (let [state (:dvergr/fork-transfer-state @(:meta room))]
+                (cond
+                  (= :tearing-down (:state state)) state
+                  (< (System/currentTimeMillis) deadline)
+                  (do (Thread/yield) (recur))
+                  :else ::timeout)))]
+        (is (map? owner-fence))
+        (let [contender-error
+              (try
+                (d/close-room! room)
+                nil
+                (catch clojure.lang.ExceptionInfo error error))]
+          (is (= ::d/room-lifecycle-in-progress
+                 (:type (ex-data contender-error))))
+          (is (= owner-fence
+                 (:dvergr/fork-transfer-state @(:meta room)))
+              "a losing close preserves the owner's token and causal allowlist"))
+        (deliver release true)
+        (is (nil? (deref owner 5000 ::timeout)))
+        (is (= :closed
+               (get-in @(:meta room)
+                       [:dvergr/fork-transfer-state :state]))))
+      (finally
+        (deliver release true)
+        (d/close-room! room)))))
+
 (deftest forked-participant-operates-on-its-joined-room
   (testing "a participant cloned into a fork sees the FORK as its room
             (discourse/join sets :room on the participant), not the parent it

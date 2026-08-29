@@ -195,10 +195,14 @@
     (bus/post! (:bus room) msg')
     msg'))
 
+(declare ensure-room-work-admitted!)
+
 (defn post!
   "Route a Message into the room. Safe to call from any thread."
   [room msg]
-  (route-and-log! room msg))
+  (locking (:meta room)
+    (ensure-room-work-admitted! room :post msg)
+    (route-and-log! room msg)))
 
 (defn room-target
   "The canonical addressing target for user input into `room`, derived from
@@ -220,8 +224,10 @@
 (defn post-batch!
   "Route msgs into the room in order."
   [room msgs]
-  (bus/post-many! (:bus room) msgs)
-  msgs)
+  (locking (:meta room)
+    (ensure-room-work-admitted! room :post-batch)
+    (bus/post-many! (:bus room) msgs)
+    msgs))
 
 (defn log
   "Return the room's full message log (vector). Mirrors `bus/log`."
@@ -546,6 +552,55 @@
   [room]
   (or (some-> room :meta deref :conversation-id) (:id room)))
 
+(def ^:private fork-transfer-state-key :dvergr/fork-transfer-state)
+
+(defn- install-room-listener!
+  [room f]
+  (binding [ec/*execution-context* (:ctx room)]
+    (let [sub (bus/subscribe! (:bus room) [:type :user/message])
+          lifecycle (atom {:status :open})
+          listener (sp/spin
+                    (loop [s (:aseq sub)]
+                      (when-let [r (sp/await (anext s))]
+                        (let [[msg rest-s] r
+                              done (promise)
+                              claimed?
+                              (loop []
+                                (let [state @lifecycle]
+                                  (if (= :open (:status state))
+                                    (if (compare-and-set! lifecycle state
+                                                          {:status :active :done done})
+                                      true
+                                      (recur))
+                                    false)))]
+                          (when claimed?
+                            (try
+                              (when (map? msg) (f msg))
+                              (catch Throwable t
+                                (tel/log! {:level :error :id :room/listener-failed
+                                           :data {:room (:id room) :error (.getMessage t)}}))
+                              (finally
+                                (swap! lifecycle
+                                       (fn [state]
+                                         {:status (if (= :closing (:status state))
+                                                    :closed
+                                                    :open)}))
+                                (deliver done true))))
+                          (recur rest-s)))))
+          _ (sp/spawn! listener
+                       {:on-error
+                        (fn [error]
+                          (when-not (= spin-core/spin-cancelled (:type (ex-data error)))
+                            (tel/log! {:level :error :id ::room-listener-error
+                                       :data {:room (:id room)
+                                              :error (ex-message error)}}
+                                      "Room listener process failed")))})
+          owned (or (:dvergr/owned-listeners @(:meta room)) (atom #{}))
+          entry {:subscription sub :spin listener :lifecycle lifecycle :callback f}]
+      (swap! owned conj entry)
+      (swap! (:meta room) assoc :dvergr/owned-listeners owned)
+      listener)))
+
 (defn on-each-message
   "Spawn a listener that calls `(f msg)` for EVERY conversational message posted
    to `room` (every `[:type :user/message]` on the bus), in order — the whole
@@ -553,18 +608,135 @@
    reflect the entire room (a channel egress that shows what a rich UI shows).
    Errors in `f` are logged, never swallowed, and don't stop the listener."
   [room f]
-  (binding [ec/*execution-context* (:ctx room)]
-    (let [sub (bus/subscribe! (:bus room) [:type :user/message])]
-      (sp/spawn!
-       (sp/spin
-        (loop [s (:aseq sub)]
-          (when-let [r (sp/await (anext s))]
-            (let [[msg rest-s] r]
-              (try (when (map? msg) (f msg))
-                   (catch Throwable t
-                     (tel/log! {:level :error :id :room/listener-failed
-                                :data {:room (:id room) :error (.getMessage t)}})))
-              (recur rest-s)))))))))
+  (locking (:meta room)
+    (ensure-room-work-admitted! room :on-each-message)
+    (install-room-listener! room f)))
+
+(declare fork-handle)
+
+(defn- begin-room-quiescence!
+  [room operation]
+  (let [token (random-uuid)]
+    (agent-run/fence-room-admission!
+     room
+     (fn [admitted active]
+       (locking (:meta room)
+         (if-let [state (get @(:meta room) fork-transfer-state-key)]
+           (throw (ex-info "Room is already fenced for lifecycle work"
+                           {:type ::room-lifecycle-in-progress
+                            :fork/id (:id room)
+                            :operation operation
+                            :fork/transfer-state state}))
+           (swap! (:meta room) assoc fork-transfer-state-key
+                  {:state :tearing-down
+                   :token token
+                   :operation operation
+                   :admitted-run-ids admitted
+                   :admitted-trigger-ids (into #{} (keep :run/trigger) active)})))))))
+
+(defn- drain-room-listeners!
+  "Stop Room-owned listeners and wait for active callbacks to physically exit.
+   Returns their callbacks so a recoverable transfer failure can reinstall them."
+  [room operation]
+  (begin-room-quiescence! room operation)
+  (if-let [owned (:dvergr/owned-listeners @(:meta room))]
+    (let [entries (vec @owned)]
+      (doseq [{:keys [subscription spin lifecycle]} entries]
+        (bus/unsubscribe! subscription)
+        (let [state (swap! lifecycle
+                           (fn [state]
+                             (case (:status state)
+                               :open {:status :closed}
+                               :active (assoc state :status :closing)
+                               state)))]
+          (cleanup-owned-spin! room spin)
+          (when-let [done (:done state)]
+            (when (= ::timeout (deref done 5000 ::timeout))
+              (swap! (:meta room) update fork-transfer-state-key
+                     assoc
+                     :state :recovery-required
+                     :operation operation
+                     :error "listener callback drain timed out")
+              (throw (ex-info "Timed out waiting for a Room listener callback"
+                              {:type ::listener-drain-timeout
+                               :room-id (:id room)}))))))
+      (reset! owned #{})
+      (mapv :callback entries))
+    []))
+
+(defn- seal-room-quiescence!
+  "Retire the causal-post handoff after every admitted Run has acknowledged
+   cancellation. No Room write may cross this boundary into settlement."
+  [room operation]
+  (locking (:meta room)
+    (let [state (get @(:meta room) fork-transfer-state-key)]
+      (when (= :tearing-down (:state state))
+        (swap! (:meta room) update fork-transfer-state-key
+               assoc :state :settling :operation operation))))
+  nil)
+
+(defn- restore-room-listeners!
+  [room callbacks]
+  (locking (:meta room)
+    (doseq [f callbacks]
+      (install-room-listener! room f))))
+
+(defn- recover-room-quiescence!
+  [room callbacks error]
+  (let [handle (fork-handle room)
+        token (get-in @(:meta room) [fork-transfer-state-key :token])]
+    (if (or (nil? handle) (ygg/open-fork? handle))
+      (let [restore-error (try
+                            (restore-room-listeners! room callbacks)
+                            nil
+                            (catch Throwable listener-error listener-error))]
+        (if restore-error
+          (do
+            (swap! (:meta room) update fork-transfer-state-key
+                   assoc :state :recovery-required :error (ex-message restore-error))
+            (throw (ex-info "Room listener restoration failed; recovery is required"
+                            {:type ::fork-transfer-recovery-required
+                             :fork/id (:id room)
+                             :operation :teardown
+                             :error (ex-message error)
+                             :restore-error (ex-message restore-error)}
+                            restore-error)))
+          (let [recovered?
+                (agent-run/recover-room-admission!
+                 room
+                 (fn []
+                   (locking (:meta room)
+                     (when (= token (get-in @(:meta room)
+                                            [fork-transfer-state-key :token]))
+                       (swap! (:meta room) dissoc fork-transfer-state-key)
+                       true))))]
+            (if recovered?
+              (throw error)
+              (throw (ex-info "Room lifecycle changed during recovery"
+                              {:type ::fork-transfer-recovery-required
+                               :fork/id (:id room)
+                               :operation :teardown
+                               :error (ex-message error)}
+                              error))))))
+      (do
+        (swap! (:meta room) update fork-transfer-state-key
+               assoc :state :recovery-required :error (ex-message error))
+        (throw error)))))
+
+(defn- mark-room-recovery-if-owned!
+  "Mark a failed lifecycle operation without overwriting a newer contender's
+   fence. A nil or stale token owns no lifecycle state."
+  [room token operation error]
+  (when token
+    (locking (:meta room)
+      (when (= token (get-in @(:meta room)
+                             [fork-transfer-state-key :token]))
+        (swap! (:meta room) update fork-transfer-state-key
+               assoc
+               :state :recovery-required
+               :operation operation
+               :error (ex-message error)))))
+  nil)
 
 (defn messages
   "Return a Room's message history.
@@ -608,6 +780,21 @@
                             :meta new-meta}))
     new-meta))
 
+(defn- ensure-room-work-admitted!
+  [room operation & [payload]]
+  (when-let [state (get @(:meta room) fork-transfer-state-key)]
+    (let [run-id (some-> payload :metadata :run-id)
+          admitted-trigger? (and (= :post operation)
+                                 (= :tearing-down (:state state))
+                                 (or (contains? (:admitted-trigger-ids state) (:id payload))
+                                     (contains? (:admitted-run-ids state) run-id)))]
+      (when-not admitted-trigger?
+        (throw (ex-info "Room is fenced for fork authority transfer"
+                        {:type ::fork-transfer-in-progress
+                         :fork/id (:id room)
+                         :operation operation
+                         :fork/transfer-state state}))))))
+
 (defn join
   "Register participant in room, subscribe its inbox + drivers on the bus,
    and start its spin. Returns the participant with :inbox-sub, :inbox-mbx
@@ -621,40 +808,42 @@
    participant sees every broadcast post; targeted posts only the
    addressed one\" — falls out naturally."
   [room p]
-  (binding [ec/*execution-context* (:ctx room)]
-    (let [inbox-sub     (bus/subscribe! (:bus room) [:to (:id p)])
-          broadcast-sub (bus/subscribe! (:bus room) [:to nil])
+  (locking (:meta room)
+    (ensure-room-work-admitted! room :join)
+    (binding [ec/*execution-context* (:ctx room)]
+      (let [inbox-sub     (bus/subscribe! (:bus room) [:to (:id p)])
+            broadcast-sub (bus/subscribe! (:bus room) [:to nil])
           ;; A Participant may be explicitly left and then joined again. Re-open
           ;; its active-handler slot before the new process can receive work.
-          _ (reset! (:active p) nil)
+            _ (reset! (:active p) nil)
           ;; Merge all subscriptions into one mailbox so the spin awaits
           ;; a single source. Each sub gets a small pump.
-          merge-mbx (sync/create-mailbox (:ctx room))
-          inbox-pump (drain-into! inbox-sub merge-mbx)
-          broadcast-pump (drain-into! broadcast-sub merge-mbx)
-          p' (-> p
-                 (assoc :inbox-sub inbox-sub
-                        :inbox-mbx merge-mbx
+            merge-mbx (sync/create-mailbox (:ctx room))
+            inbox-pump (drain-into! inbox-sub merge-mbx)
+            broadcast-pump (drain-into! broadcast-sub merge-mbx)
+            p' (-> p
+                   (assoc :inbox-sub inbox-sub
+                          :inbox-mbx merge-mbx
                         ;; The participant carries the room it is JOINED to, so a
                         ;; handler operates on its actual room — not one baked
                         ;; into a closure. Critical for fork clones: the same
                         ;; on-message, joined to a fork, must rehydrate/account
                         ;; against the FORK, not the parent it was built for.
-                        :room room)
-                 (update :subs (fn [s] (swap! s assoc [:to nil] broadcast-sub) s)))
-          proc (participant-spin p' room merge-mbx)]
-      (swap! (:pumps p') assoc ::direct inbox-pump [:to nil] broadcast-pump)
-      (sp/spawn! proc
-                 {:on-error
-                  (fn [error]
-                    (when-not (= spin-core/spin-cancelled (:type (ex-data error)))
-                      (tel/log! {:level :error :id ::participant-process-error
-                                 :data {:participant (:id p')
-                                        :error (.getMessage ^Throwable error)}}
-                                "participant process failed")))})
-      (let [p'' (assoc p' :process proc)]
-        (swap! (:participants room) assoc (:id p) p'')
-        p''))))
+                          :room room)
+                   (update :subs (fn [s] (swap! s assoc [:to nil] broadcast-sub) s)))
+            proc (participant-spin p' room merge-mbx)]
+        (swap! (:pumps p') assoc ::direct inbox-pump [:to nil] broadcast-pump)
+        (sp/spawn! proc
+                   {:on-error
+                    (fn [error]
+                      (when-not (= spin-core/spin-cancelled (:type (ex-data error)))
+                        (tel/log! {:level :error :id ::participant-process-error
+                                   :data {:participant (:id p')
+                                          :error (.getMessage ^Throwable error)}}
+                                  "participant process failed")))})
+        (let [p'' (assoc p' :process proc)]
+          (swap! (:participants room) assoc (:id p) p'')
+          p'')))))
 
 ;; ============================================================================
 ;; Dynamic subscriptions — let participants listen to extra tagged channels
@@ -673,16 +862,18 @@
   ([room p topic]
    (subscribe! room p topic nil))
   ([room p topic buffer]
-   (or (get @(:subs p) topic)
-       (let [sub (binding [ec/*execution-context* (:ctx room)]
-                   (if buffer
-                     (bus/subscribe! (:bus room) topic buffer)
-                     (bus/subscribe! (:bus room) topic)))
-             pump (binding [ec/*execution-context* (:ctx room)]
-                    (drain-into! sub (:inbox-mbx p)))]
-         (swap! (:subs p) assoc topic sub)
-         (swap! (:pumps p) assoc topic pump)
-         sub))))
+   (locking (:meta room)
+     (ensure-room-work-admitted! room :subscribe)
+     (or (get @(:subs p) topic)
+         (let [sub (binding [ec/*execution-context* (:ctx room)]
+                     (if buffer
+                       (bus/subscribe! (:bus room) topic buffer)
+                       (bus/subscribe! (:bus room) topic)))
+               pump (binding [ec/*execution-context* (:ctx room)]
+                      (drain-into! sub (:inbox-mbx p)))]
+           (swap! (:subs p) assoc topic sub)
+           (swap! (:pumps p) assoc topic pump)
+           sub)))))
 
 (defn unsubscribe!
   "Remove a previously added subscription on `topic` for `p`. The drain
@@ -796,17 +987,29 @@
 
    No-op on already-closed rooms."
   [room]
-  (when room
-    (drain-room-runs! room)
-    (leave-all! room)
-    (binding [ec/*execution-context* (room-home-ctx room)]
-      (rreg/unregister! (:id room)))
-    ;; A branchless fork carries the exact root ctx, so Spindel cannot infer from
-    ;; the context alone that closing it here would kill the parent. The durable
-    ;; room marker is the ownership boundary.
-    (when-not (fork-room? room)
-      (when-let [room-ctx (:ctx room)]
-        (ctx/close-context! room-ctx))))
+  (when (and room (not= :closed (get-in @(:meta room)
+                                        [fork-transfer-state-key :state])))
+    (let [fence-token* (volatile! nil)]
+      (try
+        (drain-room-listeners! room :close)
+        (vreset! fence-token*
+                 (get-in @(:meta room) [fork-transfer-state-key :token]))
+        (drain-room-runs! room)
+        (seal-room-quiescence! room :close)
+        (leave-all! room)
+        (binding [ec/*execution-context* (room-home-ctx room)]
+          (rreg/unregister! (:id room)))
+        ;; A branchless fork carries the exact root ctx, so Spindel cannot infer from
+        ;; the context alone that closing it here would kill the parent. The durable
+        ;; room marker is the ownership boundary.
+        (when-not (fork-room? room)
+          (when-let [room-ctx (:ctx room)]
+            (ctx/close-context! room-ctx)))
+        (swap! (:meta room) assoc fork-transfer-state-key
+               {:state :closed :operation :close})
+        (catch Throwable error
+          (mark-room-recovery-if-owned! room @fence-token* :close error)
+          (throw error)))))
   nil)
 
 ;; ============================================================================
@@ -844,11 +1047,15 @@
   [room target-id msg-spec]
   (sp/spin
    (let [asker-id (keyword (str "ask-" (random-uuid)))
-         asker-sub (binding [ec/*execution-context* (:ctx room)]
-                     (bus/subscribe! (:bus room) [:to asker-id]))]
-      ;; Register a stub so the participants map can be inspected if needed.
-     (swap! (:participants room) assoc asker-id
-            {:id asker-id :inbox-sub asker-sub})
+         asker-sub (locking (:meta room)
+                     (ensure-room-work-admitted! room :ask)
+                     (let [sub (binding [ec/*execution-context* (:ctx room)]
+                                 (bus/subscribe! (:bus room) [:to asker-id]))]
+                        ;; Register the stub under the same lifecycle lock, so
+                        ;; transfer either sees it or fences the ask first.
+                       (swap! (:participants room) assoc asker-id
+                              {:id asker-id :inbox-sub sub})
+                       sub))]
       ;; try/finally so the transient subscription + stub are reclaimed on BOTH
       ;; a normal reply AND cancellation. spindel's cancel-spin! unwinds a spin
       ;; suspended at this `await` through the finally — and reaches here even
@@ -945,27 +1152,29 @@
   ([room] (fork-room room {}))
   ([room {:keys [isolation clone-participants? fork-opts]
           :or {isolation :none clone-participants? true}}]
-   (let [short-uuid (subs (str (random-uuid)) 0 8)
-         new-slug   (str (:slug room) "/fork-" short-uuid)
+   (locking (:meta room)
+     (ensure-room-work-admitted! room :fork-room)
+     (let [short-uuid (subs (str (random-uuid)) 0 8)
+           new-slug   (str (:slug room) "/fork-" short-uuid)
          ;; Use the canonical slug→id encoding so id ↔ slug stay in
          ;; lock-step across the entire system (registry, store,
          ;; peer-bus events).
-         new-id     (rstore/slug->room-id new-slug)
-         parent-log (log room)
-         fork-handle (when (= :ctx isolation)
-                       (binding [ec/*execution-context* (:ctx room)]
-                         (ygg/fork! (merge {:purpose :workroom
-                                            :owner new-id}
-                                           fork-opts))))
-         child-ctx  (case isolation
-                      :none (:ctx room)
-                      :ctx  (:child-ctx fork-handle))
+           new-id     (rstore/slug->room-id new-slug)
+           parent-log (log room)
+           fork-handle (when (= :ctx isolation)
+                         (binding [ec/*execution-context* (:ctx room)]
+                           (ygg/fork! (merge {:purpose :workroom
+                                              :owner new-id}
+                                             fork-opts))))
+           child-ctx  (case isolation
+                        :none (:ctx room)
+                        :ctx  (:child-ctx fork-handle))
          ;; Mark a `:ctx` fork TRANSIENT so create-room-db! defers the GLOBAL
          ;; system-db grant (reconciled on merge / dropped on discard) — a fork's
          ;; agent-created DB must not resurrect on restart (P2).
-         _          (when (= :ctx isolation)
-                      (binding [ec/*execution-context* child-ctx]
-                        (ec/swap-state! [:dvergr/transient-fork?] (constantly true))))
+           _          (when (= :ctx isolation)
+                        (binding [ec/*execution-context* child-ctx]
+                          (ec/swap-state! [:dvergr/transient-fork?] (constantly true))))
          ;; `:isolation :ctx` forks BRANCH the parent's conversation. The fork
          ;; gets its OWN store wrapping the fork ctx's BRANCHED chat-db conn
          ;; (NOT the parent's fixed-conn store), and persists under the parent's
@@ -973,42 +1182,45 @@
          ;; the same logical conversation on a datahike branch, and
          ;; merge-fork! collapses them natively (no append-log!). It writes
          ;; no separate :chat entity. (doc/unified-fork-conversation.md)
-         conv-id    (conversation-id room)
+           conv-id    (conversation-id room)
          ;; RF5: the fork's store wraps the PARENT room's OWN messages conn under
          ;; the fork ctx (branched), so fork messages ride the per-room store's
          ;; branch and merge-fork! collapses them natively. (RF5 S4.3: no
          ;; chat-db fallback — every room is provisioned with its own :msgs system.)
-         fork-store (when (= :ctx isolation)
-                      (some-> (binding [ec/*execution-context* child-ctx]
-                                (srooms/msgs-conn-for-slug (:slug room)))
-                              store-dh/make))
+           fork-store (when (= :ctx isolation)
+                        (some-> (binding [ec/*execution-context* child-ctx]
+                                  (srooms/msgs-conn-for-slug (:slug room)))
+                                store-dh/make))
          ;; Durability-first for the fork too: fork-local messages persist
          ;; onto the BRANCH (under the root conversation id) inside post!,
          ;; before visibility — replacing the fork's persistence listener.
-         child-bus  (bus-with-peer-relay child-ctx new-id :fork
-                                         (when fork-store
-                                           {:durable-append!
-                                            (fn [msg]
-                                              (when (rstore/message-shape? msg)
-                                                (rstore/-store-message! fork-store conv-id msg)))}))
+           child-bus  (bus-with-peer-relay child-ctx new-id :fork
+                                           (when fork-store
+                                             {:durable-append!
+                                              (fn [msg]
+                                                (when (rstore/message-shape? msg)
+                                                  (rstore/-store-message! fork-store conv-id msg)))}))
          ;; Seed the fork's bus log with parent history so log-based
          ;; consumers see a continuous record (the cursor starts past it —
          ;; history is never re-delivered). Forks have their OWN bus so
          ;; live messages do not leak between parent and fork.
-         _          (bus/seed-log! child-bus parent-log)
-         new-room   (->Room new-id new-slug
-                            (str (:title room) " · fork " short-uuid)
-                            (:id room)
-                            (atom {})
-                            child-bus
-                            child-ctx
-                            (count parent-log)
-                            fork-store
-                            (atom (assoc @(:meta room)
-                                         :forked-from (:id room)
-                                         :conversation-id conv-id))
-                            (when fork-handle (atom fork-handle)))]
-     (agent-run/open-room-admission! new-id child-ctx)
+           _          (bus/seed-log! child-bus parent-log)
+           new-room   (->Room new-id new-slug
+                              (str (:title room) " · fork " short-uuid)
+                              (:id room)
+                              (atom {})
+                              child-bus
+                              child-ctx
+                              (count parent-log)
+                              fork-store
+                              (atom (assoc (dissoc @(:meta room) :dvergr/owned-listeners)
+                                           :forked-from (:id room)
+                                           :conversation-id conv-id))
+                              (when fork-handle (atom fork-handle)))]
+       ;; The child is not registered or otherwise visible yet. Initializing its
+       ;; admission without the global lifecycle lock avoids parent-meta ->
+       ;; lifecycle lock inversion during concurrent parent teardown.
+       (agent-run/initialize-unpublished-room-admission! new-id child-ctx)
      ;; (Fork-local persistence rides the bus's durable-append! hook now —
      ;; wired at child-bus construction above.)
      ;; Register the fork in the PARENT ctx — where the daemon UI reads the
@@ -1016,24 +1228,26 @@
      ;; (CoW), so registering there would hide the fork from the tree (and it
      ;; would render empty). The Room still carries its child-ctx in `:ctx`
      ;; for merge/diff/git. For `:none`, child-ctx == parent ctx (no change).
-     (binding [ec/*execution-context* (:ctx room)]
-       (rreg/register! new-room))
-     (when clone-participants?
-       (doseq [[_id p] @(:participants room)]
-         (when-let [fac (:factory p)]
-           (binding [ec/*execution-context* child-ctx]
-             (join new-room (fac child-ctx))))))
+       (binding [ec/*execution-context* (:ctx room)]
+         (rreg/register! new-room)
+         (when (= :ctx isolation)
+           (rreg/track-fork! new-id (:id room) (:fork-id fork-handle))))
+       (when clone-participants?
+         (doseq [[_id p] @(:participants room)]
+           (when-let [fac (:factory p)]
+             (binding [ec/*execution-context* child-ctx]
+               (join new-room (fac child-ctx))))))
      ;; Control-plane: announce the fork on the peer-bus so dashboards,
      ;; audit logs, and oversight agents see it without subscribing to
      ;; the fork's bus directly.
-     (binding [ec/*execution-context* child-ctx]
-       (peer-bus/post! {:type            :dvergr/fork-created
-                        :dvergr/origin   new-id
-                        :dvergr/parent   (:id room)
-                        :isolation       isolation
-                        :workspace-id    (when (= :ctx isolation)
-                                           (:id (geschichte/current-workspace)))}))
-     new-room)))
+       (binding [ec/*execution-context* child-ctx]
+         (peer-bus/post! {:type            :dvergr/fork-created
+                          :dvergr/origin   new-id
+                          :dvergr/parent   (:id room)
+                          :isolation       isolation
+                          :workspace-id    (when (= :ctx isolation)
+                                             (:id (geschichte/current-workspace)))}))
+       new-room))))
 
 (defn fork-handle
   "Return an isolated Room fork's process-local canonical ForkHandle, or nil.
@@ -1045,6 +1259,257 @@
   "Return the portable world descriptor for an isolated Room fork, or nil."
   [room]
   (some-> (fork-handle room) ygg/fork-descriptor))
+
+(declare fork-home-ctx)
+
+(defn- fork-transfer-children [home fork-id]
+  (binding [ec/*execution-context* home]
+    (rreg/structural-children fork-id)))
+
+(defn- assert-fork-quiescent! [fork home]
+  (when-let [run-id (some-> fork :meta deref :run-id)]
+    (when (some #(= run-id (:run/id %)) (agent-run/active-runs))
+      (throw (ex-info "A Run world cannot transfer while its executor is live"
+                      {:type ::fork-not-quiescent :fork/id (:id fork) :run/id run-id}))))
+  (when (seq @(:participants fork))
+    (throw (ex-info "Fork must be quiescent before authority transfer"
+                    {:type ::fork-not-quiescent
+                     :fork/id (:id fork)
+                     :participants (vec (keys @(:participants fork)))})))
+  (when-let [children (seq (fork-transfer-children home (:id fork)))]
+    (throw (ex-info "Settle transferred child worlds before their parent"
+                    {:type ::fork-has-open-children
+                     :fork/id (:id fork)
+                     :children (mapv :fork/id children)}))))
+
+(defn- detach-transferred-room! [fork home owner]
+  (swap! (:meta fork) assoc fork-transfer-state-key
+         {:state :transferred :owner owner})
+  (binding [ec/*execution-context* home]
+    (rreg/mark-fork-transferred! (:id fork) owner)
+    (rreg/unregister! (:id fork))))
+
+(defn transfer-fork!
+  "Transfer an isolated Room fork's settlement authority to a durable owner.
+
+   `prepare!` is the durability boundary. It is called with the prospective
+   portable descriptor (already naming `new-owner`) *before* live authority is
+   transferred. It must durably record the owner/descriptor as a retained GC
+   root, or throw. A preparation failure leaves the Room registered and its
+   original ForkHandle open.
+
+   On success the executor is quiesced, the original handle becomes stale, and
+   the transient Room disappears from the registry so its Merge/Discard UI
+   cannot compete with the adopter. The returned `:fork/handle` is the sole
+   process-local settlement capability; callers must never persist it. The
+   returned `:fork/descriptor` is data and is the canonical durable identity.
+
+   `abort!` is required and is called with the preparation receipt if the live
+   affine transfer fails. A failed compensation leaves the Room fenced in a
+   visible recovery-required state. Once transfer succeeds the durable owner is
+   authoritative; later projection/event failures never roll it back."
+  [fork new-owner prepare-or-opts]
+  (let [{:keys [prepare! abort!]}
+        (if (fn? prepare-or-opts)
+          {:prepare! prepare-or-opts}
+          prepare-or-opts)]
+    (when-not (fn? prepare!)
+      (throw (ex-info "Fork transfer requires a durable prepare! callback"
+                      {:type ::durable-prepare-required
+                       :fork/id (:id fork)})))
+    (when-not (fn? abort!)
+      (throw (ex-info "Fork transfer requires a durable abort! callback"
+                      {:type ::durable-abort-required
+                       :fork/id (:id fork)})))
+    (when (nil? new-owner)
+      (throw (ex-info "Fork transfer owner cannot be nil"
+                      {:type ::invalid-fork-owner
+                       :fork/id (:id fork)})))
+    (let [home (fork-home-ctx fork)]
+      (when-not (binding [ec/*execution-context* home]
+                  (rreg/lookup (:id fork)))
+        (throw (ex-info "Fork is not live in its parent registry"
+                        {:type ::fork-not-live
+                         :fork/id (:id fork)})))
+      (let [handle (or (fork-handle fork)
+                       (throw (ex-info "Only an isolated context fork can transfer"
+                                       {:type ::fork-not-isolated
+                                        :fork/id (:id fork)})))]
+        (when-not (ygg/open-fork? handle)
+          (throw (ex-info "Fork no longer owns open settlement authority"
+                          {:type ::fork-not-open
+                           :fork/id (:id fork)
+                           :fork/descriptor (ygg/fork-descriptor handle)})))
+        (let [prepared? (volatile! false)
+              receipt* (volatile! nil)
+              listeners* (volatile! [])
+              fence-token* (volatile! nil)
+              {:keys [adopted receipt descriptor]}
+              (try
+                ;; No worker may retain a capability into a substrate once
+                ;; ownership moves. Listener drain atomically installs the Room
+                ;; fence and closes Run admission at one lifecycle frontier.
+                (vreset! listeners* (drain-room-listeners! fork :transfer))
+                (vreset! fence-token*
+                         (get-in @(:meta fork) [fork-transfer-state-key :token]))
+                (drain-room-runs! fork)
+                ;; Once every admitted Run has physically stopped, retire its
+                ;; causal-post allowance before durable preparation or authority
+                ;; transfer can observe/move the branch.
+                (seal-room-quiescence! fork :transfer)
+                (assert-fork-quiescent! fork home)
+                (let [parent (binding [ec/*execution-context* home]
+                               (rreg/lookup (:parent-id fork)))
+                      parent-fork-id (some-> parent fork-handle ygg/fork-descriptor :fork/id)
+                      portable-ancestry {:dvergr/room-id (:id fork)
+                                         :dvergr/parent-room-id (:parent-id fork)
+                                         :dvergr/parent-fork-id parent-fork-id}
+                      prospective (merge (ygg/fork-descriptor handle)
+                                         portable-ancestry
+                                         {:fork/owner new-owner
+                                          :fork/status :open})
+                      receipt (prepare! prospective)]
+                  (vreset! prepared? true)
+                  (vreset! receipt* receipt)
+                  ;; Defense in depth against code bypassing public APIs and
+                  ;; mutating participant/topology state during preparation.
+                  (assert-fork-quiescent! fork home)
+                  (let [adopted (ygg/transfer-fork! handle new-owner)]
+                    {:adopted adopted
+                     :receipt receipt
+                     :descriptor (merge (ygg/fork-descriptor adopted)
+                                        portable-ancestry)}))
+                (catch Throwable error
+                  (let [abort-error (when @prepared?
+                                      (try
+                                        (abort! @receipt*)
+                                        nil
+                                        (catch Throwable compensation-error
+                                          compensation-error)))]
+                    (cond
+                      (= ::listener-drain-timeout (:type (ex-data error)))
+                      (do
+                        (swap! (:meta fork) update fork-transfer-state-key
+                               assoc
+                               :state :recovery-required
+                               :owner new-owner
+                               :error (ex-message error))
+                        (throw error))
+
+                      abort-error
+                      (do
+                        (swap! (:meta fork) update fork-transfer-state-key
+                               assoc
+                               :state :recovery-required
+                               :owner new-owner
+                               :error (ex-message abort-error))
+                        (throw (ex-info "Fork transfer compensation failed; recovery is required"
+                                        {:type ::fork-transfer-recovery-required
+                                         :fork/id (:id fork)
+                                         :fork/owner new-owner
+                                         :transfer-error (ex-message error)
+                                         :abort-error (ex-message abort-error)}
+                                        abort-error)))
+
+                      (ygg/open-fork? handle)
+                      (let [restore-error (try
+                                            (restore-room-listeners! fork @listeners*)
+                                            nil
+                                            (catch Throwable listener-error
+                                              listener-error))]
+                        (if restore-error
+                          (do
+                            (swap! (:meta fork) update fork-transfer-state-key
+                                   assoc
+                                   :state :recovery-required
+                                   :owner new-owner
+                                   :error (ex-message restore-error))
+                            (throw (ex-info "Fork listener restoration failed; recovery is required"
+                                            {:type ::fork-transfer-recovery-required
+                                             :fork/id (:id fork)
+                                             :fork/owner new-owner
+                                             :transfer-error (ex-message error)
+                                             :restore-error (ex-message restore-error)}
+                                            restore-error)))
+                          (let [recovered?
+                                (agent-run/recover-room-admission!
+                                 fork
+                                 (fn []
+                                   (locking (:meta fork)
+                                     (when (= @fence-token*
+                                              (get-in @(:meta fork)
+                                                      [fork-transfer-state-key :token]))
+                                       (swap! (:meta fork) dissoc fork-transfer-state-key)
+                                       true))))]
+                            (if recovered?
+                              (throw error)
+                              (throw (ex-info "Fork lifecycle changed during transfer recovery"
+                                              {:type ::fork-transfer-recovery-required
+                                               :fork/id (:id fork)
+                                               :fork/owner new-owner
+                                               :transfer-error (ex-message error)}
+                                              error))))))
+
+                      :else
+                      (do
+                        ;; Another claimant owns the affine capability. Keep
+                        ;; the stale Room inert and detach it from execution.
+                        (detach-transferred-room! fork home :external-claimant)
+                        (throw error))))))]
+         ;; Keep the stale original handle on the detached Room object. Any
+         ;; leaked reference fails affine authority checks instead of silently
+         ;; becoming a store-less conversational fork.
+          (detach-transferred-room! fork home new-owner)
+          (swap! (:meta fork) assoc :fork-transferred-to new-owner)
+          (binding [ec/*execution-context* home]
+            (try
+              (peer-bus/post! {:type :dvergr/fork-transferred
+                               :dvergr/origin (:id fork)
+                               :dvergr/parent (:parent-id fork)
+                               :fork/id (:fork/id descriptor)
+                               :fork/owner new-owner})
+              (catch Throwable error
+                (tel/log! {:level :warn
+                           :id ::fork-transfer-event-failed
+                           :data {:fork (:id fork)
+                                  :owner new-owner
+                                  :error (ex-message error)}}
+                          "Fork authority transferred but its peer event failed"))))
+          {:fork/handle adopted
+           :fork/descriptor descriptor
+           :fork/receipt receipt
+           :fork/room-id (:id fork)
+           :fork/parent-id (:parent-id fork)})))))
+
+(defn release-transferred-fork!
+  "Release a transferred child's structural parent claim after settlement.
+
+   Accepts the map returned by `transfer-fork!`. The adopted handle must already
+   be merged or discarded; an open handle cannot release ancestry."
+  [{:fork/keys [handle room-id descriptor]}]
+  (when-not (and (ygg/fork-handle? handle)
+                 (= (:fork/id descriptor) (:fork-id handle)))
+    (throw (ex-info "Transferred fork handle does not match its descriptor"
+                    {:type ::transferred-fork-identity-mismatch
+                     :fork/id room-id
+                     :fork/descriptor-id (:fork/id descriptor)
+                     :fork/handle-id (some-> handle :fork-id)})))
+  (when-not (= room-id (:dvergr/room-id descriptor))
+    (throw (ex-info "Transferred fork Room identity does not match its descriptor"
+                    {:type ::transferred-fork-identity-mismatch
+                     :fork/id room-id
+                     :fork/descriptor-room-id (:dvergr/room-id descriptor)})))
+  (let [{:keys [status token]} @(:authority handle)]
+    (when-not (and (contains? #{:merged :discarded} status)
+                   (= token (:token handle)))
+      (throw (ex-info "Transferred fork has not settled with this authority"
+                      {:type ::transferred-fork-not-settled
+                       :fork/id room-id
+                       :fork/status status
+                       :fork/current-authority? (= token (:token handle))}))))
+  (binding [ec/*execution-context* (:parent-ctx handle)]
+    (rreg/untrack-fork! room-id (:fork-id handle)))
+  nil)
 
 (defmacro with-fork-ctx
   "Execute `body` with the fork's execution context bound. Required for
@@ -1099,20 +1564,26 @@
   ;; Idempotence: once unregistered, the fork is a zombie — re-discarding would
   ;; double-delete the yggdrasil branch (which errors). Guard on registry.
   (when (binding [ec/*execution-context* (fork-home-ctx fork)] (rreg/lookup (:id fork)))
-    (drain-room-runs! fork)                    ; stop work before removing its substrate
-    (leave-all! fork)
-    (when-let [handle (fork-handle fork)]
-      ;; P2: settle the substrate first, then drop deferred grants explicitly.
-      ;; If grant cleanup fails, retrying `discard` replays the cached settlement
-      ;; and retries only this idempotent integration step.
-      (let [pending (binding [ec/*execution-context* (:ctx fork)]
-                      (ec/get-state [:dvergr/pending-grants]))]
-        (ygg/discard-fork! handle)
-        (srooms/drop-fork-grants! pending)))
-    (binding [ec/*execution-context* (fork-home-ctx fork)]
-      (rreg/unregister! (:id fork))
-      (peer-bus/post! {:type :dvergr/fork-discarded
-                       :dvergr/origin (:id fork)})))
+    (let [callbacks (drain-room-listeners! fork :discard)]
+      (try
+        (drain-room-runs! fork)                ; stop work before removing its substrate
+        (seal-room-quiescence! fork :discard)
+        (when-let [handle (fork-handle fork)]
+          ;; P2: settle the substrate first, then drop deferred grants explicitly.
+          ;; If grant cleanup fails, retrying `discard` replays the cached settlement
+          ;; and retries only this idempotent integration step.
+          (let [pending (binding [ec/*execution-context* (:ctx fork)]
+                          (ec/get-state [:dvergr/pending-grants]))]
+            (ygg/discard-fork! handle)
+            (srooms/drop-fork-grants! pending)))
+        (leave-all! fork)
+        (binding [ec/*execution-context* (fork-home-ctx fork)]
+          (rreg/untrack-fork! (:id fork) (some-> fork fork-handle :fork-id))
+          (rreg/unregister! (:id fork))
+          (peer-bus/post! {:type :dvergr/fork-discarded
+                           :dvergr/origin (:id fork)}))
+        (catch Throwable error
+          (recover-room-quiescence! fork callbacks error)))))
   fork)
 
 (defn merge-room
@@ -1132,7 +1603,10 @@
    (doc/unified-fork-conversation.md, dvergr.rooms.forks/reconcile-merge!.)"
   ([parent fork] (merge-room parent fork {}))
   ([parent fork {:keys [merge-opts]}]
-   (drain-room-runs! fork)                     ; stop work before merging its substrate
+   (let [callbacks (drain-room-listeners! fork :merge)]
+     (try
+       (drain-room-runs! fork)                 ; stop work before merging its substrate
+       (seal-room-quiescence! fork :merge)
    ;; (1) SUBSTRATE merge — branched yggdrasil systems (CRDTs, datahike, git) fold
    ;; back whenever the ctx was forked (`:isolation :ctx`), INDEPENDENT of any
    ;; conversation store. These are orthogonal: a room can carry shared CRDTs with
@@ -1141,47 +1615,50 @@
    ;; branch also collapses here (bringing its messages into the parent's
    ;; conversation under the shared :chat/id); its deferred data-DB grants commit on
    ;; accept via :on-merge (store forks only). (doc/unified-fork-conversation.md)
-   (when-let [handle (fork-handle fork)]
-     (try
-       (let [pending (when (:store fork)
-                       (binding [ec/*execution-context* (:ctx fork)]
-                         (ec/get-state [:dvergr/pending-grants])))]
-         (ygg/merge-fork! handle (or merge-opts {}))
+       (when-let [handle (fork-handle fork)]
+         (try
+           (let [pending (when (:store fork)
+                           (binding [ec/*execution-context* (:ctx fork)]
+                             (ec/get-state [:dvergr/pending-grants])))]
+             (ygg/merge-fork! handle (or merge-opts {}))
          ;; Grant integration is deliberately outside substrate settlement. A
          ;; failure leaves the handle truthfully :merged and a retry replays the
          ;; cached merge before retrying this idempotent commit.
-         (when (:store fork)
-           (srooms/commit-fork-grants! pending)))
-       (catch Throwable e
-         (tel/log! {:level :error :id :dvergr/merge-failed
-                    :data {:fork (:id fork) :parent (:id parent) :error (str e)}}
-                   "merge-room: affine yggdrasil settlement failed")
-         (binding [ec/*execution-context* (fork-home-ctx fork)]
-           (peer-bus/post! {:type :dvergr/merge-failed :dvergr/origin (:id fork)
-                            :dvergr/parent (:id parent) :error (str e)}))
-         (throw e))))
+             (when (:store fork)
+               (srooms/commit-fork-grants! pending)))
+           (catch Throwable e
+             (tel/log! {:level :error :id :dvergr/merge-failed
+                        :data {:fork (:id fork) :parent (:id parent) :error (str e)}}
+                       "merge-room: affine yggdrasil settlement failed")
+             (binding [ec/*execution-context* (fork-home-ctx fork)]
+               (peer-bus/post! {:type :dvergr/merge-failed :dvergr/origin (:id fork)
+                                :dvergr/parent (:id parent) :error (str e)}))
+             (throw e))))
    ;; (2) CONVERSATION merge — for STORE-LESS forks (`:isolation :none`, or a `:ctx`
    ;; fork without a message store), absorb the fork's post-fork bus entries into the
    ;; parent's log (merge-as-history; no re-firing of live handlers, separate buses).
    ;; A `:store` fork's messages already arrived via the datahike collapse in (1).
-   (when-not (:store fork)
-     (let [forked-at   (or (:forked-at-len fork) 0)
-           fork-log    (log fork)
-           new-entries (when (> (count fork-log) forked-at) (subvec fork-log forked-at))]
-       (when (seq new-entries)
-         (bus/append-log! (:bus parent) new-entries))))
+       (when-not (:store fork)
+         (let [forked-at   (or (:forked-at-len fork) 0)
+               fork-log    (log fork)
+               new-entries (when (> (count fork-log) forked-at) (subvec fork-log forked-at))]
+           (when (seq new-entries)
+             (bus/append-log! (:bus parent) new-entries))))
   ;; Surface the merged conversation: re-seed the parent's shared message signal
   ;; (no-op if the parent has no signal) so every frontend re-renders — the merge
   ;; is a datahike collapse / log append, not a bus post.
-   (try ((requiring-resolve 'dvergr.rooms.messages/refresh!) parent)
-        (catch Throwable _ nil))
-   (leave-all! fork)
-   (binding [ec/*execution-context* (fork-home-ctx fork)]
-     (rreg/unregister! (:id fork))
-     (peer-bus/post! {:type            :dvergr/fork-merged
-                      :dvergr/origin   (:id fork)
-                      :dvergr/parent   (:id parent)}))
-   parent))
+       (try ((requiring-resolve 'dvergr.rooms.messages/refresh!) parent)
+            (catch Throwable _ nil))
+       (leave-all! fork)
+       (binding [ec/*execution-context* (fork-home-ctx fork)]
+         (rreg/untrack-fork! (:id fork) (some-> fork fork-handle :fork-id))
+         (rreg/unregister! (:id fork))
+         (peer-bus/post! {:type            :dvergr/fork-merged
+                          :dvergr/origin   (:id fork)
+                          :dvergr/parent   (:id parent)}))
+       parent
+       (catch Throwable error
+         (recover-room-quiescence! fork callbacks error))))))
 
 ;; ============================================================================
 ;; PR-style merge review

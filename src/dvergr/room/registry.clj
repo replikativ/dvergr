@@ -17,6 +17,7 @@
   (:require [dvergr.runtime.ctx :as rctx]))
 
 (def ^:private registry-path [:dvergr/rooms])
+(def ^:private fork-topology-path [:dvergr/fork-topology])
 
 ;; Callbacks run (with the room-id) AFTER a room is unregistered. Lets
 ;; dependents (e.g. dvergr.agent.room-context) tear down per-room resources
@@ -88,6 +89,65 @@
   "Rooms whose :parent-id matches the given id. Order undefined."
   [parent-id]
   (list-rooms :where #(= parent-id (:parent-id %))))
+
+(defn track-fork!
+  "Record structural ownership of an isolated child world independently of
+   transient Room/UI registration. The link survives authority transfer and is
+   removed only after the child world has actually settled."
+  [child-id parent-id ygg-fork-id]
+  (rctx/shared-swap-state!
+   fork-topology-path
+   (fn [topology]
+     (assoc (or topology {}) child-id
+            {:fork/id child-id
+             :fork/parent-id parent-id
+             :fork/ygg-id ygg-fork-id
+             :fork/state :local})))
+  nil)
+
+(defn mark-fork-transferred!
+  "Mark a tracked child as externally owned without releasing its parent link."
+  [child-id owner]
+  (rctx/shared-swap-state!
+   fork-topology-path
+   (fn [topology]
+     (update (or topology {}) child-id
+             (fn [entry]
+               (assoc (or entry {:fork/id child-id})
+                      :fork/state :transferred
+                      :fork/owner owner)))))
+  nil)
+
+(defn untrack-fork!
+  "Release a structural child link only when its Yggdrasil fork identity
+   matches. Missing entries are idempotent; mismatches are rejected."
+  [child-id expected-ygg-fork-id]
+  (let [result (volatile! :missing)]
+    (rctx/shared-swap-state!
+     fork-topology-path
+     (fn [topology]
+       (let [topology (or topology {})
+             entry (get topology child-id)]
+         (cond
+           (nil? entry) topology
+           (= expected-ygg-fork-id (:fork/ygg-id entry))
+           (do (vreset! result :released) (dissoc topology child-id))
+           :else
+           (do (vreset! result entry) topology)))))
+    (when (map? @result)
+      (throw (ex-info "Structural fork identity mismatch"
+                      {:type ::fork-identity-mismatch
+                       :fork/id child-id
+                       :fork/expected-ygg-id (:fork/ygg-id @result)
+                       :fork/actual-ygg-id expected-ygg-fork-id}))))
+  nil)
+
+(defn structural-children
+  "Return open structural child-world projections for `parent-id`."
+  [parent-id]
+  (->> (vals (or (rctx/shared-get-state fork-topology-path) {}))
+       (filter #(= parent-id (:fork/parent-id %)))
+       vec))
 
 (defn roots
   "Rooms with no parent (top-level)."
