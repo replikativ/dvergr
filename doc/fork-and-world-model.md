@@ -64,7 +64,7 @@ The live handle is a process-local capability. A portable **ForkDescriptor**
              :branch        branch-id
              :head          snapshot-id
              :mode          :frozen|:following
-             :rights        :read|:write|:fork}}
+             :rights        :write}}
  :fork/owner    owner-id}
 ```
 
@@ -195,7 +195,7 @@ World creation needs an explicit policy surface:
 {:purpose :run|:workroom|:particle|:proposal|:experiment
  :systems :all|:none|#{system-id ...}
  :mode :overlay|:snapshot
- :rights {system-id :read|:write|:fork}
+ :rights {system-id :write}
  :effects :live|:record|:stub
  :settlement :automatic|:review|:discard}
 ```
@@ -204,6 +204,10 @@ The default for a normal isolated Dvergr Run can remain all systems granted to
 the Room. Simulations and inference should default to no live external effects
 unless explicitly granted. Eventually Kontor allocations determine both
 resource rights and the maximum fork policy a child may receive.
+
+Today Spindel accepts only the enforceable `:write` right. It rejects `:read` and
+`:fork` instead of placing an unenforced label in the descriptor. Those rights
+belong here once the substrate and SCI capability boundary can enforce them.
 
 ## Representative use cases
 

@@ -541,7 +541,7 @@
    its own `:id`. A fork BRANCHES a conversation rather than starting a new one,
    so a fork persists under the ROOT of its fork chain — stored in the room's
    meta as `:conversation-id`. Messages are thus one logical conversation that a
-   fork's datahike branch isolates, and `merge-to-parent!` collapses natively
+   fork's datahike branch isolates, and `merge-fork!` collapses natively
    (no out-of-band `append-log!`). See doc/unified-fork-conversation.md."
   [room]
   (or (some-> room :meta deref :conversation-id) (:id room)))
@@ -971,12 +971,12 @@
          ;; (NOT the parent's fixed-conn store), and persists under the parent's
          ;; CONVERSATION id (root of the fork chain) — so a fork's messages are
          ;; the same logical conversation on a datahike branch, and
-         ;; merge-to-parent! collapses them natively (no append-log!). It writes
+         ;; merge-fork! collapses them natively (no append-log!). It writes
          ;; no separate :chat entity. (doc/unified-fork-conversation.md)
          conv-id    (conversation-id room)
          ;; RF5: the fork's store wraps the PARENT room's OWN messages conn under
          ;; the fork ctx (branched), so fork messages ride the per-room store's
-         ;; branch and merge-to-parent! collapses them natively. (RF5 S4.3: no
+         ;; branch and merge-fork! collapses them natively. (RF5 S4.3: no
          ;; chat-db fallback — every room is provisioned with its own :msgs system.)
          fork-store (when (= :ctx isolation)
                       (some-> (binding [ec/*execution-context* child-ctx]
@@ -1076,13 +1076,6 @@
      (binding [ec/*execution-context* (or (:ctx r#) r#)]
        ~@body)))
 
-(defn- ctx-was-forked?
-  "True if `fork`'s ctx is a child of some parent ctx — i.e. it was
-   created by the canonical ForkHandle (or the legacy direct context path).
-   Determines whether settlement includes Yggdrasil branches."
-  [fork]
-  (some? (:parent-ctx (:ctx fork))))
-
 (defn- fork-home-ctx
   "The ctx where a fork's registry entry + control-plane events live — its
    PARENT ctx, matching `fork-room`'s registration (a `:ctx` fork's own
@@ -1108,18 +1101,14 @@
   (when (binding [ec/*execution-context* (fork-home-ctx fork)] (rreg/lookup (:id fork)))
     (drain-room-runs! fork)                    ; stop work before removing its substrate
     (leave-all! fork)
-    (when (ctx-was-forked? fork)
-      ;; P2: read the fork's deferred data-DB grants (fork-local ctx-state) and
-      ;; delete the stores it created — they were never granted, so on discard they
-      ;; must not linger. :on-discard fires inside discard-from-parent!.
+    (when-let [handle (fork-handle fork)]
+      ;; P2: settle the substrate first, then drop deferred grants explicitly.
+      ;; If grant cleanup fails, retrying `discard` replays the cached settlement
+      ;; and retries only this idempotent integration step.
       (let [pending (binding [ec/*execution-context* (:ctx fork)]
-                      (ec/get-state [:dvergr/pending-grants]))
-            opts {:on-discard (fn [_] (srooms/drop-fork-grants! pending))}]
-        (if-let [handle (fork-handle fork)]
-          (ygg/discard-fork! handle opts)
-          ;; Compatibility for Room values constructed before ForkHandle became
-          ;; canonical. New forks never take this path.
-          (ygg/discard-from-parent! (:ctx fork) opts))))
+                      (ec/get-state [:dvergr/pending-grants]))]
+        (ygg/discard-fork! handle)
+        (srooms/drop-fork-grants! pending)))
     (binding [ec/*execution-context* (fork-home-ctx fork)]
       (rreg/unregister! (:id fork))
       (peer-bus/post! {:type :dvergr/fork-discarded
@@ -1138,7 +1127,7 @@
 
    Concurrent sibling forks UNION (identity-keyed datahike merge); a genuine
    field clash (same entity+attr changed differently on both sides) is a 3-way
-   CONFLICT that `merge-to-parent!` refuses by default. Pass `{:merge-opts
+   CONFLICT that `merge-fork!` refuses by default. Pass `{:merge-opts
    {:force true}}` (the agent reconciler does, after resolving) to force past it.
    (doc/unified-fork-conversation.md, dvergr.rooms.forks/reconcile-merge!.)"
   ([parent fork] (merge-room parent fork {}))
@@ -1152,22 +1141,21 @@
    ;; branch also collapses here (bringing its messages into the parent's
    ;; conversation under the shared :chat/id); its deferred data-DB grants commit on
    ;; accept via :on-merge (store forks only). (doc/unified-fork-conversation.md)
-   (when (ctx-was-forked? fork)
+   (when-let [handle (fork-handle fork)]
      (try
        (let [pending (when (:store fork)
                        (binding [ec/*execution-context* (:ctx fork)]
                          (ec/get-state [:dvergr/pending-grants])))]
-         (let [opts (merge (or merge-opts {})
-                           (when (:store fork)
-                             {:on-merge (fn [_] (srooms/commit-fork-grants! pending))}))]
-           (if-let [handle (fork-handle fork)]
-             (ygg/merge-fork! handle opts)
-             ;; Compatibility for pre-ForkHandle Room values only.
-             (ygg/merge-to-parent! (:ctx fork) opts))))
+         (ygg/merge-fork! handle (or merge-opts {}))
+         ;; Grant integration is deliberately outside substrate settlement. A
+         ;; failure leaves the handle truthfully :merged and a retry replays the
+         ;; cached merge before retrying this idempotent commit.
+         (when (:store fork)
+           (srooms/commit-fork-grants! pending)))
        (catch Throwable e
          (tel/log! {:level :error :id :dvergr/merge-failed
                     :data {:fork (:id fork) :parent (:id parent) :error (str e)}}
-                   "merge-room: yggdrasil merge-to-parent! failed — parent state may be partial")
+                   "merge-room: affine yggdrasil settlement failed")
          (binding [ec/*execution-context* (fork-home-ctx fork)]
            (peer-bus/post! {:type :dvergr/merge-failed :dvergr/origin (:id fork)
                             :dvergr/parent (:id parent) :error (str e)}))
@@ -1219,7 +1207,7 @@
 
    Returns the proposal payload."
   [fork & {:keys [from note] :or {from :worker note ""}}]
-  (let [diff      (when (ctx-was-forked? fork)
+  (let [diff      (when (fork-handle fork)
                     (geschichte/diff-since-fork (:ctx fork)))
         proposal  (cond-> {:fork-id (:id fork)
                            :note    note}
