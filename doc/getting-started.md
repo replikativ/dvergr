@@ -174,10 +174,13 @@ something inside it (write files, change state in a branched datahike, etc.),
 inspect the result, then **merge** or **discard** atomically.
 
 ```clojure
-;; Fork the room. :ctx forks the spindel execution context — git worktree +
-;; datahike branch under [:external-refs] — so the worker's side effects are
+;; Fork the room. :ctx creates one Spindel ForkHandle over the execution
+;; context + registered git/datahike systems, so the worker's side effects are
 ;; held in isolation until you decide.
 (def fork (d/fork-room room {:isolation :ctx}))
+
+;; Portable identity/ownership/status, without the live settlement capability:
+(d/fork-descriptor fork)
 
 (binding [ec/*execution-context* (:ctx fork)]
   (d/join fork (d/coder {:id :coder}))
@@ -186,8 +189,8 @@ inspect the result, then **merge** or **discard** atomically.
 ;; The worker ran in the branched worktree + datahike. Inspect the fork's log,
 ;; its worktree, its tests…
 
-;; Accept — collapse the fork's git + datahike branch into the parent atomically:
-(d/merge-room fork room)
+;; Accept — settle the fork's git + datahike world into the parent:
+(d/merge-room room fork)
 
 ;; …or discard — drop the branches, nothing leaks into the parent:
 (d/discard fork)

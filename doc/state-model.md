@@ -8,9 +8,9 @@ dvergr is embedded as a library. Companion to `doc/configuration.md`.
 
 ### Tier 1 — Value-semantic / forkable
 Lives in the **spindel execution context** and the **yggdrasil composite workspace**
-(`[:external-refs ::workspace]`). Forking a room with `:isolation :ctx` does
-`ctx/fork-context`, which copy-on-write copies the context **and** branches the
-workspace as a unit; `merge-to-parent!` collapses the branch back.
+(registered Yggdrasil systems). Forking a room with `:isolation :ctx` creates one
+canonical Spindel `ForkHandle`, which copy-on-write copies the context **and**
+branches the workspace as a unit; settling that handle merges or discards it.
 
 - **The chat Datahike DB** (one DB, system `"dvergr-chat-db"`): messages, rooms
   (`:chat/*`), **actors/agents** (`:actor/*`), tool-uses, **ledger** (budget),
@@ -59,8 +59,8 @@ plus the per-session sandbox.
 
 ## What a `:isolation :ctx` fork actually forks
 
-`fork-room` calls `ctx/fork-context`, which CoW-copies the execution context and
-branches **every `[:external-refs]` yggdrasil system as a unit**:
+`fork-room` calls `spindel.yggdrasil/fork!`, retains its process-local
+`ForkHandle`, and branches every selected registered Yggdrasil system as a unit:
 
 - **Datahike `dvergr-chat-db`** → branched — messages, KB, ledger, proposals, all
   isolated until merge. *This is the whole chat state, forked through yggdrasil.*
@@ -74,9 +74,10 @@ branches **every `[:external-refs]` yggdrasil system as a unit**:
 
 The fork's conversation is **seeded from the branched store**, so the agent sees
 inherited (pre-fork) messages *plus* its own — exactly what the UI shows.
-`merge-room` → `yggdrasil/merge-to-parent!` lands the Datahike + git branches
-atomically; `discard` → `discard-from-parent!` deletes them. A fork is thus a fully
-**substrate-isolated world** you can review (`diff`) before committing (`merge!`).
+`merge-room` and `discard` settle that same handle exactly once. A fork is thus a
+fully **substrate-isolated world** you can review (`diff`) before adopting or
+discarding. The live handle is process-local; `dvergr.discourse/fork-descriptor`
+is the portable projection used by Runs, proposals, UIs, and audit state.
 
 ## Personas / agent config — managed, not files
 

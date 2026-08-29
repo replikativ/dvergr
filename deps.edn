@@ -48,7 +48,7 @@
         ;; (mailbox→mult→tap→pub→topic-mult→tap) under load.
         ;; Substrate for the durable-cursor bus pump + supervisor
         ;; restart.
-        org.replikativ/spindel     {:mvn/version "0.1.35"}
+        org.replikativ/spindel     {:mvn/version "0.1.41"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context
