@@ -347,9 +347,9 @@
    durable projection is correlated as `:adopted`; a projection failure is
    reported without hiding the already-transferred capability.
 
-   Adoption transfers the whole world. Per-system decisions require a future
-   affine partition primitive; callers must not settle descriptor systems by
-   bypassing the returned handle."
+   Adoption initially transfers the whole world. Use `partition-adoption!` to
+   split its settlement authority before making per-system decisions; callers
+   must never settle descriptor systems by bypassing those handles."
   [fork new-owner opts]
   (try
     (let [parent (rreg/lookup (:parent-id fork))
@@ -368,3 +368,36 @@
                :projection-error (ex-message projection-error))))
     (catch Throwable error
       {:ok? false :error (ex-message error)})))
+
+(defn partition-adoption!
+  "Split an adopted world's settlement authority into exhaustive system scopes.
+
+   This is the Room-facing wrapper over `discourse/partition-transferred-fork!`.
+   See that function for partition shape and optional durability callbacks."
+  ([adoption partitions]
+   (d/partition-transferred-fork! adoption partitions))
+  ([adoption partitions lifecycle]
+   (d/partition-transferred-fork! adoption partitions lifecycle)))
+
+(defn settle-adoption!
+  "Settle one adopted leaf with optional durable governance callbacks."
+  ([adoption operation]
+   (d/settle-transferred-fork! adoption operation))
+  ([adoption operation lifecycle]
+   (d/settle-transferred-fork! adoption operation lifecycle)))
+
+(def retry-partition-commit!
+  "Retry durable persistence of an adoption's exact partition descriptors."
+  d/retry-partition-commit!)
+
+(def retry-settlement-commit!
+  "Retry durable terminal persistence without touching substrate authority."
+  d/retry-settlement-commit!)
+
+(def retry-settlement-abort!
+  "Retry durable compensation after settlement preflight left authority open."
+  d/retry-settlement-abort!)
+
+(def release-adoption!
+  "Release Dvergr ancestry after the whole governed capability tree is durable."
+  d/release-transferred-fork!)

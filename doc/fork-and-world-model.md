@@ -252,11 +252,28 @@ The prepared descriptor includes `:dvergr/room-id`,
 `:dvergr/parent-fork-id`. The durable owner must retain that ancestry until the
 child settles; Dvergr's shared topology is its immediate in-process projection.
 
-This bridge is deliberately whole-world only. Simmis must not accept or dismiss
-descriptor-named systems independently through raw branches. Per-scope review
-first requires an affine partition/split primitive that consumes the original
-handle and returns disjoint system capabilities; each partition can then be
-settled exactly once without bypassing Spindel's lifecycle.
+Adoption starts as whole-world authority. `partition-adoption!` can then consume
+that aggregate handle into an exhaustive tree of disjoint system capabilities.
+Each leaf settles exactly once; Dvergr releases the retained structural ancestry
+only after every leaf is terminal and the supplied tree proves that no partition
+was omitted. A durable adopter prepares the intended plan before partitioning
+and commits the exact child descriptors afterward. If that commit fails, the
+API returns the error together with all live child handles so recovery cannot
+silently lose authority. No proposal layer may accept or dismiss systems by
+mutating raw branches outside this capability tree.
+
+Each durable leaf decision goes through `settle-adoption!`: governance prepares
+the intent, Spindel consumes the affine capability, and governance commits the
+terminal descriptor as Spindel's single-execution post-commit callback. A
+failed durable commit leaves terminal authority and its receipt available to
+`retry-settlement-commit!`; it never recreates an actionable review. Structural
+release rejects failed partition persistence, duplicate/substituted handles,
+and any durable leaf whose terminal commit is incomplete. Commit callbacks see
+only portable operation/descriptor data—never execution contexts or live
+systems from Spindel's internal settlement payload. Failed compensation is
+returned as explicit recovery state with the durable receipt still attached;
+`retry-settlement-abort!` repairs that durable intent before the still-open
+capability can receive a new decision.
 
 Simmis still needs to supply the durable half: store the descriptor as a GC
 root, index its systems into the existing ForkSet, and journal per-system
