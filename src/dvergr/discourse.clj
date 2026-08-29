@@ -10,8 +10,8 @@
    Algebra (combinators returning Spins):
      ask, fan-out, race, quorum, pipeline
 
-   Fork (one canonical spindel.yggdrasil/ForkHandle):
-     fork-room, merge-room, discard
+   Fork (canonical Spindel authority, optionally partitioned into a tree):
+     fork-room, merge-room, discard, transfer-fork!, partition-transferred-fork!
 
    Patterns (decomposing to the algebra):
      iterative-refinement, debate, moderate, align-on
@@ -1481,12 +1481,8 @@
            :fork/room-id (:id fork)
            :fork/parent-id (:parent-id fork)})))))
 
-(defn release-transferred-fork!
-  "Release a transferred child's structural parent claim after settlement.
-
-   Accepts the map returned by `transfer-fork!`. The adopted handle must already
-   be merged or discarded; an open handle cannot release ancestry."
-  [{:fork/keys [handle room-id descriptor]}]
+(defn- assert-transferred-node-identity!
+  [{:fork/keys [handle descriptor room-id]}]
   (when-not (and (ygg/fork-handle? handle)
                  (= (:fork/id descriptor) (:fork-id handle)))
     (throw (ex-info "Transferred fork handle does not match its descriptor"
@@ -1499,14 +1495,302 @@
                     {:type ::transferred-fork-identity-mismatch
                      :fork/id room-id
                      :fork/descriptor-room-id (:dvergr/room-id descriptor)})))
-  (let [{:keys [status token]} @(:authority handle)]
-    (when-not (and (contains? #{:merged :discarded} status)
-                   (= token (:token handle)))
+  (let [authoritative (ygg/fork-descriptor handle)
+        identity-keys [:fork/id :fork/settlement-id :fork/partition-of
+                       :fork/world-systems :fork/systems]]
+    (when-not (= (select-keys authoritative identity-keys)
+                 (select-keys descriptor identity-keys))
+      (throw (ex-info "Transferred fork descriptor does not name this settlement capability"
+                      {:type ::transferred-fork-capability-mismatch
+                       :fork/id room-id
+                       :fork/descriptor (select-keys descriptor identity-keys)
+                       :fork/authoritative (select-keys authoritative identity-keys)})))))
+
+(defn partition-transferred-fork!
+  "Consume a transferred world's aggregate authority into disjoint scopes.
+
+   `transfer` is the value returned by `transfer-fork!` (or a partition node
+   returned here). `partitions` has Spindel's exhaustive shape:
+
+     [{:systems #{system-id ...} :owner owner-id :purpose optional-tag} ...]
+
+   The optional lifecycle callbacks make the destructive authority transition
+   honest at a durable boundary:
+
+   - `prepare!` durably records the intended partition plan before Spindel
+     consumes the aggregate handle and returns a receipt.
+   - `abort!` compensates that preparation if partition validation/CAS fails.
+   - `commit!` records the exact child descriptors after their settlement IDs
+     exist. A commit failure cannot undo partitioning, so it is retained under
+     `:fork/partition-commit` alongside every live child capability and receipt.
+
+   With no callbacks, partitioning is intentionally ephemeral. If `prepare!`
+   is supplied, `abort!` and `commit!` are required. The result is a persistent
+   capability tree; callers may recursively partition a child node and replace
+   that node in the tree. Never persist any `:fork/handle`."
+  ([transfer partitions]
+   (partition-transferred-fork! transfer partitions {}))
+  ([{:fork/keys [handle descriptor room-id] :as transfer}
+    partitions
+    {:keys [prepare! abort! commit!]}]
+   (assert-transferred-node-identity! transfer)
+   (when (and (or abort! commit!) (not prepare!))
+     (throw (ex-info "Partition lifecycle callbacks require prepare!"
+                     {:type ::invalid-partition-lifecycle
+                      :fork/id room-id})))
+   (when (and prepare! (not (and (fn? prepare!) (fn? abort!) (fn? commit!))))
+     (throw (ex-info "Durable partitioning requires prepare!, abort!, and commit! callbacks"
+                     {:type ::invalid-partition-lifecycle
+                      :fork/id room-id})))
+   (locking (:authority handle)
+     (let [plan {:fork/descriptor descriptor
+                 :fork/partitions (vec partitions)}
+           prepared? (volatile! false)
+           receipt* (volatile! nil)
+           handles
+           (try
+             (when prepare!
+               (vreset! receipt* (prepare! plan))
+               (vreset! prepared? true))
+             (ygg/partition-fork! handle partitions)
+             (catch Throwable error
+               (when @prepared?
+                 (try
+                   (abort! @receipt*)
+                   (catch Throwable abort-error
+                     (throw (ex-info "Fork partition compensation failed; recovery is required"
+                                     {:type ::fork-partition-recovery-required
+                                      :fork/id room-id
+                                      :fork/receipt @receipt*
+                                      :partition-error (ex-message error)
+                                      :abort-error (ex-message abort-error)}
+                                     abort-error)))))
+               (throw error)))
+           ancestry (select-keys descriptor [:dvergr/room-id
+                                             :dvergr/parent-room-id
+                                             :dvergr/parent-fork-id])
+           nodes (mapv (fn [part-handle]
+                         {:fork/handle part-handle
+                          :fork/descriptor (merge (ygg/fork-descriptor part-handle)
+                                                  ancestry)
+                          :fork/room-id room-id
+                          :fork/parent-id (:fork/parent-id transfer)})
+                       handles)
+           result (assoc transfer
+                         :fork/descriptor (merge (ygg/fork-descriptor handle) ancestry)
+                         :fork/partitions nodes)
+           commit-error (when commit!
+                          (try
+                            (commit! @receipt* (mapv :fork/descriptor nodes))
+                            nil
+                            (catch Throwable error error)))]
+       (cond-> result
+         commit!
+         (assoc :fork/partition-commit
+                (cond-> {:status (if commit-error :failed :committed)
+                         :receipt @receipt*}
+                  commit-error (assoc :error commit-error))))))))
+
+(defn retry-partition-commit!
+  "Retry the durable exact-descriptor commit after partitioning succeeded.
+
+   Returns the same capability tree with a committed durability marker. No
+   substrate authority changes during this operation."
+  [{:fork/keys [partitions partition-commit] :as transfer} commit!]
+  (when-not (= :failed (:status partition-commit))
+    (throw (ex-info "Fork partition has no failed durable commit to retry"
+                    {:type ::partition-commit-not-retryable
+                     :fork/status (:status partition-commit)})))
+  (commit! (:receipt partition-commit) (mapv :fork/descriptor partitions))
+  (assoc transfer :fork/partition-commit
+         {:status :committed :receipt (:receipt partition-commit)}))
+
+(defn settle-transferred-fork!
+  "Settle one transferred leaf through an optional durable governance boundary.
+
+   `operation` is `:merge` or `:discard`. With lifecycle callbacks, `prepare!`
+   durably claims the decision before substrate mutation, `commit!` runs as
+   Spindel's exactly-once post-commit callback, and `abort!` compensates only a
+   failed preflight that left the capability open. A post-mutation or durable
+   commit failure is returned with the live terminal/incomplete capability and
+   receipt; it is never disguised as an open review world.
+
+   `retry-settlement-commit!` re-drives only the durable commit. The returned
+   node must replace its predecessor in the capability tree before release."
+  ([transfer operation]
+   (settle-transferred-fork! transfer operation {}))
+  ([{:fork/keys [handle descriptor room-id] :as transfer}
+    operation
+    {:keys [prepare! abort! commit!] :as lifecycle}]
+   (assert-transferred-node-identity! transfer)
+   (when-not (contains? #{:merge :discard} operation)
+     (throw (ex-info "Unknown transferred fork settlement operation"
+                     {:type ::invalid-transferred-settlement
+                      :operation operation})))
+   (when (seq (:fork/partitions transfer))
+     (throw (ex-info "Settle partition leaves, not their aggregate handle"
+                     {:type ::partition-aggregate-cannot-settle
+                      :fork/id room-id})))
+   (when (and (seq lifecycle)
+              (not (and (fn? prepare!) (fn? abort!) (fn? commit!))))
+     (throw (ex-info "Durable settlement requires prepare!, abort!, and commit! callbacks"
+                     {:type ::invalid-settlement-lifecycle
+                      :fork/id room-id})))
+   ;; Durable intent and the Spindel CAS form one Dvergr-owned frontier. Raw
+   ;; handle calls remain trusted-host internals and must not bypass this API.
+   (locking (:authority handle)
+     (when-not (ygg/open-fork? handle)
+       (throw (ex-info "Transferred fork leaf is not open"
+                       {:type ::transferred-fork-not-open
+                        :fork/id room-id
+                        :fork/status (:status (ygg/fork-disposition handle))})))
+     (let [ancestry (select-keys descriptor [:dvergr/room-id
+                                             :dvergr/parent-room-id
+                                             :dvergr/parent-fork-id])
+           plan {:fork/operation operation
+                 :fork/descriptor (merge (ygg/fork-descriptor handle) ancestry)}
+           receipt (when prepare! (prepare! plan))
+           commit-value* (atom nil)
+           commit-callback
+           (when commit!
+             (fn [_payload]
+               (let [value {:fork/operation operation
+                            :fork/descriptor (merge (ygg/fork-descriptor handle) ancestry)}]
+                 (reset! commit-value* value)
+                 (commit! receipt value))))]
+       (try
+         (let [result (case operation
+                        :merge (ygg/merge-fork! handle {:on-merge commit-callback})
+                        :discard (ygg/discard-fork! handle {:on-discard commit-callback}))]
+           (cond-> (assoc transfer
+                          :fork/descriptor (merge (ygg/fork-descriptor handle) ancestry)
+                          :fork/result result)
+             commit! (assoc :fork/settlement
+                            {:status :committed
+                             :operation operation
+                             :receipt receipt
+                             :commit-value @commit-value*})))
+         (catch Throwable error
+           (let [{:keys [status]} (ygg/fork-disposition handle)]
+             (if (= :open status)
+               (if abort!
+                 (if-let [abort-error (try
+                                        (abort! receipt)
+                                        nil
+                                        (catch Throwable abort-error abort-error))]
+                   (assoc transfer
+                          :fork/descriptor (merge (ygg/fork-descriptor handle) ancestry)
+                          :fork/settlement
+                          {:status :abort-failed
+                           :operation operation
+                           :receipt receipt
+                           :error error
+                           :abort-error abort-error})
+                   (throw error))
+                 (throw error))
+               (assoc transfer
+                      :fork/descriptor (merge (ygg/fork-descriptor handle) ancestry)
+                      :fork/settlement
+                      {:status (if (contains? #{:merged :discarded} status)
+                                 :commit-failed
+                                 :incomplete)
+                       :operation operation
+                       :receipt receipt
+                       :commit-value @commit-value*
+                       :error error})))))))))
+
+(defn retry-settlement-commit!
+  "Retry only the durable commit of a terminal transferred leaf."
+  [{:fork/keys [settlement] :as transfer} commit!]
+  (when-not (= :commit-failed (:status settlement))
+    (throw (ex-info "Fork settlement has no failed durable commit to retry"
+                    {:type ::settlement-commit-not-retryable
+                     :fork/status (:status settlement)})))
+  (commit! (:receipt settlement) (:commit-value settlement))
+  (assoc transfer :fork/settlement
+         (-> settlement
+             (assoc :status :committed)
+             (dissoc :error))))
+
+(defn retry-settlement-abort!
+  "Retry compensation after a preflight failure left authority open.
+
+   A successful retry removes the failed intent marker and returns the original
+   open capability, which may then receive a fresh governed decision."
+  [{:fork/keys [settlement] :as transfer} abort!]
+  (when-not (= :abort-failed (:status settlement))
+    (throw (ex-info "Fork settlement has no failed compensation to retry"
+                    {:type ::settlement-abort-not-retryable
+                     :fork/status (:status settlement)})))
+  (abort! (:receipt settlement))
+  (dissoc transfer :fork/settlement))
+
+(defn- assert-transferred-node-settled!
+  [{:fork/keys [handle room-id partitions partition-commit settlement] :as node}
+   seen
+   durable-required?]
+  (assert-transferred-node-identity! node)
+  (when (contains? seen (:token handle))
+    (throw (ex-info "Transferred fork capability occurs more than once in its tree"
+                    {:type ::duplicate-transferred-fork-capability
+                     :fork/id room-id
+                     :fork/settlement-id (get-in node [:fork/descriptor
+                                                       :fork/settlement-id])})))
+  (when (and partition-commit (not= :committed (:status partition-commit)))
+    (throw (ex-info "Transferred fork partition descriptors are not durably committed"
+                    {:type ::partition-commit-incomplete
+                     :fork/id room-id
+                     :fork/status (:status partition-commit)})))
+  (let [seen (conj seen (:token handle))
+        {:keys [status token] :as disposition} @(:authority handle)
+        current? (= token (:token handle))
+        durable-children? (or durable-required? (some? partition-commit))]
+    (cond
+      (and current? (contains? #{:merged :discarded} status))
+      (if (and (or durable-required? (some? settlement))
+               (not= :committed (:status settlement)))
+        (throw (ex-info "Transferred fork leaf settlement is not durably committed"
+                        {:type ::settlement-commit-incomplete
+                         :fork/id room-id
+                         :fork/status (:status settlement)}))
+        seen)
+
+      (and current? (= :partitioned status))
+      (let [_ (when (and durable-required? (nil? partition-commit))
+                (throw (ex-info "Nested fork partition descriptors are not durably committed"
+                                {:type ::partition-commit-incomplete
+                                 :fork/id room-id
+                                 :fork/status :missing})))
+            expected (set (:partitions disposition))
+            actual (set (map #(get-in % [:fork/descriptor :fork/settlement-id])
+                             partitions))]
+        (when-not (= expected actual)
+          (throw (ex-info "Transferred fork partition tree is incomplete"
+                          {:type ::transferred-fork-partitions-incomplete
+                           :fork/id room-id
+                           :expected expected
+                           :actual actual})))
+        (reduce (fn [seen part]
+                  (assert-transferred-node-settled! part seen durable-children?))
+                seen
+                partitions))
+
+      :else
       (throw (ex-info "Transferred fork has not settled with this authority"
                       {:type ::transferred-fork-not-settled
                        :fork/id room-id
                        :fork/status status
-                       :fork/current-authority? (= token (:token handle))}))))
+                       :fork/current-authority? current?})))))
+
+(defn release-transferred-fork!
+  "Release a transferred child's structural parent claim after settlement.
+
+   Accepts the capability tree returned by `transfer-fork!` and optionally
+   `partition-transferred-fork!`. Every leaf must have settled with its exact
+   affine authority and every partition node must list all children before the
+   structural ancestry claim is released."
+  [{:fork/keys [handle room-id] :as transfer}]
+  (assert-transferred-node-settled! transfer #{} false)
   (binding [ec/*execution-context* (:parent-ctx handle)]
     (rreg/untrack-fork! room-id (:fork-id handle)))
   nil)

@@ -48,7 +48,10 @@
         ;; (mailbox→mult→tap→pub→topic-mult→tap) under load.
         ;; Substrate for the durable-cursor bus pump + supervisor
         ;; restart.
-        org.replikativ/spindel     {:mvn/version "0.1.41"}
+        ;; Stacked on spindel#43 (affine partitioned world authority). Replace
+        ;; this exact reviewed commit with its Clojars release after squash.
+        org.replikativ/spindel     {:git/url "https://github.com/replikativ/spindel.git"
+                                    :git/sha "8c038f1a80de094cbd0c066add685bfd2017993f"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context

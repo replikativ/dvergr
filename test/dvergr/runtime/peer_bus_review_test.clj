@@ -12,6 +12,7 @@
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.discourse :as d]
             [dvergr.intake.bash :as b]
+            [dvergr.substrate.geschichte :as geschichte]
             [dvergr.room.registry :as registry]
             [dvergr.runtime.peer-bus :as peer-bus]
             [org.replikativ.spindel.engine.core :as ec]
@@ -195,6 +196,210 @@
         (let [events (peer-events-of-type :dvergr/fork-transferred)]
           (is (= 1 (count events)))
           (is (= owner (:fork/owner (first events)))))))))
+
+(deftest transferred-world-partitions-into-exhaustive-affine-authority
+  (binding [ec/*execution-context* *base-ctx*]
+    ;; The fixture has one Geschichte system. A second independent repository
+    ;; gives this world two real settlement scopes without a mock substrate.
+    (ygg/register! (geschichte/create-system
+                    :scope (str *sandbox-dir* "/second-repository")
+                    :system-name :second-repository))
+    (let [parent (d/room :partition-transfer-parent *base-ctx*)
+          fork (d/fork-room parent {:isolation :ctx})
+          transfer (d/transfer-fork! fork :proposal
+                                     {:prepare! (constantly :adoption-receipt)
+                                      :abort! (fn [_])})
+          systems (vec (keys (get-in transfer [:fork/descriptor :fork/systems])))
+          prepared (atom nil)
+          committed (atom nil)
+          partitioned
+          (d/partition-transferred-fork!
+           transfer
+           [{:systems #{(first systems)} :owner :reviewer-a :purpose :component}
+            {:systems #{(second systems)} :owner :reviewer-b :purpose :component}]
+           {:prepare! (fn [plan]
+                        (reset! prepared plan)
+                        :partition-receipt)
+            :abort! (fn [_])
+            :commit! (fn [receipt descriptors]
+                       (reset! committed [receipt descriptors]))})
+          parts (:fork/partitions partitioned)
+          settlement-commits (atom [])]
+      (is (= 2 (count systems)))
+      (is (= 2 (count parts)))
+      (is (= :partitioned
+             (:fork/status (:fork/descriptor partitioned))))
+      (is (= systems
+             (->> @prepared :fork/descriptor :fork/systems keys vec)))
+      (is (= :partition-receipt (first @committed)))
+      (is (= (set systems)
+             (->> (second @committed)
+                  (mapcat (comp keys :fork/systems))
+                  set)))
+      (is (every? #(= (:id fork)
+                      (get-in % [:fork/descriptor :dvergr/room-id]))
+                  parts))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"has not settled"
+                            (d/release-transferred-fork! partitioned)))
+      (let [lifecycle {:prepare! (fn [plan] (:fork/operation plan))
+                       :abort! (fn [_])
+                       :commit! (fn [receipt terminal]
+                                  (swap! settlement-commits conj
+                                         [receipt (:fork/descriptor terminal)]))}
+            settled [(d/settle-transferred-fork! (first parts) :merge lifecycle)
+                     (d/settle-transferred-fork! (second parts) :discard lifecycle)]
+            settled-tree (assoc partitioned :fork/partitions settled)]
+        (is (= 2 (count @settlement-commits)))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"incomplete"
+                              (d/release-transferred-fork!
+                               (assoc settled-tree :fork/partitions
+                                      [(first settled)]))))
+        (let [forged (assoc (first settled)
+                            :fork/descriptor (:fork/descriptor (second settled)))
+              error (try
+                      (d/release-transferred-fork!
+                       (assoc settled-tree :fork/partitions
+                              [(first settled) forged]))
+                      (catch clojure.lang.ExceptionInfo error error))]
+          (is (= ::d/transferred-fork-capability-mismatch
+                 (:type (ex-data error)))))
+        (is (nil? (d/release-transferred-fork! settled-tree)))))))
+
+(deftest partition-commit-failure-returns-every-live-capability
+  (binding [ec/*execution-context* *base-ctx*]
+    (ygg/register! (geschichte/create-system
+                    :scope (str *sandbox-dir* "/commit-failure-repository")
+                    :system-name :commit-failure-repository))
+    (let [parent (d/room :partition-commit-parent *base-ctx*)
+          fork (d/fork-room parent {:isolation :ctx})
+          transfer (d/transfer-fork! fork :proposal
+                                     {:prepare! (constantly :adoption-receipt)
+                                      :abort! (fn [_])})
+          systems (vec (keys (get-in transfer [:fork/descriptor :fork/systems])))
+          partitioned
+          (d/partition-transferred-fork!
+           transfer
+           [{:systems #{(first systems)} :owner :a}
+            {:systems #{(second systems)} :owner :b}]
+           {:prepare! (constantly :partition-receipt)
+            :abort! (fn [_])
+            :commit! (fn [_ _] (throw (ex-info "store unavailable" {})))})
+          parts (:fork/partitions partitioned)]
+      (is (= :failed (get-in partitioned [:fork/partition-commit :status])))
+      (is (= "store unavailable"
+             (ex-message (get-in partitioned [:fork/partition-commit :error]))))
+      (is (= 2 (count parts)))
+      (is (every? (comp ygg/open-fork? :fork/handle) parts))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not durably committed"
+                            (d/release-transferred-fork! partitioned)))
+      (let [partitioned (d/retry-partition-commit! partitioned (fn [_ _] :ok))
+            first-settled
+            (d/settle-transferred-fork!
+             (first (:fork/partitions partitioned)) :discard
+             {:prepare! (constantly :first-receipt)
+              :abort! (fn [_])
+              :commit! (fn [_ _] (throw (ex-info "terminal store unavailable" {})))})
+            second-settled
+            (d/settle-transferred-fork!
+             (second (:fork/partitions partitioned)) :discard
+             {:prepare! (constantly :second-receipt)
+              :abort! (fn [_])
+              :commit! (fn [_ _] :ok)})
+            failed-tree (assoc partitioned :fork/partitions
+                               [first-settled second-settled])]
+        (is (= :commit-failed (get-in first-settled [:fork/settlement :status])))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not durably committed"
+                              (d/release-transferred-fork! failed-tree)))
+        (let [recovered (d/retry-settlement-commit! first-settled (fn [_ _] :ok))
+              recovered-tree (assoc failed-tree :fork/partitions
+                                    [recovered second-settled])]
+          (d/release-transferred-fork! recovered-tree))))))
+
+(deftest governed-settlement-prepares-exactly-one-concurrent-decision
+  (binding [ec/*execution-context* *base-ctx*]
+    (let [parent (d/room :governed-settlement-parent *base-ctx*)
+          fork (d/fork-room parent {:isolation :ctx})
+          transfer (d/transfer-fork! fork :governance
+                                     {:prepare! (constantly :adoption-receipt)
+                                      :abort! (fn [_])})
+          ready (java.util.concurrent.CountDownLatch. 2)
+          start (java.util.concurrent.CountDownLatch. 1)
+          prepares (atom [])
+          lifecycle (fn [decision]
+                      {:prepare! (fn [_]
+                                   (swap! prepares conj decision)
+                                   decision)
+                       :abort! (fn [_])
+                       :commit! (fn [_ _] :ok)})
+          decide (fn [decision]
+                   (future
+                     (.countDown ready)
+                     (.await start)
+                     (try
+                       (d/settle-transferred-fork!
+                        transfer decision (lifecycle decision))
+                       (catch clojure.lang.ExceptionInfo error error))))
+          merge-result (decide :merge)
+          discard-result (decide :discard)]
+      (.await ready)
+      (.countDown start)
+      (let [results [@merge-result @discard-result]
+            winner (first (filter map? results))
+            loser (first (filter #(instance? clojure.lang.ExceptionInfo %) results))]
+        (is (= 1 (count @prepares)))
+        (is (map? winner))
+        (is (= ::d/transferred-fork-not-open (:type (ex-data loser))))
+        (is (= :committed (get-in winner [:fork/settlement :status])))
+        (d/release-transferred-fork! winner)))))
+
+(deftest whole-world-governance-retries-only-portable-durable-commit
+  (binding [ec/*execution-context* *base-ctx*]
+    (let [parent (d/room :whole-world-governance-parent *base-ctx*)
+          fork (d/fork-room parent {:isolation :ctx})
+          transfer (d/transfer-fork! fork :governance
+                                     {:prepare! (constantly :adoption-receipt)
+                                      :abort! (fn [_])})
+          settled (d/settle-transferred-fork!
+                   transfer :discard
+                   {:prepare! (constantly :settlement-receipt)
+                    :abort! (fn [_])
+                    :commit! (fn [_ _]
+                               (throw (ex-info "terminal store unavailable" {})))})]
+      (is (= :commit-failed (get-in settled [:fork/settlement :status])))
+      (is (= #{:fork/operation :fork/descriptor}
+             (set (keys (get-in settled [:fork/settlement :commit-value]))))
+          "the retry value contains no live Spindel settlement payload")
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not durably committed"
+                            (d/release-transferred-fork! settled)))
+      (let [recovered (d/retry-settlement-commit! settled (fn [_ _] :ok))]
+        (d/release-transferred-fork! recovered)))))
+
+(deftest failed-settlement-compensation-retains-recovery-receipt
+  (binding [ec/*execution-context* *base-ctx*]
+    (let [parent (d/room :settlement-abort-parent *base-ctx*)
+          fork (d/fork-room parent {:isolation :ctx})
+          transfer (d/transfer-fork! fork :governance
+                                     {:prepare! (constantly :adoption-receipt)
+                                      :abort! (fn [_])})
+          result (with-redefs [ygg/merge-fork! (fn [& _]
+                                                 (throw (ex-info "preflight failed" {})))]
+                   (d/settle-transferred-fork!
+                    transfer :merge
+                    {:prepare! (constantly :settlement-receipt)
+                     :abort! (fn [_]
+                               (throw (ex-info "abort store unavailable" {})))
+                     :commit! (fn [_ _] :ok)}))]
+      (is (= :abort-failed (get-in result [:fork/settlement :status])))
+      (is (= :settlement-receipt (get-in result [:fork/settlement :receipt])))
+      (is (ygg/open-fork? (:fork/handle result)))
+      (let [recovered (d/retry-settlement-abort! result (fn [_] :ok))
+            discarded (d/settle-transferred-fork!
+                       recovered :discard
+                       {:prepare! (constantly :discard-receipt)
+                        :abort! (fn [_])
+                        :commit! (fn [_ _] :ok)})]
+        (is (nil? (:fork/settlement recovered)))
+        (d/release-transferred-fork! discarded)))))
 
 (deftest failed-transfer-preparation-preserves-the-review-world
   (binding [ec/*execution-context* *base-ctx*]
