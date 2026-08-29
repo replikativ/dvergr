@@ -932,11 +932,17 @@
    (proposals, speculative coding-agent work). Use `:none` (default)
    for message-only ToM probes where nothing in the fork commits.
 
+   `:clone-participants?` defaults true for conversational forks. Internal Run
+   worlds pass false: they need an isolated substrate, while any nested agent
+   participation must be an explicit hire rather than an accidental clone of
+   every participant in the parent Room.
+
    `:ctx` requires that subsequent operations on the fork (e.g.
    `(ask fork :agent …)` from outside the fork's body) bind
    `*execution-context*` to the fork's ctx — see `with-fork-ctx`."
   ([room] (fork-room room {}))
-  ([room {:keys [isolation] :or {isolation :none}}]
+  ([room {:keys [isolation clone-participants?]
+          :or {isolation :none clone-participants? true}}]
    (let [short-uuid (subs (str (random-uuid)) 0 8)
          new-slug   (str (:slug room) "/fork-" short-uuid)
          ;; Use the canonical slug→id encoding so id ↔ slug stay in
@@ -1004,10 +1010,11 @@
      ;; for merge/diff/git. For `:none`, child-ctx == parent ctx (no change).
      (binding [ec/*execution-context* (:ctx room)]
        (rreg/register! new-room))
-     (doseq [[_id p] @(:participants room)]
-       (when-let [fac (:factory p)]
-         (binding [ec/*execution-context* child-ctx]
-           (join new-room (fac child-ctx)))))
+     (when clone-participants?
+       (doseq [[_id p] @(:participants room)]
+         (when-let [fac (:factory p)]
+           (binding [ec/*execution-context* child-ctx]
+             (join new-room (fac child-ctx))))))
      ;; Control-plane: announce the fork on the peer-bus so dashboards,
      ;; audit logs, and oversight agents see it without subscribing to
      ;; the fork's bus directly.

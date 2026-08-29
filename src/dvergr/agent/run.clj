@@ -17,7 +17,9 @@
 (def provenance-keys
   "Run fields an interpreter may add without changing core causal identity."
   #{:run/roster :run/agent-version :run/program-kind
-    :run/interpreter-version :run/agent-def-hash :run/chat-id})
+    :run/interpreter-version :run/agent-def-hash :run/chat-id
+    :run/world :run/isolation :run/settlement-policy
+    :run/settlement-status :run/settlement-reason})
 
 (defn- store-room-id [room]
   (or (some-> room :meta deref :conversation-id)
@@ -166,7 +168,7 @@
   "End the live execution and persist its final/waiting projection. Idempotent
    after the live entry has gone. `:waiting` has no ended-at; terminal states do."
   ([run-id status] (finish! run-id status {}))
-  ([run-id status {:keys [reason error now]}]
+  ([run-id status {:keys [reason error now settlement-status settlement-reason]}]
    (when-not (contains? finish-statuses status)
      (throw (ex-info "Invalid run finish status"
                      {:type ::invalid-finish-status :status status :run-id run-id})))
@@ -179,6 +181,8 @@
                    (contains? store/terminal-run-statuses status)
                    (assoc :run/ended-at now)
                    reason (assoc :run/reason reason)
+                   settlement-status (assoc :run/settlement-status settlement-status)
+                   settlement-reason (assoc :run/settlement-reason settlement-reason)
                    error (assoc :run/error (or (ex-message error) (str error))))]
          (when-let [room-store (:store entry)]
            (when-not (store/-store-run! room-store (:store-room-id entry) run)
@@ -200,7 +204,7 @@
    This two-phase boundary prevents Room teardown from closing the execution
    context between durable terminal persistence and Deferred publication."
   ([run-id status] (retain-finished! run-id status {}))
-  ([run-id status {:keys [reason error now]}]
+  ([run-id status {:keys [reason error now settlement-status settlement-reason]}]
    (when-not (contains? finish-statuses status)
      (throw (ex-info "Invalid run finish status"
                      {:type ::invalid-finish-status :status status :run-id run-id})))
@@ -216,6 +220,8 @@
                      (contains? store/terminal-run-statuses status)
                      (assoc :run/ended-at now)
                      reason (assoc :run/reason reason)
+                     settlement-status (assoc :run/settlement-status settlement-status)
+                     settlement-reason (assoc :run/settlement-reason settlement-reason)
                      error (assoc :run/error (or (ex-message error) (str error))))]
            (when-let [room-store (:store entry)]
              (when-not (store/-store-run! room-store (:store-room-id entry) run)
@@ -241,6 +247,56 @@
         (swap! active dissoc run-id)
         (notify! {:type :run/finished :run run})
         run))))
+
+(defn publish-finished!
+  "Publish a retained result and release its live lease under one lifecycle
+   fence. Room teardown cannot observe the lease disappear and close the
+   execution context before `publish!` has written the fork-aware result."
+  [run-id publish! result]
+  (locking lifecycle-lock
+    (when-let [entry (get @active run-id)]
+      (let [run (:run entry)]
+        (when-not (contains? finish-statuses (:run/status run))
+          (throw (ex-info "Cannot publish a non-finished Run"
+                          {:type ::run-not-finished
+                           :run/id run-id
+                           :run/status (:run/status run)})))
+        (swap! active dissoc run-id)
+        (try
+          (publish! result)
+          (catch Throwable t
+            ;; Keep the durable terminal lease recoverable if publication into
+            ;; the execution context itself fails.
+            (swap! active assoc run-id entry)
+            (throw t)))
+        (notify! {:type :run/finished :run run})
+        run))))
+
+(defn update-durable-settlement!
+  "Update the settlement axis of an already-quiesced Run. This is the durable
+   half of a later human/agent decision on a retained review world. Execution
+   identity and status are preserved."
+  [room run-id status & [reason]]
+  (when-not (keyword? status)
+    (throw (ex-info "Run settlement status must be a keyword"
+                    {:type ::invalid-settlement-status :status status})))
+  (when-let [room-store (:store room)]
+    (let [room-id (store-room-id room)
+          existing (store/-load-run room-store room-id run-id)]
+      (when-not existing
+        (throw (ex-info "Run settlement owner is not durable in this Room"
+                        {:type ::run-not-found
+                         :run/id run-id
+                         :run/room (:id room)})))
+      (let [updated (cond-> (assoc existing
+                                   :run/settlement-status status
+                                   :run/updated-at (java.util.Date.))
+                      reason (assoc :run/settlement-reason reason))]
+        (or (store/-store-run! room-store room-id updated)
+            (throw (ex-info "Run settlement update was not durable"
+                            {:type ::settlement-not-durable
+                             :run/id run-id
+                             :run/settlement-status status})))))))
 
 (defn cancel-requested?
   "True when targeted cancellation has been requested for this live Run. The

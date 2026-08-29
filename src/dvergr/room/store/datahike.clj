@@ -167,6 +167,8 @@
   '[:run/id :run/kind :run/room :run/actor :run/trigger :run/parent
     :run/roster :run/agent-version :run/program-kind :run/interpreter-version
     :run/agent-def-hash :run/chat-id
+    :run/world :run/isolation :run/settlement-policy
+    :run/settlement-status :run/settlement-reason
     :run/status :run/created-at :run/started-at :run/updated-at :run/ended-at
     :run/reason :run/error])
 
@@ -189,6 +191,14 @@
     (assoc :run/interpreter-version (:run/interpreter-version run))
     (:run/agent-def-hash run) (assoc :run/agent-def-hash (:run/agent-def-hash run))
     (:run/chat-id run) (assoc :run/chat-id (:run/chat-id run))
+    (:run/world run) (assoc :run/world (:run/world run))
+    (:run/isolation run) (assoc :run/isolation (:run/isolation run))
+    (:run/settlement-policy run)
+    (assoc :run/settlement-policy (:run/settlement-policy run))
+    (:run/settlement-status run)
+    (assoc :run/settlement-status (:run/settlement-status run))
+    (:run/settlement-reason run)
+    (assoc :run/settlement-reason (:run/settlement-reason run))
     (:run/ended-at run) (assoc :run/ended-at (:run/ended-at run))
     (:run/reason run)   (assoc :run/reason (:run/reason run))
     (:run/error run)    (assoc :run/error (str (:run/error run)))))

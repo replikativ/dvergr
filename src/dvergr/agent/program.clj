@@ -10,6 +10,7 @@
             [dvergr.agent.room-context :as room-context]
             [dvergr.agent.run :as run]
             [dvergr.agent.turn :as turn]
+            [dvergr.agent.world :as world]
             [dvergr.chat.agent :as chat-agent]
             [dvergr.chat.context :as chat-context]
             [dvergr.discourse :as d]
@@ -22,7 +23,8 @@
             [org.replikativ.spindel.atom :as ratom]
             [org.replikativ.spindel.spin.combinators :as comb]
             [org.replikativ.spindel.spin.core :as spin-core]
-            [org.replikativ.spindel.spin.sync :as sync])
+            [org.replikativ.spindel.spin.sync :as sync]
+            [taoensso.telemere :as tel])
   (:import [java.nio.charset StandardCharsets]
            [java.util UUID]
            [java.util.concurrent Callable CountDownLatch FutureTask]))
@@ -47,17 +49,20 @@
 
 (declare start-worker!)
 
-(defn- make-supervisor [execution-ctx]
-  {:execution-ctx execution-ctx
-   :state (atom {:cancelled? false
-                 :sealed? false
-                 :workers {}
-                 :cleanup nil
-                 :cleanup-phase :pending
-                 :cleanup-error nil
-                 :quiesced? false})
-   :quiesced (sync/deferred)
-   :quiesced-latch (CountDownLatch. 1)})
+(defn- make-supervisor
+  ([execution-ctx] (make-supervisor execution-ctx execution-ctx))
+  ([execution-ctx worker-ctx]
+   {:execution-ctx execution-ctx
+    :worker-ctx worker-ctx
+    :state (atom {:cancelled? false
+                  :sealed? false
+                  :workers {}
+                  :cleanup nil
+                  :cleanup-phase :pending
+                  :cleanup-error nil
+                  :quiesced? false})
+    :quiesced (sync/deferred)
+    :quiesced-latch (CountDownLatch. 1)}))
 
 (defn- advance-supervisor!
   "Advance cleanup/quiescence after an atomic supervisor transition. Cleanup
@@ -125,7 +130,7 @@
          callable   (reify Callable
                       (call [_]
                         (when (compare-and-set! phase :new :running)
-                          (binding [ec/*execution-context* (:execution-ctx supervisor)]
+                          (binding [ec/*execution-context* (:worker-ctx supervisor)]
                             (try
                               (reset! result (f))
                               (catch Throwable t
@@ -134,11 +139,13 @@
                                 (reset! phase :terminated)
                                ;; Publish the per-worker result before removing
                                ;; its live lease from the stable supervisor.
-                                (try
-                                  (done @result)
-                                  (finally
-                                    (worker-finished! supervisor worker-id kind
-                                                      @result)))))))))
+                                (binding [ec/*execution-context*
+                                          (:execution-ctx supervisor)]
+                                  (try
+                                    (done @result)
+                                    (finally
+                                      (worker-finished! supervisor worker-id kind
+                                                        @result))))))))))
          task       (proxy [FutureTask] [callable]
                       (done []
                        ;; Cancellation before the executor begins means the
@@ -211,7 +218,7 @@
   (.await ^CountDownLatch (:quiesced-latch supervisor))
   nil)
 
-(deftype RunHandle [id room-id owner-fork-id execution completion]
+(deftype RunHandle [id room-id owner-fork-id execution completion worker-execution]
   clojure.lang.ILookup
   (valAt [_ k]
     (case k
@@ -284,7 +291,7 @@
    to the hired Run. Prefer passive `result-spin` for ordinary or shared reads."
   [^RunHandle handle]
   (ensure-owner-context! handle)
-  (let [execution (.-execution handle)
+  (let [execution (.-worker-execution handle)
         id (:run/id handle)
         room-id (:run/room handle)
         observer (sp/spin
@@ -355,18 +362,21 @@
                       {:type ::no-provider
                        :agent/id (:agent/id agent)}))))
 
-(defn- new-llm-context [room run-id agent budget-dollars chat-id]
-  (let [system-id (room-context/room-system-id room)
-        borrowed-db (some-> room :store :conn)
+(defn- new-llm-context [control-room work-room run-id agent budget-dollars chat-id]
+  (let [system-id (room-context/room-system-id work-room)
+        ;; Model messages, tool results, authorization receipts, and costs are
+        ;; control-plane evidence. Keep that trace in the parent even when the
+        ;; work plane is later discarded.
+        trace-db (some-> control-room :store :conn)
         chat-ctx (turn/new-working-ctx
-                  {:execution-ctx (:ctx room)
+                  {:execution-ctx (:ctx work-room)
                    :chat-id chat-id
                    :title (str "agent-task " (name (:agent/id agent)))
                    :budget-dollars budget-dollars
-                   :db-conn borrowed-db
+                   :db-conn trace-db
                    :kb-conn (when system-id (system-rooms/room-kb-conn system-id))
                    :room-id system-id
-                   :room-runtime-id (:id room)
+                   :room-runtime-id (:id work-room)
                    ;; Until Kontor can split a resource vector, a paid child may
                    ;; only delegate provider-free work. Pure roster construction
                    ;; remains available inside SCI.
@@ -374,15 +384,21 @@
                                            :provider-effects? false
                                            :parent-run run-id}})]
     {:chat-ctx chat-ctx
-     :owned-db? (nil? borrowed-db)}))
+     :owned-db? (nil? trace-db)}))
 
-(defn- llm-tool-context [room chat-ctx agent]
+(defn- llm-tool-context [control-room room chat-ctx agent]
   (let [system-id (room-context/room-system-id room)
-        tool-map (tools/normalize-tools (or (:agent/tools agent) #{}))]
+        tool-map (tools/normalize-tools (or (:agent/tools agent) #{}))
+        ;; Ordinary room/task effects target the branched work store. A
+        ;; store-less Room uses the per-Run ephemeral DB, which is itself owned
+        ;; by the work context and closed before settlement.
+        work-db (or (some-> room :store :conn)
+                    (when-not (some-> control-room :store :conn)
+                      (:db-conn chat-ctx)))]
     {:tool-map tool-map
      :tool-ctx
      (-> (tools/make-context
-          {:db-conn (:db-conn chat-ctx)
+          {:db-conn work-db
            :chat-ctx chat-ctx
            :sci-ctx (:sci-ctx chat-ctx)
            :tools tool-map
@@ -398,7 +414,7 @@
   "Run a bounded Dvergr-native model/tool loop. Each blocking model round-trip
    runs under a supervised worker; this Spin retains orchestration, activity
    correlation, cleanup, and cancellation in the Room's execution graph."
-  [room run-id chat-id agent task trigger supervisor]
+  [control-room work-room run-id chat-id agent task trigger supervisor]
   (let [{:keys [max-model-steps budget-dollars auto-compact? compaction-model]
          :or {max-model-steps default-max-model-steps
               budget-dollars 1.0
@@ -412,12 +428,13 @@
             supervisor
             (fn []
               (let [{:keys [chat-ctx owned-db?]}
-                    (new-llm-context room run-id agent budget-dollars chat-id)
+                    (new-llm-context control-room work-room run-id agent
+                                     budget-dollars chat-id)
                     _ (when owned-db?
                         (register-cleanup!
                          supervisor #(chat-context/close-chat! chat-ctx)))
                     {:keys [tool-map tool-ctx]}
-                    (llm-tool-context room chat-ctx agent)
+                    (llm-tool-context control-room work-room chat-ctx agent)
                     model-spec (resolve-model-spec agent)
                     instructions
                     (prompt/assemble-system-prompt
@@ -464,7 +481,7 @@
                       :tools tool-map
                       :tool-ctx tool-ctx
                       :cancel? (turn/cancel?-fn
-                                chat-ctx (:ctx room)
+                                chat-ctx (:ctx work-room)
                                 (fn [] (run/cancel-requested? run-id)))
                       :auto-compact? auto-compact?
                       :compaction-model compaction-model
@@ -474,7 +491,7 @@
                       :turn-number model-step
                       :run-id run-id})))
                  outcome (sp/await (worker-result-spin call))]
-             (turn/post-turn-activity! room (:agent/id agent) chat-ctx posted
+             (turn/post-turn-activity! control-room (:agent/id agent) chat-ctx posted
                                        run-id trigger)
              (cond
                (or (= ::worker-cancelled outcome)
@@ -523,12 +540,13 @@
                (recur (inc model-step))))))))))
 
 (defn- execute-program
-  [room run-id chat-id agent task trigger supervisor]
+  [control-room work-room run-id chat-id agent task trigger supervisor]
   (case (get-in agent [:agent/program :kind])
-    :llm (execute-llm-program room run-id chat-id agent task trigger supervisor)
+    :llm (execute-llm-program control-room work-room run-id chat-id agent task
+                              trigger supervisor)
     (execute-deterministic-program run-id agent task)))
 
-(def ^:private hire-option-keys #{:task :from :parent-run})
+(def ^:private hire-option-keys #{:task :from :parent-run :settlement})
 
 (defn- validate-program!
   [{:keys [kind delay-ms max-model-steps budget-dollars auto-compact? compaction-model]
@@ -650,10 +668,7 @@
            (recur))
 
          retained
-         (try
-           (completion result)
-           (finally
-             (run/release-finished! id)))
+         (run/publish-finished! id completion result)
 
          ;; Another exactly-once settlement path already retained/released it.
          :else nil)))
@@ -678,19 +693,35 @@
           (recur))
 
         retained
-        (try
-          (completion result)
-          (finally
-            (run/release-finished! id)))
+        (run/publish-finished! id completion result)
 
         :else nil)))
   result)
 
-(defn- settle-external!
-  "Settle from a process-local watcher only after the orchestration Spin has a
+(defn- settlement-result [run-world result]
+  (let [{:keys [status reason]}
+        (try
+          (world/settle! run-world (:run/status result))
+          (catch Throwable t
+            (tel/log! {:level :error :id ::world-settlement-failed
+                       :data {:run/id (:run/id result)
+                              :run/world (:id run-world)
+                              :error (ex-message t)}}
+                      "Run world settlement failed; retaining it for review")
+            {:status :review :reason :settlement-failed}))]
+    {:result (assoc result
+                    :run/world (:id run-world)
+                    :run/settlement-status status
+                    :run/settlement-reason reason)
+     :finish-opts (cond-> {:settlement-status status}
+                    reason (assoc :settlement-reason reason))}))
+
+(defn- finalize-execution-external!
+  "Finalize from a process-local watcher only after the orchestration Spin has a
    cached terminal result and the stable supervisor reports every native worker
-   and owned cleanup quiescent."
-  [room id supervisor execution completion result]
+   and owned cleanup quiescent. World settlement happens behind the same
+   physical-quiescence fence."
+  [room run-world id supervisor execution completion outcome]
   (future
     ;; `future` conveys dynamic bindings. A cancellation hook normally launches
     ;; this watcher from the losing observer Spin, so retaining its *spin-id*
@@ -698,34 +729,40 @@
     ;; graph being reaped. Keep the Room memory context but detach graph identity.
     (binding [ec/*execution-context* (:ctx room)
               ec/*spin-id* nil]
-      ;; Keep the durable cancellation token/live lease until the executor has
+      ;; Wait until the executor has published either its ordinary outcome or
+      ;; its graph-level cancellation/failure through the process-local bridge.
+      (let [outcome @outcome]
+        ;; Keep the durable cancellation token/live lease until the executor has
       ;; acknowledged termination. Direct cancellation relies on that token at
       ;; its next cooperative checkpoint; releasing it merely because a pure
       ;; program has no native workers would let the body continue to effects.
-      (let [execution-id (spin-core/spin-id execution)]
-        (loop []
-          (when-not (ec/spin-current-result execution-id)
-            (Thread/sleep 5)
-            (recur))))
-      (await-supervisor! supervisor)
-      (let [cleanup-error (:cleanup-error @(:state supervisor))
-            result (if cleanup-error
-                     {:run/id id :run/status :failed
-                      :run/error (ex-message cleanup-error)}
-                     result)
-            finish-opts (if (= :cancelled (:run/status result))
-                          {:reason :structured-cancellation}
-                          {:reason (if cleanup-error :cleanup-error :execution-error)
-                           :error (or cleanup-error (:run/error result))})]
-        (publish-result-and-release! id completion result finish-opts)))))
+        (let [execution-id (spin-core/spin-id execution)]
+          (loop []
+            (when-not (ec/spin-current-result execution-id)
+              (Thread/sleep 5)
+              (recur))))
+        (await-supervisor! supervisor)
+        (let [cleanup-error (:cleanup-error @(:state supervisor))
+              result (if cleanup-error
+                       {:run/id id :run/status :failed
+                        :run/error (ex-message cleanup-error)}
+                       (:result outcome))
+              execution-opts (merge
+                              (:finish-opts outcome)
+                              (when cleanup-error
+                                {:reason :cleanup-error :error cleanup-error}))
+              {:keys [result finish-opts]} (settlement-result run-world result)]
+          (publish-result-and-release! id completion result
+                                       (merge execution-opts finish-opts)))))))
 
 (defn- execution-spin
-  [room agent task trigger id chat-id completion supervisor]
+  [control-room work-room agent task trigger id chat-id supervisor outcome-promise]
   (sp/spin
    (let [outcome
          (try
            (let [{status ::status value ::value reason ::reason}
-                 (sp/await (execute-program room id chat-id agent task trigger supervisor))
+                 (sp/await (execute-program control-room work-room id chat-id agent
+                                            task trigger supervisor))
                  ;; Seal admits no further provider work, runs owned cleanup
                  ;; after all workers terminate, and publishes one stable
                  ;; quiescence acknowledgement.
@@ -744,7 +781,7 @@
                                      {:role :assistant :run-id id})]
                  ;; Room posting is durability-first. Completion is acknowledged
                  ;; only after the correlated private output exists.
-                 (d/post! room output)
+                 (d/post! control-room output)
                  {:result {:run/id id
                            :run/status :completed
                            :run/value value
@@ -792,13 +829,12 @@
                                                 :program-error)
                                       :error error}})))))))
          result (:result outcome)]
-     ;; Completion is a Spindel Deferred allocated in this Room's execution
-     ;; context, not a JVM promise or host atom. Its value therefore follows
-     ;; Spindel's copy-on-write state semantics. The durable terminal projection
-     ;; retains its live lease until this publication has completed.
-     (sp/await
-      (publish-result-and-release-spin id completion result
-                                       (:finish-opts outcome))))))
+     ;; Settlement must not merge/discard a context from inside the drain graph
+     ;; currently using it. Bridge the computed outcome to the process-local
+     ;; quiescence watcher; the public result still arrives through the
+     ;; context-owned Deferred after durable settlement.
+     (deliver outcome-promise outcome)
+     result)))
 
 (defn hire!
   "Start one AgentDef execution and return an opaque RunHandle.
@@ -809,18 +845,21 @@
    - `:task`       portable task value (required)
    - `:from`       triggering actor, default `:repl`
    - `:parent-run` explicit structural parent Run UUID
+   - `:settlement`  `:automatic` (default), `:review`, or `:discard`
    Built-in program kinds are deterministic `:scripted` / `:echo` and the
    bounded Dvergr-native `:llm` model/tool loop. Simulation and replay
    interpreters implement the same boundary."
-  [room roster agent-ref {:keys [task from parent-run]
-                          :or {from :repl}
+  [room roster agent-ref {:keys [task from parent-run settlement]
+                          :or {from :repl settlement :automatic}
                           :as raw-opts}]
   (let [opts      (assoc raw-opts :from from)
         agent     (validate-hire! roster agent-ref opts)
         actor     (:agent/id agent)
         id        (random-uuid)
         chat-id   (run-chat-id id)
-        supervisor (make-supervisor (:ctx room))
+        run-world (world/open! room id settlement)
+        work-room (:work run-world)
+        supervisor (make-supervisor (:ctx room) (:ctx work-room))
         ;; Private Run facts are still Room messages, but never addressed to an
         ;; installed Participant: direct interpretation and participant routing
         ;; must not execute the same task twice.
@@ -828,16 +867,24 @@
         provenance (cond-> {:run/agent-version (:agent/version agent)
                             :run/program-kind (get-in agent [:agent/program :kind])
                             :run/interpreter-version interpreter-version
-                            :run/agent-def-hash (hasch/uuid agent)}
+                            :run/agent-def-hash (hasch/uuid agent)
+                            :run/world (:id run-world)
+                            :run/isolation :ctx
+                            :run/settlement-policy settlement
+                            :run/settlement-status :open}
                      (= :llm (get-in agent [:agent/program :kind]))
                      (assoc :run/chat-id chat-id)
                      (:roster/id roster) (assoc :run/roster (:roster/id roster)))]
     ;; Reserve durable Run ownership before any trigger effect. Teardown either
     ;; fences us out here or includes this Run in its fixed drain set; it can
     ;; never miss an orphan trigger between posting and admission.
-    (run/start! room actor trigger nil
-                (cond-> {:id id :kind :agent-task :provenance provenance}
-                  parent-run (assoc :parent parent-run)))
+    (try
+      (run/start! room actor trigger nil
+                  (cond-> {:id id :kind :agent-task :provenance provenance}
+                    parent-run (assoc :parent parent-run)))
+      (catch Throwable t
+        (d/discard work-room)
+        (throw t)))
     (run/register-cancel-hook! id ::native-worker
                                #(cancel-supervisor! supervisor))
     (try
@@ -846,39 +893,36 @@
       ;; record or an unowned message behind.
       (d/post! room trigger)
       (catch Throwable t
-        (run/finish! id :failed {:reason :trigger-emission-failed :error t})
+        (let [{:keys [status reason]} (world/settle! run-world :failed)]
+          (run/finish! id :failed {:reason :trigger-emission-failed
+                                   :error t
+                                   :settlement-status status
+                                   :settlement-reason reason}))
         (throw t)))
     (try
       (let [completion (sync/deferred)
-            execution (execution-spin room agent task trigger id chat-id
-                                      completion supervisor)
+            outcome-promise (promise)
+            worker-execution (execution-spin room work-room agent task trigger id chat-id
+                                             supervisor outcome-promise)
+            execution (sp/spin (sp/await completion))
             owner-fork-id (:fork-id (ec/current-execution-context))
-            handle    (RunHandle. id (:id room) owner-fork-id execution completion)
-            settlement-started? (atom false)
-            settle! (fn [result]
-                      (when (compare-and-set! settlement-started? false true)
-                        (settle-external! room id supervisor execution
-                                          completion result)))
+            handle    (RunHandle. id (:id room) owner-fork-id execution completion
+                                  worker-execution)
             cancel! (fn []
                       (cancel-supervisor! supervisor)
                       ;; Cancellation closes admission to further native work.
                       ;; Cleanup may still be registered by an already-running
                       ;; initialization worker while the phase is :pending; the
                       ;; supervisor starts it after that worker terminates.
-                      (seal-supervisor! supervisor)
-                      ;; Run cancellation is an execution boundary in its own
-                      ;; right, not merely a hint to the current graph. Start a
-                      ;; process-local settlement watcher now. A nested parent
-                      ;; may reap the spawned Spin's callback continuation while
-                      ;; cancelling its race arm; the execution result plus the
-                      ;; stable supervisor are the physical-quiescence fence.
-                      (settle! {:run/id id :run/status :cancelled}))]
+                      ;; The already-running process-local watcher settles only
+                      ;; after the execution and supervisor quiescence fences.
+                      (seal-supervisor! supervisor))]
         ;; Replace the early sticky worker hook with the complete cancellation
         ;; boundary. register-cancel-hook! immediately invokes it if cancellation
         ;; won between durable admission and construction of this execution.
         (run/register-cancel-hook! id ::native-worker cancel!)
         (sp/spawn!
-         execution
+         worker-execution
          {:on-error
           (fn [t]
             ;; Graph-level cancellation is settled outside the cancelled Spin:
@@ -893,10 +937,20 @@
                 (run/cancel-room-run! (:id room) id))
               (cancel-supervisor! supervisor)
               (seal-supervisor! supervisor)
-              (settle! result)))})
+              (deliver outcome-promise
+                       {:result result
+                        :finish-opts
+                        (if (= :cancelled (:run/status result))
+                          {:reason :structured-cancellation}
+                          {:reason :execution-error :error t})})))})
+        (finalize-execution-external! room run-world id supervisor worker-execution
+                                      completion outcome-promise)
         handle)
       (catch Throwable t
-        (run/finish! id :failed {:reason :spawn-failed :error t})
+        (let [{:keys [status reason]} (world/settle! run-world :failed)]
+          (run/finish! id :failed {:reason :spawn-failed :error t
+                                   :settlement-status status
+                                   :settlement-reason reason}))
         (throw t)))))
 
 (defn observe

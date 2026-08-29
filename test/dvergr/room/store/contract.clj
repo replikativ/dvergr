@@ -70,6 +70,7 @@
           ended (java.util.Date. 1787860801000)
           definition-hash (random-uuid)
           chat-id (random-uuid)
+          world-id :runs_fork_fork-contract
           running {:run/id run-id
                    :run/kind :agent-turn
                    :run/room room-id
@@ -82,12 +83,17 @@
                    :run/interpreter-version 2
                    :run/agent-def-hash definition-hash
                    :run/chat-id chat-id
+                   :run/world world-id
+                   :run/isolation :ctx
+                   :run/settlement-policy :automatic
+                   :run/settlement-status :open
                    :run/status :running
                    :run/created-at started
                    :run/started-at started
                    :run/updated-at started}
           completed (assoc running
                            :run/status :completed
+                           :run/settlement-status :merged
                            :run/updated-at ended
                            :run/ended-at ended)]
       (is (= running (store/-store-run! st room-id running)))

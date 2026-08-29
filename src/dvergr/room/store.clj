@@ -97,12 +97,15 @@
   #{:run/id :run/kind :run/room :run/actor :run/trigger :run/parent
     :run/status :run/created-at :run/started-at :run/updated-at :run/ended-at
     :run/reason :run/error
+    :run/world :run/isolation :run/settlement-policy
+    :run/settlement-status :run/settlement-reason
     :run/roster :run/agent-version :run/program-kind
     :run/interpreter-version :run/agent-def-hash :run/chat-id})
 
 (def immutable-run-keys
   [:run/id :run/kind :run/room :run/actor :run/trigger :run/parent
    :run/created-at :run/started-at
+   :run/world :run/isolation :run/settlement-policy
    :run/roster :run/agent-version :run/program-kind
    :run/interpreter-version :run/agent-def-hash :run/chat-id])
 
@@ -151,6 +154,12 @@
   (when (and (:run/chat-id run) (not (uuid? (:run/chat-id run))))
     (throw (ex-info ":run/chat-id must be a UUID"
                     {:type :room-store/invalid-run :key :run/chat-id :run run})))
+  (doseq [k [:run/world :run/isolation :run/settlement-policy
+             :run/settlement-status :run/settlement-reason]
+          :let [v (get run k)]
+          :when (and (some? v) (not (keyword? v)))]
+    (throw (ex-info (str k " must be a keyword")
+                    {:type :room-store/invalid-run :key k :run run})))
   (doseq [k [:run/created-at :run/started-at :run/updated-at]
           :when (not (instance? java.util.Date (get run k)))]
     (throw (ex-info (str k " must be an instant")

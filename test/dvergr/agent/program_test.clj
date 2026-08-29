@@ -1,17 +1,21 @@
 (ns dvergr.agent.program-test
   (:require [clojure.test :refer [deftest is testing]]
+            [datahike.api :as dh]
             [dvergr.agent.program :as program]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.run :as run]
             [dvergr.agent.turn :as turn]
             [dvergr.chat.agent :as chat-agent]
             [dvergr.chat.context :as chat-context]
+            [dvergr.chat.schema :as chat-schema]
             [dvergr.discourse :as d]
             [dvergr.model.chat :as model-chat]
             [dvergr.model.providers :as providers]
             [dvergr.room.registry :as registry]
+            [dvergr.rooms.forks :as forks]
             [dvergr.room.store :as room-store]
             [dvergr.room.store.memory :as memory]
+            [dvergr.room.store.datahike :as datahike-store]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.effects.await :refer [await]]
             [org.replikativ.spindel.engine.context :as context]
@@ -29,6 +33,15 @@
 
 (defn- test-room [id]
   (d/make-room {:id id :store (memory/make)}))
+
+(defn- datahike-test-room [id]
+  (let [cfg {:store {:backend :memory :id (random-uuid)}
+             :keep-history? false
+             :schema-flexibility :write}]
+    (dh/create-database cfg)
+    (let [conn (dh/connect cfg)]
+      (chat-schema/ensure-full-schema! conn)
+      [(d/make-room {:id id :store (datahike-store/make conn)}) conn])))
 
 (defn- fail-terminal-store [delegate fail-terminal?]
   (reify room-store/PRoomStore
@@ -86,12 +99,50 @@
         (is (= :scripted (:run/program-kind durable)))
         (is (= program/interpreter-version (:run/interpreter-version durable)))
         (is (uuid? (:run/agent-def-hash durable)))
+        (is (= :ctx (:run/isolation durable)))
+        (is (= :automatic (:run/settlement-policy durable)))
+        (is (= :merged (:run/settlement-status durable)))
+        (is (keyword? (:run/world durable)))
         (is (= "investigate" (:content trigger)))
         (is (= program/run-sink (:to trigger)))
         (is (= "evidence" (:content output)))
         (is (= program/run-sink (:to output)))
         (is (= (:id trigger) (:in-reply-to output)))
         (is (empty? (run/active-runs :program-hire))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest settlement-policy-controls-the-isolated-run-world
+  (let [room (test-room :program-settlement)
+        team (test-roster)]
+    (try
+      (testing "review retains an inspectable fork after execution"
+        (let [handle (binding [ec/*execution-context* (:ctx room)]
+                       (program/hire! room team :analyst
+                                      {:task "proposal" :settlement :review}))
+              result (binding [ec/*execution-context* (:ctx room)] @handle)
+              durable (program/observe room handle)
+              fork (binding [ec/*execution-context* (:ctx room)]
+                     (registry/lookup (:run/world durable)))]
+          (is (= :completed (:run/status result)))
+          (is (= :review (:run/settlement-status result)))
+          (is (= :review (:run/settlement-status durable)))
+          (is (= (:run/id durable) (some-> fork :meta deref :run-id)))
+          (let [action (binding [ec/*execution-context* (:ctx room)]
+                         (forks/merge! fork))]
+            (is (:ok? action) (pr-str action)))
+          (is (= :merged (:run/settlement-status
+                          (program/observe room handle))))))
+      (testing "discard removes a successful work plane"
+        (let [handle (binding [ec/*execution-context* (:ctx room)]
+                       (program/hire! room team :analyst
+                                      {:task "ephemeral" :settlement :discard}))
+              result (binding [ec/*execution-context* (:ctx room)] @handle)
+              durable (program/observe room handle)]
+          (is (= :discarded (:run/settlement-status result)))
+          (is (= :policy (:run/settlement-reason durable)))
+          (is (binding [ec/*execution-context* (:ctx room)]
+                (nil? (registry/lookup (:run/world durable)))))))
       (finally
         (d/close-room! room)))))
 
@@ -208,6 +259,39 @@
       (finally
         (d/close-room! room)))))
 
+(deftest discarded-world-retains-the-parent-owned-model-trace
+  (let [[room conn] (datahike-test-room :program-trace-control-plane)
+        team (roster/make-agent
+              (roster/make-roster)
+              {:id :audited
+               :model-policy {:provider :test :model "stub"}
+               :program {:kind :llm :max-model-steps 1}})]
+    (try
+      (with-redefs [providers/ensure-initialized! (constantly nil)
+                    chat-agent/run-agent-turn!
+                    (fn [chat-ctx _]
+                      (chat-context/add-message!
+                       chat-ctx {:role :assistant :content "audited result"})
+                      :complete)]
+        (let [handle (binding [ec/*execution-context* (:ctx room)]
+                       (program/hire! room team :audited
+                                      {:task "inspect" :settlement :discard}))
+              result (binding [ec/*execution-context* (:ctx room)] @handle)
+              durable (program/observe room handle)
+              roles (dh/q '[:find [?role ...]
+                            :in $ ?chat-id
+                            :where
+                            [?chat :chat/id ?chat-id]
+                            [?message :message/chat ?chat]
+                            [?message :message/role ?role]]
+                          @conn (:run/chat-id durable))]
+          (is (= :discarded (:run/settlement-status result)))
+          (is (= #{:system :user :assistant} (set roles))
+              "discard drops work effects, not the model/tool audit trace")))
+      (finally
+        (d/close-room! room)
+        (dh/release conn)))))
+
 (deftest llm-program-settles-at-budget-boundary
   (let [room (test-room :program-llm-budget)
         team (roster/make-agent
@@ -224,12 +308,16 @@
               result (binding [ec/*execution-context* (:ctx room)] @handle)]
           (is (= {:run/id (program/run-id handle)
                   :run/status :waiting
-                  :run/reason :budget-exhausted}
-                 result))
+                  :run/reason :budget-exhausted
+                  :run/settlement-status :review
+                  :run/settlement-reason :execution-waiting}
+                 (dissoc result :run/world)))
           (is (= :waiting (:run/status (program/observe room handle))))
           (is (empty? (filter #(= (program/run-id handle)
                                   (get-in % [:metadata :run-id]))
-                              (d/messages room {:limit 10}))))))
+                              (d/messages room {:limit 10}))))
+          (binding [ec/*execution-context* (:ctx room)]
+            (d/discard (registry/lookup (:run/world result))))))
       (finally
         (d/close-room! room)))))
 

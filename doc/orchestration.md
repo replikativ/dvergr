@@ -470,7 +470,9 @@ Implemented for `:agent-turn` Runs; see [runs.md](runs.md):
    membership through the trigger rather than duplicating it on the Run.
 3. Key live control by Run ID while preserving room-level convenience APIs.
 4. Expose an initial-snapshot lifecycle subscription and targeted cancellation.
-5. Do not introduce a universal workflow-run aggregate in this stage.
+5. Keep execution and world settlement as separate Run axes. Every AgentDef hire
+   gets an internal forked work plane; only retained review worlds need the
+   heavyweight user-visible proposal workflow.
 
 ### Stage 3: durable delegated tasks
 
@@ -483,8 +485,10 @@ Implemented for `:agent-turn` Runs; see [runs.md](runs.md):
 
 The provider-free functional-programming precursor is implemented now: immutable
 AgentDefs/Rosters compose in room SCI, and `hire!` starts a Run-backed Spindel
-computation. See [agent-programs.md](agent-programs.md). Its `:roster/scope` is
-data only until this stage supplies enforceable attenuation/accounting.
+computation whose effects execute in an isolated Run world. Automatic settlement
+is the common path; review retains the world as a normal inspectable fork. See
+[agent-programs.md](agent-programs.md). Its `:roster/scope` is data only until
+this stage supplies enforceable attenuation/accounting.
 
 ### Stage 4: recursive workrooms
 

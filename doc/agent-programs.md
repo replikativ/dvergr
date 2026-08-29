@@ -115,9 +115,12 @@ the same Run boundary:
   @(spin (await (agent/result-spin work))))
 ```
 
-Every hire receives a fresh ChatContext in the Room's Spindel execution context.
-Parallel hires therefore have independent dialogue and budget state while seeing
-the same fork-local Geschichte/Datahike substrate. The AgentDef tool set is both
+Every hire opens a cheap isolated Run world. The orchestration graph, trigger,
+tool-activity summaries, output, and durable Run projection remain in the parent
+Room's control plane; database, Geschichte/filesystem, SCI, and nested-agent
+effects resolve through the world's forked Room/context. Parallel hires therefore
+have independent dialogue and budget state while starting from the same parent
+substrate. The AgentDef tool set is both
 the schema shown to the model and the authoritative execution allowlist. An
 omitted tool set means no tools.
 
@@ -139,9 +142,27 @@ not Dvergr's scheduling clock. Reactive attention may queue, merge, observe,
 fork, or switch work around these discrete transport boundaries.
 `:budget-dollars` is a per-execution spending ceiling (default $1), not a Kontor
 resource allocation. When it is exceeded after a tool-bearing model step, the Run
-settles as `:waiting` with reason `:budget-exhausted`; no process remains active.
+settles as `:waiting` with reason `:budget-exhausted`; no process remains active,
+and its partial world is retained for review.
 A true resumable continuation and affine resource settlement are separate later
 contracts.
+
+## Execution and world settlement
+
+Execution and settlement are independent durable axes. `:run/status` describes
+what the program did (`:completed`, `:waiting`, `:failed`, or `:cancelled`).
+`:run/settlement-status` describes what happened to its isolated effects
+(`:merged`, `:review`, or `:discarded`). `hire!` accepts:
+
+- `:settlement :automatic` (default): merge completed work;
+- `:settlement :review`: retain completed work in the Room tree;
+- `:settlement :discard`: execute for its result/trace, then drop its effects.
+
+Failure and cancellation always discard the work plane. Waiting and automatic
+merge conflicts retain it for review. A later merge/discard through
+`dvergr.rooms.forks` updates the owning Run's settlement projection. World
+settlement runs only after the executor and native-worker supervisor have
+physically quiesced, outside the Spindel drain graph that used the fork.
 
 An LLM-created sandbox can still build and revise arbitrary immutable rosters,
 but its `hire!` authority currently accepts only provider-free `:echo` and
