@@ -288,7 +288,7 @@
     ;;    silently lost durability while the live message flowed).
     (let [durability (when-let [append! (:durable-append! bus)]
                        (append! msg'))]
-      (when (= :failed durability)
+      (when (or (= :failed durability) (false? durability))
         (throw (ex-info "Durable bus append failed"
                         {:type :bus/durable-append-failed
                          :message-id (:id msg')})))

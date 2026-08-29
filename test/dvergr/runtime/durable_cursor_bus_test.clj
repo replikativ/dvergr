@@ -38,7 +38,12 @@
                               (bus/post! b2 {:to :x :content "lost?"})))
         (is (empty? (bus/log b2)) "nothing on the log")
         (Thread/sleep 150)
-        (is (empty? @got2) "nothing delivered")))))
+        (is (empty? @got2) "nothing delivered"))
+      (testing "legacy boolean failure also fails closed"
+        (let [b3 (bus/create-bus {:durable-append! (constantly false)})]
+          (is (thrown-with-msg? Exception #"Durable bus append failed"
+                                (bus/post! b3 {:to :x :content "lost?"})))
+          (is (empty? (bus/log b3))))))))
 
 (deftest durable-duplicate-is-not-visible-twice
   (testing "first-write-wins covers the live log and subscribers"
