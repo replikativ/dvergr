@@ -1,7 +1,9 @@
 (ns dvergr.sandbox.agent-programming-test
   "Provider-free acceptance tests for the functional agent surface in room SCI."
   (:require [clojure.test :refer [deftest is testing]]
+            [dvergr.agent.program :as program]
             [dvergr.agent.run :as run]
+            [dvergr.agent.world :as world]
             [dvergr.discourse :as d]
             [dvergr.resource :as resource]
             [dvergr.room.registry :as room-registry]
@@ -396,7 +398,10 @@
                 "      b (agent/hire! team :slow {:task :solve})] "
                 "  @(spin (-> (await (comb/race (agent/owned-result-spin a) "
                 "                                (agent/owned-result-spin b))) "
-                "             :run/value)))")))]
+                "             :run/value)))")
+               :timeout-ms 15000))]
+        (is (not= "TimeoutException" (get-in result [:error :type]))
+            (pr-str (:error result)))
         (is (:success result) (pr-str (:error result)))
         (is (= :fast (:value result)))
         (is (wait-until #(empty? (run/active-runs (:id room))) 1000))
@@ -405,6 +410,87 @@
           (is (= :cancelled (get-in by-actor [:slow :run/status])))))
       (finally
         (d/close-room! room)))))
+
+(deftest nested-run-sci-race-cancels-and-settles-its-owned-loser
+  (let [room (d/make-room {:id :nested-sci-agent-owned-race
+                           :store (memory/make)})
+        parent-id (random-uuid)
+        trigger (d/message :repl :_runs "coordinate" nil {:role :user})
+        run-world (world/open! room parent-id :discard)
+        work-room (:work run-world)
+        supervisor (binding [ec/*execution-context* (:ctx room)]
+                     @(sp/spin
+                       (#'program/make-supervisor (:ctx room) (:ctx work-room))))
+        ceiling {:program-kinds #{:echo :scripted}
+                 :parent-run parent-id
+                 :own-child! (fn [admit!]
+                               (#'program/with-owned-child! supervisor admit!))}
+        sci-ctx (sandbox/fork-for-session (:ctx work-room))]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (run/start! room :orchestrator trigger nil
+                    {:id parent-id :kind :workflow})
+        (d/post! room trigger))
+      (agent-ns/add-programming-ns! sci-ctx (:id work-room) (:ctx work-room) ceiling)
+      (data-ns/add-spindel-extras-ns! sci-ctx (:ctx work-room)
+                                      {:room-id (:id work-room)
+                                       :room-incarnation (:incarnation work-room)})
+      (let [result
+            (binding [ec/*execution-context* (:ctx work-room)]
+              (sandbox/eval-code
+               sci-ctx
+               (str
+                "(require '[dvergr.agent :as agent] "
+                "         '[org.replikativ.spindel.spin.cps :refer [spin]] "
+                "         '[org.replikativ.spindel.effects.await :refer [await]] "
+                "         '[spindel.comb :as comb]) "
+                "(let [team (-> (agent/roster) "
+                "               (agent/make-agent {:id :fast :program {:kind :scripted :delay-ms 10 :reply :fast}}) "
+                "               (agent/make-agent {:id :slow :program {:kind :scripted :delay-ms 5000 :reply :slow}})) "
+                "      a (agent/hire! team :fast {:task :solve}) "
+                "      b (agent/hire! team :slow {:task :solve})] "
+                "  @(spin (-> (await (comb/race (agent/owned-result-spin a) "
+                "                                (agent/owned-result-spin b))) "
+                "             :run/value)))")
+               :timeout-ms 15000))]
+        (is (not= "TimeoutException" (get-in result [:error :type]))
+            (pr-str (:error result)))
+        (is (:success result) (pr-str (:error result)))
+        (is (= :fast (:value result)))
+        (is (wait-until #(= 1 (count (run/active-runs (:id room)))) 1000))
+        (let [children (remove #(= parent-id (:run/id %)) (run/runs room))
+              by-actor (into {} (map (juxt :run/actor identity)) children)]
+          (is (= parent-id (get-in by-actor [:fast :run/parent])))
+          (is (= parent-id (get-in by-actor [:slow :run/parent])))
+          (is (= :completed (get-in by-actor [:fast :run/status])))
+          (is (= :cancelled (get-in by-actor [:slow :run/status])))
+          (is (= :merged (get-in by-actor [:fast :run/settlement-status])))
+          (is (= :discarded (get-in by-actor [:slow :run/settlement-status])))
+          (binding [ec/*execution-context* (:ctx room)]
+            (is (nil? (room-registry/lookup
+                       (get-in by-actor [:fast :run/world]))))
+            (is (nil? (room-registry/lookup
+                       (get-in by-actor [:slow :run/world])))))))
+      (finally
+        (try
+          (binding [ec/*execution-context* (:ctx room)]
+            (#'program/cancel-supervisor! supervisor)
+            (#'program/seal-supervisor! supervisor)
+            (let [waiter (future (#'program/await-supervisor! supervisor))]
+              (when (= ::cleanup-timeout
+                       (deref waiter 15000 ::cleanup-timeout))
+                (future-cancel waiter)
+                (throw (ex-info "Nested agent supervisor did not quiesce"
+                                {:type ::cleanup-timeout})))))
+          (finally
+            (try
+              (binding [ec/*execution-context* (:ctx room)]
+                (when (some #(= parent-id (:run/id %))
+                            (run/active-runs (:id room)))
+                  (run/finish! parent-id :cancelled)))
+              (world/settle! run-world :cancelled)
+              (finally
+                (d/close-room! room)))))))))
 
 (deftest roomless-sci-can-build-rosters-but-cannot-launch-effects
   (let [ctx     (context/create-execution-context)
