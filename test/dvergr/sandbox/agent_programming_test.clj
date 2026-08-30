@@ -4,7 +4,10 @@
             [dvergr.agent.run :as run]
             [dvergr.discourse :as d]
             [dvergr.resource :as resource]
+            [dvergr.room.registry :as room-registry]
+            [dvergr.room.store :as room-store]
             [dvergr.room.store.memory :as memory]
+            [dvergr.rooms :as rooms]
             [dvergr.sandbox :as sandbox]
             [dvergr.sandbox.ns.agent :as agent-ns]
             [dvergr.sandbox.ns.data :as data-ns]
@@ -13,7 +16,8 @@
             [dvergr.sandbox.ns.room :as room-ns]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.context :as context]
-            [org.replikativ.spindel.engine.core :as ec]))
+            [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.work :as native-work]))
 
 (defn- wait-until [pred timeout-ms]
   (let [deadline (+ (System/nanoTime) (* timeout-ms 1000000))]
@@ -22,6 +26,30 @@
         (pred) true
         (< (System/nanoTime) deadline) (do (Thread/sleep 5) (recur))
         :else false))))
+
+(defn- ordered-delete-store [delegate order]
+  (reify room-store/PRoomStore
+    (-store-room! [_ room-id metadata]
+      (room-store/-store-room! delegate room-id metadata))
+    (-load-room [_ id-or-slug]
+      (room-store/-load-room delegate id-or-slug))
+    (-delete-room! [_ room-id]
+      (swap! order conj :delete)
+      (room-store/-delete-room! delegate room-id))
+    (-list-rooms [_]
+      (room-store/-list-rooms delegate))
+    (-store-message! [_ room-id message]
+      (room-store/-store-message! delegate room-id message))
+    (-message-thread-root [_ room-id message-id]
+      (room-store/-message-thread-root delegate room-id message-id))
+    (-list-messages [_ room-id opts]
+      (room-store/-list-messages delegate room-id opts))
+    (-store-run! [_ room-id run]
+      (room-store/-store-run! delegate room-id run))
+    (-load-run [_ room-id run-id]
+      (room-store/-load-run delegate room-id run-id))
+    (-list-runs [_ room-id opts]
+      (room-store/-list-runs delegate room-id opts))))
 
 (deftest immutable-rosters-launch-composable-room-runs-from-sci
   (let [room    (d/make-room {:id :sci-agent-programming
@@ -204,6 +232,78 @@
                     (vals (:value result)))))
       (finally
         (d/close-room! room)))))
+
+(deftest room-work-registration-preserves-ownership-and-rejects-stale-incarnations
+  (let [room (d/make-room {:id :sci-work-incarnation
+                           :store (memory/make)})
+        other-ctx (context/create-execution-context)
+        controller (sandbox-work/create!
+                    (:id room) (:ctx room) {:controllers 1}
+                    :serial {} (fn [value] (sp/spin value)))]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (room-registry/register! room))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"controller limit"
+           (sandbox-work/create! (:id room) (:ctx room) {:controllers 1}
+                                 :serial {} (fn [value] (sp/spin value))))
+          "an idempotent registry refresh does not forget live controllers")
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"another live incarnation"
+           (binding [ec/*execution-context* (:ctx room)]
+             (room-registry/register! (assoc room :ctx other-ctx)))))
+      (is (identical? room
+                      (binding [ec/*execution-context* (:ctx room)]
+                        (room-registry/lookup (:id room))))
+          "a rejected replacement leaves the registered Room untouched")
+      (finally
+        (binding [ec/*execution-context* (:ctx room)]
+          (sandbox-work/close! controller))
+        (d/close-room! room)
+        (context/close-context! other-ctx)))))
+
+(deftest room-work-teardown-broadcasts-before-joining
+  (let [room (d/make-room {:id :sci-work-broadcast
+                           :store (memory/make)})
+        controllers (vec
+                     (repeatedly
+                      2
+                      #(sandbox-work/create!
+                        (:id room) (:ctx room) nil :serial {}
+                        (fn [value] (sp/spin value)))))
+        cancellations (atom 0)]
+    (try
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"failed waiting"
+           (with-redefs [native-work/cancel!
+                         (fn [_]
+                           (when (= 1 (swap! cancellations inc))
+                             (throw (ex-info "broken cancel" {}))))
+                         native-work/completion
+                         (fn [_]
+                           (fn [success _failure] (success true)))]
+             (sandbox-work/close-room-work! room))))
+      (is (= 2 @cancellations)
+          "one cancellation failure does not prevent sibling broadcast")
+      (finally
+        ;; Restore the real implementation and make the repeated close settle
+        ;; the already-fenced generation before ordinary Room teardown.
+        (sandbox-work/close-room-work! room)
+        (d/close-room! room)))))
+
+(deftest room-deletion-quiesces-sci-work-before-durable-delete
+  (let [order (atom [])
+        room (d/make-room {:id :sci-work-delete-order
+                           :store (ordered-delete-store (memory/make) order)})
+        close-room! d/close-room!]
+    (with-redefs [d/close-room!
+                  (fn [target]
+                    (swap! order conj :quiesce)
+                    (close-room! target))]
+      (is (:ok? (rooms/delete-room! room))))
+    (is (= :delete (last @order)))
+    (is (some #{:quiesce} (butlast @order))
+        "durable deletion happens only after the runtime quiescence fence")))
 
 (deftest room-sci-race-cancels-and-settles-its-owned-loser
   (let [room (d/make-room {:id :sci-agent-owned-race

@@ -17,7 +17,7 @@
    :ingress-capacity 1024
    :event-taps 8})
 
-(deftype Controller [native room-id owner-context taps ceiling])
+(deftype Controller [native room-id generation owner-context taps ceiling])
 
 (defonce ^:private lifecycle-lock (Object.))
 (defonce ^:private rooms* (atom {}))
@@ -88,8 +88,14 @@
 
 (defn- forget-controller! [^Controller controller]
   (locking lifecycle-lock
-    (swap! rooms* update-in [(.-room-id controller) :controllers]
-           (fn [controllers] (disj (or controllers #{}) controller))))
+    (let [room-id (.-room-id controller)
+          generation (.-generation controller)]
+      (swap! rooms*
+             (fn [rooms]
+               (if (= generation (get-in rooms [room-id :generation]))
+                 (update-in rooms [room-id :controllers]
+                            (fn [controllers] (disj (or controllers #{}) controller)))
+                 rooms)))))
   nil)
 
 (defn create!
@@ -99,8 +105,15 @@
   (let [ceiling (normalize-ceiling ceiling)
         opts (bounded-opts strategy ceiling opts)]
     (locking lifecycle-lock
-      (let [{:keys [state controllers]
-             :or {state :open controllers #{}}} (get @rooms* room-id)]
+      (let [{:keys [state controllers generation]
+             lifecycle-owner :owner-context
+             :as lifecycle} (get @rooms* room-id)]
+        (when-not lifecycle
+          (throw (ex-info "Room work admission has no live lifecycle owner"
+                          {:type ::room-not-registered :room-id room-id})))
+        (when-not (identical? lifecycle-owner owner-context)
+          (throw (ex-info "SCI session does not own this Room incarnation"
+                          {:type ::stale-room-incarnation :room-id room-id})))
         (when-not (= :open state)
           (throw (ex-info "Room work admission is closed for teardown"
                           {:type ::admission-closed :room-id room-id})))
@@ -111,9 +124,9 @@
                            :ceiling (:controllers ceiling)})))
         (let [native (binding [ec/*execution-context* owner-context]
                        (work/work-admission (assoc opts :strategy strategy) work-fn))
-              controller (Controller. native room-id owner-context (atom #{}) ceiling)]
-          (swap! rooms* assoc room-id
-                 {:state :open :controllers (conj controllers controller)})
+              controller (Controller. native room-id generation owner-context
+                                      (atom #{}) ceiling)]
+          (swap! rooms* update-in [room-id :controllers] conj controller)
           ;; A passive completion observer releases the allocation slot. It does
           ;; not own/cancel the controller and cannot be abandoned by SCI.
           (binding [ec/*execution-context* owner-context]
@@ -167,11 +180,14 @@
       (swap! taps disj event-source)))
   nil)
 
+(defn- cancel-controller! [^Controller controller]
+  (binding [ec/*execution-context* (.-owner-context controller)]
+    (work/cancel! (.-native controller))))
+
 (defn- await-controller! [^Controller controller deadline-ms]
   (let [settled (promise)
         ctx (.-owner-context controller)]
     (binding [ec/*execution-context* ctx]
-      (work/cancel! (.-native controller))
       ((work/completion (.-native controller))
        #(deliver settled [:ok %])
        #(deliver settled [:error %])))
@@ -192,27 +208,98 @@
                                  (second result))))))))
 
 (defn close-room-work!
-  "Fence, cancel, and join every SCI controller owned by `room`. Idempotent."
+  "Fence, broadcast cancellation to, and join every SCI controller owned by
+   `room`. Returns the fence generation. Repeated calls join the same fence."
   [room]
   (when room
     (let [room-id (:id room)
-          controllers
+          {:keys [controllers fence]}
           (locking lifecycle-lock
-            (let [controllers (get-in @rooms* [room-id :controllers] #{})]
-              (swap! rooms* assoc room-id
-                     {:state :closing :controllers controllers})
-              controllers))
-          deadline (+ (System/currentTimeMillis) 5000)]
+            (when-let [lifecycle (get @rooms* room-id)]
+              (when-not (identical? (:owner-context lifecycle) (:ctx room))
+                (throw (ex-info "Room instance does not own its work lifecycle"
+                                {:type ::stale-room-incarnation :room-id room-id})))
+              (let [fence (or (:fence lifecycle) (random-uuid))
+                    lifecycle (assoc lifecycle :state :closing :fence fence)]
+                (swap! rooms* assoc room-id lifecycle)
+                {:controllers (:controllers lifecycle) :fence fence})))
+          deadline (+ (System/currentTimeMillis) 5000)
+          failures (transient [])]
+      ;; Cancellation is a broadcast. A broken controller must not prevent its
+      ;; siblings from receiving the teardown signal.
       (doseq [controller controllers]
-        (await-controller! controller deadline))))
+        (try
+          (cancel-controller! controller)
+          (catch Throwable error
+            (conj! failures {:phase :cancel :controller controller :error error}))))
+      ;; Then join every controller against one common deadline, aggregating all
+      ;; failures so callers can retry or enter explicit recovery.
+      (doseq [controller controllers]
+        (try
+          (await-controller! controller deadline)
+          (catch Throwable error
+            (conj! failures {:phase :join :controller controller :error error}))))
+      (let [failures (persistent! failures)]
+        (when (seq failures)
+          (throw (ex-info "Room teardown failed waiting for SCI work"
+                          {:type ::room-work-teardown-failed
+                           :room-id room-id
+                           :fence fence
+                           :failures (mapv #(select-keys % [:phase]) failures)}
+                          (:error (first failures)))))
+        fence))))
+
+(defn recover-room-work!
+  "Reopen exactly the fenced Room incarnation identified by `fence`. Returns
+   true when recovery won, false for a stale/missing fence."
+  [room fence]
+  (when (and room fence)
+    (locking lifecycle-lock
+      (let [room-id (:id room)
+            lifecycle (get @rooms* room-id)]
+        (when (and (= fence (:fence lifecycle))
+                   (= :closing (:state lifecycle))
+                   (identical? (:owner-context lifecycle) (:ctx room)))
+          (swap! rooms* assoc room-id
+                 (-> lifecycle (assoc :state :open) (dissoc :fence)))
+          true)))))
+
+(defn- register-room! [room]
+  (let [room-id (:id room)
+        owner-context (:ctx room)]
+    (locking lifecycle-lock
+      (if-let [lifecycle (get @rooms* room-id)]
+        (cond
+          (not (identical? owner-context (:owner-context lifecycle)))
+          (throw (ex-info "Room id is still owned by another live incarnation"
+                          {:type ::room-incarnation-conflict :room-id room-id}))
+
+          (not= :open (:state lifecycle))
+          (throw (ex-info "Room work lifecycle is fenced"
+                          {:type ::admission-closed :room-id room-id}))
+
+          :else
+          ;; Idempotent refresh of the same Room context preserves controllers,
+          ;; ceilings, and the lifecycle generation.
+          nil)
+        (swap! rooms* assoc room-id
+               {:state :open
+                :generation (random-uuid)
+                :owner-context owner-context
+                :controllers #{}}))))
   nil)
 
-(defn- reopen-room! [room]
+(defn- unregister-room! [room-id]
+  ;; The pre-unregister fence leaves this incarnation :closing. Removing it
+  ;; makes stale SCI sessions fail closed instead of attaching to a later Room
+  ;; that happens to reuse the durable id.
   (locking lifecycle-lock
-    (swap! rooms* assoc (:id room) {:state :open :controllers #{}}))
+    (swap! rooms* dissoc room-id))
   nil)
 
-;; Registration reopens a reused durable room id. Pre-unregister is the common
-;; settlement boundary for close, fork discard, and merge cleanup.
-(room-registry/add-register-hook! ::work-admission reopen-room!)
+;; The safety hook runs before add-or-replace registration and may reject a
+;; stale incarnation. Pre-unregister is the common settlement boundary for
+;; close, fork discard, and merge cleanup.
+(room-registry/add-pre-register-hook! ::work-admission register-room!)
 (room-registry/add-pre-unregister-hook! ::work-admission close-room-work!)
+(room-registry/add-unregister-hook! ::work-admission unregister-room!)

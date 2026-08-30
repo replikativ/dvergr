@@ -15,6 +15,8 @@
             [dvergr.substrate.geschichte :as geschichte]
             [dvergr.room.registry :as registry]
             [dvergr.runtime.peer-bus :as peer-bus]
+            [dvergr.sandbox.work :as sandbox-work]
+            [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.yggdrasil :as ygg]))
 
@@ -662,6 +664,13 @@
                   (catch clojure.lang.ExceptionInfo error error))]
       (is (= "preflight conflict" (ex-message error)))
       (is (ygg/open-fork? (d/fork-handle fork)))
+      (let [controller (sandbox-work/create!
+                        (:id fork) (:ctx fork) nil :serial {}
+                        (fn [value] (sp/spin value)))]
+        (is (some? controller)
+            "failed settlement reopens the exact SCI work-admission generation")
+        (binding [ec/*execution-context* (:ctx fork)]
+          (sandbox-work/close! controller)))
       (d/post! fork (d/message :human nil "relay after failed merge"))
       (is (= true (deref relayed 2000 ::timeout)))
       (d/discard fork))))

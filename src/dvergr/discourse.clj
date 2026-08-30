@@ -683,7 +683,7 @@
       (install-room-listener! room f))))
 
 (defn- recover-room-quiescence!
-  [room callbacks error]
+  [room callbacks work-fence error]
   (let [handle (fork-handle room)
         token (get-in @(:meta room) [fork-transfer-state-key :token])]
     (if (or (nil? handle) (ygg/open-fork? handle))
@@ -707,8 +707,10 @@
                  room
                  (fn []
                    (locking (:meta room)
-                     (when (= token (get-in @(:meta room)
-                                            [fork-transfer-state-key :token]))
+                     (when (and (= token (get-in @(:meta room)
+                                                 [fork-transfer-state-key :token]))
+                                (or (nil? work-fence)
+                                    (sandbox-work/recover-room-work! room work-fence)))
                        (swap! (:meta room) dissoc fork-transfer-state-key)
                        true))))]
             (if recovered?
@@ -1346,6 +1348,7 @@
               receipt* (volatile! nil)
               listeners* (volatile! [])
               fence-token* (volatile! nil)
+              work-fence-token* (volatile! nil)
               {:keys [adopted receipt descriptor]}
               (try
                 ;; No worker may retain a capability into a substrate once
@@ -1354,7 +1357,11 @@
                 (vreset! listeners* (drain-room-listeners! fork :transfer))
                 (vreset! fence-token*
                          (get-in @(:meta fork) [fork-transfer-state-key :token]))
-                (sandbox-work/close-room-work! fork)
+                (try
+                  (vreset! work-fence-token* (sandbox-work/close-room-work! fork))
+                  (catch Throwable error
+                    (vreset! work-fence-token* (:fence (ex-data error)))
+                    (throw error)))
                 (drain-room-runs! fork)
                 ;; Once every admitted Run has physically stopped, retire its
                 ;; causal-post allowance before durable preparation or authority
@@ -1439,9 +1446,12 @@
                                  fork
                                  (fn []
                                    (locking (:meta fork)
-                                     (when (= @fence-token*
-                                              (get-in @(:meta fork)
-                                                      [fork-transfer-state-key :token]))
+                                     (when (and (= @fence-token*
+                                                   (get-in @(:meta fork)
+                                                           [fork-transfer-state-key :token]))
+                                                (or (nil? @work-fence-token*)
+                                                    (sandbox-work/recover-room-work!
+                                                     fork @work-fence-token*)))
                                        (swap! (:meta fork) dissoc fork-transfer-state-key)
                                        true))))]
                             (if recovered?
@@ -1851,9 +1861,14 @@
   ;; Idempotence: once unregistered, the fork is a zombie — re-discarding would
   ;; double-delete the yggdrasil branch (which errors). Guard on registry.
   (when (binding [ec/*execution-context* (fork-home-ctx fork)] (rreg/lookup (:id fork)))
-    (let [callbacks (drain-room-listeners! fork :discard)]
+    (let [callbacks (drain-room-listeners! fork :discard)
+          work-fence-token* (volatile! nil)]
       (try
-        (sandbox-work/close-room-work! fork)
+        (try
+          (vreset! work-fence-token* (sandbox-work/close-room-work! fork))
+          (catch Throwable error
+            (vreset! work-fence-token* (:fence (ex-data error)))
+            (throw error)))
         (drain-room-runs! fork)                ; stop work before removing its substrate
         (seal-room-quiescence! fork :discard)
         (when-let [handle (fork-handle fork)]
@@ -1871,7 +1886,7 @@
           (peer-bus/post! {:type :dvergr/fork-discarded
                            :dvergr/origin (:id fork)}))
         (catch Throwable error
-          (recover-room-quiescence! fork callbacks error)))))
+          (recover-room-quiescence! fork callbacks @work-fence-token* error)))))
   fork)
 
 (defn merge-room
@@ -1891,9 +1906,14 @@
    (doc/unified-fork-conversation.md, dvergr.rooms.forks/reconcile-merge!.)"
   ([parent fork] (merge-room parent fork {}))
   ([parent fork {:keys [merge-opts]}]
-   (let [callbacks (drain-room-listeners! fork :merge)]
+   (let [callbacks (drain-room-listeners! fork :merge)
+         work-fence-token* (volatile! nil)]
      (try
-       (sandbox-work/close-room-work! fork)
+       (try
+         (vreset! work-fence-token* (sandbox-work/close-room-work! fork))
+         (catch Throwable error
+           (vreset! work-fence-token* (:fence (ex-data error)))
+           (throw error)))
        (drain-room-runs! fork)                 ; stop work before merging its substrate
        (seal-room-quiescence! fork :merge)
    ;; (1) SUBSTRATE merge — branched yggdrasil systems (CRDTs, datahike, git) fold
@@ -1947,7 +1967,7 @@
                           :dvergr/parent   (:id parent)}))
        parent
        (catch Throwable error
-         (recover-room-quiescence! fork callbacks error))))))
+         (recover-room-quiescence! fork callbacks @work-fence-token* error))))))
 
 ;; ============================================================================
 ;; PR-style merge review

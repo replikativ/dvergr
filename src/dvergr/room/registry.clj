@@ -30,6 +30,19 @@
 ;; can be retried safely.
 (defonce ^:private pre-unregister-hooks (atom {}))
 
+;; Registration fences run before replacing the registry entry. They are for
+;; lifecycle owners whose identity must not be reset by an add-or-replace
+;; refresh. Unlike observational register hooks, failures propagate and leave
+;; the existing registry entry untouched.
+(defonce ^:private pre-register-hooks (atom {}))
+
+(defn add-pre-register-hook!
+  "Register a Room admission fence. `f` receives the prospective Room before
+   registry replacement; failures abort registration."
+  [id f]
+  (swap! pre-register-hooks assoc id f)
+  nil)
+
 (defn add-pre-unregister-hook!
   "Register a Room teardown fence. `f` receives the live Room before removal;
    failures abort unregister and remain visible to the caller."
@@ -63,6 +76,8 @@
   "Add or replace a Room in the registry, then run register hooks. Returns the
    Room."
   [room]
+  (doseq [f (vals @pre-register-hooks)]
+    (f room))
   (rctx/shared-swap-state! registry-path (fn [m] (assoc (or m {}) (:id room) room)))
   (doseq [f (vals @register-hooks)]
     (try (f room) (catch Throwable _ nil)))
