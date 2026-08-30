@@ -154,7 +154,25 @@
   [db entity room-touch]
   (if (dh/entity db [:message/id (:message/id entity)])
     []
-    [entity room-touch]))
+    (do
+      (when (some :activity/run-id (:message/activities entity))
+        (let [message-run-id (:message/run-id entity)
+              run            (and message-run-id
+                                  (dh/entity db [:run/id message-run-id]))
+              chat-id        (second (:message/chat entity))]
+          (when-not run
+            (throw (ex-info "Run-correlated activity references a missing Run"
+                            {:type :room-store/orphan-message-activity
+                             :message-id (:message/id entity)
+                             :run-id message-run-id})))
+          (when-not (= chat-id (:chat/id (:run/chat run)))
+            (throw (ex-info "Run-correlated activity crosses Room stores"
+                            {:type :room-store/activity-room-mismatch
+                             :message-id (:message/id entity)
+                             :run-id message-run-id
+                             :message-chat chat-id
+                             :run-chat (:chat/id (:run/chat run))})))))
+      [entity room-touch])))
 
 (defn- store-attention-if-absent
   "Transaction function preserving immutable attention identity under races."

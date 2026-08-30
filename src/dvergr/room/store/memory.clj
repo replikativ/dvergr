@@ -44,6 +44,17 @@
           [before _]
           (swap-vals! state
                       (fn [s]
+                        (when-let [activity-run-id
+                                   (some :activity/run-id
+                                         (get-in msg [:metadata :activities]))]
+                          (when-not (get-in s [:runs room-id activity-run-id])
+                            (throw
+                             (ex-info
+                              "Run-correlated activity references a missing Run in this Room"
+                              {:type :room-store/orphan-message-activity
+                               :room-id room-id
+                               :message-id msg-id
+                               :run-id activity-run-id}))))
                         (if (some #(= (:id %) msg-id)
                                   (get-in s [:messages room-id] []))
                           s

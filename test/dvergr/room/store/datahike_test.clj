@@ -19,6 +19,20 @@
       (schema/ensure-full-schema! conn)
       [conn (dhs/make conn)])))
 
+(defn- store-running-run! [st room-id run-id]
+  (let [now (java.util.Date.)]
+    (store/-store-run!
+     st room-id
+     {:run/id run-id
+      :run/kind :agent-task
+      :run/room room-id
+      :run/actor :agent
+      :run/trigger (random-uuid)
+      :run/status :running
+      :run/created-at now
+      :run/started-at now
+      :run/updated-at now})))
+
 (deftest message-envelope-contract
   (let [[_conn st] (mem-store)]
     (contract/assert-message-envelope! st :envelope-datahike)))
@@ -308,6 +322,7 @@
                     :activity/tool-use-id "call-1"
                     :activity/at (java.util.Date.)}]
       (store/-store-room! st room-id {:slug (name room-id) :title "T"})
+      (store-running-run! st room-id run-id)
       (store/-store-message!
        st room-id
        {:id (random-uuid) :from :agent :content "used a tool"
@@ -334,3 +349,77 @@
                                     :activity/run-id (random-uuid)
                                     :activity/kind :tool
                                     :activity/verb :invoke}]}})))))
+
+(deftest semantic-activity-requires-an-enclosing-message-run
+  (let [[_conn st] (mem-store)
+        room-id :activity-missing-message-run]
+    (store/-store-room! st room-id {:slug (name room-id) :title "T"})
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"requires an enclosing message Run"
+         (store/-store-message!
+          st room-id
+          {:id (random-uuid) :from :agent :content "orphan"
+           :metadata {:role :tool
+                      :activities [{:activity/id (random-uuid)
+                                    :activity/run-id (random-uuid)
+                                    :activity/kind :tool
+                                    :activity/verb :invoke}]}})))))
+
+(deftest semantic-activity-requires-a-run-in-the-same-room
+  (let [[_conn st] (mem-store)
+        room-a :activity-room-a
+        room-b :activity-room-b
+        run-id (random-uuid)
+        activity {:activity/id (random-uuid)
+                  :activity/run-id run-id
+                  :activity/kind :tool
+                  :activity/verb :invoke}]
+    (doseq [room-id [room-a room-b]]
+      (store/-store-room! st room-id {:slug (name room-id) :title "T"}))
+    (is (= :failed
+           (store/-store-message!
+            st room-a
+            {:id (random-uuid) :from :agent :content "missing"
+             :metadata {:role :tool :run-id run-id :activities [activity]}})))
+    (store-running-run! st room-b run-id)
+    (is (= :failed
+           (store/-store-message!
+            st room-a
+            {:id (random-uuid) :from :agent :content "cross-room"
+             :metadata {:role :tool :run-id run-id :activities [activity]}})))
+    (is (empty? (store/-list-messages st room-a {})))))
+
+(deftest repeated-semantic-id-cannot-mutate-an-earlier-message
+  (let [[conn st] (mem-store)
+        room-id :activity-component-ownership
+        run-id (random-uuid)
+        activity-id (random-uuid)
+        message-ids [(random-uuid) (random-uuid)]]
+    (store/-store-room! st room-id {:slug (name room-id) :title "T"})
+    (store-running-run! st room-id run-id)
+    (doseq [[message-id tool-name] (map vector message-ids ["first" "second"])]
+      (is (= :inserted
+             (store/-store-message!
+              st room-id
+              {:id message-id :from :agent :content tool-name
+               :metadata {:role :tool
+                          :run-id run-id
+                          :activities [{:activity/id activity-id
+                                        :activity/run-id run-id
+                                        :activity/kind :tool
+                                        :activity/verb :invoke
+                                        :activity/tool-name tool-name}]}}))))
+    (is (= ["first" "second"]
+           (mapv #(-> % :metadata :activities first :activity/tool-name)
+                 (store/-list-messages st room-id {}))))
+    (let [component-eids
+          (dh/q '[:find [?a ...]
+                  :in $ ?activity-id
+                  :where [?a :activity/id ?activity-id]]
+                @conn activity-id)]
+      (is (= 2 (count component-eids)))
+      (dh/transact conn [[:db/retractEntity [:message/id (first message-ids)]]])
+      (is (= "second"
+             (-> (store/-list-messages st room-id {}) first
+                 :metadata :activities first :activity/tool-name))))))

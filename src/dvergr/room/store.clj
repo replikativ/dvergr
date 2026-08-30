@@ -472,6 +472,11 @@
                           {:type :room-store/invalid-message-metadata
                            :message-run-id message-run-id
                            :activity activity})))))
+    (when (and (nil? (:run-id metadata))
+               (some :activity/run-id (:activities metadata)))
+      (throw (ex-info "Run-correlated activity requires an enclosing message Run"
+                      {:type :room-store/invalid-message-metadata
+                       :activities (:activities metadata)})))
     (when (contains? metadata :object)
       (let [object (:object metadata)]
         (when-not (map? object)

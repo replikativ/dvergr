@@ -333,8 +333,8 @@
   [;; Semantic activity components embedded in canonical room messages.
    {:db/ident :activity/id
     :db/valueType :db.type/uuid
-    :db/unique :db.unique/identity
-    :db/cardinality :db.cardinality/one}
+    :db/cardinality :db.cardinality/one
+    :db/doc "Semantic observation id; not an upsert identity because the entity is owned by one message"}
    {:db/ident :activity/run-id
     :db/valueType :db.type/uuid
     :db/cardinality :db.cardinality/one
