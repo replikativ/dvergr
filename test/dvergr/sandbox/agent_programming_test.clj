@@ -3,6 +3,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [dvergr.agent.run :as run]
             [dvergr.discourse :as d]
+            [dvergr.resource :as resource]
             [dvergr.room.store.memory :as memory]
             [dvergr.sandbox :as sandbox]
             [dvergr.sandbox.ns.agent :as agent-ns]
@@ -197,6 +198,61 @@
                 "  (:run/parent (agent/observe child)))")))]
         (is (:success result) (pr-str (:error result)))
         (is (= parent-id (:value result))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest sandbox-cannot-redirect-structural-parent-authority
+  (let [room      (d/make-room {:id :sci-agent-parent-authority
+                                :store (memory/make)})
+        sci-ctx   (sandbox/fork-for-session (:ctx room))
+        parent-id (random-uuid)]
+    (try
+      (agent-ns/add-programming-ns!
+       sci-ctx (:id room) (:ctx room)
+       {:program-kinds #{:echo :scripted}
+        :parent-run parent-id})
+      (let [result
+            (binding [ec/*execution-context* (:ctx room)]
+              (sandbox/eval-code
+               sci-ctx
+               (str
+                "(require '[dvergr.agent :as agent]) "
+                "(let [team (agent/make-agent (agent/roster) "
+                "                             {:id :child :program {:kind :echo}})] "
+                "  (agent/hire! team :child {:task :work "
+                "                             :parent-run #uuid \""
+                (random-uuid)
+                "\"}))")))]
+        (is (false? (:success result)))
+        (is (re-find #"current Run" (get-in result [:error :message])))
+        (is (empty? (run/active-runs (:id room))))
+        (is (empty? (d/messages room {:limit 10}))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest sandbox-balance-projects-only-the-current-resource-wallet
+  (let [room      (d/make-room {:id :sci-agent-balance
+                                :store (memory/make)})
+        sci-ctx   (sandbox/fork-for-session (:ctx room))
+        parent-id (random-uuid)]
+    (try
+      (with-redefs [resource/balance (fn [actual-room]
+                                       (is (= room actual-room))
+                                       {"cpu-ms" 100M})
+                    resource/run-balance (fn [actual-room actual-run]
+                                           (is (= room actual-room))
+                                           (is (= parent-id actual-run))
+                                           {"cpu-ms" 40M})]
+        (agent-ns/add-programming-ns!
+         sci-ctx (:id room) (:ctx room)
+         {:program-kinds #{:echo}
+          :parent-run parent-id})
+        (let [result (binding [ec/*execution-context* (:ctx room)]
+                       (sandbox/eval-code
+                        sci-ctx
+                        "(require '[dvergr.agent :as agent]) (agent/balance)"))]
+          (is (:success result) (pr-str (:error result)))
+          (is (= {"cpu-ms" 40M} (:value result)))))
       (finally
         (d/close-room! room)))))
 

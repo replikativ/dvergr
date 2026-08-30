@@ -12,12 +12,14 @@
             [dvergr.discourse :as d]
             [dvergr.model.chat :as model-chat]
             [dvergr.model.providers :as providers]
+            [dvergr.resource :as resource]
             [dvergr.room.registry :as registry]
             [dvergr.rooms.forks :as forks]
             [dvergr.room.store :as room-store]
             [dvergr.room.store.memory :as memory]
             [dvergr.room.store.datahike :as datahike-store]
             [dvergr.tools :as tools]
+            [kontor.governance :as kontor-governance]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.effects.await :refer [await]]
             [org.replikativ.spindel.engine.context :as context]
@@ -45,6 +47,26 @@
     (let [conn (dh/connect cfg)]
       (chat-schema/ensure-full-schema! conn)
       [(d/make-room {:id id :store (datahike-store/make conn)}) conn])))
+
+(defn- resource-test-room [id]
+  (let [cfg {:store {:backend :memory :id (random-uuid)}
+             :keep-history? true
+             :schema-flexibility :write}
+        chat-id (random-uuid)]
+    (dh/create-database cfg)
+    (let [conn (dh/connect cfg)]
+      (chat-schema/ensure-full-schema! conn)
+      (dh/transact conn
+                   [(merge (chat-schema/create-chat-entity
+                            {:id chat-id :title (name id)})
+                           {:room/slug (room-store/room-id->slug id)
+                            :room/type :internal})])
+      (resource/install-connection! conn id chat-id)
+      [(d/make-room {:id id :store (datahike-store/make conn)}) conn])))
+
+(defn- close-resource-test-room! [room conn]
+  (kontor-governance/ungovern! conn)
+  (d/close-room! room))
 
 (defn- fail-terminal-store [delegate fail-terminal?]
   (reify room-store/PRoomStore
@@ -114,6 +136,189 @@
         (is (empty? (run/active-runs :program-hire))))
       (finally
         (d/close-room! room)))))
+
+(deftest hire-splits-and-returns-a-conserved-resource-vector
+  (let [[room conn] (resource-test-room :program-resources)
+        team (roster/make-agent
+              (roster/make-roster {:id :resource-team})
+              {:id :worker
+               :program {:kind :scripted :delay-ms 250 :reply :done}})]
+    (try
+      (resource/mint! room {:id (random-uuid)
+                            :resources {resource/microdollars 10M}})
+      (let [handle (binding [ec/*execution-context* (:ctx room)]
+                     (program/hire! room team :worker
+                                    {:task :work
+                                     :resources {resource/microdollars 4M}}))]
+        (is (wait-until #(= {resource/microdollars 4M}
+                            (resource/run-balance room (program/run-id handle)))
+                        2000))
+        (is (= {resource/microdollars 6M} (resource/balance room)))
+        (is (= :completed
+               (:run/status
+                (binding [ec/*execution-context* (:ctx room)] @handle))))
+        ;; Public completion is durability-first: unused authority has already
+        ;; returned through the stable receipt before the handle resolves.
+        (is (= {resource/microdollars 10M} (resource/balance room)))
+        (is (= {} (resource/run-balance room (program/run-id handle)))))
+      (finally
+        (close-resource-test-room! room conn)))))
+
+(deftest ignored-owned-child-delays-parent-resource-settlement
+  (let [[room conn] (resource-test-room :program-owned-child-resources)
+        team (-> (roster/make-roster {:id :nested-resource-team})
+                 (roster/make-agent
+                  {:id :parent :program {:kind :scripted :reply :parent-done}})
+                 (roster/make-agent
+                  {:id :child :program {:kind :scripted :reply :child-done}}))
+        parent-runtime (promise)
+        status-key (keyword "dvergr.agent.program" "status")
+        value-key (keyword "dvergr.agent.program" "value")
+        execute-program
+        (fn [control-room work-room run-id _chat-id agent _task _trigger supervisor]
+          (if (= :parent (:agent/id agent))
+            (sp/spin
+             (deliver parent-runtime [supervisor work-room])
+             (sp/await (comb/sleep 1500))
+             {status-key :completed value-key :parent-done})
+            (sp/spin
+             (sp/await (comb/sleep 2500))
+             {status-key :completed value-key :child-done})))]
+    (try
+      (resource/mint! room {:id (random-uuid)
+                            :resources {resource/microdollars 10M}})
+      (with-redefs-fn
+        {#'program/execute-program execute-program}
+        (fn []
+          (binding [ec/*execution-context* (:ctx room)]
+            (let [parent (program/hire!
+                          room team :parent
+                          {:task :coordinate
+                           :resources {resource/microdollars 10M}})
+                  [supervisor parent-work] (deref parent-runtime 2000
+                                                  [::timeout nil])
+                  child (binding [ec/*execution-context* (:ctx parent-work)]
+                          (#'program/with-owned-child!
+                           supervisor
+                           #(do
+                              (program/hire-in!
+                               room parent-work team :child
+                               {:task :delegated
+                                :parent-run (program/run-id parent)
+                                :resources {resource/microdollars 4M}}))))]
+              (is (not= ::timeout supervisor))
+              (is (= ::timeout (deref parent 1750 ::timeout))
+                  "ignoring an owned handle cannot let the parent settle early")
+              (is (= {} (resource/balance room)))
+              (is (= {resource/microdollars 6M}
+                     (resource/run-balance room (program/run-id parent))))
+              (is (= {resource/microdollars 4M}
+                     (resource/run-balance room (program/run-id child))))
+              (is (= :child-done
+                     (:run/value
+                      (binding [ec/*execution-context* (:ctx parent-work)]
+                        (deref child 5000 ::timeout)))))
+              (is (= :parent-done (:run/value (deref parent 5000 ::timeout))))
+              (is (= {resource/microdollars 10M} (resource/balance room)))
+              (is (= {} (resource/run-balance room (program/run-id parent))))
+              (is (= {} (resource/run-balance room (program/run-id child))))))))
+      (finally
+        (deliver parent-runtime [::closed nil])
+        (close-resource-test-room! room conn)))))
+
+(deftest cancellation-during-child-admission-retains-the-ownership-lease
+  (let [[room conn] (resource-test-room :program-owned-child-cancel-race)
+        team (-> (roster/make-roster {:id :cancel-race-team})
+                 (roster/make-agent
+                  {:id :parent :program {:kind :scripted :reply :parent-done}})
+                 (roster/make-agent
+                  {:id :child :program {:kind :scripted :reply :child-done}}))
+        parent-runtime (promise)
+        admission-entered (promise)
+        release-admission (promise)
+        status-key (keyword "dvergr.agent.program" "status")
+        value-key (keyword "dvergr.agent.program" "value")
+        execute-program
+        (fn [_control-room work-room _run-id _chat-id agent _task _trigger supervisor]
+          (if (= :parent (:agent/id agent))
+            (sp/spin
+             (deliver parent-runtime [supervisor work-room])
+             (sp/await (comb/sleep 5000))
+             {status-key :completed value-key :parent-done})
+            (sp/spin
+             (sp/await (comb/sleep 1000))
+             {status-key :completed value-key :child-done})))]
+    (try
+      (resource/mint! room {:id (random-uuid)
+                            :resources {resource/microdollars 10M}})
+      (with-redefs-fn
+        {#'program/execute-program execute-program}
+        (fn []
+          (binding [ec/*execution-context* (:ctx room)]
+            (let [parent (program/hire!
+                          room team :parent
+                          {:task :coordinate
+                           :resources {resource/microdollars 10M}})
+                  [supervisor parent-work] (deref parent-runtime 2000
+                                                  [::timeout nil])
+                  child-future
+                  (future
+                    (binding [ec/*execution-context* (:ctx parent-work)]
+                      (#'program/with-owned-child!
+                       supervisor
+                       #(do
+                          (deliver admission-entered true)
+                          @release-admission
+                          (program/hire-in!
+                           room parent-work team :child
+                           {:task :delegated
+                            :parent-run (program/run-id parent)
+                            :resources {resource/microdollars 4M}})))))]
+              (is (not= ::timeout supervisor))
+              (is (= true (deref admission-entered 2000 ::timeout)))
+              (is (program/cancel! parent))
+              (is (= ::timeout (deref parent 100 ::timeout))
+                  "the admission reservation prevents early parent settlement")
+              (deliver release-admission true)
+              (let [child (deref child-future 3000 ::timeout)]
+                (is (not= ::timeout child))
+                (is (run/cancel-requested? (program/run-id child)))
+                (let [child-result
+                      (binding [ec/*execution-context* (:ctx parent-work)]
+                        (deref child 4000 ::timeout))]
+                  (is (= :cancelled (:run/status child-result))
+                      (pr-str {:result child-result
+                               :durable (program/observe room child)})))
+                (is (= :cancelled (:run/status (deref parent 5000 ::timeout))))
+                (is (= {resource/microdollars 10M} (resource/balance room)))
+                (is (= {} (resource/run-balance room (program/run-id parent))))
+                (is (= {} (resource/run-balance room (program/run-id child)))))))))
+      (finally
+        (deliver parent-runtime [::closed nil])
+        (deliver admission-entered false)
+        (deliver release-admission true)
+        (close-resource-test-room! room conn)))))
+
+(deftest failed-resource-admission-starts-no-agent-effect
+  (let [[room conn] (resource-test-room :program-resource-refusal)
+        team (test-roster)]
+    (try
+      (resource/mint! room {:id (random-uuid)
+                            :resources {resource/microdollars 3M}})
+      (is (thrown? Throwable
+                   (binding [ec/*execution-context* (:ctx room)]
+                     (program/hire! room team :analyst
+                                    {:task :too-expensive
+                                     :resources {resource/microdollars 4M}}))))
+      (is (= {resource/microdollars 3M} (resource/balance room)))
+      (is (empty? (d/messages room {:limit 10})))
+      (is (empty? (run/active-runs :program-resource-refusal)))
+      (is (= :failed
+             (:run/status
+              (first (room-store/-list-runs (:store room) (:id room)
+                                            {:limit 1})))))
+      (finally
+        (close-resource-test-room! room conn)))))
 
 (deftest settlement-policy-controls-the-isolated-run-world
   (let [room (test-room :program-settlement)

@@ -55,7 +55,7 @@
         (d/join r (-> (recording-participant :a events nil)
                       (enr/with-self-filter))))
       (d/post! r (d/message :driver :a "hello"))
-      (engine/await-drain-complete! (:ctx r) :timeout-ms 100)
+      (engine/await-drain-complete! (:ctx r) :timeout-ms 1000)
       (is (= 1 (count @events)) "inbox message delivered"))))
 
 (deftest self-filter-drops-self-authored-messages

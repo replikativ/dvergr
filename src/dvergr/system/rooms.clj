@@ -21,6 +21,8 @@
             [dvergr.system.db :as sdb]
             [dvergr.kb.schema :as kbs]
             [dvergr.chat.schema :as cschema]
+            [dvergr.resource :as resource]
+            [dvergr.room.store :as room-store]
             [dvergr.search.secondary :as search-secondary]
             [dvergr.scheduler.schema :as sched-schema]
             [dvergr.runtime.ctx :as rctx]
@@ -39,17 +41,24 @@
 ;; RUNS on this ctx (bus/turn/composite = ISOLATION); its identity in the
 ;; registry is Tier-1 shared (root). See `dvergr.runtime.ctx`.
 (defonce ^:private room-ctxs (atom {}))
+(defonce ^:private room-hydration-errors (atom {}))
 
 (defn room-ctx-for
-  "The room's own execution context (created by provision/hydrate), or nil."
+  "The room's own execution context (created by provision/hydrate), or nil.
+   A known hydration failure is not allowed to fall back to the daemon root."
   [room-id]
-  (get @room-ctxs room-id))
+  (if-let [error (get @room-hydration-errors room-id)]
+    (throw (ex-info "Room is unavailable because hydration failed"
+                    {:type ::room-hydration-failed :room/id room-id}
+                    error))
+    (get @room-ctxs room-id)))
 
 (defn clear-room-ctxs!
   "Drop all per-room execution contexts. Call on daemon stop! so a same-process
    restart doesn't reuse stale forked ctxs pointing at the previous daemon root."
   []
-  (reset! room-ctxs {}))
+  (reset! room-ctxs {})
+  (reset! room-hydration-errors {}))
 
 (defn- scope-path [scope] (str (io/file (paths/systems-dir) scope)))
 
@@ -136,6 +145,18 @@
   [slug]
   (java.util.UUID/nameUUIDFromBytes (.getBytes (str "dvergr-room-msgs|" slug))))
 
+(defn- ensure-msgs-resources!
+  "Install/re-register the conserved-resource kernel for one messages store."
+  [conn]
+  (when-let [[slug chat-id]
+             (d/q '[:find [?slug ?chat-id]
+                    :where
+                    [?room :room/slug ?slug]
+                    [?room :chat/id ?chat-id]]
+                  @conn)]
+    (resource/install-connection! conn (room-store/slug->room-id slug) chat-id))
+  conn)
+
 (defn- seed-msgs-store!
   "Create the per-room messages store (if absent), install the chat schema, and
    seed its single `:chat/*`+`:room/*` row so the DatahikeStore can scope messages
@@ -144,12 +165,13 @@
   ;; RF5: schedules are a per-room project artifact — the (transparent)
   ;; :schedule/* schema rides along as :extra-schema so the room's reactive
   ;; scheduler (dvergr.rooms.scheduler) can store + fire them from this store.
-  (sdh/provision! {:cfg (msgs-cfg path)
-                   :extra-schema sched-schema/schema
-                   :seed-tx [(merge (cschema/create-chat-entity
-                                     {:id (msgs-chat-id slug) :title (or name slug)})
-                                    {:room/slug slug :room/type :internal})]
-                   :register? false})
+  (-> (sdh/provision! {:cfg (msgs-cfg path)
+                       :extra-schema sched-schema/schema
+                       :seed-tx [(merge (cschema/create-chat-entity
+                                         {:id (msgs-chat-id slug) :title (or name slug)})
+                                        {:room/slug slug :room/type :internal})]
+                       :register? false})
+      ensure-msgs-resources!)
   ;; Declare the messages fulltext (scriptum) secondary index once, after the
   ;; chat schema is installed. It's schema data in the store, so it forks with
   ;; the room; datahike maintains it on every message transact. Best-effort.
@@ -163,8 +185,9 @@
   [msgs-path kb-path repo-path]
   ;; Schema was installed at creation (seed-msgs-store! / provision-room!) —
   ;; registration is a boot concern, so :schema? false keeps it connect+register.
-  (sdh/provision! {:cfg (msgs-cfg msgs-path) :schema? false
-                   :system-name (msgs-system-name msgs-path)})
+  (-> (sdh/provision! {:cfg (msgs-cfg msgs-path) :schema? false
+                       :system-name (msgs-system-name msgs-path)})
+      ensure-msgs-resources!)
   (sdh/provision! {:cfg (kb-cfg kb-path) :schema? false
                    :system-name (kb-system-name kb-path)})
   (ygg/register! (geschichte/create-system :scope repo-path
@@ -172,12 +195,29 @@
 
 (defn- register-system-into-current!
   "Register one registry system (`{:system/type :system/scope}`) into the bound
-   ctx's composite. Best-effort."
+   ctx's composite. Optional systems remain best-effort; a messages-store
+   resource-governance failure is fatal because publishing that Room would
+   silently remove its mandatory accounting boundary."
   [{:system/keys [type scope]}]
   (try
     (case type
-      :msgs (sdh/provision! {:cfg (msgs-cfg scope) :schema? false
-                             :system-name (msgs-system-name scope)})
+      :msgs (let [conn (sdh/provision! {:cfg (msgs-cfg scope)
+                                        :schema? false
+                                        :register? false})]
+              (try
+                ;; Establish mandatory accounting governance before publishing
+                ;; this connection as a fork-visible Yggdrasil system. A failed
+                ;; install therefore cannot leave a partially registered Room
+                ;; context behind.
+                (ensure-msgs-resources! conn)
+                (sdh/provision! {:conn conn :schema? false
+                                 :system-name (msgs-system-name scope)})
+                (catch Throwable error
+                  ;; Governance is store-global and idempotent, not owned by
+                  ;; this connection attempt. It may protect another live Room
+                  ;; sharing the store, so release only this connection.
+                  (d/release conn)
+                  (throw error))))
       :kb   (sdh/provision! {:cfg (kb-cfg scope) :schema? false
                              :system-name (kb-system-name scope)})
       :repo (ygg/register! (geschichte/create-system :scope scope
@@ -188,7 +228,14 @@
       :data (sdh/provision! {:conn (connect-data-store scope) :schema? false
                              :system-name (str "room-data-" (.getName (io/file scope)))})
       nil)
-    (catch Throwable _ nil)))
+    (catch Throwable error
+      (when (= :msgs type)
+        (throw (ex-info "Messages resource kernel failed to hydrate"
+                        {:type ::resource-hydration-failed
+                         :system/type type
+                         :system/scope scope}
+                        error)))
+      nil)))
 
 (defn hydrate-rooms!
   "Recreate each room's OWN execution context (RF5 S2) on daemon boot and
@@ -199,19 +246,29 @@
    Best-effort per room."
   []
   (doseq [{:room/keys [id]} (sdb/all-rooms)]
-    (try
-      (let [room-ctx (sctx/fork-context (rctx/current-root))]
+    (let [room-ctx (sctx/fork-context (rctx/current-root))]
+      (try
         (binding [ec/*execution-context* room-ctx]
-          (doseq [{:keys [system]} (sdb/systems-for-room id)]
+          ;; The mandatory messages/accounting system is always first. If it
+          ;; cannot be governed, the fresh fork has not registered any Room
+          ;; systems and can be safely withheld without a separate fork-close
+          ;; lifecycle (Spindel forks share their root lifecycle).
+          (doseq [{:keys [system]}
+                  (sort-by #(if (= :msgs (get-in % [:system :system/type])) 0 1)
+                           (sdb/systems-for-room id))]
             (register-system-into-current! system)))
-        (swap! room-ctxs assoc id room-ctx))
-      ;; Never swallow silently: a room that fails to hydrate has NO ctx → callers
-      ;; fall back to the daemon ROOT ctx and lose all per-room isolation. Log loudly.
-      (catch Throwable e
-        ((requiring-resolve 'taoensso.telemere/log!)
-         {:level :error :id :rooms/hydrate-failed
-          :data {:room id :error (.getMessage e)}}
-         "Room hydration failed — room will lack per-room isolation until restart")))))
+        (swap! room-ctxs assoc id room-ctx)
+        (swap! room-hydration-errors dissoc id)
+        (catch Throwable e
+          (swap! room-hydration-errors assoc id e)
+          ;; Fork contexts share the root lifecycle and are not independently
+          ;; closeable. Mandatory messages governance is established before its
+          ;; system is registered, so this fresh unpublished context has no
+          ;; accounting system/capability to retain when that step fails.
+          ((requiring-resolve 'taoensso.telemere/log!)
+           {:level :error :id :rooms/hydrate-failed
+            :data {:room id :error (.getMessage e)}}
+           "Room hydration failed — context was withheld"))))))
 
 (defn provision-room!
   "Create a room/project with its OWN execution context (RF5 S2) holding its own
@@ -259,6 +316,7 @@
         (binding [ec/*execution-context* room-ctx]
           (register-room-systems! msgs-path kb-path repo-path))
         (swap! room-ctxs assoc room-id room-ctx)
+        (swap! room-hydration-errors dissoc room-id)
         (sdb/attach! room-id repo-id :owner)
         (sdb/attach! room-id kb-id   :owner)
         (sdb/attach! room-id msgs-id :owner)

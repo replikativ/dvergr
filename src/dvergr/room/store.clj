@@ -84,6 +84,31 @@
     "Return recent Runs, newest first. Optional :status and :actor filters are
      applied before :limit."))
 
+(defprotocol PResourceStore
+  "Conserved resource authority cohabiting with durable Room control state.
+
+   This deliberately exposes semantic wallet/transfer operations rather than a
+   raw database connection. SCI programs receive still narrower closures over
+   these operations, so they cannot mint authority or bypass the governor."
+
+  (-open-resource-wallet! [this spec]
+    "Open or idempotently re-open a wallet from {:id :owner :name}.")
+
+  (-install-resource-unit! [this spec]
+    "Install or idempotently re-install one conserved resource coordinate.")
+
+  (-allocate-resource-wallet! [this wallet-spec transfer-spec]
+    "Atomically open a child wallet and grant its initial conserved vector.")
+
+  (-resource-balance [this account]
+    "Return the current conserved vector for a wallet/account ref.")
+
+  (-transfer-resources! [this spec]
+    "Commit a governed :mint/:grant/:consume/:return transfer spec.")
+
+  (-resource-receipt [this transfer-id]
+    "Return the durable transfer receipt, or nil."))
+
 ;; =============================================================================
 ;; Helpers
 ;; =============================================================================

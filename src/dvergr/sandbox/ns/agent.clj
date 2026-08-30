@@ -63,6 +63,8 @@
         run-id*        (requiring-resolve 'dvergr.agent.program/run-id)
         result-spin*   (requiring-resolve 'dvergr.agent.program/result-spin)
         owned-result-spin* (requiring-resolve 'dvergr.agent.program/owned-result-spin)
+        room-balance*  (requiring-resolve 'dvergr.resource/balance)
+        run-balance*   (requiring-resolve 'dvergr.resource/run-balance)
         room-lookup*   (requiring-resolve 'dvergr.room.registry/lookup)
         current-room   (fn []
                          (when room-id
@@ -90,7 +92,8 @@
                                control-room (control-room! work-room)
                                definition (lookup-agent* roster agent-ref)
                                kind (get-in definition [:agent/program :kind])
-                               allowed-kinds (:program-kinds agent-program-ceiling)]
+                               allowed-kinds (:program-kinds agent-program-ceiling)
+                               ambient-parent (:parent-run agent-program-ceiling)]
                            (when (and allowed-kinds
                                       (not (contains? allowed-kinds kind)))
                              (throw (ex-info
@@ -99,13 +102,24 @@
                                       :agent-ref agent-ref
                                       :program-kind kind
                                       :allowed-program-kinds allowed-kinds})))
+                           (when (and ambient-parent
+                                      (contains? opts :parent-run)
+                                      (not= ambient-parent (:parent-run opts)))
+                             (throw (ex-info
+                                     "Child parent must be the current Run"
+                                     {:type ::parent-run-exceeds-authority
+                                      :parent-run (:parent-run opts)
+                                      :current-run ambient-parent})))
                            (binding [ec/*execution-context* (:ctx work-room)]
-                             (hire-in* control-room work-room roster agent-ref
-                                       (if (and (:parent-run agent-program-ceiling)
-                                                (not (contains? opts :parent-run)))
-                                         (assoc opts :parent-run
-                                                (:parent-run agent-program-ceiling))
-                                         opts)))))
+                             (let [admit-child!
+                                   #(hire-in* control-room work-room roster agent-ref
+                                              (if (and ambient-parent
+                                                       (not (contains? opts :parent-run)))
+                                                (assoc opts :parent-run ambient-parent)
+                                                opts))]
+                               (if-let [own-child! (:own-child! agent-program-ceiling)]
+                                 (own-child! admit-child!)
+                                 (admit-child!))))))
         observe-fn     (fn [handle-or-id]
                          (let [work-room (room!)
                                control-room (control-room! work-room)]
@@ -118,7 +132,13 @@
                          (let [work-room (room!)
                                control-room (control-room! work-room)]
                            (binding [ec/*execution-context* (:ctx work-room)]
-                             (cancel* control-room handle-or-id))))]
+                             (cancel* control-room handle-or-id))))
+        balance-fn     (fn []
+                         (let [work-room (room!)
+                               control-room (control-room! work-room)]
+                           (if-let [run-id (:parent-run agent-program-ceiling)]
+                             (run-balance* control-room run-id)
+                             (room-balance* control-room))))]
     (sci/add-namespace!
      sci-ctx 'dvergr.agent
      (doc/with-docs
@@ -132,6 +152,7 @@
         'hire!        hire-fn
         'observe      observe-fn
         'cancel!      cancel-fn
+        'balance      balance-fn
         'run-id       run-id*
         'result-spin  result-spin*
         'owned-result-spin owned-result-spin*}
@@ -142,9 +163,10 @@
          ref          [([agent-def]) "Return the stable {:agent/id :agent/version} reference for an AgentDef."]
          list         [([roster]) "All AgentDefs in a Roster, deterministically ordered by id."]
          select       [([roster selector]) "Select AgentDefs by :id, :status, :skill/:skills, and exact portable :where data."]
-         hire!        [([roster agent-ref opts]) "Durably start one AgentDef in the current Room: (hire! team :a {:task value}). Returns a RunHandle; opts may also include :from and structural :parent-run."]
+         hire!        [([roster agent-ref opts]) "Durably start one owned AgentDef in the current Room: (hire! team :a {:task value :resources {\"microUSD\" 1000}}). Returns a RunHandle. The current Run remains responsible for the child even if the handle is ignored; opts may also include :from, :settlement, and a positive conserved :resources vector split from the current Run/Room."]
          observe      [([handle-or-run-id]) "Read the current Room's durable Run projection for a RunHandle or UUID."]
          cancel!      [([handle-or-run-id]) "Request cooperative cancellation of exactly one live Run. Returns true when the Run was found."]
+         balance      [([]) "Return the conserved resource vector available to the current Run, or the Room root at top level."]
          run-id       [([handle]) "Return the durable Run UUID represented by a RunHandle."]
          result-spin  [([handle]) "Return a passive Spindel observer Spin for a RunHandle. Multiple observers may await it; cancelling an observer does not cancel the Run."]
          owned-result-spin [([handle]) "Return an ownership-coupled result Spin. Cancelling this observer also cancels the underlying Run; use only when the observer owns that child execution."]}))))
