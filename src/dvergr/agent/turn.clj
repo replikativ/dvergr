@@ -11,6 +11,7 @@
    - `post-turn-activity!` — the 🔧 tool-activity play-by-play (→ room `:_activity`)
    - `cancel?-fn` — the SSE-abort predicate threaded into `run-agent-turn!`"
   (:require [clojure.string :as str]
+            [dvergr.activity :as activity]
             [org.replikativ.spindel.engine.core :as rtc]
             [dvergr.discourse :as d]
             [dvergr.chat.context :as chat-ctx]
@@ -201,10 +202,14 @@
            (let [uses    (vec (or (:message/tool-uses m) (:tool-uses m)))
                  names   (keep #(or (:tool-use/name %) (:name %)) uses)
                  summary (str "🔧 " (str/join ", " names))
-                 reason  (or (:message/reasoning m) (:reasoning m))]
+                 reason  (or (:message/reasoning m) (:reasoning m))
+                 source-id (or (:message/id m) (:id m))]
              (d/post! room (activity-message
                             agent-id summary run-id trigger
-                            (cond-> {:role :tool :tool-uses uses}
+                            (cond-> {:role :tool
+                                     :tool-uses uses
+                                     :activities (activity/tool-activities
+                                                  run-id source-id uses)}
                               (seq reason) (assoc :reasoning reason)))))))
        (reset! posted (count tool-msgs)))
      nil)))
@@ -230,7 +235,11 @@
                  agent-id
                  (format "⚠️ budget exhausted — $%.2f of $%.2f used. I have stopped and am spending nothing. Raise the room budget and message me to continue."
                          (double used-dollars) (double total-dollars))
-                 run-id trigger {:role :tool}))))
+                 run-id trigger
+                 {:role :tool
+                  :activities [(activity/lifecycle-activity
+                                run-id :budget :exhaust :blocked
+                                "Run budget exhausted")]}))))
    nil))
 
 (defn post-turn-error!
@@ -247,6 +256,9 @@
      (binding [rtc/*execution-context* (:ctx room)]
        (let [detail (or (some-> err ex-message) (some-> err str) "LLM error")]
          (d/post! room
-                  (activity-message agent-id (str "⚠️ turn failed — " detail)
-                                    run-id trigger {:role :tool})))))
+                  (activity-message
+                   agent-id (str "⚠️ turn failed — " detail) run-id trigger
+                   {:role :tool
+                    :activities [(activity/lifecycle-activity
+                                  run-id :run :fail :failed detail)]})))))
    nil))

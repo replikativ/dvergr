@@ -386,13 +386,17 @@
   #{:role :source-user :source-username :source-user-id
     :audience :mentions :attachment :provenance
     :object
-    :tool-uses :reasoning :kind :from :source :schedule-id
+    :tool-uses :activities :reasoning :kind :from :source :schedule-id
     :notification/type :notification/agent :notification/task
     :notification/elapsed :run-id})
 
 (def ^:private attachment-metadata-keys #{:blob-id :node-id :mime :name :size})
 (def ^:private provenance-metadata-keys #{:mode :source})
 (def ^:private object-metadata-keys #{:kind :id})
+(def ^:private activity-metadata-keys
+  #{:activity/id :activity/run-id :activity/kind :activity/verb
+    :activity/status :activity/tool-name :activity/tool-use-id
+    :activity/outcome :activity/critical? :activity/at})
 
 (defn- reject-unknown-metadata! [kind allowed value]
   (let [unknown (seq (remove allowed (keys (or value {}))))]
@@ -402,6 +406,34 @@
                        :kind kind
                        :unknown (set unknown)
                        :allowed allowed})))))
+
+(defn- validate-activity! [activity]
+  (when-not (map? activity)
+    (throw (ex-info "Message activity must be a map"
+                    {:type :room-store/invalid-message-metadata
+                     :activity activity})))
+  (reject-unknown-metadata! :activity activity-metadata-keys activity)
+  (doseq [[key pred label] [[:activity/id uuid? "UUID"]
+                            [:activity/kind keyword? "keyword"]
+                            [:activity/verb keyword? "keyword"]
+                            [:activity/run-id uuid? "UUID"]
+                            [:activity/status keyword? "keyword"]
+                            [:activity/tool-name string? "string"]
+                            [:activity/tool-use-id string? "string"]
+                            [:activity/outcome string? "string"]
+                            [:activity/critical? boolean? "boolean"]
+                            [:activity/at #(instance? java.util.Date %) "instant"]]]
+    (when (and (contains? activity key) (not (pred (get activity key))))
+      (throw (ex-info (str "Message " key " must be a " label)
+                      {:type :room-store/invalid-message-metadata
+                       :key key :activity activity}))))
+  (when-not (and (uuid? (:activity/id activity))
+                 (keyword? (:activity/kind activity))
+                 (keyword? (:activity/verb activity)))
+    (throw (ex-info "Message activity requires UUID :activity/id and keyword kind/verb"
+                    {:type :room-store/invalid-message-metadata
+                     :activity activity})))
+  activity)
 
 (defn validate-message-metadata!
   "Validate the typed durable message metadata vocabulary and return `metadata`.
@@ -426,6 +458,20 @@
                         {:type :room-store/invalid-message-metadata
                          :provenance provenance})))
       (reject-unknown-metadata! :provenance provenance-metadata-keys provenance))
+    (when (contains? metadata :activities)
+      (when-not (sequential? (:activities metadata))
+        (throw (ex-info "Message :activities must be sequential"
+                        {:type :room-store/invalid-message-metadata
+                         :activities (:activities metadata)})))
+      (run! validate-activity! (:activities metadata)))
+    (when-let [message-run-id (:run-id metadata)]
+      (doseq [activity (:activities metadata)]
+        (when (and (:activity/run-id activity)
+                   (not= message-run-id (:activity/run-id activity)))
+          (throw (ex-info "Message activity Run must match its enclosing message"
+                          {:type :room-store/invalid-message-metadata
+                           :message-run-id message-run-id
+                           :activity activity})))))
     (when (contains? metadata :object)
       (let [object (:object metadata)]
         (when-not (map? object)

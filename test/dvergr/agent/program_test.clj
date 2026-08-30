@@ -494,7 +494,16 @@
                  (program/run-id handle)))
           (is (= ["clojure_eval"]
                  (mapv :tool-use/name
-                       (get-in activity [:metadata :tool-uses]))))))
+                       (get-in activity [:metadata :tool-uses]))))
+          (is (= [{:activity/kind :tool
+                   :activity/verb :invoke
+                   :activity/run-id (program/run-id handle)
+                   :activity/tool-name "clojure_eval"
+                   :activity/tool-use-id "call-1"}]
+                 (mapv #(select-keys % [:activity/kind :activity/verb
+                                        :activity/run-id :activity/tool-name
+                                        :activity/tool-use-id])
+                       (get-in activity [:metadata :activities]))))))
       (finally
         (d/close-room! room)))))
 

@@ -293,3 +293,44 @@
       (let [m (first (store/-list-messages st room-id {}))]
         (is (= "hi" (:content m)))
         (is (not (contains? m :tool-uses)))))))
+
+(deftest semantic-activities-round-trip
+  (testing "typed activities remain attached to their canonical room message"
+    (let [[_conn st] (mem-store)
+          room-id :activity-round-trip
+          activity-id (random-uuid)
+          run-id (random-uuid)
+          activity {:activity/id activity-id
+                    :activity/run-id run-id
+                    :activity/kind :tool
+                    :activity/verb :invoke
+                    :activity/tool-name "clojure_eval"
+                    :activity/tool-use-id "call-1"
+                    :activity/at (java.util.Date.)}]
+      (store/-store-room! st room-id {:slug (name room-id) :title "T"})
+      (store/-store-message!
+       st room-id
+       {:id (random-uuid) :from :agent :content "used a tool"
+        :metadata {:role :tool :run-id run-id :activities [activity]}})
+      (let [stored (-> (store/-list-messages st room-id {}) first :metadata :activities first)]
+        (is (= (dissoc activity :activity/at)
+               (dissoc stored :activity/at)))
+        (is (= (.getTime ^java.util.Date (:activity/at activity))
+               (.getTime ^java.util.Date (:activity/at stored))))))))
+
+(deftest semantic-activity-run-cannot-contradict-its-message
+  (let [[_conn st] (mem-store)
+        room-id :activity-run-mismatch]
+    (store/-store-room! st room-id {:slug (name room-id) :title "T"})
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"activity Run must match"
+         (store/-store-message!
+          st room-id
+          {:id (random-uuid) :from :agent :content "impossible provenance"
+           :metadata {:role :tool
+                      :run-id (random-uuid)
+                      :activities [{:activity/id (random-uuid)
+                                    :activity/run-id (random-uuid)
+                                    :activity/kind :tool
+                                    :activity/verb :invoke}]}})))))

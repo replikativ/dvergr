@@ -294,6 +294,12 @@
     :db/isComponent true
     :db/doc "Tool use requests in this message (references tool-use entities)"}
 
+   {:db/ident :message/activities
+    :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/many
+    :db/isComponent true
+    :db/doc "Compact semantic work observations projected into this message"}
+
    ;; Tool result reference (for tool-result messages)
    {:db/ident :message/tool-use-id
     :db/valueType :db.type/string
@@ -324,7 +330,41 @@
 (def tool-call-schema
   "Schema for tool calls within messages.
    Note: Uses :tool-use/ prefix for component entities in messages."
-  [;; Tool call tracking (for analytics)
+  [;; Semantic activity components embedded in canonical room messages.
+   {:db/ident :activity/id
+    :db/valueType :db.type/uuid
+    :db/unique :db.unique/identity
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :activity/run-id
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+   {:db/ident :activity/kind
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :activity/verb
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :activity/status
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :activity/tool-name
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :activity/tool-use-id
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :activity/outcome
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :activity/critical?
+    :db/valueType :db.type/boolean
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :activity/at
+    :db/valueType :db.type/instant
+    :db/cardinality :db.cardinality/one}
+
+   ;; Tool call tracking (for analytics)
    {:db/ident :tool-call/id
     :db/valueType :db.type/uuid
     :db/unique :db.unique/identity

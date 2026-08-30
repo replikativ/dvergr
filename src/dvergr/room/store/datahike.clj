@@ -139,6 +139,7 @@
       ;; gap where the room-store path used to drop tool-uses the chat-ctx
       ;; path kept.
       (seq (:tool-uses metadata)) (assoc :message/tool-uses (vec (:tool-uses metadata)))
+      (seq (:activities metadata)) (assoc :message/activities (vec (:activities metadata)))
       ;; Interleaved-thinking trace from a reasoning-model reply, so it survives
       ;; rehydration and is fed back to the model (see room-context seeding).
       (seq (:reasoning metadata))  (assoc :message/reasoning (:reasoning metadata)))))
@@ -235,7 +236,11 @@
     :message/notification-elapsed
     {:message/tool-uses
      [:tool-use/id :tool-use/name
-      {:tool-use/input [*]}]}])
+      {:tool-use/input [*]}]}
+    {:message/activities
+     [:activity/id :activity/run-id :activity/kind :activity/verb
+      :activity/status :activity/tool-name :activity/tool-use-id
+      :activity/outcome :activity/critical? :activity/at]}])
 
 (def ^:private run-pull-pattern
   '[:run/id :run/kind :run/room :run/actor :run/trigger :run/parent
@@ -516,6 +521,8 @@
                                           (:message/notification-elapsed m))
                                    (seq (:message/tool-uses m))
                                    (assoc :tool-uses (:message/tool-uses m))
+                                   (seq (:message/activities m))
+                                   (assoc :activities (:message/activities m))
                                    (seq (:message/reasoning m))
                                    (assoc :reasoning (:message/reasoning m)))]
                     (store/normalize-message-thread
