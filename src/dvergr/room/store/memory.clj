@@ -98,12 +98,13 @@
   (-store-attention! [_ room-id fact]
     (let [fact (store/validate-attention! fact)
           path [:attention room-id (:attention/id fact)]
-          existing (get-in @state path)]
-      (when (and existing (not= existing fact))
+          [_ after]
+          (swap-vals! state #(if (get-in % path) % (assoc-in % path fact)))
+          stored (get-in after path)]
+      (when-not (= stored fact)
         (throw (ex-info "Attention identity is immutable"
                         {:type :room-store/attention-identity-collision
-                         :existing existing :fact fact})))
-      (swap! state #(if (get-in % path) % (assoc-in % path fact)))
+                         :existing stored :fact fact})))
       fact))
 
   (-list-attention [_ room-id {:keys [participant limit]}]
