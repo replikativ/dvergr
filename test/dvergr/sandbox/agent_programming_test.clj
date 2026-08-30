@@ -273,6 +273,57 @@
         (d/close-room! room)
         (d/close-room! other-room)))))
 
+(deftest registry-reservation-does-not-hold-global-lock-while-draining
+  (let [room (d/make-room {:id :registry-drain-target
+                           :store (memory/make)})
+        entered (promise)
+        release (promise)]
+    (room-registry/add-pre-unregister-hook!
+     ::park-target-drain
+     (fn [target]
+       (when (= (:id room) (:id target))
+         (deliver entered true)
+         @release)))
+    (let [unregister (future
+                       (binding [ec/*execution-context* (:ctx room)]
+                         (room-registry/unregister! (:id room))))]
+      (is (= true (deref entered 2000 ::timeout)))
+      (let [other-future
+            (future
+              (d/make-room {:id :registry-unrelated-room
+                            :ctx (:ctx room)
+                            :store (memory/make)}))
+            other (deref other-future 1000 ::timeout)]
+        (try
+          (is (not= ::timeout other)
+              "unrelated registration proceeds while a Room drains outside the monitor")
+          (finally
+            (deliver release true)
+            (is (nil? (deref unregister 2000 ::timeout)))
+            (when-not (= ::timeout other)
+              (d/close-room! other))))))))
+
+(deftest sci-room-deletion-uses-lifecycle-aware-supervisor-path
+  (let [parent (d/make-room {:id :sci-delete-parent
+                             :store (memory/make)})
+        child (binding [ec/*execution-context* (:ctx parent)]
+                (d/fork-room parent {:isolation :ctx}))
+        deleted (atom nil)]
+    (try
+      (with-redefs [rooms/delete-room!
+                    (fn [room]
+                      (reset! deleted room)
+                      {:ok? true})]
+        (let [ops (kb-ns/room-ops-map (:ctx parent))]
+          (is (= {:deleted (:id child)} (('delete! ops) child)))
+          (is (identical? child @deleted))
+          (is (thrown-with-msg?
+               clojure.lang.ExceptionInfo #"cannot delete itself"
+               (('delete! ops) parent)))))
+      (finally
+        (d/discard child)
+        (d/close-room! parent)))))
+
 (deftest room-work-teardown-broadcasts-before-joining
   (let [room (d/make-room {:id :sci-work-broadcast
                            :store (memory/make)})

@@ -69,12 +69,12 @@
         join-agent!*    @(ns-resolve 'dvergr.rooms 'join-agent!)
         leave-agent!*   @(ns-resolve 'dvergr.rooms 'leave-agent!)
         set-parent!*    @(ns-resolve 'dvergr.rooms 'set-parent!)
+        delete-room!*   @(ns-resolve 'dvergr.rooms 'delete-room!)
         get-by-slug*    @(ns-resolve 'dvergr.rooms 'get-room-by-slug)
         slug->id*       @(ns-resolve 'dvergr.room.store 'slug->room-id)
         rreg-lookup*    @(ns-resolve 'dvergr.room.registry 'lookup)
         rreg-list*      @(ns-resolve 'dvergr.room.registry 'list-rooms)
         rreg-children*  @(ns-resolve 'dvergr.room.registry 'children)
-        delete!*        @(ns-resolve 'dvergr.room.store '-delete-room!)
         registry*       (find-ns 'dvergr.room.registry)
         rstore-ns*      (find-ns 'dvergr.room.store)
         ;; Helpers
@@ -142,10 +142,21 @@
         delete-fn   (fn [ref]
                       (binding [rtc/*execution-context* spindel-ctx]
                         (if-let [room (resolve-room ref)]
-                          (let [store (:store room)]
-                            (when store (delete!* store (:id room)))
-                            ((ns-resolve 'dvergr.room.registry 'unregister!) (:id room))
-                            {:deleted (:id room)})
+                          (do
+                            ;; An SCI evaluation cannot synchronously join its
+                            ;; own controller/context teardown. Self-deletion is
+                            ;; a supervisor effect; subordinate Rooms are safe.
+                            (when (identical? spindel-ctx (:ctx room))
+                              (throw (ex-info "A Room cannot delete itself from its own SCI runtime"
+                                              {:type ::self-delete
+                                               :room-id (:id room)})))
+                            (let [result (delete-room!* room)]
+                              (if (:ok? result)
+                                {:deleted (:id room)}
+                                (throw (ex-info "Room deletion failed"
+                                                {:type ::room-delete-failed
+                                                 :room-id (:id room)
+                                                 :error (:error result)})))))
                           {:error (str "Room not found: " ref)})))
         fork-fn     (fn fork-fn
                       ([ref] (fork-fn ref {}))

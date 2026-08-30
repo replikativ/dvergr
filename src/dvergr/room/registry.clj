@@ -19,6 +19,27 @@
 (def ^:private registry-path [:dvergr/rooms])
 (def ^:private fork-topology-path [:dvergr/fork-topology])
 (defonce ^:private lifecycle-lock (Object.))
+(defonce ^:private transitions (atom {}))
+
+(defn- transition-key [room-id]
+  [(:fork-id (rctx/current-root)) room-id])
+
+(defn- reserve-transition! [room-id operation]
+  (let [key (transition-key room-id)
+        token (random-uuid)]
+    (when (contains? @transitions key)
+      (throw (ex-info "Room registry lifecycle is already in progress"
+                      {:type ::lifecycle-in-progress
+                       :room-id room-id
+                       :operation operation})))
+    (swap! transitions assoc key {:token token :operation operation})
+    [key token]))
+
+(defn- release-transition! [key token]
+  (locking lifecycle-lock
+    (when (= token (get-in @transitions [key :token]))
+      (swap! transitions dissoc key)))
+  nil)
 
 ;; Callbacks run (with the room-id) AFTER a room is unregistered. Lets
 ;; dependents (e.g. dvergr.agent.room-context) tear down per-room resources
@@ -77,24 +98,56 @@
   "Add or replace a Room in the registry, then run register hooks. Returns the
    Room."
   [room]
-  (locking lifecycle-lock
-    (doseq [f (vals @pre-register-hooks)]
-      (f room))
-    (rctx/shared-swap-state! registry-path (fn [m] (assoc (or m {}) (:id room) room)))
-    (doseq [f (vals @register-hooks)]
-      (try (f room) (catch Throwable _ nil))))
-  room)
+  (let [[key token] (locking lifecycle-lock
+                      (reserve-transition! (:id room) :register))]
+    (try
+      ;; Lifecycle owners reserve/check outside the global monitor. The token
+      ;; prevents unregister/replacement from interleaving while hooks run.
+      (doseq [f (vals @pre-register-hooks)]
+        (f room))
+      (locking lifecycle-lock
+        (when-not (= token (get-in @transitions [key :token]))
+          (throw (ex-info "Room registration reservation was lost"
+                          {:type ::lifecycle-reservation-lost
+                           :room-id (:id room)})))
+        (rctx/shared-swap-state! registry-path
+                                 (fn [m] (assoc (or m {}) (:id room) room))))
+      (doseq [f (vals @register-hooks)]
+        (try (f room) (catch Throwable _ nil)))
+      room
+      (finally
+        (release-transition! key token)))))
 
 (defn unregister!
   "Remove a Room from the registry by id, then run unregister hooks."
   [room-id]
-  (locking lifecycle-lock
-    (when-let [room (get (rctx/shared-get-state registry-path) room-id)]
-      (doseq [f (vals @pre-unregister-hooks)]
-        (f room)))
-    (rctx/shared-swap-state! registry-path (fn [m] (dissoc (or m {}) room-id)))
-    (doseq [f (vals @unregister-hooks)]
-      (try (f room-id) (catch Throwable _ nil))))
+  (let [{:keys [room key token]}
+        (locking lifecycle-lock
+          (when-let [room (get (rctx/shared-get-state registry-path) room-id)]
+            (let [[key token] (reserve-transition! room-id :unregister)]
+              {:room room :key key :token token})))]
+    (when room
+      (try
+        ;; Draining user/runtime work must never hold the daemon-global monitor.
+        ;; Same-Room lifecycle contenders fail on the reservation; unrelated
+        ;; registries continue normally.
+        (doseq [f (vals @pre-unregister-hooks)]
+          (f room))
+        (locking lifecycle-lock
+          (when-not (and (= token (get-in @transitions [key :token]))
+                         (= (:incarnation room)
+                            (:incarnation (get (rctx/shared-get-state registry-path)
+                                               room-id))))
+            (throw (ex-info "Room unregister reservation no longer owns the incarnation"
+                            {:type ::lifecycle-reservation-lost
+                             :room-id room-id})))
+          (rctx/shared-swap-state! registry-path (fn [m] (dissoc (or m {}) room-id))))
+        ;; Keep the reservation through cleanup so a new incarnation cannot be
+        ;; registered before old process-local handles have been forgotten.
+        (doseq [f (vals @unregister-hooks)]
+          (try (f room-id) (catch Throwable _ nil)))
+        (finally
+          (release-transition! key token)))))
   nil)
 
 (defn lookup
