@@ -19,7 +19,8 @@
                                        `:chat/*` / `:message/*` /
                                        `:room/*` schema, same data
                                        as today's `dvergr.rooms`."
-  (:require [clojure.string :as str]))
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]))
 
 (defprotocol PRoomStore
   "Pluggable durability surface for Rooms. Implementations decide
@@ -138,15 +139,42 @@
     :attention/decision-id :attention/run-id :attention/memory :attention/activation
     :attention/control :attention/at :attention/priority
     :attention/status :attention/reason :attention/metadata
-    :attention/created-at})
+    :attention/result-run-id :attention/created-at})
 
 (defn attention-id
   "Deterministic identity for one decision or disposition over a message."
-  [participant message-id run-id phase]
+  [room-id participant message-id run-id phase]
   (java.util.UUID/nameUUIDFromBytes
-   (.getBytes (str "dvergr-attention|" participant "|" message-id "|"
-                   run-id "|" phase)
+   (.getBytes (str "dvergr-attention|" room-id "|" participant "|"
+                   message-id "|" run-id "|" phase)
               java.nio.charset.StandardCharsets/UTF_8)))
+
+(def attention-semantic-keys
+  [:attention/participant :attention/message-id :attention/run-id
+   :attention/memory :attention/activation :attention/control :attention/at
+   :attention/priority :attention/reason :attention/metadata])
+
+(defn validate-attention-disposition!
+  "Require an applied fact to match one existing ready decision exactly."
+  [decision applied]
+  (when-not decision
+    (throw (ex-info "Applied attention references a missing decision"
+                    {:type :room-store/orphan-attention-disposition
+                     :applied applied})))
+  (when-not (= :ready (:attention/status decision))
+    (throw (ex-info "Only a ready attention decision can be applied"
+                    {:type :room-store/invalid-attention-disposition
+                     :decision decision :applied applied})))
+  (when-not (= (:attention/id decision) (:attention/decision-id applied))
+    (throw (ex-info "Applied attention references the wrong decision"
+                    {:type :room-store/invalid-attention-disposition
+                     :decision decision :applied applied})))
+  (when-not (= (select-keys decision attention-semantic-keys)
+               (select-keys applied attention-semantic-keys))
+    (throw (ex-info "Applied attention axes differ from its decision"
+                    {:type :room-store/attention-disposition-mismatch
+                     :decision decision :applied applied})))
+  applied)
 
 (defn validate-attention!
   "Validate one durable participant attention projection and return it."
@@ -166,6 +194,10 @@
   (when (and (:attention/run-id fact) (not (uuid? (:attention/run-id fact))))
     (throw (ex-info ":attention/run-id must be a UUID"
                     {:type :room-store/invalid-attention :fact fact})))
+  (when (and (:attention/result-run-id fact)
+             (not (uuid? (:attention/result-run-id fact))))
+    (throw (ex-info ":attention/result-run-id must be a UUID"
+                    {:type :room-store/invalid-attention :fact fact})))
   (when (and (:attention/decision-id fact)
              (not (uuid? (:attention/decision-id fact))))
     (throw (ex-info ":attention/decision-id must be a UUID"
@@ -179,7 +211,8 @@
                        [:attention/control #{:continue :integrate :restart :suspend :cancel}]
                        [:attention/at #{:now :next-safe-boundary :before-model :token
                                         :before-tool :after-tool :after-model :quiescent}]
-                       [:attention/status #{:ready :deferred :invalid :applied}]]
+                       [:attention/status #{:ready :deferred :invalid :applied
+                                            :baseline-complete}]]
           :let [v (get fact k)]
           :when (and (some? v) (not (contains? allowed v)))]
     (throw (ex-info (str "Invalid durable " k)
@@ -196,6 +229,19 @@
              (not (map? (:attention/metadata fact))))
     (throw (ex-info ":attention/metadata must be a map"
                     {:type :room-store/invalid-attention :fact fact})))
+  (when-let [metadata (:attention/metadata fact)]
+    (let [round-trip
+          (try
+            (edn/read-string (pr-str metadata))
+            (catch Throwable error
+              (throw (ex-info ":attention/metadata must be round-trippable EDN"
+                              {:type :room-store/invalid-attention-metadata
+                               :metadata metadata}
+                              error))))]
+      (when-not (= metadata round-trip)
+        (throw (ex-info ":attention/metadata must round-trip without type loss"
+                        {:type :room-store/invalid-attention-metadata
+                         :metadata metadata :round-trip round-trip})))))
   (when-not (instance? java.util.Date (:attention/created-at fact))
     (throw (ex-info ":attention/created-at must be an instant"
                     {:type :room-store/invalid-attention :fact fact})))

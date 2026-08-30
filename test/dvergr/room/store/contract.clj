@@ -151,6 +151,20 @@
                                :attention/decision-id (:attention/id fact)
                                :attention/status :applied
                                :attention/created-at (java.util.Date. 1787860800001)))]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"missing decision"
+             (store/-store-attention!
+              st room-id (assoc applied
+                                :attention/id (random-uuid)
+                                :attention/decision-id (random-uuid)))))
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"differ"
+             (store/-store-attention!
+              st room-id (assoc applied
+                                :attention/id (random-uuid)
+                                :attention/message-id (random-uuid)))))
         (store/-store-attention! st room-id applied)
         (is (empty? (store/unapplied-attention [fact applied])))))))
 
@@ -184,3 +198,38 @@
         (is (= 1 (count (filter map? outcomes))))
         (is (= 1 (count (filter #(instance? Throwable %) outcomes))))
         (is (= 1 (count (store/-list-attention st room-id {}))))))))
+
+(defn assert-cross-room-attention-identity!
+  "One global fact identity cannot be acknowledged under a second Room."
+  [st]
+  (testing "attention identity includes and validates Room ownership"
+    (let [room-a :attention-room-a
+          room-b :attention-room-b
+          fact {:attention/id (random-uuid)
+                :attention/participant :agent/researcher
+                :attention/message-id (random-uuid)
+                :attention/memory :remember
+                :attention/status :ready
+                :attention/created-at (java.util.Date.)}]
+      (store/-store-room! st room-a {:slug (name room-a) :title "A"})
+      (store/-store-room! st room-b {:slug (name room-b) :title "B"})
+      (store/-store-attention! st room-a fact)
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"immutable"
+                            (store/-store-attention! st room-b fact)))
+      (is (empty? (store/-list-attention st room-b {}))))))
+
+(defn assert-attention-metadata-validation!
+  [st room-id]
+  (testing "durable attention metadata must round-trip as EDN"
+    (store/-store-room! st room-id {:slug (name room-id) :title "Metadata"})
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"round-trippable EDN"
+         (store/-store-attention!
+          st room-id
+          {:attention/id (random-uuid)
+           :attention/participant :agent/researcher
+           :attention/message-id (random-uuid)
+           :attention/status :ready
+           :attention/metadata {:callback (fn [])}
+           :attention/created-at (java.util.Date.)})))))

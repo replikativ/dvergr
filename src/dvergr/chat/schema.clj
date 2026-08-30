@@ -693,6 +693,12 @@
     :db/cardinality :db.cardinality/one
     :db/index true}
 
+   {:db/ident :attention/result-run-id
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/index true
+    :db/doc "Successor Run whose durable creation discharged an enqueue"}
+
    {:db/ident :attention/memory
     :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/one}

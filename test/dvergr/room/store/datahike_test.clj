@@ -78,6 +78,15 @@
     (contract/assert-concurrent-attention-identity!
      st :attention-race-datahike)))
 
+(deftest cross-room-attention-identity-contract
+  (let [[_conn st] (mem-store)]
+    (contract/assert-cross-room-attention-identity! st)))
+
+(deftest attention-metadata-validation-contract
+  (let [[_conn st] (mem-store)]
+    (contract/assert-attention-metadata-validation!
+     st :attention-metadata-datahike)))
+
 (deftest thread-filter-bounds-the-datahike-pull
   (testing "the indexed root predicate runs before message bodies are pulled"
     (let [[_conn st] (mem-store)

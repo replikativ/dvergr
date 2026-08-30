@@ -21,12 +21,16 @@
                 rooms))))
 
   (-delete-room! [_ room-id]
-    (swap! state (fn [s]
-                   (-> s
-                       (update :rooms    dissoc room-id)
-                       (update :messages dissoc room-id)
-                       (update :runs     dissoc room-id)
-                       (update :attention dissoc room-id)))))
+    (swap! state
+           (fn [s]
+             (let [attention-ids (keys (get-in s [:attention room-id] {}))]
+               (-> s
+                   (update :rooms    dissoc room-id)
+                   (update :messages dissoc room-id)
+                   (update :runs     dissoc room-id)
+                   (update :attention dissoc room-id)
+                   (update :attention-index
+                           #(apply dissoc % attention-ids)))))))
 
   (-list-rooms [_]
     (->> (vals (:rooms @state))
@@ -97,11 +101,25 @@
 
   (-store-attention! [_ room-id fact]
     (let [fact (store/validate-attention! fact)
-          path [:attention room-id (:attention/id fact)]
+          attention-id (:attention/id fact)
+          path [:attention room-id attention-id]
           [_ after]
-          (swap-vals! state #(if (get-in % path) % (assoc-in % path fact)))
-          stored (get-in after path)]
-      (when-not (= stored fact)
+          (swap-vals!
+           state
+           (fn [s]
+             (if (get-in s [:attention-index attention-id])
+               s
+               (do
+                 (when (= :applied (:attention/status fact))
+                   (store/validate-attention-disposition!
+                    (get-in s [:attention-index (:attention/decision-id fact) :fact])
+                    fact))
+                 (-> s
+                     (assoc-in path fact)
+                     (assoc-in [:attention-index attention-id]
+                               {:room-id room-id :fact fact}))))))
+          stored (get-in after [:attention-index attention-id])]
+      (when-not (= {:room-id room-id :fact fact} stored)
         (throw (ex-info "Attention identity is immutable"
                         {:type :room-store/attention-identity-collision
                          :existing stored :fact fact})))
@@ -118,4 +136,5 @@
 (defn make
   "Create a fresh in-memory store."
   []
-  (->MemoryStore (atom {:rooms {} :messages {} :runs {} :attention {}})))
+  (->MemoryStore (atom {:rooms {} :messages {} :runs {}
+                        :attention {} :attention-index {}})))

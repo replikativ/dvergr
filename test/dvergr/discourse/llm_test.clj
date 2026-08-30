@@ -484,7 +484,8 @@
 
 (deftest attention-policy-can-queue-same-thread-peer-chatter
   (testing "thread membership does not permanently imply interruption"
-    (let [r       (d/room :peer-attention-room)
+    (let [st      (memory/make)
+          r       (d/make-room {:id :peer-attention-room :store st})
           entered (promise)
           gate    (promise)
           steps   (atom [(fn [chat-ctx opts]
@@ -515,7 +516,19 @@
           (while (and (< (System/currentTimeMillis) deadline)
                       (< (count @calls) 2))
             (Thread/sleep 10)))
-        (is (= 2 (count @calls)) "peer note became a later execution")))))
+        (is (= 2 (count @calls)) "peer note became a later execution")
+        (let [applied (some #(when (and (= :applied (:attention/status %))
+                                        (= :test/peer-chatter
+                                           (:attention/reason %)))
+                               %)
+                            (store/-list-attention st (:id r)
+                                                   {:participant :policy-worker}))
+              successor (run/run r (:attention/result-run-id applied))]
+          (is (uuid? (:attention/result-run-id applied)))
+          (is (= "peer note"
+                 (:content (some #(when (= (:run/trigger successor) (:id %)) %)
+                                 (d/messages r {:limit 30}))))
+              "applied enqueue names the exact successor Run"))))))
 
 (deftest attention-policy-cancel-is-run-local-and-future-work-recovers
   (let [r (d/make-room {:id :policy-cancel-room :store (memory/make)})
@@ -733,6 +746,54 @@
         (deliver gate true)
         (is (= "done" (:content @reply-f))))
       (finally
+        (d/close-room! r)))))
+
+(deftest preempting-include-now-precedes-cancel-settlement
+  (let [st (memory/make)
+        r (d/make-room {:id :policy-restart-now :store st})
+        entered (promise)
+        cancel-seen (promise)
+        settle (promise)
+        calls (atom 0)
+        turn-fn
+        (fn [chat-ctx {:keys [cancel?]}]
+          (if (= 1 (swap! calls inc))
+            (do
+              (deliver entered true)
+              (loop []
+                (if (and cancel? (cancel?))
+                  (do (deliver cancel-seen true)
+                      @settle
+                      :cancelled)
+                  (do (Thread/sleep 5) (recur)))))
+            (do (cc/add-message! chat-ctx {:role :assistant :content "restarted"})
+                :complete)))
+        policy (fn [_]
+                 (attention/decision {:memory :include
+                                      :control :restart
+                                      :at :now
+                                      :reason :test/restart-now}))]
+    (try
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent {:id :restart-now-worker
+                                  :spec {:provider :mock :model "mock"}
+                                  :attention-policy policy
+                                  :run-turn-fn turn-fn})))
+      (let [reply-f (future (await-spin r #(d/ask % :restart-now-worker
+                                                  {:content "start"}) 5000))]
+        (is (true? (deref entered 3000 ::timeout)))
+        (let [trigger (some #(when (= "start" (:content %)) %) (d/log r))]
+          (d/post! r (d/reply :reviewer :restart-now-worker
+                              "admit before settle" trigger)))
+        (is (true? (deref cancel-seen 2000 ::timeout)))
+        (is (some #(re-find #"admit before settle"
+                            (or (:content %) (:message/content %) ""))
+                  (cc/get-messages
+                   (room-context/lookup (:id r) :restart-now-worker))))
+        (deliver settle true)
+        (is (= "restarted" (:content @reply-f))))
+      (finally
+        (deliver settle true)
         (d/close-room! r)))))
 
 (deftest quiescent-include-waits-until-run-exit

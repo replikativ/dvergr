@@ -119,6 +119,24 @@
             ;; projections existed; do not call ensure-ctx! yet.
             (let [run-ref (run/start! room :var trigger run-ctx)]
               (run/finish! (:run/id run-ref) :completed))
+            ;; Simulate a crash after the first write of baseline migration.
+            ;; A non-empty projection without the final marker must be retried.
+            (let [decision-id
+                  (rstore/attention-id (:id room) :var (:id trigger) nil
+                                       :legacy-baseline-decision)]
+              (rstore/-store-attention!
+               (:store room) (:id room)
+               {:attention/id decision-id
+                :attention/participant :var
+                :attention/message-id (:id trigger)
+                :attention/memory :include
+                :attention/activation :none
+                :attention/control :continue
+                :attention/at :now
+                :attention/priority 0.0
+                :attention/reason :migration/provider-baseline
+                :attention/status :ready
+                :attention/created-at (java.util.Date. (long (:ts trigger)))}))
             (let [restored (rc/ensure-ctx! room :var {:budget-dollars 1.0})
                   contents (non-system-contents restored)
                   facts (rstore/-list-attention (:store room) (:id room)

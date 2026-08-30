@@ -17,6 +17,13 @@
   (contract/assert-concurrent-attention-identity!
    (memory/make) :attention-race-memory))
 
+(deftest cross-room-attention-identity-contract
+  (contract/assert-cross-room-attention-identity! (memory/make)))
+
+(deftest attention-metadata-validation-contract
+  (contract/assert-attention-metadata-validation!
+   (memory/make) :attention-metadata-memory))
+
 (deftest rejects-unmodelled-durable-metadata
   (let [st (memory/make)]
     (store/-store-room! st :strict-memory {:slug "strict-memory"})

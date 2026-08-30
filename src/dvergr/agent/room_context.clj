@@ -197,21 +197,30 @@
             ;; agent sees exactly what the UI seeds. (doc/unified-fork-conversation.md)
             (let [messages (d/messages room {:limit (or limit 100)})
                   attention-store? (satisfies? rstore/PAttentionStore (:store room))
+                  conversation-id (d/conversation-id room)
                   initial-attention
                   (if attention-store?
                     (rstore/-list-attention (:store room)
-                                            (d/conversation-id room)
+                                            conversation-id
                                             {:participant agent-id :limit 1000})
                     [])
+                  baseline-message-id
+                  (rstore/attention-id conversation-id agent-id nil nil
+                                       :legacy-baseline-message)
+                  baseline-marker-id
+                  (rstore/attention-id conversation-id agent-id baseline-message-id
+                                       nil :legacy-baseline-complete)
+                  baseline-complete?
+                  (some #(= baseline-marker-id (:attention/id %)) initial-attention)
                   ;; Upgrade cutover: pre-attention rooms already have Runs but
                   ;; no participant projection. Materialize their exact current
                   ;; provider baseline before any new policy decision can make
                   ;; the projection non-empty. This is append-only and
                   ;; idempotent by deterministic identity.
-                  _ (when (and attention-store? (empty? initial-attention))
+                  _ (when (and attention-store? (not baseline-complete?))
                       (doseq [m messages :when (conversational? m)]
                         (let [decision-id
-                              (rstore/attention-id agent-id (:id m) nil
+                              (rstore/attention-id conversation-id agent-id (:id m) nil
                                                    :legacy-baseline-decision)
                               common {:attention/participant agent-id
                                       :attention/message-id (:id m)
@@ -225,22 +234,33 @@
                                       (java.util.Date. (long (or (:ts m)
                                                                  (System/currentTimeMillis))))}]
                           (rstore/-store-attention!
-                           (:store room) (d/conversation-id room)
+                           (:store room) conversation-id
                            (assoc common
                                   :attention/id decision-id
                                   :attention/status :ready))
                           (rstore/-store-attention!
-                           (:store room) (d/conversation-id room)
+                           (:store room) conversation-id
                            (assoc common
                                   :attention/id
-                                  (rstore/attention-id agent-id (:id m) nil
+                                  (rstore/attention-id conversation-id agent-id (:id m) nil
                                                        :legacy-baseline-applied)
                                   :attention/decision-id decision-id
-                                  :attention/status :applied)))))
+                                  :attention/status :applied))))
+                      ;; Written last. If any prior write fails, the next
+                      ;; hydration retries every deterministic pair and then
+                      ;; completes the cutover.
+                      (rstore/-store-attention!
+                       (:store room) conversation-id
+                       {:attention/id baseline-marker-id
+                        :attention/participant agent-id
+                        :attention/message-id baseline-message-id
+                        :attention/status :baseline-complete
+                        :attention/reason :migration/provider-baseline
+                        :attention/created-at (java.util.Date.)}))
                   attention-facts
                   (if attention-store?
                     (rstore/-list-attention (:store room)
-                                            (d/conversation-id room)
+                                            conversation-id
                                             {:participant agent-id :limit 1000})
                     [])
                   included-message-ids

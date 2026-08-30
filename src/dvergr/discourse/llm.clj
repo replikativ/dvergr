@@ -185,8 +185,9 @@
    provider context and to explain deferred decisions after restart."
   [room participant-id incoming plan run-id]
   (let [room-store (:store room)
+        room-id (some-> room d/conversation-id)
         decision (:decision plan)
-        decision-id (rstore/attention-id participant-id (:id incoming)
+        decision-id (rstore/attention-id room-id participant-id (:id incoming)
                                          run-id :decision)
         fact
         (cond-> {:attention/id decision-id
@@ -214,28 +215,33 @@
 
 (defn- record-attention-applied!
   "Append the disposition proving that every supported axis was applied."
-  [room participant-id incoming plan run-id decision-id]
-  (when (and room (:store room))
-    (let [decision (:decision plan)
-          fact
-          (cond-> {:attention/id
-                   (rstore/attention-id participant-id (:id incoming)
-                                        run-id :applied)
-                   :attention/decision-id decision-id
-                   :attention/participant participant-id
-                   :attention/message-id (:id incoming)
-                   :attention/status :applied
-                   :attention/created-at (java.util.Date.)}
-            run-id (assoc :attention/run-id run-id)
-            (:memory decision) (assoc :attention/memory (:memory decision))
-            (:activation decision) (assoc :attention/activation (:activation decision))
-            (:control decision) (assoc :attention/control (:control decision))
-            (:at decision) (assoc :attention/at (:at decision))
-            (some? (:priority decision))
-            (assoc :attention/priority (:priority decision))
-            (:reason decision) (assoc :attention/reason (:reason decision))
-            (:metadata decision) (assoc :attention/metadata (:metadata decision)))]
-      (rstore/-store-attention! (:store room) (d/conversation-id room) fact))))
+  ([room participant-id incoming plan run-id decision-id]
+   (record-attention-applied! room participant-id incoming plan run-id
+                              decision-id nil))
+  ([room participant-id incoming plan run-id decision-id result-run-id]
+   (when (and room (:store room))
+     (let [room-id (d/conversation-id room)
+           decision (:decision plan)
+           fact
+           (cond-> {:attention/id
+                    (rstore/attention-id room-id participant-id (:id incoming)
+                                         run-id :applied)
+                    :attention/decision-id decision-id
+                    :attention/participant participant-id
+                    :attention/message-id (:id incoming)
+                    :attention/status :applied
+                    :attention/created-at (java.util.Date.)}
+             run-id (assoc :attention/run-id run-id)
+             result-run-id (assoc :attention/result-run-id result-run-id)
+             (:memory decision) (assoc :attention/memory (:memory decision))
+             (:activation decision) (assoc :attention/activation (:activation decision))
+             (:control decision) (assoc :attention/control (:control decision))
+             (:at decision) (assoc :attention/at (:at decision))
+             (some? (:priority decision))
+             (assoc :attention/priority (:priority decision))
+             (:reason decision) (assoc :attention/reason (:reason decision))
+             (:metadata decision) (assoc :attention/metadata (:metadata decision)))]
+       (rstore/-store-attention! (:store room) room-id fact)))))
 
 (defn llm-agent
   "Construct a discourse Participant backed by an LLM.
@@ -508,7 +514,7 @@
                                    prior-run-id :run-id}
                                   (::deferred-attention msg)]
                          (record-attention-applied!
-                          room id msg prior-plan prior-run-id prior-decision-id))
+                          room id msg prior-plan prior-run-id prior-decision-id run-id))
                        ;; The trigger is the first attention admission for this
                        ;; Run. Persist it before provider input changes.
                        (let [trigger-plan
@@ -672,6 +678,7 @@
                                                               :as decision} (:decision plan)
                                                              decision-id
                                                              (rstore/attention-id
+                                                              (some-> room d/conversation-id)
                                                               id (:id m) run-id :decision)
                                                              entry {:message m
                                                                     :plan plan
@@ -697,6 +704,10 @@
                                                                  (swap! pending-quiescent-inclusions
                                                                         conj entry))]
                                                          (record-attention! room id m plan run-id)
+                                                         (when (and (#{:restart :suspend :cancel} control)
+                                                                    (= :include memory)
+                                                                    (= :now at))
+                                                           (fold-inbound! m))
                                                          (case control
                                                            :restart {:tag :attention
                                                                      :control :restart
@@ -778,7 +789,8 @@
                                      :attention
                                      (let [{:keys [control msg plan decision-id]
                                             attention-decision :decision} decision]
-                                       (when (= :include (:memory attention-decision))
+                                       (when (and (= :include (:memory attention-decision))
+                                                  (not= :now (:at attention-decision)))
                                          (fold-inbound! msg))
                                        (case control
                                          :restart
