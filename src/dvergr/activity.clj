@@ -4,13 +4,12 @@
    Activities are projections of work that already happened. They are not
    executable effects, lifecycle owners, or a second event log: room messages
    supply discourse identity and Runs supply execution identity."
-  (:import [java.nio.charset StandardCharsets]
-           [java.util Date UUID]))
+  (:require [hasch.core :as hasch])
+  (:import [java.util Date]))
 
 (defn- stable-id
   [parts]
-  (UUID/nameUUIDFromBytes
-   (.getBytes (str "dvergr/activity|" (pr-str parts)) StandardCharsets/UTF_8)))
+  (hasch/uuid [:dvergr/activity parts]))
 
 (defn tool-activities
   "Project the tool requests in an assistant message into compact semantic
