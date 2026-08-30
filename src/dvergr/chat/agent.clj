@@ -91,6 +91,16 @@
        "call. If the work is complete, reply with the concrete result. If more "
        "work is needed, call an available tool. Do not return an empty response."))
 
+(defn- empty-response-note [chat-ctx run-id]
+  (let [latest-user
+        (->> (chat-ctx/get-messages chat-ctx)
+             reverse
+             (filter #(#{:user "user"} (or (:role %) (:message/role %))))
+             first)
+        latest-user-id (or (:id latest-user) (:message/id latest-user))
+        scope (or run-id latest-user-id (:chat-id chat-ctx))]
+    (str empty-response-nudge "\n\nRetry scope: " scope)))
+
 (defn- has-system-note? [chat-ctx note]
   (->> (chat-ctx/get-messages chat-ctx)
        (some (fn [m]
@@ -390,18 +400,19 @@
         ;; turn costs a few cents and rescues the work.
         (cond
           (str/blank? content)
-          (if-not (has-system-note? chat-ctx empty-response-nudge)
-            (do
-              (tel/log! {:level :warn :id :agent/empty-response
-                         :data {:turn turn-number}}
-                        "Model returned no content or tools — requesting one bounded retry")
-              (chat-ctx/add-system-note! chat-ctx empty-response-nudge :important? true)
-              :continue)
-            (do
-              (tel/log! {:level :error :id :agent/repeated-empty-response
-                         :data {:turn turn-number}}
-                        "Model returned an empty response after corrective retry")
-              :error))
+          (let [note (empty-response-note chat-ctx run-id)]
+            (if-not (has-system-note? chat-ctx note)
+              (do
+                (tel/log! {:level :warn :id :agent/empty-response
+                           :data {:turn turn-number :run-id run-id}}
+                          "Model returned no content or tools — requesting one bounded retry")
+                (chat-ctx/add-system-note! chat-ctx note :important? true)
+                :continue)
+              (do
+                (tel/log! {:level :error :id :agent/repeated-empty-response
+                           :data {:turn turn-number :run-id run-id}}
+                          "Model returned an empty response after corrective retry")
+                :error)))
 
           (and (quirks/code-fragment? content)
                (not (nudged-for-fragment? chat-ctx)))
