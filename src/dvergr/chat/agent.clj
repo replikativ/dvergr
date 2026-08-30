@@ -8,7 +8,8 @@
    :continue | :complete | :cancelled | :error. The LOOPING around this core
    is the driver's job — production rooms drive it from
    `dvergr.discourse.llm` (the participant on-message turn loop)."
-  (:require [dvergr.chat.context :as chat-ctx]
+  (:require [clojure.string :as str]
+            [dvergr.chat.context :as chat-ctx]
             [dvergr.chat.compaction :as compaction]
             [dvergr.model.chat :as model-chat]
             [dvergr.model.provider :as model-provider]
@@ -82,16 +83,27 @@
        "executed.\n\n"
        "If you meant to speak to the humans, write prose."))
 
+(def empty-response-nudge
+  "One bounded retry instruction for a model that returned neither content nor
+   tool calls. Without it, a tool-bearing prior assistant message can be mistaken
+   for the final result."
+  (str "Your last response was empty: it contained neither a reply nor a tool "
+       "call. If the work is complete, reply with the concrete result. If more "
+       "work is needed, call an available tool. Do not return an empty response."))
+
+(defn- has-system-note? [chat-ctx note]
+  (->> (chat-ctx/get-messages chat-ctx)
+       (some (fn [m]
+               (and (#{:system "system"} (or (:role m) (:message/role m)))
+                    (= note (or (:content m) (:message/content m))))))
+       boolean))
+
 (defn- nudged-for-fragment?
   "Have we already told this agent, in this turn loop, that it fumbled code into
    the prose channel? A second identical nudge cannot help — if the model does
    it twice, let the turn end rather than burning budget in a nudge loop."
   [chat-ctx]
-  (->> (chat-ctx/get-messages chat-ctx)
-       (some (fn [m]
-               (and (#{:system "system"} (or (:role m) (:message/role m)))
-                    (= fragment-nudge (or (:content m) (:message/content m))))))
-       boolean))
+  (has-system-note? chat-ctx fragment-nudge))
 
 ;; ============================================================================
 ;; Agent Turn (Non-Reactive Core)
@@ -230,7 +242,7 @@
                                          :important? true))
 
           ;; Add assistant message if there's content
-          _ (when (or (seq content) (seq tool-calls))
+          _ (when (or (not (str/blank? content)) (seq tool-calls))
               (chat-ctx/add-message! chat-ctx
                                      {:role :assistant
                                       :content (if (empty? content)
@@ -376,8 +388,23 @@
         ;; misaddressed a tool call. Name that once and let it try again — the
         ;; turn loop is bounded by BUDGET, not by a turn cap, so one corrective
         ;; turn costs a few cents and rescues the work.
-        (if (and (quirks/code-fragment? content)
-                 (not (nudged-for-fragment? chat-ctx)))
+        (cond
+          (str/blank? content)
+          (if-not (has-system-note? chat-ctx empty-response-nudge)
+            (do
+              (tel/log! {:level :warn :id :agent/empty-response
+                         :data {:turn turn-number}}
+                        "Model returned no content or tools — requesting one bounded retry")
+              (chat-ctx/add-system-note! chat-ctx empty-response-nudge :important? true)
+              :continue)
+            (do
+              (tel/log! {:level :error :id :agent/repeated-empty-response
+                         :data {:turn turn-number}}
+                        "Model returned an empty response after corrective retry")
+              :error))
+
+          (and (quirks/code-fragment? content)
+               (not (nudged-for-fragment? chat-ctx)))
           (do
             (tel/log! {:level :warn :id :agent/code-in-prose-channel
                        :data {:turn turn-number
@@ -385,6 +412,8 @@
                       "Model emitted code as content instead of a tool call — nudging")
             (chat-ctx/add-system-note! chat-ctx fragment-nudge :important? true)
             :continue)
+
+          :else
           :complete)))
 
     (catch java.util.concurrent.CancellationException _
