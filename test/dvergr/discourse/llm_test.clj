@@ -511,6 +511,85 @@
             (Thread/sleep 10)))
         (is (= 2 (count @calls)) "peer note became a later execution")))))
 
+(deftest attention-policy-cancel-is-run-local-and-future-work-recovers
+  (let [r (d/make-room {:id :policy-cancel-room :store (memory/make)})
+        entered (promise)
+        steps (atom [(block-until-cancelled-step entered 8000)
+                     (reply-step "recovered answer")])
+        calls (atom [])
+        policy (fn [_]
+                 (attention/decision {:memory :remember
+                                      :control :cancel
+                                      :at :now
+                                      :reason :test/authorized-cancel}))]
+    (try
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent {:id :policy-cancel-worker
+                                  :spec {:provider :mock :model "mock"}
+                                  :budget {:dollars 10.0}
+                                  :attention-policy policy
+                                  :run-turn-fn (make-queued-turn-fn steps calls)})))
+      (let [first-reply
+            (future (await-spin r #(d/ask % :policy-cancel-worker {:content "start"})
+                                2500))]
+        (is (true? (deref entered 3000 ::timeout)))
+        (let [trigger (some #(when (= "start" (:content %)) %) (d/log r))]
+          (d/post! r (d/reply :reviewer :policy-cancel-worker "stop this run" trigger)))
+        (is (= ::timeout @first-reply) "policy cancellation emits no stale reply")
+        (is (await-condition #(empty? (run/active-runs (:id r))) 2000))
+        (is (= :cancelled (:run/status (first (run/runs r)))))
+        (is (= "recovered answer"
+               (:content (await-spin r #(d/ask % :policy-cancel-worker
+                                               {:content "new work"}) 4000)))
+            "attention cancellation does not poison later executions"))
+      (finally
+        (d/close-room! r)))))
+
+(deftest attention-policy-suspend-includes-memory-at-safe-boundary
+  (let [r (d/make-room {:id :policy-suspend-room :store (memory/make)})
+        entered (promise)
+        observed (atom nil)
+        inspect-memory
+        (fn [chat-ctx _]
+          (let [messages (cc/get-messages chat-ctx)
+                _ (reset! observed messages)
+                included? (some #(re-find #"remember before waiting"
+                                          (or (:content %) (:message/content %) ""))
+                                messages)]
+            (cc/add-message! chat-ctx {:role :assistant
+                                       :content (if included? "included" "missing")})
+            :complete))
+        steps (atom [(block-until-cancelled-step entered 8000) inspect-memory])
+        calls (atom [])
+        policy (fn [_]
+                 (attention/decision {:memory :include
+                                      :control :suspend
+                                      :at :next-safe-boundary
+                                      :reason :test/wait}))]
+    (try
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent {:id :policy-suspend-worker
+                                  :spec {:provider :mock :model "mock"}
+                                  :budget {:dollars 10.0}
+                                  :attention-policy policy
+                                  :run-turn-fn (make-queued-turn-fn steps calls)})))
+      (let [first-reply
+            (future (await-spin r #(d/ask % :policy-suspend-worker {:content "start"})
+                                2500))]
+        (is (true? (deref entered 3000 ::timeout)))
+        (let [trigger (some #(when (= "start" (:content %)) %) (d/log r))]
+          (d/post! r (d/reply :reviewer :policy-suspend-worker
+                              "remember before waiting" trigger)))
+        (is (= ::timeout @first-reply))
+        (is (await-condition #(empty? (run/active-runs (:id r))) 2000))
+        (is (= :waiting (:run/status (first (run/runs r)))))
+        (is (= "included"
+               (:content (await-spin r #(d/ask % :policy-suspend-worker
+                                               {:content "resume"}) 4000)))
+            (pr-str @observed)))
+      (finally
+        (d/close-room! r)))))
+
 (deftest cancel-directive-mid-turn
   (testing ":directive/cancel PREEMPTS a running turn (it used to queue behind it)"
     (let [r       (d/room :cancel-room)

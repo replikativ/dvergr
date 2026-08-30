@@ -148,6 +148,21 @@
     (attention/restart :conversation/same-thread)
     (attention/enqueue :conversation/different-thread)))
 
+(def llm-attention-capabilities
+  "Provider-neutral attention subset implemented by the native LLM arbiter.
+   Richer products remain durable/queued until an adapter advertises the needed
+   integration boundary; they are never silently projected to a weaker action."
+  {:memory attention/memory-modes
+   :activation attention/activation-modes
+   :control #{:continue :restart :suspend :cancel}
+   :boundaries #{:now :next-safe-boundary :quiescent}
+   :priority? false
+   :accept? (fn [{:keys [control at]}]
+              (when (and (#{:restart :suspend :cancel} control)
+                         (not (#{:now :next-safe-boundary} at)))
+                {:axes [:control :at]
+                 :values [control at]}))})
+
 (defn llm-agent
   "Construct a discourse Participant backed by an LLM.
 
@@ -290,6 +305,7 @@
                          ;; inbox after this execution. The Room log is already the
                          ;; durable source; these are only live coordination handles.
                          queued-other-threads (atom [])
+                         pending-inclusions (atom [])
                          seen-inflight-ids    (atom (cond-> #{} (:id msg) (conj (:id msg))))
                      ;; SCI sandbox: the chat-ctx's own, set up ONCE by
                      ;; turn/new-working-ctx (room fold AND room-less fallback alike)
@@ -378,6 +394,7 @@
                                     :on-reply         on-reply}
                          errored           (atom nil)
                          waiting?          (atom false)
+                         policy-cancelled? (atom false)
                          finish-after-reply? (atom false)
                      ;; #38: the last assistant message BEFORE this invocation
                      ;; runs (the store-seeded prior reply, or nil) — the exit
@@ -532,10 +549,11 @@
                                                            :incoming-message m
                                                            :participant p
                                                            :room room})
-                                                         action
+                                                         plan
                                                          (try
-                                                           (attention/legacy-action
-                                                            attention-decision)
+                                                           (attention/execution-plan
+                                                            attention-decision
+                                                            llm-attention-capabilities)
                                                            (catch Throwable error
                                                              (tel/log!
                                                               {:level :warn
@@ -544,24 +562,39 @@
                                                                       :decision attention-decision
                                                                       :error (.getMessage error)}}
                                                               "Invalid attention decision; queued conservatively")
-                                                             ::invalid-attention-decision))]
-                                                     (case action
-                                                       :steer {:tag :steer :msg m}
-                                                       :observe (recur)
-                                                       :queue (do
-                                                                (swap! queued-other-threads conj m)
-                                                                (recur))
-                                                       ::invalid-attention-decision
+                                                             {:status :invalid}))]
+                                                     (if (= :ready (:status plan))
+                                                       (let [{:keys [memory activation control]
+                                                              :as decision} (:decision plan)]
+                                                         (when (= :enqueue activation)
+                                                           (swap! queued-other-threads conj m))
+                                                         (case control
+                                                           :restart {:tag :attention
+                                                                     :control :restart
+                                                                     :msg m
+                                                                     :decision decision}
+                                                           :suspend {:tag :attention
+                                                                     :control :suspend
+                                                                     :msg m
+                                                                     :decision decision}
+                                                           :cancel {:tag :attention
+                                                                    :control :cancel
+                                                                    :msg m
+                                                                    :decision decision}
+                                                           :continue
+                                                           (do
+                                                             (when (= :include memory)
+                                                               (swap! pending-inclusions conj m))
+                                                             (recur))))
                                                        (do
-                                                         (swap! queued-other-threads conj m)
-                                                         (recur))
-                                                       (do
-                                                         (tel/log!
-                                                          {:level :warn
-                                                           :id ::invalid-attention-decision
-                                                           :data {:agent id
-                                                                  :decision attention-decision}}
-                                                          "Unsupported attention decision; queued conservatively")
+                                                         (when (= :deferred (:status plan))
+                                                           (tel/log!
+                                                            {:level :warn
+                                                             :id ::unsupported-attention-decision
+                                                             :data {:agent id
+                                                                    :decision (:decision plan)
+                                                                    :unsupported (:unsupported plan)}}
+                                                            "Unsupported attention decision; queued conservatively"))
                                                          (swap! queued-other-threads conj m)
                                                          (recur)))))))))))
                                    ;; No inbox (room-less participant that was
@@ -588,8 +621,15 @@
                                    (case (:tag decision)
                                      :cancel (do (reset! cancelled? true) nil)
                                      :switch (recur turn)
-                                     :steer  (do (fold-inbound! (:msg decision))
-                                                 (recur (inc turn)))))
+                                     :attention
+                                     (let [{:keys [control msg]
+                                            attention-decision :decision} decision]
+                                       (when (= :include (:memory attention-decision))
+                                         (fold-inbound! msg))
+                                       (case control
+                                         :restart (recur (inc turn))
+                                         :suspend (do (reset! waiting? true) nil)
+                                         :cancel (do (reset! policy-cancelled? true) nil)))))
                                  (let [result (:result decision)]
                                    (cond
                                      (or @cancelled? (run/cancel-requested? run-id)) nil
@@ -630,6 +670,10 @@
                                ;; Normal :continue, budget OK → next turn.
                                      :else (recur (inc turn)))))))))
 
+                     ;; Apply non-preempting `:include` effects only after the
+                     ;; active provider call reaches its safe completion boundary.
+                       (doseq [included @pending-inclusions]
+                         (fold-inbound! included))
                      ;; The outer participant loop can now start queued work. Put
                      ;; consumed messages in the participant-owned priority FIFO,
                      ;; not at the live mailbox tail: a newer arrival during this
@@ -647,6 +691,8 @@
                      ;; posting it is the repeating bug. Surface it instead.
                      ;; A deliberate cancel stays quiet.
                        (when (and (not @errored) (not @cancelled?)
+                                  (not @policy-cancelled?)
+                                  (not @waiting?)
                                   (not (run/cancel-requested? run-id))
                                   (not= :cancelled (cc/get-status chat-ctx))
                                   (= pre-turn-last-asst (last-assistant-message chat-ctx)))
@@ -702,6 +748,7 @@
                        (finally
                          (when (and run-id (not @finish-after-reply?))
                            (let [cancelled-run? (or @cancelled?
+                                                    @policy-cancelled?
                                                     (run/cancel-requested? run-id)
                                                     (= :cancelled (cc/get-status chat-ctx)))
                                  status (cond

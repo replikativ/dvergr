@@ -303,9 +303,10 @@ levels:
 The initial model-facing task set should include pure roster specialization,
 parallel research/review and reduction, race-with-loser-cancellation, explicit
 structural child Runs, delegation-ceiling recognition, and creation of a nested
-durable Room. Structured queue/observe/steer compatibility and reactive-boundary
-tests cover the first attention seam; later `latest`/`serial`/`busy`/`parallel`
-work-admission combinators extend it.
+durable Room. Provider-free attention tests cover capability negotiation,
+queue/observe/restart, run-local cancellation, and reactive boundaries;
+`latest`/`serial`/`busy`/`parallel` work admission covers computation overlap as
+a separate FRP layer.
 Passing only one model is not sufficient evidence that the programming surface
 is clear.
 
