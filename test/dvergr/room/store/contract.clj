@@ -199,6 +199,62 @@
         (is (= 1 (count (filter #(instance? Throwable %) outcomes))))
         (is (= 1 (count (store/-list-attention st room-id {}))))))))
 
+(defn assert-enqueue-result-run!
+  "An enqueue is applied only by the exact successor execution it caused."
+  [st room-id]
+  (testing "enqueue disposition is correlated to its successor Run"
+    (store/-store-room! st room-id {:slug (name room-id) :title "Enqueue"})
+    (let [participant :agent/researcher
+          message-id (random-uuid)
+          decision {:attention/id (random-uuid)
+                    :attention/participant participant
+                    :attention/message-id message-id
+                    :attention/memory :include
+                    :attention/activation :enqueue
+                    :attention/control :continue
+                    :attention/at :quiescent
+                    :attention/status :ready
+                    :attention/created-at (java.util.Date.)}
+          result-run-id (random-uuid)
+          unrelated-run-id (random-uuid)
+          now (java.util.Date.)
+          result-run {:run/id result-run-id
+                      :run/kind :agent-turn
+                      :run/room room-id
+                      :run/actor participant
+                      :run/trigger message-id
+                      :run/status :running
+                      :run/created-at now
+                      :run/started-at now
+                      :run/updated-at now}
+          applied (assoc decision
+                         :attention/id (random-uuid)
+                         :attention/decision-id (:attention/id decision)
+                         :attention/status :applied
+                         :attention/created-at (java.util.Date.)
+                         :attention/result-run-id result-run-id)]
+      (store/-store-attention! st room-id decision)
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"requires a successor Run"
+                            (store/-store-attention!
+                             st room-id
+                             (dissoc applied :attention/result-run-id))))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"missing successor Run"
+                            (store/-store-attention!
+                             st room-id
+                             (assoc applied :attention/id (random-uuid)
+                                    :attention/result-run-id (random-uuid)))))
+      (store/-store-run! st room-id
+                         (assoc result-run :run/id unrelated-run-id
+                                :run/actor :agent/other))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unrelated successor Run"
+                            (store/-store-attention!
+                             st room-id
+                             (assoc applied :attention/id (random-uuid)
+                                    :attention/result-run-id unrelated-run-id))))
+      (store/-store-run! st room-id result-run)
+      (is (= applied (store/-store-attention! st room-id applied)))
+      (is (empty? (store/unapplied-attention [decision applied]))))))
+
 (defn assert-cross-room-attention-identity!
   "One global fact identity cannot be acknowledged under a second Room."
   [st]

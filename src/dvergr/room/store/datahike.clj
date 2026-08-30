@@ -184,7 +184,30 @@
           (when-not (every? #(= (get decision %) (get entity %)) semantic-attrs)
             (throw (ex-info "Applied attention axes differ from its decision"
                             {:type :room-store/attention-disposition-mismatch
-                             :entity entity})))))
+                             :entity entity})))
+          (if (= :enqueue (:attention/activation entity))
+            (let [result-run-id (:attention/result-run-id entity)
+                  result-run (and result-run-id
+                                  (dh/entity db [:run/id result-run-id]))]
+              (when-not result-run-id
+                (throw (ex-info "Applied enqueue attention requires a successor Run"
+                                {:type :room-store/missing-attention-result-run
+                                 :entity entity})))
+              (when-not result-run
+                (throw (ex-info "Applied enqueue attention references a missing successor Run"
+                                {:type :room-store/missing-attention-result-run
+                                 :entity entity})))
+              (when-not (and (= (second (:attention/chat entity))
+                                (:chat/id (:run/chat result-run)))
+                             (= (:attention/participant entity) (:run/actor result-run))
+                             (= (:attention/message-id entity) (:run/trigger result-run)))
+                (throw (ex-info "Applied enqueue attention references an unrelated successor Run"
+                                {:type :room-store/invalid-attention-result-run
+                                 :entity entity}))))
+            (when (:attention/result-run-id entity)
+              (throw (ex-info "Only applied enqueue attention may reference a successor Run"
+                              {:type :room-store/unexpected-attention-result-run
+                               :entity entity}))))))
       [entity])))
 
 (def ^:private message-pull-pattern
@@ -585,12 +608,23 @@
                                 [?a :attention/id ?id]
                                 [?a :attention/chat ?c]
                                 [?c :chat/id ?chat-id]]
-                              @conn (:attention/decision-id fact))]
+                              @conn (:attention/decision-id fact))
+                        result-run
+                        (when-let [result-run-id (:attention/result-run-id fact)]
+                          (dh/q '[:find (pull ?r pattern) .
+                                  :in $ ?chat-id ?run-id pattern
+                                  :where
+                                  [?c :chat/id ?chat-id]
+                                  [?r :run/chat ?c]
+                                  [?r :run/id ?run-id]]
+                                @conn (:chat/id ent) result-run-id
+                                run-pull-pattern))]
                     (when (and decision (not= (:chat/id ent) decision-chat-id))
                       (throw (ex-info "Attention disposition crosses Room stores"
                                       {:type :room-store/attention-room-mismatch
                                        :decision decision :fact fact})))
-                    (store/validate-attention-disposition! decision fact)))
+                    (-> (store/validate-attention-disposition! decision fact)
+                        (store/validate-attention-result-run! result-run))))
               report (persist/persist-tx-result!
                       conn
                       [[:db.fn/call store-attention-if-absent
@@ -625,23 +659,33 @@
         (throw (ex-info "Cannot persist attention for unknown room"
                         {:type :room-store/missing-room :room-id room-id})))))
 
-  (-list-attention [_ room-id {:keys [participant limit]}]
+  (-list-attention [_ room-id {:keys [id participant limit]}]
     (let [slug (store/room-id->slug room-id)]
       (if-let [ent (room-by-slug conn slug)]
-        (->> (dh/q '[:find [(pull ?a pattern) ...]
-                     :in $ ?chat-id pattern
-                     :where
-                     [?c :chat/id ?chat-id]
-                     [?a :attention/chat ?c]]
-                   @conn (:chat/id ent) attention-pull-pattern)
-             (map entity->attention)
-             (filter #(if participant
-                        (= participant (:attention/participant %))
-                        true))
-             (sort-by (juxt #(some-> ^java.util.Date (:attention/created-at %) .getTime)
-                            #(str (:attention/id %))))
-             (take-last (or limit 1000))
-             vec)
+        (if id
+          (some-> (dh/q '[:find (pull ?a pattern) .
+                          :in $ ?chat-id ?id pattern
+                          :where
+                          [?c :chat/id ?chat-id]
+                          [?a :attention/chat ?c]
+                          [?a :attention/id ?id]]
+                        @conn (:chat/id ent) id attention-pull-pattern)
+                  entity->attention
+                  vector)
+          (->> (dh/q '[:find [(pull ?a pattern) ...]
+                       :in $ ?chat-id pattern
+                       :where
+                       [?c :chat/id ?chat-id]
+                       [?a :attention/chat ?c]]
+                     @conn (:chat/id ent) attention-pull-pattern)
+               (map entity->attention)
+               (filter #(if participant
+                          (= participant (:attention/participant %))
+                          true))
+               (sort-by (juxt #(some-> ^java.util.Date (:attention/created-at %) .getTime)
+                              #(str (:attention/id %))))
+               (take-last (or limit 1000))
+               vec))
         [])))
 
   store/PResourceStore

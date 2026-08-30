@@ -121,7 +121,8 @@
     "Persist one validated attention fact. Returns the stored fact.")
 
   (-list-attention [this room-id opts]
-    "List attention facts, optionally restricted by :participant and :limit."))
+    "List attention facts, optionally restricted by exact :id, :participant,
+     and :limit. Exact identity lookup is never subject to the history limit."))
 
 ;; =============================================================================
 ;; Helpers
@@ -145,8 +146,7 @@
   "Deterministic identity for one decision or disposition over a message."
   [room-id participant message-id run-id phase]
   (java.util.UUID/nameUUIDFromBytes
-   (.getBytes (str "dvergr-attention|" room-id "|" participant "|"
-                   message-id "|" run-id "|" phase)
+   (.getBytes (pr-str [:dvergr/attention room-id participant message-id run-id phase])
               java.nio.charset.StandardCharsets/UTF_8)))
 
 (def attention-semantic-keys
@@ -174,6 +174,30 @@
     (throw (ex-info "Applied attention axes differ from its decision"
                     {:type :room-store/attention-disposition-mismatch
                      :decision decision :applied applied})))
+  (if (= :enqueue (:attention/activation applied))
+    (when-not (uuid? (:attention/result-run-id applied))
+      (throw (ex-info "Applied enqueue attention requires a successor Run"
+                      {:type :room-store/missing-attention-result-run
+                       :decision decision :applied applied})))
+    (when (:attention/result-run-id applied)
+      (throw (ex-info "Only applied enqueue attention may reference a successor Run"
+                      {:type :room-store/unexpected-attention-result-run
+                       :decision decision :applied applied}))))
+  applied)
+
+(defn validate-attention-result-run!
+  "Require enqueue acknowledgement to name the exact successor execution."
+  [applied result-run]
+  (when (= :enqueue (:attention/activation applied))
+    (when-not result-run
+      (throw (ex-info "Applied enqueue attention references a missing successor Run"
+                      {:type :room-store/missing-attention-result-run
+                       :applied applied})))
+    (when-not (and (= (:attention/participant applied) (:run/actor result-run))
+                   (= (:attention/message-id applied) (:run/trigger result-run)))
+      (throw (ex-info "Applied enqueue attention references an unrelated successor Run"
+                      {:type :room-store/invalid-attention-result-run
+                       :applied applied :result-run result-run}))))
   applied)
 
 (defn validate-attention!

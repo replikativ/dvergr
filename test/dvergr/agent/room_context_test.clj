@@ -147,3 +147,47 @@
                                         (filter #(= :applied (:attention/status %))
                                                 facts)))))))
             (finally (rc/drop-ctx! :rc-legacy-cutover :var))))))))
+
+(deftest baseline-marker-lookup-is-not-history-bounded
+  (testing "an aged migration marker cannot retroactively admit ignored speech"
+    (let [c (ctx/create-execution-context)]
+      (binding [ec/*execution-context* c]
+        (let [room-id :rc-aged-baseline-marker
+              room (d/make-room {:id room-id :ctx c :store (mem/make)})
+              original (d/message :alice :var "legacy baseline" nil {:role :user})
+              ignored (d/message :bob :var "must stay ignored" nil {:role :user})]
+          (try
+            (d/post! room original)
+            (rc/ensure-ctx! room :var {:budget-dollars 1.0})
+            (rc/drop-ctx! room-id :var)
+            (d/post! room ignored)
+            (rstore/-store-attention!
+             (:store room) room-id
+             {:attention/id (random-uuid)
+              :attention/participant :var
+              :attention/message-id (:id ignored)
+              :attention/memory :ignore
+              :attention/activation :none
+              :attention/control :continue
+              :attention/at :now
+              :attention/status :ready
+              :attention/created-at (java.util.Date.)})
+            ;; Age the deterministic marker beyond the ordinary projection window.
+            (dotimes [_ 1001]
+              (rstore/-store-attention!
+               (:store room) room-id
+               {:attention/id (random-uuid)
+                :attention/participant :var
+                :attention/message-id (random-uuid)
+                :attention/memory :remember
+                :attention/status :ready
+                :attention/created-at (java.util.Date.)}))
+            (let [restored (rc/ensure-ctx! room :var {:budget-dollars 1.0})
+                  contents (non-system-contents restored)
+                  retroactive-applied-id
+                  (rstore/attention-id room-id :var (:id ignored) nil
+                                       :legacy-baseline-applied)]
+              (is (not-any? #(str/includes? % "must stay ignored") contents))
+              (is (empty? (rstore/-list-attention
+                           (:store room) room-id {:id retroactive-applied-id}))))
+            (finally (rc/drop-ctx! room-id :var))))))))

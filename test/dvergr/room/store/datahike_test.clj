@@ -87,6 +87,10 @@
     (contract/assert-attention-metadata-validation!
      st :attention-metadata-datahike)))
 
+(deftest enqueue-result-run-contract
+  (let [[_conn st] (mem-store)]
+    (contract/assert-enqueue-result-run! st :enqueue-result-datahike)))
+
 (deftest thread-filter-bounds-the-datahike-pull
   (testing "the indexed root predicate runs before message bodies are pulled"
     (let [[_conn st] (mem-store)

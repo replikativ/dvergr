@@ -24,6 +24,15 @@
   (contract/assert-attention-metadata-validation!
    (memory/make) :attention-metadata-memory))
 
+(deftest enqueue-result-run-contract
+  (contract/assert-enqueue-result-run! (memory/make) :enqueue-result-memory))
+
+(deftest attention-id-uses-an-injective-tuple-encoding
+  (let [message-id (random-uuid)]
+    ;; Both tuples rendered as `:a|:b|:c|...` under the old raw separator.
+    (is (not= (store/attention-id :a|:b :c message-id nil :ready)
+              (store/attention-id :a :b|:c message-id nil :ready)))))
+
 (deftest rejects-unmodelled-durable-metadata
   (let [st (memory/make)]
     (store/-store-room! st :strict-memory {:slug "strict-memory"})

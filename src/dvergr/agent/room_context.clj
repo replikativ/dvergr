@@ -198,12 +198,6 @@
             (let [messages (d/messages room {:limit (or limit 100)})
                   attention-store? (satisfies? rstore/PAttentionStore (:store room))
                   conversation-id (d/conversation-id room)
-                  initial-attention
-                  (if attention-store?
-                    (rstore/-list-attention (:store room)
-                                            conversation-id
-                                            {:participant agent-id :limit 1000})
-                    [])
                   baseline-message-id
                   (rstore/attention-id conversation-id agent-id nil nil
                                        :legacy-baseline-message)
@@ -211,7 +205,10 @@
                   (rstore/attention-id conversation-id agent-id baseline-message-id
                                        nil :legacy-baseline-complete)
                   baseline-complete?
-                  (some #(= baseline-marker-id (:attention/id %)) initial-attention)
+                  (and attention-store?
+                       (seq (rstore/-list-attention (:store room)
+                                                    conversation-id
+                                                    {:id baseline-marker-id})))
                   ;; Upgrade cutover: pre-attention rooms already have Runs but
                   ;; no participant projection. Materialize their exact current
                   ;; provider baseline before any new policy decision can make

@@ -111,9 +111,11 @@
                s
                (do
                  (when (= :applied (:attention/status fact))
-                   (store/validate-attention-disposition!
-                    (get-in s [:attention-index (:attention/decision-id fact) :fact])
-                    fact))
+                   (-> (store/validate-attention-disposition!
+                        (get-in s [:attention-index (:attention/decision-id fact) :fact])
+                        fact)
+                       (store/validate-attention-result-run!
+                        (get-in s [:runs room-id (:attention/result-run-id fact)]))))
                  (-> s
                      (assoc-in path fact)
                      (assoc-in [:attention-index attention-id]
@@ -125,13 +127,15 @@
                          :existing stored :fact fact})))
       fact))
 
-  (-list-attention [_ room-id {:keys [participant limit]}]
-    (->> (vals (get-in @state [:attention room-id] {}))
-         (filter #(if participant (= participant (:attention/participant %)) true))
-         (sort-by (juxt #(some-> ^java.util.Date (:attention/created-at %) .getTime)
-                        #(str (:attention/id %))))
-         (take-last (or limit 1000))
-         vec)))
+  (-list-attention [_ room-id {:keys [id participant limit]}]
+    (if id
+      (some-> (get-in @state [:attention room-id id]) vector)
+      (->> (vals (get-in @state [:attention room-id] {}))
+           (filter #(if participant (= participant (:attention/participant %)) true))
+           (sort-by (juxt #(some-> ^java.util.Date (:attention/created-at %) .getTime)
+                          #(str (:attention/id %))))
+           (take-last (or limit 1000))
+           vec))))
 
 (defn make
   "Create a fresh in-memory store."
