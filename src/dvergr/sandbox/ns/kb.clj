@@ -48,7 +48,7 @@
    `review`/`classify`/`forks`/`participants`/`root` — for the `dvergr.room` SCI
    namespace (mounted, merged with the DB surface, by `dvergr.sandbox.ns.room`).
    Persistent rooms + forks are behind one surface — same for agents, TUI, web."
-  [spindel-ctx & [agent-program-ceiling]]
+  [spindel-ctx & [agent-program-ceiling source-room]]
   (require 'dvergr.discourse)
   (require 'dvergr.rooms)
   (require 'dvergr.room.registry)
@@ -81,8 +81,8 @@
         resolve-room    (fn [ref]
                           (binding [rtc/*execution-context* spindel-ctx]
                             (cond
-                              (and (map? ref) (:bus ref) (:participants ref))
-                              ref                                ; already a Room
+                              (and (map? ref) (:id ref))
+                              (rreg-lookup* (:id ref))            ; canonical Room only
                               (keyword? ref) (rreg-lookup* ref)
                               (string? ref)  (or (rreg-lookup* ref)
                                                  (rreg-lookup* (slug->id* ref))))))
@@ -146,7 +146,9 @@
                             ;; An SCI evaluation cannot synchronously join its
                             ;; own controller/context teardown. Self-deletion is
                             ;; a supervisor effect; subordinate Rooms are safe.
-                            (when (identical? spindel-ctx (:ctx room))
+                            (when (and (= (:id source-room) (:id room))
+                                       (= (:incarnation source-room)
+                                          (:incarnation room)))
                               (throw (ex-info "A Room cannot delete itself from its own SCI runtime"
                                               {:type ::self-delete
                                                :room-id (:id room)})))

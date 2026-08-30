@@ -308,20 +308,26 @@
                              :store (memory/make)})
         child (binding [ec/*execution-context* (:ctx parent)]
                 (d/fork-room parent {:isolation :ctx}))
+        shared-child (binding [ec/*execution-context* (:ctx parent)]
+                       (d/fork-room parent {:isolation :none}))
         deleted (atom nil)]
     (try
       (with-redefs [rooms/delete-room!
                     (fn [room]
                       (reset! deleted room)
                       {:ok? true})]
-        (let [ops (kb-ns/room-ops-map (:ctx parent))]
+        (let [ops (kb-ns/room-ops-map (:ctx parent) nil
+                                      (select-keys parent [:id :incarnation]))]
           (is (= {:deleted (:id child)} (('delete! ops) child)))
           (is (identical? child @deleted))
+          (is (= {:deleted (:id shared-child)} (('delete! ops) shared-child))
+              "a subordinate sharing the source context is not mistaken for self")
           (is (thrown-with-msg?
                clojure.lang.ExceptionInfo #"cannot delete itself"
-               (('delete! ops) parent)))))
+               (('delete! ops) (assoc parent :ctx (:ctx child)))))))
       (finally
         (d/discard child)
+        (d/discard shared-child)
         (d/close-room! parent)))))
 
 (deftest room-work-teardown-broadcasts-before-joining

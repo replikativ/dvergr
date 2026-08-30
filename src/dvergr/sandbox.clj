@@ -970,7 +970,9 @@
         ;; via `dvergr.room/*kb*` + `kb-find`/`kb-search` + `d` — no separate `entity`
         ;; namespace (dropped as redundant; a global entity CRM can return later).
         (ns-room/add-room-ns! sci-ctx room-conn kb-conn room-id spindel-ctx
-                              agent-program-ceiling)
+                              agent-program-ceiling
+                              {:id (or room-runtime-id room-id)
+                               :incarnation room-incarnation})
         ;; dvergr.mail/*inbox* — the room's attached mailbox conn (fork-aware),
         ;; nil when no mailbox attached. Read helpers are seed source (dvergr/mail/).
         (ns-mail/add-mail-ns! sci-ctx)

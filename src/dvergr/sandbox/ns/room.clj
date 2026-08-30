@@ -34,7 +34,7 @@
    may be nil (room-less ctx) — the helpers degrade gracefully.
    `agent-program-ceiling` is forwarded to the room-bound SCI setup; bounded
    delegation itself lives only in the `dvergr.agent` namespace."
-  [sci-ctx room-conn kb-conn room-id ctx & [agent-program-ceiling]]
+  [sci-ctx room-conn kb-conn room-id ctx & [agent-program-ceiling source-room]]
   (let [;; EVERY readable KB, not just `*kb*`. A room's knowledge is spread over
         ;; its own KB plus whatever is granted to it, and the two are written
         ;; through different bindings of the same katzen schema — dvergr's
@@ -127,7 +127,7 @@
                                     ws)))))
         kb  (fn [slug] (safe #(binding [ec/*execution-context* ctx]
                                 (srooms/room-kb-conn room-id slug))))
-        room-map (merge (ns-kb/room-ops-map ctx agent-program-ceiling) ; create!/fork!/merge!/post!/messages/…
+        room-map (merge (ns-kb/room-ops-map ctx agent-program-ceiling source-room) ; create!/fork!/merge!/post!/messages/…
                         ;; Docs live HERE rather than only in these trailing
                         ;; comments: the comments never reached the sandbox, so
                         ;; `(clojure.repl/doc dvergr.room/kb-search)` answered
