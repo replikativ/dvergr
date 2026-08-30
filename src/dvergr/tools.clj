@@ -1702,11 +1702,15 @@ Note: changes take effect on the next agent restart or reload."
                          :program {:kind :llm
                                    :budget-dollars (or budget 0.50)}})
           handle       (binding [rtc/*execution-context* ctx]
-                         (hire-in! control-room room roster agent-id
-                                   (cond-> {:task task
-                                            :from (or actor :spawn-agent)
-                                            :settlement settlement}
-                                     run-id (assoc :parent-run run-id))))]
+                         (let [admit-child!
+                               #(hire-in! control-room room roster agent-id
+                                          (cond-> {:task task
+                                                   :from (or actor :spawn-agent)
+                                                   :settlement settlement}
+                                            run-id (assoc :parent-run run-id)))]
+                           (if-let [own-child! (:own-child! agent-program-ceiling)]
+                             (own-child! admit-child!)
+                             (admit-child!))))]
       (try
         (let [result (binding [rtc/*execution-context* ctx] @handle)]
           {:type :success

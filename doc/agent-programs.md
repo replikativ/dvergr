@@ -1,8 +1,9 @@
 # Agent programs in the room REPL
 
-Status: deterministic and native LLM/tool interpreters implemented. The data
-model and Run boundary are intentional; simulation, replay, resource splitting,
-and durable continuation are later interpreters over the same contract.
+Status: deterministic and native LLM/tool interpreters plus conserved resource
+delegation are implemented. The data model and Run boundary are intentional;
+simulation, replay, provider-usage debiting, and durable continuation are later
+interpreters over the same contract.
 
 Dvergr agents can construct specialized workers and compose their executions
 from the SCI REPL. The initial surface separates four concepts:
@@ -76,6 +77,14 @@ durability-first: once `hire!` returns, `observe` and `cancel!` can address the
 Run without a startup race. If trigger persistence or spawning fails, the
 already-admitted Run is durably failed.
 
+A recursive `hire!` is structurally owned by the current Run. Ownership does
+not depend on retaining or awaiting the returned handle: parent cleanup, world
+settlement, and resource return wait until every owned child is durably
+terminal, and parent cancellation propagates to them. This prevents an ignored
+child from returning resources into an already-settled parent wallet. Long-lived
+ambient work will require an explicit detached/service operation with its own
+durable owner and resource grant; dropping a handle is not detachment.
+
 Use `await` on `(agent/result-spin handle)` inside `spin`. This is a passive
 observer: several branches may await one Run, and cancelling one observation
 does not cancel the shared work. Use `(agent/owned-result-spin handle)` for a
@@ -140,12 +149,54 @@ subscription transports—only supply model responses.
 maximum 256). A step is one provider exchange, not a conversational turn and
 not Dvergr's scheduling clock. Reactive attention may queue, merge, observe,
 fork, or switch work around these discrete transport boundaries.
-`:budget-dollars` is a per-execution spending ceiling (default $1), not a Kontor
-resource allocation. When it is exceeded after a tool-bearing model step, the Run
+`:budget-dollars` is still a provider-loop ceiling (default $1), not itself a
+Kontor debit. When it is exceeded after a tool-bearing model step, the Run
 settles as `:waiting` with reason `:budget-exhausted`; no process remains active,
-and its partial world is retained for review.
-A true resumable continuation and affine resource settlement are separate later
-contracts.
+and its partial world is retained for review. Connecting measured provider usage
+to the Run's conserved wallet is a separate next contract.
+
+## Conserved resource delegation
+
+When the Room has a Datahike resource store, `hire!` may atomically split a
+positive resource vector from the current Run (or the Room root at top level):
+
+First, a trusted host provisions the Room root with an idempotent receipt ID;
+this API is deliberately absent from SCI:
+
+```clojure
+(require '[dvergr.resource :as resource])
+
+(resource/mint! room
+                {:id #uuid "3f1e13e2-f5ca-4f88-a847-f45978599d40"
+                 :resources {"microUSD" 1000000}})
+```
+
+The stable `:id` is part of the effect protocol: retrying the same provisioning
+request cannot mint twice. An operator may instead install and fund other
+coordinates through the same trusted host boundary.
+
+The room-bound SCI program can then inspect and split only its available
+authority:
+
+```clojure
+(let [child (agent/hire! team :analyst
+                         {:task "Inspect the evidence"
+                          :resources {"microUSD" 250000}})]
+  {:remaining (agent/balance)
+   :result (await (agent/result-spin child))})
+```
+
+Coordinates are extensible strings; `"microUSD"` is merely the first installed
+unit. Kontor records the allocation and return as balanced, idempotent receipts,
+and its Datahike writer predicate rejects overdrafts or unreceipted changes.
+Allocation happens after durable Run admission but before the trigger or any
+program effect. If it fails, the Run is durably failed and no agent effect
+starts. After all owned work quiesces, unused resources return to the structural
+parent; recursive vectors therefore remain conserved across fork/join.
+
+SCI exposes only `agent/balance` and the `:resources` argument to `hire!`. It
+does not expose connections, minting, arbitrary transfers, or a way to redirect
+`:parent-run`. Installation and minting remain trusted host operations.
 
 ## Execution and world settlement
 
@@ -172,9 +223,9 @@ the SCI `hire!` closure and model-tool adapters resolve them automatically.
 
 An LLM-created sandbox can still build and revise arbitrary immutable rosters,
 but its `hire!` authority currently accepts only provider-free `:echo` and
-`:scripted` children. This prevents a child from minting new provider spend,
-tools, or recursive LLM work before Kontor can split a resource vector from the
-parent Run. A top-level Room REPL has no such program-kind ceiling.
+`:scripted` children. Generic resource vectors can already split recursively;
+paid recursive LLM work remains closed until measured provider usage is debited
+from that wallet. A top-level Room REPL has no such program-kind ceiling.
 
 The `spawn_agent` and `propose_change` model tools are convenience adapters over
 this same boundary. They construct a portable one-agent Roster, call `hire!`,

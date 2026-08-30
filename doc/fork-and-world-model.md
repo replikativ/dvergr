@@ -232,7 +232,10 @@ The canonical nested ownership path now exists: SCI `dvergr.agent/hire!` and the
 `spawn_agent` / `propose_change` tool adapters all use Run worlds. Recursive
 `hire-in!` keeps durable facts in the root control Room while forking and settling
 against the immediate work-world parent. Paid recursive LLM delegation remains
-attenuated until resource-vector splitting exists.
+attenuated until measured provider usage is debited from the already-supported
+conserved Run resource vectors. Owned child Runs delay parent settlement and
+resource return even when their handles are ignored; ambient/detached work must
+eventually receive a distinct durable owner rather than arise by accident.
 
 ### Simmis proposal
 

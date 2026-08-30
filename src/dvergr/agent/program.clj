@@ -15,6 +15,7 @@
             [dvergr.chat.context :as chat-context]
             [dvergr.discourse :as d]
             [dvergr.model.providers :as providers]
+            [dvergr.resource :as resource]
             [dvergr.system.rooms :as system-rooms]
             [dvergr.tools :as tools]
             [hasch.core :as hasch]
@@ -35,18 +36,27 @@
    to a Participant is a separate, explicit speech act."
   :_runs)
 
-(def interpreter-version 3)
+(def interpreter-version 4)
 
 (def ^:private default-max-model-steps 32)
+
+(declare with-owned-child! cancel!)
 
 (defn- child-program-authority
   "Authority made available to code and tools running inside one paid LLM Run.
    Keep this one value shared by the SCI and native-tool surfaces so a model
    cannot bypass delegation attenuation by choosing a different interface."
-  [run-id]
+  [run-id supervisor]
   {:program-kinds #{:echo :scripted}
+   ;; Conserved vectors can now be split recursively, but model calls are not
+   ;; yet debited from the Run wallet. Keep paid recursive effects closed until
+   ;; provider usage and Kontor receipts form one atomic/effectively-once path.
    :provider-effects? false
-   :parent-run run-id})
+   :parent-run run-id
+   ;; Process-local structured ownership. The sandbox may construct immutable
+   ;; rosters freely, but every admitted child execution is leased to this
+   ;; supervisor before `hire!` returns to agent code.
+   :own-child! #(with-owned-child! supervisor %)})
 
 (defn- program-result
   ([status value] {::status status ::value value})
@@ -66,6 +76,7 @@
     :state (atom {:cancelled? false
                   :sealed? false
                   :workers {}
+                  :children {}
                   :cleanup nil
                   :cleanup-phase :pending
                   :cleanup-error nil
@@ -79,9 +90,11 @@
   [supervisor]
   (let [action
         (locking supervisor
-          (let [{:keys [sealed? workers cleanup cleanup-phase quiesced?] :as state}
+          (let [{:keys [sealed? workers children cleanup cleanup-phase quiesced?]
+                 :as state}
                 @(:state supervisor)
-                normal-live? (some #(= :normal (:kind %)) (vals workers))]
+                normal-live? (or (seq children)
+                                 (some #(= :normal (:kind %)) (vals workers)))]
             (cond
               (and sealed? (not normal-live?) (= :pending cleanup-phase) cleanup)
               (do (swap! (:state supervisor) assoc :cleanup-phase :running)
@@ -191,16 +204,27 @@
      worker)))
 
 (defn- cancel-supervisor! [supervisor]
-  (let [tasks
+  (let [[tasks cancel-children]
         (locking supervisor
           (swap! (:state supervisor) assoc :cancelled? true)
-          (->> (get @(:state supervisor) :workers)
-               vals
-               (filter #(= :normal (:kind %)))
-               (map :task)
-               vec))]
+          [(->> (get @(:state supervisor) :workers)
+                vals
+                (filter #(= :normal (:kind %)))
+                (map :task)
+                vec)
+           (->> (get @(:state supervisor) :children)
+                vals
+                (map :cancel!)
+                vec)])]
     (doseq [^FutureTask task tasks]
-      (.cancel task true)))
+      (.cancel task true))
+    (doseq [cancel-child! cancel-children]
+      (try
+        (cancel-child!)
+        (catch Throwable t
+          (tel/log! {:level :warn :id ::child-cancellation-failed
+                     :data {:error (ex-message t)}}
+                    "Owned child cancellation failed")))))
   nil)
 
 (defn- register-cleanup! [supervisor cleanup]
@@ -316,6 +340,66 @@
     (spin-core/set-owned-spins! (spin-core/spin-id observer) [execution])
     observer))
 
+(defn- child-finished! [supervisor lease-id]
+  (locking supervisor
+    (swap! (:state supervisor) update :children dissoc lease-id))
+  (advance-supervisor! supervisor))
+
+(defn- with-owned-child!
+  "Reserve parent ownership before invoking zero-argument `admit-child!`.
+
+   The reservation closes the cancellation/seal race around durable child
+   admission: a parent cannot quiesce while admission is in progress, and a
+   cancellation that arrives before the RunHandle exists is replayed against
+   it immediately afterward. The lease is released only when admission fails
+   or the admitted child reaches its durable terminal state."
+  [supervisor admit-child!]
+  (let [lease-id (random-uuid)
+        cancel-slot (atom nil)
+        watch-key (Object.)
+        acknowledged? (atom false)
+        acknowledge! (fn []
+                       (when (compare-and-set! acknowledged? false true)
+                         (run/unwatch-runs! watch-key)
+                         (child-finished! supervisor lease-id)))]
+    (locking supervisor
+      (let [{:keys [sealed? cancelled?]} @(:state supervisor)]
+        (when (or sealed? cancelled?)
+          (throw (ex-info "Cannot hire an owned child after parent cancellation/seal"
+                          {:type ::supervisor-sealed})))
+        (swap! (:state supervisor) assoc-in [:children lease-id]
+               {:cancel! #(when-let [cancel-child! @cancel-slot]
+                            (cancel-child!))})))
+    (try
+      (let [^RunHandle handle (admit-child!)
+            child-id (run-id handle)
+            owner-ctx (ec/current-execution-context)
+            cancel-child! #(binding [ec/*execution-context* owner-ctx]
+                             (cancel! handle))]
+        (reset! cancel-slot cancel-child!)
+        (locking supervisor
+          (swap! (:state supervisor) assoc-in [:children lease-id :handle] handle))
+        ;; Lifecycle registration and its initial active snapshot share the Run
+        ;; registry lock. We therefore cannot miss a child that terminalizes
+        ;; during registration, and acknowledgement is independent of either
+        ;; execution graph being cancelled.
+        (run/watch-runs!
+         watch-key
+         (fn [{:keys [type runs run]}]
+           (when (or (and (= :runs/snapshot type)
+                          (not-any? #(= child-id (:run/id %)) runs))
+                     (and (= :run/finished type)
+                          (= child-id (:run/id run))))
+             (acknowledge!))))
+        (when (:cancelled? @(:state supervisor))
+          (cancel-child!))
+        handle)
+      (catch Throwable t
+        (acknowledge!)
+        (when-let [cancel-child! @cancel-slot]
+          (try (cancel-child!) (catch Throwable _)))
+        (throw t)))))
+
 (defn- cancelled! [run-id]
   (throw (ex-info "Run cancelled" {:type ::cancelled :run/id run-id})))
 
@@ -371,7 +455,8 @@
                       {:type ::no-provider
                        :agent/id (:agent/id agent)}))))
 
-(defn- new-llm-context [control-room work-room run-id agent budget-dollars chat-id]
+(defn- new-llm-context
+  [control-room work-room run-id agent budget-dollars chat-id supervisor]
   (let [system-id (room-context/room-system-id work-room)
         ;; Model messages, tool results, authorization receipts, and costs are
         ;; control-plane evidence. Keep that trace in the parent even when the
@@ -386,14 +471,14 @@
                    :kb-conn (when system-id (system-rooms/room-kb-conn system-id))
                    :room-id system-id
                    :room-runtime-id (:id work-room)
-                   ;; Until Kontor can split a resource vector, a paid child may
-                   ;; only delegate provider-free work. Pure roster construction
-                   ;; remains available inside SCI.
-                   :agent-program-ceiling (child-program-authority run-id)})]
+                   ;; Generic resource vectors split recursively, but paid model
+                   ;; usage is not debited yet. Permit only provider-free child
+                   ;; programs until that receipt path exists.
+                   :agent-program-ceiling (child-program-authority run-id supervisor)})]
     {:chat-ctx chat-ctx
      :owned-db? (nil? trace-db)}))
 
-(defn- llm-tool-context [control-room room chat-ctx agent run-id]
+(defn- llm-tool-context [control-room room chat-ctx agent run-id supervisor]
   (let [system-id (room-context/room-system-id room)
         tool-map (tools/normalize-tools (or (:agent/tools agent) #{}))
         ;; Ordinary room/task effects target the branched work store. A
@@ -416,7 +501,7 @@
            ;; the SCI API. Carry structural parentage and the identical
            ;; attenuation policy across this boundary explicitly.
            :run-id run-id
-           :agent-program-ceiling (child-program-authority run-id)
+           :agent-program-ceiling (child-program-authority run-id supervisor)
            :actor (:agent/id agent)
            :model-policy (:agent/model-policy agent)})
          (assoc :workspace-roots
@@ -444,12 +529,13 @@
             (fn []
               (let [{:keys [chat-ctx owned-db?]}
                     (new-llm-context control-room work-room run-id agent
-                                     budget-dollars chat-id)
+                                     budget-dollars chat-id supervisor)
                     _ (when owned-db?
                         (register-cleanup!
                          supervisor #(chat-context/close-chat! chat-ctx)))
                     {:keys [tool-map tool-ctx]}
-                    (llm-tool-context control-room work-room chat-ctx agent run-id)
+                    (llm-tool-context control-room work-room chat-ctx agent run-id
+                                      supervisor)
                     model-spec (resolve-model-spec agent)
                     instructions
                     (prompt/assemble-system-prompt
@@ -561,7 +647,7 @@
                               trigger supervisor)
     (execute-deterministic-program run-id agent task)))
 
-(def ^:private hire-option-keys #{:task :from :parent-run :settlement})
+(def ^:private hire-option-keys #{:task :from :parent-run :settlement :resources})
 
 (defn- validate-program!
   [{:keys [kind delay-ms max-model-steps budget-dollars auto-compact? compaction-model]
@@ -619,7 +705,7 @@
     program))
 
 (defn- validate-hire!
-  [roster agent-ref {:keys [task from parent-run] :as opts}]
+  [roster agent-ref {:keys [task from parent-run resources] :as opts}]
   (when-let [unknown (seq (remove hire-option-keys (keys opts)))]
     (throw (ex-info "Unknown hire! options"
                     {:type ::unknown-hire-options
@@ -634,6 +720,17 @@
   (when (and parent-run (not (uuid? parent-run)))
     (throw (ex-info "hire! :parent-run must be a UUID"
                     {:type ::invalid-parent-run :parent-run parent-run})))
+  (when (and (some? resources)
+             (not (and (map? resources)
+                       (seq resources)
+                       (every? (fn [[coordinate amount]]
+                                 (and (or (string? coordinate)
+                                          (keyword? coordinate))
+                                      (number? amount)
+                                      (pos? amount)))
+                               resources))))
+    (throw (ex-info "hire! :resources must be a non-empty positive resource vector"
+                    {:type ::invalid-resources :resources resources})))
   (when-not (roster/data-value? task)
     (throw (ex-info "Task must be portable data"
                     {:type ::non-portable-task :task task})))
@@ -731,12 +828,32 @@
      :finish-opts (cond-> {:settlement-status status}
                     reason (assoc :settlement-reason reason))}))
 
+(defn- return-unused-resources!
+  "Return a Run's remaining conserved vector after its owned work quiesces.
+
+   The transfer id is stable, so a retry after an uncertain commit is
+   idempotent. A configured resource allocation is never silently abandoned:
+   transient store failures retain the live Run and retry behind the same
+   physical-quiescence fence as durable terminal persistence."
+  [room id parent-run allocated?]
+  (when allocated?
+    (loop []
+      (let [outcome (try
+                      (let [remaining (resource/run-balance room id)]
+                        (when (seq remaining)
+                          (resource/return! room id parent-run remaining))
+                        :returned)
+                      (catch Throwable t t))]
+        (when (instance? Throwable outcome)
+          (Thread/sleep 25)
+          (recur))))))
+
 (defn- finalize-execution-external!
   "Finalize from a process-local watcher only after the orchestration Spin has a
    cached terminal result and the stable supervisor reports every native worker
    and owned cleanup quiescent. World settlement happens behind the same
    physical-quiescence fence."
-  [room run-world id supervisor execution completion outcome]
+  [room control-room run-world id parent-run allocated? supervisor execution completion outcome]
   (future
     ;; `future` conveys dynamic bindings. A cancellation hook normally launches
     ;; this watcher from the losing observer Spin, so retaining its *spin-id*
@@ -757,6 +874,7 @@
               (Thread/sleep 5)
               (recur))))
         (await-supervisor! supervisor)
+        (return-unused-resources! control-room id parent-run allocated?)
         (let [cleanup-error (:cleanup-error @(:state supervisor))
               result (if cleanup-error
                        {:run/id id :run/status :failed
@@ -866,11 +984,12 @@
    - `:from`       triggering actor, default `:repl`
    - `:parent-run` explicit structural parent Run UUID
    - `:settlement`  `:automatic` (default), `:review`, or `:discard`
+   - `:resources`   positive conserved vector split from the parent Run/Room
    Built-in program kinds are deterministic `:scripted` / `:echo` and the
    bounded Dvergr-native `:llm` model/tool loop. Simulation and replay
    interpreters implement the same boundary."
   [control-room world-parent roster agent-ref
-   {:keys [task from parent-run settlement]
+   {:keys [task from parent-run settlement resources]
     :or {from :repl settlement :automatic}
     :as raw-opts}]
   (let [opts      (assoc raw-opts :from from)
@@ -906,6 +1025,15 @@
       (catch Throwable t
         (d/discard work-room)
         (throw t)))
+    (try
+      (resource/allocate-run! control-room id parent-run resources)
+      (catch Throwable t
+        (let [{:keys [status reason]} (world/settle! run-world :failed)]
+          (run/finish! id :failed {:reason :resource-allocation-failed
+                                   :error t
+                                   :settlement-status status
+                                   :settlement-reason reason}))
+        (throw t)))
     (run/register-cancel-hook! id ::native-worker
                                #(cancel-supervisor! supervisor))
     (try
@@ -914,6 +1042,7 @@
       ;; record or an unowned message behind.
       (d/post! control-room trigger)
       (catch Throwable t
+        (return-unused-resources! control-room id parent-run (boolean (seq resources)))
         (let [{:keys [status reason]} (world/settle! run-world :failed)]
           (run/finish! id :failed {:reason :trigger-emission-failed
                                    :error t
@@ -964,10 +1093,12 @@
                         (if (= :cancelled (:run/status result))
                           {:reason :structured-cancellation}
                           {:reason :execution-error :error t})})))})
-        (finalize-execution-external! world-parent run-world id supervisor worker-execution
+        (finalize-execution-external! world-parent control-room run-world id parent-run
+                                      (boolean (seq resources)) supervisor worker-execution
                                       completion outcome-promise)
         handle)
       (catch Throwable t
+        (return-unused-resources! control-room id parent-run (boolean (seq resources)))
         (let [{:keys [status reason]} (world/settle! run-world :failed)]
           (run/finish! id :failed {:reason :spawn-failed :error t
                                    :settlement-status status
