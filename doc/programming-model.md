@@ -216,11 +216,14 @@ honors only the boundaries it actually supports.
 The current LLM participant implements the former behavior as a compatibility
 subset: same-thread `restart` projects to steer; `enqueue` projects to FIFO
 queue; passive `continue` projects to observe. The former `:steer`, `:queue`, and
-`:observe` policy results remain accepted. Future work-admission combinators
-(`latest`, `serial`, `busy`, and `parallel`) will consume these decisions rather
-than adding more branches to the LLM turn loop. A valid richer decision that the
-current adapter cannot honor is queued conservatively; its unsupported axes are
-never silently discarded.
+`:observe` policy results remain accepted. Structured work admission is now
+available directly in native code and the room SCI REPL as `spindel.work/latest`,
+`serial`, `busy`, and bounded `parallel`. These are higher-order FRP policies:
+they turn event values into owned child computations and make cancellation,
+quiescence, backpressure, and completion observable. A valid richer attention
+decision that the compatibility LLM adapter cannot honor is still queued
+conservatively; the next adapter should interpret it through this substrate
+rather than add another private scheduler to the turn loop.
 
 ## Built-in directives
 

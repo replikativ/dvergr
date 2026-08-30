@@ -2,8 +2,10 @@
   "SCI injectors — datahike read/write/diff, spindel sync/combinators/signals,
    and probabilistic inference. Split out of dvergr.sandbox (Phase 4)."
   (:require [sci.core :as sci]
+            [is.simm.partial-cps.sequence :as aseq]
             [datahike.api :as dh]
             [dvergr.sandbox.ns.doc :as doc]
+            [dvergr.sandbox.work :as sandbox-work]
             [org.replikativ.spindel.engine.core :as rtc]
             [org.replikativ.spindel.core :as sync]))
 
@@ -14,44 +16,108 @@
    - spindel.comb — parallel, race, timeout, sleep
    - sync         — deferred, deliver!, mailbox, post!
    - spindel.sig  — signal (for external world boundary)
+   - spindel.work — structured latest/serial/busy/parallel admission
 
    These are safe: they only coordinate within the SCI context."
-  [sci-ctx spindel-ctx]
-  (require 'org.replikativ.spindel.spin.combinators)
-  (require 'org.replikativ.spindel.signal)
-  (let [comb-ns (find-ns 'org.replikativ.spindel.spin.combinators)
-        sig-ns  (find-ns 'org.replikativ.spindel.signal)]
-    (binding [rtc/*execution-context* spindel-ctx]
-      ;; Sync primitives (same as before but unified here)
-      (sci/add-namespace! sci-ctx 'sync
-                          {'deferred  (fn [] (sync/deferred))
-                           'deliver!  (fn [d v] (sync/deliver! d v))
-                           'mailbox   (fn [] (sync/mailbox))
-                           'post!     (fn [mb v] (mb v))})
+  ([sci-ctx spindel-ctx]
+   (add-spindel-extras-ns! sci-ctx spindel-ctx {}))
+  ([sci-ctx spindel-ctx {:keys [room-id ceiling]}]
+   (require 'org.replikativ.spindel.spin.combinators)
+   (require 'org.replikativ.spindel.signal)
+   (let [comb-ns (find-ns 'org.replikativ.spindel.spin.combinators)
+         sig-ns  (find-ns 'org.replikativ.spindel.signal)]
+     (binding [rtc/*execution-context* spindel-ctx]
+       ;; Sync primitives (same as before but unified here)
+       (sci/add-namespace! sci-ctx 'sync
+                           {'deferred  (fn [] (sync/deferred))
+                            'deliver!  (fn [d v] (sync/deliver! d v))
+                            'mailbox   (fn [] (sync/mailbox))
+                            'post!     (fn [mb v] (mb v))})
       ;; Combinators
-      (sci/add-namespace! sci-ctx 'spindel.comb
-                          (doc/with-docs
-                            {'parallel @(ns-resolve comb-ns 'parallel)
-                             'race     @(ns-resolve comb-ns 'race)
-                             'timeout  @(ns-resolve comb-ns 'timeout)
-                             'sleep    @(ns-resolve comb-ns 'sleep)}
-                            '{parallel [([& spins]) "Run Spins concurrently and produce their values in input order. Cancelling the composition cancels its branches."]
-                              race     [([& spins]) "Produce the first Spin value and cancel losing branches. For hired Runs, pass dvergr.agent/owned-result-spin when branch cancellation must cancel the Run; passive result-spin deliberately leaves shared work alive."]
-                              timeout  [([spin timeout-ms] [spin timeout-ms timeout-value]) "Race a Spin against a timer and cancel the timed-out branch."]
-                              sleep    [([milliseconds]) "Return a Spin that completes after the given duration without blocking the engine thread."]}))
+       (sci/add-namespace! sci-ctx 'spindel.comb
+                           (doc/with-docs
+                             {'parallel @(ns-resolve comb-ns 'parallel)
+                              'race     @(ns-resolve comb-ns 'race)
+                              'timeout  @(ns-resolve comb-ns 'timeout)
+                              'sleep    @(ns-resolve comb-ns 'sleep)}
+                             '{parallel [([& spins]) "Run Spins concurrently and produce their values in input order. Cancelling the composition cancels its branches."]
+                               race     [([& spins]) "Produce the first Spin value and cancel losing branches. For hired Runs, pass dvergr.agent/owned-result-spin when branch cancellation must cancel the Run; passive result-spin deliberately leaves shared work alive."]
+                               timeout  [([spin timeout-ms] [spin timeout-ms timeout-value]) "Race a Spin against a timer and cancel the timed-out branch."]
+                               sleep    [([milliseconds]) "Return a Spin that completes after the given duration without blocking the engine thread."]}))
+      ;; Structured work admission. `task` is defined below inside SCI because
+      ;; it must run partial-cps expansion in the sandbox's own symbol table;
+      ;; copying the host macro would resolve sandbox vars against the host.
+       (sci/add-namespace! sci-ctx 'spindel.work
+                           (doc/with-docs
+                             {'latest       (fn
+                                              ([work-fn]
+                                               (sandbox-work/create! room-id spindel-ctx ceiling :latest {} work-fn))
+                                              ([opts work-fn]
+                                               (sandbox-work/create! room-id spindel-ctx ceiling :latest opts work-fn)))
+                              'serial       (fn
+                                              ([work-fn]
+                                               (sandbox-work/create! room-id spindel-ctx ceiling :serial {} work-fn))
+                                              ([opts work-fn]
+                                               (sandbox-work/create! room-id spindel-ctx ceiling :serial opts work-fn)))
+                              'busy         (fn
+                                              ([work-fn]
+                                               (sandbox-work/create! room-id spindel-ctx ceiling :busy {} work-fn))
+                                              ([opts work-fn]
+                                               (sandbox-work/create! room-id spindel-ctx ceiling :busy opts work-fn)))
+                              'parallel     (fn
+                                              ([work-fn]
+                                               (sandbox-work/create! room-id spindel-ctx ceiling :parallel {} work-fn))
+                                              ([opts work-fn]
+                                               (sandbox-work/create! room-id spindel-ctx ceiling :parallel opts work-fn)))
+                              'controller   (fn
+                                              ([work-fn]
+                                               (sandbox-work/create! room-id spindel-ctx ceiling :serial {} work-fn))
+                                              ([opts work-fn]
+                                               (sandbox-work/create! room-id spindel-ctx ceiling
+                                                                     (:strategy opts :serial)
+                                                                     (dissoc opts :strategy)
+                                                                     work-fn)))
+                              'submit!      sandbox-work/submit!
+                              'events       sandbox-work/events!
+                              'next-event   aseq/anext
+                              'untap!       sandbox-work/untap!
+                              'snapshot     sandbox-work/snapshot
+                              'completion   sandbox-work/completion
+                              'close!       sandbox-work/close!
+                              'cancel!      sandbox-work/cancel!}
+                             '{latest      [([work-fn] [opts work-fn]) "Create switch-to-latest admission. A replacement starts only after superseded work has quiesced."]
+                               serial      [([work-fn] [opts work-fn]) "Create FIFO admission with bounded waiting capacity."]
+                               busy        [([work-fn] [opts work-fn]) "Create exhaust/busy admission: suppress input while work is active."]
+                               parallel    [([work-fn] [opts work-fn]) "Create bounded parallel admission; set :concurrency in opts."]
+                               controller  [([work-fn] [opts work-fn]) "Create admission with explicit :strategy (:latest, :serial, :busy, or :parallel)."]
+                               submit!     [([controller value] [controller id value]) "Submit a value without blocking; returns its correlation id or nil when ingress is closed/full."]
+                               events      [([controller]) "Open an independent hot event stream for later admission and completion events."]
+                               next-event  [([event-source]) "Return an awaitable for the next [event remaining-source] pair."]
+                               untap!      [([controller event-source]) "Detach an abandoned event stream."]
+                               snapshot    [([controller]) "Return fork-local active, queued, and lifecycle state without live handles."]
+                               completion  [([controller]) "Return a passive awaitable that joins controller quiescence after close!/cancel!."]
+                               close!      [([controller]) "Stop admission, drain accepted work, and close."]
+                               cancel!     [([controller]) "Stop admission and cooperatively cancel queued and active owned work."]}))
+       (sci/eval-string*
+        sci-ctx
+        "(ns spindel.work (:require [is.simm.partial-cps.async :as pcps-async]))
+        (defmacro task
+          \"Create reusable one-shot CPS work. The controller gives every submission fresh Spin identity and ownership.\"
+          [& body]
+          `(pcps-async/async ~@body))")
       ;; Signals — signal is a macro; wrap as a function using the underlying record
-      (let [signal-ref-ctor (ns-resolve sig-ns '->SignalRef)
-            addr-ns (do (require 'org.replikativ.spindel.engine.addressing)
-                        (find-ns 'org.replikativ.spindel.engine.addressing))
-            next-addr! @(ns-resolve addr-ns 'next-address!)
-            deltaable-ns (do (require 'org.replikativ.spindel.incremental.deltaable)
-                             (find-ns 'org.replikativ.spindel.incremental.deltaable))
-            clear-deltas @(ns-resolve deltaable-ns 'clear-deltas)]
-        (sci/add-namespace! sci-ctx 'spindel.sig
-                            {'signal (fn [initial-value]
-                                       (let [ctx (rtc/current-execution-context)
-                                             id  (next-addr! ctx "signal" {:file "sci" :line 0 :column 0})]
-                                         (signal-ref-ctor id (clear-deltas initial-value))))})))))
+       (let [signal-ref-ctor (ns-resolve sig-ns '->SignalRef)
+             addr-ns (do (require 'org.replikativ.spindel.engine.addressing)
+                         (find-ns 'org.replikativ.spindel.engine.addressing))
+             next-addr! @(ns-resolve addr-ns 'next-address!)
+             deltaable-ns (do (require 'org.replikativ.spindel.incremental.deltaable)
+                              (find-ns 'org.replikativ.spindel.incremental.deltaable))
+             clear-deltas @(ns-resolve deltaable-ns 'clear-deltas)]
+         (sci/add-namespace! sci-ctx 'spindel.sig
+                             {'signal (fn [initial-value]
+                                        (let [ctx (rtc/current-execution-context)
+                                              id  (next-addr! ctx "signal" {:file "sci" :line 0 :column 0})]
+                                          (signal-ref-ctor id (clear-deltas initial-value))))}))))))
 
 (defn add-datahike-query-ns!
   "Add datahike query namespace to SCI context.

@@ -667,6 +667,8 @@
                       "(dvergr.tasks/list)   (dvergr.tasks/complete! id)"]
    "dvergr.agent"    ["program specialized agents as immutable rosters; exact programs are {:kind :echo :delay-ms n}, {:kind :scripted :delay-ms n :reply value}, or {:kind :llm ...}; hire! starts a durable Run with an explicit result Spin"
                       "join with result-spin; for a first-result race that really cancels losing Runs: (let [team (-> (dvergr.agent/roster) (dvergr.agent/make-agent {:id :fast :program {:kind :scripted :delay-ms 10 :reply :fast}}) (dvergr.agent/make-agent {:id :slow :program {:kind :scripted :delay-ms 5000 :reply :slow}})) a (dvergr.agent/hire! team :fast {:task :solve}) b (dvergr.agent/hire! team :slow {:task :solve})] @(spin (-> (await (spindel.comb/race (dvergr.agent/owned-result-spin a) (dvergr.agent/owned-result-spin b))) :run/value)))"]
+   "spindel.work"    ["structured higher-order FRP admission: latest, serial, busy, and bounded parallel; each accepted value becomes owned work"
+                      "(let [c (spindel.work/latest (fn [x] (spindel.work/task x)))] (spindel.work/submit! c :first) (spindel.work/submit! c :newest) (spindel.work/close! c) @(spin (await (spindel.work/completion c))))"]
    "dvergr.agents"   ["directory of agents (read-only): who exists / is online"
                       "(dvergr.agents/list)   (dvergr.agents/online? :var)"]
    "dvergr.actors"   ["durable participant identities — register/retire agents or humans and assign skills"
@@ -679,7 +681,7 @@
 (def ^:private guide-order
   ["babashka.fs" "babashka.http-client" "babashka.process" "cheshire.core" "clojure.data.xml"
    "datahike.api" "dvergr.room" "dvergr.mail" "dvergr.intake" "dvergr.codec" "git" "env" "llm"
-   "dvergr.scheduler" "dvergr.tasks" "dvergr.agent" "dvergr.agents" "dvergr.actors" "dvergr.skills"
+   "dvergr.scheduler" "dvergr.tasks" "dvergr.agent" "spindel.work" "dvergr.agents" "dvergr.actors" "dvergr.skills"
    "clojure.test"])
 
 (defn ns-overview-data
@@ -810,7 +812,10 @@
        "`agent/roster`, `agent/make-agent`, and `agent/revise-agent` return new "
        "values; only `agent/hire!` starts an effect. Compose `(agent/result-spin "
        "handle)` with `await`, parallel Spins, or `race`; inspect exact signatures "
-       "with `(sandbox/doc 'dvergr.agent)`.\n\n"
+       "with `(sandbox/doc 'dvergr.agent)`. For ongoing event sources, use "
+       "`spindel.work/latest`, `serial`, `busy`, or bounded `parallel`; their "
+       "`task` bodies use the same `await` algebra. Inspect `(sandbox/doc "
+       "'spindel.work)`.\n\n"
        "**Your databases.** Your room owns its data — NOT a shared global DB. "
        "`dvergr.room/*kb*` is your knowledge base, `dvergr.room/*room*` your room's "
        "own datahike (messages/state); query them with ordinary datahike, e.g. "
@@ -978,7 +983,10 @@
     ;; value, and live execution state belongs to the Room's Spindel context.
     (ns-agent/add-programming-ns! sci-ctx (or room-runtime-id room-id) spindel-ctx
                                   agent-program-ceiling)
-    (ns-data/add-spindel-extras-ns! sci-ctx spindel-ctx)
+    (ns-data/add-spindel-extras-ns!
+     sci-ctx spindel-ctx
+     {:room-id (or room-runtime-id room-id)
+      :ceiling (:work-admission agent-program-ceiling)})
     (ns-codec/add-codec-namespaces! sci-ctx)   ; cheshire.core / clojure.data.xml / dvergr.codec
     (ns-intake/add-intake-namespaces! sci-ctx)
     (ns-io/add-fs-ns!   sci-ctx :base-path cwd :filesystem filesystem

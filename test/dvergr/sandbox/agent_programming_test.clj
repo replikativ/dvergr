@@ -8,8 +8,10 @@
             [dvergr.sandbox :as sandbox]
             [dvergr.sandbox.ns.agent :as agent-ns]
             [dvergr.sandbox.ns.data :as data-ns]
+            [dvergr.sandbox.work :as sandbox-work]
             [dvergr.sandbox.ns.kb :as kb-ns]
             [dvergr.sandbox.ns.room :as room-ns]
+            [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.context :as context]
             [org.replikativ.spindel.engine.core :as ec]))
 
@@ -30,7 +32,8 @@
       ;; the same injector from setup-agent-namespaces!; doc-coverage exercises
       ;; that full wiring and catches any omission there.
       (agent-ns/add-programming-ns! sci-ctx (:id room) (:ctx room) nil)
-      (data-ns/add-spindel-extras-ns! sci-ctx (:ctx room))
+      (data-ns/add-spindel-extras-ns! sci-ctx (:ctx room)
+                                      {:room-id (:id room)})
       (testing "progressive help contains an executable composition example"
         (let [guide (sandbox/ns-doc-md sci-ctx 'dvergr.agent)]
           (is (re-find #":scripted.*:reply" guide))
@@ -41,7 +44,11 @@
           (is (re-find #"await" guide)))
         (let [guide (sandbox/ns-doc-md sci-ctx 'spindel.comb)]
           (is (re-find #"cancel losing branches" guide))
-          (is (re-find #"owned-result-spin" guide))))
+          (is (re-find #"owned-result-spin" guide)))
+        (let [guide (sandbox/ns-doc-md sci-ctx 'spindel.work)]
+          (is (re-find #"switch-to-latest" guide))
+          (is (re-find #"parallel" guide))
+          (is (re-find #"completion" guide))))
       (let [result
             (binding [ec/*execution-context* (:ctx room)]
               (sandbox/eval-code
@@ -76,6 +83,125 @@
           (is (uuid? (get-in result [:value :analyst-run])))
           (is (= :completed (get-in result [:value :analyst-status])))
           (is (empty? (run/active-runs (:id room))))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest room-sci-programs-serial-work-without-an-llm
+  (let [room    (d/make-room {:id :sci-structured-work
+                              :store (memory/make)})
+        sci-ctx (sandbox/fork-for-session (:ctx room))]
+    (try
+      (data-ns/add-spindel-extras-ns! sci-ctx (:ctx room)
+                                      {:room-id (:id room)})
+      (let [result
+            (binding [ec/*execution-context* (:ctx room)]
+              (sandbox/eval-code
+               sci-ctx
+               (str
+                "(require '[spindel.work :as work] "
+                "         '[org.replikativ.spindel.spin.cps :refer [spin]] "
+                "         '[org.replikativ.spindel.effects.await :refer [await]]) "
+                "(let [seen (atom []) "
+                "      c (work/serial "
+                "         (fn [value] "
+                "           (work/task "
+                "             (swap! seen conj value) "
+                "             value)))] "
+                "  @(spin "
+                "     (work/submit! c :first :first) "
+                "     (work/submit! c :second :second) "
+                "     (work/close! c) "
+                "     (await (work/completion c)) "
+                "     {:seen @seen :controller-map? (map? c) "
+                "      :state (work/snapshot c)}))")))]
+        (is (:success result) (pr-str (:error result)))
+        (is (= [:first :second] (get-in result [:value :seen])))
+        (is (false? (get-in result [:value :controller-map?]))
+            "the SCI handle does not expose its owner context or live children as data")
+        (is (= 0 (get-in result [:value :state :work/active])))
+        (is (= 0 (get-in result [:value :state :work/queued])))
+        (is (true? (get-in result [:value :state :terminal?]))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest fork-discard-cancels-and-joins-room-owned-sci-work
+  (let [parent  (d/make-room {:id :sci-work-parent
+                              :store (memory/make)})
+        fork    (binding [ec/*execution-context* (:ctx parent)]
+                  (d/fork-room parent {:isolation :ctx}))
+        sci-ctx (sandbox/fork-for-session (:ctx fork))]
+    (try
+      (data-ns/add-spindel-extras-ns! sci-ctx (:ctx fork)
+                                      {:room-id (:id fork)})
+      (let [created
+            (binding [ec/*execution-context* (:ctx fork)]
+              (sandbox/eval-code
+               sci-ctx
+               (str
+                "(require '[spindel.work :as work] "
+                "         '[sync :as sync] "
+                "         '[org.replikativ.spindel.effects.await :refer [await]]) "
+                "(let [cleanup (atom false) "
+                "      started (sync/deferred) "
+                "      never (sync/deferred) "
+                "      c (work/serial "
+                "         (fn [_] "
+                "           (work/task "
+                "             (try "
+                "               (sync/deliver! started true) "
+                "               (await never) "
+                "               (finally (reset! cleanup true))))))] "
+                "  (work/submit! c :job) "
+                "  {:cleanup cleanup :started started :controller c})")))]
+        (is (:success created) (pr-str (:error created)))
+        (let [{:keys [cleanup started controller]} (:value created)]
+          (binding [ec/*execution-context* (:ctx fork)]
+            (is (true? @(sp/spin (sp/await started)))))
+          (d/discard fork)
+          (is (true? @cleanup) "task finally runs before the fork substrate is discarded")
+          (binding [ec/*execution-context* (:ctx fork)]
+            (is (true? (:terminal? (sandbox-work/snapshot controller)))))))
+      (finally
+        (d/close-room! parent)))))
+
+(deftest room-sci-work-admission-enforces-resource-ceilings
+  (let [room    (d/make-room {:id :sci-work-ceilings
+                              :store (memory/make)})
+        sci-ctx (sandbox/fork-for-session (:ctx room))]
+    (try
+      (data-ns/add-spindel-extras-ns!
+       sci-ctx (:ctx room)
+       {:room-id (:id room)
+        :ceiling {:controllers 1
+                  :concurrency 2
+                  :capacity 4
+                  :ingress-capacity 4
+                  :event-taps 1}})
+      (let [result
+            (binding [ec/*execution-context* (:ctx room)]
+              (sandbox/eval-code
+               sci-ctx
+               (str
+                "(require '[spindel.work :as work]) "
+                "(let [too-wide "
+                "      (try (work/parallel {:concurrency 3} (fn [x] (work/task x))) "
+                "           :not-rejected "
+                "           (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))) "
+                "      c (work/serial (fn [x] (work/task x))) "
+                "      tap (work/events c) "
+                "      second-tap "
+                "      (try (work/events c) :not-rejected "
+                "           (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))) "
+                "      second-controller "
+                "      (try (work/serial (fn [x] (work/task x))) :not-rejected "
+                "           (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))] "
+                "  (work/untap! c tap) "
+                "  (work/close! c) "
+                "  {:too-wide too-wide :second-tap second-tap "
+                "   :second-controller second-controller})")))]
+        (is (:success result) (pr-str (:error result)))
+        (is (every? #(= :dvergr.sandbox.work/ceiling-exceeded %)
+                    (vals (:value result)))))
       (finally
         (d/close-room! room)))))
 

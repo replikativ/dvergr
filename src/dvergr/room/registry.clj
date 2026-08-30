@@ -25,6 +25,18 @@
 ;; fork discard) funnels through `unregister!`, so one hook covers them all.
 (defonce ^:private unregister-hooks (atom {}))
 
+;; Hooks that must complete BEFORE registry removal. Unlike observation-only
+;; unregister hooks, failures propagate and keep the Room registered so teardown
+;; can be retried safely.
+(defonce ^:private pre-unregister-hooks (atom {}))
+
+(defn add-pre-unregister-hook!
+  "Register a Room teardown fence. `f` receives the live Room before removal;
+   failures abort unregister and remain visible to the caller."
+  [id f]
+  (swap! pre-unregister-hooks assoc id f)
+  nil)
+
 (defn add-unregister-hook!
   "Register `f` (1-arg, takes room-id) to run after any room is unregistered.
    Keyed by `id` so re-registration (ns reload) replaces rather than dupes."
@@ -59,6 +71,9 @@
 (defn unregister!
   "Remove a Room from the registry by id, then run unregister hooks."
   [room-id]
+  (when-let [room (get (rctx/shared-get-state registry-path) room-id)]
+    (doseq [f (vals @pre-unregister-hooks)]
+      (f room)))
   (rctx/shared-swap-state! registry-path (fn [m] (dissoc (or m {}) room-id)))
   (doseq [f (vals @unregister-hooks)]
     (try (f room-id) (catch Throwable _ nil)))

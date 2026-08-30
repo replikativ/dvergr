@@ -45,6 +45,52 @@ work-admission combinators over the same substrate. They must not be encoded as
 special cases of a global turn loop. `:llm` is the first convenient process
 interpreter, not the definition of an agent.
 
+## Admit activity over time
+
+`hire!` starts one causally bounded Run. For a source that keeps producing work,
+compose the same Run-producing or provider-free programs with `spindel.work`:
+
+```clojure
+(require '[spindel.work :as work]
+         '[org.replikativ.spindel.spin.cps :refer [spin]]
+         '[org.replikativ.spindel.effects.await :refer [await]])
+
+(def revisions
+  (work/latest
+   (fn [request]
+     (work/task
+       ;; This body may await Spins, hire agents, query the room, or update
+       ;; fork-local state. Every accepted request gets fresh Spin identity.
+       (solve request)))))
+
+(work/submit! revisions message-id request)
+(work/close! revisions)
+@(spin (await (work/completion revisions)))
+```
+
+Choose policy from semantics rather than from an LLM loop shape:
+
+| Policy | Meaning |
+|---|---|
+| `latest` | New evidence supersedes active work; replacement waits for actual hand-back. |
+| `serial` | Preserve every accepted value in FIFO order. |
+| `busy` | Admit only while idle; explicitly suppress overlap. |
+| `parallel` | Gather independent work up to a declared concurrency bound. |
+
+Controllers expose a hot event stream (`events` plus `next-event`) and a
+fork-local `snapshot`. `close!` drains accepted work; `cancel!` cancels owned
+work; `completion` joins real quiescence. They are intentionally process-local
+reactive machinery. Durable intent, Run identity, messages, and accounting stay
+in the Room store. Reconstructing a controller after restart means replaying the
+durable admitted intent under an explicit recovery policy, not serializing live
+continuations.
+
+Attention is the conversational policy layer above this mechanism. A policy may
+remember an utterance without admission, enqueue it for serial work, or request
+switch-to-latest integration at a supported execution boundary. That mapping is
+an interpreter owned by the participant; message tags themselves never acquire
+cancellation authority.
+
 ## Construct and compose
 
 Inside a room-bound agent sandbox:

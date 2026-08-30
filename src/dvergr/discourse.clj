@@ -38,6 +38,7 @@
             [dvergr.substrate.geschichte :as geschichte]
             [dvergr.runtime.peer-bus :as peer-bus]
             [dvergr.agent.run :as agent-run]
+            [dvergr.sandbox.work :as sandbox-work]
             [dvergr.room.store :as rstore]
             [dvergr.room.store.datahike :as store-dh]
             [dvergr.room.registry :as rreg]
@@ -994,6 +995,7 @@
         (drain-room-listeners! room :close)
         (vreset! fence-token*
                  (get-in @(:meta room) [fork-transfer-state-key :token]))
+        (sandbox-work/close-room-work! room)
         (drain-room-runs! room)
         (seal-room-quiescence! room :close)
         (leave-all! room)
@@ -1352,6 +1354,7 @@
                 (vreset! listeners* (drain-room-listeners! fork :transfer))
                 (vreset! fence-token*
                          (get-in @(:meta fork) [fork-transfer-state-key :token]))
+                (sandbox-work/close-room-work! fork)
                 (drain-room-runs! fork)
                 ;; Once every admitted Run has physically stopped, retire its
                 ;; causal-post allowance before durable preparation or authority
@@ -1850,6 +1853,7 @@
   (when (binding [ec/*execution-context* (fork-home-ctx fork)] (rreg/lookup (:id fork)))
     (let [callbacks (drain-room-listeners! fork :discard)]
       (try
+        (sandbox-work/close-room-work! fork)
         (drain-room-runs! fork)                ; stop work before removing its substrate
         (seal-room-quiescence! fork :discard)
         (when-let [handle (fork-handle fork)]
@@ -1889,6 +1893,7 @@
   ([parent fork {:keys [merge-opts]}]
    (let [callbacks (drain-room-listeners! fork :merge)]
      (try
+       (sandbox-work/close-room-work! fork)
        (drain-room-runs! fork)                 ; stop work before merging its substrate
        (seal-room-quiescence! fork :merge)
    ;; (1) SUBSTRATE merge — branched yggdrasil systems (CRDTs, datahike, git) fold
