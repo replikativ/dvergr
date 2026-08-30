@@ -605,6 +605,12 @@
     :db/index true
     :db/doc "Explicit structural parent that spawned/contains this run"}
 
+   {:db/ident :run/caused-by
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/many
+    :db/index true
+    :db/doc "Runs whose resolved results this run explicitly observed; unlike :run/parent, this is a causal dependency and may have many values"}
+
    {:db/ident :run/roster
     :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/one

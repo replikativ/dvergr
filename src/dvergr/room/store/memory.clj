@@ -89,11 +89,16 @@
       (vec (take-last n filtered))))
 
   (-store-run! [_ room-id run]
-    (let [run (->> run
-                   store/validate-run!
-                   (store/validate-run-update!
-                    (get-in @state [:runs room-id (:run/id run)])))]
-      (swap! state assoc-in [:runs room-id (:run/id run)] run)
+    (let [run (store/validate-run! run)]
+      (swap! state
+             (fn [snapshot]
+               (let [existing (get-in snapshot [:runs room-id (:run/id run)])
+                     run (->> run
+                              (store/validate-run-update! existing)
+                              (store/validate-run-causes!
+                               existing
+                               #(get-in snapshot [:runs room-id %])))]
+                 (assoc-in snapshot [:runs room-id (:run/id run)] run))))
       run))
 
   (-load-run [_ room-id run-id]

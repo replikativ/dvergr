@@ -313,32 +313,46 @@
    Deferred; cancelling one observer never cancels the shared execution or a
    peer observer. Use `owned-result-spin` when structured cancellation should
    propagate from a race arm to the hired Run."
-  [^RunHandle handle]
-  (ensure-owner-context! handle)
-  (let [completion (.-completion handle)]
-    (sp/spin (sp/await completion))))
+  ([^RunHandle handle]
+   (ensure-owner-context! handle)
+   (let [completion (.-completion handle)]
+     (sp/spin (sp/await completion))))
+  ([consumer-run-id ^RunHandle handle]
+   (let [observer (result-spin handle)
+         cause-run-id (run-id handle)]
+     (sp/spin
+      (let [result (sp/await observer)]
+        (run/record-cause! consumer-run-id cause-run-id)
+        result)))))
 
 (defn owned-result-spin
   "An owning Spindel observer for a RunHandle. If a combinator cancels this
    observer (for example, as the losing arm of `race`), cancellation propagates
    to the hired Run. Prefer passive `result-spin` for ordinary or shared reads."
-  [^RunHandle handle]
-  (ensure-owner-context! handle)
-  (let [execution (.-worker-execution handle)
-        id (:run/id handle)
-        room-id (:run/room handle)
-        observer (sp/spin
-                  (try
-                    (sp/await (.-completion handle))
-                    (catch Throwable t
-                      (when (= spin-core/spin-cancelled (:type (ex-data t)))
-                        (run/cancel-room-run! room-id id))
-                      (throw t))))]
-    ;; A race can choose another arm before its executor has started this
-    ;; observer, so no await-cont exists yet. Record the same fork-local
-    ;; ownership edge Spindel's fan-out combinators use for that initial window.
-    (spin-core/set-owned-spins! (spin-core/spin-id observer) [execution])
-    observer))
+  ([^RunHandle handle]
+   (ensure-owner-context! handle)
+   (let [execution (.-worker-execution handle)
+         id (:run/id handle)
+         room-id (:run/room handle)
+         observer (sp/spin
+                   (try
+                     (sp/await (.-completion handle))
+                     (catch Throwable t
+                       (when (= spin-core/spin-cancelled (:type (ex-data t)))
+                         (run/cancel-room-run! room-id id))
+                       (throw t))))]
+     ;; A race can choose another arm before its executor has started this
+     ;; observer, so no await-cont exists yet. Record the same fork-local
+     ;; ownership edge Spindel's fan-out combinators use for that initial window.
+     (spin-core/set-owned-spins! (spin-core/spin-id observer) [execution])
+     observer))
+  ([consumer-run-id ^RunHandle handle]
+   (let [observer (owned-result-spin handle)
+         cause-run-id (run-id handle)]
+     (sp/spin
+      (let [result (sp/await observer)]
+        (run/record-cause! consumer-run-id cause-run-id)
+        result)))))
 
 (defn- child-finished! [supervisor lease-id]
   (locking supervisor

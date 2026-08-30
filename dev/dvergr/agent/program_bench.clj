@@ -61,6 +61,25 @@
    :reviewer {:claim 42}
    :returned {resource/microdollars 10000M}})
 
+(def self-programming-task-v1
+  (str "Use clojure_eval to author and execute a recursive Dvergr program. "
+       "Construct an immutable roster with three cheap simulated specialists. "
+       "A :mod-five particle is scripted to return [8 23 38 53 68 83 98]. "
+       "A :mod-seven particle is scripted to return "
+       "[2 9 16 23 30 37 44 51 58 65 72 79 86 93]. "
+       "A :verifier specialist is scripted to return the independent data "
+       "{:moduli [[3 2] [5 3] [7 2]] :upper-bound 100}. Hire all three and "
+       "compositionally await their result Spins in parallel. Intersect the "
+       "particle candidates, interpret the verifier data as executable checks, "
+       "and select the unique positive integer satisfying every remainder and "
+       "the bound. Return only an EDN map shaped like "
+       "{:answer <computed-integer> :particles 2 :verified <boolean>}. Do not "
+       "merely describe the program; create the specialists, await their "
+       "results, and execute it."))
+
+(def expected-self-programming-v1
+  {:answer 23 :particles 2 :verified true})
+
 (defn- parse-edn [value]
   (when (string? value)
     (with-open [reader (PushbackReader. (StringReader. value))]
@@ -98,6 +117,21 @@
       :structural-parentage? (every? #(= root-run-id (:run/parent %)) child-runs)
       :winner-completed? (= :completed (get-in by-actor [:fast :run/status]))
       :loser-cancelled? (= :cancelled (get-in by-actor [:slow :run/status]))})))
+
+(defn- self-programming-checks
+  [{:keys [root-run-id root-causes child-runs] :as observation}]
+  (let [by-actor (into {} (map (juxt :run/actor identity)) child-runs)
+        child-ids (into #{} (map :run/id) child-runs)]
+    (merge
+     (common-checks observation expected-self-programming-v1)
+     {:three-specialists? (= 3 (count child-runs))
+      :expected-specialists? (= #{:mod-five :mod-seven :verifier}
+                                (set (keys by-actor)))
+      :structural-parentage? (every? #(= root-run-id (:run/parent %)) child-runs)
+      :all-results-observed? (= child-ids root-causes)
+      :specialists-completed? (every? #(= :completed (:run/status %)) child-runs)
+      :specialists-merged? (every? #(= :merged (:run/settlement-status %))
+                                   child-runs)})))
 
 (defn- receipt-view [receipt]
   (select-keys receipt [:id :kind :source :destination :resources]))
@@ -236,6 +270,12 @@
     :max-model-steps 8
     :verify race-checks}
 
+   :programming/self-programming-v1
+   {:task self-programming-task-v1
+    :expected expected-self-programming-v1
+    :max-model-steps 8
+    :verify self-programming-checks}
+
    :programming/resource-delegation-v1
    {:task resource-task-v1
     :expected expected-resource-v1
@@ -304,6 +344,7 @@
             observation {:result result
                          :parsed-value parsed
                          :durable-status (:run/status durable)
+                         :root-causes (set (:run/caused-by durable))
                          :room-id room-id
                          :root-run-id root-run-id
                          :child-runs child-runs
@@ -331,7 +372,7 @@
           :result result
           :parsed-value parsed
           :durable-status (:run/status durable)
-          :runs (mapv #(select-keys % [:run/id :run/parent :run/actor
+          :runs (mapv #(select-keys % [:run/id :run/parent :run/caused-by :run/actor
                                       :run/status :run/error
                                       :run/settlement-status])
                       all-runs)
@@ -363,3 +404,8 @@
   "Run conserved sibling delegation and affine resource-return environment."
   [provider model]
   (run-environment! :programming/resource-delegation-v1 provider model))
+
+(defn run-self-programming-v1!
+  "Run the model-authored particle and verifier environment."
+  [provider model]
+  (run-environment! :programming/self-programming-v1 provider model))

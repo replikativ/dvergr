@@ -83,6 +83,10 @@
   (let [[_conn st] (mem-store)]
     (contract/assert-run-lifecycle! st :runs-datahike)))
 
+(deftest run-causality-contract
+  (let [[_conn st] (mem-store)]
+    (contract/assert-run-causality! st :run-causes-datahike)))
+
 (deftest attention-projection-contract
   (let [[_conn st] (mem-store)]
     (contract/assert-attention-projection! st :attention-datahike)))

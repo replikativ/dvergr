@@ -291,6 +291,7 @@
 
 (def durable-run-keys
   #{:run/id :run/kind :run/room :run/actor :run/trigger :run/parent
+    :run/caused-by
     :run/status :run/created-at :run/started-at :run/updated-at :run/ended-at
     :run/reason :run/error
     :run/world :run/isolation :run/settlement-policy
@@ -333,6 +334,17 @@
   (when (and (:run/parent run) (not (uuid? (:run/parent run))))
     (throw (ex-info ":run/parent must be a UUID"
                     {:type :room-store/invalid-run :key :run/parent :run run})))
+  (when-not (and (set? (or (:run/caused-by run) #{}))
+                 (every? uuid? (:run/caused-by run)))
+    (throw (ex-info ":run/caused-by must be a set of Run UUIDs"
+                    {:type :room-store/invalid-run
+                     :key :run/caused-by
+                     :run run})))
+  (when (contains? (:run/caused-by run) (:run/id run))
+    (throw (ex-info "A Run cannot causally depend on itself"
+                    {:type :room-store/invalid-run
+                     :key :run/caused-by
+                     :run run})))
   (when (and (:run/roster run) (not (keyword? (:run/roster run))))
     (throw (ex-info ":run/roster must be a keyword"
                     {:type :room-store/invalid-run :key :run/roster :run run})))
@@ -364,10 +376,14 @@
              (not (instance? java.util.Date (:run/ended-at run))))
     (throw (ex-info "A terminal run requires :run/ended-at"
                     {:type :room-store/invalid-run :key :run/ended-at :run run})))
+  (when (and (not (contains? terminal-run-statuses (:run/status run)))
+             (some? (:run/ended-at run)))
+    (throw (ex-info "A nonterminal run cannot have :run/ended-at"
+                    {:type :room-store/invalid-run :key :run/ended-at :run run})))
   run)
 
 (defn validate-run-update!
-  "Reject an update that changes the causal identity of an existing Run."
+  "Reject an update that changes identity or removes durable causal evidence."
   [existing run]
   (when (and existing
              (not= (select-keys existing immutable-run-keys)
@@ -377,6 +393,48 @@
                      :run-id (:run/id run)
                      :existing (select-keys existing immutable-run-keys)
                      :update (select-keys run immutable-run-keys)})))
+  (when (and existing
+             (not (every? (or (:run/caused-by run) #{})
+                          (or (:run/caused-by existing) #{}))))
+    (throw (ex-info "Durable Run causal inputs are append-only"
+                    {:type :room-store/causes-not-append-only
+                     :run-id (:run/id run)
+                     :existing (:run/caused-by existing)
+                     :update (:run/caused-by run)})))
+  (when (and existing
+             (contains? terminal-run-statuses (:run/status existing))
+             (or (not= (:run/status existing) (:run/status run))
+                 (not= (:run/ended-at existing) (:run/ended-at run))))
+    (throw (ex-info "A terminal Run lifecycle is immutable"
+                    {:type :room-store/terminal-run-update
+                     :run-id (:run/id run)
+                     :existing-status (:run/status existing)
+                     :update-status (:run/status run)
+                     :existing-ended-at (:run/ended-at existing)
+                     :update-ended-at (:run/ended-at run)})))
+  run)
+
+(defn validate-run-causes!
+  "Validate newly asserted causal edges through `load-cause`.
+
+   The loader is scoped to the same durable Room namespace by each store. A
+   causal input must already exist there and be terminal. Existing edges are
+   not rechecked on replay, but `validate-run-update!` prevents their removal."
+  [existing load-cause run]
+  (doseq [cause-id (remove (or (:run/caused-by existing) #{})
+                           (or (:run/caused-by run) #{}))]
+    (let [cause (load-cause cause-id)]
+      (when-not cause
+        (throw (ex-info "Causal input Run is not durable in the same Room"
+                        {:type :room-store/cause-not-durable
+                         :run-id (:run/id run)
+                         :cause-run/id cause-id})))
+      (when-not (contains? terminal-run-statuses (:run/status cause))
+        (throw (ex-info "Causal input Run has not resolved"
+                        {:type :room-store/cause-not-resolved
+                         :run-id (:run/id run)
+                         :cause-run/id cause-id
+                         :cause-run/status (:run/status cause)})))))
   run)
 
 (def durable-message-metadata-keys

@@ -133,6 +133,15 @@
                                control-room (control-room! work-room)]
                            (binding [ec/*execution-context* (:ctx work-room)]
                              (cancel* control-room handle-or-id))))
+        result-spin-fn (fn [handle]
+                         (if-let [run-id (:parent-run agent-program-ceiling)]
+                           (result-spin* run-id handle)
+                           (result-spin* handle)))
+        owned-result-spin-fn
+        (fn [handle]
+          (if-let [run-id (:parent-run agent-program-ceiling)]
+            (owned-result-spin* run-id handle)
+            (owned-result-spin* handle)))
         balance-fn     (fn []
                          (let [work-room (room!)
                                control-room (control-room! work-room)]
@@ -154,8 +163,8 @@
         'cancel!      cancel-fn
         'balance      balance-fn
         'run-id       run-id*
-        'result-spin  result-spin*
-        'owned-result-spin owned-result-spin*}
+        'result-spin  result-spin-fn
+        'owned-result-spin owned-result-spin-fn}
        '{roster       [([] [opts]) "Create an immutable Roster value. Options may include portable :id, :defaults, :scope, and :metadata data."]
          make-agent   [([roster spec]) "Return a NEW Roster containing `spec`. Programs are {:kind :echo :delay-ms n}, {:kind :scripted :delay-ms n :reply value}, or {:kind :llm :max-model-steps n :budget-dollars n} plus :model-policy and :tools. Pure: input unchanged."]
          revise-agent [([roster id patch]) "Return a NEW Roster with AgentDef `id` revised and its version incremented."]
@@ -168,8 +177,8 @@
          cancel!      [([handle-or-run-id]) "Request cooperative cancellation of exactly one live Run. Returns true when the Run was found."]
          balance      [([]) "Return the conserved resource vector available to the current Run, or the Room root at top level."]
          run-id       [([handle]) "Return the durable Run UUID represented by a RunHandle."]
-         result-spin  [([handle]) "Return a passive Spindel observer Spin for a RunHandle. Multiple observers may await it; cancelling an observer does not cancel the Run."]
-         owned-result-spin [([handle]) "Return an ownership-coupled result Spin. Cancelling this observer also cancels the underlying Run; use only when the observer owns that child execution."]}))))
+         result-spin  [([handle]) "Return a passive Spindel observer Spin for a RunHandle. On resolution the current Run durably records the child as a causal input. Multiple observers may await it; cancelling an observer does not cancel the Run."]
+         owned-result-spin [([handle]) "Return an ownership-coupled result Spin. On resolution the current Run durably records the child as a causal input. Cancelling this observer also cancels the underlying Run; use only when the observer owns that child execution."]}))))
 
 (defn add-agents-ns!
   "Expose the agent registry as 'agents namespace in SCI.

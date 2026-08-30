@@ -261,7 +261,7 @@
       :activity/outcome :activity/critical? :activity/at]}])
 
 (def ^:private run-pull-pattern
-  '[:run/id :run/kind :run/room :run/actor :run/trigger :run/parent
+  '[:run/id :run/kind :run/room :run/actor :run/trigger :run/parent :run/caused-by
     :run/roster :run/agent-version :run/program-kind :run/interpreter-version
     :run/agent-def-hash :run/chat-id
     :run/world :run/isolation :run/settlement-policy
@@ -289,6 +289,7 @@
            :run/started-at (:run/started-at run)
            :run/updated-at (:run/updated-at run)}
     (:run/parent run)   (assoc :run/parent (:run/parent run))
+    (seq (:run/caused-by run)) (assoc :run/caused-by (:run/caused-by run))
     (:run/roster run) (assoc :run/roster (:run/roster run))
     (:run/agent-version run) (assoc :run/agent-version (:run/agent-version run))
     (:run/program-kind run) (assoc :run/program-kind (:run/program-kind run))
@@ -307,6 +308,10 @@
     (:run/ended-at run) (assoc :run/ended-at (:run/ended-at run))
     (:run/reason run)   (assoc :run/reason (:run/reason run))
     (:run/error run)    (assoc :run/error (str (:run/error run)))))
+
+(defn- entity->run [entity]
+  (cond-> entity
+    (:run/caused-by entity) (update :run/caused-by set)))
 
 (defn- attention->entity [chat-id fact]
   (cond-> (-> fact
@@ -571,28 +576,36 @@
   (-store-run! [this room-id run]
     (let [slug (store/room-id->slug room-id)]
       (when-let [ent (room-by-slug conn slug)]
-        (let [run (->> run
-                       store/validate-run!
-                       (store/validate-run-update!
-                        (store/-load-run this room-id (:run/id run))))]
-          (when (persist/persist-tx!
-                 conn
-                 [(run->entity (:chat/id ent) run)
-                  {:db/id [:chat/id (:chat/id ent)]
-                   :chat/updated-at (java.util.Date.)}]
-                 {:op :store-run :room-id room-id :run-id (:run/id run)})
-            run)))))
+        ;; Serialize validation and assertion on the connection. Terminal cause
+        ;; Runs cannot be retracted through this store, and append-only checking
+        ;; prevents concurrent/stale writers from losing an accepted edge.
+        (locking conn
+          (let [run (store/validate-run! run)
+                existing (store/-load-run this room-id (:run/id run))
+                run (->> run
+                         (store/validate-run-update! existing)
+                         (store/validate-run-causes!
+                          existing
+                          #(store/-load-run this room-id %)))]
+            (when (persist/persist-tx!
+                   conn
+                   [(run->entity (:chat/id ent) run)
+                    {:db/id [:chat/id (:chat/id ent)]
+                     :chat/updated-at (java.util.Date.)}]
+                   {:op :store-run :room-id room-id :run-id (:run/id run)})
+              run))))))
 
   (-load-run [_ room-id run-id]
     (let [slug (store/room-id->slug room-id)]
       (when-let [ent (room-by-slug conn slug)]
-        (dh/q '[:find (pull ?r pattern) .
-                :in $ ?chat-id ?run-id pattern
-                :where
-                [?c :chat/id ?chat-id]
-                [?r :run/chat ?c]
-                [?r :run/id ?run-id]]
-              @conn (:chat/id ent) run-id run-pull-pattern))))
+        (some-> (dh/q '[:find (pull ?r pattern) .
+                        :in $ ?chat-id ?run-id pattern
+                        :where
+                        [?c :chat/id ?chat-id]
+                        [?r :run/chat ?c]
+                        [?r :run/id ?run-id]]
+                      @conn (:chat/id ent) run-id run-pull-pattern)
+                entity->run))))
 
   (-list-runs [_ room-id {:keys [limit status actor]}]
     (let [slug (store/room-id->slug room-id)]
@@ -603,6 +616,7 @@
                      [?c :chat/id ?chat-id]
                      [?r :run/chat ?c]]
                    @conn (:chat/id ent) run-pull-pattern)
+             (map entity->run)
              (filter #(if status (= status (:run/status %)) true))
              (filter #(if actor (= actor (:run/actor %)) true))
              (sort-by (juxt #(some-> ^java.util.Date (:run/started-at %) .getTime)

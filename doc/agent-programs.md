@@ -326,6 +326,7 @@ their reports:
 (bench/run-v1! :codex-subscription "codex-subscription-sol")
 (bench/run-race-v1! :claude-code "claude-code-sonnet")
 (bench/run-resource-v1! :codex-subscription "codex-subscription-sol")
+(bench/run-self-programming-v1! :codex-subscription "codex-subscription-sol")
 
 ;; The generic entry point makes the task/version explicit.
 (bench/run-environment! :programming/race-v1
@@ -359,6 +360,19 @@ parentage and settlement, empty terminal Run wallets, the restored Room balance,
 and global quiescence. In the 2026-08-30 Codex Sol probe it passed all checks in
 three model exchanges. This evaluates affine delegation and return; it does not
 pretend the provider call itself has been debited yet.
+
+The self-programming environment asks the root model to construct two cheap
+simulated particles plus an independent verifier specification, join all three
+through Spindel, and interpret the verifier data as a pure check. Trusted host
+code scores the exact answer, structural parentage, child completion and
+settlement, durable causal observation of every child result, durable root
+completion, and global quiescence. This deliberately
+uses stubbed child effects: it tests whether a model can author recursive
+orchestration before paid recursive LLM delegation is enabled. In the
+2026-08-30 Codex Sol probe, the model discovered the programming API through
+the REPL, authored and executed the three-specialist program, and passed every
+check in six model exchanges and 31.823 seconds. The durable root's causal
+inputs exactly matched the three child Runs.
 
 This is only the seed of a training environment, not yet a reinforcement
 learning system. The intended general contract is: initialize a forked Room and
