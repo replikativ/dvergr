@@ -7,11 +7,18 @@
    reward never depends on trusting the model's prose. The corresponding
    language and lifecycle contracts live in ordinary deterministic tests."
   (:require [clojure.edn :as edn]
+            [datahike.api :as dh]
             [dvergr.agent.program :as program]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.run :as run]
+            [dvergr.chat.schema :as chat-schema]
             [dvergr.discourse :as d]
+            [dvergr.resource :as resource]
+            [dvergr.room.store :as room-store]
+            [dvergr.room.store.datahike :as datahike-store]
             [dvergr.room.store.memory :as memory]
+            [kontor.governance :as kontor-governance]
+            [kontor.resource :as kontor-resource]
             [org.replikativ.spindel.engine.core :as ec])
   (:import [java.io PushbackReader StringReader]))
 
@@ -36,6 +43,23 @@
        "value: :fast. Do not merely describe the code; execute it."))
 
 (def expected-race-v1 :fast)
+
+(def resource-task-v1
+  (str "Use clojure_eval to solve this task. Your Run owns 10000 microUSD. "
+       "Construct an immutable roster with two scripted specialists: an "
+       ":analyst that waits 1000 milliseconds and replies \"evidence\", and a "
+       ":reviewer that waits 1000 milliseconds and replies {:claim 42}. Hire "
+       "the analyst with 2000 microUSD and the reviewer with 3000 microUSD. "
+       "Compositionally await both result Spins, then record (agent/balance) "
+       "after both resources have returned. Your final answer must be exactly "
+       "this EDN value: {:analyst \"evidence\" :reviewer {:claim 42} "
+       ":returned {\"microUSD\" 10000M}}. "
+       "Do not merely describe the code; execute it."))
+
+(def expected-resource-v1
+  {:analyst "evidence"
+   :reviewer {:claim 42}
+   :returned {resource/microdollars 10000M}})
 
 (defn- parse-edn [value]
   (when (string? value)
@@ -75,6 +99,130 @@
       :winner-completed? (= :completed (get-in by-actor [:fast :run/status]))
       :loser-cancelled? (= :cancelled (get-in by-actor [:slow :run/status]))})))
 
+(defn- receipt-view [receipt]
+  (select-keys receipt [:id :kind :source :destination :resources]))
+
+(defn- resource-checks
+  [{:keys [room-id root-run-id child-runs room-balance root-balance child-balances
+           resource-receipts]
+    :as observation}]
+  (let [by-actor (into {} (map (juxt :run/actor identity)) child-runs)
+        analyst-id (get-in by-actor [:analyst :run/id])
+        reviewer-id (get-in by-actor [:reviewer :run/id])
+        room-wallet (resource/room-wallet-id room-id)
+        receipt-contract
+        {:root-allocation
+         {:id (resource/allocation-id root-run-id)
+          :kind :grant :source room-wallet :destination root-run-id
+          :resources {resource/microdollars 10000M}}
+         :analyst-allocation
+         {:id (resource/allocation-id analyst-id)
+          :kind :grant :source root-run-id :destination analyst-id
+          :resources {resource/microdollars 2000M}}
+         :reviewer-allocation
+         {:id (resource/allocation-id reviewer-id)
+          :kind :grant :source root-run-id :destination reviewer-id
+          :resources {resource/microdollars 3000M}}
+         :analyst-return
+         {:id (resource/return-id analyst-id)
+          :kind :return :source analyst-id :destination root-run-id
+          :resources {resource/microdollars 2000M}}
+         :reviewer-return
+         {:id (resource/return-id reviewer-id)
+          :kind :return :source reviewer-id :destination root-run-id
+          :resources {resource/microdollars 3000M}}
+         :root-return
+         {:id (resource/return-id root-run-id)
+          :kind :return :source root-run-id :destination room-wallet
+          :resources {resource/microdollars 10000M}}}]
+    (merge
+     (common-checks observation expected-resource-v1)
+     {:two-children? (= 2 (count child-runs))
+      :expected-actors? (= #{:analyst :reviewer} (set (keys by-actor)))
+      :structural-parentage? (every? #(= root-run-id (:run/parent %)) child-runs)
+      :children-completed? (every? #(= :completed (:run/status %)) child-runs)
+      :children-merged? (every? #(= :merged (:run/settlement-status %)) child-runs)
+      :room-resources-conserved? (= {resource/microdollars 20000M} room-balance)
+      :root-wallet-returned? (empty? root-balance)
+      :child-wallets-returned? (every? empty? (vals child-balances))
+      :canonical-resource-receipts? (= receipt-contract resource-receipts)})))
+
+(defn- memory-environment [room-id]
+  (let [room (d/make-room {:id room-id :store (memory/make)})]
+    {:room room
+     :close! #(d/close-room! room)}))
+
+(defn- close-resource-environment! [cfg conn room]
+  (try
+    (when room (d/close-room! room))
+    (finally
+      (try
+        (kontor-governance/ungovern! conn)
+        (finally
+          (dh/release conn)
+          (dh/delete-database cfg))))))
+
+(defn- resource-environment [room-id]
+  (let [cfg {:store {:backend :memory :id (random-uuid)}
+             :keep-history? true
+             :schema-flexibility :write}
+        chat-id (random-uuid)]
+    (dh/create-database cfg)
+    (let [conn (try
+                 (dh/connect cfg)
+                 (catch Throwable error
+                   (try
+                     (dh/delete-database cfg)
+                     (catch Throwable cleanup-error
+                       (.addSuppressed error cleanup-error)))
+                   (throw error)))
+          room* (atom nil)]
+      (try
+        (chat-schema/ensure-full-schema! conn)
+        (dh/transact conn
+                     [(merge (chat-schema/create-chat-entity
+                              {:id chat-id :title (name room-id)})
+                             {:room/slug (room-store/room-id->slug room-id)
+                              :room/type :internal})])
+        (resource/install-connection! conn room-id chat-id)
+        (let [room (d/make-room {:id room-id
+                                 :store (datahike-store/make conn)})]
+          (reset! room* room)
+          (resource/mint! room {:id (random-uuid)
+                                :resources {resource/microdollars 20000M}})
+          {:room room
+           :hire-opts {:resources {resource/microdollars 10000M}}
+           :resource-observation
+           (fn [root-run-id child-runs]
+             (let [by-actor (into {} (map (juxt :run/actor identity)) child-runs)
+                   analyst-id (get-in by-actor [:analyst :run/id])
+                   reviewer-id (get-in by-actor [:reviewer :run/id])
+                   receipt (fn [id]
+                             (some-> (kontor-resource/receipt conn id)
+                                     receipt-view))]
+               {:room-balance (resource/balance room)
+                :root-balance (resource/run-balance room root-run-id)
+                :child-balances
+                (into {}
+                      (map (fn [child]
+                             [(:run/id child)
+                              (resource/run-balance room (:run/id child))]))
+                      child-runs)
+                :resource-receipts
+                {:root-allocation (receipt (resource/allocation-id root-run-id))
+                 :analyst-allocation (receipt (resource/allocation-id analyst-id))
+                 :reviewer-allocation (receipt (resource/allocation-id reviewer-id))
+                 :analyst-return (receipt (resource/return-id analyst-id))
+                 :reviewer-return (receipt (resource/return-id reviewer-id))
+                 :root-return (receipt (resource/return-id root-run-id))}}))
+           :close! #(close-resource-environment! cfg conn room)})
+        (catch Throwable error
+          (try
+            (close-resource-environment! cfg conn @room*)
+            (catch Throwable cleanup-error
+              (.addSuppressed error cleanup-error)))
+          (throw error))))))
+
 (def ^:private environments
   {:programming/join-v1
    {:task task-v1
@@ -86,7 +234,14 @@
    {:task race-task-v1
     :expected expected-race-v1
     :max-model-steps 8
-    :verify race-checks}})
+    :verify race-checks}
+
+   :programming/resource-delegation-v1
+   {:task resource-task-v1
+    :expected expected-resource-v1
+    :max-model-steps 8
+    :setup resource-environment
+    :verify resource-checks}})
 
 (defn run-environment!
   "Run a named programming environment through `provider`/`model`.
@@ -102,13 +257,14 @@
      (run-environment! :programming/race-v1 :claude-code
                        \"claude-code-sonnet\")"
   [environment-id provider model]
-  (let [{:keys [task expected max-model-steps verify]}
+  (let [{:keys [task expected max-model-steps setup verify]}
         (or (get environments environment-id)
             (throw (ex-info "Unknown programming environment"
                             {:environment-id environment-id
                              :known (set (keys environments))})))
         room-id (keyword (str "programming-bench-" (random-uuid)))
-        room (d/make-room {:id room-id :store (memory/make)})
+        {:keys [room hire-opts resource-observation close!]}
+        ((or setup memory-environment) room-id)
         team (roster/make-agent
               (roster/make-roster {:id :benchmark})
               {:id :orchestrator
@@ -123,7 +279,8 @@
         started (System/nanoTime)]
     (try
       (let [handle (binding [ec/*execution-context* (:ctx room)]
-                     (program/hire! room team :orchestrator {:task task}))
+                     (program/hire! room team :orchestrator
+                                    (merge {:task task} hire-opts)))
             initial-result (binding [ec/*execution-context* (:ctx room)]
                              (deref handle 120000 ::timeout))
             timed-out? (= ::timeout initial-result)
@@ -147,39 +304,50 @@
             observation {:result result
                          :parsed-value parsed
                          :durable-status (:run/status durable)
+                         :room-id room-id
                          :root-run-id root-run-id
                          :child-runs child-runs
                          :active-after (count (run/active-runs room-id))}
+            observation (merge observation
+                               (when resource-observation
+                                 (resource-observation root-run-id child-runs)))
             checks (verify observation)
             passed? (every? true? (vals checks))]
-        {:environment environment-id
-         :provider provider
-         :model model
-         :task task
-         :expected expected
-         :checks checks
-         :reward (if passed? 1.0 0.0)
-         :passed? passed?
-         :timed-out? timed-out?
-         :elapsed-ms (long (/ (- (System/nanoTime) started) 1000000))
-         ;; Each activity row is a tool-bearing provider exchange. A successful
-         ;; exact answer requires one final, non-tool provider exchange as well.
-         :model-steps (cond-> (count activity)
-                        (= :completed (:run/status result)) inc)
-         :result result
-         :parsed-value parsed
-         :durable-status (:run/status durable)
-         :runs (mapv #(select-keys % [:run/id :run/parent :run/actor
-                                     :run/status :run/error])
-                     all-runs)
-         :tool-calls
-         (mapv (fn [message]
-                 (mapv #(select-keys % [:tool-use/name :tool-use/input])
-                       (get-in message [:metadata :tool-uses])))
-               activity)
-         :active-after (:active-after observation)})
+        (cond->
+         {:environment environment-id
+          :provider provider
+          :model model
+          :task task
+          :expected expected
+          :checks checks
+          :reward (if passed? 1.0 0.0)
+          :passed? passed?
+          :timed-out? timed-out?
+          :elapsed-ms (long (/ (- (System/nanoTime) started) 1000000))
+          ;; Each activity row is a tool-bearing provider exchange. A successful
+          ;; exact answer requires one final, non-tool provider exchange as well.
+          :model-steps (cond-> (count activity)
+                         (= :completed (:run/status result)) inc)
+          :result result
+          :parsed-value parsed
+          :durable-status (:run/status durable)
+          :runs (mapv #(select-keys % [:run/id :run/parent :run/actor
+                                      :run/status :run/error
+                                      :run/settlement-status])
+                      all-runs)
+          :tool-calls
+          (mapv (fn [message]
+                  (mapv #(select-keys % [:tool-use/name :tool-use/input])
+                        (get-in message [:metadata :tool-uses])))
+                activity)
+          :active-after (:active-after observation)}
+          resource-observation
+          (assoc :resources
+                 (select-keys observation
+                              [:room-balance :root-balance :child-balances
+                               :resource-receipts]))))
       (finally
-        (d/close-room! room)))))
+        (close!)))))
 
 (defn run-v1!
   "Compatibility entry point for the original parallel-join environment."
@@ -190,3 +358,8 @@
   "Run the ownership-aware race and loser-cancellation environment."
   [provider model]
   (run-environment! :programming/race-v1 provider model))
+
+(defn run-resource-v1!
+  "Run conserved sibling delegation and affine resource-return environment."
+  [provider model]
+  (run-environment! :programming/resource-delegation-v1 provider model))

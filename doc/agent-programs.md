@@ -325,6 +325,7 @@ their reports:
 (require '[dvergr.agent.program-bench :as bench])
 (bench/run-v1! :codex-subscription "codex-subscription-sol")
 (bench/run-race-v1! :claude-code "claude-code-sonnet")
+(bench/run-resource-v1! :codex-subscription "codex-subscription-sol")
 
 ;; The generic entry point makes the task/version explicit.
 (bench/run-environment! :programming/race-v1
@@ -349,6 +350,15 @@ On 2026-08-28, after that correction, Codex Sol solved
 `:programming/race-v1` in three model exchanges and Claude Code in five. Every
 verifier check passed: exact `:fast` result, completed winner, durably cancelled
 loser, structural parentage, completed root, and zero active Runs.
+
+The resource-delegation environment adds a Datahike/Kontor control plane. The
+root Run receives a conserved vector, splits it between two specialists from
+SCI, and joins their result Spins. Its trusted verifier checks the canonical
+Kontor allocation and return receipts for every wallet edge, durable child
+parentage and settlement, empty terminal Run wallets, the restored Room balance,
+and global quiescence. In the 2026-08-30 Codex Sol probe it passed all checks in
+three model exchanges. This evaluates affine delegation and return; it does not
+pretend the provider call itself has been debited yet.
 
 This is only the seed of a training environment, not yet a reinforcement
 learning system. The intended general contract is: initialize a forked Room and
