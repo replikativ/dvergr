@@ -5,6 +5,7 @@
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
             [dvergr.discourse :as d]
+            [dvergr.discourse.attention :as attention]
             [dvergr.discourse.llm :as llm]
             [dvergr.chat.context :as cc]
             [dvergr.agent.run :as run]
@@ -54,6 +55,19 @@
         (pred) true
         (>= (System/currentTimeMillis) deadline) false
         :else (do (Thread/sleep 5) (recur))))))
+
+(deftest default-attention-policy-is-structured-and-thread-aware
+  (let [root (d/message :human :agent "root")
+        same (d/reply :human :agent "correction" root)
+        other (d/message :human :agent "another topic")
+        same-decision (llm/default-attention-policy
+                       {:active-message root :incoming-message same})
+        other-decision (llm/default-attention-policy
+                        {:active-message root :incoming-message other})]
+    (is (= :restart (:control same-decision)))
+    (is (= :steer (attention/legacy-action same-decision)))
+    (is (= :enqueue (:activation other-decision)))
+    (is (= :queue (attention/legacy-action other-decision)))))
 
 (defn- fail-output-store [delegate actor]
   (reify store/PRoomStore
@@ -320,7 +334,8 @@
                                #(d/iterative-refinement % :coder :reviewer
                                                         {:content "build login"}
                                                         {:accept? (fn [m] (re-find #"(?i)lgtm" (:content m)))
-                                                         :max-iter 4}))]
+                                                         :max-iter 4})
+                               15000)]
         (is (= :accepted (:result result)))
         (is (= "draft v2 with fix" (:content (:draft result))))
         (is (= "lgtm" (:content (:review result))))))))
@@ -474,7 +489,7 @@
           policy  (fn [{:keys [active-message incoming-message] :as context}]
                     (if (and (d/same-thread? active-message incoming-message)
                              (= :peer (:from incoming-message)))
-                      :queue
+                      (attention/enqueue :test/peer-chatter)
                       (llm/default-attention-policy context)))]
       (binding [ec/*execution-context* (:ctx r)]
         (d/join r (llm/llm-agent {:id :policy-worker

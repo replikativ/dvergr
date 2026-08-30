@@ -191,6 +191,37 @@ Swap adapters to change F's shape without touching the agent's G-side
 spin. The distributive law is *named and pluggable* rather than baked
 into one closure.
 
+## Attention decisions and execution boundaries
+
+An utterance is a durable Room fact; it is not ambient process-control
+authority. Each participant may interpret the same fact differently through a
+pure attention policy. Policies now return a validated product rather than
+having to choose one overloaded action:
+
+```clojure
+{:memory     :remember       ; :ignore | :remember | :include
+ :activation :enqueue        ; :none | :enqueue | :wake
+ :control    :continue       ; :continue | :integrate | :restart | :suspend | :cancel
+ :at         :quiescent
+ :priority   0
+ :reason     :conversation/different-thread}
+```
+
+The axes are independent: a fact can update awareness and enqueue later work
+without interrupting the active computation. The standard boundary vocabulary
+is `:now`, `:next-safe-boundary`, `:before-model`, `:token`, `:before-tool`,
+`:after-tool`, `:after-model`, and `:quiescent`. An interpreter advertises and
+honors only the boundaries it actually supports.
+
+The current LLM participant implements the former behavior as a compatibility
+subset: same-thread `restart` projects to steer; `enqueue` projects to FIFO
+queue; passive `continue` projects to observe. The former `:steer`, `:queue`, and
+`:observe` policy results remain accepted. Future work-admission combinators
+(`latest`, `serial`, `busy`, and `parallel`) will consume these decisions rather
+than adding more branches to the LLM turn loop. A valid richer decision that the
+current adapter cannot honor is queued conservatively; its unsupported axes are
+never silently discarded.
+
 ## Built-in directives
 
 `llm-agent` already handles a small set of tagged messages:
@@ -270,6 +301,7 @@ discards — the parent's state is provably untouched.
 | Delegate from a model tool call | `spawn_agent` or `propose_change`, thin adapters over `dvergr.agent/hire!` |
 | Swap an LLM's decision shape | `(llm-agent {:run-turn-fn ...})` using a GenerationHandle adapter |
 | Observe cost / budget | read the chat-ctx `:budget-signal` (a tracked signal), or `dvergr.rooms.stats` |
+| Classify conversational activity | return `dvergr.discourse.attention/decision` data from an attention policy |
 
 ## Further reading
 
