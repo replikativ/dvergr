@@ -8,6 +8,7 @@
    language and lifecycle contracts live in ordinary deterministic tests."
   (:require [clojure.edn :as edn]
             [datahike.api :as dh]
+            [dvergr.agent.environment :as environment]
             [dvergr.agent.program :as program]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.run :as run]
@@ -181,7 +182,7 @@
       :child-wallets-returned? (every? empty? (vals child-balances))
       :canonical-resource-receipts? (= receipt-contract resource-receipts)})))
 
-(defn- memory-environment [room-id]
+(defn- memory-environment [room-id _definition]
   (let [room (d/make-room {:id room-id :store (memory/make)})]
     {:room room
      :close! #(d/close-room! room)}))
@@ -196,11 +197,13 @@
           (dh/release conn)
           (dh/delete-database cfg))))))
 
-(defn- resource-environment [room-id]
+(defn- resource-environment [room-id definition]
   (let [cfg {:store {:backend :memory :id (random-uuid)}
              :keep-history? true
              :schema-flexibility :write}
-        chat-id (random-uuid)]
+        chat-id (random-uuid)
+        {:keys [room-resources run-resources]}
+        (:environment/limits definition)]
     (dh/create-database cfg)
     (let [conn (try
                  (dh/connect cfg)
@@ -223,9 +226,9 @@
                                  :store (datahike-store/make conn)})]
           (reset! room* room)
           (resource/mint! room {:id (random-uuid)
-                                :resources {resource/microdollars 20000M}})
+                                :resources room-resources})
           {:room room
-           :hire-opts {:resources {resource/microdollars 10000M}}
+           :hire-opts {:resources run-resources}
            :resource-observation
            (fn [root-run-id child-runs]
              (let [by-actor (into {} (map (juxt :run/actor identity)) child-runs)
@@ -257,31 +260,72 @@
               (.addSuppressed error cleanup-error)))
           (throw error))))))
 
+(def ^:private memory-setup-ref
+  {:setup/id :dvergr.environment/memory-room :setup/version 1})
+
+(def ^:private resource-setup-ref
+  {:setup/id :dvergr.environment/resource-room :setup/version 1})
+
+(def ^:private trusted-setups
+  {memory-setup-ref memory-environment
+   resource-setup-ref resource-environment})
+
+(def ^:private trusted-verifiers
+  {#:verifier{:id :programming/join-checks-v1 :version 1} join-checks
+   #:verifier{:id :programming/race-checks-v1 :version 1} race-checks
+   #:verifier{:id :programming/self-programming-checks-v1 :version 1}
+   self-programming-checks
+   #:verifier{:id :programming/resource-delegation-checks-v1 :version 1}
+   resource-checks})
+
+(defn- environment-case
+  [id task verifier-id expected & [{:keys [setup limits world metadata]}]]
+  {:definition
+   (environment/make-environment
+    {:id id
+     :version 1
+     :task task
+     :verifier {:id verifier-id :version 1}
+     :limits (merge {:timeout-ms 120000
+                     :cancel-timeout-ms 10000
+                     :max-model-steps 8
+                     :budget-dollars 1.0}
+                    limits)
+     :world (merge {:isolation :ctx
+                    :settlement :automatic
+                    :setup (or setup memory-setup-ref)}
+                   world)
+     :metadata metadata})
+   :expected expected})
+
 (def ^:private environments
   {:programming/join-v1
-   {:task task-v1
-    :expected expected-v1
-    :max-model-steps 8
-    :verify join-checks}
+   (environment-case :programming/join-v1 task-v1
+                     :programming/join-checks-v1 expected-v1)
 
    :programming/race-v1
-   {:task race-task-v1
-    :expected expected-race-v1
-    :max-model-steps 8
-    :verify race-checks}
+   (environment-case :programming/race-v1 race-task-v1
+                     :programming/race-checks-v1 expected-race-v1)
 
    :programming/self-programming-v1
-   {:task self-programming-task-v1
-    :expected expected-self-programming-v1
-    :max-model-steps 8
-    :verify self-programming-checks}
+   (environment-case :programming/self-programming-v1 self-programming-task-v1
+                     :programming/self-programming-checks-v1
+                     expected-self-programming-v1
+                     {:metadata {:kind :recursive-agent-program}})
 
    :programming/resource-delegation-v1
-   {:task resource-task-v1
-    :expected expected-resource-v1
-    :max-model-steps 8
-    :setup resource-environment
-    :verify resource-checks}})
+   (environment-case :programming/resource-delegation-v1 resource-task-v1
+                     :programming/resource-delegation-checks-v1
+                     expected-resource-v1
+                     {:setup resource-setup-ref
+                      :limits {:room-resources {resource/microdollars 20000M}
+                               :run-resources {resource/microdollars 10000M}}
+                      :metadata {:kind :conserved-resource-delegation}})})
+
+(defn environment-definition
+  "Return the exact portable definition for a named benchmark environment."
+  [environment-id]
+  (some-> (get environments environment-id) :definition))
 
 (defn run-environment!
   "Run a named programming environment through `provider`/`model`.
@@ -297,14 +341,34 @@
      (run-environment! :programming/race-v1 :claude-code
                        \"claude-code-sonnet\")"
   [environment-id provider model]
-  (let [{:keys [task expected max-model-steps setup verify]}
+  (let [{:keys [definition expected]}
         (or (get environments environment-id)
             (throw (ex-info "Unknown programming environment"
                             {:environment-id environment-id
                              :known (set (keys environments))})))
+        definition (environment/validate-environment definition)
+        task (:environment/task definition)
+        verifier-ref (:environment/verifier definition)
+        verify (or (get trusted-verifiers verifier-ref)
+                   (throw (ex-info "Environment names an untrusted verifier"
+                                   {:environment-id environment-id
+                                    :verifier verifier-ref
+                                    :trusted (set (keys trusted-verifiers))})))
+        {:keys [timeout-ms cancel-timeout-ms max-model-steps budget-dollars]}
+        (:environment/limits definition)
+        {:keys [isolation settlement setup]} (:environment/world definition)
+        _ (when-not (= :ctx isolation)
+            (throw (ex-info "Benchmark runner only supports isolated ctx worlds"
+                            {:environment-id environment-id
+                             :isolation isolation})))
+        setup-environment (or (get trusted-setups setup)
+                              (throw (ex-info "Environment names an untrusted setup"
+                                              {:environment-id environment-id
+                                               :setup setup
+                                               :trusted (set (keys trusted-setups))})))
         room-id (keyword (str "programming-bench-" (random-uuid)))
         {:keys [room hire-opts resource-observation close!]}
-        ((or setup memory-environment) room-id)
+        (setup-environment room-id definition)
         team (roster/make-agent
               (roster/make-roster {:id :benchmark})
               {:id :orchestrator
@@ -314,25 +378,27 @@
                :model-policy {:provider provider :model model}
                :program {:kind :llm
                          :max-model-steps max-model-steps
-                         :budget-dollars 1.0
+                         :budget-dollars budget-dollars
                          :auto-compact? false}})
         started (System/nanoTime)]
     (try
       (let [handle (binding [ec/*execution-context* (:ctx room)]
                      (program/hire! room team :orchestrator
-                                    (merge {:task task} hire-opts)))
+                                    (merge hire-opts
+                                           {:task task :settlement settlement})))
             initial-result (binding [ec/*execution-context* (:ctx room)]
-                             (deref handle 120000 ::timeout))
+                             (deref handle timeout-ms ::timeout))
             timed-out? (= ::timeout initial-result)
             _ (when timed-out?
                 (binding [ec/*execution-context* (:ctx room)]
                   (program/cancel! handle)))
             result (if timed-out?
                      (binding [ec/*execution-context* (:ctx room)]
-                       (deref handle 10000
+                       (deref handle cancel-timeout-ms
                               {:run/id (program/run-id handle)
                                :run/status :failed
-                               :run/error "Cancellation did not quiesce within 10s"}))
+                               :run/error (str "Cancellation did not quiesce within "
+                                               cancel-timeout-ms "ms")}))
                      initial-result)
             durable (program/observe room handle)
             all-runs (run/runs room {:limit 20})
@@ -356,6 +422,8 @@
             passed? (every? true? (vals checks))]
         (cond->
          {:environment environment-id
+          :environment-ref (environment/environment-ref definition)
+          :environment-definition definition
           :provider provider
           :model model
           :task task

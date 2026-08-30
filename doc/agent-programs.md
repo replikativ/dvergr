@@ -290,6 +290,30 @@ Run must first receive an eventual Kontor-backed provider allocation.
 
 ## Evaluation ladder
 
+An evaluation environment is an immutable `EnvironmentDef`, separate from any
+attempt to execute it:
+
+```clojure
+(agent/environment
+ {:id :programming/review-v1
+  :task {:artifact "candidate.edn"}
+  :verifier {:id :checks/review-v1 :version 1
+             :basis "git:<verifier-commit>"}
+  :limits {:timeout-ms 120000 :max-model-steps 8}
+  :world {:isolation :ctx :settlement :automatic}})
+```
+
+The value has a Hasch-derived `:environment/content-id`; map ordering does not
+affect it, while changing the task, verifier reference, limits, or world policy
+does. A verifier is deliberately a versioned reference rather than an embedded
+function: untrusted SCI can author and fork definitions, but only the trusted
+runner resolves exact verifier and world-setup references and computes reward.
+The benchmark interpreter derives its timeout, cancellation grace, model-step
+and dollar limits, settlement policy, and resource grants from that validated
+definition. Each attempt still receives a fresh Run ID, so content identity
+never collapses distinct executions. The current REPL benchmark reports retain
+both the exact definition and its compact reference.
+
 The API and the instructions that teach it are evaluated together at three
 levels:
 

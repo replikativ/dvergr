@@ -665,7 +665,7 @@
                        "(dvergr.scheduler/create {:agent-id :var :schedule {:every :hour :n 4} :code \"(require 'my.ns)(my.ns/run!)\" :description \"…\"})  (dvergr.scheduler/list)  (dvergr.scheduler/cancel id)"]
    "dvergr.tasks"    ["the shared task ledger — list/accept/complete work items"
                       "(dvergr.tasks/list)   (dvergr.tasks/complete! id)"]
-   "dvergr.agent"    ["program specialized agents as immutable rosters; exact programs are {:kind :echo :delay-ms n}, {:kind :scripted :delay-ms n :reply value}, or {:kind :llm ...}; hire! starts a durable Run with an explicit result Spin"
+   "dvergr.agent"    ["program specialized agents as immutable rosters; define content-addressed verified environments as portable data; exact programs are {:kind :echo :delay-ms n}, {:kind :scripted :delay-ms n :reply value}, or {:kind :llm ...}; hire! starts a durable Run with an explicit result Spin"
                       "join with result-spin; for a first-result race that really cancels losing Runs: (let [team (-> (dvergr.agent/roster) (dvergr.agent/make-agent {:id :fast :program {:kind :scripted :delay-ms 10 :reply :fast}}) (dvergr.agent/make-agent {:id :slow :program {:kind :scripted :delay-ms 5000 :reply :slow}})) a (dvergr.agent/hire! team :fast {:task :solve}) b (dvergr.agent/hire! team :slow {:task :solve})] @(spin (-> (await (spindel.comb/race (dvergr.agent/owned-result-spin a) (dvergr.agent/owned-result-spin b))) :run/value)))"]
    "spindel.work"    ["structured higher-order FRP admission: latest, serial, busy, and bounded parallel; each accepted value becomes owned work"
                       "(let [c (spindel.work/latest (fn [x] (spindel.work/task x)))] (spindel.work/submit! c :first) (spindel.work/submit! c :newest) (spindel.work/close! c) @(spin (await (spindel.work/completion c))))"]
@@ -805,7 +805,8 @@
        "this room, write `app/index.html` (+ assets under `app/`) in your "
        "workspace — served at `/apps/<room-slug>/`.\n\n"
        "**Reactive agent programs.** `dvergr.agent` provides immutable rosters "
-       "and Run-backed execution. Use the exact Spindel namespaces: "
+       "and Run-backed execution; `agent/environment` creates a content-addressed "
+       "task/verifier/policy definition without starting an attempt. Use the exact Spindel namespaces: "
        "`(require '[dvergr.agent :as agent] "
        "'[org.replikativ.spindel.spin.cps :refer [spin]] "
        "'[org.replikativ.spindel.effects.await :refer [await]])`. "

@@ -57,6 +57,8 @@
         agent-ref*     (requiring-resolve 'dvergr.agent.roster/agent-ref)
         agents*        (requiring-resolve 'dvergr.agent.roster/agents)
         select-agents* (requiring-resolve 'dvergr.agent.roster/select-agents)
+        make-environment* (requiring-resolve 'dvergr.agent.environment/make-environment)
+        environment-ref* (requiring-resolve 'dvergr.agent.environment/environment-ref)
         hire-in*       (requiring-resolve 'dvergr.agent.program/hire-in!)
         observe*       (requiring-resolve 'dvergr.agent.program/observe)
         cancel*        (requiring-resolve 'dvergr.agent.program/cancel!)
@@ -158,6 +160,8 @@
         'ref          agent-ref*
         'list         agents*
         'select       select-agents*
+        'environment  make-environment*
+        'environment-ref environment-ref*
         'hire!        hire-fn
         'observe      observe-fn
         'cancel!      cancel-fn
@@ -172,6 +176,8 @@
          ref          [([agent-def]) "Return the stable {:agent/id :agent/version} reference for an AgentDef."]
          list         [([roster]) "All AgentDefs in a Roster, deterministically ordered by id."]
          select       [([roster selector]) "Select AgentDefs by :id, :status, :skill/:skills, and exact portable :where data."]
+         environment  [([spec]) "Create a portable, content-addressed EnvironmentDef. Requires :id, :task, and trusted verifier ref {:id keyword :version n}; optional :limits/:world/:metadata stay data, never live functions or handles."]
+         environment-ref [([environment]) "Return the stable logical/version/content reference for one exact EnvironmentDef. Individual execution Run IDs remain unique."]
          hire!        [([roster agent-ref opts]) "Durably start one owned AgentDef in the current Room: (hire! team :a {:task value :resources {\"microUSD\" 1000}}). Returns a RunHandle. The current Run remains responsible for the child even if the handle is ignored; opts may also include :from, :settlement, and a positive conserved :resources vector split from the current Run/Room."]
          observe      [([handle-or-run-id]) "Read the current Room's durable Run projection for a RunHandle or UUID."]
          cancel!      [([handle-or-run-id]) "Request cooperative cancellation of exactly one live Run. Returns true when the Run was found."]

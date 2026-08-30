@@ -71,8 +71,25 @@
           (is (re-find #":delay-ms" guide))
           (is (re-find #"result-spin" guide))
           (is (re-find #"owned-result-spin" guide))
+          (is (re-find #"content-addressed EnvironmentDef" guide))
           (is (re-find #"comb/race" guide))
           (is (re-find #"await" guide)))
+        (let [result
+              (sandbox/eval-code
+               sci-ctx
+               (str "(require '[dvergr.agent :as agent]) "
+                    "(let [a (agent/environment "
+                    "{:id :training/example :task {:input 42} "
+                    ":verifier {:id :checks/example :version 1} "
+                    ":limits {:timeout-ms 1000}}) "
+                    "b (agent/environment "
+                    "{:limits {:timeout-ms 1000} "
+                    ":verifier {:version 1 :id :checks/example} "
+                    ":task {:input 42} :id :training/example})] "
+                    "{:same? (= a b) :ref (agent/environment-ref a)})"))]
+          (is (:success result) (pr-str (:error result)))
+          (is (true? (get-in result [:value :same?])))
+          (is (uuid? (get-in result [:value :ref :environment/content-id]))))
         (let [guide (sandbox/ns-doc-md sci-ctx 'spindel.comb)]
           (is (re-find #"cancel losing branches" guide))
           (is (re-find #"owned-result-spin" guide)))
