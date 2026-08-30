@@ -43,6 +43,7 @@
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
             [dvergr.discourse :as d]
+            [dvergr.discourse.attention :as attention]
             [dvergr.discourse.enrichment :as enr]
             [dvergr.discourse.generation :as gen]
             [dvergr.chat.context :as cc]
@@ -136,13 +137,16 @@
   "Classify conversational input arriving during an active generation.
 
    The policy receives {:active-message :incoming-message :participant :room}
-   and returns :steer, :queue, or :observe. The default preserves the current
+   and returns a structured attention decision. The former :steer, :queue, and
+   :observe keywords remain accepted for compatibility. The default preserves the current
    direct-conversation behavior: same-thread input steers, while another thread
    queues a separate execution. Products with durable actor identity can refine
    this by sender/addressing (for example, human correction versus peer-agent
    chatter) without changing the Room/thread contract."
   [{:keys [active-message incoming-message]}]
-  (if (d/same-thread? active-message incoming-message) :steer :queue))
+  (if (d/same-thread? active-message incoming-message)
+    (attention/restart :conversation/same-thread)
+    (attention/enqueue :conversation/different-thread)))
 
 (defn llm-agent
   "Construct a discourse Participant backed by an LLM.
@@ -175,10 +179,12 @@
                   agent's outbound reply (e.g. resolve references) and returns
                   system notes injected into the chat-ctx for the next turn.
    :attention-policy — (fn [{:active-message :incoming-message :participant
-                             :room}] → :steer | :queue | :observe).
+                             :room}] → AttentionDecision).
                   Defaults to same-thread steer and different-thread queue.
+                  Legacy :steer/:queue/:observe returns remain accepted.
                   Override to distinguish human correction from peer chatter
-                  using the deployment's authoritative actor identity.
+                  using the deployment's authoritative actor identity. See
+                  dvergr.discourse.attention.
    :ctx         — discourse room's execution context
                   (default: `*execution-context*`)"
   [{:keys [id spec tools db-conn budget compaction
@@ -520,25 +526,42 @@
                                                  (do
                                                    (when mid
                                                      (swap! seen-inflight-ids conj mid))
-                                                   (let [attention
+                                                   (let [attention-decision
                                                          (attention-policy
                                                           {:active-message msg
                                                            :incoming-message m
                                                            :participant p
-                                                           :room room})]
-                                                     (case attention
+                                                           :room room})
+                                                         action
+                                                         (try
+                                                           (attention/legacy-action
+                                                            attention-decision)
+                                                           (catch Throwable error
+                                                             (tel/log!
+                                                              {:level :warn
+                                                               :id ::invalid-attention-decision
+                                                               :data {:agent id
+                                                                      :decision attention-decision
+                                                                      :error (.getMessage error)}}
+                                                              "Invalid attention decision; queued conservatively")
+                                                             ::invalid-attention-decision))]
+                                                     (case action
                                                        :steer {:tag :steer :msg m}
                                                        :observe (recur)
                                                        :queue (do
                                                                 (swap! queued-other-threads conj m)
                                                                 (recur))
+                                                       ::invalid-attention-decision
+                                                       (do
+                                                         (swap! queued-other-threads conj m)
+                                                         (recur))
                                                        (do
                                                          (tel/log!
                                                           {:level :warn
                                                            :id ::invalid-attention-decision
                                                            :data {:agent id
-                                                                  :decision attention}}
-                                                          "Invalid attention decision; queued conservatively")
+                                                                  :decision attention-decision}}
+                                                          "Unsupported attention decision; queued conservatively")
                                                          (swap! queued-other-threads conj m)
                                                          (recur)))))))))))
                                    ;; No inbox (room-less participant that was

@@ -38,11 +38,12 @@ The current surface deliberately reuses Spindel's algebra:
 | context fork | explore a copy-on-write alternative or particle |
 | cancellation | withdraw attention and terminate owned effects |
 
-Queueing, merging observations, switch-to-latest steering, approval gates, and
-long-lived output/effect streams should be derived attention combinators over
-the same substrate. They must not be encoded as special cases of a global turn
-loop. `:llm` is the first convenient process interpreter, not the definition of
-an agent.
+Structured attention decisions now separate memory, activation, control, and
+execution-boundary requests. Queueing, merging observations, switch-to-latest
+steering, approval gates, and long-lived output/effect streams should be derived
+work-admission combinators over the same substrate. They must not be encoded as
+special cases of a global turn loop. `:llm` is the first convenient process
+interpreter, not the definition of an agent.
 
 ## Construct and compose
 
@@ -256,7 +257,9 @@ levels:
 The initial model-facing task set should include pure roster specialization,
 parallel research/review and reduction, race-with-loser-cancellation, explicit
 structural child Runs, delegation-ceiling recognition, and creation of a nested
-durable Room. Later attention combinators add queue/observe/steer/switch tests.
+durable Room. Structured queue/observe/steer compatibility and reactive-boundary
+tests cover the first attention seam; later `latest`/`serial`/`busy`/`parallel`
+work-admission combinators extend it.
 Passing only one model is not sufficient evidence that the programming surface
 is clear.
 

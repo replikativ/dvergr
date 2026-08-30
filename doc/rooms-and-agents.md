@@ -81,9 +81,12 @@ preserved automatically:
 Thread identity also informs the attention boundary for an LLM agent. The default
 policy lets a direct same-thread message steer its active execution, while a
 direct message rooted elsewhere queues a separate execution without cancellation
-or topic mixing. `llm-agent` accepts an `:attention-policy` returning `:steer`,
-`:queue`, or `:observe`, so deployments can distinguish direct human correction
-from peer-agent chatter using their authoritative actor and addressing data.
+or topic mixing. `llm-agent` accepts an `:attention-policy` returning a validated
+`dvergr.discourse.attention` decision with independent memory, activation,
+control, boundary, and priority axes. The former `:steer`, `:queue`, and
+`:observe` results remain accepted, so deployments can migrate while refining
+human correction versus peer-agent chatter using authoritative identity and
+addressing data.
 Tool activity and telemetry remain non-waking observations.
 
 When a topic needs separate participants, permissions, budget, or a branched
