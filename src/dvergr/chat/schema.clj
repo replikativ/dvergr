@@ -682,6 +682,12 @@
     :db/cardinality :db.cardinality/one
     :db/index true}
 
+   {:db/ident :attention/decision-id
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/index true
+    :db/doc "Stable decision identified by an applied disposition fact"}
+
    {:db/ident :attention/run-id
     :db/valueType :db.type/uuid
     :db/cardinality :db.cardinality/one
@@ -715,6 +721,11 @@
    {:db/ident :attention/reason
     :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/one}
+
+   {:db/ident :attention/metadata-edn
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/doc "Non-authoritative policy metadata; never interpreted as control"}
 
    {:db/ident :attention/created-at
     :db/valueType :db.type/instant

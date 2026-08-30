@@ -13,6 +13,10 @@
 (deftest attention-projection-contract
   (contract/assert-attention-projection! (memory/make) :attention-memory))
 
+(deftest concurrent-attention-identity-contract
+  (contract/assert-concurrent-attention-identity!
+   (memory/make) :attention-race-memory))
+
 (deftest rejects-unmodelled-durable-metadata
   (let [st (memory/make)]
     (store/-store-room! st :strict-memory {:slug "strict-memory"})

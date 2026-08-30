@@ -93,7 +93,9 @@ cancellation authority. Native LLM attention decisions are durable typed Room
 projections rather than synthetic speech: `include` admits model input at the
 next supported boundary, `remember` preserves awareness outside provider
 context, and unsupported plans remain explicitly deferred for a future capable
-interpreter.
+interpreter. Stable decision facts and separate applied dispositions make crash
+windows observable without pretending that replaying a model/tool effect is
+always safe; recovery reconciles unapplied decisions with durable Runs first.
 
 ## Construct and compose
 

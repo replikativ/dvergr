@@ -5,6 +5,7 @@
             [clojure.string :as str]
             [dvergr.agent.room-context :as rc]
             [dvergr.agent.run :as run]
+            [dvergr.agent.turn :as turn]
             [dvergr.discourse :as d]
             [dvergr.room.store.memory :as mem]
             [dvergr.room.store :as rstore]
@@ -76,10 +77,12 @@
               remembered (d/message :bob :var "remember only" nil {:role :user})]
           (try
             (d/post! room trigger)
-            (d/post! room remembered)
             (let [cc (rc/ensure-ctx! room :var {:budget-dollars 1.0})
                   run-ref (run/start! room :var trigger cc)]
               (run/finish! (:run/id run-ref) :completed)
+              ;; Arrives after the legacy baseline was materialized, as an
+              ;; active-run observation would in production.
+              (d/post! room remembered)
               (rstore/-store-attention!
                (:store room) :rc-cons
                {:attention/id (random-uuid)
@@ -98,3 +101,31 @@
               (is (some #(str/includes? % "trigger") contents))
               (is (not-any? #(str/includes? % "remember only") contents)))
             (finally (rc/drop-ctx! :rc-cons :var))))))))
+
+(deftest legacy-runs-materialize-a-provider-baseline
+  (testing "pre-attention rooms keep non-trigger history even when Runs exist"
+    (let [c (ctx/create-execution-context)]
+      (binding [ec/*execution-context* c]
+        (let [room (d/make-room {:id :rc-legacy-cutover :ctx c :store (mem/make)})
+              trigger (d/message :alice :var "old trigger" nil {:role :user})
+              context (d/message :bob :var "old supporting context" nil {:role :user})
+              run-ctx (turn/new-working-ctx {:execution-ctx c
+                                             :title "legacy run"
+                                             :budget-dollars 1.0})]
+          (try
+            (d/post! room trigger)
+            (d/post! room context)
+            ;; Simulate a room persisted by the Run release before attention
+            ;; projections existed; do not call ensure-ctx! yet.
+            (let [run-ref (run/start! room :var trigger run-ctx)]
+              (run/finish! (:run/id run-ref) :completed))
+            (let [restored (rc/ensure-ctx! room :var {:budget-dollars 1.0})
+                  contents (non-system-contents restored)
+                  facts (rstore/-list-attention (:store room) (:id room)
+                                                {:participant :var})]
+              (is (some #(str/includes? % "old trigger") contents))
+              (is (some #(str/includes? % "old supporting context") contents))
+              (is (= 2 (count (set (map :attention/message-id
+                                        (filter #(= :applied (:attention/status %))
+                                                facts)))))))
+            (finally (rc/drop-ctx! :rc-legacy-cutover :var))))))))

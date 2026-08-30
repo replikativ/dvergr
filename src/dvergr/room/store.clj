@@ -135,9 +135,18 @@
 
 (def durable-attention-keys
   #{:attention/id :attention/participant :attention/message-id
-    :attention/run-id :attention/memory :attention/activation
+    :attention/decision-id :attention/run-id :attention/memory :attention/activation
     :attention/control :attention/at :attention/priority
-    :attention/status :attention/reason :attention/created-at})
+    :attention/status :attention/reason :attention/metadata
+    :attention/created-at})
+
+(defn attention-id
+  "Deterministic identity for one decision or disposition over a message."
+  [participant message-id run-id phase]
+  (java.util.UUID/nameUUIDFromBytes
+   (.getBytes (str "dvergr-attention|" participant "|" message-id "|"
+                   run-id "|" phase)
+              java.nio.charset.StandardCharsets/UTF_8)))
 
 (defn validate-attention!
   "Validate one durable participant attention projection and return it."
@@ -157,12 +166,20 @@
   (when (and (:attention/run-id fact) (not (uuid? (:attention/run-id fact))))
     (throw (ex-info ":attention/run-id must be a UUID"
                     {:type :room-store/invalid-attention :fact fact})))
+  (when (and (:attention/decision-id fact)
+             (not (uuid? (:attention/decision-id fact))))
+    (throw (ex-info ":attention/decision-id must be a UUID"
+                    {:type :room-store/invalid-attention :fact fact})))
+  (when (and (= :applied (:attention/status fact))
+             (not (uuid? (:attention/decision-id fact))))
+    (throw (ex-info "Applied attention requires :attention/decision-id"
+                    {:type :room-store/invalid-attention :fact fact})))
   (doseq [[k allowed] [[:attention/memory #{:ignore :remember :include}]
                        [:attention/activation #{:none :enqueue :wake}]
                        [:attention/control #{:continue :integrate :restart :suspend :cancel}]
                        [:attention/at #{:now :next-safe-boundary :before-model :token
                                         :before-tool :after-tool :after-model :quiescent}]
-                       [:attention/status #{:ready :deferred :invalid}]]
+                       [:attention/status #{:ready :deferred :invalid :applied}]]
           :let [v (get fact k)]
           :when (and (some? v) (not (contains? allowed v)))]
     (throw (ex-info (str "Invalid durable " k)
@@ -175,12 +192,32 @@
              (not (keyword? (:attention/reason fact))))
     (throw (ex-info ":attention/reason must be a keyword"
                     {:type :room-store/invalid-attention :fact fact})))
+  (when (and (:attention/metadata fact)
+             (not (map? (:attention/metadata fact))))
+    (throw (ex-info ":attention/metadata must be a map"
+                    {:type :room-store/invalid-attention :fact fact})))
   (when-not (instance? java.util.Date (:attention/created-at fact))
     (throw (ex-info ":attention/created-at must be an instant"
                     {:type :room-store/invalid-attention :fact fact})))
   (cond-> fact
     (some? (:attention/priority fact))
     (update :attention/priority double)))
+
+(defn unapplied-attention
+  "Return ready decisions that have no append-only applied disposition.
+
+   This is recovery/audit input, not an instruction to replay blindly: the
+   owning interpreter must reconcile the durable Run and effect boundary before
+   deciding whether retry is safe."
+  [facts]
+  (let [applied (into #{}
+                      (keep #(when (= :applied (:attention/status %))
+                               (:attention/decision-id %)))
+                      facts)]
+    (->> facts
+         (filter #(= :ready (:attention/status %)))
+         (remove #(contains? applied (:attention/id %)))
+         vec)))
 
 (def durable-run-keys
   #{:run/id :run/kind :run/room :run/actor :run/trigger :run/parent

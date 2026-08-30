@@ -9,6 +9,7 @@
             [dvergr.discourse.llm :as llm]
             [dvergr.chat.context :as cc]
             [dvergr.agent.run :as run]
+            [dvergr.agent.room-context :as room-context]
             [dvergr.room.store :as store]
             [dvergr.room.store.memory :as memory]))
 
@@ -681,7 +682,114 @@
         (is (= 1 (count (run/runs r))))
         (is (some #(= :deferred (:attention/status %))
                   (store/-list-attention st (:id r)
-                                         {:participant :deferred-worker}))))
+                                         {:participant :deferred-worker})))
+        (room-context/drop-ctx! (:id r) :deferred-worker)
+        (let [restored (room-context/ensure-ctx!
+                        r :deferred-worker {:budget-dollars 1.0})]
+          (is (not-any? #(re-find #"after the tool"
+                                  (or (:content %) (:message/content %) ""))
+                        (cc/get-messages restored))
+              "a deferred include remains unapplied after reconstruction")))
+      (finally
+        (d/close-room! r)))))
+
+(deftest include-now-updates-working-memory-before-provider-settles
+  (let [st (memory/make)
+        r (d/make-room {:id :policy-include-now :store st})
+        entered (promise)
+        gate (promise)
+        steps (atom [(fn [chat-ctx _]
+                       (deliver entered true)
+                       @gate
+                       (cc/add-message! chat-ctx {:role :assistant :content "done"})
+                       :complete)])
+        calls (atom [])
+        policy (fn [_]
+                 (attention/decision {:memory :include
+                                      :control :continue
+                                      :at :now
+                                      :reason :test/include-now}))]
+    (try
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent {:id :now-worker
+                                  :spec {:provider :mock :model "mock"}
+                                  :attention-policy policy
+                                  :run-turn-fn (make-queued-turn-fn steps calls)})))
+      (let [reply-f (future (await-spin r #(d/ask % :now-worker {:content "start"})
+                                        5000))]
+        (is (true? (deref entered 3000 ::timeout)))
+        (let [trigger (some #(when (= "start" (:content %)) %) (d/log r))]
+          (d/post! r (d/reply :reviewer :now-worker "visible immediately" trigger)))
+        (is (await-condition
+             #(some (fn [fact]
+                      (and (= :applied (:attention/status fact))
+                           (= :test/include-now (:attention/reason fact))))
+                    (store/-list-attention st (:id r) {:participant :now-worker}))
+             2000))
+        (is (some #(re-find #"visible immediately"
+                            (or (:content %) (:message/content %) ""))
+                  (cc/get-messages (room-context/lookup (:id r) :now-worker)))
+            "now admission precedes provider settlement")
+        (deliver gate true)
+        (is (= "done" (:content @reply-f))))
+      (finally
+        (d/close-room! r)))))
+
+(deftest quiescent-include-waits-until-run-exit
+  (let [st (memory/make)
+        r (d/make-room {:id :policy-include-quiescent :store st})
+        entered (promise)
+        gate (promise)
+        before-quiescence (atom nil)
+        after-quiescence (atom nil)
+        contains-note? (fn [messages]
+                         (some #(re-find #"only at quiescence"
+                                         (or (:content %) (:message/content %) ""))
+                               messages))
+        steps (atom [(fn [_ _]
+                       (deliver entered true)
+                       @gate
+                       :continue)
+                     (fn [chat-ctx _]
+                       (reset! before-quiescence (cc/get-messages chat-ctx))
+                       (cc/add-message! chat-ctx {:role :assistant :content "first done"})
+                       :complete)
+                     (fn [chat-ctx _]
+                       (reset! after-quiescence (cc/get-messages chat-ctx))
+                       (cc/add-message! chat-ctx {:role :assistant :content "second done"})
+                       :complete)])
+        calls (atom [])
+        policy (fn [_]
+                 (attention/decision {:memory :include
+                                      :control :continue
+                                      :at :quiescent
+                                      :reason :test/include-quiescent}))]
+    (try
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent {:id :quiescent-worker
+                                  :spec {:provider :mock :model "mock"}
+                                  :attention-policy policy
+                                  :run-turn-fn (make-queued-turn-fn steps calls)})))
+      (let [reply-f (future (await-spin r #(d/ask % :quiescent-worker
+                                                  {:content "start"}) 5000))]
+        (is (true? (deref entered 3000 ::timeout)))
+        (let [trigger (some #(when (= "start" (:content %)) %) (d/log r))]
+          (d/post! r (d/reply :reviewer :quiescent-worker
+                              "only at quiescence" trigger)))
+        (is (await-condition
+             #(some (fn [fact]
+                      (= :test/include-quiescent (:attention/reason fact)))
+                    (store/-list-attention st (:id r)
+                                           {:participant :quiescent-worker}))
+             2000))
+        (deliver gate true)
+        (is (= "first done" (:content @reply-f)))
+        (is (not (contains-note? @before-quiescence))
+            "provider continuation is earlier than quiescence")
+        (is (= "second done"
+               (:content (await-spin r #(d/ask % :quiescent-worker
+                                               {:content "next run"}) 5000))))
+        (is (contains-note? @after-quiescence)))
       (finally
         (d/close-room! r)))))
 

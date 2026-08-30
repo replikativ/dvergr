@@ -130,11 +130,13 @@
                 :attention/priority 0.0
                 :attention/status :ready
                 :attention/reason :peer/observation
+                :attention/metadata {:classifier :test :confidence 0.75}
                 :attention/created-at created}]
       (is (= fact (store/-store-attention! st room-id fact)))
       (is (= [fact]
              (store/-list-attention st room-id
                                     {:participant :agent/researcher})))
+      (is (= [fact] (store/unapplied-attention [fact])))
       (is (thrown-with-msg?
            clojure.lang.ExceptionInfo
            #"immutable"
@@ -143,4 +145,42 @@
       (is (empty? (store/-list-messages st room-id {}))
           "attention facts never contaminate the Room transcript")
       (is (empty? (store/-list-attention st room-id
-                                         {:participant :agent/other}))))))
+                                         {:participant :agent/other})))
+      (let [applied (-> fact
+                        (assoc :attention/id (random-uuid)
+                               :attention/decision-id (:attention/id fact)
+                               :attention/status :applied
+                               :attention/created-at (java.util.Date. 1787860800001)))]
+        (store/-store-attention! st room-id applied)
+        (is (empty? (store/unapplied-attention [fact applied])))))))
+
+(defn assert-concurrent-attention-identity!
+  "Conflicting writers must agree on one immutable attention identity."
+  [st room-id]
+  (testing "attention first-write identity is atomic"
+    (store/-store-room! st room-id {:slug (name room-id) :title "Attention race"})
+    (let [attention-id (random-uuid)
+          base {:attention/id attention-id
+                :attention/participant :agent/researcher
+                :attention/message-id (random-uuid)
+                :attention/memory :remember
+                :attention/status :ready
+                :attention/created-at (java.util.Date.)}
+          ready (java.util.concurrent.CountDownLatch. 2)
+          start (promise)
+          writer (fn [reason]
+                   (future
+                     (.countDown ready)
+                     @start
+                     (try
+                       (store/-store-attention! st room-id
+                                                (assoc base :attention/reason reason))
+                       (catch Throwable error error))))
+          a (writer :race/a)
+          b (writer :race/b)]
+      (is (.await ready 5 java.util.concurrent.TimeUnit/SECONDS))
+      (deliver start true)
+      (let [outcomes [@a @b]]
+        (is (= 1 (count (filter map? outcomes))))
+        (is (= 1 (count (filter #(instance? Throwable %) outcomes))))
+        (is (= 1 (count (store/-list-attention st room-id {}))))))))

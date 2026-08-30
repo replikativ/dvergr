@@ -7,7 +7,8 @@
    The store maps a Room's keyword id ↔ a Datahike :chat/id UUID via
    the :room/slug attribute (`slug->room-id`/`room-id->slug` in
    `dvergr.room.store`)."
-  (:require [datahike.api :as dh]
+  (:require [clojure.edn :as edn]
+            [datahike.api :as dh]
             [dvergr.chat.schema :as schema]
             [dvergr.chat.persist :as persist]
             [dvergr.room.store :as store]
@@ -199,9 +200,10 @@
 
 (def ^:private attention-pull-pattern
   '[:attention/id :attention/participant :attention/message-id
-    :attention/run-id :attention/memory :attention/activation
+    :attention/decision-id :attention/run-id :attention/memory :attention/activation
     :attention/control :attention/at :attention/priority
-    :attention/status :attention/reason :attention/created-at])
+    :attention/status :attention/reason :attention/metadata-edn
+    :attention/created-at])
 
 (defn- run->entity [chat-id run]
   (cond-> {:run/id         (:run/id run)
@@ -235,9 +237,19 @@
     (:run/error run)    (assoc :run/error (str (:run/error run)))))
 
 (defn- attention->entity [chat-id fact]
-  (cond-> (assoc fact :attention/chat [:chat/id chat-id])
+  (cond-> (-> fact
+              (dissoc :attention/metadata)
+              (assoc :attention/chat [:chat/id chat-id]))
+    (:attention/metadata fact)
+    (assoc :attention/metadata-edn (pr-str (:attention/metadata fact)))
+
     (some? (:attention/priority fact))
     (update :attention/priority double)))
+
+(defn- entity->attention [entity]
+  (cond-> (dissoc entity :attention/metadata-edn)
+    (:attention/metadata-edn entity)
+    (assoc :attention/metadata (edn/read-string (:attention/metadata-edn entity)))))
 
 ;; =============================================================================
 ;; Store impl
@@ -543,10 +555,11 @@
             (throw (ex-info "Attention persistence failed"
                             {:type :room-store/attention-persistence-failed
                              :room-id room-id :fact fact})))
-          (let [stored (dh/q '[:find (pull ?a pattern) .
-                               :in $ ?id pattern
-                               :where [?a :attention/id ?id]]
-                             @conn (:attention/id fact) attention-pull-pattern)]
+          (let [stored (some-> (dh/q '[:find (pull ?a pattern) .
+                                       :in $ ?id pattern
+                                       :where [?a :attention/id ?id]]
+                                     @conn (:attention/id fact) attention-pull-pattern)
+                               entity->attention)]
             (when-not (= fact stored)
               (throw (ex-info "Attention identity is immutable"
                               {:type :room-store/attention-identity-collision
@@ -564,6 +577,7 @@
                      [?c :chat/id ?chat-id]
                      [?a :attention/chat ?c]]
                    @conn (:chat/id ent) attention-pull-pattern)
+             (map entity->attention)
              (filter #(if participant
                         (= participant (:attention/participant %))
                         true))

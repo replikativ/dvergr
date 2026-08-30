@@ -196,8 +196,49 @@
             ;; fork already returns inherited (pre-fork) + its own messages — the
             ;; agent sees exactly what the UI seeds. (doc/unified-fork-conversation.md)
             (let [messages (d/messages room {:limit (or limit 100)})
+                  attention-store? (satisfies? rstore/PAttentionStore (:store room))
+                  initial-attention
+                  (if attention-store?
+                    (rstore/-list-attention (:store room)
+                                            (d/conversation-id room)
+                                            {:participant agent-id :limit 1000})
+                    [])
+                  ;; Upgrade cutover: pre-attention rooms already have Runs but
+                  ;; no participant projection. Materialize their exact current
+                  ;; provider baseline before any new policy decision can make
+                  ;; the projection non-empty. This is append-only and
+                  ;; idempotent by deterministic identity.
+                  _ (when (and attention-store? (empty? initial-attention))
+                      (doseq [m messages :when (conversational? m)]
+                        (let [decision-id
+                              (rstore/attention-id agent-id (:id m) nil
+                                                   :legacy-baseline-decision)
+                              common {:attention/participant agent-id
+                                      :attention/message-id (:id m)
+                                      :attention/memory :include
+                                      :attention/activation :none
+                                      :attention/control :continue
+                                      :attention/at :now
+                                      :attention/priority 0.0
+                                      :attention/reason :migration/provider-baseline
+                                      :attention/created-at
+                                      (java.util.Date. (long (or (:ts m)
+                                                                 (System/currentTimeMillis))))}]
+                          (rstore/-store-attention!
+                           (:store room) (d/conversation-id room)
+                           (assoc common
+                                  :attention/id decision-id
+                                  :attention/status :ready))
+                          (rstore/-store-attention!
+                           (:store room) (d/conversation-id room)
+                           (assoc common
+                                  :attention/id
+                                  (rstore/attention-id agent-id (:id m) nil
+                                                       :legacy-baseline-applied)
+                                  :attention/decision-id decision-id
+                                  :attention/status :applied)))))
                   attention-facts
-                  (if (satisfies? rstore/PAttentionStore (:store room))
+                  (if attention-store?
                     (rstore/-list-attention (:store room)
                                             (d/conversation-id room)
                                             {:participant agent-id :limit 1000})
@@ -209,15 +250,15 @@
                   ;; Deliberate forgetting belongs to compaction/context policy,
                   ;; not to attention races.
                   (into #{}
-                        (keep #(when (= :include (:attention/memory %))
+                        (keep #(when (and (= :applied (:attention/status %))
+                                          (= :include (:attention/memory %)))
                                  (:attention/message-id %)))
                         attention-facts)
                   agent-runs (run/runs room {:actor agent-id :limit 1000})
                   trigger-ids (into #{} (map :run/trigger) agent-runs)
-                  ;; Rooms created before durable attention facts retain their
-                  ;; historical seed. Once the participant has Runs, precise
-                  ;; causal triggers replace that compatibility fallback.
-                  legacy-history? (empty? agent-runs)]
+                  ;; Ephemeral/custom stores without the projection retain the
+                  ;; historical full-transcript behavior for compatibility.
+                  legacy-history? (not attention-store?)]
               (doseq [m messages]
                 (when (and (conversational? m)
                            (or (= agent-id (:from m))

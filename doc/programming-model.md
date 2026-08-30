@@ -226,10 +226,19 @@ continuation to wake.
 Attention is stored as a typed participant projection in the Room store, not as
 a hidden chat message. The shared transcript remains immutable speech. Provider
 working context is reconstructed from the participant's Run triggers, its own
-outputs, and monotone `include` admissions. `remember` stays durable awareness
+outputs, and monotone **applied** `include` admissions. Each decision has stable
+identity; a separate append-only disposition proves when all supported axes
+were applied. A ready decision without that disposition is recovery/audit input,
+not a command that may be blindly replayed across external effects. The native
+interpreter keeps live scheduling machinery process-local and exposes unapplied
+facts for an explicit recovery policy.
+
+`remember` stays durable awareness
 without entering model input, while `ignore` excludes the fact from that input.
 Thus live execution and restart/replay apply the same memory decision without
-contaminating thread or message projections. The former `:steer`, `:queue`, and
+contaminating thread or message projections. At first upgrade, a deterministic
+applied baseline preserves the existing provider context before new decisions
+take over projection. The former `:steer`, `:queue`, and
 `:observe` policy results remain accepted through normalization. Structured work admission is now
 available directly in native code and the room SCI REPL as `spindel.work/latest`,
 `serial`, `busy`, and bounded `parallel`. These are higher-order FRP policies:
