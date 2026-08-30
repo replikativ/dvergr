@@ -4,7 +4,8 @@
    Activities are projections of work that already happened. They are not
    executable effects, lifecycle owners, or a second event log: room messages
    supply discourse identity and Runs supply execution identity."
-  (:require [hasch.core :as hasch])
+  (:require [clojure.string :as str]
+            [hasch.core :as hasch])
   (:import [java.util Date]))
 
 (defn- stable-id
@@ -42,3 +43,33 @@
            :activity/at (Date.)}
     run-id (assoc :activity/run-id run-id)
     outcome (assoc :activity/outcome (str outcome))))
+
+(defn message-activities
+  "Return the semantic activity facts carried by a normalized or raw message."
+  [message]
+  (or (:activities message)
+      (get-in message [:metadata :activities])
+      []))
+
+(defn message-run-id
+  "Return the Run correlated with MESSAGE, accepting normalized and raw shapes."
+  [message]
+  (or (:run-id message)
+      (get-in message [:metadata :run-id])))
+
+(defn short-id
+  "Compact a UUID-like identity for human-facing correlation labels."
+  [id]
+  (when id
+    (let [s (str id)]
+      (subs s 0 (min 8 (count s))))))
+
+(defn summary
+  "Compact, non-authoritative presentation of one semantic activity fact."
+  [fact]
+  (str/join " · "
+            (keep identity
+                  [(some-> (or (:activity/verb fact) (:activity/kind fact)) name)
+                   (:activity/tool-name fact)
+                   (some-> (:activity/status fact) name)
+                   (:activity/outcome fact)])))

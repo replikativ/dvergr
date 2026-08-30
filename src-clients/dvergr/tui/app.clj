@@ -32,6 +32,7 @@
             [org.replikativ.spindel.spin.cps :refer [spin]]
             [org.replikativ.spindel.effects.track :refer [track]]
             [org.replikativ.spindel.incremental.interval :as iv]
+            [dvergr.activity :as activity]
             [dvergr.audio.record :as rec]
             [dvergr.audio.stt :as stt]
             [dvergr.discourse :as d]
@@ -686,6 +687,21 @@
          (apply str (repeat pad " "))
          (s/render (s/style :fg (s/ansi256 240)) clock))))
 
+(defn- render-activities
+  "Render compact semantic facts. Detailed arguments remain in trace mode."
+  [message inner-w]
+  (let [facts  (activity/message-activities message)
+        run-id (activity/message-run-id message)]
+    (mapcat
+     (fn [fact]
+       (let [run-label (when-let [id (activity/short-id
+                                      (or (:activity/run-id fact) run-id))]
+                         (str " · run " id))
+             label     (str "  ↳ " (activity/summary fact) run-label)]
+         (for [line (wrap-text label inner-w)]
+           (s/render (s/style :fg (s/ansi256 178)) line))))
+     facts)))
+
 (defn- render-room-message
   "Render one room message (unified shape `{:from :content :role :tool-uses}`)
    to styled lines. Three flavors, keyed on `:role`:
@@ -709,7 +725,8 @@
                   trace?               (render-reasoning (:reasoning m) inner-w)
                   (seq (:reasoning m)) [(s/render (s/style :fg (s/ansi256 240))
                                                   "  💭 thinking · ^T to show")]
-                  :else                nil)]
+                  :else                nil)
+        activities (render-activities m inner-w)]
     (cond
       ;; Fork boundary — a centered separator marking where the inherited
       ;; (pre-fork) history ends and the fork's own conversation begins.
@@ -736,6 +753,7 @@
                                        (str speaker " ") "  ")
                                 l)))
                tool-lines)
+              activities
               (when trace? (mapcat #(render-tool-use % inner-w) (:tool-uses m))))))
 
       ;; Agent reply — cyan speaker, markdown body, inline tool calls.
@@ -751,7 +769,8 @@
         ;; wrapped lines (e.g. **bold** whose SGR-open and reset land on
         ;; different lines) can't bleed into the box padding/border.
         (into [(speaker-line speaker (:ts m) (theme/ansi :assistant) inner-w)]
-              (concat reason (map #(str "  " % "\u001b[0m") body-lines) tu-lines)))
+              (concat reason (map #(str "  " % "\u001b[0m") body-lines)
+                      activities tu-lines)))
 
       ;; User / other — green speaker, plain body.
       :else
@@ -759,7 +778,8 @@
             (concat reason
                     (for [raw (str/split-lines content)
                           l   (wrap-text raw (- inner-w 2))]
-                      (s/render (s/style :fg s/white) (str "  " l))))))))
+                      (s/render (s/style :fg s/white) (str "  " l)))
+                    activities)))))
 
 (defn- room-view
   "Render the :room view: header showing the current Room's title +

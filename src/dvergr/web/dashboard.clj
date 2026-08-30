@@ -12,6 +12,7 @@
             [org.replikativ.spindel.engine.core :as ec]
             [nextjournal.markdown :as md]
             [nextjournal.markdown.transform :as mdt]
+            [dvergr.activity :as activity]
             [dvergr.rooms.tree :as rooms-tree]
             [dvergr.rooms.stats :as rstats]))
 
@@ -515,8 +516,21 @@
            [:span.tool-name (str (or (:tool-use/name tu) (:name tu)))]
            [:pre.msg-extra-body (pr-str (or (:tool-use/input tu) (:input tu)))]])]))))
 
+(defn- activity-hiccup
+  "Compact semantic facts; raw arguments remain in the existing trace details."
+  [message]
+  (when-let [facts (seq (activity/message-activities message))]
+    (let [run-id (or (activity/message-run-id message)
+                     (:activity/run-id (first facts)))]
+      [:div.msg-activities
+       (for [fact facts]
+         [:span.msg-activity
+          (activity/summary fact)
+          (when-let [id (activity/short-id (or (:activity/run-id fact) run-id))]
+            [:span.msg-run "run " id])])])))
+
 (defn- message-hiccup
-  [{:keys [id from content role ts reasoning tool-uses]}]
+  [{:keys [id from content role ts reasoning tool-uses] :as message}]
   (let [name-str (or (some-> from name) "—")
         ;; Per-speaker colour from the SHARED role→colour table — same hues the
         ;; TUI uses (dvergr.rooms.theme); was hardcoded green for every post.
@@ -530,6 +544,7 @@
       (when-let [t (fmt-ts ts)]
         [:span {:style "margin-left:auto;color:#666;font-weight:400;font-size:0.85em;"} t])]
      [:div.msg-body (md->hiccup content)]
+     (activity-hiccup message)
      (think-tool-details id reasoning tool-uses)]))
 
 (defn room-page
@@ -548,6 +563,10 @@
           .msg-body { color:#ddd; word-break:break-word; line-height:1.5; }
           .msg-body > :first-child { margin-top:0; }
           .msg-body > :last-child { margin-bottom:0; }
+          .msg-activities { display:flex;flex-wrap:wrap;gap:5px;margin-top:5px; }
+          .msg-activity { color:#c9a227;background:#25200f;border:1px solid #514519;
+                          border-radius:999px;padding:1px 7px;font-size:0.78em; }
+          .msg-run { color:#888;margin-left:7px;font-family:monospace; }
           .msg-body p { margin:0.4em 0; }
           .msg-body h1,.msg-body h2,.msg-body h3 { color:#e0e0e0; margin:0.6em 0 0.3em; line-height:1.2; }
           .msg-body h1 { font-size:1.25em; } .msg-body h2 { font-size:1.15em; } .msg-body h3 { font-size:1.05em; }
