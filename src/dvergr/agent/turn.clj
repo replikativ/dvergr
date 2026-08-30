@@ -42,7 +42,7 @@
    datahike-write behaviour (room folds pass false: the room store is the durable
    writer). Returns the ChatContext."
   [{:keys [execution-ctx chat-id title budget-dollars db-conn kb-conn room-id
-           room-runtime-id agent-program-ceiling durable? allowed-domains]}]
+           room-runtime-id room-incarnation agent-program-ceiling durable? allowed-domains]}]
   (binding [rtc/*execution-context* execution-ctx]
     (let [cctx (cond-> (chat-ctx/create-chat-context
                         (cond-> {:budget-dollars (or budget-dollars 1.0)
@@ -62,6 +62,7 @@
         (sandbox/setup-agent-namespaces! sci execution-ctx
                                          :room-conn db-conn :kb-conn kb-conn :room-id room-id
                                          :room-runtime-id room-runtime-id
+                                         :room-incarnation room-incarnation
                                          :agent-program-ceiling agent-program-ceiling
                                          ;; per-agent network egress scoping (nil/empty = open)
                                          :allowed-http-domains allowed-domains)

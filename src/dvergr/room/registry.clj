@@ -18,6 +18,7 @@
 
 (def ^:private registry-path [:dvergr/rooms])
 (def ^:private fork-topology-path [:dvergr/fork-topology])
+(defonce ^:private lifecycle-lock (Object.))
 
 ;; Callbacks run (with the room-id) AFTER a room is unregistered. Lets
 ;; dependents (e.g. dvergr.agent.room-context) tear down per-room resources
@@ -76,22 +77,24 @@
   "Add or replace a Room in the registry, then run register hooks. Returns the
    Room."
   [room]
-  (doseq [f (vals @pre-register-hooks)]
-    (f room))
-  (rctx/shared-swap-state! registry-path (fn [m] (assoc (or m {}) (:id room) room)))
-  (doseq [f (vals @register-hooks)]
-    (try (f room) (catch Throwable _ nil)))
+  (locking lifecycle-lock
+    (doseq [f (vals @pre-register-hooks)]
+      (f room))
+    (rctx/shared-swap-state! registry-path (fn [m] (assoc (or m {}) (:id room) room)))
+    (doseq [f (vals @register-hooks)]
+      (try (f room) (catch Throwable _ nil))))
   room)
 
 (defn unregister!
   "Remove a Room from the registry by id, then run unregister hooks."
   [room-id]
-  (when-let [room (get (rctx/shared-get-state registry-path) room-id)]
-    (doseq [f (vals @pre-unregister-hooks)]
-      (f room)))
-  (rctx/shared-swap-state! registry-path (fn [m] (dissoc (or m {}) room-id)))
-  (doseq [f (vals @unregister-hooks)]
-    (try (f room-id) (catch Throwable _ nil)))
+  (locking lifecycle-lock
+    (when-let [room (get (rctx/shared-get-state registry-path) room-id)]
+      (doseq [f (vals @pre-unregister-hooks)]
+        (f room)))
+    (rctx/shared-swap-state! registry-path (fn [m] (dissoc (or m {}) room-id)))
+    (doseq [f (vals @unregister-hooks)]
+      (try (f room-id) (catch Throwable _ nil))))
   nil)
 
 (defn lookup

@@ -665,7 +665,7 @@
       (is (= "preflight conflict" (ex-message error)))
       (is (ygg/open-fork? (d/fork-handle fork)))
       (let [controller (sandbox-work/create!
-                        (:id fork) (:ctx fork) nil :serial {}
+                        (:id fork) (:incarnation fork) (:ctx fork) nil :serial {}
                         (fn [value] (sp/spin value)))]
         (is (some? controller)
             "failed settlement reopens the exact SCI work-admission generation")

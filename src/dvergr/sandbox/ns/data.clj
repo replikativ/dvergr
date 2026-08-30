@@ -21,7 +21,7 @@
    These are safe: they only coordinate within the SCI context."
   ([sci-ctx spindel-ctx]
    (add-spindel-extras-ns! sci-ctx spindel-ctx {}))
-  ([sci-ctx spindel-ctx {:keys [room-id ceiling]}]
+  ([sci-ctx spindel-ctx {:keys [room-id room-incarnation ceiling]}]
    (require 'org.replikativ.spindel.spin.combinators)
    (require 'org.replikativ.spindel.signal)
    (let [comb-ns (find-ns 'org.replikativ.spindel.spin.combinators)
@@ -51,29 +51,29 @@
                            (doc/with-docs
                              {'latest       (fn
                                               ([work-fn]
-                                               (sandbox-work/create! room-id spindel-ctx ceiling :latest {} work-fn))
+                                               (sandbox-work/create! room-id room-incarnation spindel-ctx ceiling :latest {} work-fn))
                                               ([opts work-fn]
-                                               (sandbox-work/create! room-id spindel-ctx ceiling :latest opts work-fn)))
+                                               (sandbox-work/create! room-id room-incarnation spindel-ctx ceiling :latest opts work-fn)))
                               'serial       (fn
                                               ([work-fn]
-                                               (sandbox-work/create! room-id spindel-ctx ceiling :serial {} work-fn))
+                                               (sandbox-work/create! room-id room-incarnation spindel-ctx ceiling :serial {} work-fn))
                                               ([opts work-fn]
-                                               (sandbox-work/create! room-id spindel-ctx ceiling :serial opts work-fn)))
+                                               (sandbox-work/create! room-id room-incarnation spindel-ctx ceiling :serial opts work-fn)))
                               'busy         (fn
                                               ([work-fn]
-                                               (sandbox-work/create! room-id spindel-ctx ceiling :busy {} work-fn))
+                                               (sandbox-work/create! room-id room-incarnation spindel-ctx ceiling :busy {} work-fn))
                                               ([opts work-fn]
-                                               (sandbox-work/create! room-id spindel-ctx ceiling :busy opts work-fn)))
+                                               (sandbox-work/create! room-id room-incarnation spindel-ctx ceiling :busy opts work-fn)))
                               'parallel     (fn
                                               ([work-fn]
-                                               (sandbox-work/create! room-id spindel-ctx ceiling :parallel {} work-fn))
+                                               (sandbox-work/create! room-id room-incarnation spindel-ctx ceiling :parallel {} work-fn))
                                               ([opts work-fn]
-                                               (sandbox-work/create! room-id spindel-ctx ceiling :parallel opts work-fn)))
+                                               (sandbox-work/create! room-id room-incarnation spindel-ctx ceiling :parallel opts work-fn)))
                               'controller   (fn
                                               ([work-fn]
-                                               (sandbox-work/create! room-id spindel-ctx ceiling :serial {} work-fn))
+                                               (sandbox-work/create! room-id room-incarnation spindel-ctx ceiling :serial {} work-fn))
                                               ([opts work-fn]
-                                               (sandbox-work/create! room-id spindel-ctx ceiling
+                                               (sandbox-work/create! room-id room-incarnation spindel-ctx ceiling
                                                                      (:strategy opts :serial)
                                                                      (dissoc opts :strategy)
                                                                      work-fn)))

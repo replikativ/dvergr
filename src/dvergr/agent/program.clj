@@ -471,6 +471,7 @@
                    :kb-conn (when system-id (system-rooms/room-kb-conn system-id))
                    :room-id system-id
                    :room-runtime-id (:id work-room)
+                   :room-incarnation (:incarnation work-room)
                    ;; Generic resource vectors split recursively, but paid model
                    ;; usage is not debited yet. Permit only provider-free child
                    ;; programs until that receipt path exists.

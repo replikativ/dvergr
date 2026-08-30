@@ -936,7 +936,7 @@
    Returns the audit-log atom — a vector of IO events ({:op :t :data}) accumulated
    during the agent's execution.  Attach to the agent result for post-hoc analysis."
   [sci-ctx spindel-ctx & {:keys [base-path proc-allow allowed-http-domains room-conn kb-conn room-id
-                                 room-runtime-id agent-program-ceiling]
+                                 room-runtime-id room-incarnation agent-program-ceiling]
                           :or   {proc-allow #{}}}]
   (let [audit-log  (make-audit-log)
         workspace  (binding [rtc/*execution-context* spindel-ctx]
@@ -986,6 +986,7 @@
     (ns-data/add-spindel-extras-ns!
      sci-ctx spindel-ctx
      {:room-id (or room-runtime-id room-id)
+      :room-incarnation room-incarnation
       :ceiling (:work-admission agent-program-ceiling)})
     (ns-codec/add-codec-namespaces! sci-ctx)   ; cheshire.core / clojure.data.xml / dvergr.codec
     (ns-intake/add-intake-namespaces! sci-ctx)

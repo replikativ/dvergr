@@ -97,7 +97,8 @@
   ;;                 spindel.yggdrasil/ForkHandle for an isolated fork. Durable
   ;;                 identity is exposed through fork-descriptor; the live
   ;;                 settlement capability is deliberately never persisted.
-           [id slug title parent-id participants bus ctx forked-at-len store meta fork-handle])
+           [id slug title parent-id participants bus ctx forked-at-len store meta fork-handle
+            incarnation])
 
 ;; A Room's bus + participants reference back to the Room, so the default record
 ;; printer recurses forever and StackOverflows at the REPL (e.g. when `(d/room …)`
@@ -292,7 +293,8 @@
         b     (bus-with-peer-relay ctx id :room
                                    (when durable-append!
                                      {:durable-append! durable-append!}))
-        room  (->Room id slug title parent-id (atom {}) b ctx 0 store (atom (or meta {})) nil)]
+        room  (->Room id slug title parent-id (atom {}) b ctx 0 store
+                      (atom (or meta {})) nil (random-uuid))]
     (agent-run/open-room-admission! id ctx)
     ;; Persist metadata on creation so the store has it for re-hydration.
     (when store
@@ -1220,7 +1222,8 @@
                               (atom (assoc (dissoc @(:meta room) :dvergr/owned-listeners)
                                            :forked-from (:id room)
                                            :conversation-id conv-id))
-                              (when fork-handle (atom fork-handle)))]
+                              (when fork-handle (atom fork-handle))
+                              (random-uuid))]
        ;; The child is not registered or otherwise visible yet. Initializing its
        ;; admission without the global lifecycle lock avoids parent-meta ->
        ;; lifecycle lock inversion during concurrent parent teardown.

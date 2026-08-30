@@ -8,7 +8,8 @@
    projections remain in Spindel."
   (:require [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.work :as work]
-            [dvergr.room.registry :as room-registry]))
+            [dvergr.room.registry :as room-registry]
+            [dvergr.runtime.ctx :as runtime-ctx]))
 
 (def default-ceiling
   {:controllers 16
@@ -17,7 +18,7 @@
    :ingress-capacity 1024
    :event-taps 8})
 
-(deftype Controller [native room-id generation owner-context taps ceiling])
+(deftype Controller [native room-id lifecycle-key generation owner-context taps ceiling])
 
 (defonce ^:private lifecycle-lock (Object.))
 (defonce ^:private rooms* (atom {}))
@@ -58,6 +59,12 @@
     (throw (ex-info "Structured work admission requires a room-scoped SCI session"
                     {:type ::room-required}))))
 
+(defn- root-key [ctx]
+  (:fork-id (runtime-ctx/root-ctx ctx)))
+
+(defn- lifecycle-key [ctx room-id]
+  [(root-key ctx) room-id])
+
 (defn- bounded-opts [strategy ceiling opts]
   (let [allowed #{:concurrency :capacity :ingress-capacity}
         unknown (seq (remove allowed (keys opts)))
@@ -89,28 +96,33 @@
 (defn- forget-controller! [^Controller controller]
   (locking lifecycle-lock
     (let [room-id (.-room-id controller)
+          key (.-lifecycle-key controller)
           generation (.-generation controller)]
       (swap! rooms*
              (fn [rooms]
-               (if (= generation (get-in rooms [room-id :generation]))
-                 (update-in rooms [room-id :controllers]
+               (if (= generation (get-in rooms [key :generation]))
+                 (update-in rooms [key :controllers]
                             (fn [controllers] (disj (or controllers #{}) controller)))
                  rooms)))))
   nil)
 
 (defn create!
   "Create and register an opaque, room-owned controller."
-  [room-id owner-context ceiling strategy opts work-fn]
+  [room-id incarnation owner-context ceiling strategy opts work-fn]
   (ensure-room! room-id)
-  (let [ceiling (normalize-ceiling ceiling)
+  (let [key (lifecycle-key owner-context room-id)
+        ceiling (normalize-ceiling ceiling)
         opts (bounded-opts strategy ceiling opts)]
     (locking lifecycle-lock
       (let [{:keys [state controllers generation]
              lifecycle-owner :owner-context
-             :as lifecycle} (get @rooms* room-id)]
+             :as lifecycle} (get @rooms* key)]
         (when-not lifecycle
           (throw (ex-info "Room work admission has no live lifecycle owner"
                           {:type ::room-not-registered :room-id room-id})))
+        (when-not (= incarnation generation)
+          (throw (ex-info "SCI session belongs to a stale Room incarnation"
+                          {:type ::stale-room-incarnation :room-id room-id})))
         (when-not (identical? lifecycle-owner owner-context)
           (throw (ex-info "SCI session does not own this Room incarnation"
                           {:type ::stale-room-incarnation :room-id room-id})))
@@ -124,9 +136,9 @@
                            :ceiling (:controllers ceiling)})))
         (let [native (binding [ec/*execution-context* owner-context]
                        (work/work-admission (assoc opts :strategy strategy) work-fn))
-              controller (Controller. native room-id generation owner-context
+              controller (Controller. native room-id key generation owner-context
                                       (atom #{}) ceiling)]
-          (swap! rooms* update-in [room-id :controllers] conj controller)
+          (swap! rooms* update-in [key :controllers] conj controller)
           ;; A passive completion observer releases the allocation slot. It does
           ;; not own/cancel the controller and cannot be abandoned by SCI.
           (binding [ec/*execution-context* owner-context]
@@ -213,15 +225,17 @@
   [room]
   (when room
     (let [room-id (:id room)
+          key (lifecycle-key (:ctx room) room-id)
           {:keys [controllers fence]}
           (locking lifecycle-lock
-            (when-let [lifecycle (get @rooms* room-id)]
-              (when-not (identical? (:owner-context lifecycle) (:ctx room))
+            (when-let [lifecycle (get @rooms* key)]
+              (when-not (and (= (:incarnation room) (:generation lifecycle))
+                             (identical? (:owner-context lifecycle) (:ctx room)))
                 (throw (ex-info "Room instance does not own its work lifecycle"
                                 {:type ::stale-room-incarnation :room-id room-id})))
               (let [fence (or (:fence lifecycle) (random-uuid))
                     lifecycle (assoc lifecycle :state :closing :fence fence)]
-                (swap! rooms* assoc room-id lifecycle)
+                (swap! rooms* assoc key lifecycle)
                 {:controllers (:controllers lifecycle) :fence fence})))
           deadline (+ (System/currentTimeMillis) 5000)
           failures (transient [])]
@@ -256,20 +270,33 @@
   (when (and room fence)
     (locking lifecycle-lock
       (let [room-id (:id room)
-            lifecycle (get @rooms* room-id)]
+            key (lifecycle-key (:ctx room) room-id)
+            lifecycle (get @rooms* key)]
         (when (and (= fence (:fence lifecycle))
                    (= :closing (:state lifecycle))
+                   (= (:incarnation room) (:generation lifecycle))
                    (identical? (:owner-context lifecycle) (:ctx room)))
-          (swap! rooms* assoc room-id
+          (swap! rooms* assoc key
                  (-> lifecycle (assoc :state :open) (dissoc :fence)))
           true)))))
 
 (defn- register-room! [room]
   (let [room-id (:id room)
-        owner-context (:ctx room)]
+        owner-context (:ctx room)
+        registry-root (runtime-ctx/current-root)
+        owner-root (runtime-ctx/root-ctx owner-context)
+        _ (when-not (= (root-key registry-root) (root-key owner-root))
+            (throw (ex-info "Room must register in its execution tree's root registry"
+                            {:type ::registry-root-mismatch :room-id room-id})))
+        key (lifecycle-key registry-root room-id)
+        incarnation (:incarnation room)]
     (locking lifecycle-lock
-      (if-let [lifecycle (get @rooms* room-id)]
+      (if-let [lifecycle (get @rooms* key)]
         (cond
+          (not= incarnation (:generation lifecycle))
+          (throw (ex-info "Room id is still owned by another live incarnation"
+                          {:type ::room-incarnation-conflict :room-id room-id}))
+
           (not (identical? owner-context (:owner-context lifecycle)))
           (throw (ex-info "Room id is still owned by another live incarnation"
                           {:type ::room-incarnation-conflict :room-id room-id}))
@@ -282,9 +309,9 @@
           ;; Idempotent refresh of the same Room context preserves controllers,
           ;; ceilings, and the lifecycle generation.
           nil)
-        (swap! rooms* assoc room-id
+        (swap! rooms* assoc key
                {:state :open
-                :generation (random-uuid)
+                :generation incarnation
                 :owner-context owner-context
                 :controllers #{}}))))
   nil)
@@ -294,7 +321,7 @@
   ;; makes stale SCI sessions fail closed instead of attaching to a later Room
   ;; that happens to reuse the durable id.
   (locking lifecycle-lock
-    (swap! rooms* dissoc room-id))
+    (swap! rooms* dissoc (lifecycle-key (runtime-ctx/current-root) room-id)))
   nil)
 
 ;; The safety hook runs before add-or-replace registration and may reject a

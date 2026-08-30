@@ -203,6 +203,7 @@
                        ;; former so a hired agent can recursively hire into this
                        ;; exact live Room, including an ephemeral fork.
                        :room-runtime-id room-id
+                       :room-incarnation (:incarnation room)
                         ;; Per-agent network egress scope: an actor's optional
                         ;; `:config {:allowed-domains #{"https://…"}}` restricts the
                         ;; sandbox `http` primitive (nil/empty ⇒ open).

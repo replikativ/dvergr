@@ -61,7 +61,8 @@
       ;; that full wiring and catches any omission there.
       (agent-ns/add-programming-ns! sci-ctx (:id room) (:ctx room) nil)
       (data-ns/add-spindel-extras-ns! sci-ctx (:ctx room)
-                                      {:room-id (:id room)})
+                                      {:room-id (:id room)
+                                       :room-incarnation (:incarnation room)})
       (testing "progressive help contains an executable composition example"
         (let [guide (sandbox/ns-doc-md sci-ctx 'dvergr.agent)]
           (is (re-find #":scripted.*:reply" guide))
@@ -120,7 +121,8 @@
         sci-ctx (sandbox/fork-for-session (:ctx room))]
     (try
       (data-ns/add-spindel-extras-ns! sci-ctx (:ctx room)
-                                      {:room-id (:id room)})
+                                      {:room-id (:id room)
+                                       :room-incarnation (:incarnation room)})
       (let [result
             (binding [ec/*execution-context* (:ctx room)]
               (sandbox/eval-code
@@ -160,7 +162,8 @@
         sci-ctx (sandbox/fork-for-session (:ctx fork))]
     (try
       (data-ns/add-spindel-extras-ns! sci-ctx (:ctx fork)
-                                      {:room-id (:id fork)})
+                                      {:room-id (:id fork)
+                                       :room-incarnation (:incarnation fork)})
       (let [created
             (binding [ec/*execution-context* (:ctx fork)]
               (sandbox/eval-code
@@ -200,6 +203,7 @@
       (data-ns/add-spindel-extras-ns!
        sci-ctx (:ctx room)
        {:room-id (:id room)
+        :room-incarnation (:incarnation room)
         :ceiling {:controllers 1
                   :concurrency 2
                   :capacity 4
@@ -237,30 +241,37 @@
   (let [room (d/make-room {:id :sci-work-incarnation
                            :store (memory/make)})
         other-ctx (context/create-execution-context)
+        other-room (d/make-room {:id :sci-work-incarnation
+                                 :ctx other-ctx
+                                 :store (memory/make)})
         controller (sandbox-work/create!
-                    (:id room) (:ctx room) {:controllers 1}
+                    (:id room) (:incarnation room) (:ctx room) {:controllers 1}
                     :serial {} (fn [value] (sp/spin value)))]
     (try
       (binding [ec/*execution-context* (:ctx room)]
         (room-registry/register! room))
       (is (thrown-with-msg?
            clojure.lang.ExceptionInfo #"controller limit"
-           (sandbox-work/create! (:id room) (:ctx room) {:controllers 1}
+           (sandbox-work/create! (:id room) (:incarnation room) (:ctx room) {:controllers 1}
                                  :serial {} (fn [value] (sp/spin value))))
           "an idempotent registry refresh does not forget live controllers")
       (is (thrown-with-msg?
            clojure.lang.ExceptionInfo #"another live incarnation"
            (binding [ec/*execution-context* (:ctx room)]
-             (room-registry/register! (assoc room :ctx other-ctx)))))
+             (room-registry/register! (assoc room :incarnation (random-uuid))))))
       (is (identical? room
                       (binding [ec/*execution-context* (:ctx room)]
                         (room-registry/lookup (:id room))))
           "a rejected replacement leaves the registered Room untouched")
+      (is (identical? other-room
+                      (binding [ec/*execution-context* other-ctx]
+                        (room-registry/lookup (:id other-room))))
+          "equal Room ids in independent root registries do not share lifecycle state")
       (finally
         (binding [ec/*execution-context* (:ctx room)]
           (sandbox-work/close! controller))
         (d/close-room! room)
-        (context/close-context! other-ctx)))))
+        (d/close-room! other-room)))))
 
 (deftest room-work-teardown-broadcasts-before-joining
   (let [room (d/make-room {:id :sci-work-broadcast
@@ -269,7 +280,7 @@
                      (repeatedly
                       2
                       #(sandbox-work/create!
-                        (:id room) (:ctx room) nil :serial {}
+                        (:id room) (:incarnation room) (:ctx room) nil :serial {}
                         (fn [value] (sp/spin value)))))
         cancellations (atom 0)]
     (try
