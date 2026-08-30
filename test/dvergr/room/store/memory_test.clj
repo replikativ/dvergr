@@ -10,6 +10,9 @@
 (deftest run-lifecycle-contract
   (contract/assert-run-lifecycle! (memory/make) :runs-memory))
 
+(deftest attention-projection-contract
+  (contract/assert-attention-projection! (memory/make) :attention-memory))
+
 (deftest rejects-unmodelled-durable-metadata
   (let [st (memory/make)]
     (store/-store-room! st :strict-memory {:slug "strict-memory"})

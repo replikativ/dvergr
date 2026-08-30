@@ -69,6 +69,10 @@
   (let [[_conn st] (mem-store)]
     (contract/assert-run-lifecycle! st :runs-datahike)))
 
+(deftest attention-projection-contract
+  (let [[_conn st] (mem-store)]
+    (contract/assert-attention-projection! st :attention-datahike)))
+
 (deftest thread-filter-bounds-the-datahike-pull
   (testing "the indexed root predicate runs before message bodies are pulled"
     (let [[_conn st] (mem-store)

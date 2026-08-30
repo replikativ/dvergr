@@ -112,3 +112,35 @@
            clojure.lang.ExceptionInfo
            #":run/chat-id must be a UUID"
            (store/-store-run! st room-id (assoc completed :run/chat-id :not-a-uuid)))))))
+
+(defn assert-attention-projection!
+  "Exercise durable participant-specific attention storage and filtering."
+  [st room-id]
+  (testing "attention is durable control state, separate from speech"
+    (store/-store-room! st room-id {:slug (name room-id) :title "Attention"})
+    (let [created (java.util.Date. 1787860800000)
+          fact {:attention/id (random-uuid)
+                :attention/participant :agent/researcher
+                :attention/message-id (random-uuid)
+                :attention/run-id (random-uuid)
+                :attention/memory :remember
+                :attention/activation :none
+                :attention/control :continue
+                :attention/at :next-safe-boundary
+                :attention/priority 0.0
+                :attention/status :ready
+                :attention/reason :peer/observation
+                :attention/created-at created}]
+      (is (= fact (store/-store-attention! st room-id fact)))
+      (is (= [fact]
+             (store/-list-attention st room-id
+                                    {:participant :agent/researcher})))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"immutable"
+           (store/-store-attention! st room-id
+                                    (assoc fact :attention/reason :mutated/retry))))
+      (is (empty? (store/-list-messages st room-id {}))
+          "attention facts never contaminate the Room transcript")
+      (is (empty? (store/-list-attention st room-id
+                                         {:participant :agent/other}))))))

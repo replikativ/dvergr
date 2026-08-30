@@ -89,7 +89,11 @@ Attention is the conversational policy layer above this mechanism. A policy may
 remember an utterance without admission, enqueue it for serial work, or request
 switch-to-latest integration at a supported execution boundary. That mapping is
 an interpreter owned by the participant; message tags themselves never acquire
-cancellation authority.
+cancellation authority. Native LLM attention decisions are durable typed Room
+projections rather than synthetic speech: `include` admits model input at the
+next supported boundary, `remember` preserves awareness outside provider
+context, and unsupported plans remain explicitly deferred for a future capable
+interpreter.
 
 ## Construct and compose
 

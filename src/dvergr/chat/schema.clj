@@ -657,6 +657,71 @@
     :db/cardinality :db.cardinality/one}])
 
 ;; ============================================================================
+;; Attention Schema
+;; ============================================================================
+
+(def attention-schema
+  "Durable participant-specific control/memory projections over Room messages."
+  [{:db/ident :attention/id
+    :db/valueType :db.type/uuid
+    :db/unique :db.unique/identity
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :attention/chat
+    :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :attention/participant
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :attention/message-id
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :attention/run-id
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :attention/memory
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :attention/activation
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :attention/control
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :attention/at
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :attention/priority
+    :db/valueType :db.type/double
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :attention/status
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :attention/reason
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :attention/created-at
+    :db/valueType :db.type/instant
+    :db/cardinality :db.cardinality/one
+    :db/index true}])
+
+;; ============================================================================
 ;; Full Schema
 ;; ============================================================================
 
@@ -1042,6 +1107,7 @@
   (vec (concat chat-schema
                message-schema
                run-schema
+               attention-schema
                tool-call-schema
                ledger-schema
                budget-schema

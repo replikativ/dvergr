@@ -215,11 +215,21 @@ honors only the boundaries it actually supports.
 
 The native LLM participant negotiates each decision against an explicit
 capability description. It honors memory (`ignore`, `remember`, and
-safe-boundary `include`), activation (`none`, `enqueue`, and wake-while-active),
+safe-boundary `include`), activation (`none` and `enqueue`),
 and `continue`, `restart`, `suspend`, or run-local `cancel` at boundaries it can
 implement honestly. Provider-specific integration points and non-zero priority
-remain unsupported and are queued with their complete decision intact; there is
-no silent projection to a weaker action. The former `:steer`, `:queue`, and
+remain unsupported and are retained as durable deferred attention; they do not
+silently become ordinary queued Runs. `wake` is part of the provider-neutral
+algebra but is not advertised by this interpreter because it has no durable LLM
+continuation to wake.
+
+Attention is stored as a typed participant projection in the Room store, not as
+a hidden chat message. The shared transcript remains immutable speech. Provider
+working context is reconstructed from the participant's Run triggers, its own
+outputs, and monotone `include` admissions. `remember` stays durable awareness
+without entering model input, while `ignore` excludes the fact from that input.
+Thus live execution and restart/replay apply the same memory decision without
+contaminating thread or message projections. The former `:steer`, `:queue`, and
 `:observe` policy results remain accepted through normalization. Structured work admission is now
 available directly in native code and the room SCI REPL as `spindel.work/latest`,
 `serial`, `busy`, and bounded `parallel`. These are higher-order FRP policies:

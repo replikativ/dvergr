@@ -92,7 +92,12 @@
     (-load-run [_ room-id run-id]
       (store/-load-run delegate room-id run-id))
     (-list-runs [_ room-id opts]
-      (store/-list-runs delegate room-id opts))))
+      (store/-list-runs delegate room-id opts))
+    store/PAttentionStore
+    (-store-attention! [_ room-id fact]
+      (store/-store-attention! delegate room-id fact))
+    (-list-attention [_ room-id opts]
+      (store/-list-attention delegate room-id opts))))
 
 ;; ============================================================================
 ;; Tests
@@ -583,10 +588,100 @@
         (is (= ::timeout @first-reply))
         (is (await-condition #(empty? (run/active-runs (:id r))) 2000))
         (is (= :waiting (:run/status (first (run/runs r)))))
+        (is (= :attention-suspended (:run/reason (first (run/runs r)))))
         (is (= "included"
                (:content (await-spin r #(d/ask % :policy-suspend-worker
                                                {:content "resume"}) 4000)))
             (pr-str @observed)))
+      (finally
+        (d/close-room! r)))))
+
+(deftest non-preempting-include-is-admitted-between-provider-rounds
+  (let [r (d/make-room {:id :policy-include-boundary :store (memory/make)})
+        entered (promise)
+        gate (promise)
+        observed (atom nil)
+        steps (atom [(fn [_chat-ctx _]
+                       (deliver entered true)
+                       @gate
+                       :continue)
+                     (fn [chat-ctx _]
+                       (reset! observed (cc/get-messages chat-ctx))
+                       (cc/add-message! chat-ctx {:role :assistant :content "done"})
+                       :complete)])
+        calls (atom [])
+        policy (fn [_]
+                 (attention/decision {:memory :include
+                                      :control :continue
+                                      :at :next-safe-boundary
+                                      :reason :test/include-next-round}))]
+    (try
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent {:id :include-worker
+                                  :spec {:provider :mock :model "mock"}
+                                  :budget {:dollars 10.0}
+                                  :attention-policy policy
+                                  :run-turn-fn (make-queued-turn-fn steps calls)})))
+      (let [reply-f (future (await-spin r #(d/ask % :include-worker {:content "start"})
+                                        5000))]
+        (is (true? (deref entered 3000 ::timeout)))
+        (let [trigger (some #(when (= "start" (:content %)) %) (d/log r))]
+          (d/post! r (d/reply :reviewer :include-worker "use this next" trigger)))
+        (is (await-condition
+             #(some (fn [fact]
+                      (= :test/include-next-round (:attention/reason fact)))
+                    (store/-list-attention (:store r) (:id r)
+                                           {:participant :include-worker}))
+             2000))
+        (deliver gate true)
+        (is (= "done" (:content @reply-f)))
+        (is (some #(re-find #"use this next"
+                            (or (:content %) (:message/content %) ""))
+                  @observed)
+            "include is visible to the very next provider round"))
+      (finally
+        (d/close-room! r)))))
+
+(deftest unsupported-attention-remains-deferred-without-becoming-a-new-run
+  (let [st (memory/make)
+        r (d/make-room {:id :policy-deferred :store st})
+        entered (promise)
+        gate (promise)
+        calls (atom [])
+        steps (atom [(fn [chat-ctx _]
+                       (deliver entered true)
+                       @gate
+                       (cc/add-message! chat-ctx {:role :assistant :content "first"})
+                       :complete)])
+        policy (fn [_]
+                 (attention/decision {:memory :include
+                                      :control :integrate
+                                      :at :after-tool
+                                      :reason :test/provider-boundary}))]
+    (try
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent {:id :deferred-worker
+                                  :spec {:provider :mock :model "mock"}
+                                  :attention-policy policy
+                                  :run-turn-fn (make-queued-turn-fn steps calls)})))
+      (let [reply-f (future (await-spin r #(d/ask % :deferred-worker {:content "start"})
+                                        5000))]
+        (is (true? (deref entered 3000 ::timeout)))
+        (let [trigger (some #(when (= "start" (:content %)) %) (d/log r))]
+          (d/post! r (d/reply :reviewer :deferred-worker "after the tool" trigger)))
+        (is (await-condition
+             #(some (fn [fact] (= :deferred (:attention/status fact)))
+                    (store/-list-attention st (:id r)
+                                           {:participant :deferred-worker}))
+             2000))
+        (deliver gate true)
+        (is (= "first" (:content @reply-f)))
+        (Thread/sleep 150)
+        (is (= 1 (count @calls)) "deferred input is not silently degraded to enqueue")
+        (is (= 1 (count (run/runs r))))
+        (is (some #(= :deferred (:attention/status %))
+                  (store/-list-attention st (:id r)
+                                         {:participant :deferred-worker}))))
       (finally
         (d/close-room! r)))))
 

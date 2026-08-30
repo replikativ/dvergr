@@ -25,7 +25,8 @@
                    (-> s
                        (update :rooms    dissoc room-id)
                        (update :messages dissoc room-id)
-                       (update :runs     dissoc room-id)))))
+                       (update :runs     dissoc room-id)
+                       (update :attention dissoc room-id)))))
 
   (-list-rooms [_]
     (->> (vals (:rooms @state))
@@ -90,9 +91,30 @@
                         #(str (:run/id %)))
                   #(compare %2 %1))
          (take (or limit 100))
+         vec))
+
+  store/PAttentionStore
+
+  (-store-attention! [_ room-id fact]
+    (let [fact (store/validate-attention! fact)
+          path [:attention room-id (:attention/id fact)]
+          existing (get-in @state path)]
+      (when (and existing (not= existing fact))
+        (throw (ex-info "Attention identity is immutable"
+                        {:type :room-store/attention-identity-collision
+                         :existing existing :fact fact})))
+      (swap! state #(if (get-in % path) % (assoc-in % path fact)))
+      fact))
+
+  (-list-attention [_ room-id {:keys [participant limit]}]
+    (->> (vals (get-in @state [:attention room-id] {}))
+         (filter #(if participant (= participant (:attention/participant %)) true))
+         (sort-by (juxt #(some-> ^java.util.Date (:attention/created-at %) .getTime)
+                        #(str (:attention/id %))))
+         (take-last (or limit 1000))
          vec)))
 
 (defn make
   "Create a fresh in-memory store."
   []
-  (->MemoryStore (atom {:rooms {} :messages {} :runs {}})))
+  (->MemoryStore (atom {:rooms {} :messages {} :runs {} :attention {}})))

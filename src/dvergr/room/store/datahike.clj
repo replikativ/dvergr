@@ -154,6 +154,13 @@
     []
     [entity room-touch]))
 
+(defn- store-attention-if-absent
+  "Transaction function preserving immutable attention identity under races."
+  [db entity]
+  (if (dh/entity db [:attention/id (:attention/id entity)])
+    []
+    [entity]))
+
 (def ^:private message-pull-pattern
   '[:message/id :message/role :message/content
     :message/created-at :message/source-user
@@ -190,6 +197,12 @@
     :run/status :run/created-at :run/started-at :run/updated-at :run/ended-at
     :run/reason :run/error])
 
+(def ^:private attention-pull-pattern
+  '[:attention/id :attention/participant :attention/message-id
+    :attention/run-id :attention/memory :attention/activation
+    :attention/control :attention/at :attention/priority
+    :attention/status :attention/reason :attention/created-at])
+
 (defn- run->entity [chat-id run]
   (cond-> {:run/id         (:run/id run)
            :run/chat       [:chat/id chat-id]
@@ -220,6 +233,11 @@
     (:run/ended-at run) (assoc :run/ended-at (:run/ended-at run))
     (:run/reason run)   (assoc :run/reason (:run/reason run))
     (:run/error run)    (assoc :run/error (str (:run/error run)))))
+
+(defn- attention->entity [chat-id fact]
+  (cond-> (assoc fact :attention/chat [:chat/id chat-id])
+    (some? (:attention/priority fact))
+    (update :attention/priority double)))
 
 ;; =============================================================================
 ;; Store impl
@@ -263,9 +281,19 @@
                               [?c :chat/id ?cid]
                               [?r :run/chat ?c]
                               [?r :run/id ?rid]]
-                            @conn chat-id)]
+                            @conn chat-id)
+              attention-ids (dh/q '[:find [?aid ...]
+                                    :in $ ?cid
+                                    :where
+                                    [?c :chat/id ?cid]
+                                    [?a :attention/chat ?c]
+                                    [?a :attention/id ?aid]]
+                                  @conn chat-id)]
           (dh/transact conn (-> (mapv (fn [mid] [:db/retractEntity [:message/id mid]]) msg-ids)
                                 (into (map (fn [rid] [:db/retractEntity [:run/id rid]]) run-ids))
+                                (into (map (fn [aid]
+                                             [:db/retractEntity [:attention/id aid]])
+                                           attention-ids))
                                 (conj [:db/retractEntity [:chat/id chat-id]])))))))
 
   (-list-rooms [_]
@@ -495,6 +523,53 @@
                             #(str (:run/id %)))
                       #(compare %2 %1))
              (take (or limit 100))
+             vec)
+        [])))
+
+  store/PAttentionStore
+
+  (-store-attention! [_ room-id fact]
+    (let [slug (store/room-id->slug room-id)
+          fact (store/validate-attention! fact)]
+      (if-let [ent (room-by-slug conn slug)]
+        (let [report (persist/persist-tx-result!
+                      conn
+                      [[:db.fn/call store-attention-if-absent
+                        (attention->entity (:chat/id ent) fact)]]
+                      {:op :store-attention
+                       :room-id room-id
+                       :attention-id (:attention/id fact)})]
+          (when (false? report)
+            (throw (ex-info "Attention persistence failed"
+                            {:type :room-store/attention-persistence-failed
+                             :room-id room-id :fact fact})))
+          (let [stored (dh/q '[:find (pull ?a pattern) .
+                               :in $ ?id pattern
+                               :where [?a :attention/id ?id]]
+                             @conn (:attention/id fact) attention-pull-pattern)]
+            (when-not (= fact stored)
+              (throw (ex-info "Attention identity is immutable"
+                              {:type :room-store/attention-identity-collision
+                               :existing stored :fact fact})))
+            fact))
+        (throw (ex-info "Cannot persist attention for unknown room"
+                        {:type :room-store/missing-room :room-id room-id})))))
+
+  (-list-attention [_ room-id {:keys [participant limit]}]
+    (let [slug (store/room-id->slug room-id)]
+      (if-let [ent (room-by-slug conn slug)]
+        (->> (dh/q '[:find [(pull ?a pattern) ...]
+                     :in $ ?chat-id pattern
+                     :where
+                     [?c :chat/id ?chat-id]
+                     [?a :attention/chat ?c]]
+                   @conn (:chat/id ent) attention-pull-pattern)
+             (filter #(if participant
+                        (= participant (:attention/participant %))
+                        true))
+             (sort-by (juxt #(some-> ^java.util.Date (:attention/created-at %) .getTime)
+                            #(str (:attention/id %))))
+             (take-last (or limit 1000))
              vec)
         [])))
 

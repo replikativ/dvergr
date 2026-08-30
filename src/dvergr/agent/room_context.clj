@@ -1,46 +1,37 @@
 (ns dvergr.agent.room-context
   "Per-[room, agent] working ChatContext (design \"D\").
 
-   Instead of rebuilding a fresh chat-ctx every turn (re-reading + re-writing
-   the whole room log under a throwaway chat-id, all on the engine thread),
-   each (room, agent) pair gets ONE long-lived chat-ctx, created once with a
-   stable chat-id and kept current by a fold over the room bus.
+   Instead of rebuilding a fresh chat-ctx every execution, each (room, agent)
+   pair gets one long-lived provider working context. The shared Room log stays
+   the durable source of facts; explicit attention decisions project which of
+   those facts enter this participant's model input.
 
    ## Consistency model (see doc/per-room-chat-ctx.md)
 
-   The room bus is a per-room, totally-ordered message log. The room store
-   (disk) and this chat-ctx's messages-signal (memory) are two folds of that
-   same log — consistent by construction as long as every durable message
-   write goes through the bus.
-
-   - The signal is SEEDED once from the room store (conversation), then a fold
-     spin appends each new bus message FROM OTHERS (`:from` ≠ self), skipping
-     tool-activity. The agent's own turns are appended by the turn loop; the
-     fold skips self, so there is no double-add.
-   - Dedup is by message `:id` via a synchronized set (`.add` is atomic and
-     returns true only on first insert), so the seed and the live fold are
-     idempotent and race-free regardless of ordering — `append-inbound!` is the
-     single deduped appender, called by both the fold and the turn handler (for
-     the just-arrived message).
-   - Recovery = re-seed from the store. The store is the durable bottom; the
-     signal is always rebuildable from it."
+   - The active discourse interpreter is the sole live admission point. There
+     is deliberately no eager bus fold: observing a Room fact must not make an
+     `:ignore` or `:remember` decision indistinguishable from `:include`.
+   - Attention decisions are typed durable Room activity facts. On recovery,
+     Run triggers, the agent's own outputs, and explicit `:include` decisions
+     rebuild provider input; `:remember` remains Room awareness without being
+     sent to the model.
+   - Dedup is by message `:id` through a synchronized set, so a trigger already
+     present in the seed and its live admission cannot appear twice."
   (:require [dvergr.actors :as actors]
             [dvergr.discourse :as d]
+            [dvergr.agent.run :as run]
             [dvergr.agent.turn :as turn]
             [dvergr.chat.context :as chat-ctx]
             [dvergr.chat.schema :as schema]
             [dvergr.room.registry :as rreg]
+            [dvergr.room.store :as rstore]
             [dvergr.chat.accounting :as acct]
-            [dvergr.runtime.bus :as bus]
             [dvergr.system.db :as sdb]
             [dvergr.system.rooms :as srooms]
-            [org.replikativ.spindel.core :as sp]
-            [org.replikativ.spindel.spin.cps :refer [spin]]
             [org.replikativ.spindel.engine.core :as ec]
-            [is.simm.partial-cps.sequence :refer [anext]]
             [taoensso.telemere :as tel]))
 
-;; [room-id agent-id] → {:chat-ctx ChatContext :seen java.util.Set :sub Subscription}
+;; [room-id agent-id] → {:chat-ctx ChatContext :seen java.util.Set}
 (defonce ^:private room-agent-ctxs (atom {}))
 
 (defn room-system-id
@@ -104,9 +95,8 @@
 (defn append-inbound!
   "Append one inbound conversational message to the (room, agent) ctx's signal,
    EXACTLY ONCE (deduped by `msg-id` via the entry's synchronized set). Used by
-   both the bus fold and the turn handler (for the just-arrived message), so
-   whichever runs first wins and the other no-ops. Signal-only (the room store
-   already holds it durably). Returns true if appended.
+   the attention interpreter. Signal-only (the room store already holds it
+   durably). Returns true if appended.
 
    `author` is the sender's display label (nil for the agent's own messages); when
    present the content is prefixed `[author · HH:mm]` so the agent knows WHO spoke
@@ -125,25 +115,6 @@
          (append-signal-only! chat-ctx (cond-> {:role role :content decorated}
                                          (seq reasoning) (assoc :reasoning reasoning))))
        true))))
-
-(defn- start-fold!
-  "Subscribe to `room`'s bus and append each new conversational message FROM
-   OTHERS (≠ self) to `cctx`, deduped by id. Returns the Subscription. The
-   pump exits when the subscription is closed (drop-ctx!)."
-  [room self-id]
-  (binding [ec/*execution-context* (:ctx room)]
-    (let [sub (bus/subscribe! (:bus room) [:type :user/message])]
-      (sp/spawn!
-       (spin
-        (loop [s (:aseq sub)]
-          (when-let [r (sp/await (anext s))]
-            (let [[m rest-s] r]
-              (when (and (not= self-id (:from m)) (conversational? m))
-                (let [role (or (:role m) (:role (:metadata m)) :user)]
-                  (append-inbound! (:id room) self-id (:id m) role (:content m)
-                                   (display-name room (:from m)) (:ts m))))
-              (recur rest-s))))))
-      sub)))
 
 (defn raise-budget!
   "Set the live budget :total on every cached agent ctx of `room-id` to
@@ -166,10 +137,9 @@
 (defn ensure-ctx!
   "Get-or-create the long-lived working chat-ctx for `agent-id` in `room`.
 
-   On first call: create the ctx with a stable chat-id, register it (so the
-   fold + seed can find it), subscribe the fold, then SEED the conversation
-   from the room store. Subscribe-before-seed + id-dedup closes the seed/live
-   race. Subsequent calls return the cached ctx — no per-turn rebuild."
+   On first call, create the ctx with a stable chat-id and seed its durable
+   attention projection from the Room store. Subsequent calls return the
+   cached ctx; live facts enter only through explicit interpreter admission."
   [room agent-id {:keys [system-prompt budget-dollars limit]}]
   (let [room-id (:id room)
         k       [room-id agent-id]]
@@ -215,11 +185,8 @@
                         ;; accounting still persists.
                        :durable?       false})
                 seen (java.util.Collections/synchronizedSet (java.util.HashSet.))]
-            ;; Register BEFORE the fold/seed so append-inbound! finds the entry.
-            (swap! room-agent-ctxs assoc k {:chat-ctx cctx :seen seen :sub nil})
-            ;; Subscribe first (catch live messages during seeding)…
-            (let [sub (start-fold! room agent-id)]
-              (swap! room-agent-ctxs assoc-in [k :sub] sub))
+            ;; Register before seeding so append-inbound! finds the entry.
+            (swap! room-agent-ctxs assoc k {:chat-ctx cctx :seen seen})
             ;; System prompt once, then seed the conversation from the store.
             ;; Signal-only: the prompt is regenerated each session, not durable.
             (when system-prompt
@@ -228,28 +195,53 @@
             ;; (for a fork, branched) store under the conversation :chat/id, so a
             ;; fork already returns inherited (pre-fork) + its own messages — the
             ;; agent sees exactly what the UI seeds. (doc/unified-fork-conversation.md)
-            (doseq [m (d/messages room {:limit (or limit 100)})]
-              (when (conversational? m)
-                (append-inbound! room-id agent-id (:id m)
-                                 (or (:role m) (if (= agent-id (:from m)) :assistant :user))
-                                 (:content m)
+            (let [messages (d/messages room {:limit (or limit 100)})
+                  attention-facts
+                  (if (satisfies? rstore/PAttentionStore (:store room))
+                    (rstore/-list-attention (:store room)
+                                            (d/conversation-id room)
+                                            {:participant agent-id :limit 1000})
+                    [])
+                  included-message-ids
+                  ;; Admission is monotone: once a fact entered provider
+                  ;; context (most notably when queued work becomes a Run
+                  ;; trigger), a later observation cannot silently erase it.
+                  ;; Deliberate forgetting belongs to compaction/context policy,
+                  ;; not to attention races.
+                  (into #{}
+                        (keep #(when (= :include (:attention/memory %))
+                                 (:attention/message-id %)))
+                        attention-facts)
+                  agent-runs (run/runs room {:actor agent-id :limit 1000})
+                  trigger-ids (into #{} (map :run/trigger) agent-runs)
+                  ;; Rooms created before durable attention facts retain their
+                  ;; historical seed. Once the participant has Runs, precise
+                  ;; causal triggers replace that compatibility fallback.
+                  legacy-history? (empty? agent-runs)]
+              (doseq [m messages]
+                (when (and (conversational? m)
+                           (or (= agent-id (:from m))
+                               (contains? included-message-ids (:id m))
+                               (contains? trigger-ids (:id m))
+                               legacy-history?))
+                  (append-inbound! room-id agent-id (:id m)
+                                   (or (:role m) (if (= agent-id (:from m)) :assistant :user))
+                                   (:content m)
                                  ;; author nil for the agent's OWN past messages
-                                 (when (not= agent-id (:from m)) (display-name room (:from m)))
-                                 (:ts m)
+                                   (when (not= agent-id (:from m)) (display-name room (:from m)))
+                                   (:ts m)
                                  ;; feed back only the agent's OWN prior reasoning,
                                  ;; not another participant's <think>
-                                 (when (= agent-id (:from m)) (:reasoning m)))))
+                                   (when (= agent-id (:from m)) (:reasoning m))))))
             (tel/log! {:level :debug :id ::created
                        :data {:room room-id :agent agent-id
                               :seeded (count (chat-ctx/get-messages cctx))}})
             cctx)))))
 
 (defn drop-ctx!
-  "Tear down the (room, agent) ctx: unsubscribe the fold and forget it.
-   Call on agent leave / room delete / fork discard."
+  "Tear down the (room, agent) provider projection."
   [room-id agent-id]
-  (when-let [{:keys [sub]} (get @room-agent-ctxs [room-id agent-id])]
-    (when sub (try (bus/unsubscribe! sub) (catch Throwable _ nil)))
+  (when (get @room-agent-ctxs [room-id agent-id])
     (swap! room-agent-ctxs dissoc [room-id agent-id]))
   nil)
 
@@ -263,8 +255,7 @@
 
 (defn clear-all!
   "Drop every cached ctx (daemon stop — the cache is a defonce that survives a
-   same-process restart, so a fresh start must not reuse ctxs whose bus folds
-   point at the previous run's rooms)."
+   same-process restart, so a fresh start must not reuse stale projections)."
   []
   (doseq [[rid aid] (keys @room-agent-ctxs)]
     (drop-ctx! rid aid))

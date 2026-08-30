@@ -1,12 +1,13 @@
 (ns dvergr.agent.room-context-test
   "Tests for the per-[room,agent] working ChatContext (design D): caching,
-   the bus fold (append others, skip self), id-dedup, and the consistency
-   contract (the in-memory signal matches the durable room store)."
+   explicit attention admission, id-dedup, and durable reconstruction."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [dvergr.agent.room-context :as rc]
+            [dvergr.agent.run :as run]
             [dvergr.discourse :as d]
             [dvergr.room.store.memory :as mem]
+            [dvergr.room.store :as rstore]
             [dvergr.chat.context :as cctx]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.context :as ctx]))
@@ -34,24 +35,22 @@
                 "seeded the conversation from the room store")
             (finally (rc/drop-ctx! :rc-seed :var))))))))
 
-(deftest fold-appends-others-skips-self
+(deftest room-observation-does-not-bypass-attention
   (let [c (ctx/create-execution-context)]
     (binding [ec/*execution-context* c]
-      (let [room (d/make-room {:id :rc-fold :ctx c :store (mem/make)})
+      (let [room (d/make-room {:id :rc-no-eager-fold :ctx c :store (mem/make)})
             cc   (rc/ensure-ctx! room :var {:budget-dollars 1.0})]
         (try
-          (Thread/sleep 50)
           (d/post! room (d/message :alice :var "hi var" nil {:role :user}))
-          (d/post! room (d/message :var :alice "var reply"))   ; self → fold skips
-          (d/post! room (d/message :bob nil "hello room"))      ; other → fold appends
-          (Thread/sleep 350)
           (let [contents (non-system-contents cc)
                 has? (fn [s] (some #(str/includes? % s) contents))]
-            (is (has? "hi var")     "user message folded in (author·time decorated)")
-            (is (has? "hello room") "another agent's message folded in")
-            (is (not (has? "var reply"))
-                "the agent's own message is skipped by the fold (the turn loop adds it)"))
-          (finally (rc/drop-ctx! :rc-fold :var)))))))
+            (is (not (has? "hi var"))
+                "durable Room visibility alone does not admit provider input")
+            (is (true? (rc/append-inbound! :rc-no-eager-fold :var
+                                           (random-uuid) :user "admitted"
+                                           "Alice" nil)))
+            (is (some #(str/includes? % "admitted") (non-system-contents cc))))
+          (finally (rc/drop-ctx! :rc-no-eager-fold :var)))))))
 
 (deftest append-inbound-dedups-by-id
   (let [c (ctx/create-execution-context)]
@@ -67,22 +66,35 @@
               "appended exactly once despite two calls with the same id")
           (finally (rc/drop-ctx! :rc-dedup :var)))))))
 
-(deftest consistency-signal-matches-store
-  (testing "the in-memory fold and the durable room store are two projections
-            of the same bus log — their conversational content matches"
+(deftest durable-attention-rebuilds-provider-projection
+  (testing "Run triggers and :include decisions enter provider input while
+            durable :remember facts remain outside it"
     (let [c (ctx/create-execution-context)]
       (binding [ec/*execution-context* c]
         (let [room (d/make-room {:id :rc-cons :ctx c :store (mem/make)})
-              cc   (rc/ensure-ctx! room :var {:budget-dollars 1.0})]
+              trigger (d/message :alice :var "trigger" nil {:role :user})
+              remembered (d/message :bob :var "remember only" nil {:role :user})]
           (try
-            (Thread/sleep 50)
-            (doseq [[from txt] [[:alice "q1"] [:bob "q2"] [:alice "q3"] [:carol "q4"]]]
-              (d/post! room (d/message from :var txt nil {:role :user})))
-            (Thread/sleep 400)
-            (let [signal (set (non-system-contents cc))
-                  store  (set (map :content (d/messages room {:limit 50})))]
-              ;; The signal is the store's content DECORATED with [author · time];
-              ;; every stored message must appear (as a substring) in the signal.
-              (is (every? (fn [s] (some #(str/includes? % s) signal)) store)
-                  "signal (fold) is the author·time-decorated projection of the store"))
+            (d/post! room trigger)
+            (d/post! room remembered)
+            (let [cc (rc/ensure-ctx! room :var {:budget-dollars 1.0})
+                  run-ref (run/start! room :var trigger cc)]
+              (run/finish! (:run/id run-ref) :completed)
+              (rstore/-store-attention!
+               (:store room) :rc-cons
+               {:attention/id (random-uuid)
+                :attention/participant :var
+                :attention/message-id (:id remembered)
+                :attention/memory :remember
+                :attention/activation :none
+                :attention/control :continue
+                :attention/at :next-safe-boundary
+                :attention/priority 0
+                :attention/status :ready
+                :attention/created-at (java.util.Date.)})
+              (rc/drop-ctx! :rc-cons :var))
+            (let [restored (rc/ensure-ctx! room :var {:budget-dollars 1.0})
+                  contents (non-system-contents restored)]
+              (is (some #(str/includes? % "trigger") contents))
+              (is (not-any? #(str/includes? % "remember only") contents)))
             (finally (rc/drop-ctx! :rc-cons :var))))))))

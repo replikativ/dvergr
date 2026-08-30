@@ -109,6 +109,19 @@
   (-resource-receipt [this transfer-id]
     "Return the durable transfer receipt, or nil."))
 
+(defprotocol PAttentionStore
+  "Participant-specific attention projections over immutable Room messages.
+
+   Attention is control/memory state, not speech, so it deliberately does not
+   travel through PRoomStore's message log. Implementations colocate it with the
+   Room authority and make first-write identity durable."
+
+  (-store-attention! [this room-id fact]
+    "Persist one validated attention fact. Returns the stored fact.")
+
+  (-list-attention [this room-id opts]
+    "List attention facts, optionally restricted by :participant and :limit."))
+
 ;; =============================================================================
 ;; Helpers
 ;; =============================================================================
@@ -119,6 +132,55 @@
   #{:running :waiting :completed :failed :cancelled})
 
 (def terminal-run-statuses #{:completed :failed :cancelled})
+
+(def durable-attention-keys
+  #{:attention/id :attention/participant :attention/message-id
+    :attention/run-id :attention/memory :attention/activation
+    :attention/control :attention/at :attention/priority
+    :attention/status :attention/reason :attention/created-at})
+
+(defn validate-attention!
+  "Validate one durable participant attention projection and return it."
+  [fact]
+  (when-let [unknown (seq (remove durable-attention-keys (keys fact)))]
+    (throw (ex-info "Unknown durable attention keys"
+                    {:type :room-store/unknown-attention-keys
+                     :unknown (set unknown)})))
+  (doseq [k [:attention/id :attention/message-id]
+          :let [v (get fact k)]]
+    (when-not (uuid? v)
+      (throw (ex-info (str k " must be a UUID")
+                      {:type :room-store/invalid-attention :key k :fact fact}))))
+  (when-not (keyword? (:attention/participant fact))
+    (throw (ex-info ":attention/participant must be a keyword"
+                    {:type :room-store/invalid-attention :fact fact})))
+  (when (and (:attention/run-id fact) (not (uuid? (:attention/run-id fact))))
+    (throw (ex-info ":attention/run-id must be a UUID"
+                    {:type :room-store/invalid-attention :fact fact})))
+  (doseq [[k allowed] [[:attention/memory #{:ignore :remember :include}]
+                       [:attention/activation #{:none :enqueue :wake}]
+                       [:attention/control #{:continue :integrate :restart :suspend :cancel}]
+                       [:attention/at #{:now :next-safe-boundary :before-model :token
+                                        :before-tool :after-tool :after-model :quiescent}]
+                       [:attention/status #{:ready :deferred :invalid}]]
+          :let [v (get fact k)]
+          :when (and (some? v) (not (contains? allowed v)))]
+    (throw (ex-info (str "Invalid durable " k)
+                    {:type :room-store/invalid-attention :key k :value v})))
+  (when (and (some? (:attention/priority fact))
+             (not (number? (:attention/priority fact))))
+    (throw (ex-info ":attention/priority must be numeric"
+                    {:type :room-store/invalid-attention :fact fact})))
+  (when (and (:attention/reason fact)
+             (not (keyword? (:attention/reason fact))))
+    (throw (ex-info ":attention/reason must be a keyword"
+                    {:type :room-store/invalid-attention :fact fact})))
+  (when-not (instance? java.util.Date (:attention/created-at fact))
+    (throw (ex-info ":attention/created-at must be an instant"
+                    {:type :room-store/invalid-attention :fact fact})))
+  (cond-> fact
+    (some? (:attention/priority fact))
+    (update :attention/priority double)))
 
 (def durable-run-keys
   #{:run/id :run/kind :run/room :run/actor :run/trigger :run/parent
