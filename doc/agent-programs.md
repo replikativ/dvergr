@@ -537,8 +537,10 @@ facts; it introduces no lifecycle, clock, mutable cell, or settlement authority.
 Probabilistic programs use the same placement rule. In SCI, Dvergr defaults
 `infer/smc-infer`, `infer/importance-sampling`, and `infer/kernel-infer` to
 Spindel's `:world-policy :fork`. Each particle and resampling descendant owns a
-canonical Yggdrasil fork; after completion only immutable execution contexts,
-results, weights, and portable world descriptors remain. For example:
+canonical Yggdrasil fork. Before a result crosses into SCI, Dvergr removes the
+execution contexts and exposes only portable results, weights, statistics, and
+world descriptors. `infer/predict` likewise receives values rather than native
+contexts. For example:
 
 ```clojure
 (spin
@@ -555,6 +557,17 @@ does not introduce an `AgentParticle` entity and does not turn every sample into
 a Run. A Run remains the durable identity of an application-level computation;
 particles are its internal execution placements unless the program explicitly
 launches separately audited evaluations.
+
+Particle-independent Metropolis-Hastings and particle Gibbs are not exposed in
+SCI yet. Their repeated-sweep ownership and settlement contract must be made
+canonical before they become part of this surface.
+
+The current canonical fork covers Spindel execution state and every registered
+Yggdrasil system. It does not yet fork mutable cells allocated inside SCI: a
+captured SCI atom or Var is shared by model invocations. Treat SCI closures as
+pure apart from the fork-aware operations above. Full interpreter-state
+isolation depends on the forkable SCI runtime work and will strengthen this
+contract without changing the portable posterior shape.
 
 Small JVM atoms used inside a native-worker supervisor or verifier hand-off are
 short-lived synchronization primitives for non-forkable capabilities. They may

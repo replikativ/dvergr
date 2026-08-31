@@ -4,10 +4,76 @@
   (:require [sci.core :as sci]
             [is.simm.partial-cps.sequence :as aseq]
             [datahike.api :as dh]
+            [dvergr.agent.roster :as roster]
             [dvergr.sandbox.ns.doc :as doc]
             [dvergr.sandbox.work :as sandbox-work]
             [org.replikativ.spindel.engine.core :as rtc]
+            [org.replikativ.spindel.engine.protocols :as rtp]
+            [org.replikativ.spindel.effects.await :as sp-await]
+            [org.replikativ.spindel.spin.cps :as sp]
             [org.replikativ.spindel.core :as sync]))
+
+(defn- portable-posterior
+  "Project a native Spindel measure before it crosses into SCI. Execution
+   contexts and their process-local executors deliberately do not survive."
+  [measure]
+  (let [measure-ns  (find-ns 'org.replikativ.spindel.inference.measure)
+        contexts    (@(ns-resolve measure-ns 'get-contexts) measure)
+        value-of    @(ns-resolve measure-ns 'get-value)
+        log-weights (vec (@(ns-resolve measure-ns 'get-log-weights) measure))
+        values      (mapv value-of contexts)
+        worlds      (->> contexts
+                         (keep #(rtp/get-state % [:inference :world-descriptor]))
+                         vec)
+        posterior   {:posterior/values values
+                     :posterior/log-weights log-weights
+                     :posterior/weights
+                     (@(ns-resolve measure-ns 'normalize-log-weights) log-weights)
+                     :posterior/ess
+                     (@(ns-resolve measure-ns 'effective-sample-size) measure)
+                     :posterior/log-marginal
+                     (@(ns-resolve measure-ns 'log-marginal) measure)
+                     :posterior/worlds worlds}]
+    (when-not (roster/data-value? posterior)
+      (throw (ex-info "Inference result is not portable data"
+                      {:type ::non-portable-posterior})))
+    posterior))
+
+(defn- posterior-spin [native-spin]
+  (sp/spin
+   (portable-posterior (sp-await/await native-spin))))
+
+(defn- posterior-query [posterior query-fn]
+  (let [values  (mapv query-fn (:posterior/values posterior))
+        weights (:posterior/weights posterior)]
+    (when-not (every? number? values)
+      (throw (ex-info "infer/query requires numeric projected values"
+                      {:type ::non-numeric-query})))
+    (let [mean      (reduce + (map * weights values))
+          variance (reduce + (map (fn [weight value]
+                                    (* weight (Math/pow (- value mean) 2)))
+                                  weights values))
+          sorted    (vec (sort values))
+          n         (count sorted)
+          quantile  (fn [p]
+                      (nth sorted (min (dec n)
+                                       (long (Math/floor (* p n))))))]
+      {:mean mean
+       :variance variance
+       :std-dev (Math/sqrt variance)
+       :samples values
+       :weights weights
+       :quantiles {:p50 (quantile 0.5)
+                   :p025 (quantile 0.025)
+                   :p975 (quantile 0.975)}
+       :type :empirical})))
+
+(defn- posterior-predict [posterior pred-fn samples]
+  (let [measure-ns (find-ns 'org.replikativ.spindel.inference.measure)
+        indices    (@(ns-resolve measure-ns 'systematic-resample)
+                    (:posterior/weights posterior) samples)
+        values     (:posterior/values posterior)]
+    (mapv #(pred-fn (nth values %)) indices)))
 
 (defn add-spindel-extras-ns!
   "Expose spindel combinators, sync primitives, and signals to SCI.
@@ -329,15 +395,6 @@
   (let [smc*        @(resolve 'org.replikativ.spindel.inference.inference/smc-infer)
         importance* @(resolve 'org.replikativ.spindel.inference.inference/importance-sampling)
         kernel*     @(resolve 'org.replikativ.spindel.inference.inference/kernel-infer)
-        query*      @(resolve 'org.replikativ.spindel.inference.inference/query)
-        predict*    @(resolve 'org.replikativ.spindel.inference.inference/predict)
-        pimh*       @(resolve 'org.replikativ.spindel.inference.inference/pimh-infer)
-        pgibbs*     @(resolve 'org.replikativ.spindel.inference.inference/pgibbs-infer)
-        contexts*   @(resolve 'org.replikativ.spindel.inference.measure/get-contexts)
-        values*     @(resolve 'org.replikativ.spindel.inference.measure/get-value)
-        weights*    @(resolve 'org.replikativ.spindel.inference.measure/get-log-weights)
-        ess*        @(resolve 'org.replikativ.spindel.inference.measure/effective-sample-size)
-        state*      @(resolve 'org.replikativ.spindel.engine.protocols/get-state)
         world-opts  (fn [opts]
                       (merge {:world-policy :fork} (or opts {})))]
     (sci/add-namespace!
@@ -345,41 +402,39 @@
      (doc/with-docs
        {'smc-infer (fn
                      ([model particles]
-                      (smc* model particles (world-opts nil)))
+                      (posterior-spin
+                       (smc* model particles (world-opts nil))))
                      ([model particles opts]
-                      (smc* model particles (world-opts opts))))
+                      (posterior-spin
+                       (smc* model particles (world-opts opts)))))
         'importance-sampling
         (fn
           ([model particles]
-           (importance* model particles (world-opts nil)))
+           (posterior-spin
+            (importance* model particles (world-opts nil))))
           ([model particles opts]
-           (importance* model particles (world-opts opts))))
+           (posterior-spin
+            (importance* model particles (world-opts opts)))))
         'kernel-infer
         (fn
           ([model kernel particles]
-           (kernel* model kernel particles (world-opts nil)))
+           (posterior-spin
+            (kernel* model kernel particles (world-opts nil))))
           ([model kernel particles opts]
-           (kernel* model kernel particles (world-opts opts))))
-        'query       query*
-        'predict     predict*
-        'pimh-infer  pimh*
-        'pgibbs-infer pgibbs*
-        'values      (fn [measure]
-                       (mapv values* (contexts* measure)))
-        'log-weights (fn [measure] (vec (weights* measure)))
-        'ess         ess*
-        'worlds      (fn [measure]
-                       (->> (contexts* measure)
-                            (keep #(state* % [:inference :world-descriptor]))
-                            vec))}
+           (posterior-spin
+            (kernel* model kernel particles (world-opts opts)))))
+        'query       posterior-query
+        'predict     posterior-predict
+        'values      :posterior/values
+        'log-weights :posterior/log-weights
+        'ess         :posterior/ess
+        'worlds      :posterior/worlds}
        '{smc-infer [([model particles] [model particles opts]) "Run SMC. Dvergr defaults opts :world-policy to :fork; pass :fresh only for a proven-pure model."]
          importance-sampling [([model particles] [model particles opts]) "Run importance sampling with canonical particle worlds by default."]
          kernel-infer [([model kernel particles] [model kernel particles opts]) "Run a Spindel inference kernel with canonical particle worlds by default."]
-         query [([measure query-fn]) "Compute numeric posterior statistics from program results."]
-         predict [([measure pred-fn samples]) "Draw contexts from a posterior and apply pred-fn."]
-         pimh-infer [([model particles iterations] [model particles iterations opts]) "Run particle independent Metropolis-Hastings."]
-         pgibbs-infer [([model particles iterations] [model particles iterations opts]) "Run particle Gibbs. Canonical worlds do not yet support PGAS ancestor scoring."]
-         values [([measure]) "Return each particle's immutable program result in posterior order."]
+         query [([posterior query-fn]) "Compute numeric posterior statistics from portable program results."]
+         predict [([posterior pred-fn samples]) "Resample portable posterior values and apply pred-fn; execution contexts never enter SCI."]
+         values [([posterior]) "Return each particle's portable program result in posterior order."]
          log-weights [([measure]) "Return posterior particle log weights."]
          ess [([measure]) "Return effective sample size."]
          worlds [([measure]) "Return portable canonical world descriptors retained in posterior projections; never live settlement handles."]}))))

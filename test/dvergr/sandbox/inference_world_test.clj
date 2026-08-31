@@ -57,9 +57,12 @@
                   "  {:values (infer/values posterior) "
                   "   :weights (infer/log-weights posterior) "
                   "   :ess (infer/ess posterior) "
-                  "   :worlds (infer/worlds posterior)})")
+                  "   :worlds (infer/worlds posterior) "
+                  "   :raw-particles (:particles posterior) "
+                  "   :raw-executor (:executor posterior)})")
                  :timeout-ms 15000)
-                {:keys [values weights ess worlds]} (:value result)]
+                {:keys [values weights ess worlds raw-particles raw-executor]}
+                (:value result)]
             (is (:success result) (pr-str (:error result)))
             (testing "posterior values retain independent selected ancestry"
               (is (= 4 (count values)))
@@ -70,7 +73,9 @@
               (is (= 4 (count worlds)))
               (is (every? #(and (map? %)
                                 (= :particle (:fork/purpose %)))
-                          worlds)))
+                          worlds))
+              (is (nil? raw-particles))
+              (is (nil? raw-executor)))
             (testing "particle writes do not contaminate the ambient room world"
               (is (= #{:root} (g/elements @knowledge {:sync? true})))))
           (let [pure
@@ -80,10 +85,16 @@
                   "(let [posterior @(spin (await (infer/smc-infer "
                   "                              (spin 7) 2 {:world-policy :fresh})))] "
                   "  {:values (infer/values posterior) "
-                  "   :worlds (infer/worlds posterior)})")
+                  "   :worlds (infer/worlds posterior) "
+                  "   :mean (:mean (infer/query posterior identity)) "
+                  "   :predictions (infer/predict posterior inc 3)})")
                  :timeout-ms 10000)]
             (testing "a proven-pure model may explicitly choose the cheap path"
               (is (:success pure) (pr-str (:error pure)))
-              (is (= {:values [7 7] :worlds []} (:value pure)))))))
+              (is (= {:values [7 7]
+                      :worlds []
+                      :mean 7.0
+                      :predictions [8 8 8]}
+                     (:value pure)))))))
       (finally
         (context/stop-context! root)))))
