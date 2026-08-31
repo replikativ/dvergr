@@ -1269,6 +1269,23 @@
 
 (declare fork-home-ctx)
 
+(def ^:dynamic ^:private *deferred-settlement-authority* nil)
+
+(defn- assert-settlement-released! [fork operation]
+  (locking (:meta fork)
+    (let [meta @(:meta fork)
+          live (binding [ec/*execution-context* (fork-home-ctx fork)]
+                 (rreg/lookup (:id fork)))]
+      (when (and (= :deferred (:settlement-policy meta))
+                 (= fork live)
+                 (not (:settlement-released? meta))
+                 (not= (:id fork) *deferred-settlement-authority*))
+        (throw (ex-info "Deferred Run world must be released before settlement"
+                        {:type ::settlement-deferred
+                         :operation operation
+                         :fork/id (:id fork)
+                         :run/id (:run-id meta)}))))))
+
 (defn- fork-transfer-children [home fork-id]
   (binding [ec/*execution-context* home]
     (rreg/structural-children fork-id)))
@@ -1311,11 +1328,12 @@
    process-local settlement capability; callers must never persist it. The
    returned `:fork/descriptor` is data and is the canonical durable identity.
 
-   `abort!` is required and is called with the preparation receipt if the live
+  `abort!` is required and is called with the preparation receipt if the live
    affine transfer fails. A failed compensation leaves the Room fenced in a
    visible recovery-required state. Once transfer succeeds the durable owner is
    authoritative; later projection/event failures never roll it back."
   [fork new-owner prepare-or-opts]
+  (assert-settlement-released! fork :transfer)
   (let [{:keys [prepare! abort!]}
         (if (fn? prepare-or-opts)
           {:prepare! prepare-or-opts}
@@ -1861,6 +1879,7 @@
    discard of the same fork is a no-op (the branched systems are deleted only
    once)."
   [fork]
+  (assert-settlement-released! fork :discard)
   ;; Idempotence: once unregistered, the fork is a zombie — re-discarding would
   ;; double-delete the yggdrasil branch (which errors). Guard on registry.
   (when (binding [ec/*execution-context* (fork-home-ctx fork)] (rreg/lookup (:id fork)))
@@ -1892,6 +1911,54 @@
           (recover-room-quiescence! fork callbacks @work-fence-token* error)))))
   fork)
 
+(defn discard-deferred
+  "Consume the host-owned discard side of a deferred Run world.
+
+   This is the narrow substrate capability used by evaluation cancellation and
+   failed certification. Ordinary `discard`, merge, and transfer remain gated."
+  ([fork]
+   (discard-deferred fork (constantly true) (constantly nil)))
+  ([fork claim!]
+   (discard-deferred fork claim! (constantly nil)))
+  ([fork claim! abort!]
+   (locking (:meta fork)
+     (let [meta @(:meta fork)
+           live (binding [ec/*execution-context* (fork-home-ctx fork)]
+                  (rreg/lookup (:id fork)))]
+       (when-not (and (= fork live)
+                      (= :deferred (:settlement-policy meta))
+                      (not (:settlement-released? meta))
+                      (nil? (:settlement-claim meta)))
+         (throw (ex-info "Deferred discard authority is no longer current"
+                         {:type ::stale-deferred-settlement
+                          :fork/id (:id fork)
+                          :run/id (:run-id meta)})))
+       (when-not (claim!)
+         (throw (ex-info "Deferred discard lost its settlement race"
+                         {:type ::deferred-settlement-aborted
+                          :fork/id (:id fork)})))
+       (swap! (:meta fork) assoc :settlement-claim :discard)
+       (try
+         (binding [*deferred-settlement-authority* (:id fork)]
+           (discard fork))
+         (catch Throwable error
+           ;; Abort while the same affine lock is still held. If its durable
+           ;; compensation fails, retain a closed recovery claim rather than
+           ;; opening a race or holding this lock through an unbounded retry.
+           (let [abort-error (try (abort!) nil
+                                  (catch Throwable abort-error abort-error))]
+             (if abort-error
+               (swap! (:meta fork) assoc :settlement-claim :discard-recovery)
+               (swap! (:meta fork) dissoc :settlement-claim))
+             (throw (if abort-error
+                      (ex-info "Deferred discard requires durable abort recovery"
+                               {:type ::deferred-discard-recovery-required
+                                :fork/id (:id fork)
+                                :abort-error (ex-message abort-error)}
+                               error)
+                      error)))))))
+   fork))
+
 (defn merge-room
   "Merge fork into parent.
 
@@ -1909,6 +1976,7 @@
    (doc/unified-fork-conversation.md, dvergr.rooms.forks/reconcile-merge!.)"
   ([parent fork] (merge-room parent fork {}))
   ([parent fork {:keys [merge-opts]}]
+   (assert-settlement-released! fork :merge)
    (let [callbacks (drain-room-listeners! fork :merge)
          work-fence-token* (volatile! nil)]
      (try

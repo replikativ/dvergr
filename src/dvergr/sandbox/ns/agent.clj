@@ -96,6 +96,10 @@
                                kind (get-in definition [:agent/program :kind])
                                allowed-kinds (:program-kinds agent-program-ceiling)
                                ambient-parent (:parent-run agent-program-ceiling)]
+                           (when (= :deferred (:settlement opts))
+                             (throw (ex-info
+                                     "Deferred settlement is reserved for trusted host policies"
+                                     {:type ::deferred-settlement-forbidden})))
                            (when (and allowed-kinds
                                       (not (contains? allowed-kinds kind)))
                              (throw (ex-info

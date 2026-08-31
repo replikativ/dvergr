@@ -261,6 +261,8 @@ what the program did (`:completed`, `:waiting`, `:failed`, or `:cancelled`).
 - `:settlement :automatic` (default): merge completed work;
 - `:settlement :review`: retain completed work in the Room tree;
 - `:settlement :discard`: execute for its result/trace, then drop its effects.
+- `:settlement :deferred`: host-owned two-phase gate; retain the world but
+  reject merge/adoption until the host explicitly releases it.
 
 Failure and cancellation always discard the work plane. Waiting and automatic
 merge conflicts retain it for review. A later merge/discard through
@@ -300,7 +302,7 @@ attempt to execute it:
   :verifier {:id :checks/review-v1 :version 1
              :basis "git:<verifier-commit>"}
   :limits {:timeout-ms 120000 :max-model-steps 8}
-  :world {:isolation :ctx :settlement :automatic}})
+  :world {:isolation :ctx :settlement :review}})
 ```
 
 The value has a Hasch-derived `:environment/content-id`; map ordering does not
@@ -308,11 +310,14 @@ affect it, while changing the task, verifier reference, limits, or world policy
 does. A verifier is deliberately a versioned reference rather than an embedded
 function: untrusted SCI can author and fork definitions, but only the trusted
 runner resolves exact verifier and world-setup references and computes reward.
-The benchmark interpreter derives its timeout, cancellation grace, model-step
-and dollar limits, settlement policy, and resource grants from that validated
-definition. Each attempt still receives a fresh Run ID, so content identity
-never collapses distinct executions. The current REPL benchmark reports retain
-both the exact definition and its compact reference.
+The benchmark interpreter derives its timeout, cancellation grace, restrictive
+model-step and dollar limits, settlement policy, and resource grants from that
+validated definition. It rejects unsupported policy keys instead of silently
+certifying a different scenario. In particular, world `:setup` remains closed
+until the host supplies a versioned trusted setup resolver. Each attempt still
+receives a fresh Run ID, so content identity never collapses distinct
+executions. The current REPL benchmark reports retain both the exact definition
+and its compact reference.
 
 Every opt-in REPL attempt also returns a process-local, content-addressed
 `:attempt-receipt`. It binds the
@@ -321,6 +326,42 @@ system-prompt ID, per-resource usage, timing, trusted checks/reward, Run/tool
 trace, and Kontor receipts when present. SCI does not receive the receipt
 constructor or verifier registry, so an evaluated agent can propose an
 environment but cannot certify its own reward.
+
+The reusable host boundary is `dvergr.agent.evaluation/evaluate`. It returns a
+Spin rather than starting a second scheduler: when executed, it admits an
+ordinary Run in an ordinary isolated RunWorld, waits for physical quiescence,
+then invokes a version-matched host `Evaluator` to produce portable evidence,
+checks, reward, and the receipt. Successful evaluation worlds may be retained
+for review or discarded, but first settle as `:deferred`; ordinary merge and
+adoption/discard reject that same world until trusted scoring atomically claims
+release or trusted cleanup. Observer and verifier callbacks run on an external
+worker rather than Spindel's drain path. Cancellation and certification race at
+the settlement claim: a cancelled evaluation can never later make its world
+landable, even if an uncooperative callback returns late. Certification failure
+discards the uncertified world while preserving the Run ID in the structured
+error. The evaluator capability contains functions and therefore remains
+process-local and absent from SCI; SCI can author the portable EnvironmentDef
+it names.
+
+An ensemble is composition, not another primitive:
+
+```clojure
+(let [attempts (mapv #(evaluation/evaluate room team % environment evaluator)
+                     candidate-agent-refs)]
+  @(apply comb/parallel attempts))
+```
+
+Pure policy can rank/select the resulting receipts. Existing room-fork
+merge/discard/adoption remains the only settlement authority. SMC, MCTS,
+Anglican-style inference, and Raster training can consume this same boundary
+without changing Run, Room, or world semantics.
+
+For training, an accepted episode is a projection across the exact
+EnvironmentDef, AgentDef/interpreter identity, Run/tool trajectory, conserved
+resources, checks/reward, and world/memory basis. Raster can consume that
+projection, while a `pretrained-rstr` git-like memory is simply another forked
+system in the episode world. Neither training nor a particular inference
+algorithm changes the execution algebra.
 
 Dollar/token, elapsed-time, and conserved resource limits are the ordinary
 governors. `:max-model-steps` remains only a high emergency fuse for a provider
