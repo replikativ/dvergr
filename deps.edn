@@ -56,7 +56,7 @@
         ;; that release reaches Clojars, then return this to an ordinary version
         ;; coordinate.
         org.replikativ/spindel     {:git/url "https://github.com/replikativ/spindel.git"
-                                    :git/sha "2afde316edbad31e784e86fd7aabb6e8de24a563"}
+                                    :git/sha "24f9e7cd679a534c8346d9bbb25958b444fb6471"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context
