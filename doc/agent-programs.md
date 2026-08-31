@@ -534,6 +534,28 @@ branch-correct Room store while the affine world-settlement gate is held.
 `episode/export` is only a read projection joining that Attempt to current Run
 facts; it introduces no lifecycle, clock, mutable cell, or settlement authority.
 
+Probabilistic programs use the same placement rule. In SCI, Dvergr defaults
+`infer/smc-infer`, `infer/importance-sampling`, and `infer/kernel-infer` to
+Spindel's `:world-policy :fork`. Each particle and resampling descendant owns a
+canonical Yggdrasil fork; after completion only immutable execution contexts,
+results, weights, and portable world descriptors remain. For example:
+
+```clojure
+(spin
+  (let [posterior (await (infer/smc-infer (scenario-model) 64))]
+    {:values  (infer/values posterior)
+     :weights (infer/log-weights posterior)
+     :ess     (infer/ess posterior)
+     :worlds  (infer/worlds posterior)}))
+```
+
+Pass `{:world-policy :fresh}` only when the model is proven not to touch Room,
+Datahike, repository, accounting, or other registered world state. Inference
+does not introduce an `AgentParticle` entity and does not turn every sample into
+a Run. A Run remains the durable identity of an application-level computation;
+particles are its internal execution placements unless the program explicitly
+launches separately audited evaluations.
+
 Small JVM atoms used inside a native-worker supervisor or verifier hand-off are
 short-lived synchronization primitives for non-forkable capabilities. They may
 decide which already-durable transition wins, but their contents are not the

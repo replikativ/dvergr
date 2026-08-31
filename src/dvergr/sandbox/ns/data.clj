@@ -207,7 +207,13 @@
 
      (spin
        (let [measure (await (infer/smc-infer (my-model) 100))]
-         (infer/query measure identity)))
+         (infer/values measure)))
+
+   Dvergr defaults SMC, importance sampling, and the generic kernel runner to
+   `:world-policy :fork`. Each particle therefore executes in a frozen
+   canonical Yggdrasil world and only its immutable result projection survives;
+   particle worlds are discarded before the inference Spin completes. Callers
+   may explicitly request `:fresh` for a proven-pure model.
 
    Namespaces added:
    - dist/   — Anglican distributions: normal, beta, gamma, uniform, flip, …
@@ -315,12 +321,65 @@
                          'chi-squared        @(ns-resolve ar 'chi-squared)
                          'student-t          (fn [nu] (@(ns-resolve ar 'student-t) nu))}))
 
-  ;; Inference runners — these take/return spins, compose with await in spin bodies
-  (sci/add-namespace! sci-ctx 'infer
-                      {'smc-infer          @(resolve 'org.replikativ.spindel.inference.inference/smc-infer)
-                       'importance-sampling @(resolve 'org.replikativ.spindel.inference.inference/importance-sampling)
-                       'kernel-infer       @(resolve 'org.replikativ.spindel.inference.inference/kernel-infer)
-                       'query              @(resolve 'org.replikativ.spindel.inference.inference/query)
-                       'predict            @(resolve 'org.replikativ.spindel.inference.inference/predict)
-                       'pimh-infer         @(resolve 'org.replikativ.spindel.inference.inference/pimh-infer)
-                       'pgibbs-infer       @(resolve 'org.replikativ.spindel.inference.inference/pgibbs-infer)}))
+  ;; Inference runners — these take/return Spins and compose with await in Spin
+  ;; bodies. Room-capable sandboxes default to canonical particle worlds: a
+  ;; model that happens to touch a registered Yggdrasil system must not alias
+  ;; the ambient room merely because its author omitted an expert-only option.
+  ;; `:fresh` remains an explicit fast path for known-pure models.
+  (let [smc*        @(resolve 'org.replikativ.spindel.inference.inference/smc-infer)
+        importance* @(resolve 'org.replikativ.spindel.inference.inference/importance-sampling)
+        kernel*     @(resolve 'org.replikativ.spindel.inference.inference/kernel-infer)
+        query*      @(resolve 'org.replikativ.spindel.inference.inference/query)
+        predict*    @(resolve 'org.replikativ.spindel.inference.inference/predict)
+        pimh*       @(resolve 'org.replikativ.spindel.inference.inference/pimh-infer)
+        pgibbs*     @(resolve 'org.replikativ.spindel.inference.inference/pgibbs-infer)
+        contexts*   @(resolve 'org.replikativ.spindel.inference.measure/get-contexts)
+        values*     @(resolve 'org.replikativ.spindel.inference.measure/get-value)
+        weights*    @(resolve 'org.replikativ.spindel.inference.measure/get-log-weights)
+        ess*        @(resolve 'org.replikativ.spindel.inference.measure/effective-sample-size)
+        state*      @(resolve 'org.replikativ.spindel.engine.protocols/get-state)
+        world-opts  (fn [opts]
+                      (merge {:world-policy :fork} (or opts {})))]
+    (sci/add-namespace!
+     sci-ctx 'infer
+     (doc/with-docs
+       {'smc-infer (fn
+                     ([model particles]
+                      (smc* model particles (world-opts nil)))
+                     ([model particles opts]
+                      (smc* model particles (world-opts opts))))
+        'importance-sampling
+        (fn
+          ([model particles]
+           (importance* model particles (world-opts nil)))
+          ([model particles opts]
+           (importance* model particles (world-opts opts))))
+        'kernel-infer
+        (fn
+          ([model kernel particles]
+           (kernel* model kernel particles (world-opts nil)))
+          ([model kernel particles opts]
+           (kernel* model kernel particles (world-opts opts))))
+        'query       query*
+        'predict     predict*
+        'pimh-infer  pimh*
+        'pgibbs-infer pgibbs*
+        'values      (fn [measure]
+                       (mapv values* (contexts* measure)))
+        'log-weights (fn [measure] (vec (weights* measure)))
+        'ess         ess*
+        'worlds      (fn [measure]
+                       (->> (contexts* measure)
+                            (keep #(state* % [:inference :world-descriptor]))
+                            vec))}
+       '{smc-infer [([model particles] [model particles opts]) "Run SMC. Dvergr defaults opts :world-policy to :fork; pass :fresh only for a proven-pure model."]
+         importance-sampling [([model particles] [model particles opts]) "Run importance sampling with canonical particle worlds by default."]
+         kernel-infer [([model kernel particles] [model kernel particles opts]) "Run a Spindel inference kernel with canonical particle worlds by default."]
+         query [([measure query-fn]) "Compute numeric posterior statistics from program results."]
+         predict [([measure pred-fn samples]) "Draw contexts from a posterior and apply pred-fn."]
+         pimh-infer [([model particles iterations] [model particles iterations opts]) "Run particle independent Metropolis-Hastings."]
+         pgibbs-infer [([model particles iterations] [model particles iterations opts]) "Run particle Gibbs. Canonical worlds do not yet support PGAS ancestor scoring."]
+         values [([measure]) "Return each particle's immutable program result in posterior order."]
+         log-weights [([measure]) "Return posterior particle log weights."]
+         ess [([measure]) "Return effective sample size."]
+         worlds [([measure]) "Return portable canonical world descriptors retained in posterior projections; never live settlement handles."]}))))
