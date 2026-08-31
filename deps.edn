@@ -50,12 +50,13 @@
         ;; restart.
         ;; 0.1.43 includes structured cancellation and affine partitioned world
         ;; authority, the substrate used by Run-world adoption and delegation.
-        ;; Structured work admission and its cancellation hand-back fix are
-        ;; currently stacked on spindel#44/#45. Pin the reviewed commit until
+        ;; Structured work admission, cancellation hand-back, overlay
+        ;; materialization, and canonical inference worlds are currently
+        ;; stacked on spindel#44-#47. Pin the reviewed commit until
         ;; that release reaches Clojars, then return this to an ordinary version
         ;; coordinate.
         org.replikativ/spindel     {:git/url "https://github.com/replikativ/spindel.git"
-                                    :git/sha "1eb9ae72f52a863b8592d7a193442262bbc264fd"}
+                                    :git/sha "2afde316edbad31e784e86fd7aabb6e8de24a563"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context
