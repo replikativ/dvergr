@@ -21,6 +21,7 @@
    A negligible lingering no-op per deleted/discarded room until restart."
   (:require [datahike.api :as dh]
             [dvergr.agent.room-context :as room-context]
+            [dvergr.chat.context :as chat-context]
             [dvergr.discourse :as disc]
             [dvergr.runtime.clock :as clock]
             [dvergr.runtime.ctx :as rctx]
@@ -73,8 +74,9 @@
             (let [cctx (room-context/ensure-ctx! room aid {})
                   {:keys [success value error]}
                   (sandbox/eval-code
-                   (:sci-ctx cctx) (:schedule/code s)
-                   :timeout-ms (* 5 60 1000) :realize? true)]
+                   (chat-context/sci-context-in cctx (:ctx room)) (:schedule/code s)
+                   :timeout-ms (* 5 60 1000) :realize? true
+                   :execution-context (:ctx room))]
               (if success
                 (str "⏱ " (or (:schedule/description s) "code task") " → "
                      (subs value 0 (min 500 (count value))))

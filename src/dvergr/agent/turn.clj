@@ -15,6 +15,7 @@
             [dvergr.discourse :as d]
             [dvergr.chat.context :as chat-ctx]
             [dvergr.agent.run :as run]
+            [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.sandbox :as sandbox]
             [dvergr.sandbox.ns.io :as ns-io]
             ;; loaded so add-process-ns! can (find-ns 'dvergr.agent.process)
@@ -34,6 +35,40 @@
 ;; each room's own stores fork-aware off the registry (RF5 S4 — there is no shared
 ;; chat-db). Callers pass the room/agent execution-ctx; setup binds it.
 ;; ----------------------------------------------------------------------------
+(defn rebind-working-ctx!
+  "Refresh the world binding and namespace surface in a working context.
+
+   SCI forks copy the interpreter heap, including host function objects.  Those
+   Injected host functions are stable indirections through `capability-id`, so
+   even functions saved before a fork select the child binding. Namespace
+   refresh keeps newly added APIs visible; it is not the isolation boundary."
+  [cctx {:keys [execution-ctx db-conn kb-conn room-id room-runtime-id
+                room-incarnation capability-id fork-projection?
+                agent-program-ceiling allowed-domains]}]
+  (let [capability-id (or capability-id (:capability-id cctx)
+                          (throw (ex-info "Working context has no capability identity" {})))]
+    (runtime-ctx/install-sandbox-binding!
+     execution-ctx capability-id
+     (cond-> {:capability-id capability-id
+              :room-id room-id
+              :room-runtime-id room-runtime-id
+              :room-incarnation room-incarnation}
+       fork-projection? (assoc :ephemeral-databases {})))
+    (binding [rtc/*execution-context* execution-ctx]
+      (when-let [sci (chat-ctx/sci-context-in cctx execution-ctx)]
+        (sandbox/setup-agent-namespaces! sci execution-ctx
+                                         :room-conn db-conn :kb-conn kb-conn :room-id room-id
+                                         :room-runtime-id room-runtime-id
+                                         :capability-id capability-id
+                                         :agent-program-ceiling agent-program-ceiling
+                                         :allowed-http-domains allowed-domains)
+      ;; These capabilities close over the ChatContext itself, so a projected
+      ;; child facade must replace them as well.
+        (ns-io/add-bash-ns!    sci cctx)
+        (ns-io/add-media-ns!   sci cctx)
+        (ns-io/add-process-ns! sci cctx)))
+    cctx))
+
 (defn new-working-ctx
   "Create a ChatContext whose SCI sandbox has the ctx-bound agent namespaces
    injected (dh/room/intake/search/…). Does NOT seed a system prompt — callers do
@@ -42,38 +77,30 @@
    datahike-write behaviour (room folds pass false: the room store is the durable
    writer). Returns the ChatContext."
   [{:keys [execution-ctx chat-id title budget-dollars db-conn kb-conn room-id
-           room-runtime-id agent-program-ceiling durable? allowed-domains]}]
+           room-runtime-id capability-id agent-program-ceiling durable? allowed-domains]}]
   (binding [rtc/*execution-context* execution-ctx]
-    (let [cctx (cond-> (chat-ctx/create-chat-context
-                        (cond-> {:budget-dollars (or budget-dollars 1.0)
-                                 :db-conn        db-conn
-                                 :with-sci?      true
-                                 :title          (or title "agent")}
-                          chat-id (assoc :chat-id chat-id)))
-                 (some? durable?) (assoc :durable? durable?)
+    (let [capability-id (or capability-id (random-uuid))
+          cctx (assoc (cond-> (chat-ctx/create-chat-context
+                               (cond-> {:budget-dollars (or budget-dollars 1.0)
+                                        :db-conn        db-conn
+                                        :with-sci?      true
+                                        :title          (or title "agent")}
+                                 chat-id (assoc :chat-id chat-id)))
+                        (some? durable?) (assoc :durable? durable?)
                  ;; the ctx knows its room: embedder hooks (e.g. the bash
                  ;; mount provider) resolve room-scoped resources from it
-                 room-id (assoc :room-id room-id))]
+                        room-id (assoc :room-id room-id))
+                      :capability-id capability-id)]
       ;; create-chat-context forks a sci-ctx but does NOT inject the ctx-bound
       ;; namespaces — do it here so clojure_eval has the room/kb/intake nses
       ;; everywhere. `db-conn` is the room's OWN messages store (= `*room*`);
       ;; `kb-conn` its OWN knowledge base (= `*kb*`) — both fork-aware, never sdb.
-      (when-let [sci (:sci-ctx cctx)]
-        (sandbox/setup-agent-namespaces! sci execution-ctx
-                                         :room-conn db-conn :kb-conn kb-conn :room-id room-id
-                                         :room-runtime-id room-runtime-id
-                                         :agent-program-ceiling agent-program-ceiling
-                                         ;; per-agent network egress scoping (nil/empty = open)
-                                         :allowed-http-domains allowed-domains)
-        ;; Two namespaces bound to THIS chat-ctx (not just the spindel ctx), so
-        ;; they can't live in setup-agent-namespaces!: `bash` (the muschel shell
-        ;; session this chat-ctx owns — same one the `shell` tool drives) and
-        ;; `processes` (the turn process registry — list/snapshot/directive! the
-        ;; agent's own work). The daemon path wired these per-turn; now every
-        ;; working ctx gets them at creation.
-        (ns-io/add-bash-ns!    sci cctx)
-        (ns-io/add-media-ns!   sci cctx)
-        (ns-io/add-process-ns! sci cctx))
+      (rebind-working-ctx! cctx {:execution-ctx execution-ctx
+                                 :db-conn db-conn :kb-conn kb-conn
+                                 :room-id room-id :room-runtime-id room-runtime-id
+                                 :capability-id capability-id
+                                 :agent-program-ceiling agent-program-ceiling
+                                 :allowed-domains allowed-domains})
       cctx)))
 
 ;; Reserved `:to` id for agent tool-activity messages posted into a room.

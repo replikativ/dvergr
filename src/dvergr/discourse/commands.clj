@@ -440,6 +440,8 @@
              (nil? aid)  (say "Usage: /sandbox <agent> — e.g. /sandbox var")
              :else
              (if-let [cc (lookup (:id room) aid)]
-               (say (format-sandbox-report aid (status (:sci-ctx cc))))
+               (let [resolve-sci (resolve 'dvergr.chat.context/sci-context-in)]
+                 (say (format-sandbox-report
+                       aid (status (resolve-sci cc (:ctx room))))))
                (say (str "@" (name aid) " has no active sandbox yet "
                          "— message it once so its session spins up."))))))})

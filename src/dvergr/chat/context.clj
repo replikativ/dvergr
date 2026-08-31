@@ -20,6 +20,7 @@
             [org.replikativ.spindel.engine.context :as ctx]
             [org.replikativ.spindel.signal :as sig]
             [org.replikativ.spindel.core :as d]
+            [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.chat.schema :as schema]
             [dvergr.chat.accounting :as acct]
             [dvergr.chat.persist :as persist]
@@ -48,8 +49,32 @@
             db-conn           ; Datahike connection for persistence
 
      ;; SCI (optional - for agent computation)
-            sci-ctx           ; SCI context for sandboxed eval
+            sci-component     ; stable ref; resolves to this world's SCI interpreter
             ])
+
+(defn sci-context-in
+  "Resolve `chat-ctx`'s SCI interpreter in explicit `execution-context`.
+
+   The ChatContext retains only a stable world-component reference. A forked
+   Spindel context therefore selects a forked interpreter instead of retaining
+   the parent's mutable SCI heap."
+  [chat-ctx execution-context]
+  (sandbox/sci-context-in execution-context (:sci-component chat-ctx)))
+
+(defn selected-execution-context
+  "The world selected for ChatContext signals and ambient capabilities.
+
+   A bound descendant wins; calls made outside execution fall back to the
+   context's owner. This keeps the ChatContext value stable while its signals
+   and SCI interpreter select fork-local realizations."
+  [chat-ctx]
+  (runtime-ctx/selected-context (:spindel-ctx chat-ctx)))
+
+(defn sci-context
+  "Resolve `chat-ctx`'s SCI interpreter in the bound world, falling back to
+   the ChatContext's owning world when called outside a Spindel binding."
+  [chat-ctx]
+  (sci-context-in chat-ctx (selected-execution-context chat-ctx)))
 ;; ============================================================================
 ;; Signal Accessors (must be called with spindel context bound)
 ;; ============================================================================
@@ -57,19 +82,19 @@
 (defn get-messages
   "Get current messages vector from chat context."
   [chat-ctx]
-  (binding [rtc/*execution-context* (:spindel-ctx chat-ctx)]
+  (binding [rtc/*execution-context* (selected-execution-context chat-ctx)]
     @(:messages-signal chat-ctx)))
 
 (defn get-budget
   "Get current budget map from chat context."
   [chat-ctx]
-  (binding [rtc/*execution-context* (:spindel-ctx chat-ctx)]
+  (binding [rtc/*execution-context* (selected-execution-context chat-ctx)]
     @(:budget-signal chat-ctx)))
 
 (defn get-status
   "Get current status from chat context."
   [chat-ctx]
-  (binding [rtc/*execution-context* (:spindel-ctx chat-ctx)]
+  (binding [rtc/*execution-context* (selected-execution-context chat-ctx)]
     @(:status-signal chat-ctx)))
 
 ;; ============================================================================
@@ -95,7 +120,7 @@
         ;; and a side effect in it would record an abandoned computation. The
         ;; transient `::just-crossed` key always reflects this call (nil if none).
         new-state
-        (binding [rtc/*execution-context* (:spindel-ctx chat-ctx)]
+        (binding [rtc/*execution-context* (selected-execution-context chat-ctx)]
           (swap! (:budget-signal chat-ctx)
                  (fn [{:keys [total used by-type crossed-thresholds]}]
                    (let [new-used (+ used cost)
@@ -149,7 +174,7 @@
   (let [msg-entity (schema/create-message-entity
                     (assoc message :chat-id (:chat-id chat-ctx)))]
     ;; Update spindel signal (reactive)
-    (binding [rtc/*execution-context* (:spindel-ctx chat-ctx)]
+    (binding [rtc/*execution-context* (selected-execution-context chat-ctx)]
       (swap! (:messages-signal chat-ctx) conj msg-entity))
 
     ;; Persist to datahike (durable) — UNLESS this ctx delegates durability to
@@ -191,7 +216,7 @@
      chat-ctx - ChatContext
      new-messages - Complete replacement message vector"
   [chat-ctx new-messages]
-  (binding [rtc/*execution-context* (:spindel-ctx chat-ctx)]
+  (binding [rtc/*execution-context* (selected-execution-context chat-ctx)]
     (reset! (:messages-signal chat-ctx) (d/deltaable-vector (vec new-messages)))))
 
 (defn set-status!
@@ -201,7 +226,7 @@
      chat-ctx - ChatContext
      status - :active :paused :completed :cancelled :budget-exceeded"
   [chat-ctx status]
-  (binding [rtc/*execution-context* (:spindel-ctx chat-ctx)]
+  (binding [rtc/*execution-context* (selected-execution-context chat-ctx)]
     (reset! (:status-signal chat-ctx) status))
 
   ;; Persist status change
@@ -268,7 +293,7 @@
        :budget-dollars - Budget in dollars (default $1.00)
        :budget - Legacy: budget in microdollars
        :db-path - Path for datahike (default in-memory, or uses Yggdrasil db if registered)
-       :with-sci? - Create SCI context (default true)
+       :with-sci? - Register a fork-selected SCI world component (default true)
 
    Yggdrasil Integration:
      If a DatahikeSystem is registered in the current execution context
@@ -290,9 +315,9 @@
    the unit of work isolation: when a room is forked via
    `d/fork-room :isolation :ctx`, yggdrasil's registered systems
    (git worktree, datahike branch) live on the fork's ctx. The
-   chat-ctx anchoring on that ctx means tools that consult
-   `(:spindel-ctx chat-ctx)` for the workspace see the fork's
-   worktree."
+   ChatContext retains a stable SCI component ref; callers resolve its
+   interpreter through `sci-context-in`, so a fork selects a fork-local heap
+   without reconstructing the interpreter."
   [{:keys [chat-id title budget-dollars budget db-path with-sci?
            db-conn execution-context]
     :or {budget-dollars 1.0
@@ -380,11 +405,11 @@
            :by-type {}
            :crossed-thresholds #{}})
 
-        ;; Create SCI context if requested
-        ;; When *execution-context* is bound, create spindel-backed SCI with
-        ;; full FRP support (spin/await/track). Otherwise plain SCI.
-        sci-ctx (when with-sci?
-                  (sandbox/fork-for-session rtc/*execution-context*))
+        ;; Retain a stable component ref, never a raw interpreter. Resolving the
+        ;; ref through a descendant Spindel context selects that world's SCI
+        ;; fork, including vars, atoms, dynamic bindings, and continuations.
+        sci-component (when with-sci?
+                        (sandbox/create-spindel-sci-world! spindel-ctx))
 
         ;; Create signals within the owning execution context.
         [messages-signal budget-signal status-signal]
@@ -410,7 +435,7 @@
      budget-signal
      status-signal
      db-conn
-     sci-ctx)))
+     sci-component)))
 
 ;; ============================================================================
 ;; Chat Lifecycle
@@ -432,10 +457,21 @@
   [chat-ctx]
   (set-status! chat-ctx :cancelled))
 
+(defn release-sci-in!
+  "Release `chat-ctx`'s SCI realization from one execution world.
+
+   This is idempotent and does not close the chat's durable connection. Forked
+   room caches use it when a child world is discarded."
+  [chat-ctx execution-context]
+  (sandbox/release-agent-resources! execution-context (:capability-id chat-ctx))
+  (sandbox/release-spindel-sci-world!
+   execution-context (:sci-component chat-ctx)))
+
 (defn close-chat!
   "Close chat and release resources."
   [chat-ctx]
   (binding [rtc/*execution-context* (:spindel-ctx chat-ctx)]
+    (release-sci-in! chat-ctx (:spindel-ctx chat-ctx))
     ;; Close datahike connection
     (when-let [conn (:db-conn chat-ctx)]
       (dh/release conn)))
@@ -506,7 +542,7 @@
       (replace-messages! chat-ctx messages))
     ;; Restore budget (overwrite the fresh budget with saved state)
     (when budget
-      (binding [rtc/*execution-context* (:spindel-ctx chat-ctx)]
+      (binding [rtc/*execution-context* (selected-execution-context chat-ctx)]
         (reset! (:budget-signal chat-ctx) budget)))
     ;; Restore status
     (when (and status (not= status :active))

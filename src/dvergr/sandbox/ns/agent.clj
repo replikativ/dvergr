@@ -8,6 +8,7 @@
    `(find-doc …)` answer nothing for them inside the sandbox. See
    `dvergr.sandbox.ns.doc`."
   (:require [sci.core :as sci]
+            [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.sandbox.ns.doc :as doc]
             [org.replikativ.spindel.engine.core :as ec]))
 
@@ -49,7 +50,7 @@
           (-> (await (comb/race (agent/owned-result-spin a)
                                 (agent/owned-result-spin b)))
               :run/value)))"
-  [sci-ctx room-id spindel-ctx agent-program-ceiling]
+  [sci-ctx room-id spindel-ctx agent-program-ceiling & [binding-resolver]]
   (let [make-roster*   (requiring-resolve 'dvergr.agent.roster/make-roster)
         make-agent*    (requiring-resolve 'dvergr.agent.roster/make-agent)
         revise-agent*  (requiring-resolve 'dvergr.agent.roster/revise-agent)
@@ -66,9 +67,13 @@
         room-balance*  (requiring-resolve 'dvergr.resource/balance)
         run-balance*   (requiring-resolve 'dvergr.resource/run-balance)
         room-lookup*   (requiring-resolve 'dvergr.room.registry/lookup)
+        selected-ctx   #(runtime-ctx/selected-context spindel-ctx)
+        current-room-id #(or (when binding-resolver
+                               (:room-runtime-id (binding-resolver)))
+                             room-id)
         current-room   (fn []
-                         (when room-id
-                           (binding [ec/*execution-context* spindel-ctx]
+                         (when-let [room-id (current-room-id)]
+                           (binding [ec/*execution-context* (selected-ctx)]
                              (room-lookup* room-id))))
         room!          (fn []
                          (or (current-room)
@@ -149,6 +154,7 @@
         'ref          agent-ref*
         'list         agents*
         'select       select-agents*
+        'room-id      (fn [] (:id (room!)))
         'hire!        hire-fn
         'observe      observe-fn
         'cancel!      cancel-fn
@@ -163,6 +169,7 @@
          ref          [([agent-def]) "Return the stable {:agent/id :agent/version} reference for an AgentDef."]
          list         [([roster]) "All AgentDefs in a Roster, deterministically ordered by id."]
          select       [([roster selector]) "Select AgentDefs by :id, :status, :skill/:skills, and exact portable :where data."]
+         room-id      [([]) "Return the live identity of the current Room/world. In an isolated fork this is the child Room, not its parent."]
          hire!        [([roster agent-ref opts]) "Durably start one owned AgentDef in the current Room: (hire! team :a {:task value :resources {\"microUSD\" 1000}}). Returns a RunHandle. The current Run remains responsible for the child even if the handle is ignored; opts may also include :from, :settlement, and a positive conserved :resources vector split from the current Run/Room."]
          observe      [([handle-or-run-id]) "Read the current Room's durable Run projection for a RunHandle or UUID."]
          cancel!      [([handle-or-run-id]) "Request cooperative cancellation of exactly one live Run. Returns true when the Run was found."]

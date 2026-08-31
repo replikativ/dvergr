@@ -56,6 +56,28 @@
     (try (f room) (catch Throwable _ nil)))
   room)
 
+(defn register-fork!
+  "Atomically publish an isolated child Room and its structural topology edge.
+
+   Readers can never observe a globally reachable child without the settlement
+   identity needed to govern it. Register hooks run only after both projections
+   are visible."
+  [room parent-id ygg-fork-id]
+  (let [child-id (:id room)]
+    (rctx/shared-swap-root!
+     (fn [state]
+       (-> (or state {})
+           (update-in registry-path #(assoc (or % {}) child-id room))
+           (update-in fork-topology-path
+                      #(assoc (or % {}) child-id
+                              {:fork/id child-id
+                               :fork/parent-id parent-id
+                               :fork/ygg-id ygg-fork-id
+                               :fork/state :local})))))
+    (doseq [f (vals @register-hooks)]
+      (try (f room) (catch Throwable _ nil)))
+    room))
+
 (defn unregister!
   "Remove a Room from the registry by id, then run unregister hooks."
   [room-id]

@@ -415,7 +415,10 @@
             cs     (rstats/room-agent-contexts room)
             lookup (requiring-resolve 'dvergr.agent.room-context/lookup)
             sbstat (requiring-resolve 'dvergr.sandbox/sandbox-status)
-            sb-of  (fn [aid] (try (sbstat (:sci-ctx (lookup rid aid))) (catch Throwable _ nil)))]
+            sci-in (requiring-resolve 'dvergr.chat.context/sci-context-in)
+            sb-of  (fn [aid]
+                     (try (sbstat (sci-in (lookup rid aid) (:ctx room)))
+                          (catch Throwable _ nil)))]
         (str (h/html
               (if (seq cs)
                 (into [:div.ctx-agents] (map #(agent-context-row % (sb-of (:agent %))) cs))

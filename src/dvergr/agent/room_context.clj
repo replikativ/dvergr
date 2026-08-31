@@ -40,7 +40,8 @@
             [is.simm.partial-cps.sequence :refer [anext]]
             [taoensso.telemere :as tel]))
 
-;; [room-id agent-id] → {:chat-ctx ChatContext :seen java.util.Set :sub Subscription}
+;; [room-id agent-id] → {:chat-ctx ChatContext :seen java.util.Set
+;;                           :sub Subscription :execution-ctx ExecutionContext}
 (defonce ^:private room-agent-ctxs (atom {}))
 
 (defn room-system-id
@@ -83,7 +84,7 @@
    durable record of the conversation (consistency contract point 1)."
   [chat-ctx msg]
   (let [entity (schema/create-message-entity (assoc msg :chat-id (:chat-id chat-ctx)))]
-    (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
+    (binding [ec/*execution-context* (chat-ctx/selected-execution-context chat-ctx)]
       (swap! (:messages-signal chat-ctx) conj entity))))
 
 (defn- fmt-clock
@@ -154,9 +155,10 @@
   [room-id dollars]
   (let [micro (long (* (double dollars)
                        acct/MICRODOLLARS-PER-DOLLAR))]
-    (reduce (fn [n [[rid _] {:keys [chat-ctx]}]]
+    (reduce (fn [n [[rid _] {:keys [chat-ctx execution-ctx]}]]
               (if (and (= rid room-id) chat-ctx)
-                (do (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
+                (do (binding [ec/*execution-context* (or execution-ctx
+                                                         (:spindel-ctx chat-ctx))]
                       (swap! (:budget-signal chat-ctx) assoc :total micro))
                     (inc n))
                 n))
@@ -174,14 +176,21 @@
   (let [room-id (:id room)
         k       [room-id agent-id]]
     (or (:chat-ctx (get @room-agent-ctxs k))
-        (binding [ec/*execution-context* (:ctx room)]
-          (let [;; The room's system-db UUID — the key the system resolvers
+        ;; `fork-room` holds the same room-meta monitor from the Yggdrasil
+        ;; snapshot through child-cache projection. First creation must share
+        ;; that fence or a ComponentRef could appear in the parent cache after
+        ;; the child world snapshot and then be projected into a world that
+        ;; never forked it.
+        (locking (:meta room)
+          (or (:chat-ctx (get @room-agent-ctxs k))
+              (binding [ec/*execution-context* (:ctx room)]
+                (let [;; The room's system-db UUID — the key the system resolvers
                 ;; (room-kb-conn / room-kbs / room-msgs) want; distinct from the
                 ;; in-memory keyword `room-id`. Threads to the sandbox so `dvergr.room`
                 ;; + the guarded `d/connect`/`list-databases` resolve THIS room's
                 ;; fork-aware databases.
-                room-uuid (room-system-id room)
-                cctx (turn/new-working-ctx
+                      room-uuid (room-system-id room)
+                      sandbox-opts
                       {:execution-ctx  (:ctx room)
                        :chat-id        (stable-chat-id room-id agent-id)
                        :title          (str (name agent-id) "-" (name room-id))
@@ -212,44 +221,119 @@
                         ;; writer for this conversation; the agent's own turn messages
                         ;; stay signal-only (no redundant datahike write). Token
                         ;; accounting still persists.
-                       :durable?       false})
-                seen (java.util.Collections/synchronizedSet (java.util.HashSet.))]
+                       :durable?       false}
+                      cctx (turn/new-working-ctx sandbox-opts)
+                      bound-sandbox-opts (assoc sandbox-opts
+                                                :capability-id (:capability-id cctx))
+                      seen (java.util.Collections/synchronizedSet (java.util.HashSet.))]
             ;; Register BEFORE the fold/seed so append-inbound! finds the entry.
-            (swap! room-agent-ctxs assoc k {:chat-ctx cctx :seen seen :sub nil})
+                  (swap! room-agent-ctxs assoc k {:chat-ctx cctx
+                                                  :seen seen
+                                                  :sub nil
+                                                  :execution-ctx (:ctx room)
+                                                  :room-meta (:meta room)
+                                                  :sandbox-opts bound-sandbox-opts})
             ;; Subscribe first (catch live messages during seeding)…
-            (let [sub (start-fold! room agent-id)]
-              (swap! room-agent-ctxs assoc-in [k :sub] sub))
+                  (let [sub (start-fold! room agent-id)]
+                    (swap! room-agent-ctxs assoc-in [k :sub] sub))
             ;; System prompt once, then seed the conversation from the store.
             ;; Signal-only: the prompt is regenerated each session, not durable.
-            (when system-prompt
-              (append-signal-only! cctx {:role :system :content system-prompt}))
+                  (when system-prompt
+                    (append-signal-only! cctx {:role :system :content system-prompt}))
             ;; Seed the conversation from ONE query: `d/messages` reads the room's
             ;; (for a fork, branched) store under the conversation :chat/id, so a
             ;; fork already returns inherited (pre-fork) + its own messages — the
             ;; agent sees exactly what the UI seeds. (doc/unified-fork-conversation.md)
-            (doseq [m (d/messages room {:limit (or limit 100)})]
-              (when (conversational? m)
-                (append-inbound! room-id agent-id (:id m)
-                                 (or (:role m) (if (= agent-id (:from m)) :assistant :user))
-                                 (:content m)
+                  (doseq [m (d/messages room {:limit (or limit 100)})]
+                    (when (conversational? m)
+                      (append-inbound! room-id agent-id (:id m)
+                                       (or (:role m) (if (= agent-id (:from m)) :assistant :user))
+                                       (:content m)
                                  ;; author nil for the agent's OWN past messages
-                                 (when (not= agent-id (:from m)) (display-name room (:from m)))
-                                 (:ts m)
+                                       (when (not= agent-id (:from m)) (display-name room (:from m)))
+                                       (:ts m)
                                  ;; feed back only the agent's OWN prior reasoning,
                                  ;; not another participant's <think>
-                                 (when (= agent-id (:from m)) (:reasoning m)))))
-            (tel/log! {:level :debug :id ::created
-                       :data {:room room-id :agent agent-id
-                              :seeded (count (chat-ctx/get-messages cctx))}})
-            cctx)))))
+                                       (when (= agent-id (:from m)) (:reasoning m)))))
+                  (tel/log! {:level :debug :id ::created
+                             :data {:room room-id :agent agent-id
+                                    :seeded (count (chat-ctx/get-messages cctx))}})
+                  cctx)))))))
+
+(defn fork-ctx!
+  "Project an existing parent room/agent working context into `child-room`.
+
+   Yggdrasil has already forked the Spindel world, including the ChatContext's
+   signals and SCI component. The child cache therefore creates a child-owned
+   ChatContext facade over those stable identities, replacing raw persistence
+   with the child Room's branched connection. It also owns a copied dedup set
+   and child-bus fold. No interpreter is reconstructed and no prompt/history is
+   replayed. Returns the projected ChatContext, or nil when the parent had not
+   created one at the fork snapshot."
+  [parent-room child-room agent-id]
+  (let [parent-k [(:id parent-room) agent-id]
+        child-k [(:id child-room) agent-id]]
+    (when-let [{:keys [chat-ctx seen sandbox-opts]} (get @room-agent-ctxs parent-k)]
+      (or (:chat-ctx (get @room-agent-ctxs child-k))
+          ;; A context first published after the Ygg fork snapshot cannot be
+          ;; projected. The parent room lock normally makes this impossible;
+          ;; this check keeps the lower-level public helper fail-closed too.
+          (when (try
+                  (chat-ctx/sci-context-in chat-ctx (:ctx child-room))
+                  true
+                  (catch clojure.lang.ExceptionInfo _ false))
+            (let [room-uuid (binding [ec/*execution-context* (:ctx child-room)]
+                              (room-system-id child-room))
+                  child-opts (assoc sandbox-opts
+                                    :execution-ctx (:ctx child-room)
+                                    :db-conn (some-> child-room :store :conn)
+                                    :kb-conn (some-> room-uuid srooms/room-kb-conn)
+                                    :room-id room-uuid
+                                    :room-runtime-id (:id child-room)
+                                    :fork-projection? true
+                                    :capability-id (:capability-id chat-ctx))
+                  projected (assoc chat-ctx
+                                   :spindel-ctx (:ctx child-room)
+                                   :db-conn (some-> child-room :store :conn))
+                  _ (turn/rebind-working-ctx! projected child-opts)
+                  child-seen (java.util.Collections/synchronizedSet
+                              (locking seen
+                                (java.util.HashSet. ^java.util.Collection seen)))
+                  entry {:chat-ctx projected
+                         :seen child-seen
+                         :sub nil
+                         :execution-ctx (:ctx child-room)
+                         :room-meta (:meta child-room)
+                         :sandbox-opts child-opts}]
+              (swap! room-agent-ctxs
+                     (fn [m]
+                       (if (contains? m child-k) m (assoc m child-k entry))))
+              (if (identical? entry (get @room-agent-ctxs child-k))
+                (let [sub (start-fold! child-room agent-id)]
+                  (swap! room-agent-ctxs assoc-in [child-k :sub] sub)
+                  projected)
+                (:chat-ctx (get @room-agent-ctxs child-k)))))))))
+
+(defn- drop-entry! [room-id agent-id]
+  (when-let [{:keys [sub chat-ctx execution-ctx]}
+             (get @room-agent-ctxs [room-id agent-id])]
+    (when sub (try (bus/unsubscribe! sub) (catch Throwable _ nil)))
+    (when chat-ctx
+      (try (chat-ctx/release-sci-in! chat-ctx
+                                     (or execution-ctx (:spindel-ctx chat-ctx)))
+           (catch Throwable _ nil)))
+    (swap! room-agent-ctxs dissoc [room-id agent-id])))
 
 (defn drop-ctx!
   "Tear down the (room, agent) ctx: unsubscribe the fold and forget it.
    Call on agent leave / room delete / fork discard."
   [room-id agent-id]
-  (when-let [{:keys [sub]} (get @room-agent-ctxs [room-id agent-id])]
-    (when sub (try (bus/unsubscribe! sub) (catch Throwable _ nil)))
-    (swap! room-agent-ctxs dissoc [room-id agent-id]))
+  ;; Creation, projection and removal share the Room lifecycle monitor.  The
+  ;; cache entry retains it so unregister hooks can still fence teardown after
+  ;; the Room has already disappeared from the global registry.
+  (if-let [room-meta (:room-meta (get @room-agent-ctxs [room-id agent-id]))]
+    (locking room-meta (drop-entry! room-id agent-id))
+    (drop-entry! room-id agent-id))
   nil)
 
 (defn drop-room!

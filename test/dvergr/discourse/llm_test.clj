@@ -7,10 +7,15 @@
             [dvergr.discourse :as d]
             [dvergr.discourse.attention :as attention]
             [dvergr.discourse.llm :as llm]
+            [dvergr.agent.room-context :as room-context]
             [dvergr.chat.context :as cc]
+            [dvergr.runtime.ctx :as runtime-ctx]
+            [dvergr.sandbox :as sandbox]
             [dvergr.agent.run :as run]
             [dvergr.room.store :as store]
-            [dvergr.room.store.memory :as memory]))
+            [dvergr.room.store.memory :as memory]
+            [datahike.api :as dh]
+            [org.replikativ.spindel.engine.component :as component]))
 
 ;; ============================================================================
 ;; Mock turn-fn — scripts the LLM responses
@@ -97,6 +102,152 @@
 ;; ============================================================================
 ;; Tests
 ;; ============================================================================
+
+(deftest isolated-room-fork-reuses-the-forked-working-interpreter
+  (testing "participant cloning selects the inherited SCI world without registering another"
+    (let [parent (d/room :llm-world-parent)
+          parent-db (random-uuid)
+          fork* (atom nil)]
+      (try
+        (binding [ec/*execution-context* (:ctx parent)]
+          (d/join parent
+                  (llm/llm-agent
+                   {:id :researcher
+                    :spec {:provider :mock :model "mock"}
+                    :run-turn-fn (make-mock-turn-fn (atom []))})))
+        (is (empty? (binding [ec/*execution-context* (:ctx parent)]
+                      (component/registered)))
+            "a joined room participant does not eagerly allocate a room-less fallback")
+        (let [working (room-context/ensure-ctx!
+                       parent :researcher {:budget-dollars 1.0})
+              parent-sci (cc/sci-context-in working (:ctx parent))]
+          (is (= 1 (count (binding [ec/*execution-context* (:ctx parent)]
+                            (component/registered)))))
+          (is (= [:parent]
+                 (:value (sandbox/eval-code
+                          parent-sci
+                          (format
+                           "(def evidence (atom [:parent]))
+                            (defn captured-room [] (dvergr.agent/room-id))
+                            (def captured-room-fn dvergr.agent/room-id)
+                            (def captured-env-get env/get)
+                            (def captured-env-set env/set)
+                            (env/set \"WORLD\" \"parent\")
+                            (def captured-db-exists? datahike.api/database-exists?)
+                            (def captured-db-create! datahike.api/create-database)
+                            (def captured-db-connect! datahike.api/connect)
+                            (def parent-db {:store {:backend :mem :id %s}
+                                            :schema-flexibility :read})
+                            (captured-db-create! parent-db)
+                            (datahike.api/transact (captured-db-connect! parent-db)
+                              [{:marker/id :parent}])
+                            @evidence"
+                           (pr-str parent-db))
+                          :execution-context (:ctx parent)))))
+          (let [fork (d/fork-room parent {:isolation :ctx})]
+            (reset! fork* fork)
+            (let [child-working (room-context/lookup (:id fork) :researcher)
+                  child-sci (cc/sci-context-in child-working (:ctx fork))]
+              (is (not (identical? working child-working)))
+              (is (= (:sci-component working) (:sci-component child-working)))
+              (is (identical? (:ctx fork) (:spindel-ctx child-working)))
+              (is (not (identical? (:db-conn working) (:db-conn child-working)))
+                  "child persistence never retains the raw parent connection")
+              (is (= 1 (count (binding [ec/*execution-context* (:ctx fork)]
+                                (component/registered))))
+                  "the participant factory did not allocate a second interpreter")
+              (is (= (:id parent)
+                     (:value (sandbox/eval-code
+                              parent-sci "(dvergr.agent/room-id)"
+                              :execution-context (:ctx parent)))))
+              (is (= (:id fork)
+                     (:value (sandbox/eval-code
+                              child-sci "(dvergr.agent/room-id)"
+                              :execution-context (:ctx fork))))
+                  "fresh calls resolve the child Room")
+              (is (= [(:id fork) (:id fork)]
+                     (:value (sandbox/eval-code
+                              child-sci
+                              "[(captured-room) (captured-room-fn)]"
+                              :execution-context (:ctx fork))))
+                  "pre-fork helpers and first-class capabilities resolve through the child world")
+              (is (= ["parent" "parent"]
+                     (:value (sandbox/eval-code
+                              child-sci
+                              "[(env/get \"WORLD\") (captured-env-get \"WORLD\")]"
+                              :execution-context (:ctx fork))))
+                  "environment data is inherited through the child world binding")
+              (is (= :ok
+                     (:value (sandbox/eval-code
+                              child-sci
+                              "(captured-env-set \"WORLD\" \"child\")"
+                              :execution-context (:ctx fork)))))
+              (is (= ["child" "child"]
+                     (:value (sandbox/eval-code
+                              child-sci
+                              "[(env/get \"WORLD\") (captured-env-get \"WORLD\")]"
+                              :execution-context (:ctx fork)))))
+              (is (= ["parent" "parent"]
+                     (:value (sandbox/eval-code
+                              parent-sci
+                              "[(env/get \"WORLD\") (captured-env-get \"WORLD\")]"
+                              :execution-context (:ctx parent))))
+                  "a retained child mutation does not escape into the parent")
+              (is (= [false false]
+                     (:value (sandbox/eval-code
+                              child-sci
+                              "[(datahike.api/database-exists? parent-db)
+                                (captured-db-exists? parent-db)]"
+                              :execution-context (:ctx fork))))
+                  "live ephemeral database handles are disposable across a fork")
+              (is (= true
+                     (:value (sandbox/eval-code
+                              child-sci
+                              "(captured-db-create! parent-db)
+                               (datahike.api/transact (captured-db-connect! parent-db)
+                                 [{:marker/id :child}])
+                               (captured-db-exists? parent-db)"
+                              :execution-context (:ctx fork)))))
+              (is (= [:child]
+                     (:value (sandbox/eval-code
+                              child-sci
+                              "(datahike.api/q
+                                 '[:find [?v ...] :where [_ :marker/id ?v]]
+                                 @(captured-db-connect! parent-db))"
+                              :execution-context (:ctx fork))))
+                  "the inherited logical config maps to child-owned physical storage")
+              (is (= [:parent]
+                     (:value (sandbox/eval-code
+                              parent-sci
+                              "(datahike.api/q
+                                 '[:find [?v ...] :where [_ :marker/id ?v]]
+                                 @(captured-db-connect! parent-db))"
+                              :execution-context (:ctx parent))))
+                  "same-config child writes cannot reach the parent's physical database")
+              (is (= [:parent :child]
+                     (:value (sandbox/eval-code
+                              child-sci
+                              "(swap! evidence conj :child)"
+                              :execution-context (:ctx fork)))))
+              (is (= [:parent]
+                     (:value (sandbox/eval-code
+                              parent-sci "@evidence"
+                              :execution-context (:ctx parent)))))
+              (let [binding (runtime-ctx/sandbox-binding
+                             (:ctx fork) (:capability-id child-working))
+                    physical-config (-> binding :ephemeral-databases vals first :config)]
+                (is (dh/database-exists? physical-config))
+                (room-context/drop-ctx! (:id fork) :researcher)
+                (is (not (dh/database-exists? physical-config))
+                    "dropping a world deletes its process-global scratch database"))
+              (is (thrown-with-msg?
+                   clojure.lang.ExceptionInfo
+                   #"not available"
+                   (cc/sci-context-in child-working (:ctx fork)))))))
+        (finally
+          (when-let [fork @fork*]
+            (d/discard fork))
+          (d/close-room! parent))))))
 
 (deftest single-turn-replies
   (testing "Agent replies after a single :complete turn"
@@ -185,14 +336,17 @@
                                   :run-turn-fn turn-fn})))
       (try
         (d/post! r (d/message :alice :worker "cancel this run"))
-        (is (= true (deref first-started 2000 ::timeout)))
+        ;; Creating the first room-bound interpreter can compile SCI/Spindel
+        ;; namespaces. Leave enough wall-clock headroom for contended CI hosts;
+        ;; the cancellation assertions below still test the semantic deadline.
+        (is (= true (deref first-started 10000 ::timeout)))
         (let [run-id (:run/id (first (run/active-runs :run-cancel-reuse)))]
           (is (uuid? run-id))
           (is (run/cancel-run! run-id))
           (is (await-condition
                #(= :cancelled (:run/status (run/run r run-id)))
-               3000)))
-        (let [reply (await-spin r #(d/ask % :worker {:content "next run"}) 3000)]
+               10000)))
+        (let [reply (await-spin r #(d/ask % :worker {:content "next run"}) 10000)]
           (is (= "second completed" (:content reply)))
           (is (= :completed
                  (:run/status (run/run r (get-in reply [:metadata :run-id])))))

@@ -339,9 +339,11 @@ rosters without synchronization or leakage.
 If a workflow needs changing state, allocate it through Spindel's fork-aware
 state vocabulary (signals or reactive atoms) in the relevant execution context.
 Do not place semantic workflow state in a JVM atom, dynamic singleton, or
-process-global registry. SCI Var forkability is a separate runtime project; do
-not rely on a top-level `def` as the portable state boundary until that work is
-complete.
+process-global registry. SCI vars, atoms, bindings, and continuations now fork
+with the interpreter world, so top-level definitions are valid transient
+branch-local program state. They are deliberately discarded rather than merged;
+durable or reviewable meaning still belongs in Room substrates and Run/effect
+records.
 
 A RunHandle is intentionally not durable state and should not be stored inside
 an AgentDef. Its awaitable result/cache belongs to the Spindel execution graph;

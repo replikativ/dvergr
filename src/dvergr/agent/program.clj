@@ -492,7 +492,7 @@
      (-> (tools/make-context
           {:db-conn work-db
            :chat-ctx chat-ctx
-           :sci-ctx (:sci-ctx chat-ctx)
+           :sci-ctx (chat-context/sci-context-in chat-ctx (:ctx room))
            :tools tool-map
            :isolation :sci
            :execution-ctx (:ctx room)
