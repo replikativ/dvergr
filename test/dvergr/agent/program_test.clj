@@ -479,6 +479,12 @@
               activity (first (filter #(= :_activity (:to %)) messages))]
           (is (= :completed (:run/status result)))
           (is (= "The result is 2." (:run/value result)))
+          (is (uuid? (get-in result [:run/metrics :prompt-id])))
+          (is (= {:provider :codex-subscription
+                  :model "codex-subscription-sol"
+                  :model-steps 2
+                  :usage {:used 0 :by-type {}}}
+                 (dissoc (:run/metrics result) :prompt-id)))
           (is (= :completed (:run/status durable)))
           (is (uuid? (:run/chat-id durable)))
           (is (= 2 (count @calls)))
@@ -625,7 +631,9 @@
                   :run/reason :budget-exhausted
                   :run/settlement-status :review
                   :run/settlement-reason :execution-waiting}
-                 (dissoc result :run/world)))
+                 (dissoc result :run/world :run/metrics)))
+          (is (= 1 (get-in result [:run/metrics :model-steps])))
+          (is (uuid? (get-in result [:run/metrics :prompt-id])))
           (is (= :waiting (:run/status (program/observe room handle))))
           (is (empty? (filter #(= (program/run-id handle)
                                   (get-in % [:metadata :run-id]))
@@ -658,6 +666,71 @@
             (is (true? (program/cancel! handle)))
             (is (= :cancelled (:run/status (deref handle 2000 ::timeout))))
             (is (= :cancelled (:run/status (program/observe room handle)))))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest structured-llm-cancellation-retains-collected-metrics
+  (let [room (test-room :program-llm-structured-cancel)
+        team (roster/make-agent
+              (roster/make-roster)
+              {:id :worker
+               :model-policy {:provider :test :model "stub"}
+               :program {:kind :llm}})
+        calls (atom 0)
+        entered-second (promise)]
+    (try
+      (with-redefs [providers/ensure-initialized! (constantly nil)
+                    chat-agent/run-agent-turn!
+                    (fn [_ {:keys [cancel?]}]
+                      (if (= 1 (swap! calls inc))
+                        :continue
+                        (do
+                          (deliver entered-second true)
+                          (loop []
+                            (if (cancel?)
+                              :cancelled
+                              (do (Thread/sleep 5) (recur)))))))]
+        (binding [ec/*execution-context* (:ctx room)]
+          (let [handle (program/hire! room team :worker {:task "stop structurally"})]
+            (is (= true (deref entered-second 10000 ::timeout)))
+            (is (= :winner
+                   @(comb/race (sp/spin :winner)
+                               (program/owned-result-spin handle))))
+            (let [result (deref handle 2000 ::timeout)]
+              (is (= :cancelled (:run/status result)))
+              (is (= {:provider :test
+                      :model "stub"
+                      :usage {:used 0 :by-type {}}}
+                     (dissoc (:run/metrics result)
+                             :prompt-id :model-steps)))
+              (is (<= 1 (get-in result [:run/metrics :model-steps]) 2)
+                  "cancellation may win before or after the worker acknowledges step two")
+              (is (uuid? (get-in result [:run/metrics :prompt-id])))))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest llm-cleanup-failure-retains-collected-metrics
+  (let [room (test-room :program-llm-cleanup-failure)
+        team (roster/make-agent
+              (roster/make-roster)
+              {:id :worker
+               :model-policy {:provider :test :model "stub"}
+               :program {:kind :llm :max-model-steps 1}})]
+    (try
+      (with-redefs [providers/ensure-initialized! (constantly nil)
+                    chat-agent/run-agent-turn!
+                    (fn [chat-ctx _]
+                      (chat-context/add-message!
+                       chat-ctx {:role :assistant :content "done"})
+                      :complete)
+                    chat-context/close-chat!
+                    (fn [_] (throw (ex-info "cleanup exploded" {})))]
+        (binding [ec/*execution-context* (:ctx room)]
+          (let [result @(program/hire! room team :worker {:task "clean up"})]
+            (is (= :failed (:run/status result)))
+            (is (= "cleanup exploded" (:run/error result)))
+            (is (= 1 (get-in result [:run/metrics :model-steps])))
+            (is (uuid? (get-in result [:run/metrics :prompt-id]))))))
       (finally
         (d/close-room! room)))))
 

@@ -8,6 +8,7 @@
    language and lifecycle contracts live in ordinary deterministic tests."
   (:require [clojure.edn :as edn]
             [datahike.api :as dh]
+            [dvergr.activity :as activity]
             [dvergr.agent.environment :as environment]
             [dvergr.agent.program :as program]
             [dvergr.agent.roster :as roster]
@@ -64,6 +65,11 @@
 
 (def self-programming-task-v1
   (str "Use clojure_eval to author and execute a recursive Dvergr program. "
+       "Use the exact namespaces `[dvergr.agent :as agent]`, "
+       "`[org.replikativ.spindel.spin.cps :refer [spin]]`, "
+       "`[org.replikativ.spindel.effects.await :refer [await]]`, and "
+       "`[spindel.comb :as comb]`; compose the three result Spins with "
+       "`comb/parallel`. "
        "Construct an immutable roster with three cheap simulated specialists. "
        "A :mod-five particle is scripted to return [8 23 38 53 68 83 98]. "
        "A :mod-seven particle is scripted to return "
@@ -288,7 +294,9 @@
      :verifier {:id verifier-id :version 1}
      :limits (merge {:timeout-ms 120000
                      :cancel-timeout-ms 10000
-                     :max-model-steps 8
+                     ;; Resource/time limits govern normal execution. This is
+                     ;; only a runaway fuse for a malfunctioning provider loop.
+                     :max-model-steps 16
                      :budget-dollars 1.0}
                     limits)
      :world (merge {:isolation :ctx
@@ -380,7 +388,8 @@
                          :max-model-steps max-model-steps
                          :budget-dollars budget-dollars
                          :auto-compact? false}})
-        started (System/nanoTime)]
+        started-at (System/currentTimeMillis)
+        started-nanos (System/nanoTime)]
     (try
       (let [handle (binding [ec/*execution-context* (:ctx room)]
                      (program/hire! room team :orchestrator
@@ -419,7 +428,35 @@
                                (when resource-observation
                                  (resource-observation root-run-id child-runs)))
             checks (verify observation)
-            passed? (every? true? (vals checks))]
+            passed? (every? true? (vals checks))
+            reward (if passed? 1.0 0.0)
+            elapsed-ms (long (/ (- (System/nanoTime) started-nanos) 1000000))
+            run-trace (mapv #(select-keys % [:run/id :run/parent :run/caused-by
+                                             :run/actor :run/status :run/error
+                                             :run/settlement-status])
+                            all-runs)
+            tool-trace
+            (mapv activity/tool-trace-entry activity)
+            resources (when resource-observation
+                        (select-keys observation
+                                     [:room-balance :root-balance :child-balances
+                                      :resource-receipts]))
+            receipt-opts
+            (cond-> {:run-id root-run-id
+                     :provider provider
+                     :model model
+                     :status (:run/status result)
+                     :started-at started-at
+                     :elapsed-ms elapsed-ms
+                     :metrics (merge (:run/metrics result)
+                                     {:timed-out? timed-out?})
+                     :checks checks
+                     :reward reward
+                     :result parsed
+                     :trace {:runs run-trace :tool-calls tool-trace}}
+              resources (assoc :resources resources))
+            attempt-receipt
+            (environment/make-attempt-receipt definition receipt-opts)]
         (cond->
          {:environment environment-id
           :environment-ref (environment/environment-ref definition)
@@ -429,10 +466,13 @@
           :task task
           :expected expected
           :checks checks
-          :reward (if passed? 1.0 0.0)
+          :reward reward
           :passed? passed?
           :timed-out? timed-out?
-          :elapsed-ms (long (/ (- (System/nanoTime) started) 1000000))
+          :elapsed-ms elapsed-ms
+          :attempt-receipt attempt-receipt
+          :prompt-id (get-in result [:run/metrics :prompt-id])
+          :usage (get-in result [:run/metrics :usage])
           ;; Each activity row is a tool-bearing provider exchange. A successful
           ;; exact answer requires one final, non-tool provider exchange as well.
           :model-steps (cond-> (count activity)
@@ -440,21 +480,10 @@
           :result result
           :parsed-value parsed
           :durable-status (:run/status durable)
-          :runs (mapv #(select-keys % [:run/id :run/parent :run/caused-by :run/actor
-                                      :run/status :run/error
-                                      :run/settlement-status])
-                      all-runs)
-          :tool-calls
-          (mapv (fn [message]
-                  (mapv #(select-keys % [:tool-use/name :tool-use/input])
-                        (get-in message [:metadata :tool-uses])))
-                activity)
+          :runs run-trace
+          :tool-calls tool-trace
           :active-after (:active-after observation)}
-          resource-observation
-          (assoc :resources
-                 (select-keys observation
-                              [:room-balance :root-balance :child-balances
-                               :resource-receipts]))))
+          resources (assoc :resources resources)))
       (finally
         (close!)))))
 

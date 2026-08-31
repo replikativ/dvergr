@@ -1,6 +1,7 @@
 (ns dvergr.agent.environment-test
   (:require [clojure.test :refer [deftest is testing]]
-            [dvergr.agent.environment :as environment]))
+            [dvergr.agent.environment :as environment]
+            [hasch.core :as hasch]))
 
 (def base-spec
   {:id :programming/join
@@ -55,3 +56,64 @@
                           (environment/environment-ref
                            (environment/environment-ref definition))))
     (is (= definition (environment/validate-environment definition)))))
+
+(deftest trusted-attempt-receipts-bind-run-environment-evidence-and-reward
+  (let [definition (environment/make-environment base-spec)
+        run-id (random-uuid)
+        opts {:run-id run-id
+              :provider :codex-subscription
+              :model "codex-subscription-sol"
+              :status :failed
+              :started-at 1000
+              :elapsed-ms 42
+              :metrics {:prompt-id (random-uuid)
+                        :model-steps 8
+                        :usage {:by-type {:input-tokens 100}}}
+              :checks {:exact-result? false :quiescent? true}
+              :reward 0.0
+              :result nil
+              :trace {:runs [{:run/id run-id :run/status :failed}]}}
+        a (environment/make-attempt-receipt definition opts)
+        b (environment/make-attempt-receipt definition
+                                            (into (array-map) (reverse (seq opts))))
+        rehash (fn [changes]
+                 (let [changed (merge (dissoc a :attempt/content-id) changes)]
+                   (assoc changed :attempt/content-id
+                          (hasch/uuid [:dvergr/environment-attempt changed]))))]
+    (is (= a b))
+    (is (= run-id (:attempt/id a) (:attempt/run-id a)))
+    (is (= (environment/environment-ref definition)
+           (:attempt/environment a)))
+    (is (= a (environment/validate-attempt-receipt a)))
+    (is (uuid? (:attempt/content-id a)))
+    (is (not= (:attempt/content-id a)
+              (:attempt/content-id
+               (environment/make-attempt-receipt
+                definition (assoc opts :reward 1.0)))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"does not match"
+                          (environment/validate-attempt-receipt
+                           (assoc a :attempt/reward 1.0))))
+    (doseq [[message changes]
+            [[#"UUID" {:attempt/id "run" :attempt/run-id "run"}]
+             [#"EnvironmentRef" {:attempt/environment :garbage}]
+             [#"non-negative" {:attempt/elapsed-ms -1}]
+             [#"keywords to booleans" {:attempt/checks {:truth :unknown}}]
+             [#"finite" {:attempt/reward ##NaN}]]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo message
+                            (environment/validate-attempt-receipt
+                             (rehash changes)))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"keywords to booleans"
+                          (environment/make-attempt-receipt
+                           (environment/make-environment base-spec)
+                           {:run-id (random-uuid) :provider :stub :model "stub"
+                            :status :completed :started-at 0 :elapsed-ms 0
+                            :checks {:truth :unknown} :reward 0.0}))))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                        #"finite"
+                        (environment/make-attempt-receipt
+                         (environment/make-environment base-spec)
+                         {:run-id (random-uuid) :provider :stub :model "stub"
+                          :status :completed :started-at 0 :elapsed-ms 0
+                          :checks {} :reward ##Inf}))))

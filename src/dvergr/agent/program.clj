@@ -80,9 +80,16 @@
                   :cleanup nil
                   :cleanup-phase :pending
                   :cleanup-error nil
+                  :llm-metrics nil
                   :quiesced? false})
     :quiesced (sync/deferred)
     :quiesced-latch (CountDownLatch. 1)}))
+
+(defn- update-llm-metrics!
+  "Update provider evidence under the same lock as cleanup/quiescence state."
+  [supervisor f & args]
+  (locking supervisor
+    (apply swap! (:state supervisor) update :llm-metrics f args)))
 
 (defn- advance-supervisor!
   "Advance cleanup/quiescence after an atomic supervisor transition. Cleanup
@@ -562,6 +569,14 @@
                           (when-let [agent-prompt (:agent/prompt agent)]
                             (str "\n\n" agent-prompt)))
                      {:tools tool-map :isolation :sci :profile :workflow})]
+                (update-llm-metrics!
+                 supervisor
+                 (constantly
+                  {:prompt-id (hasch/uuid [:dvergr/llm-system-prompt instructions])
+                   :provider (:provider model-spec)
+                   :model (:model model-spec)
+                   :model-steps 0
+                   :usage {}}))
                 (chat-context/add-message!
                  chat-ctx {:role :system :content instructions})
                 (chat-context/add-message!
@@ -606,7 +621,11 @@
                       ;; integration step, not a conversational turn.
                       :turn-number model-step
                       :run-id run-id})))
-                 outcome (sp/await (worker-result-spin call))]
+                 outcome (sp/await (worker-result-spin call))
+                 budget (chat-context/get-budget chat-ctx)]
+             (update-llm-metrics!
+              supervisor merge {:model-steps (inc model-step)
+                                :usage (select-keys budget [:used :by-type])})
              (turn/post-turn-activity! control-room (:agent/id agent) chat-ctx posted
                                        run-id trigger)
              (cond
@@ -890,11 +909,12 @@
               (recur))))
         (await-supervisor! supervisor)
         (return-unused-resources! control-room id parent-run allocated?)
-        (let [cleanup-error (:cleanup-error @(:state supervisor))
-              result (if cleanup-error
-                       {:run/id id :run/status :failed
-                        :run/error (ex-message cleanup-error)}
-                       (:result outcome))
+        (let [{:keys [cleanup-error llm-metrics]} @(:state supervisor)
+              result (cond-> (if cleanup-error
+                               {:run/id id :run/status :failed
+                                :run/error (ex-message cleanup-error)}
+                               (:result outcome))
+                       llm-metrics (assoc :run/metrics llm-metrics))
               execution-opts (merge
                               (:finish-opts outcome)
                               (when cleanup-error
@@ -922,28 +942,31 @@
                                cleanup-error)))
              (when (run/cancel-requested? id)
                (cancelled! id))
-             (case status
-               :completed
-               (let [output (d/reply (:agent/id agent) run-sink
-                                     (result-content value) trigger
-                                     {:role :assistant :run-id id})]
+             (let [llm-metrics (:llm-metrics @(:state supervisor))]
+               (case status
+                 :completed
+                 (let [output (d/reply (:agent/id agent) run-sink
+                                       (result-content value) trigger
+                                       {:role :assistant :run-id id})]
                  ;; Room posting is durability-first. Completion is acknowledged
                  ;; only after the correlated private output exists.
-                 (d/post! control-room output)
-                 {:result {:run/id id
-                           :run/status :completed
-                           :run/value value
-                           :run/output output}
-                  :finish-opts {}})
+                   (d/post! control-room output)
+                   {:result (cond-> {:run/id id
+                                     :run/status :completed
+                                     :run/value value
+                                     :run/output output}
+                              llm-metrics (assoc :run/metrics llm-metrics))
+                    :finish-opts {}})
 
-               :waiting
-               {:result {:run/id id :run/status :waiting :run/reason reason}
-                :finish-opts {:reason reason}}
+                 :waiting
+                 {:result (cond-> {:run/id id :run/status :waiting :run/reason reason}
+                            llm-metrics (assoc :run/metrics llm-metrics))
+                  :finish-opts {:reason reason}}
 
-               (throw (ex-info "Interpreter returned an unknown program status"
-                               {:type ::unknown-program-status
-                                :status status
-                                :agent/id (:agent/id agent)}))))
+                 (throw (ex-info "Interpreter returned an unknown program status"
+                                 {:type ::unknown-program-status
+                                  :status status
+                                  :agent/id (:agent/id agent)})))))
            (catch Throwable t
              (let [cancelled? (cancelled-error? t id)
                    graph-cancelled? (graph-cancelled-error? t)
@@ -965,13 +988,16 @@
                    ;; still valid, so it returns an ordinary cancelled result.
                    (sp/await quiesced)
                    (let [cleanup-error (:cleanup-error @(:state supervisor))
-                         error (or cleanup-error t)]
+                         error (or cleanup-error t)
+                         llm-metrics (:llm-metrics @(:state supervisor))]
                      (if (and cancelled? (nil? cleanup-error))
-                       {:result {:run/id id :run/status :cancelled}
+                       {:result (cond-> {:run/id id :run/status :cancelled}
+                                  llm-metrics (assoc :run/metrics llm-metrics))
                         :finish-opts {:reason :cancel-requested}}
-                       {:result {:run/id id
-                                 :run/status :failed
-                                 :run/error (ex-message error)}
+                       {:result (cond-> {:run/id id
+                                         :run/status :failed
+                                         :run/error (ex-message error)}
+                                  llm-metrics (assoc :run/metrics llm-metrics))
                         :finish-opts {:reason (if cleanup-error
                                                 :cleanup-error
                                                 :program-error)

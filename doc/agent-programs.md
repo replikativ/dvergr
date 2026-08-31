@@ -314,6 +314,19 @@ definition. Each attempt still receives a fresh Run ID, so content identity
 never collapses distinct executions. The current REPL benchmark reports retain
 both the exact definition and its compact reference.
 
+Every opt-in REPL attempt also returns a process-local, content-addressed
+`:attempt-receipt`. It binds the
+unique root Run to the exact EnvironmentDef, provider/model, exact assembled
+system-prompt ID, per-resource usage, timing, trusted checks/reward, Run/tool
+trace, and Kontor receipts when present. SCI does not receive the receipt
+constructor or verifier registry, so an evaluated agent can propose an
+environment but cannot certify its own reward.
+
+Dollar/token, elapsed-time, and conserved resource limits are the ordinary
+governors. `:max-model-steps` remains only a high emergency fuse for a provider
+loop that keeps returning tool continuations; it is not the conversational or
+FRP unit of progress.
+
 The API and the instructions that teach it are evaluated together at three
 levels:
 
@@ -326,9 +339,10 @@ levels:
    Code, API models, and local models. A trusted host verifier scores the exact
    result plus durable Room/Run facts; model prose is never the reward source.
    Reports retain individual checks, binary reward, generated SCI, leaked
-   Runs/resources, model steps, wall time, task version, and model. Token/cost
-   receipts and a stable hash of the assembled system prompt remain reporting
-   follow-ups.
+   Runs/resources, model steps, token/cost usage, wall time, task version,
+   model, and a stable ID of the exact assembled system prompt. Durable receipt
+   persistence, trusted-writer authorization, and settlement against a retained
+   benchmark world remain follow-ups.
 
 The initial model-facing task set should include pure roster specialization,
 parallel research/review and reduction, race-with-loser-cancellation, explicit

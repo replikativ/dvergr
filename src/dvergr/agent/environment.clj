@@ -141,3 +141,163 @@
   [environment]
   (select-keys (validate-environment environment)
                [:environment/id :environment/version :environment/content-id]))
+
+(def ^:private attempt-option-keys
+  #{:run-id :provider :model :status :started-at :elapsed-ms :metrics
+    :checks :reward :result :trace :resources})
+
+(def ^:private attempt-receipt-keys
+  #{:attempt/id :attempt/run-id :attempt/environment :attempt/provider
+    :attempt/model :attempt/status :attempt/started-at :attempt/elapsed-ms
+    :attempt/metrics :attempt/checks :attempt/reward :attempt/result
+    :attempt/trace :attempt/resources :attempt/content-id})
+
+(def ^:private required-attempt-receipt-keys
+  #{:attempt/id :attempt/run-id :attempt/environment :attempt/provider
+    :attempt/model :attempt/status :attempt/started-at :attempt/elapsed-ms
+    :attempt/metrics :attempt/checks :attempt/reward :attempt/content-id})
+
+(def ^:private environment-ref-keys
+  #{:environment/id :environment/version :environment/content-id})
+
+(defn- environment-ref! [ref]
+  (when-not (and (map? ref) (= environment-ref-keys (set (keys ref))))
+    (invalid! "Attempt receipt :environment must be an exact EnvironmentRef"
+              ::invalid-attempt-environment {:environment ref}))
+  (when-not (keyword? (:environment/id ref))
+    (invalid! "EnvironmentRef :environment/id must be a keyword"
+              ::invalid-attempt-environment {:environment ref}))
+  (positive-version! "EnvironmentRef :environment/version"
+                     (:environment/version ref))
+  (when-not (uuid? (:environment/content-id ref))
+    (invalid! "EnvironmentRef :environment/content-id must be a UUID"
+              ::invalid-attempt-environment {:environment ref}))
+  ref)
+
+(defn- finite-number? [value]
+  (and (number? value)
+       (try
+         (Double/isFinite (double value))
+         (catch Throwable _ false))))
+
+(defn- attempt-fields!
+  [{:keys [run-id environment provider model status started-at elapsed-ms metrics
+           checks reward result trace resources]}]
+  (when-not (uuid? run-id)
+    (invalid! "Attempt receipt :run-id must be a UUID"
+              ::invalid-attempt-run {:run-id run-id}))
+  (environment-ref! environment)
+  (when-not (keyword? provider)
+    (invalid! "Attempt receipt :provider must be a keyword"
+              ::invalid-attempt-provider {:provider provider}))
+  (when-not (string? model)
+    (invalid! "Attempt receipt :model must be a string"
+              ::invalid-attempt-model {:model model}))
+  (when-not (keyword? status)
+    (invalid! "Attempt receipt :status must be a keyword"
+              ::invalid-attempt-status {:status status}))
+  (when-not (and (integer? started-at) (not (neg? started-at)))
+    (invalid! "Attempt receipt :started-at must be epoch milliseconds"
+              ::invalid-attempt-start {:started-at started-at}))
+  (when-not (and (integer? elapsed-ms) (not (neg? elapsed-ms)))
+    (invalid! "Attempt receipt :elapsed-ms must be a non-negative integer"
+              ::invalid-attempt-elapsed {:elapsed-ms elapsed-ms}))
+  (when-not (map? metrics)
+    (invalid! "Attempt receipt :metrics must be a map"
+              ::invalid-attempt-metrics {:metrics metrics}))
+  (when-not (and (map? checks) (every? keyword? (keys checks))
+                 (every? boolean? (vals checks)))
+    (invalid! "Attempt receipt :checks must map keywords to booleans"
+              ::invalid-attempt-checks {:checks checks}))
+  (when-not (finite-number? reward)
+    (invalid! "Attempt receipt :reward must be a finite number"
+              ::invalid-attempt-reward {:reward reward}))
+  (doseq [[label value] [[:metrics metrics] [:result result] [:trace trace]
+                         [:resources resources]]]
+    (when-not (roster/data-value? value)
+      (invalid! (str "Attempt receipt " label " must contain only portable data")
+                ::non-portable-attempt-data {:label label :value value})))
+  true)
+
+(defn make-attempt-receipt
+  "Create an immutable verified-attempt receipt for one unique root Run.
+
+   This constructor is intentionally host-only: SCI may author EnvironmentDefs,
+   but the trusted runner supplies checks and reward after observing durable
+   effects. `started-at` is epoch milliseconds; metrics/resources/trace remain
+   portable data so the receipt can live in Datahike or Geschichte."
+  [environment {:keys [run-id provider model status started-at elapsed-ms metrics
+                       checks reward result trace resources]
+                :as opts}]
+  (validate-environment environment)
+  (when-let [unknown (seq (remove attempt-option-keys (keys opts)))]
+    (invalid! "Attempt receipt contains unknown keys"
+              ::unknown-attempt-keys {:unknown (set unknown)}))
+  (let [environment-ref (environment-ref environment)
+        metrics (or metrics {})
+        _ (attempt-fields! {:run-id run-id :environment environment-ref
+                            :provider provider :model model :status status
+                            :started-at started-at :elapsed-ms elapsed-ms
+                            :metrics metrics :checks checks :reward reward
+                            :result result :trace trace :resources resources})
+        receipt (cond-> {:attempt/id run-id
+                         :attempt/run-id run-id
+                         :attempt/environment environment-ref
+                         :attempt/provider provider
+                         :attempt/model model
+                         :attempt/status status
+                         :attempt/started-at started-at
+                         :attempt/elapsed-ms elapsed-ms
+                         :attempt/metrics metrics
+                         :attempt/checks checks
+                         :attempt/reward reward}
+                  (contains? opts :result) (assoc :attempt/result result)
+                  (contains? opts :trace) (assoc :attempt/trace trace)
+                  (contains? opts :resources) (assoc :attempt/resources resources))]
+    (assoc receipt :attempt/content-id
+           (hasch/uuid [:dvergr/environment-attempt receipt]))))
+
+(defn validate-attempt-receipt
+  "Reject a malformed or stale attempt receipt before persistence/projection.
+   Content addressing detects mutation; authorization of the writer remains the
+   durable store's responsibility, not a property of an unsigned value."
+  [receipt]
+  (when-not (map? receipt)
+    (invalid! "Attempt receipt must be a map"
+              ::invalid-attempt-receipt {:value receipt}))
+  (when-let [unknown (seq (remove attempt-receipt-keys (keys receipt)))]
+    (invalid! "Attempt receipt contains unknown canonical keys"
+              ::unknown-attempt-receipt-keys {:unknown (set unknown)}))
+  (when-let [missing (seq (remove #(contains? receipt %)
+                                  required-attempt-receipt-keys))]
+    (invalid! "Attempt receipt is missing canonical keys"
+              ::missing-attempt-receipt-keys {:missing (set missing)}))
+  (when-not (roster/data-value? receipt)
+    (invalid! "Attempt receipt must contain only portable data"
+              ::non-portable-attempt-data {:value receipt}))
+  (when-not (= (:attempt/id receipt) (:attempt/run-id receipt))
+    (invalid! "Attempt identity must equal its root Run identity"
+              ::attempt-run-mismatch
+              {:attempt/id (:attempt/id receipt)
+               :attempt/run-id (:attempt/run-id receipt)}))
+  (attempt-fields! {:run-id (:attempt/run-id receipt)
+                    :environment (:attempt/environment receipt)
+                    :provider (:attempt/provider receipt)
+                    :model (:attempt/model receipt)
+                    :status (:attempt/status receipt)
+                    :started-at (:attempt/started-at receipt)
+                    :elapsed-ms (:attempt/elapsed-ms receipt)
+                    :metrics (:attempt/metrics receipt)
+                    :checks (:attempt/checks receipt)
+                    :reward (:attempt/reward receipt)
+                    :result (:attempt/result receipt)
+                    :trace (:attempt/trace receipt)
+                    :resources (:attempt/resources receipt)})
+  (let [claimed (:attempt/content-id receipt)
+        actual (hasch/uuid [:dvergr/environment-attempt
+                            (dissoc receipt :attempt/content-id)])]
+    (when-not (= claimed actual)
+      (invalid! "Attempt receipt content ID does not match its content"
+                ::attempt-content-id-mismatch
+                {:claimed claimed :actual actual})))
+  receipt)
