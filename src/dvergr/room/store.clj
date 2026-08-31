@@ -124,6 +124,26 @@
     "List attention facts, optionally restricted by exact :id, :participant,
      and :limit. Exact identity lookup is never subject to the history limit."))
 
+(defprotocol PAttemptStore
+  "Durable query projection for trusted, verified evaluation Attempts.
+
+   The Attempt is owned by the same Room store as its terminal Run. Exact
+   open-ended values may live in an immutable artifact store, but certification
+   is not durable until this typed index and all artifact references commit."
+
+  (-store-attempt! [this room-id attempt]
+    "Persist one immutable certified Attempt. The root Run must be terminal in
+     this Room. Repeating identical content is idempotent; reusing the Run
+     identity for different content is an error.")
+
+  (-load-attempt [this room-id attempt-id]
+    "Return one exact certified Attempt by UUID in `room-id`, else nil.")
+
+  (-list-attempts [this room-id opts]
+    "Return recent certified Attempts newest first. Optional exact filters are
+     :environment-id, :environment-content-id, :provider, :model, and :status;
+     :limit is applied after filtering."))
+
 ;; =============================================================================
 ;; Helpers
 ;; =============================================================================

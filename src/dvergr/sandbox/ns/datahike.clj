@@ -33,7 +33,39 @@
 (def ^:private data-ops
   '[q pull pull-many entity entity-db datoms seek-datoms
     schema reverse-schema metrics db history as-of since filter
-    transact transact! load-entities with])
+    transact transact! with])
+
+(defn- attempt-attr? [x]
+  (and (keyword? x)
+       (contains? #{"attempt" "attempt.check"} (namespace x))))
+
+(defn- attempt-entity? [conn eid]
+  (try
+    (let [entity (d/entity @conn eid)]
+      (boolean (or (:attempt/id entity) (:attempt.check/id entity))))
+    (catch Throwable _ false)))
+
+(defn- assert-no-attempt-write! [conn tx-data]
+  (doseq [form tx-data]
+    (let [protected?
+          (cond
+            (map? form)
+            (or (some attempt-attr? (keys form))
+                (attempt-entity? conn (:db/id form)))
+
+            (vector? form)
+            (let [[op eid attr] form]
+              (or (= :db.fn/call op)
+                  (attempt-attr? attr)
+                  (and (vector? eid) (attempt-attr? (first eid)))
+                  (and (#{:db/retractEntity :db.fn/retractEntity} op)
+                       (attempt-entity? conn eid))))
+
+            :else false)]
+      (when protected?
+        (throw (ex-info "Verified Attempt projections are host-certified and read-only in SCI"
+                        {:type ::protected-attempt-write :tx-form form})))))
+  tx-data)
 
 (defn- cfg-name
   "The logical database name from a datahike config: `:store :id`, else the
@@ -52,6 +84,15 @@
   (let [data      (into {} (keep (fn [sym]
                                    (when-let [v (ns-resolve 'datahike.api sym)] [sym @v]))
                                  data-ops))
+        data      (assoc data
+                         'transact
+                         (fn [conn tx-data]
+                           (d/transact conn
+                                       (assert-no-attempt-write! conn tx-data)))
+                         'transact!
+                         (fn [conn tx-data]
+                           (d/transact! conn
+                                        (assert-no-attempt-write! conn tx-data))))
         ;; per-sandbox ephemeral (:mem) databases, keyed by logical name
         ephemeral (atom {})
         in-ctx    (fn [f] (binding [ec/*execution-context* ctx] (f)))

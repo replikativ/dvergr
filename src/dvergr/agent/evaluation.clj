@@ -7,6 +7,7 @@
    receipt. Parallelism, races, quorums, and later inference policies compose
    these Spins with the existing Spindel combinators."
   (:require [dvergr.agent.environment :as environment]
+            [dvergr.agent.attempt :as attempt]
             [dvergr.agent.program :as program]
             [dvergr.agent.roster :as roster]
             [dvergr.room.registry :as registry]
@@ -278,6 +279,7 @@
               #(and evaluation-spin-id
                     (ec/spin-current-result evaluation-spin-id))
               state (atom :scoring)
+              persisted-attempt (atom nil)
               cleanup-result (atom ::pending)
               cleanup-once!
               (fn [reason]
@@ -288,6 +290,38 @@
                       cleanup)
                     @cleanup-result)))
               done (sync/deferred)
+              certification-failure!
+              (fn [error]
+                (if (cancelled-externally?)
+                  (compare-and-set! state :scoring :cancelled)
+                  (compare-and-set! state :scoring :failed))
+                (let [cleanup
+                      (cleanup-once!
+                       (if (= :cancelled @state)
+                         :evaluation-cancelled
+                         :evaluation-certification-failed))]
+                  (sync/deliver!
+                   done
+                   {:error
+                    (ex-info "Evaluation certification failed"
+                             {:type ::certification-failed
+                              :run/id run-id
+                              :run/world (:run/world result)
+                              :cleanup cleanup}
+                             error)})))
+              settlement-failure!
+              (fn [error]
+                (sync/deliver!
+                 done
+                 {:error
+                  (ex-info "Evaluation was certified but world settlement requires recovery"
+                           {:type ::settlement-recovery-required
+                            :run/id run-id
+                            :run/world (:run/world result)
+                            :attempt @persisted-attempt
+                            :run/settlement-status
+                            (:run/settlement-status result)}
+                           error)}))
               worker
               (future
                 (binding [ec/*execution-context* (:ctx room)
@@ -299,7 +333,10 @@
                             :evaluator evaluator :agent agent :run-id run-id
                             :result result :durable durable
                             :started-at started-at :started-nanos started-nanos
-                            :timeout? timeout?})]
+                            :timeout? timeout?})
+                          certified-attempt
+                          (attempt/make-attempt definition agent receipt evidence
+                                                settlement)]
                       (let [deferred? (= :deferred
                                          (:run/settlement-status result))
                             claim!
@@ -307,7 +344,16 @@
                                (do
                                  (compare-and-set! state :scoring :cancelled)
                                  false)
-                               (compare-and-set! state :scoring :certifying))]
+                               (when (compare-and-set! state :scoring
+                                                       :certifying)
+                                 ;; This write occurs inside the fork's affine
+                                 ;; settlement lock. The world cannot become
+                                 ;; reviewable or disappear before its trusted
+                                 ;; certification is durable.
+                                 (reset! persisted-attempt
+                                         (attempt/persist! room
+                                                           certified-attempt))
+                                 true))]
                         (when (cancelled-externally?)
                           (compare-and-set! state :scoring :cancelled))
                         (if (or deferred? (claim!))
@@ -325,6 +371,7 @@
                             (sync/deliver!
                              done
                              {:ok {:environment definition
+                                   :attempt @persisted-attempt
                                    :attempt-receipt receipt
                                    :evidence evidence
                                    :run/id run-id
@@ -332,23 +379,9 @@
                                    :run/handle handle}}))
                           (cleanup-once! :evaluation-cancelled))))
                     (catch Throwable error
-                      (if (cancelled-externally?)
-                        (compare-and-set! state :scoring :cancelled)
-                        (compare-and-set! state :scoring :failed))
-                      (let [cleanup
-                            (cleanup-once!
-                             (if (= :cancelled @state)
-                               :evaluation-cancelled
-                               :evaluation-certification-failed))]
-                        (sync/deliver!
-                         done
-                         {:error
-                          (ex-info "Evaluation certification failed"
-                                   {:type ::certification-failed
-                                    :run/id run-id
-                                    :run/world (:run/world result)
-                                    :cleanup cleanup}
-                                   error)}))))))]
+                      (if @persisted-attempt
+                        (settlement-failure! error)
+                        (certification-failure! error))))))]
           (try
             (let [{:keys [ok error]} (sp/await done)]
               (if error (throw error) ok))

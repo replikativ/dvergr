@@ -1,12 +1,14 @@
 (ns dvergr.agent.evaluation-test
   (:require [clojure.test :refer [deftest is]]
             [dvergr.agent.environment :as environment]
+            [dvergr.agent.episode :as episode]
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.program :as program]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.run :as run]
             [dvergr.discourse :as d]
             [dvergr.room.registry :as registry]
+            [dvergr.room.store :as store]
             [dvergr.room.store.memory :as memory]
             [dvergr.rooms.forks :as forks]
             [org.replikativ.spindel.core :as sp]
@@ -17,6 +19,33 @@
 
 (defn- test-room [id]
   (d/make-room {:id id :store (memory/make)}))
+
+(defrecord RejectingAttemptStore [delegate]
+  store/PRoomStore
+  (-store-room! [_ room-id metadata]
+    (store/-store-room! delegate room-id metadata))
+  (-load-room [_ id] (store/-load-room delegate id))
+  (-delete-room! [_ room-id] (store/-delete-room! delegate room-id))
+  (-list-rooms [_] (store/-list-rooms delegate))
+  (-store-message! [_ room-id message]
+    (store/-store-message! delegate room-id message))
+  (-message-thread-root [_ room-id message-id]
+    (store/-message-thread-root delegate room-id message-id))
+  (-list-messages [_ room-id opts]
+    (store/-list-messages delegate room-id opts))
+  (-store-run! [_ room-id value]
+    (store/-store-run! delegate room-id value))
+  (-load-run [_ room-id run-id]
+    (store/-load-run delegate room-id run-id))
+  (-list-runs [_ room-id opts]
+    (store/-list-runs delegate room-id opts))
+
+  store/PAttemptStore
+  (-store-attempt! [_ _room-id _value] nil)
+  (-load-attempt [_ room-id attempt-id]
+    (store/-load-attempt delegate room-id attempt-id))
+  (-list-attempts [_ room-id opts]
+    (store/-list-attempts delegate room-id opts)))
 
 (defn- wait-until [pred timeout-ms]
   (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
@@ -97,8 +126,45 @@
                           (map #(get-in % [:attempt-receipt :attempt/metrics
                                            :agent-def-hash])
                                results)))
+              (is (every? #(= (:attempt %)
+                              (store/-load-attempt (:store room) (:id room)
+                                                   (:run/id %)))
+                          results)
+                  "certification is durable before a retained world is exposed")
+              (is (every? #(= (:attempt %)
+                              (:episode/attempt
+                               (episode/export room (:run/id %))))
+                          results))
               (finally
                 (doseq [result results] (discard-retained! result)))))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest evaluation-fails-closed-when-attempt-certification-is-not-durable
+  (let [delegate (memory/make)
+        room (d/make-room {:id :evaluation-attempt-durability
+                           :store (->RejectingAttemptStore delegate)})
+        team (roster/make-agent (roster/make-roster)
+                                {:id :candidate :program {:kind :echo}})
+        env (definition :test/attempt-durability {})]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [error (try
+                      @(evaluation/evaluate room team :candidate env
+                                            exact-evaluator)
+                      nil
+                      (catch Throwable error error))
+              run-id (:run/id (ex-data error))]
+          (is error)
+          (is (= ::evaluation/certification-failed
+                 (:type (ex-data error))))
+          (is (uuid? run-id))
+          (is (nil? (store/-load-attempt delegate (:id room) run-id)))
+          (is (= :discarded
+                 (:run/settlement-status
+                  (store/-load-run delegate (:id room) run-id))))
+          (is (nil? (registry/lookup
+                     (:run/world (store/-load-run delegate (:id room) run-id)))))))
       (finally
         (d/close-room! room)))))
 
@@ -235,7 +301,10 @@
                5000))
           (is (not= :review
                     (:run/settlement-status
-                     (run/run room (:run/id @observed)))))))
+                     (run/run room (:run/id @observed)))))
+          (is (nil? (store/-load-attempt (:store room) (:id room)
+                                         (:run/id @observed)))
+              "cancellation before certification leaves no durable Attempt")))
       (finally
         (d/close-room! room)))))
 
@@ -275,7 +344,10 @@
                          (= :evaluation-cancelled
                             (:run/settlement-reason durable))
                          (nil? (registry/lookup world))))
-                 5000)))))
+                 5000))
+            (is (nil? (store/-load-attempt (:store room) (:id room)
+                                           (:run/id @observed)))
+                "cancellation at the affine claim gate wins before persistence"))))
       (finally
         (d/close-room! room)))))
 
@@ -316,7 +388,9 @@
           (is (nil? (registry/lookup (:run/world (ex-data error)))))
           (is (= :evaluation-certification-failed
                  (:run/settlement-reason
-                  (run/run room (:run/id (ex-data error))))))))
+                  (run/run room (:run/id (ex-data error))))))
+          (is (nil? (store/-load-attempt (:store room) (:id room)
+                                         (:run/id (ex-data error)))))))
       (is (empty? (run/active-runs (:id room))))
       (finally
         (d/close-room! room)))))
@@ -343,11 +417,66 @@
                     error)))
               durable (run/run room (:run/id (ex-data error)))
               fork (registry/lookup @world-id)]
-          (is (= :dvergr.agent.evaluation/certification-failed
+          (is (= :dvergr.agent.evaluation/settlement-recovery-required
                  (:type (ex-data error))))
           (is (= :deferred (:run/settlement-status durable)))
           (is (some? fork))
           (is (forks/deferred? fork))
+          (is (some? (store/-load-attempt (:store room) (:id room)
+                                          (:run/id (ex-data error))))
+              "certification remains truthful if later settlement projection fails")
+          ;; Restore the real durability boundary before consuming the world.
+          (is (:ok? (forks/discard-deferred!
+                     fork :test-cleanup
+                     (constantly true))))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest review-projection-failure-retains-certified-world-for-recovery
+  (let [room (test-room :evaluation-review-durability)
+        team (roster/make-agent (roster/make-roster)
+                                {:id :candidate :program {:kind :echo}})
+        env (definition :test/review-durability {})
+        original-update run/update-durable-settlement!
+        original-observe program/observe
+        calls (atom [])
+        observations (atom 0)
+        world-id (atom nil)]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [error
+              (with-redefs [run/update-durable-settlement!
+                            (fn [parent id status & [reason]]
+                              (swap! calls conj status)
+                              (if (= :review status)
+                                (throw (ex-info "store unavailable"
+                                                {:type ::store-unavailable}))
+                                (original-update parent id status reason)))
+                            program/observe
+                            (fn [parent handle]
+                              (if (= 1 (swap! observations inc))
+                                (original-observe parent handle)
+                                (throw (ex-info "store remains unavailable"
+                                                {:type ::store-unavailable}))))]
+                (try
+                  @(evaluation/evaluate room team :candidate env exact-evaluator)
+                  nil
+                  (catch clojure.lang.ExceptionInfo error
+                    (reset! world-id (:run/world (ex-data error)))
+                    error)))
+              run-id (:run/id (ex-data error))
+              durable (run/run room run-id)
+              fork (registry/lookup @world-id)]
+          (is (= :dvergr.agent.evaluation/settlement-recovery-required
+                 (:type (ex-data error))))
+          (is (= [:review] @calls)
+              "failed settlement is not followed by destructive cleanup")
+          (is (= 1 @observations)
+              "recovery delivery does not depend on another store read")
+          (is (= :deferred (:run/settlement-status durable)))
+          (is (some? fork))
+          (is (forks/deferred? fork))
+          (is (some? (store/-load-attempt (:store room) (:id room) run-id)))
           ;; Restore the real durability boundary before consuming the world.
           (is (:ok? (forks/discard-deferred!
                      fork :test-cleanup

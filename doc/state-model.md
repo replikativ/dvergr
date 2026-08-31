@@ -62,8 +62,11 @@ plus the per-session sandbox.
 `fork-room` calls `spindel.yggdrasil/fork!`, retains its process-local
 `ForkHandle`, and branches every selected registered Yggdrasil system as a unit:
 
-- **Datahike `dvergr-chat-db`** → branched — messages, KB, ledger, proposals, all
-  isolated until merge. *This is the whole chat state, forked through yggdrasil.*
+- **Datahike `dvergr-chat-db`** → branched — messages, Runs, certified Attempt
+  indexes, KB, ledger, proposals, all isolated until merge. Exact Attempt
+  payloads use the immutable global blob CAS; only a branch's typed reference
+  makes one part of that world. *This is the whole semantic chat state, forked
+  through yggdrasil.*
 - **git worktree** → a fresh worktree; the agent's file edits are isolated.
 - **muschel shell session** → its env-atom is CoW-forked alongside, so a worker's
   `cd` / shell state can't leak to the parent.
