@@ -5,6 +5,7 @@
             [is.simm.partial-cps.sequence :as aseq]
             [datahike.api :as dh]
             [dvergr.agent.roster :as roster]
+            [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.sandbox.ns.doc :as doc]
             [dvergr.sandbox.work :as sandbox-work]
             [org.replikativ.spindel.engine.core :as rtc]
@@ -87,11 +88,18 @@
    These are safe: they only coordinate within the SCI context."
   ([sci-ctx spindel-ctx]
    (add-spindel-extras-ns! sci-ctx spindel-ctx {}))
-  ([sci-ctx spindel-ctx {:keys [room-id room-incarnation ceiling]}]
+  ([sci-ctx spindel-ctx {:keys [room-id room-incarnation ceiling world-binding]}]
    (require 'org.replikativ.spindel.spin.combinators)
    (require 'org.replikativ.spindel.signal)
    (let [comb-ns (find-ns 'org.replikativ.spindel.spin.combinators)
-         sig-ns  (find-ns 'org.replikativ.spindel.signal)]
+         sig-ns  (find-ns 'org.replikativ.spindel.signal)
+         create-work (fn [strategy opts work-fn]
+                       (let [binding (when world-binding (world-binding))]
+                         (sandbox-work/create!
+                          (or (:room-runtime-id binding) room-id)
+                          (or (:room-incarnation binding) room-incarnation)
+                          (runtime-ctx/selected-context spindel-ctx)
+                          ceiling strategy opts work-fn)))]
      (binding [rtc/*execution-context* spindel-ctx]
        ;; Sync primitives (same as before but unified here)
        (sci/add-namespace! sci-ctx 'sync
@@ -117,32 +125,31 @@
                            (doc/with-docs
                              {'latest       (fn
                                               ([work-fn]
-                                               (sandbox-work/create! room-id room-incarnation spindel-ctx ceiling :latest {} work-fn))
+                                               (create-work :latest {} work-fn))
                                               ([opts work-fn]
-                                               (sandbox-work/create! room-id room-incarnation spindel-ctx ceiling :latest opts work-fn)))
+                                               (create-work :latest opts work-fn)))
                               'serial       (fn
                                               ([work-fn]
-                                               (sandbox-work/create! room-id room-incarnation spindel-ctx ceiling :serial {} work-fn))
+                                               (create-work :serial {} work-fn))
                                               ([opts work-fn]
-                                               (sandbox-work/create! room-id room-incarnation spindel-ctx ceiling :serial opts work-fn)))
+                                               (create-work :serial opts work-fn)))
                               'busy         (fn
                                               ([work-fn]
-                                               (sandbox-work/create! room-id room-incarnation spindel-ctx ceiling :busy {} work-fn))
+                                               (create-work :busy {} work-fn))
                                               ([opts work-fn]
-                                               (sandbox-work/create! room-id room-incarnation spindel-ctx ceiling :busy opts work-fn)))
+                                               (create-work :busy opts work-fn)))
                               'parallel     (fn
                                               ([work-fn]
-                                               (sandbox-work/create! room-id room-incarnation spindel-ctx ceiling :parallel {} work-fn))
+                                               (create-work :parallel {} work-fn))
                                               ([opts work-fn]
-                                               (sandbox-work/create! room-id room-incarnation spindel-ctx ceiling :parallel opts work-fn)))
+                                               (create-work :parallel opts work-fn)))
                               'controller   (fn
                                               ([work-fn]
-                                               (sandbox-work/create! room-id room-incarnation spindel-ctx ceiling :serial {} work-fn))
+                                               (create-work :serial {} work-fn))
                                               ([opts work-fn]
-                                               (sandbox-work/create! room-id room-incarnation spindel-ctx ceiling
-                                                                     (:strategy opts :serial)
-                                                                     (dissoc opts :strategy)
-                                                                     work-fn)))
+                                               (create-work (:strategy opts :serial)
+                                                            (dissoc opts :strategy)
+                                                            work-fn)))
                               'submit!      sandbox-work/submit!
                               'events       sandbox-work/events!
                               'next-event   aseq/anext

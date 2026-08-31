@@ -304,17 +304,18 @@
         ;; turn in on-message. Priority: :participant-context > :chat-ctx > fresh.
         ;; :with-sci? true so a room-less agent's clojure_eval has a sandbox.
         fallback-chat-ctx
-        (or (when participant-context
-              (pctx/->chat-context participant-context))
-            chat-ctx
-            (let [c (turn/new-working-ctx
-                     {:execution-ctx  ctx
-                      :title          (str "agent " (name id))
-                      :budget-dollars (:dollars budget 1.0)
-                      :db-conn        db-conn})]
-              (when-let [sp (:system-prompt spec)]
-                (cc/add-message! c {:role :system :content sp}))
-              c))
+        (delay
+          (or (when participant-context
+                (pctx/->chat-context participant-context))
+              chat-ctx
+              (let [c (turn/new-working-ctx
+                       {:execution-ctx  ctx
+                        :title          (str "agent " (name id))
+                        :budget-dollars (:dollars budget 1.0)
+                        :db-conn        db-conn})]
+                (when-let [sp (:system-prompt spec)]
+                  (cc/add-message! c {:role :system :content sp}))
+                c)))
         ;; Grace window for the manager to extend the budget after exhaustion.
         compaction-strategy (:strategy compaction :sync-before-turn)
         ;; In race mode, disable run-turn-fn's internal sync compaction — we
@@ -344,7 +345,7 @@
                                 (room-context/ensure-ctx! room id
                                                           {:system-prompt  (:system-prompt spec)
                                                            :budget-dollars (:dollars budget 1.0)})
-                                fallback-chat-ctx)]
+                                @fallback-chat-ctx)]
                  (case (:type msg)
 
                ;; --- directive: extend the dollar budget ---
@@ -392,7 +393,7 @@
                      ;; turn/new-working-ctx (room fold AND room-less fallback alike)
                      ;; with the agent namespaces injected — so clojure_eval has
                      ;; dh/room/intake without a per-turn re-fork.
-                         sci-ctx  (:sci-ctx chat-ctx)
+                         sci-ctx  (cc/sci-context chat-ctx)
                      ;; Normalize once: name→tool-def map (also the execute-side
                      ;; authoritative allowlist below).
                          tool-map (tools/normalize-tools tools)
@@ -952,11 +953,10 @@
 
             :factory
             (fn [new-ctx]
-         ;; Fork-room semantics for an LLM agent: re-create fresh in the
-         ;; new context. The fork's agent has no prior conversation,
-         ;; matching the §6.5 ToM-probe semantics ("what would they say,
-         ;; given only the priming I set up?"). Future enhancement: pass
-         ;; an :init-snapshot to carry conversation forward.
+         ;; `fork-room :ctx` installs the inherited room working context before
+         ;; invoking this factory, so the clone selects forked signals and SCI
+         ;; through the stable component ref. `:none` remains a lightweight
+         ;; message-only clone. The room-less fallback stays lazy in both cases.
               (llm-agent {:id          id
                           :spec        spec
                           :tools       tools

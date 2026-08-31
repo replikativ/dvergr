@@ -16,6 +16,8 @@
   (:require [datahike.api :as d]
             [dvergr.system.rooms :as srooms]
             [dvergr.sandbox.ns.kb :as ns-kb]
+            [dvergr.sandbox.ns.datahike :as ns-datahike]
+            [dvergr.runtime.ctx :as runtime-ctx]
             [clojure.string :as str]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.yggdrasil :as ygg]
@@ -34,8 +36,30 @@
    may be nil (room-less ctx) — the helpers degrade gracefully.
    `agent-program-ceiling` is forwarded to the room-bound SCI setup; bounded
    delegation itself lives only in the `dvergr.agent` namespace."
-  [sci-ctx room-conn kb-conn room-id ctx & [agent-program-ceiling source-room]]
-  (let [;; EVERY readable KB, not just `*kb*`. A room's knowledge is spread over
+  [sci-ctx room-conn kb-conn room-id ctx
+   & [agent-program-ceiling {:keys [binding-resolver source-room]}]]
+  (let [selected-ctx   #(runtime-ctx/selected-context ctx)
+        current-room-id #(or (when binding-resolver
+                               (:room-id (binding-resolver)))
+                             room-id)
+        current-source-room #(if binding-resolver
+                               (let [binding (binding-resolver)]
+                                 {:id (:room-runtime-id binding)
+                                  :incarnation (:room-incarnation binding)})
+                               source-room)
+        room-view      (when (or room-id room-conn)
+                         (ns-datahike/world-connection
+                          #(if-let [room-id (current-room-id)]
+                             (binding [ec/*execution-context* (selected-ctx)]
+                               (srooms/room-msgs-conn room-id))
+                             room-conn)))
+        kb-view        (when (or room-id kb-conn)
+                         (ns-datahike/world-connection
+                          #(if-let [room-id (current-room-id)]
+                             (binding [ec/*execution-context* (selected-ctx)]
+                               (srooms/room-kb-conn room-id))
+                             kb-conn)))
+        ;; EVERY readable KB, not just `*kb*`. A room's knowledge is spread over
         ;; its own KB plus whatever is granted to it, and the two are written
         ;; through different bindings of the same katzen schema — dvergr's
         ;; `:entity/title` and a product's `:S.Page/title`. Reading one store
@@ -46,8 +70,8 @@
         ;; address that KB by name (see `kbs` / `kb`).
         title-attrs    [:entity/title :S.Page/title]
         readable       (fn []
-                         (if room-id
-                           (binding [ec/*execution-context* ctx]
+                         (if-let [room-id (current-room-id)]
+                           (binding [ec/*execution-context* (selected-ctx)]
                              (srooms/room-kb-conns room-id))
                            (when kb-conn [{:conn kb-conn :slug "kb"}])))
         titled         (fn [db]
@@ -83,51 +107,59 @@
                                        (take 25) vec))))
         msg-time       (fn [m] (or (some-> ^java.util.Date (:message/created-at m) .getTime) 0))
         recent-msgs    (fn [n]
-                         (safe #(when room-conn
+                         (safe #(when room-view
                                   (->> (d/q '[:find [(pull ?m [:message/content :message/role :message/created-at]) ...]
-                                              :where [?m :message/content _]] @room-conn)
+                                              :where [?m :message/content _]] @room-view)
                                        (sort-by msg-time >)
                                        (take (or n 20)) vec))))
         search-msgs    (fn [term]
-                         (safe #(when room-conn
+                         (safe #(when room-view
                                   (let [lc (str/lower-case (str term))]
                                     (->> (d/q '[:find [(pull ?m [:message/content :message/role :message/created-at]) ...]
-                                                :where [?m :message/content _]] @room-conn)
+                                                :where [?m :message/content _]] @room-view)
                                          (filter (fn [m] (str/includes? (str/lower-case (str (:message/content m))) lc)))
                                          (take 50) vec)))))
         schedules      (fn []
-                         (safe #(when room-conn
+                         (safe #(when room-view
                                   (d/q '[:find [(pull ?s [*]) ...]
-                                         :where [?s :schedule/id _]] @room-conn))))
+                                         :where [?s :schedule/id _]] @room-view))))
         ;; Discovery: WHERE the agent's databases are + by-name access. Resolved
         ;; fork-aware under `ctx` so a fork lists/returns its branched systems.
-        databases      (fn [] (safe #(when room-id
-                                       (binding [ec/*execution-context* ctx]
+        databases      (fn [] (safe #(when-let [room-id (current-room-id)]
+                                       (binding [ec/*execution-context* (selected-ctx)]
                                          (srooms/room-databases room-id)))))
-        db             (fn [db-name] (safe #(when room-id
-                                              (binding [ec/*execution-context* ctx]
-                                                (srooms/room-conn-by-name room-id db-name)))))
+        db             (fn [db-name]
+                         (safe #(when-let [room-id (current-room-id)]
+                                  (ns-datahike/world-connection
+                                   (fn []
+                                     (binding [ec/*execution-context* (selected-ctx)]
+                                       (srooms/room-conn-by-name room-id db-name)))))))
         ;; Reclaim unreachable storage for THIS room/fork's workspace (datahike
         ;; index blobs + git objects). Default keeps all history (orphan garbage
         ;; only); pass {:remove-before <Date>} to collapse old history.
         gc!            (fn gc!
                          ([] (gc! {}))
-                         ([opts] (safe #(binding [ec/*execution-context* ctx] (ygg/gc! opts)))))
+                         ([opts] (safe #(binding [ec/*execution-context* (selected-ctx)]
+                                          (ygg/gc! opts)))))
         ;; Which KBs this room may WRITE, and which one `*kb*` is. A room's own
         ;; KB is the default, but a room whose knowledge lives in an ATTACHED KB
         ;; would otherwise write into its own empty one with nothing saying so —
         ;; the agent could not even name the alternatives. These make the choice
         ;; visible and addressable.
-        kbs (fn [] (safe #(binding [ec/*execution-context* ctx]
-                            (let [ws (srooms/writable-kbs room-id)]
+        kbs (fn [] (safe #(binding [ec/*execution-context* (selected-ctx)]
+                            (let [ws (srooms/writable-kbs (current-room-id))]
                               (into [] (map-indexed
                                         (fn [i {:keys [slug permission]}]
                                           {:name slug :permission permission
                                            :default? (zero? i)}))
                                     ws)))))
-        kb  (fn [slug] (safe #(binding [ec/*execution-context* ctx]
-                                (srooms/room-kb-conn room-id slug))))
-        room-map (merge (ns-kb/room-ops-map ctx agent-program-ceiling source-room) ; create!/fork!/merge!/post!/messages/…
+        kb  (fn [slug]
+              (safe #(ns-datahike/world-connection
+                      (fn []
+                        (binding [ec/*execution-context* (selected-ctx)]
+                          (srooms/room-kb-conn (current-room-id) slug))))))
+        room-map (merge (ns-kb/room-ops-map ctx agent-program-ceiling
+                                            current-source-room) ; create!/fork!/merge!/post!/messages/…
                         ;; Docs live HERE rather than only in these trailing
                         ;; comments: the comments never reached the sandbox, so
                         ;; `(clojure.repl/doc dvergr.room/kb-search)` answered
@@ -136,8 +168,8 @@
                         ;; (or nil) — values with no signature to state — so
                         ;; they carry no entry and are described in ns-guide.
                         (doc/with-docs
-                          {'*room*          room-conn      ; the room's own datahike (messages store)
-                           '*kb*            kb-conn         ; the DEFAULT writable KB (see kbs)
+                          {'*room*          room-view      ; ambient messages-store handle
+                           '*kb*            kb-view       ; ambient default-KB handle
                            'kbs             kbs             ; [{:name :permission :default?}] — writable KBs
                            'kb              kb              ; fork-aware conn to a writable KB by name
                            'databases       databases       ; [{:name :type :permission}] — your DBs

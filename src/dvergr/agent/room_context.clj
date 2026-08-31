@@ -31,7 +31,8 @@
             [org.replikativ.spindel.engine.core :as ec]
             [taoensso.telemere :as tel]))
 
-;; [room-id agent-id] → {:chat-ctx ChatContext :seen java.util.Set}
+;; [room-id agent-id] → {:chat-ctx ChatContext :seen java.util.Set
+;;                       :execution-ctx ExecutionContext :sandbox-opts map}
 (defonce ^:private room-agent-ctxs (atom {}))
 
 (defn room-system-id
@@ -151,42 +152,49 @@
                 ;; + the guarded `d/connect`/`list-databases` resolve THIS room's
                 ;; fork-aware databases.
                 room-uuid (room-system-id room)
-                cctx (turn/new-working-ctx
-                      {:execution-ctx  (:ctx room)
-                       :chat-id        (stable-chat-id room-id agent-id)
-                       :title          (str (name agent-id) "-" (name room-id))
-                       :budget-dollars budget-dollars
+                sandbox-opts
+                {:execution-ctx  (:ctx room)
+                 :chat-id        (stable-chat-id room-id agent-id)
+                 :title          (str (name agent-id) "-" (name room-id))
+                 :budget-dollars budget-dollars
                         ;; RF5 S4: the cost ledger (account-usage!) writes to THIS
                         ;; room's own msgs store — per-room, fork-aware — not the
                         ;; legacy chat-db. nil ⇒ create-chat-context auto-resolves
                         ;; (room-less fallback only).
-                       :db-conn        (some-> room :store :conn)
+                 :db-conn        (some-> room :store :conn)
                         ;; The agent's sandbox reaches its room's OWN knowledge base
                         ;; (fork-aware) through `dvergr.room/*kb*` — resolved here
                         ;; under the room's bound ctx (so a fork hands the branched
                         ;; KB). nil for room-less ctxs. The sandbox must NEVER touch
                         ;; system-db for knowledge; this is how the room KB gets in.
-                       :kb-conn        (some-> room-uuid srooms/room-kb-conn)
-                       :room-id        room-uuid
+                 :kb-conn        (some-> room-uuid srooms/room-kb-conn)
+                 :room-id        room-uuid
                        ;; Room registry identity is distinct from the system-db
                        ;; UUID above. SCI's agent-programming surface needs the
                        ;; former so a hired agent can recursively hire into this
                        ;; exact live Room, including an ephemeral fork.
-                       :room-runtime-id room-id
-                       :room-incarnation (:incarnation room)
+                 :room-runtime-id room-id
+                 :room-incarnation (:incarnation room)
                         ;; Per-agent network egress scope: an actor's optional
                         ;; `:config {:allowed-domains #{"https://…"}}` restricts the
                         ;; sandbox `http` primitive (nil/empty ⇒ open).
-                       :allowed-domains (some-> (actors/lookup (sdb/get-conn) agent-id)
-                                                :config :allowed-domains)
+                 :allowed-domains (some-> (actors/lookup (sdb/get-conn) agent-id)
+                                          :config :allowed-domains)
                         ;; The room store (bus→store listener) is the single durable
                         ;; writer for this conversation; the agent's own turn messages
                         ;; stay signal-only (no redundant datahike write). Token
                         ;; accounting still persists.
-                       :durable?       false})
+                 :durable?       false}
+                cctx (turn/new-working-ctx sandbox-opts)
+                bound-sandbox-opts (assoc sandbox-opts
+                                          :capability-id (:capability-id cctx))
                 seen (java.util.Collections/synchronizedSet (java.util.HashSet.))]
             ;; Register before seeding so append-inbound! finds the entry.
-            (swap! room-agent-ctxs assoc k {:chat-ctx cctx :seen seen})
+            (swap! room-agent-ctxs assoc k {:chat-ctx cctx
+                                            :seen seen
+                                            :execution-ctx (:ctx room)
+                                            :room-meta (:meta room)
+                                            :sandbox-opts bound-sandbox-opts})
             ;; System prompt once, then seed the conversation from the store.
             ;; Signal-only: the prompt is regenerated each session, not durable.
             (when system-prompt
@@ -296,11 +304,65 @@
                               :seeded (count (chat-ctx/get-messages cctx))}})
             cctx)))))
 
+(defn fork-ctx!
+  "Project an existing parent room/agent working context into `child-room`.
+
+   Yggdrasil has already forked the Spindel world, including the ChatContext's
+   signals and SCI component. The child facade replaces persistence and ambient
+   capabilities without reconstructing the interpreter or replaying history;
+   provider admission remains exclusively controlled by attention."
+  [parent-room child-room agent-id]
+  (let [parent-k [(:id parent-room) agent-id]
+        child-k [(:id child-room) agent-id]]
+    (when-let [{:keys [chat-ctx seen sandbox-opts]} (get @room-agent-ctxs parent-k)]
+      (or (:chat-ctx (get @room-agent-ctxs child-k))
+          (when (try
+                  (chat-ctx/sci-context-in chat-ctx (:ctx child-room))
+                  true
+                  (catch clojure.lang.ExceptionInfo _ false))
+            (let [room-uuid (binding [ec/*execution-context* (:ctx child-room)]
+                              (room-system-id child-room))
+                  child-opts (assoc sandbox-opts
+                                    :execution-ctx (:ctx child-room)
+                                    :db-conn (some-> child-room :store :conn)
+                                    :kb-conn (some-> room-uuid srooms/room-kb-conn)
+                                    :room-id room-uuid
+                                    :room-runtime-id (:id child-room)
+                                    :room-incarnation (:incarnation child-room)
+                                    :fork-projection? true
+                                    :capability-id (:capability-id chat-ctx))
+                  projected (assoc chat-ctx
+                                   :spindel-ctx (:ctx child-room)
+                                   :db-conn (some-> child-room :store :conn))
+                  _ (turn/rebind-working-ctx! projected child-opts)
+                  child-seen (java.util.Collections/synchronizedSet
+                              (locking seen
+                                (java.util.HashSet. ^java.util.Collection seen)))
+                  entry {:chat-ctx projected
+                         :seen child-seen
+                         :execution-ctx (:ctx child-room)
+                         :room-meta (:meta child-room)
+                         :sandbox-opts child-opts}]
+              (swap! room-agent-ctxs
+                     (fn [m]
+                       (if (contains? m child-k) m (assoc m child-k entry))))
+              (:chat-ctx (get @room-agent-ctxs child-k))))))))
+
+(defn- drop-entry! [room-id agent-id]
+  (when-let [{:keys [chat-ctx execution-ctx]}
+             (get @room-agent-ctxs [room-id agent-id])]
+    (when chat-ctx
+      (try (chat-ctx/release-sci-in! chat-ctx
+                                     (or execution-ctx (:spindel-ctx chat-ctx)))
+           (catch Throwable _ nil)))
+    (swap! room-agent-ctxs dissoc [room-id agent-id])))
+
 (defn drop-ctx!
   "Tear down the (room, agent) provider projection."
   [room-id agent-id]
-  (when (get @room-agent-ctxs [room-id agent-id])
-    (swap! room-agent-ctxs dissoc [room-id agent-id]))
+  (if-let [room-meta (:room-meta (get @room-agent-ctxs [room-id agent-id]))]
+    (locking room-meta (drop-entry! room-id agent-id))
+    (drop-entry! room-id agent-id))
   nil)
 
 (defn drop-room!

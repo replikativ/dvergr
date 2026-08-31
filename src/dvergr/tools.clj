@@ -595,7 +595,8 @@
                :properties {:code {:type "string"
                                    :description "Clojure code to evaluate"}}
                :required ["code"]}
-  :execute (fn [{:keys [code]} {:keys [sci-ctx isolation eval-ns chat-ctx cancel?]}]
+  :execute (fn [{:keys [code]} {:keys [sci-ctx isolation eval-ns chat-ctx cancel?
+                                       execution-ctx]}]
               ;; Native mode: use real Clojure eval
              (cond
                (= :native isolation)
@@ -631,7 +632,8 @@
                                                  (catch Throwable _ false))))]
                                      (sandbox/eval-code sci-ctx code
                                                         :timeout-ms @eval-timeout-ms
-                                                        :cancel? proc-aborted?))))
+                                                        :cancel? proc-aborted?
+                                                        :execution-context execution-ctx))))
                   ;; Block on process completion / abort.
                  (let [{:keys [ok aborted]} @result-p]
                    (cond
@@ -674,7 +676,8 @@
                sci-ctx
                (let [result (sandbox/eval-code sci-ctx code
                                                :timeout-ms @eval-timeout-ms
-                                               :cancel? cancel?)]
+                                               :cancel? cancel?
+                                               :execution-context execution-ctx)]
                  (if (:success result)
                    {:type :success
                     :content (str "=> " (pr-str (:value result))
@@ -1487,7 +1490,7 @@ Note: changes take effect on the next agent restart or reload."
   ;; The sandbox already has a ctx-aware clojure.test (run-tests / run-all-tests
   ;; enumerate vars in THIS context), so running there is both correct and
   ;; actually isolated. `:sci-ctx` is the same handle clojure_eval receives.
-  :execute (fn [{:keys [focus pattern]} {:keys [sci-ctx]}]
+  :execute (fn [{:keys [focus pattern]} {:keys [sci-ctx execution-ctx]}]
              (if-not sci-ctx
                {:type :error
                 :error "No sandbox context available to run tests in."}
@@ -1496,7 +1499,8 @@ Note: changes take effect on the next agent restart or reload."
                             pattern (str "(clojure.test/run-all-tests #\""
                                          (str/replace pattern "\"" "\\\"") "\")")
                             :else   "(clojure.test/run-all-tests)")
-                     r    (sandbox/eval-code sci-ctx form)]
+                     r    (sandbox/eval-code sci-ctx form
+                                             :execution-context execution-ctx)]
                  (if-not (:success r)
                    {:type :error
                     :error (str "Test run failed: " (get-in r [:error :message]))}

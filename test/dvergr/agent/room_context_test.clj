@@ -9,9 +9,15 @@
             [dvergr.discourse :as d]
             [dvergr.room.store.memory :as mem]
             [dvergr.room.store :as rstore]
+            [dvergr.room.store.datahike :as store-dh]
             [dvergr.chat.context :as cctx]
+            [dvergr.chat.schema :as schema]
+            [datahike.api :as dh]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.context :as ctx]))
+
+(defn- ledger-count [conn]
+  (or (dh/q '[:find (count ?e) . :where [?e :ledger/id _]] @conn) 0))
 
 (defn- roles+contents [chat-ctx]
   (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
@@ -66,6 +72,43 @@
           (is (= 1 (count (filter #(= "once" %) (non-system-contents cc))))
               "appended exactly once despite two calls with the same id")
           (finally (rc/drop-ctx! :rc-dedup :var)))))))
+
+(deftest forked-working-context-owns-child-persistence
+  (let [parent-ctx (ctx/create-execution-context)
+        child-ctx* (atom nil)
+        parent-conn (schema/create-chat-db!
+                     {:store {:backend :memory :id (random-uuid)}})
+        child-conn (schema/create-chat-db!
+                    {:store {:backend :memory :id (random-uuid)}})
+        parent (d/make-room {:id :rc-db-parent
+                             :ctx parent-ctx
+                             :store (store-dh/make parent-conn)})]
+    (try
+      (let [working (rc/ensure-ctx! parent :var {:budget-dollars 1.0})]
+        (let [child-ctx (ctx/fork-context parent-ctx :mode :frozen)
+              _ (reset! child-ctx* child-ctx)
+              child (d/make-room {:id :rc-db-child
+                                  :ctx child-ctx
+                                  :store (store-dh/make child-conn)})]
+          (dh/transact child-conn
+                       [(schema/create-chat-entity
+                         {:id (:chat-id working) :title (:title working)
+                          :budget 1000000})])
+          (let [projected (rc/fork-ctx! parent child :var)]
+            (is (identical? child-conn (:db-conn projected)))
+            (is (not (identical? parent-conn (:db-conn projected))))
+            (cctx/account-usage! projected :input-tokens 1
+                                 :model "claude-sonnet-4-5")
+            (is (= 0 (ledger-count parent-conn)))
+            (is (= 1 (ledger-count child-conn))))))
+      (finally
+        (rc/drop-ctx! :rc-db-child :var)
+        (rc/drop-ctx! :rc-db-parent :var)
+        (dh/release child-conn)
+        (dh/release parent-conn)
+        (when-let [child-ctx @child-ctx*]
+          (ctx/close-context! child-ctx))
+        (ctx/close-context! parent-ctx)))))
 
 (deftest durable-attention-rebuilds-provider-projection
   (testing "Run triggers and :include decisions enter provider input while
