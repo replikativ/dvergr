@@ -21,6 +21,7 @@
   (:require [clojure.string :as str]
             [dvergr.discourse.commands :as commands]
             [dvergr.agent.room-context :as room-context]
+            [dvergr.chat.context :as chat-context]
             [dvergr.tools :as tools]
             [org.replikativ.spindel.engine.core :as ec]))
 
@@ -72,7 +73,8 @@
                 (let [tool     (get @tools/registry tool-name)
                       tool-ctx (tools/make-context
                                 {:chat-ctx      cc
-                                 :sci-ctx       (:sci-ctx cc)   ; the agent's OWN session
+                                 :sci-ctx       (chat-context/sci-context-in
+                                                 cc (:ctx room)) ; fork-selected session
                                  :db-conn       (:db-conn cc)
                                  :tools         {tool-name tool} ; allowlist = just this tool
                                  :isolation     :sci
