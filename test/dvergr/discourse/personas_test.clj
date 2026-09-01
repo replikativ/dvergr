@@ -14,13 +14,21 @@
             [dvergr.chat.context :as cc]))
 
 (defn- await-spin
-  ([room spin-fn] (await-spin room spin-fn 3000))
+  ;; A first Room turn may need to initialize Datahike and the forkable SCI
+  ;; component before this deliberately trivial mock runs.  Three seconds made
+  ;; this an environment-speed assertion and hid the real failure behind nil
+  ;; map lookups in the callers.
+  ([room spin-fn] (await-spin room spin-fn 10000))
   ([room spin-fn wait-ms]
    (let [p (promise)]
      (binding [ec/*execution-context* (:ctx room)]
        (sp/spawn!
         (sp/spin (deliver p (sp/await (spin-fn room))))))
-     (deref p wait-ms ::timeout))))
+     (let [result (deref p wait-ms ::timeout)]
+       (when (= ::timeout result)
+         (throw (ex-info "Timed out waiting for persona mock turn"
+                         {:wait-ms wait-ms})))
+       result))))
 
 (defn- mock-turn-fn
   "A `run-turn-fn` that writes a single assistant message capturing the

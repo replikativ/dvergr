@@ -1,6 +1,6 @@
 {:paths ["src" "resources"]
 
- :deps {org.clojure/clojure       {:mvn/version "1.12.0"}
+ :deps {org.clojure/clojure       {:mvn/version "1.12.5"}
 
         ;; HTTP client for provider APIs
         hato/hato                  {:mvn/version "1.0.0"}
@@ -25,12 +25,13 @@
         ;; Async utilities
         org.clojure/core.async     {:mvn/version "1.6.681"}
 
-        ;; SCI — Small Clojure Interpreter for sandboxing.
-        org.babashka/sci           {:mvn/version "0.15.56"}
+        ;; SCI — Small Clojure Interpreter for sandboxing. The replikativ build
+        ;; carries forkable interpreter worlds while sci#1084 is upstreamed.
+        org.replikativ/sci         {:mvn/version "0.15.59-replikativ.1"}
 
-        ;; partial-cps (CPS transform for the SCI spin macro) comes TRANSITIVELY
-        ;; via spindel — not declared here, so spindel is the single source of its
-        ;; version. The `:local` alias's `../spindel` override carries it too.
+        ;; Dvergr uses the async sequence/CPS namespaces directly; keep this a
+        ;; direct dependency instead of relying on Spindel's implementation deps.
+        is.simm/partial-cps        {:mvn/version "0.1.60"}
 
         ;; Spindel — Reactive runtime with CoW forking.
         ;; 0.1.35 (#27 lost-wakeup redesign + follow-ups): continuation
@@ -48,15 +49,9 @@
         ;; (mailbox→mult→tap→pub→topic-mult→tap) under load.
         ;; Substrate for the durable-cursor bus pump + supervisor
         ;; restart.
-        ;; 0.1.43 includes structured cancellation and affine partitioned world
-        ;; authority, the substrate used by Run-world adoption and delegation.
-        ;; Structured work admission, cancellation hand-back, overlay
-        ;; materialization, and canonical inference worlds are currently
-        ;; stacked on spindel#44-#47. Pin the reviewed commit until
-        ;; that release reaches Clojars, then return this to an ordinary version
-        ;; coordinate.
-        org.replikativ/spindel     {:git/url "https://github.com/replikativ/spindel.git"
-                                    :git/sha "24f9e7cd679a534c8346d9bbb25958b444fb6471"}
+        ;; 0.1.44 includes structured work admission, cancellation hand-back,
+        ;; canonical inference worlds, and forkable SCI world components.
+        org.replikativ/spindel     {:mvn/version "0.1.44"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context
@@ -66,53 +61,44 @@
         ;; API this branch's agent workspaces are built on (isolated worktrees,
         ;; checkout semantics delegated to Geschichte, Git served from a virtual
         ;; GeschichteFS base) — so no local root is needed to build it.
-        org.replikativ/muschel     {:mvn/version "0.2.19"}
+        org.replikativ/muschel     {:mvn/version "0.2.19"
+                                    :exclusions  [org.babashka/sci]}
 
         ;; Geschichte — authoritative virtual filesystem + Git compatibility.
-        ;; 0.1.12 is the release where the Yggdrasil adapter MOVED OUT (#8), so
-        ;; there is exactly one GeschichteSystem record on the classpath — the
-        ;; one in yggdrasil.adapters.geschichte. No local root needed.
-        org.replikativ/geschichte  {:mvn/version "0.1.12"}
+        ;; Geschichte remains the authoritative virtual filesystem; its
+        ;; Yggdrasil adapter lives only in Yggdrasil.
+        org.replikativ/geschichte  {:mvn/version "0.1.15"}
 
         ;; rewrite-clj for structural editing
         rewrite-clj/rewrite-clj    {:mvn/version "1.1.48"}
 
         ;; Datahike — persistent Datalog storage
-        ;; 0.8.1861 provides writer-internal operation provenance to mandatory
-        ;; transaction predicates. Kontor uses it to keep purge/history
-        ;; validation internal without extending Datahike's public tx report.
-        org.replikativ/datahike    {:mvn/version "0.8.1861"}
+        ;; Keep the direct dependency current: Dvergr uses Datahike's API and
+        ;; transaction predicates itself, not merely through Geschichte.
+        org.replikativ/datahike    {:mvn/version "0.8.1865"}
         ;; 0.1.37 provides conserved resource vectors, durable receipts, and
         ;; mandatory Datahike invariants for Run resource delegation.
         org.replikativ/kontor      {:mvn/version "0.1.37"}
 
         ;; Yggdrasil — CoW branching for git and Datahike
-        ;; 0.3.38 adopts the Geschichte adapter (yggdrasil.adapters.geschichte,
-        ;; PR #16) and gives it the p/Mergeable it never had, so a room repo can
-        ;; finally produce a FILE diff instead of a datom count over
-        ;; Geschichte's internal schema.
-        org.replikativ/yggdrasil   {:mvn/version "0.3.38"}
+        ;; 0.3.41 includes the Geschichte content-level merge adapter and the
+        ;; current persistent-sorted-set substrate.
+        org.replikativ/yggdrasil   {:mvn/version "0.3.41"
+                                    :exclusions  [org.babashka/sci]}
 
         ;; Scriptum — CoW Lucene indices for fulltext search
-        org.replikativ/scriptum    {:mvn/version "0.1.30"}
+        org.replikativ/scriptum    {:mvn/version "0.1.32"}
 
         ;; Briefkasten (local IMAP mirror) is OPTIONAL — it backs dvergr.intake.mail
         ;; only, and pulls the jakarta-mail tree, so it lives in the
         ;; :dev/:test/:cli/:tui aliases (with clojure-mail), not core.
 
-        ;; Kabel — WebSocket peer-to-peer transport. 0.3.98 pins javac --release 11
-        ;; (0.3.97 shipped Java-25 bytecode → UnsupportedClassVersionError on JDK <25).
-        org.replikativ/kabel       {:mvn/version "0.3.98"}
-        ;; Compatibility alignment: Yggdrasil 0.3.38 still loads
-        ;; hasch.benc.HashRef, which was removed in Hasch 0.4.102. Drop this
-        ;; override when Yggdrasil moves to the new reference representation.
-        org.replikativ/hasch       {:mvn/version "0.4.101"}
+        ;; Dvergr derives stable activity and environment identities directly.
+        ;; Match Datahike's current array-hashing implementation.
+        org.replikativ/hasch       {:mvn/version "0.4.104"}
         ;; Dvergr's drive blob store uses Konserve directly. Keep this aligned
         ;; with Datahike rather than relying on Datahike's transitive API.
-        org.replikativ/konserve    {:mvn/version "0.9.385"}
-
-        ;; Distributed-scope — remote function invocation over Kabel
-        is.simm/distributed-scope  {:mvn/version "0.1.2"}
+        org.replikativ/konserve    {:mvn/version "0.9.391"}
 
         ;; tools.analyzer for code indexing
         org.clojure/tools.analyzer.jvm {:mvn/version "1.3.0"}
@@ -189,7 +175,7 @@
   ;; `:local/root "../datahike"` override uses datahike's DEFAULT :paths (which
   ;; exclude src-secondary), so we add it here for the source-override dev path.
   :local {:extra-paths ["../datahike/src-secondary"]
-          :extra-deps {org.babashka/sci           {:local/root "../sci"}
+          :extra-deps {org.replikativ/sci         {:local/root "../sci"}
                        org.replikativ/datahike    {:local/root "../datahike"}
                        org.replikativ/scriptum    {:local/root "../scriptum"}
                        org.replikativ/yggdrasil   {:local/root "../yggdrasil"}

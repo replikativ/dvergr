@@ -18,6 +18,7 @@
             [dvergr.mcp.json-rpc :as json-rpc]
             [dvergr.ops :as ops]
             [dvergr.discourse :as d]
+            [dvergr.chat.context :as chat-context]
             [org.replikativ.spindel.engine.core :as ec]
             [jsonista.core :as json])
   (:import (java.net ServerSocket Socket)
@@ -92,9 +93,11 @@
     (if room
       (binding [ec/*execution-context* (:ctx room)]
         (let [cctx (ensure-ctx! room :mcp {})]
-          (execute tname input (make-context {:sci-ctx  (:sci-ctx cctx)
+          (execute tname input (make-context {:sci-ctx  (chat-context/sci-context-in
+                                                         cctx (:ctx room))
                                               :db-conn  (:db-conn cctx)
-                                              :chat-ctx cctx}))))
+                                              :chat-ctx cctx
+                                              :execution-ctx (:ctx room)}))))
       (execute tname input (make-context {})))))
 
 (defn- coding-tool [tname tdef]

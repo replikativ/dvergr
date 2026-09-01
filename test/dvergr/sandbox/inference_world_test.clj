@@ -60,7 +60,11 @@
                   "   :worlds (infer/worlds posterior) "
                   "   :raw-particles (:particles posterior) "
                   "   :raw-executor (:executor posterior)})")
-                 :timeout-ms 15000)
+                 ;; Canonical particle worlds fork and settle four complete
+                 ;; execution contexts. Keep the watchdog well above normal
+                 ;; latency so a memory-constrained full-suite worker does not
+                 ;; cancel healthy inference midway through settlement.
+                 :timeout-ms 60000)
                 {:keys [values weights ess worlds raw-particles raw-executor]}
                 (:value result)]
             (is (:success result) (pr-str (:error result)))
@@ -88,7 +92,7 @@
                   "   :worlds (infer/worlds posterior) "
                   "   :mean (:mean (infer/query posterior identity)) "
                   "   :predictions (infer/predict posterior inc 3)})")
-                 :timeout-ms 10000)]
+                 :timeout-ms 30000)]
             (testing "a proven-pure model may explicitly choose the cheap path"
               (is (:success pure) (pr-str (:error pure)))
               (is (= {:values [7 7]
