@@ -13,6 +13,7 @@
             [dvergr.chat.context :as cctx]
             [dvergr.chat.schema :as schema]
             [datahike.api :as dh]
+            [org.replikativ.spindel.engine.component :as component]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.context :as ctx]))
 
@@ -41,6 +42,43 @@
             (is (some #(str/includes? % "earlier message") (non-system-contents cc1))
                 "seeded the conversation from the room store")
             (finally (rc/drop-ctx! :rc-seed :var))))))))
+
+(deftest concurrent-first-context-creation-is-singleton
+  (testing "one Room fence covers component allocation and cache publication"
+    (let [c (ctx/create-execution-context)
+          room (d/make-room {:id :rc-concurrent-first :ctx c :store (mem/make)})
+          original turn/new-working-ctx
+          constructor-entered (promise)
+          second-started (promise)
+          release-constructor (promise)
+          calls (atom 0)]
+      (try
+        (with-redefs [turn/new-working-ctx
+                      (fn [opts]
+                        (swap! calls inc)
+                        (deliver constructor-entered true)
+                        @release-constructor
+                        (original opts))]
+          (let [first-result (future (rc/ensure-ctx! room :var
+                                                     {:budget-dollars 1.0}))]
+            (is (true? (deref constructor-entered 3000 ::timeout)))
+            (let [second-result
+                  (future
+                    (deliver second-started true)
+                    (rc/ensure-ctx! room :var {:budget-dollars 1.0}))]
+              (is (true? (deref second-started 3000 ::timeout)))
+              (deliver release-constructor true)
+              (let [first-ctx (deref first-result 10000 ::timeout)
+                    second-ctx (deref second-result 10000 ::timeout)]
+                (is (not= ::timeout first-ctx))
+                (is (identical? first-ctx second-ctx))
+                (is (= 1 @calls))
+                (is (= 1 (count (binding [ec/*execution-context* c]
+                                  (component/registered)))))))))
+        (finally
+          (deliver release-constructor true)
+          (rc/drop-ctx! :rc-concurrent-first :var)
+          (ctx/close-context! c))))))
 
 (deftest room-observation-does-not-bypass-attention
   (let [c (ctx/create-execution-context)]

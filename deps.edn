@@ -26,7 +26,11 @@
         org.clojure/core.async     {:mvn/version "1.6.681"}
 
         ;; SCI — Small Clojure Interpreter for sandboxing.
-        org.babashka/sci           {:mvn/version "0.15.56"}
+        ;; Forkable interpreter worlds are under upstream review in sci#1084.
+        ;; Pin the reviewed 0.15.59 release commit until it is on Clojars, then
+        ;; return this to an ordinary Maven coordinate.
+        org.babashka/sci           {:git/url "https://github.com/whilo/sci.git"
+                                    :git/sha "653fe958bb2a792080ab5119237f6dd707efafea"}
 
         ;; partial-cps (CPS transform for the SCI spin macro) comes TRANSITIVELY
         ;; via spindel — not declared here, so spindel is the single source of its
@@ -56,7 +60,7 @@
         ;; that release reaches Clojars, then return this to an ordinary version
         ;; coordinate.
         org.replikativ/spindel     {:git/url "https://github.com/replikativ/spindel.git"
-                                    :git/sha "24f9e7cd679a534c8346d9bbb25958b444fb6471"}
+                                    :git/sha "5aa4917914674eea8852b17619510e8532b9db20"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context

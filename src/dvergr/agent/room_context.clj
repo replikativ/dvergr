@@ -145,164 +145,171 @@
   (let [room-id (:id room)
         k       [room-id agent-id]]
     (or (:chat-ctx (get @room-agent-ctxs k))
-        (binding [ec/*execution-context* (:ctx room)]
-          (let [;; The room's system-db UUID — the key the system resolvers
+        ;; Room forking holds the same monitor from the Yggdrasil snapshot
+        ;; through working-context projection. First allocation must share the
+        ;; fence: otherwise a component can appear after the child snapshot but
+        ;; before cache projection, or concurrent callers can orphan all but
+        ;; the last registered interpreter.
+        (locking (:meta room)
+          (or (:chat-ctx (get @room-agent-ctxs k))
+              (binding [ec/*execution-context* (:ctx room)]
+                (let [;; The room's system-db UUID — the key the system resolvers
                 ;; (room-kb-conn / room-kbs / room-msgs) want; distinct from the
                 ;; in-memory keyword `room-id`. Threads to the sandbox so `dvergr.room`
                 ;; + the guarded `d/connect`/`list-databases` resolve THIS room's
                 ;; fork-aware databases.
-                room-uuid (room-system-id room)
-                sandbox-opts
-                {:execution-ctx  (:ctx room)
-                 :chat-id        (stable-chat-id room-id agent-id)
-                 :title          (str (name agent-id) "-" (name room-id))
-                 :budget-dollars budget-dollars
+                      room-uuid (room-system-id room)
+                      sandbox-opts
+                      {:execution-ctx  (:ctx room)
+                       :chat-id        (stable-chat-id room-id agent-id)
+                       :title          (str (name agent-id) "-" (name room-id))
+                       :budget-dollars budget-dollars
                         ;; RF5 S4: the cost ledger (account-usage!) writes to THIS
                         ;; room's own msgs store — per-room, fork-aware — not the
                         ;; legacy chat-db. nil ⇒ create-chat-context auto-resolves
                         ;; (room-less fallback only).
-                 :db-conn        (some-> room :store :conn)
+                       :db-conn        (some-> room :store :conn)
                         ;; The agent's sandbox reaches its room's OWN knowledge base
                         ;; (fork-aware) through `dvergr.room/*kb*` — resolved here
                         ;; under the room's bound ctx (so a fork hands the branched
                         ;; KB). nil for room-less ctxs. The sandbox must NEVER touch
                         ;; system-db for knowledge; this is how the room KB gets in.
-                 :kb-conn        (some-> room-uuid srooms/room-kb-conn)
-                 :room-id        room-uuid
+                       :kb-conn        (some-> room-uuid srooms/room-kb-conn)
+                       :room-id        room-uuid
                        ;; Room registry identity is distinct from the system-db
                        ;; UUID above. SCI's agent-programming surface needs the
                        ;; former so a hired agent can recursively hire into this
                        ;; exact live Room, including an ephemeral fork.
-                 :room-runtime-id room-id
-                 :room-incarnation (:incarnation room)
+                       :room-runtime-id room-id
+                       :room-incarnation (:incarnation room)
                         ;; Per-agent network egress scope: an actor's optional
                         ;; `:config {:allowed-domains #{"https://…"}}` restricts the
                         ;; sandbox `http` primitive (nil/empty ⇒ open).
-                 :allowed-domains (some-> (actors/lookup (sdb/get-conn) agent-id)
-                                          :config :allowed-domains)
+                       :allowed-domains (some-> (actors/lookup (sdb/get-conn) agent-id)
+                                                :config :allowed-domains)
                         ;; The room store (bus→store listener) is the single durable
                         ;; writer for this conversation; the agent's own turn messages
                         ;; stay signal-only (no redundant datahike write). Token
                         ;; accounting still persists.
-                 :durable?       false}
-                cctx (turn/new-working-ctx sandbox-opts)
-                bound-sandbox-opts (assoc sandbox-opts
-                                          :capability-id (:capability-id cctx))
-                seen (java.util.Collections/synchronizedSet (java.util.HashSet.))]
+                       :durable?       false}
+                      cctx (turn/new-working-ctx sandbox-opts)
+                      bound-sandbox-opts (assoc sandbox-opts
+                                                :capability-id (:capability-id cctx))
+                      seen (java.util.Collections/synchronizedSet (java.util.HashSet.))]
             ;; Register before seeding so append-inbound! finds the entry.
-            (swap! room-agent-ctxs assoc k {:chat-ctx cctx
-                                            :seen seen
-                                            :execution-ctx (:ctx room)
-                                            :room-meta (:meta room)
-                                            :sandbox-opts bound-sandbox-opts})
+                  (swap! room-agent-ctxs assoc k {:chat-ctx cctx
+                                                  :seen seen
+                                                  :execution-ctx (:ctx room)
+                                                  :room-meta (:meta room)
+                                                  :sandbox-opts bound-sandbox-opts})
             ;; System prompt once, then seed the conversation from the store.
             ;; Signal-only: the prompt is regenerated each session, not durable.
-            (when system-prompt
-              (append-signal-only! cctx {:role :system :content system-prompt}))
+                  (when system-prompt
+                    (append-signal-only! cctx {:role :system :content system-prompt}))
             ;; Seed the conversation from ONE query: `d/messages` reads the room's
             ;; (for a fork, branched) store under the conversation :chat/id, so a
             ;; fork already returns inherited (pre-fork) + its own messages — the
             ;; agent sees exactly what the UI seeds. (doc/unified-fork-conversation.md)
-            (let [messages (d/messages room {:limit (or limit 100)})
-                  attention-store? (satisfies? rstore/PAttentionStore (:store room))
-                  conversation-id (d/conversation-id room)
-                  baseline-message-id
-                  (rstore/attention-id conversation-id agent-id nil nil
-                                       :legacy-baseline-message)
-                  baseline-marker-id
-                  (rstore/attention-id conversation-id agent-id baseline-message-id
-                                       nil :legacy-baseline-complete)
-                  baseline-complete?
-                  (and attention-store?
-                       (seq (rstore/-list-attention (:store room)
-                                                    conversation-id
-                                                    {:id baseline-marker-id})))
+                  (let [messages (d/messages room {:limit (or limit 100)})
+                        attention-store? (satisfies? rstore/PAttentionStore (:store room))
+                        conversation-id (d/conversation-id room)
+                        baseline-message-id
+                        (rstore/attention-id conversation-id agent-id nil nil
+                                             :legacy-baseline-message)
+                        baseline-marker-id
+                        (rstore/attention-id conversation-id agent-id baseline-message-id
+                                             nil :legacy-baseline-complete)
+                        baseline-complete?
+                        (and attention-store?
+                             (seq (rstore/-list-attention (:store room)
+                                                          conversation-id
+                                                          {:id baseline-marker-id})))
                   ;; Upgrade cutover: pre-attention rooms already have Runs but
                   ;; no participant projection. Materialize their exact current
                   ;; provider baseline before any new policy decision can make
                   ;; the projection non-empty. This is append-only and
                   ;; idempotent by deterministic identity.
-                  _ (when (and attention-store? (not baseline-complete?))
-                      (doseq [m messages :when (conversational? m)]
-                        (let [decision-id
-                              (rstore/attention-id conversation-id agent-id (:id m) nil
-                                                   :legacy-baseline-decision)
-                              common {:attention/participant agent-id
-                                      :attention/message-id (:id m)
-                                      :attention/memory :include
-                                      :attention/activation :none
-                                      :attention/control :continue
-                                      :attention/at :now
-                                      :attention/priority 0.0
-                                      :attention/reason :migration/provider-baseline
-                                      :attention/created-at
-                                      (java.util.Date. (long (or (:ts m)
-                                                                 (System/currentTimeMillis))))}]
-                          (rstore/-store-attention!
-                           (:store room) conversation-id
-                           (assoc common
-                                  :attention/id decision-id
-                                  :attention/status :ready))
-                          (rstore/-store-attention!
-                           (:store room) conversation-id
-                           (assoc common
-                                  :attention/id
-                                  (rstore/attention-id conversation-id agent-id (:id m) nil
-                                                       :legacy-baseline-applied)
-                                  :attention/decision-id decision-id
-                                  :attention/status :applied))))
+                        _ (when (and attention-store? (not baseline-complete?))
+                            (doseq [m messages :when (conversational? m)]
+                              (let [decision-id
+                                    (rstore/attention-id conversation-id agent-id (:id m) nil
+                                                         :legacy-baseline-decision)
+                                    common {:attention/participant agent-id
+                                            :attention/message-id (:id m)
+                                            :attention/memory :include
+                                            :attention/activation :none
+                                            :attention/control :continue
+                                            :attention/at :now
+                                            :attention/priority 0.0
+                                            :attention/reason :migration/provider-baseline
+                                            :attention/created-at
+                                            (java.util.Date. (long (or (:ts m)
+                                                                       (System/currentTimeMillis))))}]
+                                (rstore/-store-attention!
+                                 (:store room) conversation-id
+                                 (assoc common
+                                        :attention/id decision-id
+                                        :attention/status :ready))
+                                (rstore/-store-attention!
+                                 (:store room) conversation-id
+                                 (assoc common
+                                        :attention/id
+                                        (rstore/attention-id conversation-id agent-id (:id m) nil
+                                                             :legacy-baseline-applied)
+                                        :attention/decision-id decision-id
+                                        :attention/status :applied))))
                       ;; Written last. If any prior write fails, the next
                       ;; hydration retries every deterministic pair and then
                       ;; completes the cutover.
-                      (rstore/-store-attention!
-                       (:store room) conversation-id
-                       {:attention/id baseline-marker-id
-                        :attention/participant agent-id
-                        :attention/message-id baseline-message-id
-                        :attention/status :baseline-complete
-                        :attention/reason :migration/provider-baseline
-                        :attention/created-at (java.util.Date.)}))
-                  attention-facts
-                  (if attention-store?
-                    (rstore/-list-attention (:store room)
-                                            conversation-id
-                                            {:participant agent-id :limit 1000})
-                    [])
-                  included-message-ids
+                            (rstore/-store-attention!
+                             (:store room) conversation-id
+                             {:attention/id baseline-marker-id
+                              :attention/participant agent-id
+                              :attention/message-id baseline-message-id
+                              :attention/status :baseline-complete
+                              :attention/reason :migration/provider-baseline
+                              :attention/created-at (java.util.Date.)}))
+                        attention-facts
+                        (if attention-store?
+                          (rstore/-list-attention (:store room)
+                                                  conversation-id
+                                                  {:participant agent-id :limit 1000})
+                          [])
+                        included-message-ids
                   ;; Admission is monotone: once a fact entered provider
                   ;; context (most notably when queued work becomes a Run
                   ;; trigger), a later observation cannot silently erase it.
                   ;; Deliberate forgetting belongs to compaction/context policy,
                   ;; not to attention races.
-                  (into #{}
-                        (keep #(when (and (= :applied (:attention/status %))
-                                          (= :include (:attention/memory %)))
-                                 (:attention/message-id %)))
-                        attention-facts)
-                  agent-runs (run/runs room {:actor agent-id :limit 1000})
-                  trigger-ids (into #{} (map :run/trigger) agent-runs)
+                        (into #{}
+                              (keep #(when (and (= :applied (:attention/status %))
+                                                (= :include (:attention/memory %)))
+                                       (:attention/message-id %)))
+                              attention-facts)
+                        agent-runs (run/runs room {:actor agent-id :limit 1000})
+                        trigger-ids (into #{} (map :run/trigger) agent-runs)
                   ;; Ephemeral/custom stores without the projection retain the
                   ;; historical full-transcript behavior for compatibility.
-                  legacy-history? (not attention-store?)]
-              (doseq [m messages]
-                (when (and (conversational? m)
-                           (or (= agent-id (:from m))
-                               (contains? included-message-ids (:id m))
-                               (contains? trigger-ids (:id m))
-                               legacy-history?))
-                  (append-inbound! room-id agent-id (:id m)
-                                   (or (:role m) (if (= agent-id (:from m)) :assistant :user))
-                                   (:content m)
+                        legacy-history? (not attention-store?)]
+                    (doseq [m messages]
+                      (when (and (conversational? m)
+                                 (or (= agent-id (:from m))
+                                     (contains? included-message-ids (:id m))
+                                     (contains? trigger-ids (:id m))
+                                     legacy-history?))
+                        (append-inbound! room-id agent-id (:id m)
+                                         (or (:role m) (if (= agent-id (:from m)) :assistant :user))
+                                         (:content m)
                                  ;; author nil for the agent's OWN past messages
-                                   (when (not= agent-id (:from m)) (display-name room (:from m)))
-                                   (:ts m)
+                                         (when (not= agent-id (:from m)) (display-name room (:from m)))
+                                         (:ts m)
                                  ;; feed back only the agent's OWN prior reasoning,
                                  ;; not another participant's <think>
-                                   (when (= agent-id (:from m)) (:reasoning m))))))
-            (tel/log! {:level :debug :id ::created
-                       :data {:room room-id :agent agent-id
-                              :seeded (count (chat-ctx/get-messages cctx))}})
-            cctx)))))
+                                         (when (= agent-id (:from m)) (:reasoning m))))))
+                  (tel/log! {:level :debug :id ::created
+                             :data {:room room-id :agent agent-id
+                                    :seeded (count (chat-ctx/get-messages cctx))}})
+                  cctx)))))))
 
 (defn fork-ctx!
   "Project an existing parent room/agent working context into `child-room`.
