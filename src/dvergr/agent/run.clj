@@ -212,6 +212,43 @@
        (notify! {:type :run/started :run run}))
      run)))
 
+(defn record-cause!
+  "Durably add `cause-run-id` to the causal inputs observed by a live Run.
+
+   Structural ownership remains in `:run/parent`; this cardinality-many edge
+   records that `run-id` actually crossed the completion boundary of another
+   Run. Both Runs must have a store, and the cause must already be durable and
+   terminal in that same Room store. Parallel
+   observations serialize through the lifecycle lock, so additions cannot
+   overwrite one another."
+  [run-id cause-run-id]
+  (when-not (and (uuid? run-id) (uuid? cause-run-id) (not= run-id cause-run-id))
+    (throw (ex-info "Run causality requires two distinct Run UUIDs"
+                    {:type ::invalid-cause
+                     :run/id run-id
+                     :cause-run/id cause-run-id})))
+  (locking lifecycle-lock
+    (let [entry (or (get @active run-id)
+                    (throw (ex-info "Causal consumer Run is not live"
+                                    {:type ::run-not-active :run/id run-id})))
+          room-store (:store entry)
+          store-room-id (:store-room-id entry)]
+      (when-not room-store
+        (throw (ex-info "Durable Run causality requires a Room store"
+                        {:type ::causal-store-required :run/id run-id})))
+      (let [now (java.util.Date.)
+            updated (-> (:run entry)
+                        (update :run/caused-by (fnil conj #{}) cause-run-id)
+                        (assoc :run/updated-at now))]
+        (when room-store
+          (when-not (store/-store-run! room-store store-room-id updated)
+            (throw (ex-info "Run causality update was not durable"
+                            {:type ::cause-not-durable
+                             :run/id run-id
+                             :cause-run/id cause-run-id}))))
+        (swap! active assoc-in [run-id :run] updated)
+        updated))))
+
 (defn finish!
   "End the live execution and persist its final/waiting projection. Idempotent
    after the live entry has gone. `:waiting` has no ended-at; terminal states do."

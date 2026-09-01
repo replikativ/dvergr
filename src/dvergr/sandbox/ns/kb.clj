@@ -5,6 +5,7 @@
    datahike + spindel directly."
   (:require [sci.core :as sci]
             [datahike.api :as dh]
+            [dvergr.runtime.ctx :as runtime-ctx]
             [org.replikativ.spindel.engine.core :as rtc]
             [dvergr.sandbox.ns.doc :as doc]))
 
@@ -54,7 +55,8 @@
   (require 'dvergr.room.registry)
   (require 'dvergr.room.store)
   (require 'dvergr.rooms.forks)
-  (let [fork-diff*      @(ns-resolve 'dvergr.rooms.forks 'fork-diff)
+  (let [selected-ctx    #(runtime-ctx/selected-context spindel-ctx)
+        fork-diff*      @(ns-resolve 'dvergr.rooms.forks 'fork-diff)
         fork-review*    @(ns-resolve 'dvergr.rooms.forks 'review)
         fork-classify*  @(ns-resolve 'dvergr.rooms.forks 'classify)
         post*           @(ns-resolve 'dvergr.discourse 'post!)
@@ -77,9 +79,13 @@
         rreg-children*  @(ns-resolve 'dvergr.room.registry 'children)
         registry*       (find-ns 'dvergr.room.registry)
         rstore-ns*      (find-ns 'dvergr.room.store)
+        current-source-room (fn []
+                              (if (fn? source-room)
+                                (source-room)
+                                source-room))
         ;; Helpers
         resolve-room    (fn [ref]
-                          (binding [rtc/*execution-context* spindel-ctx]
+                          (binding [rtc/*execution-context* (selected-ctx)]
                             (cond
                               (and (map? ref) (:id ref))
                               (rreg-lookup* (:id ref))            ; canonical Room only
@@ -90,20 +96,21 @@
         create-fn   (fn [{:keys [title slug type telegram-chat-id agents
                                  agent-ids parent-id]
                           :as _opts}]
-                      (binding [rtc/*execution-context* spindel-ctx]
-                        (let [aset (set (or agents agent-ids))]
-                          (create-room!*
-                           (cond-> {:title title
-                                    :slug  slug
-                                    :type  (or type :internal)
-                                    :ctx   spindel-ctx}
-                             telegram-chat-id (assoc :telegram-chat-id telegram-chat-id)
-                             (seq aset)       (assoc :agent-ids aset)
-                             parent-id        (assoc :parent-id parent-id)))
-                          {:slug slug :title (or title slug) :agents aset
-                           :room (rreg-lookup* (slug->id* slug))})))
+                      (let [world (selected-ctx)]
+                        (binding [rtc/*execution-context* world]
+                          (let [aset (set (or agents agent-ids))]
+                            (create-room!*
+                             (cond-> {:title title
+                                      :slug  slug
+                                      :type  (or type :internal)
+                                      :ctx   world}
+                               telegram-chat-id (assoc :telegram-chat-id telegram-chat-id)
+                               (seq aset)       (assoc :agent-ids aset)
+                               parent-id        (assoc :parent-id parent-id)))
+                            {:slug slug :title (or title slug) :agents aset
+                             :room (rreg-lookup* (slug->id* slug))}))))
         list-fn     (fn [& {:keys [where]}]
-                      (binding [rtc/*execution-context* spindel-ctx]
+                      (binding [rtc/*execution-context* (selected-ctx)]
                         (if where (rreg-list* :where where) (rreg-list*))))
         get-fn      resolve-room
         post-fn     (fn [ref {:keys [content from source-user source-username source-user-id]}]
@@ -121,7 +128,7 @@
                         (messages* room (cond-> {} limit (assoc :limit limit)
                                                 since (assoc :since since)))))
         children-fn (fn [ref]
-                      (binding [rtc/*execution-context* spindel-ctx]
+                      (binding [rtc/*execution-context* (selected-ctx)]
                         (when-let [room (resolve-room ref)]
                           (rreg-children* (:id room)))))
         set-parent-fn (fn [child-ref parent-ref]
@@ -140,18 +147,19 @@
                         (leave-agent!* room agent-id)
                         {:left agent-id :room (:id room)}))
         delete-fn   (fn [ref]
-                      (binding [rtc/*execution-context* spindel-ctx]
+                      (binding [rtc/*execution-context* (selected-ctx)]
                         (if-let [room (resolve-room ref)]
                           (do
                             ;; An SCI evaluation cannot synchronously join its
                             ;; own controller/context teardown. Self-deletion is
                             ;; a supervisor effect; subordinate Rooms are safe.
-                            (when (and (= (:id source-room) (:id room))
-                                       (= (:incarnation source-room)
-                                          (:incarnation room)))
-                              (throw (ex-info "A Room cannot delete itself from its own SCI runtime"
-                                              {:type ::self-delete
-                                               :room-id (:id room)})))
+                            (let [source-room (current-source-room)]
+                              (when (and (= (:id source-room) (:id room))
+                                         (= (:incarnation source-room)
+                                            (:incarnation room)))
+                                (throw (ex-info "A Room cannot delete itself from its own SCI runtime"
+                                                {:type ::self-delete
+                                                 :room-id (:id room)}))))
                             (let [result (delete-room!* room)]
                               (if (:ok? result)
                                 {:deleted (:id room)}
@@ -163,7 +171,7 @@
         fork-fn     (fn fork-fn
                       ([ref] (fork-fn ref {}))
                       ([ref opts]
-                       (binding [rtc/*execution-context* spindel-ctx]
+                       (binding [rtc/*execution-context* (selected-ctx)]
                          (when-let [room (resolve-room ref)]
                            (binding [rtc/*execution-context* (:ctx room)]
                              (fork-room* room opts))))))
@@ -175,18 +183,18 @@
                         (discard* fork)))
         ;; Merge review — the per-system diff + tier the agent reads to decide.
         diff-fn     (fn [fork-ref]
-                      (binding [rtc/*execution-context* spindel-ctx]
+                      (binding [rtc/*execution-context* (selected-ctx)]
                         (some-> (resolve-room fork-ref) fork-diff*)))
         review-fn   (fn [fork-ref]
-                      (binding [rtc/*execution-context* spindel-ctx]
+                      (binding [rtc/*execution-context* (selected-ctx)]
                         (some-> (resolve-room fork-ref) fork-review*)))
         forks-fn    (fn []
-                      (binding [rtc/*execution-context* spindel-ctx]
+                      (binding [rtc/*execution-context* (selected-ctx)]
                         (rreg-list* :where #(some? (:forked-from @(:meta %))))))
         participants-fn (fn [room]
                           (when room (vec (keys @(:participants room)))))
         root-fn     (fn []
-                      (binding [rtc/*execution-context* spindel-ctx]
+                      (binding [rtc/*execution-context* (selected-ctx)]
                         (or (rreg-lookup* :daemon)
                             (rtc/get-state [:dvergr/discourse-root]))))]
     (doc/with-docs

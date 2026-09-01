@@ -344,6 +344,36 @@
       (throw (ex-info "Virtual filesystem sink does not accept binary content"
                       {:path path})))))
 
+(defn- world-filesystem
+  "A stable Muschel handle whose every operation resolves the ambient world.
+
+   SCI code may retain this value across an interpreter fork.  Delegating at
+   the protocol boundary prevents such saved functions from retaining the
+   parent's Geschichte workspace."
+  [resolver]
+  (letfn [(fs! [] (or (resolver)
+                      (throw (ex-info "Current world has no filesystem" {}))))]
+    (reify mfs/FS
+      (-resolve [_ path] (mfs/-resolve (fs!) path))
+      (-cwd [_] (mfs/-cwd (fs!)))
+      (-cd! [_ path] (mfs/-cd! (fs!) path))
+      (-exists? [_ path] (mfs/-exists? (fs!) path))
+      (-stat [_ path] (mfs/-stat (fs!) path))
+      (-list-dir [_ path] (mfs/-list-dir (fs!) path))
+      (-read-file [_ path] (mfs/-read-file (fs!) path))
+      (-read-bytes [_ path] (mfs/-read-bytes (fs!) path))
+      (-open-source [_ path] (mfs/-open-source (fs!) path))
+      (-open-sink [_ path append?] (mfs/-open-sink (fs!) path append?))
+      (-mkdir [_ path] (mfs/-mkdir (fs!) path))
+      (-delete [_ path] (mfs/-delete (fs!) path))
+      (-rename [_ from to] (mfs/-rename (fs!) from to))
+      (-touch [_ path] (mfs/-touch (fs!) path))
+      (-chmod [_ path mode] (mfs/-chmod (fs!) path mode))
+      (-symlink [_ target link-path] (mfs/-symlink (fs!) target link-path))
+      (-chown [_ path owner group] (mfs/-chown (fs!) path owner group))
+      (-sandbox-relativize [_ path] (mfs/-sandbox-relativize (fs!) path))
+      (-physical-path [_ path] (mfs/-physical-path (fs!) path)))))
+
 (defn- glob-regex [pattern]
   (-> pattern
       (str/replace "." "\\.")
@@ -449,9 +479,13 @@
 (defn add-fs-ns!
   "Expose a filesystem namespace backed by Muschel when `:filesystem` is
   supplied; otherwise retain the transitional physical adapter."
-  [sci-ctx & {:keys [filesystem] :as options}]
-  (if filesystem
-    (add-virtual-fs-ns! sci-ctx filesystem (:audit-log options))
+  [sci-ctx & {:keys [filesystem filesystem-resolver] :as options}]
+  (if (or filesystem filesystem-resolver)
+    (add-virtual-fs-ns! sci-ctx
+                        (if filesystem-resolver
+                          (world-filesystem filesystem-resolver)
+                          filesystem)
+                        (:audit-log options))
     (apply add-physical-fs-ns! sci-ctx (mapcat identity options))))
 
 (defn add-git-ns!
@@ -481,11 +515,14 @@
 
      (git/commit \"Add feature\")
      ;; => \"[main abc1234] Add feature\""
-  [sci-ctx & {:keys [base-path audit-log workspace]
+  [sci-ctx & {:keys [base-path audit-log workspace workspace-resolver]
               :or   {base-path ((requiring-resolve 'dvergr.substrate.git/safe-workspace-root))}}]
-  (let [run!      (if workspace
+  (let [run!      (if (or workspace workspace-resolver)
                     (fn [& args]
-                      (let [result ((requiring-resolve
+                      (let [workspace (if workspace-resolver
+                                        (workspace-resolver)
+                                        workspace)
+                            result ((requiring-resolve
                                      'dvergr.substrate.geschichte/execute-git)
                                     workspace (vec args))]
                         (if (zero? (:exit result))
@@ -549,8 +586,9 @@
      (env/get \"API_KEY\" \"default\")   ;; with fallback
      (env/keys)                        ;; list granted keys (no values)
      (env/set \"KEY\" \"value\")         ;; store in user config (session-local)"
-  [sci-ctx & {:keys [user-config secrets]}]
+  [sci-ctx & {:keys [user-config config-resolver config-swap! secrets]}]
   (let [config-atom (or user-config (atom {}))
+        config      #(if config-resolver (config-resolver) @config-atom)
         ;; A configured boundary-injection SECRET resolves to its opaque
         ;; PLACEHOLDER (never the real value) — the HTTP egress substitutes the
         ;; real value at the destination. Non-secret granted keys still return
@@ -559,12 +597,16 @@
                  (let [k (str key)]
                    (if-let [s (get secrets k)]
                      (:placeholder s)
-                     (or (get @config-atom k) (get @config-atom (keyword key))))))
+                     (or (get (config) k) (get (config) (keyword key))))))
         get-fn (fn
                  ([key]         (get-1 key))
                  ([key default] (or (get-1 key) default)))
-        set-fn (fn [key value] (swap! config-atom assoc (str key) value) :ok)
-        keys-fn (fn [] (vec (distinct (concat (map str (keys @config-atom))
+        set-fn (fn [key value]
+                 (if config-swap!
+                   (config-swap! assoc (str key) value)
+                   (swap! config-atom assoc (str key) value))
+                 :ok)
+        keys-fn (fn [] (vec (distinct (concat (map str (keys (config)))
                                               (keys (or secrets {}))))))]
     (sci/add-namespace! sci-ctx 'env
                         (doc/with-docs

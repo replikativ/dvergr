@@ -29,7 +29,7 @@
                             (often yggdrasil-managed so substrate-fork
                             branches it automatically).
      - `:role-data`       — map of role-specific extensions. LLM puts
-                            `:sci-ctx` and `:tool-ctx` here; human can
+                            `:sci-component` and `:tool-ctx` here; human can
                             stash UI prefs, presence signal, etc. Stays
                             out of the common record so role-specific
                             additions don't churn the API.
@@ -113,7 +113,7 @@
      :from-chat-ctx  — an existing dvergr.chat.context/ChatContext
      :chat-ctx-opts  — opts map passed to cc/create-chat-context
 
-   Role-data carries the chat-ctx-only fields (`:chat-ctx`, `:sci-ctx`)
+   Role-data carries the chat-ctx-only fields (`:chat-ctx`, `:sci-component`)
    so existing dvergr.chat.context callers can still reach them via
    `(:role-data pctx)`."
   [{:keys [participant-id from-chat-ctx chat-ctx-opts role-data]}]
@@ -128,7 +128,7 @@
                           (:status-signal chat-ctx)
                           (:db-conn chat-ctx)
                           (merge {:chat-ctx chat-ctx
-                                  :sci-ctx (:sci-ctx chat-ctx)}
+                                  :sci-component (:sci-component chat-ctx)}
                                  role-data))))
 
 ;; ===========================================================================

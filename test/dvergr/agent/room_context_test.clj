@@ -9,9 +9,18 @@
             [dvergr.discourse :as d]
             [dvergr.room.store.memory :as mem]
             [dvergr.room.store :as rstore]
+            [dvergr.room.store.datahike :as store-dh]
+            [dvergr.room.registry :as registry]
+            [dvergr.sandbox :as sandbox]
             [dvergr.chat.context :as cctx]
+            [dvergr.chat.schema :as schema]
+            [datahike.api :as dh]
+            [org.replikativ.spindel.engine.component :as component]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.context :as ctx]))
+
+(defn- ledger-count [conn]
+  (or (dh/q '[:find (count ?e) . :where [?e :ledger/id _]] @conn) 0))
 
 (defn- roles+contents [chat-ctx]
   (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
@@ -35,6 +44,177 @@
             (is (some #(str/includes? % "earlier message") (non-system-contents cc1))
                 "seeded the conversation from the room store")
             (finally (rc/drop-ctx! :rc-seed :var))))))))
+
+(deftest concurrent-first-context-creation-is-singleton
+  (testing "one Room fence covers component allocation and cache publication"
+    (let [c (ctx/create-execution-context)
+          room (d/make-room {:id :rc-concurrent-first :ctx c :store (mem/make)})
+          original turn/new-working-ctx
+          constructor-entered (promise)
+          second-started (promise)
+          release-constructor (promise)
+          calls (atom 0)]
+      (try
+        (with-redefs [turn/new-working-ctx
+                      (fn [opts]
+                        (swap! calls inc)
+                        (deliver constructor-entered true)
+                        @release-constructor
+                        (original opts))]
+          (let [first-result (future (rc/ensure-ctx! room :var
+                                                     {:budget-dollars 1.0}))]
+            (is (true? (deref constructor-entered 3000 ::timeout)))
+            (let [second-result
+                  (future
+                    (deliver second-started true)
+                    (rc/ensure-ctx! room :var {:budget-dollars 1.0}))]
+              (is (true? (deref second-started 3000 ::timeout)))
+              (deliver release-constructor true)
+              (let [first-ctx (deref first-result 10000 ::timeout)
+                    second-ctx (deref second-result 10000 ::timeout)]
+                (is (not= ::timeout first-ctx))
+                (is (identical? first-ctx second-ctx))
+                (is (= 1 @calls))
+                (is (= 1 (count (binding [ec/*execution-context* c]
+                                  (component/registered)))))))))
+        (finally
+          (deliver release-constructor true)
+          (rc/drop-ctx! :rc-concurrent-first :var)
+          (ctx/close-context! c))))))
+
+(deftest failed-hydration-is-unpublished-and-retryable
+  (let [c (ctx/create-execution-context)
+        room (d/make-room {:id :rc-hydration-retry :ctx c :store (mem/make)})
+        original d/messages
+        original-constructor turn/new-working-ctx
+        hydration-calls (atom 0)
+        constructor-calls (atom 0)]
+    (try
+      (with-redefs [d/messages
+                    (fn [& args]
+                      (if (= 1 (swap! hydration-calls inc))
+                        (throw (ex-info "injected hydration failure" {}))
+                        (apply original args)))
+                    turn/new-working-ctx
+                    (fn [opts]
+                      (swap! constructor-calls inc)
+                      (original-constructor opts))]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                              #"injected hydration failure"
+                              (rc/ensure-ctx! room :var
+                                              {:budget-dollars 1.0
+                                               :system-prompt "must not leak"})))
+        (is (nil? (rc/lookup (:id room) :var)))
+        (is (empty? (binding [ec/*execution-context* c]
+                      (component/registered))))
+        (is (zero? @constructor-calls)
+            "fallible durable hydration precedes all ChatContext signals")
+        (let [retried (rc/ensure-ctx! room :var
+                                      {:budget-dollars 1.0
+                                       :system-prompt "must not leak"})]
+          (is (some? retried))
+          (is (= 1 @constructor-calls))
+          (is (= 1 (count (binding [ec/*execution-context* c]
+                            (component/registered)))))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest inbound-admission-waits-for-context-publication
+  (let [c (ctx/create-execution-context)
+        room (d/make-room {:id :rc-admission-during-hydration
+                           :ctx c :store (mem/make)})
+        original d/messages
+        hydration-entered (promise)
+        release-hydration (promise)
+        msg-id (random-uuid)]
+    (try
+      (with-redefs [d/messages
+                    (fn [& args]
+                      (deliver hydration-entered true)
+                      @release-hydration
+                      (apply original args))]
+        (let [ensure-result (future (rc/ensure-ctx! room :var
+                                                    {:budget-dollars 1.0}))]
+          (is (true? (deref hydration-entered 10000 ::timeout)))
+          (let [append-result
+                (future (rc/append-inbound! room :var msg-id :user
+                                            "arrived during hydration"
+                                            "Alice" nil))]
+            (deliver release-hydration true)
+            (let [working (deref ensure-result 10000 ::timeout)]
+              (is (true? (deref append-result 10000 ::timeout)))
+              (is (some #(str/includes? % "arrived during hydration")
+                        (non-system-contents working)))))))
+      (finally
+        (deliver release-hydration true)
+        (d/close-room! room)))))
+
+(deftest working-context-construction-releases-on-rebind-failure
+  (let [c (ctx/create-execution-context)]
+    (try
+      (with-redefs [sandbox/setup-agent-namespaces!
+                    (fn [& _]
+                      (throw (ex-info "injected namespace failure" {})))]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                              #"injected namespace failure"
+                              (turn/new-working-ctx
+                               {:execution-ctx c :title "failing"})))
+        (is (empty? (binding [ec/*execution-context* c]
+                      (component/registered)))))
+      (finally
+        (ctx/close-context! c)))))
+
+(deftest unregister-fences-context-creation-and-stale-access
+  (let [c (ctx/create-execution-context)
+        room (d/make-room {:id :rc-unregister-race :ctx c :store (mem/make)})
+        original turn/new-working-ctx
+        constructor-entered (promise)
+        release-constructor (promise)]
+    (try
+      (with-redefs [turn/new-working-ctx
+                    (fn [opts]
+                      (deliver constructor-entered true)
+                      @release-constructor
+                      (original opts))]
+        (let [ensure-result (future (rc/ensure-ctx! room :var
+                                                    {:budget-dollars 1.0}))]
+          (is (true? (deref constructor-entered 3000 ::timeout)))
+          (let [unregister-result
+                (future
+                  (binding [ec/*execution-context* c]
+                    (registry/unregister! (:id room))))]
+            (deliver release-constructor true)
+            (is (not= ::timeout (deref ensure-result 10000 ::timeout)))
+            (is (nil? (deref unregister-result 10000 ::timeout)))
+            (is (nil? (binding [ec/*execution-context* c]
+                        (registry/lookup (:id room)))))
+            (is (nil? (rc/lookup (:id room) :var)))
+            (is (empty? (binding [ec/*execution-context* c]
+                          (component/registered))))
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                  #"closed Room incarnation"
+                                  (rc/ensure-ctx! room :var
+                                                  {:budget-dollars 1.0}))))))
+      (finally
+        (deliver release-constructor true)
+        (ctx/close-context! c)))))
+
+(deftest resource-cleanup-failure-still-unregisters-component
+  (let [c (ctx/create-execution-context)
+        working (turn/new-working-ctx {:execution-ctx c :title "cleanup"})]
+    (try
+      (is (= 1 (count (binding [ec/*execution-context* c]
+                        (component/registered)))))
+      (with-redefs [sandbox/release-agent-resources!
+                    (fn [& _] (throw (java.io.IOException. "injected cleanup failure")))]
+        (is (thrown-with-msg? java.io.IOException
+                              #"injected cleanup failure"
+                              (cctx/release-sci-in! working c))))
+      (is (empty? (binding [ec/*execution-context* c]
+                    (component/registered))))
+      (finally
+        (cctx/release-sci-in! working c)
+        (ctx/close-context! c)))))
 
 (deftest room-observation-does-not-bypass-attention
   (let [c (ctx/create-execution-context)]
@@ -66,6 +246,43 @@
           (is (= 1 (count (filter #(= "once" %) (non-system-contents cc))))
               "appended exactly once despite two calls with the same id")
           (finally (rc/drop-ctx! :rc-dedup :var)))))))
+
+(deftest forked-working-context-owns-child-persistence
+  (let [parent-ctx (ctx/create-execution-context)
+        child-ctx* (atom nil)
+        parent-conn (schema/create-chat-db!
+                     {:store {:backend :memory :id (random-uuid)}})
+        child-conn (schema/create-chat-db!
+                    {:store {:backend :memory :id (random-uuid)}})
+        parent (d/make-room {:id :rc-db-parent
+                             :ctx parent-ctx
+                             :store (store-dh/make parent-conn)})]
+    (try
+      (let [working (rc/ensure-ctx! parent :var {:budget-dollars 1.0})]
+        (let [child-ctx (ctx/fork-context parent-ctx :mode :frozen)
+              _ (reset! child-ctx* child-ctx)
+              child (d/make-room {:id :rc-db-child
+                                  :ctx child-ctx
+                                  :store (store-dh/make child-conn)})]
+          (dh/transact child-conn
+                       [(schema/create-chat-entity
+                         {:id (:chat-id working) :title (:title working)
+                          :budget 1000000})])
+          (let [projected (rc/fork-ctx! parent child :var)]
+            (is (identical? child-conn (:db-conn projected)))
+            (is (not (identical? parent-conn (:db-conn projected))))
+            (cctx/account-usage! projected :input-tokens 1
+                                 :model "claude-sonnet-4-5")
+            (is (= 0 (ledger-count parent-conn)))
+            (is (= 1 (ledger-count child-conn))))))
+      (finally
+        (rc/drop-ctx! :rc-db-child :var)
+        (rc/drop-ctx! :rc-db-parent :var)
+        (dh/release child-conn)
+        (dh/release parent-conn)
+        (when-let [child-ctx @child-ctx*]
+          (ctx/close-context! child-ctx))
+        (ctx/close-context! parent-ctx)))))
 
 (deftest durable-attention-rebuilds-provider-projection
   (testing "Run triggers and :include decisions enter provider input while

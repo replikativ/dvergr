@@ -5,7 +5,8 @@
    create or discard speculative application state, but they never copy or
    settle this authority: a child receives resources only through one governed
    Kontor transfer from its parent wallet."
-  (:require [dvergr.room.store :as store]
+  (:require [dvergr.agent.attempt.governance :as attempt-governance]
+            [dvergr.room.store :as store]
             [kontor.resource :as kontor])
   (:import [java.nio.charset StandardCharsets]
            [java.util Date UUID]))
@@ -50,6 +51,10 @@
    already exist so its lookup ref can own the wallet."
   [conn room-id chat-id]
   (kontor/install! conn)
+  ;; Kontor currently owns Datahike's single tx-predicate registration slot.
+  ;; Recompose the Attempt governor after every (idempotent) installation so
+  ;; neither invariant family can replace the other by boot order.
+  (attempt-governance/govern! conn)
   (kontor/install-unit! conn {:symbol microdollars
                               :name "Micro US dollars"
                               :precision 0})
