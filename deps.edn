@@ -100,9 +100,6 @@
         ;; with Datahike rather than relying on Datahike's transitive API.
         org.replikativ/konserve    {:mvn/version "0.9.391"}
 
-        ;; Distributed-scope — remote function invocation over Kabel
-        is.simm/distributed-scope  {:mvn/version "0.1.2"}
-
         ;; tools.analyzer for code indexing
         org.clojure/tools.analyzer.jvm {:mvn/version "1.3.0"}
 

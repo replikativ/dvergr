@@ -105,11 +105,12 @@
       (testing "in-jail file access works"
         (is (= true
                (:ok (eval-in sci ec
-                             "(let [p \".capability-probe\"]
-                                (spit p \"ok\")
-                                (let [exists? (babashka.fs/exists? p)]
-                                  (babashka.fs/delete-if-exists p)
-                                  exists?))")))))
+                             "(let [p (str \".capability-probe-\" (random-uuid))]
+                                (try
+                                  (spit p \"ok\")
+                                  (babashka.fs/exists? p)
+                                  (finally
+                                    (babashka.fs/delete-if-exists p))))")))))
       (testing "but escapes past the jail are refused"
         (is (:err (eval-in sci ec "(babashka.fs/exists? \"/etc/passwd\")")))
         (is (:err (eval-in sci ec "(slurp \"/etc/passwd\")")))))))
