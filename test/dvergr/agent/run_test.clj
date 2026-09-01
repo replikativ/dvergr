@@ -133,6 +133,46 @@
         (run/finish! (:run/id explicit) :completed)
         (d/close-room! room)))))
 
+(deftest resolved-run-inputs-are-durable-causality-not-structure
+  (let [[room st] (run-room :explicit-causality)
+        parent (run/start! room :orchestrator (random-uuid) (live-ctx))
+        child (run/start! room :specialist (random-uuid) (live-ctx)
+                          {:parent (:run/id parent)})]
+    (try
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"has not resolved"
+           (run/record-cause! (:run/id parent) (:run/id child))))
+      (run/finish! (:run/id child) :completed)
+      (let [updated (run/record-cause! (:run/id parent) (:run/id child))]
+        (is (= #{(:run/id child)} (:run/caused-by updated)))
+        (is (= #{(:run/id child)}
+               (:run/caused-by
+                (store/-load-run st :explicit-causality (:run/id parent)))))
+        (is (= (:run/id parent) (:run/parent child))
+            "containment remains on the child, causality on the consumer"))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"not durable"
+           (run/record-cause! (:run/id parent) (random-uuid))))
+      (finally
+        (run/finish! (:run/id parent) :completed)
+        (d/close-room! room)))))
+
+(deftest storeless-runs-cannot-claim-durable-causality
+  (let [room (d/make-room {:id :storeless-causality})
+        parent (run/start! room :orchestrator (random-uuid) (live-ctx))]
+    (try
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"requires a Room store"
+           (run/record-cause! (:run/id parent) (random-uuid))))
+      (is (nil? (:run/caused-by
+                 (first (run/active-runs :storeless-causality)))))
+      (finally
+        (run/finish! (:run/id parent) :completed)
+        (d/close-room! room)))))
+
 (deftest provenance-cannot-override-core-run-identity
   (let [[room _st] (run-room :provenance-boundary)
         trigger (d/message :alice :agent "work")]

@@ -310,9 +310,19 @@ independent reactive state and an explicit external-system/effect policy.
 Observe evidence, resample descriptors/contexts, and discard unselected
 particles. Only an explicitly selected particle can be promoted or merged.
 
-Needs: the inference coordinator must stop using raw
-`snapshot-context`/`restore-snapshot` for worlds containing Yggdrasil handles;
-that path does not invoke `PForkable` and may alias external state.
+Spindel's inference coordinator now accepts `:world-policy :fork`: initial and
+resampled particles are frozen canonical Yggdrasil forks, and the complete
+speculative tree is discarded after immutable particle results have been
+captured. Dvergr's SCI `infer/smc-infer`, `infer/importance-sampling`, and
+`infer/kernel-infer` wrappers select that policy by default. A caller may pass
+`:world-policy :fresh` only for a model known to be pure. `infer/values`,
+`infer/log-weights`, `infer/ess`, and `infer/worlds` project results and portable
+world descriptors without exposing live settlement handles.
+
+This solves isolation and affine cleanup for one inference population. It does
+not promote a posterior particle automatically: promotion remains an explicit
+Run/proposal operation, and PGAS ancestor scoring is rejected for canonical
+worlds until retained-world ancestry has a sound ownership contract.
 
 ### MCTS
 
