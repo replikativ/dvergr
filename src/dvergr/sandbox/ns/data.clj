@@ -2,10 +2,79 @@
   "SCI injectors — datahike read/write/diff, spindel sync/combinators/signals,
    and probabilistic inference. Split out of dvergr.sandbox (Phase 4)."
   (:require [sci.core :as sci]
+            [is.simm.partial-cps.sequence :as aseq]
             [datahike.api :as dh]
+            [dvergr.agent.roster :as roster]
+            [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.sandbox.ns.doc :as doc]
+            [dvergr.sandbox.work :as sandbox-work]
             [org.replikativ.spindel.engine.core :as rtc]
+            [org.replikativ.spindel.engine.protocols :as rtp]
+            [org.replikativ.spindel.effects.await :as sp-await]
+            [org.replikativ.spindel.spin.cps :as sp]
             [org.replikativ.spindel.core :as sync]))
+
+(defn- portable-posterior
+  "Project a native Spindel measure before it crosses into SCI. Execution
+   contexts and their process-local executors deliberately do not survive."
+  [measure]
+  (let [measure-ns  (find-ns 'org.replikativ.spindel.inference.measure)
+        contexts    (@(ns-resolve measure-ns 'get-contexts) measure)
+        value-of    @(ns-resolve measure-ns 'get-value)
+        log-weights (vec (@(ns-resolve measure-ns 'get-log-weights) measure))
+        values      (mapv value-of contexts)
+        worlds      (->> contexts
+                         (keep #(rtp/get-state % [:inference :world-descriptor]))
+                         vec)
+        posterior   {:posterior/values values
+                     :posterior/log-weights log-weights
+                     :posterior/weights
+                     (@(ns-resolve measure-ns 'normalize-log-weights) log-weights)
+                     :posterior/ess
+                     (@(ns-resolve measure-ns 'effective-sample-size) measure)
+                     :posterior/log-marginal
+                     (@(ns-resolve measure-ns 'log-marginal) measure)
+                     :posterior/worlds worlds}]
+    (when-not (roster/data-value? posterior)
+      (throw (ex-info "Inference result is not portable data"
+                      {:type ::non-portable-posterior})))
+    posterior))
+
+(defn- posterior-spin [native-spin]
+  (sp/spin
+   (portable-posterior (sp-await/await native-spin))))
+
+(defn- posterior-query [posterior query-fn]
+  (let [values  (mapv query-fn (:posterior/values posterior))
+        weights (:posterior/weights posterior)]
+    (when-not (every? number? values)
+      (throw (ex-info "infer/query requires numeric projected values"
+                      {:type ::non-numeric-query})))
+    (let [mean      (reduce + (map * weights values))
+          variance (reduce + (map (fn [weight value]
+                                    (* weight (Math/pow (- value mean) 2)))
+                                  weights values))
+          sorted    (vec (sort values))
+          n         (count sorted)
+          quantile  (fn [p]
+                      (nth sorted (min (dec n)
+                                       (long (Math/floor (* p n))))))]
+      {:mean mean
+       :variance variance
+       :std-dev (Math/sqrt variance)
+       :samples values
+       :weights weights
+       :quantiles {:p50 (quantile 0.5)
+                   :p025 (quantile 0.025)
+                   :p975 (quantile 0.975)}
+       :type :empirical})))
+
+(defn- posterior-predict [posterior pred-fn samples]
+  (let [measure-ns (find-ns 'org.replikativ.spindel.inference.measure)
+        indices    (@(ns-resolve measure-ns 'systematic-resample)
+                    (:posterior/weights posterior) samples)
+        values     (:posterior/values posterior)]
+    (mapv #(pred-fn (nth values %)) indices)))
 
 (defn add-spindel-extras-ns!
   "Expose spindel combinators, sync primitives, and signals to SCI.
@@ -14,44 +83,114 @@
    - spindel.comb — parallel, race, timeout, sleep
    - sync         — deferred, deliver!, mailbox, post!
    - spindel.sig  — signal (for external world boundary)
+   - spindel.work — structured latest/serial/busy/parallel admission
 
    These are safe: they only coordinate within the SCI context."
-  [sci-ctx spindel-ctx]
-  (require 'org.replikativ.spindel.spin.combinators)
-  (require 'org.replikativ.spindel.signal)
-  (let [comb-ns (find-ns 'org.replikativ.spindel.spin.combinators)
-        sig-ns  (find-ns 'org.replikativ.spindel.signal)]
-    (binding [rtc/*execution-context* spindel-ctx]
-      ;; Sync primitives (same as before but unified here)
-      (sci/add-namespace! sci-ctx 'sync
-                          {'deferred  (fn [] (sync/deferred))
-                           'deliver!  (fn [d v] (sync/deliver! d v))
-                           'mailbox   (fn [] (sync/mailbox))
-                           'post!     (fn [mb v] (mb v))})
+  ([sci-ctx spindel-ctx]
+   (add-spindel-extras-ns! sci-ctx spindel-ctx {}))
+  ([sci-ctx spindel-ctx {:keys [room-id room-incarnation ceiling world-binding]}]
+   (require 'org.replikativ.spindel.spin.combinators)
+   (require 'org.replikativ.spindel.signal)
+   (let [comb-ns (find-ns 'org.replikativ.spindel.spin.combinators)
+         sig-ns  (find-ns 'org.replikativ.spindel.signal)
+         create-work (fn [strategy opts work-fn]
+                       (let [binding (when world-binding (world-binding))]
+                         (sandbox-work/create!
+                          (or (:room-runtime-id binding) room-id)
+                          (or (:room-incarnation binding) room-incarnation)
+                          (runtime-ctx/selected-context spindel-ctx)
+                          ceiling strategy opts work-fn)))]
+     (binding [rtc/*execution-context* spindel-ctx]
+       ;; Sync primitives (same as before but unified here)
+       (sci/add-namespace! sci-ctx 'sync
+                           {'deferred  (fn [] (sync/deferred))
+                            'deliver!  (fn [d v] (sync/deliver! d v))
+                            'mailbox   (fn [] (sync/mailbox))
+                            'post!     (fn [mb v] (mb v))})
       ;; Combinators
-      (sci/add-namespace! sci-ctx 'spindel.comb
-                          (doc/with-docs
-                            {'parallel @(ns-resolve comb-ns 'parallel)
-                             'race     @(ns-resolve comb-ns 'race)
-                             'timeout  @(ns-resolve comb-ns 'timeout)
-                             'sleep    @(ns-resolve comb-ns 'sleep)}
-                            '{parallel [([& spins]) "Run Spins concurrently and produce their values in input order. Cancelling the composition cancels its branches."]
-                              race     [([& spins]) "Produce the first Spin value and cancel losing branches. For hired Runs, pass dvergr.agent/owned-result-spin when branch cancellation must cancel the Run; passive result-spin deliberately leaves shared work alive."]
-                              timeout  [([spin timeout-ms] [spin timeout-ms timeout-value]) "Race a Spin against a timer and cancel the timed-out branch."]
-                              sleep    [([milliseconds]) "Return a Spin that completes after the given duration without blocking the engine thread."]}))
+       (sci/add-namespace! sci-ctx 'spindel.comb
+                           (doc/with-docs
+                             {'parallel @(ns-resolve comb-ns 'parallel)
+                              'race     @(ns-resolve comb-ns 'race)
+                              'timeout  @(ns-resolve comb-ns 'timeout)
+                              'sleep    @(ns-resolve comb-ns 'sleep)}
+                             '{parallel [([& spins]) "Run Spins concurrently and produce their values in input order. Cancelling the composition cancels its branches."]
+                               race     [([& spins]) "Produce the first Spin value and cancel losing branches. For hired Runs, pass dvergr.agent/owned-result-spin when branch cancellation must cancel the Run; passive result-spin deliberately leaves shared work alive."]
+                               timeout  [([spin timeout-ms] [spin timeout-ms timeout-value]) "Race a Spin against a timer and cancel the timed-out branch."]
+                               sleep    [([milliseconds]) "Return a Spin that completes after the given duration without blocking the engine thread."]}))
+      ;; Structured work admission. `task` is defined below inside SCI because
+      ;; it must run partial-cps expansion in the sandbox's own symbol table;
+      ;; copying the host macro would resolve sandbox vars against the host.
+       (sci/add-namespace! sci-ctx 'spindel.work
+                           (doc/with-docs
+                             {'latest       (fn
+                                              ([work-fn]
+                                               (create-work :latest {} work-fn))
+                                              ([opts work-fn]
+                                               (create-work :latest opts work-fn)))
+                              'serial       (fn
+                                              ([work-fn]
+                                               (create-work :serial {} work-fn))
+                                              ([opts work-fn]
+                                               (create-work :serial opts work-fn)))
+                              'busy         (fn
+                                              ([work-fn]
+                                               (create-work :busy {} work-fn))
+                                              ([opts work-fn]
+                                               (create-work :busy opts work-fn)))
+                              'parallel     (fn
+                                              ([work-fn]
+                                               (create-work :parallel {} work-fn))
+                                              ([opts work-fn]
+                                               (create-work :parallel opts work-fn)))
+                              'controller   (fn
+                                              ([work-fn]
+                                               (create-work :serial {} work-fn))
+                                              ([opts work-fn]
+                                               (create-work (:strategy opts :serial)
+                                                            (dissoc opts :strategy)
+                                                            work-fn)))
+                              'submit!      sandbox-work/submit!
+                              'events       sandbox-work/events!
+                              'next-event   aseq/anext
+                              'untap!       sandbox-work/untap!
+                              'snapshot     sandbox-work/snapshot
+                              'completion   sandbox-work/completion
+                              'close!       sandbox-work/close!
+                              'cancel!      sandbox-work/cancel!}
+                             '{latest      [([work-fn] [opts work-fn]) "Create switch-to-latest admission. A replacement starts only after superseded work has quiesced."]
+                               serial      [([work-fn] [opts work-fn]) "Create FIFO admission with bounded waiting capacity."]
+                               busy        [([work-fn] [opts work-fn]) "Create exhaust/busy admission: suppress input while work is active."]
+                               parallel    [([work-fn] [opts work-fn]) "Create bounded parallel admission; set :concurrency in opts."]
+                               controller  [([work-fn] [opts work-fn]) "Create admission with explicit :strategy (:latest, :serial, :busy, or :parallel)."]
+                               submit!     [([controller value] [controller id value]) "Submit a value without blocking; returns its correlation id or nil when ingress is closed/full."]
+                               events      [([controller]) "Open an independent hot event stream for later admission and completion events."]
+                               next-event  [([event-source]) "Return an awaitable for the next [event remaining-source] pair."]
+                               untap!      [([controller event-source]) "Detach an abandoned event stream."]
+                               snapshot    [([controller]) "Return fork-local active, queued, and lifecycle state without live handles."]
+                               completion  [([controller]) "Return a passive awaitable that joins controller quiescence after close!/cancel!."]
+                               close!      [([controller]) "Stop admission, drain accepted work, and close."]
+                               cancel!     [([controller]) "Stop admission and cooperatively cancel queued and active owned work."]}))
+       (sci/eval-string*
+        sci-ctx
+        "(ns spindel.work (:require [is.simm.partial-cps.async :as pcps-async]))
+        (defmacro task
+          \"Create reusable one-shot CPS work. The controller gives every submission fresh Spin identity and ownership.\"
+          [& body]
+          `(pcps-async/async ~@body))")
       ;; Signals — signal is a macro; wrap as a function using the underlying record
-      (let [signal-ref-ctor (ns-resolve sig-ns '->SignalRef)
-            addr-ns (do (require 'org.replikativ.spindel.engine.addressing)
-                        (find-ns 'org.replikativ.spindel.engine.addressing))
-            next-addr! @(ns-resolve addr-ns 'next-address!)
-            deltaable-ns (do (require 'org.replikativ.spindel.incremental.deltaable)
-                             (find-ns 'org.replikativ.spindel.incremental.deltaable))
-            clear-deltas @(ns-resolve deltaable-ns 'clear-deltas)]
-        (sci/add-namespace! sci-ctx 'spindel.sig
-                            {'signal (fn [initial-value]
-                                       (let [ctx (rtc/current-execution-context)
-                                             id  (next-addr! ctx "signal" {:file "sci" :line 0 :column 0})]
-                                         (signal-ref-ctor id (clear-deltas initial-value))))})))))
+       (let [signal-ref-ctor (ns-resolve sig-ns '->SignalRef)
+             addr-ns (do (require 'org.replikativ.spindel.engine.addressing)
+                         (find-ns 'org.replikativ.spindel.engine.addressing))
+             next-addr! @(ns-resolve addr-ns 'next-address!)
+             deltaable-ns (do (require 'org.replikativ.spindel.incremental.deltaable)
+                              (find-ns 'org.replikativ.spindel.incremental.deltaable))
+             clear-deltas @(ns-resolve deltaable-ns 'clear-deltas)]
+         (sci/add-namespace! sci-ctx 'spindel.sig
+                             {'signal (fn [initial-value]
+                                        (let [ctx (rtc/current-execution-context)
+                                              id  (next-addr! ctx "signal" {:file "sci" :line 0 :column 0})]
+                                          (signal-ref-ctor id (clear-deltas initial-value))))}))))))
 
 (defn add-datahike-query-ns!
   "Add datahike query namespace to SCI context.
@@ -141,7 +280,13 @@
 
      (spin
        (let [measure (await (infer/smc-infer (my-model) 100))]
-         (infer/query measure identity)))
+         (infer/values measure)))
+
+   Dvergr defaults SMC, importance sampling, and the generic kernel runner to
+   `:world-policy :fork`. Each particle therefore executes in a frozen
+   canonical Yggdrasil world and only its immutable result projection survives;
+   particle worlds are discarded before the inference Spin completes. Callers
+   may explicitly request `:fresh` for a proven-pure model.
 
    Namespaces added:
    - dist/   — Anglican distributions: normal, beta, gamma, uniform, flip, …
@@ -249,12 +394,54 @@
                          'chi-squared        @(ns-resolve ar 'chi-squared)
                          'student-t          (fn [nu] (@(ns-resolve ar 'student-t) nu))}))
 
-  ;; Inference runners — these take/return spins, compose with await in spin bodies
-  (sci/add-namespace! sci-ctx 'infer
-                      {'smc-infer          @(resolve 'org.replikativ.spindel.inference.inference/smc-infer)
-                       'importance-sampling @(resolve 'org.replikativ.spindel.inference.inference/importance-sampling)
-                       'kernel-infer       @(resolve 'org.replikativ.spindel.inference.inference/kernel-infer)
-                       'query              @(resolve 'org.replikativ.spindel.inference.inference/query)
-                       'predict            @(resolve 'org.replikativ.spindel.inference.inference/predict)
-                       'pimh-infer         @(resolve 'org.replikativ.spindel.inference.inference/pimh-infer)
-                       'pgibbs-infer       @(resolve 'org.replikativ.spindel.inference.inference/pgibbs-infer)}))
+  ;; Inference runners — these take/return Spins and compose with await in Spin
+  ;; bodies. Room-capable sandboxes default to canonical particle worlds: a
+  ;; model that happens to touch a registered Yggdrasil system must not alias
+  ;; the ambient room merely because its author omitted an expert-only option.
+  ;; `:fresh` remains an explicit fast path for known-pure models.
+  (let [smc*        @(resolve 'org.replikativ.spindel.inference.inference/smc-infer)
+        importance* @(resolve 'org.replikativ.spindel.inference.inference/importance-sampling)
+        kernel*     @(resolve 'org.replikativ.spindel.inference.inference/kernel-infer)
+        world-opts  (fn [opts]
+                      (merge {:world-policy :fork} (or opts {})))]
+    (sci/add-namespace!
+     sci-ctx 'infer
+     (doc/with-docs
+       {'smc-infer (fn
+                     ([model particles]
+                      (posterior-spin
+                       (smc* model particles (world-opts nil))))
+                     ([model particles opts]
+                      (posterior-spin
+                       (smc* model particles (world-opts opts)))))
+        'importance-sampling
+        (fn
+          ([model particles]
+           (posterior-spin
+            (importance* model particles (world-opts nil))))
+          ([model particles opts]
+           (posterior-spin
+            (importance* model particles (world-opts opts)))))
+        'kernel-infer
+        (fn
+          ([model kernel particles]
+           (posterior-spin
+            (kernel* model kernel particles (world-opts nil))))
+          ([model kernel particles opts]
+           (posterior-spin
+            (kernel* model kernel particles (world-opts opts)))))
+        'query       posterior-query
+        'predict     posterior-predict
+        'values      :posterior/values
+        'log-weights :posterior/log-weights
+        'ess         :posterior/ess
+        'worlds      :posterior/worlds}
+       '{smc-infer [([model particles] [model particles opts]) "Run SMC. Dvergr defaults opts :world-policy to :fork; pass :fresh only for a proven-pure model."]
+         importance-sampling [([model particles] [model particles opts]) "Run importance sampling with canonical particle worlds by default."]
+         kernel-infer [([model kernel particles] [model kernel particles opts]) "Run a Spindel inference kernel with canonical particle worlds by default."]
+         query [([posterior query-fn]) "Compute numeric posterior statistics from portable program results."]
+         predict [([posterior pred-fn samples]) "Resample portable posterior values and apply pred-fn; execution contexts never enter SCI."]
+         values [([posterior]) "Return each particle's portable program result in posterior order."]
+         log-weights [([measure]) "Return posterior particle log weights."]
+         ess [([measure]) "Return effective sample size."]
+         worlds [([measure]) "Return portable canonical world descriptors retained in posterior projections; never live settlement handles."]}))))

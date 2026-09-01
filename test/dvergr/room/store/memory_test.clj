@@ -10,6 +10,32 @@
 (deftest run-lifecycle-contract
   (contract/assert-run-lifecycle! (memory/make) :runs-memory))
 
+(deftest run-causality-contract
+  (contract/assert-run-causality! (memory/make) :run-causes-memory))
+
+(deftest attention-projection-contract
+  (contract/assert-attention-projection! (memory/make) :attention-memory))
+
+(deftest concurrent-attention-identity-contract
+  (contract/assert-concurrent-attention-identity!
+   (memory/make) :attention-race-memory))
+
+(deftest cross-room-attention-identity-contract
+  (contract/assert-cross-room-attention-identity! (memory/make)))
+
+(deftest attention-metadata-validation-contract
+  (contract/assert-attention-metadata-validation!
+   (memory/make) :attention-metadata-memory))
+
+(deftest enqueue-result-run-contract
+  (contract/assert-enqueue-result-run! (memory/make) :enqueue-result-memory))
+
+(deftest attention-id-uses-an-injective-tuple-encoding
+  (let [message-id (random-uuid)]
+    ;; Both tuples rendered as `:a|:b|:c|...` under the old raw separator.
+    (is (not= (store/attention-id :a|:b :c message-id nil :ready)
+              (store/attention-id :a :b|:c message-id nil :ready)))))
+
 (deftest rejects-unmodelled-durable-metadata
   (let [st (memory/make)]
     (store/-store-room! st :strict-memory {:slug "strict-memory"})

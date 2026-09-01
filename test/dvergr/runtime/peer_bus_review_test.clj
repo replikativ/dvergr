@@ -14,7 +14,10 @@
             [dvergr.intake.bash :as b]
             [dvergr.substrate.geschichte :as geschichte]
             [dvergr.room.registry :as registry]
+            [dvergr.system.rooms :as srooms]
             [dvergr.runtime.peer-bus :as peer-bus]
+            [dvergr.sandbox.work :as sandbox-work]
+            [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.yggdrasil :as ygg]))
 
@@ -90,6 +93,65 @@
         (is (= (:id fork) (:dvergr/origin (first evts))))
         (is (= :parent (:dvergr/parent (first evts))))
         (is (vector? (:workspace-id (first evts))))))))
+
+(deftest failed-fork-construction-rolls-back-the-world
+  (binding [ec/*execution-context* *base-ctx*]
+    (let [parent (d/room :rollback-parent *base-ctx*)
+          bad (assoc (d/echo :bad)
+                     :factory (fn [_]
+                                (throw (ex-info "clone failed" {:type ::clone-failed}))))
+          rooms-before (set (keys (registry/snapshot)))
+          discarded (atom 0)
+          discard! ygg/discard-fork!]
+      (d/join parent bad)
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"clone failed"
+           (with-redefs [ygg/discard-fork!
+                         (fn [& args]
+                           (swap! discarded inc)
+                           (apply discard! args))]
+             (d/fork-room parent {:isolation :ctx}))))
+      (is (pos? @discarded) "the unreachable affine fork handle was settled")
+      (is (= rooms-before (set (keys (registry/snapshot))))
+          "no partially constructed Room became reachable")
+      (is (empty? (registry/structural-children (:id parent)))
+          "no stale settlement topology survived rollback"))))
+
+(deftest failed-fork-construction-drops-deferred-grants
+  (binding [ec/*execution-context* *base-ctx*]
+    (let [parent (d/room :rollback-grant-parent *base-ctx*)
+          grant {:room-id (random-uuid) :name "scratch" :scope :room}
+          dropped (atom nil)
+          bad (assoc (d/echo :bad-grant)
+                     :factory (fn [_]
+                                (ec/swap-state! [:dvergr/pending-grants]
+                                                (constantly [grant]))
+                                (throw (ex-info "clone failed after grant" {}))))]
+      (d/join parent bad)
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"clone failed after grant"
+           (with-redefs [srooms/drop-fork-grants! #(reset! dropped %)]
+             (d/fork-room parent {:isolation :ctx}))))
+      (is (= [grant] @dropped)
+          "rollback releases storage grants provisioned inside the child world"))))
+
+(deftest fork-created-observability-failure-does-not-roll-back-publication
+  (binding [ec/*execution-context* *base-ctx*]
+    (let [parent (d/room :event-failure-parent *base-ctx*)
+          discarded (atom 0)
+          fork (with-redefs [peer-bus/post! (fn [_]
+                                              (throw (ex-info "observer unavailable" {})))
+                             ygg/discard-fork! (fn [& _] (swap! discarded inc))]
+                 (d/fork-room parent {:isolation :ctx}))]
+      (try
+        (is (identical? fork (registry/lookup (:id fork)))
+            "the atomically published Room remains authoritative")
+        (is (zero? @discarded)
+            "a failed control-plane notification cannot settle its live handle")
+        (finally
+          ;; The test replaced settlement only during construction; normal
+          ;; cleanup owns and settles the retained fork now.
+          (d/discard fork))))))
 
 (deftest propose-merge!-emits-event-and-tagged-message
   (binding [ec/*execution-context* *base-ctx*]
@@ -662,6 +724,13 @@
                   (catch clojure.lang.ExceptionInfo error error))]
       (is (= "preflight conflict" (ex-message error)))
       (is (ygg/open-fork? (d/fork-handle fork)))
+      (let [controller (sandbox-work/create!
+                        (:id fork) (:incarnation fork) (:ctx fork) nil :serial {}
+                        (fn [value] (sp/spin value)))]
+        (is (some? controller)
+            "failed settlement reopens the exact SCI work-admission generation")
+        (binding [ec/*execution-context* (:ctx fork)]
+          (sandbox-work/close! controller)))
       (d/post! fork (d/message :human nil "relay after failed merge"))
       (is (= true (deref relayed 2000 ::timeout)))
       (d/discard fork))))

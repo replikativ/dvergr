@@ -112,3 +112,254 @@
            clojure.lang.ExceptionInfo
            #":run/chat-id must be a UUID"
            (store/-store-run! st room-id (assoc completed :run/chat-id :not-a-uuid)))))))
+
+(defn assert-run-causality!
+  "Exercise terminal/same-room validation and append-only causal updates."
+  [st room-id]
+  (testing "causal inputs are resolved, scoped, append-only Run evidence"
+    (let [other-room-id (keyword (str (name room-id) "-other"))
+          now (java.util.Date. 1787860800000)
+          ended (java.util.Date. 1787860801000)
+          run-map (fn [id actor status]
+                    (cond-> {:run/id id
+                             :run/kind :workflow
+                             :run/room room-id
+                             :run/actor actor
+                             :run/trigger (random-uuid)
+                             :run/status status
+                             :run/created-at now
+                             :run/started-at now
+                             :run/updated-at (if (= :running status) now ended)}
+                      (store/terminal-run-statuses status)
+                      (assoc :run/ended-at ended)))
+          root-id (random-uuid)
+          child-id (random-uuid)
+          foreign-id (random-uuid)
+          root (run-map root-id :root :running)
+          child (run-map child-id :child :running)
+          foreign (assoc (run-map foreign-id :foreign :completed)
+                         :run/room other-room-id)]
+      (store/-store-room! st room-id {:slug (name room-id) :title "causes"})
+      (store/-store-room! st other-room-id
+                          {:slug (name other-room-id) :title "other causes"})
+      (store/-store-run! st room-id root)
+      (store/-store-run! st room-id child)
+      (store/-store-run! st other-room-id foreign)
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"has not resolved"
+           (store/-store-run! st room-id
+                              (assoc root :run/caused-by #{child-id}))))
+      (store/-store-run! st room-id
+                         (assoc child :run/status :completed
+                                :run/updated-at ended :run/ended-at ended))
+      (let [caused (assoc root :run/caused-by #{child-id}
+                          :run/updated-at ended)]
+        (is (= caused (store/-store-run! st room-id caused)))
+        (is (= caused (store/-store-run! st room-id caused))
+            "replaying an existing causal set is idempotent")
+        (is (= #{child-id}
+               (:run/caused-by (store/-load-run st room-id root-id))))
+        (is (= #{child-id}
+               (:run/caused-by
+                (first (store/-list-runs st room-id {:actor :root})))))
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"append-only"
+             (store/-store-run! st room-id (dissoc caused :run/caused-by))))
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"not durable in the same Room"
+             (store/-store-run! st room-id
+                                (update caused :run/caused-by conj (random-uuid)))))
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"not durable in the same Room"
+             (store/-store-run! st room-id
+                                (update caused :run/caused-by conj foreign-id))))
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"terminal Run lifecycle is immutable"
+             (store/-store-run!
+              st room-id
+              (-> (store/-load-run st room-id child-id)
+                  (assoc :run/status :running :run/updated-at ended)
+                  (dissoc :run/ended-at))))
+            "accepted causal evidence cannot later regress to a live Run")))))
+
+(defn assert-attention-projection!
+  "Exercise durable participant-specific attention storage and filtering."
+  [st room-id]
+  (testing "attention is durable control state, separate from speech"
+    (store/-store-room! st room-id {:slug (name room-id) :title "Attention"})
+    (let [created (java.util.Date. 1787860800000)
+          fact {:attention/id (random-uuid)
+                :attention/participant :agent/researcher
+                :attention/message-id (random-uuid)
+                :attention/run-id (random-uuid)
+                :attention/memory :remember
+                :attention/activation :none
+                :attention/control :continue
+                :attention/at :next-safe-boundary
+                :attention/priority 0.0
+                :attention/status :ready
+                :attention/reason :peer/observation
+                :attention/metadata {:classifier :test :confidence 0.75}
+                :attention/created-at created}]
+      (is (= fact (store/-store-attention! st room-id fact)))
+      (is (= [fact]
+             (store/-list-attention st room-id
+                                    {:participant :agent/researcher})))
+      (is (= [fact] (store/unapplied-attention [fact])))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"immutable"
+           (store/-store-attention! st room-id
+                                    (assoc fact :attention/reason :mutated/retry))))
+      (is (empty? (store/-list-messages st room-id {}))
+          "attention facts never contaminate the Room transcript")
+      (is (empty? (store/-list-attention st room-id
+                                         {:participant :agent/other})))
+      (let [applied (-> fact
+                        (assoc :attention/id (random-uuid)
+                               :attention/decision-id (:attention/id fact)
+                               :attention/status :applied
+                               :attention/created-at (java.util.Date. 1787860800001)))]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"missing decision"
+             (store/-store-attention!
+              st room-id (assoc applied
+                                :attention/id (random-uuid)
+                                :attention/decision-id (random-uuid)))))
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"differ"
+             (store/-store-attention!
+              st room-id (assoc applied
+                                :attention/id (random-uuid)
+                                :attention/message-id (random-uuid)))))
+        (store/-store-attention! st room-id applied)
+        (is (empty? (store/unapplied-attention [fact applied])))))))
+
+(defn assert-concurrent-attention-identity!
+  "Conflicting writers must agree on one immutable attention identity."
+  [st room-id]
+  (testing "attention first-write identity is atomic"
+    (store/-store-room! st room-id {:slug (name room-id) :title "Attention race"})
+    (let [attention-id (random-uuid)
+          base {:attention/id attention-id
+                :attention/participant :agent/researcher
+                :attention/message-id (random-uuid)
+                :attention/memory :remember
+                :attention/status :ready
+                :attention/created-at (java.util.Date.)}
+          ready (java.util.concurrent.CountDownLatch. 2)
+          start (promise)
+          writer (fn [reason]
+                   (future
+                     (.countDown ready)
+                     @start
+                     (try
+                       (store/-store-attention! st room-id
+                                                (assoc base :attention/reason reason))
+                       (catch Throwable error error))))
+          a (writer :race/a)
+          b (writer :race/b)]
+      (is (.await ready 5 java.util.concurrent.TimeUnit/SECONDS))
+      (deliver start true)
+      (let [outcomes [@a @b]]
+        (is (= 1 (count (filter map? outcomes))))
+        (is (= 1 (count (filter #(instance? Throwable %) outcomes))))
+        (is (= 1 (count (store/-list-attention st room-id {}))))))))
+
+(defn assert-enqueue-result-run!
+  "An enqueue is applied only by the exact successor execution it caused."
+  [st room-id]
+  (testing "enqueue disposition is correlated to its successor Run"
+    (store/-store-room! st room-id {:slug (name room-id) :title "Enqueue"})
+    (let [participant :agent/researcher
+          message-id (random-uuid)
+          decision {:attention/id (random-uuid)
+                    :attention/participant participant
+                    :attention/message-id message-id
+                    :attention/memory :include
+                    :attention/activation :enqueue
+                    :attention/control :continue
+                    :attention/at :quiescent
+                    :attention/status :ready
+                    :attention/created-at (java.util.Date.)}
+          result-run-id (random-uuid)
+          unrelated-run-id (random-uuid)
+          now (java.util.Date.)
+          result-run {:run/id result-run-id
+                      :run/kind :agent-turn
+                      :run/room room-id
+                      :run/actor participant
+                      :run/trigger message-id
+                      :run/status :running
+                      :run/created-at now
+                      :run/started-at now
+                      :run/updated-at now}
+          applied (assoc decision
+                         :attention/id (random-uuid)
+                         :attention/decision-id (:attention/id decision)
+                         :attention/status :applied
+                         :attention/created-at (java.util.Date.)
+                         :attention/result-run-id result-run-id)]
+      (store/-store-attention! st room-id decision)
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"requires a successor Run"
+                            (store/-store-attention!
+                             st room-id
+                             (dissoc applied :attention/result-run-id))))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"missing successor Run"
+                            (store/-store-attention!
+                             st room-id
+                             (assoc applied :attention/id (random-uuid)
+                                    :attention/result-run-id (random-uuid)))))
+      (store/-store-run! st room-id
+                         (assoc result-run :run/id unrelated-run-id
+                                :run/actor :agent/other))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unrelated successor Run"
+                            (store/-store-attention!
+                             st room-id
+                             (assoc applied :attention/id (random-uuid)
+                                    :attention/result-run-id unrelated-run-id))))
+      (store/-store-run! st room-id result-run)
+      (is (= applied (store/-store-attention! st room-id applied)))
+      (is (empty? (store/unapplied-attention [decision applied]))))))
+
+(defn assert-cross-room-attention-identity!
+  "One global fact identity cannot be acknowledged under a second Room."
+  [st]
+  (testing "attention identity includes and validates Room ownership"
+    (let [room-a :attention-room-a
+          room-b :attention-room-b
+          fact {:attention/id (random-uuid)
+                :attention/participant :agent/researcher
+                :attention/message-id (random-uuid)
+                :attention/memory :remember
+                :attention/status :ready
+                :attention/created-at (java.util.Date.)}]
+      (store/-store-room! st room-a {:slug (name room-a) :title "A"})
+      (store/-store-room! st room-b {:slug (name room-b) :title "B"})
+      (store/-store-attention! st room-a fact)
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"immutable"
+                            (store/-store-attention! st room-b fact)))
+      (is (empty? (store/-list-attention st room-b {}))))))
+
+(defn assert-attention-metadata-validation!
+  [st room-id]
+  (testing "durable attention metadata must round-trip as EDN"
+    (store/-store-room! st room-id {:slug (name room-id) :title "Metadata"})
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"round-trippable EDN"
+         (store/-store-attention!
+          st room-id
+          {:attention/id (random-uuid)
+           :attention/participant :agent/researcher
+           :attention/message-id (random-uuid)
+           :attention/status :ready
+           :attention/metadata {:callback (fn [])}
+           :attention/created-at (java.util.Date.)})))))

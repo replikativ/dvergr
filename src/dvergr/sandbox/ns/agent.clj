@@ -8,6 +8,7 @@
    `(find-doc …)` answer nothing for them inside the sandbox. See
    `dvergr.sandbox.ns.doc`."
   (:require [sci.core :as sci]
+            [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.sandbox.ns.doc :as doc]
             [org.replikativ.spindel.engine.core :as ec]))
 
@@ -49,7 +50,7 @@
           (-> (await (comb/race (agent/owned-result-spin a)
                                 (agent/owned-result-spin b)))
               :run/value)))"
-  [sci-ctx room-id spindel-ctx agent-program-ceiling]
+  [sci-ctx room-id spindel-ctx agent-program-ceiling & [binding-resolver]]
   (let [make-roster*   (requiring-resolve 'dvergr.agent.roster/make-roster)
         make-agent*    (requiring-resolve 'dvergr.agent.roster/make-agent)
         revise-agent*  (requiring-resolve 'dvergr.agent.roster/revise-agent)
@@ -57,6 +58,8 @@
         agent-ref*     (requiring-resolve 'dvergr.agent.roster/agent-ref)
         agents*        (requiring-resolve 'dvergr.agent.roster/agents)
         select-agents* (requiring-resolve 'dvergr.agent.roster/select-agents)
+        make-environment* (requiring-resolve 'dvergr.agent.environment/make-environment)
+        environment-ref* (requiring-resolve 'dvergr.agent.environment/environment-ref)
         hire-in*       (requiring-resolve 'dvergr.agent.program/hire-in!)
         observe*       (requiring-resolve 'dvergr.agent.program/observe)
         cancel*        (requiring-resolve 'dvergr.agent.program/cancel!)
@@ -66,9 +69,13 @@
         room-balance*  (requiring-resolve 'dvergr.resource/balance)
         run-balance*   (requiring-resolve 'dvergr.resource/run-balance)
         room-lookup*   (requiring-resolve 'dvergr.room.registry/lookup)
+        selected-ctx   #(runtime-ctx/selected-context spindel-ctx)
+        current-room-id #(or (when binding-resolver
+                               (:room-runtime-id (binding-resolver)))
+                             room-id)
         current-room   (fn []
-                         (when room-id
-                           (binding [ec/*execution-context* spindel-ctx]
+                         (when-let [room-id (current-room-id)]
+                           (binding [ec/*execution-context* (selected-ctx)]
                              (room-lookup* room-id))))
         room!          (fn []
                          (or (current-room)
@@ -94,6 +101,10 @@
                                kind (get-in definition [:agent/program :kind])
                                allowed-kinds (:program-kinds agent-program-ceiling)
                                ambient-parent (:parent-run agent-program-ceiling)]
+                           (when (= :deferred (:settlement opts))
+                             (throw (ex-info
+                                     "Deferred settlement is reserved for trusted host policies"
+                                     {:type ::deferred-settlement-forbidden})))
                            (when (and allowed-kinds
                                       (not (contains? allowed-kinds kind)))
                              (throw (ex-info
@@ -133,6 +144,15 @@
                                control-room (control-room! work-room)]
                            (binding [ec/*execution-context* (:ctx work-room)]
                              (cancel* control-room handle-or-id))))
+        result-spin-fn (fn [handle]
+                         (if-let [run-id (:parent-run agent-program-ceiling)]
+                           (result-spin* run-id handle)
+                           (result-spin* handle)))
+        owned-result-spin-fn
+        (fn [handle]
+          (if-let [run-id (:parent-run agent-program-ceiling)]
+            (owned-result-spin* run-id handle)
+            (owned-result-spin* handle)))
         balance-fn     (fn []
                          (let [work-room (room!)
                                control-room (control-room! work-room)]
@@ -149,13 +169,16 @@
         'ref          agent-ref*
         'list         agents*
         'select       select-agents*
+        'environment  make-environment*
+        'environment-ref environment-ref*
+        'room-id      (fn [] (:id (room!)))
         'hire!        hire-fn
         'observe      observe-fn
         'cancel!      cancel-fn
         'balance      balance-fn
         'run-id       run-id*
-        'result-spin  result-spin*
-        'owned-result-spin owned-result-spin*}
+        'result-spin  result-spin-fn
+        'owned-result-spin owned-result-spin-fn}
        '{roster       [([] [opts]) "Create an immutable Roster value. Options may include portable :id, :defaults, :scope, and :metadata data."]
          make-agent   [([roster spec]) "Return a NEW Roster containing `spec`. Programs are {:kind :echo :delay-ms n}, {:kind :scripted :delay-ms n :reply value}, or {:kind :llm :max-model-steps n :budget-dollars n} plus :model-policy and :tools. Pure: input unchanged."]
          revise-agent [([roster id patch]) "Return a NEW Roster with AgentDef `id` revised and its version incremented."]
@@ -163,13 +186,16 @@
          ref          [([agent-def]) "Return the stable {:agent/id :agent/version} reference for an AgentDef."]
          list         [([roster]) "All AgentDefs in a Roster, deterministically ordered by id."]
          select       [([roster selector]) "Select AgentDefs by :id, :status, :skill/:skills, and exact portable :where data."]
+         environment  [([spec]) "Create a portable, content-addressed EnvironmentDef. Requires :id, :task, and trusted verifier ref {:id keyword :version n}; optional :limits/:world/:metadata stay data, never live functions or handles."]
+         environment-ref [([environment]) "Return the stable logical/version/content reference for one exact EnvironmentDef. Individual execution Run IDs remain unique."]
+         room-id      [([]) "Return the live identity of the current Room/world. In an isolated fork this is the child Room, not its parent."]
          hire!        [([roster agent-ref opts]) "Durably start one owned AgentDef in the current Room: (hire! team :a {:task value :resources {\"microUSD\" 1000}}). Returns a RunHandle. The current Run remains responsible for the child even if the handle is ignored; opts may also include :from, :settlement, and a positive conserved :resources vector split from the current Run/Room."]
          observe      [([handle-or-run-id]) "Read the current Room's durable Run projection for a RunHandle or UUID."]
          cancel!      [([handle-or-run-id]) "Request cooperative cancellation of exactly one live Run. Returns true when the Run was found."]
          balance      [([]) "Return the conserved resource vector available to the current Run, or the Room root at top level."]
          run-id       [([handle]) "Return the durable Run UUID represented by a RunHandle."]
-         result-spin  [([handle]) "Return a passive Spindel observer Spin for a RunHandle. Multiple observers may await it; cancelling an observer does not cancel the Run."]
-         owned-result-spin [([handle]) "Return an ownership-coupled result Spin. Cancelling this observer also cancels the underlying Run; use only when the observer owns that child execution."]}))))
+         result-spin  [([handle]) "Return a passive Spindel observer Spin for a RunHandle. On resolution the current Run durably records the child as a causal input. Multiple observers may await it; cancelling an observer does not cancel the Run."]
+         owned-result-spin [([handle]) "Return an ownership-coupled result Spin. On resolution the current Run durably records the child as a causal input. Cancelling this observer also cancels the underlying Run; use only when the observer owns that child execution."]}))))
 
 (defn add-agents-ns!
   "Expose the agent registry as 'agents namespace in SCI.

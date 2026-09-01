@@ -19,7 +19,8 @@
                                        `:chat/*` / `:message/*` /
                                        `:room/*` schema, same data
                                        as today's `dvergr.rooms`."
-  (:require [clojure.string :as str]))
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]))
 
 (defprotocol PRoomStore
   "Pluggable durability surface for Rooms. Implementations decide
@@ -109,6 +110,40 @@
   (-resource-receipt [this transfer-id]
     "Return the durable transfer receipt, or nil."))
 
+(defprotocol PAttentionStore
+  "Participant-specific attention projections over immutable Room messages.
+
+   Attention is control/memory state, not speech, so it deliberately does not
+   travel through PRoomStore's message log. Implementations colocate it with the
+   Room authority and make first-write identity durable."
+
+  (-store-attention! [this room-id fact]
+    "Persist one validated attention fact. Returns the stored fact.")
+
+  (-list-attention [this room-id opts]
+    "List attention facts, optionally restricted by exact :id, :participant,
+     and :limit. Exact identity lookup is never subject to the history limit."))
+
+(defprotocol PAttemptStore
+  "Durable query projection for trusted, verified evaluation Attempts.
+
+   The Attempt is owned by the same Room store as its terminal Run. Exact
+   open-ended values may live in an immutable artifact store, but certification
+   is not durable until this typed index and all artifact references commit."
+
+  (-store-attempt! [this room-id attempt]
+    "Persist one immutable certified Attempt. The root Run must be terminal in
+     this Room. Repeating identical content is idempotent; reusing the Run
+     identity for different content is an error.")
+
+  (-load-attempt [this room-id attempt-id]
+    "Return one exact certified Attempt by UUID in `room-id`, else nil.")
+
+  (-list-attempts [this room-id opts]
+    "Return recent certified Attempts newest first. Optional exact filters are
+     :environment-id, :environment-content-id, :provider, :model, and :status;
+     :limit is applied after filtering."))
+
 ;; =============================================================================
 ;; Helpers
 ;; =============================================================================
@@ -120,8 +155,163 @@
 
 (def terminal-run-statuses #{:completed :failed :cancelled})
 
+(def durable-attention-keys
+  #{:attention/id :attention/participant :attention/message-id
+    :attention/decision-id :attention/run-id :attention/memory :attention/activation
+    :attention/control :attention/at :attention/priority
+    :attention/status :attention/reason :attention/metadata
+    :attention/result-run-id :attention/created-at})
+
+(defn attention-id
+  "Deterministic identity for one decision or disposition over a message."
+  [room-id participant message-id run-id phase]
+  (java.util.UUID/nameUUIDFromBytes
+   (.getBytes (pr-str [:dvergr/attention room-id participant message-id run-id phase])
+              java.nio.charset.StandardCharsets/UTF_8)))
+
+(def attention-semantic-keys
+  [:attention/participant :attention/message-id :attention/run-id
+   :attention/memory :attention/activation :attention/control :attention/at
+   :attention/priority :attention/reason :attention/metadata])
+
+(defn validate-attention-disposition!
+  "Require an applied fact to match one existing ready decision exactly."
+  [decision applied]
+  (when-not decision
+    (throw (ex-info "Applied attention references a missing decision"
+                    {:type :room-store/orphan-attention-disposition
+                     :applied applied})))
+  (when-not (= :ready (:attention/status decision))
+    (throw (ex-info "Only a ready attention decision can be applied"
+                    {:type :room-store/invalid-attention-disposition
+                     :decision decision :applied applied})))
+  (when-not (= (:attention/id decision) (:attention/decision-id applied))
+    (throw (ex-info "Applied attention references the wrong decision"
+                    {:type :room-store/invalid-attention-disposition
+                     :decision decision :applied applied})))
+  (when-not (= (select-keys decision attention-semantic-keys)
+               (select-keys applied attention-semantic-keys))
+    (throw (ex-info "Applied attention axes differ from its decision"
+                    {:type :room-store/attention-disposition-mismatch
+                     :decision decision :applied applied})))
+  (if (= :enqueue (:attention/activation applied))
+    (when-not (uuid? (:attention/result-run-id applied))
+      (throw (ex-info "Applied enqueue attention requires a successor Run"
+                      {:type :room-store/missing-attention-result-run
+                       :decision decision :applied applied})))
+    (when (:attention/result-run-id applied)
+      (throw (ex-info "Only applied enqueue attention may reference a successor Run"
+                      {:type :room-store/unexpected-attention-result-run
+                       :decision decision :applied applied}))))
+  applied)
+
+(defn validate-attention-result-run!
+  "Require enqueue acknowledgement to name the exact successor execution."
+  [applied result-run]
+  (when (= :enqueue (:attention/activation applied))
+    (when-not result-run
+      (throw (ex-info "Applied enqueue attention references a missing successor Run"
+                      {:type :room-store/missing-attention-result-run
+                       :applied applied})))
+    (when-not (and (= (:attention/participant applied) (:run/actor result-run))
+                   (= (:attention/message-id applied) (:run/trigger result-run)))
+      (throw (ex-info "Applied enqueue attention references an unrelated successor Run"
+                      {:type :room-store/invalid-attention-result-run
+                       :applied applied :result-run result-run}))))
+  applied)
+
+(defn validate-attention!
+  "Validate one durable participant attention projection and return it."
+  [fact]
+  (when-let [unknown (seq (remove durable-attention-keys (keys fact)))]
+    (throw (ex-info "Unknown durable attention keys"
+                    {:type :room-store/unknown-attention-keys
+                     :unknown (set unknown)})))
+  (doseq [k [:attention/id :attention/message-id]
+          :let [v (get fact k)]]
+    (when-not (uuid? v)
+      (throw (ex-info (str k " must be a UUID")
+                      {:type :room-store/invalid-attention :key k :fact fact}))))
+  (when-not (keyword? (:attention/participant fact))
+    (throw (ex-info ":attention/participant must be a keyword"
+                    {:type :room-store/invalid-attention :fact fact})))
+  (when (and (:attention/run-id fact) (not (uuid? (:attention/run-id fact))))
+    (throw (ex-info ":attention/run-id must be a UUID"
+                    {:type :room-store/invalid-attention :fact fact})))
+  (when (and (:attention/result-run-id fact)
+             (not (uuid? (:attention/result-run-id fact))))
+    (throw (ex-info ":attention/result-run-id must be a UUID"
+                    {:type :room-store/invalid-attention :fact fact})))
+  (when (and (:attention/decision-id fact)
+             (not (uuid? (:attention/decision-id fact))))
+    (throw (ex-info ":attention/decision-id must be a UUID"
+                    {:type :room-store/invalid-attention :fact fact})))
+  (when (and (= :applied (:attention/status fact))
+             (not (uuid? (:attention/decision-id fact))))
+    (throw (ex-info "Applied attention requires :attention/decision-id"
+                    {:type :room-store/invalid-attention :fact fact})))
+  (doseq [[k allowed] [[:attention/memory #{:ignore :remember :include}]
+                       [:attention/activation #{:none :enqueue :wake}]
+                       [:attention/control #{:continue :integrate :restart :suspend :cancel}]
+                       [:attention/at #{:now :next-safe-boundary :before-model :token
+                                        :before-tool :after-tool :after-model :quiescent}]
+                       [:attention/status #{:ready :deferred :invalid :applied
+                                            :baseline-complete}]]
+          :let [v (get fact k)]
+          :when (and (some? v) (not (contains? allowed v)))]
+    (throw (ex-info (str "Invalid durable " k)
+                    {:type :room-store/invalid-attention :key k :value v})))
+  (when (and (some? (:attention/priority fact))
+             (not (number? (:attention/priority fact))))
+    (throw (ex-info ":attention/priority must be numeric"
+                    {:type :room-store/invalid-attention :fact fact})))
+  (when (and (:attention/reason fact)
+             (not (keyword? (:attention/reason fact))))
+    (throw (ex-info ":attention/reason must be a keyword"
+                    {:type :room-store/invalid-attention :fact fact})))
+  (when (and (:attention/metadata fact)
+             (not (map? (:attention/metadata fact))))
+    (throw (ex-info ":attention/metadata must be a map"
+                    {:type :room-store/invalid-attention :fact fact})))
+  (when-let [metadata (:attention/metadata fact)]
+    (let [round-trip
+          (try
+            (edn/read-string (pr-str metadata))
+            (catch Throwable error
+              (throw (ex-info ":attention/metadata must be round-trippable EDN"
+                              {:type :room-store/invalid-attention-metadata
+                               :metadata metadata}
+                              error))))]
+      (when-not (= metadata round-trip)
+        (throw (ex-info ":attention/metadata must round-trip without type loss"
+                        {:type :room-store/invalid-attention-metadata
+                         :metadata metadata :round-trip round-trip})))))
+  (when-not (instance? java.util.Date (:attention/created-at fact))
+    (throw (ex-info ":attention/created-at must be an instant"
+                    {:type :room-store/invalid-attention :fact fact})))
+  (cond-> fact
+    (some? (:attention/priority fact))
+    (update :attention/priority double)))
+
+(defn unapplied-attention
+  "Return ready decisions that have no append-only applied disposition.
+
+   This is recovery/audit input, not an instruction to replay blindly: the
+   owning interpreter must reconcile the durable Run and effect boundary before
+   deciding whether retry is safe."
+  [facts]
+  (let [applied (into #{}
+                      (keep #(when (= :applied (:attention/status %))
+                               (:attention/decision-id %)))
+                      facts)]
+    (->> facts
+         (filter #(= :ready (:attention/status %)))
+         (remove #(contains? applied (:attention/id %)))
+         vec)))
+
 (def durable-run-keys
   #{:run/id :run/kind :run/room :run/actor :run/trigger :run/parent
+    :run/caused-by
     :run/status :run/created-at :run/started-at :run/updated-at :run/ended-at
     :run/reason :run/error
     :run/world :run/isolation :run/settlement-policy
@@ -164,6 +354,17 @@
   (when (and (:run/parent run) (not (uuid? (:run/parent run))))
     (throw (ex-info ":run/parent must be a UUID"
                     {:type :room-store/invalid-run :key :run/parent :run run})))
+  (when-not (and (set? (or (:run/caused-by run) #{}))
+                 (every? uuid? (:run/caused-by run)))
+    (throw (ex-info ":run/caused-by must be a set of Run UUIDs"
+                    {:type :room-store/invalid-run
+                     :key :run/caused-by
+                     :run run})))
+  (when (contains? (:run/caused-by run) (:run/id run))
+    (throw (ex-info "A Run cannot causally depend on itself"
+                    {:type :room-store/invalid-run
+                     :key :run/caused-by
+                     :run run})))
   (when (and (:run/roster run) (not (keyword? (:run/roster run))))
     (throw (ex-info ":run/roster must be a keyword"
                     {:type :room-store/invalid-run :key :run/roster :run run})))
@@ -195,10 +396,14 @@
              (not (instance? java.util.Date (:run/ended-at run))))
     (throw (ex-info "A terminal run requires :run/ended-at"
                     {:type :room-store/invalid-run :key :run/ended-at :run run})))
+  (when (and (not (contains? terminal-run-statuses (:run/status run)))
+             (some? (:run/ended-at run)))
+    (throw (ex-info "A nonterminal run cannot have :run/ended-at"
+                    {:type :room-store/invalid-run :key :run/ended-at :run run})))
   run)
 
 (defn validate-run-update!
-  "Reject an update that changes the causal identity of an existing Run."
+  "Reject an update that changes identity or removes durable causal evidence."
   [existing run]
   (when (and existing
              (not= (select-keys existing immutable-run-keys)
@@ -208,6 +413,48 @@
                      :run-id (:run/id run)
                      :existing (select-keys existing immutable-run-keys)
                      :update (select-keys run immutable-run-keys)})))
+  (when (and existing
+             (not (every? (or (:run/caused-by run) #{})
+                          (or (:run/caused-by existing) #{}))))
+    (throw (ex-info "Durable Run causal inputs are append-only"
+                    {:type :room-store/causes-not-append-only
+                     :run-id (:run/id run)
+                     :existing (:run/caused-by existing)
+                     :update (:run/caused-by run)})))
+  (when (and existing
+             (contains? terminal-run-statuses (:run/status existing))
+             (or (not= (:run/status existing) (:run/status run))
+                 (not= (:run/ended-at existing) (:run/ended-at run))))
+    (throw (ex-info "A terminal Run lifecycle is immutable"
+                    {:type :room-store/terminal-run-update
+                     :run-id (:run/id run)
+                     :existing-status (:run/status existing)
+                     :update-status (:run/status run)
+                     :existing-ended-at (:run/ended-at existing)
+                     :update-ended-at (:run/ended-at run)})))
+  run)
+
+(defn validate-run-causes!
+  "Validate newly asserted causal edges through `load-cause`.
+
+   The loader is scoped to the same durable Room namespace by each store. A
+   causal input must already exist there and be terminal. Existing edges are
+   not rechecked on replay, but `validate-run-update!` prevents their removal."
+  [existing load-cause run]
+  (doseq [cause-id (remove (or (:run/caused-by existing) #{})
+                           (or (:run/caused-by run) #{}))]
+    (let [cause (load-cause cause-id)]
+      (when-not cause
+        (throw (ex-info "Causal input Run is not durable in the same Room"
+                        {:type :room-store/cause-not-durable
+                         :run-id (:run/id run)
+                         :cause-run/id cause-id})))
+      (when-not (contains? terminal-run-statuses (:run/status cause))
+        (throw (ex-info "Causal input Run has not resolved"
+                        {:type :room-store/cause-not-resolved
+                         :run-id (:run/id run)
+                         :cause-run/id cause-id
+                         :cause-run/status (:run/status cause)})))))
   run)
 
 (def durable-message-metadata-keys
@@ -217,13 +464,17 @@
   #{:role :source-user :source-username :source-user-id
     :audience :mentions :attachment :provenance
     :object
-    :tool-uses :reasoning :kind :from :source :schedule-id
+    :tool-uses :activities :reasoning :kind :from :source :schedule-id
     :notification/type :notification/agent :notification/task
     :notification/elapsed :run-id})
 
 (def ^:private attachment-metadata-keys #{:blob-id :node-id :mime :name :size})
 (def ^:private provenance-metadata-keys #{:mode :source})
 (def ^:private object-metadata-keys #{:kind :id})
+(def ^:private activity-metadata-keys
+  #{:activity/id :activity/run-id :activity/kind :activity/verb
+    :activity/status :activity/tool-name :activity/tool-use-id
+    :activity/outcome :activity/critical? :activity/at})
 
 (defn- reject-unknown-metadata! [kind allowed value]
   (let [unknown (seq (remove allowed (keys (or value {}))))]
@@ -233,6 +484,34 @@
                        :kind kind
                        :unknown (set unknown)
                        :allowed allowed})))))
+
+(defn- validate-activity! [activity]
+  (when-not (map? activity)
+    (throw (ex-info "Message activity must be a map"
+                    {:type :room-store/invalid-message-metadata
+                     :activity activity})))
+  (reject-unknown-metadata! :activity activity-metadata-keys activity)
+  (doseq [[key pred label] [[:activity/id uuid? "UUID"]
+                            [:activity/kind keyword? "keyword"]
+                            [:activity/verb keyword? "keyword"]
+                            [:activity/run-id uuid? "UUID"]
+                            [:activity/status keyword? "keyword"]
+                            [:activity/tool-name string? "string"]
+                            [:activity/tool-use-id string? "string"]
+                            [:activity/outcome string? "string"]
+                            [:activity/critical? boolean? "boolean"]
+                            [:activity/at #(instance? java.util.Date %) "instant"]]]
+    (when (and (contains? activity key) (not (pred (get activity key))))
+      (throw (ex-info (str "Message " key " must be a " label)
+                      {:type :room-store/invalid-message-metadata
+                       :key key :activity activity}))))
+  (when-not (and (uuid? (:activity/id activity))
+                 (keyword? (:activity/kind activity))
+                 (keyword? (:activity/verb activity)))
+    (throw (ex-info "Message activity requires UUID :activity/id and keyword kind/verb"
+                    {:type :room-store/invalid-message-metadata
+                     :activity activity})))
+  activity)
 
 (defn validate-message-metadata!
   "Validate the typed durable message metadata vocabulary and return `metadata`.
@@ -257,6 +536,25 @@
                         {:type :room-store/invalid-message-metadata
                          :provenance provenance})))
       (reject-unknown-metadata! :provenance provenance-metadata-keys provenance))
+    (when (contains? metadata :activities)
+      (when-not (sequential? (:activities metadata))
+        (throw (ex-info "Message :activities must be sequential"
+                        {:type :room-store/invalid-message-metadata
+                         :activities (:activities metadata)})))
+      (run! validate-activity! (:activities metadata)))
+    (when-let [message-run-id (:run-id metadata)]
+      (doseq [activity (:activities metadata)]
+        (when (and (:activity/run-id activity)
+                   (not= message-run-id (:activity/run-id activity)))
+          (throw (ex-info "Message activity Run must match its enclosing message"
+                          {:type :room-store/invalid-message-metadata
+                           :message-run-id message-run-id
+                           :activity activity})))))
+    (when (and (nil? (:run-id metadata))
+               (some :activity/run-id (:activities metadata)))
+      (throw (ex-info "Run-correlated activity requires an enclosing message Run"
+                      {:type :room-store/invalid-message-metadata
+                       :activities (:activities metadata)})))
     (when (contains? metadata :object)
       (let [object (:object metadata)]
         (when-not (map? object)

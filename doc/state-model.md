@@ -50,7 +50,8 @@ pair (`dvergr.agent.room-context/ensure-ctx!`) — itself a **fold of Tier 1**:
 - `budget-signal` — `{:total :used :by-type}` token accounting
 - `status-signal` — `:active` / `:paused` / `:completed`
 - `db-conn` — the `dvergr-chat-db` connection (in a fork: the *branched* one)
-- `sci-ctx` — the agent's **SCI sandbox** (its `clojure_eval` world)
+- `sci-component` — a stable Spindel component reference selecting the agent's
+  **SCI sandbox** (`clojure_eval` world) in the current execution context
 
 The agent's own ctx is **`:durable? false`** — signal-only. The room store's
 bus→store listener is the *lone* durable writer for the conversation. So the durable
@@ -62,15 +63,30 @@ plus the per-session sandbox.
 `fork-room` calls `spindel.yggdrasil/fork!`, retains its process-local
 `ForkHandle`, and branches every selected registered Yggdrasil system as a unit:
 
-- **Datahike `dvergr-chat-db`** → branched — messages, KB, ledger, proposals, all
-  isolated until merge. *This is the whole chat state, forked through yggdrasil.*
+- **Datahike `dvergr-chat-db`** → branched — messages, Runs, certified Attempt
+  indexes, KB, ledger, proposals, all isolated until merge. Exact Attempt
+  payloads use the immutable global blob CAS; only a branch's typed reference
+  makes one part of that world. *This is the whole semantic chat state, forked
+  through yggdrasil.*
 - **git worktree** → a fresh worktree; the agent's file edits are isolated.
 - **muschel shell session** → its env-atom is CoW-forked alongside, so a worker's
   `cd` / shell state can't leak to the parent.
-- **per-agent SCI sandbox** → on its first turn in the fork, `ensure-ctx!` builds a
-  fresh `ChatContext` whose `sci-ctx` is a `sandbox/fork-for-session` fork —
-  **transient and isolated per fork, never shared** with the parent or siblings
-  (`(def x …)` in one fork is invisible to others).
+- **per-agent SCI sandbox** → the SCI interpreter is a Spindel world component.
+  Forking the execution context forks its heap (vars, atoms, bindings, and
+  continuations) from the effective parent state. The child reuses the stable
+  `ChatContext` identity while resolving an independent interpreter; `(def x …)`
+  in one fork is invisible to its parent and siblings. Discard unregisters the
+  child realization rather than merging transient interpreter state.
+
+Injected host capabilities follow a stricter rule than ordinary SCI values.
+They never close over a Room, Datahike connection, Geschichte workspace, or
+filesystem. Each interpreter component owns a stable capability identity whose
+serializable binding lives in the Spindel execution context. A copied function
+therefore resolves that identity in the currently selected descendant world at
+call time. This is why a helper defined *before* a fork cannot write back into
+its parent even though the helper's SCI function value itself was inherited.
+Namespace refresh after projection exposes new APIs; it is not the isolation
+mechanism.
 
 The fork's conversation is **seeded from the branched store**, so the agent sees
 inherited (pre-fork) messages *plus* its own — exactly what the UI shows.
@@ -78,6 +94,15 @@ inherited (pre-fork) messages *plus* its own — exactly what the UI shows.
 fully **substrate-isolated world** you can review (`diff`) before adopting or
 discarding. The live handle is process-local; `dvergr.discourse/fork-descriptor`
 is the portable projection used by Runs, proposals, UIs, and audit state.
+
+### ChatContext SCI API migration
+
+`ChatContext` no longer exposes a raw `:sci-ctx` field. Embedders must call
+`dvergr.chat.context/sci-context-in` with the intended execution context, or
+`sci-context` while that context is bound. The record now carries
+`:sci-component`, which is an opaque stable reference and must not be passed to
+SCI directly. Tool contexts still use `:sci-ctx`; supply the interpreter returned
+by one of those resolver functions.
 
 ## Personas / agent config — managed, not files
 

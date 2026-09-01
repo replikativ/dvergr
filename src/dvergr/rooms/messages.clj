@@ -12,7 +12,8 @@
    Same consistency story as everything else here: the bus is the per-room
    totally-ordered log; the store (disk) and this signal (memory) are two folds
    of it, consistent by construction, deduped by message id."
-  (:require [dvergr.discourse :as d]
+  (:require [dvergr.activity :as activity]
+            [dvergr.discourse :as d]
             [dvergr.runtime.bus :as bus]
             [dvergr.runtime.ctx :as rctx]
             [dvergr.room.registry :as rreg]
@@ -64,6 +65,8 @@
    :in-reply-to (:in-reply-to m)
    :thread-root-id (d/thread-root-id m)
    :role      (store/infer-role m)
+   :run-id    (activity/message-run-id m)
+   :activities (activity/message-activities m)
    :tool-uses (or (:tool-uses m) (:tool-uses (:metadata m)))
    :reasoning (or (:reasoning m) (:reasoning (:metadata m)) (:message/reasoning m))})
 

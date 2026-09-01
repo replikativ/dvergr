@@ -8,9 +8,14 @@
             [dvergr.discourse.attention :as attention]
             [dvergr.discourse.llm :as llm]
             [dvergr.chat.context :as cc]
+            [dvergr.runtime.ctx :as runtime-ctx]
+            [dvergr.sandbox :as sandbox]
             [dvergr.agent.run :as run]
+            [dvergr.agent.room-context :as room-context]
             [dvergr.room.store :as store]
-            [dvergr.room.store.memory :as memory]))
+            [dvergr.room.store.memory :as memory]
+            [datahike.api :as dh]
+            [org.replikativ.spindel.engine.component :as component]))
 
 ;; ============================================================================
 ;; Mock turn-fn — scripts the LLM responses
@@ -92,11 +97,173 @@
     (-load-run [_ room-id run-id]
       (store/-load-run delegate room-id run-id))
     (-list-runs [_ room-id opts]
-      (store/-list-runs delegate room-id opts))))
+      (store/-list-runs delegate room-id opts))
+    store/PAttentionStore
+    (-store-attention! [_ room-id fact]
+      (store/-store-attention! delegate room-id fact))
+    (-list-attention [_ room-id opts]
+      (store/-list-attention delegate room-id opts))))
 
 ;; ============================================================================
 ;; Tests
 ;; ============================================================================
+
+(deftest isolated-room-fork-reuses-the-forked-working-interpreter
+  (testing "participant cloning selects the inherited SCI world without registering another"
+    (let [parent (d/room :llm-world-parent)
+          parent-db (random-uuid)
+          fork* (atom nil)]
+      (try
+        (binding [ec/*execution-context* (:ctx parent)]
+          (d/join parent
+                  (llm/llm-agent
+                   {:id :researcher
+                    :spec {:provider :mock :model "mock"}
+                    :run-turn-fn (make-mock-turn-fn (atom []))})))
+        (is (empty? (binding [ec/*execution-context* (:ctx parent)]
+                      (component/registered)))
+            "a joined room participant does not eagerly allocate a room-less fallback")
+        (let [working (room-context/ensure-ctx!
+                       parent :researcher {:budget-dollars 1.0})
+              parent-sci (cc/sci-context-in working (:ctx parent))]
+          (is (= 1 (count (binding [ec/*execution-context* (:ctx parent)]
+                            (component/registered)))))
+          (is (= [:parent]
+                 (:value (sandbox/eval-code
+                          parent-sci
+                          (format
+                           "(def evidence (atom [:parent]))
+                            (defn captured-room [] (dvergr.agent/room-id))
+                            (def captured-room-fn dvergr.agent/room-id)
+                            (def captured-env-get env/get)
+                            (def captured-env-set env/set)
+                            (env/set \"WORLD\" \"parent\")
+                            (def captured-db-exists? datahike.api/database-exists?)
+                            (def captured-db-create! datahike.api/create-database)
+                            (def captured-db-connect! datahike.api/connect)
+                            (def captured-work-serial spindel.work/serial)
+                            (def parent-db {:store {:backend :mem :id %s}
+                                            :schema-flexibility :read})
+                            (captured-db-create! parent-db)
+                            (datahike.api/transact (captured-db-connect! parent-db)
+                              [{:marker/id :parent}])
+                            @evidence"
+                           (pr-str parent-db))
+                          :execution-context (:ctx parent)))))
+          (let [fork (d/fork-room parent {:isolation :ctx})]
+            (reset! fork* fork)
+            (let [child-working (room-context/lookup (:id fork) :researcher)
+                  child-sci (cc/sci-context-in child-working (:ctx fork))]
+              (is (not (identical? working child-working)))
+              (is (= (:sci-component working) (:sci-component child-working)))
+              (is (identical? (:ctx fork) (:spindel-ctx child-working)))
+              (is (not (identical? (:db-conn working) (:db-conn child-working)))
+                  "child persistence never retains the raw parent connection")
+              (is (= 1 (count (binding [ec/*execution-context* (:ctx fork)]
+                                (component/registered))))
+                  "the participant factory did not allocate a second interpreter")
+              (is (= (:id parent)
+                     (:value (sandbox/eval-code
+                              parent-sci "(dvergr.agent/room-id)"
+                              :execution-context (:ctx parent)))))
+              (is (= (:id fork)
+                     (:value (sandbox/eval-code
+                              child-sci "(dvergr.agent/room-id)"
+                              :execution-context (:ctx fork))))
+                  "fresh calls resolve the child Room")
+              (is (= [(:id fork) (:id fork)]
+                     (:value (sandbox/eval-code
+                              child-sci
+                              "[(captured-room) (captured-room-fn)]"
+                              :execution-context (:ctx fork))))
+                  "pre-fork helpers and first-class capabilities resolve through the child world")
+              (is (= true
+                     (:value (sandbox/eval-code
+                              child-sci
+                              "(let [controller
+                                     (captured-work-serial
+                                      (fn [value] (spindel.work/task value)))]
+                                 (spindel.work/close! controller)
+                                 true)"
+                              :execution-context (:ctx fork))))
+                  "retained FRP constructors allocate against the child Room incarnation")
+              (is (= ["parent" "parent"]
+                     (:value (sandbox/eval-code
+                              child-sci
+                              "[(env/get \"WORLD\") (captured-env-get \"WORLD\")]"
+                              :execution-context (:ctx fork))))
+                  "environment data is inherited through the child world binding")
+              (is (= :ok
+                     (:value (sandbox/eval-code
+                              child-sci
+                              "(captured-env-set \"WORLD\" \"child\")"
+                              :execution-context (:ctx fork)))))
+              (is (= ["child" "child"]
+                     (:value (sandbox/eval-code
+                              child-sci
+                              "[(env/get \"WORLD\") (captured-env-get \"WORLD\")]"
+                              :execution-context (:ctx fork)))))
+              (is (= ["parent" "parent"]
+                     (:value (sandbox/eval-code
+                              parent-sci
+                              "[(env/get \"WORLD\") (captured-env-get \"WORLD\")]"
+                              :execution-context (:ctx parent))))
+                  "a retained child mutation does not escape into the parent")
+              (is (= [false false]
+                     (:value (sandbox/eval-code
+                              child-sci
+                              "[(datahike.api/database-exists? parent-db)
+                                (captured-db-exists? parent-db)]"
+                              :execution-context (:ctx fork))))
+                  "live ephemeral database handles are disposable across a fork")
+              (is (= true
+                     (:value (sandbox/eval-code
+                              child-sci
+                              "(captured-db-create! parent-db)
+                               (datahike.api/transact (captured-db-connect! parent-db)
+                                 [{:marker/id :child}])
+                               (captured-db-exists? parent-db)"
+                              :execution-context (:ctx fork)))))
+              (is (= [:child]
+                     (:value (sandbox/eval-code
+                              child-sci
+                              "(datahike.api/q
+                                 '[:find [?v ...] :where [_ :marker/id ?v]]
+                                 @(captured-db-connect! parent-db))"
+                              :execution-context (:ctx fork))))
+                  "the inherited logical config maps to child-owned physical storage")
+              (is (= [:parent]
+                     (:value (sandbox/eval-code
+                              parent-sci
+                              "(datahike.api/q
+                                 '[:find [?v ...] :where [_ :marker/id ?v]]
+                                 @(captured-db-connect! parent-db))"
+                              :execution-context (:ctx parent))))
+                  "same-config child writes cannot reach the parent's physical database")
+              (is (= [:parent :child]
+                     (:value (sandbox/eval-code
+                              child-sci
+                              "(swap! evidence conj :child)"
+                              :execution-context (:ctx fork)))))
+              (is (= [:parent]
+                     (:value (sandbox/eval-code
+                              parent-sci "@evidence"
+                              :execution-context (:ctx parent)))))
+              (let [binding (runtime-ctx/sandbox-binding
+                             (:ctx fork) (:capability-id child-working))
+                    physical-config (-> binding :ephemeral-databases vals first :config)]
+                (is (dh/database-exists? physical-config))
+                (room-context/drop-ctx! (:id fork) :researcher)
+                (is (not (dh/database-exists? physical-config))
+                    "dropping a world deletes its process-global scratch database"))
+              (is (thrown-with-msg?
+                   clojure.lang.ExceptionInfo
+                   #"not available"
+                   (cc/sci-context-in child-working (:ctx fork)))))))
+        (finally
+          (when-let [fork @fork*]
+            (d/discard fork))
+          (d/close-room! parent))))))
 
 (deftest single-turn-replies
   (testing "Agent replies after a single :complete turn"
@@ -185,14 +352,17 @@
                                   :run-turn-fn turn-fn})))
       (try
         (d/post! r (d/message :alice :worker "cancel this run"))
-        (is (= true (deref first-started 2000 ::timeout)))
+        ;; Creating the first room-bound interpreter can compile SCI/Spindel
+        ;; namespaces. Leave enough wall-clock headroom for contended CI hosts;
+        ;; the cancellation assertions below still test the semantic deadline.
+        (is (= true (deref first-started 10000 ::timeout)))
         (let [run-id (:run/id (first (run/active-runs :run-cancel-reuse)))]
           (is (uuid? run-id))
           (is (run/cancel-run! run-id))
           (is (await-condition
                #(= :cancelled (:run/status (run/run r run-id)))
-               3000)))
-        (let [reply (await-spin r #(d/ask % :worker {:content "next run"}) 3000)]
+               10000)))
+        (let [reply (await-spin r #(d/ask % :worker {:content "next run"}) 10000)]
           (is (= "second completed" (:content reply)))
           (is (= :completed
                  (:run/status (run/run r (get-in reply [:metadata :run-id])))))
@@ -478,7 +648,8 @@
 
 (deftest attention-policy-can-queue-same-thread-peer-chatter
   (testing "thread membership does not permanently imply interruption"
-    (let [r       (d/room :peer-attention-room)
+    (let [st      (memory/make)
+          r       (d/make-room {:id :peer-attention-room :store st})
           entered (promise)
           gate    (promise)
           steps   (atom [(fn [chat-ctx opts]
@@ -509,7 +680,343 @@
           (while (and (< (System/currentTimeMillis) deadline)
                       (< (count @calls) 2))
             (Thread/sleep 10)))
-        (is (= 2 (count @calls)) "peer note became a later execution")))))
+        (is (= 2 (count @calls)) "peer note became a later execution")
+        (let [applied (some #(when (and (= :applied (:attention/status %))
+                                        (= :test/peer-chatter
+                                           (:attention/reason %)))
+                               %)
+                            (store/-list-attention st (:id r)
+                                                   {:participant :policy-worker}))
+              successor (run/run r (:attention/result-run-id applied))]
+          (is (uuid? (:attention/result-run-id applied)))
+          (is (= "peer note"
+                 (:content (some #(when (= (:run/trigger successor) (:id %)) %)
+                                 (d/messages r {:limit 30}))))
+              "applied enqueue names the exact successor Run"))))))
+
+(deftest attention-policy-cancel-is-run-local-and-future-work-recovers
+  (let [r (d/make-room {:id :policy-cancel-room :store (memory/make)})
+        entered (promise)
+        steps (atom [(block-until-cancelled-step entered 8000)
+                     (reply-step "recovered answer")])
+        calls (atom [])
+        policy (fn [_]
+                 (attention/decision {:memory :remember
+                                      :control :cancel
+                                      :at :now
+                                      :reason :test/authorized-cancel}))]
+    (try
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent {:id :policy-cancel-worker
+                                  :spec {:provider :mock :model "mock"}
+                                  :budget {:dollars 10.0}
+                                  :attention-policy policy
+                                  :run-turn-fn (make-queued-turn-fn steps calls)})))
+      (let [first-reply
+            (future (await-spin r #(d/ask % :policy-cancel-worker {:content "start"})
+                                2500))]
+        (is (true? (deref entered 3000 ::timeout)))
+        (let [trigger (some #(when (= "start" (:content %)) %) (d/log r))]
+          (d/post! r (d/reply :reviewer :policy-cancel-worker "stop this run" trigger)))
+        (is (= ::timeout @first-reply) "policy cancellation emits no stale reply")
+        (is (await-condition #(empty? (run/active-runs (:id r))) 2000))
+        (is (= :cancelled (:run/status (first (run/runs r)))))
+        (is (= "recovered answer"
+               (:content (await-spin r #(d/ask % :policy-cancel-worker
+                                               {:content "new work"}) 4000)))
+            "attention cancellation does not poison later executions"))
+      (finally
+        (d/close-room! r)))))
+
+(deftest attention-policy-suspend-includes-memory-at-safe-boundary
+  (let [r (d/make-room {:id :policy-suspend-room :store (memory/make)})
+        entered (promise)
+        observed (atom nil)
+        inspect-memory
+        (fn [chat-ctx _]
+          (let [messages (cc/get-messages chat-ctx)
+                _ (reset! observed messages)
+                included? (some #(re-find #"remember before waiting"
+                                          (or (:content %) (:message/content %) ""))
+                                messages)]
+            (cc/add-message! chat-ctx {:role :assistant
+                                       :content (if included? "included" "missing")})
+            :complete))
+        steps (atom [(block-until-cancelled-step entered 8000) inspect-memory])
+        calls (atom [])
+        policy (fn [_]
+                 (attention/decision {:memory :include
+                                      :control :suspend
+                                      :at :next-safe-boundary
+                                      :reason :test/wait}))]
+    (try
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent {:id :policy-suspend-worker
+                                  :spec {:provider :mock :model "mock"}
+                                  :budget {:dollars 10.0}
+                                  :attention-policy policy
+                                  :run-turn-fn (make-queued-turn-fn steps calls)})))
+      (let [first-reply
+            (future (await-spin r #(d/ask % :policy-suspend-worker {:content "start"})
+                                2500))]
+        (is (true? (deref entered 3000 ::timeout)))
+        (let [trigger (some #(when (= "start" (:content %)) %) (d/log r))]
+          (d/post! r (d/reply :reviewer :policy-suspend-worker
+                              "remember before waiting" trigger)))
+        (is (= ::timeout @first-reply))
+        (is (await-condition #(empty? (run/active-runs (:id r))) 2000))
+        (is (= :waiting (:run/status (first (run/runs r)))))
+        (is (= :attention-suspended (:run/reason (first (run/runs r)))))
+        (is (= "included"
+               (:content (await-spin r #(d/ask % :policy-suspend-worker
+                                               {:content "resume"}) 4000)))
+            (pr-str @observed)))
+      (finally
+        (d/close-room! r)))))
+
+(deftest non-preempting-include-is-admitted-between-provider-rounds
+  (let [r (d/make-room {:id :policy-include-boundary :store (memory/make)})
+        entered (promise)
+        gate (promise)
+        observed (atom nil)
+        steps (atom [(fn [_chat-ctx _]
+                       (deliver entered true)
+                       @gate
+                       :continue)
+                     (fn [chat-ctx _]
+                       (reset! observed (cc/get-messages chat-ctx))
+                       (cc/add-message! chat-ctx {:role :assistant :content "done"})
+                       :complete)])
+        calls (atom [])
+        policy (fn [_]
+                 (attention/decision {:memory :include
+                                      :control :continue
+                                      :at :next-safe-boundary
+                                      :reason :test/include-next-round}))]
+    (try
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent {:id :include-worker
+                                  :spec {:provider :mock :model "mock"}
+                                  :budget {:dollars 10.0}
+                                  :attention-policy policy
+                                  :run-turn-fn (make-queued-turn-fn steps calls)})))
+      (let [reply-f (future (await-spin r #(d/ask % :include-worker {:content "start"})
+                                        5000))]
+        (is (true? (deref entered 3000 ::timeout)))
+        (let [trigger (some #(when (= "start" (:content %)) %) (d/log r))]
+          (d/post! r (d/reply :reviewer :include-worker "use this next" trigger)))
+        (is (await-condition
+             #(some (fn [fact]
+                      (= :test/include-next-round (:attention/reason fact)))
+                    (store/-list-attention (:store r) (:id r)
+                                           {:participant :include-worker}))
+             2000))
+        (deliver gate true)
+        (is (= "done" (:content @reply-f)))
+        (is (some #(re-find #"use this next"
+                            (or (:content %) (:message/content %) ""))
+                  @observed)
+            "include is visible to the very next provider round"))
+      (finally
+        (d/close-room! r)))))
+
+(deftest unsupported-attention-remains-deferred-without-becoming-a-new-run
+  (let [st (memory/make)
+        r (d/make-room {:id :policy-deferred :store st})
+        entered (promise)
+        gate (promise)
+        calls (atom [])
+        steps (atom [(fn [chat-ctx _]
+                       (deliver entered true)
+                       @gate
+                       (cc/add-message! chat-ctx {:role :assistant :content "first"})
+                       :complete)])
+        policy (fn [_]
+                 (attention/decision {:memory :include
+                                      :control :integrate
+                                      :at :after-tool
+                                      :reason :test/provider-boundary}))]
+    (try
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent {:id :deferred-worker
+                                  :spec {:provider :mock :model "mock"}
+                                  :attention-policy policy
+                                  :run-turn-fn (make-queued-turn-fn steps calls)})))
+      (let [reply-f (future (await-spin r #(d/ask % :deferred-worker {:content "start"})
+                                        5000))]
+        (is (true? (deref entered 3000 ::timeout)))
+        (let [trigger (some #(when (= "start" (:content %)) %) (d/log r))]
+          (d/post! r (d/reply :reviewer :deferred-worker "after the tool" trigger)))
+        (is (await-condition
+             #(some (fn [fact] (= :deferred (:attention/status fact)))
+                    (store/-list-attention st (:id r)
+                                           {:participant :deferred-worker}))
+             2000))
+        (deliver gate true)
+        (is (= "first" (:content @reply-f)))
+        (Thread/sleep 150)
+        (is (= 1 (count @calls)) "deferred input is not silently degraded to enqueue")
+        (is (= 1 (count (run/runs r))))
+        (is (some #(= :deferred (:attention/status %))
+                  (store/-list-attention st (:id r)
+                                         {:participant :deferred-worker})))
+        (room-context/drop-ctx! (:id r) :deferred-worker)
+        (let [restored (room-context/ensure-ctx!
+                        r :deferred-worker {:budget-dollars 1.0})]
+          (is (not-any? #(re-find #"after the tool"
+                                  (or (:content %) (:message/content %) ""))
+                        (cc/get-messages restored))
+              "a deferred include remains unapplied after reconstruction")))
+      (finally
+        (d/close-room! r)))))
+
+(deftest include-now-updates-working-memory-before-provider-settles
+  (let [st (memory/make)
+        r (d/make-room {:id :policy-include-now :store st})
+        entered (promise)
+        gate (promise)
+        steps (atom [(fn [chat-ctx _]
+                       (deliver entered true)
+                       @gate
+                       (cc/add-message! chat-ctx {:role :assistant :content "done"})
+                       :complete)])
+        calls (atom [])
+        policy (fn [_]
+                 (attention/decision {:memory :include
+                                      :control :continue
+                                      :at :now
+                                      :reason :test/include-now}))]
+    (try
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent {:id :now-worker
+                                  :spec {:provider :mock :model "mock"}
+                                  :attention-policy policy
+                                  :run-turn-fn (make-queued-turn-fn steps calls)})))
+      (let [reply-f (future (await-spin r #(d/ask % :now-worker {:content "start"})
+                                        5000))]
+        (is (true? (deref entered 3000 ::timeout)))
+        (let [trigger (some #(when (= "start" (:content %)) %) (d/log r))]
+          (d/post! r (d/reply :reviewer :now-worker "visible immediately" trigger)))
+        (is (await-condition
+             #(some (fn [fact]
+                      (and (= :applied (:attention/status fact))
+                           (= :test/include-now (:attention/reason fact))))
+                    (store/-list-attention st (:id r) {:participant :now-worker}))
+             2000))
+        (is (some #(re-find #"visible immediately"
+                            (or (:content %) (:message/content %) ""))
+                  (cc/get-messages (room-context/lookup (:id r) :now-worker)))
+            "now admission precedes provider settlement")
+        (deliver gate true)
+        (is (= "done" (:content @reply-f))))
+      (finally
+        (d/close-room! r)))))
+
+(deftest preempting-include-now-precedes-cancel-settlement
+  (let [st (memory/make)
+        r (d/make-room {:id :policy-restart-now :store st})
+        entered (promise)
+        cancel-seen (promise)
+        settle (promise)
+        calls (atom 0)
+        turn-fn
+        (fn [chat-ctx {:keys [cancel?]}]
+          (if (= 1 (swap! calls inc))
+            (do
+              (deliver entered true)
+              (loop []
+                (if (and cancel? (cancel?))
+                  (do (deliver cancel-seen true)
+                      @settle
+                      :cancelled)
+                  (do (Thread/sleep 5) (recur)))))
+            (do (cc/add-message! chat-ctx {:role :assistant :content "restarted"})
+                :complete)))
+        policy (fn [_]
+                 (attention/decision {:memory :include
+                                      :control :restart
+                                      :at :now
+                                      :reason :test/restart-now}))]
+    (try
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent {:id :restart-now-worker
+                                  :spec {:provider :mock :model "mock"}
+                                  :attention-policy policy
+                                  :run-turn-fn turn-fn})))
+      (let [reply-f (future (await-spin r #(d/ask % :restart-now-worker
+                                                  {:content "start"}) 5000))]
+        (is (true? (deref entered 3000 ::timeout)))
+        (let [trigger (some #(when (= "start" (:content %)) %) (d/log r))]
+          (d/post! r (d/reply :reviewer :restart-now-worker
+                              "admit before settle" trigger)))
+        (is (true? (deref cancel-seen 2000 ::timeout)))
+        (is (some #(re-find #"admit before settle"
+                            (or (:content %) (:message/content %) ""))
+                  (cc/get-messages
+                   (room-context/lookup (:id r) :restart-now-worker))))
+        (deliver settle true)
+        (is (= "restarted" (:content @reply-f))))
+      (finally
+        (deliver settle true)
+        (d/close-room! r)))))
+
+(deftest quiescent-include-waits-until-run-exit
+  (let [st (memory/make)
+        r (d/make-room {:id :policy-include-quiescent :store st})
+        entered (promise)
+        gate (promise)
+        before-quiescence (atom nil)
+        after-quiescence (atom nil)
+        contains-note? (fn [messages]
+                         (some #(re-find #"only at quiescence"
+                                         (or (:content %) (:message/content %) ""))
+                               messages))
+        steps (atom [(fn [_ _]
+                       (deliver entered true)
+                       @gate
+                       :continue)
+                     (fn [chat-ctx _]
+                       (reset! before-quiescence (cc/get-messages chat-ctx))
+                       (cc/add-message! chat-ctx {:role :assistant :content "first done"})
+                       :complete)
+                     (fn [chat-ctx _]
+                       (reset! after-quiescence (cc/get-messages chat-ctx))
+                       (cc/add-message! chat-ctx {:role :assistant :content "second done"})
+                       :complete)])
+        calls (atom [])
+        policy (fn [_]
+                 (attention/decision {:memory :include
+                                      :control :continue
+                                      :at :quiescent
+                                      :reason :test/include-quiescent}))]
+    (try
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent {:id :quiescent-worker
+                                  :spec {:provider :mock :model "mock"}
+                                  :attention-policy policy
+                                  :run-turn-fn (make-queued-turn-fn steps calls)})))
+      (let [reply-f (future (await-spin r #(d/ask % :quiescent-worker
+                                                  {:content "start"}) 5000))]
+        (is (true? (deref entered 10000 ::timeout)))
+        (let [trigger (some #(when (= "start" (:content %)) %) (d/log r))]
+          (d/post! r (d/reply :reviewer :quiescent-worker
+                              "only at quiescence" trigger)))
+        (is (await-condition
+             #(some (fn [fact]
+                      (= :test/include-quiescent (:attention/reason fact)))
+                    (store/-list-attention st (:id r)
+                                           {:participant :quiescent-worker}))
+             2000))
+        (deliver gate true)
+        (is (= "first done" (:content @reply-f)))
+        (is (not (contains-note? @before-quiescence))
+            "provider continuation is earlier than quiescence")
+        (is (= "second done"
+               (:content (await-spin r #(d/ask % :quiescent-worker
+                                               {:content "next run"}) 5000))))
+        (is (contains-note? @after-quiescence)))
+      (finally
+        (d/close-room! r)))))
 
 (deftest cancel-directive-mid-turn
   (testing ":directive/cancel PREEMPTS a running turn (it used to queue behind it)"

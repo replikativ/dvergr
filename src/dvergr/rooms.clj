@@ -134,8 +134,8 @@
     (rstore/slug->room-id slug)))
 
 (defn delete-room!
-  "Delete a room: retract its persisted `:chat/*`/`:message/*` entity from the
-   store, then unregister it from the registry. The CRUD counterpart of
+  "Delete a room: quiesce and unregister its live runtime, then retract its
+   persisted `:chat/*`/`:message/*` entity from the store. The CRUD counterpart of
    `create-room!` — the single op both the TUI (`d`) and web (`/delete`) call.
 
    (Distinct from `dvergr.rooms.forks/discard!`, which tears down a FORK's git +
@@ -144,9 +144,11 @@
   [room]
   (try
     (when room
+      ;; The durable store is the last boundary. Participant Runs and SCI work
+      ;; must acknowledge cancellation before conversation state disappears.
+      (d/close-room! room)
       (when-let [store (:store room)]
-        (rstore/-delete-room! store (:id room)))
-      (rreg/unregister! (:id room)))
+        (rstore/-delete-room! store (:id room))))
     {:ok? true}
     (catch Throwable t {:ok? false :error (.getMessage t)})))
 

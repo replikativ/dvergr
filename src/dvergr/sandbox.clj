@@ -12,6 +12,8 @@
             [clojure.string :as str]
             [datahike.api :as dh]
             [org.replikativ.spindel.engine.core :as rtc]
+            [org.replikativ.spindel.engine.component :as component]
+            [org.replikativ.spindel.sci.world :as sci-world]
             [org.replikativ.spindel.yggdrasil :as ygg]
             [org.replikativ.spindel.core :as sync]
             [dvergr.sci.clojure-test :as sci-test]
@@ -27,6 +29,7 @@
             [dvergr.sandbox.workspace :as workspace]
             [dvergr.sandbox.ns.agent :as ns-agent]
             [dvergr.sandbox.ns.io :as ns-io]
+            [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.system.db :as sdb])
   (:import [java.io StringWriter]
            [java.lang.management ManagementFactory]))
@@ -38,16 +41,19 @@
 ;; A consumer (e.g. an accounting kernel) registers an injector fn here at
 ;; startup; the sandbox setup runs every registered injector so its surface is
 ;; available in `clojure_eval`, WITHOUT dvergr knowing what it is. Each injector
-;; is `(fn [sci-ctx opts])`, opts = {:room-id :room-conn :kb-conn}.
+;; is `(fn [sci-ctx opts])`; opts also carries a fork-safe `:world-binding`
+;; resolver for host closures that can survive an interpreter fork.
 ;; ---------------------------------------------------------------------------
 
 (defonce ^:private ns-injectors* (atom []))
 
 (defn register-ns-injector!
   "Register an SCI namespace-injector `f` — `(fn [sci-ctx opts])`, opts =
-   {:room-id :room-conn :kb-conn} — run for every agent sandbox after the
+   {:room-id :room-conn :kb-conn :world-binding} — run for every agent sandbox after the
    built-in surface. Lets a consumer expose extra namespaces (a domain kernel)
-   in `clojure_eval` without dvergr depending on it. Idempotent per identical fn.
+   in `clojure_eval` without dvergr depending on it. A host closure which may
+   survive a fork MUST call the zero-argument `:world-binding` resolver rather
+   than capture a room id or raw resource. Idempotent per identical fn.
    Returns `f`."
   [f]
   (swap! ns-injectors* (fn [v] (if (some #{f} v) v (conj v f))))
@@ -337,6 +343,48 @@
                 ;; :sci-opts and merges it into sci/init.)
                 :sci-opts     {:load-fn workspace/load-fn}})))
 
+(defn create-spindel-sci-world!
+  "Create a fork-selected SCI interpreter component in `spindel-ctx`.
+
+   Returns a stable Spindel ComponentRef rather than the interpreter itself.
+   Resolve it with `sci-context-in`; a descendant execution context selects its
+   own SCI fork while the reference remains unchanged."
+  [spindel-ctx]
+  (let [ref (sci-world/create!
+             spindel-ctx
+             {:interrupt-fn (make-resource-limits)
+              :sci-opts {:load-fn workspace/load-fn}})
+        interpreter (sci-world/context-in spindel-ctx ref)]
+    ;; The world constructor starts from Spindel's SCI environment, not
+    ;; dvergr's plain base context. Restore the same safe classes/core shims and
+    ;; bind clojure.test to this interpreter before any descendant forks it.
+    (sci/merge-opts interpreter
+                    {:classes base-classes
+                     :namespaces {'clojure.core core-extras}})
+    (sci/merge-opts interpreter
+                    {:namespaces
+                     {'clojure.test
+                      (sci-test/ctx-aware-test-namespace interpreter)}})
+    ref))
+
+(defn sci-context-in
+  "Resolve stable SCI world `ref` in `spindel-ctx`."
+  [spindel-ctx ref]
+  (when ref
+    (sci-world/context-in spindel-ctx ref)))
+
+(defn release-spindel-sci-world!
+  "Remove stable SCI world `ref` from `spindel-ctx`.
+
+   This releases only the selected process-local interpreter realization. It is
+   deliberately separate from closing durable room resources: a forked room
+   may share a ChatContext identity while selecting an independent SCI heap."
+  [spindel-ctx ref]
+  (when ref
+    (binding [rtc/*execution-context* spindel-ctx]
+      (component/unregister! ref)))
+  nil)
+
 ;; ---------------------------------------------------------------------------
 ;; Session Context Management
 ;; ---------------------------------------------------------------------------
@@ -371,7 +419,7 @@
 ;; Evaluation
 ;; ---------------------------------------------------------------------------
 
-(defn eval-code
+(defn- eval-code*
   "Evaluate Clojure code in the session's SCI context.
 
    Returns map with:
@@ -567,6 +615,20 @@
            :stderr (str stderr)
            :success false})))))
 
+(defn eval-code
+  "Evaluate code in an SCI interpreter, selecting `:execution-context` for
+   ambient Spindel/Yggdrasil capabilities when supplied.
+
+   The interpreter selects the SCI world; the Spindel context selects the
+   matching substrate world. Other options are `:timeout-ms`, `:cancel?`, and
+   `:realize?`, as documented by the evaluator above."
+  [sci-ctx code & {:keys [execution-context] :as opts}]
+  (let [args (mapcat identity (dissoc opts :execution-context))]
+    (if execution-context
+      (binding [rtc/*execution-context* execution-context]
+        (apply eval-code* sci-ctx code args))
+      (apply eval-code* sci-ctx code args))))
+
 (defn eval-forms
   "Evaluate multiple forms sequentially in the same context.
    Returns vector of results (one per form)."
@@ -665,8 +727,10 @@
                        "(dvergr.scheduler/create {:agent-id :var :schedule {:every :hour :n 4} :code \"(require 'my.ns)(my.ns/run!)\" :description \"…\"})  (dvergr.scheduler/list)  (dvergr.scheduler/cancel id)"]
    "dvergr.tasks"    ["the shared task ledger — list/accept/complete work items"
                       "(dvergr.tasks/list)   (dvergr.tasks/complete! id)"]
-   "dvergr.agent"    ["program specialized agents as immutable rosters; exact programs are {:kind :echo :delay-ms n}, {:kind :scripted :delay-ms n :reply value}, or {:kind :llm ...}; hire! starts a durable Run with an explicit result Spin"
+   "dvergr.agent"    ["program specialized agents as immutable rosters; define content-addressed verified environments as portable data; exact programs are {:kind :echo :delay-ms n}, {:kind :scripted :delay-ms n :reply value}, or {:kind :llm ...}; hire! starts a durable Run with an explicit result Spin"
                       "join with result-spin; for a first-result race that really cancels losing Runs: (let [team (-> (dvergr.agent/roster) (dvergr.agent/make-agent {:id :fast :program {:kind :scripted :delay-ms 10 :reply :fast}}) (dvergr.agent/make-agent {:id :slow :program {:kind :scripted :delay-ms 5000 :reply :slow}})) a (dvergr.agent/hire! team :fast {:task :solve}) b (dvergr.agent/hire! team :slow {:task :solve})] @(spin (-> (await (spindel.comb/race (dvergr.agent/owned-result-spin a) (dvergr.agent/owned-result-spin b))) :run/value)))"]
+   "spindel.work"    ["structured higher-order FRP admission: latest, serial, busy, and bounded parallel; each accepted value becomes owned work"
+                      "(let [c (spindel.work/latest (fn [x] (spindel.work/task x)))] (spindel.work/submit! c :first) (spindel.work/submit! c :newest) (spindel.work/close! c) @(spin (await (spindel.work/completion c))))"]
    "dvergr.agents"   ["directory of agents (read-only): who exists / is online"
                       "(dvergr.agents/list)   (dvergr.agents/online? :var)"]
    "dvergr.actors"   ["durable participant identities — register/retire agents or humans and assign skills"
@@ -679,7 +743,7 @@
 (def ^:private guide-order
   ["babashka.fs" "babashka.http-client" "babashka.process" "cheshire.core" "clojure.data.xml"
    "datahike.api" "dvergr.room" "dvergr.mail" "dvergr.intake" "dvergr.codec" "git" "env" "llm"
-   "dvergr.scheduler" "dvergr.tasks" "dvergr.agent" "dvergr.agents" "dvergr.actors" "dvergr.skills"
+   "dvergr.scheduler" "dvergr.tasks" "dvergr.agent" "spindel.work" "dvergr.agents" "dvergr.actors" "dvergr.skills"
    "clojure.test"])
 
 (defn ns-overview-data
@@ -803,14 +867,18 @@
        "this room, write `app/index.html` (+ assets under `app/`) in your "
        "workspace — served at `/apps/<room-slug>/`.\n\n"
        "**Reactive agent programs.** `dvergr.agent` provides immutable rosters "
-       "and Run-backed execution. Use the exact Spindel namespaces: "
+       "and Run-backed execution; `agent/environment` creates a content-addressed "
+       "task/verifier/policy definition without starting an attempt. Use the exact Spindel namespaces: "
        "`(require '[dvergr.agent :as agent] "
        "'[org.replikativ.spindel.spin.cps :refer [spin]] "
        "'[org.replikativ.spindel.effects.await :refer [await]])`. "
        "`agent/roster`, `agent/make-agent`, and `agent/revise-agent` return new "
        "values; only `agent/hire!` starts an effect. Compose `(agent/result-spin "
        "handle)` with `await`, parallel Spins, or `race`; inspect exact signatures "
-       "with `(sandbox/doc 'dvergr.agent)`.\n\n"
+       "with `(sandbox/doc 'dvergr.agent)`. For ongoing event sources, use "
+       "`spindel.work/latest`, `serial`, `busy`, or bounded `parallel`; their "
+       "`task` bodies use the same `await` algebra. Inspect `(sandbox/doc "
+       "'spindel.work)`.\n\n"
        "**Your databases.** Your room owns its data — NOT a shared global DB. "
        "`dvergr.room/*kb*` is your knowledge base, `dvergr.room/*room*` your room's "
        "own datahike (messages/state); query them with ordinary datahike, e.g. "
@@ -931,9 +999,21 @@
    Returns the audit-log atom — a vector of IO events ({:op :t :data}) accumulated
    during the agent's execution.  Attach to the agent result for post-hoc analysis."
   [sci-ctx spindel-ctx & {:keys [base-path proc-allow allowed-http-domains room-conn kb-conn room-id
-                                 room-runtime-id agent-program-ceiling]
+                                 room-runtime-id room-incarnation capability-id
+                                 agent-program-ceiling]
                           :or   {proc-allow #{}}}]
   (let [audit-log  (make-audit-log)
+        binding-resolver (when capability-id
+                           (runtime-ctx/sandbox-binding-resolver spindel-ctx capability-id))
+        binding-swap! (when capability-id
+                        (fn [f & args]
+                          (apply runtime-ctx/update-sandbox-binding!
+                                 spindel-ctx capability-id f args)))
+        workspace-resolver
+        (fn []
+          (binding [rtc/*execution-context* (runtime-ctx/selected-context spindel-ctx)]
+            (try ((requiring-resolve 'dvergr.substrate.geschichte/current-workspace))
+                 (catch Throwable _ nil))))
         workspace  (binding [rtc/*execution-context* spindel-ctx]
                      (try ((requiring-resolve 'dvergr.substrate.geschichte/current-workspace))
                           (catch Throwable _ nil)))
@@ -959,13 +1039,21 @@
       ;; falls back to sys-conn so it still has a queryable db (flagged: give them a
       ;; scratch db so even room-less never writes the registry).
       (let [sys-conn (sdb/get-conn)]
-        (ns-datahike/add-datahike-ns! sci-ctx room-id spindel-ctx) ; the ONE datahike surface: faithful `d`/`datahike.api`
+        (when binding-swap!
+          (binding-swap! #(if (contains? % :ephemeral-databases)
+                            %
+                            (assoc % :ephemeral-databases {}))))
+        (ns-datahike/add-datahike-ns! sci-ctx room-id spindel-ctx
+                                      binding-resolver binding-swap!) ; the ONE datahike surface: faithful `d`/`datahike.api`
         ;; ONE `dvergr.room` (+ legacy `room` alias): the Room ops MERGED with the
         ;; room's DB surface (*room*/*kb*/databases/db + queries). The KB is reached
         ;; via `dvergr.room/*kb*` + `kb-find`/`kb-search` + `d` — no separate `entity`
         ;; namespace (dropped as redundant; a global entity CRM can return later).
         (ns-room/add-room-ns! sci-ctx room-conn kb-conn room-id spindel-ctx
-                              agent-program-ceiling)
+                              agent-program-ceiling
+                              {:binding-resolver binding-resolver
+                               :source-room {:id (or room-runtime-id room-id)
+                                             :incarnation room-incarnation}})
         ;; dvergr.mail/*inbox* — the room's attached mailbox conn (fork-aware),
         ;; nil when no mailbox attached. Read helpers are seed source (dvergr/mail/).
         (ns-mail/add-mail-ns! sci-ctx)
@@ -977,14 +1065,26 @@
     ;; effect. No roster is kept in a host atom: callers thread the immutable
     ;; value, and live execution state belongs to the Room's Spindel context.
     (ns-agent/add-programming-ns! sci-ctx (or room-runtime-id room-id) spindel-ctx
-                                  agent-program-ceiling)
-    (ns-data/add-spindel-extras-ns! sci-ctx spindel-ctx)
+                                  agent-program-ceiling binding-resolver)
+    (ns-data/add-spindel-extras-ns!
+     sci-ctx spindel-ctx
+     {:room-id (or room-runtime-id room-id)
+      :room-incarnation room-incarnation
+      :ceiling (:work-admission agent-program-ceiling)
+      :world-binding binding-resolver})
     (ns-codec/add-codec-namespaces! sci-ctx)   ; cheshire.core / clojure.data.xml / dvergr.codec
     (ns-intake/add-intake-namespaces! sci-ctx)
     (ns-io/add-fs-ns!   sci-ctx :base-path cwd :filesystem filesystem
+                        :filesystem-resolver
+                        (when workspace
+                          #(when-let [workspace (workspace-resolver)]
+                             ((requiring-resolve
+                               'dvergr.substrate.geschichte/filesystem)
+                              workspace)))
                         :audit-log audit-log)
     ;; (proc folded into the muschel-backed babashka.process — add-bash-ns! in turn.clj)
     (ns-io/add-git-ns!  sci-ctx :base-path cwd :workspace workspace
+                        :workspace-resolver (when workspace workspace-resolver)
                         :audit-log audit-log)
     (ns-kb/add-llm-ns!  sci-ctx agent-program-ceiling)
     ;; Boundary secret injection (doc/boundary-secret-injection.md): build the
@@ -997,9 +1097,23 @@
           sandbox-env  (try ((requiring-resolve 'dvergr.substrate.config/sandbox-env))
                             (catch Throwable _ nil))
           secrets      (ns-io/build-secret-registry secret-specs)]
+      (when binding-swap!
+        (binding-swap! #(if (contains? % :sandbox-env)
+                          %
+                          (assoc % :sandbox-env (or sandbox-env {})))))
       ;; :user-config = non-secret config values returned verbatim (identifiers,
       ;; site URLs); :secrets = sensitive values returned as placeholders.
-      (ns-io/add-env-ns!  sci-ctx :user-config (atom (or sandbox-env {})) :secrets secrets)
+      (ns-io/add-env-ns! sci-ctx
+                         :user-config (atom (or sandbox-env {}))
+                         :config-resolver (when binding-resolver
+                                            #(or (:sandbox-env (binding-resolver)) {}))
+                         :config-swap! (when binding-swap!
+                                         (fn [f & args]
+                                           (binding-swap!
+                                            #(update % :sandbox-env
+                                                     (fn [m]
+                                                       (apply f (or m {}) args))))))
+                         :secrets secrets)
       (ns-io/add-http-ns! sci-ctx :audit-log audit-log :allowed-domains allowed-http-domains
                           :secrets secrets))
     (ns-agent/add-scheduler-ns! sci-ctx)
@@ -1013,7 +1127,8 @@
     ;; expose their surface here without dvergr depending on them. Run before
     ;; reflection so overview sees them; a failing injector never breaks setup.
     (doseq [f (registered-ns-injectors)]
-      (try (f sci-ctx {:room-id room-id :room-conn room-conn :kb-conn kb-conn})
+      (try (f sci-ctx {:room-id room-id :room-conn room-conn :kb-conn kb-conn
+                       :world-binding binding-resolver})
            (catch Throwable e
              (binding [*out* *err*] (println "ns-injector failed:" (.getMessage e))))))
     ;; Self-reflection LAST, so (sandbox/overview) sees every ns injected above.
@@ -1021,6 +1136,19 @@
     ;; SECURITY, last of all: lock JVM interop to the class allowlist.
     (lock-interop! sci-ctx)
     audit-log))
+
+(defn release-agent-resources!
+  "Release disposable host resources owned by one SCI capability in `ctx`.
+   Durable/mergeable world state is deliberately untouched."
+  [ctx capability-id]
+  (when capability-id
+    (try
+      (let [resolver (runtime-ctx/sandbox-binding-resolver ctx capability-id)
+            swap! (fn [f & args]
+                    (apply runtime-ctx/update-sandbox-binding!
+                           ctx capability-id f args))]
+        (ns-datahike/dispose-ephemeral-databases! resolver swap!))
+      (catch clojure.lang.ExceptionInfo _ nil))))
 
 ;; ---------------------------------------------------------------------------
 ;; clojure.test Integration (from Babashka)

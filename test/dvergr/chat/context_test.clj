@@ -2,7 +2,96 @@
   "Integration tests for ChatContext budget tracking."
   (:require [clojure.test :refer [deftest is testing]]
             [dvergr.chat.context :as ctx]
-            [dvergr.chat.accounting :as acct]))
+            [dvergr.chat.accounting :as acct]
+            [dvergr.runtime.ctx :as runtime-ctx]
+            [dvergr.sandbox :as sandbox]
+            [org.replikativ.spindel.engine.component :as component]
+            [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.engine.context :as execution-context]))
+
+(deftest ambient-selection-only-refines-into-descendants
+  (let [parent (execution-context/create-execution-context)
+        owner (execution-context/fork-context parent :mode :frozen)
+        sibling (execution-context/fork-context parent :mode :frozen)
+        descendant (execution-context/fork-context owner :mode :frozen)]
+    (try
+      (is (identical? owner (runtime-ctx/selected-context owner)))
+      (binding [ec/*execution-context* parent]
+        (is (identical? owner (runtime-ctx/selected-context owner))))
+      (binding [ec/*execution-context* sibling]
+        (is (identical? owner (runtime-ctx/selected-context owner))))
+      (binding [ec/*execution-context* descendant]
+        (is (identical? descendant (runtime-ctx/selected-context owner))))
+      (finally
+        (execution-context/close-context! descendant)
+        (execution-context/close-context! sibling)
+        (execution-context/close-context! owner)
+        (execution-context/close-context! parent)))))
+
+(deftest sci-interpreter-is-selected-by-world
+  (testing "one stable ChatContext ref resolves independent SCI heaps after fork"
+    (let [parent (execution-context/create-execution-context)
+          chat   (ctx/create-chat-context
+                  {:title "forkable repl"
+                   :execution-context parent})]
+      (try
+        (let [ref (:sci-component chat)
+              parent-sci (ctx/sci-context-in chat parent)
+              eval-in (fn [world interpreter source]
+                        (sandbox/eval-code interpreter source
+                                           :execution-context world))]
+          (is (some? ref))
+          ;; Exercise the interpreter agents actually receive, not only the
+          ;; bare Spindel macro context. Every injected capability must either
+          ;; be world-relative or declare its ambient sharing policy.
+          (sandbox/setup-agent-namespaces! parent-sci parent)
+          (is (= {:value [:parent] :stdout "" :stderr "" :success true}
+                 (eval-in
+                  parent parent-sci
+                  "(def observations (atom [:parent])) @observations")))
+          (let [child (execution-context/fork-context parent :mode :frozen)]
+            (try
+              (let [child-sci (ctx/sci-context-in chat child)]
+                (is (not (identical? parent-sci child-sci)))
+                (is (= [:parent :child]
+                       (:value (eval-in
+                                child child-sci
+                                "(swap! observations conj :child)"))))
+                (is (= [:parent]
+                       (:value (eval-in parent parent-sci "@observations"))))
+                (is (= [:parent :child]
+                       (:value (eval-in child child-sci "@observations"))))
+                (let [result
+                      (eval-in
+                       child child-sci
+                       "(ns child-only-test
+                          (:require [clojure.test :refer [deftest is run-tests]]))
+                        (deftest child-proof (is (= 3 (+ 1 2))))
+                        (run-tests 'child-only-test)")]
+                  (is (:success result))
+                  (is (= {:test 1 :pass 1 :fail 0 :error 0}
+                         (select-keys (:value result)
+                                      [:test :pass :fail :error])))
+                  (is (false?
+                       (:value
+                        (eval-in
+                         parent parent-sci
+                         "(boolean (find-ns 'child-only-test))"))))))
+              (ctx/release-sci-in! chat child)
+              (is (thrown-with-msg?
+                   clojure.lang.ExceptionInfo
+                   #"not available"
+                   (ctx/sci-context-in chat child)))
+              (is (contains?
+                   (binding [ec/*execution-context* parent]
+                     (component/registered))
+                   (:id ref))
+                  "releasing a child interpreter preserves its parent")
+              (finally
+                (execution-context/close-context! child)))))
+        (finally
+          (ctx/close-chat! chat)
+          (execution-context/close-context! parent))))))
 
 (deftest create-chat-context-test
   (testing "Create chat with dollar budget"
