@@ -86,21 +86,34 @@
   (let [c (ctx/create-execution-context)
         room (d/make-room {:id :rc-hydration-retry :ctx c :store (mem/make)})
         original d/messages
-        calls (atom 0)]
+        original-constructor turn/new-working-ctx
+        hydration-calls (atom 0)
+        constructor-calls (atom 0)]
     (try
       (with-redefs [d/messages
                     (fn [& args]
-                      (if (= 1 (swap! calls inc))
+                      (if (= 1 (swap! hydration-calls inc))
                         (throw (ex-info "injected hydration failure" {}))
-                        (apply original args)))]
+                        (apply original args)))
+                    turn/new-working-ctx
+                    (fn [opts]
+                      (swap! constructor-calls inc)
+                      (original-constructor opts))]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo
                               #"injected hydration failure"
-                              (rc/ensure-ctx! room :var {:budget-dollars 1.0})))
+                              (rc/ensure-ctx! room :var
+                                              {:budget-dollars 1.0
+                                               :system-prompt "must not leak"})))
         (is (nil? (rc/lookup (:id room) :var)))
         (is (empty? (binding [ec/*execution-context* c]
                       (component/registered))))
-        (let [retried (rc/ensure-ctx! room :var {:budget-dollars 1.0})]
+        (is (zero? @constructor-calls)
+            "fallible durable hydration precedes all ChatContext signals")
+        (let [retried (rc/ensure-ctx! room :var
+                                      {:budget-dollars 1.0
+                                       :system-prompt "must not leak"})]
           (is (some? retried))
+          (is (= 1 @constructor-calls))
           (is (= 1 (count (binding [ec/*execution-context* c]
                             (component/registered)))))))
       (finally

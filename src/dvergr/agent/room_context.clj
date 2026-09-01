@@ -158,6 +158,97 @@
             0
             @room-agent-ctxs)))
 
+(defn- hydration-messages!
+  "Complete all fallible durable hydration before allocating live signals.
+
+   Attention baseline writes are deterministic/idempotent, so an interrupted
+   attempt can retry. The returned messages are pure data ready to project into
+   a newly constructed ChatContext without further store access."
+  [room agent-id limit]
+  (let [messages (d/messages room {:limit (or limit 100)})
+        attention-store? (satisfies? rstore/PAttentionStore (:store room))
+        conversation-id (d/conversation-id room)
+        baseline-message-id
+        (rstore/attention-id conversation-id agent-id nil nil
+                             :legacy-baseline-message)
+        baseline-marker-id
+        (rstore/attention-id conversation-id agent-id baseline-message-id
+                             nil :legacy-baseline-complete)
+        baseline-complete?
+        (and attention-store?
+             (seq (rstore/-list-attention (:store room)
+                                          conversation-id
+                                          {:id baseline-marker-id})))
+        ;; Upgrade cutover: pre-attention rooms already have Runs but no
+        ;; participant projection. Materialize their exact provider baseline
+        ;; before any new policy decision can make the projection non-empty.
+        _ (when (and attention-store? (not baseline-complete?))
+            (doseq [m messages :when (conversational? m)]
+              (let [decision-id
+                    (rstore/attention-id conversation-id agent-id (:id m) nil
+                                         :legacy-baseline-decision)
+                    common {:attention/participant agent-id
+                            :attention/message-id (:id m)
+                            :attention/memory :include
+                            :attention/activation :none
+                            :attention/control :continue
+                            :attention/at :now
+                            :attention/priority 0.0
+                            :attention/reason :migration/provider-baseline
+                            :attention/created-at
+                            (java.util.Date. (long (or (:ts m)
+                                                       (System/currentTimeMillis))))}]
+                (rstore/-store-attention!
+                 (:store room) conversation-id
+                 (assoc common
+                        :attention/id decision-id
+                        :attention/status :ready))
+                (rstore/-store-attention!
+                 (:store room) conversation-id
+                 (assoc common
+                        :attention/id
+                        (rstore/attention-id conversation-id agent-id (:id m) nil
+                                             :legacy-baseline-applied)
+                        :attention/decision-id decision-id
+                        :attention/status :applied))))
+            ;; Written last. If any prior write fails, the next hydration
+            ;; retries every deterministic pair and completes the cutover.
+            (rstore/-store-attention!
+             (:store room) conversation-id
+             {:attention/id baseline-marker-id
+              :attention/participant agent-id
+              :attention/message-id baseline-message-id
+              :attention/status :baseline-complete
+              :attention/reason :migration/provider-baseline
+              :attention/created-at (java.util.Date.)}))
+        attention-facts
+        (if attention-store?
+          (rstore/-list-attention (:store room)
+                                  conversation-id
+                                  {:participant agent-id :limit 1000})
+          [])
+        ;; Admission is monotone: once a fact entered provider context (most
+        ;; notably when queued work becomes a Run trigger), a later observation
+        ;; cannot silently erase it. Deliberate forgetting is compaction policy.
+        included-message-ids
+        (into #{}
+              (keep #(when (and (= :applied (:attention/status %))
+                                (= :include (:attention/memory %)))
+                       (:attention/message-id %)))
+              attention-facts)
+        agent-runs (run/runs room {:actor agent-id :limit 1000})
+        trigger-ids (into #{} (map :run/trigger) agent-runs)
+        ;; Ephemeral/custom stores without the projection retain historical
+        ;; full-transcript behavior for compatibility.
+        legacy-history? (not attention-store?)]
+    (into []
+          (filter #(and (conversational? %)
+                        (or (= agent-id (:from %))
+                            (contains? included-message-ids (:id %))
+                            (contains? trigger-ids (:id %))
+                            legacy-history?)))
+          messages)))
+
 (defn ensure-ctx!
   "Get-or-create the long-lived working chat-ctx for `agent-id` in `room`.
 
@@ -214,8 +305,9 @@
                         ;; The room store (bus→store listener) is the single durable
                         ;; writer for this conversation; the agent's own turn messages
                         ;; stay signal-only (no redundant datahike write). Token
-                        ;; accounting still persists.
+                     ;; accounting still persists.
                      :durable?       false}
+                    messages (hydration-messages! room agent-id limit)
                     cctx (turn/new-working-ctx sandbox-opts)
                     bound-sandbox-opts (assoc sandbox-opts
                                               :capability-id (:capability-id cctx))
@@ -230,106 +322,18 @@
             ;; Signal-only: the prompt is regenerated each session, not durable.
                   (when system-prompt
                     (append-signal-only! cctx {:role :system :content system-prompt}))
-            ;; Seed the conversation from ONE query: `d/messages` reads the room's
-            ;; (for a fork, branched) store under the conversation :chat/id, so a
-            ;; fork already returns inherited (pre-fork) + its own messages — the
-            ;; agent sees exactly what the UI seeds. (doc/unified-fork-conversation.md)
-                  (let [messages (d/messages room {:limit (or limit 100)})
-                        attention-store? (satisfies? rstore/PAttentionStore (:store room))
-                        conversation-id (d/conversation-id room)
-                        baseline-message-id
-                        (rstore/attention-id conversation-id agent-id nil nil
-                                             :legacy-baseline-message)
-                        baseline-marker-id
-                        (rstore/attention-id conversation-id agent-id baseline-message-id
-                                             nil :legacy-baseline-complete)
-                        baseline-complete?
-                        (and attention-store?
-                             (seq (rstore/-list-attention (:store room)
-                                                          conversation-id
-                                                          {:id baseline-marker-id})))
-                  ;; Upgrade cutover: pre-attention rooms already have Runs but
-                  ;; no participant projection. Materialize their exact current
-                  ;; provider baseline before any new policy decision can make
-                  ;; the projection non-empty. This is append-only and
-                  ;; idempotent by deterministic identity.
-                        _ (when (and attention-store? (not baseline-complete?))
-                            (doseq [m messages :when (conversational? m)]
-                              (let [decision-id
-                                    (rstore/attention-id conversation-id agent-id (:id m) nil
-                                                         :legacy-baseline-decision)
-                                    common {:attention/participant agent-id
-                                            :attention/message-id (:id m)
-                                            :attention/memory :include
-                                            :attention/activation :none
-                                            :attention/control :continue
-                                            :attention/at :now
-                                            :attention/priority 0.0
-                                            :attention/reason :migration/provider-baseline
-                                            :attention/created-at
-                                            (java.util.Date. (long (or (:ts m)
-                                                                       (System/currentTimeMillis))))}]
-                                (rstore/-store-attention!
-                                 (:store room) conversation-id
-                                 (assoc common
-                                        :attention/id decision-id
-                                        :attention/status :ready))
-                                (rstore/-store-attention!
-                                 (:store room) conversation-id
-                                 (assoc common
-                                        :attention/id
-                                        (rstore/attention-id conversation-id agent-id (:id m) nil
-                                                             :legacy-baseline-applied)
-                                        :attention/decision-id decision-id
-                                        :attention/status :applied))))
-                      ;; Written last. If any prior write fails, the next
-                      ;; hydration retries every deterministic pair and then
-                      ;; completes the cutover.
-                            (rstore/-store-attention!
-                             (:store room) conversation-id
-                             {:attention/id baseline-marker-id
-                              :attention/participant agent-id
-                              :attention/message-id baseline-message-id
-                              :attention/status :baseline-complete
-                              :attention/reason :migration/provider-baseline
-                              :attention/created-at (java.util.Date.)}))
-                        attention-facts
-                        (if attention-store?
-                          (rstore/-list-attention (:store room)
-                                                  conversation-id
-                                                  {:participant agent-id :limit 1000})
-                          [])
-                        included-message-ids
-                  ;; Admission is monotone: once a fact entered provider
-                  ;; context (most notably when queued work becomes a Run
-                  ;; trigger), a later observation cannot silently erase it.
-                  ;; Deliberate forgetting belongs to compaction/context policy,
-                  ;; not to attention races.
-                        (into #{}
-                              (keep #(when (and (= :applied (:attention/status %))
-                                                (= :include (:attention/memory %)))
-                                       (:attention/message-id %)))
-                              attention-facts)
-                        agent-runs (run/runs room {:actor agent-id :limit 1000})
-                        trigger-ids (into #{} (map :run/trigger) agent-runs)
-                  ;; Ephemeral/custom stores without the projection retain the
-                  ;; historical full-transcript behavior for compatibility.
-                        legacy-history? (not attention-store?)]
-                    (doseq [m messages]
-                      (when (and (conversational? m)
-                                 (or (= agent-id (:from m))
-                                     (contains? included-message-ids (:id m))
-                                     (contains? trigger-ids (:id m))
-                                     legacy-history?))
-                        (append-inbound-to! cctx seen (:id m)
-                                            (or (:role m) (if (= agent-id (:from m)) :assistant :user))
-                                            (:content m)
-                                 ;; author nil for the agent's OWN past messages
-                                            (when (not= agent-id (:from m)) (display-name room (:from m)))
-                                            (:ts m)
-                                 ;; feed back only the agent's OWN prior reasoning,
-                                 ;; not another participant's <think>
-                                            (when (= agent-id (:from m)) (:reasoning m))))))
+                  ;; Durable hydration above completed before signal allocation.
+                  ;; Project the staged pure messages into the fresh context.
+                  (doseq [m messages]
+                    (append-inbound-to! cctx seen (:id m)
+                                        (or (:role m) (if (= agent-id (:from m)) :assistant :user))
+                                        (:content m)
+                                        ;; author nil for the agent's own history
+                                        (when (not= agent-id (:from m))
+                                          (display-name room (:from m)))
+                                        (:ts m)
+                                        ;; feed back only the agent's own reasoning
+                                        (when (= agent-id (:from m)) (:reasoning m))))
                   (tel/log! {:level :debug :id ::created
                              :data {:room room-id :agent agent-id
                                     :seeded (count (chat-ctx/get-messages cctx))}})
