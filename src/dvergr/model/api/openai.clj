@@ -310,6 +310,9 @@
 (def ^:private default-openai-base-url "https://api.openai.com/v1")
 (def ^:private default-fireworks-base-url "https://api.fireworks.ai/inference/v1")
 
+(defn- normalize-base-url [base-url]
+  (str/replace base-url #"/+$" ""))
+
 (defn- system-env [env-key]
   (System/getenv env-key))
 
@@ -328,7 +331,8 @@
                      (env-lookup "OPENAI_API_KEY"))
          custom-base-url (or (:base-url config)
                              (env-lookup "OPENAI_BASE_URL"))
-         base-url (or custom-base-url default-openai-base-url)
+         base-url (normalize-base-url
+                   (or custom-base-url default-openai-base-url))
          provider-id (or (:provider-id config) :openai)
          credentials (or (:credentials config)
                          (when api-key
@@ -343,11 +347,11 @@
           (dissoc :api-key)
           (assoc :base-url base-url
                  :provider-id provider-id
-                 ;; A supplied base URL is an OpenAI-compatible endpoint, even if
-                 ;; it happens to equal a known provider URL. Provider identity and
-                 ;; native request capabilities are configuration, not URL guesses.
+                 ;; The documented explicit canonical URL is semantically the same
+                 ;; as omitting it. Other URLs are compatible endpoints and do not
+                 ;; inherit OpenAI-specific request roles or model workarounds.
                  :native-openai? (and (= :openai provider-id)
-                                      (nil? custom-base-url))
+                                      (= default-openai-base-url base-url))
                  :credentials credentials))))))
 
 (defn create-if-available

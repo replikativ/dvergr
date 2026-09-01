@@ -133,6 +133,19 @@
     (is (= "system" (get-in body [:messages 0 :role])))
     (is (not (contains? body :reasoning_effort)))))
 
+(deftest explicit-canonical-base-url-keeps-native-chat-behavior
+  (let [request (provider/build-request
+                 (openai/create {:api-key "test-openai-key"
+                                 :base-url "https://api.openai.com/v1/"}
+                                {})
+                 [{:role :system :content "Product policy"}
+                  {:role :user :content "Use the tool"}]
+                 {:model "gpt-5.6-sol"
+                  :tools [test-tool]})]
+    (is (= "https://api.openai.com/v1/chat/completions" (:url request)))
+    (is (= "developer" (get-in request [:body :messages 0 :role])))
+    (is (= "none" (get-in request [:body :reasoning_effort])))))
+
 (deftest models-dev-overlay-preserves-built-in-native-contract
   (let [overlay {:openai
                  {:models
