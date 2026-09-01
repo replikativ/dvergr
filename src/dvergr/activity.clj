@@ -57,6 +57,28 @@
   (or (:run-id message)
       (get-in message [:metadata :run-id])))
 
+(defn- portable-activity [fact]
+  (cond-> (select-keys fact
+                       [:activity/id :activity/kind :activity/verb :activity/at
+                        :activity/run-id :activity/tool-use-id :activity/tool-name
+                        :activity/status :activity/outcome :activity/critical?])
+    (instance? Date (:activity/at fact))
+    (assoc :activity/at (.getTime ^Date (:activity/at fact)))))
+
+(defn tool-trace-entry
+  "Project one normalized or raw tool-activity message into portable causal
+   evidence. Raw inputs remain available for replay while Run/tool-use IDs and
+   semantic activities preserve correlation under interleaving."
+  [message]
+  {:message/id (or (:id message) (:message/id message))
+   :run/id (message-run-id message)
+   :tool-uses
+   (mapv #(select-keys % [:tool-use/id :tool-use/name :tool-use/input])
+         (or (:tool-uses message)
+             (get-in message [:metadata :tool-uses])
+             []))
+   :activities (mapv portable-activity (message-activities message))})
+
 (defn short-id
   "Compact a UUID-like identity for human-facing correlation labels."
   [id]

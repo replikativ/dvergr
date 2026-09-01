@@ -703,6 +703,174 @@
     :db/cardinality :db.cardinality/one}])
 
 ;; ============================================================================
+;; Verified Attempt Schema
+;; ============================================================================
+
+(def attempt-schema
+  "Immutable typed index for one trusted evaluation certification.
+
+   Exact EnvironmentDef, AgentDef, receipt, and evidence values live in the
+   content-addressed payload. Runs, messages, and checks remain typed joins so
+   benchmark and UI queries never need to scan opaque payloads."
+  [{:db/ident :attempt.writer/token
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/doc "One-use process-local capability attached to a trusted certification transaction"}
+
+   {:db/ident :attempt/id
+    :db/valueType :db.type/uuid
+    :db/unique :db.unique/identity
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :attempt/chat
+    :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :attempt/run
+    :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/value
+    :db/doc "Terminal root Run; exactly one trusted Attempt per Run"}
+
+   {:db/ident :attempt/content-id
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/value
+    :db/doc "Exact trusted AttemptReceipt content identity"}
+
+   {:db/ident :attempt/payload-blob
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/doc "Immutable CAS reference for exact EnvironmentDef, AgentDef, receipt, and evidence"}
+
+   {:db/ident :attempt/payload-codec
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :attempt/environment-id
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :attempt/environment-version
+    :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :attempt/environment-content-id
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :attempt/verifier-id
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :attempt/verifier-version
+    :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :attempt/provider
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :attempt/model
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :attempt/status
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :attempt/started-at
+    :db/valueType :db.type/instant
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :attempt/elapsed-ms
+    :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :attempt/certified-at
+    :db/valueType :db.type/instant
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :attempt/reward
+    :db/valueType :db.type/double
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :attempt/agent-def-hash
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :attempt/program-kind
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :attempt/interpreter-version
+    :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :attempt/prompt-id
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :attempt/model-resolution
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :attempt/model-steps
+    :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :attempt/evidence-content-id
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :attempt/evidence-runs
+    :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/many
+    :db/index true}
+
+   {:db/ident :attempt/evidence-messages
+    :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/many
+    :db/index true}
+
+   {:db/ident :attempt/settlement-intent
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :attempt/checks
+    :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/many
+    :db/isComponent true}
+
+   {:db/ident :attempt.check/id
+    :db/valueType :db.type/uuid
+    :db/unique :db.unique/identity
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :attempt.check/key
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :attempt.check/passed?
+    :db/valueType :db.type/boolean
+    :db/cardinality :db.cardinality/one
+    :db/index true}])
+
+;; ============================================================================
 ;; Attention Schema
 ;; ============================================================================
 
@@ -1170,6 +1338,7 @@
   (vec (concat chat-schema
                message-schema
                run-schema
+               attempt-schema
                attention-schema
                tool-call-schema
                ledger-schema
