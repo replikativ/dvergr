@@ -103,6 +103,19 @@
       (is (str/includes? on "I should compute the product") "reasoning shown in trace")
       (is (str/includes? on "(* 19 23)") "tool input shown in trace"))))
 
+(deftest render-room-message-shows-semantic-activity-correlation
+  (let [run-id (java.util.UUID/fromString "12345678-1234-1234-1234-123456789abc")
+        lines  (render-room-message
+                {:from :var :role :tool :content "used a tool"
+                 :run-id run-id
+                 :activities [{:activity/kind :tool
+                               :activity/verb :invoke
+                               :activity/tool-name "clojure_eval"}]}
+                60 false)
+        text   (strip (str/join "\n" lines))]
+    (is (str/includes? text "invoke · clojure_eval"))
+    (is (str/includes? text "run 12345678"))))
+
 (defn- room-harness [c room-id extra-signals]
   (h/harness
    {:execution-context c

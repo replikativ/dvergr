@@ -313,6 +313,15 @@ Activity facts add structured semantics where known:
  :activity/critical?  true}
 ```
 
+The first durable projection is intentionally smaller than the eventual generic
+event envelope. Canonical `:_activity` room messages carry an `:activities`
+vector of typed component facts. Each fact inherits room, thread, actor, and
+message identity from the enclosing message and may repeat its `:activity/run-id`
+only for an indexed join to the owning Run. Tool facts keep only name and
+provider tool-use id; raw arguments, results, and authorization receipts remain
+in the tool trace. This makes semantic activity composable with conversation
+without creating another lifecycle or effect authority.
+
 Do not add an opaque EDN or JSON payload column to Datahike. Extend typed
 attributes as durable concepts stabilize; put large output behind store refs.
 

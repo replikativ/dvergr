@@ -166,3 +166,39 @@
                      {:type ::invalid-boundary :boundary type :data data})))
    (cond-> {:attention.boundary/type type}
      data (assoc :attention.boundary/data data))))
+
+(defn execution-plan
+  "Negotiate a validated decision against one interpreter's honest
+   capabilities.
+
+   Capabilities are sets under `:memory`, `:activation`, `:control`, and
+   `:boundaries`; `:priority?` declares whether non-zero priorities are honored.
+   An optional `:accept?` predicate may return nil or one explanatory map for a
+   cross-axis combination the adapter cannot implement.
+   The result preserves the complete decision. Unsupported axes produce a
+   deferred plan instead of silently degrading semantics or inventing provider
+   behavior. This is capability negotiation, not a second scheduler."
+  [x capabilities]
+  (let [d (normalize x)
+        checks [[:memory (:memory d) (:memory capabilities)]
+                [:activation (:activation d) (:activation capabilities)]
+                [:control (:control d) (:control capabilities)]
+                [:at (:at d) (:boundaries capabilities)]]
+        constraint (when-let [accept? (:accept? capabilities)]
+                     (accept? d))
+        unsupported
+        (cond->
+         (into []
+               (keep (fn [[axis value supported]]
+                       (when-not (contains? (or supported #{}) value)
+                         {:axis axis :value value})))
+               checks)
+          (and (not (:priority? capabilities))
+               (not (zero? (:priority d))))
+          (conj {:axis :priority :value (:priority d)})
+
+          constraint
+          (conj constraint))]
+    {:status (if (seq unsupported) :deferred :ready)
+     :decision d
+     :unsupported unsupported}))

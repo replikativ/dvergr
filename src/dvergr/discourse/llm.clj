@@ -148,6 +148,101 @@
     (attention/restart :conversation/same-thread)
     (attention/enqueue :conversation/different-thread)))
 
+(def llm-attention-capabilities
+  "Provider-neutral attention subset implemented by the native LLM arbiter.
+   Richer products remain durable/queued until an adapter advertises the needed
+   integration boundary; they are never silently projected to a weaker action."
+  {:memory attention/memory-modes
+   ;; This interpreter can retain later work. It cannot wake a suspended
+   ;; continuation because LLM calls currently have no durable continuation.
+   :activation #{:none :enqueue}
+   :control #{:continue :restart :suspend :cancel}
+   :boundaries #{:now :next-safe-boundary :quiescent}
+   :priority? false
+   :accept? (fn [{:keys [memory activation control at]}]
+              (cond
+                (and (#{:restart :suspend :cancel} control)
+                     (not (#{:now :next-safe-boundary} at)))
+                {:axes [:control :at]
+                 :values [control at]}
+
+                (and (= :enqueue activation) (not= :continue control))
+                {:axes [:activation :control]
+                 :values [activation control]}
+
+                ;; The current adapter has one disposition per decision. Do not
+                ;; claim atomic replay for "include now and enqueue later" until
+                ;; partial-axis acknowledgements exist.
+                (and (= :enqueue activation) (= :include memory))
+                {:axes [:memory :activation]
+                 :values [memory activation]}))})
+
+(defn- record-attention!
+  "Persist one participant's decision over `incoming` as typed Room activity.
+
+   The activity is deliberately not conversational input and does not claim a
+   thread. It is the durable projection used to rebuild participant-specific
+   provider context and to explain deferred decisions after restart."
+  [room participant-id incoming plan run-id]
+  (let [room-store (:store room)
+        room-id (some-> room d/conversation-id)
+        decision (:decision plan)
+        decision-id (rstore/attention-id room-id participant-id (:id incoming)
+                                         run-id :decision)
+        fact
+        (cond-> {:attention/id decision-id
+                 :attention/participant participant-id
+                 :attention/message-id (:id incoming)
+                 :attention/status (:status plan)
+                 :attention/created-at (java.util.Date.)}
+          run-id (assoc :attention/run-id run-id)
+          (:memory decision) (assoc :attention/memory (:memory decision))
+          (:activation decision) (assoc :attention/activation (:activation decision))
+          (:control decision) (assoc :attention/control (:control decision))
+          (:at decision) (assoc :attention/at (:at decision))
+          (some? (:priority decision))
+          (assoc :attention/priority (:priority decision))
+          (:reason decision) (assoc :attention/reason (:reason decision))
+          (:metadata decision) (assoc :attention/metadata (:metadata decision)))]
+    (when room
+      (when room-store
+        (when-not (satisfies? rstore/PAttentionStore room-store)
+          (throw (ex-info "Configured Room store lacks durable attention support"
+                          {:type ::attention-store-unsupported
+                           :room (:id room)})))
+        (rstore/-store-attention! room-store (d/conversation-id room) fact)))
+    decision-id))
+
+(defn- record-attention-applied!
+  "Append the disposition proving that every supported axis was applied."
+  ([room participant-id incoming plan run-id decision-id]
+   (record-attention-applied! room participant-id incoming plan run-id
+                              decision-id nil))
+  ([room participant-id incoming plan run-id decision-id result-run-id]
+   (when (and room (:store room))
+     (let [room-id (d/conversation-id room)
+           decision (:decision plan)
+           fact
+           (cond-> {:attention/id
+                    (rstore/attention-id room-id participant-id (:id incoming)
+                                         run-id :applied)
+                    :attention/decision-id decision-id
+                    :attention/participant participant-id
+                    :attention/message-id (:id incoming)
+                    :attention/status :applied
+                    :attention/created-at (java.util.Date.)}
+             run-id (assoc :attention/run-id run-id)
+             result-run-id (assoc :attention/result-run-id result-run-id)
+             (:memory decision) (assoc :attention/memory (:memory decision))
+             (:activation decision) (assoc :attention/activation (:activation decision))
+             (:control decision) (assoc :attention/control (:control decision))
+             (:at decision) (assoc :attention/at (:at decision))
+             (some? (:priority decision))
+             (assoc :attention/priority (:priority decision))
+             (:reason decision) (assoc :attention/reason (:reason decision))
+             (:metadata decision) (assoc :attention/metadata (:metadata decision)))]
+       (rstore/-store-attention! (:store room) room-id fact)))))
+
 (defn llm-agent
   "Construct a discourse Participant backed by an LLM.
 
@@ -204,22 +299,23 @@
   (let [ctx       (or ctx ec/*execution-context*)
         ;; Room-less FALLBACK working ctx (sidecar / tests). When the
         ;; agent is joined to a ROOM, the per-[room,agent] room-context ctx is
-        ;; used instead — seeded from the room store, kept current by a bus fold,
+        ;; used instead — seeded from the room store and admitted by attention,
         ;; stable id (budget + persistence across restart/fork) — resolved per
         ;; turn in on-message. Priority: :participant-context > :chat-ctx > fresh.
         ;; :with-sci? true so a room-less agent's clojure_eval has a sandbox.
         fallback-chat-ctx
-        (or (when participant-context
-              (pctx/->chat-context participant-context))
-            chat-ctx
-            (let [c (turn/new-working-ctx
-                     {:execution-ctx  ctx
-                      :title          (str "agent " (name id))
-                      :budget-dollars (:dollars budget 1.0)
-                      :db-conn        db-conn})]
-              (when-let [sp (:system-prompt spec)]
-                (cc/add-message! c {:role :system :content sp}))
-              c))
+        (delay
+          (or (when participant-context
+                (pctx/->chat-context participant-context))
+              chat-ctx
+              (let [c (turn/new-working-ctx
+                       {:execution-ctx  ctx
+                        :title          (str "agent " (name id))
+                        :budget-dollars (:dollars budget 1.0)
+                        :db-conn        db-conn})]
+                (when-let [sp (:system-prompt spec)]
+                  (cc/add-message! c {:role :system :content sp}))
+                c)))
         ;; Grace window for the manager to extend the budget after exhaustion.
         compaction-strategy (:strategy compaction :sync-before-turn)
         ;; In race mode, disable run-turn-fn's internal sync compaction — we
@@ -242,14 +338,14 @@
                (let [room     (:room p)        ; the Room this participant is joined to
                      turn-ctx (if room (:ctx room) ctx)  ; run the turn in the ROOM's ctx
                    ;; Per-[room,agent] working chat-ctx (design D): seeded from the
-                   ;; room store, kept current by a bus fold, stable id (budget +
+                   ;; room store, updated by explicit attention admission, stable id (budget +
                    ;; persistence across restart/fork). Room-less → the fallback ctx.
                    ;; Directives AND the turn loop share this resolved chat-ctx.
                      chat-ctx (if room
                                 (room-context/ensure-ctx! room id
                                                           {:system-prompt  (:system-prompt spec)
                                                            :budget-dollars (:dollars budget 1.0)})
-                                fallback-chat-ctx)]
+                                @fallback-chat-ctx)]
                  (case (:type msg)
 
                ;; --- directive: extend the dollar budget ---
@@ -290,12 +386,14 @@
                          ;; inbox after this execution. The Room log is already the
                          ;; durable source; these are only live coordination handles.
                          queued-other-threads (atom [])
+                         pending-safe-inclusions (atom [])
+                         pending-quiescent-inclusions (atom [])
                          seen-inflight-ids    (atom (cond-> #{} (:id msg) (conj (:id msg))))
                      ;; SCI sandbox: the chat-ctx's own, set up ONCE by
                      ;; turn/new-working-ctx (room fold AND room-less fallback alike)
                      ;; with the agent namespaces injected — so clojure_eval has
                      ;; dh/room/intake without a per-turn re-fork.
-                         sci-ctx  (:sci-ctx chat-ctx)
+                         sci-ctx  (cc/sci-context chat-ctx)
                      ;; Normalize once: name→tool-def map (also the execute-side
                      ;; authoritative allowlist below).
                          tool-map (tools/normalize-tools tools)
@@ -377,29 +475,59 @@
                                 ;; system notes for unresolvable ones.
                                     :on-reply         on-reply}
                          errored           (atom nil)
-                         waiting?          (atom false)
+                         wait-reason       (atom nil)
+                         policy-cancelled? (atom false)
                          finish-after-reply? (atom false)
                      ;; #38: the last assistant message BEFORE this invocation
                      ;; runs (the store-seeded prior reply, or nil) — the exit
                      ;; path uses it to tell a genuinely NEW reply from stale
                      ;; seeded history.
                          pre-turn-last-asst (last-assistant-message chat-ctx)
-                     ;; Inbound fold: ROOM path append-inbound! (deduped
-                     ;; against the bus fold by msg id, decorated with author
+                     ;; Inbound admission: ROOM path append-inbound! (deduped
+                     ;; against the durable seed by msg id, decorated with author
                      ;; + time); room-less adds directly to the fallback ctx.
                      ;; Used for the triggering message AND for steer folds.
                          fold-inbound!
                          (fn [m]
                            (if room
-                             (room-context/append-inbound! (:id room) id (:id m)
+                             (room-context/append-inbound! room id (:id m)
                                                            :user (:content m)
                                                            (room-context/display-name room (:from m))
                                                            (:ts m))
-                             (cc/add-message! chat-ctx {:role :user :content (:content m)})))]
+                             (cc/add-message! chat-ctx {:role :user :content (:content m)})))
+                         drain-inclusions!
+                         (fn [pending]
+                           (let [[included _]
+                                 (swap-vals! pending (constantly []))]
+                             (doseq [{:keys [message plan decision-id]} included]
+                               (fold-inbound! message)
+                               (record-attention-applied!
+                                room id message plan run-id decision-id))))]
                  ;; The just-arrived user message (and any message that STEERS a
                  ;; running turn, below) folds in via fold-inbound! from the let.
                      (try
-                       (fold-inbound! msg)
+                       ;; A quiescent enqueue is only durably applied once its
+                       ;; successor Run exists. Until this handler starts, the
+                       ;; participant FIFO is process-local and the ready fact
+                       ;; intentionally remains visible to recovery.
+                       (when-let [{prior-plan :plan
+                                   prior-decision-id :decision-id
+                                   prior-run-id :run-id}
+                                  (::deferred-attention msg)]
+                         (record-attention-applied!
+                          room id msg prior-plan prior-run-id prior-decision-id run-id))
+                       ;; The trigger is the first attention admission for this
+                       ;; Run. Persist it before provider input changes.
+                       (let [trigger-plan
+                             {:status :ready
+                              :decision (attention/decision
+                                         {:memory :include
+                                          :reason :run/trigger})}
+                             trigger-decision-id
+                             (record-attention! room id msg trigger-plan run-id)]
+                         (fold-inbound! msg)
+                         (record-attention-applied!
+                          room id msg trigger-plan run-id trigger-decision-id))
                  ;; ONE CONTROL PLANE (steerable turn). Every influence on a
                  ;; running turn arrives as a message on the participant's own
                  ;; inbox — INCLUDING the LLM call's completion, which a bridge
@@ -532,10 +660,11 @@
                                                            :incoming-message m
                                                            :participant p
                                                            :room room})
-                                                         action
+                                                         plan
                                                          (try
-                                                           (attention/legacy-action
-                                                            attention-decision)
+                                                           (attention/execution-plan
+                                                            attention-decision
+                                                            llm-attention-capabilities)
                                                            (catch Throwable error
                                                              (tel/log!
                                                               {:level :warn
@@ -543,26 +672,92 @@
                                                                :data {:agent id
                                                                       :decision attention-decision
                                                                       :error (.getMessage error)}}
-                                                              "Invalid attention decision; queued conservatively")
-                                                             ::invalid-attention-decision))]
-                                                     (case action
-                                                       :steer {:tag :steer :msg m}
-                                                       :observe (recur)
-                                                       :queue (do
-                                                                (swap! queued-other-threads conj m)
-                                                                (recur))
-                                                       ::invalid-attention-decision
+                                                              "Invalid attention decision retained for diagnosis")
+                                                             {:status :invalid}))]
+                                                     (if (= :ready (:status plan))
+                                                       (let [{:keys [memory activation control at]
+                                                              :as decision} (:decision plan)
+                                                             decision-id
+                                                             (rstore/attention-id
+                                                              (some-> room d/conversation-id)
+                                                              id (:id m) run-id :decision)
+                                                             entry {:message m
+                                                                    :plan plan
+                                                                    :decision-id decision-id}
+                                                             ;; Stage boundary/queue state
+                                                             ;; before publishing a ready
+                                                             ;; decision. The applied fact is
+                                                             ;; written only after every axis
+                                                             ;; actually takes effect.
+                                                             _ (cond
+                                                                 (= :enqueue activation)
+                                                                 nil
+
+                                                                 (and (= :continue control)
+                                                                      (= :include memory)
+                                                                      (= :next-safe-boundary at))
+                                                                 (swap! pending-safe-inclusions
+                                                                        conj entry)
+
+                                                                 (and (= :continue control)
+                                                                      (= :include memory)
+                                                                      (= :quiescent at))
+                                                                 (swap! pending-quiescent-inclusions
+                                                                        conj entry))]
+                                                         (record-attention! room id m plan run-id)
+                                                         (when (and (#{:restart :suspend :cancel} control)
+                                                                    (= :include memory)
+                                                                    (= :now at))
+                                                           (fold-inbound! m))
+                                                         (case control
+                                                           :restart {:tag :attention
+                                                                     :control :restart
+                                                                     :msg m
+                                                                     :decision decision
+                                                                     :plan plan
+                                                                     :decision-id decision-id}
+                                                           :suspend {:tag :attention
+                                                                     :control :suspend
+                                                                     :msg m
+                                                                     :decision decision
+                                                                     :plan plan
+                                                                     :decision-id decision-id}
+                                                           :cancel {:tag :attention
+                                                                    :control :cancel
+                                                                    :msg m
+                                                                    :decision decision
+                                                                    :plan plan
+                                                                    :decision-id decision-id}
+                                                           :continue
+                                                           (cond
+                                                             (= :enqueue activation)
+                                                             (do (swap! queued-other-threads conj entry)
+                                                                 (recur))
+
+                                                             (and (= :include memory)
+                                                                  (= :now at))
+                                                             (do (fold-inbound! m)
+                                                                 (record-attention-applied!
+                                                                  room id m plan run-id decision-id)
+                                                                 (recur))
+
+                                                             (= :include memory)
+                                                             (recur)
+
+                                                             :else
+                                                             (do (record-attention-applied!
+                                                                  room id m plan run-id decision-id)
+                                                                 (recur)))))
                                                        (do
-                                                         (swap! queued-other-threads conj m)
-                                                         (recur))
-                                                       (do
-                                                         (tel/log!
-                                                          {:level :warn
-                                                           :id ::invalid-attention-decision
-                                                           :data {:agent id
-                                                                  :decision attention-decision}}
-                                                          "Unsupported attention decision; queued conservatively")
-                                                         (swap! queued-other-threads conj m)
+                                                         (record-attention! room id m plan run-id)
+                                                         (when (= :deferred (:status plan))
+                                                           (tel/log!
+                                                            {:level :warn
+                                                             :id ::unsupported-attention-decision
+                                                             :data {:agent id
+                                                                    :decision (:decision plan)
+                                                                    :unsupported (:unsupported plan)}}
+                                                            "Unsupported attention decision retained as durable deferred attention"))
                                                          (recur)))))))))))
                                    ;; No inbox (room-less participant that was
                                    ;; never joined): plain await, no steering.
@@ -585,11 +780,34 @@
                                    (cc/set-status! chat-ctx :cancelled)
                                    (sp/await (:done h))
                                    (cc/set-status! chat-ctx :active)
+                                   ;; `:next-safe-boundary` is reached when the
+                                   ;; provider call settles. Admit all earlier
+                                   ;; non-preempting includes before restarting.
+                                   (drain-inclusions! pending-safe-inclusions)
                                    (case (:tag decision)
                                      :cancel (do (reset! cancelled? true) nil)
                                      :switch (recur turn)
-                                     :steer  (do (fold-inbound! (:msg decision))
-                                                 (recur (inc turn)))))
+                                     :attention
+                                     (let [{:keys [control msg plan decision-id]
+                                            attention-decision :decision} decision]
+                                       (when (and (= :include (:memory attention-decision))
+                                                  (not= :now (:at attention-decision)))
+                                         (fold-inbound! msg))
+                                       (case control
+                                         :restart
+                                         (do (record-attention-applied!
+                                              room id msg plan run-id decision-id)
+                                             (recur (inc turn)))
+                                         :suspend
+                                         (do (reset! wait-reason :attention-suspended)
+                                             (record-attention-applied!
+                                              room id msg plan run-id decision-id)
+                                             nil)
+                                         :cancel
+                                         (do (reset! policy-cancelled? true)
+                                             (record-attention-applied!
+                                              room id msg plan run-id decision-id)
+                                             nil)))))
                                  (let [result (:result decision)]
                                    (cond
                                      (or @cancelled? (run/cancel-requested? run-id)) nil
@@ -623,19 +841,34 @@
                                                used  (/ (:used b) (double acct/MICRODOLLARS-PER-DOLLAR))
                                                total (/ (:total b) (double acct/MICRODOLLARS-PER-DOLLAR))]
                                            (turn/post-budget-warning! room id used total run-id msg)))
-                                       (reset! waiting? true)
+                                       (reset! wait-reason :budget-exhausted)
                                        (proc/budget-exhausted! id chat-ctx)
                                        nil)
 
                                ;; Normal :continue, budget OK → next turn.
-                                     :else (recur (inc turn)))))))))
+                                     :else (do
+                                             ;; Provider/tool `:continue` is the
+                                             ;; next safe integration boundary,
+                                             ;; not the end of the whole Run.
+                                             (drain-inclusions! pending-safe-inclusions)
+                                             (recur (inc turn))))))))))
 
+                     ;; Resolve the final safe boundary, then quiescence. Keeping
+                     ;; these queues distinct makes `:quiescent` strictly later
+                     ;; than provider/tool continuation boundaries.
+                       (drain-inclusions! pending-safe-inclusions)
+                       (drain-inclusions! pending-quiescent-inclusions)
                      ;; The outer participant loop can now start queued work. Put
                      ;; consumed messages in the participant-owned priority FIFO,
                      ;; not at the live mailbox tail: a newer arrival during this
                      ;; hand-back window must not overtake older topics.
-                       (doseq [queued @queued-other-threads]
-                         (d/defer-inbox! p queued))
+                       (doseq [{:keys [message plan decision-id]}
+                               @queued-other-threads]
+                         (d/defer-inbox!
+                          p (assoc message ::deferred-attention
+                                   {:plan plan
+                                    :decision-id decision-id
+                                    :run-id run-id})))
                      ;; A FAILED turn produced no new reply — surface it as a NON-triggering
                      ;; :_activity row and DON'T fall through to re-post the STALE last reply
                      ;; (which the room's other agents answer, looping — the "repeating" bug).
@@ -647,6 +880,8 @@
                      ;; posting it is the repeating bug. Surface it instead.
                      ;; A deliberate cancel stays quiet.
                        (when (and (not @errored) (not @cancelled?)
+                                  (not @policy-cancelled?)
+                                  (not @wait-reason)
                                   (not (run/cancel-requested? run-id))
                                   (not= :cancelled (cc/get-status chat-ctx))
                                   (= pre-turn-last-asst (last-assistant-message chat-ctx)))
@@ -702,26 +937,26 @@
                        (finally
                          (when (and run-id (not @finish-after-reply?))
                            (let [cancelled-run? (or @cancelled?
+                                                    @policy-cancelled?
                                                     (run/cancel-requested? run-id)
                                                     (= :cancelled (cc/get-status chat-ctx)))
                                  status (cond
                                           cancelled-run? :cancelled
                                           @errored :failed
-                                          @waiting? :waiting
+                                          @wait-reason :waiting
                                           :else :completed)]
                              (run/finish! run-id status
                                           (cond-> {}
                                             cancelled-run? (assoc :reason :cancel-requested)
-                                            @waiting? (assoc :reason :budget-exhausted)
+                                            @wait-reason (assoc :reason @wait-reason)
                                             @errored (assoc :reason :error :error @errored))))))))))))
 
             :factory
             (fn [new-ctx]
-         ;; Fork-room semantics for an LLM agent: re-create fresh in the
-         ;; new context. The fork's agent has no prior conversation,
-         ;; matching the §6.5 ToM-probe semantics ("what would they say,
-         ;; given only the priming I set up?"). Future enhancement: pass
-         ;; an :init-snapshot to carry conversation forward.
+         ;; `fork-room :ctx` installs the inherited room working context before
+         ;; invoking this factory, so the clone selects forked signals and SCI
+         ;; through the stable component ref. `:none` remains a lightweight
+         ;; message-only clone. The room-less fallback stays lazy in both cases.
               (llm-agent {:id          id
                           :spec        spec
                           :tools       tools

@@ -1167,20 +1167,22 @@
          ;; peer-bus events).
            new-id     (rstore/slug->room-id new-slug)
            parent-log (log room)
+           room*       (volatile! nil)
            fork-handle (when (= :ctx isolation)
                          (binding [ec/*execution-context* (:ctx room)]
                            (ygg/fork! (merge {:purpose :workroom
                                               :owner new-id}
-                                             fork-opts))))
-           child-ctx  (case isolation
-                        :none (:ctx room)
-                        :ctx  (:child-ctx fork-handle))
+                                             fork-opts))))]
+       (try
+         (let [child-ctx  (case isolation
+                            :none (:ctx room)
+                            :ctx  (:child-ctx fork-handle))
          ;; Mark a `:ctx` fork TRANSIENT so create-room-db! defers the GLOBAL
          ;; system-db grant (reconciled on merge / dropped on discard) — a fork's
          ;; agent-created DB must not resurrect on restart (P2).
-           _          (when (= :ctx isolation)
-                        (binding [ec/*execution-context* child-ctx]
-                          (ec/swap-state! [:dvergr/transient-fork?] (constantly true))))
+               _          (when (= :ctx isolation)
+                            (binding [ec/*execution-context* child-ctx]
+                              (ec/swap-state! [:dvergr/transient-fork?] (constantly true))))
          ;; `:isolation :ctx` forks BRANCH the parent's conversation. The fork
          ;; gets its OWN store wrapping the fork ctx's BRANCHED chat-db conn
          ;; (NOT the parent's fixed-conn store), and persists under the parent's
@@ -1188,73 +1190,135 @@
          ;; the same logical conversation on a datahike branch, and
          ;; merge-fork! collapses them natively (no append-log!). It writes
          ;; no separate :chat entity. (doc/unified-fork-conversation.md)
-           conv-id    (conversation-id room)
+               conv-id    (conversation-id room)
          ;; RF5: the fork's store wraps the PARENT room's OWN messages conn under
          ;; the fork ctx (branched), so fork messages ride the per-room store's
          ;; branch and merge-fork! collapses them natively. (RF5 S4.3: no
          ;; chat-db fallback — every room is provisioned with its own :msgs system.)
-           fork-store (when (= :ctx isolation)
-                        (some-> (binding [ec/*execution-context* child-ctx]
-                                  (srooms/msgs-conn-for-slug (:slug room)))
-                                store-dh/make))
+               fork-store (when (= :ctx isolation)
+                            (some-> (binding [ec/*execution-context* child-ctx]
+                                      (srooms/msgs-conn-for-slug (:slug room)))
+                                    store-dh/make))
          ;; Durability-first for the fork too: fork-local messages persist
          ;; onto the BRANCH (under the root conversation id) inside post!,
          ;; before visibility — replacing the fork's persistence listener.
-           child-bus  (bus-with-peer-relay child-ctx new-id :fork
-                                           (when fork-store
-                                             {:durable-append!
-                                              (fn [msg]
-                                                (when (rstore/message-shape? msg)
-                                                  (rstore/-store-message! fork-store conv-id msg)))}))
+               child-bus  (bus-with-peer-relay child-ctx new-id :fork
+                                               (when fork-store
+                                                 {:durable-append!
+                                                  (fn [msg]
+                                                    (when (rstore/message-shape? msg)
+                                                      (rstore/-store-message! fork-store conv-id msg)))}))
          ;; Seed the fork's bus log with parent history so log-based
          ;; consumers see a continuous record (the cursor starts past it —
          ;; history is never re-delivered). Forks have their OWN bus so
          ;; live messages do not leak between parent and fork.
-           _          (bus/seed-log! child-bus parent-log)
-           new-room   (->Room new-id new-slug
-                              (str (:title room) " · fork " short-uuid)
-                              (:id room)
-                              (atom {})
-                              child-bus
-                              child-ctx
-                              (count parent-log)
-                              fork-store
-                              (atom (assoc (dissoc @(:meta room) :dvergr/owned-listeners)
-                                           :forked-from (:id room)
-                                           :conversation-id conv-id))
-                              (when fork-handle (atom fork-handle))
-                              (random-uuid))]
-       ;; The child is not registered or otherwise visible yet. Initializing its
+               _          (bus/seed-log! child-bus parent-log)
+               new-room   (->Room new-id new-slug
+                                  (str (:title room) " · fork " short-uuid)
+                                  (:id room)
+                                  (atom {})
+                                  child-bus
+                                  child-ctx
+                                  (count parent-log)
+                                  fork-store
+                                  (atom (assoc (dissoc @(:meta room) :dvergr/owned-listeners)
+                                               :forked-from (:id room)
+                                               :conversation-id conv-id))
+                                  (when fork-handle (atom fork-handle))
+                                  (random-uuid))
+           ;; The child is not registered or otherwise visible yet. Initializing its
        ;; admission without the global lifecycle lock avoids parent-meta ->
        ;; lifecycle lock inversion during concurrent parent teardown.
-       (agent-run/initialize-unpublished-room-admission! new-id child-ctx)
+               _ (vreset! room* new-room)
+               _ (agent-run/initialize-unpublished-room-admission! new-id child-ctx)]
      ;; (Fork-local persistence rides the bus's durable-append! hook now —
      ;; wired at child-bus construction above.)
-     ;; Register the fork in the PARENT ctx — where the daemon UI reads the
-     ;; registry. A `:ctx` fork's own child-ctx is invisible to the parent
-     ;; (CoW), so registering there would hide the fork from the tree (and it
-     ;; would render empty). The Room still carries its child-ctx in `:ctx`
-     ;; for merge/diff/git. For `:none`, child-ctx == parent ctx (no change).
-       (binding [ec/*execution-context* (:ctx room)]
-         (rreg/register! new-room)
-         (when (= :ctx isolation)
-           (rreg/track-fork! new-id (:id room) (:fork-id fork-handle))))
-       (when clone-participants?
-         (doseq [[_id p] @(:participants room)]
-           (when-let [fac (:factory p)]
-             (binding [ec/*execution-context* child-ctx]
-               (join new-room (fac child-ctx))))))
+     ;; Initialize participant/cache projections before publishing the Room.
+     ;; Otherwise an external registry reader could send work into a partially
+     ;; constructed child and win the inherited-context installation race.
+           (when clone-participants?
+             (doseq [[_id p] @(:participants room)]
+               (when-let [fac (:factory p)]
+             ;; Yggdrasil already forked every registered world component. If
+             ;; this participant has a live room working context, install its
+             ;; child projection before the factory runs so the clone selects
+             ;; that inherited SCI heap instead of constructing a second one.
+             ;; `requiring-resolve` avoids discourse <-> room-context cycles.
+                 (when (= :ctx isolation)
+                   (when-let [fork-working-ctx!
+                              (requiring-resolve 'dvergr.agent.room-context/fork-ctx!)]
+                     (fork-working-ctx! room new-room (:id p))))
+                 (binding [ec/*execution-context* child-ctx]
+                   (join new-room (fac child-ctx))))))
+     ;; Register the fully initialized fork in the PARENT ctx — where the daemon
+     ;; UI reads the registry. A `:ctx` fork's own child-ctx is invisible to the
+     ;; parent (CoW), so registering there would hide the fork from the tree.
+           ;; Publication and its control event share the child's lifecycle
+           ;; monitor. A reader may discover the complete Room+topology pair,
+           ;; but cannot begin settlement until the creation event is posted.
+           (locking (:meta new-room)
+             (binding [ec/*execution-context* (:ctx room)]
+               (if (= :ctx isolation)
+                 (rreg/register-fork! new-room (:id room) (:fork-id fork-handle))
+                 (rreg/register! new-room)))
      ;; Control-plane: announce the fork on the peer-bus so dashboards,
      ;; audit logs, and oversight agents see it without subscribing to
      ;; the fork's bus directly.
-       (binding [ec/*execution-context* child-ctx]
-         (peer-bus/post! {:type            :dvergr/fork-created
-                          :dvergr/origin   new-id
-                          :dvergr/parent   (:id room)
-                          :isolation       isolation
-                          :workspace-id    (when (= :ctx isolation)
-                                             (:id (geschichte/current-workspace)))}))
-       new-room))))
+             (binding [ec/*execution-context* child-ctx]
+               ;; Publication above is the authoritative commit point.  This
+               ;; observability event must therefore never turn successful
+               ;; construction into rollback after another thread has admitted
+               ;; settlement of the published affine handle.
+               (try
+                 (peer-bus/post! {:type            :dvergr/fork-created
+                                  :dvergr/origin   new-id
+                                  :dvergr/parent   (:id room)
+                                  :isolation       isolation
+                                  :workspace-id    (when (= :ctx isolation)
+                                                     (:id (geschichte/current-workspace)))})
+                 (catch Throwable event-error
+                   (tel/log! {:level :error :id ::fork-created-event-failed
+                              :error event-error
+                              :data {:room new-id :parent (:id room)}})))))
+           new-room)
+         (catch Throwable error
+           ;; Construction owns the affine handle until successful return. Any
+           ;; failure before then must settle it and retract every process-local
+           ;; projection; otherwise the caller has no capability with which to
+           ;; recover the unreachable branch.
+           (binding [ec/*execution-context* (:ctx room)]
+             (when-let [constructed @room*]
+               (try (leave-all! constructed)
+                    (catch Throwable cleanup-error
+                      (.addSuppressed error cleanup-error)))
+               (try
+                 (when-let [drop-room!
+                            (requiring-resolve 'dvergr.agent.room-context/drop-room!)]
+                   (drop-room! new-id))
+                 (catch Throwable cleanup-error
+                   (.addSuppressed error cleanup-error)))
+               (when (rreg/lookup new-id)
+                 (try
+                   (when fork-handle
+                     (rreg/untrack-fork! new-id (:fork-id fork-handle)))
+                   (catch Throwable cleanup-error
+                     (.addSuppressed error cleanup-error)))
+                 (rreg/unregister! new-id))))
+           (when fork-handle
+             (let [pending (try
+                             (binding [ec/*execution-context*
+                                       (or (some-> @room* :ctx)
+                                           (:child-ctx fork-handle))]
+                               (ec/get-state [:dvergr/pending-grants]))
+                             (catch Throwable cleanup-error
+                               (.addSuppressed error cleanup-error)
+                               nil))]
+               (try
+                 (ygg/discard-fork! fork-handle)
+                 (srooms/drop-fork-grants! pending)
+                 (catch Throwable cleanup-error
+                   (.addSuppressed error cleanup-error)))))
+           (throw error)))))))
 
 (defn fork-handle
   "Return an isolated Room fork's process-local canonical ForkHandle, or nil.
@@ -1268,6 +1332,23 @@
   (some-> (fork-handle room) ygg/fork-descriptor))
 
 (declare fork-home-ctx)
+
+(def ^:dynamic ^:private *deferred-settlement-authority* nil)
+
+(defn- assert-settlement-released! [fork operation]
+  (locking (:meta fork)
+    (let [meta @(:meta fork)
+          live (binding [ec/*execution-context* (fork-home-ctx fork)]
+                 (rreg/lookup (:id fork)))]
+      (when (and (= :deferred (:settlement-policy meta))
+                 (= fork live)
+                 (not (:settlement-released? meta))
+                 (not= (:id fork) *deferred-settlement-authority*))
+        (throw (ex-info "Deferred Run world must be released before settlement"
+                        {:type ::settlement-deferred
+                         :operation operation
+                         :fork/id (:id fork)
+                         :run/id (:run-id meta)}))))))
 
 (defn- fork-transfer-children [home fork-id]
   (binding [ec/*execution-context* home]
@@ -1311,11 +1392,12 @@
    process-local settlement capability; callers must never persist it. The
    returned `:fork/descriptor` is data and is the canonical durable identity.
 
-   `abort!` is required and is called with the preparation receipt if the live
+  `abort!` is required and is called with the preparation receipt if the live
    affine transfer fails. A failed compensation leaves the Room fenced in a
    visible recovery-required state. Once transfer succeeds the durable owner is
    authoritative; later projection/event failures never roll it back."
   [fork new-owner prepare-or-opts]
+  (assert-settlement-released! fork :transfer)
   (let [{:keys [prepare! abort!]}
         (if (fn? prepare-or-opts)
           {:prepare! prepare-or-opts}
@@ -1861,6 +1943,7 @@
    discard of the same fork is a no-op (the branched systems are deleted only
    once)."
   [fork]
+  (assert-settlement-released! fork :discard)
   ;; Idempotence: once unregistered, the fork is a zombie — re-discarding would
   ;; double-delete the yggdrasil branch (which errors). Guard on registry.
   (when (binding [ec/*execution-context* (fork-home-ctx fork)] (rreg/lookup (:id fork)))
@@ -1892,6 +1975,54 @@
           (recover-room-quiescence! fork callbacks @work-fence-token* error)))))
   fork)
 
+(defn discard-deferred
+  "Consume the host-owned discard side of a deferred Run world.
+
+   This is the narrow substrate capability used by evaluation cancellation and
+   failed certification. Ordinary `discard`, merge, and transfer remain gated."
+  ([fork]
+   (discard-deferred fork (constantly true) (constantly nil)))
+  ([fork claim!]
+   (discard-deferred fork claim! (constantly nil)))
+  ([fork claim! abort!]
+   (locking (:meta fork)
+     (let [meta @(:meta fork)
+           live (binding [ec/*execution-context* (fork-home-ctx fork)]
+                  (rreg/lookup (:id fork)))]
+       (when-not (and (= fork live)
+                      (= :deferred (:settlement-policy meta))
+                      (not (:settlement-released? meta))
+                      (nil? (:settlement-claim meta)))
+         (throw (ex-info "Deferred discard authority is no longer current"
+                         {:type ::stale-deferred-settlement
+                          :fork/id (:id fork)
+                          :run/id (:run-id meta)})))
+       (when-not (claim!)
+         (throw (ex-info "Deferred discard lost its settlement race"
+                         {:type ::deferred-settlement-aborted
+                          :fork/id (:id fork)})))
+       (swap! (:meta fork) assoc :settlement-claim :discard)
+       (try
+         (binding [*deferred-settlement-authority* (:id fork)]
+           (discard fork))
+         (catch Throwable error
+           ;; Abort while the same affine lock is still held. If its durable
+           ;; compensation fails, retain a closed recovery claim rather than
+           ;; opening a race or holding this lock through an unbounded retry.
+           (let [abort-error (try (abort!) nil
+                                  (catch Throwable abort-error abort-error))]
+             (if abort-error
+               (swap! (:meta fork) assoc :settlement-claim :discard-recovery)
+               (swap! (:meta fork) dissoc :settlement-claim))
+             (throw (if abort-error
+                      (ex-info "Deferred discard requires durable abort recovery"
+                               {:type ::deferred-discard-recovery-required
+                                :fork/id (:id fork)
+                                :abort-error (ex-message abort-error)}
+                               error)
+                      error)))))))
+   fork))
+
 (defn merge-room
   "Merge fork into parent.
 
@@ -1909,6 +2040,7 @@
    (doc/unified-fork-conversation.md, dvergr.rooms.forks/reconcile-merge!.)"
   ([parent fork] (merge-room parent fork {}))
   ([parent fork {:keys [merge-opts]}]
+   (assert-settlement-released! fork :merge)
    (let [callbacks (drain-room-listeners! fork :merge)
          work-fence-token* (volatile! nil)]
      (try

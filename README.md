@@ -279,17 +279,14 @@ The standalone, runnable scenarios these import live in [`examples/`](examples/)
 | [hato](https://github.com/gnarroway/hato) | HTTP client for provider APIs |
 | [Telemere](https://github.com/taoensso/telemere) | Structured logging + observability |
 
-> **SCI fork note (Clojars library consumers only).** dvergr pins a fork of SCI
-> (`whilo/sci`, branch `resource-check`) for the `:interrupt-fn` cancellation the
-> sandbox relies on, pending an upstream PR. tools.build's `write-pom` emits only
-> Maven coords, so this git dep is **not** in the published pom. The uberjar/CLI
-> and git-dep consumers get it transitively and need nothing extra; a pure-Clojars
-> library consumer must add it themselves:
+> **SCI fork note.** dvergr directly depends on the published replikativ SCI
+> build for resource interruption and forkable interpreter worlds while the
+> corresponding changes are reviewed upstream. Maven and git consumers resolve
+> the same implementation:
 > ```clojure
-> org.babashka/sci {:git/url "https://github.com/whilo/sci"
->                   :git/sha "24762a163ef5b25c692d0e5cd4ea63a5bd6b0a16"}
+> org.replikativ/sci {:mvn/version "0.15.59-replikativ.1"}
 > ```
-> (Goes away once the fork lands upstream or is published to Maven.)
+> This returns to `org.babashka/sci` once the fork lands upstream.
 
 ## License
 

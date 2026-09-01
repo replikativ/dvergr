@@ -56,6 +56,40 @@
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unknown execution boundary"
                         (attention/boundary-event :provider/private-step))))
 
+(deftest execution-plans-negotiate-without-losing-decision-axes
+  (let [capabilities {:memory attention/memory-modes
+                      :activation attention/activation-modes
+                      :control #{:continue :restart :suspend :cancel}
+                      :boundaries #{:now :next-safe-boundary :quiescent}
+                      :priority? false
+                      :accept? (fn [{:keys [control at]}]
+                                 (when (and (= :restart control)
+                                            (= :quiescent at))
+                                   {:axes [:control :at]
+                                    :values [control at]}))}
+        ready (attention/execution-plan
+               {:memory :ignore :activation :wake
+                :control :cancel :at :now}
+               capabilities)
+        unavailable (attention/execution-plan
+                     {:memory :include :activation :enqueue
+                      :control :integrate :at :after-tool :priority 7}
+                     capabilities)
+        cross-axis (attention/execution-plan
+                    {:control :restart :at :quiescent}
+                    capabilities)]
+    (is (= :ready (:status ready)))
+    (is (= {:memory :ignore :activation :wake
+            :control :cancel :at :now :priority 0}
+           (:decision ready)))
+    (is (= :deferred (:status unavailable)))
+    (is (= #{:control :at :priority}
+           (into #{} (map :axis) (:unsupported unavailable))))
+    (is (= :deferred (:status cross-axis)))
+    (is (= [{:axes [:control :at]
+             :values [:restart :quiescent]}]
+           (:unsupported cross-axis)))))
+
 (deftest attention-composes-reactively-with-execution-boundaries
   (testing "continuous observation can defer integration until a safe boundary"
     (let [ctx (context/create-execution-context)]

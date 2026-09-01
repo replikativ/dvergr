@@ -28,8 +28,12 @@
   "Apply the shared retry/dead-letter policy, returning the Datahike report on
    success and false after terminal failure."
   ([conn tx-data] (persist-tx-result! conn tx-data {}))
-  ([conn tx-data {:keys [op room-id msg-id] :as ctx}]
-   (letfn [(attempt [] (d/transact conn tx-data))]
+  ([conn tx-data {:keys [op room-id msg-id tx-meta] :as ctx}]
+   (letfn [(attempt []
+             (d/transact conn
+                         (if tx-meta
+                           {:tx-data tx-data :tx-meta tx-meta}
+                           tx-data)))]
      (try
        (attempt)
        (catch Throwable t1

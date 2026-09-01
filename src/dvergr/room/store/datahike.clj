@@ -7,12 +7,17 @@
    The store maps a Room's keyword id ↔ a Datahike :chat/id UUID via
    the :room/slug attribute (`slug->room-id`/`room-id->slug` in
    `dvergr.room.store`)."
-  (:require [datahike.api :as dh]
+  (:require [clojure.edn :as edn]
+            [datahike.api :as dh]
+            [dvergr.agent.attempt :as attempt]
+            [dvergr.agent.attempt.governance :as attempt-governance]
+            [dvergr.artifact :as artifact]
             [dvergr.chat.schema :as schema]
             [dvergr.chat.persist :as persist]
             [dvergr.room.store :as store]
             [kontor.gate :as kontor-gate]
             [kontor.resource :as resource]
+            [hasch.core :as hasch]
             [taoensso.telemere :as tel]))
 
 ;; =============================================================================
@@ -138,6 +143,7 @@
       ;; gap where the room-store path used to drop tool-uses the chat-ctx
       ;; path kept.
       (seq (:tool-uses metadata)) (assoc :message/tool-uses (vec (:tool-uses metadata)))
+      (seq (:activities metadata)) (assoc :message/activities (vec (:activities metadata)))
       ;; Interleaved-thinking trace from a reasoning-model reply, so it survives
       ;; rehydration and is fed back to the model (see room-context seeding).
       (seq (:reasoning metadata))  (assoc :message/reasoning (:reasoning metadata)))))
@@ -152,7 +158,135 @@
   [db entity room-touch]
   (if (dh/entity db [:message/id (:message/id entity)])
     []
-    [entity room-touch]))
+    (do
+      (when (some :activity/run-id (:message/activities entity))
+        (let [message-run-id (:message/run-id entity)
+              run            (and message-run-id
+                                  (dh/entity db [:run/id message-run-id]))
+              chat-id        (second (:message/chat entity))]
+          (when-not run
+            (throw (ex-info "Run-correlated activity references a missing Run"
+                            {:type :room-store/orphan-message-activity
+                             :message-id (:message/id entity)
+                             :run-id message-run-id})))
+          (when-not (= chat-id (:chat/id (:run/chat run)))
+            (throw (ex-info "Run-correlated activity crosses Room stores"
+                            {:type :room-store/activity-room-mismatch
+                             :message-id (:message/id entity)
+                             :run-id message-run-id
+                             :message-chat chat-id
+                             :run-chat (:chat/id (:run/chat run))})))))
+      [entity room-touch])))
+
+(defn- store-attention-if-absent
+  "Transaction function preserving immutable attention identity under races."
+  [db entity]
+  (if (dh/entity db [:attention/id (:attention/id entity)])
+    []
+    (do
+      (when (= :applied (:attention/status entity))
+        (let [decision (dh/entity db [:attention/id (:attention/decision-id entity)])
+              semantic-attrs [:attention/participant :attention/message-id
+                              :attention/run-id :attention/memory
+                              :attention/activation :attention/control
+                              :attention/at :attention/priority
+                              :attention/reason :attention/metadata-edn]]
+          (when-not decision
+            (throw (ex-info "Applied attention references a missing decision"
+                            {:type :room-store/orphan-attention-disposition
+                             :entity entity})))
+          (when-not (= :ready (:attention/status decision))
+            (throw (ex-info "Only ready attention can be applied"
+                            {:type :room-store/invalid-attention-disposition
+                             :entity entity})))
+          (when-not (= (second (:attention/chat entity))
+                       (:chat/id (:attention/chat decision)))
+            (throw (ex-info "Attention disposition crosses Room stores"
+                            {:type :room-store/attention-room-mismatch
+                             :entity entity})))
+          (when-not (every? #(= (get decision %) (get entity %)) semantic-attrs)
+            (throw (ex-info "Applied attention axes differ from its decision"
+                            {:type :room-store/attention-disposition-mismatch
+                             :entity entity})))
+          (if (= :enqueue (:attention/activation entity))
+            (let [result-run-id (:attention/result-run-id entity)
+                  result-run (and result-run-id
+                                  (dh/entity db [:run/id result-run-id]))]
+              (when-not result-run-id
+                (throw (ex-info "Applied enqueue attention requires a successor Run"
+                                {:type :room-store/missing-attention-result-run
+                                 :entity entity})))
+              (when-not result-run
+                (throw (ex-info "Applied enqueue attention references a missing successor Run"
+                                {:type :room-store/missing-attention-result-run
+                                 :entity entity})))
+              (when-not (and (= (second (:attention/chat entity))
+                                (:chat/id (:run/chat result-run)))
+                             (= (:attention/participant entity) (:run/actor result-run))
+                             (= (:attention/message-id entity) (:run/trigger result-run)))
+                (throw (ex-info "Applied enqueue attention references an unrelated successor Run"
+                                {:type :room-store/invalid-attention-result-run
+                                 :entity entity}))))
+            (when (:attention/result-run-id entity)
+              (throw (ex-info "Only applied enqueue attention may reference a successor Run"
+                              {:type :room-store/unexpected-attention-result-run
+                               :entity entity}))))))
+      [entity])))
+
+(defn- store-attempt-if-absent
+  "Transaction function for immutable first-write-wins Attempt certification."
+  [db entity]
+  (if (dh/entity db [:attempt/id (:attempt/id entity)])
+    []
+    (let [chat-id (second (:attempt/chat entity))
+          run-id (second (:attempt/run entity))
+          run (dh/entity db [:run/id run-id])
+          terminal? #{:completed :failed :cancelled}]
+      (when-not run
+        (throw (ex-info "Attempt references a missing Run"
+                        {:type :room-store/invalid-attempt-run
+                         :attempt/id (:attempt/id entity) :run/id run-id})))
+      (when-not (= chat-id (:chat/id (:run/chat run)))
+        (throw (ex-info "Attempt Run crosses Room stores"
+                        {:type :room-store/attempt-room-mismatch
+                         :attempt/id (:attempt/id entity) :run/id run-id})))
+      (when-not (contains? terminal? (:run/status run))
+        (throw (ex-info "Attempt Run is not terminal"
+                        {:type :room-store/non-terminal-attempt-run
+                         :attempt/id (:attempt/id entity)
+                         :run/status (:run/status run)})))
+      (when-not (= (:run/status run) (:attempt/status entity))
+        (throw (ex-info "Attempt status differs from its Run"
+                        {:type :room-store/attempt-run-status-mismatch
+                         :run/status (:run/status run)
+                         :attempt/status (:attempt/status entity)})))
+      (doseq [[attempt-key run-key]
+              [[:attempt/agent-def-hash :run/agent-def-hash]
+               [:attempt/program-kind :run/program-kind]
+               [:attempt/interpreter-version :run/interpreter-version]]]
+        (when-not (= (get entity attempt-key) (get run run-key))
+          (throw (ex-info "Attempt provenance differs from its Run"
+                          {:type :room-store/attempt-run-provenance-mismatch
+                           :attempt/key attempt-key
+                           :attempt/value (get entity attempt-key)
+                           :run/value (get run run-key)}))))
+      (doseq [ref (:attempt/evidence-runs entity)]
+        (let [evidence-run (dh/entity db ref)]
+          (when-not (and evidence-run
+                         (= chat-id (:chat/id (:run/chat evidence-run))))
+            (throw (ex-info "Attempt evidence Run is missing or cross-Room"
+                            {:type :room-store/invalid-attempt-evidence-run
+                             :attempt/id (:attempt/id entity)
+                             :run/ref ref})))))
+      (doseq [ref (:attempt/evidence-messages entity)]
+        (let [message (dh/entity db ref)]
+          (when-not (and message
+                         (= chat-id (:chat/id (:message/chat message))))
+            (throw (ex-info "Attempt evidence message is missing or cross-Room"
+                            {:type :room-store/invalid-attempt-evidence-message
+                             :attempt/id (:attempt/id entity)
+                             :message/ref ref})))))
+      [entity])))
 
 (def ^:private message-pull-pattern
   '[:message/id :message/role :message/content
@@ -179,16 +313,45 @@
     :message/notification-elapsed
     {:message/tool-uses
      [:tool-use/id :tool-use/name
-      {:tool-use/input [*]}]}])
+      {:tool-use/input [*]}]}
+    {:message/activities
+     [:activity/id :activity/run-id :activity/kind :activity/verb
+      :activity/status :activity/tool-name :activity/tool-use-id
+      :activity/outcome :activity/critical? :activity/at]}])
 
 (def ^:private run-pull-pattern
-  '[:run/id :run/kind :run/room :run/actor :run/trigger :run/parent
+  '[:run/id :run/kind :run/room :run/actor :run/trigger :run/parent :run/caused-by
     :run/roster :run/agent-version :run/program-kind :run/interpreter-version
     :run/agent-def-hash :run/chat-id
     :run/world :run/isolation :run/settlement-policy
     :run/settlement-status :run/settlement-reason
     :run/status :run/created-at :run/started-at :run/updated-at :run/ended-at
     :run/reason :run/error])
+
+(def ^:private attempt-pull-pattern
+  '[:attempt/id :attempt/content-id :attempt/payload-blob
+    :attempt/payload-codec :attempt/environment-id
+    :attempt/environment-version :attempt/environment-content-id
+    :attempt/verifier-id :attempt/verifier-version
+    :attempt/provider :attempt/model :attempt/status
+    :attempt/started-at :attempt/elapsed-ms :attempt/certified-at
+    :attempt/reward :attempt/agent-def-hash :attempt/program-kind
+    :attempt/interpreter-version :attempt/prompt-id
+    :attempt/model-resolution :attempt/model-steps
+    :attempt/evidence-content-id :attempt/settlement-intent
+    {:attempt/run [:run/id]}
+    {:attempt/evidence-runs [:run/id]}
+    {:attempt/evidence-messages [:message/id]}
+    {:attempt/checks [:attempt.check/id :attempt.check/key
+                      :attempt.check/passed?]}])
+
+(def ^:private attention-pull-pattern
+  '[:attention/id :attention/participant :attention/message-id
+    :attention/decision-id :attention/run-id :attention/result-run-id
+    :attention/memory :attention/activation
+    :attention/control :attention/at :attention/priority
+    :attention/status :attention/reason :attention/metadata-edn
+    :attention/created-at])
 
 (defn- run->entity [chat-id run]
   (cond-> {:run/id         (:run/id run)
@@ -202,6 +365,7 @@
            :run/started-at (:run/started-at run)
            :run/updated-at (:run/updated-at run)}
     (:run/parent run)   (assoc :run/parent (:run/parent run))
+    (seq (:run/caused-by run)) (assoc :run/caused-by (:run/caused-by run))
     (:run/roster run) (assoc :run/roster (:run/roster run))
     (:run/agent-version run) (assoc :run/agent-version (:run/agent-version run))
     (:run/program-kind run) (assoc :run/program-kind (:run/program-kind run))
@@ -221,11 +385,147 @@
     (:run/reason run)   (assoc :run/reason (:run/reason run))
     (:run/error run)    (assoc :run/error (str (:run/error run)))))
 
+(defn- entity->run [entity]
+  (cond-> entity
+    (:run/caused-by entity) (update :run/caused-by set)))
+
+(defn- check-id [attempt-id check-key]
+  (hasch/uuid [:dvergr/attempt-check attempt-id check-key]))
+
+(defn- attempt->entity [chat-id value payload-ref]
+  (let [receipt (:attempt/receipt value)
+        definition (:attempt/environment value)
+        verifier (:environment/verifier definition)
+        metrics (:attempt/metrics receipt)]
+    (cond-> {:attempt/id (:attempt/id value)
+             :attempt/chat [:chat/id chat-id]
+             :attempt/run [:run/id (:attempt/run-id value)]
+             :attempt/content-id (:attempt/content-id value)
+             :attempt/payload-blob payload-ref
+             :attempt/payload-codec :edn-v1
+             :attempt/environment-id (:environment/id definition)
+             :attempt/environment-version (:environment/version definition)
+             :attempt/environment-content-id (:environment/content-id definition)
+             :attempt/verifier-id (:verifier/id verifier)
+             :attempt/verifier-version (:verifier/version verifier)
+             :attempt/provider (:attempt/provider receipt)
+             :attempt/model (:attempt/model receipt)
+             :attempt/status (:attempt/status receipt)
+             :attempt/started-at (java.util.Date. ^long (:attempt/started-at receipt))
+             :attempt/elapsed-ms (long (:attempt/elapsed-ms receipt))
+             :attempt/certified-at (java.util.Date. ^long (:attempt/certified-at value))
+             :attempt/reward (double (:attempt/reward receipt))
+             :attempt/agent-def-hash (:attempt/agent-def-hash value)
+             :attempt/program-kind (:program-kind metrics)
+             :attempt/interpreter-version (long (:interpreter-version metrics))
+             :attempt/evidence-content-id (:attempt/evidence-content-id value)
+             :attempt/evidence-runs
+             (mapv (fn [id] [:run/id id]) (:attempt/evidence-run-ids value))
+             :attempt/settlement-intent (:attempt/settlement-intent value)
+             :attempt/checks
+             (mapv (fn [[k passed?]]
+                     {:attempt.check/id (check-id (:attempt/id value) k)
+                      :attempt.check/key k
+                      :attempt.check/passed? passed?})
+                   (:attempt/checks receipt))}
+      (:prompt-id metrics) (assoc :attempt/prompt-id (:prompt-id metrics))
+      (:model-resolution metrics)
+      (assoc :attempt/model-resolution (:model-resolution metrics))
+      (:model-steps metrics) (assoc :attempt/model-steps (long (:model-steps metrics)))
+      (seq (:attempt/evidence-message-ids value))
+      (assoc :attempt/evidence-messages
+             (mapv (fn [id] [:message/id id])
+                   (:attempt/evidence-message-ids value))))))
+
+(defn- entity->attempt [entity artifacts]
+  (when entity
+    (when-not (= :edn-v1 (:attempt/payload-codec entity))
+      (throw (ex-info "Unsupported Attempt payload codec"
+                      {:type :room-store/unsupported-attempt-payload
+                       :codec (:attempt/payload-codec entity)})))
+    (let [value (artifact/get-value artifacts (:attempt/payload-blob entity))]
+      (when-not value
+        (throw (ex-info "Attempt payload artifact is unavailable"
+                        {:type :room-store/missing-attempt-payload
+                         :attempt/id (:attempt/id entity)
+                         :artifact/ref (:attempt/payload-blob entity)})))
+      (attempt/validate-attempt value)
+      (let [receipt (:attempt/receipt value)
+            definition (:attempt/environment value)
+            verifier (:environment/verifier definition)
+            metrics (:attempt/metrics receipt)
+            checks (into {}
+                         (map (juxt :attempt.check/key
+                                    :attempt.check/passed?))
+                         (:attempt/checks entity))
+            projected {:attempt/id (:attempt/id value)
+                       :attempt/content-id (:attempt/content-id value)
+                       :attempt/environment-id (:environment/id definition)
+                       :attempt/environment-version (:environment/version definition)
+                       :attempt/environment-content-id
+                       (:environment/content-id definition)
+                       :attempt/verifier-id (:verifier/id verifier)
+                       :attempt/verifier-version (:verifier/version verifier)
+                       :attempt/provider (:attempt/provider receipt)
+                       :attempt/model (:attempt/model receipt)
+                       :attempt/status (:attempt/status receipt)
+                       :attempt/started-at
+                       (java.util.Date. ^long (:attempt/started-at receipt))
+                       :attempt/elapsed-ms (:attempt/elapsed-ms receipt)
+                       :attempt/certified-at
+                       (java.util.Date. ^long (:attempt/certified-at value))
+                       :attempt/reward (double (:attempt/reward receipt))
+                       :attempt/agent-def-hash (:attempt/agent-def-hash value)
+                       :attempt/program-kind (:program-kind metrics)
+                       :attempt/interpreter-version (:interpreter-version metrics)
+                       :attempt/prompt-id (:prompt-id metrics)
+                       :attempt/model-resolution (:model-resolution metrics)
+                       :attempt/model-steps (:model-steps metrics)
+                       :attempt/evidence-content-id
+                       (:attempt/evidence-content-id value)
+                       :attempt/settlement-intent
+                       (:attempt/settlement-intent value)
+                       :attempt/check-map (:attempt/checks receipt)
+                       :attempt/evidence-run-ids
+                       (:attempt/evidence-run-ids value)
+                       :attempt/evidence-message-ids
+                       (or (:attempt/evidence-message-ids value) #{})}
+            actual (assoc entity
+                          :attempt/check-map checks
+                          :attempt/evidence-run-ids
+                          (into #{} (map :run/id)
+                                (:attempt/evidence-runs entity))
+                          :attempt/evidence-message-ids
+                          (into #{} (map :message/id)
+                                (:attempt/evidence-messages entity)))]
+        (doseq [[k expected] projected]
+          (when-not (= expected (get actual k))
+            (throw (ex-info "Attempt typed projection differs from exact payload"
+                            {:type :room-store/corrupt-attempt-projection
+                             :attempt/id (:attempt/id value)
+                             :key k :expected expected :actual (get actual k)}))))
+        value))))
+
+(defn- attention->entity [chat-id fact]
+  (cond-> (-> fact
+              (dissoc :attention/metadata)
+              (assoc :attention/chat [:chat/id chat-id]))
+    (:attention/metadata fact)
+    (assoc :attention/metadata-edn (pr-str (:attention/metadata fact)))
+
+    (some? (:attention/priority fact))
+    (update :attention/priority double)))
+
+(defn- entity->attention [entity]
+  (cond-> (dissoc entity :attention/metadata-edn)
+    (:attention/metadata-edn entity)
+    (assoc :attention/metadata (edn/read-string (:attention/metadata-edn entity)))))
+
 ;; =============================================================================
 ;; Store impl
 ;; =============================================================================
 
-(defrecord DatahikeStore [conn]
+(defrecord DatahikeStore [conn artifacts]
   store/PRoomStore
 
   (-store-room! [_ room-id metadata]
@@ -263,9 +563,29 @@
                               [?c :chat/id ?cid]
                               [?r :run/chat ?c]
                               [?r :run/id ?rid]]
-                            @conn chat-id)]
-          (dh/transact conn (-> (mapv (fn [mid] [:db/retractEntity [:message/id mid]]) msg-ids)
+                            @conn chat-id)
+              attempt-ids (dh/q '[:find [?aid ...]
+                                  :in $ ?cid
+                                  :where
+                                  [?c :chat/id ?cid]
+                                  [?a :attempt/chat ?c]
+                                  [?a :attempt/id ?aid]]
+                                @conn chat-id)
+              attention-ids (dh/q '[:find [?aid ...]
+                                    :in $ ?cid
+                                    :where
+                                    [?c :chat/id ?cid]
+                                    [?a :attention/chat ?c]
+                                    [?a :attention/id ?aid]]
+                                  @conn chat-id)]
+          (dh/transact conn (-> (mapv (fn [aid]
+                                        [:db/retractEntity [:attempt/id aid]])
+                                      attempt-ids)
+                                (into (map (fn [mid] [:db/retractEntity [:message/id mid]]) msg-ids))
                                 (into (map (fn [rid] [:db/retractEntity [:run/id rid]]) run-ids))
+                                (into (map (fn [aid]
+                                             [:db/retractEntity [:attention/id aid]])
+                                           attention-ids))
                                 (conj [:db/retractEntity [:chat/id chat-id]])))))))
 
   (-list-rooms [_]
@@ -427,6 +747,8 @@
                                           (:message/notification-elapsed m))
                                    (seq (:message/tool-uses m))
                                    (assoc :tool-uses (:message/tool-uses m))
+                                   (seq (:message/activities m))
+                                   (assoc :activities (:message/activities m))
                                    (seq (:message/reasoning m))
                                    (assoc :reasoning (:message/reasoning m)))]
                     (store/normalize-message-thread
@@ -457,28 +779,36 @@
   (-store-run! [this room-id run]
     (let [slug (store/room-id->slug room-id)]
       (when-let [ent (room-by-slug conn slug)]
-        (let [run (->> run
-                       store/validate-run!
-                       (store/validate-run-update!
-                        (store/-load-run this room-id (:run/id run))))]
-          (when (persist/persist-tx!
-                 conn
-                 [(run->entity (:chat/id ent) run)
-                  {:db/id [:chat/id (:chat/id ent)]
-                   :chat/updated-at (java.util.Date.)}]
-                 {:op :store-run :room-id room-id :run-id (:run/id run)})
-            run)))))
+        ;; Serialize validation and assertion on the connection. Terminal cause
+        ;; Runs cannot be retracted through this store, and append-only checking
+        ;; prevents concurrent/stale writers from losing an accepted edge.
+        (locking conn
+          (let [run (store/validate-run! run)
+                existing (store/-load-run this room-id (:run/id run))
+                run (->> run
+                         (store/validate-run-update! existing)
+                         (store/validate-run-causes!
+                          existing
+                          #(store/-load-run this room-id %)))]
+            (when (persist/persist-tx!
+                   conn
+                   [(run->entity (:chat/id ent) run)
+                    {:db/id [:chat/id (:chat/id ent)]
+                     :chat/updated-at (java.util.Date.)}]
+                   {:op :store-run :room-id room-id :run-id (:run/id run)})
+              run))))))
 
   (-load-run [_ room-id run-id]
     (let [slug (store/room-id->slug room-id)]
       (when-let [ent (room-by-slug conn slug)]
-        (dh/q '[:find (pull ?r pattern) .
-                :in $ ?chat-id ?run-id pattern
-                :where
-                [?c :chat/id ?chat-id]
-                [?r :run/chat ?c]
-                [?r :run/id ?run-id]]
-              @conn (:chat/id ent) run-id run-pull-pattern))))
+        (some-> (dh/q '[:find (pull ?r pattern) .
+                        :in $ ?chat-id ?run-id pattern
+                        :where
+                        [?c :chat/id ?chat-id]
+                        [?r :run/chat ?c]
+                        [?r :run/id ?run-id]]
+                      @conn (:chat/id ent) run-id run-pull-pattern)
+                entity->run))))
 
   (-list-runs [_ room-id {:keys [limit status actor]}]
     (let [slug (store/room-id->slug room-id)]
@@ -489,6 +819,7 @@
                      [?c :chat/id ?chat-id]
                      [?r :run/chat ?c]]
                    @conn (:chat/id ent) run-pull-pattern)
+             (map entity->run)
              (filter #(if status (= status (:run/status %)) true))
              (filter #(if actor (= actor (:run/actor %)) true))
              (sort-by (juxt #(some-> ^java.util.Date (:run/started-at %) .getTime)
@@ -496,6 +827,198 @@
                       #(compare %2 %1))
              (take (or limit 100))
              vec)
+        [])))
+
+  store/PAttemptStore
+
+  (-store-attempt! [this room-id value]
+    (let [value (attempt/validate-attempt value)
+          slug (store/room-id->slug room-id)]
+      (when-let [ent (room-by-slug conn slug)]
+        ;; CAS is immutable: a blob written before a failed Datahike commit is a
+        ;; harmless unreferenced object and can be collected independently.
+        (let [payload-ref (artifact/put-value! artifacts value)
+              entity (attempt->entity (:chat/id ent) value payload-ref)]
+          (locking conn
+            (if-let [existing (store/-load-attempt this room-id
+                                                   (:attempt/id value))]
+              (if (= existing value)
+                existing
+                (throw (ex-info "Attempt identity is immutable"
+                                {:type :room-store/attempt-identity-collision
+                                 :existing existing :attempt value})))
+              (let [report
+                    (attempt-governance/with-authorized-write
+                      conn (:attempt/id value)
+                      (fn [tx-meta]
+                        (persist/persist-tx-result!
+                         conn
+                         [[:db.fn/call store-attempt-if-absent entity]]
+                         {:op :store-attempt :room-id room-id
+                          :attempt-id (:attempt/id value)
+                          :tx-meta tx-meta})))]
+                (when report
+                  ;; A concurrent identical writer may have won. Always compare
+                  ;; the exact payload after the serialized first-write decision.
+                  (let [stored (store/-load-attempt this room-id
+                                                    (:attempt/id value))]
+                    (when-not (= stored value)
+                      (throw (ex-info "Concurrent Attempt identity collision"
+                                      {:type :room-store/attempt-identity-collision
+                                       :stored stored :attempt value})))
+                    stored)))))))))
+
+  (-load-attempt [_ room-id attempt-id]
+    (let [slug (store/room-id->slug room-id)]
+      (when-let [ent (room-by-slug conn slug)]
+        (some-> (dh/q '[:find (pull ?a pattern) .
+                        :in $ ?chat-id ?attempt-id pattern
+                        :where
+                        [?c :chat/id ?chat-id]
+                        [?a :attempt/chat ?c]
+                        [?a :attempt/id ?attempt-id]]
+                      @conn (:chat/id ent) attempt-id attempt-pull-pattern)
+                (entity->attempt artifacts)))))
+
+  (-list-attempts [_ room-id {:keys [limit environment-id
+                                     environment-content-id provider model
+                                     status]}]
+    (let [slug (store/room-id->slug room-id)]
+      (if-let [ent (room-by-slug conn slug)]
+        (let [where (cond-> '[[?c :chat/id ?chat-id]
+                              [?a :attempt/chat ?c]]
+                      environment-id
+                      (conj '[?a :attempt/environment-id ?environment-id])
+                      environment-content-id
+                      (conj '[?a :attempt/environment-content-id
+                              ?environment-content-id])
+                      provider (conj '[?a :attempt/provider ?provider])
+                      model (conj '[?a :attempt/model ?model])
+                      status (conj '[?a :attempt/status ?status]))
+              inputs (cond-> '[$ ?chat-id pattern]
+                       environment-id (conj '?environment-id)
+                       environment-content-id (conj '?environment-content-id)
+                       provider (conj '?provider)
+                       model (conj '?model)
+                       status (conj '?status))
+              args (cond-> [@conn (:chat/id ent) attempt-pull-pattern]
+                     environment-id (conj environment-id)
+                     environment-content-id (conj environment-content-id)
+                     provider (conj provider)
+                     model (conj model)
+                     status (conj status))
+              query {:find '[(pull ?a pattern)]
+                     :in inputs
+                     :where where}]
+          (->> (apply dh/q query args)
+               (map first)
+               (sort-by (juxt #(some-> ^java.util.Date
+                                (:attempt/certified-at %) .getTime)
+                              #(str (:attempt/id %)))
+                        #(compare %2 %1))
+               (take (or limit 100))
+               (mapv #(entity->attempt % artifacts))))
+        [])))
+
+  store/PAttentionStore
+
+  (-store-attention! [_ room-id fact]
+    (let [slug (store/room-id->slug room-id)
+          fact (store/validate-attention! fact)]
+      (if-let [ent (room-by-slug conn slug)]
+        (let [_ (when (= :applied (:attention/status fact))
+                  (let [decision
+                        (some-> (dh/q '[:find (pull ?a pattern) .
+                                        :in $ ?id pattern
+                                        :where [?a :attention/id ?id]]
+                                      @conn (:attention/decision-id fact)
+                                      attention-pull-pattern)
+                                entity->attention)
+                        decision-chat-id
+                        (dh/q '[:find ?chat-id .
+                                :in $ ?id
+                                :where
+                                [?a :attention/id ?id]
+                                [?a :attention/chat ?c]
+                                [?c :chat/id ?chat-id]]
+                              @conn (:attention/decision-id fact))
+                        result-run
+                        (when-let [result-run-id (:attention/result-run-id fact)]
+                          (dh/q '[:find (pull ?r pattern) .
+                                  :in $ ?chat-id ?run-id pattern
+                                  :where
+                                  [?c :chat/id ?chat-id]
+                                  [?r :run/chat ?c]
+                                  [?r :run/id ?run-id]]
+                                @conn (:chat/id ent) result-run-id
+                                run-pull-pattern))]
+                    (when (and decision (not= (:chat/id ent) decision-chat-id))
+                      (throw (ex-info "Attention disposition crosses Room stores"
+                                      {:type :room-store/attention-room-mismatch
+                                       :decision decision :fact fact})))
+                    (-> (store/validate-attention-disposition! decision fact)
+                        (store/validate-attention-result-run! result-run))))
+              report (persist/persist-tx-result!
+                      conn
+                      [[:db.fn/call store-attention-if-absent
+                        (attention->entity (:chat/id ent) fact)]]
+                      {:op :store-attention
+                       :room-id room-id
+                       :attention-id (:attention/id fact)})]
+          (when (false? report)
+            (throw (ex-info "Attention persistence failed"
+                            {:type :room-store/attention-persistence-failed
+                             :room-id room-id :fact fact})))
+          (let [stored (some-> (dh/q '[:find (pull ?a pattern) .
+                                       :in $ ?id pattern
+                                       :where [?a :attention/id ?id]]
+                                     @conn (:attention/id fact) attention-pull-pattern)
+                               entity->attention)
+                stored-chat-id
+                (dh/q '[:find ?chat-id .
+                        :in $ ?id
+                        :where
+                        [?a :attention/id ?id]
+                        [?a :attention/chat ?c]
+                        [?c :chat/id ?chat-id]]
+                      @conn (:attention/id fact))]
+            (when-not (and (= (:chat/id ent) stored-chat-id)
+                           (= fact stored))
+              (throw (ex-info "Attention identity is immutable"
+                              {:type :room-store/attention-identity-collision
+                               :existing stored :existing-chat-id stored-chat-id
+                               :room-chat-id (:chat/id ent) :fact fact})))
+            fact))
+        (throw (ex-info "Cannot persist attention for unknown room"
+                        {:type :room-store/missing-room :room-id room-id})))))
+
+  (-list-attention [_ room-id {:keys [id participant limit]}]
+    (let [slug (store/room-id->slug room-id)]
+      (if-let [ent (room-by-slug conn slug)]
+        (if id
+          (some-> (dh/q '[:find (pull ?a pattern) .
+                          :in $ ?chat-id ?id pattern
+                          :where
+                          [?c :chat/id ?chat-id]
+                          [?a :attention/chat ?c]
+                          [?a :attention/id ?id]]
+                        @conn (:chat/id ent) id attention-pull-pattern)
+                  entity->attention
+                  vector)
+          (->> (dh/q '[:find [(pull ?a pattern) ...]
+                       :in $ ?chat-id pattern
+                       :where
+                       [?c :chat/id ?chat-id]
+                       [?a :attention/chat ?c]]
+                     @conn (:chat/id ent) attention-pull-pattern)
+               (map entity->attention)
+               (filter #(if participant
+                          (= participant (:attention/participant %))
+                          true))
+               (sort-by (juxt #(some-> ^java.util.Date (:attention/created-at %) .getTime)
+                              #(str (:attention/id %))))
+               (take-last (or limit 1000))
+               vec))
         [])))
 
   store/PResourceStore
@@ -535,6 +1058,10 @@
 
 (defn make
   "Create a DatahikeStore. `conn` must be an existing Datahike
-   connection whose db includes the dvergr.chat.schema attributes."
-  [conn]
-  (->DatahikeStore conn))
+   connection whose db includes the dvergr.chat.schema attributes. An optional
+   artifact store can be injected for tests; production uses the blob CAS."
+  ([conn]
+   (make conn (artifact/blob-store)))
+  ([conn artifacts]
+   (attempt-governance/govern! conn)
+   (->DatahikeStore conn artifacts)))

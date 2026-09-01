@@ -89,7 +89,13 @@ Attention is the conversational policy layer above this mechanism. A policy may
 remember an utterance without admission, enqueue it for serial work, or request
 switch-to-latest integration at a supported execution boundary. That mapping is
 an interpreter owned by the participant; message tags themselves never acquire
-cancellation authority.
+cancellation authority. Native LLM attention decisions are durable typed Room
+projections rather than synthetic speech: `include` admits model input at the
+next supported boundary, `remember` preserves awareness outside provider
+context, and unsupported plans remain explicitly deferred for a future capable
+interpreter. Stable decision facts and separate applied dispositions make crash
+windows observable without pretending that replaying a model/tool effect is
+always safe; recovery reconciles unapplied decisions with durable Runs first.
 
 ## Construct and compose
 
@@ -255,6 +261,8 @@ what the program did (`:completed`, `:waiting`, `:failed`, or `:cancelled`).
 - `:settlement :automatic` (default): merge completed work;
 - `:settlement :review`: retain completed work in the Room tree;
 - `:settlement :discard`: execute for its result/trace, then drop its effects.
+- `:settlement :deferred`: host-owned two-phase gate; retain the world but
+  reject merge/adoption until the host explicitly releases it.
 
 Failure and cancellation always discard the work plane. Waiting and automatic
 merge conflicts retain it for review. A later merge/discard through
@@ -284,6 +292,106 @@ Run must first receive an eventual Kontor-backed provider allocation.
 
 ## Evaluation ladder
 
+An evaluation environment is an immutable `EnvironmentDef`, separate from any
+attempt to execute it:
+
+```clojure
+(agent/environment
+ {:id :programming/review-v1
+  :task {:artifact "candidate.edn"}
+  :verifier {:id :checks/review-v1 :version 1
+             :basis "git:<verifier-commit>"}
+  :limits {:timeout-ms 120000 :max-model-steps 8}
+  :world {:isolation :ctx :settlement :review}})
+```
+
+The value has a Hasch-derived `:environment/content-id`; map ordering does not
+affect it, while changing the task, verifier reference, limits, or world policy
+does. A verifier is deliberately a versioned reference rather than an embedded
+function: untrusted SCI can author and fork definitions, but only the trusted
+runner resolves exact verifier and world-setup references and computes reward.
+The benchmark interpreter derives its timeout, cancellation grace, restrictive
+model-step and dollar limits, settlement policy, and resource grants from that
+validated definition. It rejects unsupported policy keys instead of silently
+certifying a different scenario. In particular, world `:setup` remains closed
+until the host supplies a versioned trusted setup resolver. Each attempt still
+receives a fresh Run ID, so content identity never collapses distinct
+executions. The current REPL benchmark reports retain both the exact definition
+and its compact reference.
+
+Every opt-in REPL attempt returns a content-addressed `:attempt-receipt`. It binds the
+unique root Run to the exact EnvironmentDef, provider/model, exact assembled
+system-prompt ID, per-resource usage, timing, trusted checks/reward, Run/tool
+trace, and Kontor receipts when present. SCI does not receive the receipt
+constructor or verifier registry, so an evaluated agent can propose an
+environment but cannot certify its own reward.
+
+When the Room has a store, trusted certification persists an immutable Attempt
+before the world can become reviewable or be discarded. The typed Datahike row
+indexes Run, environment, verifier, provider/model, status, timing, reward,
+checks, prompt/program/interpreter provenance, and evidence references. The
+exact EnvironmentDef, AgentDef, receipt, and portable evidence live together in
+Dvergr's immutable blob CAS; the row holds the content reference rather than an
+opaque EDN/JSON column. SCI can query this projection but its Datahike surface
+rejects writes or retractions in the `:attempt/*` and `:attempt.check/*`
+namespaces. A Hasch identity detects content mutation; it does not authenticate
+an external writer, so cross-process imports require a trusted manifest or
+signature before their rewards are admitted.
+
+The reusable host boundary is `dvergr.agent.evaluation/evaluate`. It returns a
+Spin rather than starting a second scheduler: when executed, it admits an
+ordinary Run in an ordinary isolated RunWorld, waits for physical quiescence,
+then invokes a version-matched host `Evaluator` to produce portable evidence,
+checks, reward, and the receipt. Successful evaluation worlds may be retained
+for review or discarded, but first settle as `:deferred`; ordinary merge and
+adoption/discard reject that same world until trusted scoring atomically claims
+release or trusted cleanup. Observer and verifier callbacks run on an external
+worker rather than Spindel's drain path. Cancellation and certification race at
+the settlement claim: a cancelled evaluation can never later make its world
+landable, even if an uncooperative callback returns late. Certification failure
+discards the uncertified world while preserving the Run ID in the structured
+error. The evaluator capability contains functions and therefore remains
+process-local and absent from SCI; SCI can author the portable EnvironmentDef
+it names.
+
+An Episode is a pure export/read projection, not another durable lifecycle:
+
+```text
+Episode = immutable certified Attempt
+        + current durable Run settlement
+        + referenced Runs/messages/activity/resource facts
+```
+
+Review may later merge or discard the Run world. That changes the joined Run
+projection while the historical AttemptReceipt stays content-identical.
+Dataset acceptance, train/eval splits, rankings, particles, and proposal status
+are separate later projections; none mutate certification.
+
+An ensemble is composition, not another primitive:
+
+```clojure
+(let [attempts (mapv #(evaluation/evaluate room team % environment evaluator)
+                     candidate-agent-refs)]
+  @(apply comb/parallel attempts))
+```
+
+Pure policy can rank/select the resulting receipts. Existing room-fork
+merge/discard/adoption remains the only settlement authority. SMC, MCTS,
+Anglican-style inference, and Raster training can consume this same boundary
+without changing Run, Room, or world semantics.
+
+For training, an accepted episode is a projection across the exact
+EnvironmentDef, AgentDef/interpreter identity, Run/tool trajectory, conserved
+resources, checks/reward, and world/memory basis. Raster can consume that
+projection, while a `pretrained-rstr` git-like memory is simply another forked
+system in the episode world. Neither training nor a particular inference
+algorithm changes the execution algebra.
+
+Dollar/token, elapsed-time, and conserved resource limits are the ordinary
+governors. `:max-model-steps` remains only a high emergency fuse for a provider
+loop that keeps returning tool continuations; it is not the conversational or
+FRP unit of progress.
+
 The API and the instructions that teach it are evaluated together at three
 levels:
 
@@ -296,16 +404,18 @@ levels:
    Code, API models, and local models. A trusted host verifier scores the exact
    result plus durable Room/Run facts; model prose is never the reward source.
    Reports retain individual checks, binary reward, generated SCI, leaked
-   Runs/resources, model steps, wall time, task version, and model. Token/cost
-   receipts and a stable hash of the assembled system prompt remain reporting
-   follow-ups.
+   Runs/resources, model steps, token/cost usage, wall time, task version,
+   model, and a stable ID of the exact assembled system prompt. Durable receipt
+   persistence, trusted-writer authorization, and settlement against a retained
+   benchmark world remain follow-ups.
 
 The initial model-facing task set should include pure roster specialization,
 parallel research/review and reduction, race-with-loser-cancellation, explicit
 structural child Runs, delegation-ceiling recognition, and creation of a nested
-durable Room. Structured queue/observe/steer compatibility and reactive-boundary
-tests cover the first attention seam; later `latest`/`serial`/`busy`/`parallel`
-work-admission combinators extend it.
+durable Room. Provider-free attention tests cover capability negotiation,
+queue/observe/restart, run-local cancellation, and reactive boundaries;
+`latest`/`serial`/`busy`/`parallel` work admission covers computation overlap as
+a separate FRP layer.
 Passing only one model is not sufficient evidence that the programming surface
 is clear.
 
@@ -318,6 +428,8 @@ their reports:
 (require '[dvergr.agent.program-bench :as bench])
 (bench/run-v1! :codex-subscription "codex-subscription-sol")
 (bench/run-race-v1! :claude-code "claude-code-sonnet")
+(bench/run-resource-v1! :codex-subscription "codex-subscription-sol")
+(bench/run-self-programming-v1! :codex-subscription "codex-subscription-sol")
 
 ;; The generic entry point makes the task/version explicit.
 (bench/run-environment! :programming/race-v1
@@ -342,6 +454,28 @@ On 2026-08-28, after that correction, Codex Sol solved
 `:programming/race-v1` in three model exchanges and Claude Code in five. Every
 verifier check passed: exact `:fast` result, completed winner, durably cancelled
 loser, structural parentage, completed root, and zero active Runs.
+
+The resource-delegation environment adds a Datahike/Kontor control plane. The
+root Run receives a conserved vector, splits it between two specialists from
+SCI, and joins their result Spins. Its trusted verifier checks the canonical
+Kontor allocation and return receipts for every wallet edge, durable child
+parentage and settlement, empty terminal Run wallets, the restored Room balance,
+and global quiescence. In the 2026-08-30 Codex Sol probe it passed all checks in
+three model exchanges. This evaluates affine delegation and return; it does not
+pretend the provider call itself has been debited yet.
+
+The self-programming environment asks the root model to construct two cheap
+simulated particles plus an independent verifier specification, join all three
+through Spindel, and interpret the verifier data as a pure check. Trusted host
+code scores the exact answer, structural parentage, child completion and
+settlement, durable causal observation of every child result, durable root
+completion, and global quiescence. This deliberately
+uses stubbed child effects: it tests whether a model can author recursive
+orchestration before paid recursive LLM delegation is enabled. In the
+2026-08-30 Codex Sol probe, the model discovered the programming API through
+the REPL, authored and executed the three-specialist program, and passed every
+check in six model exchanges and 31.823 seconds. The durable root's causal
+inputs exactly matched the three child Runs.
 
 This is only the seed of a training environment, not yet a reinforcement
 learning system. The intended general contract is: initialize a forked Room and
@@ -382,12 +516,74 @@ A Roster is a value, not a hidden registry. Thread it through functions or carry
 it as a Spin result. Forked computations can therefore use different derived
 rosters without synchronization or leakage.
 
+The evaluation path follows the same placement rule end to end:
+
+| State | Representation |
+|---|---|
+| workflow dependency, awaiting, cancellation | Spin nodes and continuations in the execution context |
+| changing beliefs, populations, queues, or search policy | Spindel signals/runtime atoms in the execution context |
+| Room, Run, message, ledger, and certified Attempt facts | the Datahike Yggdrasil system registered in that context |
+| files and other world substrates | their registered Yggdrasil systems |
+| Roster, AgentDef, EnvironmentDef, evidence, receipt | immutable values flowing through Spins |
+| provider stream, native worker, verifier function, live Run/Fork handle | process-local capability, never semantic or portable state |
+
+Consequently `evaluate` is a lazy Spin rather than another scheduler. It hires
+an ordinary Run in a Yggdrasil-forked world, awaits that Run through Spindel,
+and returns values. Certification writes one immutable Attempt into the
+branch-correct Room store while the affine world-settlement gate is held.
+`episode/export` is only a read projection joining that Attempt to current Run
+facts; it introduces no lifecycle, clock, mutable cell, or settlement authority.
+
+Probabilistic programs use the same placement rule. In SCI, Dvergr defaults
+`infer/smc-infer`, `infer/importance-sampling`, and `infer/kernel-infer` to
+Spindel's `:world-policy :fork`. Each particle and resampling descendant owns a
+canonical Yggdrasil fork. Before a result crosses into SCI, Dvergr removes the
+execution contexts and exposes only portable results, weights, statistics, and
+world descriptors. `infer/predict` likewise receives values rather than native
+contexts. For example:
+
+```clojure
+(spin
+  (let [posterior (await (infer/smc-infer (scenario-model) 64))]
+    {:values  (infer/values posterior)
+     :weights (infer/log-weights posterior)
+     :ess     (infer/ess posterior)
+     :worlds  (infer/worlds posterior)}))
+```
+
+Pass `{:world-policy :fresh}` only when the model is proven not to touch Room,
+Datahike, repository, accounting, or other registered world state. Inference
+does not introduce an `AgentParticle` entity and does not turn every sample into
+a Run. A Run remains the durable identity of an application-level computation;
+particles are its internal execution placements unless the program explicitly
+launches separately audited evaluations.
+
+Particle-independent Metropolis-Hastings and particle Gibbs are not exposed in
+SCI yet. Their repeated-sweep ownership and settlement contract must be made
+canonical before they become part of this surface.
+
+The current canonical fork covers Spindel execution state and every registered
+Yggdrasil system. It does not yet fork mutable cells allocated inside SCI: a
+captured SCI atom or Var is shared by model invocations. Treat SCI closures as
+pure apart from the fork-aware operations above. Full interpreter-state
+isolation depends on the forkable SCI runtime work and will strengthen this
+contract without changing the portable posterior shape.
+
+Small JVM atoms used inside a native-worker supervisor or verifier hand-off are
+short-lived synchronization primitives for non-forkable capabilities. They may
+decide which already-durable transition wins, but their contents are not the
+workflow's recoverable meaning. If a value must survive a continuation, affect
+branch semantics, or be available after restart, it belongs in Spindel state or
+one of the registered Yggdrasil systems instead.
+
 If a workflow needs changing state, allocate it through Spindel's fork-aware
 state vocabulary (signals or reactive atoms) in the relevant execution context.
 Do not place semantic workflow state in a JVM atom, dynamic singleton, or
-process-global registry. SCI Var forkability is a separate runtime project; do
-not rely on a top-level `def` as the portable state boundary until that work is
-complete.
+process-global registry. SCI vars, atoms, bindings, and continuations now fork
+with the interpreter world, so top-level definitions are valid transient
+branch-local program state. They are deliberately discarded rather than merged;
+durable or reviewable meaning still belongs in Room substrates and Run/effect
+records.
 
 A RunHandle is intentionally not durable state and should not be stored inside
 an AgentDef. Its awaitable result/cache belongs to the Spindel execution graph;

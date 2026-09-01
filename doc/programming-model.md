@@ -213,17 +213,41 @@ is `:now`, `:next-safe-boundary`, `:before-model`, `:token`, `:before-tool`,
 `:after-tool`, `:after-model`, and `:quiescent`. An interpreter advertises and
 honors only the boundaries it actually supports.
 
-The current LLM participant implements the former behavior as a compatibility
-subset: same-thread `restart` projects to steer; `enqueue` projects to FIFO
-queue; passive `continue` projects to observe. The former `:steer`, `:queue`, and
-`:observe` policy results remain accepted. Structured work admission is now
+The native LLM participant negotiates each decision against an explicit
+capability description. It honors memory (`ignore`, `remember`, and
+safe-boundary `include`), activation (`none` and `enqueue`),
+and `continue`, `restart`, `suspend`, or run-local `cancel` at boundaries it can
+implement honestly. Provider-specific integration points and non-zero priority
+remain unsupported and are retained as durable deferred attention; they do not
+silently become ordinary queued Runs. `wake` is part of the provider-neutral
+algebra but is not advertised by this interpreter because it has no durable LLM
+continuation to wake.
+
+Attention is stored as a typed participant projection in the Room store, not as
+a hidden chat message. The shared transcript remains immutable speech. Provider
+working context is reconstructed from the participant's Run triggers, its own
+outputs, and monotone **applied** `include` admissions. Each decision has stable
+identity; a separate append-only disposition proves when all supported axes
+were applied. A ready decision without that disposition is recovery/audit input,
+not a command that may be blindly replayed across external effects. The native
+interpreter keeps live scheduling machinery process-local and exposes unapplied
+facts for an explicit recovery policy.
+
+`remember` stays durable awareness
+without entering model input, while `ignore` excludes the fact from that input.
+Thus live execution and restart/replay apply the same memory decision without
+contaminating thread or message projections. At first upgrade, a deterministic
+applied baseline preserves the existing provider context before new decisions
+take over projection. The former `:steer`, `:queue`, and
+`:observe` policy results remain accepted through normalization. Structured work admission is now
 available directly in native code and the room SCI REPL as `spindel.work/latest`,
 `serial`, `busy`, and bounded `parallel`. These are higher-order FRP policies:
 they turn event values into owned child computations and make cancellation,
-quiescence, backpressure, and completion observable. A valid richer attention
-decision that the compatibility LLM adapter cannot honor is still queued
-conservatively; the next adapter should interpret it through this substrate
-rather than add another private scheduler to the turn loop.
+quiescence, backpressure, and completion observable. Attention decides what an
+activity means to one participant; work admission decides how resulting
+computations overlap. Keeping these layers separate lets another interpreter add
+token- or tool-boundary integration without creating another scheduler or
+changing the decision algebra.
 
 ## Built-in directives
 
