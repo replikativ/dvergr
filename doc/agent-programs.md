@@ -534,6 +534,41 @@ branch-correct Room store while the affine world-settlement gate is held.
 `episode/export` is only a read projection joining that Attempt to current Run
 facts; it introduces no lifecycle, clock, mutable cell, or settlement authority.
 
+Probabilistic programs use the same placement rule. In SCI, Dvergr defaults
+`infer/smc-infer`, `infer/importance-sampling`, and `infer/kernel-infer` to
+Spindel's `:world-policy :fork`. Each particle and resampling descendant owns a
+canonical Yggdrasil fork. Before a result crosses into SCI, Dvergr removes the
+execution contexts and exposes only portable results, weights, statistics, and
+world descriptors. `infer/predict` likewise receives values rather than native
+contexts. For example:
+
+```clojure
+(spin
+  (let [posterior (await (infer/smc-infer (scenario-model) 64))]
+    {:values  (infer/values posterior)
+     :weights (infer/log-weights posterior)
+     :ess     (infer/ess posterior)
+     :worlds  (infer/worlds posterior)}))
+```
+
+Pass `{:world-policy :fresh}` only when the model is proven not to touch Room,
+Datahike, repository, accounting, or other registered world state. Inference
+does not introduce an `AgentParticle` entity and does not turn every sample into
+a Run. A Run remains the durable identity of an application-level computation;
+particles are its internal execution placements unless the program explicitly
+launches separately audited evaluations.
+
+Particle-independent Metropolis-Hastings and particle Gibbs are not exposed in
+SCI yet. Their repeated-sweep ownership and settlement contract must be made
+canonical before they become part of this surface.
+
+The current canonical fork covers Spindel execution state and every registered
+Yggdrasil system. It does not yet fork mutable cells allocated inside SCI: a
+captured SCI atom or Var is shared by model invocations. Treat SCI closures as
+pure apart from the fork-aware operations above. Full interpreter-state
+isolation depends on the forkable SCI runtime work and will strengthen this
+contract without changing the portable posterior shape.
+
 Small JVM atoms used inside a native-worker supervisor or verifier hand-off are
 short-lived synchronization primitives for non-forkable capabilities. They may
 decide which already-durable transition wins, but their contents are not the
@@ -544,9 +579,11 @@ one of the registered Yggdrasil systems instead.
 If a workflow needs changing state, allocate it through Spindel's fork-aware
 state vocabulary (signals or reactive atoms) in the relevant execution context.
 Do not place semantic workflow state in a JVM atom, dynamic singleton, or
-process-global registry. SCI Var forkability is a separate runtime project; do
-not rely on a top-level `def` as the portable state boundary until that work is
-complete.
+process-global registry. SCI vars, atoms, bindings, and continuations now fork
+with the interpreter world, so top-level definitions are valid transient
+branch-local program state. They are deliberately discarded rather than merged;
+durable or reviewable meaning still belongs in Room substrates and Run/effect
+records.
 
 A RunHandle is intentionally not durable state and should not be stored inside
 an AgentDef. Its awaitable result/cache belongs to the Spindel execution graph;
