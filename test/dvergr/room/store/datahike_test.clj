@@ -5,10 +5,17 @@
    chat-ctx path kept)."
   (:require [clojure.test :refer [deftest is testing]]
             [datahike.api :as dh]
+            [dvergr.agent.attempt :as attempt]
+            [dvergr.agent.attempt.governance :as attempt-governance]
+            [dvergr.agent.environment :as environment]
+            [dvergr.agent.roster :as roster]
+            [dvergr.artifact :as artifact]
             [dvergr.chat.schema :as schema]
             [dvergr.room.store :as store]
             [dvergr.room.store.contract :as contract]
-            [dvergr.room.store.datahike :as dhs]))
+            [dvergr.room.store.datahike :as dhs]
+            [hasch.core :as hasch]
+            [kontor.resource :as kontor]))
 
 (defn- mem-store []
   (let [cfg {:store {:backend :memory :id (random-uuid)}
@@ -32,6 +39,111 @@
       :run/created-at now
       :run/started-at now
       :run/updated-at now})))
+
+(defn- certified-attempt [run-id agent]
+  (let [definition
+        (environment/make-environment
+         {:id :datahike/exact :task {:answer 42}
+          :verifier {:id :datahike/exact :version 1}
+          :world {:isolation :ctx :settlement :review}})
+        receipt
+        (environment/make-attempt-receipt
+         definition
+         {:run-id run-id :provider :dvergr :model "echo"
+          :status :completed :started-at 1000 :elapsed-ms 10
+          :metrics {:program-kind :echo :model-resolution :not-applicable
+                    :agent-version 1 :agent-def-hash (hasch/uuid agent)
+                    :interpreter-version 5}
+          :checks {:exact? true :portable? true} :reward 1.0
+          :trace {:runs [{:run/id run-id :run/status :completed}]}})]
+    (attempt/make-attempt definition agent receipt
+                          {:trace {:runs [{:run/id run-id
+                                           :run/status :completed}]}}
+                          :review)))
+
+(deftest certified-attempt-round-trips-through-typed-index-and-cas
+  (let [[conn _] (mem-store)
+        artifacts (artifact/memory-store)
+        st (dhs/make conn artifacts)
+        room-id :datahike-attempt
+        run-id (random-uuid)
+        agent (-> (roster/make-roster)
+                  (roster/make-agent {:id :candidate
+                                      :program {:kind :echo}})
+                  (roster/agent :candidate))
+        value (certified-attempt run-id agent)
+        now (java.util.Date. 1000)]
+    (store/-store-room! st room-id {:slug (name room-id)})
+    (store/-store-run!
+     st room-id
+     {:run/id run-id :run/kind :agent-task :run/room room-id
+      :run/actor :candidate :run/trigger (random-uuid)
+      :run/status :completed :run/created-at now :run/started-at now
+      :run/updated-at now :run/ended-at (java.util.Date. 1010)
+      :run/agent-version 1 :run/program-kind :echo
+      :run/interpreter-version 5 :run/agent-def-hash (hasch/uuid agent)})
+    (is (= value (store/-store-attempt! st room-id value)))
+    (is (= value (store/-load-attempt st room-id run-id)))
+    (is (= [value]
+           (store/-list-attempts st room-id
+                                 {:environment-content-id
+                                  (get-in value [:attempt/environment
+                                                 :environment/content-id])
+                                  :model "echo"})))
+    (is (= 2
+           (dh/q '[:find (count ?check) .
+                   :where [?a :attempt/checks ?check]] @conn)))
+    (testing "the mandatory writer predicate guards raw API writes"
+      (is (thrown-with-msg?
+           Throwable #"trusted writer"
+           (dh/transact conn [{:attempt/id (random-uuid)}])))
+      (is (thrown-with-msg?
+           Throwable #"immutable"
+           (dh/transact conn [[:db/add [:attempt/id run-id]
+                               :attempt/reward 0.0]]))))
+    (testing "an arbitrary transaction function is not a trusted writer"
+      (let [rogue-run-id (random-uuid)
+            rogue (certified-attempt rogue-run-id agent)
+            chat-id (dh/q '[:find ?chat-id . :in $ ?slug
+                            :where
+                            [?c :room/slug ?slug]
+                            [?c :chat/id ?chat-id]]
+                          @conn (name room-id))
+            rogue-entity (#'dhs/attempt->entity
+                          chat-id
+                          rogue (artifact/put-value! artifacts rogue))]
+        (store/-store-run!
+         st room-id
+         {:run/id rogue-run-id :run/kind :agent-task :run/room room-id
+          :run/actor :candidate :run/trigger (random-uuid)
+          :run/status :completed :run/created-at now :run/started-at now
+          :run/updated-at now :run/ended-at (java.util.Date. 1010)
+          :run/agent-version 1 :run/program-kind :echo
+          :run/interpreter-version 5 :run/agent-def-hash (hasch/uuid agent)})
+        (is (thrown-with-msg?
+             Throwable #"trusted writer"
+             (dh/transact conn [[:db.fn/call (fn [_] [])] rogue-entity])))
+        (is (nil? (store/-load-attempt st room-id rogue-run-id)))))
+    (testing "installing Kontor preserves both mandatory governors"
+      (kontor/install! conn)
+      (attempt-governance/govern! conn)
+      (is (thrown-with-msg?
+           Throwable #"immutable"
+           (dh/transact conn [[:db/add [:attempt/id run-id]
+                               :attempt/reward 0.25]]))))
+    (testing "the typed row points to the terminal Run rather than copying it"
+      (is (= run-id
+             (dh/q '[:find ?run-id .
+                     :where
+                     [?a :attempt/id _]
+                     [?a :attempt/run ?r]
+                     [?r :run/id ?run-id]] @conn))))
+    (testing "Room deletion removes Attempt components through the same governor"
+      (store/-delete-room! st room-id)
+      (is (nil? (store/-load-attempt st room-id run-id)))
+      (is (zero? (or (dh/q '[:find (count ?check) .
+                             :where [?a :attempt/checks ?check]] @conn)
+                     0))))))
 
 (deftest message-envelope-contract
   (let [[_conn st] (mem-store)]
@@ -82,6 +194,10 @@
 (deftest run-lifecycle-contract
   (let [[_conn st] (mem-store)]
     (contract/assert-run-lifecycle! st :runs-datahike)))
+
+(deftest run-causality-contract
+  (let [[_conn st] (mem-store)]
+    (contract/assert-run-causality! st :run-causes-datahike)))
 
 (deftest attention-projection-contract
   (let [[_conn st] (mem-store)]

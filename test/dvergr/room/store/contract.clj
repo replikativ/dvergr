@@ -113,6 +113,80 @@
            #":run/chat-id must be a UUID"
            (store/-store-run! st room-id (assoc completed :run/chat-id :not-a-uuid)))))))
 
+(defn assert-run-causality!
+  "Exercise terminal/same-room validation and append-only causal updates."
+  [st room-id]
+  (testing "causal inputs are resolved, scoped, append-only Run evidence"
+    (let [other-room-id (keyword (str (name room-id) "-other"))
+          now (java.util.Date. 1787860800000)
+          ended (java.util.Date. 1787860801000)
+          run-map (fn [id actor status]
+                    (cond-> {:run/id id
+                             :run/kind :workflow
+                             :run/room room-id
+                             :run/actor actor
+                             :run/trigger (random-uuid)
+                             :run/status status
+                             :run/created-at now
+                             :run/started-at now
+                             :run/updated-at (if (= :running status) now ended)}
+                      (store/terminal-run-statuses status)
+                      (assoc :run/ended-at ended)))
+          root-id (random-uuid)
+          child-id (random-uuid)
+          foreign-id (random-uuid)
+          root (run-map root-id :root :running)
+          child (run-map child-id :child :running)
+          foreign (assoc (run-map foreign-id :foreign :completed)
+                         :run/room other-room-id)]
+      (store/-store-room! st room-id {:slug (name room-id) :title "causes"})
+      (store/-store-room! st other-room-id
+                          {:slug (name other-room-id) :title "other causes"})
+      (store/-store-run! st room-id root)
+      (store/-store-run! st room-id child)
+      (store/-store-run! st other-room-id foreign)
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"has not resolved"
+           (store/-store-run! st room-id
+                              (assoc root :run/caused-by #{child-id}))))
+      (store/-store-run! st room-id
+                         (assoc child :run/status :completed
+                                :run/updated-at ended :run/ended-at ended))
+      (let [caused (assoc root :run/caused-by #{child-id}
+                          :run/updated-at ended)]
+        (is (= caused (store/-store-run! st room-id caused)))
+        (is (= caused (store/-store-run! st room-id caused))
+            "replaying an existing causal set is idempotent")
+        (is (= #{child-id}
+               (:run/caused-by (store/-load-run st room-id root-id))))
+        (is (= #{child-id}
+               (:run/caused-by
+                (first (store/-list-runs st room-id {:actor :root})))))
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"append-only"
+             (store/-store-run! st room-id (dissoc caused :run/caused-by))))
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"not durable in the same Room"
+             (store/-store-run! st room-id
+                                (update caused :run/caused-by conj (random-uuid)))))
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"not durable in the same Room"
+             (store/-store-run! st room-id
+                                (update caused :run/caused-by conj foreign-id))))
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"terminal Run lifecycle is immutable"
+             (store/-store-run!
+              st room-id
+              (-> (store/-load-run st room-id child-id)
+                  (assoc :run/status :running :run/updated-at ended)
+                  (dissoc :run/ended-at))))
+            "accepted causal evidence cannot later regress to a live Run")))))
+
 (defn assert-attention-projection!
   "Exercise durable participant-specific attention storage and filtering."
   [st room-id]

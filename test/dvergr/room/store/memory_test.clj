@@ -10,6 +10,9 @@
 (deftest run-lifecycle-contract
   (contract/assert-run-lifecycle! (memory/make) :runs-memory))
 
+(deftest run-causality-contract
+  (contract/assert-run-causality! (memory/make) :run-causes-memory))
+
 (deftest attention-projection-contract
   (contract/assert-attention-projection! (memory/make) :attention-memory))
 
