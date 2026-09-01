@@ -155,11 +155,14 @@ model `:codex-subscription-cli` / `"codex-subscription-cli"`.
 | Fireworks account | `FIREWORKS_API_KEY` | `:fireworks` / `"accounts/fireworks/models/minimax-m2p7"` |
 | OpenAI API account | `OPENAI_API_KEY`, plus an OpenAI registry entry | `:openai` / the registered model id |
 
-The built-in registry currently carries Anthropic, Claude Code, Codex
-subscription, and Fireworks models. Public OpenAI API models can be loaded with
-`(registry/refresh-from-models-dev! #{:openai})` or declared in
-`resources/models.edn`; the API key alone registers the transport but does not
-invent model metadata.
+The built-in registry carries Anthropic, Claude Code, Codex subscription, five
+native OpenAI Chat models, and the curated Fireworks registry in
+`resources/models.edn`. `OPENAI_API_KEY` can therefore run one of the built-in
+OpenAI models immediately. `(registry/refresh-from-models-dev! #{:openai})` is
+an opt-in runtime overlay: it can add current models and replace its mapped
+limits/rates in this process, but does not rewrite a resource or source file.
+Declare a model in `resources/models.edn` when it is a dvergr-maintained
+configuration rather than a live overlay.
 
 For a custom or local OpenAI-compatible endpoint, register both its credentials
 and at least one model. A credential-free local endpoint still receives an
@@ -224,7 +227,11 @@ Opus/Sonnet/Haiku plus Claude-Code and Codex-subscription models, defined in
 `model/registry.clj`).
 
 `(registry/refresh-from-models-dev! #{:anthropic …})` is an opt-in, network call
-that overlays live pricing/context from <https://models.dev>.
+that overlays live pricing/context from <https://models.dev> into process state
+only. It is not a build or release generator and does not persist a downloaded
+snapshot. Built-in OpenAI rate fields are a separately documented dated
+snapshot in `model/registry.clj`; `resources/models.edn` is a distinct curated
+registry.
 
 **Vision models** carry `:vision` in `:capabilities`. `dvergr.media.vision`
 (image describe/extract) picks the registry's vision default, overridable with

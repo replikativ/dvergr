@@ -17,9 +17,10 @@
 (defn- format-message
   "Format a single message for OpenAI API.
    Preserves tool_calls on assistant messages and tool_call_id on tool messages."
-  [msg]
+  [msg instruction-role]
   (let [role (:role msg)
-        role-str (if (keyword? role) (name role) role)]
+        role-str (if (keyword? role) (name role) role)
+        role-str (if (= "system" role-str) instruction-role role-str)]
     (cond-> {:role role-str
              :content (:content msg)}
       ;; Preserve tool_calls on assistant messages
@@ -29,20 +30,32 @@
       ;; Preserve interleaved-thinking state fed back to the model
       (:reasoning_content msg) (assoc :reasoning_content (:reasoning_content msg)))))
 
-(defn- with-system
-  "Prepend a system message from the `:system` opt when one isn't already present
-   in the list. Parity with the Anthropic provider (which reads `:system` from
-   opts); OpenAI-compatible APIs take the system prompt as the first message."
-  [messages system]
+(defn- with-instructions
+  "Prepend product instructions from `:system` when the message list does not
+   already contain an instruction message. Native o1-and-newer OpenAI models use
+   `developer`; compatible endpoints retain the broadly supported `system` role."
+  [messages system instruction-role]
   (if (and system (not (str/blank? system))
-           (not (some #(let [r (:role %)] (= "system" (if (keyword? r) (name r) r))) messages)))
-    (into [{:role "system" :content system}] (vec messages))
+           (not (some #(let [r (:role %)
+                             r (if (keyword? r) (name r) r)]
+                         (#{"system" "developer"} r))
+                      messages)))
+    (into [{:role instruction-role :content system}] (vec messages))
     (vec messages)))
 
 (defn- format-messages
   "Format messages for OpenAI API."
-  [messages]
-  (mapv format-message messages))
+  [messages instruction-role]
+  (mapv #(format-message % instruction-role) messages))
+
+(defn- product-instruction-role
+  "Wire role for product instructions. This is model metadata, not an ID guess,
+   and is native-only because compatible services need not implement OpenAI's
+   o1-and-newer developer-message contract."
+  [config model]
+  (if (:native-openai? config)
+    (name (registry/instruction-role model))
+    "system"))
 
 ;; ============================================================================
 ;; Provider Record
@@ -57,7 +70,21 @@
   (api-type [_] :openai-chat)
 
   (build-request [_ messages opts]
-    (let [tools (:tools opts)]
+    (let [tools (:tools opts)
+          instruction-role (product-instruction-role config (:model opts))
+          ;; GPT-5.6: /v1/chat/completions refuses function tools unless
+          ;; reasoning_effort is "none" — "To use function tools, use
+          ;; /v1/responses or set reasoning_effort to 'none'". Sending it
+          ;; buys tool use at the cost of server-side reasoning; a model
+          ;; that needs both belongs on the Responses API, which this
+          ;; provider does not speak. Only for models carrying the quirk:
+          ;; gpt-5.5 and older take tools and reasoning together, and
+          ;; forcing "none" there would quietly make them dumber. Compatible
+          ;; endpoints do not get the native workaround merely because they
+          ;; share this adapter.
+          effort-none? (and (:native-openai? config)
+                            (seq tools)
+                            (registry/get-quirk (:model opts) :chat-tools-need-effort-none?))]
       {:url (str (or (:base-url config) "https://api.openai.com/v1") "/chat/completions")
        :headers (merge {"Content-Type" "application/json"}
                        (:extra-headers config))
@@ -66,14 +93,17 @@
                       :max_completion_tokens (:max-tokens opts 8192)
                       :stream true
                       :stream_options {:include_usage true}
-                      :messages (format-messages (with-system messages (:system opts)))}
+                      :messages (format-messages
+                                 (with-instructions messages (:system opts) instruction-role)
+                                 instruction-role)}
                ;; Temperature if specified (some models like Kimi K2.5 require specific values)
                (:temperature opts) (assoc :temperature (:temperature opts))
                ;; Top-p if specified (Kimi / MiniMax M2 use 0.95)
                (:top-p opts) (assoc :top_p (:top-p opts))
                ;; Top-k if specified — a Fireworks extension param (MiniMax M2: 40)
                (:top-k opts) (assoc :top_k (:top-k opts))
-               (seq tools) (assoc :tools (p/format-tools _ tools)))}))
+               (seq tools) (assoc :tools (p/format-tools _ tools))
+               effort-none? (assoc :reasoning_effort "none"))}))
 
   (create-accumulator [_ model-def]
     {:current-blocks {}
@@ -234,7 +264,8 @@
   (format-messages [_ messages model]
     ;; OpenAI/Fireworks: tool results as separate "tool" messages with tool_call_id
     ;; Kimi K2 quirk: rewrite tool IDs to functions.{name}:{idx}
-    (let [messages (if (registry/has-quirk? model :kimi-tool-id-format?)
+    (let [instruction-role (product-instruction-role config model)
+          messages (if (registry/has-quirk? model :kimi-tool-id-format?)
                      (quirks/rewrite-kimi-tool-ids messages)
                      messages)]
       (mapv (fn [msg]
@@ -264,7 +295,9 @@
                                                                            (tool-schema/input-entity->args (:tool-use/input tu)))}})
                                                  tool-uses)}
                         (seq reasoning) (assoc :reasoning_content reasoning))
-                      (cond-> {:role (name role)
+                      (cond-> {:role (if (= role :system)
+                                       instruction-role
+                                       (name role))
                                :content (:message/content msg)}
                         (and (= role :assistant) (seq reasoning))
                         (assoc :reasoning_content reasoning)))))))
@@ -274,6 +307,15 @@
 ;; Constructors
 ;; ============================================================================
 
+(def ^:private default-openai-base-url "https://api.openai.com/v1")
+(def ^:private default-fireworks-base-url "https://api.fireworks.ai/inference/v1")
+
+(defn- normalize-base-url [base-url]
+  (str/replace base-url #"/+$" ""))
+
+(defn- system-env [env-key]
+  (System/getenv env-key))
+
 (defn create
   "Create an OpenAI provider instance.
 
@@ -282,29 +324,45 @@
    - :base-url      - API base URL (default: https://api.openai.com/v1)
    - :provider-id   - Override provider ID (default: :openai)
    - :extra-headers - Additional HTTP headers"
-  [config]
-  (let [api-key (or (:api-key config)
-                    (System/getenv "OPENAI_API_KEY"))]
-    (when-not (or api-key (:credentials config))
-      (throw (ex-info "OpenAI API key required" {:env "OPENAI_API_KEY"})))
-    (let [base-url (or (:base-url config)
-                       (System/getenv "OPENAI_BASE_URL")
-                       "https://api.openai.com/v1")
-          credentials (or (:credentials config)
-                          (gateway/static-credentials
-                           :openai-api-key
-                           {"Authorization" (str "Bearer " api-key)}
-                           #{(gateway/request-origin base-url)}))]
-      (->OpenAIProvider (-> config
-                            (dissoc :api-key)
-                            (assoc :base-url base-url
-                                   :credentials credentials))))))
+  ([config]
+   (create config system-env))
+  ([config env-lookup]
+   (let [api-key (or (:api-key config)
+                     (env-lookup "OPENAI_API_KEY"))
+         custom-base-url (or (:base-url config)
+                             (env-lookup "OPENAI_BASE_URL"))
+         base-url (normalize-base-url
+                   (or custom-base-url default-openai-base-url))
+         provider-id (or (:provider-id config) :openai)
+         credentials (or (:credentials config)
+                         (when api-key
+                           (gateway/static-credentials
+                            :openai-api-key
+                            {"Authorization" (str "Bearer " api-key)}
+                            #{(gateway/request-origin base-url)})))]
+     (when-not credentials
+       (throw (ex-info "OpenAI API key required" {:env "OPENAI_API_KEY"})))
+     (->OpenAIProvider
+      (-> config
+          (dissoc :api-key)
+          (assoc :base-url base-url
+                 :provider-id provider-id
+                 ;; The documented explicit canonical URL is semantically the same
+                 ;; as omitting it. Other URLs are compatible endpoints and do not
+                 ;; inherit OpenAI-specific request roles or model workarounds.
+                 :native-openai? (and (= :openai provider-id)
+                                      (= default-openai-base-url base-url))
+                 :credentials credentials))))))
 
 (defn create-if-available
   "Create OpenAI provider if API key is available, otherwise nil."
-  [config]
-  (when (or (:api-key config) (System/getenv "OPENAI_API_KEY"))
-    (create config)))
+  ([config]
+   (create-if-available config system-env))
+  ([config env-lookup]
+   (when (or (:credentials config)
+             (:api-key config)
+             (env-lookup "OPENAI_API_KEY"))
+     (create config env-lookup))))
 
 ;; ============================================================================
 ;; Fireworks Provider (OpenAI-compatible)
@@ -317,29 +375,37 @@
    - :api-key       - Fireworks API key (or from env)
    - :base-url      - API base URL (default: Fireworks endpoint)
    - :extra-headers - Additional HTTP headers"
-  [config]
-  (let [api-key (or (:api-key config)
-                    (System/getenv "FIREWORKS_API_KEY"))
-        base-url (or (:base-url config)
-                     (System/getenv "FIREWORKS_BASE_URL")
-                     "https://api.fireworks.ai/inference/v1")]
-    (when-not (or api-key (:credentials config))
-      (throw (ex-info "Fireworks API key required"
-                      {:env "FIREWORKS_API_KEY"})))
-    (let [credentials (or (:credentials config)
-                          (gateway/static-credentials
-                           :fireworks-api-key
-                           {"Authorization" (str "Bearer " api-key)}
-                           #{(gateway/request-origin base-url)}))]
-      (->OpenAIProvider (-> config
-                            (dissoc :api-key)
-                            (assoc :credentials credentials
-                                   :base-url base-url
-                                   :provider-id :fireworks))))))
+  ([config]
+   (create-fireworks config system-env))
+  ([config env-lookup]
+   (let [api-key (or (:api-key config)
+                     (env-lookup "FIREWORKS_API_KEY"))
+         base-url (or (:base-url config)
+                      (env-lookup "FIREWORKS_BASE_URL")
+                      default-fireworks-base-url)
+         credentials (or (:credentials config)
+                         (when api-key
+                           (gateway/static-credentials
+                            :fireworks-api-key
+                            {"Authorization" (str "Bearer " api-key)}
+                            #{(gateway/request-origin base-url)})))]
+     (when-not credentials
+       (throw (ex-info "Fireworks API key required"
+                       {:env "FIREWORKS_API_KEY"})))
+     (->OpenAIProvider
+      (-> config
+          (dissoc :api-key)
+          (assoc :credentials credentials
+                 :base-url base-url
+                 :provider-id :fireworks
+                 :native-openai? false))))))
 
 (defn create-fireworks-if-available
   "Create Fireworks provider if API key is available, otherwise nil."
-  [config]
-  (when (or (:api-key config)
-            (System/getenv "FIREWORKS_API_KEY"))
-    (create-fireworks config)))
+  ([config]
+   (create-fireworks-if-available config system-env))
+  ([config env-lookup]
+   (when (or (:credentials config)
+             (:api-key config)
+             (env-lookup "FIREWORKS_API_KEY"))
+     (create-fireworks config env-lookup))))

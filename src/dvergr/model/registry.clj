@@ -17,7 +17,7 @@
     :vision          ; Image input
     :thinking        ; Extended thinking/reasoning
     :streaming       ; SSE streaming
-    :system-prompt   ; Separate system prompt field
+    :system-prompt   ; Product/provider instructions (wire role may be developer)
     :cache-control   ; Prompt caching
     :json-mode})     ; Structured JSON output
 
@@ -39,7 +39,12 @@
      :cache-write   — 5-minute prompt-cache write (1.25× input)
      :cache-write-1h— 1-hour prompt-cache write (2× input), where available
 
-   Snapshot date: 2026-05-24. See claude.com/pricing for live prices."
+   Anthropic prices: claude.com/pricing. OpenAI identities, limits, reasoning
+   levels, capabilities, and rate fields checked 2026-08-28 against OpenAI model
+   documentation and <https://models.dev/api.json>.
+   Base rates exclude long-context, service-tier, and account-specific billing.
+
+   `refresh-from-models-dev!` reads models.dev live."
   {;; ── Claude Opus 4.x ──────────────────────────────────────────────
    "claude-opus-4-7"
    {:id "claude-opus-4-7"
@@ -141,6 +146,87 @@
     :context 200000
     :max-output 32000
     :pricing {:input 0 :output 0}
+    :quirks {}}
+
+   ;; ── OpenAI GPT-5.6 ───────────────────────────────────────────────
+   ;; The whole 5.6 line carries :chat-tools-need-effort-none? — on
+   ;; /v1/chat/completions these models refuse function tools unless
+   ;; reasoning_effort is "none" ("To use function tools, use /v1/responses
+   ;; or set reasoning_effort to 'none'"). The openai adapter sends it for
+   ;; them whenever tools are present, which trades server-side reasoning
+   ;; for tool use. An agent that needs BOTH wants the Responses API, which
+   ;; this provider does not speak yet — pick gpt-5.5 until it does.
+   "gpt-5.6-sol"
+   {:id "gpt-5.6-sol"
+    :name "GPT-5.6 Sol"
+    :provider :openai
+    :api-type :openai-chat
+    :capabilities #{:tools :vision :thinking :streaming :system-prompt :cache-control}
+    :context 1050000
+    :max-output 128000
+    :reasoning-efforts ["none" "low" "medium" "high" "xhigh" "max"]
+    :default-reasoning-effort "medium"
+    :instruction-role :developer
+    :pricing {:input 4.0 :output 20.0 :cache-read 0.40 :cache-write 5.0}
+    :quirks {:chat-tools-need-effort-none? true}}
+
+   "gpt-5.6-terra"
+   {:id "gpt-5.6-terra"
+    :name "GPT-5.6 Terra"
+    :provider :openai
+    :api-type :openai-chat
+    :capabilities #{:tools :vision :thinking :streaming :system-prompt :cache-control}
+    :context 1050000
+    :max-output 128000
+    :reasoning-efforts ["none" "low" "medium" "high" "xhigh" "max"]
+    :default-reasoning-effort "medium"
+    :instruction-role :developer
+    :pricing {:input 2.0 :output 12.0 :cache-read 0.20 :cache-write 2.50}
+    :quirks {:chat-tools-need-effort-none? true}}
+
+   "gpt-5.6-luna"
+   {:id "gpt-5.6-luna"
+    :name "GPT-5.6 Luna"
+    :provider :openai
+    :api-type :openai-chat
+    :capabilities #{:tools :vision :thinking :streaming :system-prompt :cache-control}
+    :context 1050000
+    :max-output 128000
+    :reasoning-efforts ["none" "low" "medium" "high" "xhigh" "max"]
+    :default-reasoning-effort "medium"
+    :instruction-role :developer
+    :pricing {:input 0.20 :output 1.20 :cache-read 0.02 :cache-write 0.25}
+    :quirks {:chat-tools-need-effort-none? true}}
+
+   ;; ── OpenAI GPT-5.5 / 5.4 ─────────────────────────────────────────
+   ;; GPT-5.5 has its own documented reasoning contract: medium is the default
+   ;; and max is not supported. It does not inherit the GPT-5.6 Chat tool quirk.
+   "gpt-5.5"
+   {:id "gpt-5.5"
+    :name "GPT-5.5"
+    :provider :openai
+    :api-type :openai-chat
+    :capabilities #{:tools :vision :thinking :streaming :system-prompt :cache-control}
+    :context 1050000
+    :max-output 128000
+    :reasoning-efforts ["none" "low" "medium" "high" "xhigh"]
+    :default-reasoning-effort "medium"
+    :instruction-role :developer
+    :pricing {:input 5.0 :output 30.0 :cache-read 0.50}
+    :quirks {}}
+
+   "gpt-5.4-mini"
+   {:id "gpt-5.4-mini"
+    :name "GPT-5.4 mini"
+    :provider :openai
+    :api-type :openai-chat
+    :capabilities #{:tools :vision :thinking :streaming :system-prompt :cache-control}
+    :context 400000
+    :max-output 128000
+    :reasoning-efforts ["none" "low" "medium" "high" "xhigh"]
+    :default-reasoning-effort "none"
+    :instruction-role :developer
+    :pricing {:input 0.75 :output 4.50 :cache-read 0.075}
     :quirks {}}
 
    ;; Native Codex Responses models (via an existing ChatGPT subscription). These ids are
@@ -327,6 +413,21 @@
   [model-id]
   (:max-output (get-model model-id)))
 
+(defn reasoning-efforts
+  "Get the supported reasoning_effort values for a model."
+  [model-id]
+  (or (:reasoning-efforts (get-model model-id)) []))
+
+(defn default-reasoning-effort
+  "Get the documented default reasoning_effort for a model."
+  [model-id]
+  (:default-reasoning-effort (get-model model-id)))
+
+(defn instruction-role
+  "Get the provider-native role used for product instructions."
+  [model-id]
+  (or (:instruction-role (get-model model-id)) :system))
+
 ;; ============================================================================
 ;; EDN Loading
 ;; ============================================================================
@@ -412,6 +513,10 @@
   [provider-id mid m]
   (let [cost  (:cost m)
         limit (:limit m)
+        reasoning-efforts (some (fn [option]
+                                  (when (= "effort" (:type option))
+                                    (vec (:values option))))
+                                (:reasoning_options m))
         caps  (cond-> #{:streaming}
                 (:tool_call m)       (conj :tools)
                 (:reasoning m)       (conj :thinking)
@@ -419,20 +524,21 @@
                 (conj :vision)
                 true                 (conj :system-prompt)
                 (some? (:cache_read cost)) (conj :cache-control))]
-    {:id (name mid)
-     :name (or (:name m) (name mid))
-     :provider provider-id
-     :api-type (case provider-id
-                 :anthropic :anthropic-messages
-                 :openai    :openai-chat
-                 :openai-chat)
-     :capabilities caps
-     :context (:context limit)
-     :max-output (:output limit)
-     :pricing (cond-> {:input  (:input cost)
-                       :output (:output cost)}
-                (:cache_read cost)  (assoc :cache-read (:cache_read cost))
-                (:cache_write cost) (assoc :cache-write (:cache_write cost)))}))
+    (cond-> {:id (name mid)
+             :name (or (:name m) (name mid))
+             :provider provider-id
+             :api-type (case provider-id
+                         :anthropic :anthropic-messages
+                         :openai    :openai-chat
+                         :openai-chat)
+             :capabilities caps
+             :context (:context limit)
+             :max-output (:output limit)
+             :pricing (cond-> {:input  (:input cost)
+                               :output (:output cost)}
+                        (:cache_read cost)  (assoc :cache-read (:cache_read cost))
+                        (:cache_write cost) (assoc :cache-write (:cache_write cost)))}
+      (seq reasoning-efforts) (assoc :reasoning-efforts reasoning-efforts))))
 
 (defn refresh-from-models-dev!
   "Fetch <https://models.dev/api.json> and overlay all entries from the
@@ -443,7 +549,7 @@
    last release.
 
    Returns the number of models registered (or nil on network failure)."
-  ([] (refresh-from-models-dev! #{:anthropic}))
+  ([] (refresh-from-models-dev! #{:anthropic :openai}))
   ([providers]
    (when-let [data (models-dev-fetch)]
      (let [n (atom 0)]
@@ -453,7 +559,17 @@
                :when (some? prov)
                [mid m] models]
          (let [entry (coerce-models-dev-model prov-key mid m)]
-           (swap! registry assoc (:id entry) entry)
+           ;; NATIVE CONTRACT SURVIVES THE OVERLAY. models.dev carries live
+           ;; limits, rates, and reasoning options, but not dvergr's Chat
+           ;; compatibility quirks, the official default effort, or the
+           ;; o1-and-newer instruction role. Dropping those built-in fields
+           ;; would silently change the wire payload after a metadata refresh.
+           (swap! registry update (:id entry)
+                  (fn [existing]
+                    (merge (select-keys existing
+                                        [:quirks :reasoning-efforts
+                                         :default-reasoning-effort :instruction-role])
+                           entry)))
            (swap! n inc)))
        @n))))
 
@@ -465,6 +581,13 @@
   aliases (atom {"sonnet" "claude-sonnet-4-6"
                  "opus"   "claude-opus-4-7"
                  "haiku"  "claude-haiku-4-5"
+                 ;; Official OpenAI family alias: routes to GPT-5.6 Sol.
+                 "gpt-5.6"  "gpt-5.6-sol"
+                 "gpt"      "gpt-5.5"
+                 "gpt-mini" "gpt-5.4-mini"
+                 "sol"      "gpt-5.6-sol"
+                 "terra"    "gpt-5.6-terra"
+                 "luna"     "gpt-5.6-luna"
                  "opus-4-6" "claude-opus-4-6"
                  "opus-4-5" "claude-opus-4-5"
                  "sonnet-4-5" "claude-sonnet-4-5"
