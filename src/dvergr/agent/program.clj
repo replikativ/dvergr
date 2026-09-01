@@ -36,7 +36,7 @@
    to a Participant is a separate, explicit speech act."
   :_runs)
 
-(def interpreter-version 4)
+(def interpreter-version 5)
 
 (def ^:private default-max-model-steps 32)
 
@@ -514,7 +514,7 @@
      (-> (tools/make-context
           {:db-conn work-db
            :chat-ctx chat-ctx
-           :sci-ctx (:sci-ctx chat-ctx)
+           :sci-ctx (chat-context/sci-context-in chat-ctx (:ctx room))
            :tools tool-map
            :isolation :sci
            :execution-ctx (:ctx room)
@@ -536,11 +536,18 @@
   "Run a bounded Dvergr-native model/tool loop. Each blocking model round-trip
    runs under a supervised worker; this Spin retains orchestration, activity
    correlation, cleanup, and cancellation in the Room's execution graph."
-  [control-room work-room run-id chat-id agent task trigger supervisor]
+  [control-room work-room run-id chat-id agent task trigger supervisor limits]
   (let [{:keys [max-model-steps budget-dollars auto-compact? compaction-model]
          :or {max-model-steps default-max-model-steps
               budget-dollars 1.0
-              auto-compact? true}} (:agent/program agent)]
+              auto-compact? true}} (:agent/program agent)
+        max-model-steps (min max-model-steps
+                             (or (:max-model-steps limits) max-model-steps))
+        budget-dollars (min (double budget-dollars)
+                            (double (or (:budget-dollars limits)
+                                        budget-dollars)))
+        effective-limits {:max-model-steps max-model-steps
+                          :budget-dollars budget-dollars}]
     (sp/spin
      ;; Context/schema/SCI construction and credential discovery may block.
      ;; Build the whole runtime bundle under the same supervised worker as
@@ -572,11 +579,13 @@
                 (update-llm-metrics!
                  supervisor
                  (constantly
-                  {:prompt-id (hasch/uuid [:dvergr/llm-system-prompt instructions])
-                   :provider (:provider model-spec)
-                   :model (:model model-spec)
-                   :model-steps 0
-                   :usage {}}))
+                  (cond->
+                   {:prompt-id (hasch/uuid [:dvergr/llm-system-prompt instructions])
+                    :provider (:provider model-spec)
+                    :model (:model model-spec)
+                    :model-steps 0
+                    :usage {}}
+                    (seq limits) (assoc :limits effective-limits))))
                 (chat-context/add-message!
                  chat-ctx {:role :system :content instructions})
                 (chat-context/add-message!
@@ -678,10 +687,11 @@
   [control-room work-room run-id chat-id agent task trigger supervisor]
   (case (get-in agent [:agent/program :kind])
     :llm (execute-llm-program control-room work-room run-id chat-id agent task
-                              trigger supervisor)
+                              trigger supervisor (::limits agent))
     (execute-deterministic-program run-id agent task)))
 
-(def ^:private hire-option-keys #{:task :from :parent-run :settlement :resources})
+(def ^:private hire-option-keys
+  #{:task :from :parent-run :settlement :resources :limits})
 
 (defn- validate-program!
   [{:keys [kind delay-ms max-model-steps budget-dollars auto-compact? compaction-model]
@@ -716,6 +726,7 @@
                        :max-model-steps max-model-steps})))
     (when (and (= :llm kind)
                (not (and (number? (or budget-dollars 1.0))
+                         (Double/isFinite (double (or budget-dollars 1.0)))
                          (pos? (double (or budget-dollars 1.0))))))
       (throw (ex-info "LLM program :budget-dollars must be positive"
                       {:type ::invalid-budget :budget-dollars budget-dollars})))
@@ -739,7 +750,7 @@
     program))
 
 (defn- validate-hire!
-  [roster agent-ref {:keys [task from parent-run resources] :as opts}]
+  [roster agent-ref {:keys [task from parent-run resources limits] :as opts}]
   (when-let [unknown (seq (remove hire-option-keys (keys opts)))]
     (throw (ex-info "Unknown hire! options"
                     {:type ::unknown-hire-options
@@ -765,6 +776,25 @@
                                resources))))
     (throw (ex-info "hire! :resources must be a non-empty positive resource vector"
                     {:type ::invalid-resources :resources resources})))
+  (when-not (or (nil? limits) (map? limits))
+    (throw (ex-info "hire! :limits must be a map"
+                    {:type ::invalid-limits :limits limits})))
+  (when-let [unknown (seq (remove #{:max-model-steps :budget-dollars}
+                                  (keys limits)))]
+    (throw (ex-info "hire! :limits contains unknown keys"
+                    {:type ::unknown-limit-options
+                     :unknown (set unknown)
+                     :allowed #{:max-model-steps :budget-dollars}})))
+  (when-let [value (:max-model-steps limits)]
+    (when-not (and (integer? value) (<= 1 value 256))
+      (throw (ex-info "hire! limit :max-model-steps must be an integer from 1 to 256"
+                      {:type ::invalid-max-model-steps :max-model-steps value}))))
+  (when-let [value (:budget-dollars limits)]
+    (when-not (and (number? value)
+                   (Double/isFinite (double value))
+                   (pos? (double value)))
+      (throw (ex-info "hire! limit :budget-dollars must be positive"
+                      {:type ::invalid-budget :budget-dollars value}))))
   (when-not (roster/data-value? task)
     (throw (ex-info "Task must be portable data"
                     {:type ::non-portable-task :task task})))
@@ -772,6 +802,11 @@
                   (throw (ex-info "Unknown AgentRef"
                                   {:type ::unknown-agent :agent-ref agent-ref})))]
     (validate-program! (:agent/program agent) agent-ref agent)
+    (when (and (seq limits) (not= :llm (get-in agent [:agent/program :kind])))
+      (throw (ex-info "hire! model limits require an LLM AgentDef"
+                      {:type ::limits-require-llm
+                       :agent-ref agent-ref
+                       :limits limits})))
     agent))
 
 (defn- cancelled-error? [t run-id]
@@ -924,13 +959,16 @@
                                        (merge execution-opts finish-opts)))))))
 
 (defn- execution-spin
-  [control-room work-room agent task trigger id chat-id supervisor outcome-promise]
+  [control-room work-room agent task trigger id chat-id supervisor limits outcome-promise]
   (sp/spin
    (let [outcome
          (try
            (let [{status ::status value ::value reason ::reason}
-                 (sp/await (execute-program control-room work-room id chat-id agent
-                                            task trigger supervisor))
+                 (sp/await
+                  (execute-program control-room work-room id chat-id
+                                   (cond-> agent
+                                     (seq limits) (assoc ::limits limits))
+                                   task trigger supervisor))
                  ;; Seal admits no further provider work, runs owned cleanup
                  ;; after all workers terminate, and publishes one stable
                  ;; quiescence acknowledgement.
@@ -1024,13 +1062,14 @@
    - `:task`       portable task value (required)
    - `:from`       triggering actor, default `:repl`
    - `:parent-run` explicit structural parent Run UUID
-   - `:settlement`  `:automatic` (default), `:review`, or `:discard`
+   - `:settlement`  `:automatic` (default), `:review`, `:discard`, or host-owned `:deferred`
    - `:resources`   positive conserved vector split from the parent Run/Room
+   - `:limits`      restrictive LLM `:max-model-steps` / `:budget-dollars`
    Built-in program kinds are deterministic `:scripted` / `:echo` and the
    bounded Dvergr-native `:llm` model/tool loop. Simulation and replay
    interpreters implement the same boundary."
   [control-room world-parent roster agent-ref
-   {:keys [task from parent-run settlement resources]
+   {:keys [task from parent-run settlement resources limits]
     :or {from :repl settlement :automatic}
     :as raw-opts}]
   (let [opts      (assoc raw-opts :from from)
@@ -1094,7 +1133,7 @@
       (let [completion (sync/deferred)
             outcome-promise (promise)
             worker-execution (execution-spin control-room work-room agent task trigger id chat-id
-                                             supervisor outcome-promise)
+                                             supervisor limits outcome-promise)
             execution (sp/spin (sp/await completion))
             owner-fork-id (:fork-id (ec/current-execution-context))
             handle    (RunHandle. id (:id control-room) owner-fork-id execution completion

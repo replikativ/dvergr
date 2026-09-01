@@ -542,6 +542,35 @@
       (finally
         (d/close-room! room)))))
 
+(deftest hire-limits-can-only-restrict-an-llm-agent-policy
+  (let [room (test-room :program-restrictive-limits)
+        team (roster/make-agent
+              (roster/make-roster)
+              {:id :particle
+               :model-policy {:provider :test :model "stub"}
+               :program {:kind :llm :max-model-steps 4
+                         :budget-dollars 2.0}})
+        calls (atom 0)]
+    (try
+      (with-redefs [providers/ensure-initialized! (constantly nil)
+                    chat-agent/run-agent-turn!
+                    (fn [_ _]
+                      (swap! calls inc)
+                      :continue)]
+        (let [handle (binding [ec/*execution-context* (:ctx room)]
+                       (program/hire!
+                        room team :particle
+                        {:task :bounded
+                         :limits {:max-model-steps 1
+                                  :budget-dollars 0.01}}))
+              result (binding [ec/*execution-context* (:ctx room)] @handle)]
+          (is (= :failed (:run/status result)))
+          (is (= 1 @calls))
+          (is (= {:max-model-steps 1 :budget-dollars 0.01}
+                 (get-in result [:run/metrics :limits])))))
+      (finally
+        (d/close-room! room)))))
+
 (deftest delegation-tools-are-thin-run-interpreter-adapters
   (let [room (test-room :program-tool-delegation)
         parent-run (random-uuid)]

@@ -35,7 +35,7 @@
   "Run f with the chat-ctx's spindel-ctx bound. f sees a stable
    *execution-context* for ec/swap-state! and signal derefs."
   [chat-ctx f]
-  (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
+  (binding [ec/*execution-context* (chat-ctx/selected-execution-context chat-ctx)]
     (f)))
 
 (defn- registry
@@ -147,7 +147,8 @@
   "Return the latest progress snapshot for a process — a pure read.
    Does not disturb the parked spin."
   [process]
-  (binding [ec/*execution-context* (:spindel-ctx (:chat-ctx process))]
+  (binding [ec/*execution-context*
+            (chat-ctx/selected-execution-context (:chat-ctx process))]
     (let [now (System/currentTimeMillis)
           term-at (some-> (:terminated-at-ref process) .get)]
       {:id             (:id process)
@@ -195,7 +196,7 @@
   (if-let [process *current-process*]
     (let [chat-ctx  (:chat-ctx process)
           grace-ms  (:grace-ms process 5000)
-          chat-spc  (:spindel-ctx chat-ctx)]
+          chat-spc  (chat-ctx/selected-execution-context chat-ctx)]
       (binding [ec/*execution-context* chat-spc]
         (reset! (:progress-signal process)
                 (cond-> (or state {})
@@ -256,7 +257,7 @@
           ;; sees the latch — flip status directly so work-owners
           ;; polling (aborted? proc) see the abort.
           (when (and (:tracked-only? process) (= :abort (:type canonical)))
-            (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
+            (binding [ec/*execution-context* (chat-ctx/selected-execution-context chat-ctx)]
               (reset! (:status-signal process) :aborted))
             (mark-terminated! process))
           :delivered)
@@ -285,13 +286,15 @@
              :or {grace-ms 5000}}]
   {:pre [(string? description)]}
   (let [pid (or id (random-uuid))
+        world (chat-ctx/selected-execution-context chat-ctx)
+        process-chat-ctx (assoc chat-ctx :spindel-ctx world)
         process
-        (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
+        (binding [ec/*execution-context* world]
           (let [s (sig/signal :running)
                 p (sig/signal {})]
             (map->Proc
              {:id              pid
-              :chat-ctx        chat-ctx
+              :chat-ctx        process-chat-ctx
               :description     description
               :grace-ms        grace-ms
               :status-signal   s
@@ -301,13 +304,14 @@
               :started-at        (System/currentTimeMillis)
               :terminated-at-ref (AtomicReference. nil)
               :tracked-only?   true})))]
-    (swap-registry! chat-ctx assoc pid process)
+    (swap-registry! process-chat-ctx assoc pid process)
     process))
 
 (defn progress!
   "Update the progress signal on a tracked process."
   [process state]
-  (binding [ec/*execution-context* (:spindel-ctx (:chat-ctx process))]
+  (binding [ec/*execution-context*
+            (chat-ctx/selected-execution-context (:chat-ctx process))]
     (reset! (:progress-signal process) state))
   state)
 
@@ -317,7 +321,7 @@
    finishes normally."
   [process]
   (let [cctx (:chat-ctx process)]
-    (binding [ec/*execution-context* (:spindel-ctx cctx)]
+    (binding [ec/*execution-context* (chat-ctx/selected-execution-context cctx)]
       (reset! (:status-signal process) :completed))
     (mark-terminated! process)
     ;; Stays in registry briefly so a manager can still snapshot. We
@@ -357,7 +361,7 @@
    summary is wanted it should be an explicit choice — which is what the
    decision protocol makes it (see .internal/decision-protocol-assessment.md)."
   [agent-id chat-ctx]
-  (let [spc           (:spindel-ctx chat-ctx)
+  (let [spc           (chat-ctx/selected-execution-context chat-ctx)
         budget        (binding [ec/*execution-context* spc]
                         @(:budget-signal chat-ctx))
         used-dollars  (/ (:used budget) (double acct/MICRODOLLARS-PER-DOLLAR))
@@ -381,7 +385,8 @@
    at safe points."
   [process]
   (= :aborted
-     (binding [ec/*execution-context* (:spindel-ctx (:chat-ctx process))]
+     (binding [ec/*execution-context*
+               (chat-ctx/selected-execution-context (:chat-ctx process))]
        @(:status-signal process))))
 
 (defn ->process
@@ -403,13 +408,15 @@
    body-fn]
   {:pre [(string? description)]}
   (let [pid (or id (random-uuid))
+        world (chat-ctx/selected-execution-context chat-ctx)
+        process-chat-ctx (assoc chat-ctx :spindel-ctx world)
         process
-        (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
+        (binding [ec/*execution-context* world]
           (let [s (sig/signal :running)
                 p (sig/signal {})]
             (map->Proc
              {:id              pid
-              :chat-ctx        chat-ctx
+              :chat-ctx        process-chat-ctx
               :description     description
               :grace-ms        grace-ms
               :status-signal   s
@@ -418,10 +425,10 @@
               :directive-latch   (CountDownLatch. 1)
               :started-at        (System/currentTimeMillis)
               :terminated-at-ref (AtomicReference. nil)})))]
-    (swap-registry! chat-ctx assoc pid process)
+    (swap-registry! process-chat-ctx assoc pid process)
     (future
       (binding [*current-process*    process
-                ec/*execution-context* (:spindel-ctx chat-ctx)]
+                ec/*execution-context* world]
         (try
           (let [result (body-fn)]
             (reset! (:status-signal process) :completed)
