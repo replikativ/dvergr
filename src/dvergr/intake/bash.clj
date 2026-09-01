@@ -405,32 +405,36 @@
 
    Stored under `[:dvergr/bash-session WORKSPACE-ID]`."
   [chat-ctx]
-  (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
-    (let [ws (default-workspace)
-          key (if (map? ws) (:id ws) ws)
-          path (session-path key)]
-      (or (ec/get-state path)
+  (let [world ((requiring-resolve
+                'dvergr.chat.context/selected-execution-context) chat-ctx)]
+    (binding [ec/*execution-context* world]
+      (let [ws (default-workspace)
+            key (if (map? ws) (:id ws) ws)
+            path (session-path key)]
+        (or (ec/get-state path)
           ;; cwd is the SANDBOX root "/" (= the worktree via make-host's
           ;; :mount-at "/"); `ws` (the real path) stays only as the cache key.
-          (let [s (ms/spindel-session-using (:spindel-ctx chat-ctx)
-                                            (make-sandboxed-env {:cwd "/"}))]
-            (ec/swap-state! path (fn [existing] (or existing s)))
-            (ec/get-state path))))))
+            (let [s (ms/spindel-session-using world
+                                              (make-sandboxed-env {:cwd "/"}))]
+              (ec/swap-state! path (fn [existing] (or existing s)))
+              (ec/get-state path)))))))
 
 (defn get-or-create-host!
   "Return the chat-ctx's BuiltinHost for the current workspace,
    creating it on first use. See `get-or-create-session!` for why
    this is keyed by workspace path."
   [chat-ctx]
-  (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
-    (let [ws (default-workspace)
-          key (if (map? ws) (:id ws) ws)
-          path (host-path key)]
-      (or (ec/get-state path)
-          (let [h (make-host {:workspace ws
-                              :mounts (resolve-mounts chat-ctx)})]
-            (ec/swap-state! path (fn [existing] (or existing h)))
-            (ec/get-state path))))))
+  (let [world ((requiring-resolve
+                'dvergr.chat.context/selected-execution-context) chat-ctx)]
+    (binding [ec/*execution-context* world]
+      (let [ws (default-workspace)
+            key (if (map? ws) (:id ws) ws)
+            path (host-path key)]
+        (or (ec/get-state path)
+            (let [h (make-host {:workspace ws
+                                :mounts (resolve-mounts chat-ctx)})]
+              (ec/swap-state! path (fn [existing] (or existing h)))
+              (ec/get-state path)))))))
 
 ;; ============================================================================
 ;; Public API
@@ -560,7 +564,9 @@
           ;; time (make-sandboxed-env), so the snapshot is already
           ;; secret-free. Pass it as the explicit starting env so
           ;; one-shot library use stays well-defined.
-          env0 (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
+          env0 (binding [ec/*execution-context*
+                         ((requiring-resolve
+                           'dvergr.chat.context/selected-execution-context) chat-ctx)]
                  (msession/-env sess))
           interrupt-fn (mbudget/combine (process-abort-interrupt-fn process))
           {:keys [stdout stderr exit env permit trace]}

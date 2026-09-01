@@ -7,7 +7,7 @@
    review, or discarded without rewriting its execution outcome."
   (:require [dvergr.discourse :as d]))
 
-(def settlement-policies #{:automatic :review :discard})
+(def settlement-policies #{:automatic :review :discard :deferred})
 
 (defrecord RunWorld [id parent work policy settlement])
 
@@ -51,11 +51,20 @@
   [world execution-status]
   (settle-once!
    world
+   ;; Deferred settlement is a generic two-phase gate. The work plane stays
+   ;; inspectable, but cannot be merged or adopted until its host policy
+   ;; explicitly releases it after verification/approval.
    (fn []
      (cond
        (#{:failed :cancelled} execution-status)
-       (do (d/discard (:work world))
+       (do ((if (= :deferred (:policy world))
+              d/discard-deferred
+              d/discard)
+            (:work world))
            {:status :discarded :reason execution-status})
+
+       (= :deferred (:policy world))
+       {:status :deferred :reason :policy}
 
        (= :waiting execution-status)
        {:status :review :reason :execution-waiting}

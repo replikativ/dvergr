@@ -19,6 +19,107 @@
 
 (declare fork-diff)
 
+(defn deferred?
+  "True when a Run world is retained behind its host-owned settlement gate."
+  [fork]
+  (let [meta (some-> fork :meta deref)]
+    (and (= :deferred (:settlement-policy meta))
+         (not (:settlement-released? meta)))))
+
+(defn release-deferred!
+  "Release an existing deferred Run world for ordinary review/settlement.
+
+   Durable projection is updated before the process-local gate opens, so a
+   reviewer can never merge a world whose certification state is still
+   `:deferred`. This does not merge, copy, or create another fork."
+  ([fork reason]
+   (release-deferred! fork reason (constantly true)))
+  ([fork reason claim!]
+   (locking (:meta fork)
+     (let [parent (rreg/lookup (:parent-id fork))
+           live (rreg/lookup (:id fork))
+           meta @(:meta fork)
+           run-id (:run-id meta)]
+       (when-not (and (= fork live)
+                      (= :deferred (:settlement-policy meta))
+                      (not (:settlement-released? meta))
+                      (nil? (:settlement-claim meta)))
+         (throw (ex-info "Fork is not awaiting deferred settlement"
+                         {:type ::not-deferred :fork/id (:id fork)})))
+       (when-not (and parent run-id)
+         (throw (ex-info "Deferred Run world has no live settlement owner"
+                         {:type ::missing-settlement-owner
+                          :fork/id (:id fork)
+                          :run/id run-id})))
+       (when-not (claim!)
+         (throw (ex-info "Deferred release lost its settlement race"
+                         {:type ::deferred-settlement-aborted
+                          :fork/id (:id fork)})))
+       (agent-run/update-durable-settlement! parent run-id :review reason)
+       (swap! (:meta fork) assoc :settlement-released? true
+              :settlement-claim :release)
+       {:ok? true :status :review :run/id run-id :fork/id (:id fork)}))))
+
+(defn discard-deferred!
+  "Durability-first consumption of a deferred Run world's discard capability.
+
+   The terminal projection is written by the claim callback while the fork's
+   affine settlement lock is held, before substrate destruction. A projection
+   failure therefore leaves the world live. If physical discard fails after
+   preparation, compensate the still-live world back to `:deferred`."
+  ([fork reason]
+   (discard-deferred! fork reason (constantly true)))
+  ([fork reason claim!]
+   (let [parent (rreg/lookup (:parent-id fork))
+         run-id (some-> fork :meta deref :run-id)
+         prepared? (atom false)
+         durable-claim!
+         (fn []
+           (when (claim!)
+             (when (and parent run-id)
+               (agent-run/update-durable-settlement! parent run-id :discarded
+                                                     reason))
+             (reset! prepared? true)
+             true))
+         durable-abort!
+         (fn []
+           (when (and @prepared? parent run-id)
+             (agent-run/update-durable-settlement!
+              parent run-id :deferred :discard-failed)))]
+     (try
+       (d/discard-deferred fork durable-claim! durable-abort!)
+       {:ok? true}
+       (catch Throwable error
+         {:ok? false :error (ex-message error)})))))
+
+(defn retry-deferred-discard-abort!
+  "Restore a live world fenced by a failed durable discard compensation."
+  [fork]
+  (locking (:meta fork)
+    (let [meta @(:meta fork)
+          parent (rreg/lookup (:parent-id fork))
+          live (rreg/lookup (:id fork))
+          run-id (:run-id meta)]
+      (when-not (and (= fork live)
+                     (= :deferred (:settlement-policy meta))
+                     (= :discard-recovery (:settlement-claim meta))
+                     parent run-id)
+        (throw (ex-info "Fork has no current deferred discard recovery"
+                        {:type ::no-discard-recovery
+                         :fork/id (:id fork)})))
+      (agent-run/update-durable-settlement! parent run-id :deferred
+                                            :discard-failed)
+      (swap! (:meta fork) dissoc :settlement-claim)
+      {:ok? true :status :deferred :run/id run-id :fork/id (:id fork)})))
+
+(defn- require-settleable! [fork operation]
+  (when (deferred? fork)
+    (throw (ex-info "Deferred Run world must be released before settlement"
+                    {:type ::settlement-deferred
+                     :operation operation
+                     :fork/id (:id fork)
+                     :run/id (some-> fork :meta deref :run-id)}))))
+
 (defn fork?
   "Is this Room a fork? The canonical marker is `:forked-from` in the room's
    meta — set by `fork-room` — the SAME thing `dvergr.rooms.tree` keys its
@@ -82,7 +183,8 @@
        :files       (vec (:files gdiff))
        :db-changes  db-changes
        :msgs-since  (max 0 (- total flen))
-       :mergeable?  (boolean parent)})))
+       :mergeable?  (boolean (and parent (not (deferred? fork))))
+       :settlement-deferred? (deferred? fork)})))
 
 ;; ---------------------------------------------------------------------------
 ;; Unified diff + tier classification — the substrate the agent merge-reviewer
@@ -151,6 +253,7 @@
    {:ok? true :parent-slug ...} or {:ok? false :error ...}."
   [fork]
   (try
+    (require-settleable! fork :merge)
     (if-let [parent (rreg/lookup (:parent-id fork))]
       (let [run-id (some-> fork :meta deref :run-id)]
         (d/merge-room parent fork)
@@ -326,17 +429,20 @@
 
 (defn discard!
   "Discard a fork (`discourse/discard`) — deletes its branches. Returns
-   {:ok? true} or {:ok? false :error ...}."
-  [fork]
-  (try
-    (let [parent (rreg/lookup (:parent-id fork))
-          run-id (some-> fork :meta deref :run-id)]
-      (d/discard fork)
-      (when (and parent run-id)
-        (agent-run/update-durable-settlement! parent run-id :discarded
-                                              :review-rejected))
-      {:ok? true})
-    (catch Throwable t {:ok? false :error (.getMessage t)})))
+   {:ok? true} or {:ok? false :error ...}. An explicit reason lets trusted
+   policies distinguish rejection, evaluation policy, and failed certification."
+  ([fork]
+   (discard! fork :review-rejected))
+  ([fork reason]
+   (try
+     (require-settleable! fork :discard)
+     (let [parent (rreg/lookup (:parent-id fork))
+           run-id (some-> fork :meta deref :run-id)]
+       (d/discard fork)
+       (when (and parent run-id)
+         (agent-run/update-durable-settlement! parent run-id :discarded reason))
+       {:ok? true})
+     (catch Throwable t {:ok? false :error (.getMessage t)}))))
 
 (defn adopt!
   "Promote a retained isolated fork into an external durable owner.
@@ -352,6 +458,7 @@
    must never settle descriptor systems by bypassing those handles."
   [fork new-owner opts]
   (try
+    (require-settleable! fork :adopt)
     (let [parent (rreg/lookup (:parent-id fork))
           run-id (some-> fork :meta deref :run-id)
           transfer (d/transfer-fork! fork new-owner opts)

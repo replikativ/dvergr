@@ -8,6 +8,8 @@
    registry and durable Datahike row."
   (:require [clojure.test :refer [deftest is testing]]
             [dvergr.agent.turn :as turn]
+            [dvergr.chat.context :as chat-context]
+            [dvergr.discourse :as discourse]
             [dvergr.discourse.definitions :as definitions]
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.room.registry :as room-registry]
@@ -63,7 +65,8 @@
            tool-ctx
            (binding [ec/*execution-context* (:ctx parent)]
              (tools/make-context
-              {:sci-ctx       (:sci-ctx chat-ctx)
+              {:sci-ctx       (chat-context/sci-context-in
+                               chat-ctx (:ctx parent))
                :chat-ctx      chat-ctx
                :execution-ctx (:ctx parent)
                :isolation     :sci
@@ -81,33 +84,75 @@
                 ":children (set (map :slug "
                 "(dvergr.room/children " (pr-str parent-slug) ")))}")
            inspect-result (eval! parent tool-ctx inspect-code)
-           create-value (get-in create-result [:metadata :value])
-           inspect-value (get-in inspect-result [:metadata :value])
-           live-child (binding [ec/*execution-context* execution-ctx]
-                        (room-registry/lookup child-id))
-           durable-child (binding [ec/*execution-context* execution-ctx]
-                           (rooms/get-room-by-slug child-slug))
-           checks
-           {:create-tool-succeeded (= :success (:type create-result))
-            :inspect-tool-succeeded (= :success (:type inspect-result))
-            :sandbox-created-child  (= child-slug (get-in create-value [:child :slug]))
-            :repl-state-persisted   (= child-slug (:session-child-slug inspect-value))
-            :sandbox-sees-child     (true? (:visible? inspect-value))
-            :sandbox-sees-nesting   (contains? (:children inspect-value) child-slug)
-            :host-sees-child        (= child-id (:id live-child))
-            :host-sees-nesting      (= (room-store/slug->room-id parent-slug)
-                                       (:parent-id live-child))
-            :datahike-sees-child    (= child-slug (:room/slug durable-child))
-            :datahike-sees-nesting  (= parent-slug (:room/parent-slug durable-child))}]
-       {:passed? (every? true? (vals checks))
-        :checks checks
-        :parent-slug parent-slug
-        :child-slug child-slug
-        :create-result create-result
-        :inspect-result inspect-result
-        :live-room (select-keys live-child [:id :slug :title :parent-id])
-        :durable-room (select-keys durable-child
-                                   [:room/id :room/slug :room/name :room/parent-slug])}))))
+           world-fork (binding [ec/*execution-context* (:ctx parent)]
+                        (discourse/fork-room parent {:isolation :ctx}))]
+       (try
+         (let [fork-tool-ctx
+               (tools/make-context
+                {:sci-ctx       (chat-context/sci-context-in
+                                 chat-ctx (:ctx world-fork))
+                 :chat-ctx      chat-ctx
+                 :execution-ctx (:ctx world-fork)
+                 :isolation     :sci
+                 :tools         {"clojure_eval" (tools/get-tool "clojure_eval")}})
+               probe-id (random-uuid)
+               fork-result
+               (eval!
+                world-fork fork-tool-ctx
+                (str "(require '[datahike.api :as d] '[dvergr.room :as room]) "
+                     "(def fork-local " (pr-str probe-id) ") "
+                     "(d/transact room/*room* [{:message/id " (pr-str probe-id)
+                     " :message/content \"child-world-probe\"}]) "
+                     "{:var fork-local "
+                     " :db (d/q '[:find ?v . :in $ ?id :where "
+                     "[?e :message/id ?id] [?e :message/content ?v]] "
+                     "@room/*room* " (pr-str probe-id) ")}"))
+               parent-after-fork
+               (eval!
+                parent tool-ctx
+                (str "(require '[datahike.api :as d] '[dvergr.room :as room]) "
+                     "{:var-defined? (boolean (resolve 'fork-local)) "
+                     " :db (d/q '[:find ?v . :in $ ?id :where "
+                     "[?e :message/id ?id] [?e :message/content ?v]] "
+                     "@room/*room* " (pr-str probe-id) ")}"))
+               create-value (get-in create-result [:metadata :value])
+               inspect-value (get-in inspect-result [:metadata :value])
+               fork-value (get-in fork-result [:metadata :value])
+               parent-after-fork-value (get-in parent-after-fork [:metadata :value])
+               live-child (binding [ec/*execution-context* execution-ctx]
+                            (room-registry/lookup child-id))
+               durable-child (binding [ec/*execution-context* execution-ctx]
+                               (rooms/get-room-by-slug child-slug))
+               checks
+               {:create-tool-succeeded (= :success (:type create-result))
+                :inspect-tool-succeeded (= :success (:type inspect-result))
+                :sandbox-created-child  (= child-slug (get-in create-value [:child :slug]))
+                :repl-state-persisted   (= child-slug (:session-child-slug inspect-value))
+                :sandbox-sees-child     (true? (:visible? inspect-value))
+                :sandbox-sees-nesting   (contains? (:children inspect-value) child-slug)
+                :host-sees-child        (= child-id (:id live-child))
+                :host-sees-nesting      (= (room-store/slug->room-id parent-slug)
+                                           (:parent-id live-child))
+                :datahike-sees-child    (= child-slug (:room/slug durable-child))
+                :datahike-sees-nesting  (= parent-slug (:room/parent-slug durable-child))
+                :fork-tool-succeeded    (= :success (:type fork-result))
+                :fork-repl-diverged     (= probe-id (:var fork-value))
+                :fork-db-diverged       (= "child-world-probe" (:db fork-value))
+                :parent-var-unchanged   (false? (:var-defined? parent-after-fork-value))
+                :parent-db-unchanged    (nil? (:db parent-after-fork-value))}]
+           {:passed? (every? true? (vals checks))
+            :checks checks
+            :parent-slug parent-slug
+            :child-slug child-slug
+            :create-result create-result
+            :inspect-result inspect-result
+            :fork-result fork-result
+            :parent-after-fork parent-after-fork
+            :live-room (select-keys live-child [:id :slug :title :parent-id])
+            :durable-room (select-keys durable-child
+                                       [:room/id :room/slug :room/name :room/parent-slug])})
+         (finally
+           (discourse/discard world-fork)))))))
 
 (defn run-contract!
   "Run the contract in an isolated, provider-free daemon.
@@ -148,5 +193,6 @@
 (deftest agent-facing-repl-constructs-a-durable-nested-room
   (let [result (run-contract!)]
     (testing "every layer observes the room created from clojure_eval"
-      (is (:passed? result) (pr-str (:checks result)))
+      (is (:passed? result)
+          (pr-str (select-keys result [:checks :fork-result :parent-after-fork])))
       (is (every? true? (vals (:checks result)))))))
