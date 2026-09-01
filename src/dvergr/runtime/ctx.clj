@@ -32,6 +32,74 @@
   [ctx]
   (if-let [p (:parent-ctx ctx)] (recur p) ctx))
 
+(defn descendant-context?
+  "True when `candidate` is `ancestor` or belongs to its fork lineage.
+
+   A dynamically bound context must not override an object's owning world when
+   it is the owner's parent or an unrelated sibling. That would make an async
+   coordinator accidentally read the parent projection of child-owned state."
+  [candidate ancestor]
+  (boolean
+   (when (and candidate ancestor)
+     (loop [ctx candidate]
+       (cond
+         (or (identical? ctx ancestor)
+             (= (:fork-id ctx) (:fork-id ancestor))) true
+         (:parent-ctx ctx) (recur (:parent-ctx ctx))
+         :else false)))))
+
+(defn selected-context
+  "Select a bound descendant of `owner`, otherwise retain `owner`.
+
+   This is the ambient-world rule for stable handles: child execution may
+   refine an owner into its fork, while parent/sibling execution cannot pull a
+   child-owned value out of its world."
+  [owner]
+  (let [bound (when (ec/execution-context-bound?)
+                (ec/current-execution-context))]
+    (if (descendant-context? bound owner) bound owner)))
+
+(def ^:private sandbox-bindings-path
+  "Fork-local bindings used by stable SCI host capabilities.  The binding key
+   is stable for the lifetime of one interpreter component; Yggdrasil copies
+   the map into a child and the child projection replaces only its data."
+  [:dvergr/sandbox-bindings])
+
+(defn install-sandbox-binding!
+  "Install serializable world data for `binding-id` in `ctx`.
+
+   Host functions injected into SCI must capture only `owner` + `binding-id`,
+   never a Room, connection, filesystem or workspace.  That makes functions
+   defined before a SCI fork select the child binding when invoked there."
+  [ctx binding-id data]
+  (binding [ec/*execution-context* ctx]
+    (ec/swap-state! (conj sandbox-bindings-path binding-id)
+                    #(merge (or % {}) data)))
+  data)
+
+(defn update-sandbox-binding!
+  "Update a capability binding in the ambient descendant world of `owner`."
+  [owner binding-id f & args]
+  (let [ctx (selected-context owner)]
+    (binding [ec/*execution-context* ctx]
+      (ec/swap-state! (conj sandbox-bindings-path binding-id)
+                      #(apply f (or % {}) args)))))
+
+(defn sandbox-binding
+  "Read `binding-id` in the ambient descendant world of `owner`."
+  [owner binding-id]
+  (let [ctx (selected-context owner)]
+    (binding [ec/*execution-context* ctx]
+      (ec/get-state (conj sandbox-bindings-path binding-id)))))
+
+(defn sandbox-binding-resolver
+  "Return a stable zero-argument resolver suitable for an SCI host closure."
+  [owner binding-id]
+  #(or (sandbox-binding owner binding-id)
+       (throw (ex-info "SCI capability has no world binding"
+                       {:binding-id binding-id
+                        :owner-fork-id (:fork-id owner)}))))
+
 (defn current-root
   "The root of the currently-bound execution context."
   []
@@ -43,6 +111,14 @@
    registry, tree/message signals, peer-bus — anything the UI reactively reads."
   [path f]
   (rtp/swap-state! (current-root) path f))
+
+(defn shared-swap-root!
+  "Atomically update the complete Tier-1 root state.
+
+   Use this sparingly for invariants spanning multiple Tier-1 paths, such as
+   publishing a Room together with its structural fork edge."
+  [f]
+  (rtp/swap-state! (current-root) [] f))
 
 (defn shared-get-state
   "Tier-1 read from the ROOT ctx (the authoritative copy)."

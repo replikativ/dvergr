@@ -118,6 +118,42 @@
       (finally
         (release-transition! key token)))))
 
+(defn register-fork!
+  "Atomically publish an isolated child Room and its structural topology edge.
+
+   Readers can never observe a globally reachable child without the settlement
+  identity needed to govern it. Register hooks run only after both projections
+   are visible."
+  [room parent-id ygg-fork-id]
+  (let [child-id (:id room)
+        [key token] (locking lifecycle-lock
+                      (reserve-transition! child-id :register-fork))]
+    (try
+      ;; A fork is still a Room incarnation. Run the same admission fences as
+      ;; ordinary registration before making either global projection visible.
+      (doseq [f (vals @pre-register-hooks)]
+        (f room))
+      (locking lifecycle-lock
+        (when-not (= token (get-in @transitions [key :token]))
+          (throw (ex-info "Fork registration reservation was lost"
+                          {:type ::lifecycle-reservation-lost
+                           :room-id child-id})))
+        (rctx/shared-swap-root!
+         (fn [state]
+           (-> (or state {})
+               (update-in registry-path #(assoc (or % {}) child-id room))
+               (update-in fork-topology-path
+                          #(assoc (or % {}) child-id
+                                  {:fork/id child-id
+                                   :fork/parent-id parent-id
+                                   :fork/ygg-id ygg-fork-id
+                                   :fork/state :local}))))))
+      (doseq [f (vals @register-hooks)]
+        (try (f room) (catch Throwable _ nil)))
+      room
+      (finally
+        (release-transition! key token)))))
+
 (defn unregister!
   "Remove a Room from the registry by id, then run unregister hooks."
   [room-id]
@@ -158,6 +194,21 @@
       (keyword? id-or-slug) (get m id-or-slug)
       (string? id-or-slug)  (some (fn [[_ r]] (when (= (:slug r) id-or-slug) r)) m)
       :else                 nil)))
+
+(defn admitted-incarnation?
+  "True when `room` is the currently published incarnation and no lifecycle
+   transition owns its registry slot.
+
+   Callers that allocate process-local Room resources use this while holding
+   the Room's own lifecycle fence. An unregister reservation therefore closes
+   admission before pre-unregister cleanup starts, and a failed unregister
+   automatically reopens admission when its reservation is released."
+  [room]
+  (locking lifecycle-lock
+    (let [room-id (:id room)
+          current (get (rctx/shared-get-state registry-path) room-id)]
+      (and (= (:incarnation room) (:incarnation current))
+           (not (contains? @transitions (transition-key room-id)))))))
 
 (defn list-rooms
   "All rooms in the registry. Optional :where filter as a predicate.

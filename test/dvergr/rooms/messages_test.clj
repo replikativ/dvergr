@@ -4,6 +4,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [dvergr.rooms.messages :as rmsg]
             [dvergr.discourse :as d]
+            [dvergr.room.store :as store]
             [dvergr.room.store.memory :as mem]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.context :as ctx]
@@ -42,6 +43,38 @@
             (is (contains? cs "agent reply") "room signal includes agent replies (unlike per-agent ctx)")
             (is (contains? cs "🔧 grep")     "room signal includes tool-activity rows"))
           (finally (rmsg/drop-room! :rm-fold)))))))
+
+(deftest normalizes-semantic-activity-and-run-correlation
+  (let [c      (ctx/create-execution-context)
+        run-id (random-uuid)
+        fact   {:activity/id (random-uuid)
+                :activity/run-id run-id
+                :activity/kind :tool
+                :activity/verb :invoke
+                :activity/tool-name "clojure_eval"}]
+    (binding [ec/*execution-context* c]
+      (let [st   (mem/make)
+            room (d/make-room {:id :rm-semantic-activity :ctx c :store st})
+            sig  (rmsg/messages-signal room)]
+        (try
+          (let [now (java.util.Date.)]
+            (store/-store-run! st :rm-semantic-activity
+                               {:run/id run-id
+                                :run/kind :agent-turn
+                                :run/room :rm-semantic-activity
+                                :run/actor :var
+                                :run/trigger (random-uuid)
+                                :run/status :running
+                                :run/created-at now
+                                :run/started-at now
+                                :run/updated-at now}))
+          (d/post! room (d/message :var :_activity "tool activity" nil
+                                   {:role :tool :run-id run-id :activities [fact]}))
+          (engine/await-drain-complete! c :timeout-ms 350)
+          (let [view (some #(when (= "tool activity" (:content %)) %) @sig)]
+            (is (= run-id (:run-id view)))
+            (is (= [fact] (:activities view))))
+          (finally (rmsg/drop-room! :rm-semantic-activity)))))))
 
 (deftest dedups-by-id-and-matches-store
   (testing "the room signal and the store are two folds of the same bus —
