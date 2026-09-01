@@ -103,7 +103,13 @@
       (testing "the agent's own room-facing surface is present"
         (is (= true (:ok (eval-in sci ec "(some? dvergr.room/kb-search)")))))
       (testing "in-jail file access works"
-        (is (= true (:ok (eval-in sci ec "(babashka.fs/exists? \"deps.edn\")")))))
+        (is (= true
+               (:ok (eval-in sci ec
+                             "(let [p \".capability-probe\"]
+                                (spit p \"ok\")
+                                (let [exists? (babashka.fs/exists? p)]
+                                  (babashka.fs/delete-if-exists p)
+                                  exists?))")))))
       (testing "but escapes past the jail are refused"
         (is (:err (eval-in sci ec "(babashka.fs/exists? \"/etc/passwd\")")))
         (is (:err (eval-in sci ec "(slurp \"/etc/passwd\")")))))))
