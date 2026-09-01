@@ -93,8 +93,23 @@
            (catch Throwable _ nil))
       (some-> from name)))
 
+(defn- append-inbound-to!
+  [chat-ctx seen msg-id role content author ts reasoning]
+  (when (.add ^java.util.Set seen msg-id)
+    (let [decorated (if (and author (not= :system role))
+                      (str "[" author (when-let [t (fmt-clock ts)] (str " · " t)) "] " content)
+                      content)]
+      (append-signal-only! chat-ctx (cond-> {:role role :content decorated}
+                                      (seq reasoning) (assoc :reasoning reasoning))))
+    true))
+
 (defn append-inbound!
-  "Append one inbound conversational message to the (room, agent) ctx's signal,
+  "Append one inbound conversational message to the (room, agent) ctx's signal.
+
+   `room-or-id` should be the Room for lifecycle-safe admission during first
+   hydration; the id form remains for callers that target an already-published
+   cache entry.
+
    EXACTLY ONCE (deduped by `msg-id` via the entry's synchronized set). Used by
    the attention interpreter. Signal-only (the room store already holds it
    durably). Returns true if appended.
@@ -102,20 +117,28 @@
    `author` is the sender's display label (nil for the agent's own messages); when
    present the content is prefixed `[author · HH:mm]` so the agent knows WHO spoke
    and WHEN — essential in multi-party rooms where roles alone are ambiguous."
-  ([room-id agent-id msg-id role content author ts]
-   (append-inbound! room-id agent-id msg-id role content author ts nil))
-  ([room-id agent-id msg-id role content author ts reasoning]
-   (when-let [{:keys [chat-ctx seen]} (get @room-agent-ctxs [room-id agent-id])]
-     (when (.add ^java.util.Set seen msg-id)
-       (let [decorated (if (and author (not= :system role))
-                         (str "[" author (when-let [t (fmt-clock ts)] (str " · " t)) "] " content)
-                         content)]
-         ;; `reasoning` (the agent's OWN prior <think> trace) rides along so
-         ;; reasoning models keep it across a rehydrate — see create-message-entity
-         ;; (:reasoning → :message/reasoning) + messages->api-format.
-         (append-signal-only! chat-ctx (cond-> {:role role :content decorated}
-                                         (seq reasoning) (assoc :reasoning reasoning))))
-       true))))
+  ([room-or-id agent-id msg-id role content author ts]
+   (append-inbound! room-or-id agent-id msg-id role content author ts nil))
+  ([room-or-id agent-id msg-id role content author ts reasoning]
+   (let [room? (map? room-or-id)
+         room-id (if room? (:id room-or-id) room-or-id)
+         k [room-id agent-id]
+         room-meta (or (when room? (:meta room-or-id))
+                       (:room-meta (get @room-agent-ctxs k)))]
+     (when room-meta
+       ;; Admission may race first hydration. Sharing the lifecycle fence makes
+       ;; the append wait for the fully seeded cache publication instead of
+       ;; observing an absent/partial entry and dropping a durable attention fact.
+       (locking room-meta
+         (binding [ec/*execution-context* (if room?
+                                            (:ctx room-or-id)
+                                            ec/*execution-context*)]
+           (when (or (not room?) (rreg/admitted-incarnation? room-or-id))
+             (when-let [{:keys [chat-ctx seen]} (get @room-agent-ctxs k)]
+               ;; `reasoning` (the agent's OWN prior <think> trace) rides along so
+               ;; reasoning models keep it across a rehydrate — see create-message-entity
+               ;; (:reasoning → :message/reasoning) + messages->api-format.
+               (append-inbound-to! chat-ctx seen msg-id role content author ts reasoning)))))))))
 
 (defn raise-budget!
   "Set the live budget :total on every cached agent ctx of `room-id` to
@@ -144,64 +167,65 @@
   [room agent-id {:keys [system-prompt budget-dollars limit]}]
   (let [room-id (:id room)
         k       [room-id agent-id]]
-    (or (:chat-ctx (get @room-agent-ctxs k))
-        ;; Room forking holds the same monitor from the Yggdrasil snapshot
-        ;; through working-context projection. First allocation must share the
-        ;; fence: otherwise a component can appear after the child snapshot but
-        ;; before cache projection, or concurrent callers can orphan all but
-        ;; the last registered interpreter.
-        (locking (:meta room)
+    ;; Room forking and unregister hold the same monitor. Cache reads belong
+    ;; inside it too: a returned handle must remain live through this boundary.
+    (locking (:meta room)
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [_ (when-not (rreg/admitted-incarnation? room)
+                  (throw (ex-info "Working context requested for a closed Room incarnation"
+                                  {:type ::closed-room
+                                   :room-id room-id
+                                   :room/incarnation (:incarnation room)})))]
           (or (:chat-ctx (get @room-agent-ctxs k))
-              (binding [ec/*execution-context* (:ctx room)]
-                (let [;; The room's system-db UUID — the key the system resolvers
+              (let [;; The room's system-db UUID — the key the system resolvers
                 ;; (room-kb-conn / room-kbs / room-msgs) want; distinct from the
                 ;; in-memory keyword `room-id`. Threads to the sandbox so `dvergr.room`
                 ;; + the guarded `d/connect`/`list-databases` resolve THIS room's
                 ;; fork-aware databases.
-                      room-uuid (room-system-id room)
-                      sandbox-opts
-                      {:execution-ctx  (:ctx room)
-                       :chat-id        (stable-chat-id room-id agent-id)
-                       :title          (str (name agent-id) "-" (name room-id))
-                       :budget-dollars budget-dollars
+                    room-uuid (room-system-id room)
+                    sandbox-opts
+                    {:execution-ctx  (:ctx room)
+                     :chat-id        (stable-chat-id room-id agent-id)
+                     :title          (str (name agent-id) "-" (name room-id))
+                     :budget-dollars budget-dollars
                         ;; RF5 S4: the cost ledger (account-usage!) writes to THIS
                         ;; room's own msgs store — per-room, fork-aware — not the
                         ;; legacy chat-db. nil ⇒ create-chat-context auto-resolves
                         ;; (room-less fallback only).
-                       :db-conn        (some-> room :store :conn)
+                     :db-conn        (some-> room :store :conn)
                         ;; The agent's sandbox reaches its room's OWN knowledge base
                         ;; (fork-aware) through `dvergr.room/*kb*` — resolved here
                         ;; under the room's bound ctx (so a fork hands the branched
                         ;; KB). nil for room-less ctxs. The sandbox must NEVER touch
                         ;; system-db for knowledge; this is how the room KB gets in.
-                       :kb-conn        (some-> room-uuid srooms/room-kb-conn)
-                       :room-id        room-uuid
+                     :kb-conn        (some-> room-uuid srooms/room-kb-conn)
+                     :room-id        room-uuid
                        ;; Room registry identity is distinct from the system-db
                        ;; UUID above. SCI's agent-programming surface needs the
                        ;; former so a hired agent can recursively hire into this
                        ;; exact live Room, including an ephemeral fork.
-                       :room-runtime-id room-id
-                       :room-incarnation (:incarnation room)
+                     :room-runtime-id room-id
+                     :room-incarnation (:incarnation room)
                         ;; Per-agent network egress scope: an actor's optional
                         ;; `:config {:allowed-domains #{"https://…"}}` restricts the
                         ;; sandbox `http` primitive (nil/empty ⇒ open).
-                       :allowed-domains (some-> (actors/lookup (sdb/get-conn) agent-id)
-                                                :config :allowed-domains)
+                     :allowed-domains (some-> (actors/lookup (sdb/get-conn) agent-id)
+                                              :config :allowed-domains)
                         ;; The room store (bus→store listener) is the single durable
                         ;; writer for this conversation; the agent's own turn messages
                         ;; stay signal-only (no redundant datahike write). Token
                         ;; accounting still persists.
-                       :durable?       false}
-                      cctx (turn/new-working-ctx sandbox-opts)
-                      bound-sandbox-opts (assoc sandbox-opts
-                                                :capability-id (:capability-id cctx))
-                      seen (java.util.Collections/synchronizedSet (java.util.HashSet.))]
-            ;; Register before seeding so append-inbound! finds the entry.
-                  (swap! room-agent-ctxs assoc k {:chat-ctx cctx
-                                                  :seen seen
-                                                  :execution-ctx (:ctx room)
-                                                  :room-meta (:meta room)
-                                                  :sandbox-opts bound-sandbox-opts})
+                     :durable?       false}
+                    cctx (turn/new-working-ctx sandbox-opts)
+                    bound-sandbox-opts (assoc sandbox-opts
+                                              :capability-id (:capability-id cctx))
+                    seen (java.util.Collections/synchronizedSet (java.util.HashSet.))
+                    entry {:chat-ctx cctx
+                           :seen seen
+                           :execution-ctx (:ctx room)
+                           :room-meta (:meta room)
+                           :sandbox-opts bound-sandbox-opts}]
+                (try
             ;; System prompt once, then seed the conversation from the store.
             ;; Signal-only: the prompt is regenerated each session, not durable.
                   (when system-prompt
@@ -297,19 +321,28 @@
                                      (contains? included-message-ids (:id m))
                                      (contains? trigger-ids (:id m))
                                      legacy-history?))
-                        (append-inbound! room-id agent-id (:id m)
-                                         (or (:role m) (if (= agent-id (:from m)) :assistant :user))
-                                         (:content m)
+                        (append-inbound-to! cctx seen (:id m)
+                                            (or (:role m) (if (= agent-id (:from m)) :assistant :user))
+                                            (:content m)
                                  ;; author nil for the agent's OWN past messages
-                                         (when (not= agent-id (:from m)) (display-name room (:from m)))
-                                         (:ts m)
+                                            (when (not= agent-id (:from m)) (display-name room (:from m)))
+                                            (:ts m)
                                  ;; feed back only the agent's OWN prior reasoning,
                                  ;; not another participant's <think>
-                                         (when (= agent-id (:from m)) (:reasoning m))))))
+                                            (when (= agent-id (:from m)) (:reasoning m))))))
                   (tel/log! {:level :debug :id ::created
                              :data {:room room-id :agent agent-id
                                     :seeded (count (chat-ctx/get-messages cctx))}})
-                  cctx)))))))
+                  ;; Publication is the commit point. Before this swap, no
+                  ;; concurrent fast path can observe partially hydrated state.
+                  (swap! room-agent-ctxs assoc k entry)
+                  cctx
+                  (catch Throwable error
+                    (try
+                      (chat-ctx/release-sci-in! cctx (:ctx room))
+                      (catch Throwable cleanup-error
+                        (.addSuppressed error cleanup-error)))
+                    (throw error))))))))))
 
 (defn fork-ctx!
   "Project an existing parent room/agent working context into `child-room`.
@@ -380,6 +413,19 @@
     (drop-ctx! rid aid))
   nil)
 
+(defn- close-room-contexts!
+  "Fence one registered Room incarnation against further context access.
+
+   Runs as a pre-unregister hook while the Room is still authoritative. The
+   shared monitor makes the closed marker and complete component teardown one
+   lifecycle transition, so a stale caller cannot publish after cleanup."
+  [room]
+  (locking (:meta room)
+    (doseq [[rid aid] (keys @room-agent-ctxs)
+            :when (= rid (:id room))]
+      (drop-entry! rid aid)))
+  nil)
+
 (defn clear-all!
   "Drop every cached ctx (daemon stop — the cache is a defonce that survives a
    same-process restart, so a fresh start must not reuse stale projections)."
@@ -393,6 +439,7 @@
   [room-id agent-id]
   (:chat-ctx (get @room-agent-ctxs [room-id agent-id])))
 
-;; Tear down a room's cached ctxs whenever it leaves the registry (room delete,
-;; fork discard) — one hook covers all teardown paths. Idempotent across reload.
-(rreg/add-unregister-hook! ::drop-room drop-room!)
+;; Fence + tear down before registry removal. Keeping this in the lifecycle
+;; transaction prevents stale scheduler/MCP callers from recreating a component
+;; after a post-unregister key snapshot.
+(rreg/add-pre-unregister-hook! ::close-room-contexts close-room-contexts!)

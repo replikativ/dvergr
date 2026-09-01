@@ -195,6 +195,21 @@
       (string? id-or-slug)  (some (fn [[_ r]] (when (= (:slug r) id-or-slug) r)) m)
       :else                 nil)))
 
+(defn admitted-incarnation?
+  "True when `room` is the currently published incarnation and no lifecycle
+   transition owns its registry slot.
+
+   Callers that allocate process-local Room resources use this while holding
+   the Room's own lifecycle fence. An unregister reservation therefore closes
+   admission before pre-unregister cleanup starts, and a failed unregister
+   automatically reopens admission when its reservation is released."
+  [room]
+  (locking lifecycle-lock
+    (let [room-id (:id room)
+          current (get (rctx/shared-get-state registry-path) room-id)]
+      (and (= (:incarnation room) (:incarnation current))
+           (not (contains? @transitions (transition-key room-id)))))))
+
 (defn list-rooms
   "All rooms in the registry. Optional :where filter as a predicate.
 

@@ -405,12 +405,6 @@
            :by-type {}
            :crossed-thresholds #{}})
 
-        ;; Retain a stable component ref, never a raw interpreter. Resolving the
-        ;; ref through a descendant Spindel context selects that world's SCI
-        ;; fork, including vars, atoms, dynamic bindings, and continuations.
-        sci-component (when with-sci?
-                        (sandbox/create-spindel-sci-world! spindel-ctx))
-
         ;; Create signals within the owning execution context.
         [messages-signal budget-signal status-signal]
         (binding [rtc/*execution-context* spindel-ctx]
@@ -425,7 +419,13 @@
                          [(schema/create-chat-entity
                            {:id chat-id
                             :title (or title "Untitled Chat")
-                            :budget budget-microdollars})]))]
+                            :budget budget-microdollars})]))
+
+        ;; Allocate the process-local interpreter only after every fallible
+        ;; durable/signal initialization step. Once registered, no operation
+        ;; below can strand the component without returning its ChatContext.
+        sci-component (when with-sci?
+                        (sandbox/create-spindel-sci-world! spindel-ctx))]
 
     (->ChatContext
      chat-id
@@ -463,9 +463,14 @@
    This is idempotent and does not close the chat's durable connection. Forked
    room caches use it when a child world is discarded."
   [chat-ctx execution-context]
-  (sandbox/release-agent-resources! execution-context (:capability-id chat-ctx))
-  (sandbox/release-spindel-sci-world!
-   execution-context (:sci-component chat-ctx)))
+  (try
+    (sandbox/release-agent-resources! execution-context (:capability-id chat-ctx))
+    (finally
+      ;; Disposable-resource cleanup is best-effort with respect to component
+      ;; reachability: even an unexpected backend failure must not strand the
+      ;; interpreter in Spindel after its cache handle is removed.
+      (sandbox/release-spindel-sci-world!
+       execution-context (:sci-component chat-ctx)))))
 
 (defn close-chat!
   "Close chat and release resources."

@@ -10,6 +10,8 @@
             [dvergr.room.store.memory :as mem]
             [dvergr.room.store :as rstore]
             [dvergr.room.store.datahike :as store-dh]
+            [dvergr.room.registry :as registry]
+            [dvergr.sandbox :as sandbox]
             [dvergr.chat.context :as cctx]
             [dvergr.chat.schema :as schema]
             [datahike.api :as dh]
@@ -79,6 +81,127 @@
           (deliver release-constructor true)
           (rc/drop-ctx! :rc-concurrent-first :var)
           (ctx/close-context! c))))))
+
+(deftest failed-hydration-is-unpublished-and-retryable
+  (let [c (ctx/create-execution-context)
+        room (d/make-room {:id :rc-hydration-retry :ctx c :store (mem/make)})
+        original d/messages
+        calls (atom 0)]
+    (try
+      (with-redefs [d/messages
+                    (fn [& args]
+                      (if (= 1 (swap! calls inc))
+                        (throw (ex-info "injected hydration failure" {}))
+                        (apply original args)))]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                              #"injected hydration failure"
+                              (rc/ensure-ctx! room :var {:budget-dollars 1.0})))
+        (is (nil? (rc/lookup (:id room) :var)))
+        (is (empty? (binding [ec/*execution-context* c]
+                      (component/registered))))
+        (let [retried (rc/ensure-ctx! room :var {:budget-dollars 1.0})]
+          (is (some? retried))
+          (is (= 1 (count (binding [ec/*execution-context* c]
+                            (component/registered)))))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest inbound-admission-waits-for-context-publication
+  (let [c (ctx/create-execution-context)
+        room (d/make-room {:id :rc-admission-during-hydration
+                           :ctx c :store (mem/make)})
+        original d/messages
+        hydration-entered (promise)
+        release-hydration (promise)
+        msg-id (random-uuid)]
+    (try
+      (with-redefs [d/messages
+                    (fn [& args]
+                      (deliver hydration-entered true)
+                      @release-hydration
+                      (apply original args))]
+        (let [ensure-result (future (rc/ensure-ctx! room :var
+                                                    {:budget-dollars 1.0}))]
+          (is (true? (deref hydration-entered 10000 ::timeout)))
+          (let [append-result
+                (future (rc/append-inbound! room :var msg-id :user
+                                            "arrived during hydration"
+                                            "Alice" nil))]
+            (deliver release-hydration true)
+            (let [working (deref ensure-result 10000 ::timeout)]
+              (is (true? (deref append-result 10000 ::timeout)))
+              (is (some #(str/includes? % "arrived during hydration")
+                        (non-system-contents working)))))))
+      (finally
+        (deliver release-hydration true)
+        (d/close-room! room)))))
+
+(deftest working-context-construction-releases-on-rebind-failure
+  (let [c (ctx/create-execution-context)]
+    (try
+      (with-redefs [sandbox/setup-agent-namespaces!
+                    (fn [& _]
+                      (throw (ex-info "injected namespace failure" {})))]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                              #"injected namespace failure"
+                              (turn/new-working-ctx
+                               {:execution-ctx c :title "failing"})))
+        (is (empty? (binding [ec/*execution-context* c]
+                      (component/registered)))))
+      (finally
+        (ctx/close-context! c)))))
+
+(deftest unregister-fences-context-creation-and-stale-access
+  (let [c (ctx/create-execution-context)
+        room (d/make-room {:id :rc-unregister-race :ctx c :store (mem/make)})
+        original turn/new-working-ctx
+        constructor-entered (promise)
+        release-constructor (promise)]
+    (try
+      (with-redefs [turn/new-working-ctx
+                    (fn [opts]
+                      (deliver constructor-entered true)
+                      @release-constructor
+                      (original opts))]
+        (let [ensure-result (future (rc/ensure-ctx! room :var
+                                                    {:budget-dollars 1.0}))]
+          (is (true? (deref constructor-entered 3000 ::timeout)))
+          (let [unregister-result
+                (future
+                  (binding [ec/*execution-context* c]
+                    (registry/unregister! (:id room))))]
+            (deliver release-constructor true)
+            (is (not= ::timeout (deref ensure-result 10000 ::timeout)))
+            (is (nil? (deref unregister-result 10000 ::timeout)))
+            (is (nil? (binding [ec/*execution-context* c]
+                        (registry/lookup (:id room)))))
+            (is (nil? (rc/lookup (:id room) :var)))
+            (is (empty? (binding [ec/*execution-context* c]
+                          (component/registered))))
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                  #"closed Room incarnation"
+                                  (rc/ensure-ctx! room :var
+                                                  {:budget-dollars 1.0}))))))
+      (finally
+        (deliver release-constructor true)
+        (ctx/close-context! c)))))
+
+(deftest resource-cleanup-failure-still-unregisters-component
+  (let [c (ctx/create-execution-context)
+        working (turn/new-working-ctx {:execution-ctx c :title "cleanup"})]
+    (try
+      (is (= 1 (count (binding [ec/*execution-context* c]
+                        (component/registered)))))
+      (with-redefs [sandbox/release-agent-resources!
+                    (fn [& _] (throw (java.io.IOException. "injected cleanup failure")))]
+        (is (thrown-with-msg? java.io.IOException
+                              #"injected cleanup failure"
+                              (cctx/release-sci-in! working c))))
+      (is (empty? (binding [ec/*execution-context* c]
+                    (component/registered))))
+      (finally
+        (cctx/release-sci-in! working c)
+        (ctx/close-context! c)))))
 
 (deftest room-observation-does-not-bypass-attention
   (let [c (ctx/create-execution-context)]

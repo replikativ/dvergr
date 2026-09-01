@@ -490,7 +490,7 @@
                          fold-inbound!
                          (fn [m]
                            (if room
-                             (room-context/append-inbound! (:id room) id (:id m)
+                             (room-context/append-inbound! room id (:id m)
                                                            :user (:content m)
                                                            (room-context/display-name room (:from m))
                                                            (:ts m))

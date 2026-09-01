@@ -98,14 +98,23 @@
       ;; namespaces — do it here so clojure_eval has the room/kb/intake nses
       ;; everywhere. `db-conn` is the room's OWN messages store (= `*room*`);
       ;; `kb-conn` its OWN knowledge base (= `*kb*`) — both fork-aware, never sdb.
-      (rebind-working-ctx! cctx {:execution-ctx execution-ctx
-                                 :db-conn db-conn :kb-conn kb-conn
-                                 :room-id room-id :room-runtime-id room-runtime-id
-                                 :room-incarnation room-incarnation
-                                 :capability-id capability-id
-                                 :agent-program-ceiling agent-program-ceiling
-                                 :allowed-domains allowed-domains})
-      cctx)))
+      (try
+        (rebind-working-ctx! cctx {:execution-ctx execution-ctx
+                                   :db-conn db-conn :kb-conn kb-conn
+                                   :room-id room-id :room-runtime-id room-runtime-id
+                                   :room-incarnation room-incarnation
+                                   :capability-id capability-id
+                                   :agent-program-ceiling agent-program-ceiling
+                                   :allowed-domains allowed-domains})
+        cctx
+        (catch Throwable error
+          ;; Namespace/resource installation is part of construction. A caller
+          ;; must never receive—or lose track of—a half-bound interpreter.
+          (try
+            (chat-ctx/release-sci-in! cctx execution-ctx)
+            (catch Throwable cleanup-error
+              (.addSuppressed error cleanup-error)))
+          (throw error))))))
 
 ;; Reserved `:to` id for agent tool-activity messages posted into a room.
 ;; Nothing subscribes to it, so no participant (agent or egress) receives these
