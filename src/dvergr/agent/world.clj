@@ -23,7 +23,17 @@
                      :allowed settlement-policies})))
   (let [work (d/fork-room parent {:isolation :ctx
                                   :fork-opts {:purpose :run
-                                              :owner run-id}
+                                              :owner run-id
+                                              ;; A hired agent receives the
+                                              ;; durable substrate of its
+                                              ;; parent world, but constructs
+                                              ;; a fresh process-local runtime.
+                                              ;; In particular, recursively
+                                              ;; hiring from SCI must not try
+                                              ;; to fork the interpreter that
+                                              ;; is currently evaluating the
+                                              ;; hire! call.
+                                              :forkable-components #{}}
                                   ;; A Run world is an internal transaction, not
                                   ;; a child conversation. Nested agents enter
                                   ;; only through explicit hire/tool effects.

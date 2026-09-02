@@ -513,6 +513,56 @@
       (finally
         (d/close-room! room)))))
 
+(deftest llm-clojure-eval-can-recursively-hire-from-its-active-sci-world
+  (let [room (test-room :program-llm-recursive-sci-hire)
+        team (roster/make-agent
+              (roster/make-roster {:id :recursive-team})
+              {:id :orchestrator
+               :tools #{:clojure_eval}
+               :model-policy {:provider :test :model "stub"}
+               :program {:kind :llm :max-model-steps 2 :auto-compact? false}})
+        calls (atom 0)]
+    (try
+      (with-redefs [providers/ensure-initialized! (constantly nil)
+                    chat-agent/messages->api-format (fn [messages _ _] messages)
+                    model-chat/chat
+                    (fn [_ _]
+                      (if (= 1 (swap! calls inc))
+                        {:content ""
+                         :tool-calls
+                         [{:id "recursive-hire"
+                           :name "clojure_eval"
+                           :input
+                           {:code
+                            (str
+                             "(require '[dvergr.agent :as agent] "
+                             "         '[org.replikativ.spindel.spin.cps :refer [spin]] "
+                             "         '[org.replikativ.spindel.effects.await :refer [await]]) "
+                             "(let [team (-> (agent/roster) "
+                             "               (agent/make-agent {:id :child "
+                             "                                  :program {:kind :scripted :reply :ok}})) "
+                             "      child (agent/hire! team :child {:task :work})] "
+                             "  @(spin (-> (await (agent/result-spin child)) :run/value)))")}}]
+                         :usage {:input-tokens 0 :output-tokens 0}
+                         :stop-reason :tool-use}
+                        {:content "done"
+                         :tool-calls nil
+                         :usage {:input-tokens 0 :output-tokens 0}
+                         :stop-reason :end-turn}))]
+        (let [root (binding [ec/*execution-context* (:ctx room)]
+                     (program/hire! room team :orchestrator {:task "delegate"}))
+              result (binding [ec/*execution-context* (:ctx room)] @root)
+              children (remove #(= (program/run-id root) (:run/id %))
+                               (run/runs room))]
+          (is (= :completed (:run/status result)))
+          (is (= 1 (count children)))
+          (is (= :child (:run/actor (first children))))
+          (is (= (program/run-id root) (:run/parent (first children))))
+          (is (= :completed (:run/status (first children))))
+          (is (= :merged (:run/settlement-status (first children))))))
+      (finally
+        (d/close-room! room)))))
+
 (deftest parallel-llm-hires-have-independent-chat-contexts
   (let [room (test-room :program-llm-isolation)
         team (roster/make-agent
