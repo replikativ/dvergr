@@ -104,6 +104,31 @@
       (is (= completed (store/-store-run! st room-id completed)))
       (is (= [completed] (store/-list-runs st room-id {:actor :agent/researcher})))
       (is (empty? (store/-list-runs st room-id {:status :failed})))
+      (let [lower-id (java.util.UUID/fromString
+                      "00000000-0000-0000-0000-000000000001")
+            upper-id (java.util.UUID/fromString
+                      "00000000-0000-0000-0000-000000000002")
+            child (fn [id actor]
+                    (-> completed
+                        (assoc :run/id id
+                               :run/actor actor
+                               :run/trigger (random-uuid)
+                               :run/parent run-id)
+                        (dissoc :run/caused-by)))]
+        (store/-store-run! st room-id (child upper-id :upper))
+        (store/-store-run! st room-id (child lower-id :lower))
+        (is (= #{run-id lower-id}
+               (set (map :run/id
+                         (store/-list-runs st room-id
+                                           {:root-run-id run-id :limit 2}))))
+            "bounded subtree selection is root-first with ascending UUID ties")
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"do not combine"
+             (store/-list-runs st room-id
+                               {:root-run-id run-id
+                                :status :completed
+                                :limit 1}))))
       (is (thrown-with-msg?
            clojure.lang.ExceptionInfo
            #"immutable"

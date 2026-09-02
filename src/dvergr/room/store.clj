@@ -67,11 +67,15 @@
      This bounded lookup lets the authoritative Room derive and validate a
      reply's thread without trusting a client-supplied ancestor.")
 
-  (-list-messages [this room-id {:keys [limit since thread-root-id]}]
+  (-list-messages [this room-id {:keys [limit since thread-root-id run-ids message-ids]}]
     "Return messages in chronological order. :limit caps result size
      (default impl-specific); :since is an instant — only messages
      after that ts are returned; :thread-root-id restricts the result to one
-     topical projection before the limit is applied.")
+     topical projection before the limit is applied. :run-ids and :message-ids
+     select execution-correlated or exact envelope identities before limiting;
+     they are combined as a union and support bounded Run-tree observation.
+     Thread and execution projections are distinct query modes and cannot be
+     combined.")
 
   (-store-run! [this room-id run]
     "Create or update a durable Run projection owned by `room-id`. Run identity,
@@ -81,9 +85,12 @@
   (-load-run [this room-id run-id]
     "Return one durable Run by UUID when it belongs to `room-id`, else nil.")
 
-  (-list-runs [this room-id {:keys [limit status actor]}]
+  (-list-runs [this room-id {:keys [limit status actor root-run-id]}]
     "Return recent Runs, newest first. Optional :status and :actor filters are
-     applied before :limit."))
+     applied before :limit. :root-run-id restricts to that structural Run and
+     all descendants before limiting. Structural traversal cannot be combined
+     with :status or :actor; callers should project the bounded subtree and
+     filter it explicitly."))
 
 (defprotocol PResourceStore
   "Conserved resource authority cohabiting with durable Room control state.

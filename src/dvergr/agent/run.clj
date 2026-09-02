@@ -499,7 +499,10 @@
     (store/-load-run room-store (store-room-id room) run-id)))
 
 (defn runs
-  "List recent durable Runs from a Room store. Options: :limit, :status, :actor."
+  "List durable Runs from a Room store.
+
+   Options: :limit, :status, :actor, and :root-run-id. The structural root
+   restricts the query to that Run and descendants before applying the limit."
   ([room] (runs room {}))
   ([room opts]
    (if-let [room-store (:store room)]
