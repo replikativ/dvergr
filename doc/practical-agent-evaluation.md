@@ -142,6 +142,43 @@ The deterministic model contract exercises this complete path in CI. Live
 Codex/Claude candidates can use the same EnvironmentDef, evaluator and setup;
 only their AgentDefs and prompt policies differ.
 
+The first native Codex-subscription probe of this arena exposed two benchmark
+contract bugs before it passed. The portable task originally said only that a
+specialist returned a signal and that the root returned a plan ID, while the
+trusted verifier required full signal records and a `{:plan/id UUID}` result.
+Those shapes now live explicitly in the task data rather than only in hidden
+host code. The probe also showed that three provider exchanges and 30 seconds
+were accidental turn-like limits: Codex was still inspecting the unfamiliar
+SCI surface when the first attempt stopped. The environment now uses time and
+resource limits as its work budget and retains sixteen model exchanges only as
+a runaway fuse. With a 120-second limit, Codex queried the fork-local state,
+authored and ran both specialists, submitted the exact evidence, consumed one
+review unit, and passed all fifteen trusted checks in eight model exchanges.
+This is one successful discoverability probe, not yet a model-quality estimate.
+The same path is available from a fully initialized room REPL without exposing
+the raw trace to evaluated agents:
+
+```clojure
+(require '[dvergr.agent.arenas.renewal :as renewal]
+         '[dvergr.agent.arenas.renewal-bench :as renewal-bench])
+
+(renewal/provision-review-capacity! room 1)
+(def report
+  (renewal-bench/run!
+   room
+   {:id :codex-renewal
+    :provider :codex-subscription
+    :model "codex-subscription-sol"}))
+
+(get-in report [:scorecard :scorecard/summary])
+(:host/tool-trace report) ; host-only generated inputs and semantic outcomes
+```
+
+`run!` uses the caller's real Room and leaves its lifecycle with the caller. It
+does not manufacture a lighter pseudo-room or copy the experiment scheduler.
+Cleanup is joined before it returns or throws, and the diagnostic trace is
+restricted to the admitted root Run and its structural descendants.
+
 The comparison unit is now explicit. A DatasetDef fixes a non-empty ordered set
 of exact environments; an ExperimentDef fixes exact candidate AgentDef content
 and repetitions. Host-owned admission policy caps total attempts and

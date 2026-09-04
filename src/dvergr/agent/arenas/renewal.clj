@@ -27,6 +27,19 @@
 (def support-signal-id
   (hasch/uuid [:dvergr/renewal-signal arena-version account-id :support]))
 
+(def specialist-output-contracts
+  {:sales
+   {:record :renewal.signal
+    :exact-fields
+    [:renewal.signal/id :renewal.signal/source
+     :renewal.signal/kind :renewal.signal/value]}
+   :support
+   {:record :renewal.signal
+    :exact-fields
+    [:renewal.signal/id :renewal.signal/source
+     :renewal.signal/kind :renewal.signal/count
+     :renewal.signal/severity]}})
+
 (def arena-basis
   {:account {:id account-id
              :name "Acme"
@@ -50,14 +63,15 @@
   {:objective :propose-renewal-intervention
    :account account-id
    :specialists [{:id :sales :task :report-sales-evidence
-                  :returns :sales-signal}
+                  :returns (:sales specialist-output-contracts)}
                  {:id :support :task :report-support-evidence
-                  :returns :support-signal}]
+                  :returns (:support specialist-output-contracts)}]
    :coordination {:hire :both
                   :await :both
                   :use-returned-signal-ids-as-plan-evidence true}
    :submission-tool "renewal_plan"
-   :requires-resource-receipt true})
+   :requires-resource-receipt true
+   :result {:exact-shape {:plan/id :uuid}}})
 
 (def verification-contract
   {:setup :exact-scenario
@@ -67,7 +81,8 @@
    :children {:count 2 :actors #{:sales :support}
               :status :completed :settlement :merged
               :causality :all-results-observed
-              :results {:sales sales-signal-id :support support-signal-id}}
+              :results {:match :exact-seeded-record-by-actor
+                        :contracts specialist-output-contracts}}
    :tool {:name "renewal_plan" :completed-count 1}
    :resource {:kind :consume :unit review-unit :amount 1}
    :result :returns-plan-id
@@ -199,8 +214,9 @@
     :verifier {:id :business/renewal-intervention
                :version arena-version
                :basis {:scenario/content-id arena-content-id}}
-    :limits {:timeout-ms 30000 :cancel-timeout-ms 5000
-             :max-model-steps 3 :budget-dollars 2.0}
+    :limits {:timeout-ms 120000 :cancel-timeout-ms 10000
+             ;; A malfunction fuse, not the conversational work budget.
+             :max-model-steps 16 :budget-dollars 2.0}
     :world {:isolation :ctx
             :settlement :discard
             :resources {review-unit 1}
@@ -401,6 +417,9 @@
                   [(:run/actor child) (read-result (:run/value child))]))
            children)))
 
+(defn- returned-plan-match? [plan result]
+  (= {:plan/id (:renewal.plan/id plan)} result))
+
 (defn- attach-specialist-results [children messages]
   (mapv
    (fn [child]
@@ -492,7 +511,6 @@
              :charged-once? (and (= :consume (:kind receipt))
                                  (= #{review-unit} (set (keys (:resources receipt))))
                                  (== 1 (get (:resources receipt) review-unit 0)))
-             :returned-plan? (= (:renewal.plan/id plan)
-                                (or (:plan/id result) (:plan-id result)))}]
+             :returned-plan? (returned-plan-match? plan result)}]
         {:checks checks
          :reward (if (every? true? (vals checks)) 1.0 0.0)}))}))

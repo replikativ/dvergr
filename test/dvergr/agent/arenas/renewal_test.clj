@@ -89,7 +89,16 @@
         children-without-values (mapv #(dissoc % :run/value) real-children)]
     (is (= renewal/task-contract task))
     (is (= #{:sales :support} (set (map :id (:specialists task)))))
+    (is (= {:exact-shape {:plan/id :uuid}} (:result task)))
+    (is (every? #(= :renewal.signal (get-in % [:returns :record]))
+                (:specialists task)))
+    (is (every? #(not (contains? (:returns %) :required-fields))
+                (:specialists task)))
     (is (true? (#'renewal/specialist-results-match? real-children)))
+    (is (false? (#'renewal/specialist-results-match?
+                 (update-in real-children [0 :run/value]
+                            assoc :renewal.signal/extra true)))
+        "the visible exact-fields contract rejects extra child output")
     (is (false? (#'renewal/specialist-results-match?
                  (mapv #(assoc % :run/value nil) real-children)))
         "child topology without the specialists' returned evidence is insufficient")
@@ -100,7 +109,13 @@
                  (#'renewal/attach-specialist-results
                   children-without-values
                   (mapv #(assoc % :message/content-truncated? true) messages))))
-        "a truncated child body is never parsed or certified")))
+        "a truncated child body is never parsed or certified")
+    (let [id (random-uuid)
+          plan {:renewal.plan/id id}]
+      (is (true? (#'renewal/returned-plan-match? plan {:plan/id id})))
+      (is (false? (#'renewal/returned-plan-match? plan {:plan-id id})))
+      (is (false? (#'renewal/returned-plan-match?
+                   plan {:plan/id id :extra true}))))))
 
 (deftest setup-and-semantic-tool-use-the-real-fork-and-affine-book
   (with-production-room
