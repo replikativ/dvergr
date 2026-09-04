@@ -158,6 +158,20 @@ in three model steps, with exactly two completed children, an exact result, and
 zero active Runs. This is one smoke result, not a quality ranking; repetitions
 and held-out environments are required for comparative claims.
 
+The first repeated Codex subscription probe then ran
+`:programming/self-programming-v1` twice through the Experiment API. Each root
+used `clojure_eval` to author a Roster, hired three simulated specialists in
+isolated worlds, observed their results through Spindel, and computed the exact
+answer. Both Attempts passed all ten trusted checks in four model steps; the two
+root Runs and six child Runs quiesced, and the resulting 2/2 Scorecard
+round-tripped through the Room store. A deterministic model simulator now
+exercises that same complete path in CI—from the native LLM/tool loop through
+SCI-authored recursive hires, world settlement, trusted verification, Attempt
+certification, and durable Scorecard. Building that contract exposed and fixed
+an observation projection typo that had hidden `:run/world` identities, which
+is precisely the kind of harness failure these paired probes are intended to
+find.
+
 ## Port order driven by failures
 
 1. Complete scoped observation and expose it in the REPL/UI.

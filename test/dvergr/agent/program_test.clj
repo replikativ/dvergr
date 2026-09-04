@@ -25,7 +25,8 @@
             [org.replikativ.spindel.engine.context :as context]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.spin.combinators :as comb]
-            [org.replikativ.spindel.yggdrasil :as ygg]))
+            [org.replikativ.spindel.yggdrasil :as ygg])
+  (:import [java.util.concurrent ExecutorService Executors]))
 
 (defn- test-roster []
   (-> (roster/make-roster {:id :test-team})
@@ -866,6 +867,36 @@
               "cleanup errors are collected only after every lease unwinds")
           (is (= :discarded (:run/settlement-status result)))))
       (finally
+        (d/close-room! room)))))
+
+(deftest native-run-supervision-does-not-depend-on-clojure-send-off
+  (let [room (test-room :program-native-executor-isolation)
+        team (test-roster)
+        cleaned (promise)
+        original-executor clojure.lang.Agent/soloExecutor
+        ^ExecutorService rejecting-executor (Executors/newSingleThreadExecutor)]
+    ;; An already-shut-down executor rejects every future/send-off submission.
+    ;; Before Dvergr owned its native supervision executor, either prepared work
+    ;; or the blocking finalizer passed through Agent/soloExecutor and this Run
+    ;; could not reach a durable terminal result.
+    (.shutdownNow rejecting-executor)
+    (try
+      (set-agent-send-off-executor! rejecting-executor)
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [handle
+              (program/hire-prepared-in!
+               room room team :analyst
+               {:task :work :settlement :discard}
+               (fn [{register! :register-cleanup!}]
+                 (register! #(deliver cleaned true))))
+              result (deref handle 5000 ::timeout)]
+          (is (= :completed (:run/status result)))
+          (is (= :discarded (:run/settlement-status result)))
+          (is (= true (deref cleaned 5000 ::timeout)))
+          (is (empty? (run/active-runs (:id room))))))
+      (finally
+        (set-agent-send-off-executor! original-executor)
+        (.shutdownNow rejecting-executor)
         (d/close-room! room)))))
 
 (deftest cancellation-unwinds-every-resource-acquired-during-preparation
