@@ -342,6 +342,9 @@
                                   entries))))
       (invalid! "Scorecard contains duplicate experiment cells"
                 ::duplicate-scorecard-cells {}))
+    (when-not (= (count entries) (count (set (map :attempt/id entries))))
+      (invalid! "Scorecard repetitions must name distinct Attempts"
+                ::duplicate-scorecard-attempts {}))
     (let [scorecard {:scorecard/experiment experiment
                      :scorecard/entries entries
                      :scorecard/summary (summarize entries)}]
@@ -416,6 +419,9 @@
                                   entries))))
       (invalid! "Scorecard contains duplicate experiment cells"
                 ::duplicate-scorecard-cells {}))
+    (when-not (= (count entries) (count (set (map :attempt/id entries))))
+      (invalid! "Scorecard repetitions must name distinct Attempts"
+                ::duplicate-scorecard-attempts {}))
     (when-not (= (:scorecard/summary scorecard) (summarize entries))
       (invalid! "Scorecard summary does not match its entries"
                 ::scorecard-summary-mismatch {})))
