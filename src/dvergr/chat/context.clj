@@ -171,8 +171,10 @@
      chat-ctx - ChatContext
      message - Map with :role, :content, :tokens, etc."
   [chat-ctx message]
-  (let [msg-entity (schema/create-message-entity
-                    (assoc message :chat-id (:chat-id chat-ctx)))]
+  (let [opts (assoc message :chat-id (:chat-id chat-ctx))
+        msg-entity (if-let [conn (:db-conn chat-ctx)]
+                     (schema/create-message-entity! conn opts)
+                     (schema/create-message-entity opts))]
     ;; Update spindel signal (reactive)
     (binding [rtc/*execution-context* (selected-execution-context chat-ctx)]
       (swap! (:messages-signal chat-ctx) conj msg-entity))

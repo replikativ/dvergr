@@ -10,6 +10,7 @@
             [dvergr.code.index :as idx]
             [dvergr.tools.structural :as structural]
             [dvergr.chat.compaction :as compaction]
+            [dvergr.chat.tool-schema :as tool-schema]
             [muschel.fs :as mfs]
             [org.replikativ.spindel.engine.core :as rtc])
   (:import [java.util.concurrent TimeUnit]))
@@ -45,9 +46,21 @@
     (->> xs (map clojure.string/trim) (remove clojure.string/blank?) set not-empty)))
 
 (defn register!
-  "Register a tool in the registry."
+  "Register a tool in the registry.
+
+   A tool name also owns a durable Datahike attribute namespace. Re-registering
+   may add input properties, but cannot remove or change an existing durable
+   property. Use a new tool/schema version for an incompatible contract."
   [tool-def]
-  (swap! registry assoc (:name tool-def) tool-def))
+  (locking registry
+    (when-let [previous (get @registry (:name tool-def))]
+      (when-not (tool-schema/compatible-evolution? previous tool-def)
+        (throw (ex-info "Incompatible durable tool schema evolution; use a new tool name/version"
+                        {:type ::incompatible-tool-schema
+                         :tool-name (:name tool-def)
+                         :previous (:parameters previous)
+                         :proposed (:parameters tool-def)}))))
+    (swap! registry assoc (:name tool-def) tool-def)))
 
 (defn get-tool [name]
   (get @registry name))

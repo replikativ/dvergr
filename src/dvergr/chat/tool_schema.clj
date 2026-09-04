@@ -185,6 +185,28 @@
   (when (and name parameters (= "object" (:type parameters)))
     (generate-object-schema name [] parameters)))
 
+(defn compatible-evolution?
+  "True when `new-tool` is a monotonic durable-schema evolution of `old-tool`.
+
+   A tool name owns its generated Datahike attribute namespace. Once those
+   attributes contain data, their value type/cardinality cannot safely change
+   and an old attribute cannot disappear. Descriptions, handlers and
+   non-storage JSON-Schema constraints may change; new properties may be added."
+  [old-tool new-tool]
+  (let [durable-shape (fn [tool]
+                        (into {}
+                              (map (juxt :db/ident
+                                         #(select-keys % [:db/valueType
+                                                          :db/cardinality
+                                                          :db/isComponent
+                                                          :db/unique])))
+                              (or (generate-tool-schema tool) [])))
+        old-shape (durable-shape old-tool)
+        new-shape (durable-shape new-tool)]
+    (every? (fn [[ident shape]]
+              (= shape (get new-shape ident)))
+            old-shape)))
+
 ;; ============================================================================
 ;; Schema Installation
 ;; ============================================================================

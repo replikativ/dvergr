@@ -15,6 +15,7 @@
             [dvergr.room.store :as store]
             [dvergr.room.store.contract :as contract]
             [dvergr.room.store.datahike :as dhs]
+            [dvergr.tools :as tools]
             [hasch.core :as hasch]
             [kontor.resource :as kontor]))
 
@@ -550,6 +551,83 @@
         (is (= #{"grep" "read_file"}
                (set (map :tool-use/name (:tool-uses m))))
             "structured tool-uses round-trip through the store")))))
+
+(deftest late-registered-tool-input-schema-is-installed-on-first-use
+  (testing "a trusted semantic tool registered after Room provisioning remains durable"
+    (let [[conn st] (mem-store)
+          room-id :late-tool-schema
+          tool-name "late_bound_probe"
+          previous (tools/get-tool tool-name)
+          tool {:name tool-name
+                :description "late-bound test tool"
+                :parameters {:type "object"
+                             :properties {:value {:type "string"}}
+                             :required ["value"]}}]
+      (try
+        (store/-store-room! st room-id {:slug (name room-id) :title "T"})
+        (tools/register! tool)
+        (let [message-id (random-uuid)
+              tool-uses
+              (:message/tool-uses
+               (schema/create-message-entity
+                {:chat-id (random-uuid) :role :assistant :content ""
+                 :tool-uses [{:tool-use/id "late-1"
+                              :tool-use/name tool-name
+                              :tool-use/input {:value "durable"}}]}))]
+          (is (= :inserted
+                 (store/-store-message!
+                  st room-id
+                  {:id message-id :from :agent :content "late tool"
+                   :metadata {:role :assistant :tool-uses tool-uses}})))
+          (is (some? (dh/entity @conn :tool-input.late-bound-probe/value)))
+          (is (= "durable"
+                 (-> (store/-list-messages st room-id {}) first
+                     :metadata :tool-uses first :tool-use/input
+                     :tool-input.late-bound-probe/value)))
+          (tools/register!
+           (assoc-in tool [:parameters :properties :revision]
+                     {:type "integer"}))
+          (let [revised-tool-uses
+                (:message/tool-uses
+                 (schema/create-message-entity
+                  {:chat-id (random-uuid) :role :assistant :content ""
+                   :tool-uses [{:tool-use/id "late-2"
+                                :tool-use/name tool-name
+                                :tool-use/input {:value "again"
+                                                 :revision 2}}]}))]
+            (is (= :inserted
+                   (store/-store-message!
+                    st room-id
+                    {:id (random-uuid) :from :agent :content "revised tool"
+                     :metadata {:role :assistant
+                                :tool-uses revised-tool-uses}})))
+            (is (some? (dh/entity @conn
+                                  :tool-input.late-bound-probe/revision))
+                "a revised late-bound definition installs its added field")
+            (let [incompatible (assoc-in tool [:parameters :properties :value]
+                                         {:type "integer"})]
+              (is (= ::tools/incompatible-tool-schema
+                     (try
+                       (tools/register! incompatible)
+                       ::not-rejected
+                       (catch clojure.lang.ExceptionInfo e
+                         (:type (ex-data e)))))
+                  "a populated durable attribute cannot change type")
+              ;; Simulate registry drift from another process/version. An exact
+              ;; durable retry is still a duplicate and must not attempt the
+              ;; now-incompatible schema transaction first.
+              (locking tools/registry
+                (swap! tools/registry assoc tool-name incompatible))
+              (is (= :duplicate
+                     (store/-store-message!
+                      st room-id
+                      {:id message-id :from :agent :content "late tool"
+                       :metadata {:role :assistant :tool-uses tool-uses}}))))))
+        (finally
+          (locking tools/registry
+            (if previous
+              (swap! tools/registry assoc tool-name previous)
+              (swap! tools/registry dissoc tool-name))))))))
 
 (deftest plain-message-has-no-tool-uses-key
   (testing "a message without tool activity carries no :tool-uses key"

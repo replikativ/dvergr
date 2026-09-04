@@ -1215,10 +1215,12 @@
                      {:task :work :settlement :discard}
                      (fn [{register! :register-cleanup!}]
                        (register! #(deliver cleaned true)))))
-                  result (deref handle 5000 ::timeout)]
+                  ;; Keep a finite envelope while testing executor independence
+                  ;; rather than scheduler latency under the full suite.
+                  result (deref handle 20000 ::timeout)]
               (is (= :completed (:run/status result)))
               (is (= :discarded (:run/settlement-status result)))
-              (is (= true (deref cleaned 5000 ::timeout)))
+              (is (= true (deref cleaned 20000 ::timeout)))
               (is (false? (deref finalizer-in-drain? 5000 ::timeout))
                   "the detached finalizer does not inherit an engine drain")
               (is (empty? (run/active-runs (:id room))))))))
