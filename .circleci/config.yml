@@ -77,6 +77,10 @@ jobs:
       - run:
           name: Run tests (kaocha)
           command: clojure -M:test
+          # The dots reporter may produce no newline while a compilation-heavy
+          # namespace runs. Keep CircleCI's inactivity watchdog above the
+          # suite's bounded test waits; assertion failures still exit normally.
+          no_output_timeout: 20m
 
   build-harness:
     executor: clojure-java22
