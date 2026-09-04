@@ -350,6 +350,20 @@
    resource-setup-ref resource-environment
    renewal-risk-setup-ref renewal-risk-environment})
 
+(def ^:private trusted-world-setups
+  (into {}
+        (map (fn [ref]
+               [ref (evaluation/make-world-setup
+                     {:id (:setup/id ref)
+                      :version (:setup/version ref)
+                      :basis (:setup/basis ref)
+                      ;; The current Room factories establish their shared
+                      ;; baseline before the experiment. This exact per-Run
+                      ;; hook still closes the semantic setup gate and is where
+                      ;; fork-local scenario transactions compose next.
+                      :prepare (fn [_] {:setup/ref ref})})]))
+        [memory-setup-ref resource-setup-ref renewal-risk-setup-ref]))
+
 (def ^:private trusted-verifiers
   {#:verifier{:id :programming/join-checks-v1 :version 1} join-checks
    #:verifier{:id :programming/race-checks-v1 :version 1} race-checks
@@ -450,7 +464,7 @@
                 (contains? verifier :verifier/basis)
                 (assoc :basis (:verifier/basis verifier)))
               :limits (:environment/limits definition)
-              :world (-> world (dissoc :setup) (assoc :settlement :discard))}
+              :world (assoc world :settlement :discard)}
        (contains? definition :environment/metadata)
        (assoc :metadata (:environment/metadata definition))))))
 
@@ -591,8 +605,9 @@
                                    evaluator])))
                          definitions)]
     (experiment/run room team experiment-definition evaluators
-                    (select-keys opts [:parallelism :max-parallelism
-                                       :max-attempts]))))
+                    (assoc (select-keys opts [:parallelism :max-parallelism
+                                              :max-attempts])
+                           :world-setups trusted-world-setups))))
 
 (defn run-paired-experiment!
   "Convenience REPL entry point for a live paired experiment.

@@ -126,6 +126,14 @@ and Attempts remain the evidence of record. A leaderboard can later be a
 Datahike projection over admitted Scorecards rather than mutable benchmark
 state.
 
+An EnvironmentDef may also name an exact WorldSetup reference. The host
+resolves that reference before admitting any experiment cell, while the actual
+preparer runs separately for every cell inside its already-forked Run world.
+This makes fixture construction part of the reproducible environment identity
+without exposing live preparers or verifier authority to SCI. Shared substrate
+provisioning—such as opening a Datahike/Kontor arena or a managed browser—stays
+an outer resource lifecycle; fork-local scenario state belongs to WorldSetup.
+
 The first provider-free room-REPL probe on 2026-09-04 executed two echo
 candidates against two environments with two repetitions and parallelism two.
 It produced eight distinct durable Runs, eight certified Attempts, two 4/4

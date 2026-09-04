@@ -50,6 +50,27 @@
              :verifier/version (or version 1)}
       basis (assoc :verifier/basis basis))))
 
+(def ^:private setup-ref-keys #{:setup/id :setup/version :setup/basis})
+
+(defn- setup-ref! [setup]
+  (when-not (map? setup)
+    (invalid! "Environment world :setup must be an exact reference map"
+              ::invalid-setup {:setup setup}))
+  (when-let [unknown (seq (remove setup-ref-keys (keys setup)))]
+    (invalid! "Environment world :setup contains unknown keys"
+              ::unknown-setup-keys {:unknown (set unknown)}))
+  (when-not (keyword? (:setup/id setup))
+    (invalid! "World setup :setup/id must be a keyword"
+              ::invalid-setup-id {:id (:setup/id setup)}))
+  (positive-version! "World setup :setup/version" (:setup/version setup))
+  (when-not (roster/data-value? (:setup/basis setup))
+    (invalid! "World setup :setup/basis must contain only portable data"
+              ::non-portable-setup-basis {:basis (:setup/basis setup)}))
+  (cond-> {:setup/id (:setup/id setup)
+           :setup/version (:setup/version setup)}
+    (some? (:setup/basis setup))
+    (assoc :setup/basis (:setup/basis setup))))
+
 (defn make-environment
   "Construct a portable, content-addressed EnvironmentDef.
 
@@ -82,19 +103,22 @@
   (when-not (map? world)
     (invalid! "Environment :world must be a map"
               ::invalid-world {:world world}))
-  (when (and metadata (not (map? metadata)))
-    (invalid! "Environment :metadata must be a map"
-              ::invalid-metadata {:metadata metadata}))
-  (let [definition (cond-> {:environment/id id
-                            :environment/version version
-                            :environment/task task
-                            :environment/verifier (verifier-ref! verifier)
-                            :environment/limits limits
-                            :environment/world world}
-                     metadata (assoc :environment/metadata metadata))]
-    (assoc definition
-           :environment/content-id
-           (hasch/uuid [:dvergr/environment-definition definition]))))
+  (let [world (if (contains? world :setup)
+                (assoc world :setup (setup-ref! (:setup world)))
+                world)]
+    (when (and metadata (not (map? metadata)))
+      (invalid! "Environment :metadata must be a map"
+                ::invalid-metadata {:metadata metadata}))
+    (let [definition (cond-> {:environment/id id
+                              :environment/version version
+                              :environment/task task
+                              :environment/verifier (verifier-ref! verifier)
+                              :environment/limits limits
+                              :environment/world world}
+                       metadata (assoc :environment/metadata metadata))]
+      (assoc definition
+             :environment/content-id
+             (hasch/uuid [:dvergr/environment-definition definition])))))
 
 (defn validate-environment
   "Validate that `environment` is canonical portable data and that its content

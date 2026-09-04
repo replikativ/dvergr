@@ -242,10 +242,11 @@ authority:
 Coordinates are extensible strings; `"microUSD"` is merely the first installed
 unit. Kontor records the allocation and return as balanced, idempotent receipts,
 and its Datahike writer predicate rejects overdrafts or unreceipted changes.
-Allocation happens after durable Run admission but before the trigger or any
-program effect. If it fails, the Run is durably failed and no agent effect
-starts. After all owned work quiesces, unused resources return to the structural
-parent; recursive vectors therefore remain conserved across fork/join.
+Allocation happens after durable Run admission and persistence of its private
+causal trigger, but before any agent effect. If it fails, the Run is durably
+failed and no agent effect starts. After all owned work quiesces, unused
+resources return to the structural parent; recursive vectors therefore remain
+conserved across fork/join.
 
 SCI exposes only `agent/balance` and the `:resources` argument to `hire!`. It
 does not expose connections, minting, arbitrary transfers, or a way to redirect
@@ -349,11 +350,16 @@ runner resolves exact verifier and world-setup references and computes reward.
 The benchmark interpreter derives its timeout, cancellation grace, restrictive
 model-step and dollar limits, settlement policy, and resource grants from that
 validated definition. It rejects unsupported policy keys instead of silently
-certifying a different scenario. In particular, world `:setup` remains closed
-until the host supplies a versioned trusted setup resolver. Each attempt still
-receives a fresh Run ID, so content identity never collapses distinct
-executions. The current REPL benchmark reports retain both the exact definition
-and its compact reference.
+certifying a different scenario. A world `:setup` is an exact portable
+reference resolved to a process-local trusted `WorldSetup`; the preparer runs
+as supervised, cancellable host work against the already-forked candidate world
+after durable Run admission and its private causal trigger, but before resource
+allocation or model work. Setup failure/cancellation is audited on the Run but
+never scored as a candidate Attempt. Setup evidence is portable and visible
+only to the trusted observer. Missing or mismatched setup capabilities fail
+during experiment preflight. Each attempt still receives a fresh Run ID, so
+content identity never collapses distinct executions. The current REPL
+benchmark reports retain both the exact definition and its compact reference.
 
 Every opt-in REPL attempt returns a content-addressed `:attempt-receipt`. It binds the
 unique root Run to the exact EnvironmentDef, provider/model, exact assembled
@@ -467,8 +473,8 @@ levels:
    Reports retain individual checks, binary reward, generated SCI, leaked
    Runs/resources, model steps, token/cost usage, wall time, task version,
    model, typed allowlisted tool diagnostics, and a stable ID of the exact assembled system
-   prompt. Durable receipt
-   persistence, trusted-writer authorization, and settlement against a retained
+   prompt. Exact trusted world setup and durable receipt persistence now guard
+   the attempt; trusted-writer authorization and settlement against a retained
    benchmark world remain follow-ups.
 
 The initial model-facing task set should include pure roster specialization,

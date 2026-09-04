@@ -233,6 +233,19 @@
                                        :environment
                                        (environment/environment-ref definition)}))))
 
+(defn- world-setup! [world-setups definition]
+  (when-let [ref (get-in definition [:environment/world :setup])]
+    (or (get world-setups ref)
+        (invalid! "Experiment has no exact host WorldSetup for an environment"
+                  ::missing-world-setup
+                  {:setup ref
+                   :environment (environment/environment-ref definition)}))))
+
+(defn- cell-evaluation-opts [world-setups opts definition]
+  (if-let [setup (world-setup! world-setups definition)]
+    (assoc opts :world-setup setup)
+    opts))
+
 (defn- jobs [experiment]
   (for [candidate (:experiment/candidates experiment)
         definition (get-in experiment
@@ -242,12 +255,13 @@
      :environment definition
      :repetition repetition}))
 
-(defn- result-spin [room team evaluators opts job]
+(defn- result-spin [room team evaluators world-setups opts job]
   (let [definition (:environment job)
         candidate (:candidate job)
         evaluation-spin
         (evaluation/evaluate room team (:candidate/agent candidate)
-                             definition (evaluator! evaluators definition) opts)]
+                             definition (evaluator! evaluators definition)
+                             (cell-evaluation-opts world-setups opts definition))]
     (sp/spin
      (let [result (sp/await evaluation-spin)]
        (assoc result :experiment/job
@@ -438,24 +452,29 @@
    admission ceilings are preflighted before the Spin can admit a Run. Jobs and
    evaluation Spins are realized one bounded batch at a time. Options include
    ordinary evaluation `:from`/`:parent-run` plus host-owned `:parallelism`,
-   `:max-parallelism`, and `:max-attempts`. Experiment batches initially require
-   discard settlement; retained partial experiments need durable execution
-   identity and recovery first."
+   `:max-parallelism`, `:max-attempts`, and an exact `:world-setups` capability
+   map for environments that name setup references. Experiment batches
+   initially require discard settlement; retained partial experiments need
+   durable execution identity and recovery first."
   ([room team experiment evaluators]
    (run room team experiment evaluators {}))
   ([room team experiment evaluators
-    {:keys [parallelism max-parallelism max-attempts]
-     :or {parallelism 1 max-parallelism 16 max-attempts 256}
+    {:keys [parallelism max-parallelism max-attempts world-setups]
+     :or {parallelism 1 max-parallelism 16 max-attempts 256 world-setups {}}
      :as opts}]
    (validate-experiment experiment)
    (when-not (map? evaluators)
      (invalid! "Experiment evaluators must be a host capability map"
                ::invalid-evaluators {:evaluators evaluators}))
+   (when-not (map? world-setups)
+     (invalid! "Experiment WorldSetups must be a host capability map"
+               ::invalid-world-setups {:world-setups world-setups}))
    (doseq [candidate (:experiment/candidates experiment)]
      (exact-agent! team candidate))
    (doseq [definition (get-in experiment
                               [:experiment/dataset :dataset/environments])]
      (evaluator! evaluators definition)
+     (world-setup! world-setups definition)
      (when-not (= :discard (get-in definition
                                    [:environment/world :settlement]))
        (invalid! "Experiment batches currently require :discard settlement"
@@ -464,7 +483,8 @@
                   :settlement (get-in definition
                                       [:environment/world :settlement])})))
    (when-let [unknown (seq (remove #{:from :parent-run :parallelism
-                                     :max-parallelism :max-attempts}
+                                     :max-parallelism :max-attempts
+                                     :world-setups}
                                    (keys opts)))]
      (invalid! "Experiment contains unknown run options"
                ::unknown-run-options {:unknown (set unknown)}))
@@ -486,17 +506,20 @@
                        ::attempts-exceed-ceiling
                        {:attempt-count attempt-count
                         :max-attempts max-attempts}))
-         evaluation-opts (select-keys opts [:from :parent-run])
+         base-evaluation-opts (select-keys opts [:from :parent-run])
          ;; Validate every distinct candidate/environment pairing once before
          ;; execution. Repetitions are constructed lazily per bounded batch.
          _ (doseq [candidate (:experiment/candidates experiment)
                    definition (get-in experiment
                                       [:experiment/dataset
                                        :dataset/environments])]
-             (evaluation/evaluate room team (:candidate/agent candidate)
-                                  definition (evaluator! evaluators definition)
-                                  evaluation-opts))
-         spins (map #(result-spin room team evaluators evaluation-opts %)
+             (evaluation/evaluate
+              room team (:candidate/agent candidate)
+              definition (evaluator! evaluators definition)
+              (cell-evaluation-opts world-setups base-evaluation-opts
+                                    definition)))
+         spins (map #(result-spin room team evaluators world-setups
+                                  base-evaluation-opts %)
                     (jobs experiment))]
      (sp/spin
       (let [results (sp/await (run-batches spins parallelism))]

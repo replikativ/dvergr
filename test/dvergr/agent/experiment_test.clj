@@ -138,6 +138,26 @@
              clojure.lang.ExceptionInfo #"host admission ceiling"
              (experiment/run room team oversized
                              {(:ref exact-evaluator) exact-evaluator}))))
+      (let [setup-ref {:setup/id :test/experiment-fixture :setup/version 1}
+            setup-env
+            (environment-def/make-environment
+             {:id :test/setup
+              :task :setup
+              :verifier {:id :test/exact :version 1
+                         :basis "experiment-test:v1"}
+              :limits {:timeout-ms 2000 :cancel-timeout-ms 1000}
+              :world {:isolation :ctx :settlement :discard
+                      :setup setup-ref}})
+            setup-experiment
+            (experiment/make-experiment
+             {:id :test/setup
+              :dataset (experiment/make-dataset
+                        {:id :test/setup :environments [setup-env]})
+              :candidates [(roster/agent team :alpha)]})]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"no exact host WorldSetup"
+             (experiment/run room team setup-experiment
+                             {(:ref exact-evaluator) exact-evaluator}))))
       (is (thrown-with-msg?
            clojure.lang.ExceptionInfo #"parallelism exceeds"
            (experiment/run room team definition
@@ -145,6 +165,49 @@
                            {:parallelism 3 :max-parallelism 2})))
       (is (empty? (run/active-runs (:id room))))
       (finally
+        (d/close-room! room)))))
+
+(deftest experiment-applies-an-exact-world-setup-to-every-cell
+  (let [{:keys [team]} (fixture)
+        setup-ref {:setup/id :test/experiment-fixture :setup/version 1}
+        setup-env
+        (environment-def/make-environment
+         {:id :test/setup-cells
+          :task :setup-cells
+          :verifier {:id :test/exact :version 1
+                     :basis "experiment-test:v1"}
+          :limits {:timeout-ms 2000 :cancel-timeout-ms 1000}
+          :world {:isolation :ctx :settlement :discard :setup setup-ref}})
+        definition
+        (experiment/make-experiment
+         {:id :test/setup-cells
+          :dataset (experiment/make-dataset
+                    {:id :test/setup-cells :environments [setup-env]})
+          :candidates [(roster/agent team :alpha) (roster/agent team :beta)]
+          :repetitions 2})
+        prepared (atom [])
+        setup (evaluation/make-world-setup
+               {:id :test/experiment-fixture
+                :prepare (fn [{run-id :run/id}]
+                           (swap! prepared conj run-id)
+                           {:prepared run-id})})
+        room (d/make-room {:id :experiment-world-setups
+                           :store (memory/make)})]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [{:keys [attempts scorecard]}
+              @(experiment/run room team definition
+                               {(:ref exact-evaluator) exact-evaluator}
+                               {:parallelism 2
+                                :world-setups {setup-ref setup}})]
+          (is (= 4 (count attempts)))
+          (is (= 4 (count @prepared)))
+          (is (= (set (map :attempt/run-id attempts)) (set @prepared)))
+          (is (= 4 (count (:scorecard/entries scorecard))))
+          (is (every? #(= :discarded (:run/settlement-status %))
+                      (run/runs room {:limit 10})))))
+      (finally
+        (evaluation/await-cleanups! room 5000)
         (d/close-room! room)))))
 
 (deftest repeated-paired-experiment-composes-ordinary-certified-evaluations
