@@ -546,14 +546,15 @@
    admission ceilings are preflighted before the Spin can admit a Run. Jobs and
    evaluation Spins are realized one bounded batch at a time. Options include
    ordinary evaluation `:from`/`:parent-run` plus host-owned `:parallelism`,
-   `:max-parallelism`, `:max-attempts`, and an exact `:world-setups` capability
-   map for environments that name setup references. Experiment batches
+   `:max-parallelism`, `:max-attempts`, an optional process-local
+   `:cleanup-group`, and an exact `:world-setups` capability map for environments
+   that name setup references. Experiment batches
    initially require discard settlement; retained partial experiments need
    durable execution identity and recovery first."
   ([room team experiment evaluators]
    (run room team experiment evaluators {}))
   ([room team experiment evaluators
-    {:keys [parallelism max-parallelism max-attempts world-setups]
+    {:keys [parallelism max-parallelism max-attempts world-setups cleanup-group]
      :or {parallelism 1 max-parallelism 16 max-attempts 256 world-setups {}}
      :as opts}]
    (validate-experiment experiment)
@@ -578,7 +579,7 @@
                                       [:environment/world :settlement])})))
    (when-let [unknown (seq (remove #{:from :parent-run :parallelism
                                      :max-parallelism :max-attempts
-                                     :world-setups}
+                                     :world-setups :cleanup-group}
                                    (keys opts)))]
      (invalid! "Experiment contains unknown run options"
                ::unknown-run-options {:unknown (set unknown)}))
@@ -590,7 +591,10 @@
      (invalid! "Experiment parallelism exceeds the host admission ceiling"
                ::parallelism-exceeds-ceiling
                {:parallelism parallelism :max-parallelism max-parallelism}))
-   (let [attempt-count (* (count (:experiment/candidates experiment))
+   (let [cleanup-group (if (some? cleanup-group)
+                         cleanup-group
+                         (evaluation/cleanup-group))
+         attempt-count (* (count (:experiment/candidates experiment))
                           (count (get-in experiment
                                          [:experiment/dataset
                                           :dataset/environments]))
@@ -600,7 +604,8 @@
                        ::attempts-exceed-ceiling
                        {:attempt-count attempt-count
                         :max-attempts max-attempts}))
-         base-evaluation-opts (select-keys opts [:from :parent-run])
+         base-evaluation-opts (assoc (select-keys opts [:from :parent-run])
+                                     :cleanup-group cleanup-group)
          ;; Validate every distinct candidate/environment pairing once before
          ;; execution. Repetitions are constructed lazily per bounded batch.
          _ (doseq [candidate (:experiment/candidates experiment)
@@ -622,7 +627,8 @@
                              (persist-scorecard! room))]
           {:experiment experiment
            :execution {:parallelism parallelism
-                       :attempt-count attempt-count}
+                       :attempt-count attempt-count
+                       :cleanup-group cleanup-group}
            :results results
            :attempts (mapv :attempt results)
            :scorecard scorecard}))))))

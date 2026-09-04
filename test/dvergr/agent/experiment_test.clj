@@ -170,6 +170,12 @@
            (experiment/run room team definition
                            {(:ref exact-evaluator) exact-evaluator}
                            {:parallelism 3 :max-parallelism 2})))
+      (doseq [invalid-group [:not-a-uuid false]]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"Cleanup group must be a UUID"
+             (experiment/run room team definition
+                             {(:ref exact-evaluator) exact-evaluator}
+                             {:cleanup-group invalid-group}))))
       (is (empty? (run/active-runs (:id room))))
       (finally
         (d/close-room! room)))))
@@ -257,18 +263,23 @@
 (deftest repeated-paired-experiment-composes-ordinary-certified-evaluations
   (let [{:keys [team definition]} (fixture)
         room (d/make-room {:id :experiment-run :store (memory/make)})
-        evaluator-ref (:ref exact-evaluator)]
+        evaluator-ref (:ref exact-evaluator)
+        cleanup-group (evaluation/cleanup-group)]
     (try
       (binding [ec/*execution-context* (:ctx room)]
         (let [spin (experiment/run room team definition
                                    {evaluator-ref exact-evaluator}
-                                   {:parallelism 2})]
+                                   {:parallelism 2
+                                    :cleanup-group cleanup-group})]
           (is (empty? (run/active-runs (:id room)))
               "constructing the Experiment Spin admits no Runs")
           (let [{:keys [results attempts scorecard execution]} @spin]
             (try
               (is (= 8 (count results) (count attempts)))
-              (is (= {:parallelism 2 :attempt-count 8} execution))
+              (is (= {:parallelism 2
+                      :attempt-count 8
+                      :cleanup-group cleanup-group}
+                     execution))
               (is (= 8 (count (set (map :attempt/id attempts)))))
               (is (= 8 (count (:scorecard/entries scorecard))))
               (is (= [{:candidate/id :alpha :attempt-count 4

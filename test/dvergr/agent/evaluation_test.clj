@@ -57,6 +57,41 @@
         (do (Thread/sleep 5) (recur))
         :else false))))
 
+(deftest cleanup-groups-isolate-operation-failures
+  (let [room (test-room :cleanup-groups)
+        first-group (evaluation/cleanup-group)
+        second-group (evaluation/cleanup-group)
+        first-error (ex-info "first cleanup" {})
+        second-error (ex-info "second cleanup" {})
+        first-task (#'evaluation/start-task!
+                    room first-group #(throw first-error))
+        second-task (#'evaluation/start-task!
+                     room second-group #(throw second-error))]
+    (try
+      @(:gate first-task)
+      @(:gate second-task)
+      (let [failure (try
+                      (evaluation/await-cleanups-for! room first-group 1000)
+                      nil
+                      (catch clojure.lang.ExceptionInfo error error))]
+        (is (= :dvergr.agent.evaluation/cleanup-incomplete
+               (:type (ex-data failure))))
+        (is (= [first-error]
+               (mapv :error (:failures (ex-data failure))))))
+      (is (true? (evaluation/await-cleanups-for! room first-group 1000))
+          "the first group was consumed without touching the second")
+      (let [failure (try
+                      (evaluation/await-cleanups-for! room second-group 1000)
+                      nil
+                      (catch clojure.lang.ExceptionInfo error error))]
+        (is (= [second-error]
+               (mapv :error (:failures (ex-data failure))))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (evaluation/await-cleanups-for! room :not-a-uuid 1000)))
+      (is (true? (evaluation/await-cleanups! room 1000)))
+      (finally
+        (d/close-room! room)))))
+
 (defn- definition [id opts]
   (environment/make-environment
    (merge {:id id
