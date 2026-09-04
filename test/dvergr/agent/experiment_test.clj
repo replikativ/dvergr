@@ -141,6 +141,15 @@
                      clojure.lang.ExceptionInfo #"content ID"
                      (experiment/validate-scorecard
                       (assoc scorecard :scorecard/content-id (random-uuid))))))
+              (testing "one certified attempt cannot fill two repetitions"
+                (let [same-cell-results
+                      (-> results
+                          vec
+                          (assoc-in [1 :attempt] (:attempt (first results))))]
+                  (is (thrown-with-msg?
+                       clojure.lang.ExceptionInfo #"distinct Attempts"
+                       (experiment/make-scorecard definition
+                                                  same-cell-results)))))
               (finally
                 (doseq [result results]
                   (when-let [fork (some-> result :run/result :run/world
