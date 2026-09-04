@@ -105,11 +105,11 @@
    :candidate/agent-content-id (hasch/uuid agent)})
 
 (def ^:private experiment-spec-keys
-  #{:id :version :dataset :candidates :repetitions :parallelism :metadata})
+  #{:id :version :dataset :candidates :repetitions :metadata})
 (def ^:private experiment-keys
   #{:experiment/id :experiment/version :experiment/dataset
-    :experiment/candidates :experiment/repetitions :experiment/parallelism
-    :experiment/metadata :experiment/content-id})
+    :experiment/candidates :experiment/repetitions :experiment/metadata
+    :experiment/content-id})
 (def ^:private required-experiment-keys
   (disj experiment-keys :experiment/metadata))
 
@@ -119,9 +119,10 @@
    `:candidates` is a non-empty vector of AgentDefs. Each stored candidate binds
    its lightweight AgentRef to the hash of the complete definition. Every
    candidate is evaluated in every DatasetDef environment `:repetitions` times.
-   `:parallelism` is an explicit bounded execution policy and defaults to one."
-  [{:keys [id version dataset candidates repetitions parallelism metadata]
-    :or {version 1 repetitions 1 parallelism 1}
+   Concurrency and admission ceilings belong to host execution policy, not to
+   this agent-authorable definition."
+  [{:keys [id version dataset candidates repetitions metadata]
+    :or {version 1 repetitions 1}
     :as opts}]
   (when-let [unknown (seq (remove experiment-spec-keys (keys opts)))]
     (invalid! "Experiment contains unknown keys" ::unknown-experiment-keys
@@ -140,15 +141,13 @@
       (invalid! "Experiment candidate ids must be unique"
                 ::duplicate-candidates {:candidate-ids ids}))
     (positive-int! "Experiment :repetitions" repetitions)
-    (positive-int! "Experiment :parallelism" parallelism)
     (when (some? metadata) (portable-map! "Experiment :metadata" metadata))
     (let [definition
           (cond-> {:experiment/id id
                    :experiment/version version
                    :experiment/dataset dataset
                    :experiment/candidates candidates
-                   :experiment/repetitions repetitions
-                   :experiment/parallelism parallelism}
+                   :experiment/repetitions repetitions}
             (some? metadata) (assoc :experiment/metadata metadata))]
       (assoc definition :experiment/content-id
              (hasch/uuid [:dvergr/experiment-definition definition])))))
@@ -190,7 +189,6 @@
                 {:candidate-ids (mapv :candidate/id candidates)})))
   (positive-int! "Experiment :version" (:experiment/version experiment))
   (positive-int! "Experiment :repetitions" (:experiment/repetitions experiment))
-  (positive-int! "Experiment :parallelism" (:experiment/parallelism experiment))
   (when (contains? experiment :experiment/metadata)
     (portable-map! "Experiment :metadata" (:experiment/metadata experiment)))
   (when-not (and (keyword? (:experiment/id experiment))
@@ -236,21 +234,17 @@
                                        (environment/environment-ref definition)}))))
 
 (defn- jobs [experiment]
-  (vec
-   (for [candidate (:experiment/candidates experiment)
-         definition (get-in experiment
-                            [:experiment/dataset :dataset/environments])
-         repetition (range (:experiment/repetitions experiment))]
-     {:candidate candidate
-      :environment definition
-      :repetition repetition})))
+  (for [candidate (:experiment/candidates experiment)
+        definition (get-in experiment
+                           [:experiment/dataset :dataset/environments])
+        repetition (range (:experiment/repetitions experiment))]
+    {:candidate candidate
+     :environment definition
+     :repetition repetition}))
 
 (defn- result-spin [room team evaluators opts job]
   (let [definition (:environment job)
         candidate (:candidate job)
-        ;; Construct every evaluation Spin during experiment preflight. This
-        ;; validates evaluator capability identity and environment policy before
-        ;; the first batch can admit a Run.
         evaluation-spin
         (evaluation/evaluate room team (:candidate/agent candidate)
                              definition (evaluator! evaluators definition) opts)]
@@ -314,6 +308,8 @@
 (defn- entry-sort-key [entry]
   [(str (:candidate/id entry))
    (str (get-in entry [:environment :environment/id]))
+   (get-in entry [:environment :environment/version])
+   (str (get-in entry [:environment :environment/content-id]))
    (:repetition entry)])
 
 (declare validate-scorecard)
@@ -438,12 +434,19 @@
   "Return a lazy Spin for one complete ExperimentDef.
 
    `evaluators` is a host-owned map from exact verifier refs to Evaluator
-   capabilities. All candidates and evaluators are preflighted before the Spin
-   can admit a Run. Work is executed in bounded batches using Spindel. Options
-   are the ordinary evaluation options `:from` and `:parent-run`."
+   capabilities. All candidates, evaluators, environment policies, and host
+   admission ceilings are preflighted before the Spin can admit a Run. Jobs and
+   evaluation Spins are realized one bounded batch at a time. Options include
+   ordinary evaluation `:from`/`:parent-run` plus host-owned `:parallelism`,
+   `:max-parallelism`, and `:max-attempts`. Experiment batches initially require
+   discard settlement; retained partial experiments need durable execution
+   identity and recovery first."
   ([room team experiment evaluators]
    (run room team experiment evaluators {}))
-  ([room team experiment evaluators opts]
+  ([room team experiment evaluators
+    {:keys [parallelism max-parallelism max-attempts]
+     :or {parallelism 1 max-parallelism 16 max-attempts 256}
+     :as opts}]
    (validate-experiment experiment)
    (when-not (map? evaluators)
      (invalid! "Experiment evaluators must be a host capability map"
@@ -452,16 +455,54 @@
      (exact-agent! team candidate))
    (doseq [definition (get-in experiment
                               [:experiment/dataset :dataset/environments])]
-     (evaluator! evaluators definition))
-   (when-let [unknown (seq (remove #{:from :parent-run} (keys opts)))]
+     (evaluator! evaluators definition)
+     (when-not (= :discard (get-in definition
+                                   [:environment/world :settlement]))
+       (invalid! "Experiment batches currently require :discard settlement"
+                 ::retained-experiment-unsupported
+                 {:environment (environment/environment-ref definition)
+                  :settlement (get-in definition
+                                      [:environment/world :settlement])})))
+   (when-let [unknown (seq (remove #{:from :parent-run :parallelism
+                                     :max-parallelism :max-attempts}
+                                   (keys opts)))]
      (invalid! "Experiment contains unknown run options"
                ::unknown-run-options {:unknown (set unknown)}))
-   (let [spins (mapv #(result-spin room team evaluators opts %)
-                     (jobs experiment))]
+   (doseq [[label value] [["Experiment :parallelism" parallelism]
+                          ["Experiment :max-parallelism" max-parallelism]
+                          ["Experiment :max-attempts" max-attempts]]]
+     (positive-int! label value))
+   (when (> parallelism max-parallelism)
+     (invalid! "Experiment parallelism exceeds the host admission ceiling"
+               ::parallelism-exceeds-ceiling
+               {:parallelism parallelism :max-parallelism max-parallelism}))
+   (let [attempt-count (* (count (:experiment/candidates experiment))
+                          (count (get-in experiment
+                                         [:experiment/dataset
+                                          :dataset/environments]))
+                          (:experiment/repetitions experiment))
+         _ (when (> attempt-count max-attempts)
+             (invalid! "Experiment size exceeds the host admission ceiling"
+                       ::attempts-exceed-ceiling
+                       {:attempt-count attempt-count
+                        :max-attempts max-attempts}))
+         evaluation-opts (select-keys opts [:from :parent-run])
+         ;; Validate every distinct candidate/environment pairing once before
+         ;; execution. Repetitions are constructed lazily per bounded batch.
+         _ (doseq [candidate (:experiment/candidates experiment)
+                   definition (get-in experiment
+                                      [:experiment/dataset
+                                       :dataset/environments])]
+             (evaluation/evaluate room team (:candidate/agent candidate)
+                                  definition (evaluator! evaluators definition)
+                                  evaluation-opts))
+         spins (map #(result-spin room team evaluators evaluation-opts %)
+                    (jobs experiment))]
      (sp/spin
-      (let [results (sp/await
-                     (run-batches spins (:experiment/parallelism experiment)))]
+      (let [results (sp/await (run-batches spins parallelism))]
         {:experiment experiment
+         :execution {:parallelism parallelism
+                     :attempt-count attempt-count}
          :results results
          :attempts (mapv :attempt results)
          :scorecard (make-scorecard experiment results)})))))

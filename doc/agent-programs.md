@@ -404,8 +404,8 @@ Dataset acceptance, train/eval splits, particles, and proposal status are
 separate projections; none mutate certification.
 
 A `DatasetDef` groups exact EnvironmentDefs. An `ExperimentDef` binds that
-dataset to the complete Hasch identity of every candidate AgentDef, a repetition
-count, and bounded parallelism:
+dataset to the complete Hasch identity of every candidate AgentDef and a
+repetition count:
 
 ```clojure
 (let [dataset (agent/dataset
@@ -416,17 +416,21 @@ count, and bounded parallelism:
                    :dataset dataset
                    :candidates [(agent/lookup team :codex)
                                 (agent/lookup team :claude)]
-                   :repetitions 5
-                   :parallelism 2})]
+                   :repetitions 5})]
   ;; Host code supplies exact trusted Evaluator capabilities.
-  @(experiment/run room team experiment evaluator-map))
+  @(experiment/run room team experiment evaluator-map
+                   {:parallelism 2 :max-attempts 100}))
 ```
 
 Dataset and experiment construction is pure and available inside SCI. Execution
 and reward certification are host-only: an agent can propose the benchmark it
 should face, but it cannot install its verifier or certify itself. Before any
 Run is admitted, execution rejects a changed candidate definition or a missing
-exact Evaluator. It then composes ordinary evaluation Spins in bounded batches.
+exact Evaluator. Host policy—not agent-authored data—caps the attempt matrix and
+parallelism, then realizes ordinary evaluation Spins one bounded batch at a
+time. Batch execution initially accepts only `:discard` environments so a late
+failure cannot orphan earlier reviewable worlds without a recoverable partial
+experiment identity.
 The result contains every certified Attempt plus a content-addressed Scorecard
 with one entry per candidate/environment/repetition cell and deterministic
 per-candidate aggregates. Scorecards are immutable projections, not a mutable
