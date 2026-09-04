@@ -63,6 +63,10 @@ jobs:
     steps:
       - attach_workspace:
           at: ~/
+      - restore_cache:
+          keys:
+            - v1-deps-{{ checksum "deps.edn" }}
+            - v1-deps-
       - install-clojure
       - run:
           name: Check formatting (cljfmt)
@@ -73,6 +77,10 @@ jobs:
     steps:
       - attach_workspace:
           at: ~/
+      - restore_cache:
+          keys:
+            - v1-deps-{{ checksum "deps.edn" }}
+            - v1-deps-
       - install-clojure
       - run:
           name: Run tests (kaocha)
@@ -87,6 +95,10 @@ jobs:
     steps:
       - attach_workspace:
           at: ~/
+      - restore_cache:
+          keys:
+            - v1-deps-{{ checksum "deps.edn" }}
+            - v1-deps-
       - install-clojure
       - run:
           name: Build standalone harness uberjar
@@ -103,6 +115,10 @@ jobs:
     steps:
       - attach_workspace:
           at: ~/
+      - restore_cache:
+          keys:
+            - v1-deps-{{ checksum "deps.edn" }}
+            - v1-deps-
       - install-clojure
       - run:
           name: Deploy library jar to Clojars
