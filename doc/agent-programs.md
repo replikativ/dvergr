@@ -290,6 +290,42 @@ ceiling, so changing interface cannot mint provider authority. A trusted
 top-level Participant/tool context may delegate an LLM child; a paid AgentDef
 Run must first receive an eventual Kontor-backed provider allocation.
 
+## Scoped reflective observation
+
+The host REPL and a nested SCI harness use the same bounded projection over
+execution facts. From a hired program, `(agent/inspect)` returns the ambient Run
+and its structural descendants, correlated trigger/output/activity messages,
+active frontier, failures, settlement facts, and conserved balances when
+installed. It cannot enumerate its parent or siblings. A trusted Room operator
+uses `dvergr.clients.client/inspect-runs` with a nil scope to inspect the whole
+Room, or supplies a Run UUID to inspect exactly that subtree.
+
+```clojure
+(let [child (agent/hire! team :analyst {:task :renewal-risk})
+      _     (await (agent/result-spin child))
+      view  (agent/inspect)]
+  {:actors   (mapv :run/actor (:observation/runs view))
+   :frontier (:observation/frontier view)
+   :failures (:observation/failures view)})
+```
+
+The snapshot is a read model, not a second trace or mutable harness object.
+Durable Runs, Room messages, semantic activities, and Kontor receipts remain
+authoritative. Tool names and compact content previews are included; raw tool
+inputs are intentionally omitted. Per-message detail, total preview content,
+and live resource balances are independently capped because the value may enter
+an LLM context. A later reactive observer should fold the same facts into a
+Spindel signal rather than introduce another event family.
+
+SCI inspection also emits a correlated semantic observation receipt and returns
+its UUID. The durable activity is the audit projection; a bounded, single-use
+process-local issuance record supplies verifier authority, so writable Room data
+cannot forge proof that the trusted closure ran. This lets a live evaluator
+distinguish an actual inspection from generated code that merely mentions the
+API. A future cross-process verifier should replace the live issuance record
+with a governed signed receipt. The host snapshot remains a pure Room-operator
+query.
+
 ## Evaluation ladder
 
 An evaluation environment is an immutable `EnvironmentDef`, separate from any
@@ -417,7 +453,9 @@ queue/observe/restart, run-local cancellation, and reactive boundaries;
 `latest`/`serial`/`busy`/`parallel` work admission covers computation overlap as
 a separate FRP layer.
 Passing only one model is not sufficient evidence that the programming surface
-is clear.
+is clear. The broader business and machine-work portfolio, simulation ladder,
+and related Hermes reliability findings are tracked in
+[`practical-agent-evaluation.md`](practical-agent-evaluation.md).
 
 The first opt-in environments live in `dvergr.agent.program-bench` on the
 `:dev` classpath. They run through the production prompt, provider, tool, SCI,
@@ -430,6 +468,7 @@ their reports:
 (bench/run-race-v1! :claude-code "claude-code-sonnet")
 (bench/run-resource-v1! :codex-subscription "codex-subscription-sol")
 (bench/run-self-programming-v1! :codex-subscription "codex-subscription-sol")
+(bench/run-renewal-risk-v1! :codex-subscription "codex-subscription-sol")
 
 ;; The generic entry point makes the task/version explicit.
 (bench/run-environment! :programming/race-v1
@@ -439,7 +478,13 @@ their reports:
 It is an explicit REPL benchmark rather than a CI test because it is
 nondeterministic, needs local subscription authentication, and consumes model
 resources. Its language and lifecycle contracts are duplicated as
-provider-free deterministic tests. In the 2026-08-28 probe, Codex Sol and Claude
+provider-free deterministic tests. The renewal-risk environment is the first
+simulated business workflow: a model must construct sales/support specialists,
+join their evidence, and use scoped reflection while a private sibling Run
+exists in the control Room. Withheld Run and durable inspection-receipt UUIDs
+must be copied from the projection, so returning the right static business facts
+without actually inspecting cannot pass. The trusted verifier also checks the
+durable execution topology. In the 2026-08-28 probe, Codex Sol and Claude
 Code Sonnet each discovered the API, created and joined two child Runs, and
 returned the expected value with two `clojure_eval` calls. Earlier attempts
 exposed two real harness defects: the native interpreter omitted the shared

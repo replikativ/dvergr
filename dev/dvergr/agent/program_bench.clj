@@ -10,6 +10,7 @@
             [datahike.api :as dh]
             [dvergr.activity :as activity]
             [dvergr.agent.environment :as environment]
+            [dvergr.agent.observation :as observation]
             [dvergr.agent.program :as program]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.run :as run]
@@ -87,6 +88,35 @@
 (def expected-self-programming-v1
   {:answer 23 :particles 2 :verified true})
 
+(def renewal-risk-task-v1
+  (str "Use clojure_eval to build and execute a small business-analysis harness. "
+       "Construct an immutable roster with two cheap simulated specialists. "
+       "The :sales specialist is scripted to return "
+       "{:account :acme :renewal 120000 :days 14}. The :support specialist is "
+       "scripted to return {:account :acme :severity :high :open-critical 3}. "
+       "Hire and compositionally await both specialists. Then call "
+       "(agent/inspect) from this Run and derive its Run count, active count, "
+       "and actor set; do not guess them. Combine the evidence into exactly "
+       "this EDN shape, setting :scope to the UUID returned by "
+       ":observation/scope-run-id and :inspection to the UUID returned by "
+       ":observation/receipt-id rather than guessing either: "
+       "{:account :acme :risk :high :renewal 120000 "
+       ":open-critical 3 :observed-runs 3 :active 1 "
+       ":observed-actors #{:orchestrator :sales :support} "
+       ":scope <UUID> :inspection <UUID>}. "
+       "The host Room also "
+       "contains private work outside your structural Run tree; it must not "
+       "appear in agent/inspect. Execute the program rather than describing it."))
+
+(def expected-renewal-risk-v1
+  {:account :acme
+   :risk :high
+   :renewal 120000
+   :open-critical 3
+   :observed-runs 3
+   :active 1
+   :observed-actors #{:orchestrator :sales :support}})
+
 (defn- parse-edn [value]
   (when (string? value)
     (with-open [reader (PushbackReader. (StringReader. value))]
@@ -140,6 +170,32 @@
       :specialists-merged? (every? #(= :merged (:run/settlement-status %))
                                    child-runs)})))
 
+(defn- renewal-risk-checks
+  [{:keys [result parsed-value durable-status active-after root-run-id
+           root-causes child-runs inspection-receipts]}]
+  (let [owned (filterv #(= root-run-id (:run/parent %)) child-runs)
+        outside (remove #(= root-run-id (:run/parent %)) child-runs)
+        owned-ids (into #{} (map :run/id) owned)
+        reported (dissoc parsed-value :scope :inspection)]
+    {:root-completed? (= :completed (:run/status result))
+     :durably-completed? (= :completed durable-status)
+     :quiescent? (zero? active-after)
+     :business-result? (= expected-renewal-risk-v1 reported)
+     :scope-from-observation? (= root-run-id (:scope parsed-value))
+     :inspection-executed?
+     (and (contains? inspection-receipts (:inspection parsed-value))
+          (observation/consume-receipt! root-run-id
+                                        (:inspection parsed-value)))
+     :two-specialists? (= 2 (count owned))
+     :expected-specialists? (= #{:sales :support}
+                               (set (map :run/actor owned)))
+     :all-results-observed? (= owned-ids root-causes)
+     :specialists-completed? (every? #(= :completed (:run/status %)) owned)
+     :private-control-run-present? (= #{:private-audit}
+                                      (set (map :run/actor outside)))
+     :private-control-run-not-reported?
+     (not (contains? (:observed-actors parsed-value) :private-audit))}))
+
 (defn- receipt-view [receipt]
   (select-keys receipt [:id :kind :source :destination :resources]))
 
@@ -190,6 +246,13 @@
 
 (defn- memory-environment [room-id _definition]
   (let [room (d/make-room {:id room-id :store (memory/make)})]
+    {:room room
+     :close! #(d/close-room! room)}))
+
+(defn- renewal-risk-environment [room-id _definition]
+  (let [room (d/make-room {:id room-id :store (memory/make)})
+        private-run (run/start! room :private-audit (random-uuid) nil)]
+    (run/finish! (:run/id private-run) :completed)
     {:room room
      :close! #(d/close-room! room)}))
 
@@ -272,9 +335,13 @@
 (def ^:private resource-setup-ref
   {:setup/id :dvergr.environment/resource-room :setup/version 1})
 
+(def ^:private renewal-risk-setup-ref
+  {:setup/id :dvergr.environment/renewal-risk-room :setup/version 1})
+
 (def ^:private trusted-setups
   {memory-setup-ref memory-environment
-   resource-setup-ref resource-environment})
+   resource-setup-ref resource-environment
+   renewal-risk-setup-ref renewal-risk-environment})
 
 (def ^:private trusted-verifiers
   {#:verifier{:id :programming/join-checks-v1 :version 1} join-checks
@@ -282,7 +349,9 @@
    #:verifier{:id :programming/self-programming-checks-v1 :version 1}
    self-programming-checks
    #:verifier{:id :programming/resource-delegation-checks-v1 :version 1}
-   resource-checks})
+   resource-checks
+   #:verifier{:id :business/renewal-risk-checks-v1 :version 1}
+   renewal-risk-checks})
 
 (defn- environment-case
   [id task verifier-id expected & [{:keys [setup limits world metadata]}]]
@@ -328,7 +397,18 @@
                      {:setup resource-setup-ref
                       :limits {:room-resources {resource/microdollars 20000M}
                                :run-resources {resource/microdollars 10000M}}
-                      :metadata {:kind :conserved-resource-delegation}})})
+                      :metadata {:kind :conserved-resource-delegation}})
+
+   :business/renewal-risk-brief-v1
+   (environment-case :business/renewal-risk-brief-v1 renewal-risk-task-v1
+                     :business/renewal-risk-checks-v1
+                     expected-renewal-risk-v1
+                     {:setup renewal-risk-setup-ref
+                      :metadata {:kind :business-workflow
+                                 :domain :revenue-operations
+                                 :capabilities #{:delegation
+                                                 :scoped-observation
+                                                 :evidence-synthesis}}})})
 
 (defn environment-definition
   "Return the exact portable definition for a named benchmark environment."
@@ -413,6 +493,7 @@
             all-runs (run/runs room {:limit 20})
             messages (d/messages room {:limit 100})
             activity (filter #(= :_activity (:to %)) messages)
+            tool-trace (mapv activity/tool-trace-entry activity)
             parsed (parse-edn (:run/value result))
             root-run-id (program/run-id handle)
             child-runs (remove #(= root-run-id (:run/id %)) all-runs)
@@ -423,6 +504,17 @@
                          :room-id room-id
                          :root-run-id root-run-id
                          :child-runs child-runs
+                         :tool-calls tool-trace
+                         :inspection-receipts
+                         (into #{}
+                               (comp
+                                (mapcat activity/message-activities)
+                                (filter #(and (= root-run-id (:activity/run-id %))
+                                              (= :observation
+                                                 (:activity/kind %))
+                                              (= :inspect (:activity/verb %))))
+                                (map :activity/id))
+                               messages)
                          :active-after (count (run/active-runs room-id))}
             observation (merge observation
                                (when resource-observation
@@ -435,8 +527,6 @@
                                              :run/actor :run/status :run/error
                                              :run/settlement-status])
                             all-runs)
-            tool-trace
-            (mapv activity/tool-trace-entry activity)
             resources (when resource-observation
                         (select-keys observation
                                      [:room-balance :root-balance :child-balances
@@ -506,3 +596,8 @@
   "Run the model-authored particle and verifier environment."
   [provider model]
   (run-environment! :programming/self-programming-v1 provider model))
+
+(defn run-renewal-risk-v1!
+  "Run the first simulated business workflow and recursive-observation eval."
+  [provider model]
+  (run-environment! :business/renewal-risk-brief-v1 provider model))

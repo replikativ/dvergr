@@ -78,8 +78,14 @@
     (some #(when (= message-id (:id %)) (:thread-root-id %))
           (get-in @state [:messages room-id] [])))
 
-  (-list-messages [_ room-id {:keys [limit since thread-root-id]}]
+  (-list-messages [_ room-id {:keys [limit since thread-root-id
+                                     run-ids message-ids]}]
+    (when (and thread-root-id (or (some? run-ids) (some? message-ids)))
+      (throw (ex-info "Thread and execution message filters cannot be combined"
+                      {:type :room-store/incompatible-message-filters})))
     (let [all (get-in @state [:messages room-id] [])
+          selected-run-ids (set run-ids)
+          selected-message-ids (set message-ids)
           filtered (cond->> all
                      since
                      (filter #(let [t (:ts %)]
@@ -87,7 +93,13 @@
                                           (.getTime ^java.util.Date since)))))
 
                      thread-root-id
-                     (filter #(= thread-root-id (:thread-root-id %))))
+                     (filter #(= thread-root-id (:thread-root-id %)))
+
+                     (or (some? run-ids) (some? message-ids))
+                     (filter #(or (contains? selected-run-ids
+                                             (or (:run-id %)
+                                                 (get-in % [:metadata :run-id])))
+                                  (contains? selected-message-ids (:id %)))))
           n (or limit (count filtered))]
       (vec (take-last n filtered))))
 
@@ -107,15 +119,50 @@
   (-load-run [_ room-id run-id]
     (get-in @state [:runs room-id run-id]))
 
-  (-list-runs [_ room-id {:keys [limit status actor]}]
-    (->> (vals (get-in @state [:runs room-id] {}))
-         (filter #(if status (= status (:run/status %)) true))
-         (filter #(if actor (= actor (:run/actor %)) true))
-         (sort-by (juxt #(some-> ^java.util.Date (:run/started-at %) .getTime)
-                        #(str (:run/id %)))
-                  #(compare %2 %1))
-         (take (or limit 100))
-         vec))
+  (-list-runs [_ room-id {:keys [limit status actor root-run-id]}]
+    (when (and root-run-id (or status actor))
+      (throw (ex-info "Structural Run queries do not combine with status/actor"
+                      {:type :room-store/incompatible-run-filters
+                       :root-run-id root-run-id :status status :actor actor})))
+    (let [runs (vals (get-in @state [:runs room-id] {}))
+          n (or limit 100)
+          visible-runs
+          (when root-run-id
+            (when-let [root (some #(when (= root-run-id (:run/id %)) %) runs)]
+              (loop [selected [root]
+                     frontier [root-run-id]]
+                (let [remaining (- n (count selected))]
+                  (if (or (zero? remaining) (empty? frontier))
+                    selected
+                    (let [parents (set frontier)
+                          children
+                          (->> runs
+                               (filter #(contains? parents (:run/parent %)))
+                               (sort
+                                (fn [left right]
+                                  (let [left-time
+                                        (some-> ^java.util.Date
+                                         (:run/started-at left) .getTime)
+                                        right-time
+                                        (some-> ^java.util.Date
+                                         (:run/started-at right) .getTime)
+                                        time-order (compare right-time left-time)]
+                                    (if (zero? time-order)
+                                      (compare (str (:run/id left))
+                                               (str (:run/id right)))
+                                      time-order))))
+                               (take remaining)
+                               vec)]
+                      (recur (into selected children)
+                             (mapv :run/id children))))))))]
+      (->> (if root-run-id visible-runs runs)
+           (filter #(if status (= status (:run/status %)) true))
+           (filter #(if actor (= actor (:run/actor %)) true))
+           (sort-by (juxt #(some-> ^java.util.Date (:run/started-at %) .getTime)
+                          #(str (:run/id %)))
+                    #(compare %2 %1))
+           (take n)
+           vec)))
 
   store/PAttemptStore
 

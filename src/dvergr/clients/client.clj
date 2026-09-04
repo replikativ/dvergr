@@ -33,6 +33,7 @@
             [dvergr.discourse :as d]
             [dvergr.discourse.personas :as personas]
             [dvergr.agent.run :as run]
+            [dvergr.agent.observation :as observation]
             [dvergr.room.registry :as rreg]
             [dvergr.ops :as ops]
             [dvergr.orchestration.skills :as skills]
@@ -136,6 +137,13 @@
   "Recent durable Runs for a Room, newest first."
   ([room] (run/runs room))
   ([room opts] (run/runs room opts)))
+
+(defn inspect-runs
+  "Inspect a Room execution tree. With `scope-run-id`, restrict the projection
+   to that Run and its structural descendants; nil is the Room-operator view."
+  ([room] (observation/snapshot room nil))
+  ([room scope-run-id] (observation/snapshot room scope-run-id))
+  ([room scope-run-id opts] (observation/snapshot room scope-run-id opts)))
 
 (defn cancel-run!
   "Cooperatively cancel one live Run by UUID."

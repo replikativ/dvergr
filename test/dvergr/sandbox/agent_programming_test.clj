@@ -1,6 +1,8 @@
 (ns dvergr.sandbox.agent-programming-test
   "Provider-free acceptance tests for the functional agent surface in room SCI."
   (:require [clojure.test :refer [deftest is testing]]
+            [dvergr.activity :as activity]
+            [dvergr.agent.observation :as observation]
             [dvergr.agent.program :as program]
             [dvergr.agent.run :as run]
             [dvergr.agent.world :as world]
@@ -665,6 +667,71 @@
                  (:run/caused-by (run/run room parent-id))))))
       (finally
         (run/finish! parent-id :completed)
+        (d/close-room! room)))))
+
+(deftest nested-sci-harness-inspects-only-its-run-tree
+  (let [room       (d/make-room {:id :sci-agent-scoped-inspection
+                                 :store (memory/make)})
+        sci-ctx    (sandbox/fork-for-session (:ctx room))
+        parent-id  (:run/id (run/start! room :orchestrator (random-uuid) nil))
+        sibling-id (:run/id (run/start! room :private-sibling (random-uuid) nil))]
+    (try
+      (agent-ns/add-programming-ns!
+       sci-ctx (:id room) (:ctx room)
+       {:program-kinds #{:echo :scripted}
+        :parent-run parent-id})
+      (let [result
+            (binding [ec/*execution-context* (:ctx room)]
+              (sandbox/eval-code
+               sci-ctx
+               (str
+                "(require '[dvergr.agent :as agent] "
+                "         '[org.replikativ.spindel.spin.cps :refer [spin]] "
+                "         '[org.replikativ.spindel.effects.await :refer [await]]) "
+                "(let [team (agent/make-agent (agent/roster) "
+                "                             {:id :analyst :program {:kind :echo}}) "
+                "      child (agent/hire! team :analyst {:task :renewal-risk})] "
+                "  @(spin (await (agent/result-spin child))) "
+                "  (let [view (agent/inspect)] "
+                "    {:scope (:observation/scope-run-id view) "
+                "     :receipt (:observation/receipt-id view) "
+                "     :actors (mapv :run/actor (:observation/runs view)) "
+                "     :runs (get-in view [:observation/summary :runs])}))")))]
+        (is (:success result) (pr-str (:error result)))
+        (is (= parent-id (get-in result [:value :scope])))
+        (is (= [:orchestrator :analyst] (get-in result [:value :actors])))
+        (is (= 2 (get-in result [:value :runs])))
+        (is (not-any? #{:private-sibling} (get-in result [:value :actors])))
+        (is (some #(= (get-in result [:value :receipt]) (:activity/id %))
+                  (mapcat activity/message-activities
+                          (d/messages room {:limit 20}))))
+        (is (false? (observation/consume-receipt! parent-id (random-uuid)))
+            "writable Room activity alone cannot mint verifier authority")
+        (is (observation/consume-receipt!
+             parent-id (get-in result [:value :receipt])))
+        (is (false? (observation/consume-receipt!
+                     parent-id (get-in result [:value :receipt])))
+            "inspection proof is single-use"))
+      (finally
+        (run/finish! parent-id :completed)
+        (run/finish! sibling-id :completed)
+        (d/close-room! room)))))
+
+(deftest sci-inspection-without-an-ambient-run-fails-closed
+  (let [room (d/make-room {:id :sci-agent-unscoped-inspection
+                           :store (memory/make)})
+        sci-ctx (sandbox/fork-for-session (:ctx room))]
+    (try
+      (agent-ns/add-programming-ns!
+       sci-ctx (:id room) (:ctx room) {:program-kinds #{:echo}})
+      (let [result (binding [ec/*execution-context* (:ctx room)]
+                     (sandbox/eval-code
+                      sci-ctx
+                      "(require '[dvergr.agent :as agent]) (agent/inspect)"))]
+        (is (false? (:success result)))
+        (is (re-find #"requires an ambient Run scope"
+                     (str (:error result)))))
+      (finally
         (d/close-room! room)))))
 
 (deftest sandbox-cannot-redirect-structural-parent-authority

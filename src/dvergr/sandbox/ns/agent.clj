@@ -62,6 +62,12 @@
         environment-ref* (requiring-resolve 'dvergr.agent.environment/environment-ref)
         hire-in*       (requiring-resolve 'dvergr.agent.program/hire-in!)
         observe*       (requiring-resolve 'dvergr.agent.program/observe)
+        snapshot*      (requiring-resolve 'dvergr.agent.observation/snapshot)
+        issue-receipt* (requiring-resolve 'dvergr.agent.observation/issue-receipt!)
+        revoke-receipt* (requiring-resolve 'dvergr.agent.observation/revoke-receipt!)
+        lifecycle-activity* (requiring-resolve 'dvergr.activity/lifecycle-activity)
+        message*       (requiring-resolve 'dvergr.discourse/message)
+        post*          (requiring-resolve 'dvergr.discourse/post!)
         cancel*        (requiring-resolve 'dvergr.agent.program/cancel!)
         run-id*        (requiring-resolve 'dvergr.agent.program/run-id)
         result-spin*   (requiring-resolve 'dvergr.agent.program/result-spin)
@@ -136,6 +142,39 @@
                                control-room (control-room! work-room)]
                            (binding [ec/*execution-context* (:ctx work-room)]
                              (observe* control-room handle-or-id))))
+        inspect-fn     (fn inspect-fn
+                         ([] (inspect-fn {}))
+                         ([opts]
+                          (let [work-room (room!)
+                                control-room (control-room! work-room)
+                                scope-run-id (:parent-run agent-program-ceiling)]
+                            (when-not scope-run-id
+                              (throw
+                               (ex-info
+                                "agent/inspect requires an ambient Run scope"
+                                {:type ::inspection-scope-required})))
+                            (binding [ec/*execution-context* (:ctx work-room)]
+                              (let [view (snapshot* control-room scope-run-id opts)
+                                    receipt-id (issue-receipt* scope-run-id)
+                                    receipt
+                                    (assoc
+                                     (lifecycle-activity*
+                                      scope-run-id :observation :inspect
+                                      :completed nil)
+                                     :activity/id receipt-id)]
+                                (try
+                                  (post* control-room
+                                         (message*
+                                          :system :_activity
+                                          "Inspected scoped execution tree"
+                                          nil
+                                          {:role :tool
+                                           :run-id scope-run-id
+                                           :activities [receipt]}))
+                                  (assoc view :observation/receipt-id receipt-id)
+                                  (catch Throwable error
+                                    (revoke-receipt* scope-run-id receipt-id)
+                                    (throw error))))))))
         cancel-fn      (fn [handle-or-id]
                          ;; Run cancellation tokens are process-local. Binding
                          ;; the Room ctx keeps this boundary consistent with
@@ -174,6 +213,7 @@
         'room-id      (fn [] (:id (room!)))
         'hire!        hire-fn
         'observe      observe-fn
+        'inspect      inspect-fn
         'cancel!      cancel-fn
         'balance      balance-fn
         'run-id       run-id*
@@ -191,6 +231,7 @@
          room-id      [([]) "Return the live identity of the current Room/world. In an isolated fork this is the child Room, not its parent."]
          hire!        [([roster agent-ref opts]) "Durably start one owned AgentDef in the current Room: (hire! team :a {:task value :resources {\"microUSD\" 1000}}). Returns a RunHandle. The current Run remains responsible for the child even if the handle is ignored; opts may also include :from, :settlement, and a positive conserved :resources vector split from the current Run/Room."]
          observe      [([handle-or-run-id]) "Read the current Room's durable Run projection for a RunHandle or UUID."]
+         inspect      [([] [opts]) "Inspect the current Run and its structural descendants as one bounded snapshot of Runs, frontier, correlated messages, semantic activities, failures, and conserved balances. Inside a hired agent this cannot see parent or sibling Runs, and inspection without an ambient Run fails closed. A durable semantic receipt identifies the inspection. Options: :run-limit, :message-limit, :content-limit, :content-budget, :detail-limit."]
          cancel!      [([handle-or-run-id]) "Request cooperative cancellation of exactly one live Run. Returns true when the Run was found."]
          balance      [([]) "Return the conserved resource vector available to the current Run, or the Room root at top level."]
          run-id       [([handle]) "Return the durable Run UUID represented by a RunHandle."]

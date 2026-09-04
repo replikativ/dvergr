@@ -644,18 +644,24 @@
               (:message/in-reply-to message)
               (:message/id message))))))
 
-  (-list-messages [_ room-id {:keys [limit since thread-root-id]}]
+  (-list-messages [_ room-id {:keys [limit since thread-root-id
+                                     run-ids message-ids]}]
+    (when (and thread-root-id (or (some? run-ids) (some? message-ids)))
+      (throw (ex-info "Thread and execution message filters cannot be combined"
+                      {:type :room-store/incompatible-message-filters})))
     (let [slug (store/room-id->slug room-id)]
       (when-let [ent (room-by-slug conn slug)]
         (let [chat-id (:chat/id ent)
+              n (or limit 100)
               ;; Resolve matching entity ids in Datalog before pulling message
               ;; bodies. In particular, the indexed thread root now bounds the
               ;; amount of data crossing the store boundary instead of loading
               ;; the whole Room and filtering it in Clojure. The two legacy
               ;; branches retain compatibility only for rows written before the
               ;; typed root existed.
-              message-ids
-              (if thread-root-id
+              thread-message-eids
+              (cond
+                thread-root-id
                 (dh/q '[:find [?m ...]
                         :in $ ?cid ?root
                         :where
@@ -668,13 +674,66 @@
                                  (and [?m :message/in-reply-to ?root]
                                       (not [?m :message/thread-root-id _])))]
                       @conn chat-id thread-root-id)
+
+                (or (some? run-ids) (some? message-ids))
+                nil
+
+                :else
                 (dh/q '[:find [?m ...]
                         :in $ ?cid
                         :where
                         [?c :chat/id ?cid]
                         [?m :message/chat ?c]]
                       @conn chat-id))
-              base    (dh/pull-many @conn message-pull-pattern message-ids)
+              execution-message-eids
+              (when (or (some? run-ids) (some? message-ids))
+                (let [run-rows
+                      (when (seq run-ids)
+                        (dh/q
+                         {:query
+                          '[:find ?m ?created ?id
+                            :in $ ?cid [?rid ...]
+                            :where
+                            [?c :chat/id ?cid]
+                            [?m :message/chat ?c]
+                            [?m :message/run-id ?rid]
+                            [?m :message/created-at ?created]
+                            [?m :message/id ?id]]
+                          :args [@conn chat-id (vec run-ids)]
+                          :order-by '[?created :desc ?id :asc]
+                          :limit n}))
+                      exact-rows
+                      (when (seq message-ids)
+                        (dh/q
+                         {:query
+                          '[:find ?m ?created ?id
+                            :in $ ?cid [?id ...]
+                            :where
+                            [?c :chat/id ?cid]
+                            [?m :message/chat ?c]
+                            [?m :message/id ?id]
+                            [?m :message/created-at ?created]]
+                          :args [@conn chat-id (vec message-ids)]
+                          :order-by '[?created :desc ?id :asc]
+                          :limit n}))]
+                  (->> (concat run-rows exact-rows)
+                       distinct
+                       (sort (fn [[_ left-time left-id]
+                                  [_ right-time right-id]]
+                               (let [time-order (compare right-time left-time)]
+                                 (if (zero? time-order)
+                                   (compare (str left-id) (str right-id))
+                                   time-order))))
+                       (take n)
+                       (mapv first))))
+              selected-message-eids
+              (cond
+                (nil? thread-message-eids) execution-message-eids
+                (some? execution-message-eids)
+                (filterv (set execution-message-eids) thread-message-eids)
+                :else thread-message-eids)
+              base    (dh/pull-many @conn message-pull-pattern
+                                    selected-message-eids)
               sorted  (sort-by #(.getTime (or (:message/created-at %)
                                               (java.util.Date. 0))) base)
               filtered (if since
@@ -810,15 +869,54 @@
                       @conn (:chat/id ent) run-id run-pull-pattern)
                 entity->run))))
 
-  (-list-runs [_ room-id {:keys [limit status actor]}]
+  (-list-runs [_ room-id {:keys [limit status actor root-run-id]}]
+    (when (and root-run-id (or status actor))
+      (throw (ex-info "Structural Run queries do not combine with status/actor"
+                      {:type :room-store/incompatible-run-filters
+                       :root-run-id root-run-id :status status :actor actor})))
     (let [slug (store/room-id->slug room-id)]
       (if-let [ent (room-by-slug conn slug)]
-        (->> (dh/q '[:find [(pull ?r pattern) ...]
-                     :in $ ?chat-id pattern
-                     :where
-                     [?c :chat/id ?chat-id]
-                     [?r :run/chat ?c]]
-                   @conn (:chat/id ent) run-pull-pattern)
+        (->> (if root-run-id
+               (let [db @conn
+                     chat-id (:chat/id ent)
+                     n (or limit 100)
+                     root (dh/q '[:find (pull ?r pattern) .
+                                  :in $ ?chat-id ?root-id pattern
+                                  :where
+                                  [?c :chat/id ?chat-id]
+                                  [?r :run/chat ?c]
+                                  [?r :run/id ?root-id]]
+                                db chat-id root-run-id run-pull-pattern)]
+                 (if-not root
+                   []
+                   (loop [selected [root]
+                          frontier [root-run-id]]
+                     (let [remaining (- n (count selected))]
+                       (if (or (zero? remaining) (empty? frontier))
+                         selected
+                         (let [rows
+                               (dh/q
+                                {:query
+                                 '[:find (pull ?r pattern) ?started ?id
+                                   :in $ ?chat-id [?parent-id ...] pattern
+                                   :where
+                                   [?c :chat/id ?chat-id]
+                                   [?r :run/chat ?c]
+                                   [?r :run/parent ?parent-id]
+                                   [?r :run/started-at ?started]
+                                   [?r :run/id ?id]]
+                                 :args [db chat-id frontier run-pull-pattern]
+                                 :order-by '[?started :desc ?id :asc]
+                                 :limit remaining})
+                               children (mapv first rows)]
+                           (recur (into selected children)
+                                  (mapv :run/id children))))))))
+               (dh/q '[:find [(pull ?r pattern) ...]
+                       :in $ ?chat-id pattern
+                       :where
+                       [?c :chat/id ?chat-id]
+                       [?r :run/chat ?c]]
+                     @conn (:chat/id ent) run-pull-pattern))
              (map entity->run)
              (filter #(if status (= status (:run/status %)) true))
              (filter #(if actor (= actor (:run/actor %)) true))
