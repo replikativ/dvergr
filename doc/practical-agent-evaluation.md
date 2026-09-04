@@ -112,6 +112,36 @@ private work exists in the same control Room. Its deterministic SCI contract and
 trusted model-backed verifier establish the recursive boundary before real CRM,
 support, scheduling, or delivery effects are added.
 
+`dvergr.agent.arenas.renewal` is the first consequential state-backed successor.
+Its exact WorldSetup seeds an account and sales/support signals inside every
+candidate Run world. A candidate must hire both specialists, obtain their actual
+results, and call the semantic `renewal_plan` tool with the exact evidence IDs.
+That tool validates the fork-local business state, consumes one conserved
+`renewal-review` unit from the Run wallet, and writes the proposed intervention
+only into the disposable candidate world. The trusted evaluator then checks the
+plan, Run topology, causal observation, tool activity, resource receipt, and
+returned result before discard settlement. Static prose cannot pass it.
+
+The host composes it from ordinary definitions rather than a special arena
+scheduler:
+
+```clojure
+(require '[dvergr.agent.arenas.renewal :as renewal]
+         '[dvergr.agent.experiment :as experiment])
+
+(renewal/register-tool!)
+(renewal/provision-review-capacity! room candidate-cells)
+
+@(experiment/run
+  room roster experiment-def
+  {renewal/verifier-ref (renewal/evaluator)}
+  {:world-setups {renewal/setup-ref (renewal/world-setup)}})
+```
+
+The deterministic model contract exercises this complete path in CI. Live
+Codex/Claude candidates can use the same EnvironmentDef, evaluator and setup;
+only their AgentDefs and prompt policies differ.
+
 The comparison unit is now explicit. A DatasetDef fixes a non-empty ordered set
 of exact environments; an ExperimentDef fixes exact candidate AgentDef content
 and repetitions. Host-owned admission policy caps total attempts and
