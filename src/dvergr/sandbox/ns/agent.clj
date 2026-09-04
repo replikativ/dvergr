@@ -238,7 +238,7 @@
          environment-ref [([environment]) "Return the stable logical/version/content reference for one exact EnvironmentDef. Individual execution Run IDs remain unique."]
          dataset      [([spec]) "Create a portable DatasetDef from a non-empty vector of exact EnvironmentDefs. Dataset construction is pure and content-addressed."]
          dataset-ref  [([dataset]) "Return the stable logical/version/content reference for one exact DatasetDef."]
-         experiment   [([spec]) "Create a portable full-factorial ExperimentDef. Requires a DatasetDef and a non-empty vector of AgentDefs; repetitions and bounded parallelism default to one. Candidates bind the exact AgentDef content, not only id/version."]
+         experiment   [([spec]) "Create a portable full-factorial ExperimentDef. Requires a DatasetDef and a non-empty vector of AgentDefs; repetitions default to one. Candidates bind exact AgentDef content. Concurrency and admission ceilings remain host policy."]
          experiment-ref [([experiment]) "Return the stable logical/version/content reference for one exact ExperimentDef. Running and trusted scoring remain host-owned capabilities."]
          room-id      [([]) "Return the live identity of the current Room/world. In an isolated fork this is the child Room, not its parent."]
          hire!        [([roster agent-ref opts]) "Durably start one owned AgentDef in the current Room: (hire! team :a {:task value :resources {\"microUSD\" 1000}}). Returns a RunHandle. The current Run remains responsible for the child even if the handle is ignored; opts may also include :from, :settlement, and a positive conserved :resources vector split from the current Run/Room."]

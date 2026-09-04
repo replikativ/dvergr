@@ -1,5 +1,6 @@
 (ns dvergr.agent.experiment-test
   (:require [clojure.test :refer [deftest is testing]]
+            [dvergr.agent.environment :as environment-def]
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.experiment :as experiment]
             [dvergr.agent.roster :as roster]
@@ -8,15 +9,19 @@
             [dvergr.room.registry :as registry]
             [dvergr.room.store :as store]
             [dvergr.room.store.memory :as memory]
+            [hasch.core :as hasch]
             [org.replikativ.spindel.engine.core :as ec]))
 
-(defn- environment [id task]
-  ((requiring-resolve 'dvergr.agent.environment/make-environment)
-   {:id id
-    :task task
-    :verifier {:id :test/exact :version 1 :basis "experiment-test:v1"}
-    :limits {:timeout-ms 2000 :cancel-timeout-ms 1000}
-    :world {:isolation :ctx :settlement :review}}))
+(defn- environment
+  ([id task] (environment id 1 task))
+  ([id version task]
+   (environment-def/make-environment
+    {:id id
+     :version version
+     :task task
+     :verifier {:id :test/exact :version 1 :basis "experiment-test:v1"}
+     :limits {:timeout-ms 2000 :cancel-timeout-ms 1000}
+     :world {:isolation :ctx :settlement :discard}})))
 
 (def exact-evaluator
   (evaluation/make-evaluator
@@ -35,8 +40,9 @@
                  (roster/make-agent {:id :beta :program {:kind :echo}}))
         dataset (experiment/make-dataset
                  {:id :experiment/tasks
-                  :environments [(environment :task/one {:value 1})
-                                 (environment :task/two {:value 2})]})]
+                  ;; Logical IDs may recur across exact environment versions.
+                  :environments [(environment :task/versioned 1 {:value 1})
+                                 (environment :task/versioned 2 {:value 2})]})]
     {:team team
      :dataset dataset
      :definition
@@ -44,8 +50,7 @@
       {:id :experiment/paired
        :dataset dataset
        :candidates [(roster/agent team :alpha) (roster/agent team :beta)]
-       :repetitions 2
-       :parallelism 2})}))
+       :repetitions 2})}))
 
 (deftest definitions-are-canonical-portable-values
   (let [{:keys [team dataset definition]} (fixture)
@@ -102,6 +107,40 @@
              clojure.lang.ExceptionInfo #"does not match"
              (experiment/run room team definition
                              {(:ref exact-evaluator) wrong}))))
+      (let [retained-env
+            (environment-def/make-environment
+             {:id :test/retained
+              :task :retained
+              :verifier {:id :test/exact :version 1
+                         :basis "experiment-test:v1"}
+              :limits {:timeout-ms 2000 :cancel-timeout-ms 1000}
+              :world {:isolation :ctx :settlement :review}})
+            retained-dataset (experiment/make-dataset
+                              {:id :test/retained
+                               :environments [retained-env]})
+            retained-experiment
+            (experiment/make-experiment
+             {:id :test/retained
+              :dataset retained-dataset
+              :candidates [(roster/agent team :alpha)]})]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"require :discard"
+             (experiment/run room team retained-experiment
+                             {(:ref exact-evaluator) exact-evaluator}))))
+      (let [oversized (experiment/make-experiment
+                       {:id :test/oversized
+                        :dataset (:experiment/dataset definition)
+                        :candidates [(roster/agent team :alpha)]
+                        :repetitions 1000000000})]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"host admission ceiling"
+             (experiment/run room team oversized
+                             {(:ref exact-evaluator) exact-evaluator}))))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"parallelism exceeds"
+           (experiment/run room team definition
+                           {(:ref exact-evaluator) exact-evaluator}
+                           {:parallelism 3 :max-parallelism 2})))
       (is (empty? (run/active-runs (:id room))))
       (finally
         (d/close-room! room)))))
@@ -113,12 +152,14 @@
     (try
       (binding [ec/*execution-context* (:ctx room)]
         (let [spin (experiment/run room team definition
-                                   {evaluator-ref exact-evaluator})]
+                                   {evaluator-ref exact-evaluator}
+                                   {:parallelism 2})]
           (is (empty? (run/active-runs (:id room)))
               "constructing the Experiment Spin admits no Runs")
-          (let [{:keys [results attempts scorecard]} @spin]
+          (let [{:keys [results attempts scorecard execution]} @spin]
             (try
               (is (= 8 (count results) (count attempts)))
+              (is (= {:parallelism 2 :attempt-count 8} execution))
               (is (= 8 (count (set (map :attempt/id attempts)))))
               (is (= 8 (count (:scorecard/entries scorecard))))
               (is (= [{:candidate/id :alpha :attempt-count 4
@@ -150,10 +191,58 @@
                        clojure.lang.ExceptionInfo #"distinct Attempts"
                        (experiment/make-scorecard definition
                                                   same-cell-results)))))
+              (testing "exact environment identity determines canonical order"
+                (let [entries (:scorecard/entries scorecard)
+                      ;; This order is canonical under the old
+                      ;; [candidate logical-environment-id repetition] key:
+                      ;; versions compare equal within each repetition. It is
+                      ;; not canonical under exact environment identity.
+                      alternate-entries
+                      (into [(nth entries 2) (nth entries 0)
+                             (nth entries 3) (nth entries 1)]
+                            (drop 4 entries))
+                      swapped (-> scorecard
+                                  (assoc :scorecard/entries alternate-entries)
+                                  (dissoc :scorecard/content-id))
+                      swapped (assoc swapped :scorecard/content-id
+                                     (hasch/uuid
+                                      [:dvergr/experiment-scorecard swapped]))]
+                  (is (thrown-with-msg?
+                       clojure.lang.ExceptionInfo #"canonical cell order"
+                       (experiment/validate-scorecard swapped)))))
               (finally
                 (doseq [result results]
                   (when-let [fork (some-> result :run/result :run/world
                                           registry/lookup)]
                     (d/discard fork))))))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest later-cell-failure-leaves-no-retained-run-worlds
+  (let [{:keys [team definition]} (fixture)
+        room (d/make-room {:id :experiment-partial-failure
+                           :store (memory/make)})
+        failing-evaluator
+        (evaluation/make-evaluator
+         {:id :test/exact
+          :version 1
+          :basis "experiment-test:v1"
+          :observe (fn [{:keys [default]}] default)
+          :verify (fn [definition _]
+                    (if (= 2 (:environment/version definition))
+                      (throw (ex-info "deliberate verifier failure" {}))
+                      {:checks {:first-cell? true} :reward 1.0}))})]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"certification failed"
+             @(experiment/run room team definition
+                              {(:ref failing-evaluator) failing-evaluator}
+                              {:parallelism 1})))
+        (is (empty? (run/active-runs (:id room))))
+        (let [runs (run/runs room {:limit 20})]
+          (is (seq runs))
+          (is (every? #(= :discarded (:run/settlement-status %)) runs))
+          (is (every? #(nil? (registry/lookup (:run/world %))) runs))))
       (finally
         (d/close-room! room)))))

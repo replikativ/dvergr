@@ -113,12 +113,15 @@ trusted model-backed verifier establish the recursive boundary before real CRM,
 support, scheduling, or delivery effects are added.
 
 The comparison unit is now explicit. A DatasetDef fixes a non-empty ordered set
-of exact environments; an ExperimentDef fixes exact candidate AgentDef content,
-repetitions, and bounded parallelism. Its lazy Spindel execution produces the
+of exact environments; an ExperimentDef fixes exact candidate AgentDef content
+and repetitions. Host-owned admission policy caps total attempts and
+parallelism. Its lazy Spindel execution produces the
 ordinary certified Attempts and a deterministic Scorecard over the full paired
 matrix. This supports repeated provider/model comparisons without giving
 Dvergr a second scheduler or allowing evaluated SCI code to own trusted
-verifiers. Initially the Scorecard is a portable returned value; durable Runs
+verifiers. Jobs are realized only one bounded batch at a time, and batch
+environments initially require discard settlement until partial experiments
+have durable recoverable identity. Initially the Scorecard is a portable returned value; durable Runs
 and Attempts remain the evidence of record. A leaderboard can later be a
 Datahike projection over admitted Scorecards rather than mutable benchmark
 state.

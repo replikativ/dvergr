@@ -99,7 +99,7 @@
                     "{:same? (= a b) :ref (agent/environment-ref a) "
                     ":dataset-ref (agent/dataset-ref dataset) "
                     ":experiment-ref (agent/experiment-ref experiment) "
-                    ":parallelism (:experiment/parallelism experiment)})"))]
+                    ":repetitions (:experiment/repetitions experiment)})"))]
           (is (:success result) (pr-str (:error result)))
           (is (true? (get-in result [:value :same?])))
           (is (uuid? (get-in result [:value :ref :environment/content-id])))
@@ -107,7 +107,7 @@
                              [:value :dataset-ref :dataset/content-id])))
           (is (uuid? (get-in result
                              [:value :experiment-ref :experiment/content-id])))
-          (is (= 1 (get-in result [:value :parallelism]))))
+          (is (= 2 (get-in result [:value :repetitions]))))
         (let [guide (sandbox/ns-doc-md sci-ctx 'spindel.comb)]
           (is (re-find #"cancel losing branches" guide))
           (is (re-find #"owned-result-spin" guide)))
