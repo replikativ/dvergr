@@ -21,6 +21,7 @@
             [org.replikativ.spindel.spin.sync :as sync]))
 
 (defrecord Evaluator [ref observe verify])
+(defrecord WorldSetup [ref prepare])
 
 (defonce ^:private pending-tasks (atom {}))
 
@@ -146,10 +147,43 @@
                  (some? basis) (assoc :verifier/basis basis))
                observe verify))
 
+(defn make-world-setup
+  "Create a process-local trusted preparer for one exact world setup.
+
+   `prepare` runs after the candidate Run and its isolated world exist, but
+   before resource allocation or candidate work. Its private causal trigger is
+   already durable. It receives
+   `{:room isolated-work-room :run/id uuid :environment EnvironmentDef}` and may
+   transact only against that fork-local world. Its optional return value must
+   be portable data and is supplied to the trusted Evaluator observer as
+   `:setup/evidence`. The capability itself is never portable or exposed to SCI."
+  [{:keys [id version basis prepare]
+    :or {version 1}}]
+  (when-not (keyword? id)
+    (throw (ex-info "World setup :id must be a keyword"
+                    {:type ::invalid-setup-id :id id})))
+  (when-not (and (integer? version) (pos? version))
+    (throw (ex-info "World setup :version must be a positive integer"
+                    {:type ::invalid-setup-version :version version})))
+  (when-not (roster/data-value? basis)
+    (throw (ex-info "World setup :basis must contain only portable data"
+                    {:type ::invalid-setup-basis :basis basis})))
+  (when-not (fn? prepare)
+    (throw (ex-info "World setup :prepare must be a function"
+                    {:type ::invalid-setup-preparer})))
+  (->WorldSetup (cond-> {:setup/id id :setup/version version}
+                  (some? basis) (assoc :setup/basis basis))
+                prepare))
+
 (defn evaluator-ref
   "Return the portable verifier reference named by an Evaluator capability."
   [evaluator]
   (:ref evaluator))
+
+(defn world-setup-ref
+  "Return the portable exact reference named by a WorldSetup capability."
+  [setup]
+  (:ref setup))
 
 (defn- require-matching-evaluator! [definition evaluator]
   (when-not (instance? Evaluator evaluator)
@@ -163,6 +197,26 @@
                        :expected expected
                        :actual actual}))))
   evaluator)
+
+(defn- require-matching-setup! [definition setup]
+  (let [expected (get-in definition [:environment/world :setup])]
+    (cond
+      (nil? expected)
+      (when setup
+        (throw (ex-info "Environment without :setup received a WorldSetup"
+                        {:type ::unexpected-world-setup
+                         :actual (when (instance? WorldSetup setup)
+                                   (:ref setup))})))
+
+      (not (instance? WorldSetup setup))
+      (throw (ex-info "Environment requires an exact host WorldSetup"
+                      {:type ::missing-world-setup :expected expected}))
+
+      (not= expected (:ref setup))
+      (throw (ex-info "WorldSetup does not match EnvironmentDef"
+                      {:type ::world-setup-mismatch
+                       :expected expected :actual (:ref setup)})))
+    setup))
 
 (defn- default-evidence [{:keys [result durable]}]
   {:result (:run/value result)
@@ -213,7 +267,7 @@
       (throw (ex-info "Evaluation environment contains unsupported limits"
                       {:type ::unsupported-evaluation-limits
                        :unknown (set unknown)})))
-    (when-let [unknown (seq (remove #{:isolation :settlement :resources}
+    (when-let [unknown (seq (remove #{:isolation :settlement :resources :setup}
                                     (keys world)))]
       (throw (ex-info
               "Evaluation environment contains unsupported world policy; setup requires a trusted resolver"
@@ -257,10 +311,12 @@
           (recur (ex-cause error))))))
 
 (defn- certification-candidate
-  [{:keys [room definition evaluator agent run-id result durable
-           started-at started-nanos timeout?]}]
+  [{:keys [room world-room setup-evidence definition evaluator agent run-id
+           result durable started-at started-nanos timeout?]}]
   (let [evidence ((:observe evaluator)
                   {:room room
+                   :world/room world-room
+                   :setup/evidence setup-evidence
                    :environment definition
                    :run-id run-id
                    :result result
@@ -306,10 +362,12 @@
   ([room team agent-ref definition evaluator]
    (evaluate room team agent-ref definition evaluator {}))
   ([room team agent-ref definition evaluator
-    {:keys [from parent-run] :or {from :environment} :as opts}]
+    {:keys [from parent-run world-setup]
+     :or {from :environment} :as opts}]
    (environment/validate-environment definition)
    (require-matching-evaluator! definition evaluator)
-   (let [agent (roster/agent team agent-ref)
+   (let [world-setup (require-matching-setup! definition world-setup)
+         agent (roster/agent team agent-ref)
          {:keys [timeout-ms cancel-timeout-ms]
           :or {timeout-ms 120000 cancel-timeout-ms 10000}}
          (:environment/limits definition)
@@ -317,7 +375,8 @@
           :or {settlement :review}}
          (:environment/world definition)
          model-limits (when agent (require-supported-policy! definition agent))]
-     (when-let [unknown (seq (remove #{:from :parent-run} (keys opts)))]
+     (when-let [unknown (seq (remove #{:from :parent-run :world-setup}
+                                     (keys opts)))]
        (throw (ex-info "Evaluation contains unknown options"
                        {:type ::unknown-evaluation-options
                         :unknown (set unknown)})))
@@ -350,7 +409,19 @@
                         parent-run (assoc :parent-run parent-run)
                         (seq resources) (assoc :resources resources)
                         (seq model-limits) (assoc :limits model-limits))
-            handle (program/hire! room team agent-ref hire-opts)
+            setup-evidence (atom nil)
+            prepare-world!
+            (when world-setup
+              (fn [context]
+                (let [evidence ((:prepare world-setup)
+                                (assoc context :environment definition))]
+                  (when-not (roster/data-value? evidence)
+                    (throw (ex-info "World setup evidence must be portable"
+                                    {:type ::non-portable-setup-evidence
+                                     :setup (:ref world-setup)})))
+                  (reset! setup-evidence evidence))))
+            handle (program/hire-prepared-in! room room team agent-ref hire-opts
+                                              prepare-world!)
             timed-out ::timed-out
             initial (sp/await
                      (comb/timeout (program/owned-result-spin handle)
@@ -370,6 +441,21 @@
         (let [run-id (program/run-id handle)
               durable (program/observe room handle)
               fork (some-> (:run/world result) registry/lookup)
+              _ (when (contains? #{:world-setup-failed
+                                   :world-setup-cancelled}
+                                 (:run/reason durable))
+                  ;; Setup is trusted environment construction, not candidate
+                  ;; work. It has an auditable Run and settled world but must
+                  ;; never produce a reward-bearing Attempt or enter the
+                  ;; evaluator.
+                  (throw
+                   (ex-info (or (:run/error durable)
+                                "Environment world setup did not complete")
+                            {:type ::world-setup-failed
+                             :run/id run-id
+                             :run/world (:run/world result)
+                             :run/status (:run/status durable)
+                             :run/reason (:run/reason durable)})))
               evaluation-spin-id ec/*spin-id*
               cancelled-externally?
               #(and evaluation-spin-id
@@ -434,6 +520,8 @@
                            (certification-candidate
                             {:room room :definition definition
                              :evaluator evaluator :agent agent :run-id run-id
+                             :world-room fork
+                             :setup-evidence @setup-evidence
                              :result result :durable durable
                              :started-at started-at :started-nanos started-nanos
                              :timeout? timeout?})

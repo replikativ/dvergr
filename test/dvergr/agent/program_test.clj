@@ -311,12 +311,19 @@
                                     {:task :too-expensive
                                      :resources {resource/microdollars 4M}}))))
       (is (= {resource/microdollars 3M} (resource/balance room)))
-      (is (empty? (d/messages room {:limit 10})))
+      (let [[trigger :as messages] (d/messages room {:limit 10})]
+        (is (= 1 (count messages)))
+        (is (= [:repl :_runs]
+               ((juxt :from :to) trigger)))
+        (is (empty? (filter #(= :analyst (:from %)) messages))
+            "resource refusal starts no candidate effect"))
       (is (empty? (run/active-runs :program-resource-refusal)))
-      (is (= :failed
-             (:run/status
-              (first (room-store/-list-runs (:store room) (:id room)
-                                            {:limit 1})))))
+      (let [failed (first (room-store/-list-runs (:store room) (:id room)
+                                                 {:limit 1}))]
+        (is (= :failed (:run/status failed)))
+        (is (= :resource-allocation-failed (:run/reason failed)))
+        (is (= (:run/trigger failed)
+               (:id (first (d/messages room {:limit 1}))))))
       (finally
         (close-resource-test-room! room conn)))))
 
