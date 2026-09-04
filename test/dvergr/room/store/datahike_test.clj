@@ -8,6 +8,7 @@
             [dvergr.agent.attempt :as attempt]
             [dvergr.agent.attempt.governance :as attempt-governance]
             [dvergr.agent.environment :as environment]
+            [dvergr.agent.experiment :as experiment]
             [dvergr.agent.roster :as roster]
             [dvergr.artifact :as artifact]
             [dvergr.chat.schema :as schema]
@@ -60,6 +61,134 @@
                           {:trace {:runs [{:run/id run-id
                                            :run/status :completed}]}}
                           :review)))
+
+(defn- certified-scorecard [value agent]
+  (let [definition
+        (experiment/make-experiment
+         {:id :datahike/scorecard
+          :dataset
+          (experiment/make-dataset
+           {:id :datahike/scorecard
+            :environments [(:attempt/environment value)]})
+          :candidates [agent]})
+        candidate (first (:experiment/candidates definition))]
+    (experiment/make-scorecard
+     definition
+     [{:experiment/job
+       {:candidate/id (:candidate/id candidate)
+        :candidate/agent (:candidate/agent candidate)
+        :candidate/agent-content-id (:candidate/agent-content-id candidate)
+        :environment
+        (environment/environment-ref (:attempt/environment value))
+        :repetition 0}
+       :attempt value}])))
+
+(deftest certified-scorecard-round-trips-through-indexed-attempt-joins
+  (let [[conn _] (mem-store)
+        artifacts (artifact/memory-store)
+        st (dhs/make conn artifacts)
+        room-id :datahike-scorecard
+        other-room-id :other-scorecard-room
+        run-id (random-uuid)
+        agent (-> (roster/make-roster)
+                  (roster/make-agent {:id :candidate
+                                      :program {:kind :echo}})
+                  (roster/agent :candidate))
+        value (certified-attempt run-id agent)
+        scorecard (certified-scorecard value agent)
+        scorecard-id (:scorecard/content-id scorecard)
+        now (java.util.Date. 1000)]
+    (doseq [id [room-id other-room-id]]
+      (store/-store-room! st id {:slug (name id)}))
+    (store/-store-run!
+     st room-id
+     {:run/id run-id :run/kind :agent-task :run/room room-id
+      :run/actor :candidate :run/trigger (random-uuid)
+      :run/status :completed :run/created-at now :run/started-at now
+      :run/updated-at now :run/ended-at (java.util.Date. 1010)
+      :run/agent-version 1 :run/program-kind :echo
+      :run/interpreter-version 5 :run/agent-def-hash (hasch/uuid agent)})
+    (store/-store-attempt! st room-id value)
+    (is (= scorecard (store/-store-scorecard! st room-id scorecard)))
+    (is (= scorecard (store/-store-scorecard! st room-id scorecard)))
+    (is (= scorecard (store/-load-scorecard st room-id scorecard-id)))
+    (is (= [scorecard]
+           (store/-list-scorecards
+            st room-id
+            {:experiment-id :datahike/scorecard
+             :experiment-content-id
+             (get-in scorecard [:scorecard/experiment :experiment/content-id])
+             :dataset-id :datahike/scorecard
+             :candidate-id :candidate
+             :candidate-content-id (hasch/uuid agent)})))
+    (is (empty? (store/-list-scorecards st room-id
+                                        {:candidate-id :absent})))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"another Room"
+         (store/-store-scorecard! st other-room-id scorecard)))
+    (let [unbacked (-> scorecard
+                       (assoc-in [:scorecard/entries 0 :attempt/id]
+                                 (random-uuid))
+                       (dissoc :scorecard/content-id))
+          unbacked (assoc unbacked :scorecard/content-id
+                          (hasch/uuid [:dvergr/experiment-scorecard unbacked]))]
+      (is (= unbacked (experiment/validate-scorecard unbacked)))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"Attempt set differs"
+           (store/-store-scorecard! st other-room-id unbacked))))
+    (let [mismatched (-> scorecard
+                         (assoc-in [:scorecard/entries 0 :attempt/content-id]
+                                   (random-uuid))
+                         (dissoc :scorecard/content-id))
+          mismatched
+          (assoc mismatched :scorecard/content-id
+                 (hasch/uuid [:dvergr/experiment-scorecard mismatched]))]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"certified Attempt"
+           (store/-store-scorecard! st room-id mismatched))))
+    (let [forged (-> scorecard
+                     (assoc-in [:scorecard/entries 0 :reward] 99.0)
+                     (assoc-in [:scorecard/summary 0 :reward-sum] 99.0)
+                     (assoc-in [:scorecard/summary 0 :reward-mean] 99.0)
+                     (dissoc :scorecard/content-id))
+          forged (assoc forged :scorecard/content-id
+                        (hasch/uuid [:dvergr/experiment-scorecard forged]))]
+      (is (= forged (experiment/validate-scorecard forged)))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"certified Attempt"
+           (store/-store-scorecard! st room-id forged))))
+    (testing "typed joins and summaries are queryable"
+      (is (= [run-id]
+             (dh/q '[:find [?attempt-id ...]
+                     :where
+                     [?s :scorecard/id _]
+                     [?s :scorecard/attempts ?a]
+                     [?a :attempt/id ?attempt-id]] @conn)))
+      (is (= #{[:candidate 1 1 1.0]}
+             (dh/q '[:find ?candidate ?attempts ?passed ?reward
+                     :where
+                     [?s :scorecard/id _]
+                     [?s :scorecard/summaries ?summary]
+                     [?summary :scorecard.summary/candidate-id ?candidate]
+                     [?summary :scorecard.summary/attempt-count ?attempts]
+                     [?summary :scorecard.summary/passed-count ?passed]
+                     [?summary :scorecard.summary/reward-mean ?reward]] @conn))))
+    (testing "the mandatory writer predicate guards scorecards and summaries"
+      (is (thrown-with-msg?
+           Throwable #"trusted writer"
+           (dh/transact conn [{:scorecard/id (random-uuid)}])))
+      (is (thrown-with-msg?
+           Throwable #"trusted writer"
+           (dh/transact conn [{:scorecard.summary/id (random-uuid)}])))
+      (is (thrown-with-msg?
+           Throwable #"immutable"
+           (dh/transact conn [[:db/add [:scorecard/id scorecard-id]
+                               :scorecard/experiment-id :forged]]))))
+    (store/-delete-room! st room-id)
+    (is (nil? (store/-load-scorecard st room-id scorecard-id)))
+    (is (zero? (or (dh/q '[:find (count ?summary) .
+                           :where [?s :scorecard/summaries ?summary]] @conn)
+                   0)))))
 
 (deftest certified-attempt-round-trips-through-typed-index-and-cas
   (let [[conn _] (mem-store)
@@ -148,6 +277,10 @@
 (deftest message-envelope-contract
   (let [[_conn st] (mem-store)]
     (contract/assert-message-envelope! st :envelope-datahike)))
+
+(deftest cross-room-scorecard-identity-contract
+  (let [[_conn st] (mem-store)]
+    (contract/assert-cross-room-scorecard-identity! st)))
 
 (deftest concurrent-message-writes-are-atomically-first-write-wins
   (testing "the first committed immutable envelope cannot be overwritten"

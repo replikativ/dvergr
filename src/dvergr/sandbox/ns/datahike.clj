@@ -64,36 +64,41 @@
     schema reverse-schema metrics db history as-of since filter
     transact transact! with])
 
-(defn- attempt-attr? [x]
+(defn- certified-evaluation-attr? [x]
   (and (keyword? x)
-       (contains? #{"attempt" "attempt.check"} (namespace x))))
+       (contains? #{"attempt" "attempt.check"
+                    "scorecard" "scorecard.summary"}
+                  (namespace x))))
 
-(defn- attempt-entity? [conn eid]
+(defn- certified-evaluation-entity? [conn eid]
   (try
     (let [entity (d/entity @conn eid)]
-      (boolean (or (:attempt/id entity) (:attempt.check/id entity))))
+      (boolean (or (:attempt/id entity) (:attempt.check/id entity)
+                   (:scorecard/id entity) (:scorecard.summary/id entity))))
     (catch Throwable _ false)))
 
-(defn- assert-no-attempt-write! [conn tx-data]
+(defn- assert-no-certified-evaluation-write! [conn tx-data]
   (doseq [form tx-data]
     (let [protected?
           (cond
             (map? form)
-            (or (some attempt-attr? (keys form))
-                (attempt-entity? conn (:db/id form)))
+            (or (some certified-evaluation-attr? (keys form))
+                (certified-evaluation-entity? conn (:db/id form)))
 
             (vector? form)
             (let [[op eid attr] form]
               (or (= :db.fn/call op)
-                  (attempt-attr? attr)
-                  (and (vector? eid) (attempt-attr? (first eid)))
+                  (certified-evaluation-attr? attr)
+                  (and (vector? eid)
+                       (certified-evaluation-attr? (first eid)))
                   (and (#{:db/retractEntity :db.fn/retractEntity} op)
-                       (attempt-entity? conn eid))))
+                       (certified-evaluation-entity? conn eid))))
 
             :else false)]
       (when protected?
-        (throw (ex-info "Verified Attempt projections are host-certified and read-only in SCI"
-                        {:type ::protected-attempt-write :tx-form form})))))
+        (throw
+         (ex-info "Certified evaluation projections are host-owned and read-only in SCI"
+                  {:type ::protected-evaluation-write :tx-form form})))))
   tx-data)
 
 (defn- cfg-name
@@ -173,12 +178,14 @@
                          (fn [conn tx-data]
                            (let [conn (resolve-connection conn)]
                              (d/transact conn
-                                         (assert-no-attempt-write! conn tx-data))))
+                                         (assert-no-certified-evaluation-write!
+                                          conn tx-data))))
                          'transact!
                          (fn [conn tx-data]
                            (let [conn (resolve-connection conn)]
                              (d/transact! conn
-                                          (assert-no-attempt-write! conn tx-data)))))
+                                          (assert-no-certified-evaluation-write!
+                                           conn tx-data)))))
         ;; per-sandbox ephemeral (:mem) databases, keyed by logical name
         ephemeral (atom {})
         ephemeral-map #(if binding-resolver

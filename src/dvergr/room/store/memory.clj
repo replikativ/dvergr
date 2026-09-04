@@ -5,12 +5,24 @@
   (:require [dvergr.agent.attempt :as attempt]
             [dvergr.room.store :as store]))
 
+(defn- validate-scorecard [value]
+  ;; Keep the generic Room store below the Experiment execution layer. The
+  ;; validator is resolved only at this protocol boundary to avoid making Room
+  ;; construction depend cyclically on agent/program/discourse namespaces.
+  ((requiring-resolve 'dvergr.agent.experiment/validate-scorecard) value))
+
+(defn- validate-scorecard-attempts [value attempts]
+  ((requiring-resolve
+    'dvergr.agent.experiment/validate-scorecard-attempts)
+   value attempts))
+
 (defrecord MemoryStore [state]
   ;; state atom shape:
   ;;   {:rooms     {room-id metadata}
   ;;    :messages  {room-id [msg ...] (chronological)}
   ;;    :runs      {room-id {run-id run}}
-  ;;    :attempts  {room-id {attempt-id attempt}}}
+  ;;    :attempts  {room-id {attempt-id attempt}}
+  ;;    :scorecards {room-id {scorecard-id {:value scorecard :stored-at date}}}}
   store/PRoomStore
 
   (-store-room! [_ room-id metadata]
@@ -25,12 +37,16 @@
   (-delete-room! [_ room-id]
     (swap! state
            (fn [s]
-             (let [attention-ids (keys (get-in s [:attention room-id] {}))]
+             (let [attention-ids (keys (get-in s [:attention room-id] {}))
+                   scorecard-ids (keys (get-in s [:scorecards room-id] {}))]
                (-> s
                    (update :rooms    dissoc room-id)
                    (update :messages dissoc room-id)
                    (update :runs     dissoc room-id)
                    (update :attempts dissoc room-id)
+                   (update :scorecards dissoc room-id)
+                   (update :scorecard-index
+                           #(apply dissoc % scorecard-ids))
                    (update :attention dissoc room-id)
                    (update :attention-index
                            #(apply dissoc % attention-ids)))))))
@@ -264,6 +280,89 @@
          (take (or limit 100))
          vec))
 
+  store/PScorecardStore
+
+  (-store-scorecard! [_ room-id value]
+    (let [value (validate-scorecard value)
+          scorecard-id (:scorecard/content-id value)]
+      (swap! state
+             (fn [snapshot]
+               (let [global (get-in snapshot [:scorecard-index scorecard-id])
+                     _ (when (and global (not= room-id (:room-id global)))
+                         (throw
+                          (ex-info "Scorecard identity belongs to another Room"
+                                   {:type :room-store/scorecard-room-mismatch
+                                    :scorecard/id scorecard-id})))
+                     _ (validate-scorecard-attempts
+                        value
+                        (into {}
+                              (keep (fn [entry]
+                                      (when-let [stored
+                                                 (get-in
+                                                  snapshot
+                                                  [:attempts room-id
+                                                   (:attempt/id entry)])]
+                                        [(:attempt/id entry) stored])))
+                              (:scorecard/entries value)))
+                     existing (get-in snapshot
+                                      [:scorecards room-id scorecard-id :value])]
+                 (when (and existing (not= existing value))
+                   (throw (ex-info "Scorecard identity is immutable"
+                                   {:type :room-store/scorecard-identity-collision
+                                    :existing existing :scorecard value})))
+                 (if existing
+                   snapshot
+                   (let [entry {:value value :stored-at (java.util.Date.)}]
+                     (-> snapshot
+                         (assoc-in [:scorecards room-id scorecard-id] entry)
+                         (assoc-in [:scorecard-index scorecard-id]
+                                   {:room-id room-id :value value})))))))
+      value))
+
+  (-load-scorecard [_ room-id scorecard-id]
+    (get-in @state [:scorecards room-id scorecard-id :value]))
+
+  (-list-scorecards [_ room-id {:keys [limit experiment-id
+                                       experiment-content-id dataset-id
+                                       dataset-content-id candidate-id
+                                       candidate-content-id]}]
+    (->> (vals (get-in @state [:scorecards room-id] {}))
+         (filter
+          (fn [{:keys [value]}]
+            (and
+             (if experiment-id
+               (= experiment-id (get-in value [:scorecard/experiment
+                                               :experiment/id]))
+               true)
+             (if experiment-content-id
+               (= experiment-content-id
+                  (get-in value [:scorecard/experiment
+                                 :experiment/content-id]))
+               true)
+             (if dataset-id
+               (= dataset-id (get-in value [:scorecard/experiment
+                                            :experiment/dataset :dataset/id]))
+               true)
+             (if dataset-content-id
+               (= dataset-content-id
+                  (get-in value [:scorecard/experiment
+                                 :experiment/dataset :dataset/content-id]))
+               true)
+             (if candidate-id
+               (some #(= candidate-id (:candidate/id %))
+                     (:scorecard/summary value))
+               true)
+             (if candidate-content-id
+               (some #(= candidate-content-id
+                         (:candidate/agent-content-id %))
+                     (:scorecard/entries value))
+               true))))
+         (sort-by (juxt #(some-> ^java.util.Date (:stored-at %) .getTime)
+                        #(str (get-in % [:value :scorecard/content-id])))
+                  #(compare %2 %1))
+         (take (or limit 100))
+         (mapv :value)))
+
   store/PAttentionStore
 
   (-store-attention! [_ room-id fact]
@@ -308,4 +407,5 @@
   "Create a fresh in-memory store."
   []
   (->MemoryStore (atom {:rooms {} :messages {} :runs {} :attempts {}
+                        :scorecards {} :scorecard-index {}
                         :attention {} :attention-index {}})))

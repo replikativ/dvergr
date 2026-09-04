@@ -233,6 +233,38 @@
                        :passed-count 4 :reward-sum 4.0 :reward-mean 1.0}]
                      (:scorecard/summary scorecard)))
               (is (= scorecard (experiment/validate-scorecard scorecard)))
+              (is (= scorecard
+                     (experiment/scorecard room
+                                           (:scorecard/content-id scorecard))))
+              (is (= [scorecard]
+                     (experiment/scorecards
+                      room {:experiment-content-id
+                            (:experiment/content-id definition)
+                            :dataset-content-id
+                            (get-in definition [:experiment/dataset
+                                                :dataset/content-id])
+                            :candidate-id :alpha
+                            :candidate-content-id
+                            (get-in definition [:experiment/candidates 0
+                                                :candidate/agent-content-id])})))
+              (is (= scorecard (experiment/persist-scorecard! room scorecard))
+                  "repeating the same immutable projection is idempotent")
+              (testing "a new content hash cannot forge certified rewards"
+                (let [forged (-> scorecard
+                                 (assoc-in [:scorecard/entries 0 :reward] 99.0)
+                                 (assoc-in [:scorecard/summary 0 :reward-sum]
+                                           102.0)
+                                 (assoc-in [:scorecard/summary 0 :reward-mean]
+                                           25.5)
+                                 (dissoc :scorecard/content-id))
+                      forged
+                      (assoc forged :scorecard/content-id
+                             (hasch/uuid
+                              [:dvergr/experiment-scorecard forged]))]
+                  (is (= forged (experiment/validate-scorecard forged)))
+                  (is (thrown-with-msg?
+                       clojure.lang.ExceptionInfo #"certified Attempt"
+                       (experiment/persist-scorecard! room forged)))))
               (is (every? #(= % (store/-load-attempt
                                  (:store room) (:id room) (:attempt/id %)))
                           attempts))
