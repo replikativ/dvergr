@@ -230,10 +230,21 @@
   ([room agent-id chat-ctx posted]
    (post-turn-activity! room agent-id chat-ctx posted nil nil))
   ([room agent-id chat-ctx posted run-id trigger]
-   (let [tool-msgs (->> (chat-ctx/get-messages chat-ctx)
+   (let [messages (chat-ctx/get-messages chat-ctx)
+         tool-msgs (->> messages
                         (filter #(= :assistant (or (:role %) (:message/role %))))
                         (filter #(seq (or (:message/tool-uses %) (:tool-uses %))))
-                        vec)]
+                        vec)
+         outcomes (into {}
+                        (keep (fn [message]
+                                (when (= :tool-result
+                                         (or (:role message)
+                                             (:message/role message)))
+                                  [(or (:tool-use-id message)
+                                       (:message/tool-use-id message))
+                                   (or (:content message)
+                                       (:message/content message))])))
+                        messages)]
      (when (> (count tool-msgs) @posted)
        (binding [rtc/*execution-context* (:ctx room)]
          (doseq [m (subvec tool-msgs @posted)]
@@ -247,7 +258,7 @@
                             (cond-> {:role :tool
                                      :tool-uses uses
                                      :activities (activity/tool-activities
-                                                  run-id source-id uses)}
+                                                  run-id source-id uses outcomes)}
                               (seq reason) (assoc :reasoning reason)))))))
        (reset! posted (count tool-msgs)))
      nil)))

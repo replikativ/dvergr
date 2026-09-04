@@ -466,7 +466,8 @@ levels:
    result plus durable Room/Run facts; model prose is never the reward source.
    Reports retain individual checks, binary reward, generated SCI, leaked
    Runs/resources, model steps, token/cost usage, wall time, task version,
-   model, and a stable ID of the exact assembled system prompt. Durable receipt
+   model, typed allowlisted tool diagnostics, and a stable ID of the exact assembled system
+   prompt. Durable receipt
    persistence, trusted-writer authorization, and settlement against a retained
    benchmark world remain follow-ups.
 
@@ -498,6 +499,23 @@ their reports:
 ;; The generic entry point makes the task/version explicit.
 (bench/run-environment! :programming/race-v1
                         :codex-subscription "codex-subscription-sol")
+
+;; Generic, repeated full-factorial comparison. The prompt is exact AgentDef
+;; content, so prompt policy can vary without changing the environment/verifier.
+(bench/run-paired-experiment!
+ {:environment-ids [:programming/join-v1]
+  :candidates
+  [{:id :codex-safe
+    :provider :codex-subscription
+    :model "codex-subscription-sol"
+    :prompt bench/effect-safe-repl-prompt-v1}
+   {:id :claude-safe
+    :provider :claude-code
+    :model "claude-code-sonnet"
+    :prompt bench/effect-safe-repl-prompt-v1}]
+  :repetitions 3
+  :parallelism 2
+  :max-attempts 20})
 ```
 
 It is an explicit REPL benchmark rather than a CI test because it is

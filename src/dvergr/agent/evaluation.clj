@@ -21,6 +21,97 @@
 
 (defrecord Evaluator [ref observe verify])
 
+(defonce ^:private pending-tasks (atom {}))
+
+(declare positive-timeout!)
+
+(defn- cleanup-scope [room]
+  [(:id room) (:incarnation room)])
+
+(defn- start-task! [room task-fn]
+  (let [scope (cleanup-scope room)
+        token (random-uuid)
+        gate (promise)
+        started (promise)]
+    ;; Registration happens before the Future can start. A caller that regains
+    ;; control after evaluation cancellation can therefore never miss the
+    ;; cleanup it must join before closing the Room.
+    (swap! pending-tasks update scope (fnil assoc {}) token gate)
+    (let [worker
+          (future
+            (deliver started true)
+            (let [outcome
+                  (try
+                    (let [result (task-fn)]
+                      (if (and (map? result) (false? (:ok? result)))
+                        {:error (ex-info "Evaluation task failed"
+                                         {:type ::cleanup-failed
+                                          :result result})}
+                        {:ok result}))
+                    (catch Throwable error {:error error}))]
+              (deliver gate outcome)
+              ;; Successful work no longer needs a barrier entry. Failures stay
+              ;; until a teardown owner observes them rather than being silently
+              ;; forgotten.
+              (when (contains? outcome :ok)
+                (swap! pending-tasks update scope dissoc token))))]
+      {:token token :gate gate :started started :future worker})))
+
+(defn await-cleanups!
+  "Block a host teardown boundary until detached evaluation cleanup completes.
+
+   Evaluation cancellation itself stays non-blocking for the Spindel drain.
+   Ephemeral Room owners must call this outside a Spin before closing the Room.
+   Throws on timeout or a cleanup failure."
+  ([room] (await-cleanups! room 30000))
+  ([room timeout-ms]
+   (positive-timeout! "Cleanup timeout" timeout-ms)
+   (let [scope (cleanup-scope room)
+         deadline (+ (System/nanoTime) (* 1000000 timeout-ms))]
+     (loop [observed #{} failures []]
+       (let [entries (remove (comp observed key)
+                             (get @pending-tasks scope))]
+         (if (seq entries)
+           (let [outcomes
+                 (mapv
+                  (fn [[token gate]]
+                    (let [remaining-ms
+                          (max 1 (long (/ (- deadline (System/nanoTime))
+                                          1000000)))
+                          outcome (deref gate remaining-ms ::timeout)]
+                      [token outcome]))
+                  entries)
+                 failures'
+                 (into failures
+                       (keep (fn [[token outcome]]
+                               (cond
+                                 (= ::timeout outcome)
+                                 {:token token :type ::cleanup-timeout}
+
+                                 (:error outcome)
+                                 {:token token :type ::cleanup-failed
+                                  :error (:error outcome)}
+
+                                 :else nil)))
+                       outcomes)]
+             ;; Every completed gate has now been handed to this teardown
+             ;; owner. Timed-out gates remain registered and keep the Room
+             ;; non-closeable; completed failures are removed but reported
+             ;; together after all siblings have been joined.
+             (doseq [[token outcome] outcomes
+                     :when (not= ::timeout outcome)]
+               (swap! pending-tasks update scope dissoc token))
+             (recur (into observed (map first outcomes)) failures'))
+           (if (seq failures)
+             (throw (ex-info "Evaluation work did not quiesce before Room close"
+                             {:type ::cleanup-incomplete
+                              :room/id (:id room)
+                              :timeout-ms timeout-ms
+                              :failures failures}))
+             (do
+               (swap! pending-tasks dissoc scope)
+               true))))))))
+
 (defn make-evaluator
   "Create a process-local trusted evaluator capability.
 
@@ -308,7 +399,8 @@
                               :run/id run-id
                               :run/world (:run/world result)
                               :cleanup cleanup}
-                             error)})))
+                             error)})
+                  cleanup))
               settlement-failure!
               (fn [error]
                 (sync/deliver!
@@ -321,79 +413,86 @@
                             :attempt @persisted-attempt
                             :run/settlement-status
                             (:run/settlement-status result)}
-                           error)}))
+                           error)})
+                {:ok? false
+                 :run/id run-id
+                 :run/world (:run/world result)
+                 :reason :settlement-recovery-required})
               worker
-              (future
-                (binding [ec/*execution-context* (:ctx room)
-                          ec/*spin-id* nil]
-                  (try
-                    (let [{:keys [evidence receipt]}
-                          (certification-candidate
-                           {:room room :definition definition
-                            :evaluator evaluator :agent agent :run-id run-id
-                            :result result :durable durable
-                            :started-at started-at :started-nanos started-nanos
-                            :timeout? timeout?})
-                          certified-attempt
-                          (attempt/make-attempt definition agent receipt evidence
-                                                settlement)]
-                      (let [deferred? (= :deferred
-                                         (:run/settlement-status result))
-                            claim!
-                            #(if (cancelled-externally?)
-                               (do
-                                 (compare-and-set! state :scoring :cancelled)
-                                 false)
-                               (when (compare-and-set! state :scoring
-                                                       :certifying)
+              (start-task!
+               room
+               (fn []
+                 (binding [ec/*execution-context* (:ctx room)
+                           ec/*spin-id* nil]
+                   (try
+                     (let [{:keys [evidence receipt]}
+                           (certification-candidate
+                            {:room room :definition definition
+                             :evaluator evaluator :agent agent :run-id run-id
+                             :result result :durable durable
+                             :started-at started-at :started-nanos started-nanos
+                             :timeout? timeout?})
+                           certified-attempt
+                           (attempt/make-attempt definition agent receipt evidence
+                                                 settlement)]
+                       (let [deferred? (= :deferred
+                                          (:run/settlement-status result))
+                             claim!
+                             #(if (cancelled-externally?)
+                                (do
+                                  (compare-and-set! state :scoring :cancelled)
+                                  false)
+                                (when (compare-and-set! state :scoring
+                                                        :certifying)
                                  ;; This write occurs inside the fork's affine
                                  ;; settlement lock. The world cannot become
                                  ;; reviewable or disappear before its trusted
                                  ;; certification is durable.
-                                 (reset! persisted-attempt
-                                         (attempt/persist! room
-                                                           certified-attempt))
-                                 true))]
-                        (when (cancelled-externally?)
-                          (compare-and-set! state :scoring :cancelled))
-                        (if (or deferred? (claim!))
-                          (let [final-settlement
-                                (if deferred?
-                                  (settle-certified! fork settlement claim!)
-                                  (:run/settlement-status result))
-                                result (assoc result
-                                              :run/settlement-status
-                                              (case final-settlement
-                                                :discard :discarded
-                                                :review :review
-                                                final-settlement))]
-                            (reset! state :certified)
-                            (sync/deliver!
-                             done
-                             {:ok {:environment definition
-                                   :attempt @persisted-attempt
-                                   :attempt-receipt receipt
-                                   :evidence evidence
-                                   :run/id run-id
-                                   :run/result result
-                                   :run/handle handle}}))
-                          (cleanup-once! :evaluation-cancelled))))
-                    (catch Throwable error
-                      (if @persisted-attempt
-                        (settlement-failure! error)
-                        (certification-failure! error))))))]
+                                  (reset! persisted-attempt
+                                          (attempt/persist! room
+                                                            certified-attempt))
+                                  true))]
+                         (when (cancelled-externally?)
+                           (compare-and-set! state :scoring :cancelled))
+                         (if (or deferred? (claim!))
+                           (let [final-settlement
+                                 (if deferred?
+                                   (settle-certified! fork settlement claim!)
+                                   (:run/settlement-status result))
+                                 result (assoc result
+                                               :run/settlement-status
+                                               (case final-settlement
+                                                 :discard :discarded
+                                                 :review :review
+                                                 final-settlement))]
+                             (reset! state :certified)
+                             (sync/deliver!
+                              done
+                              {:ok {:environment definition
+                                    :attempt @persisted-attempt
+                                    :attempt-receipt receipt
+                                    :evidence evidence
+                                    :run/id run-id
+                                    :run/result result
+                                    :run/handle handle}}))
+                           (cleanup-once! :evaluation-cancelled))))
+                     (catch Throwable error
+                       (if @persisted-attempt
+                         (settlement-failure! error)
+                         (certification-failure! error)))))))]
           (try
             (let [{:keys [ok error]} (sp/await done)]
               (if error (throw error) ok))
             (catch Throwable error
               (when (and (spin-cancelled? error)
                          (compare-and-set! state :scoring :cancelled))
-                (future-cancel worker)
-                ;; Cancellation remains non-blocking for the Spindel drain
-                ;; path. The gate is already closed by `state`; cleanup runs
-                ;; externally and the interrupted worker can never certify.
-                (future
-                  (binding [ec/*execution-context* (:ctx room)
-                            ec/*spin-id* nil]
-                    (cleanup-once! :evaluation-cancelled))))
+                ;; Interrupt an evaluator already executing on its worker. A
+                ;; not-yet-started worker is left scheduled: it will observe the
+                ;; closed state and cannot certify, while its registered gate
+                ;; prevents teardown from racing it.
+                ;; Cancellation remains non-blocking for the Spindel drain.
+                ;; The scorer owns cleanup and stays registered until it
+                ;; physically exits; the closed gate prevents certification.
+                (when (realized? (:started worker))
+                  (future-cancel (:future worker))))
               (throw error)))))))))

@@ -1,5 +1,6 @@
 (ns dvergr.activity-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [dvergr.activity :as activity]
             [dvergr.agent.environment :as environment]))
 
@@ -19,6 +20,29 @@
       (is (uuid? first-id))
       (is (= first-id replay-id))
       (is (not= first-id other-id)))))
+
+(deftest tool-activities-carry-only-typed-allowlisted-diagnostics
+  (let [run-id (random-uuid)
+        source-id (random-uuid)
+        uses [{:tool-use/id "call-1" :tool-use/name "clojure_eval"}
+              {:tool-use/id "call-2" :tool-use/name "clojure_eval"}
+              {:tool-use/id "call-3" :tool-use/name "read_file"}]
+        activities (activity/tool-activities
+                    run-id source-id uses
+                    {"call-1" "=> \"secret-token\""
+                     "call-2" "Evaluation error: private@example.test"
+                     "call-3" "secret file contents"})]
+    (is (= :completed (:activity/status (first activities))))
+    (is (nil? (:activity/outcome (first activities))))
+    (is (= {:activity/status :failed
+            :activity/outcome "clojure-eval/error"}
+           (select-keys (second activities)
+                        [:activity/status :activity/outcome])))
+    (is (nil? (:activity/status (nth activities 2))))
+    (is (nil? (:activity/outcome (nth activities 2))))
+    (is (not (str/includes? (pr-str activities) "secret")))
+    (is (not (str/includes? (pr-str activities)
+                            "private@example.test")))))
 
 (deftest tool-traces-preserve-correlation-across-interleaved-runs
   (let [run-a (random-uuid)
