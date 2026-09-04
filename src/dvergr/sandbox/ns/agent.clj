@@ -60,6 +60,10 @@
         select-agents* (requiring-resolve 'dvergr.agent.roster/select-agents)
         make-environment* (requiring-resolve 'dvergr.agent.environment/make-environment)
         environment-ref* (requiring-resolve 'dvergr.agent.environment/environment-ref)
+        make-dataset*   (requiring-resolve 'dvergr.agent.experiment/make-dataset)
+        dataset-ref*    (requiring-resolve 'dvergr.agent.experiment/dataset-ref)
+        make-experiment* (requiring-resolve 'dvergr.agent.experiment/make-experiment)
+        experiment-ref* (requiring-resolve 'dvergr.agent.experiment/experiment-ref)
         hire-in*       (requiring-resolve 'dvergr.agent.program/hire-in!)
         observe*       (requiring-resolve 'dvergr.agent.program/observe)
         snapshot*      (requiring-resolve 'dvergr.agent.observation/snapshot)
@@ -210,6 +214,10 @@
         'select       select-agents*
         'environment  make-environment*
         'environment-ref environment-ref*
+        'dataset      make-dataset*
+        'dataset-ref  dataset-ref*
+        'experiment   make-experiment*
+        'experiment-ref experiment-ref*
         'room-id      (fn [] (:id (room!)))
         'hire!        hire-fn
         'observe      observe-fn
@@ -228,6 +236,10 @@
          select       [([roster selector]) "Select AgentDefs by :id, :status, :skill/:skills, and exact portable :where data."]
          environment  [([spec]) "Create a portable, content-addressed EnvironmentDef. Requires :id, :task, and trusted verifier ref {:id keyword :version n}; optional :limits/:world/:metadata stay data, never live functions or handles."]
          environment-ref [([environment]) "Return the stable logical/version/content reference for one exact EnvironmentDef. Individual execution Run IDs remain unique."]
+         dataset      [([spec]) "Create a portable DatasetDef from a non-empty vector of exact EnvironmentDefs. Dataset construction is pure and content-addressed."]
+         dataset-ref  [([dataset]) "Return the stable logical/version/content reference for one exact DatasetDef."]
+         experiment   [([spec]) "Create a portable full-factorial ExperimentDef. Requires a DatasetDef and a non-empty vector of AgentDefs; repetitions and bounded parallelism default to one. Candidates bind the exact AgentDef content, not only id/version."]
+         experiment-ref [([experiment]) "Return the stable logical/version/content reference for one exact ExperimentDef. Running and trusted scoring remain host-owned capabilities."]
          room-id      [([]) "Return the live identity of the current Room/world. In an isolated fork this is the child Room, not its parent."]
          hire!        [([roster agent-ref opts]) "Durably start one owned AgentDef in the current Room: (hire! team :a {:task value :resources {\"microUSD\" 1000}}). Returns a RunHandle. The current Run remains responsible for the child even if the handle is ignored; opts may also include :from, :settlement, and a positive conserved :resources vector split from the current Run/Room."]
          observe      [([handle-or-run-id]) "Read the current Room's durable Run projection for a RunHandle or UUID."]

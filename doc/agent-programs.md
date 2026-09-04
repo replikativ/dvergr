@@ -400,20 +400,41 @@ Episode = immutable certified Attempt
 
 Review may later merge or discard the Run world. That changes the joined Run
 projection while the historical AttemptReceipt stays content-identical.
-Dataset acceptance, train/eval splits, rankings, particles, and proposal status
-are separate later projections; none mutate certification.
+Dataset acceptance, train/eval splits, particles, and proposal status are
+separate projections; none mutate certification.
 
-An ensemble is composition, not another primitive:
+A `DatasetDef` groups exact EnvironmentDefs. An `ExperimentDef` binds that
+dataset to the complete Hasch identity of every candidate AgentDef, a repetition
+count, and bounded parallelism:
 
 ```clojure
-(let [attempts (mapv #(evaluation/evaluate room team % environment evaluator)
-                     candidate-agent-refs)]
-  @(apply comb/parallel attempts))
+(let [dataset (agent/dataset
+               {:id :programming/core-v1
+                :environments [review-env race-env resource-env]})
+      experiment (agent/experiment
+                  {:id :models/paired-v1
+                   :dataset dataset
+                   :candidates [(agent/lookup team :codex)
+                                (agent/lookup team :claude)]
+                   :repetitions 5
+                   :parallelism 2})]
+  ;; Host code supplies exact trusted Evaluator capabilities.
+  @(experiment/run room team experiment evaluator-map))
 ```
 
-Pure policy can rank/select the resulting receipts. Existing room-fork
+Dataset and experiment construction is pure and available inside SCI. Execution
+and reward certification are host-only: an agent can propose the benchmark it
+should face, but it cannot install its verifier or certify itself. Before any
+Run is admitted, execution rejects a changed candidate definition or a missing
+exact Evaluator. It then composes ordinary evaluation Spins in bounded batches.
+The result contains every certified Attempt plus a content-addressed Scorecard
+with one entry per candidate/environment/repetition cell and deterministic
+per-candidate aggregates. Scorecards are immutable projections, not a mutable
+leaderboard or scheduler.
+
+Pure policy can rank/select the scorecards. Existing room-fork
 merge/discard/adoption remains the only settlement authority. SMC, MCTS,
-Anglican-style inference, and Raster training can consume this same boundary
+Anglican-style inference, and Raster training can consume the same Attempts
 without changing Run, Room, or world semantics.
 
 For training, an accepted episode is a projection across the exact
