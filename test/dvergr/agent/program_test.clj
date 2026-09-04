@@ -166,6 +166,54 @@
       (finally
         (close-resource-test-room! room conn)))))
 
+(deftest stable-resource-effects-retry-without-clock-drift
+  (let [[room conn] (resource-test-room :program-resource-retry)
+        mint-id (random-uuid)
+        consume-id (random-uuid)
+        run-id (random-uuid)
+        trigger (d/message :test :_runs "retry resources" nil {:role :user})
+        same-receipt? #(= (dissoc %1 :status) (dissoc %2 :status))]
+    (try
+      (let [mint-a (resource/mint! room {:id mint-id
+                                         :resources {resource/microdollars 10M}})
+            mint-b (resource/mint! room {:id mint-id
+                                         :resources {resource/microdollars 10M}})]
+        (is (same-receipt? mint-a mint-b)
+            "mint retry returns the original durable receipt")
+        (is (= :duplicate (:status mint-b))))
+      (d/post! room trigger)
+      (run/start! room :resource-test trigger nil {:id run-id})
+      (let [grant-a (resource/allocate-run!
+                     room run-id nil {resource/microdollars 6M})
+            grant-b (resource/allocate-run!
+                     room run-id nil {resource/microdollars 6M})]
+        (is (same-receipt? (:receipt grant-a) (:receipt grant-b))
+            "allocation uses the durable Run start instant")
+        (is (= :duplicate (get-in grant-b [:receipt :status]))))
+      (let [consume-a (resource/consume!
+                       room run-id {:id consume-id
+                                    :resources {resource/microdollars 2M}})
+            consume-b (resource/consume!
+                       room run-id {:id consume-id
+                                    :resources {resource/microdollars 2M}})]
+        (is (same-receipt? consume-a consume-b)
+            "consume retry does not acquire a new timestamp")
+        (is (= :duplicate (:status consume-b))))
+      (let [return-a (resource/return!
+                      room run-id nil {resource/microdollars 4M})
+            return-b (resource/return!
+                      room run-id nil {resource/microdollars 4M})]
+        (is (same-receipt? return-a return-b)
+            "return retry is one semantic transfer")
+        (is (= :duplicate (:status return-b))))
+      (is (= {} (resource/run-balance room run-id)))
+      (is (= {resource/microdollars 8M} (resource/balance room)))
+      (run/finish! run-id :completed)
+      (finally
+        (when (some #(= run-id (:run/id %)) (run/active-runs))
+          (run/finish! run-id :cancelled {:reason :test-cleanup}))
+        (close-resource-test-room! room conn)))))
+
 (deftest ignored-owned-child-delays-parent-resource-settlement
   (let [[room conn] (resource-test-room :program-owned-child-resources)
         team (-> (roster/make-roster {:id :nested-resource-team})

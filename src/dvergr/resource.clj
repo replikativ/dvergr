@@ -9,7 +9,7 @@
             [dvergr.room.store :as store]
             [kontor.resource :as kontor])
   (:import [java.nio.charset StandardCharsets]
-           [java.util Date UUID]))
+           [java.util UUID]))
 
 (def microdollars
   "The initial numeraire coordinate. Other coordinates remain ordinary data and
@@ -43,6 +43,10 @@
                       {:type ::resource-store-unavailable
                        :room-id (:id room)})))
     resource-store))
+
+(defn- store-room-id [room]
+  (or (some-> room :meta deref :conversation-id)
+      (:id room)))
 
 (defn install-connection!
   "Install the minimal Kontor kernel and the Room's root wallet on `conn`.
@@ -88,8 +92,8 @@
             :kind :mint
             :source kontor/source-account
             :destination (kontor/account-ref (room-wallet-id (:id room)))
-            :resources resources
-            :effective-date (or effective-date (Date.))}
+            :resources resources}
+     effective-date (assoc :effective-date effective-date)
      posted-at (assoc :posted-at posted-at)
      actor (assoc :actor actor))))
 
@@ -102,12 +106,17 @@
           parent-wallet (if parent-run
                           (run-wallet-id parent-run)
                           (room-wallet-id (:id room)))
+          started-at (:run/started-at
+                      (store/-load-run resource-store (store-room-id room) run-id))
+          _ (when-not started-at
+              (throw (ex-info "Run resource allocation requires a durable Run"
+                              {:type ::run-not-durable :run/id run-id})))
           transfer {:id (allocation-id run-id)
                     :kind :grant
                     :source (kontor/account-ref parent-wallet)
                     :destination (kontor/account-ref (run-wallet-id run-id))
                     :resources resources
-                    :effective-date (Date.)}]
+                    :effective-date started-at}]
       {:wallet (kontor/account-ref (run-wallet-id run-id))
        :receipt (store/-allocate-resource-wallet!
                  resource-store
@@ -126,8 +135,8 @@
             :kind :consume
             :source (kontor/account-ref (run-wallet-id run-id))
             :destination kontor/sink-account
-            :resources resources
-            :effective-date (or effective-date (Date.))}
+            :resources resources}
+     effective-date (assoc :effective-date effective-date)
      posted-at (assoc :posted-at posted-at)
      actor (assoc :actor actor))))
 
@@ -143,5 +152,4 @@
                   (if parent-run
                     (run-wallet-id parent-run)
                     (room-wallet-id (:id room))))
-    :resources resources
-    :effective-date (Date.)}))
+    :resources resources}))
