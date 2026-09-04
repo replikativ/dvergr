@@ -944,6 +944,117 @@
       (finally
         (d/close-room! room)))))
 
+(deftest trusted-preparation-registers-an-affine-cleanup-stack
+  (let [room (test-room :program-preparation-cleanup-stack)
+        team (test-roster)
+        cleaned (atom [])]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [handle
+              (program/hire-prepared-in!
+               room room team :analyst
+               {:task :work :settlement :discard}
+               (fn [{register! :register-cleanup!}]
+                 (register! #(swap! cleaned conj :first))
+                 (register! #(swap! cleaned conj :second))))
+              result @handle]
+          (is (= :completed (:run/status result)))
+          (is (= [:second :first] @cleaned)
+              "live resources unwind in reverse acquisition order")
+          (is (= :discarded (:run/settlement-status result)))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest one-cleanup-failure-does-not-leak-the-rest-of-the-stack
+  (let [room (test-room :program-preparation-cleanup-failure)
+        team (test-roster)
+        cleaned (atom [])]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [handle
+              (program/hire-prepared-in!
+               room room team :analyst
+               {:task :work :settlement :discard}
+               (fn [{register! :register-cleanup!}]
+                 (register! #(swap! cleaned conj :first))
+                 (register!
+                  #(do (swap! cleaned conj :second)
+                       (throw (ex-info "second cleanup failed" {}))))))
+              result @handle]
+          (is (= :failed (:run/status result)))
+          (is (= "second cleanup failed" (:run/error result)))
+          (is (= [:second :first] @cleaned)
+              "cleanup errors are collected only after every lease unwinds")
+          (is (= :discarded (:run/settlement-status result)))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest cancellation-unwinds-every-resource-acquired-during-preparation
+  (let [room (test-room :program-preparation-cleanup-cancel)
+        team (test-roster)
+        entered (promise)
+        cleaned (atom [])]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [handle
+              (program/hire-prepared-in!
+               room room team :analyst
+               {:task :work :settlement :discard}
+               (fn [{register! :register-cleanup!}]
+                 (register! #(swap! cleaned conj :first))
+                 (register! #(swap! cleaned conj :second))
+                 (deliver entered true)
+                 (Thread/sleep 10000)))]
+          (is (= true (deref entered 2000 ::timeout)))
+          (is (true? (program/cancel! handle)))
+          (let [result (deref handle 2000 ::timeout)]
+            (is (= :cancelled (:run/status result)))
+            (is (= [:second :first] @cleaned))
+            (is (= :discarded (:run/settlement-status result))))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest cancellation-does-not-clean-up-before-the-orchestration-body-is-terminal
+  (let [room (test-room :program-preparation-cleanup-body-fence)
+        team (test-roster)
+        allocation-entered (promise)
+        release-allocation (promise)
+        allocation-returned (promise)
+        cleanup-entered (promise)]
+    (try
+      (with-redefs [resource/allocate-run!
+                    (fn [& _]
+                      ;; Reproduce the post-setup gap: the setup worker has
+                      ;; terminated, but its enclosing orchestration body is
+                      ;; still using the acquired resource during allocation.
+                      (deliver allocation-entered true)
+                      @release-allocation
+                      (deliver allocation-returned true))]
+        (binding [ec/*execution-context* (:ctx room)]
+          (let [handle
+                (program/hire-prepared-in!
+                 room room team :analyst
+                 {:task :work :settlement :discard}
+                 (fn [{register! :register-cleanup!}]
+                   (register! #(deliver cleanup-entered true))))]
+            ;; These positive waits tolerate a loaded randomized suite. The
+            ;; bounded negative wait below is the actual ordering assertion.
+            (is (= true (deref allocation-entered 15000 ::timeout)))
+            (is (true? (program/cancel! handle)))
+            (is (= ::timeout (deref cleanup-entered 500 ::timeout))
+                "sealing cancellation is not permission to release a resource")
+            (is (not (realized? allocation-returned)))
+            (deliver release-allocation true)
+            (is (= true (deref allocation-returned 15000 ::timeout)))
+            (let [result (deref handle 15000 ::timeout)]
+              (is (= :cancelled (:run/status result)))
+              (is (= true (deref cleanup-entered 15000 ::timeout)))
+              (is (= :discarded (:run/settlement-status result)))))))
+      (finally
+        ;; Never strand the Room executor if an earlier assertion fails.
+        (deliver release-allocation true)
+        (d/close-room! room)))))
+
 (deftest llm-program-uses-one-normalized-tool-contract
   (let [room (test-room :program-llm-tools)
         team (-> (roster/make-roster)

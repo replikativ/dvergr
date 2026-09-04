@@ -361,6 +361,18 @@ during experiment preflight. Each attempt still receives a fresh Run ID, so
 content identity never collapses distinct executions. The current REPL
 benchmark reports retain both the exact definition and its compact reference.
 
+Trusted preparation also receives a process-local `:register-cleanup!`
+capability. Every acquired database, browser, process, session, or other live
+lease must register its release immediately. The Run supervisor unwinds all
+registrations in reverse acquisition order after candidate work quiesces and
+before world settlement; one failing release does not skip the remaining
+releases. A cleanup callback must complete—or internally await—the physical
+release before it returns; launching detached asynchronous cleanup does not
+extend the supervisor's quiescence fence. This is the common affine lifecycle
+for later resource arenas, not a second world/fork mechanism. The registrar and
+live resources are never part of portable EnvironmentDefs, SCI bindings, or
+mergeable world state.
+
 Every opt-in REPL attempt returns a content-addressed `:attempt-receipt`. It binds the
 unique root Run to the exact EnvironmentDef, provider/model, exact assembled
 system-prompt ID, per-resource usage, timing, trusted checks/reward, Run/tool
