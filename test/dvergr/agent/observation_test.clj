@@ -3,6 +3,7 @@
             [datahike.api :as dh]
             [dvergr.activity :as activity]
             [dvergr.agent.observation :as observation]
+            [dvergr.agent.roster :as roster]
             [dvergr.agent.run :as run]
             [dvergr.chat.schema :as schema]
             [dvergr.discourse :as d]
@@ -65,7 +66,13 @@
                      :activity/run-id)))
           (is (= (activity/message-run-id
                   {:metadata {:run-id (:run/id child)}})
-                 (:run/id child)))))
+                 (:run/id child))))
+        (testing "the complete projection is portable workflow/evidence data"
+          (is (roster/data-value? scoped))
+          (is (integer? (-> scoped :observation/runs first :run/started-at)))
+          (is (integer? (:message/at tool-message)))
+          (is (integer? (-> scoped :observation/activities first
+                            :activity/at)))))
       (testing "a foreign or stale scope fails closed"
         (is (thrown-with-msg? clojure.lang.ExceptionInfo
                               #"not a Run in this Room"

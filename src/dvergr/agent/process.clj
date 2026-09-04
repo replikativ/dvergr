@@ -18,6 +18,7 @@
    Effects are applied by `run-effect!`, a multimethod against
    chat-ctx — unknown ops are logged and skipped, never crash."
   (:require [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.engine.impl.simple :as simple]
             [org.replikativ.spindel.signal :as sig]
             [dvergr.chat.context :as chat-ctx]
             [dvergr.chat.accounting :as acct]
@@ -428,7 +429,14 @@
     (swap-registry! process-chat-ctx assoc pid process)
     (future
       (binding [*current-process*    process
-                ec/*execution-context* world]
+                ec/*execution-context* world
+                ;; Clojure futures convey dynamic bindings from their creator.
+                ;; ->process is often called by a Spindel drain slice, but its
+                ;; body runs on a genuinely separate worker and may safely
+                ;; deref a Spin. Do not leak the creator's re-entrancy guard or
+                ;; structural Spin identity across this detached boundary.
+                simple/*in-drain?* false
+                ec/*spin-id* nil]
         (try
           (let [result (body-fn)]
             (reset! (:status-signal process) :completed)

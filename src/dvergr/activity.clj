@@ -12,25 +12,62 @@
   [parts]
   (hasch/uuid [:dvergr/activity parts]))
 
+(defn- tool-result-fact [tool-name value]
+  ;; Tool results belong to the private ChatContext/tool-call trace. Room
+  ;; activities may reveal only a typed status and an allowlisted diagnostic —
+  ;; never a prefix, hash, or derivative of arbitrary user/tool content.
+  (when (and (= "clojure_eval" (str tool-name)) (string? value))
+    (cond
+      (str/starts-with? value "Evaluation cancelled:")
+      {:activity/status :cancelled
+       :activity/outcome "clojure-eval/cancelled"}
+
+      (str/starts-with? value "Evaluation error:")
+      {:activity/status :failed
+       :activity/outcome
+       (cond
+         (str/includes?
+          value "Cannot deref @(spin ...) from inside a drain context")
+         "spindel/deref-in-drain"
+
+         (str/includes? value "Unknown hire! options")
+         "dvergr.agent/unknown-hire-options"
+
+         (str/includes? value "await called outside of asynchronous scope")
+         "spindel/await-outside-async-scope"
+
+         :else "clojure-eval/error")}
+
+      (str/starts-with? value "=> ")
+      {:activity/status :completed}
+
+      :else nil)))
+
 (defn tool-activities
   "Project the tool requests in an assistant message into compact semantic
-   observations. Raw arguments and results remain in the existing tool trace.
+   observations. Raw arguments and results remain in the private tool trace;
+   an optional result map adds only typed, allowlisted diagnostics.
 
    `source-id` should identify the source assistant message when available.
    The ordinal keeps repeated provider tool-use ids distinct."
-  [run-id source-id tool-uses]
-  (mapv (fn [ordinal tool-use]
-          (let [tool-id (or (:tool-use/id tool-use) (:id tool-use))
-                name    (or (:tool-use/name tool-use) (:name tool-use))]
-            (cond-> {:activity/id (stable-id [run-id source-id tool-id ordinal])
-                     :activity/kind :tool
-                     :activity/verb :invoke
-                     :activity/at (Date.)}
-              run-id (assoc :activity/run-id run-id)
-              tool-id (assoc :activity/tool-use-id (str tool-id))
-              name (assoc :activity/tool-name (str name)))))
-        (range)
-        tool-uses))
+  ([run-id source-id tool-uses]
+   (tool-activities run-id source-id tool-uses {}))
+  ([run-id source-id tool-uses outcomes]
+   (mapv (fn [ordinal tool-use]
+           (let [tool-id (or (:tool-use/id tool-use) (:id tool-use))
+                 name    (or (:tool-use/name tool-use) (:name tool-use))
+                 result-fact (tool-result-fact name (get outcomes tool-id))]
+             (cond-> (merge
+                      {:activity/id (stable-id [run-id source-id tool-id ordinal])
+                       :activity/kind :tool
+                       :activity/verb :invoke
+                       :activity/at (Date.)}
+                      result-fact)
+               run-id (assoc :activity/run-id run-id)
+               tool-id (assoc :activity/tool-use-id (str tool-id))
+               name (assoc :activity/tool-name (str name)))))
+         (range)
+         tool-uses)))
 
 (defn lifecycle-activity
   "Create a semantic Run lifecycle observation for a visible activity message."

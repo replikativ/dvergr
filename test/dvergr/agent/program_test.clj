@@ -464,7 +464,7 @@
                            chat-ctx
                            {:role :tool-result
                             :tool-use-id "call-1"
-                            :content "2"})
+                            :content "=> 2"})
                           :continue)
                         (do
                           (chat-context/add-message!
@@ -501,6 +501,9 @@
           (is (= ["clojure_eval"]
                  (mapv :tool-use/name
                        (get-in activity [:metadata :tool-uses]))))
+          (is (= [:completed]
+                 (mapv :activity/status
+                       (get-in activity [:metadata :activities]))))
           (is (= [{:activity/kind :tool
                    :activity/verb :invoke
                    :activity/run-id (program/run-id handle)

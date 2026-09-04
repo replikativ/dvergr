@@ -9,8 +9,10 @@
             [dvergr.room.registry :as registry]
             [dvergr.room.store :as store]
             [dvergr.room.store.memory :as memory]
+            [dvergr.rooms.forks :as forks]
             [hasch.core :as hasch]
-            [org.replikativ.spindel.engine.core :as ec]))
+            [org.replikativ.spindel.engine.core :as ec])
+  (:import [java.util.concurrent CountDownLatch TimeUnit]))
 
 (defn- environment
   ([id task] (environment id 1 task))
@@ -245,4 +247,82 @@
           (is (every? #(= :discarded (:run/settlement-status %)) runs))
           (is (every? #(nil? (registry/lookup (:run/world %))) runs))))
       (finally
+        (d/close-room! room)))))
+
+(deftest parallel-cell-failure-has-a-host-cleanup-barrier
+  (let [team (-> (roster/make-roster {:id :experiment/cleanup-team})
+                 (roster/make-agent {:id :alpha :program {:kind :echo}}))
+        dataset (experiment/make-dataset
+                 {:id :experiment/cleanup-tasks
+                  :environments [(environment :cleanup/slow-a 1 :slow-a)
+                                 (environment :cleanup/slow-b 1 :slow-b)
+                                 (environment :cleanup/fail 1 :fail)]})
+        definition (experiment/make-experiment
+                    {:id :experiment/parallel-cleanup
+                     :dataset dataset
+                     :candidates [(roster/agent team :alpha)]})
+        slow-started (CountDownLatch. 2)
+        evaluator
+        (evaluation/make-evaluator
+         {:id :test/exact
+          :version 1
+          :basis "experiment-test:v1"
+          :observe (fn [{:keys [default]}] default)
+          :verify
+          (fn [environment _]
+            (if (contains? #{:slow-a :slow-b}
+                           (:environment/task environment))
+              (do
+                (.countDown slow-started)
+                (Thread/sleep 10000)
+                {:checks {:unexpected? true} :reward 0.0})
+              (do
+                (when-not (.await slow-started 5 TimeUnit/SECONDS)
+                  (throw (ex-info "slow verifiers did not start" {})))
+                (throw (ex-info "deliberate parallel verifier failure" {})))))})
+        room (d/make-room {:id :experiment-parallel-cleanup
+                           :store (memory/make)})
+        discard! forks/discard-deferred!
+        discard-count (atom 0)
+        failing-discard
+        (fn failing-discard
+          ([fork reason]
+           (failing-discard fork reason (constantly true)))
+          ([fork reason claim!]
+           (if (= 2 (swap! discard-count inc))
+             {:ok? false
+              :fork/id (:id fork)
+              :error :deliberate-discard-failure}
+             (discard! fork reason claim!))))]
+    (try
+      (with-redefs [forks/discard-deferred! failing-discard]
+        (binding [ec/*execution-context* (:ctx room)]
+          (is (thrown-with-msg?
+               clojure.lang.ExceptionInfo #"certification failed"
+               @(experiment/run room team definition
+                                {(:ref evaluator) evaluator}
+                                {:parallelism 3}))))
+        (let [error (try
+                      (evaluation/await-cleanups! room 5000)
+                      nil
+                      (catch clojure.lang.ExceptionInfo error error))]
+          (is (= :dvergr.agent.evaluation/cleanup-incomplete
+                 (:type (ex-data error))))
+          (is (= 1 (count (:failures (ex-data error))))))
+        (is (= 3 @discard-count)
+            "the barrier joins every sibling despite one cleanup failure"))
+      (is (empty? (run/active-runs (:id room))))
+      (let [runs (run/runs room {:limit 10})]
+        (is (= 3 (count runs)))
+        (is (= 2 (count (filter #(= :discarded
+                                    (:run/settlement-status %))
+                                runs))))
+        ;; Recover the one retained affine world before closing the fixture.
+        (binding [ec/*execution-context* (:ctx room)]
+          (doseq [run runs
+                  :let [fork (registry/lookup (:run/world run))]
+                  :when fork]
+            (is (:ok? (discard! fork :test-recovery))))))
+      (finally
+        (evaluation/await-cleanups! room 5000)
         (d/close-room! room)))))
