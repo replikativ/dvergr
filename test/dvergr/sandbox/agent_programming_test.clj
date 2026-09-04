@@ -87,11 +87,27 @@
                     "b (agent/environment "
                     "{:limits {:timeout-ms 1000} "
                     ":verifier {:version 1 :id :checks/example} "
-                    ":task {:input 42} :id :training/example})] "
-                    "{:same? (= a b) :ref (agent/environment-ref a)})"))]
+                    ":task {:input 42} :id :training/example}) "
+                    "team (agent/make-agent (agent/roster) "
+                    "{:id :candidate :program {:kind :echo}}) "
+                    "dataset (agent/dataset "
+                    "{:id :training/smoke :environments [a]}) "
+                    "experiment (agent/experiment "
+                    "{:id :training/paired :dataset dataset "
+                    ":candidates [(agent/lookup team :candidate)] "
+                    ":repetitions 2})] "
+                    "{:same? (= a b) :ref (agent/environment-ref a) "
+                    ":dataset-ref (agent/dataset-ref dataset) "
+                    ":experiment-ref (agent/experiment-ref experiment) "
+                    ":parallelism (:experiment/parallelism experiment)})"))]
           (is (:success result) (pr-str (:error result)))
           (is (true? (get-in result [:value :same?])))
-          (is (uuid? (get-in result [:value :ref :environment/content-id]))))
+          (is (uuid? (get-in result [:value :ref :environment/content-id])))
+          (is (uuid? (get-in result
+                             [:value :dataset-ref :dataset/content-id])))
+          (is (uuid? (get-in result
+                             [:value :experiment-ref :experiment/content-id])))
+          (is (= 1 (get-in result [:value :parallelism]))))
         (let [guide (sandbox/ns-doc-md sci-ctx 'spindel.comb)]
           (is (re-find #"cancel losing branches" guide))
           (is (re-find #"owned-result-spin" guide)))

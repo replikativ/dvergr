@@ -112,10 +112,30 @@ private work exists in the same control Room. Its deterministic SCI contract and
 trusted model-backed verifier establish the recursive boundary before real CRM,
 support, scheduling, or delivery effects are added.
 
+The comparison unit is now explicit. A DatasetDef fixes a non-empty ordered set
+of exact environments; an ExperimentDef fixes exact candidate AgentDef content,
+repetitions, and bounded parallelism. Its lazy Spindel execution produces the
+ordinary certified Attempts and a deterministic Scorecard over the full paired
+matrix. This supports repeated provider/model comparisons without giving
+Dvergr a second scheduler or allowing evaluated SCI code to own trusted
+verifiers. Initially the Scorecard is a portable returned value; durable Runs
+and Attempts remain the evidence of record. A leaderboard can later be a
+Datahike projection over admitted Scorecards rather than mutable benchmark
+state.
+
+The first provider-free room-REPL probe on 2026-09-04 executed two echo
+candidates against two environments with two repetitions and parallelism two.
+It produced eight distinct durable Runs, eight certified Attempts, two 4/4
+candidate summaries, one content-addressed Scorecard, and zero active Runs at
+completion. This validates the experiment composition itself; it is not model
+quality evidence. The existing Codex/Claude live environments still use a
+bespoke trusted setup path. Migrating one of them is the acceptance criterion
+for the next setup-capability slice.
+
 ## Port order driven by failures
 
 1. Complete scoped observation and expose it in the REPL/UI.
-2. Add DatasetDef/ExperimentDef/Scorecard projections and repeated paired runs.
+2. Use DatasetDef/ExperimentDef/Scorecard repeated paired runs in the live REPL.
 3. Build a forkable business-state simulator and import an AutomationBench
    smoke subset.
 4. Add scheduled trigger/execution/delivery receipts using ordinary Runs.
