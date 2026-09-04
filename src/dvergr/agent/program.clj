@@ -22,6 +22,7 @@
             [hasch.core :as hasch]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.engine.impl.simple :as simple]
             [org.replikativ.spindel.atom :as ratom]
             [org.replikativ.spindel.spin.combinators :as comb]
             [org.replikativ.spindel.spin.core :as spin-core]
@@ -29,7 +30,9 @@
             [taoensso.telemere :as tel])
   (:import [java.nio.charset StandardCharsets]
            [java.util UUID]
-           [java.util.concurrent Callable CountDownLatch FutureTask]))
+           [java.util.concurrent Callable CountDownLatch Executors FutureTask
+            ThreadFactory]
+           [java.util.concurrent.atomic AtomicLong]))
 
 (def run-sink
   "Reserved non-subscribed Room address for private Run inputs and outputs.
@@ -40,6 +43,23 @@
 (def interpreter-version 5)
 
 (def ^:private default-max-model-steps 32)
+
+(defonce ^:private native-thread-counter (AtomicLong.))
+
+(defonce ^:private native-executor
+  ;; Clojure futures and send-off share Agent/soloExecutor. A finalization watcher
+  ;; blocks until its orchestration publishes an outcome, so using that same
+  ;; executor for the native worker which produces the outcome creates a
+  ;; scheduler-dependent deadlock when an embedder bounds or replaces the Agent
+  ;; executor. Dvergr owns this cached daemon pool as part of its process-local
+  ;; Run supervisor instead.
+  (Executors/newCachedThreadPool
+   (reify ThreadFactory
+     (newThread [_ runnable]
+       (doto (Thread. ^Runnable runnable)
+         (.setName (str "dvergr-agent-native-"
+                        (.incrementAndGet native-thread-counter)))
+         (.setDaemon true))))))
 
 (declare with-owned-child! cancel!)
 
@@ -232,7 +252,7 @@
       ;; Do not even enqueue work when cancellation preceded registration.
        (.cancel task false)
        (try
-         (.execute clojure.lang.Agent/soloExecutor task)
+         (.execute native-executor task)
          (catch Throwable t
           ;; Make executor rejection flow through the same acknowledgement path.
            (reset! result {::worker-error t})
@@ -990,41 +1010,42 @@
    cached terminal result and the stable supervisor reports every native worker
    and owned cleanup quiescent. World settlement happens behind the same
    physical-quiescence fence."
-  [room control-room run-world id parent-run allocation-state supervisor execution completion outcome]
-  (future
-    ;; `future` conveys dynamic bindings. A cancellation hook normally launches
-    ;; this watcher from the losing observer Spin, so retaining its *spin-id*
-    ;; would make the supposedly external durability path a child of the very
-    ;; graph being reaped. Keep the Room memory context but detach graph identity.
-    (binding [ec/*execution-context* (:ctx room)
-              ec/*spin-id* nil]
-      ;; Wait until the executor has published either its ordinary outcome or
-      ;; its graph-level cancellation/failure through the process-local bridge.
-      (let [outcome @outcome]
-        ;; Keep the durable cancellation token/live lease until the executor has
-      ;; acknowledged termination. Direct cancellation relies on that token at
-      ;; its next cooperative checkpoint; releasing it merely because a pure
-      ;; program has no native workers would let the body continue to effects.
-        (let [execution-id (spin-core/spin-id execution)]
-          (loop []
-            (when-not (ec/spin-current-result execution-id)
-              (Thread/sleep 5)
-              (recur))))
-        (await-supervisor! supervisor)
-        (return-unused-resources! control-room id parent-run allocation-state)
-        (let [{:keys [cleanup-error llm-metrics]} @(:state supervisor)
-              result (cond-> (if cleanup-error
-                               {:run/id id :run/status :failed
-                                :run/error (ex-message cleanup-error)}
-                               (:result outcome))
-                       llm-metrics (assoc :run/metrics llm-metrics))
-              execution-opts (merge
-                              (:finish-opts outcome)
-                              (when cleanup-error
-                                {:reason :cleanup-error :error cleanup-error}))
-              {:keys [result finish-opts]} (settlement-result run-world result)]
-          (publish-result-and-release! id completion result
-                                       (merge execution-opts finish-opts)))))))
+  [room control-room run-world id parent-run allocation-state supervisor execution-terminal
+   completion outcome]
+  (.execute
+   native-executor
+   ^Runnable
+   (bound-fn []
+     ;; `bound-fn` conveys dynamic bindings. A cancellation hook normally
+     ;; launches this watcher from the losing observer Spin, so retaining its
+     ;; *spin-id* would make the supposedly external durability path a child of
+     ;; the very graph being reaped. Keep the Room memory context but detach
+     ;; graph identity.
+     (binding [simple/*in-drain?* false
+               ec/*execution-context* (:ctx room)
+               ec/*spin-id* nil]
+       ;; Wait until the executor has published either its ordinary outcome or
+       ;; its graph-level cancellation/failure through the process-local bridge.
+       (let [outcome @outcome]
+         ;; Keep the durable cancellation token/live lease until the supervising
+         ;; Spin explicitly acknowledges terminality. Polling context state is
+         ;; racy with graph cleanup and is not a compositional completion edge.
+         @execution-terminal
+         (await-supervisor! supervisor)
+         (return-unused-resources! control-room id parent-run allocation-state)
+         (let [{:keys [cleanup-error llm-metrics]} @(:state supervisor)
+               result (cond-> (if cleanup-error
+                                {:run/id id :run/status :failed
+                                 :run/error (ex-message cleanup-error)}
+                                (:result outcome))
+                        llm-metrics (assoc :run/metrics llm-metrics))
+               execution-opts (merge
+                               (:finish-opts outcome)
+                               (when cleanup-error
+                                 {:reason :cleanup-error :error cleanup-error}))
+               {:keys [result finish-opts]} (settlement-result run-world result)]
+           (publish-result-and-release! id completion result
+                                        (merge execution-opts finish-opts))))))))
 
 (defn- execution-spin
   [control-room work-room agent task trigger id chat-id supervisor limits outcome-promise]
@@ -1309,6 +1330,7 @@
                                        prepare-world!)
               (execution-spin control-room work-room agent task trigger id chat-id
                               supervisor limits outcome-promise))
+            execution-terminal (promise)
             execution (sp/spin (sp/await completion))
             owner-fork-id (:fork-id (ec/current-execution-context))
             handle    (RunHandle. id (:id control-room) owner-fork-id execution completion
@@ -1326,10 +1348,18 @@
         ;; boundary. register-cancel-hook! immediately invokes it if cancellation
         ;; won between durable admission and construction of this execution.
         (run/register-cancel-hook! id ::native-worker cancel!)
-        (sp/spawn!
+        ;; Use Spindel's fire-and-forget GC pin together with exact terminal
+        ;; callbacks instead of polling internal context state.
+        (sync/spawn!
          worker-execution
-         {:on-error
+         {:on-success
+          (fn [_]
+            (deliver execution-terminal true))
+          :on-error
           (fn [t]
+            ;; This callback is invoked only after the Spin rejects, including
+            ;; cancellation before its body begins.
+            (deliver execution-terminal true)
             ;; Graph-level cancellation is settled outside the cancelled Spin:
             ;; this callback may safely block on stable supervisor quiescence,
             ;; while the cancelled body may not cross another await breakpoint.
@@ -1366,7 +1396,7 @@
                           {:reason failure-reason
                            :error t})})))})
         (finalize-execution-external! world-parent control-room run-world id parent-run
-                                      allocation-state supervisor worker-execution
+                                      allocation-state supervisor execution-terminal
                                       completion outcome-promise)
         handle)
       (catch Throwable t

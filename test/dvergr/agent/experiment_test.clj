@@ -1,11 +1,18 @@
 (ns dvergr.agent.experiment-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
+            [dvergr.activity :as activity]
             [dvergr.agent.environment :as environment-def]
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.experiment :as experiment]
+            [dvergr.agent.observation :as observation]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.run :as run]
+            [dvergr.chat.agent :as chat-agent]
             [dvergr.discourse :as d]
+            [dvergr.model.chat :as model-chat]
+            [dvergr.model.providers :as providers]
             [dvergr.room.registry :as registry]
             [dvergr.room.store :as store]
             [dvergr.room.store.memory :as memory]
@@ -455,6 +462,186 @@
                   :let [fork (registry/lookup (:run/world run))]
                   :when fork]
             (is (:ok? (discard! fork :test-recovery))))))
+      (finally
+        (evaluation/await-cleanups! room 5000)
+        (d/close-room! room)))))
+
+(def ^:private recursive-program-result
+  {:answer 23 :particles 2 :verified true})
+
+(def ^:private recursive-program-code
+  (str
+   "(require '[dvergr.agent :as agent] "
+   "         '[org.replikativ.spindel.spin.cps :refer [spin]] "
+   "         '[org.replikativ.spindel.effects.await :refer [await]] "
+   "         '[spindel.comb :as comb]) "
+   "(let [team (-> (agent/roster {:id :particle-eval}) "
+   "               (agent/make-agent {:id :mod-five "
+   "                 :program {:kind :scripted "
+   "                           :reply [8 23 38 53 68 83 98]}}) "
+   "               (agent/make-agent {:id :mod-seven "
+   "                 :program {:kind :scripted "
+   "                           :reply [2 9 16 23 30 37 44 51 58 65 72 79 86 93]}}) "
+   "               (agent/make-agent {:id :verifier "
+   "                 :program {:kind :scripted "
+   "                           :reply {:moduli [[3 2] [5 3] [7 2]] "
+   "                                   :upper-bound 100}}})) "
+   "      a (agent/hire! team :mod-five {:task :candidates}) "
+   "      b (agent/hire! team :mod-seven {:task :candidates}) "
+   "      v (agent/hire! team :verifier {:task :constraints}) "
+   "      [ra rb rv] @(spin (await (comb/parallel "
+   "                                  (agent/result-spin a) "
+   "                                  (agent/result-spin b) "
+   "                                  (agent/result-spin v)))) "
+   "      [xs ys spec] (mapv :run/value [ra rb rv]) "
+   "      candidates (filter (set ys) xs) "
+   "      valid? (fn [n] (and (pos? n) (< n (:upper-bound spec)) "
+   "                            (every? (fn [[m r]] (= r (mod n m))) "
+   "                                    (:moduli spec)))) "
+   "      answers (vec (filter valid? candidates))] "
+   "  {:answer (first answers) :particles 2 :verified (= [23] answers)})"))
+
+(defn- read-one-edn [value]
+  (when (string? value)
+    (try
+      (edn/read-string value)
+      (catch Throwable _ nil))))
+
+(deftest deterministic-model-certifies-the-complete-recursive-harness-path
+  (let [verifier-ref {:verifier/id :test/recursive-harness
+                      :verifier/version 1
+                      :verifier/basis "recursive-harness-test:v1"}
+        definition
+        (environment-def/make-environment
+         {:id :test/recursive-harness
+          :task :author-and-run-particle-program
+          :verifier {:id :test/recursive-harness :version 1
+                     :basis "recursive-harness-test:v1"}
+          :limits {:timeout-ms 10000 :cancel-timeout-ms 2000
+                   :max-model-steps 2 :budget-dollars 1.0}
+          :world {:isolation :ctx :settlement :discard}})
+        team (-> (roster/make-roster {:id :test/recursive-candidates})
+                 (roster/make-agent
+                  {:id :simulated-model
+                   :tools #{:clojure_eval}
+                   :model-policy {:provider :test :model "deterministic"}
+                   :program {:kind :llm :max-model-steps 2
+                             :budget-dollars 1.0 :auto-compact? false}}))
+        experiment-def
+        (experiment/make-experiment
+         {:id :test/recursive-harness
+          :dataset
+          (experiment/make-dataset
+           {:id :test/recursive-harness
+            :environments [definition]})
+          :candidates [(roster/agent team :simulated-model)]})
+        evaluator
+        (evaluation/make-evaluator
+         {:id :test/recursive-harness
+          :version 1
+          :basis "recursive-harness-test:v1"
+          :observe
+          (fn [{:keys [room run-id result durable]}]
+            (let [snapshot (observation/snapshot
+                            room run-id
+                            {:run-limit 20 :message-limit 100
+                             :content-limit 1000 :content-budget 32000
+                             :detail-limit 100})]
+              {:result (read-one-edn (:run/value result))
+               :durable-status (:run/status durable)
+               :root-run-id run-id
+               :runs (:observation/runs snapshot)
+               :activities (:observation/activities snapshot)}))
+          :verify
+          (fn [_ {:keys [result durable-status root-run-id runs activities]}]
+            (let [root (some #(when (= root-run-id (:run/id %)) %) runs)
+                  children (remove #(= root-run-id (:run/id %)) runs)
+                  child-ids (into #{} (map :run/id) children)
+                  root-evals
+                  (filter #(and (= root-run-id (:activity/run-id %))
+                                (= :tool (:activity/kind %))
+                                (= :invoke (:activity/verb %))
+                                (= "clojure_eval" (:activity/tool-name %))
+                                (= :completed (:activity/status %)))
+                          activities)
+                  checks
+                  {:exact-result? (= recursive-program-result result)
+                   :durably-completed? (= :completed durable-status)
+                   :four-run-tree? (= 4 (count runs))
+                   :three-specialists? (= #{:mod-five :mod-seven :verifier}
+                                          (set (map :run/actor children)))
+                   :structural-parentage?
+                   (every? #(= root-run-id (:run/parent %)) children)
+                   :all-results-observed?
+                   (= child-ids (set (:run/caused-by root)))
+                   :specialists-completed?
+                   (every? #(= :completed (:run/status %)) children)
+                   :specialists-merged?
+                   (every? #(= :merged (:run/settlement-status %)) children)
+                   :distinct-worlds?
+                   (= 4 (count (set (map :run/world runs))))
+                   :one-real-clojure-eval? (= 1 (count root-evals))}]
+              {:checks checks
+               :reward (if (every? true? (vals checks)) 1.0 0.0)}))})
+        room (d/make-room {:id :experiment-recursive-harness
+                           :store (memory/make)})
+        calls (atom 0)
+        forwarded-tool-result (atom nil)]
+    (try
+      (with-redefs
+       [providers/ensure-initialized! (constantly nil)
+        chat-agent/messages->api-format (fn [messages _ _] messages)
+        model-chat/chat
+        (fn [messages _]
+          (case (swap! calls inc)
+            1 {:content ""
+               :tool-calls [{:id "recursive-program"
+                             :name "clojure_eval"
+                             :input {:code recursive-program-code}}]
+               :usage {:input-tokens 10 :output-tokens 20}
+               :stop-reason :tool-use}
+            2 (let [content
+                    (some (fn [message]
+                            (when (and (= :tool-result (:message/role message))
+                                       (= "recursive-program"
+                                          (:message/tool-use-id message)))
+                              (:message/content message)))
+                          messages)
+                    _ (when-not (and (string? content)
+                                     (str/starts-with? content "=> "))
+                        (throw (ex-info "missing recursive tool result"
+                                        {:messages messages})))
+                    value (edn/read-string (subs content 3))]
+                (reset! forwarded-tool-result value)
+                {:content (pr-str value)
+                 :tool-calls nil
+                 :usage {:input-tokens 30 :output-tokens 10}
+                 :stop-reason :end-turn})
+            (throw (ex-info "deterministic model called too often"
+                            {:calls @calls}))))]
+        (binding [ec/*execution-context* (:ctx room)]
+          (let [{:keys [attempts scorecard]}
+                @(experiment/run room team experiment-def
+                                 {verifier-ref evaluator}
+                                 {:parallelism 1})
+                attempt (first attempts)
+                checks (get-in attempt [:attempt/receipt :attempt/checks])
+                runs (run/runs room {:limit 20})]
+            (is (= 2 @calls))
+            (is (= recursive-program-result @forwarded-tool-result)
+                "the simulated model forwards the actual tool result")
+            (is (= 1 (count attempts)))
+            (is (every? true? (vals checks)) (pr-str checks))
+            (is (= 1.0 (get-in attempt [:attempt/receipt :attempt/reward])))
+            (is (= scorecard
+                   (experiment/scorecard room (:scorecard/content-id scorecard))))
+            (is (= [{:candidate/id :simulated-model
+                     :attempt-count 1 :passed-count 1
+                     :reward-sum 1.0 :reward-mean 1.0}]
+                   (:scorecard/summary scorecard)))
+            (is (empty? (run/active-runs (:id room))))
+            (is (every? #(nil? (registry/lookup (:run/world %))) runs)
+                "all discarded/merged Run worlds release their registry handles"))))
       (finally
         (evaluation/await-cleanups! room 5000)
         (d/close-room! room)))))
