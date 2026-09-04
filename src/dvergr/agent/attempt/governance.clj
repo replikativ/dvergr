@@ -1,5 +1,5 @@
 (ns dvergr.agent.attempt.governance
-  "Mandatory Datahike writer predicate for certified Attempt projections.
+  "Mandatory Datahike writer predicate for certified evaluation projections.
 
    This composes with an existing store predicate (notably Kontor) and validates
    fully-resolved datoms. It prevents raw transactions, imports, and remote
@@ -18,9 +18,25 @@
     :attempt/evidence-content-id :attempt/evidence-runs
     :attempt/settlement-intent :attempt/checks})
 
+(def ^:private scorecard-required
+  #{:scorecard/id :scorecard/chat :scorecard/payload-blob
+    :scorecard/payload-codec :scorecard/experiment-id
+    :scorecard/experiment-version :scorecard/experiment-content-id
+    :scorecard/dataset-id :scorecard/dataset-version
+    :scorecard/dataset-content-id :scorecard/stored-at
+    :scorecard/attempts :scorecard/summaries})
+
+(def ^:private summary-required
+  #{:scorecard.summary/id :scorecard.summary/candidate-id
+    :scorecard.summary/candidate-content-id
+    :scorecard.summary/attempt-count :scorecard.summary/passed-count
+    :scorecard.summary/reward-sum :scorecard.summary/reward-mean})
+
 (defn- protected-ident? [ident]
   (and (keyword? ident)
-       (contains? #{"attempt" "attempt.check"} (namespace ident))))
+       (contains? #{"attempt" "attempt.check"
+                    "scorecard" "scorecard.summary"}
+                  (namespace ident))))
 
 (defn- datom-ident [db datom]
   (let [attr (nth datom 1)]
@@ -38,16 +54,25 @@
     {:attempt/run [* {:run/chat [:db/id :chat/id]}]}
     {:attempt/evidence-runs [* {:run/chat [:db/id :chat/id]}]}
     {:attempt/evidence-messages [* {:message/chat [:db/id :chat/id]}]}
-    {:attempt/checks [*]}])
+    {:attempt/checks [*]}
+    {:scorecard/chat [:db/id :chat/id]}
+    {:scorecard/attempts [* {:attempt/chat [:db/id :chat/id]}]}
+    {:scorecard/summaries [*]}])
 
 (defn- entity-map [db eid]
   (d/pull db entity-pattern eid))
 
 (defn- attempt? [entity] (uuid? (:attempt/id entity)))
 (defn- check? [entity] (uuid? (:attempt.check/id entity)))
+(defn- scorecard? [entity] (uuid? (:scorecard/id entity)))
+(defn- summary? [entity] (uuid? (:scorecard.summary/id entity)))
 
 (defn- same-chat? [attempt run]
   (= (:db/id (:attempt/chat attempt)) (:db/id (:run/chat run))))
+
+(defn- same-scorecard-chat? [scorecard attempt]
+  (= (:db/id (:scorecard/chat scorecard))
+     (:db/id (:attempt/chat attempt))))
 
 (defn- validate-new-attempt! [db entity]
   (let [missing (remove #(contains? entity %) attempt-required)
@@ -94,6 +119,43 @@
                          :attempt/id (:attempt/id entity)}))))
     db))
 
+(defn- validate-new-scorecard! [db entity]
+  (let [missing (remove #(contains? entity %) scorecard-required)]
+    (when (seq missing)
+      (throw (ex-info "Certified Scorecard row is incomplete"
+                      {:type ::incomplete-scorecard :missing (set missing)})))
+    (when-not (seq (:scorecard/attempts entity))
+      (throw (ex-info "Certified Scorecard requires Attempts"
+                      {:type ::scorecard-without-attempts
+                       :scorecard/id (:scorecard/id entity)})))
+    (doseq [attempt (:scorecard/attempts entity)]
+      (when-not (and (attempt? attempt)
+                     (same-scorecard-chat? entity attempt))
+        (throw (ex-info "Certified Scorecard has a missing or cross-Room Attempt"
+                        {:type ::invalid-scorecard-attempt
+                         :scorecard/id (:scorecard/id entity)}))))
+    (doseq [summary (:scorecard/summaries entity)]
+      (let [missing-summary (remove #(contains? summary %) summary-required)]
+        (when (seq missing-summary)
+          (throw (ex-info "Certified Scorecard summary is incomplete"
+                          {:type ::incomplete-scorecard-summary
+                           :scorecard/id (:scorecard/id entity)
+                           :missing (set missing-summary)})))
+        (when-not (and (keyword? (:scorecard.summary/candidate-id summary))
+                       (uuid? (:scorecard.summary/candidate-content-id summary))
+                       (pos-int? (:scorecard.summary/attempt-count summary))
+                       (nat-int? (:scorecard.summary/passed-count summary))
+                       (<= (:scorecard.summary/passed-count summary)
+                           (:scorecard.summary/attempt-count summary))
+                       (Double/isFinite
+                        (double (:scorecard.summary/reward-sum summary)))
+                       (Double/isFinite
+                        (double (:scorecard.summary/reward-mean summary))))
+          (throw (ex-info "Certified Scorecard summary is malformed"
+                          {:type ::invalid-scorecard-summary
+                           :scorecard/id (:scorecard/id entity)})))))
+    db))
+
 (defonce ^:private authorized-writes (atom {}))
 
 (defn- store-id [conn-or-db]
@@ -106,24 +168,44 @@
   [conn attempt-id f]
   (let [token (random-uuid)
         key [(store-id conn) token]]
-    (swap! authorized-writes assoc key attempt-id)
+    (swap! authorized-writes assoc key {:kind :attempt :id attempt-id})
     (try
-      (f {:attempt.writer/token token})
+      (f {:evaluation.writer/token token})
       (finally
         (swap! authorized-writes dissoc key)))))
 
 (defn- authorized-attempt-id [report]
-  (when-let [token (get-in report [:tx-meta :attempt.writer/token])]
-    (get @authorized-writes
-         [(get-in report [:db-after :config :store :id]) token])))
+  (when-let [token (get-in report [:tx-meta :evaluation.writer/token])]
+    (let [authorization
+          (get @authorized-writes
+               [(get-in report [:db-after :config :store :id]) token])]
+      (when (= :attempt (:kind authorization)) (:id authorization)))))
+
+(defn with-authorized-scorecard-write
+  "Invoke `f` with a one-use capability for one certified Scorecard identity."
+  [conn scorecard-id f]
+  (let [token (random-uuid)
+        key [(store-id conn) token]]
+    (swap! authorized-writes assoc key {:kind :scorecard :id scorecard-id})
+    (try
+      (f {:evaluation.writer/token token})
+      (finally
+        (swap! authorized-writes dissoc key)))))
+
+(defn- authorized-scorecard-id [report]
+  (when-let [token (get-in report [:tx-meta :evaluation.writer/token])]
+    (let [authorization
+          (get @authorized-writes
+               [(get-in report [:db-after :config :store :id]) token])]
+      (when (= :scorecard (:kind authorization)) (:id authorization)))))
 
 (defn validate-report
-  "Reject unauthorized creation and every mutation of certified Attempt facts."
+  "Reject unauthorized creation and mutation of certified evaluation facts."
   [{:keys [db-before db-after tx-data] :as report}]
   (let [changed (vec (touched report))
         eids (into #{} (map #(nth % 0)) changed)
-        merge? (seq (get-in db-after [:meta :datahike/merge-parents]))
-        authorized-id (authorized-attempt-id report)]
+        authorized-id (authorized-attempt-id report)
+        authorized-scorecard-id (authorized-scorecard-id report)]
     (doseq [eid eids]
       (let [before (entity-map db-before eid)
             after (entity-map db-after eid)
@@ -131,11 +213,15 @@
             after-attempt? (attempt? after)
             before-check? (check? before)
             after-check? (check? after)
+            before-scorecard? (scorecard? before)
+            after-scorecard? (scorecard? after)
+            before-summary? (summary? before)
+            after-summary? (summary? after)
             entity-datoms (filter #(= eid (nth % 0)) changed)]
         (cond
           (and (not before-attempt?) after-attempt?)
           (do
-            (when-not (or merge? (= authorized-id (:attempt/id after)))
+            (when-not (= authorized-id (:attempt/id after))
               (throw (ex-info "Certified Attempts require the trusted writer"
                               {:type ::unauthorized-attempt-create
                                :attempt/id (:attempt/id after)})))
@@ -156,7 +242,7 @@
                              :attempt/id (:attempt/id before)})))
 
           (and (not before-check?) after-check?)
-          (when-not (or merge? authorized-id)
+          (when-not authorized-id
             (throw (ex-info "Attempt checks require the trusted writer"
                             {:type ::unauthorized-check-create})))
 
@@ -174,7 +260,51 @@
             (when (attempt? (entity-map db-after owner))
               (throw (ex-info "Attempt check deletion requires Attempt deletion"
                               {:type ::check-deletion
-                               :check/id (:attempt.check/id before)})))))))
+                               :check/id (:attempt.check/id before)}))))
+
+          (and (not before-scorecard?) after-scorecard?)
+          (do
+            (when-not (= authorized-scorecard-id (:scorecard/id after))
+              (throw (ex-info "Certified Scorecards require the trusted writer"
+                              {:type ::unauthorized-scorecard-create
+                               :scorecard/id (:scorecard/id after)})))
+            (validate-new-scorecard! db-after after))
+
+          (and before-scorecard? after-scorecard?)
+          (when (seq entity-datoms)
+            (throw (ex-info "Certified Scorecard rows are immutable"
+                            {:type ::scorecard-mutation
+                             :scorecard/id (:scorecard/id before)})))
+
+          (and before-scorecard? (not after-scorecard?))
+          (when (:chat/id
+                 (d/pull db-after [:chat/id]
+                         (get-in before [:scorecard/chat :db/id])))
+            (throw (ex-info "Certified Scorecard deletion requires Room deletion"
+                            {:type ::scorecard-deletion
+                             :scorecard/id (:scorecard/id before)})))
+
+          (and (not before-summary?) after-summary?)
+          (when-not authorized-scorecard-id
+            (throw (ex-info "Scorecard summaries require the trusted writer"
+                            {:type ::unauthorized-scorecard-summary-create})))
+
+          (and before-summary? after-summary?)
+          (when (seq entity-datoms)
+            (throw (ex-info "Scorecard summaries are immutable"
+                            {:type ::scorecard-summary-mutation
+                             :summary/id (:scorecard.summary/id before)})))
+
+          (and before-summary? (not after-summary?))
+          (when-let [owner
+                     (d/q '[:find ?s . :in $ ?summary
+                            :where [?s :scorecard/summaries ?summary]]
+                          db-before eid)]
+            (when (scorecard? (entity-map db-after owner))
+              (throw
+               (ex-info "Scorecard summary deletion requires Scorecard deletion"
+                        {:type ::scorecard-summary-deletion
+                         :summary/id (:scorecard.summary/id before)})))))))
     ;; A newly-created check must be owned by an Attempt component edge.
     (doseq [eid eids
             :let [before (entity-map db-before eid)
@@ -184,12 +314,28 @@
                        :where [?a :attempt/checks ?check]] db-after eid)
         (throw (ex-info "Attempt check is not owned by a certified Attempt"
                         {:type ::orphan-check :check/id (:attempt.check/id after)}))))
+    ;; A newly-created summary must be a component of the authorized Scorecard.
+    (doseq [eid eids
+            :let [before (entity-map db-before eid)
+                  after (entity-map db-after eid)]
+            :when (and (not (summary? before)) (summary? after))]
+      (let [owner (d/q '[:find ?s . :in $ ?summary
+                         :where [?s :scorecard/summaries ?summary]]
+                       db-after eid)
+            owner-scorecard (when owner (entity-map db-after owner))]
+        (when-not (and (scorecard? owner-scorecard)
+                       (= authorized-scorecard-id
+                          (:scorecard/id owner-scorecard)))
+          (throw
+           (ex-info "Scorecard summary is not owned by its certified Scorecard"
+                    {:type ::orphan-scorecard-summary
+                     :summary/id (:scorecard.summary/id after)})))))
     report))
 
 (defonce ^:private installed (atom {}))
 
 (defn govern!
-  "Compose Attempt validation with the store's current mandatory predicate."
+  "Compose certified Attempt/Scorecard validation with the store predicate."
   [conn]
   (let [store-id (get-in @conn [:config :store :id])
         tx-pred-for (requiring-resolve 'datahike.tx-preds/tx-pred-for)

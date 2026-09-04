@@ -452,7 +452,21 @@ experiment identity.
 The result contains every certified Attempt plus a content-addressed Scorecard
 with one entry per candidate/environment/repetition cell and deterministic
 per-candidate aggregates. Scorecards are immutable projections, not a mutable
-leaderboard or scheduler.
+leaderboard or scheduler. When the Room has a store, completion durably writes
+the exact Scorecard only after all referenced Attempts are certified. The
+Datahike projection joins those same-Room Attempts and indexes experiment,
+dataset, and candidate identities; its mandatory writer predicate rejects raw
+creation or later mutation. Host code can use `experiment/scorecard` and
+`experiment/scorecards` to reconstruct exact comparisons without replaying
+model work. A failed partial batch still leaves its individual Attempts but no
+misleading complete Scorecard.
+
+Attempts and Scorecards are certified control-plane facts, not candidate-world
+state. They are written through the trusted Room store after effects settle and
+are never admitted merely because a Datahike branch was merged. Fork/proposal
+settlement may carry the work that an Attempt evaluated, while certification is
+re-established through its one-use host writer capability in the authoritative
+Room. Every Scorecard identity consequently has one Room owner.
 
 Pure policy can rank/select the scorecards. Existing room-fork
 merge/discard/adoption remains the only settlement authority. SMC, MCTS,

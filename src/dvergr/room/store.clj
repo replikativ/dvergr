@@ -151,6 +151,28 @@
      :environment-id, :environment-content-id, :provider, :model, and :status;
      :limit is applied after filtering."))
 
+(defprotocol PScorecardStore
+  "Durable immutable projection of completed certified Experiments.
+
+   A Scorecard contains the exact ExperimentDef and full cell matrix, while its
+   Attempt references must resolve to already-certified Attempts in the same
+   Room. It is a query/index projection, not another execution lifecycle."
+
+  (-store-scorecard! [this room-id scorecard]
+    "Persist one canonical completed Scorecard. Repeating identical content is
+     idempotent. Its content identity has one authoritative Room owner across
+     the store; claiming it from another Room or with different content is an
+     error.")
+
+  (-load-scorecard [this room-id scorecard-id]
+    "Return one exact Scorecard by content UUID in `room-id`, else nil.")
+
+  (-list-scorecards [this room-id opts]
+    "Return recently stored Scorecards newest first. Optional exact filters are
+     :experiment-id, :experiment-content-id, :dataset-id,
+     :dataset-content-id, :candidate-id, and :candidate-content-id; :limit is
+     applied after filtering."))
+
 ;; =============================================================================
 ;; Helpers
 ;; =============================================================================

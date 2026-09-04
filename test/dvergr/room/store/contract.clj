@@ -1,7 +1,79 @@
 (ns dvergr.room.store.contract
   "Behavioral contract shared by every PRoomStore implementation."
   (:require [clojure.test :refer [is testing]]
-            [dvergr.room.store :as store]))
+            [dvergr.agent.attempt :as attempt]
+            [dvergr.agent.environment :as environment]
+            [dvergr.agent.experiment :as experiment]
+            [dvergr.agent.roster :as roster]
+            [dvergr.room.store :as store]
+            [hasch.core :as hasch]))
+
+(defn assert-cross-room-scorecard-identity!
+  "One certified Scorecard content identity has exactly one control Room owner."
+  [st]
+  (testing "Scorecard identity cannot be claimed by another Room"
+    (let [room-a :scorecard-room-a
+          room-b :scorecard-room-b
+          run-id (random-uuid)
+          now (java.util.Date. 1000)
+          agent (-> (roster/make-roster)
+                    (roster/make-agent {:id :candidate
+                                        :program {:kind :echo}})
+                    (roster/agent :candidate))
+          definition
+          (environment/make-environment
+           {:id :contract/exact :task :ok
+            :verifier {:id :contract/exact :version 1}
+            :world {:isolation :ctx :settlement :review}})
+          receipt
+          (environment/make-attempt-receipt
+           definition
+           {:run-id run-id :provider :dvergr :model "echo"
+            :status :completed :started-at 1000 :elapsed-ms 10
+            :metrics {:program-kind :echo :model-resolution :not-applicable
+                      :agent-version 1 :agent-def-hash (hasch/uuid agent)
+                      :interpreter-version 5}
+            :checks {:exact? true} :reward 1.0
+            :trace {:runs [{:run/id run-id :run/status :completed}]}})
+          certified
+          (attempt/make-attempt
+           definition agent receipt
+           {:trace {:runs [{:run/id run-id :run/status :completed}]}}
+           :review)
+          experiment-def
+          (experiment/make-experiment
+           {:id :contract/scorecard
+            :dataset (experiment/make-dataset
+                      {:id :contract/scorecard
+                       :environments [definition]})
+            :candidates [agent]})
+          candidate (first (:experiment/candidates experiment-def))
+          scorecard
+          (experiment/make-scorecard
+           experiment-def
+           [{:experiment/job
+             {:candidate/id (:candidate/id candidate)
+              :candidate/agent (:candidate/agent candidate)
+              :candidate/agent-content-id
+              (:candidate/agent-content-id candidate)
+              :environment (environment/environment-ref definition)
+              :repetition 0}
+             :attempt certified}])]
+      (doseq [room-id [room-a room-b]]
+        (store/-store-room! st room-id {:slug (name room-id)}))
+      (store/-store-run!
+       st room-a
+       {:run/id run-id :run/kind :agent-task :run/room room-a
+        :run/actor :candidate :run/trigger (random-uuid)
+        :run/status :completed :run/created-at now :run/started-at now
+        :run/updated-at now :run/ended-at (java.util.Date. 1010)
+        :run/agent-version 1 :run/program-kind :echo
+        :run/interpreter-version 5 :run/agent-def-hash (hasch/uuid agent)})
+      (store/-store-attempt! st room-a certified)
+      (is (= scorecard (store/-store-scorecard! st room-a scorecard)))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"another Room"
+                            (store/-store-scorecard! st room-b scorecard)))
+      (is (empty? (store/-list-scorecards st room-b {}))))))
 
 (defn assert-message-envelope!
   "Exercise lossless envelope replay and first-write-wins idempotence."
