@@ -128,16 +128,23 @@ scheduler:
 
 ```clojure
 (require '[dvergr.agent.arenas.renewal :as renewal]
+         '[dvergr.agent.evaluation :as evaluation]
          '[dvergr.agent.experiment :as experiment])
 
 (renewal/register-tool!)
 (renewal/provision-review-capacity!
  room {:id provisioning-event-id :amount candidate-cells})
 
-@(experiment/run
-  room roster experiment-def
-  {renewal/verifier-ref (renewal/evaluator)}
-  {:world-setups {renewal/setup-ref (renewal/world-setup)}})
+(let [cleanup-group (evaluation/cleanup-group)]
+  (try
+    @(experiment/run
+      room roster experiment-def
+      {renewal/verifier-ref (renewal/evaluator)}
+      {:cleanup-group cleanup-group
+       :world-setups {renewal/setup-ref (renewal/world-setup)}})
+    (finally
+      ;; Shared-Room callers join only this operation's detached cleanup.
+      (evaluation/await-cleanups-for! room cleanup-group))))
 ```
 
 The deterministic model contract exercises this complete path in CI. Live
