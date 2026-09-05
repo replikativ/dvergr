@@ -327,6 +327,127 @@
       (finally
         (close-resource-test-room! room conn)))))
 
+(deftest committed-resource-admission-error-returns-the-stable-grant
+  (let [[room conn] (resource-test-room :program-resource-uncertain-commit)
+        team (test-roster)
+        allocate! resource/allocate-run!]
+    (try
+      (resource/mint! room {:id (random-uuid)
+                            :resources {resource/microdollars 3M}})
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"lost allocation acknowledgement"
+           (with-redefs
+            [resource/allocate-run!
+             (fn [& args]
+               (apply allocate! args)
+               ;; Simulate transport/process acknowledgement loss after the
+               ;; PResourceStore transaction and stable receipt committed.
+               (throw (ex-info "lost allocation acknowledgement" {})))]
+             (binding [ec/*execution-context* (:ctx room)]
+               (program/hire! room team :analyst
+                              {:task :uncertain-allocation
+                               :resources {resource/microdollars 2M}})))))
+      (let [[failed] (run/runs room)
+            run-id (:run/id failed)]
+        (is (= :failed (:run/status failed)))
+        (is (= :resource-allocation-failed (:run/reason failed)))
+        (is (some? (room-store/-resource-receipt
+                    (:store room) (resource/allocation-id run-id)))
+            "the simulated failure happened after a durable allocation")
+        (is (= {} (resource/run-balance room run-id)))
+        (is (= {resource/microdollars 3M} (resource/balance room)))
+        (is (empty? (filter #(= :analyst (:from %))
+                            (d/messages room {:limit 10})))
+            "candidate execution never starts after admission failure")
+        (is (empty? (run/active-runs (:id room)))))
+      (finally
+        (close-resource-test-room! room conn)))))
+
+(deftest prepared-run-setup-failure-with-resources-terminalizes-without-a-wallet
+  (let [[room conn] (resource-test-room :program-setup-resource-failure)
+        team (test-roster)]
+    (try
+      (let [handle
+            (binding [ec/*execution-context* (:ctx room)]
+              (program/hire-prepared-in!
+               room room team :analyst
+               {:task :fixture-fails
+                :resources {resource/microdollars 1M}}
+               (fn [_]
+                 (throw (ex-info "fixture failed" {})))))
+            result (binding [ec/*execution-context* (:ctx room)]
+                     (deref handle 5000 ::timeout))
+            durable (program/observe room handle)]
+        (is (not= ::timeout result))
+        (is (= :failed (:run/status result)))
+        (is (= :world-setup-failed (:run/reason durable)))
+        (is (= :discarded (:run/settlement-status durable)))
+        (is (= {} (resource/balance room)))
+        (is (empty? (run/active-runs (:id room)))))
+      (finally
+        (close-resource-test-room! room conn)))))
+
+(deftest prepared-run-resource-refusal-terminalizes-without-candidate-effects
+  (let [[room conn] (resource-test-room :program-prepared-resource-refusal)
+        team (test-roster)]
+    (try
+      (let [handle
+            (binding [ec/*execution-context* (:ctx room)]
+              (program/hire-prepared-in!
+               room room team :analyst
+               {:task :too-expensive
+                :resources {resource/microdollars 1M}}
+               (constantly nil)))
+            result (binding [ec/*execution-context* (:ctx room)]
+                     (deref handle 5000 ::timeout))
+            durable (program/observe room handle)]
+        (is (not= ::timeout result))
+        (is (= :failed (:run/status result)))
+        (is (= :resource-allocation-failed (:run/reason durable)))
+        (is (= :discarded (:run/settlement-status durable)))
+        (is (= {} (resource/balance room)))
+        (is (empty? (filter #(= :analyst (:from %))
+                            (d/messages room {:limit 10})))
+            "resource refusal starts no candidate program")
+        (is (empty? (run/active-runs (:id room)))))
+      (finally
+        (close-resource-test-room! room conn)))))
+
+(deftest prepared-resource-allocation-does-not-block-the-spindel-drain
+  (let [room (test-room :program-prepared-resource-drain)
+        team (test-roster)
+        allocation-entered (promise)
+        release-allocation (promise)
+        drain-progress (promise)]
+    (try
+      (with-redefs
+       [resource/allocate-run!
+        (fn [& _]
+          (deliver allocation-entered true)
+          @release-allocation
+          {:receipt :committed})
+        resource/run-balance (fn [& _] {})]
+        (let [handle
+              (binding [ec/*execution-context* (:ctx room)]
+                (program/hire-prepared-in!
+                 room room team :analyst
+                 {:task :allocated-off-drain
+                  :resources {resource/microdollars 1M}}
+                 (constantly nil)))]
+          (is (= true (deref allocation-entered 2000 ::timeout)))
+          (binding [ec/*execution-context* (:ctx room)]
+            (sp/spawn! (sp/spin (deliver drain-progress true))))
+          (is (= true (deref drain-progress 500 ::timeout))
+              "the Room execution context remains reactive during allocation")
+          (deliver release-allocation true)
+          (is (= :completed
+                 (:run/status
+                  (binding [ec/*execution-context* (:ctx room)]
+                    (deref handle 5000 ::timeout)))))))
+      (finally
+        (deliver release-allocation true)
+        (d/close-room! room)))))
+
 (deftest settlement-policy-controls-the-isolated-run-world
   (let [room (test-room :program-settlement)
         team (test-roster)]
