@@ -210,6 +210,43 @@
         (evaluation/await-cleanups! room 5000)
         (d/close-room! room)))))
 
+(deftest finite-cell-rewards-cannot-overflow-scorecard-aggregates
+  (let [team (-> (roster/make-roster {:id :experiment/overflow-team})
+                 (roster/make-agent {:id :candidate :program {:kind :echo}}))
+        definition
+        (experiment/make-experiment
+         {:id :experiment/overflow
+          :dataset
+          (experiment/make-dataset
+           {:id :experiment/overflow
+            :environments [(environment :experiment/overflow :ok)]})
+          :candidates [(roster/agent team :candidate)]
+          :repetitions 2})
+        evaluator
+        (evaluation/make-evaluator
+         {:id :test/exact
+          :version 1
+          :basis "experiment-test:v1"
+          :observe (fn [{:keys [default]}] default)
+          :verify (fn [_ _]
+                    {:checks {:finite-cell? true}
+                     :reward Double/MAX_VALUE})})
+        room (d/make-room {:id :experiment-overflow
+                           :store (memory/make)})]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"aggregates must be finite"
+             @(experiment/run room team definition
+                              {(:ref evaluator) evaluator}))))
+      (is (= 2 (count (store/-list-attempts (:store room) (:id room) {})))
+          "every finite cell Attempt remains certified for diagnosis")
+      (is (empty? (store/-list-scorecards (:store room) (:id room) {}))
+          "the constructor never exposes or persists an invalid Scorecard")
+      (finally
+        (evaluation/await-cleanups! room 5000)
+        (d/close-room! room)))))
+
 (deftest repeated-paired-experiment-composes-ordinary-certified-evaluations
   (let [{:keys [team definition]} (fixture)
         room (d/make-room {:id :experiment-run :store (memory/make)})
