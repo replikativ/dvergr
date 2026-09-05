@@ -51,7 +51,7 @@
         ;; restart.
         ;; 0.1.44 includes structured work admission, cancellation hand-back,
         ;; canonical inference worlds, and forkable SCI world components.
-        org.replikativ/spindel     {:mvn/version "0.1.44"}
+        org.replikativ/spindel     {:mvn/version "0.1.45"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context
