@@ -548,7 +548,11 @@
    ordinary evaluation `:from`/`:parent-run` plus host-owned `:parallelism`,
    `:max-parallelism`, `:max-attempts`, an optional process-local
    `:cleanup-group`, and an exact `:world-setups` capability map for environments
-   that name setup references. Experiment batches
+   that name setup references. A caller-supplied cleanup group is known before
+   realization and can be joined with `evaluation/await-cleanups-for!` after a
+   failed or cancelled operation. When omitted, detached cleanup remains owned
+   by the Room and must be joined with `evaluation/await-cleanups!` at teardown.
+   Experiment batches
    initially require discard settlement; retained partial experiments need
    durable execution identity and recovery first."
   ([room team experiment evaluators]
@@ -591,10 +595,7 @@
      (invalid! "Experiment parallelism exceeds the host admission ceiling"
                ::parallelism-exceeds-ceiling
                {:parallelism parallelism :max-parallelism max-parallelism}))
-   (let [cleanup-group (if (some? cleanup-group)
-                         cleanup-group
-                         (evaluation/cleanup-group))
-         attempt-count (* (count (:experiment/candidates experiment))
+   (let [attempt-count (* (count (:experiment/candidates experiment))
                           (count (get-in experiment
                                          [:experiment/dataset
                                           :dataset/environments]))

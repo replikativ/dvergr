@@ -573,7 +573,8 @@
    content-addressed experimental variable. Supported environments currently
    need no setup beyond the shared memory baseline: join, race, and
    self-programming v1. Host execution options are `:parallelism`,
-   `:max-parallelism`, and `:max-attempts`."
+   `:max-parallelism`, `:max-attempts`, and an optional caller-owned
+   `:cleanup-group` for operation-scoped cleanup."
   [room {:keys [environment-ids candidates repetitions id]
          :or {repetitions 1 id :live/paired-v1}
          :as opts}]
@@ -606,7 +607,7 @@
                          definitions)]
     (experiment/run room team experiment-definition evaluators
                     (assoc (select-keys opts [:parallelism :max-parallelism
-                                              :max-attempts])
+                                              :max-attempts :cleanup-group])
                            :world-setups trusted-world-setups))))
 
 (defn run-paired-experiment!
@@ -618,17 +619,19 @@
    inspection is more important than convenience."
   [opts]
   (let [room-id (keyword (str "paired-bench-" (random-uuid)))
-        room (d/make-room {:id room-id :store (memory/make)})]
+        room (d/make-room {:id room-id :store (memory/make)})
+        cleanup-group (evaluation/cleanup-group)]
     (try
       (let [result (binding [ec/*execution-context* (:ctx room)]
-                     @(paired-experiment-spin room opts))]
+                     @(paired-experiment-spin
+                       room (assoc opts :cleanup-group cleanup-group)))]
         (select-keys result [:experiment :execution :attempts :scorecard]))
       (finally
         ;; Parallel failure cancels sibling evaluations immediately, while
         ;; their world discard runs off-drain. Join that physical cleanup
         ;; before invalidating the ephemeral Room context/store.
         (try
-          (evaluation/await-cleanups! room)
+          (evaluation/await-cleanups-for! room cleanup-group)
           (catch Throwable error
             ;; The caller can recover/inspect this process-local Room from
             ;; ex-data. Closing here would destroy the fork authority whose

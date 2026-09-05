@@ -208,11 +208,13 @@
                            :store (memory/make)})]
     (try
       (binding [ec/*execution-context* (:ctx room)]
-        (let [{:keys [attempts scorecard]}
+        (let [{:keys [attempts scorecard execution]}
               @(experiment/run room team definition
                                {(:ref exact-evaluator) exact-evaluator}
                                {:parallelism 2
                                 :world-setups {setup-ref setup}})]
+          (is (nil? (:cleanup-group execution))
+              "an omitted group leaves cleanup owned by the Room")
           (is (= 4 (count attempts)))
           (is (= 4 (count @prepared)))
           (is (= (set (map :attempt/run-id attempts)) (set @prepared)))
@@ -432,6 +434,11 @@
                 (throw (ex-info "deliberate parallel verifier failure" {})))))})
         room (d/make-room {:id :experiment-parallel-cleanup
                            :store (memory/make)})
+        cleanup-group (evaluation/cleanup-group)
+        unrelated-group (evaluation/cleanup-group)
+        unrelated-error (ex-info "unrelated cleanup" {})
+        unrelated-task (#'evaluation/start-task!
+                        room unrelated-group #(throw unrelated-error))
         discard! forks/discard-deferred!
         discard-count (atom 0)
         failing-discard
@@ -445,20 +452,31 @@
               :error :deliberate-discard-failure}
              (discard! fork reason claim!))))]
     (try
+      (is (map? @(:gate unrelated-task)))
       (with-redefs [forks/discard-deferred! failing-discard]
         (binding [ec/*execution-context* (:ctx room)]
           (is (thrown-with-msg?
                clojure.lang.ExceptionInfo #"certification failed"
                @(experiment/run room team definition
                                 {(:ref evaluator) evaluator}
-                                {:parallelism 3}))))
+                                {:parallelism 3
+                                 :cleanup-group cleanup-group}))))
         (let [error (try
-                      (evaluation/await-cleanups! room 5000)
+                      (evaluation/await-cleanups-for! room cleanup-group 5000)
                       nil
                       (catch clojure.lang.ExceptionInfo error error))]
           (is (= :dvergr.agent.evaluation/cleanup-incomplete
                  (:type (ex-data error))))
           (is (= 1 (count (:failures (ex-data error))))))
+        (is (true? (evaluation/await-cleanups-for! room cleanup-group 5000))
+            "the failed operation's cleanup was consumed")
+        (let [error (try
+                      (evaluation/await-cleanups-for! room unrelated-group 5000)
+                      nil
+                      (catch clojure.lang.ExceptionInfo error error))]
+          (is (= [unrelated-error]
+                 (mapv :error (:failures (ex-data error))))
+              "operation cleanup did not consume another group's failure"))
         (is (= 3 @discard-count)
             "the barrier joins every sibling despite one cleanup failure"))
       (is (empty? (run/active-runs (:id room))))

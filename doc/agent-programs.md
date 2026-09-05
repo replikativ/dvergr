@@ -434,11 +434,24 @@ repetition count:
                    :dataset dataset
                    :candidates [(agent/lookup team :codex)
                                 (agent/lookup team :claude)]
-                   :repetitions 5})]
-  ;; Host code supplies exact trusted Evaluator capabilities.
-  @(experiment/run room team experiment evaluator-map
-                   {:parallelism 2 :max-attempts 100}))
+                   :repetitions 5})
+      ;; Allocate operation-scoped cleanup authority before realization so it
+      ;; remains available when the Experiment fails or is cancelled.
+      cleanup-group (evaluation/cleanup-group)]
+  (try
+    ;; Host code supplies exact trusted Evaluator capabilities.
+    @(experiment/run room team experiment evaluator-map
+                     {:parallelism 2 :max-attempts 100
+                      :cleanup-group cleanup-group})
+    (finally
+      (evaluation/await-cleanups-for! room cleanup-group))))
 ```
+
+Omitting `:cleanup-group` deliberately makes detached evaluation cleanup
+Room-owned. This is convenient for a single-operation ephemeral Room, whose
+owner joins all work with `evaluation/await-cleanups!` before teardown. Shared
+Rooms should allocate a group before starting each operation and join that exact
+group in `finally`, so another operation's work or failure is never consumed.
 
 Dataset and experiment construction is pure and available inside SCI. Execution
 and reward certification are host-only: an agent can propose the benchmark it
