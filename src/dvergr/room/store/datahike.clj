@@ -324,6 +324,49 @@
                              :attempt/id (:attempt/id attempt-entity)})))))
       [entity])))
 
+(defn- assert-run-allocation-live
+  "Transaction guard coupling a Run's first grant to its durable lifecycle.
+
+   A receipt which appeared after the caller's optimistic read deliberately
+   aborts this transaction. The adapter then re-enters Kontor's complete
+   replay check, so a colliding command can never masquerade as a duplicate.
+   Existing receipts take that replay path before this function is invoked and
+   therefore remain replayable after the Run has terminated. The account and
+   transfer datoms remain adjacent top-level operations, so Kontor's complete
+   validation machinery still sees them before this guard and those operations
+   commit as one transaction.
+
+   This establishes the terminal-first boundary: a first grant cannot serialize
+   after terminal state. If the grant commits first, ordinary Run lifecycle code
+   remains responsible for returning or consuming it before finishing."
+  [db wallet-spec transfer-spec]
+  (let [transfer-id (:id transfer-spec)
+        owner       (:owner wallet-spec)
+        run-id      (when (and (vector? owner)
+                               (= :run/id (first owner)))
+                      (second owner))
+        run         (and run-id (dh/entity db owner))]
+    (when (dh/entity db [:kontor.resource-transfer/id transfer-id])
+      (throw (ex-info "Run allocation receipt appeared concurrently"
+                      {:type :room-store/concurrent-resource-allocation
+                       :run/id run-id
+                       :transfer/id transfer-id})))
+    (when-not (and run
+                   (= :grant (:kind transfer-spec))
+                   (= [:kontor.resource-account/id (:id wallet-spec)]
+                      (:destination transfer-spec)))
+      (throw (ex-info "Run allocation does not identify its durable Run"
+                      {:type :room-store/invalid-run-resource-allocation
+                       :run/id run-id
+                       :transfer/id transfer-id})))
+    (when (contains? store/terminal-run-statuses (:run/status run))
+      (throw (ex-info "A terminal Run cannot receive its first resource grant"
+                      {:type :room-store/terminal-run-resource-allocation
+                       :run/id run-id
+                       :run/status (:run/status run)
+                       :transfer/id transfer-id})))
+    []))
+
 (def ^:private message-pull-pattern
   '[:message/id :message/role :message/content
     :message/created-at :message/source-user
@@ -1413,10 +1456,13 @@
       ;; never mistaken for a successful replay.
       (resource/transfer! conn transfer-spec)
       (try
-        (kontor-gate/transact-with-validation
-         conn
-         (into (vec (resource/open-account-tx-data wallet-spec))
-               (resource/transfer-tx-data transfer-spec)))
+        (let [guard [[:db.fn/call assert-run-allocation-live
+                      wallet-spec transfer-spec]]
+              tx-data (into guard
+                            (concat
+                             (resource/open-account-tx-data wallet-spec)
+                             (resource/transfer-tx-data transfer-spec)))]
+          (kontor-gate/transact-with-validation conn tx-data))
         (assoc (resource/receipt conn (:id transfer-spec)) :status :committed)
         (catch Throwable error
           ;; Resolve the only benign race: another identical allocator may
