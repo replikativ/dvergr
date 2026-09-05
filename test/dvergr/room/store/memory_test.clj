@@ -23,6 +23,13 @@
 (deftest cross-room-attention-identity-contract
   (contract/assert-cross-room-attention-identity! (memory/make)))
 
+(deftest cross-room-scorecard-identity-contract
+  (contract/assert-cross-room-scorecard-identity! (memory/make)))
+
+(deftest finite-scorecard-aggregate-contract
+  (contract/assert-non-finite-scorecard-aggregates-rejected!
+   (memory/make) :scorecard-overflow-memory))
+
 (deftest attention-metadata-validation-contract
   (contract/assert-attention-metadata-validation!
    (memory/make) :attention-metadata-memory))

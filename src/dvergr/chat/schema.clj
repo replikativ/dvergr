@@ -712,10 +712,10 @@
    Exact EnvironmentDef, AgentDef, receipt, and evidence values live in the
    content-addressed payload. Runs, messages, and checks remain typed joins so
    benchmark and UI queries never need to scan opaque payloads."
-  [{:db/ident :attempt.writer/token
+  [{:db/ident :evaluation.writer/token
     :db/valueType :db.type/uuid
     :db/cardinality :db.cardinality/one
-    :db/doc "One-use process-local capability attached to a trusted certification transaction"}
+    :db/doc "One-use process-local capability attached to a trusted evaluation projection transaction"}
 
    {:db/ident :attempt/id
     :db/valueType :db.type/uuid
@@ -867,6 +867,109 @@
 
    {:db/ident :attempt.check/passed?
     :db/valueType :db.type/boolean
+    :db/cardinality :db.cardinality/one
+    :db/index true}])
+
+;; ============================================================================
+;; Certified Experiment Scorecard Schema
+;; ============================================================================
+
+(def scorecard-schema
+  "Immutable typed index for one complete certified Experiment scorecard.
+
+   The canonical ExperimentDef, entries, and summaries live in the immutable
+   payload. Typed Attempt joins and candidate summaries make provenance and
+   leaderboard queries available without scanning that payload."
+  [{:db/ident :scorecard/id
+    :db/valueType :db.type/uuid
+    :db/unique :db.unique/identity
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :scorecard/chat
+    :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :scorecard/payload-blob
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :scorecard/payload-codec
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :scorecard/experiment-id
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :scorecard/experiment-version
+    :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :scorecard/experiment-content-id
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :scorecard/dataset-id
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :scorecard/dataset-version
+    :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :scorecard/dataset-content-id
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :scorecard/stored-at
+    :db/valueType :db.type/instant
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :scorecard/attempts
+    :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/many
+    :db/index true}
+
+   {:db/ident :scorecard/summaries
+    :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/many
+    :db/isComponent true}
+
+   {:db/ident :scorecard.summary/id
+    :db/valueType :db.type/uuid
+    :db/unique :db.unique/identity
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :scorecard.summary/candidate-id
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :scorecard.summary/candidate-content-id
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :scorecard.summary/attempt-count
+    :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :scorecard.summary/passed-count
+    :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :scorecard.summary/reward-sum
+    :db/valueType :db.type/double
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :scorecard.summary/reward-mean
+    :db/valueType :db.type/double
     :db/cardinality :db.cardinality/one
     :db/index true}])
 
@@ -1339,6 +1442,7 @@
                message-schema
                run-schema
                attempt-schema
+               scorecard-schema
                attention-schema
                tool-call-schema
                ledger-schema

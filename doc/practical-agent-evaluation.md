@@ -121,10 +121,13 @@ matrix. This supports repeated provider/model comparisons without giving
 Dvergr a second scheduler or allowing evaluated SCI code to own trusted
 verifiers. Jobs are realized only one bounded batch at a time, and batch
 environments initially require discard settlement until partial experiments
-have durable recoverable identity. Initially the Scorecard is a portable returned value; durable Runs
-and Attempts remain the evidence of record. A leaderboard can later be a
-Datahike projection over admitted Scorecards rather than mutable benchmark
-state.
+have durable recoverable identity. Completed Scorecards are immutable durable
+Room projections over the already-certified Attempts: the exact value lives in
+the content-addressed artifact store, while Datahike indexes exact experiment,
+dataset, candidate, and Attempt joins. Mandatory writer validation rejects
+forged or mutable leaderboard rows. Incomplete batches leave their individual
+Attempts but never publish a complete Scorecard; durable resumption of the
+partial matrix remains a later execution policy.
 
 An EnvironmentDef may also name an exact WorldSetup reference. The host
 resolves that reference before admitting any experiment cell, while the actual

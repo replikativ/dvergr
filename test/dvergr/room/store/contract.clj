@@ -1,7 +1,155 @@
 (ns dvergr.room.store.contract
   "Behavioral contract shared by every PRoomStore implementation."
   (:require [clojure.test :refer [is testing]]
-            [dvergr.room.store :as store]))
+            [dvergr.agent.attempt :as attempt]
+            [dvergr.agent.environment :as environment]
+            [dvergr.agent.experiment :as experiment]
+            [dvergr.agent.roster :as roster]
+            [dvergr.room.store :as store]
+            [hasch.core :as hasch]))
+
+(defn assert-cross-room-scorecard-identity!
+  "One certified Scorecard content identity has exactly one control Room owner."
+  [st]
+  (testing "Scorecard identity cannot be claimed by another Room"
+    (let [room-a :scorecard-room-a
+          room-b :scorecard-room-b
+          run-id (random-uuid)
+          now (java.util.Date. 1000)
+          agent (-> (roster/make-roster)
+                    (roster/make-agent {:id :candidate
+                                        :program {:kind :echo}})
+                    (roster/agent :candidate))
+          definition
+          (environment/make-environment
+           {:id :contract/exact :task :ok
+            :verifier {:id :contract/exact :version 1}
+            :world {:isolation :ctx :settlement :review}})
+          receipt
+          (environment/make-attempt-receipt
+           definition
+           {:run-id run-id :provider :dvergr :model "echo"
+            :status :completed :started-at 1000 :elapsed-ms 10
+            :metrics {:program-kind :echo :model-resolution :not-applicable
+                      :agent-version 1 :agent-def-hash (hasch/uuid agent)
+                      :interpreter-version 5}
+            :checks {:exact? true} :reward 1.0
+            :trace {:runs [{:run/id run-id :run/status :completed}]}})
+          certified
+          (attempt/make-attempt
+           definition agent receipt
+           {:trace {:runs [{:run/id run-id :run/status :completed}]}}
+           :review)
+          experiment-def
+          (experiment/make-experiment
+           {:id :contract/scorecard
+            :dataset (experiment/make-dataset
+                      {:id :contract/scorecard
+                       :environments [definition]})
+            :candidates [agent]})
+          candidate (first (:experiment/candidates experiment-def))
+          scorecard
+          (experiment/make-scorecard
+           experiment-def
+           [{:experiment/job
+             {:candidate/id (:candidate/id candidate)
+              :candidate/agent (:candidate/agent candidate)
+              :candidate/agent-content-id
+              (:candidate/agent-content-id candidate)
+              :environment (environment/environment-ref definition)
+              :repetition 0}
+             :attempt certified}])]
+      (doseq [room-id [room-a room-b]]
+        (store/-store-room! st room-id {:slug (name room-id)}))
+      (store/-store-run!
+       st room-a
+       {:run/id run-id :run/kind :agent-task :run/room room-a
+        :run/actor :candidate :run/trigger (random-uuid)
+        :run/status :completed :run/created-at now :run/started-at now
+        :run/updated-at now :run/ended-at (java.util.Date. 1010)
+        :run/agent-version 1 :run/program-kind :echo
+        :run/interpreter-version 5 :run/agent-def-hash (hasch/uuid agent)})
+      (store/-store-attempt! st room-a certified)
+      (is (= scorecard (store/-store-scorecard! st room-a scorecard)))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"another Room"
+                            (store/-store-scorecard! st room-b scorecard)))
+      (is (empty? (store/-list-scorecards st room-b {}))))))
+
+(defn- finite-reward-overflow-scorecard []
+  (let [agent (-> (roster/make-roster)
+                  (roster/make-agent {:id :overflow-candidate
+                                      :program {:kind :echo}})
+                  (roster/agent :overflow-candidate))
+        definition
+        (environment/make-environment
+         {:id :contract/overflow :task :ok
+          :verifier {:id :contract/overflow :version 1}
+          :world {:isolation :ctx :settlement :review}})
+        experiment-def
+        (experiment/make-experiment
+         {:id :contract/overflow
+          :dataset (experiment/make-dataset
+                    {:id :contract/overflow
+                     :environments [definition]})
+          :candidates [agent]
+          :repetitions 2})
+        candidate (first (:experiment/candidates experiment-def))
+        result
+        (fn [repetition]
+          (let [run-id (random-uuid)
+                receipt
+                (environment/make-attempt-receipt
+                 definition
+                 {:run-id run-id :provider :dvergr :model "echo"
+                  :status :completed :started-at 1000 :elapsed-ms 10
+                  :metrics {:program-kind :echo
+                            :model-resolution :not-applicable
+                            :agent-version 1
+                            :agent-def-hash (hasch/uuid agent)
+                            :interpreter-version 5}
+                  :checks {:exact? true} :reward 1.0
+                  :trace {:runs [{:run/id run-id
+                                  :run/status :completed}]}})
+                certified
+                (attempt/make-attempt
+                 definition agent receipt
+                 {:trace {:runs [{:run/id run-id :run/status :completed}]}}
+                 :review)]
+            {:experiment/job
+             {:candidate/id (:candidate/id candidate)
+              :candidate/agent (:candidate/agent candidate)
+              :candidate/agent-content-id
+              (:candidate/agent-content-id candidate)
+              :environment (environment/environment-ref definition)
+              :repetition repetition}
+             :attempt certified}))
+        valid (experiment/make-scorecard experiment-def [(result 0) (result 1)])
+        overflow (-> valid
+                     (update :scorecard/entries
+                             #(mapv (fn [entry]
+                                      (assoc entry :reward Double/MAX_VALUE))
+                                    %))
+                     (assoc :scorecard/summary
+                            [{:candidate/id :overflow-candidate
+                              :attempt-count 2
+                              :passed-count 2
+                              :reward-sum ##Inf
+                              :reward-mean ##Inf}])
+                     (dissoc :scorecard/content-id))]
+    (assoc overflow :scorecard/content-id
+           (hasch/uuid [:dvergr/experiment-scorecard overflow]))))
+
+(defn assert-non-finite-scorecard-aggregates-rejected!
+  "Canonical and store validation reject overflow from finite cell rewards."
+  [st room-id]
+  (testing "non-finite derived Scorecard aggregates are rejected consistently"
+    (let [scorecard (finite-reward-overflow-scorecard)]
+      (store/-store-room! st room-id {:slug (name room-id)})
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be finite"
+                            (experiment/validate-scorecard scorecard)))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be finite"
+                            (store/-store-scorecard! st room-id scorecard)))
+      (is (empty? (store/-list-scorecards st room-id {}))))))
 
 (defn assert-message-envelope!
   "Exercise lossless envelope replay and first-write-wins idempotence."

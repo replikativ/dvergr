@@ -9,6 +9,7 @@
             [dvergr.agent.environment :as environment]
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.roster :as roster]
+            [dvergr.room.store :as store]
             [hasch.core :as hasch]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.spin.combinators :as comb]))
@@ -434,7 +435,16 @@
                 ::duplicate-scorecard-attempts {}))
     (when-not (= (:scorecard/summary scorecard) (summarize entries))
       (invalid! "Scorecard summary does not match its entries"
-                ::scorecard-summary-mismatch {})))
+                ::scorecard-summary-mismatch {}))
+    (doseq [summary (:scorecard/summary scorecard)
+            key [:reward-sum :reward-mean]
+            :let [value (get summary key)]]
+      (when-not (and (number? value)
+                     (Double/isFinite (double value)))
+        (invalid! "Scorecard reward aggregates must be finite"
+                  ::non-finite-scorecard-summary
+                  {:candidate/id (:candidate/id summary)
+                   :key key :value value}))))
   (let [claimed (:scorecard/content-id scorecard)
         actual (hasch/uuid [:dvergr/experiment-scorecard
                             (dissoc scorecard :scorecard/content-id)])]
@@ -443,6 +453,90 @@
                 ::scorecard-content-id-mismatch
                 {:claimed claimed :actual actual})))
   scorecard)
+
+(defn validate-scorecard-attempts
+  "Verify that every Scorecard entry is an exact projection of its certified
+   Attempt, then return `scorecard` unchanged.
+
+   `attempts` is a map keyed by Attempt UUID. Repetition is intentionally the
+   Experiment cell coordinate: repeated Attempts for one exact candidate and
+   environment are exchangeable, but their identities must remain distinct."
+  [scorecard attempts]
+  (validate-scorecard scorecard)
+  (when-not (map? attempts)
+    (invalid! "Scorecard Attempts must be keyed by UUID"
+              ::invalid-scorecard-attempts {:attempts attempts}))
+  (let [entries (:scorecard/entries scorecard)
+        entry-ids (set (map :attempt/id entries))]
+    (when-not (= entry-ids (set (keys attempts)))
+      (invalid! "Scorecard Attempt set differs from its certifications"
+                ::scorecard-attempt-set-mismatch
+                {:expected entry-ids :actual (set (keys attempts))}))
+    (doseq [entry entries]
+      (let [certified
+            (or (some-> (get attempts (:attempt/id entry))
+                        attempt/validate-attempt)
+                (invalid! "Scorecard references an uncertified Attempt"
+                          ::uncertified-scorecard-attempt
+                          {:scorecard/id (:scorecard/content-id scorecard)
+                           :attempt/id (:attempt/id entry)}))
+            receipt (:attempt/receipt certified)
+            expected {:attempt/content-id (:attempt/content-id certified)
+                      :candidate/agent (roster/agent-ref
+                                        (:attempt/agent certified))
+                      :candidate/agent-content-id
+                      (:attempt/agent-def-hash certified)
+                      :environment (:attempt/environment receipt)
+                      :reward (:attempt/reward receipt)
+                      :passed? (passed? receipt)}
+            actual (select-keys entry (keys expected))]
+        (when-not (= expected actual)
+          (invalid! "Scorecard entry differs from its certified Attempt"
+                    ::scorecard-attempt-mismatch
+                    {:scorecard/id (:scorecard/content-id scorecard)
+                     :attempt/id (:attempt/id entry)
+                     :expected expected :actual actual})))))
+  scorecard)
+
+(defn persist-scorecard!
+  "Persist a completed canonical Scorecard through its Room store.
+
+   Rooms without a store intentionally return an ephemeral value. A configured
+   store must support certified Scorecards; returning a leaderboard projection
+   that cannot be reconstructed from the Room would violate the evaluation
+   boundary."
+  [room scorecard]
+  (validate-scorecard scorecard)
+  (if-let [room-store (:store room)]
+    (if (satisfies? store/PScorecardStore room-store)
+      (or (store/-store-scorecard! room-store (:id room) scorecard)
+          (invalid! "Scorecard was not durable"
+                    ::scorecard-not-durable
+                    {:scorecard/id (:scorecard/content-id scorecard)}))
+      (invalid! "Configured Room store does not support durable Scorecards"
+                ::unsupported-scorecard-store {:store (class room-store)}))
+    scorecard))
+
+(defn scorecard
+  "Load one completed certified Scorecard from `room` by content UUID."
+  [room scorecard-id]
+  (if-let [room-store (:store room)]
+    (if (satisfies? store/PScorecardStore room-store)
+      (store/-load-scorecard room-store (:id room) scorecard-id)
+      (invalid! "Configured Room store does not support durable Scorecards"
+                ::unsupported-scorecard-store {:store (class room-store)}))
+    nil))
+
+(defn scorecards
+  "List completed certified Scorecards in `room` using indexed exact filters."
+  ([room] (scorecards room {}))
+  ([room opts]
+   (if-let [room-store (:store room)]
+     (if (satisfies? store/PScorecardStore room-store)
+       (store/-list-scorecards room-store (:id room) opts)
+       (invalid! "Configured Room store does not support durable Scorecards"
+                 ::unsupported-scorecard-store {:store (class room-store)}))
+     [])))
 
 (defn run
   "Return a lazy Spin for one complete ExperimentDef.
@@ -523,9 +617,12 @@
                     (jobs experiment))]
      (sp/spin
       (let [results (sp/await (run-batches spins parallelism))]
-        {:experiment experiment
-         :execution {:parallelism parallelism
-                     :attempt-count attempt-count}
-         :results results
-         :attempts (mapv :attempt results)
-         :scorecard (make-scorecard experiment results)})))))
+        (let [scorecard (->> results
+                             (make-scorecard experiment)
+                             (persist-scorecard! room))]
+          {:experiment experiment
+           :execution {:parallelism parallelism
+                       :attempt-count attempt-count}
+           :results results
+           :attempts (mapv :attempt results)
+           :scorecard scorecard}))))))

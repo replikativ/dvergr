@@ -210,6 +210,43 @@
         (evaluation/await-cleanups! room 5000)
         (d/close-room! room)))))
 
+(deftest finite-cell-rewards-cannot-overflow-scorecard-aggregates
+  (let [team (-> (roster/make-roster {:id :experiment/overflow-team})
+                 (roster/make-agent {:id :candidate :program {:kind :echo}}))
+        definition
+        (experiment/make-experiment
+         {:id :experiment/overflow
+          :dataset
+          (experiment/make-dataset
+           {:id :experiment/overflow
+            :environments [(environment :experiment/overflow :ok)]})
+          :candidates [(roster/agent team :candidate)]
+          :repetitions 2})
+        evaluator
+        (evaluation/make-evaluator
+         {:id :test/exact
+          :version 1
+          :basis "experiment-test:v1"
+          :observe (fn [{:keys [default]}] default)
+          :verify (fn [_ _]
+                    {:checks {:finite-cell? true}
+                     :reward Double/MAX_VALUE})})
+        room (d/make-room {:id :experiment-overflow
+                           :store (memory/make)})]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"aggregates must be finite"
+             @(experiment/run room team definition
+                              {(:ref evaluator) evaluator}))))
+      (is (= 2 (count (store/-list-attempts (:store room) (:id room) {})))
+          "every finite cell Attempt remains certified for diagnosis")
+      (is (empty? (store/-list-scorecards (:store room) (:id room) {}))
+          "the constructor never exposes or persists an invalid Scorecard")
+      (finally
+        (evaluation/await-cleanups! room 5000)
+        (d/close-room! room)))))
+
 (deftest repeated-paired-experiment-composes-ordinary-certified-evaluations
   (let [{:keys [team definition]} (fixture)
         room (d/make-room {:id :experiment-run :store (memory/make)})
@@ -233,6 +270,38 @@
                        :passed-count 4 :reward-sum 4.0 :reward-mean 1.0}]
                      (:scorecard/summary scorecard)))
               (is (= scorecard (experiment/validate-scorecard scorecard)))
+              (is (= scorecard
+                     (experiment/scorecard room
+                                           (:scorecard/content-id scorecard))))
+              (is (= [scorecard]
+                     (experiment/scorecards
+                      room {:experiment-content-id
+                            (:experiment/content-id definition)
+                            :dataset-content-id
+                            (get-in definition [:experiment/dataset
+                                                :dataset/content-id])
+                            :candidate-id :alpha
+                            :candidate-content-id
+                            (get-in definition [:experiment/candidates 0
+                                                :candidate/agent-content-id])})))
+              (is (= scorecard (experiment/persist-scorecard! room scorecard))
+                  "repeating the same immutable projection is idempotent")
+              (testing "a new content hash cannot forge certified rewards"
+                (let [forged (-> scorecard
+                                 (assoc-in [:scorecard/entries 0 :reward] 99.0)
+                                 (assoc-in [:scorecard/summary 0 :reward-sum]
+                                           102.0)
+                                 (assoc-in [:scorecard/summary 0 :reward-mean]
+                                           25.5)
+                                 (dissoc :scorecard/content-id))
+                      forged
+                      (assoc forged :scorecard/content-id
+                             (hasch/uuid
+                              [:dvergr/experiment-scorecard forged]))]
+                  (is (= forged (experiment/validate-scorecard forged)))
+                  (is (thrown-with-msg?
+                       clojure.lang.ExceptionInfo #"certified Attempt"
+                       (experiment/persist-scorecard! room forged)))))
               (is (every? #(= % (store/-load-attempt
                                  (:store room) (:id room) (:attempt/id %)))
                           attempts))

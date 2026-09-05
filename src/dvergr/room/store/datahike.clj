@@ -20,6 +20,17 @@
             [hasch.core :as hasch]
             [taoensso.telemere :as tel]))
 
+(defn- validate-scorecard [value]
+  ;; DatahikeStore is loaded below discourse, which the Experiment interpreter
+  ;; itself uses. Resolve the pure validator at the store call boundary rather
+  ;; than introducing that namespace cycle at load time.
+  ((requiring-resolve 'dvergr.agent.experiment/validate-scorecard) value))
+
+(defn- validate-scorecard-attempts [value attempts]
+  ((requiring-resolve
+    'dvergr.agent.experiment/validate-scorecard-attempts)
+   value attempts))
+
 ;; =============================================================================
 ;; Helpers
 ;; =============================================================================
@@ -288,6 +299,31 @@
                              :message/ref ref})))))
       [entity])))
 
+(defn- store-scorecard-if-absent
+  "Transaction function for one immutable Scorecard over same-Room Attempts."
+  [db entity]
+  (if-let [existing (dh/entity db [:scorecard/id (:scorecard/id entity)])]
+    (if (= (second (:scorecard/chat entity))
+           (:chat/id (:scorecard/chat existing)))
+      []
+      (throw (ex-info "Scorecard identity belongs to another Room"
+                      {:type :room-store/scorecard-room-mismatch
+                       :scorecard/id (:scorecard/id entity)})))
+    (let [chat-id (second (:scorecard/chat entity))]
+      (doseq [ref (:scorecard/attempts entity)]
+        (let [attempt-entity (dh/entity db ref)]
+          (when-not attempt-entity
+            (throw (ex-info "Scorecard references an uncertified Attempt"
+                            {:type :room-store/invalid-scorecard-attempt
+                             :scorecard/id (:scorecard/id entity)
+                             :attempt/ref ref})))
+          (when-not (= chat-id (:chat/id (:attempt/chat attempt-entity)))
+            (throw (ex-info "Scorecard Attempt crosses Room stores"
+                            {:type :room-store/scorecard-room-mismatch
+                             :scorecard/id (:scorecard/id entity)
+                             :attempt/id (:attempt/id attempt-entity)})))))
+      [entity])))
+
 (def ^:private message-pull-pattern
   '[:message/id :message/role :message/content
     :message/created-at :message/source-user
@@ -344,6 +380,19 @@
     {:attempt/evidence-messages [:message/id]}
     {:attempt/checks [:attempt.check/id :attempt.check/key
                       :attempt.check/passed?]}])
+
+(def ^:private scorecard-pull-pattern
+  '[:scorecard/id :scorecard/payload-blob :scorecard/payload-codec
+    :scorecard/experiment-id :scorecard/experiment-version
+    :scorecard/experiment-content-id :scorecard/dataset-id
+    :scorecard/dataset-version :scorecard/dataset-content-id
+    :scorecard/stored-at
+    {:scorecard/attempts [:attempt/id :attempt/content-id]}
+    {:scorecard/summaries
+     [:scorecard.summary/id :scorecard.summary/candidate-id
+      :scorecard.summary/candidate-content-id
+      :scorecard.summary/attempt-count :scorecard.summary/passed-count
+      :scorecard.summary/reward-sum :scorecard.summary/reward-mean]}])
 
 (def ^:private attention-pull-pattern
   '[:attention/id :attention/participant :attention/message-id
@@ -506,6 +555,105 @@
                              :key k :expected expected :actual (get actual k)}))))
         value))))
 
+(defn- scorecard-summary-id [scorecard-id candidate-id]
+  (hasch/uuid [:dvergr/scorecard-summary scorecard-id candidate-id]))
+
+(defn- scorecard->entity [chat-id value payload-ref stored-at]
+  (let [definition (:scorecard/experiment value)
+        dataset (:experiment/dataset definition)
+        candidates (into {} (map (juxt :candidate/id identity)
+                                 (:experiment/candidates definition)))
+        scorecard-id (:scorecard/content-id value)]
+    {:scorecard/id scorecard-id
+     :scorecard/chat [:chat/id chat-id]
+     :scorecard/payload-blob payload-ref
+     :scorecard/payload-codec :edn-v1
+     :scorecard/experiment-id (:experiment/id definition)
+     :scorecard/experiment-version (long (:experiment/version definition))
+     :scorecard/experiment-content-id (:experiment/content-id definition)
+     :scorecard/dataset-id (:dataset/id dataset)
+     :scorecard/dataset-version (long (:dataset/version dataset))
+     :scorecard/dataset-content-id (:dataset/content-id dataset)
+     :scorecard/stored-at stored-at
+     :scorecard/attempts
+     (mapv (fn [entry] [:attempt/id (:attempt/id entry)])
+           (:scorecard/entries value))
+     :scorecard/summaries
+     (mapv
+      (fn [summary]
+        (let [candidate (get candidates (:candidate/id summary))]
+          {:scorecard.summary/id
+           (scorecard-summary-id scorecard-id (:candidate/id summary))
+           :scorecard.summary/candidate-id (:candidate/id summary)
+           :scorecard.summary/candidate-content-id
+           (:candidate/agent-content-id candidate)
+           :scorecard.summary/attempt-count (long (:attempt-count summary))
+           :scorecard.summary/passed-count (long (:passed-count summary))
+           :scorecard.summary/reward-sum (double (:reward-sum summary))
+           :scorecard.summary/reward-mean (double (:reward-mean summary))}))
+      (:scorecard/summary value))}))
+
+(defn- entity->scorecard [entity artifacts]
+  (when entity
+    (when-not (= :edn-v1 (:scorecard/payload-codec entity))
+      (throw (ex-info "Unsupported Scorecard payload codec"
+                      {:type :room-store/unsupported-scorecard-payload
+                       :codec (:scorecard/payload-codec entity)})))
+    (let [value (artifact/get-value artifacts (:scorecard/payload-blob entity))]
+      (when-not value
+        (throw (ex-info "Scorecard payload artifact is unavailable"
+                        {:type :room-store/missing-scorecard-payload
+                         :scorecard/id (:scorecard/id entity)
+                         :artifact/ref (:scorecard/payload-blob entity)})))
+      (validate-scorecard value)
+      (let [definition (:scorecard/experiment value)
+            dataset (:experiment/dataset definition)
+            candidates (into {} (map (juxt :candidate/id identity)
+                                     (:experiment/candidates definition)))
+            expected-summaries
+            (set
+             (map
+              (fn [summary]
+                (let [candidate (get candidates (:candidate/id summary))]
+                  {:scorecard.summary/id
+                   (scorecard-summary-id (:scorecard/content-id value)
+                                         (:candidate/id summary))
+                   :scorecard.summary/candidate-id (:candidate/id summary)
+                   :scorecard.summary/candidate-content-id
+                   (:candidate/agent-content-id candidate)
+                   :scorecard.summary/attempt-count (:attempt-count summary)
+                   :scorecard.summary/passed-count (:passed-count summary)
+                   :scorecard.summary/reward-sum (double (:reward-sum summary))
+                   :scorecard.summary/reward-mean
+                   (double (:reward-mean summary))}))
+              (:scorecard/summary value)))
+            expected {:scorecard/id (:scorecard/content-id value)
+                      :scorecard/experiment-id (:experiment/id definition)
+                      :scorecard/experiment-version (:experiment/version definition)
+                      :scorecard/experiment-content-id
+                      (:experiment/content-id definition)
+                      :scorecard/dataset-id (:dataset/id dataset)
+                      :scorecard/dataset-version (:dataset/version dataset)
+                      :scorecard/dataset-content-id (:dataset/content-id dataset)
+                      :scorecard/attempts
+                      (set (map (juxt :attempt/id :attempt/content-id)
+                                (:scorecard/entries value)))
+                      :scorecard/summaries expected-summaries}
+            actual (assoc entity
+                          :scorecard/attempts
+                          (set (map (juxt :attempt/id :attempt/content-id)
+                                    (:scorecard/attempts entity)))
+                          :scorecard/summaries
+                          (set (:scorecard/summaries entity)))]
+        (doseq [[k expected-value] expected]
+          (when-not (= expected-value (get actual k))
+            (throw
+             (ex-info "Scorecard typed projection differs from exact payload"
+                      {:type :room-store/corrupt-scorecard-projection
+                       :scorecard/id (:scorecard/content-id value)
+                       :key k :expected expected-value :actual (get actual k)}))))
+        value))))
+
 (defn- attention->entity [chat-id fact]
   (cond-> (-> fact
               (dissoc :attention/metadata)
@@ -571,6 +719,13 @@
                                   [?a :attempt/chat ?c]
                                   [?a :attempt/id ?aid]]
                                 @conn chat-id)
+              scorecard-ids (dh/q '[:find [?sid ...]
+                                    :in $ ?cid
+                                    :where
+                                    [?c :chat/id ?cid]
+                                    [?s :scorecard/chat ?c]
+                                    [?s :scorecard/id ?sid]]
+                                  @conn chat-id)
               attention-ids (dh/q '[:find [?aid ...]
                                     :in $ ?cid
                                     :where
@@ -578,9 +733,12 @@
                                     [?a :attention/chat ?c]
                                     [?a :attention/id ?aid]]
                                   @conn chat-id)]
-          (dh/transact conn (-> (mapv (fn [aid]
-                                        [:db/retractEntity [:attempt/id aid]])
-                                      attempt-ids)
+          (dh/transact conn (-> (mapv (fn [sid]
+                                        [:db/retractEntity [:scorecard/id sid]])
+                                      scorecard-ids)
+                                (into (map (fn [aid]
+                                             [:db/retractEntity [:attempt/id aid]])
+                                           attempt-ids))
                                 (into (map (fn [mid] [:db/retractEntity [:message/id mid]]) msg-ids))
                                 (into (map (fn [rid] [:db/retractEntity [:run/id rid]]) run-ids))
                                 (into (map (fn [aid]
@@ -1016,6 +1174,128 @@
                         #(compare %2 %1))
                (take (or limit 100))
                (mapv #(entity->attempt % artifacts))))
+        [])))
+
+  store/PScorecardStore
+
+  (-store-scorecard! [this room-id value]
+    (let [value (validate-scorecard value)
+          scorecard-id (:scorecard/content-id value)
+          slug (store/room-id->slug room-id)]
+      (when-let [ent (room-by-slug conn slug)]
+        (let [payload-ref (artifact/put-value! artifacts value)
+              entity (scorecard->entity (:chat/id ent) value payload-ref
+                                        (java.util.Date.))]
+          (locking conn
+            (if-let [existing (store/-load-scorecard this room-id scorecard-id)]
+              (if (= existing value)
+                existing
+                (throw (ex-info "Scorecard identity is immutable"
+                                {:type :room-store/scorecard-identity-collision
+                                 :existing existing :scorecard value})))
+              (let [existing-chat-id
+                    (dh/q '[:find ?chat-id .
+                            :in $ ?scorecard-id
+                            :where
+                            [?s :scorecard/id ?scorecard-id]
+                            [?s :scorecard/chat ?c]
+                            [?c :chat/id ?chat-id]]
+                          @conn scorecard-id)
+                    _ (when (and existing-chat-id
+                                 (not= existing-chat-id (:chat/id ent)))
+                        (throw
+                         (ex-info "Scorecard identity belongs to another Room"
+                                  {:type :room-store/scorecard-room-mismatch
+                                   :scorecard/id scorecard-id})))
+                    _ (validate-scorecard-attempts
+                       value
+                       (into {}
+                             (keep
+                              (fn [entry]
+                                (when-let [stored
+                                           (store/-load-attempt
+                                            this room-id (:attempt/id entry))]
+                                  [(:attempt/id entry) stored])))
+                             (:scorecard/entries value)))
+                    report
+                    (attempt-governance/with-authorized-scorecard-write
+                      conn scorecard-id
+                      (fn [tx-meta]
+                        (persist/persist-tx-result!
+                         conn
+                         [[:db.fn/call store-scorecard-if-absent entity]]
+                         {:op :store-scorecard :room-id room-id
+                          :scorecard-id scorecard-id :tx-meta tx-meta})))]
+                (when report
+                  (let [stored (store/-load-scorecard this room-id scorecard-id)]
+                    (when-not (= stored value)
+                      (throw
+                       (ex-info "Concurrent Scorecard identity collision"
+                                {:type :room-store/scorecard-identity-collision
+                                 :stored stored :scorecard value})))
+                    stored)))))))))
+
+  (-load-scorecard [_ room-id scorecard-id]
+    (let [slug (store/room-id->slug room-id)]
+      (when-let [ent (room-by-slug conn slug)]
+        (some-> (dh/q '[:find (pull ?s pattern) .
+                        :in $ ?chat-id ?scorecard-id pattern
+                        :where
+                        [?c :chat/id ?chat-id]
+                        [?s :scorecard/chat ?c]
+                        [?s :scorecard/id ?scorecard-id]]
+                      @conn (:chat/id ent) scorecard-id
+                      scorecard-pull-pattern)
+                (entity->scorecard artifacts)))))
+
+  (-list-scorecards [_ room-id {:keys [limit experiment-id
+                                       experiment-content-id dataset-id
+                                       dataset-content-id candidate-id
+                                       candidate-content-id]}]
+    (let [slug (store/room-id->slug room-id)]
+      (if-let [ent (room-by-slug conn slug)]
+        (let [where
+              (cond-> '[[?c :chat/id ?chat-id]
+                        [?s :scorecard/chat ?c]]
+                experiment-id
+                (conj '[?s :scorecard/experiment-id ?experiment-id])
+                experiment-content-id
+                (conj '[?s :scorecard/experiment-content-id
+                        ?experiment-content-id])
+                dataset-id (conj '[?s :scorecard/dataset-id ?dataset-id])
+                dataset-content-id
+                (conj '[?s :scorecard/dataset-content-id ?dataset-content-id])
+                candidate-id
+                (into '[[?s :scorecard/summaries ?summary]
+                        [?summary :scorecard.summary/candidate-id ?candidate-id]])
+                candidate-content-id
+                (into '[[?s :scorecard/summaries ?summary]
+                        [?summary :scorecard.summary/candidate-content-id
+                         ?candidate-content-id]]))
+              inputs (cond-> '[$ ?chat-id pattern]
+                       experiment-id (conj '?experiment-id)
+                       experiment-content-id (conj '?experiment-content-id)
+                       dataset-id (conj '?dataset-id)
+                       dataset-content-id (conj '?dataset-content-id)
+                       candidate-id (conj '?candidate-id)
+                       candidate-content-id (conj '?candidate-content-id))
+              args (cond-> [@conn (:chat/id ent) scorecard-pull-pattern]
+                     experiment-id (conj experiment-id)
+                     experiment-content-id (conj experiment-content-id)
+                     dataset-id (conj dataset-id)
+                     dataset-content-id (conj dataset-content-id)
+                     candidate-id (conj candidate-id)
+                     candidate-content-id (conj candidate-content-id))
+              query {:find '[(pull ?s pattern)] :in inputs :where where}]
+          (->> (apply dh/q query args)
+               (map first)
+               distinct
+               (sort-by (juxt #(some-> ^java.util.Date
+                                (:scorecard/stored-at %) .getTime)
+                              #(str (:scorecard/id %)))
+                        #(compare %2 %1))
+               (take (or limit 100))
+               (mapv #(entity->scorecard % artifacts))))
         [])))
 
   store/PAttentionStore
