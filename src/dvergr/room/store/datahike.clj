@@ -803,24 +803,32 @@
   (-store-message! [_ room-id msg]
     (let [slug (store/room-id->slug room-id)]
       (if-let [ent (room-by-slug conn slug)]
-        (let [chat-id (:chat/id ent)
-              entity  (message->entity chat-id msg)]
+        ;; An exact retry cannot need schema work: its durable entity already
+        ;; exists. Decide this first so registry drift cannot turn an otherwise
+        ;; idempotent retry into an unrelated schema failure. The transaction
+        ;; function below remains the authority for concurrent first writers.
+        (if (dh/entity @conn [:message/id (:id msg)])
+          :duplicate
+          (let [_ (schema/ensure-tool-use-schemas!
+                   conn (get-in msg [:metadata :tool-uses]))
+                chat-id (:chat/id ent)
+                entity  (message->entity chat-id msg)]
           ;; One durability policy (surface + retry-once + dead-letter) instead
           ;; of the old catch-and-silently-drop — a lost message is now visible
           ;; and recoverable, not swallowed at :warn. The transaction function
           ;; makes the idempotence decision inside Datahike's write serialization.
-          (let [report
-                (persist/persist-tx-result!
-                 conn
-                 [[:db.fn/call store-message-if-absent
-                   entity
-                   {:db/id [:chat/id chat-id]
-                    :chat/updated-at (java.util.Date.)}]]
-                 {:op :store-message :room-id room-id :msg-id (:id msg)})]
-            (cond
-              (false? report) :failed
-              (seq (:tx-data report)) :inserted
-              :else :duplicate)))
+            (let [report
+                  (persist/persist-tx-result!
+                   conn
+                   [[:db.fn/call store-message-if-absent
+                     entity
+                     {:db/id [:chat/id chat-id]
+                      :chat/updated-at (java.util.Date.)}]]
+                   {:op :store-message :room-id room-id :msg-id (:id msg)})]
+              (cond
+                (false? report) :failed
+                (seq (:tx-data report)) :inserted
+                :else :duplicate))))
         (do
           (tel/log! {:level :error :id :room-store/datahike-missing-room
                      :data {:room-id room-id :msg-id (:id msg)}}

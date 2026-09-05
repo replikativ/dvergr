@@ -185,9 +185,70 @@
   (when (and name parameters (= "object" (:type parameters)))
     (generate-object-schema name [] parameters)))
 
+(defn compatible-evolution?
+  "True when `new-tool` is a monotonic durable-schema evolution of `old-tool`.
+
+   A tool name owns its generated Datahike attribute namespace. Once those
+   attributes contain data, their value type/cardinality cannot safely change
+   and an old attribute cannot disappear. Descriptions, handlers and
+   non-storage JSON-Schema constraints may change; new properties may be added."
+  [old-tool new-tool]
+  (let [durable-shape (fn [tool]
+                        (into {}
+                              (map (juxt :db/ident
+                                         #(select-keys % [:db/valueType
+                                                          :db/cardinality
+                                                          :db/isComponent
+                                                          :db/unique])))
+                              (or (generate-tool-schema tool) [])))
+        old-shape (durable-shape old-tool)
+        new-shape (durable-shape new-tool)]
+    (every? (fn [[ident shape]]
+              (= shape (get new-shape ident)))
+            old-shape)))
+
 ;; ============================================================================
 ;; Schema Installation
 ;; ============================================================================
+
+(def ^:private durable-schema-keys
+  [:db/valueType :db/cardinality :db/isComponent :db/unique])
+
+(defn- durable-attr-shape [attr]
+  (select-keys attr durable-schema-keys))
+
+(defn- install-compatible-attrs
+  "Datahike transaction function for an atomic schema claim.
+
+   Writer serialization makes the current DB schema authoritative even when
+   different processes race the first use of one late-bound tool. Existing
+   attributes must have the same durable shape; only absent attributes are
+   returned for installation. In particular, do not rely on Datahike rejecting
+   a redeclaration: under `:schema-flexibility :write` it may legally rewrite
+   an unused attribute before an older serialized message reaches the writer."
+  [db attrs]
+  (let [installed (d/schema db)]
+    (reduce
+     (fn [missing attr]
+       (let [ident (:db/ident attr)]
+         (if-let [current (get installed ident)]
+           (let [current-shape (durable-attr-shape current)
+                 proposed-shape (durable-attr-shape attr)]
+             (when-not (= current-shape proposed-shape)
+               (throw
+                (ex-info
+                 "Incompatible durable tool schema is already installed"
+                 {:type ::incompatible-installed-tool-schema
+                  :attribute ident
+                  :installed current-shape
+                  :proposed proposed-shape})))
+             missing)
+           (conj missing attr))))
+     []
+     attrs)))
+
+(defn- install-compatible-schema! [conn schema]
+  (d/transact conn [[:db.fn/call install-compatible-attrs schema]]))
 
 (defn install-tool-schema!
   "Install schema for a tool into a Datahike connection.
@@ -205,14 +266,8 @@
   [conn tool-def]
   (when-let [schema (generate-tool-schema tool-def)]
     (when (seq schema)
-      (try
-        (d/transact conn schema)
-        (count schema)
-        (catch Exception e
-          ;; Schema might already exist - that's fine
-          (when-not (re-find #"already exists|already defined" (.getMessage e))
-            (throw e))
-          (count schema))))))
+      (install-compatible-schema! conn schema)
+      (count schema))))
 
 ;; Defined below; referenced by install-all-tool-schemas! (resolved at call time).
 (declare raw-input-schema)
@@ -231,11 +286,7 @@
   ;; Always install the raw-EDN fallback attributes. serialize-tool-use degrades
   ;; a tool input it cannot type into :tool-input.raw/*, so persistence stays
   ;; total — these MUST exist before any such write can land.
-  (try
-    (d/transact conn raw-input-schema)
-    (catch Exception e
-      (when-not (re-find #"already exists|already defined" (.getMessage e))
-        (throw e))))
+  (install-compatible-schema! conn raw-input-schema)
   (->> registry
        (map (fn [[tool-name tool-def]]
               [tool-name (install-tool-schema! conn tool-def)]))

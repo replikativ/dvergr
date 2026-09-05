@@ -1500,6 +1500,36 @@
   (java.util.Collections/synchronizedSet
    (java.util.Collections/newSetFromMap (java.util.IdentityHashMap.))))
 
+(defonce ^:private ensured-dynamic-tool-schemas
+  ;; Run-world connections are deliberately short lived. Weak keys prevent
+  ;; late-registered semantic tools from retaining discarded branches.
+  (java.util.Collections/synchronizedMap (java.util.WeakHashMap.)))
+
+(defn ensure-tool-use-schemas!
+  "Ensure schemas for registered tools appearing in `tool-uses` exist on
+   `conn`. Rooms install the registry known at provisioning time, but trusted
+   hosts may register semantic tools later; their first durable use must remain
+   transactable. Unknown tool calls still use the raw-EDN fallback schema."
+  ([conn tool-uses]
+   (ensure-tool-use-schemas! conn tool-uses (get-tool-registry)))
+  ([conn tool-uses registry]
+   (doseq [tool-name (into #{} (keep :tool-use/name) tool-uses)
+           :let [tool (get registry tool-name)]
+           :when tool]
+     (let [fingerprint (select-keys tool [:name :parameters])]
+        ;; Keep schema installation and publication under the same lock. If the
+        ;; cache were marked first, a concurrent message could transact typed
+        ;; tool input while the schema transaction was still in flight. Cache
+        ;; the definition fingerprint rather than only its name so a trusted
+        ;; host can add fields to a late-bound tool before its next use.
+       (locking ensured-dynamic-tool-schemas
+         (let [installed (or (.get ensured-dynamic-tool-schemas conn) {})]
+           (when-not (= fingerprint (get installed tool-name))
+             (tool-schema/install-tool-schema! conn tool)
+             (.put ensured-dynamic-tool-schemas conn
+                   (assoc installed tool-name fingerprint)))))))
+   conn))
+
 (defn ensure-full-schema!
   "Ensure the full schema is installed on `conn` — exactly once per process
    per connection. Subsequent calls are a cheap no-op.
@@ -1539,15 +1569,20 @@
            :chat/updated-at (java.util.Date.)}
     description (assoc :chat/description description)))
 
+(defn- get-tool-registry-atom
+  "Dynamically resolve the registry atom without introducing a schema/tools
+   namespace cycle."
+  []
+  (try
+    (require 'dvergr.tools)
+    @(ns-resolve 'dvergr.tools 'registry)
+    (catch Exception _ nil)))
+
 (defn- get-tool-registry
   "Dynamically get the tool registry to avoid circular deps.
    Returns the registry map (not the atom)."
   []
-  (try
-    (require 'dvergr.tools)
-    ;; ns-resolve returns the var, @ gets the atom, @@ gets the map
-    @@(ns-resolve 'dvergr.tools 'registry)
-    (catch Exception _ nil)))
+  (some-> (get-tool-registry-atom) deref))
 
 (defn- serialize-tool-use
   "Serialize a tool-use for Datahike storage.
@@ -1563,10 +1598,9 @@
    is always transactable. Persisting an agent's turn must not crash on a bad
    tool call — tool EXECUTION returns the \"unknown tool\" / validation error the
    model then recovers from."
-  [tool-use]
+  [registry tool-use]
   (let [tool-name (:tool-use/name tool-use)
         input     (:tool-use/input tool-use)
-        registry  (get-tool-registry)
         tool-def  (get registry tool-name)
         entity    (when (and tool-def (map? input))
                     (try (tool-schema/tool-input->entity tool-def input)
@@ -1595,7 +1629,7 @@
       :else
       (dissoc tool-use :tool-use/input))))
 
-(defn create-message-entity
+(defn- create-message-entity*
   "Create a message entity map for transacting.
 
    Args:
@@ -1603,7 +1637,7 @@
 
    Tool-uses are stored as component entities with input serialized to EDN.
    The :message/tool-uses key references the tool-use entities."
-  [{:keys [chat-id role content reasoning tokens important? compacted? reply-to-id tool-uses tool-use-id turn-number]}]
+  [registry {:keys [chat-id role content reasoning tokens important? compacted? reply-to-id tool-uses tool-use-id turn-number]}]
   (cond-> {:message/id (random-uuid)
            :message/chat [:chat/id chat-id]
            :message/role (or role :user)
@@ -1615,9 +1649,28 @@
     important? (assoc :message/important? true)
     compacted? (assoc :message/compacted? true)
     reply-to-id (assoc :message/reply-to [:message/id reply-to-id])
-    (seq tool-uses) (assoc :message/tool-uses (mapv serialize-tool-use tool-uses))
+    (seq tool-uses) (assoc :message/tool-uses
+                           (mapv (partial serialize-tool-use registry) tool-uses))
     tool-use-id (assoc :message/tool-use-id tool-use-id)
     turn-number (assoc :message/turn-number (long turn-number))))
+
+(defn create-message-entity
+  "Create a message entity using one coherent snapshot of the tool registry."
+  [opts]
+  (if-let [registry-atom (get-tool-registry-atom)]
+    (locking registry-atom
+      (create-message-entity* @registry-atom opts))
+    (create-message-entity* {} opts)))
+
+(defn create-message-entity!
+  "Ensure and serialize a message's tool inputs from one registry revision."
+  [conn opts]
+  (if-let [registry-atom (get-tool-registry-atom)]
+    (locking registry-atom
+      (let [registry @registry-atom]
+        (ensure-tool-use-schemas! conn (:tool-uses opts) registry)
+        (create-message-entity* registry opts)))
+    (create-message-entity* {} opts)))
 
 ;; ============================================================================
 ;; Tool Call Queries (for UI rendering)
