@@ -140,6 +140,39 @@
       (finally
         (d/close-room! room)))))
 
+(deftest host-evaluator-workers-can-compose-and-deref-spins
+  (let [room (test-room :evaluation-worker-spin)
+        team (roster/make-agent
+              (roster/make-roster)
+              {:id :candidate
+               :program {:kind :echo}})
+        env (definition :test/worker-spin {})
+        evaluator
+        (evaluation/make-evaluator
+         {:id :test/exact
+          :version 1
+          :basis "test:v1"
+          :observe (fn [{:keys [default]}]
+                     @(sp/spin default))
+          :verify (fn [environment evidence]
+                    @(sp/spin
+                      (let [exact? (= (:environment/task environment)
+                                      (:result evidence))]
+                        {:checks {:exact? exact?}
+                         :reward (if exact? 1.0 0.0)})))})]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [result @(evaluation/evaluate room team :candidate env evaluator)]
+          (try
+            (is (= {:exact? true}
+                   (get-in result [:attempt-receipt :attempt/checks])))
+            (is (= 1.0 (get-in result [:attempt-receipt :attempt/reward])))
+            (finally
+              (discard-retained! result)))))
+      (finally
+        (evaluation/await-cleanups! room 5000)
+        (d/close-room! room)))))
+
 (deftest evaluation-fails-closed-when-attempt-certification-is-not-durable
   (let [delegate (memory/make)
         room (d/make-room {:id :evaluation-attempt-durability

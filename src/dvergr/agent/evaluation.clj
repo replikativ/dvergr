@@ -15,6 +15,7 @@
             [hasch.core :as hasch]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.engine.impl.simple :as simple]
             [org.replikativ.spindel.spin.combinators :as comb]
             [org.replikativ.spindel.spin.core :as spin-core]
             [org.replikativ.spindel.spin.sync :as sync]))
@@ -42,7 +43,11 @@
             (deliver started true)
             (let [outcome
                   (try
-                    (let [result (task-fn)]
+                    ;; Futures convey dynamic bindings, but this worker is no
+                    ;; longer executing on the originating engine drain.
+                    (let [result (binding [simple/*in-drain?* false
+                                           ec/*spin-id* nil]
+                                   (task-fn))]
                       (if (and (map? result) (false? (:ok? result)))
                         {:error (ex-info "Evaluation task failed"
                                          {:type ::cleanup-failed
