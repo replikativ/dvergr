@@ -7,7 +7,12 @@
             [dvergr.discourse :as d]
             [dvergr.discourse.attention :as attention]
             [dvergr.discourse.llm :as llm]
+            [dvergr.chat.agent :as chat-agent]
             [dvergr.chat.context :as cc]
+            [dvergr.model.chat :as model-chat]
+            [dvergr.model.provider :as model-provider]
+            [dvergr.model.providers :as model-providers]
+            [dvergr.model.registry :as model-registry]
             [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.sandbox :as sandbox]
             [dvergr.agent.run :as run]
@@ -543,11 +548,12 @@
 
 (defn- make-queued-turn-fn
   "Each element of `steps-atom` is (fn [chat-ctx opts] -> result), consumed
-   one per LLM call. Exhausted → :complete. `calls-log` records the :spec
-   each call saw."
+   one per LLM call. Exhausted → :complete. `calls-log` records the admitted
+   model policy each call saw."
   [steps-atom calls-log]
   (fn [chat-ctx opts]
-    (swap! calls-log conj {:spec (:spec opts)})
+    (swap! calls-log conj
+           (select-keys opts [:provider :model :spec :tool-ctx]))
     (let [step (first @steps-atom)]
       (swap! steps-atom rest)
       (if step (step chat-ctx opts) :complete))))
@@ -1079,4 +1085,162 @@
           (is (= "answer from new model" (:content reply)))
           (is (= 2 (count @calls)))
           (is (= "mock-2" (get-in (second @calls) [:spec :model]))
-              "restarted call carries the swapped model in its spec"))))))
+              "restarted call carries the swapped model in its spec")
+          (is (= {:provider :mock :model "mock-2"}
+                 (select-keys (second @calls) [:provider :model]))
+              "the real turn options, not only the diagnostic spec, switch")
+          (is (= {:provider :mock :model "mock-2"}
+                 (get-in (second @calls) [:tool-ctx :model-policy]))
+              "delegation inherits the admitted provider and model")
+          (is (= :mock (:provider (second @calls)))
+              "omitting provider from the directive preserves the current one"))))))
+
+(deftest idle-switch-drives-the-default-turn-options
+  (testing "the shipped run-turn bridge receives the switched provider and model"
+    (let [r (d/room :default-switch-room)
+          calls (atom [])]
+      (try
+        (with-redefs [chat-agent/run-agent-turn!
+                      (fn [chat-ctx opts]
+                        (swap! calls conj opts)
+                        (cc/add-message! chat-ctx
+                                         {:role :assistant :content "switched"})
+                        :complete)]
+          (binding [ec/*execution-context* (:ctx r)]
+            (d/join r (llm/llm-agent
+                       {:id :switch-worker
+                        :spec {:provider :old-provider :model "old-model"}})))
+          (d/post! r {:to :switch-worker
+                      :type :directive/switch-model
+                      :payload {:provider :new-provider :model "new-model"}})
+          (is (= "switched"
+                 (:content
+                  (await-spin r #(d/ask % :switch-worker {:content "go"})
+                              10000))))
+          (is (= {:provider :new-provider :model "new-model"}
+                 (select-keys (first @calls) [:provider :model])))
+          (is (= {:provider :new-provider :model "new-model"}
+                 (get-in (first @calls) [:tool-ctx :model-policy]))))
+        (finally
+          (d/close-room! r))))))
+
+(deftest omitted-provider-is-completed-from-the-model-registry
+  (let [r (d/room :provider-inference-room)
+        calls (atom [])]
+    (try
+      (with-redefs [chat-agent/run-agent-turn!
+                    (fn [chat-ctx opts]
+                      (swap! calls conj opts)
+                      (cc/add-message! chat-ctx
+                                       {:role :assistant :content "inferred"})
+                      :complete)]
+        (binding [ec/*execution-context* (:ctx r)]
+          (d/join r (llm/llm-agent
+                     {:id :inferred-worker
+                      :spec {:model "gpt-5.6-sol"}})))
+        (is (= "inferred"
+               (:content
+                (await-spin r #(d/ask % :inferred-worker {:content "go"})
+                            10000))))
+        (is (= :openai (:provider (first @calls))))
+        (is (= {:provider :openai :model "gpt-5.6-sol"}
+               (get-in (first @calls) [:tool-ctx :model-policy]))))
+      (finally
+        (d/close-room! r)))))
+
+(deftest inferred-provider-reaches-the-default-formatter
+  (let [r (d/room :provider-formatter-room)
+        model-id "formatter-inference-test-model"
+        formatted (atom [])
+        calls (atom [])
+        original-models @model-registry/registry
+        original-providers @model-providers/providers
+        formatter (reify model-provider/MessageFormatter
+                    (format-messages [_ messages model]
+                      (swap! formatted conj {:messages messages :model model})
+                      messages))]
+    (try
+      (model-registry/register-model!
+       {:id model-id :provider :inferred-test-provider})
+      (model-providers/register! :inferred-test-provider formatter)
+      (with-redefs [model-chat/chat
+                    (fn [messages opts]
+                      (swap! calls conj {:messages messages :opts opts})
+                      {:content "formatted"
+                       :tool-calls []
+                       :usage {:input-tokens 1 :output-tokens 1}
+                       :stop-reason :end-turn})]
+        (binding [ec/*execution-context* (:ctx r)]
+          (d/join r (llm/llm-agent
+                     {:id :formatter-worker
+                      :spec {:model model-id}
+                      :tools {}})))
+        (is (= "formatted"
+               (:content
+                (await-spin r #(d/ask % :formatter-worker {:content "go"})
+                            10000))))
+        (is (= model-id (:model (first @formatted))))
+        (is (= {:provider :inferred-test-provider :model model-id}
+               (select-keys (:opts (first @calls)) [:provider :model]))))
+      (finally
+        (reset! model-registry/registry original-models)
+        (reset! model-providers/providers original-providers)
+        (d/close-room! r)))))
+
+(deftest fork-snapshots-the-latest-switched-spec
+  (let [parent (d/room :switched-fork-parent)
+        fork* (atom nil)
+        calls (atom [])
+        turn-fn (fn [chat-ctx opts]
+                  (swap! calls conj
+                         {:ctx ec/*execution-context*
+                          :provider (:provider opts)
+                          :model (:model opts)
+                          :model-policy (get-in opts [:tool-ctx :model-policy])})
+                  (cc/add-message! chat-ctx {:role :assistant :content "ok"})
+                  :complete)]
+    (try
+      (binding [ec/*execution-context* (:ctx parent)]
+        (d/join parent
+                (llm/llm-agent {:id :fork-worker
+                                :spec {:provider :mock :model "mock-1"}
+                                :run-turn-fn turn-fn})))
+      ;; The ask follows the directive in the participant's FIFO, so completion
+      ;; is also an acknowledgement that the parent applied the switch.
+      (d/post! parent {:to :fork-worker
+                       :type :directive/switch-model
+                       :payload {:model "mock-2"}})
+      (is (= "ok" (:content
+                   (await-spin parent
+                               #(d/ask % :fork-worker {:content "parent"})
+                               10000))))
+      (let [fork (d/fork-room parent {:isolation :ctx})]
+        (reset! fork* fork)
+        (is (= "ok" (:content
+                     (await-spin fork
+                                 #(d/ask % :fork-worker {:content "child"})
+                                 10000))))
+        (d/post! parent {:to :fork-worker
+                         :type :directive/switch-model
+                         :payload {:model "mock-3"}})
+        (is (= "ok" (:content
+                     (await-spin parent
+                                 #(d/ask % :fork-worker {:content "parent again"})
+                                 10000))))
+        (is (= "ok" (:content
+                     (await-spin fork
+                                 #(d/ask % :fork-worker {:content "child again"})
+                                 10000))))
+        (is (= ["mock-2" "mock-2" "mock-3" "mock-2"]
+               (mapv :model @calls))
+            "the child snapshots the latest parent spec and then diverges")
+        (is (identical? (:ctx parent) (:ctx (first @calls))))
+        (is (identical? (:ctx fork) (:ctx (second @calls)))
+            "the cloned participant executes in the fork's context")
+        (is (every? #(= {:provider :mock :model (:model %)}
+                        (:model-policy %))
+                    @calls)))
+      (finally
+        (when-let [fork @fork*]
+          (d/discard fork))
+        (d/close-room! parent)))))

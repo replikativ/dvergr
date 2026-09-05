@@ -59,6 +59,7 @@
             [dvergr.agent.process :as proc]
             [dvergr.room.store :as rstore]
             [dvergr.system.rooms :as srooms]
+            [dvergr.model.registry :as model-registry]
             [dvergr.model.quirks :as quirks]
             [org.replikativ.spindel.spin.sync :as ssync]
             [taoensso.telemere :as tel]
@@ -72,6 +73,16 @@
   "Default `run-turn-fn`: delegates to `dvergr.chat.agent/run-agent-turn!`."
   [chat-ctx opts]
   (ca/run-agent-turn! chat-ctx opts))
+
+(defn- admit-model-spec
+  "Complete one call-boundary model policy without overriding an explicit
+   provider. Unknown models retain the prior nil-provider failure semantics."
+  [spec]
+  (if (or (:provider spec) (nil? (:model spec)))
+    spec
+    (if-let [provider (some-> (:model spec) model-registry/get-model :provider)]
+      (assoc spec :provider provider)
+      spec)))
 
 (defn- assistant-text
   "Extract a string from an assistant message entity. Handles plain-string
@@ -439,18 +450,9 @@
                          tool-ctx          (cond-> (assoc tool-ctx
                                                           :execution-ctx turn-ctx
                                                           :control-room room
-                                                          :actor id
-                                                          :model-policy
-                                                          (select-keys spec
-                                                                       [:provider :model]))
+                                                          :actor id)
                                              run-id (assoc :run-id run-id))
-                         turn-opts {:provider         (:provider spec)
-                                ;; Per-room /model override (commands registry)
-                                ;; wins over the spec's model, matching the daemon.
-                                    :model            (or (when room
-                                                            (commands/model-override (:id room) id))
-                                                          (:model spec))
-                                    :tools            tools
+                         turn-opts {:tools            tools
                                     :tool-ctx         tool-ctx
                                 ;; SSE-abort predicate (Esc-cancel flips status).
                                     :cancel?          (turn/cancel?-fn
@@ -579,12 +581,32 @@
                                                   chat-ctx
                                                   :model (:model compaction))
                                                  (catch Throwable _ nil))))))))
-                             (let [h (gen/future-handle
+                             (let [;; Admit one immutable spec snapshot for the
+                                   ;; whole provider/tool step. A switch directive
+                                   ;; changes `spec-atom`, settles this call, and
+                                   ;; the restart admits the new snapshot. `/model`
+                                   ;; remains the room-local model override.
+                                   room-model-override
+                                   (when room
+                                     (commands/model-override (:id room) id))
+                                   admitted-spec
+                                   (admit-model-spec
+                                    (cond-> @spec-atom
+                                      room-model-override
+                                      (assoc :model room-model-override)))
+                                   admitted-tool-ctx
+                                   (assoc tool-ctx :model-policy
+                                          (select-keys admitted-spec
+                                                       [:provider :model]))
+                                   h (gen/future-handle
                                       turn-ctx
                                       #(run-turn-fn chat-ctx
                                                     (assoc turn-opts
+                                                           :provider (:provider admitted-spec)
+                                                           :model (:model admitted-spec)
+                                                           :tool-ctx admitted-tool-ctx
                                                            :turn-number turn
-                                                           :spec @spec-atom
+                                                           :spec admitted-spec
                                                            :tools tools
                                                            :run-id run-id)))
                                    call-id (random-uuid)
@@ -958,7 +980,10 @@
          ;; through the stable component ref. `:none` remains a lightweight
          ;; message-only clone. The room-less fallback stays lazy in both cases.
               (llm-agent {:id          id
-                          :spec        spec
+                          ;; A fork snapshots the latest admitted participant
+                          ;; policy, then owns an independent spec atom. Existing
+                          ;; forks therefore remain isolated from later switches.
+                          :spec        @spec-atom
                           :tools       tools
                           :db-conn     db-conn
                           :budget      budget
