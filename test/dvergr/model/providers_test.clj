@@ -117,6 +117,19 @@
           (is (= "Bearer fireworks-only-credential" (bearer request)))
           (is (not (contains? (:body request) :reasoning_effort))))))))
 
+(deftest fireworks-custom-base-normalizes-like-catalog-discovery
+  (let [base-url "https://fireworks-gateway.example.test/v1"
+        env {"FIREWORKS_API_KEY" "fireworks-custom-credential"
+             "FIREWORKS_BASE_URL" (str base-url "///")}]
+    (with-provider-env
+      env
+      (fn []
+        (let [request (request-for :fireworks)]
+          (is (= (str base-url "/chat/completions") (:url request)))
+          (is (= "Bearer fireworks-custom-credential" (bearer request)))
+          (is (= #{"https://fireworks-gateway.example.test"}
+                 (gateway/allowed-origins (:credentials request)))))))))
+
 (deftest both-provider-credentials
   (let [env {"OPENAI_API_KEY" "openai-both-credential"
              "FIREWORKS_API_KEY" "fireworks-both-credential"}]

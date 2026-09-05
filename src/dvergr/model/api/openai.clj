@@ -380,9 +380,10 @@
   ([config env-lookup]
    (let [api-key (or (:api-key config)
                      (env-lookup "FIREWORKS_API_KEY"))
-         base-url (or (:base-url config)
-                      (env-lookup "FIREWORKS_BASE_URL")
-                      default-fireworks-base-url)
+         base-url (normalize-base-url
+                   (or (:base-url config)
+                       (env-lookup "FIREWORKS_BASE_URL")
+                       default-fireworks-base-url))
          credentials (or (:credentials config)
                          (when api-key
                            (gateway/static-credentials
