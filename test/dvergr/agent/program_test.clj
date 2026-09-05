@@ -1096,27 +1096,35 @@
       (finally
         (d/close-room! room)))))
 
-(deftest cancellation-does-not-clean-up-before-the-orchestration-body-is-terminal
+(deftest cancellation-awaits-physical-allocation-exit-before-cleanup
   (let [room (test-room :program-preparation-cleanup-body-fence)
         team (test-roster)
         allocation-entered (promise)
-        release-allocation (promise)
+        release-allocation (java.util.concurrent.CountDownLatch. 1)
         allocation-returned (promise)
         cleanup-entered (promise)]
     (try
       (with-redefs [resource/allocate-run!
                     (fn [& _]
-                      ;; Reproduce the post-setup gap: the setup worker has
-                      ;; terminated, but its enclosing orchestration body is
-                      ;; still using the acquired resource during allocation.
+                      ;; Allocation is now a supervised worker. Model an I/O
+                      ;; operation that cannot physically stop on interruption:
+                      ;; graph cancellation must not release its resources yet.
                       (deliver allocation-entered true)
-                      @release-allocation
-                      (deliver allocation-returned true))]
+                      (loop []
+                        (let [released?
+                              (try
+                                (.await release-allocation)
+                                true
+                                (catch InterruptedException _ false))]
+                          (when-not released? (recur))))
+                      (deliver allocation-returned true))
+                    resource/run-balance (fn [& _] {})]
         (binding [ec/*execution-context* (:ctx room)]
           (let [handle
                 (program/hire-prepared-in!
                  room room team :analyst
-                 {:task :work :settlement :discard}
+                 {:task :work :settlement :discard
+                  :resources {resource/microdollars 1M}}
                  (fn [{register! :register-cleanup!}]
                    (register! #(deliver cleanup-entered true))))]
             ;; These positive waits tolerate a loaded randomized suite. The
@@ -1126,7 +1134,7 @@
             (is (= ::timeout (deref cleanup-entered 500 ::timeout))
                 "sealing cancellation is not permission to release a resource")
             (is (not (realized? allocation-returned)))
-            (deliver release-allocation true)
+            (.countDown release-allocation)
             (is (= true (deref allocation-returned 15000 ::timeout)))
             (let [result (deref handle 15000 ::timeout)]
               (is (= :cancelled (:run/status result)))
@@ -1134,7 +1142,7 @@
               (is (= :discarded (:run/settlement-status result)))))))
       (finally
         ;; Never strand the Room executor if an earlier assertion fails.
-        (deliver release-allocation true)
+        (.countDown release-allocation)
         (d/close-room! room)))))
 
 (deftest llm-program-uses-one-normalized-tool-contract
