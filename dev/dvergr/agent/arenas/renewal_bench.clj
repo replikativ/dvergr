@@ -58,7 +58,7 @@
     (throw (ex-info "Renewal benchmark requires a durable Datahike Room"
                     {:type ::datahike-room-required
                      :room/id (:id room)})))
-  (when-not (= renewal/renewal-plan-tool (tools/get-tool "renewal_plan"))
+  (when-not (renewal/exact-tool-installed? (tools/get-tool "renewal_plan"))
     (throw (ex-info "Install the exact renewal arena tool before running"
                     {:type ::renewal-tool-not-installed
                      :tool "renewal_plan"})))

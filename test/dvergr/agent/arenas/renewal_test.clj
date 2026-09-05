@@ -121,6 +121,22 @@
       (is (false? (#'renewal/returned-plan-match?
                    plan {:plan/id id :extra true}))))))
 
+(deftest arena-tool-registration-survives-namespace-style-reload
+  (let [previous-tool (tools/get-tool "renewal_plan")
+        stale-closure-tool
+        (assoc renewal/renewal-plan-tool :execute (fn [_ _] :stale))]
+    (try
+      (tools/register! stale-closure-tool)
+      (is (renewal/exact-tool-installed? (tools/get-tool "renewal_plan")))
+      (renewal/register-tool!)
+      (is (identical? (:execute renewal/renewal-plan-tool)
+                      (:execute (tools/get-tool "renewal_plan")))
+          "registration refreshes only the reload-sensitive executable")
+      (finally
+        (if previous-tool
+          (tools/register! previous-tool)
+          (swap! tools/registry dissoc "renewal_plan"))))))
+
 (deftest setup-and-semantic-tool-use-the-real-fork-and-affine-book
   (with-production-room
     (fn [room]

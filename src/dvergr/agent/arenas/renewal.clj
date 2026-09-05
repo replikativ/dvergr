@@ -328,8 +328,13 @@
 (defn- reject! [message data]
   (throw (ex-info message (assoc data :type ::invalid-plan-command))))
 
+(def tool-owner
+  {:kind :dvergr.agent.arena
+   :content-id arena-content-id})
+
 (def renewal-plan-tool
   {:name "renewal_plan"
+   :dvergr.tool/owner tool-owner
    :description
    (str "After hiring and awaiting the :sales and :support specialists, propose "
         "the verified Acme intervention using the exact signal UUID returned by "
@@ -401,10 +406,22 @@
                 :content (pr-str value)
                 :metadata {:value value}}))))))})
 
+(defn exact-tool-installed?
+  "Whether `tool` is this arena's exact stable tool contract.
+
+   The executable closure is deliberately excluded: reloading this namespace
+   creates a fresh function object without changing the durable tool contract."
+  [tool]
+  (= (dissoc renewal-plan-tool :execute)
+     (some-> tool (dissoc :execute))))
+
 (defn register-tool! []
   (if-let [installed (tools/get-tool "renewal_plan")]
-    (if (= renewal-plan-tool installed)
-      renewal-plan-tool
+    (if (exact-tool-installed? installed)
+      ;; Refresh the executable after an ordinary REPL namespace reload. The
+      ;; registry itself enforces compatible durable schema evolution.
+      (do (tools/register! renewal-plan-tool)
+          renewal-plan-tool)
       (throw (ex-info "A different renewal_plan tool is already installed"
                       {:type ::tool-name-conflict :name "renewal_plan"})))
     (do (tools/register! renewal-plan-tool)
