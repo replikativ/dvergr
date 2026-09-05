@@ -1,6 +1,7 @@
 (ns dvergr.chat.tool-schema-test
   "Tests for critical tool schema generation features."
   (:require [clojure.test :refer [deftest is testing]]
+            [datahike.api :as d]
             [dvergr.chat.tool-schema :as ts]))
 
 ;; NOTE: Removed reset-installed-schemas! fixture - no longer needed
@@ -21,6 +22,18 @@
                                                    :port {:type "integer"}}}
                              :enabled {:type "boolean"}}
                 :required ["server"]}})
+
+(defn- test-conn []
+  (let [cfg {:store {:backend :memory :id (random-uuid)}
+             :schema-flexibility :write}]
+    (d/create-database cfg)
+    {:cfg cfg :conn (d/connect cfg)}))
+
+(defn- error-type [error]
+  (loop [error error]
+    (when error
+      (or (:type (ex-data error))
+          (recur (ex-cause error))))))
 
 (deftest generate-tool-schema-test
   (testing "Simple tool schema generation"
@@ -62,3 +75,73 @@
                                                   :items {:type "string"}}}}}
           entity (ts/tool-input->entity tool {:items ["a" "b" "c"]})]
       (is (= ["a" "b" "c"] (:tool-input.batch/items entity))))))
+
+(deftest incompatible-concurrent-first-installs-have-one-durable-winner
+  (let [{:keys [cfg conn]} (test-conn)
+        ready (java.util.concurrent.CountDownLatch. 2)
+        start (java.util.concurrent.CountDownLatch. 1)
+        tool (fn [type]
+               {:name "schema_race"
+                :parameters {:type "object"
+                             :properties {:value {:type type}}}})
+        attempt
+        (fn [type]
+          (future
+            (.countDown ready)
+            (.await start)
+            (try
+              (ts/install-tool-schema! conn (tool type))
+              {:status :installed :type type}
+              (catch Throwable error
+                {:status :rejected :type type :error error}))))
+        string-attempt (attempt "string")
+        integer-attempt (attempt "integer")]
+    (try
+      (is (.await ready 5 java.util.concurrent.TimeUnit/SECONDS))
+      (.countDown start)
+      (let [string-outcome (deref string-attempt 5000 ::timeout)
+            integer-outcome (deref integer-attempt 5000 ::timeout)
+            outcomes [string-outcome integer-outcome]
+            installed (filter #(= :installed (:status %)) outcomes)
+            rejected (filter #(= :rejected (:status %)) outcomes)
+            installed-value-type
+            (get {"string" :db.type/string "integer" :db.type/long}
+                 (:type (first installed)))]
+        (is (not= ::timeout string-outcome))
+        (is (not= ::timeout integer-outcome))
+        (is (= 1 (count installed)) outcomes)
+        (is (= 1 (count rejected)) outcomes)
+        (is (= ::ts/incompatible-installed-tool-schema
+               (error-type (:error (first rejected)))))
+        (is (= installed-value-type
+               (:db/valueType (d/entity @conn :tool-input.schema-race/value)))
+            "the losing first use cannot rewrite an unused durable attribute"))
+      (finally
+        (.countDown start)
+        (future-cancel string-attempt)
+        (future-cancel integer-attempt)
+        (d/release conn)
+        (d/delete-database cfg)))))
+
+(deftest compatible-schema-extension-installs-only-new-attributes
+  (let [{:keys [cfg conn]} (test-conn)
+        base {:name "schema_extension"
+              :parameters {:type "object"
+                           :properties {:value {:type "string"}}}}
+        extended (assoc-in base [:parameters :properties :revision]
+                           {:type "integer"})]
+    (try
+      (is (= 1 (ts/install-tool-schema! conn base)))
+      (is (= 2 (ts/install-tool-schema! conn extended)))
+      ;; An older compatible process may race after the extension. Its subset
+      ;; must neither fail nor retract the already-installed field.
+      (is (= 1 (ts/install-tool-schema! conn base)))
+      (is (= :db.type/string
+             (:db/valueType
+              (d/entity @conn :tool-input.schema-extension/value))))
+      (is (= :db.type/long
+             (:db/valueType
+              (d/entity @conn :tool-input.schema-extension/revision))))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
