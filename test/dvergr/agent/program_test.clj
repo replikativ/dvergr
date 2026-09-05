@@ -19,6 +19,7 @@
             [dvergr.room.store.memory :as memory]
             [dvergr.room.store.datahike :as datahike-store]
             [dvergr.tools :as tools]
+            [kontor.gate :as kontor-gate]
             [kontor.governance :as kontor-governance]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.effects.await :refer [await]]
@@ -209,6 +210,67 @@
       (is (= {} (resource/run-balance room run-id)))
       (is (= {resource/microdollars 8M} (resource/balance room)))
       (run/finish! run-id :completed)
+      (let [replay (resource/allocate-run!
+                    room run-id nil {resource/microdollars 6M})]
+        (is (= :duplicate (get-in replay [:receipt :status]))
+            "the stable first grant remains replayable after termination")
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (resource/allocate-run!
+                      room run-id nil {resource/microdollars 5M}))
+            "terminal replay still checks the complete command"))
+      (finally
+        (when (some #(= run-id (:run/id %)) (run/active-runs))
+          (run/finish! run-id :cancelled {:reason :test-cleanup}))
+        (close-resource-test-room! room conn)))))
+
+(deftest terminal-run-cannot-receive-a-first-resource-grant
+  (let [[room conn] (resource-test-room :program-terminal-first-grant)
+        run-id (random-uuid)
+        trigger (d/message :test :_runs "late allocation" nil {:role :user})]
+    (try
+      (resource/mint! room {:id (random-uuid)
+                            :resources {resource/microdollars 10M}})
+      (d/post! room trigger)
+      (run/start! room :resource-test trigger nil {:id run-id})
+      (run/finish! run-id :completed)
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"terminal Run cannot receive"
+           (resource/allocate-run!
+            room run-id nil {resource/microdollars 4M})))
+      (is (nil? (room-store/-resource-receipt
+                 (:store room) (resource/allocation-id run-id))))
+      (is (= {resource/microdollars 10M} (resource/balance room)))
+      (finally
+        (close-resource-test-room! room conn)))))
+
+(deftest terminalization-between-allocation-setup-and-commit-wins-atomically
+  (let [[room conn] (resource-test-room :program-allocation-terminal-race)
+        run-id (random-uuid)
+        trigger (d/message :test :_runs "racing allocation" nil {:role :user})
+        original-transact kontor-gate/transact-with-validation
+        terminalized? (atom false)]
+    (try
+      (resource/mint! room {:id (random-uuid)
+                            :resources {resource/microdollars 10M}})
+      (d/post! room trigger)
+      (run/start! room :resource-test trigger nil {:id run-id})
+      ;; Force terminal persistence after allocate-run!'s optimistic Run read,
+      ;; but before Datahike serializes the wallet/grant transaction.
+      (with-redefs [kontor-gate/transact-with-validation
+                    (fn [conn tx-data]
+                      (when (compare-and-set! terminalized? false true)
+                        (run/finish! run-id :completed))
+                      (original-transact conn tx-data))]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"terminal Run cannot receive"
+             (resource/allocate-run!
+              room run-id nil {resource/microdollars 4M}))))
+      (is @terminalized?)
+      (is (nil? (room-store/-resource-receipt
+                 (:store room) (resource/allocation-id run-id))))
+      (is (= {resource/microdollars 10M} (resource/balance room)))
       (finally
         (when (some #(= run-id (:run/id %)) (run/active-runs))
           (run/finish! run-id :cancelled {:reason :test-cleanup}))
