@@ -989,6 +989,88 @@
       (finally
         (d/close-room! room)))))
 
+(deftest cleanup-admission-does-not-reopen-between-stack-entries
+  (let [room (test-room :program-cleanup-admission)
+        supervisor (binding [ec/*execution-context* (:ctx room)]
+                     (#'program/make-supervisor (:ctx room)))
+        claimed-cleanup (promise)]
+    (try
+      (#'program/register-cleanup! supervisor (constantly :older))
+      (#'program/register-cleanup! supervisor (constantly :newer))
+      ;; Claim the first physical cleanup without starting its worker so the
+      ;; transition into the between-callback :pending phase is deterministic.
+      (with-redefs-fn
+        {#'program/start-worker!
+         (fn [_ cleanup kind]
+           (is (= :cleanup kind))
+           (deliver claimed-cleanup cleanup))}
+        #(do
+           (#'program/mark-cleanup-safe! supervisor)
+           (#'program/seal-supervisor! supervisor)))
+      (is (fn? (deref claimed-cleanup 5000 ::timeout)))
+      (is (false? (:cleanup-admission-open? @(:state supervisor))))
+      (with-redefs-fn
+        {#'program/advance-supervisor! (constantly nil)}
+        (fn []
+          (#'program/worker-finished! supervisor ::claimed-cleanup :cleanup nil)))
+      (is (= :pending (:cleanup-phase @(:state supervisor))))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"Cleanup registered after supervisor cleanup began"
+           (#'program/register-cleanup! supervisor (constantly :late))))
+      (is (= 1 (count (:cleanups @(:state supervisor))))
+          "the older cleanup remains without admitting a late stack entry")
+      (finally
+        (d/close-room! room)))))
+
+(deftest cancelled-live-setup-worker-can-register-before-first-cleanup-claim
+  (let [room (test-room :program-cleanup-live-handback)
+        supervisor (binding [ec/*execution-context* (:ctx room)]
+                     (#'program/make-supervisor (:ctx room)))
+        entered (promise)
+        registered (promise)
+        cleaned (promise)
+        waiter (atom nil)
+        release-worker (java.util.concurrent.CountDownLatch. 1)]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (#'program/start-worker!
+         supervisor
+         (fn []
+           (deliver entered true)
+           ;; Model non-interruptible teardown/acquisition hand-back: targeted
+           ;; cancellation interrupts the wait, but the worker remains live until
+           ;; its owner releases it and must still be allowed to register.
+           (loop []
+             (when (pos? (.getCount release-worker))
+               (let [released?
+                     (try
+                       (.await release-worker)
+                       true
+                       (catch InterruptedException _ false))]
+                 (when-not released? (recur)))))
+           (#'program/register-cleanup! supervisor #(deliver cleaned true))
+           (deliver registered true))))
+      (is (= true (deref entered 5000 ::timeout)))
+      (#'program/cancel-supervisor! supervisor)
+      (#'program/mark-cleanup-safe! supervisor)
+      (#'program/seal-supervisor! supervisor)
+      (is (true? (:cleanup-admission-open? @(:state supervisor)))
+          "cleanup admission remains open while the cancelled worker is live")
+      (is (= ::pending (deref cleaned 100 ::pending)))
+      (.countDown release-worker)
+      (is (= true (deref registered 5000 ::timeout)))
+      (reset! waiter (future (#'program/await-supervisor! supervisor)))
+      (is (nil? (deref @waiter 5000 ::timeout)))
+      (is (= true (deref cleaned 5000 ::timeout)))
+      (is (false? (:cleanup-admission-open? @(:state supervisor))))
+      (is (= :done (:cleanup-phase @(:state supervisor))))
+      (finally
+        (.countDown release-worker)
+        (when-let [waiter @waiter]
+          (future-cancel waiter))
+        (d/close-room! room)))))
+
 (deftest cancellation-unwinds-every-resource-acquired-during-preparation
   (let [room (test-room :program-preparation-cleanup-cancel)
         team (test-roster)

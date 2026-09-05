@@ -83,6 +83,11 @@
                   :workers {}
                   :children {}
                   :cleanups []
+                  ;; Cleanup registration remains open while a cancelled but
+                  ;; still-live setup worker hands back resources. The first
+                  ;; physical cleanup claim closes it monotonically; unlike
+                  ;; :cleanup-phase, it never reopens between stack entries.
+                  :cleanup-admission-open? true
                   :cleanup-phase :pending
                   :cleanup-error nil
                   :llm-metrics nil
@@ -115,12 +120,16 @@
               (let [cleanup (peek cleanups)]
                 (swap! (:state supervisor)
                        #(-> %
-                            (assoc :cleanup-phase :running)
+                            (assoc :cleanup-admission-open? false
+                                   :cleanup-phase :running)
                             (update :cleanups pop)))
                 [:cleanup cleanup])
 
               (and sealed? cleanup-safe? (not normal-live?) (= :pending cleanup-phase))
-              (do (swap! (:state supervisor) assoc :cleanup-phase :done)
+              (do (swap! (:state supervisor)
+                         assoc
+                         :cleanup-admission-open? false
+                         :cleanup-phase :done)
                   :advance)
 
               (and sealed? (= :done cleanup-phase) (empty? workers) (not quiesced?))
@@ -259,7 +268,7 @@
     (throw (ex-info "Run cleanup must be a function"
                     {:type ::invalid-cleanup})))
   (locking supervisor
-    (when-not (= :pending (:cleanup-phase @(:state supervisor)))
+    (when-not (:cleanup-admission-open? @(:state supervisor))
       (throw (ex-info "Cleanup registered after supervisor cleanup began"
                       {:type ::late-cleanup-registration})))
     ;; Stack order is intentional: resources unwind in reverse acquisition
