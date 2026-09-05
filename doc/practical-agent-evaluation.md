@@ -131,14 +131,27 @@ candidates against two environments with two repetitions and parallelism two.
 It produced eight distinct durable Runs, eight certified Attempts, two 4/4
 candidate summaries, one content-addressed Scorecard, and zero active Runs at
 completion. This validates the experiment composition itself; it is not model
-quality evidence. The existing Codex/Claude live environments still use a
-bespoke trusted setup path. Migrating one of them is the acceptance criterion
-for the next setup-capability slice.
+quality evidence.
+
+The first generic live migration used the same `:programming/join-v1`
+EnvironmentDef to compare Claude Code and Codex subscription AgentDefs. It
+immediately found two observable failures: retries left duplicate child Runs,
+and the REPL's process worker inherited Spindel's drain marker, so the documented
+`@(spin (await ...))` bridge rejected valid composition as a deadlock. Tool
+activities now retain typed status and allowlisted diagnostic codes—but never
+raw result content—making that class of failure visible in certified evidence
+after an ephemeral Room closes. Clearing the drain marker and ambient Spin
+identity at the real worker boundary restored the advertised algebra. With the same concise,
+content-addressed effect-safety prompt, both providers then passed independently
+in three model steps, with exactly two completed children, an exact result, and
+zero active Runs. This is one smoke result, not a quality ranking; repetitions
+and held-out environments are required for comparative claims.
 
 ## Port order driven by failures
 
 1. Complete scoped observation and expose it in the REPL/UI.
-2. Use DatasetDef/ExperimentDef/Scorecard repeated paired runs in the live REPL.
+2. Extend DatasetDef/ExperimentDef/Scorecard live runs beyond the migrated
+   setup-free join/race/self-programming environments.
 3. Build a forkable business-state simulator and import an AutomationBench
    smoke subset.
 4. Add scheduled trigger/execution/delivery receipts using ordinary Runs.

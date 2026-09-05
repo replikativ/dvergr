@@ -95,15 +95,22 @@
   (when (some? value)
     (content-preview value 80)))
 
+(defn- portable-time [value]
+  (if (instance? java.util.Date value)
+    (.getTime ^java.util.Date value)
+    value))
+
 (defn- run-summary [candidate cause-limit]
   (let [all-causes (vec (:run/caused-by candidate))
         causes (take cause-limit all-causes)]
     (cond->
-     (select-keys candidate
-                  [:run/id :run/kind :run/room :run/actor :run/trigger
-                   :run/parent :run/status :run/started-at
-                   :run/ended-at :run/world-id :run/settlement-status
-                   :run/settlement-reason])
+     (-> (select-keys candidate
+                      [:run/id :run/kind :run/room :run/actor :run/trigger
+                       :run/parent :run/status :run/started-at
+                       :run/ended-at :run/world-id :run/settlement-status
+                       :run/settlement-reason])
+         (update :run/started-at portable-time)
+         (update :run/ended-at portable-time))
       (seq causes)
       (assoc :run/caused-by (set causes)
              :run/caused-by-count (count all-causes)
@@ -139,10 +146,11 @@
 
 (defn- activity-summary [fact]
   (cond->
-   (select-keys fact
-                [:activity/id :activity/kind :activity/verb :activity/at
-                 :activity/run-id :activity/tool-use-id :activity/status
-                 :activity/critical?])
+   (update (select-keys fact
+                        [:activity/id :activity/kind :activity/verb :activity/at
+                         :activity/run-id :activity/tool-use-id :activity/status
+                         :activity/critical?])
+           :activity/at portable-time)
     (:activity/tool-name fact)
     (assoc :activity/tool-name (compact-value (:activity/tool-name fact)))
     (:activity/outcome fact)
@@ -158,7 +166,7 @@
     (cond-> {:message/id (:id message)
              :message/from (:from message)
              :message/to (:to message)
-             :message/at (:ts message)
+             :message/at (portable-time (:ts message))
              :message/in-reply-to (:in-reply-to message)
              :message/thread-root-id (discourse/thread-root-id message)
              :message/run-id (activity/message-run-id message)}

@@ -10,6 +10,8 @@
             [datahike.api :as dh]
             [dvergr.activity :as activity]
             [dvergr.agent.environment :as environment]
+            [dvergr.agent.evaluation :as evaluation]
+            [dvergr.agent.experiment :as experiment]
             [dvergr.agent.observation :as observation]
             [dvergr.agent.program :as program]
             [dvergr.agent.roster :as roster]
@@ -35,6 +37,9 @@
        "Do not merely describe the code; execute it."))
 
 (def expected-v1 {:analyst "evidence" :reviewer {:claim 42}})
+
+(def effect-safe-repl-prompt-v1
+  "Exercise Dvergr through clojure_eval and complete the requested computation before answering. Treat calls ending in ! as durable effects: inspect or validate their complete call shape before executing them, execute each requested effect exactly once, and never run documentation examples as probes. agent/hire! takes an options map; put every task value, including a map-valued task, under the :task key. If a later pure composition fails, reuse the handles already created instead of hiring again.")
 
 (def race-task-v1
   (str "Use clojure_eval to solve this task. Construct an immutable roster with "
@@ -130,11 +135,12 @@
         (catch Throwable _ nil)))))
 
 (defn- common-checks
-  [{:keys [result parsed-value durable-status active-after]} expected]
-  {:root-completed? (= :completed (:run/status result))
-   :durably-completed? (= :completed durable-status)
-   :exact-result? (= expected parsed-value)
-   :quiescent? (zero? active-after)})
+  [{:keys [result run-result parsed-value durable-status active-after]} expected]
+  (let [execution-result (or run-result result)]
+    {:root-completed? (= :completed (:run/status execution-result))
+     :durably-completed? (= :completed durable-status)
+     :exact-result? (= expected parsed-value)
+     :quiescent? (zero? active-after)}))
 
 (defn- join-checks [{:keys [root-run-id child-runs] :as observation}]
   (let [by-actor (group-by :run/actor child-runs)]
@@ -171,13 +177,14 @@
                                    child-runs)})))
 
 (defn- renewal-risk-checks
-  [{:keys [result parsed-value durable-status active-after root-run-id
+  [{:keys [result run-result parsed-value durable-status active-after root-run-id
            root-causes child-runs inspection-receipts]}]
-  (let [owned (filterv #(= root-run-id (:run/parent %)) child-runs)
+  (let [execution-result (or run-result result)
+        owned (filterv #(= root-run-id (:run/parent %)) child-runs)
         outside (remove #(= root-run-id (:run/parent %)) child-runs)
         owned-ids (into #{} (map :run/id) owned)
         reported (dissoc parsed-value :scope :inspection)]
-    {:root-completed? (= :completed (:run/status result))
+    {:root-completed? (= :completed (:run/status execution-result))
      :durably-completed? (= :completed durable-status)
      :quiescent? (zero? active-after)
      :business-result? (= expected-renewal-risk-v1 reported)
@@ -414,6 +421,209 @@
   "Return the exact portable definition for a named benchmark environment."
   [environment-id]
   (some-> (get environments environment-id) :definition))
+
+(def ^:private paired-environment-ids
+  #{:programming/join-v1
+    :programming/race-v1
+    :programming/self-programming-v1})
+
+(defn- paired-environment [environment-id]
+  (when-not (contains? paired-environment-ids environment-id)
+    (throw (ex-info
+            "Environment requires trusted setup not yet supported by paired runs"
+            {:environment-id environment-id
+             :supported paired-environment-ids})))
+  (let [definition (environment-definition environment-id)
+        verifier (:environment/verifier definition)
+        world (:environment/world definition)]
+    (when-not (= memory-setup-ref (:setup world))
+      (throw (ex-info "Paired environment does not use the memory baseline"
+                      {:environment-id environment-id
+                       :setup (:setup world)})))
+    (environment/make-environment
+     (cond-> {:id (:environment/id definition)
+              :version (:environment/version definition)
+              :task (:environment/task definition)
+              :verifier
+              (cond-> {:id (:verifier/id verifier)
+                       :version (:verifier/version verifier)}
+                (contains? verifier :verifier/basis)
+                (assoc :basis (:verifier/basis verifier)))
+              :limits (:environment/limits definition)
+              :world (-> world (dissoc :setup) (assoc :settlement :discard))}
+       (contains? definition :environment/metadata)
+       (assoc :metadata (:environment/metadata definition))))))
+
+(defn- scoped-observation
+  [{:keys [room run-id result durable]}]
+  (let [all-runs (run/runs room {:root-run-id run-id :limit 200})
+        run-ids (into #{} (map :run/id) all-runs)
+        trigger-ids (into #{} (keep :run/trigger) all-runs)
+        messages (d/messages room {:limit 500
+                                   :run-ids run-ids
+                                   :message-ids trigger-ids})
+        projection (observation/snapshot
+                    room run-id
+                    {:run-limit 200 :message-limit 500
+                     :content-limit 1000 :content-budget 64000
+                     :detail-limit 500})
+        activity-messages (filter #(= :_activity (:to %)) messages)
+        tool-trace (mapv activity/tool-trace-entry activity-messages)
+        parsed (parse-edn (:run/value result))
+        run-trace (mapv #(select-keys % [:run/id :run/parent :run/caused-by
+                                         :run/actor :run/status :run/error
+                                         :run/settlement-status])
+                        all-runs)
+        child-runs (filterv #(not= run-id (:run/id %)) run-trace)]
+    (let [evidence
+          {:run-result (select-keys result
+                                    [:run/id :run/status :run/value :run/error
+                                     :run/metrics :run/world
+                                     :run/settlement-status])
+           :result parsed
+           :parsed-value parsed
+           :durable-status (:run/status durable)
+           :root-causes (set (:run/caused-by durable))
+           :room-id (:id room)
+           :root-run-id run-id
+           :child-runs child-runs
+           :tool-calls tool-trace
+           :inspection-receipts
+           (into #{}
+                 (comp
+                  (mapcat activity/message-activities)
+                  (filter #(and (= run-id (:activity/run-id %))
+                                (= :observation (:activity/kind %))
+                                (= :inspect (:activity/verb %))))
+                  (map :activity/id))
+                 messages)
+           :active-after (count (filter #(contains? #{:running :cancelling}
+                                                    (:run/status %))
+                                        run-trace))
+           :trace {:runs run-trace
+                   :messages (:observation/messages projection)
+                   :tool-calls tool-trace}}]
+      (when-not (roster/data-value? evidence)
+        (throw (ex-info
+                "Paired verifier produced non-portable evidence"
+                {:non-portable
+                 (into {}
+                       (keep (fn [[k value]]
+                               (when-not (roster/data-value? value)
+                                 [k (some-> value class str)])))
+                       evidence)})))
+      evidence)))
+
+(defn- paired-evaluator [definition]
+  (let [verifier-ref (:environment/verifier definition)
+        verify (or (get trusted-verifiers verifier-ref)
+                   (throw (ex-info "Environment names an untrusted verifier"
+                                   {:environment
+                                    (environment/environment-ref definition)
+                                    :verifier verifier-ref})))]
+    (evaluation/make-evaluator
+     (cond-> {:id (:verifier/id verifier-ref)
+              :version (:verifier/version verifier-ref)
+              :observe scoped-observation
+              :verify (fn [_ evidence]
+                        (let [checks (verify evidence)]
+                          {:checks checks
+                           :reward (if (every? true? (vals checks)) 1.0 0.0)}))}
+       (contains? verifier-ref :verifier/basis)
+       (assoc :basis (:verifier/basis verifier-ref))))))
+
+(defn- candidate-agent [team {:keys [id provider model prompt] :as candidate}]
+  (when-not (and (keyword? id) (keyword? provider) (string? model))
+    (throw (ex-info "Candidate requires keyword :id/:provider and string :model"
+                    {:candidate candidate})))
+  (when-not (or (nil? prompt) (string? prompt))
+    (throw (ex-info "Candidate :prompt must be a string when present"
+                    {:candidate candidate})))
+  (roster/make-agent
+   team
+   {:id id
+    :prompt (or prompt
+                (str "Exercise Dvergr through clojure_eval. Complete the "
+                     "requested computation before answering."))
+    :tools #{:clojure_eval}
+    :model-policy {:provider provider :model model}
+    :program {:kind :llm :max-model-steps 16
+              :budget-dollars 1.0 :auto-compact? false}}))
+
+(defn paired-experiment-spin
+  "Build a repeated paired live-model experiment and return its lazy Spin.
+
+   The caller owns `room`, so durable Runs and Attempts remain inspectable after
+   completion. Candidates are maps with keyword `:id`/`:provider`, string
+   `:model`, and an optional string `:prompt`; this makes prompt policy an exact
+   content-addressed experimental variable. Supported environments currently
+   need no setup beyond the shared memory baseline: join, race, and
+   self-programming v1. Host execution options are `:parallelism`,
+   `:max-parallelism`, and `:max-attempts`."
+  [room {:keys [environment-ids candidates repetitions id]
+         :or {repetitions 1 id :live/paired-v1}
+         :as opts}]
+  (when-not (and (vector? environment-ids) (seq environment-ids))
+    (throw (ex-info ":environment-ids must be a non-empty vector"
+                    {:environment-ids environment-ids})))
+  (when-not (and (vector? candidates) (seq candidates))
+    (throw (ex-info ":candidates must be a non-empty vector"
+                    {:candidates candidates})))
+  (let [definitions (mapv paired-environment environment-ids)
+        team (reduce candidate-agent
+                     (roster/make-roster {:id :live/paired-candidates})
+                     candidates)
+        dataset (experiment/make-dataset
+                 {:id (keyword (namespace id) (str (name id) "-dataset"))
+                  :environments definitions
+                  :metadata {:source :dvergr.agent.program-bench}})
+        experiment-definition
+        (experiment/make-experiment
+         {:id id
+          :dataset dataset
+          :candidates (roster/agents team)
+          :repetitions repetitions
+          :metadata {:kind :live-model-comparison}})
+        evaluators (into {}
+                         (map (fn [definition]
+                                (let [evaluator (paired-evaluator definition)]
+                                  [(evaluation/evaluator-ref evaluator)
+                                   evaluator])))
+                         definitions)]
+    (experiment/run room team experiment-definition evaluators
+                    (select-keys opts [:parallelism :max-parallelism
+                                       :max-attempts]))))
+
+(defn run-paired-experiment!
+  "Convenience REPL entry point for a live paired experiment.
+
+   Creates and closes an ephemeral in-memory Room, returning the portable
+   ExperimentDef, execution summary, certified Attempts, and Scorecard. Use
+   `paired-experiment-spin` with a caller-owned Room when interactive durable
+   inspection is more important than convenience."
+  [opts]
+  (let [room-id (keyword (str "paired-bench-" (random-uuid)))
+        room (d/make-room {:id room-id :store (memory/make)})]
+    (try
+      (let [result (binding [ec/*execution-context* (:ctx room)]
+                     @(paired-experiment-spin room opts))]
+        (select-keys result [:experiment :execution :attempts :scorecard]))
+      (finally
+        ;; Parallel failure cancels sibling evaluations immediately, while
+        ;; their world discard runs off-drain. Join that physical cleanup
+        ;; before invalidating the ephemeral Room context/store.
+        (try
+          (evaluation/await-cleanups! room)
+          (catch Throwable error
+            ;; The caller can recover/inspect this process-local Room from
+            ;; ex-data. Closing here would destroy the fork authority whose
+            ;; cleanup just failed.
+            (throw (ex-info "Benchmark Room retained for cleanup recovery"
+                            {:type ::cleanup-recovery-required
+                             :room/id (:id room)
+                             :room room}
+                            error))))
+        (d/close-room! room)))))
 
 (defn run-environment!
   "Run a named programming environment through `provider`/`model`.
