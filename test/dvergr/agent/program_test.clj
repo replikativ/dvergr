@@ -24,8 +24,10 @@
             [org.replikativ.spindel.effects.await :refer [await]]
             [org.replikativ.spindel.engine.context :as context]
             [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.engine.impl.simple :as simple]
             [org.replikativ.spindel.spin.combinators :as comb]
-            [org.replikativ.spindel.yggdrasil :as ygg]))
+            [org.replikativ.spindel.yggdrasil :as ygg])
+  (:import [java.util.concurrent ExecutorService Executors]))
 
 (defn- test-roster []
   (-> (roster/make-roster {:id :test-team})
@@ -1069,6 +1071,50 @@
         (.countDown release-worker)
         (when-let [waiter @waiter]
           (future-cancel waiter))
+        (d/close-room! room)))))
+
+(deftest native-run-supervision-does-not-depend-on-clojure-send-off
+  (let [room (test-room :program-native-executor-isolation)
+        team (test-roster)
+        cleaned (promise)
+        finalizer-in-drain? (promise)
+        publish! @#'program/publish-result-and-release!
+        original-executor clojure.lang.Agent/soloExecutor
+        ^ExecutorService rejecting-executor (Executors/newSingleThreadExecutor)]
+    ;; An already-shut-down executor rejects every future/send-off submission.
+    ;; Before Dvergr owned its native supervision executor, either prepared work
+    ;; or the blocking finalizer passed through Agent/soloExecutor and this Run
+    ;; could not reach a durable terminal result.
+    (.shutdownNow rejecting-executor)
+    (try
+      (set-agent-send-off-executor! rejecting-executor)
+      (with-redefs-fn
+        {#'program/publish-result-and-release!
+         (fn [& args]
+           (deliver finalizer-in-drain? simple/*in-drain?*)
+           (apply publish! args))}
+        (fn []
+          (binding [ec/*execution-context* (:ctx room)]
+            (let [handle
+                  ;; Model scheduling from an engine drain without blocking in
+                  ;; it. The detached finalizer's bound-fn would otherwise carry
+                  ;; this marker onto the native executor.
+                  (binding [simple/*in-drain?* true]
+                    (program/hire-prepared-in!
+                     room room team :analyst
+                     {:task :work :settlement :discard}
+                     (fn [{register! :register-cleanup!}]
+                       (register! #(deliver cleaned true)))))
+                  result (deref handle 5000 ::timeout)]
+              (is (= :completed (:run/status result)))
+              (is (= :discarded (:run/settlement-status result)))
+              (is (= true (deref cleaned 5000 ::timeout)))
+              (is (false? (deref finalizer-in-drain? 5000 ::timeout))
+                  "the detached finalizer does not inherit an engine drain")
+              (is (empty? (run/active-runs (:id room))))))))
+      (finally
+        (set-agent-send-off-executor! original-executor)
+        (.shutdownNow rejecting-executor)
         (d/close-room! room)))))
 
 (deftest cancellation-unwinds-every-resource-acquired-during-preparation

@@ -107,7 +107,7 @@
      (-> (select-keys candidate
                       [:run/id :run/kind :run/room :run/actor :run/trigger
                        :run/parent :run/status :run/started-at
-                       :run/ended-at :run/world-id :run/settlement-status
+                       :run/ended-at :run/world :run/settlement-status
                        :run/settlement-reason])
          (update :run/started-at portable-time)
          (update :run/ended-at portable-time))
