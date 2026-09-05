@@ -114,8 +114,9 @@ support, scheduling, or delivery effects are added.
 
 `dvergr.agent.arenas.renewal` is the first consequential state-backed successor.
 Its exact WorldSetup seeds an account and sales/support signals inside every
-candidate Run world. A candidate must hire both specialists, obtain their actual
-results, and call the semantic `renewal_plan` tool with the exact evidence IDs.
+candidate Run world. A candidate must construct and hire both exact scripted
+specialist-service fixtures, obtain their actual child Run results, and call the
+semantic `renewal_plan` tool with the exact evidence IDs.
 That tool validates the fork-local business state, consumes one conserved
 `renewal-review` unit from the Run wallet, and writes the proposed intervention
 only into the disposable candidate world. The trusted evaluator then checks the
@@ -130,7 +131,8 @@ scheduler:
          '[dvergr.agent.experiment :as experiment])
 
 (renewal/register-tool!)
-(renewal/provision-review-capacity! room candidate-cells)
+(renewal/provision-review-capacity!
+ room {:id provisioning-event-id :amount candidate-cells})
 
 @(experiment/run
   room roster experiment-def
@@ -140,7 +142,10 @@ scheduler:
 
 The deterministic model contract exercises this complete path in CI. Live
 Codex/Claude candidates can use the same EnvironmentDef, evaluator and setup;
-only their AgentDefs and prompt policies differ.
+only their AgentDefs and prompt policies differ. The scripted children measure
+recursive construction, causal joining, world/resource ownership, and merge—not
+specialist model reasoning. A later arena can replace them with paid specialist
+models once nested provider effects debit conserved Run wallets.
 
 The first native Codex-subscription probe of this arena exposed two benchmark
 contract bugs before it passed. The portable task originally said only that a
@@ -153,7 +158,9 @@ SCI surface when the first attempt stopped. The environment now uses time and
 resource limits as its work budget and retains sixteen model exchanges only as
 a runaway fuse. With a 120-second limit, Codex queried the fork-local state,
 authored and ran both specialists, submitted the exact evidence, consumed one
-review unit, and passed all fifteen trusted checks in eight model exchanges.
+review unit, and passed the then-current fifteen trusted checks in eight model
+exchanges. The current contract additionally verifies exact child AgentDef
+identities; the historical probe has not yet been rerun against that revision.
 This is one successful discoverability probe, not yet a model-quality estimate.
 The same path is available from a fully initialized room REPL without exposing
 the raw trace to evaluated agents:
@@ -162,7 +169,9 @@ the raw trace to evaluated agents:
 (require '[dvergr.agent.arenas.renewal :as renewal]
          '[dvergr.agent.arenas.renewal-bench :as renewal-bench])
 
-(renewal/provision-review-capacity! room 1)
+(renewal/register-tool!)
+(renewal/provision-review-capacity!
+ room {:id (random-uuid) :amount 1})
 (def report
   (renewal-bench/run!
    room
@@ -175,9 +184,11 @@ the raw trace to evaluated agents:
 ```
 
 `run!` uses the caller's real Room and leaves its lifecycle with the caller. It
-does not manufacture a lighter pseudo-room or copy the experiment scheduler.
-Cleanup is joined before it returns or throws, and the diagnostic trace is
-restricted to the admitted root Run and its structural descendants.
+requires the semantic tool to be installed explicitly and never mutates the
+process-global tool registry itself. It does not manufacture a lighter
+pseudo-room or copy the experiment scheduler. Evaluation cleanup is joined
+before it returns or throws, and the diagnostic trace is restricted to the
+admitted root Run and its structural descendants.
 
 The comparison unit is now explicit. A DatasetDef fixes a non-empty ordered set
 of exact environments; an ExperimentDef fixes exact candidate AgentDef content

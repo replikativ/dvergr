@@ -92,6 +92,10 @@
     (is (= {:exact-shape {:plan/id :uuid}} (:result task)))
     (is (every? #(= :renewal.signal (get-in % [:returns :record]))
                 (:specialists task)))
+    (is (every? #(= {:kind :scripted :reply :exact-seeded-record}
+                    (:program %))
+                (:specialists task))
+        "the portable contract describes fixture semantics honestly")
     (is (every? #(not (contains? (:returns %) :required-fields))
                 (:specialists task)))
     (is (true? (#'renewal/specialist-results-match? real-children)))
@@ -120,7 +124,14 @@
 (deftest setup-and-semantic-tool-use-the-real-fork-and-affine-book
   (with-production-room
     (fn [room]
-      (renewal/provision-review-capacity! room 1)
+      (let [provision-id (random-uuid)]
+        (renewal/provision-review-capacity!
+         room {:id provision-id :amount 1})
+        (is (= {renewal/review-unit 1M} (resource/balance room)))
+        (renewal/provision-review-capacity!
+         room {:id provision-id :amount 1})
+        (is (= {renewal/review-unit 1M} (resource/balance room))
+            "retrying one provisioning event is idempotent"))
       (let [run-id (random-uuid)
             trigger (discourse/message :test :_runs "renewal" nil {:role :user})
             run-world (world/open! room run-id :discard)
@@ -182,6 +193,10 @@
                                :where [?plan :renewal.plan/id]]
                              @work-conn)))
                 (is (= {} (resource/run-balance room run-id)))))
+            (renewal/provision-review-capacity!
+             room {:id (random-uuid) :amount 1})
+            (is (= {renewal/review-unit 1M} (resource/balance room))
+                "a distinct provisioning event may add the same amount again")
             (let [{:keys [status reason]} (world/settle! run-world :completed)]
               (run/finish! run-id :completed
                            {:settlement-status status
@@ -239,7 +254,8 @@
       (let [previous-tool (tools/get-tool "renewal_plan")]
         (try
           (renewal/register-tool!)
-          (renewal/provision-review-capacity! room 1)
+          (renewal/provision-review-capacity!
+           room {:id (random-uuid) :amount 1})
           (let [environment (renewal/environment-def)
                 team (-> (roster/make-roster {:id :renewal/candidates})
                          (roster/make-agent
@@ -297,6 +313,7 @@
                        :world-setups {renewal/setup-ref (renewal/world-setup)}})
                     attempt (first attempts)
                     checks (get-in attempt [:attempt/receipt :attempt/checks])
+                    evidence (:attempt/evidence attempt)
                     run-id (:attempt/run-id attempt)
                     durable-runs (run/runs room {:limit 20})
                     parent-conn (:conn (:store room))]
@@ -304,6 +321,20 @@
                 (is (= 1 (count attempts)))
                 (is (every? true? (vals checks)) (pr-str checks))
                 (is (= 1.0 (get-in attempt [:attempt/receipt :attempt/reward])))
+                (let [extra-plan ((:verify (renewal/evaluator))
+                                  environment (assoc evidence :plan-count 2))
+                      forged-child
+                      ((:verify (renewal/evaluator))
+                       environment
+                       (update-in evidence [:children 0 :run/agent-def-hash]
+                                  (constantly (random-uuid))))]
+                  (is (false? (get-in extra-plan [:checks :one-plan?]))
+                      "an additional candidate-authored plan loses certification")
+                  (is (zero? (:reward extra-plan)))
+                  (is (false? (get-in forged-child
+                                      [:checks :specialist-definitions?]))
+                      "arbitrary scripted provenance cannot impersonate the fixture")
+                  (is (zero? (:reward forged-child))))
                 (is (= scorecard
                        (experiment/scorecard room (:scorecard/content-id scorecard))))
                 (is (= :discarded

@@ -15,6 +15,7 @@
             [dvergr.discourse :as discourse]
             [dvergr.resource :as resource]
             [dvergr.room.store.datahike]
+            [dvergr.tools :as tools]
             [org.replikativ.spindel.engine.core :as ec]))
 
 (def default-prompt
@@ -57,6 +58,10 @@
     (throw (ex-info "Renewal benchmark requires a durable Datahike Room"
                     {:type ::datahike-room-required
                      :room/id (:id room)})))
+  (when-not (= renewal/renewal-plan-tool (tools/get-tool "renewal_plan"))
+    (throw (ex-info "Install the exact renewal arena tool before running"
+                    {:type ::renewal-tool-not-installed
+                     :tool "renewal_plan"})))
   (let [balance (resource/balance room)
         available (get balance renewal/review-unit 0)]
     (when (< available 1)
@@ -97,13 +102,14 @@
    subscription/API resources. Invalid storage or missing review capacity fail
    before the Experiment can admit model work.
 
-     (renewal/provision-review-capacity! room 1)
+     (renewal/register-tool!)
+     (renewal/provision-review-capacity!
+      room {:id (random-uuid) :amount 1})
      (run! room {:id :codex-renewal
                  :provider :codex-subscription
                  :model \"codex-subscription-sol\"})"
   [room candidate-opts]
   (preflight-room! room)
-  (renewal/register-tool!)
   (let [cleanup-group (evaluation/cleanup-group)
         environment (renewal/environment-def)
         team (candidate

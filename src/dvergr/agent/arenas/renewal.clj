@@ -10,6 +10,8 @@
             [dvergr.agent.environment :as environment]
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.observation :as observation]
+            [dvergr.agent.roster :as roster]
+            [dvergr.agent.run :as run]
             [dvergr.resource :as resource]
             [dvergr.room.store :as store]
             [dvergr.room.store.datahike :as datahike-store]
@@ -63,8 +65,10 @@
   {:objective :propose-renewal-intervention
    :account account-id
    :specialists [{:id :sales :task :report-sales-evidence
+                  :program {:kind :scripted :reply :exact-seeded-record}
                   :returns (:sales specialist-output-contracts)}
                  {:id :support :task :report-support-evidence
+                  :program {:kind :scripted :reply :exact-seeded-record}
                   :returns (:support specialist-output-contracts)}]
    :coordination {:hire :both
                   :await :both
@@ -203,8 +207,8 @@
 (defn charge-id [run-id]
   (hasch/uuid [:dvergr/renewal-charge arena-content-id run-id account-id]))
 
-(defn mint-id [room-id amount]
-  (hasch/uuid [:dvergr/renewal-mint arena-content-id room-id amount]))
+(defn mint-id [room-id provision-id]
+  (hasch/uuid [:dvergr/renewal-mint arena-content-id room-id provision-id]))
 
 (defn environment-def []
   (environment/make-environment
@@ -242,15 +246,22 @@
          :signal/ids #{sales-signal-id support-signal-id}}))}))
 
 (defn provision-review-capacity!
-  "Install and mint `amount` review units in the durable control Room."
-  [room amount]
+  "Install and mint review units in the durable control Room.
+
+   `provision` is `{:id UUID :amount positive-integer}`. The caller-owned ID is
+   an idempotency identity: retrying the same event cannot mint twice, while a
+   distinct event can provision the same amount again."
+  [room {:keys [id amount] :as provision}]
+  (when-not (and (= #{:id :amount} (set (keys provision))) (uuid? id))
+    (throw (ex-info "Renewal provisioning requires exactly :id UUID and :amount"
+                    {:type ::invalid-provision :provision provision})))
   (when-not (and (integer? amount) (pos? amount))
     (throw (ex-info "Renewal review capacity must be a positive integer"
                     {:type ::invalid-review-capacity :amount amount})))
   (resource/install-unit! room {:symbol review-unit
                                 :name "Renewal reviews"
                                 :precision 0})
-  (resource/mint! room {:id (mint-id (:id room) amount)
+  (resource/mint! room {:id (mint-id (:id room) id)
                         :resources {review-unit amount}}))
 
 (defn- parse-evidence-uuid [value]
@@ -391,8 +402,13 @@
                 :metadata {:value value}}))))))})
 
 (defn register-tool! []
-  (tools/register! renewal-plan-tool)
-  renewal-plan-tool)
+  (if-let [installed (tools/get-tool "renewal_plan")]
+    (if (= renewal-plan-tool installed)
+      renewal-plan-tool
+      (throw (ex-info "A different renewal_plan tool is already installed"
+                      {:type ::tool-name-conflict :name "renewal_plan"})))
+    (do (tools/register! renewal-plan-tool)
+        renewal-plan-tool)))
 
 (def expected-specialist-results
   {:sales {:renewal.signal/id sales-signal-id
@@ -405,6 +421,24 @@
              :renewal.signal/count 3
              :renewal.signal/severity :high}})
 
+(defn specialist-fixture-roster
+  "Return the exact deterministic specialist-service fixture for this arena.
+
+   These scripted children certify recursive construction, hiring, observation,
+   merge, and provenance. They deliberately do not claim to measure specialist
+   model reasoning; paid recursive model work awaits metered provider effects."
+  []
+  (reduce-kv
+   (fn [team id reply]
+     (roster/make-agent team {:id id :program {:kind :scripted :reply reply}}))
+   (roster/make-roster {:id :renewal-specialists})
+   expected-specialist-results))
+
+(def expected-specialist-agent-hashes
+  (into {}
+        (map (fn [agent] [(:agent/id agent) (hasch/uuid agent)]))
+        (roster/agents (specialist-fixture-roster))))
+
 (defn- read-result [value]
   (if (string? value)
     (try (edn/read-string value) (catch Throwable _ nil))
@@ -415,6 +449,12 @@
      (into {}
            (map (fn [child]
                   [(:run/actor child) (read-result (:run/value child))]))
+           children)))
+
+(defn- specialist-definitions-match? [children]
+  (= expected-specialist-agent-hashes
+     (into {}
+           (map (juxt :run/actor :run/agent-def-hash))
            children)))
 
 (defn- returned-plan-match? [plan result]
@@ -435,6 +475,46 @@
        (assoc child :run/value (read-result output))))
    children))
 
+(defn- verification-checks
+  [{:keys [setup result plan plan-count root children activities receipt
+           completed-plan-tool-count]}]
+  (let [child-ids (into #{} (map :run/id) children)
+        evidence-ids (into #{} (map :renewal.signal/id)
+                           (:renewal.plan/evidence plan))
+        plan-tools (filter #(= "renewal_plan" (:activity/tool-name %))
+                           activities)
+        result (read-result result)]
+    {:exact-setup? (= {:arena/content-id arena-content-id
+                       :account/id account-id
+                       :signal/ids #{sales-signal-id support-signal-id}}
+                      setup)
+     :one-plan? (and (= 1 plan-count) (some? plan))
+     :root-owned-plan? (= (:run/id root) (:renewal.plan/run-id plan))
+     :stable-plan-id? (= (plan-id (:run/id root)) (:renewal.plan/id plan))
+     :decision-derived? (= [:high :executive-escalation :proposed]
+                           ((juxt :renewal.plan/risk
+                                  :renewal.plan/action
+                                  :renewal.plan/status) plan))
+     :exact-evidence? (= #{sales-signal-id support-signal-id} evidence-ids)
+     :two-specialists? (= #{:sales :support} (set (map :run/actor children)))
+     :structural-parentage? (= 2 (count children))
+     :all-results-observed? (= child-ids (set (:run/caused-by root)))
+     :specialist-results? (specialist-results-match? children)
+     :specialist-definitions? (specialist-definitions-match? children)
+     :specialists-completed? (every? #(= :completed (:run/status %)) children)
+     :specialists-merged? (every? #(= :merged (:run/settlement-status %)) children)
+     :one-plan-tool? (and (= 1 (count plan-tools))
+                          (= 1 completed-plan-tool-count))
+     :charged-once? (and (= :consume (:kind receipt))
+                         (= #{review-unit} (set (keys (:resources receipt))))
+                         (== 1 (get (:resources receipt) review-unit 0)))
+     :returned-plan? (returned-plan-match? plan result)}))
+
+(defn- verification-result [evidence]
+  (let [checks (verification-checks evidence)]
+    {:checks checks
+     :reward (if (every? true? (vals checks)) 1.0 0.0)}))
+
 (defn evaluator []
   (evaluation/make-evaluator
    {:id :business/renewal-intervention
@@ -452,14 +532,28 @@
                        :content-limit 1000 :content-budget 32000
                        :detail-limit 100})
             runs (:observation/runs snapshot)
-            children (filterv #(= run-id (:run/parent %)) runs)
+            durable-runs (into {}
+                               (map (juxt :run/id identity))
+                               (run/runs control-room
+                                         {:root-run-id run-id :limit 20}))
+            children (->> runs
+                          (filter #(= run-id (:run/parent %)))
+                          (mapv #(merge %
+                                        (select-keys
+                                         (get durable-runs (:run/id %))
+                                         [:run/agent-def-hash]))))
             messages (:observation/messages snapshot)
             children (attach-specialist-results children messages)
             receipt (store/-resource-receipt (:store control-room)
-                                             (charge-id run-id))]
+                                             (charge-id run-id))
+            plan-count (when conn
+                         (d/q '[:find (count ?plan) .
+                                :where [?plan :renewal.plan/id]]
+                              @conn))]
         {:setup setup-evidence
          :result (:run/value result)
          :plan (when conn (plan conn plan-id))
+         :plan-count (or plan-count 0)
          :root (some #(when (= run-id (:run/id %)) %) runs)
          :children children
          :activities (:observation/activities snapshot)
@@ -475,42 +569,4 @@
              0)
          :receipt (select-keys receipt [:id :kind :source :destination
                                         :resources])}))
-    :verify
-    (fn [_ {:keys [setup result plan root children activities receipt
-                   completed-plan-tool-count]}]
-      (let [child-ids (into #{} (map :run/id) children)
-            evidence-ids (into #{} (map :renewal.signal/id)
-                               (:renewal.plan/evidence plan))
-            plan-tools (filter #(= "renewal_plan" (:activity/tool-name %))
-                               activities)
-            result (if (string? result)
-                     (try (edn/read-string result) (catch Throwable _ nil))
-                     result)
-            checks
-            {:exact-setup? (= {:arena/content-id arena-content-id
-                               :account/id account-id
-                               :signal/ids #{sales-signal-id support-signal-id}}
-                              setup)
-             :one-plan? (some? plan)
-             :root-owned-plan? (= (:run/id root) (:renewal.plan/run-id plan))
-             :stable-plan-id? (= (plan-id (:run/id root)) (:renewal.plan/id plan))
-             :decision-derived? (= [:high :executive-escalation :proposed]
-                                   ((juxt :renewal.plan/risk
-                                          :renewal.plan/action
-                                          :renewal.plan/status) plan))
-             :exact-evidence? (= #{sales-signal-id support-signal-id} evidence-ids)
-             :two-specialists? (= #{:sales :support}
-                                  (set (map :run/actor children)))
-             :structural-parentage? (= 2 (count children))
-             :all-results-observed? (= child-ids (set (:run/caused-by root)))
-             :specialist-results? (specialist-results-match? children)
-             :specialists-completed? (every? #(= :completed (:run/status %)) children)
-             :specialists-merged? (every? #(= :merged (:run/settlement-status %)) children)
-             :one-plan-tool? (and (= 1 (count plan-tools))
-                                  (= 1 completed-plan-tool-count))
-             :charged-once? (and (= :consume (:kind receipt))
-                                 (= #{review-unit} (set (keys (:resources receipt))))
-                                 (== 1 (get (:resources receipt) review-unit 0)))
-             :returned-plan? (returned-plan-match? plan result)}]
-        {:checks checks
-         :reward (if (every? true? (vals checks)) 1.0 0.0)}))}))
+    :verify (fn [_ evidence] (verification-result evidence))}))
