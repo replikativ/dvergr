@@ -16,6 +16,7 @@
             [dvergr.discourse :as d]
             [dvergr.model.providers :as providers]
             [dvergr.resource :as resource]
+            [dvergr.room.store :as room-store]
             [dvergr.system.rooms :as system-rooms]
             [dvergr.tools :as tools]
             [hasch.core :as hasch]
@@ -81,6 +82,7 @@
                   :cleanup-phase :pending
                   :cleanup-error nil
                   :llm-metrics nil
+                  :execution-phase :admitted
                   :quiesced? false})
     :quiesced (sync/deferred)
     :quiesced-latch (CountDownLatch. 1)}))
@@ -159,7 +161,13 @@
          callable   (reify Callable
                       (call [_]
                         (when (compare-and-set! phase :new :running)
-                          (binding [ec/*execution-context* (:worker-ctx supervisor)]
+                          (binding [ec/*execution-context* (:worker-ctx supervisor)
+                                    ;; A native worker is an effect boundary,
+                                    ;; not another node in the caller's Spin.
+                                    ;; In particular trusted world setup must
+                                    ;; not inherit the drain/graph identity
+                                    ;; which admitted the Run.
+                                    ec/*spin-id* nil]
                             (try
                               (reset! result (f))
                               (catch Throwable t
@@ -904,25 +912,46 @@
    idempotent. A configured resource allocation is never silently abandoned:
    transient store failures retain the live Run and retry behind the same
    physical-quiescence fence as durable terminal persistence."
-  [room id parent-run allocated?]
-  (when allocated?
-    (loop []
-      (let [outcome (try
-                      (let [remaining (resource/run-balance room id)]
-                        (when (seq remaining)
-                          (resource/return! room id parent-run remaining))
-                        :returned)
-                      (catch Throwable t t))]
-        (when (instance? Throwable outcome)
-          (Thread/sleep 25)
-          (recur))))))
+  [room id parent-run allocation-state]
+  (let [allocated?
+        (loop []
+          (case @allocation-state
+            (:not-requested :not-started) false
+            :allocated true
+            ;; The allocating worker exited through an exception. Reconcile its
+            ;; stable transfer identity after physical quiescence: a receipt is
+            ;; authoritative evidence that the wallet/grant committed, while an
+            ;; authoritative nil proves there is nothing to return.
+            (:attempting :uncertain)
+            (let [outcome
+                  (try
+                    (if (satisfies? room-store/PResourceStore (:store room))
+                      (boolean
+                       (room-store/-resource-receipt
+                        (:store room) (resource/allocation-id id)))
+                      false)
+                    (catch Throwable t t))]
+              (if (instance? Throwable outcome)
+                (do (Thread/sleep 25) (recur))
+                outcome))))]
+    (when allocated?
+      (loop []
+        (let [outcome (try
+                        (let [remaining (resource/run-balance room id)]
+                          (when (seq remaining)
+                            (resource/return! room id parent-run remaining))
+                          :returned)
+                        (catch Throwable t t))]
+          (when (instance? Throwable outcome)
+            (Thread/sleep 25)
+            (recur)))))))
 
 (defn- finalize-execution-external!
   "Finalize from a process-local watcher only after the orchestration Spin has a
    cached terminal result and the stable supervisor reports every native worker
    and owned cleanup quiescent. World settlement happens behind the same
    physical-quiescence fence."
-  [room control-room run-world id parent-run allocated? supervisor execution completion outcome]
+  [room control-room run-world id parent-run allocation-state supervisor execution completion outcome]
   (future
     ;; `future` conveys dynamic bindings. A cancellation hook normally launches
     ;; this watcher from the losing observer Spin, so retaining its *spin-id*
@@ -943,7 +972,7 @@
               (Thread/sleep 5)
               (recur))))
         (await-supervisor! supervisor)
-        (return-unused-resources! control-room id parent-run allocated?)
+        (return-unused-resources! control-room id parent-run allocation-state)
         (let [{:keys [cleanup-error llm-metrics]} @(:state supervisor)
               result (cond-> (if cleanup-error
                                {:run/id id :run/status :failed
@@ -1048,30 +1077,96 @@
      (deliver outcome-promise outcome)
      result)))
 
-(defn hire-in!
-  "Start one AgentDef execution with separate control and work parents.
+(defn- prepared-execution-spin
+  "Run trusted fork-local preparation off the drain before candidate effects.
+
+   The setup worker is owned by the same supervisor as model/native work, so
+   targeted cancellation interrupts it and physical quiescence waits for its
+   actual exit. Resource allocation and candidate execution remain behind the
+   successful setup gate; the private causal trigger is already durable."
+  [control-room work-room agent task trigger id chat-id parent-run resources
+   supervisor allocation-state limits outcome-promise prepare-world!]
+  (sp/spin
+   (let [_ (swap! (:state supervisor) assoc :execution-phase :world-setup)
+         worker (start-worker! supervisor
+                               #(prepare-world! {:room work-room :run/id id}))
+         prepared (sp/await (worker-result-spin worker))]
+     (cond
+       (run/cancel-requested? id)
+       (throw (ex-info "Run cancelled during world setup"
+                       {:type ::world-setup-cancelled :run/id id}))
+
+       (worker-error? prepared)
+       (let [cause (::worker-error prepared)]
+         (throw (ex-info (str "Run world setup failed: " (ex-message cause))
+                         {:type ::world-setup-failed :run/id id}
+                         cause))))
+     ;; Durable resource admission can block on Datahike. Keep it off the
+     ;; execution-context drain and under the same cancellation/quiescence fence
+     ;; as setup and provider work.
+     (when (seq resources)
+       (swap! (:state supervisor) assoc :execution-phase :resource-allocation)
+       (let [allocation-worker
+             (start-worker!
+              supervisor
+              (fn []
+                (reset! allocation-state :attempting)
+                (try
+                  (let [allocation
+                        (resource/allocate-run! control-room id parent-run resources)]
+                    (reset! allocation-state :allocated)
+                    allocation)
+                  (catch Throwable t
+                    (reset! allocation-state :uncertain)
+                    (throw t)))))
+             allocation (sp/await (worker-result-spin allocation-worker))]
+         (when (or (= ::worker-cancelled allocation)
+                   (run/cancel-requested? id))
+           (throw (ex-info "Run cancelled during resource allocation"
+                           {:type ::world-setup-cancelled :run/id id})))
+         (when (worker-error? allocation)
+           (throw (ex-info "Run resource allocation failed"
+                           {:type ::resource-allocation-failed :run/id id}
+                           (::worker-error allocation))))))
+     (when (run/cancel-requested? id)
+       (throw (ex-info "Run cancelled after world setup"
+                       {:type ::world-setup-cancelled :run/id id})))
+     (swap! (:state supervisor) assoc :execution-phase :candidate)
+     (sp/await
+      (execution-spin control-room work-room agent task trigger id chat-id
+                      supervisor limits outcome-promise)))))
+
+(defn- execution-failure-reason [error]
+  (loop [error error]
+    (if error
+      (case (:type (ex-data error))
+        ::world-setup-failed :world-setup-failed
+        ::world-setup-cancelled :world-setup-cancelled
+        ::resource-allocation-failed :resource-allocation-failed
+        ::trigger-emission-failed :trigger-emission-failed
+        (recur (ex-cause error)))
+      :execution-error)))
+
+(defn ^:no-doc hire-prepared-in!
+  "Host-only Run admission with a trusted fork-local world preparer.
 
    `control-room` owns durable Run/message facts. `world-parent` is the
    immediate Spindel/Yggdrasil world that the child forks and later settles
    into. They are identical for a top-level hire and intentionally differ for
    recursive hires inside an already-isolated Run world.
 
-   `agent-ref` is a keyword id or versioned ref resolved against immutable
-   `roster`. Options:
-
-   - `:task`       portable task value (required)
-   - `:from`       triggering actor, default `:repl`
-   - `:parent-run` explicit structural parent Run UUID
-   - `:settlement`  `:automatic` (default), `:review`, `:discard`, or host-owned `:deferred`
-   - `:resources`   positive conserved vector split from the parent Run/Room
-   - `:limits`      restrictive LLM `:max-model-steps` / `:budget-dollars`
-   Built-in program kinds are deterministic `:scripted` / `:echo` and the
-   bounded Dvergr-native `:llm` model/tool loop. Simulation and replay
-   interpreters implement the same boundary."
+   The preparer runs against the isolated work Room after durable admission and
+   before resource allocation or candidate-visible work. The private trigger
+   is already durable at that point so a setup failure remains causally valid.
+   This entry point is deliberately absent from the SCI surface."
   [control-room world-parent roster agent-ref
    {:keys [task from parent-run settlement resources limits]
     :or {from :repl settlement :automatic}
-    :as raw-opts}]
+    :as raw-opts}
+   prepare-world!]
+  (when-not (or (nil? prepare-world!) (fn? prepare-world!))
+    (throw (ex-info "Run world preparer must be a function"
+                    {:type ::invalid-world-preparer})))
   (let [opts      (assoc raw-opts :from from)
         agent     (validate-hire! roster agent-ref opts)
         actor     (:agent/id agent)
@@ -1080,6 +1175,8 @@
         run-world (world/open! world-parent id settlement)
         work-room (:work run-world)
         supervisor (make-supervisor (:ctx world-parent) (:ctx work-room))
+        allocation-state
+        (atom (if (seq resources) :not-started :not-requested))
         ;; Private Run facts are still Room messages, but never addressed to an
         ;; installed Participant: direct interpretation and participant routing
         ;; must not execute the same task twice.
@@ -1105,35 +1202,57 @@
       (catch Throwable t
         (d/discard work-room)
         (throw t)))
-    (try
-      (resource/allocate-run! control-room id parent-run resources)
-      (catch Throwable t
-        (let [{:keys [status reason]} (world/settle! run-world :failed)]
-          (run/finish! id :failed {:reason :resource-allocation-failed
-                                   :error t
-                                   :settlement-status status
-                                   :settlement-reason reason}))
-        (throw t)))
     (run/register-cancel-hook! id ::native-worker
                                #(cancel-supervisor! supervisor))
+    ;; The trigger is the Run's durable causal input, not candidate execution.
+    ;; Persist it for every admitted Run—including setup failures—before any
+    ;; asynchronous phase starts. The private run sink prevents participant
+    ;; routing, while the exact message remains available to thread/audit
+    ;; projections.
     (try
-      ;; The precise trigger must exist before execution begins. A failed post
-      ;; terminalizes the already-admitted Run instead of leaving a :running
-      ;; record or an unowned message behind.
       (d/post! control-room trigger)
       (catch Throwable t
-        (return-unused-resources! control-room id parent-run (boolean (seq resources)))
-        (let [{:keys [status reason]} (world/settle! run-world :failed)]
-          (run/finish! id :failed {:reason :trigger-emission-failed
-                                   :error t
-                                   :settlement-status status
-                                   :settlement-reason reason}))
+        (let [{:keys [result finish-opts]}
+              (settlement-result
+               run-world
+               {:run/id id :run/status :failed
+                :run/error (ex-message t)})]
+          (run/finish! id (:run/status result)
+                       (merge {:reason :trigger-emission-failed :error t}
+                              finish-opts)))
         (throw t)))
+    ;; The ordinary path retains its fail-fast admission semantics. Trusted
+    ;; setup runs through `prepared-execution-spin` instead so setup, allocation,
+    ;; and candidate execution are all behind one timed/cancellable gate.
+    (when-not prepare-world!
+      (when (seq resources) (reset! allocation-state :attempting))
+      (try
+        (resource/allocate-run! control-room id parent-run resources)
+        (when (seq resources) (reset! allocation-state :allocated))
+        (catch Throwable t
+          ;; The durable transfer may have committed even when its caller saw an
+          ;; exception. Reconcile its stable receipt and return any authority
+          ;; before publishing the failed Run; hire! retains its synchronous
+          ;; admission-failure contract without leaking a committed grant.
+          (when (seq resources) (reset! allocation-state :uncertain))
+          (return-unused-resources! control-room id parent-run allocation-state)
+          (let [{:keys [status reason]} (world/settle! run-world :failed)]
+            (run/finish! id :failed {:reason :resource-allocation-failed
+                                     :error t
+                                     :settlement-status status
+                                     :settlement-reason reason}))
+          (throw t))))
     (try
       (let [completion (sync/deferred)
             outcome-promise (promise)
-            worker-execution (execution-spin control-room work-room agent task trigger id chat-id
-                                             supervisor limits outcome-promise)
+            worker-execution
+            (if prepare-world!
+              (prepared-execution-spin control-room work-room agent task trigger
+                                       id chat-id parent-run resources supervisor
+                                       allocation-state limits outcome-promise
+                                       prepare-world!)
+              (execution-spin control-room work-room agent task trigger id chat-id
+                              supervisor limits outcome-promise))
             execution (sp/spin (sp/await completion))
             owner-fork-id (:fork-id (ec/current-execution-context))
             handle    (RunHandle. id (:id control-room) owner-fork-id execution completion
@@ -1159,7 +1278,16 @@
             ;; this callback may safely block on stable supervisor quiescence,
             ;; while the cancelled body may not cross another await breakpoint.
             ;; finish! is idempotent if another terminal path already won.
-            (let [result (if (cancelled-error? t id)
+            (let [cancelled? (cancelled-error? t id)
+                  setup-cancelled?
+                  (and cancelled?
+                       prepare-world!
+                       (not= :candidate
+                             (:execution-phase @(:state supervisor))))
+                  failure-reason (if setup-cancelled?
+                                   :world-setup-cancelled
+                                   (execution-failure-reason t))
+                  result (if cancelled?
                            {:run/id id :run/status :cancelled}
                            {:run/id id :run/status :failed
                             :run/error (ex-message t)})]
@@ -1171,19 +1299,45 @@
                        {:result result
                         :finish-opts
                         (if (= :cancelled (:run/status result))
-                          {:reason :structured-cancellation}
-                          {:reason :execution-error :error t})})))})
+                          {:reason (if (= :world-setup-cancelled failure-reason)
+                                     failure-reason
+                                     :structured-cancellation)}
+                          {:reason failure-reason
+                           :error t})})))})
         (finalize-execution-external! world-parent control-room run-world id parent-run
-                                      (boolean (seq resources)) supervisor worker-execution
+                                      allocation-state supervisor worker-execution
                                       completion outcome-promise)
         handle)
       (catch Throwable t
-        (return-unused-resources! control-room id parent-run (boolean (seq resources)))
+        (return-unused-resources! control-room id parent-run allocation-state)
         (let [{:keys [status reason]} (world/settle! run-world :failed)]
           (run/finish! id :failed {:reason :spawn-failed :error t
                                    :settlement-status status
                                    :settlement-reason reason}))
         (throw t)))))
+
+(defn hire-in!
+  "Start one AgentDef execution with separate control and work parents.
+
+   `control-room` owns durable Run/message facts. `world-parent` is the
+   immediate Spindel/Yggdrasil world that the child forks and later settles
+   into. They are identical for a top-level hire and intentionally differ for
+   recursive hires inside an already-isolated Run world.
+
+   `agent-ref` is a keyword id or versioned ref resolved against immutable
+   `roster`. Options:
+
+   - `:task`       portable task value (required)
+   - `:from`       triggering actor, default `:repl`
+   - `:parent-run` explicit structural parent Run UUID
+   - `:settlement` `:automatic` (default), `:review`, `:discard`, or host-owned `:deferred`
+   - `:resources`  positive conserved vector split from the parent Run/Room
+   - `:limits`     restrictive LLM `:max-model-steps` / `:budget-dollars`
+   Built-in program kinds are deterministic `:scripted` / `:echo` and the
+   bounded Dvergr-native `:llm` model/tool loop. Simulation and replay
+   interpreters implement the same boundary."
+  [control-room world-parent roster agent-ref opts]
+  (hire-prepared-in! control-room world-parent roster agent-ref opts nil))
 
 (defn hire!
   "Start a top-level AgentDef execution in `room` and return an opaque

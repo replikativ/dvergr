@@ -23,7 +23,9 @@
            (environment/environment-ref a)))
     (doseq [changed [(assoc base-spec :task "Different task")
                      (assoc-in base-spec [:verifier :version] 2)
-                     (assoc-in base-spec [:limits :max-model-steps] 9)]]
+                     (assoc-in base-spec [:limits :max-model-steps] 9)
+                     (assoc-in base-spec [:world :setup]
+                               {:setup/id :fixture :setup/version 1})]]
       (is (not= (:environment/content-id a)
                 (:environment/content-id
                  (environment/make-environment changed)))))))
@@ -39,6 +41,30 @@
                           #"portable data"
                           (environment/make-environment
                            (assoc base-spec :metadata {:state (atom 0)})))))
+  (testing "world setup is an exact portable reference"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"exact reference map"
+                          (environment/make-environment
+                           (assoc-in base-spec [:world :setup] :fixture))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"positive integer"
+                          (environment/make-environment
+                           (assoc-in base-spec [:world :setup]
+                                     {:setup/id :fixture :setup/version 0}))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"unknown keys"
+                          (environment/make-environment
+                           (assoc-in base-spec [:world :setup]
+                                     {:setup/id :fixture :setup/version 1
+                                      :prepare :not-a-capability}))))
+    (is (= {:setup/id :fixture :setup/version 1}
+           (get-in
+            (environment/make-environment
+             (assoc-in base-spec [:world :setup]
+                       {:setup/id :fixture :setup/version 1
+                        :setup/basis nil}))
+            [:environment/world :setup]))
+        "an absent and explicit nil setup basis have one canonical form"))
   (testing "unknown keys fail rather than silently changing hash semantics"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo
                           #"unknown keys"

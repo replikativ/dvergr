@@ -13,6 +13,7 @@
             [dvergr.rooms.forks :as forks]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.engine.protocols :as rtp]
             [org.replikativ.spindel.spin.combinators :as comb]
             [org.replikativ.spindel.spin.core :as spin-core]
             [org.replikativ.spindel.yggdrasil :as ygg]))
@@ -384,18 +385,206 @@
       (finally
         (d/close-room! room)))))
 
-(deftest unsupported-world-setup-is-rejected-before-admission
-  (let [room (test-room :evaluation-unsupported-setup)
+(deftest exact-world-setup-prepares-only-the-candidate-fork
+  (let [room (test-room :evaluation-world-setup)
         team (roster/make-agent (roster/make-roster)
                                 {:id :candidate :program {:kind :echo}})
-        env (definition :test/setup {:world {:isolation :ctx
-                                             :settlement :review
-                                             :setup {:fixture :v1}}})]
+        setup-ref {:setup/id :test/fixture :setup/version 1
+                   :setup/basis "fixture:v1"}
+        env (definition :test/setup
+              {:world {:isolation :ctx :settlement :discard
+                       :setup setup-ref}})
+        setup
+        (evaluation/make-world-setup
+         {:id :test/fixture :version 1 :basis "fixture:v1"
+          :prepare
+          (fn [{work-room :room run-id :run/id}]
+            ;; Exercise the ordinary ambient Spindel state API, not only an
+            ;; explicit Room operation. This state must land in the candidate
+            ;; fork and disappear with its discard, never touch the parent.
+            (ec/swap-state! [:test :world-setup] (constantly run-id))
+            (d/post! work-room
+                     (d/message :fixture :_fixture {:run/id run-id}))
+            {:fixture/run-id run-id
+             :ambient-is-work-context?
+             (identical? (ec/current-execution-context) (:ctx work-room))
+             :ambient-spin-detached? (nil? ec/*spin-id*)
+             :work-state (ec/get-state [:test :world-setup])
+             :parent-state (rtp/get-state (:ctx room)
+                                          [:test :world-setup])})})
+        evaluator
+        (evaluation/make-evaluator
+         {:id :test/exact :version 1 :basis "test:v1"
+          :observe
+          (fn [{control-room :room work-room :world/room
+                setup-evidence :setup/evidence default :default}]
+            (let [fixture? #(= :fixture (:from %))]
+              (assoc default
+                     :setup-evidence setup-evidence
+                     :work-fixtures (count (filter fixture?
+                                                   (d/messages work-room)))
+                     :control-fixtures (count (filter fixture?
+                                                      (d/messages control-room))))))
+          :verify
+          (fn [_ evidence]
+            (let [exact? (= {:claim 42} (:result evidence))
+                  isolated? (= [1 0] [(:work-fixtures evidence)
+                                      (:control-fixtures evidence)])
+                  same-run? (= (get-in evidence [:trace :runs 0 :run/id])
+                               (get-in evidence [:setup-evidence
+                                                 :fixture/run-id]))
+                  ambient-isolated?
+                  (let [{:keys [fixture/run-id ambient-is-work-context?
+                                ambient-spin-detached? work-state parent-state]}
+                        (:setup-evidence evidence)]
+                    (and ambient-is-work-context?
+                         ambient-spin-detached?
+                         (= run-id work-state)
+                         (nil? parent-state)))]
+              {:checks {:exact? exact? :isolated? isolated?
+                        :same-run? same-run?
+                        :ambient-isolated? ambient-isolated?}
+               :reward (if (and exact? isolated? same-run? ambient-isolated?)
+                         1.0
+                         0.0)}))})]
     (try
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"trusted resolver"
+      (is (= setup-ref (evaluation/world-setup-ref setup)))
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [result @(evaluation/evaluate room team :candidate env evaluator
+                                           {:world-setup setup})]
+          (is (= {:exact? true :isolated? true :same-run? true
+                  :ambient-isolated? true}
+                 (get-in result [:attempt-receipt :attempt/checks])))
+          (is (= :discarded
+                 (get-in result [:run/result :run/settlement-status])))
+          (is (nil? (registry/lookup
+                     (get-in result [:run/result :run/world]))))))
+      (is (empty? (filter #(= :fixture (:from %)) (d/messages room))))
+      (is (nil? (rtp/get-state (:ctx room) [:test :world-setup])))
+      (is (empty? (run/active-runs (:id room))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest world-setup-mismatch-and-failure-are-closed-before-candidate-work
+  (let [room (test-room :evaluation-world-setup-failure)
+        team (roster/make-agent (roster/make-roster)
+                                {:id :candidate :program {:kind :echo}})
+        setup-ref {:setup/id :test/fixture :setup/version 1}
+        env (definition :test/setup-failure
+              {:world {:isolation :ctx :settlement :discard
+                       :setup setup-ref}})
+        wrong (evaluation/make-world-setup
+               {:id :test/wrong :prepare (constantly nil)})
+        failing (evaluation/make-world-setup
+                 {:id :test/fixture
+                  :prepare
+                  (fn [{work-room :room}]
+                    (d/post! work-room (d/message :fixture :_fixture :partial))
+                    (throw (ex-info "deliberate setup failure" {})))})]
+    (try
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"requires an exact"
                             (evaluation/evaluate room team :candidate env
                                                  exact-evaluator)))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"does not match"
+                            (evaluation/evaluate room team :candidate env
+                                                 exact-evaluator
+                                                 {:world-setup wrong})))
+      (is (empty? (run/runs room)))
+      (binding [ec/*execution-context* (:ctx room)]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                              #"deliberate setup failure"
+                              @(evaluation/evaluate room team :candidate env
+                                                    exact-evaluator
+                                                    {:world-setup failing}))))
+      (let [[failed] (run/runs room)]
+        (is (= :failed (:run/status failed)))
+        (is (= :world-setup-failed (:run/reason failed)))
+        (is (= :discarded (:run/settlement-status failed)))
+        (is (some #(= (:run/trigger failed) (:id %)) (d/messages room))
+            "the failed Run retains a real causal trigger")
+        (binding [ec/*execution-context* (:ctx room)]
+          (is (nil? (registry/lookup (:run/world failed))))))
+      (is (empty? (filter #(= :fixture (:from %)) (d/messages room))))
       (is (empty? (run/active-runs (:id room))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest world-setup-timeout-is-supervised-and-never-scored
+  (let [room (test-room :evaluation-world-setup-timeout)
+        team (roster/make-agent (roster/make-roster)
+                                {:id :candidate :program {:kind :echo}})
+        env (definition :test/setup-timeout
+              {:limits {:timeout-ms 20 :cancel-timeout-ms 2000}
+               :world {:isolation :ctx :settlement :discard
+                       :setup {:setup/id :test/slow :setup/version 1}}})
+        entered (promise)
+        interrupted (promise)
+        setup (evaluation/make-world-setup
+               {:id :test/slow
+                :prepare
+                (fn [_]
+                  (deliver entered true)
+                  (try
+                    (Thread/sleep 10000)
+                    (catch InterruptedException error
+                      (deliver interrupted true)
+                      (throw error))))})]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [started (System/currentTimeMillis)
+              error (try
+                      @(evaluation/evaluate room team :candidate env
+                                            exact-evaluator
+                                            {:world-setup setup})
+                      nil
+                      (catch clojure.lang.ExceptionInfo error error))]
+          (is (= true (deref entered 1000 ::timeout)))
+          (is (= true (deref interrupted 1000 ::timeout)))
+          (is (= ::evaluation/world-setup-failed
+                 (:type (ex-data error))))
+          (is (< (- (System/currentTimeMillis) started) 2000))))
+      (let [[cancelled] (run/runs room)]
+        (is (= :cancelled (:run/status cancelled)))
+        (is (= :world-setup-cancelled (:run/reason cancelled)))
+        (is (= :discarded (:run/settlement-status cancelled)))
+        (is (some #(= (:run/trigger cancelled) (:id %)) (d/messages room))))
+      (is (empty? (filter #(= :candidate (:from %)) (d/messages room))))
+      (is (empty? (episode/attempts room)))
+      (is (empty? (run/active-runs (:id room))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest world-setup-failure-retains-recovery-when-discard-fails
+  (let [room (test-room :evaluation-world-setup-discard-failure)
+        team (roster/make-agent (roster/make-roster)
+                                {:id :candidate :program {:kind :echo}})
+        env (definition :test/setup-discard-failure
+              {:world {:isolation :ctx :settlement :discard
+                       :setup {:setup/id :test/failing :setup/version 1}}})
+        setup (evaluation/make-world-setup
+               {:id :test/failing
+                :prepare #(throw (ex-info "broken fixture" %))})]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (with-redefs [d/discard-deferred
+                      (fn [& _] (throw (ex-info "discard unavailable" {})))]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"broken fixture"
+                                @(evaluation/evaluate room team :candidate env
+                                                      exact-evaluator
+                                                      {:world-setup setup})))))
+      (let [[failed] (run/runs room)
+            retained (binding [ec/*execution-context* (:ctx room)]
+                       (registry/lookup (:run/world failed)))]
+        (is (= :failed (:run/status failed)))
+        (is (= :world-setup-failed (:run/reason failed)))
+        (is (= :review (:run/settlement-status failed)))
+        (is (= :settlement-failed (:run/settlement-reason failed)))
+        (is (some? retained) "the failed world remains available for recovery")
+        (is (empty? (episode/attempts room)))
+        (is (empty? (run/active-runs (:id room))))
+        (when retained
+          (binding [ec/*execution-context* (:ctx room)]
+            (d/discard-deferred retained))))
       (finally
         (d/close-room! room)))))
 
