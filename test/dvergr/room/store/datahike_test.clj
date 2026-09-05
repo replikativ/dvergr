@@ -282,6 +282,11 @@
   (let [[_conn st] (mem-store)]
     (contract/assert-cross-room-scorecard-identity! st)))
 
+(deftest finite-scorecard-aggregate-contract
+  (let [[_conn st] (mem-store)]
+    (contract/assert-non-finite-scorecard-aggregates-rejected!
+     st :scorecard-overflow-datahike)))
+
 (deftest concurrent-message-writes-are-atomically-first-write-wins
   (testing "the first committed immutable envelope cannot be overwritten"
     (let [[_conn st] (mem-store)

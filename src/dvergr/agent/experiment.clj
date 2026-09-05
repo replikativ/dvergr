@@ -435,7 +435,16 @@
                 ::duplicate-scorecard-attempts {}))
     (when-not (= (:scorecard/summary scorecard) (summarize entries))
       (invalid! "Scorecard summary does not match its entries"
-                ::scorecard-summary-mismatch {})))
+                ::scorecard-summary-mismatch {}))
+    (doseq [summary (:scorecard/summary scorecard)
+            key [:reward-sum :reward-mean]
+            :let [value (get summary key)]]
+      (when-not (and (number? value)
+                     (Double/isFinite (double value)))
+        (invalid! "Scorecard reward aggregates must be finite"
+                  ::non-finite-scorecard-summary
+                  {:candidate/id (:candidate/id summary)
+                   :key key :value value}))))
   (let [claimed (:scorecard/content-id scorecard)
         actual (hasch/uuid [:dvergr/experiment-scorecard
                             (dissoc scorecard :scorecard/content-id)])]
