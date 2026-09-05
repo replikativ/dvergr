@@ -30,7 +30,28 @@
 (defn- cleanup-scope [room]
   [(:id room) (:incarnation room)])
 
-(defn- start-task! [room task-fn]
+(defn cleanup-group
+  "Create a process-local identity for cleanup tasks owned by one host
+   operation. Pass it through evaluation/experiment options and join it with
+   `await-cleanups-for!`; it is coordination authority, not durable evidence."
+  []
+  (random-uuid))
+
+(defn- require-cleanup-group! [group]
+  (when-not (uuid? group)
+    (throw (ex-info "Cleanup group must be a UUID"
+                    {:type ::invalid-cleanup-group :cleanup/group group})))
+  group)
+
+(defn- remove-task! [scope token]
+  (swap! pending-tasks
+         (fn [tasks]
+           (let [remaining (dissoc (get tasks scope) token)]
+             (if (seq remaining)
+               (assoc tasks scope remaining)
+               (dissoc tasks scope))))))
+
+(defn- start-task! [room group task-fn]
   (let [scope (cleanup-scope room)
         token (random-uuid)
         gate (promise)
@@ -38,7 +59,8 @@
     ;; Registration happens before the Future can start. A caller that regains
     ;; control after evaluation cancellation can therefore never miss the
     ;; cleanup it must join before closing the Room.
-    (swap! pending-tasks update scope (fnil assoc {}) token gate)
+    (swap! pending-tasks update scope (fnil assoc {}) token
+           {:gate gate :group group})
     (let [worker
           (future
             (deliver started true)
@@ -60,63 +82,77 @@
               ;; until a teardown owner observes them rather than being silently
               ;; forgotten.
               (when (contains? outcome :ok)
-                (swap! pending-tasks update scope dissoc token))))]
+                (remove-task! scope token))))]
       {:token token :gate gate :started started :future worker})))
 
+(defn- await-cleanups* [room group timeout-ms]
+  (positive-timeout! "Cleanup timeout" timeout-ms)
+  (let [scope (cleanup-scope room)
+        deadline (+ (System/nanoTime) (* 1000000 timeout-ms))]
+    (loop [observed #{} failures []]
+      (let [entries (->> (get @pending-tasks scope)
+                         (remove (comp observed key))
+                         (filter (fn [[_ entry]]
+                                   (or (nil? group)
+                                       (= group (:group entry))))))]
+        (if (seq entries)
+          (let [outcomes
+                (mapv
+                 (fn [[token {:keys [gate]}]]
+                   (let [remaining-ms
+                         (max 1 (long (/ (- deadline (System/nanoTime))
+                                         1000000)))
+                         outcome (deref gate remaining-ms ::timeout)]
+                     [token outcome]))
+                 entries)
+                failures'
+                (into failures
+                      (keep (fn [[token outcome]]
+                              (cond
+                                (= ::timeout outcome)
+                                {:token token :type ::cleanup-timeout}
+
+                                (:error outcome)
+                                {:token token :type ::cleanup-failed
+                                 :error (:error outcome)}
+
+                                :else nil)))
+                      outcomes)]
+            ;; Every completed gate has now been handed to this owner. A timed
+            ;; out task remains registered so a later join or Room teardown can
+            ;; still recover it.
+            (doseq [[token outcome] outcomes
+                    :when (not= ::timeout outcome)]
+              (remove-task! scope token))
+            (recur (into observed (map first outcomes)) failures'))
+          (if (seq failures)
+            (throw (ex-info "Evaluation work did not quiesce before cleanup boundary"
+                            {:type ::cleanup-incomplete
+                             :room/id (:id room)
+                             :cleanup/group group
+                             :timeout-ms timeout-ms
+                             :failures failures}))
+            true))))))
+
 (defn await-cleanups!
-  "Block a host teardown boundary until detached evaluation cleanup completes.
+  "Block a Room teardown boundary until all detached evaluation cleanup completes.
 
    Evaluation cancellation itself stays non-blocking for the Spindel drain.
    Ephemeral Room owners must call this outside a Spin before closing the Room.
    Throws on timeout or a cleanup failure."
   ([room] (await-cleanups! room 30000))
   ([room timeout-ms]
-   (positive-timeout! "Cleanup timeout" timeout-ms)
-   (let [scope (cleanup-scope room)
-         deadline (+ (System/nanoTime) (* 1000000 timeout-ms))]
-     (loop [observed #{} failures []]
-       (let [entries (remove (comp observed key)
-                             (get @pending-tasks scope))]
-         (if (seq entries)
-           (let [outcomes
-                 (mapv
-                  (fn [[token gate]]
-                    (let [remaining-ms
-                          (max 1 (long (/ (- deadline (System/nanoTime))
-                                          1000000)))
-                          outcome (deref gate remaining-ms ::timeout)]
-                      [token outcome]))
-                  entries)
-                 failures'
-                 (into failures
-                       (keep (fn [[token outcome]]
-                               (cond
-                                 (= ::timeout outcome)
-                                 {:token token :type ::cleanup-timeout}
+   (await-cleanups* room nil timeout-ms)))
 
-                                 (:error outcome)
-                                 {:token token :type ::cleanup-failed
-                                  :error (:error outcome)}
+(defn await-cleanups-for!
+  "Join only detached evaluation cleanup owned by `group` in `room`.
 
-                                 :else nil)))
-                       outcomes)]
-             ;; Every completed gate has now been handed to this teardown
-             ;; owner. Timed-out gates remain registered and keep the Room
-             ;; non-closeable; completed failures are removed but reported
-             ;; together after all siblings have been joined.
-             (doseq [[token outcome] outcomes
-                     :when (not= ::timeout outcome)]
-               (swap! pending-tasks update scope dissoc token))
-             (recur (into observed (map first outcomes)) failures'))
-           (if (seq failures)
-             (throw (ex-info "Evaluation work did not quiesce before Room close"
-                             {:type ::cleanup-incomplete
-                              :room/id (:id room)
-                              :timeout-ms timeout-ms
-                              :failures failures}))
-             (do
-               (swap! pending-tasks dissoc scope)
-               true))))))))
+   This is the operation boundary for experiments in a shared Room. It never
+   waits on or consumes failures from another cleanup group. Room owners must
+   still use `await-cleanups!` before teardown."
+  ([room group] (await-cleanups-for! room group 30000))
+  ([room group timeout-ms]
+   (await-cleanups* room (require-cleanup-group! group) timeout-ms)))
 
 (defn make-evaluator
   "Create a process-local trusted evaluator capability.
@@ -362,7 +398,7 @@
   ([room team agent-ref definition evaluator]
    (evaluate room team agent-ref definition evaluator {}))
   ([room team agent-ref definition evaluator
-    {:keys [from parent-run world-setup]
+    {:keys [from parent-run world-setup cleanup-group]
      :or {from :environment} :as opts}]
    (environment/validate-environment definition)
    (require-matching-evaluator! definition evaluator)
@@ -375,7 +411,8 @@
           :or {settlement :review}}
          (:environment/world definition)
          model-limits (when agent (require-supported-policy! definition agent))]
-     (when-let [unknown (seq (remove #{:from :parent-run :world-setup}
+     (when-let [unknown (seq (remove #{:from :parent-run :world-setup
+                                       :cleanup-group}
                                      (keys opts)))]
        (throw (ex-info "Evaluation contains unknown options"
                        {:type ::unknown-evaluation-options
@@ -383,6 +420,7 @@
      (when-not agent
        (throw (ex-info "Evaluation AgentDef does not exist in the Roster"
                        {:type ::unknown-agent :agent-ref agent-ref})))
+     (when (some? cleanup-group) (require-cleanup-group! cleanup-group))
      (positive-timeout! "Environment :timeout-ms" timeout-ms)
      (positive-timeout! "Environment :cancel-timeout-ms" cancel-timeout-ms)
      (when-not (contains? #{nil :ctx}
@@ -512,6 +550,7 @@
               worker
               (start-task!
                room
+               cleanup-group
                (fn []
                  (binding [ec/*execution-context* (:ctx room)
                            ec/*spin-id* nil]
