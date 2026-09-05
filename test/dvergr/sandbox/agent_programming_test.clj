@@ -574,6 +574,10 @@
         (try
           (binding [ec/*execution-context* (:ctx room)]
             (#'program/cancel-supervisor! supervisor)
+            ;; This test owns the private supervisor directly rather than via
+            ;; execution-spin, so it must acknowledge that its orchestration
+            ;; body is terminal before cleanup/quiescence becomes eligible.
+            (#'program/mark-cleanup-safe! supervisor)
             (#'program/seal-supervisor! supervisor)
             (let [waiter (future (#'program/await-supervisor! supervisor))]
               (when (= ::cleanup-timeout

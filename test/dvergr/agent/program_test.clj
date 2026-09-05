@@ -944,6 +944,207 @@
       (finally
         (d/close-room! room)))))
 
+(deftest trusted-preparation-registers-an-affine-cleanup-stack
+  (let [room (test-room :program-preparation-cleanup-stack)
+        team (test-roster)
+        cleaned (atom [])]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [handle
+              (program/hire-prepared-in!
+               room room team :analyst
+               {:task :work :settlement :discard}
+               (fn [{register! :register-cleanup!}]
+                 (register! #(swap! cleaned conj :first))
+                 (register! #(swap! cleaned conj :second))))
+              result @handle]
+          (is (= :completed (:run/status result)))
+          (is (= [:second :first] @cleaned)
+              "live resources unwind in reverse acquisition order")
+          (is (= :discarded (:run/settlement-status result)))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest one-cleanup-failure-does-not-leak-the-rest-of-the-stack
+  (let [room (test-room :program-preparation-cleanup-failure)
+        team (test-roster)
+        cleaned (atom [])]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [handle
+              (program/hire-prepared-in!
+               room room team :analyst
+               {:task :work :settlement :discard}
+               (fn [{register! :register-cleanup!}]
+                 (register! #(swap! cleaned conj :first))
+                 (register!
+                  #(do (swap! cleaned conj :second)
+                       (throw (ex-info "second cleanup failed" {}))))))
+              result @handle]
+          (is (= :failed (:run/status result)))
+          (is (= "second cleanup failed" (:run/error result)))
+          (is (= [:second :first] @cleaned)
+              "cleanup errors are collected only after every lease unwinds")
+          (is (= :discarded (:run/settlement-status result)))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest cleanup-admission-does-not-reopen-between-stack-entries
+  (let [room (test-room :program-cleanup-admission)
+        supervisor (binding [ec/*execution-context* (:ctx room)]
+                     (#'program/make-supervisor (:ctx room)))
+        claimed-cleanup (promise)]
+    (try
+      (#'program/register-cleanup! supervisor (constantly :older))
+      (#'program/register-cleanup! supervisor (constantly :newer))
+      ;; Claim the first physical cleanup without starting its worker so the
+      ;; transition into the between-callback :pending phase is deterministic.
+      (with-redefs-fn
+        {#'program/start-worker!
+         (fn [_ cleanup kind]
+           (is (= :cleanup kind))
+           (deliver claimed-cleanup cleanup))}
+        #(do
+           (#'program/mark-cleanup-safe! supervisor)
+           (#'program/seal-supervisor! supervisor)))
+      (is (fn? (deref claimed-cleanup 5000 ::timeout)))
+      (is (false? (:cleanup-admission-open? @(:state supervisor))))
+      (with-redefs-fn
+        {#'program/advance-supervisor! (constantly nil)}
+        (fn []
+          (#'program/worker-finished! supervisor ::claimed-cleanup :cleanup nil)))
+      (is (= :pending (:cleanup-phase @(:state supervisor))))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"Cleanup registered after supervisor cleanup began"
+           (#'program/register-cleanup! supervisor (constantly :late))))
+      (is (= 1 (count (:cleanups @(:state supervisor))))
+          "the older cleanup remains without admitting a late stack entry")
+      (finally
+        (d/close-room! room)))))
+
+(deftest cancelled-live-setup-worker-can-register-before-first-cleanup-claim
+  (let [room (test-room :program-cleanup-live-handback)
+        supervisor (binding [ec/*execution-context* (:ctx room)]
+                     (#'program/make-supervisor (:ctx room)))
+        entered (promise)
+        registered (promise)
+        cleaned (promise)
+        waiter (atom nil)
+        release-worker (java.util.concurrent.CountDownLatch. 1)]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (#'program/start-worker!
+         supervisor
+         (fn []
+           (deliver entered true)
+           ;; Model non-interruptible teardown/acquisition hand-back: targeted
+           ;; cancellation interrupts the wait, but the worker remains live until
+           ;; its owner releases it and must still be allowed to register.
+           (loop []
+             (when (pos? (.getCount release-worker))
+               (let [released?
+                     (try
+                       (.await release-worker)
+                       true
+                       (catch InterruptedException _ false))]
+                 (when-not released? (recur)))))
+           (#'program/register-cleanup! supervisor #(deliver cleaned true))
+           (deliver registered true))))
+      (is (= true (deref entered 5000 ::timeout)))
+      (#'program/cancel-supervisor! supervisor)
+      (#'program/mark-cleanup-safe! supervisor)
+      (#'program/seal-supervisor! supervisor)
+      (is (true? (:cleanup-admission-open? @(:state supervisor)))
+          "cleanup admission remains open while the cancelled worker is live")
+      (is (= ::pending (deref cleaned 100 ::pending)))
+      (.countDown release-worker)
+      (is (= true (deref registered 5000 ::timeout)))
+      (reset! waiter (future (#'program/await-supervisor! supervisor)))
+      (is (nil? (deref @waiter 5000 ::timeout)))
+      (is (= true (deref cleaned 5000 ::timeout)))
+      (is (false? (:cleanup-admission-open? @(:state supervisor))))
+      (is (= :done (:cleanup-phase @(:state supervisor))))
+      (finally
+        (.countDown release-worker)
+        (when-let [waiter @waiter]
+          (future-cancel waiter))
+        (d/close-room! room)))))
+
+(deftest cancellation-unwinds-every-resource-acquired-during-preparation
+  (let [room (test-room :program-preparation-cleanup-cancel)
+        team (test-roster)
+        entered (promise)
+        cleaned (atom [])]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [handle
+              (program/hire-prepared-in!
+               room room team :analyst
+               {:task :work :settlement :discard}
+               (fn [{register! :register-cleanup!}]
+                 (register! #(swap! cleaned conj :first))
+                 (register! #(swap! cleaned conj :second))
+                 (deliver entered true)
+                 (Thread/sleep 10000)))]
+          (is (= true (deref entered 2000 ::timeout)))
+          (is (true? (program/cancel! handle)))
+          (let [result (deref handle 2000 ::timeout)]
+            (is (= :cancelled (:run/status result)))
+            (is (= [:second :first] @cleaned))
+            (is (= :discarded (:run/settlement-status result))))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest cancellation-awaits-physical-allocation-exit-before-cleanup
+  (let [room (test-room :program-preparation-cleanup-body-fence)
+        team (test-roster)
+        allocation-entered (promise)
+        release-allocation (java.util.concurrent.CountDownLatch. 1)
+        allocation-returned (promise)
+        cleanup-entered (promise)]
+    (try
+      (with-redefs [resource/allocate-run!
+                    (fn [& _]
+                      ;; Allocation is now a supervised worker. Model an I/O
+                      ;; operation that cannot physically stop on interruption:
+                      ;; graph cancellation must not release its resources yet.
+                      (deliver allocation-entered true)
+                      (loop []
+                        (let [released?
+                              (try
+                                (.await release-allocation)
+                                true
+                                (catch InterruptedException _ false))]
+                          (when-not released? (recur))))
+                      (deliver allocation-returned true))
+                    resource/run-balance (fn [& _] {})]
+        (binding [ec/*execution-context* (:ctx room)]
+          (let [handle
+                (program/hire-prepared-in!
+                 room room team :analyst
+                 {:task :work :settlement :discard
+                  :resources {resource/microdollars 1M}}
+                 (fn [{register! :register-cleanup!}]
+                   (register! #(deliver cleanup-entered true))))]
+            ;; These positive waits tolerate a loaded randomized suite. The
+            ;; bounded negative wait below is the actual ordering assertion.
+            (is (= true (deref allocation-entered 15000 ::timeout)))
+            (is (true? (program/cancel! handle)))
+            (is (= ::timeout (deref cleanup-entered 500 ::timeout))
+                "sealing cancellation is not permission to release a resource")
+            (is (not (realized? allocation-returned)))
+            (.countDown release-allocation)
+            (is (= true (deref allocation-returned 15000 ::timeout)))
+            (let [result (deref handle 15000 ::timeout)]
+              (is (= :cancelled (:run/status result)))
+              (is (= true (deref cleanup-entered 15000 ::timeout)))
+              (is (= :discarded (:run/settlement-status result)))))))
+      (finally
+        ;; Never strand the Room executor if an earlier assertion fails.
+        (.countDown release-allocation)
+        (d/close-room! room)))))
+
 (deftest llm-program-uses-one-normalized-tool-contract
   (let [room (test-room :program-llm-tools)
         team (-> (roster/make-roster)

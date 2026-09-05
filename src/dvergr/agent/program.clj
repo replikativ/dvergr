@@ -76,9 +76,18 @@
     :worker-ctx worker-ctx
     :state (atom {:cancelled? false
                   :sealed? false
+                  ;; Sealing closes admission. It does not prove that the
+                  ;; orchestration body has stopped using resources acquired
+                  ;; by a completed worker. Cleanup needs this separate gate.
+                  :cleanup-safe? false
                   :workers {}
                   :children {}
-                  :cleanup nil
+                  :cleanups []
+                  ;; Cleanup registration remains open while a cancelled but
+                  ;; still-live setup worker hands back resources. The first
+                  ;; physical cleanup claim closes it monotonically; unlike
+                  ;; :cleanup-phase, it never reopens between stack entries.
+                  :cleanup-admission-open? true
                   :cleanup-phase :pending
                   :cleanup-error nil
                   :llm-metrics nil
@@ -99,18 +108,28 @@
   [supervisor]
   (let [action
         (locking supervisor
-          (let [{:keys [sealed? workers children cleanup cleanup-phase quiesced?]
+          (let [{:keys [sealed? cleanup-safe? workers children cleanups
+                        cleanup-phase quiesced?]
                  :as state}
                 @(:state supervisor)
                 normal-live? (or (seq children)
                                  (some #(= :normal (:kind %)) (vals workers)))]
             (cond
-              (and sealed? (not normal-live?) (= :pending cleanup-phase) cleanup)
-              (do (swap! (:state supervisor) assoc :cleanup-phase :running)
-                  [:cleanup cleanup])
+              (and sealed? cleanup-safe? (not normal-live?) (= :pending cleanup-phase)
+                   (seq cleanups))
+              (let [cleanup (peek cleanups)]
+                (swap! (:state supervisor)
+                       #(-> %
+                            (assoc :cleanup-admission-open? false
+                                   :cleanup-phase :running)
+                            (update :cleanups pop)))
+                [:cleanup cleanup])
 
-              (and sealed? (not normal-live?) (= :pending cleanup-phase))
-              (do (swap! (:state supervisor) assoc :cleanup-phase :done)
+              (and sealed? cleanup-safe? (not normal-live?) (= :pending cleanup-phase))
+              (do (swap! (:state supervisor)
+                         assoc
+                         :cleanup-admission-open? false
+                         :cleanup-phase :done)
                   :advance)
 
               (and sealed? (= :done cleanup-phase) (empty? workers) (not quiesced?))
@@ -142,10 +161,12 @@
            (fn [state]
              (cond-> (update state :workers dissoc worker-id)
                (= :cleanup kind)
-               (assoc :cleanup-phase :done
-                      :cleanup-error (when (and (map? result)
-                                                (contains? result ::worker-error))
-                                       (::worker-error result)))))))
+               (assoc :cleanup-phase :pending)
+
+               (and (= :cleanup kind)
+                    (map? result)
+                    (contains? result ::worker-error))
+               (update :cleanup-error #(or % (::worker-error result)))))))
   (advance-supervisor! supervisor))
 
 (defn- start-worker!
@@ -243,11 +264,29 @@
   nil)
 
 (defn- register-cleanup! [supervisor cleanup]
+  (when-not (fn? cleanup)
+    (throw (ex-info "Run cleanup must be a function"
+                    {:type ::invalid-cleanup})))
   (locking supervisor
-    (when-not (= :pending (:cleanup-phase @(:state supervisor)))
+    (when-not (:cleanup-admission-open? @(:state supervisor))
       (throw (ex-info "Cleanup registered after supervisor cleanup began"
                       {:type ::late-cleanup-registration})))
-    (swap! (:state supervisor) assoc :cleanup cleanup))
+    ;; Stack order is intentional: resources unwind in reverse acquisition
+    ;; order, as with lexical `finally` scopes. Every registered cleanup runs
+    ;; even when an earlier cleanup fails; the first error determines the Run
+    ;; outcome after physical quiescence.
+    (swap! (:state supervisor) update :cleanups conj cleanup))
+  nil)
+
+(defn- mark-cleanup-safe!
+  "Acknowledge that the orchestration body can no longer touch acquired live
+   resources. Cancellation alone must never make cleanup eligible: a setup
+   worker can finish while the enclosing Spin is still allocating resources or
+   transitioning into candidate execution."
+  [supervisor]
+  (locking supervisor
+    (swap! (:state supervisor) assoc :cleanup-safe? true))
+  (advance-supervisor! supervisor)
   nil)
 
 (defn- seal-supervisor! [supervisor]
@@ -998,6 +1037,10 @@
                                    (cond-> agent
                                      (seq limits) (assoc ::limits limits))
                                    task trigger supervisor))
+                 ;; Candidate execution has returned and can no longer touch
+                 ;; setup-owned resources. This is distinct from sealing:
+                 ;; cancellation may seal admission while this body is live.
+                 _ (mark-cleanup-safe! supervisor)
                  ;; Seal admits no further provider work, runs owned cleanup
                  ;; after all workers terminate, and publishes one stable
                  ;; quiescence acknowledgement.
@@ -1037,6 +1080,11 @@
            (catch Throwable t
              (let [cancelled? (cancelled-error? t id)
                    graph-cancelled? (graph-cancelled-error? t)
+                   ;; A graph cancellation is only cleanup-safe once the
+                   ;; terminal spawn callback runs. Other failures are handled
+                   ;; by this still-live body after candidate work unwound.
+                   _ (when-not graph-cancelled?
+                       (mark-cleanup-safe! supervisor))
                    quiesced (seal-supervisor! supervisor)]
                (if graph-cancelled?
                  ;; Cancellation is sticky on a Spin. Awaiting `quiesced` from
@@ -1088,8 +1136,16 @@
    supervisor allocation-state limits outcome-promise prepare-world!]
   (sp/spin
    (let [_ (swap! (:state supervisor) assoc :execution-phase :world-setup)
-         worker (start-worker! supervisor
-                               #(prepare-world! {:room work-room :run/id id}))
+         worker (start-worker!
+                 supervisor
+                 #(prepare-world!
+                   {:room work-room
+                    :run/id id
+                    ;; Host-only affine registrar. WorldSetup code may acquire
+                    ;; several live resources, but cannot transfer this
+                    ;; process-local authority to SCI or durable definitions.
+                    :register-cleanup!
+                    (fn [cleanup] (register-cleanup! supervisor cleanup))}))
          prepared (sp/await (worker-result-spin worker))]
      (cond
        (run/cancel-requested? id)
@@ -1294,6 +1350,11 @@
               (when (= :cancelled (:run/status result))
                 (run/cancel-room-run! (:id control-room) id))
               (cancel-supervisor! supervisor)
+              ;; The spawned orchestration graph is terminal here. In
+              ;; particular, a cancellation during the gap after setup cannot
+              ;; release its resources before this callback acknowledges that
+              ;; the enclosing body has stopped using them.
+              (mark-cleanup-safe! supervisor)
               (seal-supervisor! supervisor)
               (deliver outcome-promise
                        {:result result
