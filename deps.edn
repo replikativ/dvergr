@@ -83,7 +83,7 @@
         ;; Yggdrasil — CoW branching for git and Datahike
         ;; 0.3.41 includes the Geschichte content-level merge adapter and the
         ;; current persistent-sorted-set substrate.
-        org.replikativ/yggdrasil   {:mvn/version "0.3.41"
+        org.replikativ/yggdrasil   {:mvn/version "0.3.42"
                                     :exclusions  [org.babashka/sci]}
 
         ;; Scriptum — CoW Lucene indices for fulltext search
