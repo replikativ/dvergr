@@ -3,6 +3,8 @@
             [clojure.test :refer [deftest is testing]]
             [dvergr.chat.agent :as agent]
             [dvergr.chat.context :as chat-ctx]
+            [dvergr.chat.accounting :as accounting]
+            [datahike.api :as dh]
             [dvergr.model.chat :as model-chat]))
 
 (defn- response [content]
@@ -10,6 +12,45 @@
    :tool-calls []
    :usage {}
    :stop-reason :stop})
+
+(deftest provider-usage-is-accounted-once-with-model-pricing
+  (doseq [model ["codex-subscription-sol" "claude-sonnet-4-5"]]
+    (let [ctx (chat-ctx/create-chat-context {:title "usage" :with-sci? false})
+          usage {:input-tokens 565 :output-tokens 328}]
+      (try
+        (with-redefs [agent/messages->api-format (fn [messages _ _] messages)
+                      model-chat/chat (fn [& _] (assoc (response "verified") :usage usage))]
+          (is (= :complete
+                 (agent/run-agent-turn! ctx {:provider :test :model model :tools {}
+                                             :auto-compact? false :turn-number 0})))
+          (is (= usage (:by-type (chat-ctx/get-budget ctx))))
+          (is (= #{[:input-tokens 565 model] [:output-tokens 328 model]}
+                 (set (dh/q '[:find ?kind ?amount ?model
+                              :in $ ?chat-id
+                              :where [?c :chat/id ?chat-id]
+                              [?l :ledger/context ?c]
+                              [?l :ledger/resource ?kind]
+                              [?l :ledger/amount ?amount]
+                              [?l :ledger/model ?model]]
+                            @(:db-conn ctx) (:chat-id ctx)))))
+          (is (= 2 (dh/q '[:find (count ?l) . :in $ ?chat-id
+                           :where [?c :chat/id ?chat-id] [?l :ledger/context ?c]]
+                         @(:db-conn ctx) (:chat-id ctx))))
+          (is (= (reduce + (for [[kind amount] usage]
+                             (accounting/calculate-cost kind amount {:model model})))
+                 (:used (chat-ctx/get-budget ctx))
+                 (accounting/get-total-cost (:db-conn ctx) (:chat-id ctx)))))
+        (finally (chat-ctx/close-chat! ctx))))))
+
+(deftest message-token-metadata-does-not-charge-for-appending-history
+  (let [ctx (chat-ctx/create-chat-context {:title "message-metadata" :with-sci? false})]
+    (try
+      (let [before (chat-ctx/get-budget ctx)]
+        (doseq [role [:user :assistant]]
+          (chat-ctx/add-message! ctx {:role role :content "retained history" :tokens 123}))
+        (is (= [123 123] (mapv :message/tokens (chat-ctx/get-messages ctx))))
+        (is (= before (chat-ctx/get-budget ctx))))
+      (finally (chat-ctx/close-chat! ctx)))))
 
 (deftest empty-response-after-tools-cannot-complete-with-stale-placeholder
   (testing "one corrective integration step obtains a real final result"

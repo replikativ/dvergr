@@ -145,7 +145,7 @@
 (defn append-memory!
   "Append `entry` to the participant's memory. For :llm role with a
    wrapped ChatContext this also routes through dvergr.chat.context/
-   add-message! so datahike persistence + token accounting fire. For
+   add-message! for datahike persistence (usage is accounted separately). For
    :human role, just appends to the signal (and to db-conn if any).
 
    The expected entry shape is role-specific:

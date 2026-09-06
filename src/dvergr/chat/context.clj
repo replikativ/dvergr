@@ -167,6 +167,9 @@
 (defn add-message!
   "Add a message to the chat.
 
+   :tokens is message metadata, not a billable usage event. Account actual
+   provider usage separately with account-tokens!, including model pricing.
+
    Args:
      chat-ctx - ChatContext
      message - Map with :role, :content, :tokens, etc."
@@ -183,19 +186,12 @@
     ;; the room store (`:durable? false`, set by dvergr.agent.room-context).
     ;; In the room model the bus→store listener is the single durable writer for
     ;; the conversation; re-writing message entities under the chat-id would be a
-    ;; redundant second write. Token accounting (ledger, below) still runs — the
-    ;; budget is reconstructed from the ledger on restore.
+    ;; redundant second write. Provider usage is accounted separately; the
+    ;; budget is reconstructed from that ledger on restore.
     (when-let [conn (:db-conn chat-ctx)]
       (when-not (false? (:durable? chat-ctx))
         (persist/persist-tx! conn [msg-entity]
                              {:op :add-message :msg-id (:message/id msg-entity)})))
-
-    ;; Account tokens if provided
-    (when-let [tokens (:tokens message)]
-      (account-tokens! chat-ctx (if (= :assistant (:role message))
-                                  :output-tokens
-                                  :input-tokens)
-                       tokens))
 
     msg-entity))
 
