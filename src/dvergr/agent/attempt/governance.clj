@@ -9,7 +9,7 @@
 
 (def ^:private attempt-required
   #{:attempt/id :attempt/chat :attempt/run :attempt/content-id
-    :attempt/payload-blob :attempt/payload-codec :attempt/environment-id
+    :attempt/payload-codec :attempt/environment-id
     :attempt/environment-version :attempt/environment-content-id
     :attempt/verifier-id :attempt/verifier-version :attempt/provider
     :attempt/model :attempt/status :attempt/started-at :attempt/elapsed-ms
@@ -19,7 +19,7 @@
     :attempt/settlement-intent :attempt/checks})
 
 (def ^:private scorecard-required
-  #{:scorecard/id :scorecard/chat :scorecard/payload-blob
+  #{:scorecard/id :scorecard/chat
     :scorecard/payload-codec :scorecard/experiment-id
     :scorecard/experiment-version :scorecard/experiment-content-id
     :scorecard/dataset-id :scorecard/dataset-version
@@ -74,7 +74,14 @@
   (= (:db/id (:scorecard/chat scorecard))
      (:db/id (:attempt/chat attempt))))
 
+(defn- validate-payload! [entity ref-key legacy-key]
+  (when-not (or (and (uuid? (get entity ref-key)) (not (contains? entity legacy-key)))
+                (and (string? (get entity legacy-key)) (not (contains? entity ref-key))))
+    (throw (ex-info "Require exactly one immutable payload representation"
+                    {:type ::invalid-payload-reference :attribute ref-key}))))
+
 (defn- validate-new-attempt! [db entity]
+  (validate-payload! entity :attempt/payload-ref :attempt/payload-blob)
   (let [missing (remove #(contains? entity %) attempt-required)
         run (:attempt/run entity)]
     (when (seq missing)
@@ -120,6 +127,7 @@
     db))
 
 (defn- validate-new-scorecard! [db entity]
+  (validate-payload! entity :scorecard/payload-ref :scorecard/payload-blob)
   (let [missing (remove #(contains? entity %) scorecard-required)]
     (when (seq missing)
       (throw (ex-info "Certified Scorecard row is incomplete"

@@ -308,7 +308,10 @@ Response capture is off by default. A host can opt in on its Room:
 ```
 
 This stores eligible credential-scrubbed text responses in the RoomStore's
-content-addressed artifact store. Responses expose a `:dvergr/acquisition`
+content-addressed artifact store. By default, payload bytes live in that room
+database's Konserve store, addressed by `datahike.blob/blob-id`. The receipt's
+`:acquisition/body-store-ref` is `:db.type/store-ref`: Datahike tracks its
+reachability through branches and retained history. Responses expose a `:dvergr/acquisition`
 envelope only after outcome persistence succeeds. The metadata records origin,
 not raw request paths, queries, headers or request bodies. A deterministic
 `request-key` over pre-injection URL/method/query parameters permits host-side
@@ -322,7 +325,23 @@ and cumulative resource budgets are separate follow-ups. A request left
 `:started` after interruption has an unknown outcome. Persistence failures do
 not retry the HTTP effect, and an outcome-recording failure must not be treated
 as proof that the request never happened. Room deletion retracts receipt
-projections; shared artifact reclamation is a separate storage lifecycle.
+projections; Datahike GC can reclaim managed bodies once no retained branch or
+history references them, subject to its normal retention and writer-age policy.
+
+Attempts and Scorecards use the same managed publication path through
+`:attempt/payload-ref` and `:scorecard/payload-ref`. `artifact/publish-value!`
+holds Datahike's canonical-store write guard from the binary write through the
+referencing transaction. Its host callback must finish the transaction before
+returning; it must not return an unfinished future or Spin. This is a storage
+commit boundary, not a new agent scheduling primitive.
+
+Existing string `payload-blob` / `body-ref` attributes retain their types; old
+Attempt/Scorecard payloads remain readable from the legacy global blob store.
+No existing records or historical blobs are rewritten. Explicit legacy artifact
+store injection still uses that unmanaged path and does not gain automatic GC.
+Failed publications leave collectable orphans: reference-only persistence dead
+letters are diagnostic records, not self-contained replay bundles. Recovery
+must republish the exact payload before retrying the domain write.
 
 These receipts establish acquisition provenance, not whether a quotation
 supports a claim. A discovery evaluator must still verify the Run, request

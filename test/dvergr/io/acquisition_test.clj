@@ -18,7 +18,8 @@
         cfg {:store {:backend :file :path path :id (random-uuid)} :schema-flexibility :write :keep-history? true}
         _ (dh/create-database cfg)
         conn (dh/connect cfg)
-        artifacts (artifact/memory-store)
+        artifacts (artifact/datahike-store conn)
+        captured-ref (atom nil)
         run-id (random-uuid)
         room-id (keyword (str "receipt-" (random-uuid)))]
     (try
@@ -62,8 +63,9 @@
                                                       (assoc ctx :run-id second-run :execution-ctx (:ctx child))))))
                 (let [row (first (acquisition/list-for-run conn room-id second-run 10))]
                   (is (= :captured (:acquisition/capture row)))
+                  (reset! captured-ref (:acquisition/body-store-ref row))
                   (is (= {:body "private fixture"}
-                         (artifact/get-value artifacts (:acquisition/body-ref row))))
+                         (artifact/get-value artifacts (:acquisition/body-store-ref row))))
                   (is (not= (:acquisition/world-id (first (acquisition/list-for-run conn room-id run-id 10)))
                             (:acquisition/world-id row))))
                 (finally (d/discard child)))
@@ -72,6 +74,8 @@
       (dh/release conn)
       (let [reopened (dh/connect cfg)]
         (try (is (= 1 (count (acquisition/list-for-run reopened room-id run-id 10))))
+             (is (= {:body "private fixture"}
+                    (artifact/get-value (artifact/datahike-store reopened) @captured-ref)))
              (is (empty? (acquisition/list-for-run reopened :other-room run-id 10)))
              (room-store/-delete-room! (store/make reopened artifacts) room-id)
              (is (empty? (acquisition/list-for-run reopened room-id run-id 10)))
@@ -110,7 +114,7 @@
         (acquisition/record-request! {:url "https://example.org/path?token=private"}
                                      #(identity {:status 200 :body "éé"}))
         (is (= :too-large (:acquisition/capture (last @txs))))
-        (is (nil? (:acquisition/body-ref (last @txs))))
+        (is (nil? (:acquisition/body-store-ref (last @txs))))
         (is (not (.contains (pr-str @txs) "private")))
         (acquisition/record-request! {:url "https://other.example/path"}
                                      #(identity {:status 200 :body "x"}))
@@ -137,5 +141,5 @@
           (is (= (:acquisition/id (first @txs)) (:id provenance)))
           (is (= :completed (:acquisition/status (last @txs))))
           (is (= :captured (:capture provenance)))
-          (is (= (:acquisition/body-ref (last @txs)) (:body-ref provenance)))
+          (is (= (:acquisition/body-store-ref (last @txs)) (:body-ref provenance)))
           (is (= {:body "source"} (artifact/get-value artifacts (:body-ref provenance)))))))))

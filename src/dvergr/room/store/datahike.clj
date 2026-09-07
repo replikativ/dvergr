@@ -408,7 +408,7 @@
     :run/reason :run/error])
 
 (def ^:private attempt-pull-pattern
-  '[:attempt/id :attempt/content-id :attempt/payload-blob
+  '[:attempt/id :attempt/content-id :attempt/payload-ref :attempt/payload-blob
     :attempt/payload-codec :attempt/environment-id
     :attempt/environment-version :attempt/environment-content-id
     :attempt/verifier-id :attempt/verifier-version
@@ -425,7 +425,7 @@
                       :attempt.check/passed?]}])
 
 (def ^:private scorecard-pull-pattern
-  '[:scorecard/id :scorecard/payload-blob :scorecard/payload-codec
+  '[:scorecard/id :scorecard/payload-ref :scorecard/payload-blob :scorecard/payload-codec
     :scorecard/experiment-id :scorecard/experiment-version
     :scorecard/experiment-content-id :scorecard/dataset-id
     :scorecard/dataset-version :scorecard/dataset-content-id
@@ -493,7 +493,7 @@
              :attempt/chat [:chat/id chat-id]
              :attempt/run [:run/id (:attempt/run-id value)]
              :attempt/content-id (:attempt/content-id value)
-             :attempt/payload-blob payload-ref
+             (if (uuid? payload-ref) :attempt/payload-ref :attempt/payload-blob) payload-ref
              :attempt/payload-codec :edn-v1
              :attempt/environment-id (:environment/id definition)
              :attempt/environment-version (:environment/version definition)
@@ -535,12 +535,12 @@
       (throw (ex-info "Unsupported Attempt payload codec"
                       {:type :room-store/unsupported-attempt-payload
                        :codec (:attempt/payload-codec entity)})))
-    (let [value (artifact/get-value artifacts (:attempt/payload-blob entity))]
+    (let [value (artifact/get-value artifacts (or (:attempt/payload-ref entity) (:attempt/payload-blob entity)))]
       (when-not value
         (throw (ex-info "Attempt payload artifact is unavailable"
                         {:type :room-store/missing-attempt-payload
                          :attempt/id (:attempt/id entity)
-                         :artifact/ref (:attempt/payload-blob entity)})))
+                         :artifact/ref (or (:attempt/payload-ref entity) (:attempt/payload-blob entity))})))
       (attempt/validate-attempt value)
       (let [receipt (:attempt/receipt value)
             definition (:attempt/environment value)
@@ -609,7 +609,7 @@
         scorecard-id (:scorecard/content-id value)]
     {:scorecard/id scorecard-id
      :scorecard/chat [:chat/id chat-id]
-     :scorecard/payload-blob payload-ref
+     (if (uuid? payload-ref) :scorecard/payload-ref :scorecard/payload-blob) payload-ref
      :scorecard/payload-codec :edn-v1
      :scorecard/experiment-id (:experiment/id definition)
      :scorecard/experiment-version (long (:experiment/version definition))
@@ -642,12 +642,12 @@
       (throw (ex-info "Unsupported Scorecard payload codec"
                       {:type :room-store/unsupported-scorecard-payload
                        :codec (:scorecard/payload-codec entity)})))
-    (let [value (artifact/get-value artifacts (:scorecard/payload-blob entity))]
+    (let [value (artifact/get-value artifacts (or (:scorecard/payload-ref entity) (:scorecard/payload-blob entity)))]
       (when-not value
         (throw (ex-info "Scorecard payload artifact is unavailable"
                         {:type :room-store/missing-scorecard-payload
                          :scorecard/id (:scorecard/id entity)
-                         :artifact/ref (:scorecard/payload-blob entity)})))
+                         :artifact/ref (or (:scorecard/payload-ref entity) (:scorecard/payload-blob entity))})))
       (validate-scorecard value)
       (let [definition (:scorecard/experiment value)
             dataset (:experiment/dataset definition)
@@ -1146,38 +1146,40 @@
     (let [value (attempt/validate-attempt value)
           slug (store/room-id->slug room-id)]
       (when-let [ent (room-by-slug conn slug)]
-        ;; CAS is immutable: a blob written before a failed Datahike commit is a
-        ;; harmless unreferenced object and can be collected independently.
-        (let [payload-ref (artifact/put-value! artifacts value)
-              entity (attempt->entity (:chat/id ent) value payload-ref)]
-          (locking conn
-            (if-let [existing (store/-load-attempt this room-id
-                                                   (:attempt/id value))]
-              (if (= existing value)
-                existing
-                (throw (ex-info "Attempt identity is immutable"
-                                {:type :room-store/attempt-identity-collision
-                                 :existing existing :attempt value})))
-              (let [report
-                    (attempt-governance/with-authorized-write
-                      conn (:attempt/id value)
-                      (fn [tx-meta]
-                        (persist/persist-tx-result!
-                         conn
-                         [[:db.fn/call store-attempt-if-absent entity]]
-                         {:op :store-attempt :room-id room-id
-                          :attempt-id (:attempt/id value)
-                          :tx-meta tx-meta})))]
-                (when report
+        ;; Publication holds the Datahike write guard across bytes and commit.
+        ;; A failed publication leaves a collectable orphan, never a live root.
+        (artifact/publish-value!
+         artifacts value
+         (fn [payload-ref]
+           (let [entity (attempt->entity (:chat/id ent) value payload-ref)]
+             (locking conn
+               (if-let [existing (store/-load-attempt this room-id
+                                                      (:attempt/id value))]
+                 (if (= existing value)
+                   existing
+                   (throw (ex-info "Attempt identity is immutable"
+                                   {:type :room-store/attempt-identity-collision
+                                    :existing existing :attempt value})))
+                 (let [report
+                       (attempt-governance/with-authorized-write
+                         conn (:attempt/id value)
+                         (fn [tx-meta]
+                           (persist/persist-tx-result!
+                            conn
+                            [[:db.fn/call store-attempt-if-absent entity]]
+                            {:op :store-attempt :room-id room-id
+                             :attempt-id (:attempt/id value)
+                             :tx-meta tx-meta})))]
+                   (when report
                   ;; A concurrent identical writer may have won. Always compare
                   ;; the exact payload after the serialized first-write decision.
-                  (let [stored (store/-load-attempt this room-id
-                                                    (:attempt/id value))]
-                    (when-not (= stored value)
-                      (throw (ex-info "Concurrent Attempt identity collision"
-                                      {:type :room-store/attempt-identity-collision
-                                       :stored stored :attempt value})))
-                    stored)))))))))
+                     (let [stored (store/-load-attempt this room-id
+                                                       (:attempt/id value))]
+                       (when-not (= stored value)
+                         (throw (ex-info "Concurrent Attempt identity collision"
+                                         {:type :room-store/attempt-identity-collision
+                                          :stored stored :attempt value})))
+                       stored)))))))))))
 
   (-load-attempt [_ room-id attempt-id]
     (let [slug (store/room-id->slug room-id)]
@@ -1238,57 +1240,59 @@
           scorecard-id (:scorecard/content-id value)
           slug (store/room-id->slug room-id)]
       (when-let [ent (room-by-slug conn slug)]
-        (let [payload-ref (artifact/put-value! artifacts value)
-              entity (scorecard->entity (:chat/id ent) value payload-ref
-                                        (java.util.Date.))]
-          (locking conn
-            (if-let [existing (store/-load-scorecard this room-id scorecard-id)]
-              (if (= existing value)
-                existing
-                (throw (ex-info "Scorecard identity is immutable"
-                                {:type :room-store/scorecard-identity-collision
-                                 :existing existing :scorecard value})))
-              (let [existing-chat-id
-                    (dh/q '[:find ?chat-id .
-                            :in $ ?scorecard-id
-                            :where
-                            [?s :scorecard/id ?scorecard-id]
-                            [?s :scorecard/chat ?c]
-                            [?c :chat/id ?chat-id]]
-                          @conn scorecard-id)
-                    _ (when (and existing-chat-id
-                                 (not= existing-chat-id (:chat/id ent)))
-                        (throw
-                         (ex-info "Scorecard identity belongs to another Room"
-                                  {:type :room-store/scorecard-room-mismatch
-                                   :scorecard/id scorecard-id})))
-                    _ (validate-scorecard-attempts
-                       value
-                       (into {}
-                             (keep
-                              (fn [entry]
-                                (when-let [stored
-                                           (store/-load-attempt
-                                            this room-id (:attempt/id entry))]
-                                  [(:attempt/id entry) stored])))
-                             (:scorecard/entries value)))
-                    report
-                    (attempt-governance/with-authorized-scorecard-write
-                      conn scorecard-id
-                      (fn [tx-meta]
-                        (persist/persist-tx-result!
-                         conn
-                         [[:db.fn/call store-scorecard-if-absent entity]]
-                         {:op :store-scorecard :room-id room-id
-                          :scorecard-id scorecard-id :tx-meta tx-meta})))]
-                (when report
-                  (let [stored (store/-load-scorecard this room-id scorecard-id)]
-                    (when-not (= stored value)
-                      (throw
-                       (ex-info "Concurrent Scorecard identity collision"
-                                {:type :room-store/scorecard-identity-collision
-                                 :stored stored :scorecard value})))
-                    stored)))))))))
+        (artifact/publish-value!
+         artifacts value
+         (fn [payload-ref]
+           (let [entity (scorecard->entity (:chat/id ent) value payload-ref
+                                           (java.util.Date.))]
+             (locking conn
+               (if-let [existing (store/-load-scorecard this room-id scorecard-id)]
+                 (if (= existing value)
+                   existing
+                   (throw (ex-info "Scorecard identity is immutable"
+                                   {:type :room-store/scorecard-identity-collision
+                                    :existing existing :scorecard value})))
+                 (let [existing-chat-id
+                       (dh/q '[:find ?chat-id .
+                               :in $ ?scorecard-id
+                               :where
+                               [?s :scorecard/id ?scorecard-id]
+                               [?s :scorecard/chat ?c]
+                               [?c :chat/id ?chat-id]]
+                             @conn scorecard-id)
+                       _ (when (and existing-chat-id
+                                    (not= existing-chat-id (:chat/id ent)))
+                           (throw
+                            (ex-info "Scorecard identity belongs to another Room"
+                                     {:type :room-store/scorecard-room-mismatch
+                                      :scorecard/id scorecard-id})))
+                       _ (validate-scorecard-attempts
+                          value
+                          (into {}
+                                (keep
+                                 (fn [entry]
+                                   (when-let [stored
+                                              (store/-load-attempt
+                                               this room-id (:attempt/id entry))]
+                                     [(:attempt/id entry) stored])))
+                                (:scorecard/entries value)))
+                       report
+                       (attempt-governance/with-authorized-scorecard-write
+                         conn scorecard-id
+                         (fn [tx-meta]
+                           (persist/persist-tx-result!
+                            conn
+                            [[:db.fn/call store-scorecard-if-absent entity]]
+                            {:op :store-scorecard :room-id room-id
+                             :scorecard-id scorecard-id :tx-meta tx-meta})))]
+                   (when report
+                     (let [stored (store/-load-scorecard this room-id scorecard-id)]
+                       (when-not (= stored value)
+                         (throw
+                          (ex-info "Concurrent Scorecard identity collision"
+                                   {:type :room-store/scorecard-identity-collision
+                                    :stored stored :scorecard value})))
+                       stored)))))))))))
 
   (-load-scorecard [_ room-id scorecard-id]
     (let [slug (store/room-id->slug room-id)]
@@ -1495,9 +1499,10 @@
 (defn make
   "Create a DatahikeStore. `conn` must be an existing Datahike
    connection whose db includes the dvergr.chat.schema attributes. An optional
-   artifact store can be injected for tests; production uses the blob CAS."
+   artifact store can be injected for tests; by default payloads live in this
+   database's Konserve store and participate in its store-ref GC lifecycle."
   ([conn]
-   (make conn (artifact/blob-store)))
+   (make conn (artifact/datahike-store conn)))
   ([conn artifacts]
    (attempt-governance/govern! conn)
    (->DatahikeStore conn artifacts)))

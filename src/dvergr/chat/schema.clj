@@ -745,6 +745,11 @@
     :db/cardinality :db.cardinality/one
     :db/doc "Immutable CAS reference for exact EnvironmentDef, AgentDef, receipt, and evidence"}
 
+   {:db/ident :attempt/payload-ref
+    :db/valueType :db.type/store-ref
+    :db/cardinality :db.cardinality/one
+    :db/doc "GC-tracked immutable exact Attempt payload"}
+
    {:db/ident :attempt/payload-codec
     :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/one}
@@ -897,6 +902,10 @@
 
    {:db/ident :scorecard/payload-codec
     :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :scorecard/payload-ref
+    :db/valueType :db.type/store-ref
     :db/cardinality :db.cardinality/one}
 
    {:db/ident :scorecard/experiment-id

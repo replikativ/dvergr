@@ -22,7 +22,8 @@
          [:acquisition/status :db.type/keyword] [:acquisition/method :db.type/keyword]
          [:acquisition/origin :db.type/string] [:acquisition/started-at :db.type/instant]
          [:acquisition/ended-at :db.type/instant] [:acquisition/http-status :db.type/long]
-         [:acquisition/body-ref :db.type/string] [:acquisition/capture :db.type/keyword]
+         [:acquisition/body-ref :db.type/string]
+         [:acquisition/body-store-ref :db.type/store-ref] [:acquisition/capture :db.type/keyword]
          [:acquisition/request-key :db.type/uuid]
          [:acquisition/error-class :db.type/string]]))
 
@@ -34,7 +35,7 @@
     (when (and conn (:run-id ctx))
       {:conn conn :room-id (:id room) :run-id (:run-id ctx)
        :tool-use-id (:tool-use-id ctx) :execution-ctx (:execution-ctx ctx)
-       :artifacts (or (some-> room :store :artifacts) (artifact/blob-store))
+       :artifacts (or (some-> room :store :artifacts) (artifact/datahike-store conn))
        :capture-policy (:http-capture @(:meta room))})))
 
 (defn origin [url]
@@ -53,25 +54,25 @@
   (hasch/uuid [:http-acquisition/v1 (or (:method opts) :get)
                (str (:url opts)) (:query-params opts)]))
 
-(defn- capture [scope request-origin response]
+(defn- capture [scope request-origin response publish]
   (let [{:keys [allowed-origins max-bytes]} (:capture-policy scope)
         body (:body response)]
     (cond
       (not (and (set? allowed-origins) (contains? allowed-origins request-origin)
                 (integer? max-bytes) (pos? max-bytes)))
-      {:acquisition/capture :disabled}
+      (publish {:acquisition/capture :disabled})
 
-      (not (string? body)) {:acquisition/capture :unsupported-body}
+      (not (string? body)) (publish {:acquisition/capture :unsupported-body})
 
       ;; UTF-16 length is a lower bound on UTF-8 bytes for valid text. Reject
       ;; huge responses before allocating a second full-size encoding buffer.
       (or (> (count body) max-bytes)
           (> (alength (.getBytes ^String body java.nio.charset.StandardCharsets/UTF_8)) max-bytes))
-      {:acquisition/capture :too-large}
+      (publish {:acquisition/capture :too-large})
 
-      :else {:acquisition/capture :captured
-             :acquisition/body-ref
-             (artifact/put-value! (:artifacts scope) {:body body})})))
+      :else (artifact/publish-value! (:artifacts scope) {:body body}
+                                     #(publish {:acquisition/capture :captured
+                                                (if (uuid? %) :acquisition/body-store-ref :acquisition/body-ref) %})))))
 
 (defn record-request!
   "Observe one HTTP invocation. `perform` retains existing transport/egress policy
@@ -94,31 +95,33 @@
       (dh/transact conn [started])
       (let [outcome (try {:response (perform)} (catch Exception e {:error e}))
             response (:response outcome)
+            publish (fn [captured]
+                      (dh/transact conn
+                                   [(merge {:acquisition/id id
+                                            :acquisition/ended-at (java.util.Date.)
+                                            :acquisition/status (if (:error outcome) :failed :completed)}
+                                           (when (:status response)
+                                             {:acquisition/http-status (long (:status response))})
+                                           (when-let [e (:error outcome)]
+                                             {:acquisition/error-class (.getName (class e))})
+                                           captured)])
+                      captured)
             captured (try
-                       (if response (capture scope request-origin response)
-                           {:acquisition/capture :disabled})
+                       (if response
+                         (capture scope request-origin response publish)
+                         (publish {:acquisition/capture :disabled}))
                        (catch Exception e
-                         (throw (ex-info "HTTP capture failed; the request may have completed. Do not retry the HTTP effect automatically."
+                         (throw (ex-info "HTTP outcome recording failed; the request may have completed. Do not retry the HTTP effect automatically."
                                          {:type ::outcome-recording-failed :acquisition/id id} e))))]
-        (try
-          (dh/transact conn
-                       [(merge {:acquisition/id id :acquisition/ended-at (java.util.Date.)
-                                :acquisition/status (if (:error outcome) :failed :completed)}
-                               (when (:status response) {:acquisition/http-status (long (:status response))})
-                               (when-let [e (:error outcome)]
-                                 {:acquisition/error-class (.getName (class e))})
-                               captured)])
-          (catch Exception e
-            (throw (ex-info "HTTP outcome recording failed; the request may have completed. Do not retry the HTTP effect automatically."
-                            {:type ::outcome-recording-failed :acquisition/id id} e))))
         (if-let [e (:error outcome)]
           (throw e)
           ;; Correlation only, not permission to read the audit DB or artifact
           ;; store. Publish this envelope only AFTER outcome persistence succeeds.
           (assoc response :dvergr/acquisition
                  (cond-> {:id id :capture (:acquisition/capture captured)}
-                   (:acquisition/body-ref captured)
-                   (assoc :body-ref (:acquisition/body-ref captured)))))))
+                   (or (:acquisition/body-store-ref captured) (:acquisition/body-ref captured))
+                   (assoc :body-ref (or (:acquisition/body-store-ref captured)
+                                        (:acquisition/body-ref captured))))))))
     (perform)))
 
 (defn list-for-run

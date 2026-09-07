@@ -275,6 +275,27 @@
                              :where [?a :attempt/checks ?check]] @conn)
                      0))))))
 
+(deftest legacy-artifact-injection-and-domain-readers-remain-compatible
+  (let [[conn _] (mem-store)
+        bytes-by-id (atom {})]
+    (try
+      (with-redefs [dvergr.drive.blobs/store!
+                    (fn [bytes _]
+                      (let [id (dvergr.drive.blobs/sha256-hex bytes)]
+                        (swap! bytes-by-id assoc id bytes)
+                        {:blob/id id}))
+                    dvergr.drive.blobs/get-bytes #(get @bytes-by-id %)]
+        (contract/assert-cross-room-scorecard-identity!
+         (dhs/make conn (artifact/blob-store)))
+        ;; Schema installation must leave historical string attributes intact.
+        (dvergr.chat.schema/ensure-full-schema! conn)
+        (is (= :db.type/string (get-in @conn [:schema :attempt/payload-blob :db/valueType])))
+        (is (= :db.type/store-ref (get-in @conn [:schema :attempt/payload-ref :db/valueType])))
+        (let [modern (dhs/make conn)]
+          (is (= 1 (count (store/-list-attempts modern :scorecard-room-a {}))))
+          (is (= 1 (count (store/-list-scorecards modern :scorecard-room-a {}))))))
+      (finally (dh/release conn)))))
+
 (deftest message-envelope-contract
   (let [[_conn st] (mem-store)]
     (contract/assert-message-envelope! st :envelope-datahike)))
