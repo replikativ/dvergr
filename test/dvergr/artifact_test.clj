@@ -32,9 +32,9 @@
       (is (thrown? Exception (artifact/put-value! st {:body "unsafe"})))
       (let [ref (artifact/publish-value! st {:body "source"}
                                          (fn [ref]
-                    (is (guard/in-flight? sid))
-                    (is (not (contains? (set (async/<!! (gc/gc-storage! @conn))) ref))
-                        "collection during the unpublished write window must spare the bytes")
+                                           (is (guard/in-flight? sid))
+                                           (is (not (contains? (set (async/<!! (gc/gc-storage! @conn))) ref))
+                                               "collection during the unpublished write window must spare the bytes")
                                            (is (= {:body "source"} (artifact/get-value st ref)))
                                            (d/transact conn [{:test/id :one :test/payload ref}])
                                            ref))]
