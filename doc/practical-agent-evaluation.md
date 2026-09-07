@@ -289,6 +289,45 @@ validation, strict output parsing, scripted certification, persistence and
 cleanup. This small fixture is not a general entailment judge, competitor
 discovery benchmark, deployment audit or validation of market demand.
 
+## HTTP acquisition receipts
+
+Tool-driven sandbox HTTP requests in a Datahike-backed control Room record
+Run-correlated acquisition metadata before executing the request and its outcome
+afterward. A receipt also identifies the tool call and execution world. Execution
+audit stays in the control Room when a speculative work world is discarded.
+Receipt reads are host-only and require the caller to authorize Room/Run access;
+`dvergr.io.acquisition/list-for-run` reads a bounded prefix in Run-index order.
+An in-memory RoomStore or a direct HTTP call outside a tool invocation does not
+automatically acquire this durable audit capability.
+
+Response capture is off by default. A host can opt in on its Room:
+
+```clojure
+(swap! (:meta room) assoc :http-capture
+       {:allowed-origins #{"https://example.org"} :max-bytes 65536})
+```
+
+This stores eligible credential-scrubbed text responses in the RoomStore's
+content-addressed artifact store. Responses expose a `:dvergr/acquisition`
+envelope only after outcome persistence succeeds. The metadata records origin,
+not raw request paths, queries, headers or request bodies. A deterministic
+`request-key` over pre-injection URL/method/query parameters permits host-side
+citation matching; it is not encryption. Captured response text can itself be
+sensitive, so enable capture only for sources the host intends to retain.
+Redirects are not followed automatically.
+
+`:max-bytes` limits each stored body, not network bytes, total Run storage or
+HTTP transport allocation. The HTTP client still buffers its response; transport
+and cumulative resource budgets are separate follow-ups. A request left
+`:started` after interruption has an unknown outcome. Persistence failures do
+not retry the HTTP effect, and an outcome-recording failure must not be treated
+as proof that the request never happened. Room deletion retracts receipt
+projections; shared artifact reclamation is a separate storage lifecycle.
+
+These receipts establish acquisition provenance, not whether a quotation
+supports a claim. A discovery evaluator must still verify the Run, request
+fingerprint, captured body and submitted evidence together.
+
 ## Port order driven by failures
 
 1. Complete scoped observation and expose it in the REPL/UI.

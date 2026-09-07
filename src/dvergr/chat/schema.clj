@@ -13,6 +13,7 @@
   (:require [datahike.api :as d]
             [taoensso.telemere :as tel]
             [dvergr.kb.schema :as kb]
+            [dvergr.io.acquisition :as acquisition]
             [dvergr.chat.tool-schema :as tool-schema]))
 
 ;; ============================================================================
@@ -1441,6 +1442,7 @@
   (vec (concat chat-schema
                message-schema
                run-schema
+               acquisition/schema
                attempt-schema
                scorecard-schema
                attention-schema

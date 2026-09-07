@@ -315,7 +315,7 @@
                                     ;; the room's own + attached repos (load-fn falls
                                     ;; back to the base workspace if absent).
                                    result (binding [workspace/*workspace-roots* (:workspace-roots ctx)]
-                                            (tools/execute name input ctx))
+                                            (tools/execute name input (assoc ctx :tool-use-id id)))
                                    duration-ms (- (System/currentTimeMillis) start-time)
                                    error? (= :error (:type result))]
                                (when-let [conn (:db-conn chat-ctx)]

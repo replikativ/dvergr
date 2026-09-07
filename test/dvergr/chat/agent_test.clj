@@ -5,6 +5,7 @@
             [dvergr.chat.context :as chat-ctx]
             [dvergr.chat.accounting :as accounting]
             [datahike.api :as dh]
+            [dvergr.tools :as tools]
             [dvergr.model.chat :as model-chat]))
 
 (defn- response [content]
@@ -12,6 +13,29 @@
    :tool-calls []
    :usage {}
    :stop-reason :stop})
+
+(deftest dispatch-correlates-each-tool-call
+  (let [ctx (chat-ctx/create-chat-context {:title "tool-correlation" :with-sci? false})
+        calls [{:id "call-a" :name "fixture" :input {}}
+               {:id "call-b" :name "fixture" :input {}}]
+        observed (atom [])]
+    (try
+      (with-redefs [agent/messages->api-format (fn [messages _ _] messages)
+                    model-chat/chat (fn [& _] (assoc (response "") :tool-calls calls))
+                    tools/execute (fn [_ _ tool-ctx]
+                                    (swap! observed conj (:tool-use-id tool-ctx))
+                                    {:type :success :content "done"
+                                     :authorization {:decision :authorized
+                                                     :sources #{:test}}})]
+        (is (= :continue
+               (agent/run-agent-turn! ctx {:provider :test :model "stub" :tools {}
+                                           :tool-ctx {:tool-use-id "stale"}
+                                           :auto-compact? false :turn-number 0})))
+        (is (= ["call-a" "call-b"] @observed))
+        (reset! observed [])
+        (tools/execute-parallel calls {:tool-use-id "stale"})
+        (is (= #{"call-a" "call-b"} (set @observed))))
+      (finally (chat-ctx/close-chat! ctx)))))
 
 (deftest provider-usage-is-accounted-once-with-model-pricing
   (doseq [model ["codex-subscription-sol" "claude-sonnet-4-5"]]

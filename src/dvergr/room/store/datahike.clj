@@ -755,6 +755,9 @@
                               [?r :run/chat ?c]
                               [?r :run/id ?rid]]
                             @conn chat-id)
+              acquisition-ids (dh/q '[:find [?id ...] :in $ ?room
+                                      :where [?e :acquisition/room-id ?room]
+                                      [?e :acquisition/id ?id]] @conn room-id)
               attempt-ids (dh/q '[:find [?aid ...]
                                   :in $ ?cid
                                   :where
@@ -784,6 +787,7 @@
                                            attempt-ids))
                                 (into (map (fn [mid] [:db/retractEntity [:message/id mid]]) msg-ids))
                                 (into (map (fn [rid] [:db/retractEntity [:run/id rid]]) run-ids))
+                                (into (map (fn [id] [:db/retractEntity [:acquisition/id id]]) acquisition-ids))
                                 (into (map (fn [aid]
                                              [:db/retractEntity [:attention/id aid]])
                                            attention-ids))

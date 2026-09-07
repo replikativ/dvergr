@@ -8,6 +8,7 @@
             [jsonista.core :as j]
             [babashka.fs :as fs]
             [muschel.fs :as mfs]
+            [dvergr.io.acquisition :as acquisition]
             [dvergr.sandbox.ns.doc :as doc])
   (:import [java.io File]))
 
@@ -638,7 +639,7 @@
      (http/request {:url \"...\" :method :put :headers {...} :body \"...\"})"
   [sci-ctx & {:keys [audit-log allowed-domains secrets]}]
   (let [domain-check (make-domain-policy allowed-domains)
-        do-request
+        perform-request
         (fn [{:keys [url method headers body json query-params timeout]
               :or {method :get timeout 30000}}]
           ;; Audit first (even blocked requests should appear in the log)
@@ -650,6 +651,7 @@
           (let [hato-request (requiring-resolve 'hato.client/request)
                 opts (cond-> {:url url
                               :method method
+                              :http-client {:redirect-policy :never}
                               :connect-timeout timeout
                               :socket-timeout timeout}
                        headers (assoc :headers headers)
@@ -670,7 +672,9 @@
             ;; The agent parses explicitly — (cheshire.core/parse-string (:body r) true).
             {:status (:status resp)
              :headers (into {} (:headers resp))
-             :body (:body resp)}))]
+             :body (:body resp)}))
+        do-request (fn [opts]
+                     (acquisition/record-request! opts #(perform-request opts)))]
     (sci/add-namespace! sci-ctx 'babashka.http-client
                         {'request do-request
                          'get     (fn [url & [opts]] (do-request (merge {:url url :method :get} opts)))
