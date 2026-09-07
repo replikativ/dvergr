@@ -257,6 +257,38 @@ an observation projection typo that had hidden `:run/world` identities, which
 is precisely the kind of harness failure these paired probes are intended to
 find.
 
+## Frozen market-evidence benchmark
+
+`dvergr.benchmarks.market-evidence` measures source faithfulness: classify nine
+claims against five frozen public documentation excerpts as supported,
+contradicted or unknown. Supported and contradicted claims require an exact,
+relevant complete source sentence; unknown claims must not invent evidence.
+The host-owned verifier checks the answer without exposing its answer key to
+the candidate. Fixture provenance and verifier identity are content-addressed.
+
+With `src` and `dev` on the classpath and the chosen provider registered:
+
+```clojure
+(require '[dvergr.agent.market-bench :as market]
+         '[org.replikativ.spindel.engine.core :as ec])
+
+;; Host REPL: room is caller-owned. evaluate returns a lazy Spindel computation.
+(binding [ec/*execution-context* (:ctx room)]
+  @(market/evaluate room :codex-subscription "codex-subscription-sol"))
+```
+
+The result uses ordinary Run and certified Attempt projections. Join evaluation
+cleanup before closing the caller-owned Room; an in-memory store is not restart
+durability. The candidate has no tools, a 180-second deadline, a ten-second
+cancellation grace and a two-request provider-loop fuse. Its nominal dollar
+budget is not a token quota for zero-priced subscription models. Track actual
+usage and elapsed time separately.
+
+Deterministic tests in `dvergr.benchmarks.market-evidence-test` cover evidence
+validation, strict output parsing, scripted certification, persistence and
+cleanup. This small fixture is not a general entailment judge, competitor
+discovery benchmark, deployment audit or validation of market demand.
+
 ## Port order driven by failures
 
 1. Complete scoped observation and expose it in the REPL/UI.
