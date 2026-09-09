@@ -107,6 +107,9 @@ reported as deficient model reasoning.
 
 ### Evidence from unsuccessful coding attempts
 
+See [Coding benchmarks](coding-benchmarks.md) for the reusable Spindel
+permutation repair fixture and its REPL entry point.
+
 A failed or cancelled Run discards its work world after supervised execution
 and cleanup stop. The evaluator's ordinary `:observe` therefore cannot assume
 that `:world/room` still exists. Use the optional host-only `:capture` callback
