@@ -25,6 +25,7 @@
          [:acquisition/body-ref :db.type/string]
          [:acquisition/body-store-ref :db.type/store-ref] [:acquisition/capture :db.type/keyword]
          [:acquisition/request-key :db.type/uuid]
+         [:acquisition/fixture-id :db.type/uuid]
          [:acquisition/error-class :db.type/string]]))
 
 (defn tool-scope [ctx]
@@ -102,6 +103,8 @@
                                             :acquisition/status (if (:error outcome) :failed :completed)}
                                            (when (:status response)
                                              {:acquisition/http-status (long (:status response))})
+                                           (when-let [fixture-id (:dvergr/fixture-id response)]
+                                             {:acquisition/fixture-id fixture-id})
                                            (when-let [e (:error outcome)]
                                              {:acquisition/error-class (.getName (class e))})
                                            captured)])

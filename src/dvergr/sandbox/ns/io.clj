@@ -626,6 +626,10 @@
    JSON bodies are auto-parsed.
 
    :audit-log      - atom from (make-audit-log); records every request (method + url, no body)
+   :fixture-transport - trusted host-only offline request function, local to this
+                        SCI namespace. Preserves domain checks and acquisition
+                        recording; replaces DNS/network and secret injection.
+                        Never expose transport installation to candidate code.
    :allowed-domains - set of URL prefix strings; non-empty set restricts outbound requests.
                       Empty or nil permits all domains (open).
                       Example: #{\"https://api.github.com\" \"https://slack.com\"}
@@ -637,7 +641,7 @@
        {:headers {\"Authorization\" (str \"Bearer \" (env/get \"MY_SERVICE_TOKEN\"))}
         :json {:channel \"#general\" :text \"Hello from dvergr\"}})
      (http/request {:url \"...\" :method :put :headers {...} :body \"...\"})"
-  [sci-ctx & {:keys [audit-log allowed-domains secrets]}]
+  [sci-ctx & {:keys [audit-log allowed-domains secrets fixture-transport]}]
   (let [domain-check (make-domain-policy allowed-domains)
         perform-request
         (fn [{:keys [url method headers body json query-params timeout]
@@ -673,8 +677,18 @@
             {:status (:status resp)
              :headers (into {} (:headers resp))
              :body (:body resp)}))
+        ;; Host-only, namespace-local substitution. Never consult a global
+        ;; transport Var: concurrent live and simulated interpreters coexist.
+        ;; A fixture does no DNS, secret substitution or network fallback.
         do-request (fn [opts]
-                     (acquisition/record-request! opts #(perform-request opts)))]
+                     (acquisition/record-request!
+                      opts #(if fixture-transport
+                              (do
+                                (audit! audit-log :http/request
+                                        {:method (or (:method opts) :get) :url (:url opts)})
+                                (when domain-check (domain-check (:url opts)))
+                                (fixture-transport opts))
+                              (perform-request opts))))]
     (sci/add-namespace! sci-ctx 'babashka.http-client
                         {'request do-request
                          'get     (fn [url & [opts]] (do-request (merge {:url url :method :get} opts)))
