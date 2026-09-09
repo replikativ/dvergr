@@ -373,16 +373,43 @@ Page GETs return exact fixture text. Unsupported options/methods and unknown
 URLs return HTTP errors without DNS or live-network fallback.
 
 This namespace-local capability contains no mutable replay cursor. It is safe
-to share between interpreter forks, but newly constructed interpreters need
-explicit installation; this does not yet wire nested-room setup automatically.
+to share between interpreter forks. Used alone, newly constructed interpreters
+need explicit installation; the WorldSetup integration below supplies it.
 Use a fake `BRAVE_API_KEY` in the fixture's sandbox environment to exercise the
 existing intake without credentials. Domain checks still apply. With an active
 acquisition scope, each call creates a fresh receipt; successful transport
 responses (including HTTP errors) carry a content-derived
 `:acquisition/fixture-id`. Captured bodies still require host capture policy.
 Simulated acquisitions must not be represented as live observations or billed
-as actual provider usage. This slice does not add automatic accounting charges,
-model-response replay, or the complete discovery Environment/Evaluator.
+as actual provider usage. The transport itself does not add automatic accounting
+charges or model-response replay.
+
+`dvergr.benchmarks.discovery` composes this substrate into a synthetic discovery
+Environment/Evaluator. Give the durable control Room
+`{:http-capture discovery/capture-policy}` in its metadata, then execute
+`(evaluation/evaluate room team :researcher (discovery/definition)
+  (discovery/evaluator) {:world-setup (discovery/world-setup)})` as an ordinary
+Spin. The candidate AgentDef needs `:tools #{:clojure_eval}`. Bind the room's
+Spindel context at the host entry point; compose with `await` inside Spins.
+
+Trusted WorldSetup installs an immutable offline HTTP capability and dummy
+service config in Spindel execution-context state, before interpreter creation.
+New interpreters in descendant context forks inherit it; existing interpreters
+retain their already-installed transport. Reconstruct capabilities through the
+content-addressed setup after restart, not by serializing host functions.
+Fixture mode does not load host service secrets. Installation is host-only,
+not a new candidate-visible switch for choosing live versus simulated effects.
+
+Candidates must cite one actual search response and page receipts from the
+same Run. Scoring checks that submitted URLs occurred in those search results,
+that all receipts belong to this fixture, and that exact fetched text supports
+the submitted alternatives. Completion and correct setup gate reward; failure,
+cancellation and waiting earn no credit. This first contract deliberately uses
+one cited search response, not yet a multi-query causal discovery graph.
+The three synthetic companies are a plumbing test, not a substantive market
+benchmark. The provider-free test substitutes only model responses and unrelated
+workspace bootstrapping: tool execution, SCI, receipts, scoring and settlement
+remain real. Live candidates can use exactly the same Environment/Evaluator.
 
 ## Port order driven by failures
 

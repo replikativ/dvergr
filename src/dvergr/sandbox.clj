@@ -1092,10 +1092,14 @@
     ;; env), and share it between `env` (returns placeholders) and `http`
     ;; (substitutes at egress + scrubs the response). requiring-resolve to avoid a
     ;; sandbox→config compile dep; nil specs ⇒ empty registry ⇒ no-op.
-    (let [secret-specs (try ((requiring-resolve 'dvergr.substrate.config/secret-specs))
-                            (catch Throwable _ nil))
-          sandbox-env  (try ((requiring-resolve 'dvergr.substrate.config/sandbox-env))
-                            (catch Throwable _ nil))
+    (let [fixture (binding [rtc/*execution-context* spindel-ctx]
+                    (rtc/get-state [:dvergr.sandbox.ns.io/http-fixture]))
+          secret-specs (when-not fixture
+                         (try ((requiring-resolve 'dvergr.substrate.config/secret-specs))
+                              (catch Throwable _ nil)))
+          sandbox-env  (if fixture (:env fixture)
+                           (try ((requiring-resolve 'dvergr.substrate.config/sandbox-env))
+                                (catch Throwable _ nil)))
           secrets      (ns-io/build-secret-registry secret-specs)]
       (when binding-swap!
         (binding-swap! #(if (contains? % :sandbox-env)
@@ -1106,7 +1110,8 @@
       (ns-io/add-env-ns! sci-ctx
                          :user-config (atom (or sandbox-env {}))
                          :config-resolver (when binding-resolver
-                                            #(or (:sandbox-env (binding-resolver)) {}))
+                                            #(merge (or (:sandbox-env (binding-resolver)) {})
+                                                    (:env fixture)))
                          :config-swap! (when binding-swap!
                                          (fn [f & args]
                                            (binding-swap!
@@ -1115,7 +1120,7 @@
                                                        (apply f (or m {}) args))))))
                          :secrets secrets)
       (ns-io/add-http-ns! sci-ctx :audit-log audit-log :allowed-domains allowed-http-domains
-                          :secrets secrets))
+                          :secrets secrets :fixture-transport (:transport fixture)))
     (ns-agent/add-scheduler-ns! sci-ctx)
     ;; Default coder kit: discovery, dep-add, HTML, tests — these are
     ;; safe and useful for any coding agent regardless of role. Each
