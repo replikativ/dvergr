@@ -16,6 +16,16 @@
    may be installed by the trusted host API."
   "microUSD")
 
+(def model-dispatches
+  "Optional conserved allowance for native provider HTTP dispatch admissions.
+   This is neither a token budget nor a price. Each retry needs another unit."
+  "model-dispatch")
+
+(def ^:dynamic *model-scope*
+  "Trusted process-local scope for a resource-governed model worker. Balances
+   remain in Kontor's control store, never in this binding or a forked counter."
+  nil)
+
 (defn- stable-id [value]
   (UUID/nameUUIDFromBytes
    (.getBytes (str value) StandardCharsets/UTF_8)))
@@ -139,6 +149,27 @@
      effective-date (assoc :effective-date effective-date)
      posted-at (assoc :posted-at posted-at)
      actor (assoc :actor actor))))
+
+(defn model-scope
+  "Resolve opt-in dispatch authority from the original durable Run allocation,
+   not its remaining balance (zero must never disable enforcement)."
+  [room run-id]
+  (when (satisfies? store/PResourceStore (:store room))
+    (let [allocation (store/-resource-receipt (:store room) (allocation-id run-id))]
+      (when (contains? (:resources allocation) model-dispatches)
+        {:room room :run-id run-id}))))
+
+(defn admit-model-dispatch!
+  "Spend one admission immediately before native model egress. No read/check/
+   write race: Kontor validates the debit atomically. Rejected admission never
+   reaches the provider. An admitted failed/ambiguous dispatch is not refunded.
+   Each gateway retry has a new identity, not a replay of the previous effect."
+  []
+  (when-let [{:keys [room run-id cancel?]} *model-scope*]
+    (when (or (.isInterrupted (Thread/currentThread)) (and cancel? (cancel?)))
+      (throw (java.util.concurrent.CancellationException. "Model admission cancelled")))
+    (consume! room run-id {:id (UUID/randomUUID)
+                           :resources {model-dispatches 1M}})))
 
 (defn return!
   "Return an explicit positive vector from a Run to its immediate parent/Room."

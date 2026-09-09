@@ -11,6 +11,7 @@
             [dvergr.chat.schema :as chat-schema]
             [dvergr.discourse :as d]
             [dvergr.model.chat :as model-chat]
+            [dvergr.model.gateway :as gateway]
             [dvergr.model.providers :as providers]
             [dvergr.resource :as resource]
             [dvergr.room.registry :as registry]
@@ -964,6 +965,43 @@
             (d/discard (registry/lookup (:run/world result))))))
       (finally
         (d/close-room! room)))))
+
+(deftest llm-worker-enforces-dispatch-authority-and-returns-only-unused-units
+  (doseq [complete? [true false]]
+    (let [[room conn] (resource-test-room (keyword (str "dispatch-worker-" (random-uuid))))
+          called (atom 0)
+          team (roster/make-agent (roster/make-roster)
+                                  {:id :worker :model-policy {:provider :test :model "stub"}
+                                   :program {:kind :llm :max-model-steps 4}})]
+      (try
+        (resource/install-unit! room {:symbol resource/model-dispatches
+                                      :name "Dispatch admission" :precision 0})
+        (resource/mint! room {:id (random-uuid) :resources {resource/model-dispatches 3M}})
+        (with-redefs [providers/ensure-initialized! (constantly nil)
+                      chat-agent/run-agent-turn!
+                      (fn [chat-ctx _]
+                        (binding [gateway/*request-fn* (fn [_] (swap! called inc) {:status 200})]
+                          (gateway/request! {:url "https://model.test/responses"
+                                             :credentials (gateway/static-credentials
+                                                           :test {} #{"https://model.test"})}))
+                        (if complete?
+                          (do (chat-context/add-message! chat-ctx {:role :assistant :content "done"})
+                              :complete)
+                          :continue))]
+          (let [handle (binding [ec/*execution-context* (:ctx room)]
+                         (program/hire! room team :worker
+                                        {:task "bounded" :settlement :discard
+                                         :resources {resource/model-dispatches 2M}}))
+                finished (promise)]
+            (binding [ec/*execution-context* (:ctx room)]
+              ((program/owned-result-spin handle) #(deliver finished %) #(deliver finished %)))
+            (let [result (deref finished 30000 ::timeout)]
+              (is (= (if complete? :completed :failed) (:run/status result)))
+              (is (= (if complete? 1 2) @called))
+              (is (= {resource/model-dispatches (if complete? 2M 1M)} (resource/balance room)))
+              (is (= {} (resource/run-balance room (program/run-id handle))))
+              (is (= :discarded (:run/settlement-status result))))))
+        (finally (close-resource-test-room! room conn))))))
 
 (deftest llm-program-cancellation-aborts-the-live-turn
   (let [room (test-room :program-llm-cancel)

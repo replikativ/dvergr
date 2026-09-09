@@ -252,6 +252,47 @@ SCI exposes only `agent/balance` and the `:resources` argument to `hire!`. It
 does not expose connections, minting, arbitrary transfers, or a way to redirect
 `:parent-run`. Installation and minting remain trusted host operations.
 
+### Opt-in native model dispatch allowance
+
+The trusted host can install and provision a conserved `"model-dispatch"`
+coordinate, then allocate part of it with the existing `:resources` option:
+
+```clojure
+(resource/install-unit! room {:symbol resource/model-dispatches
+                              :name "Native model dispatch admission" :precision 0})
+(resource/mint! room {:id (random-uuid)
+                      :resources {resource/model-dispatches 20M}})
+;; In the room's Spindel context, with an existing LLM AgentDef:
+(agent/hire! team :researcher
+             {:task "Investigate the supplied evidence"
+              :resources {"model-dispatch" 8M}})
+```
+
+An AgentDef Run whose original allocation contains this coordinate spends one
+unit **before each native gateway dispatch**, including explicit authentication
+and transient-error retries. Main and compaction calls made by its supervised
+model worker use the same wallet. Kontor rejects concurrent overdrafts atomically;
+an empty balance does not disable enforcement. Exhaustion fails the Run rather
+than resuming it automatically. Unspent units return through normal Run cleanup.
+
+The unit buys admission, not a successful answer: a failed or ambiguous dispatch
+remains spent, as does one cancelled between debit and network handoff. Discarding
+a work world does not refund it. Cancellation observed before admission spends
+nothing. Receipts live in the control store and reference the Run's wallet.
+
+Governed calls reject redirects and require a non-redirecting HTTP client.
+Opaque DirectChat/CLI providers are rejected under this allowance because their
+internal dispatches are not observable here; native Codex subscription HTTP is
+supported. Runs without this coordinate retain their previous behavior.
+
+This counts gateway admissions, not transport-internal reconnects, tokens,
+elapsed time, heap, or provider charges. It is not an equal-token team budget.
+`"microUSD"` is still not automatically debited for model usage, and a zero-priced
+subscription does not consume a dollar ceiling. Token reservation, unknown-usage
+reconciliation and agent-spawned paid LLM children remain follow-up work; the
+existing paid-child restriction is unchanged. No new turn-based programming
+semantics or fork-local spending counter is introduced.
+
 ## Execution and world settlement
 
 Execution and settlement are independent durable axes. `:run/status` describes
@@ -755,5 +796,6 @@ than wrapping another harness. It preserves:
 `:roster/scope` is still portable policy data, not an enforced resource grant.
 The native interpreter enforces its concrete tool allowlist, model-step bound, and
 ChatContext spending ceiling, but does not pretend those are an affine resource
-split. A Kontor-backed admission/settlement interpreter should make declared
-resource vectors executable before scopes can delegate assets to child Runs.
+split. The opt-in native dispatch allowance above makes one resource coordinate
+executable at the gateway; token/cost reservation and reconciliation are still
+required before scopes can delegate paid model work to child Runs.
