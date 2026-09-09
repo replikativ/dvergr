@@ -104,3 +104,42 @@ regression test's reported counts as well as independent source verification.
 Next steps are held-out task variants, repeated model attempts and recursive
 repair/review workflows. Comparing models
 requires distributions of outcomes and resource use, not one successful repair.
+
+## Compare editing affordances
+
+`examples/coding_tool_comparison.clj` composes the existing APIs into a four-Run
+smoke comparison. Both candidates have the same model, common prompt, 180-second
+RSS environment, and 32-request runaway fuse. One receives only `clojure_eval`;
+the other also receives `clojure_edit` and `write_file`. The treatment includes
+their descriptions/context overhead and optional use, not just editor speed.
+The fixture's instruction to use the REPL is unchanged; the common AgentDef
+prompt permits all granted tools. Inspect actual tool usage before attributing
+any outcome to structured editing.
+
+```clojure
+(load-file "examples/coding_tool_comparison.clj")
+(def comparison
+  (coding-tool-comparison/plan
+   {:provider :codex-subscription :model "codex-subscription-luna"}))
+(def group (evaluation/cleanup-group))
+(def done (promise))
+(binding [ec/*execution-context* (:ctx room)]
+  (let [workflow (coding-tool-comparison/run room comparison group)]
+    (workflow #(deliver done {:result %}) #(deliver done {:error %}))))
+(deref done 0 nil)
+;; Once finished/cancelled, join detached cleanup before closing the Room:
+;; (evaluation/await-cleanups-for! room group)
+```
+
+The order is REPL → editing → editing → REPL, implemented as two serial ordinary
+experiments. Each block persists its own scorecard and certified Attempts;
+aggregate both blocks when reporting the two observations per candidate. No
+failure is retried or dropped. A certification/cleanup error can abort the
+remaining workflow; report incomplete cells rather than inventing receipts.
+
+The Run API does not currently enforce token caps. This example measures tokens
+and uses time plus the request fuse as limits; it must not be described as a
+token-budget-controlled comparison. Four observations cannot establish a
+ranking, significance, or a causal performance improvement. Log model resolution,
+actual calls/tools, errors, tokens, elapsed time and captured artifacts, then
+choose larger repeated or held-out experiments based on those observations.
