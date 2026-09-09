@@ -9,10 +9,24 @@
             [babashka.fs :as fs]
             [muschel.fs :as mfs]
             [dvergr.io.acquisition :as acquisition]
+            [org.replikativ.spindel.engine.core :as ec]
             [dvergr.sandbox.ns.doc :as doc])
   (:import [java.io File]))
 
 (declare fs-safe-resolve git-run* parse-porcelain-status parse-git-log)
+
+(defn install-http-fixture!
+  "Host-only world setup: install an immutable offline capability in the current
+   Spindel context before constructing candidate interpreters. Forks inherit it;
+   it is not a durable function serialization scheme. Reconstruct via WorldSetup.
+   Existing interpreters retain their installed transport. env contains dummy,
+   non-secret configuration for the simulated service."
+  [{:keys [id transport env] :as fixture}]
+  (when-not (and (uuid? id) (fn? transport) (map? env)
+                 (every? string? (concat (keys env) (vals env))))
+    (throw (ex-info "Invalid host HTTP fixture" {})))
+  (ec/swap-state! [::http-fixture] (constantly fixture))
+  id)
 
 (defn- audit!
   "Append an IO event to the audit log (no-op when log is nil)."
