@@ -825,7 +825,10 @@
   :execute (fn [{:keys [file_path form_type form_name operation new_source]}
                 {:keys [session-id] :as ctx}]
              (let [full-path (tool-path ctx file_path)
-                   op-keyword (keyword operation)
+                   op-keyword (case operation
+                                "insert_before" :insert-before
+                                "insert_after" :insert-after
+                                (keyword operation))
                    result (if (:filesystem ctx)
                             (if-let [source (workspace-read ctx file_path)]
                               (structural/edit-clojure-source source form_type form_name
