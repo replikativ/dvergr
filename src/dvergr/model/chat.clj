@@ -7,6 +7,7 @@
             [dvergr.model.gateway :as gateway]
             [dvergr.model.providers :as providers]
             [dvergr.model.registry :as registry]
+            [dvergr.resource :as resource]
             [hato.client :as hc]
             [jsonista.core :as json]
             [clojure.java.io :as io]
@@ -25,7 +26,7 @@
 (defn- get-http-client []
   (or *http-client*
       (hc/build-http-client {:connect-timeout 30000
-                             :redirect-policy :normal})))
+                             :redirect-policy (if resource/*model-scope* :never :normal)})))
 
 ;; ============================================================================
 ;; Retry Configuration
@@ -283,7 +284,11 @@
 
     ;; DirectChat providers bypass the HTTP+SSE path entirely
     (if (p/implements-direct-chat? provider)
-      (p/direct-chat provider messages opts)
+      (if resource/*model-scope*
+        (throw (ex-info "Dispatch-governed Runs require a native HTTP provider"
+                        {:type ::unsupported-dispatch-accounting
+                         :provider provider-key}))
+        (p/direct-chat provider messages opts))
 
       ;; Standard HTTP+SSE streaming path
       (let [{:keys [events close!]} (stream-chat provider model-def messages opts)

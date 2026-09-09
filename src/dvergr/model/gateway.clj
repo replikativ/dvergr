@@ -6,8 +6,10 @@
    and attach a Credentials implementation. The gateway validates the target,
    injects authentication at the last possible moment, and owns the one-shot
    unauthorized recovery path used by rotating credentials."
-  (:require [hato.client :as hc])
+  (:require [hato.client :as hc]
+            [dvergr.resource :as resource])
   (:import [java.io Closeable]
+           [java.net.http HttpClient HttpClient$Redirect]
            [java.net URI]))
 
 (defprotocol Credentials
@@ -86,6 +88,26 @@
                     (assoc :headers (merge headers (:headers auth))))
        :auth auth})))
 
+(defn- dispatch! [request]
+  (resource/admit-model-dispatch!)
+  (let [response (*request-fn* request)]
+    (when (and resource/*model-scope* (<= 300 (:status response) 399))
+      (close-body! response)
+      (throw (ex-info "Governed model dispatch does not follow redirects"
+                      {:type ::redirect-not-supported :status (:status response)})))
+    response))
+
+(defn- governed-client [request]
+  (if-not resource/*model-scope*
+    request
+    (let [client (or (:http-client request)
+                     (hc/build-http-client {:connect-timeout 30000 :redirect-policy :never}))]
+      (when-not (and (instance? HttpClient client)
+                     (= HttpClient$Redirect/NEVER (.followRedirects ^HttpClient client)))
+        (throw (ex-info "Governed model dispatch requires a non-redirecting HTTP client"
+                        {:type ::redirecting-client})))
+      (assoc request :http-client client))))
+
 (defn request!
   "Execute a trusted provider request.
 
@@ -94,12 +116,13 @@
    before retrying. Authentication headers are never returned in errors or
    telemetry by this layer."
   [request]
-  (let [{authorized :request auth :auth} (authorize request)
-        response (*request-fn* authorized)]
+  (let [request (governed-client request)
+        {authorized :request auth :auth} (authorize request)
+        response (dispatch! authorized)]
     (if (and (= 401 (:status response))
              (recover-auth! (:credentials request) request auth))
       (do
         (close-body! response)
         (let [{retry :request} (authorize request)]
-          (*request-fn* retry)))
+          (dispatch! retry)))
       response)))

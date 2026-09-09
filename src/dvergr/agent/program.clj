@@ -679,24 +679,27 @@
                  (start-worker!
                   supervisor
                   (fn []
-                    (chat-agent/run-agent-turn!
-                     chat-ctx
-                     {:provider (:provider model-spec)
-                      :model (:model model-spec)
+                    (binding [resource/*model-scope*
+                              (some-> (resource/model-scope control-room run-id)
+                                      (assoc :cancel? #(run/cancel-requested? run-id)))]
+                      (chat-agent/run-agent-turn!
+                       chat-ctx
+                       {:provider (:provider model-spec)
+                        :model (:model model-spec)
                         ;; The SAME normalized map defines both the model schema
                         ;; and execute-side authority. Empty means no tools.
-                      :tools tool-map
-                      :tool-ctx tool-ctx
-                      :cancel? (turn/cancel?-fn
-                                chat-ctx (:ctx work-room)
-                                (fn [] (run/cancel-requested? run-id)))
-                      :auto-compact? auto-compact?
-                      :compaction-model compaction-model
+                        :tools tool-map
+                        :tool-ctx tool-ctx
+                        :cancel? (turn/cancel?-fn
+                                  chat-ctx (:ctx work-room)
+                                  (fn [] (run/cancel-requested? run-id)))
+                        :auto-compact? auto-compact?
+                        :compaction-model compaction-model
                       ;; The existing single-exchange core still calls this
                       ;; trace field `turn-number`; semantically it is a model
                       ;; integration step, not a conversational turn.
-                      :turn-number model-step
-                      :run-id run-id})))
+                        :turn-number model-step
+                        :run-id run-id}))))
                  outcome (sp/await (worker-result-spin call))
                  budget (chat-context/get-budget chat-ctx)]
              (update-llm-metrics!
