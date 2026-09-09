@@ -53,6 +53,20 @@
         (is (:success r))
         (is (= {:body "saved" :receipt :receipt} (:value r)))))))
 
+(deftest quoted-source-writing-guidance-is-executable
+  (with-sandbox
+    (fn [sci-ctx ec]
+      (let [forms '[(defn generated [] "a quoted \"value\"")
+                    (clojure.test/deftest generated-test
+                      (clojure.test/is (= "a quoted \"value\"" (generated))))]
+            r (eval-in sci-ctx ec
+                       (str "(require 'clojure.test) "
+                            "(load-string (clojure.string/join \"\\n\" (map pr-str '"
+                            (pr-str forms) "))) (clojure.test/run-tests 'user)"))]
+        (is (:success r))
+        (is (= {:test 1 :pass 1 :fail 0 :error 0}
+               (select-keys (:value r) [:test :pass :fail :error])))))))
+
 (deftest failing-assertion-detail-reaches-the-sandbox-stdout
   (with-sandbox
     (fn [sci-ctx ec]
