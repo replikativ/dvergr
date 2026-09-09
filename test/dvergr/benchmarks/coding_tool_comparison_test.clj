@@ -33,7 +33,7 @@
   (let [room (d/make-room {:id :coding-comparison :store (memory/make)})
         calls (atom [])
         first-started (promise)
-        allow-first (sync/deferred)
+        allow-first (sync/create-deferred (:ctx room))
         group (evaluation/cleanup-group)
         plan (coding-tool-comparison/plan {:provider :test :model "stub"})]
     (try
