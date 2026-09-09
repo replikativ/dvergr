@@ -166,10 +166,13 @@ the code.
 ;; not eight tool calls.
 ```
 
-**SCI gotcha**: `*out*` isn't always bound in the agent sandbox; prefer
-returning values from your eval over `println`/`prn` for visibility.
-`(do (println "X") :ok)` will succeed but you won't see "X". Build a
-result map and return it instead.
+**REPL results**: in SCI, only the last form's value is returned. Wrap multiple
+forms in `(do ...)` for portability to native mode, which currently evaluates
+only its first top-level form. `println`/`prn`
+output is captured too, but prefer a small result map or vector when inspecting
+several things. Keep complete HTTP/intake responses in bindings before projecting
+fields: acquisition receipts are map entries, not Clojure metadata. Reuse those
+values rather than fetching the same page again to recover a discarded receipt.
 
 **What you can and can't create:**
 - ✅ **Rooms** — yes, freely via `dvergr.room/create!`. They land in the tree

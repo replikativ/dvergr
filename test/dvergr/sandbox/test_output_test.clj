@@ -37,6 +37,22 @@
   (binding [rtc/*execution-context* ec]
     (sandbox/eval-code sci-ctx code)))
 
+(deftest inspection-guidance-matches-evaluation-semantics
+  (with-sandbox
+    (fn [sci-ctx ec]
+      (let [r (eval-in sci-ctx ec
+                       "(def response {:body \"saved\" :dvergr/acquisition {:id :receipt}})
+                        (keys response) (meta response)
+                        (println \"visible\") :last")]
+        (is (:success r))
+        (is (= :last (:value r)))
+        (is (= "visible\n" (:stdout r))))
+      (let [r (eval-in sci-ctx ec
+                       "{:body (:body response)
+                         :receipt (get-in response [:dvergr/acquisition :id])}")]
+        (is (:success r))
+        (is (= {:body "saved" :receipt :receipt} (:value r)))))))
+
 (deftest failing-assertion-detail-reaches-the-sandbox-stdout
   (with-sandbox
     (fn [sci-ctx ec]

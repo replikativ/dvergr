@@ -3,6 +3,18 @@
             [clojure.test :refer [deftest is testing]]
             [dvergr.agent.prompt :as prompt]))
 
+(deftest repl-guidance-reaches-both-agent-profiles
+  (doseq [profile [:participant :workflow]]
+    (let [assembled (prompt/assemble-system-prompt
+                     "Research a task."
+                     {:profile profile :tools #{:clojure_eval} :isolation :sci
+                      :room-dir "/tmp/dvergr-prompt-test-no-workspace"
+                      :env-lookup (constantly nil)})]
+      (doseq [guidance ["only the LAST" "first top-level form" "output is also captured"
+                        ":dvergr/acquisition" ":description" "not metadata"
+                        "not proof that a quote supports a claim"]]
+        (is (str/includes? assembled guidance) (str profile " lacks " guidance))))))
+
 (deftest participant-profile-preserves-the-established-prompt
   (let [base "You are the room analyst."
         opts {:tools #{:shell}

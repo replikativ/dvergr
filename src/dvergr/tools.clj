@@ -582,6 +582,14 @@
    - You can require namespaces
    - Changes don't affect other sessions
 
+   Wrap multiple forms in (do ...) for portable sequential evaluation; only
+   the LAST value is returned. SCI also accepts unwrapped multiple forms;
+   native mode currently evaluates only the first top-level form.
+   Return a map or vector to inspect several things: {:keys (keys r) :receipt
+   (get-in r [:dvergr/acquisition :id])}. println/prn output is captured too,
+   but a small returned value is easier to reuse. Keep the original response
+   when projecting fields: receipts are ordinary map entries, not metadata.
+
    LARGE DATA — hold and reduce, don't dump. The printed result is truncated
    for context (~15K tokens), but that clips only what is PRINTED — the VALUE
    persists in the session. So for a fetched page/feed or a big file, capture
