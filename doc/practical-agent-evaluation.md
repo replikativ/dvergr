@@ -347,6 +347,21 @@ These receipts establish acquisition provenance, not whether a quotation
 supports a claim. A discovery evaluator must still verify the Run, request
 fingerprint, captured body and submitted evidence together.
 
+`dvergr.benchmarks.discovery-citations/verify` provides the first frozen-fixture
+check over that boundary. A host supplies an exact reference map and room/Run;
+the submitted answer names receipt UUIDs, URLs and complete evidence sentences.
+Only successful, captured GET responses from that scope can earn credit.
+Partial valid coverage earns partial reward; any invalid extra citation gates
+reward to zero. Foreign or nonexistent receipts cannot authorize artifact reads.
+The provider-free test uses synthetic businesses, a failed response and an
+irrelevant page. It checks real persisted receipts and managed artifact bodies,
+not an agent-reported fetch log.
+
+This helper checks exact plaintext fixtures, not arbitrary HTML or semantic
+entailment. It does not certify Run completion, execute searches, or constitute a
+live discovery benchmark; those belong to the enclosing Environment/Evaluator
+workflow. Its reference answers must remain host-owned.
+
 ## Port order driven by failures
 
 1. Complete scoped observation and expose it in the REPL/UI.
