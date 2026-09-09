@@ -6,6 +6,7 @@
             [clojure.edn :as edn]
             [datahike.api :as d]
             [dvergr.sandbox :as sandbox]
+            [dvergr.io.acquisition :as acquisition]
             [dvergr.agent.process :as proc]
             [dvergr.code.index :as idx]
             [dvergr.tools.structural :as structural]
@@ -302,12 +303,13 @@
             ;; The runtime, not the tool implementation, owns this field: an
             ;; untrusted/custom tool cannot claim broader authority by putting
             ;; a fabricated receipt in its result.
-            (assoc (-> (if-let [exec-fn (:execute tool)]
-                         (exec-fn input ctx)
-                         (when-let [handler-fn (:handler tool)]
-                           (handler-fn input)))
-                       (compaction/truncate-tool-result))
-                   :authorization decision)
+            (binding [acquisition/*scope* (acquisition/tool-scope ctx)]
+              (assoc (-> (if-let [exec-fn (:execute tool)]
+                           (exec-fn input ctx)
+                           (when-let [handler-fn (:handler tool)]
+                             (handler-fn input)))
+                         (compaction/truncate-tool-result))
+                     :authorization decision))
             (catch Exception e
               {:type :error
                :error (.getMessage e)
@@ -331,7 +333,7 @@
   [tool-calls ctx]
   (let [futures (mapv (fn [{:keys [id name input]}]
                         {:id id
-                         :future (future (execute name input ctx))})
+                         :future (future (execute name input (assoc ctx :tool-use-id id)))})
                       tool-calls)]
     (mapv (fn [{:keys [id future]}]
             {:id id

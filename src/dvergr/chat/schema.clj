@@ -13,6 +13,7 @@
   (:require [datahike.api :as d]
             [taoensso.telemere :as tel]
             [dvergr.kb.schema :as kb]
+            [dvergr.io.acquisition :as acquisition]
             [dvergr.chat.tool-schema :as tool-schema]))
 
 ;; ============================================================================
@@ -744,6 +745,11 @@
     :db/cardinality :db.cardinality/one
     :db/doc "Immutable CAS reference for exact EnvironmentDef, AgentDef, receipt, and evidence"}
 
+   {:db/ident :attempt/payload-ref
+    :db/valueType :db.type/store-ref
+    :db/cardinality :db.cardinality/one
+    :db/doc "GC-tracked immutable exact Attempt payload"}
+
    {:db/ident :attempt/payload-codec
     :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/one}
@@ -896,6 +902,10 @@
 
    {:db/ident :scorecard/payload-codec
     :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :scorecard/payload-ref
+    :db/valueType :db.type/store-ref
     :db/cardinality :db.cardinality/one}
 
    {:db/ident :scorecard/experiment-id
@@ -1441,6 +1451,7 @@
   (vec (concat chat-schema
                message-schema
                run-schema
+               acquisition/schema
                attempt-schema
                scorecard-schema
                attention-schema

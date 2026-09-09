@@ -72,10 +72,19 @@
                                    :program {:kind :scripted :reply reply}})]
       (try
         (binding [ec/*execution-context* (:ctx room)]
-          (let [result @(evaluation/evaluate
-                         room team :fixture
-                         (evidence/definition)
-                         (evidence/evaluator))
+          (let [completion (promise)
+                computation (evaluation/evaluate room team :fixture
+                                                 (evidence/definition)
+                                                 (evidence/evaluator))
+                ;; Observe asynchronous completion; never block by dereferencing
+                ;; the Spin. Only the host test runner waits on this barrier.
+                _ (computation #(deliver completion {:result %})
+                               #(deliver completion {:error %}))
+                outcome (deref completion 200000 ::timeout)
+                _ (when (= ::timeout outcome)
+                    (throw (ex-info "Evaluation did not complete" {})))
+                _ (when-let [error (:error outcome)] (throw error))
+                result (:result outcome)
                 receipt (:attempt-receipt result)]
             (is (= :completed (:attempt/status receipt)))
             (is (= reward (:attempt/reward receipt)))

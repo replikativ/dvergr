@@ -289,6 +289,64 @@ validation, strict output parsing, scripted certification, persistence and
 cleanup. This small fixture is not a general entailment judge, competitor
 discovery benchmark, deployment audit or validation of market demand.
 
+## HTTP acquisition receipts
+
+Tool-driven sandbox HTTP requests in a Datahike-backed control Room record
+Run-correlated acquisition metadata before executing the request and its outcome
+afterward. A receipt also identifies the tool call and execution world. Execution
+audit stays in the control Room when a speculative work world is discarded.
+Receipt reads are host-only and require the caller to authorize Room/Run access;
+`dvergr.io.acquisition/list-for-run` reads a bounded prefix in Run-index order.
+An in-memory RoomStore or a direct HTTP call outside a tool invocation does not
+automatically acquire this durable audit capability.
+
+Response capture is off by default. A host can opt in on its Room:
+
+```clojure
+(swap! (:meta room) assoc :http-capture
+       {:allowed-origins #{"https://example.org"} :max-bytes 65536})
+```
+
+This stores eligible credential-scrubbed text responses in the RoomStore's
+content-addressed artifact store. By default, payload bytes live in that room
+database's Konserve store, addressed by `datahike.blob/blob-id`. The receipt's
+`:acquisition/body-store-ref` is `:db.type/store-ref`: Datahike tracks its
+reachability through branches and retained history. Responses expose a `:dvergr/acquisition`
+envelope only after outcome persistence succeeds. The metadata records origin,
+not raw request paths, queries, headers or request bodies. A deterministic
+`request-key` over pre-injection URL/method/query parameters permits host-side
+citation matching; it is not encryption. Captured response text can itself be
+sensitive, so enable capture only for sources the host intends to retain.
+Redirects are not followed automatically.
+
+`:max-bytes` limits each stored body, not network bytes, total Run storage or
+HTTP transport allocation. The HTTP client still buffers its response; transport
+and cumulative resource budgets are separate follow-ups. A request left
+`:started` after interruption has an unknown outcome. Persistence failures do
+not retry the HTTP effect, and an outcome-recording failure must not be treated
+as proof that the request never happened. Room deletion retracts receipt
+projections; Datahike GC can reclaim managed bodies once no retained branch or
+history references them, subject to its normal retention and writer-age policy.
+
+Attempts and Scorecards use the same managed publication path through
+`:attempt/payload-ref` and `:scorecard/payload-ref`. `artifact/publish-value!`
+holds Datahike's canonical-store write guard from the binary write through the
+referencing transaction. Its host callback must finish the transaction before
+returning; it must not return an unfinished future or Spin. This is a storage
+commit boundary, not a new agent scheduling primitive.
+
+Existing string `payload-blob` / `body-ref` attributes retain their types; old
+Attempt/Scorecard payloads remain readable from the legacy global blob store.
+No existing records or historical blobs are rewritten. Explicit legacy artifact
+store injection still uses that unmanaged path and does not gain automatic GC.
+Failed publications leave collectable orphans: reference-only persistence dead
+letters are diagnostic records, not self-contained replay bundles. Recovery
+must republish the exact payload before retrying the domain write.
+
+These receipts establish acquisition provenance, not whether a quotation
+supports a claim. A discovery evaluator must still verify the Run, request
+fingerprint, captured body and submitted evidence together.
+
 ## Port order driven by failures
 
 1. Complete scoped observation and expose it in the REPL/UI.
