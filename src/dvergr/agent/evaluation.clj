@@ -20,7 +20,7 @@
             [org.replikativ.spindel.spin.core :as spin-core]
             [org.replikativ.spindel.spin.sync :as sync]))
 
-(defrecord Evaluator [ref observe verify])
+(defrecord Evaluator [ref observe verify capture])
 (defrecord WorldSetup [ref prepare])
 
 (defonce ^:private pending-tasks (atom {}))
@@ -161,8 +161,18 @@
    EnvironmentDef verifier reference. `observe` receives durable execution
    facts and returns portable evidence. `verify` receives the EnvironmentDef
    plus that evidence and returns `{:checks {keyword boolean} :reward number}`.
+   Optional `capture` receives `{:room control-room :world/room work-room
+   :run-id uuid :environment EnvironmentDef}` after candidate work and owned
+   resource cleanup quiesce, before world settlement (including failure and
+   cancellation). It must perform bounded, read-only collection of portable
+   data, not execute candidate source or depend on already-closed resources.
+   Its result is passed to `observe` as `:execution/evidence`; the observer must
+   include it in its returned map to persist it. Capture errors fail
+   certification, not the candidate Run. Capture is supervised cleanup and
+   must terminate promptly. Capture time counts toward the Run deadline, but
+   cancellation does not interrupt cleanup.
    Evaluators are deliberately not portable and are never exposed to SCI."
-  [{:keys [id version basis observe verify]
+  [{:keys [id version basis observe verify capture]
     :or {version 1}}]
   (when-not (keyword? id)
     (throw (ex-info "Evaluator :id must be a keyword"
@@ -176,12 +186,15 @@
   (when-not (fn? verify)
     (throw (ex-info "Evaluator :verify must be a function"
                     {:type ::invalid-verifier})))
+  (when-not (or (nil? capture) (fn? capture))
+    (throw (ex-info "Evaluator :capture must be a function"
+                    {:type ::invalid-capture})))
   (when-not (roster/data-value? basis)
     (throw (ex-info "Evaluator :basis must contain only portable data"
                     {:type ::invalid-evaluator-basis :basis basis})))
   (->Evaluator (cond-> {:verifier/id id :verifier/version version}
                  (some? basis) (assoc :verifier/basis basis))
-               observe verify))
+               observe verify capture))
 
 (defn make-world-setup
   "Create a process-local trusted preparer for one exact world setup.
@@ -347,12 +360,13 @@
           (recur (ex-cause error))))))
 
 (defn- certification-candidate
-  [{:keys [room world-room setup-evidence definition evaluator agent run-id
+  [{:keys [room world-room setup-evidence execution-evidence definition evaluator agent run-id
            result durable started-at started-nanos timeout?]}]
   (let [evidence ((:observe evaluator)
                   {:room room
                    :world/room world-room
                    :setup/evidence setup-evidence
+                   :execution/evidence execution-evidence
                    :environment definition
                    :run-id run-id
                    :result result
@@ -448,16 +462,38 @@
                         (seq resources) (assoc :resources resources)
                         (seq model-limits) (assoc :limits model-limits))
             setup-evidence (atom nil)
+            ;; Per-invocation host handoff, not another world-state store.
+            ;; Portable captured evidence enters the durable Attempt.
+            captured (atom ::pending)
             prepare-world!
-            (when world-setup
+            (when (or world-setup (:capture evaluator))
               (fn [context]
-                (let [evidence ((:prepare world-setup)
-                                (assoc context :environment definition))]
-                  (when-not (roster/data-value? evidence)
-                    (throw (ex-info "World setup evidence must be portable"
-                                    {:type ::non-portable-setup-evidence
-                                     :setup (:ref world-setup)})))
-                  (reset! setup-evidence evidence))))
+                (when-let [capture (:capture evaluator)]
+                  ;; Register first: supervisor cleanup is LIFO, so capture
+                  ;; sees the final substrate after other resource cleanup.
+                  ((:register-cleanup! context)
+                   (fn []
+                     (reset! captured
+                             (try
+                               (let [evidence
+                                     (capture {:room room
+                                               :world/room (:room context)
+                                               :run-id (:run/id context)
+                                               :environment definition})]
+                                 (when-not (roster/data-value? evidence)
+                                   (throw (ex-info "Captured evidence must be portable"
+                                                   {:type ::invalid-captured-evidence})))
+                                 {:ok evidence})
+                               (catch Throwable error {:error error})))
+                     nil)))
+                (when world-setup
+                  (let [evidence ((:prepare world-setup)
+                                  (assoc context :environment definition))]
+                    (when-not (roster/data-value? evidence)
+                      (throw (ex-info "World setup evidence must be portable"
+                                      {:type ::non-portable-setup-evidence
+                                       :setup (:ref world-setup)})))
+                    (reset! setup-evidence evidence)))))
             handle (program/hire-prepared-in! room room team agent-ref hire-opts
                                               prepare-world!)
             timed-out ::timed-out
@@ -555,12 +591,19 @@
                  (binding [ec/*execution-context* (:ctx room)
                            ec/*spin-id* nil]
                    (try
-                     (let [{:keys [evidence receipt]}
+                     (let [_ (when (and (:capture evaluator)
+                                        (not (and (map? @captured)
+                                                  (contains? @captured :ok))))
+                               (throw (ex-info "Execution evidence capture failed"
+                                               {:type ::capture-failed :run/id run-id}
+                                               (:error @captured))))
+                           {:keys [evidence receipt]}
                            (certification-candidate
                             {:room room :definition definition
                              :evaluator evaluator :agent agent :run-id run-id
                              :world-room fork
                              :setup-evidence @setup-evidence
+                             :execution-evidence (:ok @captured)
                              :result result :durable durable
                              :started-at started-at :started-nanos started-nanos
                              :timeout? timeout?})

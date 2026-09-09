@@ -105,6 +105,43 @@ context/tool discovery, orchestration, effect execution, verification,
 settlement, delivery, or external-system drift. A failed setup must not be
 reported as deficient model reasoning.
 
+### Evidence from unsuccessful coding attempts
+
+A failed or cancelled Run discards its work world after supervised execution
+and cleanup stop. The evaluator's ordinary `:observe` therefore cannot assume
+that `:world/room` still exists. Use the optional host-only `:capture` callback
+to snapshot selected source/test files before settlement, on successful and
+unsuccessful execution alike. It receives the exact work Room, control Room,
+Run ID and EnvironmentDef, and runs after other owned resource cleanup.
+
+The callback must be a bounded, read-only collector, not a test runner. Check
+file sizes before reading, select explicit paths, and return portable data or
+artifact references. Do not fall back to reading the parent workspace when a
+candidate file is missing. Verify saved source separately in a clean,
+resource-bounded interpreter; candidate-authored test results are diagnostic
+evidence, not the trusted score.
+
+```clojure
+(evaluation/make-evaluator
+ {:id :coding/checks :version 1 :basis fixture-and-checks-hash
+  ;; Host-supplied bounded file collector, not an SCI capability.
+  :capture (fn [{work-room :world/room}]
+             (capture-selected-files work-room))
+  :observe (fn [{:keys [default execution/evidence]}]
+             (assoc default :files evidence))
+  :verify verify-saved-source})
+```
+
+The observer must include captured data in its returned evidence map for it to
+be persisted in the Attempt. A thrown capture error or non-portable capture
+result prevents certification and uses the existing uncertified-world cleanup;
+it does not rewrite the candidate Run as a capture failure. Setup failures
+still produce no Attempt. Capture time counts toward the total Run deadline,
+but cleanup must finish before disposal, even after cancellation. Consequently
+capture must terminate promptly and must not depend on live resources already
+closed by cleanup. This facility preserves diagnostics; it does not introduce
+another world retention, forking, or settlement policy.
+
 The first environment, `:business/renewal-risk-brief-v1`, is deliberately small.
 It requires a model to construct sales and support specialists, join evidence,
 inspect its own execution tree, and produce an exact risk brief while unrelated
