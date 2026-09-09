@@ -99,6 +99,19 @@
    'java.time.format.DateTimeFormatter java.time.format.DateTimeFormatter
    'java.time.temporal.ChronoUnit java.time.temporal.ChronoUnit
    'java.util.UUID java.util.UUID
+   ;; Keep URI data operations, but never produce URL objects: their ordinary
+   ;; hash/equality methods can resolve DNS even without explicit URL interop.
+   'java.net.URI
+   {:class java.net.URI
+    :closed true
+    :static-methods {'create true}
+    :instance-methods
+    (zipmap '[resolve normalize relativize parseServerAuthority
+              getScheme getAuthority getRawAuthority getHost getPort
+              getUserInfo getRawUserInfo getPath getRawPath getQuery getRawQuery
+              getFragment getRawFragment getSchemeSpecificPart getRawSchemeSpecificPart
+              isAbsolute isOpaque toString toASCIIString equals hashCode compareTo]
+            (repeat true))}
    'java.util.Date java.util.Date})
 
 (def ^:private core-extras
@@ -877,6 +890,18 @@
        "with a task string) only when each run needs your judgment. To publish a STATIC SITE for "
        "this room, write `app/index.html` (+ assets under `app/`) in your "
        "workspace — served at `/apps/<room-slug>/`.\n\n"
+       "**Editing and testing Clojure.** Prefer `slurp`/`spit` and small REPL "
+       "expressions for source edits. Generate new forms with `pr-str` on quoted "
+       "data rather than hand-escaping Clojure inside strings. After saving, "
+       "`(require 'my.ns :reload)` reloads your workspace code. Require "
+       "`clojure.test` separately WITHOUT `:reload`: sandbox-provided namespaces "
+       "cannot be replaced. `test/` is not a source root; use "
+       "`(load-string (slurp \"test/my_test.clj\"))`, then "
+       "`(clojure.test/run-tests 'my-test)`. Inspect `:fail` and `:error` in the "
+       "summary: successful evaluation alone does not mean tests passed. "
+       "`java.net.URI` supports immutable URI parsing/resolution, e.g. "
+       "`(str (.resolve (java.net.URI. \"https://example.org/blog/\") \"feed.xml\"))`. "
+       "`toURL` is unavailable; fetching uses the HTTP capability.\n\n"
        "**Reactive agent programs.** `dvergr.agent` provides immutable rosters "
        "and Run-backed execution; `agent/environment` creates a content-addressed "
        "task/verifier/policy definition without starting an attempt. Use the exact Spindel namespaces: "
