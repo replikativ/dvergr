@@ -362,6 +362,28 @@ entailment. It does not certify Run completion, execute searches, or constitute 
 live discovery benchmark; those belong to the enclosing Environment/Evaluator
 workflow. Its reference answers must remain host-owned.
 
+For variable-query experiments, `dvergr.benchmarks.frozen-web/transport`
+compiles immutable `{url {:title text :body text}}` pages into an offline HTTP
+function. The host installs it with
+`(dvergr.sandbox.ns.io/add-http-ns! sci-ctx :fixture-transport transport)`.
+It accepts the Brave search endpoint and returns its JSON response shape;
+ranking uses distinct lexical overlap with stable URL tie-breaking, not Brave's
+production ranking. Queries may vary; the corpus and algorithm stay fixed.
+Page GETs return exact fixture text. Unsupported options/methods and unknown
+URLs return HTTP errors without DNS or live-network fallback.
+
+This namespace-local capability contains no mutable replay cursor. It is safe
+to share between interpreter forks, but newly constructed interpreters need
+explicit installation; this does not yet wire nested-room setup automatically.
+Use a fake `BRAVE_API_KEY` in the fixture's sandbox environment to exercise the
+existing intake without credentials. Domain checks still apply. With an active
+acquisition scope, each call creates a fresh receipt; successful transport
+responses (including HTTP errors) carry a content-derived
+`:acquisition/fixture-id`. Captured bodies still require host capture policy.
+Simulated acquisitions must not be represented as live observations or billed
+as actual provider usage. This slice does not add automatic accounting charges,
+model-response replay, or the complete discovery Environment/Evaluator.
+
 ## Port order driven by failures
 
 1. Complete scoped observation and expose it in the REPL/UI.
