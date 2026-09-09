@@ -74,6 +74,33 @@ stub provider exercises the same tool/world/capture path in tests; it does not
 measure model reasoning. The checker has a bounded SCI evaluation window, not a
 separate process/heap boundary. Do not treat it as an adversarial code runner.
 
-Next steps are the RSS reference-resolution fixture, held-out task variants,
-repeated model attempts and recursive repair/review workflows. Comparing models
+## RSS reference-resolution fixture
+
+`dvergr.benchmarks.rss` provides the same `definition`, `world-setup`, and
+`evaluator` entry points. Substitute those constructors in the example above.
+It packages a pinned, Apache-licensed intake source snapshot with a historical
+relative-URL bug; it does not modify production intake code.
+
+Setup resets `/dvergr/intake/rss.clj`, `/test/rss_repair_test.clj`, and a labelled
+stub at `/dvergr/intake/core.clj` in the candidate fork. The stub's `fetch-text`
+returns an error until a test supplies HTML/XML with `with-redefs`. Verification
+reconstructs the stub independently, so changing that dependency cannot fix
+the submitted RSS source. Source and test files are captured as in the
+permutation fixture; the parent dependency is not overwritten.
+
+There are 18 explicit URL cases covering document-relative paths, dot segments,
+scheme-relative links, absolute references, ports, encoded paths, queries and
+fragments. Four further checks cover fetch errors, fallback probing, RSS
+parsing/count limits, and Atom title/link/category extraction. The snapshot has
+an unrelated empty-string fallback issue for Atom summaries/dates; these fields
+are deliberately outside this URL-repair task. This fixture exercises the
+real sandbox XML parser but not production HTTP acquisition.
+
+Deterministic lifecycle tests distinguish unchanged source (completed, reward
+zero), repaired source (completed, reward one), and provider failure after
+repair (failed, reward zero, artifacts retained). They check the authored
+regression test's reported counts as well as independent source verification.
+
+Next steps are held-out task variants, repeated model attempts and recursive
+repair/review workflows. Comparing models
 requires distributions of outcomes and resource use, not one successful repair.
