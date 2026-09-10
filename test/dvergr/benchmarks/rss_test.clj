@@ -70,9 +70,10 @@
                     "(spit " (pr-str rss/test-path) " " (pr-str regression-source) ") "
                     "(require 'dvergr.intake.rss :reload) "
                     "(load-string (slurp " (pr-str rss/test-path) ")) "
-                    "(clojure.test/run-tests 'rss-repair-test) "
+                    "(let [result (clojure.test/run-tests 'rss-repair-test)] "
                     (when (= :scaffold-changed variant)
-                      (str "(spit " (pr-str rss/dependency-path) " \"restored upstream dependency\")")))]
+                      (str "(spit " (pr-str rss/dependency-path) " \"restored upstream dependency\") "))
+                    "result)")]
       (try
         (binding [ec/*execution-context* (:ctx room)]
           (ygg/register! (gy/create conn {:system-name "room-repo-rss-test"}))
