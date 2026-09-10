@@ -82,19 +82,21 @@
        "Write/run clojure.test regressions at " test-path "; load tests using load-string/slurp "
        "rather than reloading clojure.test. The fixture replaces dvergr.intake.core/fetch-text "
        "with an explicit offline stub: use with-redefs to supply HTML/XML bodies or {:error ...} "
-       "for each test. Do not change the stub to fix the task; verification reconstructs it. "
+       "for each test. Keep /dvergr/intake/core.clj byte-for-byte unchanged, including at completion. "
+       "The stub is intentional fixture scaffolding, even if Git shows it as modified; do not restore it from HEAD. "
+       "Verification reconstructs it independently and checks that your saved stub is unchanged. "
        "A fresh SCI interpreter verifies saved RSS source with 18 public URL cases and "
        "error/fallback/RSS/Atom regressions, not your final prose or REPL definitions. "
        "Finish with your counterexample, change summary and test results."))
 
 (def manifest
-  {:fixture/version 1 :source/repository "https://github.com/replikativ/dvergr-sandbox"
+  {:fixture/version 2 :source/repository "https://github.com/replikativ/dvergr-sandbox"
    :source/commit "25436365b401b928fc8bebf295afe017cd9c9a45"
    :source/path "dvergr/intake/rss.clj" :source/hash (hasch/uuid original-source)
    :dependency/hash (hasch/uuid dependency-source)
    :runtime/profile :dvergr-sci-closed-uri-v1
-   :checks/version 1 :checks/hash (hasch/uuid [cases check-expression])
-   :capture/paths [source-path test-path] :capture/max-file-bytes 32768
+   :checks/version 2 :checks/hash (hasch/uuid [cases check-expression :dependency-unchanged? dependency-source])
+   :capture/paths [source-path test-path dependency-path] :capture/max-file-bytes 32768
    :verification/timeout-ms 3000})
 (def basis (hasch/uuid [manifest task]))
 (def setup-ref {:setup/id :coding/rss :setup/version 1 :setup/basis basis})
@@ -151,12 +153,15 @@
   (evaluation/make-evaluator
    {:id :coding/rss :version 1 :basis basis
     :capture (fn [{:keys [world/room]}]
-               (workspace/capture room [source-path test-path] 32768))
+               (workspace/capture room [source-path test-path dependency-path] 32768))
     :observe (fn [{:keys [default execution/evidence result]}]
                (assoc default :artifacts evidence :fixture/basis basis
                       :completed? (= :completed (:run/status result))))
     :verify (fn [_ evidence]
               (let [file (get-in evidence [:artifacts :files source-path])
+                    dependency (get-in evidence [:artifacts :files dependency-path])
                     checks (assoc (check-source (when (= :ok (:status file)) (:source file)))
+                                  :dependency-unchanged? (and (= :ok (:status dependency))
+                                                              (= dependency-source (:source dependency)))
                                   :completed? (true? (:completed? evidence)))]
                 {:checks checks :reward (if (every? true? (vals checks)) 1.0 0.0)}))}))
