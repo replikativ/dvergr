@@ -85,8 +85,17 @@ Setup resets `/dvergr/intake/rss.clj`, `/test/rss_repair_test.clj`, and a labell
 stub at `/dvergr/intake/core.clj` in the candidate fork. The stub's `fetch-text`
 returns an error until a test supplies HTML/XML with `with-redefs`. Verification
 reconstructs the stub independently, so changing that dependency cannot fix
-the submitted RSS source. Source and test files are captured as in the
-permutation fixture; the parent dependency is not overwritten.
+the submitted RSS source. Fixture version 2 also captures the dependency and
+requires its exact original text at completion (`:dependency-unchanged?`). Missing,
+unreadable or oversized dependency captures fail that check. The task explicitly
+identifies the stub as intentional scaffolding: do not restore it from Git HEAD
+even if it appears as a working-tree modification. Source, tests and dependency
+are captured with the same per-file bounds; the parent dependency is not overwritten.
+
+This changes the fixture basis and checks version. Historical version-1 Attempts
+retain their original meaning: functional success did not imply scaffold
+preservation. This is a final-state check, not a prohibition on every intermediate
+write or a complete audit of unrelated workspace paths.
 
 There are 18 explicit URL cases covering document-relative paths, dot segments,
 scheme-relative links, absolute references, ports, encoded paths, queries and

@@ -56,7 +56,7 @@
        "(:url (first (rss/discover-feeds \"https://example.org/blog/\")))))))\n"))
 
 (deftest rss-repair-through-real-sci-tools-and-disposal
-  (doseq [variant [:unchanged :repaired :failed]]
+  (doseq [variant [:unchanged :repaired :failed :scaffold-changed]]
     (let [{:keys [conn close!]} (gfs/memory-repository! {:name "rss-coding-run"})
           room (d/make-room {:id :rss-coding-run :store (memory/make)})
           source (if (= :unchanged variant) rss/original-source repaired-source)
@@ -70,7 +70,10 @@
                     "(spit " (pr-str rss/test-path) " " (pr-str regression-source) ") "
                     "(require 'dvergr.intake.rss :reload) "
                     "(load-string (slurp " (pr-str rss/test-path) ")) "
-                    "(clojure.test/run-tests 'rss-repair-test)")]
+                    "(let [result (clojure.test/run-tests 'rss-repair-test)] "
+                    (when (= :scaffold-changed variant)
+                      (str "(spit " (pr-str rss/dependency-path) " \"restored upstream dependency\") "))
+                    "result)")]
       (try
         (binding [ec/*execution-context* (:ctx room)]
           (ygg/register! (gy/create conn {:system-name "room-repo-rss-test"}))
@@ -109,6 +112,9 @@
                     (str @tool-result))
                 (is (= source (get-in persisted [:attempt/evidence :artifacts :files rss/source-path :source])))
                 (is (= regression-source (get-in persisted [:attempt/evidence :artifacts :files rss/test-path :source])))
+                (is (= (not= :scaffold-changed variant) (:dependency-unchanged? (:attempt/checks receipt))))
+                (is (= (if (= :scaffold-changed variant) "restored upstream dependency" rss/dependency-source)
+                       (get-in persisted [:attempt/evidence :artifacts :files rss/dependency-path :source])))
                 (is (nil? (registry/lookup (get-in result [:run/result :run/world]))))
                 (is (nil? (fs/stat (g/filesystem) rss/source-path)))
                 (is (nil? (fs/stat (g/filesystem) rss/test-path)))
@@ -118,3 +124,15 @@
           (evaluation/await-cleanups! room)
           (d/close-room! room)
           (close!))))))
+
+(deftest scaffold-capture-fails-closed
+  (let [verify (:verify (rss/evaluator))]
+    (with-redefs [rss/check-source (constantly {:evaluated? true})]
+      (doseq [dependency [nil {:status :missing} {:status :size-rejected}
+                          {:status :ok :source "changed"}
+                          {:status :unreadable :source rss/dependency-source}]]
+        (let [result (verify (rss/definition)
+                             {:completed? true
+                              :artifacts {:files {rss/dependency-path dependency}}})]
+          (is (false? (get-in result [:checks :dependency-unchanged?])))
+          (is (= 0.0 (:reward result))))))))
