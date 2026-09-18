@@ -99,19 +99,51 @@
   [text]
   (str/replace text tool-result-pattern ""))
 
+(def ^:private bare-call-pattern
+  "A whole response that is only a JSON object, optionally fenced."
+  #"(?s)\A\s*(?:```(?:json)?\s*)?(\{.*\})\s*(?:```)?\s*\z")
+
+(defn- bare-tool-call
+  "Recover a tool call the model emitted without its <tool_use> wrapper.
+
+   Only a response consisting of exactly one JSON object with a string
+   `name` naming an OFFERED tool and a map (or absent) `input` qualifies.
+   Anything else stays text: prose that merely contains JSON, unknown names,
+   or extra keys are never executed."
+  [text tool-names]
+  (when-let [[_ json-str] (re-matches bare-call-pattern text)]
+    (let [parsed (try (json/read-value json-str json/keyword-keys-object-mapper)
+                      (catch Exception _ nil))]
+      (when (and (map? parsed)
+                 (string? (:name parsed))
+                 (contains? tool-names (:name parsed))
+                 (every? #{:name :input} (keys parsed))
+                 (or (nil? (:input parsed)) (map? (:input parsed))))
+        (tel/log! {:level :info :id :claude-code/bare-tool-call-recovered
+                   :data {:name (:name parsed)}}
+                  "Recovered unwrapped tool call")
+        {:id (str "tc_" (java.util.UUID/randomUUID))
+         :name (:name parsed)
+         :input (or (:input parsed) {})}))))
+
 (defn- parse-tool-calls
   "Parse <tool_use> blocks from response text.
    Strips hallucinated <tool_result> blocks first to avoid matching old content.
-   Deduplicates file-writing tools by path (last writer wins).
+   Deduplicates file-writing tools by path (last writer wins). When no block
+   is present, a response that is solely one well-formed call of an offered
+   tool is recovered (see `bare-tool-call`).
    Returns {:text stripped-text, :tool-calls [{:id :name :input}]}."
-  [text]
+  ([text] (parse-tool-calls text #{}))
+  ([text tool-names]
   (if (str/blank? text)
     {:text "" :tool-calls nil}
     (let [;; Strip hallucinated tool_results FIRST — they may contain old tool_use blocks
           cleaned (clean-response-text text)
           matches (re-seq tool-call-pattern cleaned)]
       (if (empty? matches)
-        {:text (str/trim cleaned) :tool-calls nil}
+        (if-let [call (bare-tool-call cleaned tool-names)]
+          {:text "" :tool-calls [call]}
+          {:text (str/trim cleaned) :tool-calls nil})
         (let [raw-calls
               (into []
                     (comp
@@ -142,7 +174,7 @@
                            (str/replace tool-call-pattern "")
                            str/trim)]
           {:text stripped
-           :tool-calls (when (seq tool-calls) tool-calls)})))))
+           :tool-calls (when (seq tool-calls) tool-calls)}))))))
 
 ;; ============================================================================
 ;; Model Mapping
@@ -356,7 +388,8 @@
                 raw-content (or (:result result-event) "")
                 ;; Parse tool calls from response text
                 {:keys [text tool-calls]} (if (seq tools)
-                                            (parse-tool-calls raw-content)
+                                            (parse-tool-calls raw-content
+                                                              (set (keep :name tools)))
                                             {:text raw-content :tool-calls nil})]
             {:content text
              :tool-calls tool-calls

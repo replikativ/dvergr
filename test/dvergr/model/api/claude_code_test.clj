@@ -113,3 +113,24 @@
       (is (not= ::timeout outcome))
       (is (= "callback failed" (ex-message throwable)))
       (is (false? (.isAlive ^Process process))))))
+
+(deftest unwrapped-tool-calls-are-recovered-only-when-unambiguous
+  (let [parse #(@#'claude-code/parse-tool-calls %1 #{"cancel_pending_order"})
+        call "{\"name\":\"cancel_pending_order\",\"input\":{\"order_id\":\"#W1\",\"reason\":\"ordered by mistake\"}}"]
+    (testing "a response that is solely one offered call becomes a tool call"
+      (let [{:keys [text tool-calls]} (parse call)]
+        (is (= "" text))
+        (is (= [["cancel_pending_order" {:order_id "#W1" :reason "ordered by mistake"}]]
+               (mapv (juxt :name :input) tool-calls))))
+      (is (= "cancel_pending_order"
+             (-> (parse (str "```json\n" call "\n```")) :tool-calls first :name))))
+    (testing "everything else stays text"
+      (doseq [text [(str "Here is the call: " call)
+                    "{\"name\":\"delete_everything\",\"input\":{}}"
+                    "{\"name\":\"cancel_pending_order\",\"input\":{},\"extra\":1}"
+                    "{\"name\":\"cancel_pending_order\",\"input\":\"x\"}"
+                    "{\"order_id\":\"#W1\"}"
+                    "{not json}"]]
+        (is (nil? (:tool-calls (parse text))) text)))
+    (testing "wrapped calls keep precedence"
+      (is (= 1 (count (:tool-calls (parse (str "<tool_use>\n" call "\n</tool_use>")))))))))

@@ -229,6 +229,21 @@
     :pricing {:input 0.75 :output 4.50 :cache-read 0.075}
     :quirks {}}
 
+   ;; ── OpenAI GPT-4.1 ────────────────────────────────────────────────
+   ;; Non-reasoning. Registered because tau2-bench's published results use
+   ;; gpt-4.1 (temperature 0) as the user simulator and NL-assertion judge.
+   "gpt-4.1"
+   {:id "gpt-4.1"
+    :name "GPT-4.1"
+    :provider :openai
+    :api-type :openai-chat
+    :capabilities #{:tools :vision :streaming :system-prompt :cache-control}
+    :context 1047576
+    :max-output 32768
+    :instruction-role :system
+    :pricing {:input 2.0 :output 8.0 :cache-read 0.50}
+    :quirks {}}
+
    ;; Native Codex Responses models (via an existing ChatGPT subscription). These ids are
    ;; deliberately distinct from the OpenAI API models so both providers can be
    ;; configured at once.
