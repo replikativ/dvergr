@@ -8,7 +8,7 @@ equivalent to the upstream implementation (see *Equivalence method* below).
 
 | Tier | Meaning | Status |
 | --- | --- | --- |
-| 0 | Fully native, in-memory, forkable | tau2-bench retail (this document) |
+| 0 | Fully native, in-memory, forkable | tau2-bench retail, tau2-bench banking_knowledge (bm25) |
 | 1 | Frozen/recorded IO, no containers | planned |
 | 2 | Container-bound public leaderboards (Terminal-Bench, SWE-bench) | calibration only, via an external adapter |
 
@@ -90,6 +90,68 @@ Failure classes in that run were:
 - one tool call emitted without `<tool_use>` tags (90). This was a
   Claude Code adapter gap, since fixed.
 
+## tau2-bench (banking_knowledge, `bm25` retrieval)
+
+This is τ³'s knowledge domain. It has 97 tasks over a bank database, a
+698-document knowledge base, and dual control: the simulated user has tools
+too. The leaderboard requires reporting the retrieval configuration. Dvergr
+transcribes `bm25`, which is sparse `KB_search` over `rank_bm25.BM25Okapi`
+and needs no embedding API.
+
+| Namespace | Role |
+| --- | --- |
+| `dvergr.benchmarks.tau2.python` | Python 3.12 semantics that tool outputs expose: `repr`/`str`, `format(x, '.2f')`, `json.loads` with CPython's error messages, `json.dumps(indent=2)`, `str.title`, `float()`/`int()`, and comparisons that raise `TypeError` |
+| `dvergr.benchmarks.tau2.banking.db` | The TransactionalDB value, `db_query`, deterministic ids, validation helpers, Python keyword binding, and the tool-definition format |
+| `dvergr.benchmarks.tau2.banking` | BM25, the 15 agent tools, the unlock/give/call discoverable-tool mechanics, user tools, and the environment dispatcher |
+| `dvergr.benchmarks.tau2.banking.tools-{a,b,c}` | The 43 agent-discoverable tools (plus the upstream example tool) |
+
+A banking world is `{:db :agent-unlocked :user-given :allowlist}`. Only `:db`
+is graded; unlock and give state is behavioral, like upstream's in-memory
+toolkit state. `(t2/load-domain "banking_knowledge")` works with the same
+episode driver and runner as retail. The driver runs both sides: user tool
+calls execute with requestor `:user`, and results go back to the simulated
+user only. Grading adds tau2's ACTION component. Note that upstream compares
+only the argument keys of the *predicted* call unless `compare_args` is set;
+the port does the same.
+
+Faithfulness choices:
+
+- **Knowledge-base document order.** Upstream takes it from `glob()`, which
+  depends on the filesystem, and it breaks BM25 score ties. The order is
+  pinned from the oracle in `resources/benchmarks/tau2/banking-tools.json`.
+- **Task source.** Tasks load from `tasks/task_*.json`, as upstream's
+  `get_tasks` does. The combined `tasks.json` next to them is stale upstream:
+  13 tasks differ.
+- **Search timing.** `KB_search` ends with a wall-clock timing line upstream.
+  The port prints zeros so worlds stay pure functions of their inputs, and
+  equivalence masks the digits.
+- **Other upstream quirks, reproduced deliberately:**
+  - numbers in discoverable-tool JSON are parsed as floats (`parse_int=float`);
+  - discoverable tools can be called directly by name, without unlocking;
+  - `list_discoverable_*_tools` tests for a message that is never produced;
+  - calls that mutate and then raise keep their partial writes;
+  - a savings-account early-closure fee never triggers, because the code
+    checks `savings` but the data says `saving`;
+  - `str.upper()` status checks;
+  - JSON-injection through f-string query constraints.
+
+  The transcription comments name each one.
+
+Verified on 2026-09-18 against upstream `b7ea907`, with 0 mismatches:
+
+| Check | Calls |
+| --- | --- |
+| Gold actions of all 97 tasks (agent and user requestors) | 955 |
+| Seeded core corpus: `KB_search`, core tools, the unlock/give/call mechanics, user tools, and malformed or wrongly-typed arguments | 3315 |
+| All 44 discoverable agent tools called directly (int/float/str/bool spellings, every error branch, dependent chains, injected fixture records) | 1661 |
+| The same calls through `unlock` + `call_discoverable_agent_tool` (float-parsed JSON) | 3316 |
+| Agent prompt, 97 user-simulator prompts, per-task user tool sets, tool signatures, mutation flags | identical |
+| Gold agent and user through the dual-control episode protocol | 97/97 reward 1.0 |
+
+`test/dvergr/benchmarks/tau2_banking_test.clj` pins all of this as digests.
+The directly-called corpus is vendored as `banking_corpus.json`, and its
+generators live in `dev/benchmarks/tau2/banking/`.
+
 ## Equivalence method
 
 `dev/benchmarks/tau2/oracle.py` is the only Python involved, and it runs
@@ -138,4 +200,7 @@ environment execution only; model latency dominates live episodes.
    tasks.
 3. Use forks for branching. Branch at a user turn for counterfactual rollouts
    and cheap pass^k/GRPO-style groups from one shared prefix.
-4. Port the airline domain the same way: oracle, fuzz, equivalence, then live.
+4. Port the airline and telecom domains the same way: oracle, fuzz,
+   equivalence, then live. Banking's other retrieval configurations
+   (`grep_only`, `full_kb`, `golden_retrieval`) need no embeddings and reuse
+   the same tools.

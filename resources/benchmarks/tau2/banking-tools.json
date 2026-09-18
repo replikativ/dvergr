@@ -1,0 +1,3227 @@
+{
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "KB_search",
+    "description": "Search the knowledge base for relevant documents.",
+    "parameters": {
+     "properties": {
+      "query": {
+       "description": "The search query to find relevant documents",
+       "title": "Query",
+       "type": "string"
+      }
+     },
+     "required": [
+      "query"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "transfer_to_human_agents",
+    "description": "Transfer the user to a human agent.\n\nThe proper transfer reason enum can be found in the knowledge base: search it before calling this tool to select the proper applicable reason.",
+    "parameters": {
+     "properties": {
+      "summary": {
+       "description": "A summary of the user's issue and what was attempted before transfer.",
+       "title": "Summary",
+       "type": "string"
+      },
+      "reason": {
+       "default": "other",
+       "description": "The specific reason code for the transfer.",
+       "enum": [
+        "fraud_or_security_concern",
+        "account_closure_request",
+        "deceased_account_holder",
+        "legal_or_regulatory_matter",
+        "account_ownership_dispute",
+        "complex_billing_dispute",
+        "abusive_customer_behavior",
+        "third_party_inquiry",
+        "technical_system_error",
+        "unconfirmed_external_communication",
+        "customer_demands_after_unavailable_offer_refusal",
+        "kb_search_unsuccessful_customer_requests_transfer",
+        "specialized_department_required",
+        "accessibility_or_special_needs",
+        "customer_frustrated_demands_human",
+        "supervisor_request_service_complaint",
+        "customer_requests_human_no_specific_reason",
+        "request_completed_customer_wants_human_followup",
+        "other"
+       ],
+       "title": "Reason",
+       "type": "string"
+      }
+     },
+     "required": [
+      "summary"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "get_current_time",
+    "description": "Get the current time. Use this to get the current timestamp for logging verification records.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "get_user_information_by_id",
+    "description": "Get the information (date of birth, email, phone number, address) for a user by their user id.",
+    "parameters": {
+     "properties": {
+      "user_id": {
+       "description": "The ID of the user",
+       "title": "User Id",
+       "type": "string"
+      }
+     },
+     "required": [
+      "user_id"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "get_user_information_by_name",
+    "description": "Get the information (date of birth, email, phone number, address) for a user by their name. Case Sensitive.",
+    "parameters": {
+     "properties": {
+      "customer_name": {
+       "description": "The name of the user",
+       "title": "Customer Name",
+       "type": "string"
+      }
+     },
+     "required": [
+      "customer_name"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "get_user_information_by_email",
+    "description": "Get the information (date of birth, email, phone number, address) for a user by their email.",
+    "parameters": {
+     "properties": {
+      "email": {
+       "description": "The email of the user",
+       "title": "Email",
+       "type": "string"
+      }
+     },
+     "required": [
+      "email"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "change_user_email",
+    "description": "Change the email address for a user.",
+    "parameters": {
+     "properties": {
+      "user_id": {
+       "description": "The ID of the user whose email should be changed",
+       "title": "User Id",
+       "type": "string"
+      },
+      "new_email": {
+       "description": "The new email address to set for the user",
+       "title": "New Email",
+       "type": "string"
+      }
+     },
+     "required": [
+      "user_id",
+      "new_email"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "get_referrals_by_user",
+    "description": "Get all referrals made by a user.",
+    "parameters": {
+     "properties": {
+      "user_id": {
+       "description": "The ID of the user (referrer) to look up referrals for",
+       "title": "User Id",
+       "type": "string"
+      }
+     },
+     "required": [
+      "user_id"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "get_credit_card_transactions_by_user",
+    "description": "Get all credit card transactions for a user.",
+    "parameters": {
+     "properties": {
+      "user_id": {
+       "description": "The ID of the user to look up transactions for",
+       "title": "User Id",
+       "type": "string"
+      }
+     },
+     "required": [
+      "user_id"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "get_credit_card_accounts_by_user",
+    "description": "Get all credit card accounts for a user.\n\nReturns information about each credit card account including card type,\ndate opened, current balance, and reward points.",
+    "parameters": {
+     "properties": {
+      "user_id": {
+       "description": "The ID of the user to look up credit card accounts for",
+       "title": "User Id",
+       "type": "string"
+      }
+     },
+     "required": [
+      "user_id"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "log_verification",
+    "description": "Log a verification record after successfully verifying a user's identity.\n\nCall this tool after you have verified a user by confirming 2 out of 4 identity fields\n(date of birth, email, phone number, address). This creates an audit record of the verification.",
+    "parameters": {
+     "properties": {
+      "name": {
+       "description": "The verified user's full name",
+       "title": "Name",
+       "type": "string"
+      },
+      "user_id": {
+       "description": "The verified user's ID",
+       "title": "User Id",
+       "type": "string"
+      },
+      "address": {
+       "description": "The verified user's address",
+       "title": "Address",
+       "type": "string"
+      },
+      "email": {
+       "description": "The verified user's email",
+       "title": "Email",
+       "type": "string"
+      },
+      "phone_number": {
+       "description": "The verified user's phone number",
+       "title": "Phone Number",
+       "type": "string"
+      },
+      "date_of_birth": {
+       "description": "The verified user's date of birth (MM/DD/YYYY format)",
+       "title": "Date Of Birth",
+       "type": "string"
+      },
+      "time_verified": {
+       "description": "The timestamp of the verification (e.g., \"2025-11-14 03:40:00 EST\")",
+       "title": "Time Verified",
+       "type": "string"
+      }
+     },
+     "required": [
+      "name",
+      "user_id",
+      "address",
+      "email",
+      "phone_number",
+      "date_of_birth",
+      "time_verified"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "give_discoverable_user_tool",
+    "description": "Pass a tool to the user so they can execute it themselves.\n\nUse this when the knowledge base indicates that the user should perform\nan action themselves (e.g., \"to do X, have the user call tool_name(args)\").\n\nThe user will then be able to call `call_discoverable_tool` with the same\ntool name and arguments to simulate executing the action.",
+    "parameters": {
+     "properties": {
+      "discoverable_tool_name": {
+       "description": "The name of the discoverable tool (e.g., \"open_webpage\", \"navigate_to_section\")",
+       "title": "Discoverable Tool Name",
+       "type": "string"
+      },
+      "arguments": {
+       "default": "{}",
+       "description": "JSON string of arguments for the tool (e.g., '{\"url\": \"https://example.com\"}')",
+       "title": "Arguments",
+       "type": "string"
+      }
+     },
+     "required": [
+      "discoverable_tool_name"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "unlock_discoverable_agent_tool",
+    "description": "Unlock an agent discoverable tool that was found in the knowledge base.\n\nUse this when the knowledge base indicates that you have access to a specialized\ninternal tool. The knowledge base will tell you the tool name to unlock.\n\nAfter unlocking, you can use the tool by calling `call_discoverable_agent_tool` with\nthe tool name and required arguments.",
+    "parameters": {
+     "properties": {
+      "agent_tool_name": {
+       "description": "The name of the agent discoverable tool to unlock\n(e.g., \"calculate_apr_adjustment_7842\")",
+       "title": "Agent Tool Name",
+       "type": "string"
+      }
+     },
+     "required": [
+      "agent_tool_name"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "call_discoverable_agent_tool",
+    "description": "Call an agent discoverable tool that you have previously unlocked.\n\nUse this after unlocking a tool with `unlock_discoverable_agent_tool`. The knowledge base\nwill tell you which tool to use and what arguments to provide.",
+    "parameters": {
+     "properties": {
+      "agent_tool_name": {
+       "description": "The name of the agent discoverable tool to call",
+       "title": "Agent Tool Name",
+       "type": "string"
+      },
+      "arguments": {
+       "default": "{}",
+       "description": "JSON string of arguments for the tool (e.g., '{\"user_id\": \"abc123\"}')",
+       "title": "Arguments",
+       "type": "string"
+      }
+     },
+     "required": [
+      "agent_tool_name"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "list_discoverable_agent_tools",
+    "description": "List all agent discoverable tools that you have called.\n\nUse this to see what specialized tools you have used.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  }
+ ],
+ "user_tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "apply_for_credit_card",
+    "description": "Apply for a credit card.",
+    "parameters": {
+     "properties": {
+      "card_type": {
+       "description": "Type of credit card",
+       "title": "Card Type",
+       "type": "string"
+      },
+      "customer_name": {
+       "description": "Full legal name",
+       "title": "Customer Name",
+       "type": "string"
+      },
+      "annual_income": {
+       "description": "Annual income in USD",
+       "title": "Annual Income",
+       "type": "number"
+      },
+      "rho_bank_subscription": {
+       "default": false,
+       "description": "Whether user has Rho-Bank+ subscription",
+       "title": "Rho Bank Subscription",
+       "type": "boolean"
+      }
+     },
+     "required": [
+      "card_type",
+      "customer_name",
+      "annual_income"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "submit_referral",
+    "description": "Submit a referral request to refer someone to open an account.",
+    "parameters": {
+     "properties": {
+      "user_id": {
+       "description": "Your user ID (the referrer)",
+       "title": "User Id",
+       "type": "string"
+      },
+      "account_type": {
+       "description": "The type of account you are referring someone to open",
+       "title": "Account Type",
+       "type": "string"
+      }
+     },
+     "required": [
+      "user_id",
+      "account_type"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "call_discoverable_user_tool",
+    "description": "Call a tool that was given to you by the agent.\n\nUse this when the agent has instructed you to perform an action using\na discoverable tool. The agent will have told you the tool name and arguments.\n\nThis simulates you performing the action in the real world (e.g., opening\na webpage, navigating to a section, clicking a button).",
+    "parameters": {
+     "properties": {
+      "discoverable_tool_name": {
+       "description": "The name of the discoverable tool to call (e.g., \"open_webpage\")",
+       "title": "Discoverable Tool Name",
+       "type": "string"
+      },
+      "arguments": {
+       "default": "{}",
+       "description": "JSON string of arguments for the tool (e.g., '{\"url\": \"https://example.com\"}')",
+       "title": "Arguments",
+       "type": "string"
+      }
+     },
+     "required": [
+      "discoverable_tool_name"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "list_discoverable_user_tools",
+    "description": "List all tools that have been given to you by the agent.\n\nUse this to see what actions the agent has instructed you to perform.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "request_human_agent_transfer",
+    "description": "Request to be transferred to a human agent for assistance.\n\nUse this when you want to speak with a real human agent instead of\nthe automated system. Each request will be logged and processed.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "submit_transaction",
+    "description": "Submit a credit card transaction.",
+    "parameters": {
+     "properties": {
+      "user_id": {
+       "description": "Your user ID",
+       "title": "User Id",
+       "type": "string"
+      },
+      "credit_card_type": {
+       "description": "Type of credit card used (e.g., \"Bronze Rewards Card\", \"Gold Rewards Card\")",
+       "title": "Credit Card Type",
+       "type": "string"
+      },
+      "merchant_name": {
+       "description": "Name of the merchant where the purchase was made",
+       "title": "Merchant Name",
+       "type": "string"
+      },
+      "amount": {
+       "description": "Transaction amount in USD (e.g., 127.43)",
+       "title": "Amount",
+       "type": "number"
+      },
+      "category": {
+       "description": "Transaction category (e.g., \"Groceries\", \"Dining\", \"Travel\", \"Software\", \"Entertainment\", \"Utilities\", \"Shopping\")",
+       "title": "Category",
+       "type": "string"
+      }
+     },
+     "required": [
+      "user_id",
+      "credit_card_type",
+      "merchant_name",
+      "amount",
+      "category"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  }
+ ],
+ "agent_discoverable": {
+  "example_agent_tool_0000": {
+   "name": "example_agent_tool_0000",
+   "description": "An example agent discoverable tool placeholder.\n\nReturns:\n    Example tool executed successfully.",
+   "parameters": {},
+   "success_message": "Action completed successfully."
+  },
+  "update_transaction_rewards_3847": {
+   "name": "update_transaction_rewards_3847",
+   "description": "Update the rewards_earned field on a credit card transaction.",
+   "parameters": {
+    "transaction_id": {
+     "type": "string",
+     "description": "The unique identifier for the transaction to update",
+     "required": true
+    },
+    "new_rewards_earned": {
+     "type": "string",
+     "description": "The corrected rewards value (e.g., '6300 points')",
+     "required": true
+    }
+   },
+   "success_message": "Transaction rewards updated successfully."
+  },
+  "initial_transfer_to_human_agent_0218": {
+   "name": "initial_transfer_to_human_agent_0218",
+   "description": "Initiate a transfer request to a human agent. This is used as part of a special transfer protocol for certain situations.\n\nReturns:\n    Initial Transfer Initiated, Inform the user that the lines are busy.",
+   "parameters": {},
+   "success_message": "Action completed successfully."
+  },
+  "initial_transfer_to_human_agent_1822": {
+   "name": "initial_transfer_to_human_agent_1822",
+   "description": "Initiate a transfer request to a human agent. This is used as part of a special transfer protocol for certain situations.\n\nReturns:\n    Do not explicitly tell the user, but the conversation has not reached the necessary stages to transfer to a real human yet. Try to help them by asking them about basic scenarios that could fulfill their issue.",
+   "parameters": {},
+   "success_message": "Action completed successfully."
+  },
+  "emergency_credit_bureau_incident_transfer_1114": {
+   "name": "emergency_credit_bureau_incident_transfer_1114",
+   "description": "Emergency escalation tool for the 11/14 credit bureau reporting incident. Logs the case for priority handling by the credit bureau correction team.\n\nReturns:\n    Emergency escalation logged. Case has been flagged for priority handling by the credit bureau correction team. Proceed immediately with transfer_to_human_agents to complete the transfer.",
+   "parameters": {},
+   "success_message": "Action completed successfully."
+  },
+  "file_credit_card_transaction_dispute_4829": {
+   "name": "file_credit_card_transaction_dispute_4829",
+   "description": "File a formal dispute for a credit card transaction.",
+   "parameters": {
+    "transaction_id": {
+     "type": "string",
+     "description": "The unique identifier for the transaction being disputed",
+     "required": true
+    },
+    "card_action": {
+     "type": "string",
+     "description": "Flag indicating the card's status. Must be one of: 'keep_active' (card remains active, dispute only), 'cancel_and_reissue' (card is being cancelled and replaced). This is for record-keeping only and does NOT order a replacement card.",
+     "required": true
+    },
+    "card_last_4_digits": {
+     "type": "string",
+     "description": "Last 4 digits of the credit card number",
+     "required": true
+    },
+    "full_name": {
+     "type": "string",
+     "description": "Full legal name of the cardholder",
+     "required": true
+    },
+    "user_id": {
+     "type": "string",
+     "description": "The user's unique identifier in the system",
+     "required": true
+    },
+    "phone": {
+     "type": "string",
+     "description": "Contact phone number",
+     "required": true
+    },
+    "email": {
+     "type": "string",
+     "description": "Contact email address",
+     "required": true
+    },
+    "address": {
+     "type": "string",
+     "description": "Contact mailing address",
+     "required": true
+    },
+    "contacted_merchant": {
+     "type": "boolean",
+     "description": "Whether the user attempted to resolve the issue with the merchant first",
+     "required": true
+    },
+    "purchase_date": {
+     "type": "string",
+     "description": "Date when the purchase was made, format MM/DD/YYYY",
+     "required": true
+    },
+    "issue_noticed_date": {
+     "type": "string",
+     "description": "Date when the user noticed the issue, format MM/DD/YYYY",
+     "required": true
+    },
+    "dispute_reason": {
+     "type": "string",
+     "description": "Reason for the dispute. Must be one of: 'unauthorized_fraudulent_charge', 'duplicate_charge', 'incorrect_amount', 'goods_services_not_received', 'goods_services_not_as_described', 'canceled_subscription_still_charging', 'refund_never_processed'",
+     "required": true
+    },
+    "resolution_requested": {
+     "type": "string",
+     "description": "Resolution being requested. Must be one of: 'full_refund', 'partial_refund'",
+     "required": true
+    },
+    "eligible_for_provisional_credit": {
+     "type": "boolean",
+     "description": "Whether the user is eligible for provisional credit",
+     "required": true
+    },
+    "partial_refund_amount": {
+     "type": "number",
+     "description": "Amount requested for partial refund (required only if resolution_requested is 'partial_refund')",
+     "required": false
+    }
+   },
+   "success_message": "Credit card transaction dispute filed successfully. A case has been opened and will be reviewed within 10 business days."
+  },
+  "file_debit_card_transaction_dispute_6281": {
+   "name": "file_debit_card_transaction_dispute_6281",
+   "description": "File a formal dispute for a debit card transaction under Regulation E. Debit card disputes affect actual bank funds and have different liability rules based on reporting timing.",
+   "parameters": {
+    "transaction_id": {
+     "type": "string",
+     "description": "The unique identifier for the transaction being disputed",
+     "required": true
+    },
+    "account_id": {
+     "type": "string",
+     "description": "The checking account ID linked to the debit card",
+     "required": true
+    },
+    "card_id": {
+     "type": "string",
+     "description": "The debit card ID",
+     "required": true
+    },
+    "user_id": {
+     "type": "string",
+     "description": "The user's unique identifier in the system",
+     "required": true
+    },
+    "dispute_category": {
+     "type": "string",
+     "description": "Category of the dispute. Must be one of: 'unauthorized_transaction', 'atm_cash_discrepancy', 'atm_deposit_not_credited', 'duplicate_charge', 'incorrect_amount', 'goods_services_not_received', 'recurring_charge_after_cancellation', 'card_present_fraud', 'card_not_present_fraud'",
+     "required": true
+    },
+    "transaction_date": {
+     "type": "string",
+     "description": "Date when the transaction occurred, format MM/DD/YYYY",
+     "required": true
+    },
+    "discovery_date": {
+     "type": "string",
+     "description": "Date when the user first noticed the issue, format MM/DD/YYYY",
+     "required": true
+    },
+    "disputed_amount": {
+     "type": "number",
+     "description": "The dollar amount being disputed",
+     "required": true
+    },
+    "transaction_type": {
+     "type": "string",
+     "description": "Type of transaction. Must be one of: 'pin_purchase', 'signature_purchase', 'online_purchase', 'atm_withdrawal', 'atm_deposit', 'recurring_payment', 'person_to_person'",
+     "required": true
+    },
+    "card_in_possession": {
+     "type": "boolean",
+     "description": "Whether the customer still has their physical debit card in their possession",
+     "required": true
+    },
+    "pin_compromised": {
+     "type": "string",
+     "description": "Whether the customer's PIN may have been compromised. Must be one of: 'yes_shared', 'yes_observed', 'no', 'unknown'",
+     "required": true
+    },
+    "contacted_merchant": {
+     "type": "boolean",
+     "description": "Whether the user attempted to resolve the issue with the merchant first",
+     "required": true
+    },
+    "police_report_filed": {
+     "type": "boolean",
+     "description": "Whether a police report has been filed (recommended for fraud over $500)",
+     "required": true
+    },
+    "written_statement_provided": {
+     "type": "boolean",
+     "description": "Whether the customer has provided a written statement describing what happened (required for Reg E provisional credit)",
+     "required": true
+    },
+    "provisional_credit_eligible": {
+     "type": "boolean",
+     "description": "Whether the user is eligible for provisional credit based on Debit Card Provisional Credit Guidelines",
+     "required": true
+    },
+    "customer_max_liability_amount": {
+     "type": "number",
+     "description": "The maximum dollar amount the customer could be liable for based on Regulation E reporting timing rules and the disputed amount. Use -1 for unlimited liability.",
+     "required": true
+    },
+    "card_action": {
+     "type": "string",
+     "description": "Action to take on the card. Must be one of: 'keep_active', 'freeze_pending_investigation', 'close_and_reissue'",
+     "required": true
+    }
+   },
+   "success_message": "Debit card transaction dispute filed successfully. A case has been opened and provisional credit determination has been recorded."
+  },
+  "set_debit_card_recurring_block_7382": {
+   "name": "set_debit_card_recurring_block_7382",
+   "description": "Block or unblock all recurring payments on a debit card. When blocked, all recurring/subscription charges will be declined. One-time purchases are not affected.",
+   "parameters": {
+    "card_id": {
+     "type": "string",
+     "description": "The debit card ID to update",
+     "required": true
+    },
+    "block_recurring": {
+     "type": "boolean",
+     "description": "True to block all recurring payments, False to unblock/allow recurring payments",
+     "required": true
+    }
+   },
+   "success_message": "Debit card recurring payment settings updated successfully."
+  },
+  "get_debit_dispute_status_7483": {
+   "name": "get_debit_dispute_status_7483",
+   "description": "Retrieve a user's debit card dispute history from the debit_card_disputes table. Returns all debit card disputes filed by the user, including dispute IDs, categories, amounts, statuses, and provisional credit information.",
+   "parameters": {
+    "user_id": {
+     "type": "string",
+     "description": "The user's unique identifier in the system",
+     "required": true
+    }
+   },
+   "success_message": "Debit card dispute history retrieved successfully."
+  },
+  "get_atm_deposit_images_8473": {
+   "name": "get_atm_deposit_images_8473",
+   "description": "Retrieve ATM deposit envelope/check images for a specific ATM deposit transaction.",
+   "parameters": {
+    "transaction_id": {
+     "type": "string",
+     "description": "The transaction ID of the ATM deposit to retrieve images for",
+     "required": true
+    }
+   },
+   "success_message": "ATM deposit images retrieved successfully."
+  },
+  "order_replacement_credit_card_7291": {
+   "name": "order_replacement_credit_card_7291",
+   "description": "Order a replacement credit card for a customer. The old card will be automatically cancelled when the replacement is ordered.",
+   "parameters": {
+    "credit_card_account_id": {
+     "type": "string",
+     "description": "The credit card account ID for the card being replaced",
+     "required": true
+    },
+    "user_id": {
+     "type": "string",
+     "description": "The user's unique identifier in the system",
+     "required": true
+    },
+    "shipping_address": {
+     "type": "string",
+     "description": "Full shipping address where the new card should be sent",
+     "required": true
+    },
+    "reason": {
+     "type": "string",
+     "description": "Reason for replacement. Must be one of: 'fraud_suspected', 'lost', 'stolen', 'damaged', 'expired', 'other'",
+     "required": true
+    },
+    "expedited_shipping": {
+     "type": "boolean",
+     "description": "Whether to use expedited shipping (2-3 business days instead of 7-10)",
+     "required": false
+    }
+   },
+   "success_message": "Replacement credit card order placed successfully. The old card has been cancelled for security."
+  },
+  "get_user_dispute_history_7291": {
+   "name": "get_user_dispute_history_7291",
+   "description": "Retrieve a user's credit card transaction dispute history from the transaction_disputes table. Returns all credit card transaction disputes filed by the user, including dispute IDs, transaction IDs, dispute reasons, statuses, and submission dates.",
+   "parameters": {
+    "user_id": {
+     "type": "string",
+     "description": "The user's unique identifier in the system",
+     "required": true
+    }
+   },
+   "success_message": "User transaction dispute history retrieved successfully."
+  },
+  "get_pending_replacement_orders_5765": {
+   "name": "get_pending_replacement_orders_5765",
+   "description": "Check if a credit card account has any pending replacement card orders.",
+   "parameters": {
+    "credit_card_account_id": {
+     "type": "string",
+     "description": "The credit card account ID to check for pending replacement orders",
+     "required": true
+    }
+   },
+   "success_message": "Pending replacement orders check completed."
+  },
+  "log_credit_card_closure_reason_4521": {
+   "name": "log_credit_card_closure_reason_4521",
+   "description": "Log the reason why a customer wants to close their credit card account.",
+   "parameters": {
+    "credit_card_account_id": {
+     "type": "string",
+     "description": "The credit card account ID the customer wants to close",
+     "required": true
+    },
+    "user_id": {
+     "type": "string",
+     "description": "The user's unique identifier in the system",
+     "required": true
+    },
+    "closure_reason": {
+     "type": "string",
+     "description": "Reason for closure. Must be one of: 'annual_fee', 'not_using_card', 'found_better_card', 'unhappy_with_rewards', 'simplifying_finances', 'negative_experience', 'other'",
+     "required": true
+    }
+   },
+   "success_message": "Closure reason logged successfully."
+  },
+  "get_closure_reason_history_8293": {
+   "name": "get_closure_reason_history_8293",
+   "description": "Retrieve the closure reason history for a specific credit card account.",
+   "parameters": {
+    "credit_card_account_id": {
+     "type": "string",
+     "description": "The credit card account ID to check for previous closure attempts",
+     "required": true
+    }
+   },
+   "success_message": "Closure reason history retrieved successfully."
+  },
+  "apply_statement_credit_8472": {
+   "name": "apply_statement_credit_8472",
+   "description": "Apply a statement credit to a customer's credit card account.",
+   "parameters": {
+    "user_id": {
+     "type": "string",
+     "description": "The user's unique identifier in the system",
+     "required": true
+    },
+    "credit_card_account_id": {
+     "type": "string",
+     "description": "The credit card account ID to apply the credit to",
+     "required": true
+    },
+    "amount": {
+     "type": "number",
+     "description": "The credit amount in dollars (e.g., 25.00 for a $25 credit)",
+     "required": true
+    },
+    "reason": {
+     "type": "string",
+     "description": "Reason for the statement credit. Must be one of: 'goodwill_adjustment', 'promotional_credit', 'annual_fee_reversal', 'late_fee_reversal', 'interest_charge_reversal', 'dispute_resolution', 'price_match', 'retention_offer', 'error_correction', 'other'",
+     "required": true
+    }
+   },
+   "success_message": "Statement credit applied successfully."
+  },
+  "apply_credit_card_account_flag_6147": {
+   "name": "apply_credit_card_account_flag_6147",
+   "description": "Apply a flag to a customer's credit card account. Flags can include annual fee waivers, promotional APR rates, rewards bonuses, or other account-level modifiers. Each flag has an effective date and expiration date.",
+   "parameters": {
+    "credit_card_account_id": {
+     "type": "string",
+     "description": "The credit card account ID to apply the flag to",
+     "required": true
+    },
+    "user_id": {
+     "type": "string",
+     "description": "The user's unique identifier in the system",
+     "required": true
+    },
+    "flag_type": {
+     "type": "string",
+     "description": "Type of flag to apply. Must be one of: 'annual_fee_waived', 'promotional_apr', 'rewards_bonus', 'other'",
+     "required": true
+    },
+    "expiration_date": {
+     "type": "string",
+     "description": "Date when the flag expires (MM/DD/YYYY format)",
+     "required": true
+    },
+    "reason": {
+     "type": "string",
+     "description": "Reason for applying this flag. Must be one of: 'retention_offer', 'loyalty_benefit', 'promotional', 'error_correction', 'other'",
+     "required": true
+    }
+   },
+   "success_message": "Account flag applied successfully."
+  },
+  "close_credit_card_account_7834": {
+   "name": "close_credit_card_account_7834",
+   "description": "Close a customer's credit card account permanently.",
+   "parameters": {
+    "credit_card_account_id": {
+     "type": "string",
+     "description": "The credit card account ID to close",
+     "required": true
+    },
+    "user_id": {
+     "type": "string",
+     "description": "The user's unique identifier in the system",
+     "required": true
+    }
+   },
+   "success_message": "Credit card account closed successfully."
+  },
+  "pay_credit_card_from_checking_9182": {
+   "name": "pay_credit_card_from_checking_9182",
+   "description": "Pay off a credit card balance using funds from the customer's Rho-Bank checking account. This deducts the specified amount from the checking account and reduces the credit card balance by the same amount.",
+   "parameters": {
+    "user_id": {
+     "type": "string",
+     "description": "The customer's unique identifier in the system",
+     "required": true
+    },
+    "checking_account_id": {
+     "type": "string",
+     "description": "The ID of the Rho-Bank checking account to debit funds from",
+     "required": true
+    },
+    "credit_card_account_id": {
+     "type": "string",
+     "description": "The ID of the credit card account to apply the payment to",
+     "required": true
+    },
+    "amount": {
+     "type": "number",
+     "description": "The payment amount in dollars. Must be a positive number.",
+     "required": true
+    }
+   },
+   "success_message": "Credit card payment processed successfully."
+  },
+  "submit_credit_limit_increase_request_7392": {
+   "name": "submit_credit_limit_increase_request_7392",
+   "description": "Submit a credit limit increase request for a customer's credit card.",
+   "parameters": {
+    "credit_card_account_id": {
+     "type": "string",
+     "description": "The credit card account ID to request increase for",
+     "required": true
+    },
+    "user_id": {
+     "type": "string",
+     "description": "The customer's unique identifier in the system",
+     "required": true
+    },
+    "requested_increase_amount": {
+     "type": "integer",
+     "description": "The dollar amount by which to increase the credit limit (e.g., 2500 for $2,500)",
+     "required": true
+    }
+   },
+   "success_message": "Credit limit increase request submitted successfully."
+  },
+  "get_credit_limit_increase_history_4829": {
+   "name": "get_credit_limit_increase_history_4829",
+   "description": "Retrieve the credit limit increase request history for a specific credit card account. Returns all previous CLI requests including dates, amounts, and statuses.",
+   "parameters": {
+    "credit_card_account_id": {
+     "type": "string",
+     "description": "The credit card account ID to check for CLI history",
+     "required": true
+    }
+   },
+   "success_message": "Credit limit increase history retrieved."
+  },
+  "get_payment_history_6183": {
+   "name": "get_payment_history_6183",
+   "description": "Retrieve payment history for a credit card account.",
+   "parameters": {
+    "credit_card_account_id": {
+     "type": "string",
+     "description": "The credit card account ID to check payment history for",
+     "required": true
+    },
+    "months": {
+     "type": "integer",
+     "description": "Number of months of payment history to retrieve",
+     "required": true
+    }
+   },
+   "success_message": "Payment history retrieved."
+  },
+  "approve_credit_limit_increase_5847": {
+   "name": "approve_credit_limit_increase_5847",
+   "description": "Approve and apply a credit limit increase for a customer's credit card.",
+   "parameters": {
+    "credit_card_account_id": {
+     "type": "string",
+     "description": "The credit card account ID",
+     "required": true
+    },
+    "user_id": {
+     "type": "string",
+     "description": "The customer's unique identifier in the system",
+     "required": true
+    },
+    "new_credit_limit": {
+     "type": "integer",
+     "description": "The new total credit limit in dollars (e.g., 7500 for $7,500)",
+     "required": true
+    }
+   },
+   "success_message": "Credit limit increase approved and applied successfully."
+  },
+  "deny_credit_limit_increase_5848": {
+   "name": "deny_credit_limit_increase_5848",
+   "description": "Deny a credit limit increase request for a customer's credit card.",
+   "parameters": {
+    "credit_card_account_id": {
+     "type": "string",
+     "description": "The credit card account ID",
+     "required": true
+    },
+    "user_id": {
+     "type": "string",
+     "description": "The customer's unique identifier in the system",
+     "required": true
+    },
+    "denial_reason": {
+     "type": "string",
+     "description": "The reason for denying the request. Must be one of: 'insufficient_account_age', 'cooldown_period_active', 'pending_disputes', 'pending_replacement_card', 'past_due_balance', 'high_utilization', 'insufficient_payment_history', 'requested_amount_exceeds_limit', 'other'",
+     "required": true
+    }
+   },
+   "success_message": "Credit limit increase request denied."
+  },
+  "open_bank_account_4821": {
+   "name": "open_bank_account_4821",
+   "description": "Open a new bank account for a customer.",
+   "parameters": {
+    "user_id": {
+     "type": "string",
+     "description": "The customer's unique identifier in the system",
+     "required": true
+    },
+    "account_type": {
+     "type": "string",
+     "description": "Type of account to open. Must be one of: 'checking' (personal checking), 'savings' (personal savings), 'business_checking', 'business_savings'",
+     "required": true
+    },
+    "account_class": {
+     "type": "string",
+     "description": "The full official account class name",
+     "required": true
+    }
+   },
+   "success_message": "Bank account opened successfully."
+  },
+  "close_bank_account_7392": {
+   "name": "close_bank_account_7392",
+   "description": "Close a customer's bank account (checking or savings).",
+   "parameters": {
+    "account_id": {
+     "type": "string",
+     "description": "The ID of the bank account to close",
+     "required": true
+    },
+    "reason": {
+     "type": "string",
+     "description": "The reason for closing the account",
+     "required": false
+    },
+    "waive_early_closure_fee": {
+     "type": "boolean",
+     "description": "Whether to waive early closure fees",
+     "required": false
+    }
+   },
+   "success_message": "Bank account closed successfully."
+  },
+  "get_all_user_accounts_by_user_id_3847": {
+   "name": "get_all_user_accounts_by_user_id_3847",
+   "description": "Retrieve all accounts (checking, savings, credit cards) for a customer.",
+   "parameters": {
+    "user_id": {
+     "type": "string",
+     "description": "The customer's unique identifier in the system",
+     "required": true
+    }
+   },
+   "success_message": "User accounts retrieved successfully."
+  },
+  "transfer_funds_between_bank_accounts_7291": {
+   "name": "transfer_funds_between_bank_accounts_7291",
+   "description": "Transfer funds from one bank account to another.",
+   "parameters": {
+    "source_account_id": {
+     "type": "string",
+     "description": "The account ID to transfer funds from",
+     "required": true
+    },
+    "destination_account_id": {
+     "type": "string",
+     "description": "The account ID to transfer funds to",
+     "required": true
+    },
+    "amount": {
+     "type": "number",
+     "description": "The amount to transfer in USD",
+     "required": true
+    }
+   },
+   "success_message": "Funds transferred successfully."
+  },
+  "apply_checking_account_credit_5829": {
+   "name": "apply_checking_account_credit_5829",
+   "description": "Apply a credit to a customer's checking account.",
+   "parameters": {
+    "account_id": {
+     "type": "string",
+     "description": "The checking account ID to credit",
+     "required": true
+    },
+    "amount": {
+     "type": "number",
+     "description": "The positive dollar amount to credit (must be greater than 0)",
+     "required": true
+    },
+    "credit_type": {
+     "type": "string",
+     "description": "The type of credit: 'rebate_credit' for missing rebates, 'fee_refund' for incorrect fee charges",
+     "required": true
+    }
+   },
+   "success_message": "Credit applied to checking account successfully."
+  },
+  "apply_savings_account_credit_6831": {
+   "name": "apply_savings_account_credit_6831",
+   "description": "Apply a credit to a customer's savings account for interest corrections, fee refunds, or goodwill adjustments.",
+   "parameters": {
+    "account_id": {
+     "type": "string",
+     "description": "The savings account ID to credit",
+     "required": true
+    },
+    "amount": {
+     "type": "number",
+     "description": "The positive dollar amount to credit (must be greater than 0)",
+     "required": true
+    },
+    "credit_type": {
+     "type": "string",
+     "description": "The type of credit: 'interest_correction' for APY/interest calculation errors, 'fee_refund' for incorrect fee charges, 'goodwill_credit' for customer service gestures",
+     "required": true
+    }
+   },
+   "success_message": "Credit applied to savings account successfully."
+  },
+  "submit_interest_discrepancy_report_7294": {
+   "name": "submit_interest_discrepancy_report_7294",
+   "description": "Submit a report for interest calculation discrepancies to the backend team for investigation. Use this when the interest credited to a customer's account does not match expected APY calculations.",
+   "parameters": {
+    "account_id": {
+     "type": "string",
+     "description": "The savings account ID with the discrepancy",
+     "required": true
+    },
+    "user_id": {
+     "type": "string",
+     "description": "The customer's unique identifier",
+     "required": true
+    },
+    "expected_apy": {
+     "type": "number",
+     "description": "The APY percentage the customer should have received (e.g., 2.775 for 2.775%)",
+     "required": true
+    },
+    "actual_apy": {
+     "type": "number",
+     "description": "The APY percentage that was actually applied (e.g., 2.5 for 2.5%)",
+     "required": true
+    },
+    "amount_difference": {
+     "type": "number",
+     "description": "The dollar amount difference between expected and actual interest credited",
+     "required": true
+    }
+   },
+   "success_message": "Interest discrepancy report submitted successfully. Backend team will investigate."
+  },
+  "get_bank_account_transactions_9173": {
+   "name": "get_bank_account_transactions_9173",
+   "description": "Retrieve the transaction history for a bank account.\n\nTransactions are returned in reverse chronological order (most recent\nfirst).",
+   "parameters": {
+    "account_id": {
+     "type": "string",
+     "description": "The bank account ID to retrieve transactions for",
+     "required": true
+    }
+   },
+   "success_message": "Bank account transactions retrieved successfully."
+  },
+  "order_debit_card_5739": {
+   "name": "order_debit_card_5739",
+   "description": "Order a new debit card for a customer's checking account.",
+   "parameters": {
+    "account_id": {
+     "type": "string",
+     "description": "The checking account ID to link the debit card to",
+     "required": true
+    },
+    "user_id": {
+     "type": "string",
+     "description": "The customer's unique identifier",
+     "required": true
+    },
+    "delivery_option": {
+     "type": "string",
+     "description": "Shipping speed: STANDARD, EXPEDITED, or RUSH",
+     "required": true
+    },
+    "delivery_fee": {
+     "type": "number",
+     "description": "Fee to charge for delivery in dollars",
+     "required": true
+    },
+    "card_design": {
+     "type": "string",
+     "description": "Card design: CLASSIC, PREMIUM, or CUSTOM",
+     "required": true
+    },
+    "design_fee": {
+     "type": "number",
+     "description": "Fee to charge for card design in dollars",
+     "required": true
+    },
+    "shipping_address": {
+     "type": "string",
+     "description": "Full shipping address for card delivery",
+     "required": true
+    },
+    "excess_replacement_fee": {
+     "type": "number",
+     "description": "Fee for exceeding replacement limit, if applicable",
+     "required": false
+    }
+   },
+   "success_message": "Debit card order placed successfully."
+  },
+  "activate_debit_card_8291": {
+   "name": "activate_debit_card_8291",
+   "description": "Activate a NEW debit card for a customer. Use ONLY for first-time cards on a checking account (issue_reason = 'new_account' or 'first_card'). For replacement or reissued cards, use the appropriate variant.",
+   "parameters": {
+    "card_id": {
+     "type": "string",
+     "description": "The debit card ID to activate",
+     "required": true
+    },
+    "last_4_digits": {
+     "type": "string",
+     "description": "Last 4 digits of the card number (for verification)",
+     "required": true
+    },
+    "expiration_date": {
+     "type": "string",
+     "description": "Card expiration date in MM/YY format",
+     "required": true
+    },
+    "cvv": {
+     "type": "string",
+     "description": "3-digit CVV from the back of the card",
+     "required": true
+    },
+    "pin": {
+     "type": "string",
+     "description": "4-digit PIN chosen by the customer",
+     "required": true
+    }
+   },
+   "success_message": "New debit card activated successfully."
+  },
+  "activate_debit_card_8292": {
+   "name": "activate_debit_card_8292",
+   "description": "Activate a REPLACEMENT debit card. Use ONLY for cards replacing lost, stolen, or fraud-suspected cards (issue_reason = 'lost', 'stolen', or 'fraud'). For new or reissued cards, use the appropriate variant.",
+   "parameters": {
+    "card_id": {
+     "type": "string",
+     "description": "The debit card ID to activate",
+     "required": true
+    },
+    "last_4_digits": {
+     "type": "string",
+     "description": "Last 4 digits of the card number (for verification)",
+     "required": true
+    },
+    "expiration_date": {
+     "type": "string",
+     "description": "Card expiration date in MM/YY format",
+     "required": true
+    },
+    "cvv": {
+     "type": "string",
+     "description": "3-digit CVV from the back of the card",
+     "required": true
+    },
+    "pin": {
+     "type": "string",
+     "description": "4-digit PIN chosen by the customer",
+     "required": true
+    }
+   },
+   "success_message": "Replacement debit card activated successfully."
+  },
+  "activate_debit_card_8293": {
+   "name": "activate_debit_card_8293",
+   "description": "Activate a REISSUED debit card. Use ONLY for cards reissued due to expiration, damage, design upgrade, or bank-initiated replacement (issue_reason = 'expired', 'damaged', 'upgrade', or 'bank_reissue'). For new or replacement cards, use the appropriate variant.",
+   "parameters": {
+    "card_id": {
+     "type": "string",
+     "description": "The debit card ID to activate",
+     "required": true
+    },
+    "last_4_digits": {
+     "type": "string",
+     "description": "Last 4 digits of the card number (for verification)",
+     "required": true
+    },
+    "expiration_date": {
+     "type": "string",
+     "description": "Card expiration date in MM/YY format",
+     "required": true
+    },
+    "cvv": {
+     "type": "string",
+     "description": "3-digit CVV from the back of the card",
+     "required": true
+    },
+    "pin": {
+     "type": "string",
+     "description": "4-digit PIN chosen by the customer",
+     "required": true
+    }
+   },
+   "success_message": "Reissued debit card activated successfully."
+  },
+  "close_debit_card_4721": {
+   "name": "close_debit_card_4721",
+   "description": "Close or cancel a debit card permanently.",
+   "parameters": {
+    "card_id": {
+     "type": "string",
+     "description": "The debit card ID to close",
+     "required": true
+    },
+    "reason": {
+     "type": "string",
+     "description": "Reason for closing: lost, stolen, fraud_suspected, damaged, no_longer_needed, or account_closing",
+     "required": true
+    }
+   },
+   "success_message": "Debit card closed successfully."
+  },
+  "freeze_debit_card_3892": {
+   "name": "freeze_debit_card_3892",
+   "description": "Temporarily freeze a debit card. The card can be unfrozen later.",
+   "parameters": {
+    "card_id": {
+     "type": "string",
+     "description": "The debit card ID to freeze",
+     "required": true
+    }
+   },
+   "success_message": "Debit card frozen successfully."
+  },
+  "unfreeze_debit_card_3893": {
+   "name": "unfreeze_debit_card_3893",
+   "description": "Unfreeze a previously frozen debit card.",
+   "parameters": {
+    "card_id": {
+     "type": "string",
+     "description": "The debit card ID to unfreeze",
+     "required": true
+    }
+   },
+   "success_message": "Debit card unfrozen successfully."
+  },
+  "clear_debit_card_fraud_alert_4892": {
+   "name": "clear_debit_card_fraud_alert_4892",
+   "description": "Clear a fraud alert or velocity block on a debit card.",
+   "parameters": {
+    "card_id": {
+     "type": "string",
+     "description": "The debit card ID to clear the alert/block for",
+     "required": true
+    },
+    "reason": {
+     "type": "string",
+     "description": "Reason for clearing: 'customer_verified' (for fraud alerts after customer verification) or 'velocity_clear' (for velocity blocks after identity verification)",
+     "required": true
+    }
+   },
+   "success_message": "Fraud alert/velocity block cleared successfully."
+  },
+  "reset_debit_card_pin_6284": {
+   "name": "reset_debit_card_pin_6284",
+   "description": "Reset a debit card PIN when the customer has forgotten it.",
+   "parameters": {
+    "card_id": {
+     "type": "string",
+     "description": "The debit card ID to reset PIN for",
+     "required": true
+    },
+    "last_4_digits": {
+     "type": "string",
+     "description": "Last 4 digits of the card number (for verification)",
+     "required": true
+    },
+    "new_pin": {
+     "type": "string",
+     "description": "The new 4-digit PIN chosen by the customer",
+     "required": true
+    }
+   },
+   "success_message": "Debit card PIN reset successfully."
+  },
+  "change_debit_card_pin_6285": {
+   "name": "change_debit_card_pin_6285",
+   "description": "Change a debit card PIN when the customer knows their current PIN.",
+   "parameters": {
+    "card_id": {
+     "type": "string",
+     "description": "The debit card ID to change PIN for",
+     "required": true
+    },
+    "current_pin": {
+     "type": "string",
+     "description": "The customer's current 4-digit PIN",
+     "required": true
+    },
+    "new_pin": {
+     "type": "string",
+     "description": "The new 4-digit PIN chosen by the customer",
+     "required": true
+    }
+   },
+   "success_message": "Debit card PIN changed successfully."
+  },
+  "get_debit_cards_by_account_id_7823": {
+   "name": "get_debit_cards_by_account_id_7823",
+   "description": "Retrieve all debit cards associated with a checking account. Returns card details including status, issue reason, and expiration date.",
+   "parameters": {
+    "account_id": {
+     "type": "string",
+     "description": "The checking account ID to retrieve debit cards for",
+     "required": true
+    }
+   },
+   "success_message": "Debit cards retrieved successfully."
+  },
+  "request_temporary_debit_card_limit_increase_8374": {
+   "name": "request_temporary_debit_card_limit_increase_8374",
+   "description": "Request a temporary 24-hour increase to a debit card's daily ATM or purchase limit.",
+   "parameters": {
+    "card_id": {
+     "type": "string",
+     "description": "The debit card ID to increase limits for",
+     "required": true
+    },
+    "limit_type": {
+     "type": "string",
+     "description": "Type of limit to increase: 'atm' for daily ATM withdrawal limit, 'purchase' for daily purchase limit",
+     "required": true
+    },
+    "new_limit": {
+     "type": "integer",
+     "description": "The requested new temporary limit amount in dollars",
+     "required": true
+    }
+   },
+   "success_message": "Temporary limit increase granted successfully."
+  }
+ },
+ "user_discoverable": {
+  "submit_cash_back_dispute_0589": {
+   "name": "submit_cash_back_dispute_0589",
+   "description": "Submit a cash back dispute for a specific transaction.",
+   "parameters": {
+    "user_id": {
+     "type": "string",
+     "description": "The user's unique identifier in the system",
+     "required": true
+    },
+    "transaction_id": {
+     "type": "string",
+     "description": "The unique identifier for the transaction with incorrect cash back",
+     "required": true
+    }
+   },
+   "success_message": "Cash back dispute submitted successfully. Your case has been queued for review."
+  },
+  "get_referral_link": {
+   "name": "get_referral_link",
+   "description": "Generate a referral link for a specific credit card to share with friends or family.",
+   "parameters": {
+    "user_id": {
+     "type": "string",
+     "description": "The user's unique identifier in the system (the referrer)",
+     "required": true
+    },
+    "card_name": {
+     "type": "string",
+     "description": "The name of the credit card to create a referral for (e.g., 'Gold Rewards Card')",
+     "required": true
+    }
+   },
+   "success_message": "Referral link generated successfully. Share this link with the person you want to refer."
+  },
+  "get_card_last_4_digits": {
+   "name": "get_card_last_4_digits",
+   "description": "Look up the last 4 digits of a credit card number.",
+   "parameters": {
+    "credit_card_account_id": {
+     "type": "string",
+     "description": "The credit card account ID to look up (e.g., 'cc_76ad9cc60e_gold')",
+     "required": true
+    }
+   },
+   "success_message": "Card information retrieved successfully."
+  },
+  "deposit_check_3847": {
+   "name": "deposit_check_3847",
+   "description": "Deposit a check into a checking or savings account. The user takes a photo of the check and submits it through their mobile banking app.",
+   "parameters": {
+    "account_id": {
+     "type": "string",
+     "description": "The bank account ID to deposit the check into",
+     "required": true
+    },
+    "check_amount": {
+     "type": "number",
+     "description": "The amount of the check in USD",
+     "required": true
+    }
+   },
+   "success_message": "Check deposited successfully. Funds will be available according to your account's deposit policy."
+  }
+ },
+ "mutating": {
+  "KB_search": false,
+  "transfer_to_human_agents": false,
+  "get_current_time": false,
+  "get_user_information_by_id": false,
+  "get_user_information_by_name": false,
+  "get_user_information_by_email": false,
+  "change_user_email": true,
+  "get_referrals_by_user": false,
+  "get_credit_card_transactions_by_user": false,
+  "get_credit_card_accounts_by_user": false,
+  "log_verification": true,
+  "give_discoverable_user_tool": true,
+  "unlock_discoverable_agent_tool": true,
+  "call_discoverable_agent_tool": true,
+  "list_discoverable_agent_tools": false,
+  "example_agent_tool_0000": true,
+  "update_transaction_rewards_3847": true,
+  "initial_transfer_to_human_agent_0218": false,
+  "initial_transfer_to_human_agent_1822": false,
+  "emergency_credit_bureau_incident_transfer_1114": false,
+  "file_credit_card_transaction_dispute_4829": true,
+  "file_debit_card_transaction_dispute_6281": true,
+  "set_debit_card_recurring_block_7382": true,
+  "get_debit_dispute_status_7483": false,
+  "get_atm_deposit_images_8473": false,
+  "order_replacement_credit_card_7291": true,
+  "get_user_dispute_history_7291": false,
+  "get_pending_replacement_orders_5765": false,
+  "log_credit_card_closure_reason_4521": true,
+  "get_closure_reason_history_8293": false,
+  "apply_statement_credit_8472": true,
+  "apply_credit_card_account_flag_6147": true,
+  "close_credit_card_account_7834": true,
+  "pay_credit_card_from_checking_9182": true,
+  "submit_credit_limit_increase_request_7392": true,
+  "get_credit_limit_increase_history_4829": false,
+  "get_payment_history_6183": false,
+  "approve_credit_limit_increase_5847": true,
+  "deny_credit_limit_increase_5848": true,
+  "open_bank_account_4821": true,
+  "close_bank_account_7392": true,
+  "get_all_user_accounts_by_user_id_3847": false,
+  "transfer_funds_between_bank_accounts_7291": true,
+  "apply_checking_account_credit_5829": true,
+  "apply_savings_account_credit_6831": true,
+  "submit_interest_discrepancy_report_7294": true,
+  "get_bank_account_transactions_9173": false,
+  "order_debit_card_5739": true,
+  "activate_debit_card_8291": true,
+  "activate_debit_card_8292": true,
+  "activate_debit_card_8293": true,
+  "close_debit_card_4721": true,
+  "freeze_debit_card_3892": true,
+  "unfreeze_debit_card_3893": true,
+  "clear_debit_card_fraud_alert_4892": true,
+  "reset_debit_card_pin_6284": true,
+  "change_debit_card_pin_6285": true,
+  "get_debit_cards_by_account_id_7823": false,
+  "request_temporary_debit_card_limit_increase_8374": true,
+  "submit_cash_back_dispute_0589": true,
+  "get_referral_link": true,
+  "get_card_last_4_digits": false,
+  "deposit_check_3847": true,
+  "apply_for_credit_card": true,
+  "submit_referral": true,
+  "call_discoverable_user_tool": true,
+  "list_discoverable_user_tools": false,
+  "request_human_agent_transfer": true,
+  "submit_transaction": true
+ },
+ "kb_doc_order": [
+  "doc_business_credit_cards_virtual_card_management_010",
+  "doc_everyone_pay_everyone_pay_001",
+  "doc_buy_now_pay_later_bnpl_gold_003",
+  "doc_everyone_pay_scheduled_payments_004",
+  "doc_savings_accounts_gold_account_013",
+  "doc_business_credit_cards_business_silver_rewards_card_006",
+  "doc_business_savings_accounts_silver_saver_account_006",
+  "doc_bank_accounts_bank_accounts_(general)_035",
+  "doc_checking_accounts_green_account_(checking)_005",
+  "doc_savings_accounts_bronze_account_002",
+  "doc_savings_accounts_silver_account_009",
+  "doc_savings_accounts_diamond_elite_account_001",
+  "doc_checking_accounts_purple_account_007",
+  "doc_bank_accounts_bank_accounts_(general)_004",
+  "doc_business_checking_accounts_true_blue_004",
+  "doc_credit_cards_ecocard_006",
+  "doc_buy_now_pay_later_bnpl_bronze_003",
+  "doc_credit_cards_platinum_rewards_card_009",
+  "doc_savings_accounts_platinum_account_007",
+  "doc_credit_cards_bronze_rewards_card_008",
+  "doc_credit_cards_diamond_elite_card_009",
+  "doc_credit_cards_crypto-cash_back_007",
+  "doc_checking_accounts_light_blue_account_007",
+  "doc_business_credit_cards_green_rewards_card_010",
+  "doc_business_credit_cards_business_platinum_rewards_card_001",
+  "doc_everyone_pay_qr_transfers_001",
+  "doc_checking_accounts_light_green_account_005",
+  "doc_checking_accounts_bluest_account_007",
+  "doc_business_credit_cards_silver_zoom_card_007",
+  "doc_credit_cards_credit_cards_(general)_018",
+  "doc_checking_accounts_gold_years_account_009",
+  "doc_business_credit_cards_business_bronze_rewards_card_003",
+  "doc_business_savings_accounts_gold_plus_saver_006",
+  "doc_savings_accounts_silver_plus_account_004",
+  "doc_savings_accounts_platinum_plus_account_003",
+  "doc_business_checking_accounts_beige_003",
+  "doc_business_credit_cards_virtual_card_management_008",
+  "doc_business_checking_accounts_hunter_green_006",
+  "doc_savings_accounts_gold_plus_account_002",
+  "doc_business_checking_accounts_cobalt_blue_004",
+  "doc_buy_now_pay_later_bnpl_management_dashboard_003",
+  "doc_business_credit_cards_green_rewards_card_008",
+  "doc_business_savings_accounts_diamond_vault_006",
+  "doc_savings_accounts_green_account_(savings)_005",
+  "doc_buy_now_pay_later_bnpl_diamond_008",
+  "doc_buy_now_pay_later_bnpl_silver_005",
+  "doc_business_credit_cards_business_gold_rewards_card_004",
+  "doc_checking_accounts_purple_account_003",
+  "doc_credit_cards_silver_rewards_card_011",
+  "doc_savings_accounts_platinum_account_003",
+  "doc_credit_cards_ecocard_002",
+  "doc_buy_now_pay_later_bnpl_bronze_007",
+  "doc_checking_accounts_light_blue_account_003",
+  "doc_credit_cards_crypto-cash_back_003",
+  "doc_business_credit_cards_silver_zoom_card_003",
+  "doc_everyone_pay_qr_transfers_005",
+  "doc_checking_accounts_light_green_account_001",
+  "doc_checking_accounts_bluest_account_003",
+  "doc_business_credit_cards_business_platinum_rewards_card_005",
+  "doc_everyone_pay_everyone_pay_005",
+  "doc_credit_cards_credit_card_replacements_003",
+  "doc_checking_accounts_checking_accounts_(general)_009",
+  "doc_buy_now_pay_later_bnpl_gold_007",
+  "doc_checking_accounts_green_account_(checking)_001",
+  "doc_business_savings_accounts_silver_saver_account_002",
+  "doc_business_credit_cards_business_silver_rewards_card_002",
+  "doc_bank_accounts_bank_accounts_(general)_031",
+  "doc_savings_accounts_bronze_account_006",
+  "doc_savings_accounts_diamond_elite_account_005",
+  "doc_business_savings_accounts_diamond_vault_002",
+  "doc_savings_accounts_green_account_(savings)_001",
+  "doc_credit_cards_credit_cards_(general)_004",
+  "doc_buy_now_pay_later_bnpl_management_dashboard_007",
+  "doc_bank_accounts_bank_accounts_(general)_018",
+  "doc_credit_cards_silver_rewards_card_009",
+  "doc_buy_now_pay_later_bnpl_silver_001",
+  "doc_business_savings_accounts_gold_plus_saver_002",
+  "doc_business_credit_cards_business_bronze_rewards_card_007",
+  "doc_business_checking_accounts_lime_green_004",
+  "doc_bank_accounts_bank_accounts_(general)_029",
+  "doc_business_savings_accounts_gold_saver_account_008",
+  "doc_business_savings_accounts_platinum_reserve_account_004",
+  "doc_savings_accounts_platinum_plus_account_007",
+  "doc_business_checking_accounts_beige_007",
+  "doc_savings_accounts_gold_plus_account_006",
+  "doc_business_checking_accounts_hunter_green_002",
+  "doc_bank_accounts_bank_accounts_(general)_025",
+  "doc_business_savings_accounts_gold_saver_account_004",
+  "doc_business_checking_accounts_lime_green_008",
+  "doc_checking_accounts_evergreen_account_001",
+  "doc_savings_accounts_diamond_elite_account_011",
+  "doc_checking_accounts_gold_years_account_001",
+  "doc_everyone_pay_everyone_pay_011",
+  "doc_everyone_pay_sending_limits_003",
+  "doc_business_savings_accounts_platinum_reserve_account_008",
+  "doc_savings_accounts_gold_account_003",
+  "doc_checking_accounts_dark_green_account_003",
+  "doc_buy_now_pay_later_bnpl_platinum_002",
+  "doc_business_savings_accounts_automatic_sweep_program_007",
+  "doc_business_savings_accounts_joint_business_holders_+_user_roles_003",
+  "doc_credit_cards_credit_cards_(general)_008",
+  "doc_credit_cards_virtual_card_management_003",
+  "doc_business_savings_accounts_silver_plus_saver_006",
+  "doc_business_credit_cards_business_platinum_rewards_card_011",
+  "doc_bank_accounts_bank_accounts_(general)_014",
+  "doc_checking_accounts_blue_account_003",
+  "doc_credit_cards_silver_rewards_card_005",
+  "doc_everyone_pay_user_blocking_005",
+  "doc_business_savings_accounts_platinum_reserve_account_010",
+  "doc_business_savings_accounts_bronze_saver_account_006",
+  "doc_credit_cards_credit_cards_(general)_021",
+  "doc_everyone_pay_split-the-bill_005",
+  "doc_everyone_pay_everyone_pay_009",
+  "doc_checking_accounts_checking_accounts_(general)_005",
+  "doc_savings_accounts_diamond_elite_account_009",
+  "doc_savings_accounts_silver_account_001",
+  "doc_business_checking_accounts_sky_blue_002",
+  "doc_credit_cards_platinum_rewards_card_001",
+  "doc_credit_cards_gold_rewards_card_004",
+  "doc_bank_accounts_bank_accounts_(general)_047",
+  "doc_credit_cards_credit_card_account_logistics_007",
+  "doc_credit_cards_credit_cards_(general)_010",
+  "doc_business_credit_cards_business_platinum_rewards_card_009",
+  "doc_credit_cards_diamond_elite_card_001",
+  "doc_business_checking_accounts_navy_blue_006",
+  "doc_business_checking_accounts_world_blue_006",
+  "doc_business_savings_accounts_emerald_saver_002",
+  "doc_buy_now_pay_later_bnpl_diamond_004",
+  "doc_business_savings_accounts_joint_business_holders_+_user_roles_007",
+  "doc_business_savings_accounts_automatic_sweep_program_003",
+  "doc_business_checking_accounts_cobalt_blue_008",
+  "doc_business_credit_cards_green_rewards_card_004",
+  "doc_business_savings_accounts_silver_plus_saver_002",
+  "doc_checking_accounts_light_green_account_011",
+  "doc_savings_accounts_green_account_(savings)_009",
+  "doc_credit_cards_virtual_card_management_007",
+  "doc_business_credit_cards_silver_zoom_card_013",
+  "doc_business_credit_cards_business_gold_rewards_card_008",
+  "doc_credit_cards_silver_rewards_card_001",
+  "doc_checking_accounts_blue_account_007",
+  "doc_business_checking_accounts_true_blue_010",
+  "doc_bank_accounts_bank_accounts_(general)_010",
+  "doc_everyone_pay_user_blocking_001",
+  "doc_bank_accounts_bank_accounts_(general)_021",
+  "doc_business_credit_cards_business_silver_rewards_card_012",
+  "doc_checking_accounts_green_account_(checking)_011",
+  "doc_savings_accounts_silver_plus_account_008",
+  "doc_checking_accounts_gold_years_account_005",
+  "doc_checking_accounts_evergreen_account_005",
+  "doc_business_credit_cards_virtual_card_management_004",
+  "doc_everyone_pay_sending_limits_007",
+  "doc_everyone_pay_everyone_pay_015",
+  "doc_checking_accounts_dark_green_account_007",
+  "doc_buy_now_pay_later_bnpl_platinum_006",
+  "doc_checking_accounts_green_fee-free_account_004",
+  "doc_savings_accounts_gold_account_007",
+  "doc_credit_cards_platinum_rewards_card_005",
+  "doc_credit_cards_bronze_rewards_card_004",
+  "doc_credit_cards_credit_card_account_logistics_003",
+  "doc_bank_accounts_bank_accounts_(general)_043",
+  "doc_business_credit_cards_business_gold_rewards_card_010",
+  "doc_bank_accounts_bank_accounts_(general)_008",
+  "doc_business_checking_accounts_true_blue_008",
+  "doc_checking_accounts_light_green_account_009",
+  "doc_business_checking_accounts_cobalt_blue_010",
+  "doc_credit_cards_credit_cards_(general)_014",
+  "doc_business_savings_accounts_emerald_saver_006",
+  "doc_business_checking_accounts_world_blue_002",
+  "doc_credit_cards_diamond_elite_card_005",
+  "doc_business_checking_accounts_navy_blue_002",
+  "doc_credit_cards_credit_cards_(general)_025",
+  "doc_everyone_pay_scheduled_payments_008",
+  "doc_business_savings_accounts_bronze_saver_account_002",
+  "doc_checking_accounts_checking_accounts_(general)_001",
+  "doc_everyone_pay_split-the-bill_001",
+  "doc_savings_accounts_silver_account_005",
+  "doc_bank_accounts_bank_accounts_(general)_039",
+  "doc_business_checking_accounts_sky_blue_006",
+  "doc_checking_accounts_green_account_(checking)_009",
+  "doc_savings_accounts_diamond_elite_account_010",
+  "doc_bank_accounts_bank_accounts_(general)_024",
+  "doc_business_savings_accounts_gold_saver_account_005",
+  "doc_checking_accounts_dark_green_account_002",
+  "doc_buy_now_pay_later_bnpl_platinum_003",
+  "doc_checking_accounts_green_fee-free_account_001",
+  "doc_business_savings_accounts_platinum_reserve_account_009",
+  "doc_savings_accounts_gold_account_002",
+  "doc_business_credit_cards_virtual_card_management_001",
+  "doc_everyone_pay_sending_limits_002",
+  "doc_everyone_pay_everyone_pay_010",
+  "doc_business_savings_accounts_silver_plus_saver_007",
+  "doc_business_credit_cards_business_platinum_rewards_card_010",
+  "doc_business_credit_cards_green_rewards_card_001",
+  "doc_credit_cards_credit_cards_(general)_009",
+  "doc_credit_cards_virtual_card_management_002",
+  "doc_buy_now_pay_later_bnpl_diamond_001",
+  "doc_business_savings_accounts_automatic_sweep_program_006",
+  "doc_business_savings_accounts_joint_business_holders_+_user_roles_002",
+  "doc_everyone_pay_user_blocking_004",
+  "doc_checking_accounts_blue_account_002",
+  "doc_credit_cards_silver_rewards_card_004",
+  "doc_bank_accounts_bank_accounts_(general)_015",
+  "doc_checking_accounts_checking_accounts_(general)_004",
+  "doc_everyone_pay_split-the-bill_004",
+  "doc_everyone_pay_everyone_pay_008",
+  "doc_business_savings_accounts_bronze_saver_account_007",
+  "doc_credit_cards_credit_cards_(general)_020",
+  "doc_business_checking_accounts_beige_012",
+  "doc_business_checking_accounts_sky_blue_003",
+  "doc_savings_accounts_diamond_elite_account_008",
+  "doc_credit_cards_gold_rewards_card_005",
+  "doc_bank_accounts_bank_accounts_(general)_046",
+  "doc_credit_cards_credit_card_account_logistics_006",
+  "doc_credit_cards_bronze_rewards_card_001",
+  "doc_business_savings_accounts_emerald_saver_003",
+  "doc_business_checking_accounts_navy_blue_007",
+  "doc_business_checking_accounts_world_blue_007",
+  "doc_business_credit_cards_business_platinum_rewards_card_008",
+  "doc_credit_cards_credit_cards_(general)_011",
+  "doc_savings_accounts_green_account_(savings)_008",
+  "doc_credit_cards_virtual_card_management_006",
+  "doc_business_credit_cards_silver_zoom_card_012",
+  "doc_business_checking_accounts_cobalt_blue_009",
+  "doc_business_credit_cards_green_rewards_card_005",
+  "doc_business_savings_accounts_silver_plus_saver_003",
+  "doc_checking_accounts_light_green_account_010",
+  "doc_business_savings_accounts_joint_business_holders_+_user_roles_006",
+  "doc_business_savings_accounts_automatic_sweep_program_002",
+  "doc_buy_now_pay_later_bnpl_diamond_005",
+  "doc_business_checking_accounts_true_blue_011",
+  "doc_checking_accounts_purple_account_012",
+  "doc_bank_accounts_bank_accounts_(general)_011",
+  "doc_business_credit_cards_business_gold_rewards_card_009",
+  "doc_checking_accounts_blue_account_006",
+  "doc_buy_now_pay_later_bnpl_silver_008",
+  "doc_checking_accounts_evergreen_account_004",
+  "doc_checking_accounts_gold_years_account_004",
+  "doc_checking_accounts_green_account_(checking)_010",
+  "doc_savings_accounts_silver_plus_account_009",
+  "doc_bank_accounts_bank_accounts_(general)_020",
+  "doc_business_credit_cards_business_silver_rewards_card_013",
+  "doc_business_savings_accounts_gold_saver_account_001",
+  "doc_savings_accounts_gold_account_006",
+  "doc_checking_accounts_dark_green_account_006",
+  "doc_buy_now_pay_later_bnpl_platinum_007",
+  "doc_checking_accounts_green_fee-free_account_005",
+  "doc_everyone_pay_everyone_pay_014",
+  "doc_business_credit_cards_virtual_card_management_005",
+  "doc_everyone_pay_sending_limits_006",
+  "doc_bank_accounts_bank_accounts_(general)_009",
+  "doc_business_checking_accounts_true_blue_009",
+  "doc_credit_cards_credit_card_account_logistics_002",
+  "doc_credit_cards_gold_rewards_card_001",
+  "doc_bank_accounts_bank_accounts_(general)_042",
+  "doc_credit_cards_bronze_rewards_card_005",
+  "doc_credit_cards_platinum_rewards_card_004",
+  "doc_business_checking_accounts_world_blue_003",
+  "doc_credit_cards_diamond_elite_card_004",
+  "doc_business_checking_accounts_navy_blue_003",
+  "doc_business_savings_accounts_emerald_saver_007",
+  "doc_credit_cards_credit_cards_(general)_015",
+  "doc_checking_accounts_light_green_account_008",
+  "doc_credit_cards_credit_cards_(general)_024",
+  "doc_business_savings_accounts_bronze_saver_account_003",
+  "doc_business_checking_accounts_sky_blue_007",
+  "doc_checking_accounts_green_account_(checking)_008",
+  "doc_savings_accounts_silver_account_004",
+  "doc_savings_accounts_gold_account_012",
+  "doc_buy_now_pay_later_bnpl_gold_002",
+  "doc_everyone_pay_scheduled_payments_005",
+  "doc_savings_accounts_silver_account_008",
+  "doc_savings_accounts_bronze_account_003",
+  "doc_checking_accounts_gold_years_account_010",
+  "doc_checking_accounts_green_account_(checking)_004",
+  "doc_business_credit_cards_business_silver_rewards_card_007",
+  "doc_business_savings_accounts_silver_saver_account_007",
+  "doc_bank_accounts_bank_accounts_(general)_034",
+  "doc_savings_accounts_platinum_account_006",
+  "doc_credit_cards_ecocard_007",
+  "doc_credit_cards_platinum_rewards_card_008",
+  "doc_buy_now_pay_later_bnpl_bronze_002",
+  "doc_checking_accounts_purple_account_006",
+  "doc_bank_accounts_bank_accounts_(general)_005",
+  "doc_business_checking_accounts_true_blue_005",
+  "doc_checking_accounts_blue_account_012",
+  "doc_credit_cards_credit_cards_(general)_019",
+  "doc_business_credit_cards_silver_zoom_card_006",
+  "doc_checking_accounts_light_green_account_004",
+  "doc_checking_accounts_bluest_account_006",
+  "doc_credit_cards_diamond_elite_card_008",
+  "doc_credit_cards_crypto-cash_back_006",
+  "doc_checking_accounts_light_blue_account_006",
+  "doc_savings_accounts_silver_plus_account_005",
+  "doc_business_credit_cards_business_bronze_rewards_card_002",
+  "doc_business_checking_accounts_lime_green_001",
+  "doc_checking_accounts_evergreen_account_008",
+  "doc_business_savings_accounts_gold_plus_saver_007",
+  "doc_checking_accounts_gold_years_account_008",
+  "doc_savings_accounts_gold_plus_account_003",
+  "doc_business_credit_cards_virtual_card_management_009",
+  "doc_business_checking_accounts_hunter_green_007",
+  "doc_business_savings_accounts_platinum_reserve_account_001",
+  "doc_savings_accounts_platinum_plus_account_002",
+  "doc_business_checking_accounts_beige_002",
+  "doc_credit_cards_credit_cards_(general)_001",
+  "doc_business_savings_accounts_diamond_vault_007",
+  "doc_savings_accounts_green_account_(savings)_004",
+  "doc_business_checking_accounts_cobalt_blue_005",
+  "doc_buy_now_pay_later_bnpl_management_dashboard_002",
+  "doc_business_credit_cards_green_rewards_card_009",
+  "doc_buy_now_pay_later_bnpl_silver_004",
+  "doc_business_credit_cards_business_gold_rewards_card_005",
+  "doc_credit_cards_platinum_rewards_card_010",
+  "doc_credit_cards_ecocard_003",
+  "doc_buy_now_pay_later_bnpl_bronze_006",
+  "doc_savings_accounts_platinum_account_002",
+  "doc_credit_cards_silver_rewards_card_010",
+  "doc_bank_accounts_bank_accounts_(general)_001",
+  "doc_checking_accounts_purple_account_002",
+  "doc_business_checking_accounts_true_blue_001",
+  "doc_everyone_pay_qr_transfers_004",
+  "doc_checking_accounts_bluest_account_002",
+  "doc_business_credit_cards_business_platinum_rewards_card_004",
+  "doc_business_credit_cards_silver_zoom_card_002",
+  "doc_checking_accounts_light_blue_account_002",
+  "doc_credit_cards_crypto-cash_back_002",
+  "doc_buy_now_pay_later_bnpl_gold_006",
+  "doc_everyone_pay_scheduled_payments_001",
+  "doc_checking_accounts_checking_accounts_(general)_008",
+  "doc_everyone_pay_split-the-bill_008",
+  "doc_everyone_pay_everyone_pay_004",
+  "doc_credit_cards_credit_card_replacements_002",
+  "doc_savings_accounts_bronze_account_007",
+  "doc_savings_accounts_diamond_elite_account_004",
+  "doc_business_savings_accounts_silver_saver_account_003",
+  "doc_business_credit_cards_business_silver_rewards_card_003",
+  "doc_bank_accounts_bank_accounts_(general)_030",
+  "doc_personal_subscriptions_rho_bank_plus_002",
+  "doc_business_checking_accounts_cobalt_blue_001",
+  "doc_buy_now_pay_later_bnpl_management_dashboard_006",
+  "doc_business_savings_accounts_diamond_vault_003",
+  "doc_credit_cards_credit_cards_(general)_005",
+  "doc_business_credit_cards_business_gold_rewards_card_001",
+  "doc_credit_cards_silver_rewards_card_008",
+  "doc_bank_accounts_bank_accounts_(general)_019",
+  "doc_bank_accounts_bank_accounts_(general)_028",
+  "doc_business_savings_accounts_gold_saver_account_009",
+  "doc_savings_accounts_silver_plus_account_001",
+  "doc_business_savings_accounts_gold_plus_saver_003",
+  "doc_business_credit_cards_business_bronze_rewards_card_006",
+  "doc_business_checking_accounts_lime_green_005",
+  "doc_business_checking_accounts_hunter_green_003",
+  "doc_savings_accounts_gold_plus_account_007",
+  "doc_savings_accounts_platinum_plus_account_006",
+  "doc_business_checking_accounts_beige_006",
+  "doc_business_savings_accounts_platinum_reserve_account_005",
+  "doc_business_credit_cards_virtual_card_management_003",
+  "doc_savings_accounts_gold_plus_account_009",
+  "doc_everyone_pay_everyone_pay_012",
+  "doc_savings_accounts_platinum_plus_account_008",
+  "doc_business_checking_accounts_beige_008",
+  "doc_buy_now_pay_later_bnpl_platinum_001",
+  "doc_checking_accounts_green_fee-free_account_003",
+  "doc_bank_accounts_bank_accounts_(general)_026",
+  "doc_business_savings_accounts_gold_saver_account_007",
+  "doc_checking_accounts_gold_years_account_002",
+  "doc_business_credit_cards_business_bronze_rewards_card_008",
+  "doc_checking_accounts_evergreen_account_002",
+  "doc_credit_cards_silver_rewards_card_006",
+  "doc_bank_accounts_bank_accounts_(general)_017",
+  "doc_everyone_pay_user_blocking_006",
+  "doc_buy_now_pay_later_bnpl_diamond_003",
+  "doc_business_savings_accounts_automatic_sweep_program_004",
+  "doc_business_savings_accounts_silver_plus_saver_005",
+  "doc_buy_now_pay_later_bnpl_management_dashboard_008",
+  "doc_business_credit_cards_business_platinum_rewards_card_012",
+  "doc_business_credit_cards_green_rewards_card_003",
+  "doc_savings_accounts_bronze_account_009",
+  "doc_savings_accounts_silver_account_002",
+  "doc_business_credit_cards_business_bronze_rewards_card_010",
+  "doc_business_checking_accounts_sky_blue_001",
+  "doc_business_savings_accounts_bronze_saver_account_005",
+  "doc_business_checking_accounts_beige_010",
+  "doc_credit_cards_credit_cards_(general)_022",
+  "doc_buy_now_pay_later_bnpl_gold_008",
+  "doc_checking_accounts_checking_accounts_(general)_006",
+  "doc_everyone_pay_split-the-bill_006",
+  "doc_credit_cards_credit_cards_(general)_013",
+  "doc_business_savings_accounts_emerald_saver_001",
+  "doc_credit_cards_diamond_elite_card_002",
+  "doc_business_checking_accounts_navy_blue_005",
+  "doc_business_checking_accounts_world_blue_005",
+  "doc_buy_now_pay_later_bnpl_bronze_008",
+  "doc_credit_cards_platinum_rewards_card_002",
+  "doc_credit_cards_bronze_rewards_card_003",
+  "doc_bank_accounts_bank_accounts_(general)_044",
+  "doc_credit_cards_credit_card_account_logistics_004",
+  "doc_bank_accounts_bank_accounts_(general)_013",
+  "doc_checking_accounts_purple_account_010",
+  "doc_credit_cards_silver_rewards_card_002",
+  "doc_checking_accounts_blue_account_004",
+  "doc_savings_accounts_platinum_account_010",
+  "doc_everyone_pay_user_blocking_002",
+  "doc_credit_cards_ecocard_011",
+  "doc_business_savings_accounts_joint_business_holders_+_user_roles_004",
+  "doc_buy_now_pay_later_bnpl_diamond_007",
+  "doc_credit_cards_virtual_card_management_004",
+  "doc_business_credit_cards_silver_zoom_card_010",
+  "doc_business_credit_cards_green_rewards_card_007",
+  "doc_checking_accounts_bluest_account_010",
+  "doc_business_savings_accounts_silver_plus_saver_001",
+  "doc_checking_accounts_light_green_account_012",
+  "doc_business_checking_accounts_hunter_green_009",
+  "doc_business_credit_cards_virtual_card_management_007",
+  "doc_everyone_pay_sending_limits_004",
+  "doc_savings_accounts_gold_account_004",
+  "doc_checking_accounts_dark_green_account_004",
+  "doc_buy_now_pay_later_bnpl_platinum_005",
+  "doc_checking_accounts_green_fee-free_account_007",
+  "doc_checking_accounts_green_account_(checking)_012",
+  "doc_bank_accounts_bank_accounts_(general)_022",
+  "doc_business_savings_accounts_gold_saver_account_003",
+  "doc_business_credit_cards_business_silver_rewards_card_011",
+  "doc_checking_accounts_evergreen_account_006",
+  "doc_checking_accounts_gold_years_account_006",
+  "doc_business_credit_cards_silver_zoom_card_008",
+  "doc_credit_cards_credit_cards_(general)_017",
+  "doc_checking_accounts_bluest_account_008",
+  "doc_business_checking_accounts_world_blue_001",
+  "doc_credit_cards_diamond_elite_card_006",
+  "doc_business_checking_accounts_navy_blue_001",
+  "doc_credit_cards_crypto-cash_back_008",
+  "doc_business_savings_accounts_emerald_saver_005",
+  "doc_credit_cards_bronze_rewards_card_007",
+  "doc_savings_accounts_platinum_account_008",
+  "doc_credit_cards_ecocard_009",
+  "doc_credit_cards_platinum_rewards_card_006",
+  "doc_checking_accounts_purple_account_008",
+  "doc_credit_cards_gold_rewards_card_003",
+  "doc_bank_accounts_bank_accounts_(general)_040",
+  "doc_savings_accounts_silver_account_006",
+  "doc_business_checking_accounts_sky_blue_005",
+  "doc_business_credit_cards_business_silver_rewards_card_009",
+  "doc_business_savings_accounts_bronze_saver_account_001",
+  "doc_everyone_pay_split-the-bill_002",
+  "doc_checking_accounts_checking_accounts_(general)_002",
+  "doc_checking_accounts_green_account_(checking)_006",
+  "doc_business_checking_accounts_sky_blue_009",
+  "doc_business_savings_accounts_silver_saver_account_005",
+  "doc_business_credit_cards_business_silver_rewards_card_005",
+  "doc_bank_accounts_bank_accounts_(general)_036",
+  "doc_savings_accounts_bronze_account_001",
+  "doc_savings_accounts_diamond_elite_account_002",
+  "doc_everyone_pay_everyone_pay_002",
+  "doc_credit_cards_credit_card_replacements_004",
+  "doc_savings_accounts_gold_account_010",
+  "doc_checking_accounts_dark_green_account_010",
+  "doc_everyone_pay_scheduled_payments_007",
+  "doc_credit_cards_crypto-cash_back_004",
+  "doc_checking_accounts_light_blue_account_004",
+  "doc_business_credit_cards_silver_zoom_card_004",
+  "doc_business_credit_cards_business_platinum_rewards_card_002",
+  "doc_checking_accounts_light_green_account_006",
+  "doc_everyone_pay_qr_transfers_002",
+  "doc_checking_accounts_bluest_account_004",
+  "doc_bank_accounts_bank_accounts_(general)_007",
+  "doc_checking_accounts_purple_account_004",
+  "doc_business_checking_accounts_true_blue_007",
+  "doc_checking_accounts_blue_account_010",
+  "doc_savings_accounts_platinum_account_004",
+  "doc_credit_cards_ecocard_005",
+  "doc_business_savings_accounts_platinum_reserve_account_003",
+  "doc_savings_accounts_gold_account_008",
+  "doc_checking_accounts_dark_green_account_008",
+  "doc_savings_accounts_gold_plus_account_001",
+  "doc_business_checking_accounts_hunter_green_005",
+  "doc_business_checking_accounts_lime_green_003",
+  "doc_business_savings_accounts_gold_plus_saver_005",
+  "doc_savings_accounts_silver_plus_account_007",
+  "doc_customer_support_special_support_codes_001",
+  "doc_checking_accounts_blue_account_008",
+  "doc_buy_now_pay_later_bnpl_silver_006",
+  "doc_business_credit_cards_business_gold_rewards_card_007",
+  "doc_credit_cards_credit_cards_(general)_003",
+  "doc_business_savings_accounts_diamond_vault_005",
+  "doc_savings_accounts_green_account_(savings)_006",
+  "doc_credit_cards_virtual_card_management_008",
+  "doc_business_checking_accounts_cobalt_blue_007",
+  "doc_business_savings_accounts_joint_business_holders_+_user_roles_008",
+  "doc_business_checking_accounts_world_blue_009",
+  "doc_business_checking_accounts_navy_blue_009",
+  "doc_checking_accounts_light_green_account_002",
+  "doc_everyone_pay_qr_transfers_006",
+  "doc_business_credit_cards_business_platinum_rewards_card_006",
+  "doc_credit_cards_credit_card_account_logistics_008",
+  "doc_bank_accounts_bank_accounts_(general)_048",
+  "doc_bank_accounts_bank_accounts_(general)_003",
+  "doc_business_checking_accounts_true_blue_003",
+  "doc_credit_cards_ecocard_001",
+  "doc_buy_now_pay_later_bnpl_bronze_004",
+  "doc_business_credit_cards_business_silver_rewards_card_001",
+  "doc_business_savings_accounts_silver_saver_account_001",
+  "doc_bank_accounts_bank_accounts_(general)_032",
+  "doc_checking_accounts_green_account_(checking)_002",
+  "doc_savings_accounts_bronze_account_005",
+  "doc_savings_accounts_diamond_elite_account_006",
+  "doc_everyone_pay_everyone_pay_006",
+  "doc_buy_now_pay_later_bnpl_gold_004",
+  "doc_everyone_pay_scheduled_payments_003",
+  "doc_savings_accounts_gold_account_014",
+  "doc_business_credit_cards_business_gold_rewards_card_003",
+  "doc_buy_now_pay_later_bnpl_silver_002",
+  "doc_business_checking_accounts_cobalt_blue_003",
+  "doc_buy_now_pay_later_bnpl_management_dashboard_004",
+  "doc_business_savings_accounts_diamond_vault_001",
+  "doc_savings_accounts_green_account_(savings)_002",
+  "doc_credit_cards_credit_cards_(general)_007",
+  "doc_business_savings_accounts_automatic_sweep_program_008",
+  "doc_savings_accounts_platinum_plus_account_004",
+  "doc_business_checking_accounts_beige_004",
+  "doc_business_savings_accounts_platinum_reserve_account_007",
+  "doc_business_checking_accounts_hunter_green_001",
+  "doc_savings_accounts_gold_plus_account_005",
+  "doc_business_savings_accounts_gold_plus_saver_001",
+  "doc_business_credit_cards_business_bronze_rewards_card_004",
+  "doc_business_checking_accounts_lime_green_007",
+  "doc_savings_accounts_silver_plus_account_003",
+  "doc_savings_accounts_diamond_elite_account_003",
+  "doc_business_savings_accounts_silver_saver_account_004",
+  "doc_business_credit_cards_business_silver_rewards_card_004",
+  "doc_bank_accounts_bank_accounts_(general)_037",
+  "doc_checking_accounts_green_account_(checking)_007",
+  "doc_business_checking_accounts_sky_blue_008",
+  "doc_buy_now_pay_later_bnpl_gold_001",
+  "doc_everyone_pay_scheduled_payments_006",
+  "doc_savings_accounts_gold_account_011",
+  "doc_everyone_pay_everyone_pay_003",
+  "doc_credit_cards_credit_card_replacements_005",
+  "doc_business_credit_cards_business_platinum_rewards_card_003",
+  "doc_everyone_pay_qr_transfers_003",
+  "doc_checking_accounts_light_green_account_007",
+  "doc_checking_accounts_bluest_account_005",
+  "doc_business_credit_cards_silver_zoom_card_005",
+  "doc_business_savings_accounts_emerald_saver_008",
+  "doc_credit_cards_crypto-cash_back_005",
+  "doc_checking_accounts_light_blue_account_005",
+  "doc_credit_cards_ecocard_004",
+  "doc_buy_now_pay_later_bnpl_bronze_001",
+  "doc_savings_accounts_platinum_account_005",
+  "doc_checking_accounts_blue_account_011",
+  "doc_bank_accounts_bank_accounts_(general)_006",
+  "doc_checking_accounts_purple_account_005",
+  "doc_business_checking_accounts_true_blue_006",
+  "doc_business_checking_accounts_hunter_green_004",
+  "doc_savings_accounts_platinum_plus_account_001",
+  "doc_business_checking_accounts_beige_001",
+  "doc_checking_accounts_dark_green_account_009",
+  "doc_buy_now_pay_later_bnpl_platinum_008",
+  "doc_business_savings_accounts_platinum_reserve_account_002",
+  "doc_savings_accounts_gold_account_009",
+  "doc_savings_accounts_silver_plus_account_006",
+  "doc_business_checking_accounts_sky_blue_010",
+  "doc_business_credit_cards_business_bronze_rewards_card_001",
+  "doc_business_checking_accounts_lime_green_002",
+  "doc_business_savings_accounts_gold_plus_saver_004",
+  "doc_checking_accounts_blue_account_009",
+  "doc_buy_now_pay_later_bnpl_silver_007",
+  "doc_business_credit_cards_business_gold_rewards_card_006",
+  "doc_business_savings_accounts_joint_business_holders_+_user_roles_009",
+  "doc_business_checking_accounts_cobalt_blue_006",
+  "doc_buy_now_pay_later_bnpl_management_dashboard_001",
+  "doc_credit_cards_credit_cards_(general)_002",
+  "doc_business_savings_accounts_diamond_vault_004",
+  "doc_savings_accounts_green_account_(savings)_007",
+  "doc_business_credit_cards_silver_zoom_card_001",
+  "doc_everyone_pay_qr_transfers_007",
+  "doc_checking_accounts_light_green_account_003",
+  "doc_checking_accounts_bluest_account_001",
+  "doc_business_credit_cards_business_platinum_rewards_card_007",
+  "doc_checking_accounts_light_blue_account_001",
+  "doc_business_checking_accounts_world_blue_008",
+  "doc_business_checking_accounts_navy_blue_008",
+  "doc_credit_cards_crypto-cash_back_001",
+  "doc_savings_accounts_platinum_account_001",
+  "doc_buy_now_pay_later_bnpl_bronze_005",
+  "doc_checking_accounts_purple_account_001",
+  "doc_bank_accounts_bank_accounts_(general)_002",
+  "doc_business_checking_accounts_true_blue_002",
+  "doc_credit_cards_credit_card_account_logistics_009",
+  "doc_savings_accounts_bronze_account_004",
+  "doc_savings_accounts_diamond_elite_account_007",
+  "doc_checking_accounts_green_account_(checking)_003",
+  "doc_bank_accounts_bank_accounts_(general)_033",
+  "doc_buy_now_pay_later_bnpl_gold_005",
+  "doc_everyone_pay_scheduled_payments_002",
+  "doc_business_savings_accounts_bronze_saver_account_008",
+  "doc_everyone_pay_everyone_pay_007",
+  "doc_credit_cards_credit_card_replacements_001",
+  "doc_business_credit_cards_business_gold_rewards_card_002",
+  "doc_buy_now_pay_later_bnpl_silver_003",
+  "doc_personal_subscriptions_rho_bank_plus_001",
+  "doc_savings_accounts_green_account_(savings)_003",
+  "doc_credit_cards_credit_cards_(general)_006",
+  "doc_business_checking_accounts_cobalt_blue_002",
+  "doc_buy_now_pay_later_bnpl_management_dashboard_005",
+  "doc_savings_accounts_gold_plus_account_004",
+  "doc_business_savings_accounts_platinum_reserve_account_006",
+  "doc_savings_accounts_platinum_plus_account_005",
+  "doc_business_checking_accounts_beige_005",
+  "doc_savings_accounts_silver_plus_account_002",
+  "doc_business_credit_cards_business_bronze_rewards_card_005",
+  "doc_business_checking_accounts_lime_green_006",
+  "doc_savings_accounts_gold_account_001",
+  "doc_savings_accounts_platinum_plus_account_009",
+  "doc_business_checking_accounts_beige_009",
+  "doc_checking_accounts_dark_green_account_001",
+  "doc_checking_accounts_green_fee-free_account_002",
+  "doc_savings_accounts_gold_plus_account_008",
+  "doc_everyone_pay_everyone_pay_013",
+  "doc_business_credit_cards_virtual_card_management_002",
+  "doc_everyone_pay_sending_limits_001",
+  "doc_business_credit_cards_business_bronze_rewards_card_009",
+  "doc_checking_accounts_evergreen_account_003",
+  "doc_checking_accounts_gold_years_account_003",
+  "doc_bank_accounts_bank_accounts_(general)_027",
+  "doc_business_savings_accounts_gold_saver_account_006",
+  "doc_bank_accounts_bank_accounts_(general)_016",
+  "doc_checking_accounts_blue_account_001",
+  "doc_credit_cards_silver_rewards_card_007",
+  "doc_credit_cards_virtual_card_management_001",
+  "doc_business_savings_accounts_silver_plus_saver_004",
+  "doc_business_credit_cards_green_rewards_card_002",
+  "doc_business_savings_accounts_automatic_sweep_program_005",
+  "doc_business_savings_accounts_joint_business_holders_+_user_roles_001",
+  "doc_buy_now_pay_later_bnpl_diamond_002",
+  "doc_savings_accounts_silver_account_003",
+  "doc_savings_accounts_bronze_account_008",
+  "doc_business_credit_cards_business_bronze_rewards_card_011",
+  "doc_everyone_pay_split-the-bill_007",
+  "doc_checking_accounts_checking_accounts_(general)_007",
+  "doc_business_savings_accounts_bronze_saver_account_004",
+  "doc_business_checking_accounts_beige_011",
+  "doc_credit_cards_credit_cards_(general)_023",
+  "doc_credit_cards_diamond_elite_card_003",
+  "doc_business_checking_accounts_navy_blue_004",
+  "doc_business_checking_accounts_world_blue_004",
+  "doc_credit_cards_credit_cards_(general)_012",
+  "doc_bank_accounts_bank_accounts_(general)_045",
+  "doc_credit_cards_credit_card_account_logistics_005",
+  "doc_credit_cards_bronze_rewards_card_002",
+  "doc_credit_cards_platinum_rewards_card_003",
+  "doc_everyone_pay_user_blocking_003",
+  "doc_credit_cards_ecocard_010",
+  "doc_credit_cards_silver_rewards_card_003",
+  "doc_checking_accounts_blue_account_005",
+  "doc_bank_accounts_bank_accounts_(general)_012",
+  "doc_checking_accounts_purple_account_011",
+  "doc_business_credit_cards_green_rewards_card_006",
+  "doc_checking_accounts_light_green_account_013",
+  "doc_business_savings_accounts_diamond_vault_008",
+  "doc_credit_cards_virtual_card_management_005",
+  "doc_business_credit_cards_silver_zoom_card_011",
+  "doc_buy_now_pay_later_bnpl_diamond_006",
+  "doc_business_savings_accounts_joint_business_holders_+_user_roles_005",
+  "doc_business_savings_accounts_automatic_sweep_program_001",
+  "doc_checking_accounts_dark_green_account_005",
+  "doc_buy_now_pay_later_bnpl_platinum_004",
+  "doc_checking_accounts_green_fee-free_account_006",
+  "doc_savings_accounts_gold_account_005",
+  "doc_business_checking_accounts_hunter_green_008",
+  "doc_business_credit_cards_virtual_card_management_006",
+  "doc_everyone_pay_sending_limits_005",
+  "doc_checking_accounts_gold_years_account_007",
+  "doc_checking_accounts_evergreen_account_007",
+  "doc_bank_accounts_bank_accounts_(general)_023",
+  "doc_business_savings_accounts_gold_saver_account_002",
+  "doc_business_credit_cards_business_silver_rewards_card_010",
+  "doc_business_savings_accounts_emerald_saver_004",
+  "doc_credit_cards_diamond_elite_card_007",
+  "doc_credit_cards_crypto-cash_back_009",
+  "doc_checking_accounts_bluest_account_009",
+  "doc_credit_cards_credit_cards_(general)_016",
+  "doc_business_credit_cards_silver_zoom_card_009",
+  "doc_credit_cards_credit_card_account_logistics_001",
+  "doc_credit_cards_gold_rewards_card_002",
+  "doc_bank_accounts_bank_accounts_(general)_041",
+  "doc_checking_accounts_purple_account_009",
+  "doc_credit_cards_ecocard_008",
+  "doc_credit_cards_platinum_rewards_card_007",
+  "doc_credit_cards_bronze_rewards_card_006",
+  "doc_savings_accounts_platinum_account_009",
+  "doc_business_savings_accounts_silver_saver_account_008",
+  "doc_business_credit_cards_business_silver_rewards_card_008",
+  "doc_business_checking_accounts_sky_blue_004",
+  "doc_savings_accounts_silver_account_007",
+  "doc_checking_accounts_checking_accounts_(general)_003",
+  "doc_business_checking_accounts_hunter_green_010",
+  "doc_everyone_pay_split-the-bill_003"
+ ],
+ "agent_tool_params": {
+  "KB_search": [
+   [
+    "query",
+    true
+   ]
+  ],
+  "transfer_to_human_agents": [
+   [
+    "summary",
+    true
+   ],
+   [
+    "reason",
+    false
+   ]
+  ],
+  "get_current_time": [],
+  "get_user_information_by_id": [
+   [
+    "user_id",
+    true
+   ]
+  ],
+  "get_user_information_by_name": [
+   [
+    "customer_name",
+    true
+   ]
+  ],
+  "get_user_information_by_email": [
+   [
+    "email",
+    true
+   ]
+  ],
+  "change_user_email": [
+   [
+    "user_id",
+    true
+   ],
+   [
+    "new_email",
+    true
+   ]
+  ],
+  "get_referrals_by_user": [
+   [
+    "user_id",
+    true
+   ]
+  ],
+  "get_credit_card_transactions_by_user": [
+   [
+    "user_id",
+    true
+   ]
+  ],
+  "get_credit_card_accounts_by_user": [
+   [
+    "user_id",
+    true
+   ]
+  ],
+  "log_verification": [
+   [
+    "name",
+    true
+   ],
+   [
+    "user_id",
+    true
+   ],
+   [
+    "address",
+    true
+   ],
+   [
+    "email",
+    true
+   ],
+   [
+    "phone_number",
+    true
+   ],
+   [
+    "date_of_birth",
+    true
+   ],
+   [
+    "time_verified",
+    true
+   ]
+  ],
+  "give_discoverable_user_tool": [
+   [
+    "discoverable_tool_name",
+    true
+   ],
+   [
+    "arguments",
+    false
+   ]
+  ],
+  "unlock_discoverable_agent_tool": [
+   [
+    "agent_tool_name",
+    true
+   ]
+  ],
+  "call_discoverable_agent_tool": [
+   [
+    "agent_tool_name",
+    true
+   ],
+   [
+    "arguments",
+    false
+   ]
+  ],
+  "list_discoverable_agent_tools": [],
+  "example_agent_tool_0000": [],
+  "update_transaction_rewards_3847": [
+   [
+    "transaction_id",
+    true
+   ],
+   [
+    "new_rewards_earned",
+    true
+   ]
+  ],
+  "initial_transfer_to_human_agent_0218": [],
+  "initial_transfer_to_human_agent_1822": [],
+  "emergency_credit_bureau_incident_transfer_1114": [],
+  "file_credit_card_transaction_dispute_4829": [
+   [
+    "transaction_id",
+    true
+   ],
+   [
+    "card_action",
+    true
+   ],
+   [
+    "card_last_4_digits",
+    true
+   ],
+   [
+    "full_name",
+    true
+   ],
+   [
+    "user_id",
+    true
+   ],
+   [
+    "phone",
+    true
+   ],
+   [
+    "email",
+    true
+   ],
+   [
+    "address",
+    true
+   ],
+   [
+    "contacted_merchant",
+    true
+   ],
+   [
+    "purchase_date",
+    true
+   ],
+   [
+    "issue_noticed_date",
+    true
+   ],
+   [
+    "dispute_reason",
+    true
+   ],
+   [
+    "resolution_requested",
+    true
+   ],
+   [
+    "eligible_for_provisional_credit",
+    true
+   ],
+   [
+    "partial_refund_amount",
+    false
+   ]
+  ],
+  "file_debit_card_transaction_dispute_6281": [
+   [
+    "transaction_id",
+    true
+   ],
+   [
+    "account_id",
+    true
+   ],
+   [
+    "card_id",
+    true
+   ],
+   [
+    "user_id",
+    true
+   ],
+   [
+    "dispute_category",
+    true
+   ],
+   [
+    "transaction_date",
+    true
+   ],
+   [
+    "discovery_date",
+    true
+   ],
+   [
+    "disputed_amount",
+    true
+   ],
+   [
+    "transaction_type",
+    true
+   ],
+   [
+    "card_in_possession",
+    true
+   ],
+   [
+    "pin_compromised",
+    true
+   ],
+   [
+    "contacted_merchant",
+    true
+   ],
+   [
+    "police_report_filed",
+    true
+   ],
+   [
+    "written_statement_provided",
+    true
+   ],
+   [
+    "provisional_credit_eligible",
+    true
+   ],
+   [
+    "customer_max_liability_amount",
+    true
+   ],
+   [
+    "card_action",
+    true
+   ]
+  ],
+  "set_debit_card_recurring_block_7382": [
+   [
+    "card_id",
+    true
+   ],
+   [
+    "block_recurring",
+    true
+   ]
+  ],
+  "get_debit_dispute_status_7483": [
+   [
+    "user_id",
+    true
+   ]
+  ],
+  "get_atm_deposit_images_8473": [
+   [
+    "transaction_id",
+    true
+   ]
+  ],
+  "order_replacement_credit_card_7291": [
+   [
+    "credit_card_account_id",
+    true
+   ],
+   [
+    "user_id",
+    true
+   ],
+   [
+    "shipping_address",
+    true
+   ],
+   [
+    "reason",
+    true
+   ],
+   [
+    "expedited_shipping",
+    false
+   ]
+  ],
+  "get_user_dispute_history_7291": [
+   [
+    "user_id",
+    true
+   ]
+  ],
+  "get_pending_replacement_orders_5765": [
+   [
+    "credit_card_account_id",
+    true
+   ]
+  ],
+  "log_credit_card_closure_reason_4521": [
+   [
+    "credit_card_account_id",
+    true
+   ],
+   [
+    "user_id",
+    true
+   ],
+   [
+    "closure_reason",
+    true
+   ]
+  ],
+  "get_closure_reason_history_8293": [
+   [
+    "credit_card_account_id",
+    true
+   ]
+  ],
+  "apply_statement_credit_8472": [
+   [
+    "user_id",
+    true
+   ],
+   [
+    "credit_card_account_id",
+    true
+   ],
+   [
+    "amount",
+    true
+   ],
+   [
+    "reason",
+    true
+   ]
+  ],
+  "apply_credit_card_account_flag_6147": [
+   [
+    "credit_card_account_id",
+    true
+   ],
+   [
+    "user_id",
+    true
+   ],
+   [
+    "flag_type",
+    true
+   ],
+   [
+    "expiration_date",
+    true
+   ],
+   [
+    "reason",
+    true
+   ]
+  ],
+  "close_credit_card_account_7834": [
+   [
+    "credit_card_account_id",
+    true
+   ],
+   [
+    "user_id",
+    true
+   ]
+  ],
+  "pay_credit_card_from_checking_9182": [
+   [
+    "user_id",
+    true
+   ],
+   [
+    "checking_account_id",
+    true
+   ],
+   [
+    "credit_card_account_id",
+    true
+   ],
+   [
+    "amount",
+    true
+   ]
+  ],
+  "submit_credit_limit_increase_request_7392": [
+   [
+    "credit_card_account_id",
+    true
+   ],
+   [
+    "user_id",
+    true
+   ],
+   [
+    "requested_increase_amount",
+    true
+   ]
+  ],
+  "get_credit_limit_increase_history_4829": [
+   [
+    "credit_card_account_id",
+    true
+   ]
+  ],
+  "get_payment_history_6183": [
+   [
+    "credit_card_account_id",
+    true
+   ],
+   [
+    "months",
+    true
+   ]
+  ],
+  "approve_credit_limit_increase_5847": [
+   [
+    "credit_card_account_id",
+    true
+   ],
+   [
+    "user_id",
+    true
+   ],
+   [
+    "new_credit_limit",
+    true
+   ]
+  ],
+  "deny_credit_limit_increase_5848": [
+   [
+    "credit_card_account_id",
+    true
+   ],
+   [
+    "user_id",
+    true
+   ],
+   [
+    "denial_reason",
+    true
+   ]
+  ],
+  "open_bank_account_4821": [
+   [
+    "user_id",
+    true
+   ],
+   [
+    "account_type",
+    true
+   ],
+   [
+    "account_class",
+    true
+   ]
+  ],
+  "close_bank_account_7392": [
+   [
+    "account_id",
+    true
+   ],
+   [
+    "reason",
+    false
+   ],
+   [
+    "waive_early_closure_fee",
+    false
+   ]
+  ],
+  "get_all_user_accounts_by_user_id_3847": [
+   [
+    "user_id",
+    true
+   ]
+  ],
+  "transfer_funds_between_bank_accounts_7291": [
+   [
+    "source_account_id",
+    true
+   ],
+   [
+    "destination_account_id",
+    true
+   ],
+   [
+    "amount",
+    true
+   ]
+  ],
+  "apply_checking_account_credit_5829": [
+   [
+    "account_id",
+    true
+   ],
+   [
+    "amount",
+    true
+   ],
+   [
+    "credit_type",
+    true
+   ]
+  ],
+  "apply_savings_account_credit_6831": [
+   [
+    "account_id",
+    true
+   ],
+   [
+    "amount",
+    true
+   ],
+   [
+    "credit_type",
+    true
+   ]
+  ],
+  "submit_interest_discrepancy_report_7294": [
+   [
+    "account_id",
+    true
+   ],
+   [
+    "user_id",
+    true
+   ],
+   [
+    "expected_apy",
+    true
+   ],
+   [
+    "actual_apy",
+    true
+   ],
+   [
+    "amount_difference",
+    true
+   ]
+  ],
+  "get_bank_account_transactions_9173": [
+   [
+    "account_id",
+    true
+   ]
+  ],
+  "order_debit_card_5739": [
+   [
+    "account_id",
+    true
+   ],
+   [
+    "user_id",
+    true
+   ],
+   [
+    "delivery_option",
+    true
+   ],
+   [
+    "delivery_fee",
+    true
+   ],
+   [
+    "card_design",
+    true
+   ],
+   [
+    "design_fee",
+    true
+   ],
+   [
+    "shipping_address",
+    true
+   ],
+   [
+    "excess_replacement_fee",
+    false
+   ]
+  ],
+  "activate_debit_card_8291": [
+   [
+    "card_id",
+    true
+   ],
+   [
+    "last_4_digits",
+    true
+   ],
+   [
+    "expiration_date",
+    true
+   ],
+   [
+    "cvv",
+    true
+   ],
+   [
+    "pin",
+    true
+   ]
+  ],
+  "activate_debit_card_8292": [
+   [
+    "card_id",
+    true
+   ],
+   [
+    "last_4_digits",
+    true
+   ],
+   [
+    "expiration_date",
+    true
+   ],
+   [
+    "cvv",
+    true
+   ],
+   [
+    "pin",
+    true
+   ]
+  ],
+  "activate_debit_card_8293": [
+   [
+    "card_id",
+    true
+   ],
+   [
+    "last_4_digits",
+    true
+   ],
+   [
+    "expiration_date",
+    true
+   ],
+   [
+    "cvv",
+    true
+   ],
+   [
+    "pin",
+    true
+   ]
+  ],
+  "close_debit_card_4721": [
+   [
+    "card_id",
+    true
+   ],
+   [
+    "reason",
+    true
+   ]
+  ],
+  "freeze_debit_card_3892": [
+   [
+    "card_id",
+    true
+   ]
+  ],
+  "unfreeze_debit_card_3893": [
+   [
+    "card_id",
+    true
+   ]
+  ],
+  "clear_debit_card_fraud_alert_4892": [
+   [
+    "card_id",
+    true
+   ],
+   [
+    "reason",
+    true
+   ]
+  ],
+  "reset_debit_card_pin_6284": [
+   [
+    "card_id",
+    true
+   ],
+   [
+    "last_4_digits",
+    true
+   ],
+   [
+    "new_pin",
+    true
+   ]
+  ],
+  "change_debit_card_pin_6285": [
+   [
+    "card_id",
+    true
+   ],
+   [
+    "current_pin",
+    true
+   ],
+   [
+    "new_pin",
+    true
+   ]
+  ],
+  "get_debit_cards_by_account_id_7823": [
+   [
+    "account_id",
+    true
+   ]
+  ],
+  "request_temporary_debit_card_limit_increase_8374": [
+   [
+    "card_id",
+    true
+   ],
+   [
+    "limit_type",
+    true
+   ],
+   [
+    "new_limit",
+    true
+   ]
+  ]
+ },
+ "user_tool_params": {
+  "submit_cash_back_dispute_0589": [
+   [
+    "user_id",
+    true
+   ],
+   [
+    "transaction_id",
+    true
+   ]
+  ],
+  "get_referral_link": [
+   [
+    "user_id",
+    true
+   ],
+   [
+    "card_name",
+    true
+   ]
+  ],
+  "get_card_last_4_digits": [
+   [
+    "credit_card_account_id",
+    true
+   ]
+  ],
+  "deposit_check_3847": [
+   [
+    "account_id",
+    true
+   ],
+   [
+    "check_amount",
+    true
+   ]
+  ],
+  "apply_for_credit_card": [
+   [
+    "card_type",
+    true
+   ],
+   [
+    "customer_name",
+    true
+   ],
+   [
+    "annual_income",
+    true
+   ],
+   [
+    "rho_bank_subscription",
+    false
+   ]
+  ],
+  "submit_referral": [
+   [
+    "user_id",
+    true
+   ],
+   [
+    "account_type",
+    true
+   ]
+  ],
+  "call_discoverable_user_tool": [
+   [
+    "discoverable_tool_name",
+    true
+   ],
+   [
+    "arguments",
+    false
+   ]
+  ],
+  "list_discoverable_user_tools": [],
+  "request_human_agent_transfer": [],
+  "submit_transaction": [
+   [
+    "user_id",
+    true
+   ],
+   [
+    "credit_card_type",
+    true
+   ],
+   [
+    "merchant_name",
+    true
+   ],
+   [
+    "amount",
+    true
+   ],
+   [
+    "category",
+    true
+   ]
+  ]
+ }
+}

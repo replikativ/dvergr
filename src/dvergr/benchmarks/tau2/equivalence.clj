@@ -7,7 +7,8 @@
    `dev/benchmarks/tau2/oracle.py`; this namespace replays the same corpus in
    Clojure and reports every divergence in tool content, error flag, or final
    database hash."
-  (:require [dvergr.benchmarks.tau2.pyjson :as pj]))
+  (:require [clojure.string :as str]
+            [dvergr.benchmarks.tau2.pyjson :as pj]))
 
 (defn replay
   "Replay one call sequence from `db` with `respond-fn`
@@ -175,4 +176,196 @@
         (map (fn [sequence]
                (let [{:strs [id outputs db]} (replay respond-fn db sequence)]
                  [id (sequence-digest outputs (hash-fn db))])))
+        corpus))
+
+;; ---------------------------------------------------------------------------
+;; Banking core corpus (base agent tools, KB_search, discoverable mechanics,
+;; user tools). Discoverable agent tools have their own per-chunk corpora.
+
+(def ^:private kb-queries
+  ["credit card annual fee" "how do I dispute a transaction" "Gold Rewards Card cash back"
+   "transfer to human agent reasons" "debit card PIN reset" "" "   " "the"
+   "overdraft fee refund policy checking account" "Rho-Bank+ subscription benefits"
+   "zzzz nonexistent qqqq" "BNPL" "credit limit increase eligibility 14 days"
+   "a a a a" "Crypto-Cash Back wallet" "unlock_discoverable_agent_tool"])
+
+(defn banking-core-corpus
+  "Seeded sequences over the core tools. `db` is the base TransactionalDB."
+  [db seed n]
+  (let [rng (java.util.Random. (long seed))
+        pick #(let [xs (vec %)] (nth xs (.nextInt rng (count xs))))
+        chance #(< (.nextDouble rng) %)
+        users (vec (vals (get-in db ["users" "data"])))
+        cc-ids (vec (keys (get-in db ["credit_card_accounts" "data"])))
+        account-ids (vec (keys (get-in db ["accounts" "data"])))
+        user-tools ["submit_cash_back_dispute_0589" "get_referral_link"
+                    "get_card_last_4_digits" "deposit_check_3847"]
+        agent-call
+        (fn [u]
+          (let [uid (if (chance 0.1) (pick ["nobody" "12\"3" 123]) (get u "user_id"))]
+            (case (int (.nextInt rng 16))
+              0 ["KB_search" {"query" (pick kb-queries)}]
+              1 ["KB_search" {"query" (str (pick kb-queries) " " (pick kb-queries))}]
+              2 ["get_user_information_by_id" {"user_id" uid}]
+              3 ["get_user_information_by_name" {"customer_name" (if (chance 0.2) (str/lower-case (get u "name")) (get u "name"))}]
+              4 ["get_user_information_by_email" {"email" (get u "email")}]
+              5 ["change_user_email" {"user_id" uid "new_email" "new@example.com"}]
+              6 ["get_referrals_by_user" {"user_id" uid}]
+              7 ["get_credit_card_transactions_by_user" {"user_id" uid}]
+              8 ["get_credit_card_accounts_by_user" {"user_id" uid}]
+              9 ["log_verification" {"name" (get u "name") "user_id" (get u "user_id")
+                                     "address" (get u "address") "email" (get u "email")
+                                     "phone_number" (get u "phone_number")
+                                     "date_of_birth" (get u "date_of_birth")
+                                     "time_verified" (pick ["2025-11-14 03:40:00 EST" "2025-11-14"])}]
+              10 ["give_discoverable_user_tool"
+                  {"discoverable_tool_name" (pick (conj user-tools "apply_for_credit_card" "nope"))
+                   "arguments" (pick ["{}" (str "{\"user_id\": \"" (get u "user_id") "\"}")
+                                      "{\"bogus\": 1}" "{\"self\": 1}" "not json" "[\"user_id\"]"
+                                      "{\"user_id\": \"x\", \"transaction_id\": \"t\"}"])}]
+              11 ["unlock_discoverable_agent_tool" {"agent_tool_name" (pick ["example_agent_tool_0000" "nope_1234"])}]
+              12 ["call_discoverable_agent_tool" {"agent_tool_name" (pick ["example_agent_tool_0000" "nope_1234"])
+                                                  "arguments" (pick ["{}" "{\"x\": 1}" "{bad" "[]"])}]
+              13 ["list_discoverable_agent_tools" {}]
+              14 ["transfer_to_human_agents" (cond-> {"summary" "help"}
+                                               (chance 0.8) (assoc "reason" (pick ["other" "fraud_or_security_concern" "made_up"])))]
+              15 (pick [["get_current_time" {}] ["get_user_information_by_id" {}]
+                        ["log_verification" {"name" "x"}] ["no_such_tool" {}]
+                        ["KB_search" {"query" 7}] ["KB_search" {"query" 0}]]))))
+        user-call
+        (fn [u]
+          (let [uid (get u "user_id")]
+            (case (int (.nextInt rng 9))
+              0 ["apply_for_credit_card" (cond-> {"card_type" (pick ["Gold Rewards Card" "EcoCard" "Titanium Card"])
+                                                  "customer_name" (get u "name")
+                                                  "annual_income" (pick [100000 100000.0 "85000" "lots" 52000.5])}
+                                           (chance 0.5) (assoc "rho_bank_subscription" (pick [true false "yes"])))]
+              1 ["submit_referral" {"user_id" uid "account_type" (pick ["Gold Rewards Card" "checking"])}]
+              2 ["call_discoverable_user_tool"
+                 {"discoverable_tool_name" (pick (conj user-tools "nope"))
+                  "arguments" (pick [(str "{\"user_id\": \"" uid "\", \"transaction_id\": \"txn_8d1aa1219382\"}")
+                                     (str "{\"user_id\": \"" uid "\", \"card_name\": \"Gold Rewards Card\"}")
+                                     (str "{\"credit_card_account_id\": \"" (pick cc-ids) "\"}")
+                                     (str "{\"account_id\": \"" (pick account-ids) "\", \"check_amount\": " (pick ["120" "99.5" "-3" "\"abc\""]) "}")
+                                     "{}" "{\"extra\": 1}" "{oops"])}]
+              3 ["list_discoverable_user_tools" {}]
+              4 ["request_human_agent_transfer" {}]
+              5 ["submit_transaction" {"user_id" uid "credit_card_type" (pick ["Gold Rewards Card" "Silver Rewards Card" "Unknown Card"])
+                                       "merchant_name" (pick ["Costco" "Delta"]) "amount" (pick [127.43 100 "12.5" 0.005])
+                                       "category" (pick ["Travel" "Groceries" "Software"])}]
+              6 [(pick user-tools) (pick [{"user_id" uid "transaction_id" "txn_8d1aa1219382"}
+                                          {"user_id" uid "card_name" "Gold Rewards Card"}
+                                          {"credit_card_account_id" (pick cc-ids)}
+                                          {"account_id" (pick account-ids) "check_amount" (pick [50 50.0 "7"])}])]
+              7 ["get_user_information_by_id" {"user_id" uid}]
+              8 ["submit_transaction" {"user_id" uid}])))]
+    (vec (for [i (range n)]
+           (let [u (pick users)]
+             {"id" (str "bk-core-" seed "-" i)
+              "task" (when (chance 0.2) (pick ["task_026" "task_027" "task_031"]))
+              "calls" (mapv (fn [_]
+                              (let [[requestor [name args]] (if (chance 0.35)
+                                                              ["user" (user-call u)]
+                                                              ["assistant" (agent-call u)])]
+                                {"name" name "arguments" args "requestor" requestor}))
+                            (range (inc (.nextInt rng 10))))})))))
+
+(defn mask-timing
+  "KB search results end with wall-clock timings upstream; compare modulo them."
+  [content]
+  (if (string? content)
+    (str/replace content #"\[Timing: retrieval=\d+ms(, reranking=\d+ms)?, total=\d+ms\]"
+                 "[Timing: masked]")
+    content))
+
+(defn compare-world-corpus
+  "Like `compare-corpus` for world-valued domains with requestors and tasks:
+   `respond-fn` is `(fn [world requestor name args] -> {:world :content :error})`,
+   `initial-world-fn` receives the whole sequence map (its \"task\" id and
+   any fixture keys), `hash-fn` hashes a world."
+  [respond-fn initial-world-fn hash-fn corpus oracle-results]
+  (let [by-id (into {} (map (juxt #(get % "id") identity)) oracle-results)
+        diffs
+        (for [{:strs [id task calls] :as sequence} corpus
+              :let [theirs (get by-id id)
+                    [world outputs]
+                    (reduce (fn [[w outs] {:strs [name arguments requestor]}]
+                              (let [{w' :world :keys [content error]}
+                                    (respond-fn w (if (= "user" requestor) :user :assistant)
+                                                name arguments)]
+                                [w' (conj outs {"content" (mask-timing content) "error" error})]))
+                            [(initial-world-fn sequence) []]
+                            calls)
+                    call-diffs (keep-indexed
+                                (fn [i [o t]]
+                                  (let [t (update t "content" mask-timing)]
+                                    (when (not= o t)
+                                      {:call i :call/name (get-in calls [i "name"])
+                                       :call/args (get-in calls [i "arguments"])
+                                       :ours o :theirs t})))
+                                (map vector outputs (get theirs "outputs")))
+                    our-hash (hash-fn world)
+                    hash-diff (when (not= our-hash (get theirs "db_hash"))
+                                {:ours our-hash :theirs (get theirs "db_hash")})]
+              :when (or (nil? theirs) (seq call-diffs) hash-diff)]
+          {:id id :task task :missing-oracle? (nil? theirs)
+           :calls (vec (take 3 call-diffs)) :call-diff-count (count call-diffs)
+           :hash hash-diff})]
+    {:sequences (count corpus)
+     :calls (reduce + (map #(count (get % "calls")) corpus))
+     :mismatched-sequences (count diffs)
+     :diffs (vec diffs)}))
+
+(defn via-unlock
+  "Rewrite direct calls of `discoverable` tools as unlock + call through
+   `call_discoverable_agent_tool` (JSON-string args, parsed upstream with
+   `parse_int=float`), exercising the path an agent actually uses."
+  [discoverable corpus]
+  (vec (for [s corpus]
+         (-> s
+             (update "id" #(str "unlock-" %))
+             (update "calls"
+                     (fn [calls]
+                       (vec (mapcat (fn [{:strs [name arguments] :as c}]
+                                      (if (contains? discoverable name)
+                                        [{"name" "unlock_discoverable_agent_tool"
+                                          "arguments" {"agent_tool_name" name}
+                                          "requestor" "assistant"}
+                                         {"name" "call_discoverable_agent_tool"
+                                          "arguments" {"agent_tool_name" name
+                                                       "arguments" (pj/dumps arguments)}
+                                          "requestor" "assistant"}]
+                                        [c]))
+                                    calls))))))))
+
+(defn gold-corpus
+  "One sequence per task replaying its gold actions (with requestors)."
+  [tasks]
+  (vec (for [task tasks]
+         {"id" (get task "id") "task" (get task "id")
+          "calls" (mapv (fn [{:strs [name arguments requestor]}]
+                          {"name" name "arguments" arguments
+                           "requestor" (or requestor "assistant")})
+                        (get-in task ["evaluation_criteria" "actions"]))})))
+
+(defn world-oracle-digests
+  "`{id digest}` from oracle results, timing lines masked."
+  [oracle-results]
+  (into (sorted-map)
+        (map (fn [{:strs [id outputs db_hash]}]
+               [id (sequence-digest (mapv #(update % "content" mask-timing) outputs) db_hash)]))
+        oracle-results))
+
+(defn world-replay-digests [respond-fn initial-world-fn hash-fn corpus]
+  (into (sorted-map)
+        (map (fn [{:strs [id calls] :as sequence}]
+               (let [[world outputs]
+                     (reduce (fn [[w outs] {:strs [name arguments requestor]}]
+                               (let [{w' :world :keys [content error]}
+                                     (respond-fn w (if (= "user" requestor) :user :assistant)
+                                                 name arguments)]
+                                 [w' (conj outs {"content" (mask-timing content) "error" error})]))
+                             [(initial-world-fn sequence) []]
+                             calls)]
+                 [id (sequence-digest outputs (hash-fn world))])))
         corpus))

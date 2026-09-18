@@ -11,10 +11,13 @@ Run from a tau2-bench checkout:
         retail replay input.json output.json
     uv run python .../oracle.py retail schema output.json
 
-`input.json` is a list of {"id": str, "calls": [{"name": str,
-"arguments": {...}}]}. Every sequence starts from a fresh database.
+`input.json` is a list of {"id": str, "task": optional task id,
+"inject": optional [[table, id, record], ...], "calls": [{"name": str,
+"arguments": {...}, "requestor": "assistant"|"user"}]}. Every sequence
+starts from a fresh database (plus the task's initialization data).
 """
 
+import inspect
 import json
 import sys
 
@@ -22,11 +25,39 @@ from tau2.data_model.message import ToolCall
 import importlib
 
 
-def fresh_env(domain):
+BANKING_VARIANT = "bm25"
+
+
+def domain_module(domain):
     # Import the domain directly: tau2.registry also imports optional voice
     # providers that the text environments do not need.
-    module = importlib.import_module(f"tau2.domains.{domain}.environment")
-    return module.get_environment()
+    return importlib.import_module(f"tau2.domains.{domain}.environment")
+
+
+def domain_tasks(domain):
+    return {t.id: t for t in domain_module(domain).get_tasks(None)}
+
+
+def fresh_env(domain, task=None):
+    """Fresh environment; for banking_knowledge with the `bm25` retrieval
+    variant, the task's read-log allowlist, and its initialization data."""
+    module = domain_module(domain)
+    if domain != "banking_knowledge":
+        return module.get_environment()
+    from tau2.runner.build import _derive_read_log_allowlist
+
+    env = module.get_environment(
+        retrieval_variant=BANKING_VARIANT,
+        task=task,
+        read_log_allowlist=_derive_read_log_allowlist(task) if task else None,
+    )
+    if task is not None and task.initial_state is not None:
+        env.set_state(
+            initialization_data=task.initial_state.initialization_data,
+            initialization_actions=task.initial_state.initialization_actions,
+            message_history=[],
+        )
+    return env
 
 
 def entity_snapshot(db):
@@ -46,9 +77,14 @@ def changed_entities(before, after):
 
 
 def replay(domain, sequences):
+    tasks = domain_tasks(domain) if domain == "banking_knowledge" else {}
     results = []
     for seq in sequences:
-        env = fresh_env(domain)
+        env = fresh_env(domain, tasks.get(seq.get("task")))
+        # Optional fixture records reaching branches no shipped data reaches:
+        # "inject": [[table, record_id, record], ...] (banking tables).
+        for table, record_id, record in seq.get("inject", []):
+            getattr(env.tools.db, table).data[record_id] = record
         before = entity_snapshot(env.tools.db)
         outputs = []
         for i, call in enumerate(seq["calls"]):
@@ -57,7 +93,7 @@ def replay(domain, sequences):
                     id=f"{seq['id']}-{i}",
                     name=call["name"],
                     arguments=call["arguments"],
-                    requestor="assistant",
+                    requestor=call.get("requestor", "assistant"),
                 )
             )
             outputs.append({"content": msg.content, "error": msg.error})
@@ -75,11 +111,43 @@ def replay(domain, sequences):
 
 def schema(domain):
     env = fresh_env(domain)
-    return {
+    out = {
         "policy": env.policy,
         "initial_db_hash": env.get_db_hash(),
         "tools": [t.openai_schema for t in env.get_tools()],
     }
+    if env.user_tools is not None:
+        from tau2.domains.banking_knowledge.tools import (
+            parse_discoverable_tool_docstring,
+        )
+
+        out["user_tools"] = [t.openai_schema for t in env.get_user_tools()]
+        out["mutating"] = {
+            name: env._is_mutating_tool(name)
+            for name in list(env.tools.tools) + list(env.user_tools.tools)
+        }
+        out["agent_discoverable"] = {
+            name: parse_discoverable_tool_docstring(fn)
+            for name, fn in env.tools.get_discoverable_tools().items()
+        }
+        out["user_discoverable"] = {
+            name: parse_discoverable_tool_docstring(fn)
+            for name, fn in env.user_tools.get_discoverable_tools().items()
+        }
+        out["agent_tool_params"] = {
+            name: [[p.name, p.default is inspect.Parameter.empty]
+                   for p in inspect.signature(fn).parameters.values()]
+            for name, fn in env.tools.tools.items()
+        }
+        # glob() order of the documents directory: filesystem-dependent
+        # upstream; pinned here because BM25 breaks score ties by it.
+        out["kb_doc_order"] = list(domain_module(domain).get_knowledge_base().documents)
+        out["user_tool_params"] = {
+            name: [[p.name, p.default is inspect.Parameter.empty]
+                   for p in inspect.signature(fn).parameters.values()]
+            for name, fn in env.user_tools.tools.items()
+        }
+    return out
 
 
 def prompts(domain):
@@ -88,17 +156,23 @@ def prompts(domain):
     from tau2.orchestrator.orchestrator import DEFAULT_FIRST_AGENT_MESSAGE
     from tau2.user.user_simulator import UserSimulator
 
-    module = importlib.import_module(f"tau2.domains.{domain}.environment")
-    env = module.get_environment()
+    module = domain_module(domain)
+    env = fresh_env(domain)
     agent = LLMAgent(tools=env.get_tools(), domain_policy=env.policy, llm="none")
     users = {}
+    user_tools = {}
     for task in module.get_tasks(None):
-        user = UserSimulator(llm="none", instructions=task.user_scenario)
+        tools = None
+        if env.user_tools is not None:
+            tools = env.get_user_tools(include=task.user_tools) or None
+            user_tools[task.id] = [t.name for t in tools or []]
+        user = UserSimulator(llm="none", instructions=task.user_scenario, tools=tools)
         users[task.id] = user.system_prompt
     return {
         "agent_system": agent.system_prompt,
         "first_agent_message": DEFAULT_FIRST_AGENT_MESSAGE.content,
         "user_system": users,
+        "user_tools": user_tools,
     }
 
 

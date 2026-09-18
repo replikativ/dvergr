@@ -8,7 +8,7 @@
    number without that identity is not comparable to anything.
 
      (def dom (t2/load-domain \"retail\"))
-     (run! dom {:split \"test\" :trials 1 :parallelism 2
+     (run! dom {:split \"train\" :trials 1 :parallelism 2
                 :agent {:model \"claude-code-sonnet\"}
                 :user {:model \"claude-code-sonnet\"}
                 :judge {:model \"claude-code-sonnet\"}})"
@@ -97,7 +97,8 @@
    resume it."
   [domain {:keys [split task-ids trials parallelism dir agent user judge
                   agent-fn user-fn judge-fn]
-           :or {split "test" trials 1 parallelism 1}
+           ;; Leaderboard methodology: the full `base` split, >= 4 trials.
+           :or {split "base" trials 4 parallelism 1}
            :as opts}]
   (let [run-id (str (java.time.LocalDateTime/now))
         dir (io/file (or dir (str default-dir "/" (str/replace run-id ":" "-"))))
@@ -112,6 +113,7 @@
                 :task-ids (mapv #(get % "id") tasks)
                 :trials trials
                 :agent agent :user user :judge judge
+                :retrieval-config (:retrieval-config domain)
                 :protocol (select-keys opts [:max-steps :max-errors :enforce-protocol?])
                 :initial-db-hash (:initial-db-hash domain)}
         header-file (io/file dir "run.edn")

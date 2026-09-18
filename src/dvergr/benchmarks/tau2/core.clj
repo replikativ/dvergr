@@ -17,7 +17,10 @@
    replay of its tool calls."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
+            [dvergr.benchmarks.tau2.banking :as banking]
+            [dvergr.benchmarks.tau2.banking.db :as banking-db]
             [dvergr.benchmarks.tau2.pyjson :as pj]
+            [dvergr.benchmarks.tau2.python :as py]
             [dvergr.benchmarks.tau2.retail :as retail]))
 
 ;; ---------------------------------------------------------------------------
@@ -33,7 +36,10 @@
              "tasks.json" "8e03ebce7901bd6218e7a7dc3105faa9324091a68058f7fe61c65262868812e8"
              "policy.md" "2c9652afbce57d6e087768d37cda64d31c53d50b3e3225cfdb791bac66466467"
              "split_tasks.json" "ed0580ec52575b63fbf76568af42490da6ee7783ecb4aa81af46961291358f20"}
-   :user-guidelines "740a29dfa64d7bc08eea3bf7493575b914a63f744acbaf7f199ee07eddaf72d3"})
+   "banking_knowledge" {"db.json" "e692feb797c659f0e21ff7380aa87beb4e95a0694d7bb7945f073102f0293d28"
+                        "tasks/" "b9efd448d38015c5707b61a341e6423c27ba7a8cc62f7fa726379b1e4f018206"}
+   :user-guidelines "740a29dfa64d7bc08eea3bf7493575b914a63f744acbaf7f199ee07eddaf72d3"
+   :user-guidelines-tools "cbf3d8a4d8642fd04e559862f1afef55d7dd4e6a7e727ca49e239023c599de0c"})
 
 (def default-root
   "A tau2-bench checkout next to Dvergr. Override with `:root`."
@@ -49,35 +55,91 @@
                        :upstream upstream})))
     text))
 
-(def ^:private domain-impls
-  {"retail" {:respond retail/respond
-             :normalize-db retail/normalize-db
-             :db-hash retail/db-hash
-             :tools-resource "benchmarks/tau2/retail-tools.json"}})
+(defn- read-guidelines [root tools?]
+  (let [file (if tools? "simulation_guidelines_tools.md" "simulation_guidelines.md")]
+    (verified-slurp (io/file root "data/tau2/user_simulator" file)
+                    (get file-digests (if tools? :user-guidelines-tools :user-guidelines)))))
+
+(defn- load-retail [root]
+  (let [dir (io/file root "data/tau2/domains/retail")
+        digests (get file-digests "retail")
+        read-json #(pj/parse (verified-slurp (io/file dir %) (get digests %)))
+        db (retail/normalize-db (read-json "db.json"))
+        tasks (read-json "tasks.json")]
+    {:domain "retail"
+     :db db
+     :initial-db-hash (retail/db-hash db)
+     :initial-world (fn [_task] db)
+     ;; Retail has no user tools: upstream raises for user tool calls.
+     :respond (fn [world requestor name args]
+                (if (= requestor :user)
+                  {:world world :content "Error: User tools not available" :error true}
+                  (let [{d :db :keys [content error]} (retail/respond world name args)]
+                    {:world d :content content :error error})))
+     :world-hash retail/db-hash
+     :policy (verified-slurp (io/file dir "policy.md") (get digests "policy.md"))
+     :tasks (into (array-map) (map (juxt #(get % "id") identity)) tasks)
+     :splits (read-json "split_tasks.json")
+     :tool-schemas (pj/parse (slurp (io/resource "benchmarks/tau2/retail-tools.json")))
+     :user-tool-schemas (constantly nil)
+     :user-guidelines (read-guidelines root false)}))
+
+(defn- load-banking [root]
+  (let [dir (io/file root "data/tau2/domains/banking_knowledge")
+        digests (get file-digests "banking_knowledge")
+        base-db (banking-db/normalize-db
+                 (pj/parse (verified-slurp (io/file dir "db.json") (get digests "db.json"))))
+        ;; `get_tasks` reads tasks/task_*.json (sorted); the combined
+        ;; tasks.json in the same directory is stale upstream.
+        task-files (sort-by #(.getName ^java.io.File %)
+                            (filter #(re-matches #"task_.*\.json" (.getName ^java.io.File %))
+                                    (.listFiles (io/file dir "tasks"))))
+        task-texts (mapv slurp task-files)
+        tasks-digest (pj/sha256-hex (str/join "\n" (map (fn [f t] (str (.getName ^java.io.File f) ":" (pj/sha256-hex t)))
+                                                         task-files task-texts)))
+        _ (when (not= tasks-digest (get digests "tasks/"))
+            (throw (ex-info "tau2 data file does not match the pinned upstream revision"
+                            {:type ::data-digest-mismatch :path (str (io/file dir "tasks"))
+                             :expected (get digests "tasks/") :actual tasks-digest
+                             :upstream upstream})))
+        tasks (mapv pj/parse task-texts)
+        index (banking/build-bm25 (banking/load-documents (io/file dir "documents")))
+        kits (banking/toolkits index)
+        meta @banking/metadata
+        user-schemas (get meta "user_tools")]
+    {:domain "banking_knowledge"
+     :retrieval-config "bm25"
+     :db base-db
+     :initial-db-hash (banking-db/db-hash base-db)
+     :initial-world (fn [task] (banking/initial-world base-db task))
+     :respond (fn [world requestor name args]
+                (banking/respond kits world requestor name args))
+     :world-hash (comp banking-db/db-hash :db)
+     :policy (banking/policy (io/file dir "prompts"))
+     :tasks (into (array-map) (map (juxt #(get % "id") identity)) tasks)
+     :splits {"base" (mapv #(get % "id") tasks)}
+     :tool-schemas (get meta "tools")
+     ;; `environment.get_user_tools(include=task.user_tools) or None`
+     :user-tool-schemas (fn [task]
+                          (let [include (get task "user_tools")]
+                            (not-empty
+                             (if (nil? include)
+                               user-schemas
+                               (filterv #(some #{(get-in % ["function" "name"])} include)
+                                        user-schemas)))))
+     :user-guidelines (read-guidelines root false)
+     :user-guidelines-tools (read-guidelines root true)}))
 
 (defn load-domain
-  "Load one text domain from a pinned tau2-bench checkout. Every data file is
-   verified against the upstream digest recorded in `file-digests`."
+  "Load one text domain from a pinned tau2-bench checkout. Data files are
+   verified against the upstream digests recorded in `file-digests`.
+   Supported: \"retail\", \"banking_knowledge\" (bm25 retrieval)."
   ([domain] (load-domain domain {}))
   ([domain {:keys [root] :or {root default-root}}]
-   (let [impl (or (get domain-impls domain)
-                  (throw (ex-info "Unsupported tau2 domain" {:domain domain})))
-         dir (io/file root "data/tau2/domains" domain)
-         digests (get file-digests domain)
-         read-json #(pj/parse (verified-slurp (io/file dir %) (get digests %)))
-         db ((:normalize-db impl) (read-json "db.json"))
-         tasks (read-json "tasks.json")]
-     (merge impl
-            {:domain domain
-             :db db
-             :initial-db-hash ((:db-hash impl) db)
-             :policy (verified-slurp (io/file dir "policy.md") (get digests "policy.md"))
-             :tasks (into (array-map) (map (juxt #(get % "id") identity)) tasks)
-             :splits (read-json "split_tasks.json")
-             :tool-schemas (pj/parse (slurp (io/resource (:tools-resource impl))))
-             :user-guidelines (verified-slurp
-                               (io/file root "data/tau2/user_simulator/simulation_guidelines.md")
-                               (:user-guidelines file-digests))}))))
+   (case domain
+     "retail" (load-retail root)
+     "banking_knowledge" (load-banking root)
+     (throw (ex-info "Unsupported tau2 domain" {:domain domain})))))
 
 (defn split-tasks
   "Tasks of a named upstream split (\"train\", \"test\", \"base\")."
@@ -130,8 +192,10 @@
               true (into ["Instructions:" (indent (instructions-str instructions) "\t")]))))
 
 (defn user-system-prompt [domain task]
-  (str (str/replace (:user-guidelines domain) "<PERSONA_GUIDELINES>" "")
-       "\n\n<scenario>\n" (scenario-str (get task "user_scenario")) "\n</scenario>"))
+  (let [tools? (some? ((:user-tool-schemas domain) task))
+        guidelines (if tools? (:user-guidelines-tools domain) (:user-guidelines domain))]
+    (str (str/replace guidelines "<PERSONA_GUIDELINES>" "")
+         "\n\n<scenario>\n" (scenario-str (get task "user_scenario")) "\n</scenario>")))
 
 ;; ---------------------------------------------------------------------------
 ;; Episode protocol
@@ -145,22 +209,43 @@
     (sequential? x) (mapv stringify-keys x)
     :else x))
 
+(defn- execute-calls
+  "Run tool calls in order for `requestor`; returns `[world tool-messages]`."
+  [respond world requestor tool-calls]
+  (reduce (fn [[world results] {:keys [id name arguments]}]
+            (let [{world' :world :keys [content error]} (respond world requestor name arguments)]
+              [world' (conj results {:role :tool :id id :content content :error error
+                                     :requestor requestor})]))
+          [world []]
+          tool-calls))
+
+(defn- normalize-calls [tool-calls]
+  (not-empty (mapv #(update % :arguments stringify-keys) tool-calls)))
+
 (defn run-episode
-  "Run one task and return `{:messages :termination :db :usage}`.
+  "Run one task and return `{:messages :termination :world :db :usage}`.
 
    `agent` and `user` are generate functions
    `(fn [{:keys [system messages tools]}] -> {:content str :tool-calls [{:id :name :arguments}] :usage map})`.
    Messages use tau2's shape: `{:role :assistant|:user|:tool :content str
-   :tool-calls [...] :id str :error bool}`; the user simulator receives the
-   role-flipped history of the text exchange, exactly like upstream."
+   :tool-calls [...] :id str :error bool :requestor :assistant|:user}`.
+
+   Each participant sees its own history like upstream: the agent receives
+   user text plus its own tool traffic; the user simulator receives a
+   role-flipped history of agent text plus its own tool calls and results
+   (dual control, e.g. banking user tools)."
   [domain task {:keys [agent user max-steps max-errors enforce-protocol?]
                 :or {max-steps 200 max-errors 10 enforce-protocol? false}}]
   (let [agent-system (agent-system-prompt domain)
         user-system (user-system-prompt domain task)
-        tools (:tool-schemas domain)
+        agent-tools (:tool-schemas domain)
+        user-tools ((:user-tool-schemas domain) task)
         respond (:respond domain)
-        greeting {:role :assistant :content first-agent-message}]
-    (loop [db (:db domain)
+        greeting {:role :assistant :content first-agent-message}
+        malformed? (fn [content calls]
+                     (or (and (not calls) (not (has-text? content)))
+                         (and enforce-protocol? calls (has-text? content))))]
+    (loop [world ((:initial-world domain) task)
            trajectory [greeting]
            ;; histories as seen by each participant
            agent-view [greeting]
@@ -169,88 +254,112 @@
            steps 0
            errors 0
            usage []]
-      (let [done (fn [reason]
-                   {:messages trajectory :termination reason :db db
+      (let [done (fn [reason & {:keys [trajectory steps usage]
+                                :or {trajectory trajectory steps steps usage usage}}]
+                   {:messages trajectory :termination reason :world world
+                    :db (if (map? world) (get world :db world) world)
                     :steps steps :errors errors :usage usage})]
         (cond
           (>= steps max-steps) (done :max-steps)
           (>= errors max-errors) (done :too-many-errors)
 
           (= to :user)
-          (let [{:keys [content usage] :as reply} (user {:system user-system
-                                                         :messages user-view})
-                msg {:role :user :content content}
+          (let [{:keys [content tool-calls] :as reply}
+                (user (cond-> {:system user-system :messages user-view}
+                        user-tools (assoc :tools user-tools)))
+                calls (normalize-calls tool-calls)
+                msg (cond-> {:role :user :content content}
+                      calls (assoc :tool-calls calls))
                 trajectory (conj trajectory msg)
                 usage-log (conj usage {:role :user :usage (:usage reply)})]
             (cond
-              (not (has-text? content))
-              {:messages trajectory :termination :user-error :db db
-               :steps (inc steps) :errors errors :usage usage-log}
+              (malformed? content calls)
+              (done :user-error :trajectory trajectory :steps (inc steps) :usage usage-log)
 
-              (some #(str/includes? content %) user-stop-tokens)
-              {:messages trajectory :termination :user-stop :db db
-               :steps (inc steps) :errors errors :usage usage-log}
+              (and (string? content) (some #(str/includes? content %) user-stop-tokens))
+              (done :user-stop :trajectory trajectory :steps (inc steps) :usage usage-log)
+
+              calls
+              (let [own (cond-> {:role :assistant :content content} calls (assoc :tool-calls calls))
+                    [world results] (execute-calls respond world :user calls)]
+                (recur world (into trajectory results) agent-view
+                       (into (conj user-view own) results)
+                       :user (+ steps 2) (+ errors (count (filter :error results)))
+                       usage-log))
 
               :else
-              (recur db trajectory (conj agent-view msg)
+              (recur world trajectory (conj agent-view msg)
                      (conj user-view {:role :assistant :content content})
                      :agent (inc steps) errors usage-log)))
 
           (= to :agent)
           (let [{:keys [content tool-calls] :as reply}
-                (agent {:system agent-system :messages agent-view :tools tools})
-                tool-calls (not-empty (mapv #(update % :arguments stringify-keys) tool-calls))
+                (agent {:system agent-system :messages agent-view :tools agent-tools})
+                calls (normalize-calls tool-calls)
                 msg (cond-> {:role :assistant :content content}
-                      tool-calls (assoc :tool-calls tool-calls))
+                      calls (assoc :tool-calls calls))
                 trajectory (conj trajectory msg)
-                usage-log (conj usage {:role :agent :usage (:usage reply)})
-                stop? (and (string? content) (str/includes? content stop-token))]
+                usage-log (conj usage {:role :agent :usage (:usage reply)})]
             (cond
               ;; `validate()` rejects empty messages. Mixed text+tool-call
               ;; messages are only an error under tau2's opt-in
               ;; `enforce_communication_protocol` (default off); otherwise they
               ;; route to the environment and the user never sees the text.
-              (or (and (not tool-calls) (not (has-text? content)))
-                  (and enforce-protocol? tool-calls (has-text? content)))
-              {:messages trajectory :termination :agent-error :db db
-               :steps (inc steps) :errors errors :usage usage-log}
+              (malformed? content calls)
+              (done :agent-error :trajectory trajectory :steps (inc steps) :usage usage-log)
 
-              stop?
-              {:messages trajectory :termination :agent-stop :db db
-               :steps (inc steps) :errors errors :usage usage-log}
+              (and (string? content) (str/includes? content stop-token))
+              (done :agent-stop :trajectory trajectory :steps (inc steps) :usage usage-log)
 
-              tool-calls
+              calls
               ;; AGENT -> ENV is one step, ENV -> AGENT is the next.
-              (let [[db results] (reduce (fn [[db results] {:keys [id name arguments]}]
-                                           (let [{db' :db :keys [content error]}
-                                                 (respond db name arguments)]
-                                             [db' (conj results {:role :tool :id id
-                                                                 :content content
-                                                                 :error error})]))
-                                         [db []]
-                                         tool-calls)]
-                (recur db (into trajectory results)
+              (let [[world results] (execute-calls respond world :assistant calls)]
+                (recur world (into trajectory results)
                        (into (conj agent-view msg) results)
                        user-view :agent (+ steps 2)
                        (+ errors (count (filter :error results)))
                        usage-log))
 
               :else
-              (recur db trajectory (conj agent-view msg)
+              (recur world trajectory (conj agent-view msg)
                      (conj user-view {:role :user :content content})
                      :user (inc steps) errors usage-log))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Grading
 
-(defn gold-db
-  "The database after replaying a task's gold actions (errors ignored, as
-   upstream logs and continues)."
+(defn gold-world
+  "The world after replaying a task's gold actions from its initial world
+   (errors ignored, as upstream logs and continues)."
   [domain task]
-  (reduce (fn [db {:strs [name arguments]}]
-            (:db ((:respond domain) db name arguments)))
-          (:db domain)
+  (reduce (fn [world {:strs [name arguments requestor]}]
+            (:world ((:respond domain) world (if (= "user" requestor) :user :assistant)
+                                       name arguments)))
+          ((:initial-world domain) task)
           (get-in task ["evaluation_criteria" "actions"])))
+
+(defn gold-db
+  "Retail compatibility: the gold world's database."
+  [domain task]
+  (let [w (gold-world domain task)] (if (map? w) (get w :db w) w)))
+
+(defn action-checks
+  "tau2 `ActionEvaluator`: every gold action must match some tool call of
+   either participant. Only the keys the *predicted* call used are compared
+   unless the action names `compare_args` (upstream quirk kept)."
+  [task messages]
+  (let [calls (mapcat :tool-calls (filter #(#{:assistant :user} (:role %)) messages))]
+    (vec (for [{:strs [name arguments compare_args] :as action}
+               (get-in task ["evaluation_criteria" "actions"])]
+           {:action action
+            :met (boolean
+                  (some (fn [{call-name :name call-args :arguments}]
+                          (and (= name call-name)
+                               (let [ks (if (nil? compare_args) (keys call-args) compare_args)]
+                                 (or (empty? ks)
+                                     (py/py-eq (select-keys call-args ks)
+                                               (select-keys arguments ks))))))
+                        calls))}))))
 
 (defn communicate-checks [task messages]
   (vec (for [info (get-in task ["evaluation_criteria" "communicate_info"])]
@@ -313,14 +422,16 @@
 (defn grade
   "tau2 `evaluate_simulation` with EvaluationType.ALL for one episode.
    `judge` may be nil when no task in scope needs NL assertions."
-  [domain task {:keys [messages termination db]} {:keys [judge]}]
+  [domain task {:keys [messages termination world db]} {:keys [judge]}]
   (if-not (#{:agent-stop :user-stop} termination)
     {:reward 0.0 :termination termination
      :note "Simulation terminated prematurely"}
     (let [basis (set (get-in task ["evaluation_criteria" "reward_basis"]))
-          hash-fn (:db-hash domain)
-          db-match (= (hash-fn (gold-db domain task)) (hash-fn db))
+          hash-fn (or (:world-hash domain) (:db-hash domain))
+          final (if (some? world) world db)
+          db-match (= (hash-fn (gold-world domain task)) (hash-fn final))
           comm (communicate-checks task messages)
+          actions (action-checks task messages)
           nl (when (contains? basis "NL_ASSERTION")
                (if judge
                  (nl-assertion-checks task messages judge)
@@ -329,15 +440,18 @@
                                   :task (get task "id")}))))
           components (cond-> {}
                        (contains? basis "DB") (assoc :db (if db-match 1.0 0.0))
+                       (contains? basis "ACTION")
+                       (assoc :action (if (every? :met actions) 1.0 0.0))
                        (contains? basis "COMMUNICATE")
                        (assoc :communicate (if (every? :met comm) 1.0 0.0))
                        (contains? basis "NL_ASSERTION")
                        (assoc :nl-assertion (if (every? :met nl) 1.0 0.0)))]
-      (when-let [unsupported (seq (remove #{"DB" "COMMUNICATE" "NL_ASSERTION"} basis))]
+      (when-let [unsupported (seq (remove #{"DB" "ACTION" "COMMUNICATE" "NL_ASSERTION"} basis))]
         (throw (ex-info "Unsupported reward basis" {:basis (set unsupported)})))
       {:reward (reduce * 1.0 (vals components))
        :termination termination
        :reward-breakdown components
        :db-match db-match
+       :action-checks (when (contains? basis "ACTION") actions)
        :communicate-checks comm
        :nl-assertions nl})))

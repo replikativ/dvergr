@@ -51,9 +51,13 @@
   [x ndigits]
   (if (integer? x)
     x
-    (-> (BigDecimal. (double x))
-        (.setScale (int ndigits) RoundingMode/HALF_EVEN)
-        (.doubleValue))))
+    (let [d (double x)
+          r (-> (BigDecimal. d)
+                (.setScale (int ndigits) RoundingMode/HALF_EVEN)
+                (.doubleValue))]
+      ;; BigDecimal has no negative zero; Python keeps the sign:
+      ;; round(-2e-05, 4) == -0.0.
+      (if (zero? r) (Math/copySign 0.0 d) r))))
 
 (defn py-str
   "Python `str()` for the scalar values tau2 tools stringify."
