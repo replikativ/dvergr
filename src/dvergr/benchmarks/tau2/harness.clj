@@ -107,7 +107,19 @@
 
 (defn make-agent-turn
   "Return `{:turn (fn [{:keys [world history message]}] -> {:world :reply :messages :usage})
-            :close (fn [])}` for one episode.
+            ;; Dvergr's own view of the episode: the system prompt as sent, every
+     ;; model message with its tool uses (e.g. the clojure_eval code), and
+     ;; every tool result, in chat order.
+     :transcript (fn []
+                   (mapv (fn [m]
+                           (let [m (into {} (remove (fn [[k _]] (= :db/id k))) m)]
+                             (cond-> m
+                               (:message/tool-uses m)
+                               (update :message/tool-uses
+                                       (fn [tus] (mapv #(into {} (remove (fn [[k _]] (= :db/id k))) %)
+                                                       tus))))))
+                         (chat-context/get-messages chat-ctx)))
+     :close (fn [])}` for one episode.
 
    `spec` is `{:model id :provider kw? :action-space :tools|:repl
    :max-model-steps n :budget-dollars n}`."
@@ -155,6 +167,18 @@
           :reply (when (= :complete outcome) reply)
           :outcome outcome
           :usage (chat-context/get-budget chat-ctx)}))
+     ;; Dvergr's own view of the episode: the system prompt as sent, every
+     ;; model message with its tool uses (e.g. the clojure_eval code), and
+     ;; every tool result, in chat order.
+     :transcript (fn []
+                   (mapv (fn [m]
+                           (let [m (into {} (remove (fn [[k _]] (= :db/id k))) m)]
+                             (cond-> m
+                               (:message/tool-uses m)
+                               (update :message/tool-uses
+                                       (fn [tus] (mapv #(into {} (remove (fn [[k _]] (= :db/id k))) %)
+                                                       tus))))))
+                         (chat-context/get-messages chat-ctx)))
      :close (fn []
               (try (chat-context/close-chat! chat-ctx) (catch Throwable _ nil))
               (d/close-room! room))}))

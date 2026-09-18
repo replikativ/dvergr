@@ -84,6 +84,7 @@
          :steps (:steps episode)
          :tool-errors (:errors episode)
          :messages (:messages episode)
+         :harness-transcript (when harness-turn ((:transcript harness-turn)))
          :usage (:usage episode)
          :duration-ms (- (System/currentTimeMillis) started)})
       (catch Throwable t
