@@ -78,8 +78,18 @@ tuning must never see.
 | Date | Agent | User sim / judge | Split | Trials | pass^1 | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
 | 2026-09-18 | Sonnet 5 via Claude Code (`claude-code-sonnet`) | same | test (40) | 1 | 0.80 | Internal only: not a leaderboard setting |
+| 2026-09-18 | reference loop, Sonnet 5 via Claude Code | Opus 5 via Claude Code | test (40) | 1 | 0.925 | Room path (`retail-cmp-A`) |
+| 2026-09-18 | Dvergr `llm-agent`, JSON tools, Sonnet 5 | Opus 5 | test (40) | 1 | 0.925 | Room path; ~113k agent input tokens per episode |
+| 2026-09-18 | Dvergr `llm-agent`, REPL, Sonnet 5 | Opus 5 | test (40) | 1 | 0.900 | Room path; ~80k agent input tokens per episode (−30%) |
 
-Failure classes in that run were:
+In `retail-cmp-A` all three candidates fail tasks 27 and 38 (DB) and 68 (NL
+assertion); the REPL candidate also fails task 64. Every one of the 120
+episodes passes `verify-world` and `verify-episode`. One trial cannot rank
+the candidates. The REPL candidate needs about 30% fewer agent input tokens,
+because it composes several tool calls per `clojure_eval` (263 evaluations
+for 366 domain calls).
+
+Failure classes in the first (host-runner) run were:
 
 - incomplete multi-request (tasks 71, 97);
 - ordering against the one-return-or-exchange policy (27);
