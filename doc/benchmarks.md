@@ -73,6 +73,23 @@ tuning must never see.
   LLM-judged NL assertions. The predicted DB is the episode's final value, not
   a replay of its calls, which is equivalent because tools are deterministic.
 
+### Baselines
+
+| Date | Agent | User sim / judge | Split | Trials | pass^1 | Notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2026-09-18 | Sonnet 5 via Claude Code (`claude-code-sonnet`) | same | test (40) | 1 | 0.80 | Internal only: not a leaderboard setting |
+
+Failure classes in that run were:
+
+- incomplete multi-request (tasks 71, 97);
+- ordering against the one-return-or-exchange policy (27);
+- wrong variant choice (60);
+- no write at all (39);
+- a cancel reason the scenario never specifies (38);
+- an unstated order total, failed by the judge (68);
+- one tool call emitted without `<tool_use>` tags (90). This was a
+  Claude Code adapter gap, since fixed.
+
 ## Equivalence method
 
 `dev/benchmarks/tau2/oracle.py` is the only Python involved, and it runs
