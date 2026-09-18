@@ -225,7 +225,8 @@
 (defn run-episode
   "Run one task and return `{:messages :termination :world :db :usage}`.
 
-   `agent` and `user` are generate functions
+   `agent` and `user` are generate functions (or `agent-turn`, a whole-turn
+   candidate `(fn [{:keys [world message]}] -> {:world :reply :messages})`)
    `(fn [{:keys [system messages tools]}] -> {:content str :tool-calls [{:id :name :arguments}] :usage map})`.
    Messages use tau2's shape: `{:role :assistant|:user|:tool :content str
    :tool-calls [...] :id str :error bool :requestor :assistant|:user}`.
@@ -234,7 +235,7 @@
    user text plus its own tool traffic; the user simulator receives a
    role-flipped history of agent text plus its own tool calls and results
    (dual control, e.g. banking user tools)."
-  [domain task {:keys [agent user max-steps max-errors enforce-protocol?]
+  [domain task {:keys [agent agent-turn user max-steps max-errors enforce-protocol?]
                 :or {max-steps 200 max-errors 10 enforce-protocol? false}}]
   (let [agent-system (agent-system-prompt domain)
         user-system (user-system-prompt domain task)
@@ -291,6 +292,30 @@
               (recur world trajectory (conj agent-view msg)
                      (conj user-view {:role :assistant :content content})
                      :agent (inc steps) errors usage-log)))
+
+          (and (= to :agent) agent-turn)
+          ;; Whole-turn candidate (e.g. Dvergr's own agent loop): the tool
+          ;; traffic is spliced into the trajectory with tau2's step and error
+          ;; accounting, then the reply goes to the user.
+          (let [{:keys [world reply messages outcome] :as result}
+                (agent-turn {:world world :message (:content (peek agent-view))})
+                results (filter #(= :tool (:role %)) messages)
+                steps (+ steps (* 2 (count results)) 1)
+                errors (+ errors (count (filter :error results)))
+                msg {:role :assistant :content reply}
+                trajectory (conj (into trajectory messages) msg)
+                usage-log (conj usage {:role :agent :usage (:usage result) :outcome outcome})
+                done* (fn [reason]
+                        {:messages trajectory :termination reason :world world
+                         :db (if (map? world) (get world :db world) world)
+                         :steps steps :errors errors :usage usage-log})]
+            (cond
+              (not (has-text? reply)) (done* :agent-error)
+              (str/includes? reply stop-token) (done* :agent-stop)
+              (>= errors max-errors) (done* :too-many-errors)
+              :else (recur world trajectory (conj (into agent-view messages) msg)
+                           (conj user-view {:role :user :content reply})
+                           :user steps errors usage-log)))
 
           (= to :agent)
           (let [{:keys [content tool-calls] :as reply}

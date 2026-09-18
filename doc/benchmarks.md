@@ -90,6 +90,30 @@ Failure classes in that run were:
 - one tool call emitted without `<tool_use>` tags (90). This was a
   Claude Code adapter gap, since fixed.
 
+### Candidates
+
+A candidate is whatever answers the simulated user. Grading, protocol and
+worlds are identical across candidates.
+
+| Candidate | Agent spec | What is under test |
+| --- | --- | --- |
+| Reference | `{:model m}` | tau2's `LLMAgent`: one model step per protocol step (`live/model-generate`) |
+| Dvergr loop | `{:model m :harness :dvergr :action-space :tools}` | Dvergr's own agent turn (`chat.agent/run-agent-turn!`) inside one working chat context per episode, with the domain tools as JSON tools |
+| Dvergr REPL | `{:model m :harness :dvergr :action-space :repl}` | The same loop with one `clojure_eval` tool. The domain tools are SCI functions `tau2/<tool>` returning upstream's strings, plus `tau2/parse` |
+
+`dvergr.benchmarks.tau2.harness` binds each harness turn to the episode's
+world value. Every tool call, including calls made inside `clojure_eval`, is
+recorded as a tau2 tool-call message, so DB and ACTION grading and step/error
+accounting are unchanged. Harness candidates change the orchestration, so
+their results would be tau2 "custom" submissions.
+
+First comparison (2026-09-18) on retail train tasks 0–8, 1 trial, Sonnet 5 via
+Claude Code as agent, user and judge: reference 8/8, Dvergr loop 8/8,
+Dvergr REPL 6/8. The REPL failures were a correct DB with an unfiltered count
+of unavailable variants (task 3, judged) and a wrong exchange variant (task 6).
+At this sample size the candidates are indistinguishable; the comparison
+proves the plumbing, not a ranking.
+
 ## tau2-bench (banking_knowledge, `bm25` retrieval)
 
 This is τ³'s knowledge domain. It has 97 tasks over a bank database, a
@@ -195,9 +219,9 @@ environment execution only; model latency dominates live episodes.
    plus a trusted `Evaluator`. The retail DB value lives in the Run's forked
    world, the simulated user is a room participant, and results become
    `Attempt`s and `Scorecard`s.
-2. Add a REPL action-space candidate. Expose the same tools as SCI functions
-   through `clojure_eval` and compare against JSON tool calling on the same
-   tasks.
+2. Measure the candidates properly: full `base` split, 4 trials, and a
+   user simulator that differs from the agent model. Then tune the REPL
+   candidate's prompt and affordances on `train` only.
 3. Use forks for branching. Branch at a user turn for counterfactual rollouts
    and cheap pass^k/GRPO-style groups from one shared prefix.
 4. Port the airline and telecom domains the same way: oracle, fuzz,

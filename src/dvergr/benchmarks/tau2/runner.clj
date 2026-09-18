@@ -17,6 +17,7 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [dvergr.benchmarks.tau2.core :as t2]
+            [dvergr.benchmarks.tau2.harness :as harness]
             [dvergr.benchmarks.tau2.live :as live])
   (:import [java.util.concurrent Executors TimeUnit]))
 
@@ -62,13 +63,19 @@
         (mapv edn/read-string (remove str/blank? (line-seq r))))
       [])))
 
-(defn- run-one [domain task trial {:keys [agent user judge] :as config}]
-  (let [started (System/currentTimeMillis)]
+(defn- run-one [domain task trial {:keys [agent agent-spec user judge] :as config}]
+  (let [started (System/currentTimeMillis)
+        ;; Harness candidates own a working chat context per episode.
+        harness-turn (when (:harness agent-spec)
+                       (harness/make-agent-turn domain (dissoc agent-spec :harness)))]
     (try
       (let [episode (t2/run-episode domain task
                                     (merge (select-keys config [:max-steps :max-errors
                                                                 :enforce-protocol?])
-                                           {:agent agent :user user}))
+                                           {:user user}
+                                           (if harness-turn
+                                             {:agent-turn (:turn harness-turn)}
+                                             {:agent agent})))
             grade (t2/grade domain task episode {:judge judge})]
         {:task-id (get task "id")
          :trial trial
@@ -87,11 +94,16 @@
          :failure {:message (.getMessage t)
                    :class (.getName (class t))
                    :data (pr-str (ex-data t))}
-         :duration-ms (- (System/currentTimeMillis) started)}))))
+         :duration-ms (- (System/currentTimeMillis) started)})
+      (finally
+        (when harness-turn ((:close harness-turn)))))))
 
 (defn run!
   "Run `trials` episodes for each task of `split` (or explicit `:task-ids`).
-   Model specs are maps for `live/model-generate`; tests may pass generate
+   Model specs are maps for `live/model-generate`. An agent spec with
+   `:harness :dvergr` runs Dvergr's own agent loop instead
+   (`harness/make-agent-turn`: `:model`, `:action-space :tools|:repl`,
+   `:max-model-steps`). Tests may pass generate
    functions directly as `:agent-fn`/`:user-fn`/`:judge-fn`. Returns the run
    header, metrics, and output directory. Pass `:dir` of an earlier run to
    resume it."
@@ -121,7 +133,8 @@
         done (set (map (juxt :task-id :trial)
                        (remove :failure (read-episodes dir))))
         config (merge opts
-                      {:agent (or agent-fn (live/model-generate agent))
+                      {:agent-spec agent
+                       :agent (or agent-fn (when-not (:harness agent) (live/model-generate agent)))
                        :user (or user-fn (live/model-generate user))
                        :judge (or judge-fn (when judge (live/model-generate judge)))})
         jobs (for [trial (range trials) task tasks
