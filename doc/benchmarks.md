@@ -114,6 +114,46 @@ of unavailable variants (task 3, judged) and a wrong exchange variant (task 6).
 At this sample size the candidates are indistinguishable; the comparison
 proves the plumbing, not a ranking.
 
+### Certified runs inside Rooms
+
+Experiments normally run as certified conversational episodes inside
+Dvergr's programming model; see `doc/conversation-evaluation.md` for the
+design. Each experiment directory holds one durable store with:
+
+- the experiment Room;
+- one episode Room per cell, containing the dialogue, the candidate's
+  `:agent-turn` Runs and tool activity, and the environment's effect rows;
+- a certified Attempt per cell;
+- a Scorecard once the experiment is complete and fault-free.
+
+Run it in a dedicated JVM, because it isolates Dvergr's home to the
+experiment directory:
+
+```clojure
+(require '[dvergr.benchmarks.tau2.core :as t2]
+         '[dvergr.benchmarks.tau2.experiment :as tx]
+         '[dvergr.benchmarks.tau2.inspect :as insp]
+         '[dvergr.agent.conversation :as conv])
+(def dom (t2/load-domain "retail"))
+(tx/run! {:dir ".dvergr/benchmarks/retail-cmp" :domain dom :split "base"
+          :repetitions 4 :parallelism 3
+          :candidates [{:id :reference :harness :reference :model "claude-code-sonnet"}
+                       {:id :dvergr-tools :harness :dvergr :action-space :tools :model "claude-code-sonnet"}
+                       {:id :dvergr-repl :harness :dvergr :action-space :repl :model "claude-code-sonnet"}]
+          :user {:model "claude-code-opus"} :judge {:model "claude-code-opus"}})
+;; Re-running the same call resumes: completed cells are skipped.
+
+(def xs (conv/open-store! ".dvergr/benchmarks/retail-cmp"))
+(insp/summary xs :tau2/retail-cmp)                ; reward, pass^k, failures
+(def e (insp/episode xs :tau2/retail-cmp attempt-id))
+(insp/print-transcript e)                        ; dialogue, REPL code, effects
+(insp/verify-world dom task e)                   ; replay reproduces the certified hash
+(insp/verify-episode e)                          ; graded log equals the Room rows
+```
+
+The host runner (`dvergr.benchmarks.tau2.runner`) remains available for
+quick, unrecorded batches.
+
 ## tau2-bench (banking_knowledge, `bm25` retrieval)
 
 This is τ³'s knowledge domain. It has 97 tasks over a bank database, a
@@ -215,10 +255,8 @@ environment execution only; model latency dominates live episodes.
 
 ## Next steps
 
-1. Lift episodes into certified Runs. The episode becomes an `EnvironmentDef`
-   plus a trusted `Evaluator`. The retail DB value lives in the Run's forked
-   world, the simulated user is a room participant, and results become
-   `Attempt`s and `Scorecard`s.
+1. Fork-at-turn rollouts. These need a frozen context fork and a store that
+   follows the fork (`doc/conversation-evaluation.md`, revision 10).
 2. Measure the candidates properly: full `base` split, 4 trials, and a
    user simulator that differs from the agent model. Then tune the REPL
    candidate's prompt and affordances on `train` only.

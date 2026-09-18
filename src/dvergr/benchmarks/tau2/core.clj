@@ -202,7 +202,9 @@
 
 (defn- has-text? [content] (and (string? content) (not (str/blank? content))))
 
-(defn- stringify-keys [x]
+(defn stringify-keys
+  "Keyword keys to strings, recursively (tool arguments are JSON objects)."
+  [x]
   (cond
     (map? x) (into (array-map) (map (fn [[k v]] [(if (keyword? k) (name k) k)
                                                  (stringify-keys v)])) x)
