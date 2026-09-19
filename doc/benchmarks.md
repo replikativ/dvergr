@@ -158,6 +158,30 @@ Failure classes in the first (host-runner) run were:
 - one tool call emitted without `<tool_use>` tags (90). This was a
   Claude Code adapter gap, since fixed.
 
+### Judge re-grading (replay)
+
+Recorded episodes can be re-graded without re-running them: only the judge
+is called. `retail-cmp-A`'s 33 episodes with NL assertions (45 assertions),
+re-judged 2026-09-19, compared with the recorded Opus verdicts:
+
+| Judge | Assertions agreeing | Episode verdicts agreeing |
+| --- | --- | --- |
+| Opus 5, second pass | 42/45 | 30/33 |
+| Sonnet 5 | 43/45 | 31/33 |
+| Haiku 4.5 | 42/45 | 30/33 |
+
+Every disagreement is on a recorded "not met" (Opus said unmet, the other
+pass said met), and all but one are task 68 ("Agent should tell the user the
+order total is $829.43"). In all three candidates' episodes the agent stated
+$829.43 among three order totals but, lacking order dates, never identified
+it as the most recent order's. The literal reading of the assertion is met,
+its intent is not, and judges (Opus included) split on it. On unambiguous
+assertions every judge agreed. So judge variance is set by assertion
+ambiguity, not by judge size: a cheaper judge is as consistent with the
+recorded Opus verdicts as Opus itself on this set. The set is small
+(4 failing episodes), so treat NL-assertion outcomes on ambiguous tasks as
+noise when ranking candidates.
+
 ### Candidates
 
 A candidate is whatever answers the simulated user. Grading, protocol and
