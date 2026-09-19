@@ -8,7 +8,7 @@ equivalent to the upstream implementation (see *Equivalence method* below).
 
 | Tier | Meaning | Status |
 | --- | --- | --- |
-| 0 | Fully native, in-memory, forkable | tau2-bench retail, tau2-bench banking_knowledge (bm25) |
+| 0 | Fully native, in-memory, forkable | tau2-bench retail, tau2-bench banking_knowledge (bm25), tau2-bench airline |
 | 1 | Frozen/recorded IO, no containers | planned |
 | 2 | Container-bound public leaderboards (Terminal-Bench, SWE-bench) | calibration only, via an external adapter |
 
@@ -399,6 +399,64 @@ Verified on 2026-09-18 against upstream `b7ea907`, with 0 mismatches:
 The directly-called corpus is vendored as `banking_corpus.json`, and its
 generators live in `dev/benchmarks/tau2/banking/`.
 
+## tau2-bench (airline)
+
+This domain has 50 tasks over a flight database: 300 flights with per-date
+status, 500 users, and 2000 reservations. It has 14 agent tools and no user
+tools. Every task's `reward_basis` is DB plus COMMUNICATE.
+
+| Namespace | Role |
+| --- | --- |
+| `dvergr.benchmarks.tau2.airline` | FlightDB normalization, the 14 tools, `respond`, and `load-airline`, which verifies the data files against pinned digests |
+| `dvergr.benchmarks.tau2.airline.pydantic` | The lax-mode pydantic 2.13 coercions and the exact `ValidationError` text the tools expose, including `input_value` truncation |
+| `dvergr.benchmarks.tau2.airline.corpus` | The seeded differential corpus: random calls plus hand-shaped scenarios |
+
+Tool schemas are vendored from the oracle as
+`resources/benchmarks/tau2/airline-tools.json`. The oracle is
+`dev/benchmarks/tau2/airline/oracle_airline.py`. It drives the real upstream
+`Environment.get_response` and can record a DB hash after every call.
+
+The port reproduces these upstream quirks deliberately:
+
+- **Fixed values.** The current time is fixed at `2024-05-15T15:00:00`.
+  Reservation ids are `HATHAT`/`HATHAU`/`HATHAV`, and a fourth booking fails.
+  Certificate ids are `certificate_3221322..24`.
+- **Validation only where upstream builds a model.** Arguments are checked
+  only when upstream constructs a pydantic model. Elsewhere, raw values go
+  through Python arithmetic and are stored as given:
+  - `update_reservation_baggages` stores `"5"` or `1.5`;
+  - `update_reservation_passengers` stores a string or a mixed list whose
+    length matches;
+  - `50 * "1"` in `book_reservation` raises `int += str`.
+- **Seats.** Cancelling releases no seats, and changing flights books none.
+- **Unknown cabins.** An unknown cabin fails only with a `KeyError` on a new
+  leg's seat lookup. With an empty flight list, it is stored.
+- **Unpadded next-day date.** `search_onestop_flight` builds the next day
+  as `2024-05-{day+1}` without zero padding.
+- **Partial effects.** A repeated certificate in `book_reservation` passes
+  the balance check once per entry, then raises `KeyError` after the earlier
+  gift-card and certificate deductions have been applied. A fractional
+  baggage charge debits the gift card before `Payment(amount=int)` rejects
+  it. Both partial effects are kept.
+
+Verified on 2026-09-19 against upstream `b7ea907` (pydantic 2.13.5), with 0
+mismatches in tool content, error flags, and final DB hashes:
+
+| Check | Sequences / calls |
+| --- | --- |
+| Initial DB hash | identical |
+| Gold actions of all 50 tasks | 50 / 142 |
+| Seeded corpus (seed 11): bookings with split certificate, gift-card, and credit-card payments, changes, cancellations, and certificates; 2261 error outputs covering validation text, TypeErrors, KeyErrors, unhashable ids, argument errors, and user-requestor calls | 1200 / 5888 |
+| Earlier development corpora (seeds 1 and 2, not pinned) | 700 / 3394 |
+| Agent prompt, 50 user-simulator prompts, tool schemas, mutation flags | identical |
+| Gold agent through the episode protocol | 50/50 reward 1.0 |
+
+`test/dvergr/benchmarks/tau2_airline_test.clj` pins all of this as digests
+in `airline_oracle_digests.edn`. The corpus is regenerated from its seed, so
+no corpus file is vendored. Environment replay of the pinned corpus takes
+about 8.5 minutes in Python and about 60 s in Clojure. The Clojure time is
+dominated by hashing the 7 MB database once per sequence.
+
 ## Equivalence method
 
 `dev/benchmarks/tau2/oracle.py` is the only Python involved, and it runs
@@ -445,7 +503,7 @@ environment execution only; model latency dominates live episodes.
    candidate's prompt and affordances on `train` only.
 3. Use forks for branching. Branch at a user turn for counterfactual rollouts
    and cheap pass^k/GRPO-style groups from one shared prefix.
-4. Port the airline and telecom domains the same way: oracle, fuzz,
+4. Port the telecom domain the same way: oracle, fuzz,
    equivalence, then live. Banking's other retrieval configurations
    (`grep_only`, `full_kb`, `golden_retrieval`) need no embeddings and reuse
    the same tools.
