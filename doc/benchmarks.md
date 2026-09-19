@@ -180,6 +180,28 @@ sha256. `tau2/shape` exists because REPL agents computed over data they had
 not looked at: product `variants` are a map keyed by item id, and
 `(filter #(get % "available") variants)` over its entries counted nothing.
 
+### Result types (malli)
+
+`dvergr.benchmarks.tau2.schemas` holds curated malli types for tool results
+(retail: order, user, product, variant, payment method, ...), drafted with
+`malli.provider` from every result of the gold trajectories and a seeded fuzz
+corpus and then curated (id-keyed maps as `:map-of` with a description,
+payment methods as a union, enums and nullable fields from the data). The
+schema test validates every corpus result against them. The REPL candidate
+sees each tool's result type in its doc and prompt, and has `(tau2/types)`
+and `(tau2/check type x)` at runtime.
+
+The full type section is deliberately NOT in the default prompt. Interleaved
+probes on task 2 (count available T-shirts): `:shape` 15/16, `:typed` (same
+prompt plus all type definitions) 8/16, p = 0.007. With the types in front of
+them agents trusted the schema, went straight to `(count variants)` and never
+looked at the records whose `available` flags decide the answer. Types say
+what a value's structure is, not which fields matter.
+
+Probe samples run in one parallel batch are correlated (the same variant
+went 2/8 and 8/8 in consecutive batches), so compare variants interleaved
+within the same rounds.
+
 ### Decision-point probes
 
 `dvergr.benchmarks.tau2.probe` re-samples one candidate turn from a recorded

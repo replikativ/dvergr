@@ -28,6 +28,7 @@
             [dvergr.benchmarks.tau2.core :as t2]
             [dvergr.benchmarks.tau2.live :as live]
             [dvergr.benchmarks.tau2.pyjson :as pj]
+            [dvergr.benchmarks.tau2.schemas :as schemas]
             [dvergr.chat.agent :as chat-agent]
             [dvergr.chat.context :as cc]
             [dvergr.discourse :as d]
@@ -38,6 +39,8 @@
             [dvergr.sandbox :as sandbox]
             [dvergr.sandbox.ns.doc :as ns-doc]
             [dvergr.tools :as tools]
+            [malli.core :as m]
+            [malli.error :as me]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
             [taoensso.telemere :as tel]))
@@ -189,19 +192,36 @@
          ")")))
 
 (defn- tool-doc
-  "Description plus one line per argument, as `doc` and the prompt show it."
-  [{:strs [description parameters]}]
-  (str/join "\n" (cons (str/trim (str description))
-                        (for [[k t req? d] (tool-args parameters)]
-                          (str "  " k " (" t (when-not req? ", optional") ")"
-                               (when d (str ": " d)))))))
+  "Description, one line per argument and, when the domain has curated types,
+   the type of the parsed result -- as `doc` and the prompt show it."
+  [domain-name {:strs [name description parameters]}]
+  (str/join "\n" (concat [(str/trim (str description))]
+                          (for [[k t req? d] (tool-args parameters)]
+                            (str "  " k " (" t (when-not req? ", optional") ")"
+                                 (when d (str ": " d))))
+                          (when-let [t (schemas/returns domain-name name)]
+                            [(str "  returns (after tau2/parse): " t)]))))
+
+(defn types-doc
+  "The domain's named malli types, one per line, or nil."
+  [domain-name]
+  (when-let [reg (schemas/registry domain-name)]
+    (str/join "\n" (for [[k form] (sort-by (comp str key) reg)]
+                      (str k " " (pr-str form))))))
 
 (defn tool-signatures
   "The domain tools as Clojure calls with their full descriptions: the same
-   information the JSON-tools candidate receives in its tool schemas."
-  [schemas]
-  (str/join "\n\n" (for [{:strs [function]} schemas]
-                       (str (tool-call-shape function) "\n" (tool-doc function)))))
+   information the JSON-tools candidate receives in its tool schemas, plus the
+   curated result types."
+  ([domain] (tool-signatures domain false))
+  ([domain with-types?]
+   (str (str/join "\n\n" (for [{:strs [function]} (:tool-schemas domain)]
+                             (str (tool-call-shape function) "\n" (tool-doc (:domain domain) function))))
+        (if-let [types (and with-types? (types-doc (:domain domain)))]
+          (str "\n\nResult types (malli; string keys; `(tau2/check type x)` validates):\n" types)
+          (when (types-doc (:domain domain))
+            (str "\n\nResult types are malli schemas: `(tau2/types)` lists them, "
+                 "`(tau2/check type x)` validates data against one."))))))
 
 (defn data-shape
   "A compact description of parsed JSON data: map keys with their value
@@ -233,34 +253,46 @@
 
 (defn install-tau2-fns!
   "Domain tools as documented SCI functions `tau2/<tool>` (one map argument,
-   the tool's exact text result) plus `tau2/parse` for JSON text, so
-   `(clojure.repl/doc tau2/<tool>)` and `(sandbox/doc 'tau2)` describe them.
-   `call!` is `(fn [tool-name args] -> text)`."
-  [sci-ctx schemas call!]
-  (let [fns (into {'parse (fn [s] (pj/parse s))
-                   'shape (fn [x] (data-shape (if (string? x) (pj/parse x) x)))}
-                  (map (fn [{:strs [function]}]
-                         (let [tool-name (get function "name")]
-                           [(symbol tool-name)
-                            (fn ([] (call! tool-name {}))
-                              ([args] (call! tool-name args)))])))
-                  schemas)
-        docs (into {'parse ['([json-text])
-                            "Parse a tool's JSON text result into Clojure data (string keys)."]
-                    'shape ['([data-or-json-text])
-                            "Compact structure of parsed data: keys and value types; maps keyed by ids show one sample value and the count."]}
-                   (map (fn [{:strs [function]}]
-                          (let [args (tool-args (get function "parameters"))]
-                            [(symbol (get function "name"))
-                             [(list (if (seq args)
-                                      [{:strs (mapv (comp symbol first) args)}]
-                                      []))
-                              (tool-doc function)]])))
-                   schemas)]
+   the tool's exact text result) plus `tau2/parse` for JSON text,
+   `tau2/shape`, and -- with curated types -- `tau2/check` and
+   `tau2/types`, so `(clojure.repl/doc tau2/<tool>)` and `(sandbox/doc 'tau2)`
+   describe them. `call!` is `(fn [tool-name args] -> text)`."
+  [sci-ctx domain call!]
+  (let [schemas (:tool-schemas domain)
+        domain-name (:domain domain)
+        reg (schemas/registry domain-name)
+        opts {:registry (merge (m/default-schemas) reg)}
+        fns (cond-> (into {'parse (fn [s] (pj/parse s))
+                           'shape (fn [x] (data-shape (if (string? x) (pj/parse x) x)))}
+                          (map (fn [{:strs [function]}]
+                                 (let [tool-name (get function "name")]
+                                   [(symbol tool-name)
+                                    (fn ([] (call! tool-name {}))
+                                      ([args] (call! tool-name args)))])))
+                          schemas)
+              reg (assoc 'check (fn [type x]
+                                  (some-> (m/explain type (if (string? x) (pj/parse x) x) opts)
+                                          me/humanize))
+                         'types (fn [] reg)))
+        docs (cond-> (into {'parse ['([json-text])
+                                    "Parse a tool's JSON text result into Clojure data (string keys)."]
+                            'shape ['([data-or-json-text])
+                                    "Compact structure of parsed data: keys and value types; maps keyed by ids show one sample value and the count."]}
+                           (map (fn [{:strs [function]}]
+                                  (let [args (tool-args (get function "parameters"))]
+                                    [(symbol (get function "name"))
+                                     [(list (if (seq args)
+                                              [{:strs (mapv (comp symbol first) args)}]
+                                              []))
+                                      (tool-doc domain-name function)]])))
+                           schemas)
+               reg (assoc 'check ['([type data-or-json-text])
+                                  "nil when the data matches the named result type (e.g. :tau2.retail/order), else the humanized errors."]
+                          'types ['([]) "The domain's named result types: {type malli-form}."]))]
     (sandbox/add-namespace! sci-ctx 'tau2 (ns-doc/with-docs fns docs))))
 
 (defn- install-tau2-namespace! [sci-ctx episode]
-  (install-tau2-fns! sci-ctx (get-in episode [:domain :tool-schemas])
+  (install-tau2-fns! sci-ctx (:domain episode)
                      (fn [tool-name args] (effect! episode :assistant tool-name args))))
 
 (def ^:private repl-guidance-head
@@ -302,13 +334,19 @@
         "than by eye, checking the fields that decide the answer (availability, "
         "status, options, prices) explicitly. " repl-guidance-tail)})
 
+(def ^:private with-types-section?
+  "Guidance variants whose prompt includes the full result-type section."
+  #{:typed})
+
 (defn agent-system-prompt
   "The system prompt a candidate receives (recorded as a hash in evidence)."
   [domain agent]
-  (cond-> (t2/agent-system-prompt domain)
-    (= :repl (get-in agent [:agent/metadata :conversation/action-space]))
-    (str (format (repl-guidance (get-in agent [:agent/metadata :conversation/repl-guidance] :shape))
-                 (tool-signatures (:tool-schemas domain))))))
+  (let [base (t2/agent-system-prompt domain)
+        g (get-in agent [:agent/metadata :conversation/repl-guidance] :shape)]
+    (if (= :repl (get-in agent [:agent/metadata :conversation/action-space]))
+      (str base (format (repl-guidance (if (= :typed g) :shape g))
+                        (tool-signatures domain (contains? with-types-section? g))))
+      base)))
 
 ;; ---------------------------------------------------------------------------
 ;; Participants

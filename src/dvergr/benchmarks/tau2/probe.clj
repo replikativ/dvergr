@@ -97,7 +97,7 @@
                                             [name {:name name :description description :parameters parameters
                                                    :execute (fn [input _] {:type :success :content (call! name input)})}])))
                                 schemas)
-                   :repl (do (ep/install-tau2-fns! sci-ctx schemas call!)
+                   :repl (do (ep/install-tau2-fns! sci-ctx domain call!)
                              {"clojure_eval" (tools/get-tool "clojure_eval")}))
         tool-ctx {:chat-ctx chat-ctx :tools tool-map :sci-ctx sci-ctx :execution-ctx (:ctx room)}]
     (try
