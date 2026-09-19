@@ -3,7 +3,8 @@
    search, entity graph, and the unified room API. Split out of dvergr.sandbox
    (Phase 4). Subsystems reached via inline require + ns-resolve; entity/room use
    datahike + spindel directly."
-  (:require [sci.core :as sci]
+  (:require [dvergr.substrate.load :as load]
+            [sci.core :as sci]
             [datahike.api :as dh]
             [dvergr.runtime.ctx :as runtime-ctx]
             [org.replikativ.spindel.engine.core :as rtc]
@@ -22,7 +23,7 @@
    historical unbounded surface. A nested authority with
    `:provider-effects? false` removes this provider-spend bypass."
   [sci-ctx & [agent-program-ceiling]]
-  (require 'dvergr.tools.llm-call)
+  (load/require! 'dvergr.tools.llm-call)
   (let [raw-call-fn  @(ns-resolve 'dvergr.tools.llm-call 'cheap-llm-call)
         call-fn      (fn [& args]
                        (when (false? (:provider-effects? agent-program-ceiling))
@@ -50,11 +51,11 @@
    namespace (mounted, merged with the DB surface, by `dvergr.sandbox.ns.room`).
    Persistent rooms + forks are behind one surface — same for agents, TUI, web."
   [spindel-ctx & [agent-program-ceiling source-room]]
-  (require 'dvergr.discourse)
-  (require 'dvergr.rooms)
-  (require 'dvergr.room.registry)
-  (require 'dvergr.room.store)
-  (require 'dvergr.rooms.forks)
+  (load/require! 'dvergr.discourse)
+  (load/require! 'dvergr.rooms)
+  (load/require! 'dvergr.room.registry)
+  (load/require! 'dvergr.room.store)
+  (load/require! 'dvergr.rooms.forks)
   (let [selected-ctx    #(runtime-ctx/selected-context spindel-ctx)
         fork-diff*      @(ns-resolve 'dvergr.rooms.forks 'fork-diff)
         fork-review*    @(ns-resolve 'dvergr.rooms.forks 'review)
