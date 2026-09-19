@@ -7,7 +7,8 @@
    closures carry `:doc`/`:arglists` — without it `(clojure.repl/doc …)` and
    `(find-doc …)` answer nothing for them inside the sandbox. See
    `dvergr.sandbox.ns.doc`."
-  (:require [dvergr.substrate.load :as load]
+  (:require [clojure.string :as str]
+            [dvergr.substrate.load :as load]
             [sci.core :as sci]
             [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.sandbox.ns.doc :as doc]
@@ -654,7 +655,7 @@
          experiment   [([spec]) "Create a portable full-factorial ExperimentDef. Requires a DatasetDef and a non-empty vector of AgentDefs; repetitions default to one. Candidates bind exact AgentDef content. Concurrency and admission ceilings remain host policy."]
          experiment-ref [([experiment]) "Return the stable logical/version/content reference for one exact ExperimentDef. Running and trusted scoring remain host-owned capabilities."]
          room-id      [([]) "Return the live identity of the current Room/world. In an isolated fork this is the child Room, not its parent."]
-         hire!        [([roster agent-ref opts]) "Durably start one owned AgentDef in the current Room: (hire! team :a {:task value :resources {\"microUSD\" 1000}}). Returns a RunHandle. The current Run remains responsible for the child even if the handle is ignored; opts may also include :from, :settlement, and a positive conserved :resources vector split from the current Run/Room."]
+         hire!        [([roster agent-ref opts]) "Durably start one owned AgentDef in the current Room: (hire! team :a {:task value :resources {\"microUSD\" 1000}}). Returns a RunHandle. The current Run remains responsible for the child even if the handle is ignored. opts: :task (required); :from (a keyword sender); :settlement (:automatic, :review or :discard); :resources, a MAP of resource coordinate → positive amount (e.g. {\"microUSD\" 1000}) split from the current Run/Room's conserved balance; :limits {:max-model-steps n :budget-dollars x}, which can only TIGHTEN the agent's own limits for this Run; :parent-run, the parent Run's uuid (defaults to the current Run and, when one is ambient, must equal it). Unknown keys are rejected."]
          observe      [([handle-or-run-id]) "Read the current Room's durable Run projection for a RunHandle or UUID."]
          inspect      [([] [opts]) "Inspect the current Run and its structural descendants as one bounded snapshot of Runs, frontier, correlated messages, semantic activities, failures, and conserved balances. Inside a hired agent this cannot see parent or sibling Runs, and inspection without an ambient Run fails closed. A durable semantic receipt identifies the inspection. Options: :run-limit, :message-limit, :content-limit, :content-budget, :detail-limit."]
          cancel!      [([handle-or-run-id]) "Request cooperative cancellation of exactly one live Run. Returns true when the Run was found."]
@@ -737,7 +738,6 @@
   [sci-ctx conn]
   (load/require! 'dvergr.orchestration.skills)
   (let [load-all*   @(ns-resolve 'dvergr.orchestration.skills 'load-all)
-        list-fn     @(ns-resolve 'dvergr.orchestration.skills 'list-skills)
         read-skill* @(ns-resolve 'dvergr.orchestration.skills 'read-skill)
         find-prov   @(ns-resolve 'dvergr.orchestration.skills 'find-providers)
         rank-prov   @(ns-resolve 'dvergr.orchestration.skills 'rank-providers)
@@ -747,11 +747,22 @@
         promote*    @(requiring-resolve 'dvergr.discourse.definitions/promote!)
         ;; Resolved lazily at call time: an agent runs in its ROOM's execution
         ;; context, so this returns the room's sandbox-repo path — letting
-        ;; `all`/`read` see skills the room itself defines (highest precedence)
-        ;; and `author!`/`promote!` write into the room's own repo.
+        ;; `all`/`read`/`find` see skills the room itself defines (highest
+        ;; precedence). Reads fall back to the shared workspace.
         room-dir    (fn [] (try ((requiring-resolve
                                   'dvergr.sandbox.workspace/workspace-root))
-                                (catch Throwable _ nil)))]
+                                (catch Throwable _ nil)))
+        ;; WRITES (author!/lift!/promote!) need the ROOM's own versioned repo —
+        ;; never the shared fallback workspace, which `workspace-root` returns
+        ;; when no room is bound. nil here means there is no room repo.
+        room-repo   (fn [] (try ((requiring-resolve
+                                  'dvergr.sandbox.workspace/room-workspace-root))
+                                (catch Throwable _ nil)))
+        room-repo!  (fn [op]
+                      (or (room-repo)
+                          (throw (ex-info (str "skills/" op " needs a room sandbox repo (no room workspace bound)")
+                                          {:op (symbol op)}))))
+        provides?   (fn [tag s] (some #(= tag %) (:provides s)))]
     (sci/add-namespace! sci-ctx 'dvergr.skills
                         (doc/with-docs
                           {'all       (fn [] (load-all* (room-dir)))
@@ -759,7 +770,8 @@
                          ;; brief index; pull a skill's FULL instructions here.
                            'read      (fn [skill-name] (read-skill* skill-name (room-dir)))
                            'find      (fn [provides-tag]
-                                        (vec (list-fn :provides provides-tag)))
+                                        (into [] (filter #(provides? provides-tag %))
+                                              (vals (load-all* (room-dir)))))
                            'providers (fn [skill] (find-prov conn skill))
                            'rank      (fn [skill] (rank-prov conn skill))
                            'dispatch  (fn [skill] (dispatch conn skill))
@@ -770,32 +782,43 @@
                          ;; skills land `vetted: false`, so the vetting gate keeps
                          ;; them out of prompts until a reviewer promotes them.
                            'author!   (fn [skill-name frontmatter body]
-                                        (if-let [dir (room-dir)]
-                                          (author* "skills" dir (str skill-name) frontmatter (str body))
-                                          (throw (ex-info "skills/author! needs a room sandbox repo (no room ctx bound)" {}))))
+                                        (author* "skills" (room-repo! "author!") (str skill-name)
+                                                 frontmatter (str body)))
                          ;; Lift external content (an openclaw/Claude skill, a URL
                          ;; you fetched) into the room as an UNVETTED skill.
                            'lift!     (fn [skill-name source body]
-                                        (if-let [dir (room-dir)]
-                                          (author* "skills" dir (str skill-name)
-                                                   {:source (str source) :vetted false} (str body))
-                                          (throw (ex-info "skills/lift! needs a room sandbox repo (no room ctx bound)" {}))))
+                                        (author* "skills" (room-repo! "lift!") (str skill-name)
+                                                 {:source (str source) :vetted false} (str body)))
                          ;; Promote a room skill to vetted (reviewer action).
+                         ;; Only the ROOM's own skills: user/project/builtin
+                         ;; definitions live outside the room repo (a sandbox
+                         ;; must not rewrite ~/.dvergr or the classpath).
                            'promote!  (fn [skill-name by date]
-                                        (if-let [definition (get (load-all* (room-dir)) (str skill-name))]
-                                          (do (promote* definition (str by) (str date)) true)
-                                          (throw (ex-info (str "no such skill to promote: " skill-name) {}))))}
+                                        (let [definition (get (load-all* (room-repo! "promote!"))
+                                                              (str skill-name))]
+                                          (cond
+                                            (nil? definition)
+                                            (throw (ex-info (str "no such skill to promote: " skill-name) {}))
+
+                                            (not= :room (:scope definition))
+                                            (throw (ex-info (str "skills/promote!: " skill-name
+                                                                 " is a " (name (:scope definition))
+                                                                 " skill, not one of this room's — only room skills can be promoted here")
+                                                            {:skill (str skill-name) :scope (:scope definition)}))
+
+                                            :else
+                                            (do (promote* definition (str by) (str date)) true))))}
                           (with-schemas
                           '{all       [([]) "Every skill visible here — on disk plus any this room defines (the room's own take precedence). A map of skill-name → definition."]
                             read      [([skill-name]) "The FULL instructions for one skill. The system prompt carries only a brief index; pull the body with this before following a skill."]
-                            find      [([provides-tag]) "Skill definitions that provide `provides-tag` (e.g. :research) — a vector, possibly empty."]
+                            find      [([provides-tag]) "Skill definitions that provide `provides-tag` (e.g. :research) — a vector, possibly empty. Includes this room's own skills (as `all` does)."]
                             providers [([skill]) "Actor-ids that declare they can perform `skill`, whether or not they are online."]
                             rank      [([skill]) "Providers of `skill` ranked by suitability, ONLINE ones only."]
                             dispatch  [([skill]) "The single best online provider for `skill` (an actor map), or nil if nobody can take it."]
                             dispatch! [([skill opts]) "Actually hand `skill` to its best provider. `opts` carries the payload for the receiving actor."]
-                            author!   [([skill-name frontmatter body]) "Write a NEW skill into this room's repo (versioned, forkable, mergeable). Lands `vetted: false`, so it stays out of prompts until a reviewer promotes it. Needs a room ctx."]
-                            lift!     [([skill-name source body]) "Import external content (another agent's skill, a fetched URL) into the room as an UNVETTED skill, recording `source`. Needs a room ctx."]
-                            promote!  [([skill-name by date]) "Mark a room skill vetted — a REVIEWER action; this is what lets it appear in prompts. Throws if there is no such skill."]}
+                            author!   [([skill-name frontmatter body]) "Write a NEW skill into this room's repo (versioned, forkable, mergeable). Lands `vetted: false`, so it stays out of prompts until a reviewer promotes it. Throws if no room workspace is bound."]
+                            lift!     [([skill-name source body]) "Import external content (another agent's skill, a fetched URL) into the room as an UNVETTED skill, recording `source`. Throws if no room workspace is bound."]
+                            promote!  [([skill-name by date]) "Mark one of THIS room's skills vetted — a REVIEWER action; this is what lets it appear in prompts. Throws if there is no such skill, if it is not a room skill (user/project/built-in skills are not promotable from here), or if no room workspace is bound."]}
                            {'all       [:=> [:cat] [:map-of :string SkillDef]]
                             'read      [:=> [:cat SkillName] [:maybe :string]]
                             'find      [:=> [:cat :keyword] [:vector SkillDef]]
@@ -953,6 +976,7 @@
         room!         (fn []
                         (or (current-room)
                             (throw (ex-info "No current room — schedules are per-room" {}))))
+        create-keys   #{:agent-id :task :code :interval-ms :schedule :description :id}
 
         every-fn (fn [period & args]
                    ;; Dispatch on ARITY, not on the types of the first two args.
@@ -1029,7 +1053,17 @@
         ;; :n multiplies :minute/:hour/:day/:week into a fixed
         ;; interval), {:every-ms N}, {:at \"ISO\" :once true}.
         ;; Unknown keys are REJECTED (no silent wrong cadence).
-        'create   (fn [cfg] (sched-create (room!) cfg))
+        'create   (fn [cfg]
+                    ;; `:schedule` keys are checked by the cadence parser; the
+                    ;; TOP-level keys are checked here, so a typo like
+                    ;; `:intervall-ms` fails loudly instead of being ignored.
+                    (when-let [unknown (seq (remove create-keys (keys cfg)))]
+                      (throw (ex-info (str "scheduler/create: unknown key(s) "
+                                           (str/join " " (map pr-str unknown))
+                                           " — allowed: "
+                                           (str/join " " (map pr-str (sort create-keys))))
+                                      {:unknown (vec unknown) :allowed create-keys})))
+                    (sched-create (room!) cfg))
         'cancel   (fn [id] (sched-cancel (room!) id))
         'list     (fn [] (sched-list (room!)))}
        (with-schemas
@@ -1042,7 +1076,7 @@
            interval [([ms agent-id task])
                      "Repeat every `ms` milliseconds."]
            create   [([cfg])
-                     "Richest form. cfg = {:agent-id kw :task \"…\" | :code \"…\" :schedule {…} | :interval-ms N :description \"…\"}. `:code` evals in your sandbox on each fire with no LLM turn. Unknown keys are REJECTED."]
+                     "Richest form. cfg = {:agent-id kw :task \"…\" | :code \"…\" :schedule {…} | :interval-ms N :description \"…\"}. `:code` evals in your sandbox on each fire with no LLM turn. Unknown keys — top-level or inside :schedule — are REJECTED."]
            cancel   [([schedule-id])
                      "Deactivate a schedule BY ID — the uuid itself, not the map `list` returns."]
            list     [([])
@@ -1053,7 +1087,7 @@
                      [:=> [:cat :keyword :keyword :string :keyword :string] :uuid]]
           'at       [:=> [:cat :string :keyword :string] :uuid]
           'interval [:=> [:cat PosInt :keyword :string] :uuid]
-          'create   [:=> [:cat [:map
+          'create   [:=> [:cat [:map {:closed true}
                                 [:agent-id :keyword]
                                 [:task {:optional true} :string]
                                 [:code {:optional true} :string]

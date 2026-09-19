@@ -35,11 +35,27 @@
    "&nbsp;" " " "&mdash;" "—" "&ndash;" "–" "&hellip;" "…" "&rsquo;" "’"
    "&lsquo;" "‘" "&ldquo;" "“" "&rdquo;" "”"})
 
-(defn- html-decode-entities [s]
+(defn- code-point->str
+  "The character(s) for Unicode code point `n` — supplementary planes (emoji)
+   included, which `(char n)` cannot represent. An invalid code point is left
+   undecoded (nil)."
+  [n]
+  (when (Character/isValidCodePoint (int n))
+    (String. (Character/toChars (int n)))))
+
+(defn- html-decode-entities
+  "Decode HTML entities in ONE left-to-right pass, so a decoded `&` never starts
+   a second entity (`&amp;lt;` → `&lt;`, not `<`). Unknown or out-of-range
+   entities are left as written."
+  [s]
   (when s
-    (-> (reduce (fn [acc [k v]] (str/replace acc k v)) (str s) named-entities)
-        (str/replace #"&#(\d+);" (fn [[_ n]] (str (char (Integer/parseInt n)))))
-        (str/replace #"&#x([0-9A-Fa-f]+);" (fn [[_ h]] (str (char (Integer/parseInt h 16))))))))
+    (str/replace (str s) #"&(?:#(\d{1,7})|#[xX]([0-9A-Fa-f]{1,6})|[A-Za-z]+);"
+                 (fn [[m dec hex]]
+                   (or (cond
+                         dec  (code-point->str (Long/parseLong dec))
+                         hex  (code-point->str (Long/parseLong hex 16))
+                         :else (get named-entities m))
+                       m)))))
 
 (defn- html-strip-tags [s]
   (when s
@@ -140,7 +156,7 @@
                                           [:=> [:cat :string] :string]]
                           url-decode      [([s]) "Reverse percent-encoding."
                                           [:=> [:cat :string] :string]]
-                          decode-entities [([html]) "Turn HTML entities (&amp;, &#39;, …) into the characters they denote."
+                          decode-entities [([html]) "Turn HTML entities (&amp;, &#39;, &#x1F600;, …) into the characters they denote, in ONE pass — `&amp;lt;` becomes `&lt;`, not `<`. Numeric entities cover all of Unicode (emoji included); unknown ones are left as written."
                                           [:=> [:cat [:maybe :string]] [:maybe :string]]]
                           strip-tags      [([html]) "Strip HTML tags, leaving the text — handy for turning a fetched page into something summarizable."
                                           [:=> [:cat [:maybe :string]] [:maybe :string]]]}))

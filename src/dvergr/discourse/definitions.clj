@@ -361,14 +361,21 @@
         (.getPath f)))))
 
 (defn promote!
-  "Mark the definition file at `path` vetted — flip `vetted: false` → `true` and
+  "Mark the definition file at `path` (or a loaded definition map — on-disk ones
+   carry `:path`, virtual ones `:storage`) vetted — flip `vetted: false` → `true` and
    stamp `vetted_by: <by>` / `vetted_at: <date>` (adding the lines if absent).
    The reviewer action that lets an agent-authored or externally-lifted
    definition become eligible. `date` is an ISO yyyy-mm-dd string (pass it in;
    no clock is read here). Returns the new file text."
   [path-or-definition by date]
   (let [storage (when (map? path-or-definition) (:storage path-or-definition))
-        path (if storage (:path storage) path-or-definition)
+        ;; A definition map from the REAL filesystem carries its file `:path`
+        ;; (no `:storage`); a virtual one carries `:storage {:fs :path}`.
+        path (cond storage                    (:path storage)
+                   (map? path-or-definition) (or (:path path-or-definition)
+                                                 (throw (ex-info "definition has no :path to promote"
+                                                                 {:name (:name path-or-definition)})))
+                   :else                     path-or-definition)
         text  (if storage (mfs/read-file (:fs storage) path) (slurp path))
         text' (-> text
                   (str/replace #"(?m)^vetted:\s*false\s*$" "vetted: true")

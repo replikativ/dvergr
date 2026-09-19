@@ -12,7 +12,7 @@
             [dvergr.sandbox.ns.doc :as doc])
   (:import [java.io File]))
 
-(declare fs-safe-resolve git-run* parse-porcelain-status parse-git-log)
+(declare fs-safe-resolve git-run* parse-porcelain-status parse-git-log git-log-format)
 
 (defn- audit!
   "Append an IO event to the audit log (no-op when log is nil)."
@@ -538,7 +538,7 @@
         log-fn    (fn [& [opts]]
                     (let [n (str "-" (or (:n opts) 10))]
                       (parse-git-log
-                       (run! "log" "--format=%H|%s|%an|%ai" n))))
+                       (run! "log" git-log-format n))))
 
         diff-fn   (fn [& args]
                     (if (seq args)
@@ -614,7 +614,11 @@
                    (config-swap! assoc (str key) value)
                    (swap! config-atom assoc (str key) value))
                  :ok)
-        keys-fn (fn [] (vec (distinct (concat (map str (keys (config)))
+        ;; List names `env/get` resolves: a keyword config key `:foo` is listed
+        ;; as "foo" (a namespaced `:a/b` as "a/b"), not ":foo" — `get-1` finds
+        ;; it again through `(keyword key)`.
+        key-name (fn [k] (if (keyword? k) (subs (str k) 1) (str k)))
+        keys-fn (fn [] (vec (distinct (concat (map key-name (keys (config)))
                                               (keys (or secrets {}))))))]
     (sci/add-namespace! sci-ctx 'env
                         (doc/with-docs
@@ -627,7 +631,7 @@
                                   [:=> [:cat [:or :string :keyword :symbol] :any] :any]]]
                             set  [([key value]) "Set a config key for this sandbox session. Returns :ok."
                                  [:=> [:cat [:or :string :keyword :symbol] :any] [:= :ok]]]
-                            keys [([]) "Every config key readable here, including the names of injected secrets (whose values stay placeholders)."
+                            keys [([]) "Every config key readable here, as names `env/get` accepts, including the names of injected secrets (whose values stay placeholders)."
                                  [:=> :cat [:vector :string]]]}))))
 
 (defn add-http-ns!
@@ -864,13 +868,23 @@
      :unstaged  (mapv :path (filter :unstaged? entries))
      :untracked (mapv :path (filter :untracked? entries))}))
 
+(def ^:private git-log-format
+  "`git log --format` for `parse-git-log`: each record STARTS with the ASCII
+   record separator (U+001E) and its fields are split by the unit separator
+   (U+001F) — control characters that cannot occur in a subject or author name,
+   unlike `|`. The separators are passed LITERALLY (not as `%x1e`/`%x1f`) so the
+   virtual Geschichte git, which expands only the placeholders themselves,
+   emits them unchanged; record-splitting also survives a multi-line message."
+  "--format=\u001e%H\u001f%s\u001f%an\u001f%ai")
+
 (defn- parse-git-log
-  "Parse `git log --format=%H|%s|%an|%ai` output into vector of maps."
+  "Parse `git log` output written with `git-log-format` into a vector of
+   {:hash :message :author :date} maps."
   [output]
-  (->> (str/split-lines output)
+  (->> (str/split (str output) #"\x1e")
        (remove str/blank?)
-       (mapv (fn [line]
-               (let [[hash msg author date] (str/split line #"\|" 4)]
+       (mapv (fn [record]
+               (let [[hash msg author date] (str/split record #"\x1f" 4)]
                  {:hash    (str/trim (str hash))
                   :message (str/trim (str msg))
                   :author  (str/trim (str author))
