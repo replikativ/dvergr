@@ -8,7 +8,7 @@ equivalent to the upstream implementation (see *Equivalence method* below).
 
 | Tier | Meaning | Status |
 | --- | --- | --- |
-| 0 | Fully native, in-memory, forkable | tau2-bench retail, tau2-bench banking_knowledge (bm25), tau2-bench airline |
+| 0 | Fully native, in-memory, forkable | tau2-bench retail, airline, banking_knowledge (bm25), telecom |
 | 1 | Frozen/recorded IO, no containers | planned |
 | 2 | Container-bound public leaderboards (Terminal-Bench, SWE-bench) | calibration only, via an external adapter |
 
@@ -456,6 +456,160 @@ in `airline_oracle_digests.edn`. The corpus is regenerated from its seed, so
 no corpus file is vendored. Environment replay of the pinned corpus takes
 about 8.5 minutes in Python and about 60 s in Clojure. The Clojure time is
 dominated by hashing the 7 MB database once per sequence.
+
+## tau2-bench (telecom)
+
+Telecom is a technical-support domain with **dual control**: the agent works
+on the carrier's database (customers, lines, plans, bills), and the simulated
+user operates their own phone (airplane mode, SIM, mobile data, roaming, APN,
+network mode, VPN, Wi-Fi calling, app permissions, payments). Tasks are
+graded almost entirely by **environment assertions** on the final state,
+e.g. "mobile data works and the speed test reports Excellent".
+
+| Namespace | Role |
+| --- | --- |
+| `dvergr.benchmarks.tau2.telecom` | Environment: dispatch (`respond`), `sync-tools`, initialization actions, env assertions, world hash, `load-telecom` |
+| `dvergr.benchmarks.tau2.telecom.db` | TOML subset reader, the pydantic models as ordered maps, both hashes |
+| `dvergr.benchmarks.tau2.telecom.agent` | The 13 agent tools of `TelecomTools`, plus initialization functions and assertions |
+| `dvergr.benchmarks.tau2.telecom.device` | The 30 user tools of `TelecomUserTools` (the phone simulation), the `APNSettings` validation, initialization functions and assertions |
+| `dvergr.benchmarks.tau2.telecom.corpus` | Gold, fuzz, flow and grading corpora, Clojure replay, digests |
+
+A telecom world is `{:db :user :vpn-performance :bill-seq}`. `:db` is the
+agent's TelecomDB, `:user` the TelecomUserDB (`device` plus `surroundings`).
+Upstream grades both databases, so `world-hash` is `agent-hash|user-hash`.
+`(tc/load-domain)` returns a domain map with the same keys as
+`load-banking`, plus `:env-assertion-checks` and `:settle`.
+
+### Upstream configuration, read from the code
+
+- **Environment**: the registry's `"telecom"` domain is
+  `get_environment(policy_type="manual")`, not solo. The `"telecom-workflow"`
+  variant (tech_support_workflow.md) and solo mode (main_policy_solo.md) are
+  not ported.
+- **Agent policy**: `"<main_policy>\n" + main_policy.md + "\n</main_policy>\n<tech_support_policy>\n" + tech_support_manual.md + "\n</tech_support_policy>"`.
+  The tech-support manual is part of the agent's system prompt.
+- **Tasks**: `get_tasks` loads `tasks.json`. It is byte-identical to
+  `tasks_full.json` (2285 tasks). `tasks_small.json` is no longer used. The
+  default split is `base` (`--task-split-name` defaults to `"base"`): 114
+  tasks, returned in `tasks.json` order. `train` (74) + `test` (40) = `base`.
+  `small` (20) is disjoint from `base`. `full` is all 2285.
+- **User simulator**: every task gets all 30 user tools (`task.user_tools` is
+  never set), so the user simulator uses `simulation_guidelines_tools.md`.
+  40 of the 114 base tasks have a persona string (`[PERSONA:Easy|Hard]`).
+- **Initial state**: no task has initialization data or message history.
+  Every task has initialization actions (`set_user_info`, `turn_airplane_mode_on`,
+  `break_apn_settings`, `set_data_usage`, `suspend_line_for_overdue_bill`, …),
+  replayed by `set_state`. Each action is followed by `sync_tools`, and one
+  more sync runs at the end.
+- **Reward basis**: `ENV_ASSERTION` for 94 base tasks, and `ENV_ASSERTION` +
+  `ACTION` for 20. No telecom task uses DB, COMMUNICATE or NL_ASSERTION.
+
+### Protocol notes
+
+- **Sync.** `Environment.get_response` runs `TelecomEnvironment.sync_tools`
+  after every successful tool call, from either side. The orchestrator also
+  runs it after every step. Sync copies the agent DB's state for the user's
+  line onto the phone: `line_active`, `roaming_allowed`, and
+  `mobile_data_usage_exceeded` (data used ≥ plan limit + refueled). It also
+  settles payments: a paid request marks its bill `Paid`, then the first bill
+  awaiting payment becomes the new request. `respond` does the same.
+  A sync that raises (a phone number with no line) turns a successful call
+  into an error but keeps the call's effects, as upstream does.
+- **Grading.** Upstream rebuilds the predicted environment by replaying the
+  trajectory's mutating calls (`set_state`), ends with a sync, and runs each
+  assertion followed by a sync. The port grades the episode's final world
+  after one `settle` (a sync; syncing is idempotent). The two agree on every
+  trajectory checked (see below).
+- **ACTION** tasks expect `transfer_to_human_agents` with `compare_args: []`,
+  so only the tool name is matched. `core/action-checks` already implements this.
+- **DB is not usable for telecom.** Upstream's gold environment replays the
+  gold actions with `make_tool_call`, which does not sync, so its user DB
+  never matches a live one. On 71 of the 114 base tasks the DB check fails
+  even for the gold trajectory. It is not in any reward basis, so this
+  changes no score. `core/grade` still computes `:db-match`; ignore it here.
+
+### Deliberate deviations (upstream nondeterminism)
+
+- **Draft-bill ids.** `_apply_one_time_charge` names a new draft bill
+  `B{uuid4().hex[:8]}`, which is random. The port uses a per-world counter
+  (`B00000001`, …). The oracle pins `uuid4` to the same counter. Upstream,
+  any `refuel_data` for a customer without a draft bill therefore makes the
+  DB hash irreproducible. Only C1001 has a draft bill, and the gold
+  trajectories only touch C1001.
+- **Shared VPN details.** `TelecomUserTools.default_vpn_details` is a class
+  attribute. `connect_vpn` assigns that object to the device, and `break_vpn`
+  mutates it in place (server performance POOR). Within one episode this
+  means every later `connect_vpn` gets a POOR server; the port carries it as
+  `:vpn-performance`. Upstream the object is also shared across the whole
+  process: after any task ran `break_vpn`, a later task in the same process
+  that connects a VPN gets a slow connection (0.1× speed), which can fail
+  `assert_internet_speed`. The port models a fresh process per episode. The
+  oracle resets the attribute before every sequence.
+
+### Upstream quirks reproduced
+
+The transcription comments name each one.
+
+- Tool arguments are not validated (tools are plain methods), so errors are
+  Python's own: `'int' object has no attribute 'startswith'`,
+  `'<=' not supported between instances of 'str' and 'int'`,
+  `unhashable type: 'list'`, `slice indices must be integers or None …`, and
+  keyword-binding `TypeError`s. That includes argument names that collide with
+  `Environment.make_tool_call`'s own parameters (`requestor`, `tool_name`, `self`).
+- `set_network_mode_preference` stores a non-string mode unvalidated, runs a
+  network search (falling back to 4G), then fails on `.value`. The junk value
+  stays on the phone. `mode=None` returns "Failed to set …" but still
+  changes the preference and searches.
+- `set_apn_settings` validates dicts with pydantic 2.13. The ValidationError
+  text is reproduced byte for byte: enum, bool parsing, int-from-float, extra
+  keys, and 50-character repr truncation. Non-dict arguments are stored
+  unvalidated, and every later APN access raises `AttributeError` until a
+  valid dict replaces them, including a partial network search.
+- Dict tool results go through `Environment.to_json_str._process`, which turns
+  numbers into strings: `get_data_usage` returns `"data_used_gb": "8.7"`,
+  and `refuel_data` returns `"charge": "4.0"`. Model results keep real floats.
+  `datetime` fields render as `2025-01-20 14:30:00` (`default=str`).
+- `refuel_data` does not check the line status (the check is commented out
+  upstream). It echoes `gb_amount` with `str()` (`2 GB`, `True GB`).
+- `check_vpn_status` prints the details dict with Python's enum repr,
+  `<PerformanceLevel.EXCELLENT: 'excellent'>`.
+
+### Verified
+
+Verified 2026-09-19 against upstream `b7ea907` (Python 3.12.2,
+pydantic 2.13.5). Every check below has 0 mismatches.
+
+| Check | Size |
+| --- | --- |
+| Initial agent DB and user DB (full dumps and both hashes) | identical |
+| Gold actions (agent and user) + env assertions, **all 2285 tasks**, run from each task's initialization actions | 2285 sequences, 13,215 calls, 3,674 assertions (base: 114 / 516 calls, 393 of them by the user / 209 assertions) |
+| Seeded fuzz (seed 11): default state, any of the 2285 task states, or random stacks of initialization functions; both toolkits; wrongly typed, missing, extra and colliding arguments; wrong-requestor and unknown tools; assertions with `assert_value` true/false | 1500 sequences, 11,196 calls, 1,114 initialization calls, 3,068 assertions |
+| Seeded flows (seed 23): payment request → pay → sync → resume; junk APN → reset/reboot/MMS; PIN/PUK locks and unseated SIM; data exhaustion, refuel and new draft bills; broken VPN reconnects | 600 sequences, 5,863 calls, 726 initialization calls, 868 assertions |
+| Agent system prompt, greeting, 2285 user-simulator prompts, per-task user tool sets, tool schemas, parameters, mutation flags | identical |
+| Grading vs upstream `EnvironmentEvaluator` + `ActionEvaluator` on perturbed base trajectories (gold, drop-first, drop-last, reversed, gold+noise, noise) | 684 trajectories, same reward (305 × 1.0, 379 × 0.0) |
+| Upstream's own grade of the base gold trajectories | 114/114 reward 1.0 |
+| Gold agent + user through `core/run-episode` + `core/grade` | 114/114 reward 1.0; an agent that stops immediately scores 0.0 on all 114 |
+
+The replays compare tool content, error flags, both database hashes,
+initialization-call results and assertion results. Digests are pinned in
+`test/dvergr/benchmarks/tau2/telecom_oracle_digests.edn`, and
+`test/dvergr/benchmarks/tau2_telecom_test.clj` rechecks all of it without
+Python (6 tests, 567 assertions, about 80 s including JVM start). The corpora
+are regenerated from their seeds by `telecom.corpus`, and the tool schemas are
+vendored in `resources/benchmarks/tau2/telecom-tools.json`.
+
+Oracle: `dev/benchmarks/tau2/telecom/oracle_telecom.py`
+(`replay | schema | prompts | gold-eval | grade`), run in the checkout with
+`uv run --no-sync python …`.
+
+### Not done / unverified
+
+- Solo mode, the workflow policy variant and the voice task set.
+- Malli result types and REPL-candidate docs (`schemas.clj`) for telecom.
+- Live episodes with a model.
+- A second draft bill in one sequence (id `B00000002`) is never reached.
+  Junk values written by initialization functions (e.g. a non-numeric
+  `set_data_usage`) are not exercised; tasks never produce them.
 
 ## Equivalence method
 

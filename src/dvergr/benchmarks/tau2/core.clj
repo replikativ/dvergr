@@ -17,11 +17,13 @@
    replay of its tool calls."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
+            [dvergr.benchmarks.tau2.airline :as airline]
             [dvergr.benchmarks.tau2.banking :as banking]
             [dvergr.benchmarks.tau2.banking.db :as banking-db]
             [dvergr.benchmarks.tau2.pyjson :as pj]
             [dvergr.benchmarks.tau2.python :as py]
-            [dvergr.benchmarks.tau2.retail :as retail]))
+            [dvergr.benchmarks.tau2.retail :as retail]
+            [dvergr.benchmarks.tau2.telecom :as telecom]))
 
 ;; ---------------------------------------------------------------------------
 ;; Provenance and data
@@ -133,12 +135,15 @@
 (defn load-domain
   "Load one text domain from a pinned tau2-bench checkout. Data files are
    verified against the upstream digests recorded in `file-digests`.
-   Supported: \"retail\", \"banking_knowledge\" (bm25 retrieval)."
+   Supported: \"retail\", \"airline\", \"banking_knowledge\" (bm25 retrieval),
+   \"telecom\"."
   ([domain] (load-domain domain {}))
   ([domain {:keys [root] :or {root default-root}}]
    (case domain
      "retail" (load-retail root)
+     "airline" (airline/load-airline root)
      "banking_knowledge" (load-banking root)
+     "telecom" (telecom/load-telecom root)
      (throw (ex-info "Unsupported tau2 domain" {:domain domain})))))
 
 (defn split-tasks
@@ -465,6 +470,12 @@
                  (throw (ex-info "Task requires an NL assertion judge"
                                  {:type ::judge-required
                                   :task (get task "id")}))))
+          ;; Telecom grades the final world (agent DB + user device) with
+          ;; the domain's own environment assertions.
+          env (when (contains? basis "ENV_ASSERTION")
+                ((or (:env-assertion-checks domain)
+                     (throw (ex-info "Domain has no environment assertions" {:domain (:domain domain)})))
+                 task final))
           components (cond-> {}
                        (contains? basis "DB") (assoc :db (if db-match 1.0 0.0))
                        (contains? basis "ACTION")
@@ -472,8 +483,10 @@
                        (contains? basis "COMMUNICATE")
                        (assoc :communicate (if (every? :met comm) 1.0 0.0))
                        (contains? basis "NL_ASSERTION")
-                       (assoc :nl-assertion (if (every? :met nl) 1.0 0.0)))]
-      (when-let [unsupported (seq (remove #{"DB" "ACTION" "COMMUNICATE" "NL_ASSERTION"} basis))]
+                       (assoc :nl-assertion (if (every? :met nl) 1.0 0.0))
+                       (contains? basis "ENV_ASSERTION")
+                       (assoc :env-assertion (if (every? :met env) 1.0 0.0)))]
+      (when-let [unsupported (seq (remove #{"DB" "ACTION" "COMMUNICATE" "NL_ASSERTION" "ENV_ASSERTION"} basis))]
         (throw (ex-info "Unsupported reward basis" {:basis (set unsupported)})))
       {:reward (reduce * 1.0 (vals components))
        :termination termination
@@ -481,4 +494,5 @@
        :db-match db-match
        :action-checks (when (contains? basis "ACTION") actions)
        :communicate-checks comm
-       :nl-assertions nl})))
+       :nl-assertions nl
+       :env-assertion-checks env})))

@@ -666,7 +666,7 @@
                                :user-system-sha256 (pj/sha256-hex (t2/user-system-prompt domain task))}
                      :world {:final-hash world-hash}
                      :grading (select-keys grade [:db-match :action-checks :communicate-checks
-                                                  :nl-assertions :note])
+                                                  :nl-assertions :env-assertion-checks :note])
                      :failure failure}
                     evidence-extra)]
       (conv/finish-episode! run-id status (when failure :infrastructure-error))
