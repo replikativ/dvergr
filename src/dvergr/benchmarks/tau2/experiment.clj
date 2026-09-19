@@ -36,6 +36,7 @@
             [dvergr.benchmarks.tau2.core :as t2]
             [dvergr.benchmarks.tau2.episode :as episode]
             [dvergr.benchmarks.tau2.live :as live]
+            [dvergr.benchmarks.tau2.pyjson :as pj]
             [dvergr.discourse :as d]
             [dvergr.model.api.claude-code :as cc]
             [dvergr.model.registry :as registry]
@@ -58,8 +59,11 @@
 
 (defn candidate-roster
   "AgentDefs for candidate specs `{:id :harness :action-space :model :provider
-   :max-model-steps :budget-dollars}`."
-  [specs]
+   :max-model-steps :budget-dollars}`. With `domain`, each AgentDef carries the
+   sha256 of the system prompt it will run with, so a prompt change is a new
+   candidate (never resumed into old cells)."
+  ([specs] (candidate-roster specs nil))
+  ([specs domain]
   (reduce (fn [team {:keys [id harness action-space model provider max-model-steps budget-dollars]
                      :or {harness :dvergr action-space :tools max-model-steps 100 budget-dollars 5.0}}]
             (let [model-id (registry/resolve-alias model)]
@@ -71,10 +75,14 @@
                 :model-policy {:provider (or provider (:provider (registry/get-model! model-id)))
                                :model model-id}
                 :program {:kind :llm :max-model-steps max-model-steps :budget-dollars budget-dollars}
-                :metadata (cond-> {:conversation/harness harness}
-                            (= :dvergr harness) (assoc :conversation/action-space action-space))})))
+                :metadata (let [m (cond-> {:conversation/harness harness}
+                                    (= :dvergr harness) (assoc :conversation/action-space action-space))]
+                            (cond-> m
+                              domain (assoc :conversation/system-prompt-sha256
+                                            (pj/sha256-hex (episode/agent-system-prompt
+                                                            domain {:agent/metadata m})))))})))
           (roster/make-roster {:id :tau2/candidates})
-          specs))
+          specs)))
 
 (def host-context-note
   "Appended to every Claude Code system prompt in an experiment."
@@ -143,7 +151,7 @@
         room (d/make-room {:id room-id :store (:store xs) :title (str "tau2 experiment " (name room-id))})
         task-ids (or task-ids (get-in domain [:splits split]))
         definitions (mapv #(environment-def domain % limits) task-ids)
-        team (candidate-roster candidates)
+        team (candidate-roster candidates domain)
         experiment-def (experiment/make-experiment
                         {:id (keyword "tau2" (name room-id))
                          :dataset (experiment/make-dataset

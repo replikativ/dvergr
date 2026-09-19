@@ -204,3 +204,32 @@
           (is (every? #(not= :running (:run/status %)) (:runs e)))
           (is (= 4 (count (:effects e))) "1 message + 4 batches x 2 steps reaches 9"))
         (finally (conv/close-store! xs))))))
+
+(deftest repl-candidate-discovers-documented-tools
+  (if-not checkout?
+    (println "SKIP repl-candidate-discovers-documented-tools: no ../tau2-bench checkout")
+    (let [dom (without-nl (t2/load-domain "retail"))
+          seen (atom [])
+          code (str "[(with-out-str (clojure.repl/doc tau2/cancel_pending_order)) "
+                    "(sandbox/doc 'tau2)]")
+          responses [{:content "" :usage usage
+                      :tool-calls [{:id "e1" :name "clojure_eval" :input {:code code}}]}
+                     {:content "Done. ###STOP###" :usage usage}]
+          chat (scripted-chat responses)
+          dir (temp-dir)]
+      (with-redefs [model-chat/chat (fn [messages opts] (swap! seen conj [messages opts]) (chat messages opts))]
+        (tx/run! {:dir dir :domain dom :task-ids ["0"]
+                  :candidates [{:id :dv :harness :dvergr :action-space :repl :model "claude-code-sonnet"}]
+                  :user-fn (constantly {:content "I need help with an exchange."})}))
+      (let [[first-messages first-opts] (first @seen)
+            ;; The evaluation result is the last message of the second model call.
+            result (str (:content (last (first (second @seen)))))
+            all-text (pr-str @seen)]
+        (testing "the prompt carries the tool signatures and descriptions"
+          (is (re-find #"\(tau2/cancel_pending_order \{\\\"order_id\\\" \\\"reason\\\"\}\)" all-text))
+          (is (re-find #"ordered by mistake" (pr-str first-messages first-opts))))
+        (testing "clojure.repl/doc and sandbox/doc describe the tau2 functions at runtime"
+          (is (re-find #"Cancel a pending order" result))
+          (is (re-find #"order_id reason" result) "arglists are shown")
+          (is (re-find #"get_order_details" result))
+          (is (not (re-find #"fns: " result)) "signatures, not bare names"))))))

@@ -36,6 +36,7 @@
             [dvergr.discourse.llm :as llm]
             [dvergr.model.providers :as providers]
             [dvergr.sandbox :as sandbox]
+            [dvergr.sandbox.ns.doc :as ns-doc]
             [dvergr.tools :as tools]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
@@ -167,31 +168,80 @@
                                     :content (effect! episode requestor name input)})}])))
         schemas))
 
+(defn- param-type [{:strs [type anyOf items]}]
+  (cond
+    (= "array" type) (str "array of " (param-type items))
+    type type
+    anyOf (str/join " | " (map param-type anyOf))
+    :else "any"))
+
+(defn- tool-args
+  "`[[name type required? description]]` of a tool's parameters, schema order."
+  [{:strs [properties required]}]
+  (let [req (set required)]
+    (for [[k p] properties]
+      [k (param-type p) (contains? req k) (get p "description")])))
+
+(defn- tool-call-shape [{:strs [name parameters]}]
+  (let [args (tool-args parameters)]
+    (str "(tau2/" name (when (seq args)
+                         (str " {" (str/join " " (map #(pr-str (first %)) args)) "}"))
+         ")")))
+
+(defn- tool-doc
+  "Description plus one line per argument, as `doc` and the prompt show it."
+  [{:strs [description parameters]}]
+  (str/join "\n" (cons (str/trim (str description))
+                        (for [[k t req? d] (tool-args parameters)]
+                          (str "  " k " (" t (when-not req? ", optional") ")"
+                               (when d (str ": " d)))))))
+
+(defn tool-signatures
+  "The domain tools as Clojure calls with their full descriptions: the same
+   information the JSON-tools candidate receives in its tool schemas."
+  [schemas]
+  (str/join "\n\n" (for [{:strs [function]} schemas]
+                       (str (tool-call-shape function) "\n" (tool-doc function)))))
+
 (defn- install-tau2-namespace!
-  "Domain tools as SCI functions `tau2/<tool>` (one map argument, the tool's
-   exact text result) plus `tau2/parse` for JSON text."
+  "Domain tools as documented SCI functions `tau2/<tool>` (one map argument,
+   the tool's exact text result) plus `tau2/parse` for JSON text, so
+   `(clojure.repl/doc tau2/<tool>)` and `(sandbox/doc 'tau2)` describe them."
   [sci-ctx episode]
-  (sandbox/add-namespace!
-   sci-ctx 'tau2
-   (into {'parse (fn [s] (pj/parse s))}
-         (map (fn [{:strs [function]}]
-                (let [tool-name (get function "name")]
-                  [(symbol tool-name)
-                   (fn ([] (effect! episode :assistant tool-name {}))
-                     ([args] (effect! episode :assistant tool-name args)))])))
-         (get-in episode [:domain :tool-schemas]))))
+  (let [schemas (get-in episode [:domain :tool-schemas])
+        fns (into {'parse (fn [s] (pj/parse s))}
+                  (map (fn [{:strs [function]}]
+                         (let [tool-name (get function "name")]
+                           [(symbol tool-name)
+                            (fn ([] (effect! episode :assistant tool-name {}))
+                              ([args] (effect! episode :assistant tool-name args)))])))
+                  schemas)
+        docs (into {'parse ['([json-text])
+                            "Parse a tool's JSON text result into Clojure data (string keys)."]}
+                   (map (fn [{:strs [function]}]
+                          (let [args (tool-args (get function "parameters"))]
+                            [(symbol (get function "name"))
+                             [(list (if (seq args)
+                                      [{:strs (mapv (comp symbol first) args)}]
+                                      []))
+                              (tool-doc function)]])))
+                   schemas)]
+    (sandbox/add-namespace! sci-ctx 'tau2 (ns-doc/with-docs fns docs))))
 
 (def repl-guidance
   "Appended to the agent system prompt for the REPL action space."
-  (str "\n\n<tools>\nYou act through the `clojure_eval` tool, a Clojure (SCI) REPL. "
-       "The customer-service tools are Clojure functions in namespace `tau2`, "
-       "each taking one map with string keys and returning the tool's text "
-       "result exactly, e.g. (tau2/get_order_details {\"order_id\" \"#W0000001\"}). "
-       "(tau2/parse s) turns JSON text into Clojure data, so you can filter, "
-       "count and select precisely in code instead of reading long JSON by eye. "
-       "Write actions (modify/cancel/exchange/return/transfer and similar) take "
-       "effect immediately: only call them after explicit user confirmation, "
-       "exactly once. Available: %s.\n</tools>"))
+  (str "\n\n<tools>\nYou act through the `clojure_eval` tool, a Clojure (SCI) REPL; "
+       "definitions persist across evaluations. The customer-service tools are "
+       "functions in namespace `tau2`, each taking one map with string keys and "
+       "returning the tool's text result exactly. `(tau2/parse s)` turns a JSON "
+       "result into Clojure data (string keys): whenever an answer depends on "
+       "counting, filtering, comparing or summing (available variants, totals, "
+       "prices), compute it in code over the parsed data instead of reading JSON "
+       "by eye. Several read calls can run in one evaluation. Write actions "
+       "(modify/cancel/exchange/return/transfer and similar) take effect "
+       "immediately: only call them after explicit user confirmation, exactly "
+       "once. `(clojure.repl/doc tau2/<tool>)` and `(sandbox/doc 'tau2)` show "
+       "these docs at runtime.\n\n%s\n</tools>"))
 
 (defn agent-system-prompt
   "The system prompt a candidate receives (recorded as a hash in evidence)."
@@ -199,7 +249,7 @@
   (cond-> (t2/agent-system-prompt domain)
     (= :repl (get-in agent [:agent/metadata :conversation/action-space]))
     (str (format repl-guidance
-                 (str/join ", " (map #(get-in % ["function" "name"]) (:tool-schemas domain)))))))
+                 (tool-signatures (:tool-schemas domain))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Participants
