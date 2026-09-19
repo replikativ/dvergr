@@ -228,27 +228,43 @@
                    schemas)]
     (sandbox/add-namespace! sci-ctx 'tau2 (ns-doc/with-docs fns docs))))
 
-(def repl-guidance
-  "Appended to the agent system prompt for the REPL action space."
+(def ^:private repl-guidance-head
   (str "\n\n<tools>\nYou act through the `clojure_eval` tool, a Clojure (SCI) REPL; "
        "definitions persist across evaluations. The customer-service tools are "
        "functions in namespace `tau2`, each taking one map with string keys and "
        "returning the tool's text result exactly. `(tau2/parse s)` turns a JSON "
-       "result into Clojure data (string keys): whenever an answer depends on "
-       "counting, filtering, comparing or summing (available variants, totals, "
-       "prices), compute it in code over the parsed data instead of reading JSON "
-       "by eye. Several read calls can run in one evaluation. Write actions "
+       "result into Clojure data (string keys). "))
+
+(def ^:private repl-guidance-tail
+  (str "Several read calls can run in one evaluation. Write actions "
        "(modify/cancel/exchange/return/transfer and similar) take effect "
        "immediately: only call them after explicit user confirmation, exactly "
        "once. `(clojure.repl/doc tau2/<tool>)` and `(sandbox/doc 'tau2)` show "
        "these docs at runtime.\n\n%s\n</tools>"))
+
+(def repl-guidance
+  "Variants of the REPL action-space guidance, selected by the candidate's
+   `:conversation/repl-guidance` (default :compute)."
+  {:compute
+   (str repl-guidance-head
+        "Whenever an answer depends on counting, filtering, comparing or summing "
+        "(available variants, totals, prices), compute it in code over the parsed "
+        "data instead of reading JSON by eye. " repl-guidance-tail)
+   :inspect
+   (str repl-guidance-head
+        "Use it to select exactly what you need, but a computed value only shows "
+        "what you asked for: first look at the records themselves (their keys and "
+        "the fields that decide the answer, such as availability, status, options "
+        "and prices), then filter, count, compare or sum in code over the parsed "
+        "data rather than by eye, checking those deciding fields explicitly. "
+        repl-guidance-tail)})
 
 (defn agent-system-prompt
   "The system prompt a candidate receives (recorded as a hash in evidence)."
   [domain agent]
   (cond-> (t2/agent-system-prompt domain)
     (= :repl (get-in agent [:agent/metadata :conversation/action-space]))
-    (str (format repl-guidance
+    (str (format (repl-guidance (get-in agent [:agent/metadata :conversation/repl-guidance] :compute))
                  (tool-signatures (:tool-schemas domain))))))
 
 ;; ---------------------------------------------------------------------------

@@ -64,7 +64,8 @@
    candidate (never resumed into old cells)."
   ([specs] (candidate-roster specs nil))
   ([specs domain]
-  (reduce (fn [team {:keys [id harness action-space model provider max-model-steps budget-dollars]
+  (reduce (fn [team {:keys [id harness action-space model provider max-model-steps budget-dollars
+                            repl-guidance]
                      :or {harness :dvergr action-space :tools max-model-steps 100 budget-dollars 5.0}}]
             (let [model-id (registry/resolve-alias model)]
               (roster/make-agent
