@@ -24,6 +24,7 @@
             [dvergr.agent.conversation :as conv]
             [dvergr.agent.environment :as environment]
             [dvergr.agent.room-context :as room-context]
+            [org.replikativ.spindel.engine.context :as ectx]
             [dvergr.agent.run :as run]
             [dvergr.benchmarks.tau2.core :as t2]
             [dvergr.benchmarks.tau2.live :as live]
@@ -57,6 +58,29 @@
 (defn- set-world! [room w]
   (binding [ec/*execution-context* (:ctx room)]
     (ec/swap-state! world-path (constantly w))))
+
+(deftype CtxAtom [ctx path]
+  ;; An atom whose value lives in an execution context's state, so forking
+  ;; the context forks the value (copy-on-write) with the tau2 world and the
+  ;; candidate's working context. Update fns must be pure: state swaps retry.
+  clojure.lang.IDeref
+  (deref [_] (binding [ec/*execution-context* ctx] (ec/get-state path)))
+  clojure.lang.IAtom
+  (swap [_ f] (binding [ec/*execution-context* ctx] (ec/swap-state! path f)))
+  (swap [_ f x] (binding [ec/*execution-context* ctx] (ec/swap-state! path #(f % x))))
+  (swap [_ f x y] (binding [ec/*execution-context* ctx] (ec/swap-state! path #(f % x y))))
+  (swap [_ f x y args] (binding [ec/*execution-context* ctx] (ec/swap-state! path #(apply f % x y args))))
+  (compareAndSet [_ old new]
+    (binding [ec/*execution-context* ctx]
+      (let [set? (volatile! false)]
+        (ec/swap-state! path (fn [cur] (if (= cur old) (do (vreset! set? true) new) (do (vreset! set? false) cur))))
+        @set?)))
+  (reset [_ new] (binding [ec/*execution-context* ctx] (ec/swap-state! path (constantly new)))))
+
+(defn- ctx-atom
+  "Episode state cell `k` in `room`'s execution context."
+  [room k]
+  (->CtxAtom (:ctx room) [::cells k]))
 
 (defn- ended? [episode] (realized? (:ended episode)))
 
@@ -364,7 +388,7 @@
         action-space (get-in agent [:agent/metadata :conversation/action-space] :tools)
         system-prompt (agent-system-prompt domain agent)
         budget (double (or budget-dollars 5.0))
-        model-steps (atom 0)
+        model-steps (ctx-atom room :model-steps)
         ctx-opts {:system-prompt system-prompt :budget-dollars budget}
         tool-map (case action-space
                    :tools (schema-tool-map episode (:tool-schemas domain) :assistant)
@@ -384,7 +408,7 @@
        ;; model step that ran tools (the text reply is counted by the
        ;; customer when it arrives).
        :run-turn-fn (fn [chat-ctx opts]
-                      (if (> (swap! model-steps inc) (or max-model-steps 100))
+                      (if (> (swap! model-steps (fnil inc 0)) (or max-model-steps 100))
                         (do (end! episode :max-model-steps) :error)
                         (let [outcome (chat-agent/run-agent-turn! chat-ctx (dissoc opts :system-suffix))]
                           (when (= :continue outcome) (add-steps! episode 2))
@@ -429,7 +453,8 @@
         generate (or agent-generate (live/model-generate (:agent/model-policy agent)))
         system (t2/agent-system-prompt domain)
         tools (:tool-schemas domain)
-        history (atom [{:role :assistant :content t2/first-agent-message}])]
+        history (doto (ctx-atom room :agent-history)
+                  (swap! #(or % [{:role :assistant :content t2/first-agent-message}])))]
     {:participant
      (d/participant
       {:id :agent
@@ -466,6 +491,9 @@
      :after-greeting (fn [])
      :usage (fn [] (get-in @(:state episode) [:usage :agent]))}))
 
+(defn- customer-message-count [episode]
+  (count (filter #(and (= :message (:kind %)) (= :user (:role %))) (:log @(:state episode)))))
+
 (defn- customer
   "The simulated user: role-flipped history of the dialogue, its own tools
    through the effect interpreter, stop tokens end the episode."
@@ -473,7 +501,7 @@
   (let [{:keys [domain room task]} episode
         system (t2/user-system-prompt domain task)
         user-tools ((:user-tool-schemas domain) task)
-        history (atom [])
+        history (doto (ctx-atom room :customer-history) (swap! #(or % [])))
         ;; Recorded, but addressed to the activity channel so it cannot start
         ;; another candidate turn.
         record-final! (fn [reply kind]
@@ -511,10 +539,21 @@
                    (do (record-final! reply :tau2/stop) (end! episode :user-stop) nil)
                    :else
                    (do (record-message! episode :user reply)
-                       (if (bound-exceeded! episode)
+                       (cond
+                         (bound-exceeded! episode)
                          (do (d/post! room (d/message :customer :_activity reply nil
                                                       {:role :user :kind :tau2/after-bound}))
                              nil)
+
+                         ;; Checkpoint: hold the k-th customer message back.
+                         ;; The candidate is idle, so the Room is a clean fork
+                         ;; point; each branch delivers it.
+                         (= (:checkpoint-at episode) (customer-message-count episode))
+                         (do (swap! (:state episode) assoc :pending {:content reply})
+                             (end! episode :checkpoint)
+                             nil)
+
+                         :else
                          {:to :agent :content reply :metadata {:role :user}})))))))))})))
 
 ;; ---------------------------------------------------------------------------
@@ -554,6 +593,104 @@
                            :failure failure}})
      :episode-room-id room-id :termination :infrastructure-error :failure failure}))
 
+(defn- new-episode [domain task limits room checkpoint-at]
+  {:domain domain :task task :limits limits :room room
+   :state (ctx-atom room :state)
+   :lock (Object.) :ended (promise) :failure (atom nil)
+   :checkpoint-at checkpoint-at})
+
+(defn- watch-candidate-runs!
+  "A candidate turn that fails, is cancelled, or stops on its budget posts no
+   reply; end the episode. The callback runs under the Run lifecycle lock and
+   only delivers."
+  [episode]
+  (let [room-id (:id (:room episode))]
+    (run/watch-runs! room-id
+                     (fn [{:keys [type run]}]
+                       (when (and (= :run/finished type)
+                                  (= room-id (:run/room run))
+                                  (= :agent (:run/actor run))
+                                  (not (ended? episode)))
+                         (case (:run/status run)
+                           :completed nil
+                           :waiting (end! episode :agent-budget)
+                           (end! episode :agent-error)))))))
+
+(defn- attach!
+  "Join the candidate and the customer. Returns the candidate."
+  [episode agent agent-generate user]
+  (let [room (:room episode)
+        candidate (case (get-in agent [:agent/metadata :conversation/harness] :dvergr)
+                    :dvergr (dvergr-candidate episode agent)
+                    :reference (reference-candidate episode agent agent-generate))]
+    (binding [ec/*execution-context* (:ctx room)]
+      (d/join room (:participant candidate))
+      (d/join room (customer episode user)))
+    candidate))
+
+(defn- conclude!
+  "Cancel candidate Runs once the episode ended, grade, finish the episode
+   Run and certify its Attempt."
+  [{:keys [experiment-room domain task definition agent judge run-id opened
+           started-at started-nanos base-metrics evidence-extra]}
+   episode candidate]
+  (let [{:keys [room]} episode
+        room-id (:id room)]
+    (run/cancel-room-runs! room-id)
+    (let [quiescent? (await-quiescence! room-id 60000)
+          termination @(:ended episode)
+          [final-world {:keys [log steps errors usage]}]
+          (locking (:lock episode) [(world room) @(:state episode)])
+          failure (or @(:failure episode)
+                      (when-not quiescent?
+                        {:source :teardown :message "candidate Runs did not quiesce"}))
+          grade (when-not failure
+                  (try (t2/grade domain task {:messages (trajectory log) :termination termination
+                                              :world final-world}
+                                 {:judge judge})
+                       (catch Throwable t (fault! episode :grading t) nil)))
+          failure (or failure @(:failure episode))
+          status (if (and grade (not failure)) :completed :failed)
+          world-hash (when final-world ((:world-hash domain) final-world))
+          evidence (merge
+                    {:result {:termination termination
+                              :reward-breakdown (:reward-breakdown grade)}
+                     :trace {:runs [{:run/id run-id}] :messages [{:message/id (:id opened)}]}
+                     :episode {:room room-id
+                               :agent-runs (mapv (juxt :run/id :run/status)
+                                                 (run/runs room {:limit 100000}))
+                               :effects (count (filter #(= :tool (:kind %)) log))
+                               :dialogue (count (filter #(= :message (:kind %)) log))}
+                     :trajectory log
+                     :prompts {:agent-system-sha256 (pj/sha256-hex (agent-system-prompt domain agent))
+                               :user-system-sha256 (pj/sha256-hex (t2/user-system-prompt domain task))}
+                     :world {:final-hash world-hash}
+                     :grading (select-keys grade [:db-match :action-checks :communicate-checks
+                                                  :nl-assertions :note])
+                     :failure failure}
+                    evidence-extra)]
+      (conv/finish-episode! run-id status (when failure :infrastructure-error))
+      {:attempt (conv/certify!
+                 experiment-room definition agent
+                 {:run-id run-id :status status :started-at started-at
+                  :elapsed-ms (elapsed-ms started-nanos)
+                  :checks (if grade (checks-from grade termination) {:terminated-normally false})
+                  :reward (if grade (double (:reward grade)) 0.0)
+                  :metrics (merge base-metrics
+                                  {:steps steps :errors errors :termination termination
+                                   :world-hash world-hash
+                                   :usage (assoc usage :agent ((:usage candidate)))})
+                  :evidence evidence})
+       :episode-room-id room-id :termination termination :grade grade :failure failure})))
+
+(defn- close-quietly! [room]
+  (when room
+    (try (d/close-room! room)
+         (catch Throwable t
+           (tel/log! {:level :warn :id ::episode-room-close-failed
+                      :data {:room (:id room) :error (.getMessage t)}}
+                     "episode Room teardown failed")))))
+
 (defn run!
   "Run one certified episode on the calling (host) thread. Returns
    `{:attempt :episode-room-id :termination :grade :failure}`.
@@ -562,10 +699,16 @@
    (EnvironmentDef) :agent (candidate AgentDef) :user and :judge (tau2
    generate fns) :limits {:max-steps :max-errors} :timeout-ms :repetition
    :experiment-content-id, and for the reference harness an optional
-   `:agent-generate` (tests)."
+   `:agent-generate` (tests).
+
+   With `:checkpoint-at k` the episode stops before the k-th customer message
+   reaches the candidate and returns `{:checkpoint cp}` instead: the Room
+   stays open as a fork point for `branch!` (release it with
+   `release-checkpoint!`); nothing is graded or certified."
   [{:keys [experiment-room store domain task definition agent agent-generate user judge
-           limits timeout-ms repetition experiment-content-id]
-    :or {limits {:max-steps 200 :max-errors 10} timeout-ms (* 30 60 1000)}}]
+           limits timeout-ms repetition experiment-content-id checkpoint-at]
+    :or {limits {:max-steps 200 :max-errors 10} timeout-ms (* 30 60 1000)}
+    :as opts}]
   (let [started-at (System/currentTimeMillis)
         started-nanos (System/nanoTime)
         room-id (keyword "tau2" (str "ep-" (random-uuid)))
@@ -576,35 +719,19 @@
         {episode-run :run opened :opened}
         (conv/open-episode! experiment-room agent (environment/environment-ref definition) room-id)
         run-id (:run/id episode-run)
-        room* (atom nil)]
+        room* (atom nil)
+        keep-room? (volatile! false)]
     (try
       (let [room (d/make-room {:id room-id :store store :parent-id (:id experiment-room)
                                :title (str (:domain domain) " task " (get task "id"))})
             _ (reset! room* room)
-            episode {:domain domain :task task :limits limits :room room
-                     :state (atom {:seq 0 :steps 0 :errors 0 :log [] :usage {}})
-                     :lock (Object.) :ended (promise) :failure (atom nil)}
-            ;; A candidate turn that fails, is cancelled, or stops on its
-            ;; budget posts no reply; end the episode. The callback runs under
-            ;; the Run lifecycle lock and only delivers.
-            _ (run/watch-runs! room-id
-                               (fn [{:keys [type run]}]
-                                 (when (and (= :run/finished type)
-                                            (= room-id (:run/room run))
-                                            (= :agent (:run/actor run))
-                                            (not (ended? episode)))
-                                   (case (:run/status run)
-                                     :completed nil
-                                     :waiting (end! episode :agent-budget)
-                                     (end! episode :agent-error)))))
-            candidate (case harness
-                        :dvergr (dvergr-candidate episode agent)
-                        :reference (reference-candidate episode agent agent-generate))]
+            episode (new-episode domain task limits room checkpoint-at)
+            _ (reset! (:state episode) {:seq 0 :steps 0 :errors 0 :log [] :usage {}})
+            _ (watch-candidate-runs! episode)
+            candidate (attach! episode agent agent-generate user)]
         (try
           (set-world! room ((:initial-world domain) task))
           (binding [ec/*execution-context* (:ctx room)]
-            (d/join room (:participant candidate))
-            (d/join room (customer episode user))
             ;; The customer logs the greeting on arrival like every candidate
             ;; message, which counts a step; the greeting is not a tau2 step.
             (swap! (:state episode) update :steps dec)
@@ -613,50 +740,21 @@
           (when (= ::timeout (deref (:ended episode) timeout-ms ::timeout))
             (end! episode :timeout))
           (catch Throwable t (fault! episode :setup t)))
-        (run/cancel-room-runs! room-id)
-        (let [quiescent? (await-quiescence! room-id 60000)
-              termination @(:ended episode)
-              [final-world {:keys [log steps errors usage]}]
-              (locking (:lock episode) [(world room) @(:state episode)])
-              failure (or @(:failure episode)
-                          (when-not quiescent?
-                            {:source :teardown :message "candidate Runs did not quiesce"}))
-              grade (when-not failure
-                      (try (t2/grade domain task {:messages (trajectory log) :termination termination
-                                                  :world final-world}
-                                     {:judge judge})
-                           (catch Throwable t (fault! episode :grading t) nil)))
-              failure (or failure @(:failure episode))
-              status (if (and grade (not failure)) :completed :failed)
-              world-hash (when final-world ((:world-hash domain) final-world))
-              evidence {:result {:termination termination
-                                 :reward-breakdown (:reward-breakdown grade)}
-                        :trace {:runs [{:run/id run-id}] :messages [{:message/id (:id opened)}]}
-                        :episode {:room room-id
-                                  :agent-runs (mapv (juxt :run/id :run/status)
-                                                    (run/runs room {:limit 100000}))
-                                  :effects (count (filter #(= :tool (:kind %)) log))
-                                  :dialogue (count (filter #(= :message (:kind %)) log))}
-                        :trajectory log
-                        :prompts {:agent-system-sha256 (pj/sha256-hex (agent-system-prompt domain agent))
-                                  :user-system-sha256 (pj/sha256-hex (t2/user-system-prompt domain task))}
-                        :world {:final-hash world-hash}
-                        :grading (select-keys grade [:db-match :action-checks :communicate-checks
-                                                     :nl-assertions :note])
-                        :failure failure}]
-          (conv/finish-episode! run-id status (when failure :infrastructure-error))
-          {:attempt (conv/certify!
-                     experiment-room definition agent
-                     {:run-id run-id :status status :started-at started-at
-                      :elapsed-ms (elapsed-ms started-nanos)
-                      :checks (if grade (checks-from grade termination) {:terminated-normally false})
-                      :reward (if grade (double (:reward grade)) 0.0)
-                      :metrics (merge base-metrics
-                                      {:steps steps :errors errors :termination termination
-                                       :world-hash world-hash
-                                       :usage (assoc usage :agent ((:usage candidate)))})
-                      :evidence evidence})
-           :episode-room-id room-id :termination termination :grade grade :failure failure}))
+        (if (and checkpoint-at (= :checkpoint @(:ended episode)) (not @(:failure episode)))
+          (do (conv/finish-episode! run-id :cancelled :checkpoint)
+              (vreset! keep-room? true)
+              {:checkpoint (merge (select-keys opts [:experiment-room :store :domain :task :definition
+                                                     :agent :agent-generate :user :judge :timeout-ms
+                                                     :repetition :experiment-content-id])
+                                  {:room room :limits limits :at checkpoint-at
+                                   :pending (:pending @(:state episode))
+                                   :log (:log @(:state episode))})
+               :episode-room-id room-id :termination :checkpoint})
+          (conclude! {:experiment-room experiment-room :domain domain :task task
+                      :definition definition :agent agent :judge judge :run-id run-id
+                      :opened opened :started-at started-at :started-nanos started-nanos
+                      :base-metrics base-metrics}
+                     episode candidate)))
       (catch Throwable t
         ;; Admission succeeded but the episode could not complete normally:
         ;; still finish the Run and certify a :failed Attempt.
@@ -664,9 +762,73 @@
                         started-at started-nanos base-metrics t))
       (finally
         (run/unwatch-runs! room-id)
-        (when-let [room @room*]
-          (try (d/close-room! room)
-               (catch Throwable t
-                 (tel/log! {:level :warn :id ::episode-room-close-failed
-                            :data {:room room-id :error (.getMessage t)}}
-                           "episode Room teardown failed"))))))))
+        (when-not @keep-room? (close-quietly! @room*))))))
+
+(defn branch!
+  "Continue checkpoint `cp` (from `run!` with `:checkpoint-at`) as a new
+   certified episode in a copy-on-write fork of its world: the tau2 world,
+   the dialogue and episode log so far, the customer's history and the
+   candidate's working context (chat history and REPL heap) are the fork's,
+   so branches never see each other or change the checkpoint. The withheld
+   customer message is delivered and the episode runs to its end.
+
+   `opts` may override :user and :judge (e.g. another simulator), and
+   :agent-generate for the reference harness; the candidate AgentDef stays
+   the checkpoint's. The Attempt records `{:branch {:checkpoint-room :at}}`."
+  ([cp] (branch! cp {}))
+  ([cp opts]
+   (let [{:keys [experiment-room store domain task definition agent agent-generate user judge
+                 limits timeout-ms repetition experiment-content-id room at pending]
+          :or {timeout-ms (* 30 60 1000)}} (merge cp opts)
+         parent room
+         started-at (System/currentTimeMillis)
+         started-nanos (System/nanoTime)
+         room-id (keyword "tau2" (str "br-" (random-uuid)))
+         harness (get-in agent [:agent/metadata :conversation/harness] :dvergr)
+         branch-info {:checkpoint-room (:id parent) :at at}
+         base-metrics {:repetition (or repetition 0)
+                       :experiment-content-id experiment-content-id
+                       :harness harness
+                       :branch branch-info}
+         {episode-run :run opened :opened}
+         (conv/open-episode! experiment-room agent (environment/environment-ref definition) room-id)
+         run-id (:run/id episode-run)
+         room* (atom nil)]
+     (try
+       (let [child-ctx (ectx/fork-context (:ctx parent) :mode :frozen)
+             room (d/make-room {:id room-id :store store :parent-id (:id experiment-room)
+                                :ctx child-ctx
+                                :title (str (:domain domain) " task " (get task "id") " branch at " at)})
+             _ (reset! room* room)
+             ;; The candidate's working context (chat history + SCI heap) forks
+             ;; with the world; project it into the branch before the
+             ;; candidate participant is built.
+             _ (when (= :dvergr harness) (room-context/fork-ctx! parent room :agent))
+             episode (new-episode domain task limits room nil)
+             _ (watch-candidate-runs! episode)
+             candidate (attach! episode agent agent-generate user)]
+         (try
+           ;; Rebinds the branch's tools (the forked heap's tau2/* still
+           ;; point at the checkpoint's world) before the message arrives.
+           ((:after-greeting candidate))
+           (binding [ec/*execution-context* (:ctx room)]
+             (d/post! room (d/message :customer :agent (:content pending) nil {:role :user})))
+           (when (= ::timeout (deref (:ended episode) timeout-ms ::timeout))
+             (end! episode :timeout))
+           (catch Throwable t (fault! episode :setup t)))
+         (conclude! {:experiment-room experiment-room :domain domain :task task
+                     :definition definition :agent agent :judge judge :run-id run-id
+                     :opened opened :started-at started-at :started-nanos started-nanos
+                     :base-metrics base-metrics :evidence-extra {:branch branch-info}}
+                    episode candidate))
+       (catch Throwable t
+         (certify-fault! experiment-room definition agent run-id opened room-id
+                         started-at started-nanos base-metrics t))
+       (finally
+         (run/unwatch-runs! room-id)
+         (close-quietly! @room*))))))
+
+(defn release-checkpoint!
+  "Close a checkpoint's Room once no more branches will be taken."
+  [cp]
+  (close-quietly! (:room cp)))

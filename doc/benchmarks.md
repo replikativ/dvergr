@@ -202,6 +202,43 @@ Probe samples run in one parallel batch are correlated (the same variant
 went 2/8 and 8/8 in consecutive batches), so compare variants interleaved
 within the same rounds.
 
+### Checkpoints and branches (copy-on-write)
+
+An episode's whole live state is forkable: the tau2 world, the graded log
+and step/error counters, the customer's history, the reference agent's
+history and the Dvergr candidate's working context (chat history and SCI
+REPL heap) all live in the episode Room's execution context
+(`episode/CtxAtom` cells).
+
+```clojure
+(let [{cp :checkpoint} (ep/run! (assoc opts :checkpoint-at 3))]   ; pause before the 3rd customer message
+  (try
+    (mapv (fn [_] (ep/branch! cp)) (range 8))                       ; 8 certified continuations
+    (finally (ep/release-checkpoint! cp))))
+```
+
+- `run!` with `:checkpoint-at k` stops when the customer has produced its
+  k-th message and holds it back: the candidate is idle, so the Room is a
+  clean fork point. Nothing is graded or certified; the Room stays open.
+- `branch!` forks the checkpoint Room's execution context (`:mode :frozen`,
+  O(1) copy-on-write) into a new episode Room on the experiment store,
+  projects the candidate's working context into it (`room-context/fork-ctx!`),
+  rebinds the `tau2/*` tools to the branch's world, delivers the held
+  message and runs to the end. Each branch is an ordinary certified Attempt
+  whose metrics and evidence carry `{:branch {:checkpoint-room :at}}`; its
+  trajectory starts with the checkpoint's log. Branches never see each other
+  and never change the checkpoint (`tau2_lab_test`: gold vs idle
+  continuations 1.0 / 0.0 from one checkpoint; a REPL definition made before
+  the checkpoint is inherited, a redefinition in one branch is invisible to
+  the others).
+- `opts` may vary the customer (`:user`), the judge and, for the reference
+  harness, the agent's generate fn; the Dvergr candidate keeps the
+  checkpoint's working context (its prompt and model are fixed there).
+
+Limits: checkpoints are taken live (a certified log can only be replayed
+into a probe, since it does not contain the candidate's REPL heap); forks
+happen only between model steps.
+
 ### Decision-point probes
 
 `dvergr.benchmarks.tau2.probe` re-samples one candidate turn from a recorded
