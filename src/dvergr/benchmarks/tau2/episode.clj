@@ -203,21 +203,52 @@
   (str/join "\n\n" (for [{:strs [function]} schemas]
                        (str (tool-call-shape function) "\n" (tool-doc function)))))
 
-(defn- install-tau2-namespace!
+(defn data-shape
+  "A compact description of parsed JSON data: map keys with their value
+   shapes, id-keyed maps (all values of one shape) as `{\"<id>\" shape}` with
+   their count, vectors as `[shape]` with their count, scalars as type names."
+  ([x] (data-shape x 3))
+  ([x depth]
+   (cond
+     (map? x)
+     (let [vs (vals x)
+           keyed? (or (and (> (count x) 1) (every? map? vs)
+                           (apply = (map (comp set keys) vs)))
+                      ;; many keys with one scalar type: a lookup table
+                      (and (> (count x) 8) (not-any? coll? vs)
+                           (apply = (map type vs))))]
+       (cond
+         (zero? depth) (str "map of " (count x))
+         keyed? {(str "<" (count x) " keys, e.g. " (pr-str (first (keys x))) ">")
+                 (data-shape (first vs) (dec depth))}
+         :else (into (array-map) (map (fn [[k v]] [k (data-shape v (dec depth))])) x)))
+     (sequential? x) (if (or (empty? x) (zero? depth))
+                       (str "vector of " (count x))
+                       [(str "<" (count x) " items>") (data-shape (first x) (dec depth))])
+     (string? x) "string"
+     (number? x) "number"
+     (boolean? x) "boolean"
+     (nil? x) "null"
+     :else (str (type x)))))
+
+(defn install-tau2-fns!
   "Domain tools as documented SCI functions `tau2/<tool>` (one map argument,
    the tool's exact text result) plus `tau2/parse` for JSON text, so
-   `(clojure.repl/doc tau2/<tool>)` and `(sandbox/doc 'tau2)` describe them."
-  [sci-ctx episode]
-  (let [schemas (get-in episode [:domain :tool-schemas])
-        fns (into {'parse (fn [s] (pj/parse s))}
+   `(clojure.repl/doc tau2/<tool>)` and `(sandbox/doc 'tau2)` describe them.
+   `call!` is `(fn [tool-name args] -> text)`."
+  [sci-ctx schemas call!]
+  (let [fns (into {'parse (fn [s] (pj/parse s))
+                   'shape (fn [x] (data-shape (if (string? x) (pj/parse x) x)))}
                   (map (fn [{:strs [function]}]
                          (let [tool-name (get function "name")]
                            [(symbol tool-name)
-                            (fn ([] (effect! episode :assistant tool-name {}))
-                              ([args] (effect! episode :assistant tool-name args)))])))
+                            (fn ([] (call! tool-name {}))
+                              ([args] (call! tool-name args)))])))
                   schemas)
         docs (into {'parse ['([json-text])
-                            "Parse a tool's JSON text result into Clojure data (string keys)."]}
+                            "Parse a tool's JSON text result into Clojure data (string keys)."]
+                    'shape ['([data-or-json-text])
+                            "Compact structure of parsed data: keys and value types; maps keyed by ids show one sample value and the count."]}
                    (map (fn [{:strs [function]}]
                           (let [args (tool-args (get function "parameters"))]
                             [(symbol (get function "name"))
@@ -227,6 +258,10 @@
                               (tool-doc function)]])))
                    schemas)]
     (sandbox/add-namespace! sci-ctx 'tau2 (ns-doc/with-docs fns docs))))
+
+(defn- install-tau2-namespace! [sci-ctx episode]
+  (install-tau2-fns! sci-ctx (get-in episode [:domain :tool-schemas])
+                     (fn [tool-name args] (effect! episode :assistant tool-name args))))
 
 (def ^:private repl-guidance-head
   (str "\n\n<tools>\nYou act through the `clojure_eval` tool, a Clojure (SCI) REPL; "
@@ -244,7 +279,7 @@
 
 (def repl-guidance
   "Variants of the REPL action-space guidance, selected by the candidate's
-   `:conversation/repl-guidance` (default :compute)."
+   `:conversation/repl-guidance` (default :shape)."
   {:compute
    (str repl-guidance-head
         "Whenever an answer depends on counting, filtering, comparing or summing "
@@ -257,14 +292,22 @@
         "the fields that decide the answer, such as availability, status, options "
         "and prices), then filter, count, compare or sum in code over the parsed "
         "data rather than by eye, checking those deciding fields explicitly. "
-        repl-guidance-tail)})
+        repl-guidance-tail)
+   :shape
+   (str repl-guidance-head
+        "`(tau2/shape x)` shows the structure of a result (x parsed or JSON "
+        "text): which values are maps keyed by ids (iterate with `vals`), which "
+        "are vectors, and the keys of their elements. Check the shape before "
+        "computing over data, then filter, count, compare or sum in code rather "
+        "than by eye, checking the fields that decide the answer (availability, "
+        "status, options, prices) explicitly. " repl-guidance-tail)})
 
 (defn agent-system-prompt
   "The system prompt a candidate receives (recorded as a hash in evidence)."
   [domain agent]
   (cond-> (t2/agent-system-prompt domain)
     (= :repl (get-in agent [:agent/metadata :conversation/action-space]))
-    (str (format (repl-guidance (get-in agent [:agent/metadata :conversation/repl-guidance] :compute))
+    (str (format (repl-guidance (get-in agent [:agent/metadata :conversation/repl-guidance] :shape))
                  (tool-signatures (:tool-schemas domain))))))
 
 ;; ---------------------------------------------------------------------------
