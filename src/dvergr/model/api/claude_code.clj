@@ -29,16 +29,28 @@
 ;; ============================================================================
 
 (defonce ^:private settings
-  (atom {:cli "claude" :system-note nil}))
+  (atom {:cli "claude" :system-note nil :env nil}))
 
 (defn configure!
   "Process-wide CLI settings, merged into the current ones:
      :cli          executable to run (a versioned binary pins the CLI)
-     :system-note  text appended to every system prompt, or nil"
+     :system-note  text appended to every system prompt, or nil
+     :env          environment entries added to the CLI process, e.g.
+                   {\"CLAUDE_CONFIG_DIR\" dir \"CLAUDE_CODE_OAUTH_TOKEN\" token}"
   [m]
-  (swap! settings merge (select-keys m [:cli :system-note])))
+  (swap! settings merge (select-keys m [:cli :system-note :env])))
 
 (defn settings-snapshot [] @settings)
+
+(defn token-env
+  "CLI environment for an isolated, token-authenticated CLI: an empty config
+   directory (no stored account profile, hence no injected account email) and
+   a long-lived inference token from `claude setup-token`, which never
+   refreshes and so cannot disturb the interactive login."
+  [config-dir token]
+  (.mkdirs (java.io.File. (str config-dir)))
+  {"CLAUDE_CONFIG_DIR" (.getAbsolutePath (java.io.File. (str config-dir)))
+   "CLAUDE_CODE_OAUTH_TOKEN" (str/trim (str token))})
 
 (def ^:private cli-version*
   (memoize
@@ -364,8 +376,11 @@
 (def ^:private process-exit-grace-ms 100)
 
 (defn- start-process [cmd]
-  (.start (doto (ProcessBuilder. ^java.util.List cmd)
-            (.redirectErrorStream false))))
+  (let [pb (doto (ProcessBuilder. ^java.util.List cmd)
+             (.redirectErrorStream false))]
+    (when-let [env (:env @settings)]
+      (.putAll (.environment pb) ^java.util.Map env))
+    (.start pb)))
 
 (defn- close-quietly! [resource]
   (when (instance? Closeable resource)

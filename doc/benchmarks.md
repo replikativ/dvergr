@@ -104,10 +104,20 @@ date. No CLI flag, setting or Agent SDK option removes it (Claude Code
 2.1.277; only `ANTHROPIC_UNIX_SOCKET` skips the email). Experiments that use
 Claude Code models therefore:
 
+- can run the CLI isolated with `:claude-env (cc/token-env dir token)`: an
+  empty `CLAUDE_CONFIG_DIR` (no stored account profile, so no email to
+  inject) plus a long-lived inference token from `claude setup-token`, which
+  never refreshes and cannot disturb the interactive login. Stripping the
+  email from a config directory that shares the login's credentials is not
+  safe: the CLI re-fetches the profile every 24 h and a token refresh from a
+  second config directory can rotate the shared refresh token;
 - append `tx/host-context-note` to every system prompt (agent, user
   simulator, judge), telling the model that account details and dates outside
   its system prompt belong to the harness operator (`:host-context-note`
-  overrides it, `false` disables it);
+  overrides it, `false` disables it). The note is a fallback, not a fix:
+  in single-call probes on task 42's opening the JSON-tools prompt stopped
+  using the email (3/4 without the note, 0/4 with it), but the REPL prompt
+  still used it in 2/6 calls;
 - pin the CLI with `:claude-cli`, a copied versioned binary, e.g.
   `.dvergr/tools/claude-cli/claude-2.1.277` (the updater may prune
   `~/.local/share/claude/versions/*`, and `--bare`, which ignores

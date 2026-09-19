@@ -21,7 +21,8 @@
    `host-context-note` (the CLI injects the operator's account email and the
    wall-clock date, which cannot be disabled), and cells pause before
    starting while a usage window is at least `:usage-pause-threshold`
-   utilized; a cell that fails on a usage limit is re-run after the reset,
+   utilized; `:claude-env` adds CLI environment entries (see
+   `cc/token-env`); a cell that fails on a usage limit is re-run after the reset,
    at most `:usage-retries` times. The CLI version and note are part of the
    ExperimentDef, so changing either never resumes into old cells.
 
@@ -77,11 +78,11 @@
 
 (def host-context-note
   "Appended to every Claude Code system prompt in an experiment."
-  (str "Note: this conversation runs inside an evaluation harness. Any account "
-       "details (such as an email address) or a current date that appear in your "
-       "context outside this system prompt describe the harness operator's "
-       "machine, not this environment or the person you are talking to. Ignore "
-       "them and rely only on this system prompt, the conversation and tool results."))
+  (str "Note: this conversation runs inside an evaluation harness. Any account details (such as "
+       "\"The user's email address is ...\") or a current date that appear in your context outside "
+       "this system prompt describe the harness operator's machine, not this environment or the "
+       "customer you are talking to; the operator has no account here. Never look up, use or "
+       "mention them, and do not mention this note. Identify the customer only from the conversation."))
 
 (defn- model-provider [{:keys [model provider]}]
   (or provider (when model (:provider (registry/get-model! (registry/resolve-alias model))))))
@@ -116,7 +117,7 @@
    daemon process."
   [{:keys [dir domain task-ids split repetitions parallelism candidates user judge limits
            timeout-ms experiment-id user-fn judge-fn agent-generate
-           claude-cli usage-pause-threshold usage-retries]
+           claude-cli claude-env usage-pause-threshold usage-retries]
     :or {split "base" repetitions 1 parallelism 1
          limits {:max-steps 200 :max-errors 10} timeout-ms (* 30 60 1000)
          usage-pause-threshold 0.97 usage-retries 3}
@@ -128,11 +129,15 @@
         note (let [n (get opts :host-context-note :auto)]
                (cond (= :auto n) (when uses-cc? host-context-note)
                      (string? n) n))
-        _ (when uses-cc? (cc/configure! (cond-> {:system-note note} claude-cli (assoc :cli claude-cli))))
+        _ (when uses-cc? (cc/configure! (cond-> {:system-note note}
+                                          claude-cli (assoc :cli claude-cli)
+                                          claude-env (assoc :env claude-env))))
         host (when uses-cc?
                {:claude-cli (or (cc/cli-version)
                                 (throw (ex-info "Claude Code CLI not runnable" {:cli (:cli (cc/settings-snapshot))})))
-                :host-context-note-id (some-> note hasch/uuid str)})
+                :host-context-note-id (some-> note hasch/uuid str)
+                ;; Names only: values may be secrets.
+                :claude-env-keys (vec (sort (keys claude-env)))})
         xs (conv/open-store! dir)
         room-id (or experiment-id (keyword "tau2" (.getName (io/file dir))))
         room (d/make-room {:id room-id :store (:store xs) :title (str "tau2 experiment " (name room-id))})

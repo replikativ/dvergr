@@ -61,6 +61,15 @@
   [{:keys [ended]} termination]
   (deliver ended termination))
 
+(defn- stack-head
+  "The first frames of `t`'s stack (and its root cause's), for fault evidence."
+  [^Throwable t]
+  (let [root (last (take-while some? (iterate #(.getCause ^Throwable %) t)))]
+    (cond-> {:frames (mapv str (take 15 (.getStackTrace t)))}
+      (not (identical? root t))
+      (assoc :root {:class (.getName (class root)) :message (.getMessage ^Throwable root)
+                    :frames (mapv str (take 15 (.getStackTrace ^Throwable root)))}))))
+
 (defn- fault!
   "Record an infrastructure fault (never scored as model behavior)."
   [{:keys [failure] :as episode} source error]
@@ -69,7 +78,8 @@
                      :class (if (instance? Throwable error) (.getName (class error)) "error-result")
                      :message (if (instance? Throwable error) (.getMessage ^Throwable error) (str error))
                      :data (when (instance? clojure.lang.ExceptionInfo error)
-                             (pr-str (ex-data error)))})
+                             (pr-str (ex-data error)))
+                     :stack (when (instance? Throwable error) (stack-head error))})
   (end! episode :infrastructure-error))
 
 (defn- bound-exceeded!
@@ -380,7 +390,10 @@
 (defn- certify-fault!
   "Certify an episode whose orchestration failed after admission."
   [experiment-room definition agent run-id opened room-id started-at started-nanos metrics t]
-  (let [failure {:source :orchestration :class (.getName (class t)) :message (.getMessage ^Throwable t)}]
+  (let [failure {:source :orchestration :class (.getName (class t)) :message (.getMessage ^Throwable t)
+                 :stack (stack-head t)}]
+    (tel/log! {:level :error :id ::episode-fault :error t :data {:room room-id}}
+              "tau2 episode orchestration failed")
     (try (conv/finish-episode! run-id :failed :infrastructure-error) (catch Throwable _ nil))
     {:attempt (conv/certify!
                experiment-room definition agent
