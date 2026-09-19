@@ -1,7 +1,8 @@
 (ns dvergr.sandbox.ns.data
   "SCI injectors — datahike read/write/diff, spindel sync/combinators/signals,
    and probabilistic inference. Split out of dvergr.sandbox (Phase 4)."
-  (:require [sci.core :as sci]
+  (:require [dvergr.substrate.load :as load]
+            [sci.core :as sci]
             [is.simm.partial-cps.sequence :as aseq]
             [datahike.api :as dh]
             [dvergr.agent.roster :as roster]
@@ -89,8 +90,8 @@
   ([sci-ctx spindel-ctx]
    (add-spindel-extras-ns! sci-ctx spindel-ctx {}))
   ([sci-ctx spindel-ctx {:keys [room-id room-incarnation ceiling world-binding]}]
-   (require 'org.replikativ.spindel.spin.combinators)
-   (require 'org.replikativ.spindel.signal)
+   (load/require! 'org.replikativ.spindel.spin.combinators)
+   (load/require! 'org.replikativ.spindel.signal)
    (let [comb-ns (find-ns 'org.replikativ.spindel.spin.combinators)
          sig-ns  (find-ns 'org.replikativ.spindel.signal)
          create-work (fn [strategy opts work-fn]
@@ -180,10 +181,10 @@
           `(pcps-async/async ~@body))")
       ;; Signals — signal is a macro; wrap as a function using the underlying record
        (let [signal-ref-ctor (ns-resolve sig-ns '->SignalRef)
-             addr-ns (do (require 'org.replikativ.spindel.engine.addressing)
+             addr-ns (do (load/require! 'org.replikativ.spindel.engine.addressing)
                          (find-ns 'org.replikativ.spindel.engine.addressing))
              next-addr! @(ns-resolve addr-ns 'next-address!)
-             deltaable-ns (do (require 'org.replikativ.spindel.incremental.deltaable)
+             deltaable-ns (do (load/require! 'org.replikativ.spindel.incremental.deltaable)
                               (find-ns 'org.replikativ.spindel.incremental.deltaable))
              clear-deltas @(ns-resolve deltaable-ns 'clear-deltas)]
          (sci/add-namespace! sci-ctx 'spindel.sig

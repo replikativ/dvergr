@@ -3,7 +3,8 @@
    audited), proc (capability-gated), git (worktree-scoped), env, http
    (domain-policy gated), bash (muschel), process (monitoring). Includes the
    path/domain safety policies. Split out of dvergr.sandbox (Phase 4)."
-  (:require [sci.core :as sci]
+  (:require [dvergr.substrate.load :as load]
+            [sci.core :as sci]
             [clojure.string :as str]
             [jsonista.core :as j]
             [babashka.fs :as fs]
@@ -232,7 +233,7 @@
      (fs/write \"src/out.clj\" content)"
   [sci-ctx & {:keys [base-path audit-log]
               :or   {base-path ((requiring-resolve 'dvergr.substrate.git/safe-workspace-root))}}]
-  (require 'babashka.fs)
+  (load/require! 'babashka.fs)
   (let [fs-ns          (find-ns 'babashka.fs)
         r              (fn [s] @(ns-resolve fs-ns s))
         base-canonical (-> (java.io.File. (str base-path)) .getCanonicalFile)
@@ -646,7 +647,7 @@
           (audit! audit-log :http/request {:method method :url url})
           (when domain-check (domain-check url))
           (ssrf-guard! url)
-          (require 'hato.client)
+          (load/require! 'hato.client)
           (let [hato-request (requiring-resolve 'hato.client/request)
                 opts (cond-> {:url url
                               :method method
@@ -740,7 +741,7 @@
    picks whichever door fits the call site — direct tool for typical
    ops, SCI fn for pipelines that mix bash and Clojure transforms."
   [sci-ctx chat-ctx]
-  (require 'dvergr.intake.bash)
+  (load/require! 'dvergr.intake.bash)
   (let [run-fn       (var-get (ns-resolve 'dvergr.intake.bash 'run))
         check-fn     (var-get (ns-resolve 'dvergr.intake.bash 'check))
         builtins-fn  (var-get (ns-resolve 'dvergr.intake.bash 'builtins))

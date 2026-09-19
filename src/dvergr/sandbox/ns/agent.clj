@@ -7,7 +7,8 @@
    closures carry `:doc`/`:arglists` — without it `(clojure.repl/doc …)` and
    `(find-doc …)` answer nothing for them inside the sandbox. See
    `dvergr.sandbox.ns.doc`."
-  (:require [sci.core :as sci]
+  (:require [dvergr.substrate.load :as load]
+            [sci.core :as sci]
             [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.sandbox.ns.doc :as doc]
             [org.replikativ.spindel.engine.core :as ec]))
@@ -265,7 +266,7 @@
      (agents/online? :huginn)             ; convenience boolean
      (agents/by-tag :coding)              ; ids matching a tag"
   [sci-ctx]
-  (require 'dvergr.actors)
+  (load/require! 'dvergr.actors)
   (let [online-actors* @(ns-resolve 'dvergr.actors 'online-actors)
         online?*       @(ns-resolve 'dvergr.actors 'online?)
         list-fn      (fn [] (online-actors*))
@@ -294,7 +295,7 @@
      (skills/rank :research)             ; ranked online providers
      (skills/dispatch :research)         ; the single best provider (actor map or nil)"
   [sci-ctx conn]
-  (require 'dvergr.orchestration.skills)
+  (load/require! 'dvergr.orchestration.skills)
   (let [load-all*   @(ns-resolve 'dvergr.orchestration.skills 'load-all)
         list-fn     @(ns-resolve 'dvergr.orchestration.skills 'list-skills)
         read-skill* @(ns-resolve 'dvergr.orchestration.skills 'read-skill)
@@ -381,7 +382,7 @@
      (actors/add-skill! :scribe :prose)
      (actors/remove-skill! :scribe :writing)"
   [sci-ctx conn]
-  (require 'dvergr.actors)
+  (load/require! 'dvergr.actors)
   (let [list-fn         @(ns-resolve 'dvergr.actors 'list-actors)
         lookup-fn       @(ns-resolve 'dvergr.actors 'lookup)
         online?-fn      @(ns-resolve 'dvergr.actors 'online?)
@@ -428,7 +429,7 @@
      (tasks/complete! task-uuid \"done — here's what I found\")
      (tasks/ignore!   task-uuid)"
   [sci-ctx conn]
-  (require 'dvergr.orchestration.tasks)
+  (load/require! 'dvergr.orchestration.tasks)
   (let [list-fn     @(ns-resolve 'dvergr.orchestration.tasks 'list-tasks)
         lookup-fn   @(ns-resolve 'dvergr.orchestration.tasks 'lookup)
         accept-fn   @(ns-resolve 'dvergr.orchestration.tasks 'accept!)
@@ -460,7 +461,7 @@
      (scheduler/cancel schedule-id)
      (scheduler/list)"
   [sci-ctx]
-  (require 'dvergr.scheduler.core)
+  (load/require! 'dvergr.scheduler.core)
   (let [documented
         ;; `dvergr.sandbox` already reports `:arglists`/`:doc` off each injected
         ;; value, and `dev/doc` prints them — but a raw `(fn …)` carries no

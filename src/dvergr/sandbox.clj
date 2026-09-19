@@ -6,7 +6,8 @@
    - Virtual filesystem in memory/datahike
    - Integration with yggdrasil for CoW branching
    - Integration with spindel for async execution (CPS works through SCI)"
-  (:require [sci.core :as sci]
+  (:require [dvergr.substrate.load :as load]
+            [sci.core :as sci]
             [sci.ctx-store :as sci-ctx-store]
             [sci.impl.utils :refer [clojure-core-ns]]
             [clojure.string :as str]
@@ -65,7 +66,7 @@
 
 ;; Lazy-load spindel SCI macro support to avoid compile-time dep
 (defn- spindel-sci-macro-ns []
-  (require 'org.replikativ.spindel.sci.macro)
+  (load/require! 'org.replikativ.spindel.sci.macro)
   (find-ns 'org.replikativ.spindel.sci.macro))
 
 ;; ---------------------------------------------------------------------------

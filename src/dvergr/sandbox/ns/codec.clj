@@ -7,7 +7,8 @@
                           expose the real clojure.data.xml (XXE/entity-expansion);
                           `parse-str` here forbids DOCTYPE → no XXE / billion-laughs / SSRF.
      dvergr.codec       — base64 / url / html helpers (no babashka equivalent; ours)."
-  (:require [clojure.string :as str]
+  (:require [dvergr.substrate.load :as load]
+            [clojure.string :as str]
             [sci.core :as sci]
             [dvergr.sandbox.ns.doc :as doc])
   (:import [javax.xml.parsers SAXParserFactory]
@@ -114,7 +115,7 @@
   "Mount cheshire.core (real), clojure.data.xml (hardened), dvergr.codec (extras)."
   [sci-ctx]
   ;; the REAL cheshire.core — generate-string/parse-string/encode/decode/…
-  (require 'cheshire.core)
+  (load/require! 'cheshire.core)
   (sci/add-namespace! sci-ctx 'cheshire.core
                       (into {} (map (fn [[s v]] [s (deref v)])) (ns-publics 'cheshire.core)))
   ;; clojure.data.xml NAME, our hardened parser (string or reader)

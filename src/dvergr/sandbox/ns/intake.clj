@@ -9,7 +9,8 @@
 
    Only sources that genuinely can't be interpreted stay native and are mounted
    here — currently just `intake.mail` (briefkasten + javax.mail are too heavy)."
-  (:require [sci.core :as sci]))
+  (:require [dvergr.substrate.load :as load]
+            [sci.core :as sci]))
 
 (def ^:private native-mail-vars
   {'inbox  'list-inbox
@@ -33,7 +34,7 @@
 
 (defn- load-mail-bindings []
   (try
-    (require 'dvergr.intake.mail)
+    (load/require! 'dvergr.intake.mail)
     (resolve-mail-bindings (find-ns 'dvergr.intake.mail))
     (catch Throwable _
       nil)))
