@@ -110,7 +110,12 @@ Claude Code models therefore:
   never refreshes and cannot disturb the interactive login. Stripping the
   email from a config directory that shares the login's credentials is not
   safe: the CLI re-fetches the profile every 24 h and a token refresh from a
-  second config directory can rotate the shared refresh token;
+  second config directory can rotate the shared refresh token. Verified
+  2026-09-19: with the token and an empty config directory the model sees no
+  email (the same probe on the normal login lists it), the CLI stores no
+  account profile, usage reports still arrive, and the REPL probe that used
+  the email in 4/6 calls without a note used it in 0/6. Only the date remains;
+  the note covers it;
 - append `tx/host-context-note` to every system prompt (agent, user
   simulator, judge), telling the model that account details and dates outside
   its system prompt belong to the harness operator (`:host-context-note`
@@ -130,6 +135,14 @@ Claude Code models therefore:
   because the subscription rejected a call keeps its `:failed` Attempt and
   is re-run after the reset, at most `:usage-retries` (3) times. An error
   result from the CLI is now an error, never a model reply.
+
+```clojure
+(def claude-env (cc/token-env ".dvergr/benchmarks/claude-config"
+                              (slurp (str (System/getProperty "user.home")
+                                          "/.dvergr/secrets/claude-oauth-token"))))
+(tx/run! {... :claude-cli ".dvergr/tools/claude-cli/claude-2.1.277"
+          :claude-env claude-env})
+```
 
 Anthropic's terms allow a subscription through the unmodified CLI for one's
 own use; products built for other users must use API keys.
