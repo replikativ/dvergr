@@ -143,3 +143,16 @@
                               {:role :user :content nil}]
                              ["Agent's reply" "say \"hi\"" "both ' and \"" "tab\there"
                               "back\\slash"]))))
+
+(deftest episode-usage-is-logged-per-model-call
+  (if-not checkout?
+    (println "SKIP episode-usage-is-logged-per-model-call: no ../tau2-bench checkout")
+    (let [dom @domain
+          n (atom 0)
+          ep (t2/run-episode dom (get-in dom [:tasks "0"])
+                             {:agent (fn [_] (if (< (swap! n inc) 3)
+                                               {:content "hello" :usage {:input-tokens 10}}
+                                               {:content "bye ###STOP###" :usage {:input-tokens 10}}))
+                              :user (constantly {:content "hi" :usage {:input-tokens 5}})})]
+      (is (= {:agent 3 :user 3} (frequencies (map :role (:usage ep)))))
+      (is (= 45 (reduce + (map #(get-in % [:usage :input-tokens]) (:usage ep))))))))
