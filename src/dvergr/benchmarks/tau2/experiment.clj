@@ -16,6 +16,15 @@
                           :model \"claude-code-sonnet\"}]
             :user {:model \"claude-code-opus\"} :judge {:model \"claude-code-opus\"}})
 
+   Claude Code models (subscription via `claude -p`): the CLI can be pinned
+   with `:claude-cli` (a versioned binary), every system prompt gets
+   `host-context-note` (the CLI injects the operator's account email and the
+   wall-clock date, which cannot be disabled), and cells pause before
+   starting while a usage window is at least `:usage-pause-threshold`
+   utilized; a cell that fails on a usage limit is re-run after the reset,
+   at most `:usage-retries` times. The CLI version and note are part of the
+   ExperimentDef, so changing either never resumes into old cells.
+
    Use `dvergr.benchmarks.tau2.inspect` to read the results."
   (:refer-clojure :exclude [run!])
   (:require [clojure.java.io :as io]
@@ -27,6 +36,7 @@
             [dvergr.benchmarks.tau2.episode :as episode]
             [dvergr.benchmarks.tau2.live :as live]
             [dvergr.discourse :as d]
+            [dvergr.model.api.claude-code :as cc]
             [dvergr.model.registry :as registry]
             [dvergr.room.store :as store]
             [hasch.core :as hasch])
@@ -65,6 +75,17 @@
           (roster/make-roster {:id :tau2/candidates})
           specs))
 
+(def host-context-note
+  "Appended to every Claude Code system prompt in an experiment."
+  (str "Note: this conversation runs inside an evaluation harness. Any account "
+       "details (such as an email address) or a current date that appear in your "
+       "context outside this system prompt describe the harness operator's "
+       "machine, not this environment or the person you are talking to. Ignore "
+       "them and rely only on this system prompt, the conversation and tool results."))
+
+(defn- model-provider [{:keys [model provider]}]
+  (or provider (when model (:provider (registry/get-model! (registry/resolve-alias model))))))
+
 (defn- cell-key
   "A cell is identified within one exact ExperimentDef (candidates, dataset,
    repetitions, user/judge models, limits): resuming under different settings
@@ -94,11 +115,25 @@
    the whole process. Run experiments in a dedicated JVM or REPL, never in a
    daemon process."
   [{:keys [dir domain task-ids split repetitions parallelism candidates user judge limits
-           timeout-ms experiment-id user-fn judge-fn agent-generate]
+           timeout-ms experiment-id user-fn judge-fn agent-generate
+           claude-cli usage-pause-threshold usage-retries]
     :or {split "base" repetitions 1 parallelism 1
-         limits {:max-steps 200 :max-errors 10} timeout-ms (* 30 60 1000)}}]
+         limits {:max-steps 200 :max-errors 10} timeout-ms (* 30 60 1000)
+         usage-pause-threshold 0.97 usage-retries 3}
+    :as opts}]
   (conv/isolate-home! dir)
-  (let [xs (conv/open-store! dir)
+  (let [cc-before (cc/settings-snapshot)
+        uses-cc? (boolean (some #{:claude-code}
+                                (map model-provider (concat candidates [user judge]))))
+        note (let [n (get opts :host-context-note :auto)]
+               (cond (= :auto n) (when uses-cc? host-context-note)
+                     (string? n) n))
+        _ (when uses-cc? (cc/configure! (cond-> {:system-note note} claude-cli (assoc :cli claude-cli))))
+        host (when uses-cc?
+               {:claude-cli (or (cc/cli-version)
+                                (throw (ex-info "Claude Code CLI not runnable" {:cli (:cli (cc/settings-snapshot))})))
+                :host-context-note-id (some-> note hasch/uuid str)})
+        xs (conv/open-store! dir)
         room-id (or experiment-id (keyword "tau2" (.getName (io/file dir))))
         room (d/make-room {:id room-id :store (:store xs) :title (str "tau2 experiment " (name room-id))})
         task-ids (or task-ids (get-in domain [:splits split]))
@@ -112,9 +147,10 @@
                                     :metadata {:upstream t2/upstream :split (if (:task-ids domain) :explicit split)}})
                          :candidates (roster/agents team)
                          :repetitions repetitions
-                         :metadata {:user (select-keys user [:model :provider])
-                                    :judge (select-keys judge [:model :provider])
-                                    :limits limits}})
+                         :metadata (cond-> {:user (select-keys user [:model :provider])
+                                            :judge (select-keys judge [:model :provider])
+                                            :limits limits}
+                                     host (assoc :host host))})
         ;; `:user-fn`/`:judge-fn`/`:agent-generate` inject scripted models (tests).
         user-gen (or user-fn (live/model-generate user))
         judge-gen (or judge-fn (when judge (live/model-generate judge)))
@@ -129,7 +165,7 @@
                         k (cell-key (:experiment/content-id experiment-def)
                                     (:candidate/agent-content-id candidate)
                                     (:environment/content-id definition) repetition)
-                        attempt (or (get done k)
+                        run-cell (fn []
                                     (let [task (get-in domain [:tasks (get-in definition [:environment/task :task-id])])
                                           r (episode/run!
                                              {:experiment-room room :store (:store xs) :domain domain
@@ -138,7 +174,18 @@
                                               :user user-gen :judge judge-gen :limits limits
                                               :timeout-ms timeout-ms :repetition repetition
                                               :experiment-content-id (:experiment/content-id experiment-def)})]
-                                      (:attempt r)))]
+                                      (:attempt r)))
+                        attempt (or (get done k)
+                                    (loop [n 0]
+                                      (when uses-cc? (cc/await-usage-window! {:threshold usage-pause-threshold}))
+                                      (let [a (run-cell)]
+                                        ;; The failed Attempt stays recorded; the cell is re-run
+                                        ;; once the window resets.
+                                        (if (and uses-cc? (< n usage-retries)
+                                                 (not= :completed (get-in a [:attempt/receipt :attempt/status]))
+                                                 (cc/usage-limited?))
+                                          (recur (inc n))
+                                          a))))]
                     {:experiment/job {:candidate/id (:candidate/id candidate)
                                       :candidate/agent (:candidate/agent candidate)
                                       :candidate/agent-content-id (:candidate/agent-content-id candidate)
@@ -170,4 +217,5 @@
         (.shutdown pool)
         (.awaitTermination pool 1 TimeUnit/MINUTES)
         (try (d/close-room! room) (catch Throwable _ nil))
-        (conv/close-store! xs)))))
+        (conv/close-store! xs)
+        (cc/configure! cc-before)))))

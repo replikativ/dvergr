@@ -89,6 +89,41 @@ the candidates. The REPL candidate needs about 30% fewer agent input tokens,
 because it composes several tool calls per `clojure_eval` (263 evaluations
 for 366 domain calls).
 
+`retail-cmp-A` predates the host-context note (below): the CLI's injected
+operator email reached the candidates, which looked it up with
+`find_user_id_by_email` (or offered it to the customer) in 11/40 REPL, 3/40
+JSON-tools and 3/40 reference episodes. None of these are failed tasks, so
+the rewards stand, but the REPL candidate's step, error and token counts are
+inflated.
+
+### Claude Code as the model backend
+
+Claude Code (`claude -p`, billed to a Pro/Max subscription) injects host
+context into every call: the signed-in account's email and the wall-clock
+date. No CLI flag, setting or Agent SDK option removes it (Claude Code
+2.1.277; only `ANTHROPIC_UNIX_SOCKET` skips the email). Experiments that use
+Claude Code models therefore:
+
+- append `tx/host-context-note` to every system prompt (agent, user
+  simulator, judge), telling the model that account details and dates outside
+  its system prompt belong to the harness operator (`:host-context-note`
+  overrides it, `false` disables it);
+- pin the CLI with `:claude-cli`, a copied versioned binary, e.g.
+  `.dvergr/tools/claude-cli/claude-2.1.277` (the updater may prune
+  `~/.local/share/claude/versions/*`, and `--bare`, which ignores
+  subscription login, is announced as a future default for `-p`);
+- record `{:claude-cli version :host-context-note-id id}` under the
+  ExperimentDef's `:host` metadata, so changing either starts fresh cells;
+- read the CLI's `rate_limit_event`s (`cc/rate-limit-status`) and pause
+  before each cell while a usage window is at least
+  `:usage-pause-threshold` (default 0.97) utilized. A cell that fails
+  because the subscription rejected a call keeps its `:failed` Attempt and
+  is re-run after the reset, at most `:usage-retries` (3) times. An error
+  result from the CLI is now an error, never a model reply.
+
+Anthropic's terms allow a subscription through the unmodified CLI for one's
+own use; products built for other users must use API keys.
+
 Failure classes in the first (host-runner) run were:
 
 - incomplete multi-request (tasks 71, 97);
