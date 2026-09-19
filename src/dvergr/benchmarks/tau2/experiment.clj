@@ -29,6 +29,7 @@
    Use `dvergr.benchmarks.tau2.inspect` to read the results."
   (:refer-clojure :exclude [run!])
   (:require [clojure.java.io :as io]
+            [clojure.string :as str]
             [dvergr.agent.conversation :as conv]
             [dvergr.agent.environment :as environment]
             [dvergr.agent.experiment :as experiment]
@@ -44,11 +45,22 @@
             [hasch.core :as hasch])
   (:import [java.util.concurrent Executors TimeUnit]))
 
+(defn- id-name
+  "`task-id` as the name part of a readable keyword. Ids of safe characters
+   (retail, airline, banking) are unchanged; others (telecom's
+   `[mms_issue]a|b[PERSONA:Hard]`) are sanitized with a digest suffix, since
+   the keyword must survive an EDN round trip (Attempts are stored as EDN)."
+  [task-id]
+  (let [safe (str/replace (str task-id) #"[^A-Za-z0-9_.\-]" "_")]
+    (if (= safe (str task-id))
+      safe
+      (str safe "-" (subs (pj/sha256-hex (str task-id)) 0 12)))))
+
 (defn environment-def
   "Content-addressed EnvironmentDef naming one upstream tau2 task."
   [domain task-id limits]
   (environment/make-environment
-   {:id (keyword (str "tau2." (:domain domain)) (str "task-" task-id))
+   {:id (keyword (str "tau2." (:domain domain)) (str "task-" (id-name task-id)))
     :task {:domain (:domain domain) :task-id task-id
            :upstream (:revision t2/upstream)
            :retrieval-config (:retrieval-config domain)}

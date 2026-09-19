@@ -104,11 +104,11 @@
 
 (defn- eval-call [code] {:content "" :usage usage :tool-calls [{:id (str (random-uuid)) :name "clojure_eval" :input {:code code}}]})
 
-(defn- last-tool-result
-  "The newest message the model saw (the REPL result, in the provider's
-   message format)."
+(defn- last-eval-value
+  "The value the model's last clojure_eval returned (`=> v` in the newest
+   message it saw); the message also carries a random tool-use id."
   [seen]
-  (str (:content (last (last @seen)))))
+  (second (re-find #"=> (\S+)" (str (:content (last (last @seen)))))))
 
 (deftest dvergr-branches-inherit-and-isolate-the-repl-heap
   (if-not checkout?
@@ -132,13 +132,13 @@
                           :checkpoint-at 2 :timeout-ms 60000}))
               _ (is (some? checkpoint) "paused before the second customer message")
               [a seen-a] (branch-with checkpoint [(eval-call "(inc helper)") {:content "Done. ###STOP###" :usage usage}])
-              [b seen-b] (branch-with checkpoint [(eval-call "(def helper 99)") {:content "Done. ###STOP###" :usage usage}])
+              [b seen-b] (branch-with checkpoint [(eval-call "(do (def helper 99) helper)") {:content "Done. ###STOP###" :usage usage}])
               [c seen-c] (branch-with checkpoint [(eval-call "helper") {:content "Done. ###STOP###" :usage usage}])]
           (testing "a branch inherits the checkpoint's REPL definitions"
-            (is (str/includes? (last-tool-result seen-a) "42")))
+            (is (= "42" (last-eval-value seen-a))))
           (testing "a redefinition in one branch is invisible to the others"
-            (is (str/includes? (last-tool-result seen-c) "41"))
-            (is (not (str/includes? (last-tool-result seen-c) "99"))))
+            (is (= "99" (last-eval-value seen-b)) "the redefinition happened in its own branch")
+            (is (= "41" (last-eval-value seen-c))))
           (testing "every branch completes and is certified"
             (is (every? #(= :agent-stop (:termination %)) [a b c])))
           (ep/release-checkpoint! checkpoint))

@@ -5,6 +5,7 @@
    experiments resume from their Attempts, and the durable store alone
    reconstructs each episode (world replay reproduces the certified hash)."
   (:require [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [dvergr.agent.conversation :as conv]
             [dvergr.benchmarks.tau2.core :as t2]
@@ -79,46 +80,87 @@
                    (insp/verify-episode e)))))
         (finally (conv/close-store! xs))))))
 
+(defn- gold-through-rooms
+  "Replay each task's gold actions through `tx/run!` (Rooms, certified
+   Attempts) with a scripted agent and customer sharing one cursor over the
+   gold sequence: whichever side owns the next action performs it, the other
+   hands the turn over. Returns the experiment's Attempts with their episodes."
+  [dom experiment-id task-ids]
+  (let [dir (temp-dir)]
+    (doseq [task-id task-ids
+            :let [task (get-in dom [:tasks task-id])
+                  actions (vec (get-in task ["evaluation_criteria" "actions"]))
+                  cursor (atom 0)
+                  user? #(= "user" (get % "requestor"))
+                  emit (fn [] (let [{:strs [name arguments action_id]} (nth actions @cursor)]
+                                (swap! cursor inc)
+                                {:tool-calls [{:id (or action_id (str "a" @cursor))
+                                               :name name :arguments arguments}]}))
+                  agent-gen (fn [_]
+                              (fn [_]
+                                (let [a (get actions @cursor)]
+                                  (cond (nil? a) {:content (str "All done. "
+                                                                (str/join " " (get-in task ["evaluation_criteria" "communicate_info"]))
+                                                                " ###STOP###")}
+                                        (user? a) {:content "Please go ahead on your side."}
+                                        :else (emit)))))
+                  user (fn [_]
+                         (let [a (get actions @cursor)]
+                           (if (and a (user? a)) (emit) {:content "Done on my side."})))
+                  r (tx/run! {:dir dir :domain dom :task-ids [task-id] :experiment-id experiment-id
+                              :candidates [{:id :gold :harness :reference :model "claude-code-sonnet"}]
+                              :user-fn user :agent-generate agent-gen})]]
+      (is (= 1 (:results r)) task-id))
+    (let [xs (conv/open-store! dir)]
+      (try
+        (mapv (fn [a]
+                {:attempt a
+                 :episode (insp/episode xs experiment-id (:attempt/id a))
+                 :task (get-in dom [:tasks (get-in a [:attempt/environment :environment/task :task-id])])})
+              (insp/attempts xs experiment-id))
+        (finally (conv/close-store! xs))))))
+
+(defn- tasks-with-user-actions [dom split n]
+  (->> (get-in dom [:splits split])
+       (filter #(some (fn [a] (= "user" (get a "requestor")))
+                      (get-in dom [:tasks % "evaluation_criteria" "actions"])))
+       (take n) vec))
+
 (deftest banking-dual-control-gold-through-rooms
   (if-not checkout?
     (println "SKIP banking-dual-control-gold-through-rooms: no ../tau2-bench checkout")
-    (let [dom (without-nl (t2/load-domain "banking_knowledge"))
-          ;; tasks whose gold trajectory includes user-side tool calls
-          task-ids ["task_001" "task_026"]
-          dir (temp-dir)]
-      ;; A scripted pair shares one cursor over the gold sequence: whichever
-      ;; side owns the next action performs it, the other hands the turn over.
-      (doseq [task-id task-ids
-              :let [task (get-in dom [:tasks task-id])
-                    actions (vec (get-in task ["evaluation_criteria" "actions"]))
-                    cursor (atom 0)
-                    user? #(= "user" (get % "requestor"))
-                    emit (fn [] (let [{:strs [name arguments action_id]} (nth actions @cursor)]
-                                  (swap! cursor inc)
-                                  {:tool-calls [{:id (or action_id (str "a" @cursor))
-                                                 :name name :arguments arguments}]}))
-                    agent-gen (fn [_]
-                                (fn [_]
-                                  (let [a (get actions @cursor)]
-                                    (cond (nil? a) {:content "All done. ###STOP###"}
-                                          (user? a) {:content "Please go ahead on your side."}
-                                          :else (emit)))))
-                    user (fn [_]
-                           (let [a (get actions @cursor)]
-                             (if (and a (user? a)) (emit) {:content "Done on my side."})))
-                    r (tx/run! {:dir dir :domain dom :task-ids [task-id] :experiment-id :tau2/banking-gold
-                                :candidates [{:id :gold :harness :reference :model "claude-code-sonnet"}]
-                                :user-fn user :agent-generate agent-gen})]]
-        (is (= 1 (:results r)) task-id))
-      (let [xs (conv/open-store! dir)]
-        (try
-          (doseq [a (insp/attempts xs :tau2/banking-gold)
-                  :let [e (insp/episode xs :tau2/banking-gold (:attempt/id a))
-                        task (get-in dom [:tasks (get-in a [:attempt/environment :environment/task :task-id])])]]
-            (is (= 1.0 (get-in a [:attempt/receipt :attempt/reward])))
-            (is (some #(= :user (:requestor %)) (:effects e)) "user-side tool effects are recorded")
-            (is (:match? (insp/verify-world dom task e))))
-          (finally (conv/close-store! xs)))))))
+    (let [dom (without-nl (t2/load-domain "banking_knowledge"))]
+      (doseq [{:keys [attempt episode task]} (gold-through-rooms dom :tau2/banking-gold ["task_001" "task_026"])]
+        (is (= 1.0 (get-in attempt [:attempt/receipt :attempt/reward])))
+        (is (some #(= :user (:requestor %)) (:effects episode)) "user-side tool effects are recorded")
+        (is (:match? (insp/verify-world dom task episode)))))))
+
+(deftest airline-gold-through-rooms
+  (if-not checkout?
+    (println "SKIP airline-gold-through-rooms: no ../tau2-bench checkout")
+    (let [dom (without-nl (t2/load-domain "airline"))
+          ids (->> (get-in dom [:splits "base"])
+                   (filter #(seq (get-in dom [:tasks % "evaluation_criteria" "actions"])))
+                   (take 3) vec)
+          results (gold-through-rooms dom :tau2/airline-gold ids)]
+      (is (= 3 (count results)))
+      (doseq [{:keys [attempt episode task]} results]
+        (is (= 1.0 (get-in attempt [:attempt/receipt :attempt/reward])) (get task "id"))
+        (is (:match? (insp/verify-world dom task episode)))))))
+
+(deftest telecom-dual-control-gold-through-rooms
+  (if-not checkout?
+    (println "SKIP telecom-dual-control-gold-through-rooms: no ../tau2-bench checkout")
+    (let [dom (without-nl (t2/load-domain "telecom"))
+          ids (tasks-with-user-actions dom "base" 3)
+          results (gold-through-rooms dom :tau2/telecom-gold ids)]
+      (is (= 3 (count results)))
+      (doseq [{:keys [attempt episode task]} results]
+        (is (= 1.0 (get-in attempt [:attempt/receipt :attempt/reward])) (get task "id"))
+        (is (true? (get-in attempt [:attempt/receipt :attempt/checks :env-assertion]))
+            "graded by the domain's environment assertions")
+        (is (some #(= :user (:requestor %)) (:effects episode)) "the customer operated the phone")
+        (is (:match? (insp/verify-world dom task episode)))))))
 
 (def ^:private usage {:input-tokens 1 :output-tokens 1})
 
