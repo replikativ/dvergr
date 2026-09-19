@@ -30,7 +30,8 @@
                          (throw (ex-info
                                  "LLM provider effects exceed this sandbox's delegation ceiling"
                                  {:type ::provider-effects-disallowed})))
-                       (apply raw-call-fn args))
+                       ;; The documented 2-arity: default opts.
+                       (apply raw-call-fn (cond-> (vec args) (= 2 (count args)) (conj {}))))
         summarize-fn (fn [content & [opts]]
                        (call-fn "Summarize the key points concisely:"
                                 content (or opts {})))]
@@ -38,8 +39,20 @@
                         (doc/with-docs
                           {'call      call-fn
                            'summarize summarize-fn}
-                          '{call      [([system-prompt content] [system-prompt content opts]) "One-shot call to a CHEAP model — for mechanical language work (extract, classify, rewrite) inside a larger job, not for reasoning you should do yourself. `opts` takes :max-tokens. Available only when this sandbox has provider-effect authority."]
-                            summarize [([content] [content opts]) "Summarize text with the cheap model. `opts` takes :max-tokens, e.g. (llm/summarize page {:max-tokens 300})."]}))))
+                          '{call      [([system-prompt content] [system-prompt content opts]) "One-shot call to a CHEAP model — for mechanical language work (extract, classify, rewrite) inside a larger job, not for reasoning you should do yourself. `opts` takes :max-tokens. Available only when this sandbox has provider-effect authority."
+                                       [:=> [:cat :string [:maybe :string]
+                                             [:? [:map [:max-tokens {:optional true} :int]
+                                                  [:model {:optional true} :string]
+                                                  [:system {:optional true} :string]]]]
+                                        [:or [:map [:text :string] [:usage [:maybe :map]] [:model :string]]
+                                         [:map [:error [:maybe :string]]]]]]
+                            summarize [([content] [content opts]) "Summarize text with the cheap model. `opts` takes :max-tokens, e.g. (llm/summarize page {:max-tokens 300})."
+                                       [:=> [:cat [:maybe :string]
+                                             [:? [:maybe [:map [:max-tokens {:optional true} :int]
+                                                          [:model {:optional true} :string]
+                                                          [:system {:optional true} :string]]]]]
+                                        [:or [:map [:text :string] [:usage [:maybe :map]] [:model :string]]
+                                         [:map [:error [:maybe :string]]]]]]}))))
 
 ;; (RF5: the calendar folded into the per-room scheduler — see `scheduler/*` +
 ;; `dvergr.room/schedules`. The standalone calendar subsystem is gone.)
@@ -221,19 +234,19 @@
       '{create!      [([opts]) "Create a persistent room. `opts` takes :slug :title :agents. Rooms are the unit of work: each has its own git repo, knowledge base and schedules."]
         list         [([]) "Every room you can see, as maps."]
         get          [([ref]) "One room by slug or id, or nil."]
-        post!        [([ref content]) "Post a message into a room — how you talk to the people and agents in it. `ref` is a slug or id."]
+        post!        [([ref {:keys [content]}]) "Post a message into a room — how you talk to the people and agents in it. `ref` is a slug or id; the message is a map, e.g. (dvergr.room/post! \"ops\" {:content \"deploy done\"})."]
         messages     [([ref] [ref opts]) "Recent messages in a room, newest first."]
         children     [([ref]) "Rooms whose parent is this one."]
         set-parent!  [([child parent]) "Re-parent a room, building the room tree."]
-        join!        [([ref] [ref who]) "Join a room so you receive its messages."]
-        leave!       [([ref] [ref who]) "Stop receiving a room's messages."]
+        join!        [([ref who]) "Join a room so `who` (an agent id) receives its messages."]
+        leave!       [([ref who]) "Stop `who` (an agent id) receiving a room's messages."]
         delete!      [([ref]) "Delete a room. Destructive — prefer discard! on a fork, or archiving."]
         fork!        [([ref]) "Branch a room into an ISOLATED copy — its own git repo AND database — so you can experiment freely. This is the safe way to attempt a substantial or risky change: fork, work, then merge! or discard!."]
         merge!       [([parent fork]) "Collapse a fork's work back into its parent, surfacing a git + database diff for review. The other half of the fork→test→merge loop."]
         discard!     [([fork]) "Throw a fork away, keeping the parent untouched."]
         diff         [([fork]) "What a fork CHANGED versus its parent — code and data — so you can judge it before merging."]
         review       [([fork]) "An agent review of a fork's changes: the fork tiering + review pipeline, not just a raw diff."]
-        classify     [([fork]) "How mergeable a fork is (its tier) — used to route it as a task vs a proposal."]
-        forks        [([ref]) "Every fork of a room."]
-        participants [([ref]) "Who is in a room — agents and humans."]
+        classify     [([diff conflicts]) "How mergeable a fork's diff is (its tier) — used to route it as a task vs a proposal."]
+        forks        [([]) "Every fork of this room."]
+        participants [([room]) "Who is in a room (a Room value, e.g. from dvergr.room/room) — agents and humans."]
         root         [([]) "The root room of the tree. Delegate work through dvergr.agent/hire! so it remains Run-backed and Spindel-composable."]})))

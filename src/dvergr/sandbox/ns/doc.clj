@@ -35,25 +35,30 @@
   (:require [clojure.string :as str]))
 
 (defn documented
-  "Return `f` with `:name`/`:arglists`/`:doc` metadata attached.
+  "Return `f` with `:name`/`:arglists`/`:doc` (and, when given, its malli
+   function schema as `:malli/schema`) metadata attached.
 
    Only values that can carry metadata are touched — a datahike conn, `nil`, or
    any other non-`IObj` injected value is returned unchanged rather than
    throwing, so a doc table may mention a var whose value is not a fn without
    the caller special-casing it."
-  [sym arglists doc f]
-  (if (instance? clojure.lang.IObj f)
-    (vary-meta f merge (cond-> {:name sym}
-                         arglists (assoc :arglists arglists)
-                         doc      (assoc :doc doc)))
-    f))
+  ([sym arglists doc f] (documented sym arglists doc nil f))
+  ([sym arglists doc schema f]
+   (if (instance? clojure.lang.IObj f)
+     (vary-meta f merge (cond-> {:name sym}
+                          arglists (assoc :arglists arglists)
+                          doc      (assoc :doc doc)
+                          schema   (assoc :malli/schema schema)))
+     f)))
 
 (defn with-docs
   "Attach metadata from a doc table to an SCI namespace map.
 
    `ns-map` is the map you would pass to `sci/add-namespace!`.
-   `docs` is `{sym [arglists doc]}` — typically quoted as a whole, so the
-   arglists read like the ones on a real `defn`.
+   `docs` is `{sym [arglists doc]}` or `{sym [arglists doc schema]}` —
+   typically quoted as a whole, so the arglists read like the ones on a real
+   `defn`. `schema` is the fn's malli function schema (`[:=> [:cat …] ret]`);
+   `sandbox/doc` renders it.
 
    Vars absent from `docs` pass through untouched (a var that legitimately has
    no signature to state, e.g. `*kb*`, needs no entry). Entries in `docs` that
@@ -66,9 +71,9 @@
                            (str/join ", " (sort (map str unknown))))
                       {:unknown (vec (sort unknown))
                        :injected (vec (sort (map str (keys ns-map))))}))))
-  (reduce-kv (fn [m sym [arglists doc]]
+  (reduce-kv (fn [m sym [arglists doc schema]]
                (cond-> m
-                 (contains? m sym) (update sym #(documented sym arglists doc %))))
+                 (contains? m sym) (update sym #(documented sym arglists doc schema %))))
              ns-map
              docs))
 

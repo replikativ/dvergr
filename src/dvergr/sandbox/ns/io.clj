@@ -563,11 +563,18 @@
                            'diff   diff-fn
                            'add    add-fn
                            'commit commit-fn}
-                          '{status [([]) "Working-tree status of YOUR room's repo, PARSED into a map (not porcelain text) — branch plus changed paths."]
-                            log    [([] [opts]) "Recent commits as maps of :hash/:subject/:author/:date. `opts` takes :n (default 10)."]
-                            diff   [([] [& args]) "Unified diff text. No args = unstaged changes; extra args pass through to `git diff` (e.g. \"--staged\", a path)."]
-                            add    [([& paths]) "Stage paths for commit. Audited. Returns :ok."]
-                            commit [([message] [message opts]) "Commit staged changes with `message`, returning the trimmed git output. `opts` takes :author. Audited."]}))))
+                          '{status [([]) "Working-tree status of YOUR room's repo, PARSED into a map (not porcelain text) — branch plus changed paths."
+                                   [:=> :cat [:map [:branch :string] [:staged [:vector :string]]
+                                              [:unstaged [:vector :string]] [:untracked [:vector :string]]]]]
+                            log    [([] [opts]) "Recent commits as maps of :hash/:message/:author/:date. `opts` takes :n (default 10)."
+                                   [:=> [:cat [:? [:maybe [:map [:n {:optional true} :int]]]]]
+                                    [:vector [:map [:hash :string] [:message :string] [:author :string] [:date :string]]]]]
+                            diff   [([] [& args]) "Unified diff text. No args = unstaged changes; extra args pass through to `git diff` (e.g. \"--staged\", a path)."
+                                   [:=> [:cat [:* :string]] :string]]
+                            add    [([& paths]) "Stage paths for commit. Audited. Returns :ok."
+                                   [:=> [:cat [:+ :string]] [:= :ok]]]
+                            commit [([message] [message opts]) "Commit staged changes with `message`, returning the trimmed git output. `opts` takes :author. Audited."
+                                   [:=> [:cat :string [:? [:maybe [:map [:author {:optional true} :string]]]]] :string]]}))))
 
 (defn add-env-ns!
   "Expose config-scoped key access as the 'env namespace in SCI. Resolves ONLY from
@@ -614,9 +621,14 @@
                           {'get  get-fn
                            'set  set-fn
                            'keys keys-fn}
-                          '{get  [([key] [key default]) "Read a config key granted to YOU. This is NOT the host process environment — System/getenv is unreachable, so the daemon's own secrets are not visible here. A key configured as an injected secret returns an opaque PLACEHOLDER, never the real value; HTTP egress substitutes the real one at the destination."]
-                            set  [([key value]) "Set a config key for this sandbox session. Returns :ok."]
-                            keys [([]) "Every config key readable here, including the names of injected secrets (whose values stay placeholders)."]}))))
+                          '{get  [([key] [key default]) "Read a config key granted to YOU. This is NOT the host process environment — System/getenv is unreachable, so the daemon's own secrets are not visible here. A key configured as an injected secret returns an opaque PLACEHOLDER, never the real value; HTTP egress substitutes the real one at the destination."
+                                 [:function
+                                  [:=> [:cat [:or :string :keyword :symbol]] [:maybe :any]]
+                                  [:=> [:cat [:or :string :keyword :symbol] :any] :any]]]
+                            set  [([key value]) "Set a config key for this sandbox session. Returns :ok."
+                                 [:=> [:cat [:or :string :keyword :symbol] :any] [:= :ok]]]
+                            keys [([]) "Every config key readable here, including the names of injected secrets (whose values stay placeholders)."
+                                 [:=> :cat [:vector :string]]]}))))
 
 (defn add-http-ns!
   "Expose HTTP client as 'http namespace in SCI.

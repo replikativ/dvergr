@@ -159,19 +159,32 @@
                               'completion   sandbox-work/completion
                               'close!       sandbox-work/close!
                               'cancel!      sandbox-work/cancel!}
-                             '{latest      [([work-fn] [opts work-fn]) "Create switch-to-latest admission. A replacement starts only after superseded work has quiesced."]
-                               serial      [([work-fn] [opts work-fn]) "Create FIFO admission with bounded waiting capacity."]
-                               busy        [([work-fn] [opts work-fn]) "Create exhaust/busy admission: suppress input while work is active."]
-                               parallel    [([work-fn] [opts work-fn]) "Create bounded parallel admission; set :concurrency in opts."]
-                               controller  [([work-fn] [opts work-fn]) "Create admission with explicit :strategy (:latest, :serial, :busy, or :parallel)."]
-                               submit!     [([controller value] [controller id value]) "Submit a value without blocking; returns its correlation id or nil when ingress is closed/full."]
-                               events      [([controller]) "Open an independent hot event stream for later admission and completion events."]
-                               next-event  [([event-source]) "Return an awaitable for the next [event remaining-source] pair."]
-                               untap!      [([controller event-source]) "Detach an abandoned event stream."]
-                               snapshot    [([controller]) "Return fork-local active, queued, and lifecycle state without live handles."]
-                               completion  [([controller]) "Return a passive awaitable that joins controller quiescence after close!/cancel!."]
-                               close!      [([controller]) "Stop admission, drain accepted work, and close."]
-                               cancel!     [([controller]) "Stop admission and cooperatively cancel queued and active owned work."]}))
+                             '{latest      [([work-fn] [opts work-fn]) "Create switch-to-latest admission. A replacement starts only after superseded work has quiesced."
+                                             [:function [:=> [:cat fn?] :any] [:=> [:cat [:map {:closed true} [:concurrency {:optional true} pos-int?] [:capacity {:optional true} nat-int?] [:ingress-capacity {:optional true} pos-int?]] fn?] :any]]]
+                               serial      [([work-fn] [opts work-fn]) "Create FIFO admission with bounded waiting capacity."
+                                             [:function [:=> [:cat fn?] :any] [:=> [:cat [:map {:closed true} [:concurrency {:optional true} pos-int?] [:capacity {:optional true} nat-int?] [:ingress-capacity {:optional true} pos-int?]] fn?] :any]]]
+                               busy        [([work-fn] [opts work-fn]) "Create exhaust/busy admission: suppress input while work is active."
+                                             [:function [:=> [:cat fn?] :any] [:=> [:cat [:map {:closed true} [:concurrency {:optional true} pos-int?] [:capacity {:optional true} nat-int?] [:ingress-capacity {:optional true} pos-int?]] fn?] :any]]]
+                               parallel    [([work-fn] [opts work-fn]) "Create bounded parallel admission; set :concurrency in opts."
+                                             [:function [:=> [:cat fn?] :any] [:=> [:cat [:map {:closed true} [:concurrency {:optional true} pos-int?] [:capacity {:optional true} nat-int?] [:ingress-capacity {:optional true} pos-int?]] fn?] :any]]]
+                               controller  [([work-fn] [opts work-fn]) "Create admission with explicit :strategy (:latest, :serial, :busy, or :parallel)."
+                                             [:function [:=> [:cat fn?] :any] [:=> [:cat [:map {:closed true} [:strategy {:optional true} [:enum :latest :serial :busy :parallel]] [:concurrency {:optional true} pos-int?] [:capacity {:optional true} nat-int?] [:ingress-capacity {:optional true} pos-int?]] fn?] :any]]]
+                               submit!     [([controller value] [controller id value]) "Submit a value without blocking; returns its correlation id or nil when ingress is closed/full."
+                                             [:function [:=> [:cat :any :any] [:maybe :any]] [:=> [:cat :any :any :any] [:maybe :any]]]]
+                               events      [([controller]) "Open an independent hot event stream for later admission and completion events."
+                                             [:=> [:cat :any] :any]]
+                               next-event  [([event-source]) "Return an awaitable for the next [event remaining-source] pair."
+                                             [:=> [:cat :any] :any]]
+                               untap!      [([controller event-source]) "Detach an abandoned event stream."
+                                             [:=> [:cat :any :any] :any]]
+                               snapshot    [([controller]) "Return fork-local active, queued, and lifecycle state without live handles."
+                                             [:=> [:cat :any] [:map [:work/active nat-int?] [:work/queued nat-int?]]]]
+                               completion  [([controller]) "Return a passive awaitable that joins controller quiescence after close!/cancel!."
+                                             [:=> [:cat :any] :any]]
+                               close!      [([controller]) "Stop admission, drain accepted work, and close."
+                                             [:=> [:cat :any] :any]]
+                               cancel!     [([controller]) "Stop admission and cooperatively cancel queued and active owned work."
+                                             [:=> [:cat :any] :any]]}))
        (sci/eval-string*
         sci-ctx
         "(ns spindel.work (:require [is.simm.partial-cps.async :as pcps-async]))

@@ -132,10 +132,16 @@
                          'url-decode      url-decode
                          'decode-entities html-decode-entities
                          'strip-tags      html-strip-tags}
-                        '{base64-encode   [([s]) "Base64-encode a string."]
-                          base64-decode   [([s]) "Decode a base64 string back to a string."]
-                          url-encode      [([s]) "Percent-encode a string for use in a URL query/path segment."]
-                          url-decode      [([s]) "Reverse percent-encoding."]
-                          decode-entities [([html]) "Turn HTML entities (&amp;, &#39;, …) into the characters they denote."]
-                          strip-tags      [([html]) "Strip HTML tags, leaving the text — handy for turning a fetched page into something summarizable."]}))
+                        '{base64-encode   [([s]) "Base64-encode a string."
+                                          [:=> [:cat [:or :string bytes?]] :string]]
+                          base64-decode   [([s]) "Decode a base64 string back to a string."
+                                          [:=> [:cat :string] :string]]
+                          url-encode      [([s]) "Percent-encode a string for use in a URL query/path segment."
+                                          [:=> [:cat :string] :string]]
+                          url-decode      [([s]) "Reverse percent-encoding."
+                                          [:=> [:cat :string] :string]]
+                          decode-entities [([html]) "Turn HTML entities (&amp;, &#39;, …) into the characters they denote."
+                                          [:=> [:cat [:maybe :string]] [:maybe :string]]]
+                          strip-tags      [([html]) "Strip HTML tags, leaving the text — handy for turning a fetched page into something summarizable."
+                                          [:=> [:cat [:maybe :string]] [:maybe :string]]]}))
   sci-ctx)

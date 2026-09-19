@@ -13,6 +13,417 @@
             [dvergr.sandbox.ns.doc :as doc]
             [org.replikativ.spindel.engine.core :as ec]))
 
+;; ============================================================================
+;; Malli shapes for the injected fns' function schemas.
+;;
+;; These are plain literal malli forms (data), shared across the doc tables
+;; below via `with-schemas`, so each fn's `:malli/schema` states the exact map
+;; keys it takes and returns. They mirror the host validators
+;; (`dvergr.agent.roster`, `.environment`, `.experiment`, `.program`,
+;; `dvergr.room.store/validate-run!`, `dvergr.actors`, ...), which remain the
+;; enforcing authority — these schemas describe, they do not validate.
+;; ============================================================================
+
+(def ^:private PosInt [:int {:min 1}])
+
+(def ^:private SkillName
+  "Skill/definition names are `str`-ed by the wrappers."
+  [:or :string :keyword :symbol])
+
+(def ^:private KeywordColl
+  "Accepted wherever the host calls `(set x)` on a keyword collection."
+  [:or [:set :keyword] [:sequential :keyword]])
+
+(def ^:private AgentProgram
+  "The program kinds `hire!` has interpreters for (validated at hire time)."
+  [:multi {:dispatch :kind}
+   [:echo [:map {:closed true}
+           [:kind [:= :echo]]
+           [:delay-ms {:optional true} [:int {:min 0 :max 600000}]]]]
+   [:scripted [:map {:closed true}
+               [:kind [:= :scripted]]
+               [:delay-ms {:optional true} [:int {:min 0 :max 600000}]]
+               [:reply {:optional true} :any]
+               [:result {:optional true} :any]]]
+   [:llm [:map {:closed true}
+          [:kind [:= :llm]]
+          [:max-model-steps {:optional true} [:int {:min 1 :max 256}]]
+          [:budget-dollars {:optional true} [:and 'number? 'pos?]]
+          [:auto-compact? {:optional true} :boolean]
+          [:compaction-model {:optional true} :string]]]])
+
+(def ^:private ModelPolicy [:map {:closed true} [:provider :keyword] [:model :string]])
+
+(def ^:private AgentSpec
+  "Friendly keys shown; canonical `:agent/*` spellings are accepted too."
+  [:map
+   [:id :keyword]
+   [:version {:optional true} PosInt]
+   [:status {:optional true} :keyword]
+   [:skills {:optional true} KeywordColl]
+   [:name {:optional true} :string]
+   [:prompt {:optional true} :string]
+   [:program {:optional true} AgentProgram]
+   [:tools {:optional true} KeywordColl]
+   [:model-policy {:optional true} ModelPolicy]
+   [:metadata {:optional true} :any]])
+
+(def ^:private AgentDef
+  [:map {:closed true}
+   [:agent/id :keyword]
+   [:agent/version PosInt]
+   [:agent/status :keyword]
+   [:agent/skills [:set :keyword]]
+   [:agent/name {:optional true} :string]
+   [:agent/prompt {:optional true} :string]
+   [:agent/program {:optional true} AgentProgram]
+   [:agent/tools {:optional true} [:set :keyword]]
+   [:agent/model-policy {:optional true} ModelPolicy]
+   [:agent/metadata {:optional true} :any]])
+
+(def ^:private AgentRef [:map [:agent/id :keyword] [:agent/version PosInt]])
+
+(def ^:private AgentIdOrRef [:or :keyword AgentRef])
+
+(def ^:private Roster
+  [:map {:closed true}
+   [:roster/agents [:map-of :keyword AgentDef]]
+   [:roster/defaults :map]
+   [:roster/scope :map]
+   [:roster/id {:optional true} :keyword]
+   [:roster/metadata {:optional true} :map]])
+
+(def ^:private RosterOpts
+  [:map {:closed true}
+   [:id {:optional true} :keyword]
+   [:defaults {:optional true} :map]
+   [:scope {:optional true} :map]
+   [:metadata {:optional true} :map]])
+
+(def ^:private AgentSelector
+  [:map
+   [:id {:optional true} :keyword]
+   [:status {:optional true} :keyword]
+   [:skill {:optional true} :keyword]
+   [:skills {:optional true} KeywordColl]
+   [:where {:optional true} :map]])
+
+(def ^:private SetupRef
+  [:map {:closed true}
+   [:setup/id :keyword]
+   [:setup/version PosInt]
+   [:setup/basis {:optional true} :any]])
+
+(def ^:private EnvironmentSpec
+  [:map {:closed true}
+   [:id :keyword]
+   [:version {:optional true} PosInt]
+   [:task :any]
+   [:verifier [:map {:closed true}
+               [:id :keyword]
+               [:version {:optional true} PosInt]
+               [:basis {:optional true} :any]]]
+   [:limits {:optional true} :map]
+   [:world {:optional true} [:map [:setup {:optional true} SetupRef]]]
+   [:metadata {:optional true} :map]])
+
+(def ^:private EnvironmentDef
+  [:map {:closed true}
+   [:environment/id :keyword]
+   [:environment/version PosInt]
+   [:environment/task :any]
+   [:environment/verifier [:map {:closed true}
+                           [:verifier/id :keyword]
+                           [:verifier/version PosInt]
+                           [:verifier/basis {:optional true} :any]]]
+   [:environment/limits :map]
+   [:environment/world [:map [:setup {:optional true} SetupRef]]]
+   [:environment/metadata {:optional true} :map]
+   [:environment/content-id :uuid]])
+
+(def ^:private EnvironmentRef
+  [:map [:environment/id :keyword] [:environment/version PosInt]
+   [:environment/content-id :uuid]])
+
+(def ^:private DatasetSpec
+  [:map {:closed true}
+   [:id :keyword]
+   [:version {:optional true} PosInt]
+   [:environments [:vector {:min 1} EnvironmentDef]]
+   [:metadata {:optional true} :map]])
+
+(def ^:private DatasetDef
+  [:map {:closed true}
+   [:dataset/id :keyword]
+   [:dataset/version PosInt]
+   [:dataset/environments [:vector {:min 1} EnvironmentDef]]
+   [:dataset/metadata {:optional true} :map]
+   [:dataset/content-id :uuid]])
+
+(def ^:private DatasetRef
+  [:map [:dataset/id :keyword] [:dataset/version PosInt] [:dataset/content-id :uuid]])
+
+(def ^:private ExperimentSpec
+  [:map {:closed true}
+   [:id :keyword]
+   [:version {:optional true} PosInt]
+   [:dataset DatasetDef]
+   [:candidates [:vector {:min 1} AgentDef]]
+   [:repetitions {:optional true} PosInt]
+   [:metadata {:optional true} :map]])
+
+(def ^:private ExperimentDef
+  [:map {:closed true}
+   [:experiment/id :keyword]
+   [:experiment/version PosInt]
+   [:experiment/dataset DatasetDef]
+   [:experiment/candidates
+    [:vector {:min 1} [:map {:closed true}
+                       [:candidate/id :keyword]
+                       [:candidate/agent AgentRef]
+                       [:candidate/agent-content-id :uuid]]]]
+   [:experiment/repetitions PosInt]
+   [:experiment/metadata {:optional true} :map]
+   [:experiment/content-id :uuid]])
+
+(def ^:private ExperimentRef
+  [:map [:experiment/id :keyword] [:experiment/version PosInt]
+   [:experiment/content-id :uuid]])
+
+(def ^:private RunHandle
+  "Opaque `dvergr.agent.program.RunHandle`; `(:run/id h)`/`(:run/room h)` read it."
+  :any)
+
+(def ^:private HireOpts
+  [:map {:closed true}
+   [:task :any]
+   [:from {:optional true} :keyword]
+   [:parent-run {:optional true} :uuid]
+   [:settlement {:optional true} [:enum :automatic :review :discard]]
+   [:resources {:optional true}
+    [:map-of {:min 1} [:or :string :keyword] [:and 'number? 'pos?]]]
+   [:limits {:optional true}
+    [:map {:closed true}
+     [:max-model-steps {:optional true} [:int {:min 1 :max 256}]]
+     [:budget-dollars {:optional true} [:and 'number? 'pos?]]]]])
+
+(def ^:private Balance
+  "Conserved resource vector: coordinate symbol (e.g. \"microUSD\") → amount
+   (BigDecimal); zero coordinates are omitted."
+  [:map-of :string 'number?])
+
+(def ^:private Run
+  "Durable Run projection (`dvergr.room.store/validate-run!`)."
+  [:map
+   [:run/id :uuid]
+   [:run/kind :keyword]
+   [:run/room :keyword]
+   [:run/actor :keyword]
+   [:run/trigger :uuid]
+   [:run/status [:enum :running :waiting :completed :failed :cancelled]]
+   [:run/created-at 'inst?]
+   [:run/started-at 'inst?]
+   [:run/updated-at 'inst?]
+   [:run/ended-at {:optional true} 'inst?]
+   [:run/parent {:optional true} :uuid]
+   [:run/caused-by {:optional true} [:set :uuid]]
+   [:run/reason {:optional true} :any]
+   [:run/error {:optional true} :any]
+   [:run/world {:optional true} :keyword]
+   [:run/isolation {:optional true} :keyword]
+   [:run/settlement-policy {:optional true} :keyword]
+   [:run/settlement-status {:optional true} :keyword]
+   [:run/settlement-reason {:optional true} :keyword]
+   [:run/roster {:optional true} :keyword]
+   [:run/agent-version {:optional true} PosInt]
+   [:run/program-kind {:optional true} :keyword]
+   [:run/interpreter-version {:optional true} PosInt]
+   [:run/agent-def-hash {:optional true} :uuid]
+   [:run/chat-id {:optional true} :uuid]])
+
+(def ^:private RunSummary
+  "`inspect`'s compact Run: instants become epoch millis."
+  [:map
+   [:run/id :uuid]
+   [:run/kind :keyword]
+   [:run/room :keyword]
+   [:run/actor :keyword]
+   [:run/trigger :uuid]
+   [:run/status :keyword]
+   [:run/started-at [:maybe :int]]
+   [:run/ended-at [:maybe :int]]
+   [:run/parent {:optional true} :uuid]
+   [:run/world {:optional true} :keyword]
+   [:run/settlement-status {:optional true} :keyword]
+   [:run/settlement-reason {:optional true} :keyword]
+   [:run/caused-by {:optional true} [:set :uuid]]
+   [:run/caused-by-count {:optional true} :int]
+   [:run/caused-by-truncated? {:optional true} :boolean]
+   [:run/reason {:optional true} :any]
+   [:run/error {:optional true} :any]])
+
+(def ^:private MessageSummary
+  [:map
+   [:message/id :any]
+   [:message/from :any]
+   [:message/to :any]
+   [:message/at :any]
+   [:message/in-reply-to :any]
+   [:message/thread-root-id :any]
+   [:message/run-id [:maybe :uuid]]
+   [:message/content-preview {:optional true} :string]
+   [:message/content-truncated? {:optional true} :boolean]
+   [:message/activities {:optional true} [:vector :map]]
+   [:message/activity-count {:optional true} :int]
+   [:message/activities-truncated? {:optional true} :boolean]
+   [:message/tool-uses {:optional true}
+    [:vector [:map [:tool-use/id :any] [:tool-use/name :any]]]]
+   [:message/tool-use-count {:optional true} :int]
+   [:message/tool-uses-truncated? {:optional true} :boolean]])
+
+(def ^:private InspectOpts
+  [:map {:closed true}
+   [:run-limit {:optional true} PosInt]
+   [:message-limit {:optional true} PosInt]
+   [:content-limit {:optional true} PosInt]
+   [:content-budget {:optional true} PosInt]
+   [:detail-limit {:optional true} PosInt]])
+
+(def ^:private Observation
+  [:map
+   [:observation/room-id :keyword]
+   [:observation/scope-run-id :uuid]
+   [:observation/runs [:vector RunSummary]]
+   [:observation/frontier [:vector :uuid]]
+   [:observation/messages [:vector MessageSummary]]
+   [:observation/activities [:vector :map]]
+   [:observation/failures [:vector :map]]
+   [:observation/summary [:map
+                          [:runs :int] [:active :int] [:messages :int]
+                          [:activities :int] [:failures :int]
+                          [:possibly-truncated? :boolean]]]
+   [:observation/resources {:optional true}
+    [:map [:scope Balance] [:runs [:map-of :uuid Balance]]
+     [:possibly-truncated? :boolean]]]
+   [:observation/receipt-id :uuid]])
+
+(def ^:private OnlineAgent
+  [:map [:id :keyword] [:status :keyword] [:tags [:set :keyword]] [:description :any]])
+
+(def ^:private Actor
+  "Durable actor row as `dvergr.actors/lookup` returns it (nil fields dropped)."
+  [:map
+   [:id :keyword]
+   [:kind :keyword]
+   [:status :keyword]
+   [:skills [:set :keyword]]
+   [:created-at 'inst?]
+   [:name {:optional true} :string]
+   [:profile-ref {:optional true} :string]
+   [:system-prompt {:optional true} :string]
+   [:cost {:optional true} :any]
+   [:config {:optional true} :any]
+   [:external-refs {:optional true} [:map-of :keyword :any]]
+   [:skill-priorities {:optional true} [:map-of :keyword :int]]])
+
+(def ^:private ActorFields
+  [:map
+   [:name {:optional true} :string]
+   [:profile-ref {:optional true} :string]
+   [:system-prompt {:optional true} :string]
+   [:skills {:optional true} KeywordColl]
+   [:status {:optional true} :keyword]
+   [:cost {:optional true} :any]
+   [:config {:optional true} :map]
+   [:external-refs {:optional true} [:map-of :keyword :any]]
+   [:skill-priorities {:optional true} [:map-of :keyword :int]]])
+
+(def ^:private Task
+  "A task-ledger row (`dvergr.orchestration.tasks`, nil fields dropped)."
+  [:map
+   [:id :uuid]
+   [:actor-id :keyword]
+   [:room-id :keyword]
+   [:content :string]
+   [:status [:enum :pending :accepted :completed :ignored]]
+   [:created-at 'inst?]
+   [:from-actor {:optional true} :keyword]
+   [:skill {:optional true} :keyword]
+   [:completed-at {:optional true} 'inst?]
+   [:result {:optional true} :string]])
+
+(def ^:private SkillDef
+  "A parsed skill definition: frontmatter fields plus loader keys (open map)."
+  [:map
+   [:name :string]
+   [:content :string]
+   [:file :string]
+   [:path :string]
+   [:scope [:enum :builtin :user :project :room]]
+   [:description {:optional true} :string]
+   [:provides {:optional true} [:vector :keyword]]
+   [:vetted {:optional true} :boolean]
+   [:vetted-by {:optional true} :string]
+   [:vetted-at {:optional true} :string]
+   [:source {:optional true} :string]
+   [:requires-tools {:optional true} [:vector :string]]
+   [:requires-env {:optional true} [:vector :string]]])
+
+(def ^:private DispatchResult
+  [:map
+   [:status [:enum :dispatched :no-provider :unsupported :error]]
+   [:actor {:optional true} Actor]
+   [:task {:optional true} [:maybe Task]]
+   [:error {:optional true} :string]])
+
+(def ^:private ScheduleSpec
+  [:map {:closed true}
+   [:every {:optional true} :keyword]
+   [:n {:optional true} PosInt]
+   [:every-ms {:optional true} PosInt]
+   [:interval-ms {:optional true} PosInt]
+   [:at {:optional true} :string]
+   [:on {:optional true} :keyword]
+   [:on-day {:optional true} :int]
+   [:once {:optional true} :boolean]
+   [:tz {:optional true} :string]])
+
+(def ^:private Schedule
+  [:map
+   [:id :uuid]
+   [:agent-id :keyword]
+   [:task [:maybe :string]]
+   [:code [:maybe :string]]
+   [:kind [:enum :interval :once :recurring]]
+   [:active? :boolean]
+   [:next-fire [:maybe 'inst?]]
+   [:last-run [:maybe 'inst?]]
+   [:description [:maybe :string]]
+   [:interval-ms {:optional true} :int]
+   [:every {:optional true} :keyword]
+   [:at {:optional true} :string]
+   [:on {:optional true} :keyword]
+   [:on-day {:optional true} :int]])
+
+(defn- via-var
+  "A metadata-carrying fn that calls through host var `v`. A `Var` is not an
+   `IObj`, so `doc/with-docs` cannot attach the sandbox doc/schema to it
+   directly; calling through the var keeps host redefinitions live."
+  [v]
+  (fn [& args] (apply v args)))
+
+(defn- with-schemas
+  "Append each fn's malli function schema as the third element of its
+   `{sym [arglists doc]}` doc-table entry. A schema for a symbol the table
+   does not document is a typo and throws."
+  [docs schemas]
+  (when-let [unknown (seq (remove #(contains? docs %) (keys schemas)))]
+    (throw (ex-info "Schemas for undocumented symbols" {:unknown (vec unknown)})))
+  (reduce-kv (fn [m sym schema]
+               (update m sym (fn [[arglists doc]] [arglists doc schema])))
+             docs
+             schemas))
+
 (defn add-programming-ns!
   "Expose immutable AgentDefs and Run-backed hiring as `dvergr.agent` in SCI.
 
@@ -206,29 +617,30 @@
     (sci/add-namespace!
      sci-ctx 'dvergr.agent
      (doc/with-docs
-       {'roster       make-roster*
-        'make-agent   make-agent*
-        'revise-agent revise-agent*
-        'lookup       lookup-agent*
-        'ref          agent-ref*
-        'list         agents*
-        'select       select-agents*
-        'environment  make-environment*
-        'environment-ref environment-ref*
-        'dataset      make-dataset*
-        'dataset-ref  dataset-ref*
-        'experiment   make-experiment*
-        'experiment-ref experiment-ref*
+       {'roster       (via-var make-roster*)
+        'make-agent   (via-var make-agent*)
+        'revise-agent (via-var revise-agent*)
+        'lookup       (via-var lookup-agent*)
+        'ref          (via-var agent-ref*)
+        'list         (via-var agents*)
+        'select       (via-var select-agents*)
+        'environment  (via-var make-environment*)
+        'environment-ref (via-var environment-ref*)
+        'dataset      (via-var make-dataset*)
+        'dataset-ref  (via-var dataset-ref*)
+        'experiment   (via-var make-experiment*)
+        'experiment-ref (via-var experiment-ref*)
         'room-id      (fn [] (:id (room!)))
         'hire!        hire-fn
         'observe      observe-fn
         'inspect      inspect-fn
         'cancel!      cancel-fn
         'balance      balance-fn
-        'run-id       run-id*
+        'run-id       (via-var run-id*)
         'result-spin  result-spin-fn
         'owned-result-spin owned-result-spin-fn}
-       '{roster       [([] [opts]) "Create an immutable Roster value. Options may include portable :id, :defaults, :scope, and :metadata data."]
+       (with-schemas
+       '{roster      [([] [opts]) "Create an immutable Roster value. Options may include portable :id, :defaults, :scope, and :metadata data."]
          make-agent   [([roster spec]) "Return a NEW Roster containing `spec`. Programs are {:kind :echo :delay-ms n}, {:kind :scripted :delay-ms n :reply value}, or {:kind :llm :max-model-steps n :budget-dollars n} plus :model-policy and :tools. Pure: input unchanged."]
          revise-agent [([roster id patch]) "Return a NEW Roster with AgentDef `id` revised and its version incremented."]
          lookup       [([roster id-or-ref]) "Resolve an AgentDef by keyword id or versioned AgentRef. A stale versioned ref is an error."]
@@ -248,8 +660,31 @@
          cancel!      [([handle-or-run-id]) "Request cooperative cancellation of exactly one live Run. Returns true when the Run was found."]
          balance      [([]) "Return the conserved resource vector available to the current Run, or the Room root at top level."]
          run-id       [([handle]) "Return the durable Run UUID represented by a RunHandle."]
-         result-spin  [([handle]) "Return a passive Spindel observer Spin for a RunHandle. On resolution the current Run durably records the child as a causal input. Multiple observers may await it; cancelling an observer does not cancel the Run."]
-         owned-result-spin [([handle]) "Return an ownership-coupled result Spin. On resolution the current Run durably records the child as a causal input. Cancelling this observer also cancels the underlying Run; use only when the observer owns that child execution."]}))))
+         result-spin  [([handle]) "Return a passive Spindel observer Spin for a RunHandle. On resolution the current Run durably records the child as a causal input. Multiple observers may await it; cancelling an observer does not cancel the Run. The Spin resolves to the result map {:run/id uuid :run/status :completed|:waiting|:cancelled|:failed :run/value … :run/world … :run/settlement-status …} (plus :run/output/:run/reason/:run/error/:run/metrics as applicable)."]
+         owned-result-spin [([handle]) "Return an ownership-coupled result Spin. On resolution the current Run durably records the child as a causal input. Cancelling this observer also cancels the underlying Run; use only when the observer owns that child execution. Resolves to the same result map as `result-spin`."]}
+       {'roster          [:function [:=> [:cat] Roster] [:=> [:cat RosterOpts] Roster]]
+        'make-agent      [:=> [:cat Roster AgentSpec] Roster]
+        'revise-agent    [:=> [:cat Roster :keyword [:map-of :keyword :any]] Roster]
+        'lookup          [:=> [:cat Roster AgentIdOrRef] [:maybe AgentDef]]
+        'ref             [:=> [:cat AgentDef] AgentRef]
+        'list            [:=> [:cat Roster] [:vector AgentDef]]
+        'select          [:=> [:cat Roster AgentSelector] [:vector AgentDef]]
+        'environment     [:=> [:cat EnvironmentSpec] EnvironmentDef]
+        'environment-ref [:=> [:cat EnvironmentDef] EnvironmentRef]
+        'dataset         [:=> [:cat DatasetSpec] DatasetDef]
+        'dataset-ref     [:=> [:cat DatasetDef] DatasetRef]
+        'experiment      [:=> [:cat ExperimentSpec] ExperimentDef]
+        'experiment-ref  [:=> [:cat ExperimentDef] ExperimentRef]
+        'room-id         [:=> [:cat] :keyword]
+        'hire!           [:=> [:cat Roster AgentIdOrRef HireOpts] RunHandle]
+        'observe         [:=> [:cat [:or :uuid RunHandle]] [:maybe Run]]
+        'inspect         [:function [:=> [:cat] Observation]
+                          [:=> [:cat InspectOpts] Observation]]
+        'cancel!         [:=> [:cat [:or :uuid RunHandle]] :boolean]
+        'balance         [:=> [:cat] Balance]
+        'run-id          [:=> [:cat RunHandle] :uuid]
+        'result-spin     [:=> [:cat RunHandle] :any]
+        'owned-result-spin [:=> [:cat RunHandle] :any]})))))
 
 (defn add-agents-ns!
   "Expose the agent registry as 'agents namespace in SCI.
@@ -279,10 +714,15 @@
                            'lookup  lookup-fn
                            'online? online?-fn
                            'by-tag  by-tag-fn}
+                          (with-schemas
                           '{list    [([]) "Every agent currently ONLINE in this daemon, as a vector of entries. Ground-truth for who can actually take work right now — a profile mentioning an agent does not mean it is running."]
                             lookup  [([id]) "The full entry for one agent id (e.g. :skald), or nil if it is not online."]
                             online? [([id]) "Whether an agent id is running right now. Check before dispatching work to it."]
-                            by-tag  [([tag]) "Online agents whose :tags contain `tag` (e.g. :coding) — a vector, possibly empty."]}))))
+                            by-tag  [([tag]) "Online agents whose :tags contain `tag` (e.g. :coding) — a vector, possibly empty."]}
+                           {'list    [:=> [:cat] [:vector OnlineAgent]]
+                            'lookup  [:=> [:cat :keyword] [:maybe OnlineAgent]]
+                            'online? [:=> [:cat :keyword] :boolean]
+                            'by-tag  [:=> [:cat :keyword] [:vector OnlineAgent]]})))))
 
 (defn add-skills-ns!
   "Expose the skill registry + dispatch as 'skills namespace in SCI.
@@ -345,6 +785,7 @@
                                         (if-let [definition (get (load-all* (room-dir)) (str skill-name))]
                                           (do (promote* definition (str by) (str date)) true)
                                           (throw (ex-info (str "no such skill to promote: " skill-name) {}))))}
+                          (with-schemas
                           '{all       [([]) "Every skill visible here — on disk plus any this room defines (the room's own take precedence). A map of skill-name → definition."]
                             read      [([skill-name]) "The FULL instructions for one skill. The system prompt carries only a brief index; pull the body with this before following a skill."]
                             find      [([provides-tag]) "Skill definitions that provide `provides-tag` (e.g. :research) — a vector, possibly empty."]
@@ -354,7 +795,22 @@
                             dispatch! [([skill opts]) "Actually hand `skill` to its best provider. `opts` carries the payload for the receiving actor."]
                             author!   [([skill-name frontmatter body]) "Write a NEW skill into this room's repo (versioned, forkable, mergeable). Lands `vetted: false`, so it stays out of prompts until a reviewer promotes it. Needs a room ctx."]
                             lift!     [([skill-name source body]) "Import external content (another agent's skill, a fetched URL) into the room as an UNVETTED skill, recording `source`. Needs a room ctx."]
-                            promote!  [([skill-name by date]) "Mark a room skill vetted — a REVIEWER action; this is what lets it appear in prompts. Throws if there is no such skill."]}))))
+                            promote!  [([skill-name by date]) "Mark a room skill vetted — a REVIEWER action; this is what lets it appear in prompts. Throws if there is no such skill."]}
+                           {'all       [:=> [:cat] [:map-of :string SkillDef]]
+                            'read      [:=> [:cat SkillName] [:maybe :string]]
+                            'find      [:=> [:cat :keyword] [:vector SkillDef]]
+                            'providers [:=> [:cat :keyword] [:vector :keyword]]
+                            'rank      [:=> [:cat :keyword] [:vector Actor]]
+                            'dispatch  [:=> [:cat :keyword] [:maybe Actor]]
+                            'dispatch! [:=> [:cat :keyword
+                                             [:map
+                                              [:task :string]
+                                              [:room-id {:optional true} :keyword]
+                                              [:from-actor {:optional true} [:maybe :keyword]]]]
+                                        DispatchResult]
+                            'author!   [:=> [:cat SkillName [:map-of :keyword :any] :any] :string]
+                            'lift!     [:=> [:cat SkillName :any :any] :string]
+                            'promote!  [:=> [:cat SkillName :any :any] [:= true]]})))))
 
 (defn add-actors-ns!
   "Expose the durable actor table as 'actors namespace in SCI.
@@ -403,6 +859,7 @@
                            'update!       (fn [id patch] (update-fn conn id patch))
                            'add-skill!    (fn [id skill] (add-skill-fn conn id skill))
                            'remove-skill! (fn [id skill] (remove-skill-fn conn id skill))}
+                          (with-schemas
                           '{list          [([] [& {:keys [kind status]}]) "Every DURABLE actor the system knows — including offline and retired ones (contrast dvergr.agents/list, which is who is alive now). Filter with :kind (:agent/:human) and :status (e.g. :online, :retired)."]
                             lookup        [([id]) "The durable row for one actor id, or nil. Persisted state, not runtime state."]
                             online?       [([id]) "Runtime check — is this actor actually running now?"]
@@ -411,7 +868,23 @@
                             dismiss!      [([id]) "Retire an actor — flags :status :retired rather than deleting, so its history survives."]
                             update!       [([id patch]) "Merge `patch` into an actor's durable row (e.g. {:skills #{:prose :writing}})."]
                             add-skill!    [([id skill]) "Declare that an actor can perform `skill` — this is what makes it show up in dvergr.skills/providers."]
-                            remove-skill! [([id skill]) "Withdraw a skill declaration from an actor."]}))))
+                            remove-skill! [([id skill]) "Withdraw a skill declaration from an actor."]}
+                           {'list          [:=> [:cat [:* [:alt [:cat [:= :kind] :keyword]
+                                                            [:cat [:= :status] :keyword]
+                                                            [:cat [:= :skill] :keyword]]]]
+                                            [:vector Actor]]
+                            'lookup        [:=> [:cat :keyword] [:maybe Actor]]
+                            'online?       [:=> [:cat :keyword] :boolean]
+                            'spawn-agent!  [:=> [:cat (into [:map [:id :keyword]] (rest ActorFields))] Actor]
+                            'spawn-human!  [:=> [:cat (into [:map [:id :keyword]
+                                                             [:external-refs [:map-of {:min 1} :keyword :any]]]
+                                                            (remove #(= :external-refs (first %)))
+                                                            (rest ActorFields))]
+                                            Actor]
+                            'dismiss!      [:=> [:cat :keyword] [:maybe [:= :dismissed]]]
+                            'update!       [:=> [:cat :keyword ActorFields] [:maybe Actor]]
+                            'add-skill!    [:=> [:cat :keyword :keyword] Actor]
+                            'remove-skill! [:=> [:cat :keyword :keyword] Actor]})))))
 
 (defn add-tasks-ns!
   "Expose the task ledger as 'tasks namespace in SCI.
@@ -442,11 +915,19 @@
                            'accept!   (fn [id]    (accept-fn conn id))
                            'complete! (fn [id r]  (complete-fn conn id r))
                            'ignore!   (fn [id]    (ignore-fn conn id))}
+                          (with-schemas
                           '{list      [([] [& {:keys [actor-id status]}]) "The shared task ledger — persistent rows for work dispatched to non-agent actors (humans). Filter with :actor-id and :status (e.g. :pending). Agents themselves just react to inbox messages and need no task row."]
                             lookup    [([id]) "One task by its uuid, or nil."]
                             accept!   [([id]) "Claim a task — marks it accepted so nobody else picks it up."]
                             complete! [([id result]) "Finish a task, recording `result` (a string describing what was done/found)."]
-                            ignore!   [([id]) "Decline a task, leaving it for someone else."]}))))
+                            ignore!   [([id]) "Decline a task, leaving it for someone else."]}
+                           {'list      [:=> [:cat [:* [:alt [:cat [:= :actor-id] :keyword]
+                                                        [:cat [:= :status] :keyword]]]]
+                                        [:vector Task]]
+                            'lookup    [:=> [:cat :uuid] [:maybe Task]]
+                            'accept!   [:=> [:cat :uuid] [:maybe Task]]
+                            'complete! [:=> [:cat :uuid :any] [:maybe Task]]
+                            'ignore!   [:=> [:cat :uuid] [:maybe Task]]})))))
 
 (defn add-scheduler-ns!
   "Expose scheduling as 'scheduler namespace in SCI.
@@ -462,15 +943,10 @@
      (scheduler/list)"
   [sci-ctx]
   (load/require! 'dvergr.scheduler.core)
-  (let [documented
-        ;; `dvergr.sandbox` already reports `:arglists`/`:doc` off each injected
-        ;; value, and `dev/doc` prints them — but a raw `(fn …)` carries no
-        ;; metadata, so everything below contributed nothing and the docstring
-        ;; on THIS function never reached the sandbox. An agent's only way to
-        ;; learn a signature was to call it and read the error.
-        (fn [sym arglists doc f]
-          (vary-meta f merge {:name sym :arglists arglists :doc doc}))
-        sched-create  @(ns-resolve 'dvergr.scheduler.core 'create-schedule!)
+  ;; A raw `(fn …)` carries no metadata, so the closures below are documented
+  ;; through `doc/with-docs` — otherwise an agent's only way to learn a
+  ;; signature was to call it and read the error.
+  (let [sched-create  @(ns-resolve 'dvergr.scheduler.core 'create-schedule!)
         sched-cancel  @(ns-resolve 'dvergr.scheduler.core 'cancel-schedule!)
         sched-list    @(ns-resolve 'dvergr.scheduler.core 'list-schedules)
         current-room  @(ns-resolve 'dvergr.scheduler.core 'current-room)
@@ -534,55 +1010,57 @@
                                     {:agent-id agent-id :task task
                                      :interval-ms ms
                                      :description (str "Every " (/ ms 60000.0) " minutes")}))]
-    (sci/add-namespace! sci-ctx 'dvergr.scheduler
-                        {'every
-                         (documented 'every
-                                     '([period agent-id task]
-                                       [period at agent-id task]
-                                       [period day-of-week at agent-id task])
-                                     (str "Recurring schedule in THIS room. `period` is :day/:week/…, "
-                                          "`at` is \"HH:MM\" wall-clock, `day-of-week` a keyword like "
-                                          ":monday. e.g. (every :day \"09:00\" :huginn \"Morning sweep\").")
-                                     every-fn)
-                         'at
-                         (documented 'at
-                                     '([iso-datetime agent-id task])
-                                     (str "One-shot at a FULL ISO datetime — \"2026-04-01T09:00\", not "
-                                          "\"09:00\". For a daily wall-clock time use `every` instead.")
-                                     at-fn)
-                         'interval
-                         (documented 'interval
-                                     '([ms agent-id task])
-                                     "Repeat every `ms` milliseconds."
-                                     interval-fn)
-                         ;; CODE schedules — the durable-pipeline primitive:
-                         ;; the form evals in YOUR sandbox on each fire
-                         ;; (deterministic, no LLM turn). Put the fns in a
-                         ;; namespace in your workspace repo, then e.g.
-                         ;; (dvergr.scheduler/create
-                         ;;   {:agent-id :me :schedule {:every :day :at \"07:00\"}
-                         ;;    :code \"(require 'intake.news)(intake.news/scan!)\"
-                         ;;    :description \"morning news scan\"})
-                         ;; Cadence forms: {:every :day :at \"07:00\"} (daily at
-                         ;; a wall-clock time), {:every :hour :n 4} (every 4h —
-                         ;; :n multiplies :minute/:hour/:day/:week into a fixed
-                         ;; interval), {:every-ms N}, {:at \"ISO\" :once true}.
-                         ;; Unknown keys are REJECTED (no silent wrong cadence).
-                         'create
-                         (documented 'create
-                                     '([cfg])
-                                     (str "Richest form. cfg = {:agent-id kw :task \"…\" | :code \"…\" "
-                                          ":schedule {…} | :interval-ms N :description \"…\"}. `:code` "
-                                          "evals in your sandbox on each fire with no LLM turn. "
-                                          "Unknown keys are REJECTED.")
-                                     (fn [cfg] (sched-create (room!) cfg)))
-                         'cancel
-                         (documented 'cancel
-                                     '([schedule-id])
-                                     "Deactivate a schedule BY ID — the uuid itself, not the map `list` returns."
-                                     (fn [id] (sched-cancel (room!) id)))
-                         'list
-                         (documented 'list
-                                     '([])
-                                     "Active schedules in this room, as maps carrying :id :kind :next-fire …"
-                                     (fn [] (sched-list (room!))))})))
+    (sci/add-namespace!
+     sci-ctx 'dvergr.scheduler
+     (doc/with-docs
+       {'every    every-fn
+        'at       at-fn
+        'interval interval-fn
+        ;; CODE schedules — the durable-pipeline primitive:
+        ;; the form evals in YOUR sandbox on each fire
+        ;; (deterministic, no LLM turn). Put the fns in a
+        ;; namespace in your workspace repo, then e.g.
+        ;; (dvergr.scheduler/create
+        ;;   {:agent-id :me :schedule {:every :day :at \"07:00\"}
+        ;;    :code \"(require 'intake.news)(intake.news/scan!)\"
+        ;;    :description \"morning news scan\"})
+        ;; Cadence forms: {:every :day :at \"07:00\"} (daily at
+        ;; a wall-clock time), {:every :hour :n 4} (every 4h —
+        ;; :n multiplies :minute/:hour/:day/:week into a fixed
+        ;; interval), {:every-ms N}, {:at \"ISO\" :once true}.
+        ;; Unknown keys are REJECTED (no silent wrong cadence).
+        'create   (fn [cfg] (sched-create (room!) cfg))
+        'cancel   (fn [id] (sched-cancel (room!) id))
+        'list     (fn [] (sched-list (room!)))}
+       (with-schemas
+         '{every    [([period agent-id task]
+                      [period at agent-id task]
+                      [period day-of-week at agent-id task])
+                     "Recurring schedule in THIS room. `period` is :day/:week/…, `at` is \"HH:MM\" wall-clock, `day-of-week` a keyword like :monday. e.g. (every :day \"09:00\" :huginn \"Morning sweep\")."]
+           at       [([iso-datetime agent-id task])
+                     "One-shot at a FULL ISO datetime — \"2026-04-01T09:00\", not \"09:00\". For a daily wall-clock time use `every` instead."]
+           interval [([ms agent-id task])
+                     "Repeat every `ms` milliseconds."]
+           create   [([cfg])
+                     "Richest form. cfg = {:agent-id kw :task \"…\" | :code \"…\" :schedule {…} | :interval-ms N :description \"…\"}. `:code` evals in your sandbox on each fire with no LLM turn. Unknown keys are REJECTED."]
+           cancel   [([schedule-id])
+                     "Deactivate a schedule BY ID — the uuid itself, not the map `list` returns."]
+           list     [([])
+                     "Active schedules in this room, as maps carrying :id :kind :next-fire …"]}
+         {'every    [:function
+                     [:=> [:cat :keyword :keyword :string] :uuid]
+                     [:=> [:cat :keyword :string :keyword :string] :uuid]
+                     [:=> [:cat :keyword :keyword :string :keyword :string] :uuid]]
+          'at       [:=> [:cat :string :keyword :string] :uuid]
+          'interval [:=> [:cat PosInt :keyword :string] :uuid]
+          'create   [:=> [:cat [:map
+                                [:agent-id :keyword]
+                                [:task {:optional true} :string]
+                                [:code {:optional true} :string]
+                                [:interval-ms {:optional true} PosInt]
+                                [:schedule {:optional true} ScheduleSpec]
+                                [:description {:optional true} :string]
+                                [:id {:optional true} :uuid]]]
+                     :uuid]
+          'cancel   [:=> [:cat :uuid] [:maybe [:= :cancelled]]]
+          'list     [:=> [:cat] [:vector Schedule]]})))))
