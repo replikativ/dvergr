@@ -167,7 +167,39 @@ worlds are identical across candidates.
 | --- | --- | --- |
 | Reference | `{:model m}` | tau2's `LLMAgent`: one model step per protocol step (`live/model-generate`) |
 | Dvergr loop | `{:model m :harness :dvergr :action-space :tools}` | Dvergr's own agent turn (`chat.agent/run-agent-turn!`) inside one working chat context per episode, with the domain tools as JSON tools |
-| Dvergr REPL | `{:model m :harness :dvergr :action-space :repl}` | The same loop with one `clojure_eval` tool. The domain tools are SCI functions `tau2/<tool>` returning upstream's strings, plus `tau2/parse` |
+| Dvergr REPL | `{:model m :harness :dvergr :action-space :repl :repl-guidance g}` | The same loop with one `clojure_eval` tool. The domain tools are documented SCI functions `tau2/<tool>` returning upstream's strings, plus `tau2/parse` and `tau2/shape` |
+
+The REPL candidate gets the same information as the JSON-tools candidate: its
+prompt lists every tool as a Clojure call with its full description and
+arguments (7.9k characters against 11.8k of JSON schema), and
+`(clojure.repl/doc tau2/<tool>)` / `(sandbox/doc 'tau2)` show the same docs at
+runtime. Before 2026-09-19 it saw only tool names. `:repl-guidance` selects the
+action-space guidance (`:shape`, the default; `:compute`; `:inspect`); each
+variant is a distinct candidate because AgentDefs carry their system prompt's
+sha256. `tau2/shape` exists because REPL agents computed over data they had
+not looked at: product `variants` are a map keyed by item id, and
+`(filter #(get % "available") variants)` over its entries counted nothing.
+
+### Decision-point probes
+
+`dvergr.benchmarks.tau2.probe` re-samples one candidate turn from a recorded
+episode: the world is rebuilt by replaying the certified effects, the
+candidate's history is the recorded dialogue with earlier tool traffic in its
+own action space, and only the answer to one customer message runs, `n` times
+in parallel. A probe costs one agent turn instead of an episode (seconds,
+~0.01% of a Max weekly window), so prompt and harness changes are checked at
+the decision points where candidates went wrong before a full run confirms
+them. Probes are diagnostics, not certified results.
+
+```clojure
+(pr/probe! dom task (:trajectory evidence) cut
+           {:action-space :repl :repl-guidance :shape :model "claude-code-sonnet"} 6)
+```
+
+Task 2 (count available T-shirts), 2026-09-19: JSON tools 4/4; REPL with
+names-only prompt failed in both full episodes; REPL with signatures
+`:compute` 6/6 and `:shape` 6/6, `:shape` with 3.8 evaluations per turn
+against 5.3.
 
 `dvergr.benchmarks.tau2.harness` binds each harness turn to the episode's
 world value. Every tool call, including calls made inside `clojure_eval`, is
