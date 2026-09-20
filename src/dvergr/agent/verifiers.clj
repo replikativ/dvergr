@@ -3,9 +3,10 @@
 
    An EnvironmentDef names its verifier and world setup by exact reference
    and never contains them. This registry is where a host resolves those
-   references: benchmark providers register their `Evaluator` and
-   `WorldSetup` capabilities here, and `evaluators` / `world-setups` return
-   the capability maps `dvergr.agent.experiment/run` takes.
+   references: benchmark providers register their `Evaluator`,
+   `WorldSetup` and `Protocol` capabilities here, and `evaluators`,
+   `world-setups` and `protocols` return the capability maps
+   `dvergr.agent.experiment/run` takes.
 
    Capabilities are host functions, so the registry is process-local and is
    never exposed to SCI. Registering is idempotent for the same capability
@@ -14,7 +15,7 @@
    verdicts mean."
   (:require [dvergr.agent.evaluation :as evaluation]))
 
-(defonce ^:private registry (atom {:evaluators {} :world-setups {}}))
+(defonce ^:private registry (atom {:evaluators {} :world-setups {} :protocols {}}))
 
 (defn- register! [kind ref capability]
   (swap! registry
@@ -42,6 +43,14 @@
     (throw (ex-info "Not a WorldSetup capability" {:type ::invalid-world-setup})))
   (register! :world-setups (evaluation/world-setup-ref setup) setup))
 
+(defn register-protocol!
+  "Register `protocol` (from `evaluation/make-protocol`) under its protocol
+   reference. Returns the reference."
+  [protocol]
+  (when-not (instance? dvergr.agent.evaluation.Protocol protocol)
+    (throw (ex-info "Not a Protocol capability" {:type ::invalid-protocol})))
+  (register! :protocols (evaluation/protocol-ref protocol) protocol))
+
 (defn evaluator
   "The Evaluator bound to verifier reference `ref`, or nil."
   [ref]
@@ -51,6 +60,11 @@
   "The WorldSetup bound to setup reference `ref`, or nil."
   [ref]
   (get-in @registry [:world-setups ref]))
+
+(defn protocol
+  "The Protocol bound to protocol reference `ref`, or nil."
+  [ref]
+  (get-in @registry [:protocols ref]))
 
 (defn tier
   "Trust tier of the verifier bound to `ref`, or nil when unregistered."
@@ -67,8 +81,14 @@
   []
   (:world-setups @registry))
 
+(defn protocols
+  "`{protocol-ref Protocol}`: the `:protocols` option of `experiment/run`."
+  []
+  (:protocols @registry))
+
 (defn unregister!
   "Remove the capabilities bound to `ref` (tests, reloading)."
   [ref]
-  (swap! registry #(-> % (update :evaluators dissoc ref) (update :world-setups dissoc ref)))
+  (swap! registry #(-> % (update :evaluators dissoc ref) (update :world-setups dissoc ref)
+                       (update :protocols dissoc ref)))
   nil)

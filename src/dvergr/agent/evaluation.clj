@@ -28,6 +28,7 @@
    (`:verifier-trust` in its metrics), so a reward is never read without it."
   [:trusted :room :ad-hoc])
 (defrecord WorldSetup [ref prepare])
+(defrecord Protocol [ref run limit-keys])
 
 (defonce ^:private pending-tasks (atom {}))
 
@@ -184,6 +185,47 @@
                   (some? basis) (assoc :setup/basis basis))
                 prepare))
 
+(defn make-protocol
+  "Create a process-local trusted interaction protocol.
+
+   By default a Run interprets its AgentDef's program against one task. An
+   environment that names a protocol instead has the Run host an interaction
+   in its isolated world, e.g. a conversation between the candidate and an
+   environment driver (a simulated counterpart with its own tools and private
+   scenario).
+
+   `run` is blocking host work, called under the Run's supervisor with
+   `{:control-room :room (the isolated work Room) :run/id :agent (AgentDef)
+   :task :limits :cancelled? (fn [])}`. It must leave the work Room quiescent
+   (no participants, no live Runs) and return the Run's portable value.
+   `limit-keys` names the environment limits this protocol interprets, beyond
+   the evaluator's own. The capability is never portable or exposed to SCI."
+  [{:keys [id version basis run limit-keys]
+    :or {version 1 limit-keys #{}}}]
+  (when-not (keyword? id)
+    (throw (ex-info "Protocol :id must be a keyword"
+                    {:type ::invalid-protocol-id :id id})))
+  (when-not (and (integer? version) (pos? version))
+    (throw (ex-info "Protocol :version must be a positive integer"
+                    {:type ::invalid-protocol-version :version version})))
+  (when-not (roster/data-value? basis)
+    (throw (ex-info "Protocol :basis must contain only portable data"
+                    {:type ::invalid-protocol-basis :basis basis})))
+  (when-not (fn? run)
+    (throw (ex-info "Protocol :run must be a function"
+                    {:type ::invalid-protocol-run})))
+  (when-not (and (set? limit-keys) (every? keyword? limit-keys))
+    (throw (ex-info "Protocol :limit-keys must be a set of keywords"
+                    {:type ::invalid-protocol-limit-keys :limit-keys limit-keys})))
+  (->Protocol (cond-> {:protocol/id id :protocol/version version}
+                (some? basis) (assoc :protocol/basis basis))
+              run limit-keys))
+
+(defn protocol-ref
+  "Return the portable exact reference named by a Protocol capability."
+  [protocol]
+  (:ref protocol))
+
 (defn evaluator-ref
   "Return the portable verifier reference named by an Evaluator capability."
   [evaluator]
@@ -232,6 +274,26 @@
                        :expected expected :actual (:ref setup)})))
     setup))
 
+(defn- require-matching-protocol! [definition protocol]
+  (let [expected (get-in definition [:environment/world :protocol])]
+    (cond
+      (nil? expected)
+      (when protocol
+        (throw (ex-info "Environment without :protocol received a Protocol"
+                        {:type ::unexpected-protocol
+                         :actual (when (instance? Protocol protocol)
+                                   (:ref protocol))})))
+
+      (not (instance? Protocol protocol))
+      (throw (ex-info "Environment requires an exact host Protocol"
+                      {:type ::missing-protocol :expected expected}))
+
+      (not= expected (:ref protocol))
+      (throw (ex-info "Protocol does not match EnvironmentDef"
+                      {:type ::protocol-mismatch
+                       :expected expected :actual (:ref protocol)})))
+    protocol))
+
 (defn- default-evidence [{:keys [result durable]}]
   {:result (:run/value result)
    :trace
@@ -271,17 +333,19 @@
                     {:type ::invalid-timeout :label label :value value})))
   value)
 
-(defn- require-supported-policy! [definition agent]
+(defn- require-supported-policy! [definition agent protocol]
   (let [limits (:environment/limits definition)
         world (:environment/world definition)
         model-limits (select-keys limits [:max-model-steps :budget-dollars])]
-    (when-let [unknown (seq (remove #{:timeout-ms :cancel-timeout-ms
-                                      :max-model-steps :budget-dollars}
+    (when-let [unknown (seq (remove (into #{:timeout-ms :cancel-timeout-ms
+                                            :max-model-steps :budget-dollars}
+                                          (:limit-keys protocol))
                                     (keys limits)))]
       (throw (ex-info "Evaluation environment contains unsupported limits"
                       {:type ::unsupported-evaluation-limits
                        :unknown (set unknown)})))
-    (when-let [unknown (seq (remove #{:isolation :settlement :resources :setup}
+    (when-let [unknown (seq (remove #{:isolation :settlement :resources :setup
+                                      :protocol}
                                     (keys world)))]
       (throw (ex-info
               "Evaluation environment contains unsupported world policy; setup requires a trusted resolver"
@@ -326,7 +390,7 @@
 
 (defn- certification-candidate
   [{:keys [room world-room setup-evidence definition evaluator agent run-id
-           result durable started-at started-nanos timeout?]}]
+           result durable started-at started-nanos timeout? extra-metrics]}]
   (let [evidence ((:observe evaluator)
                   {:room room
                    :world/room world-room
@@ -352,7 +416,9 @@
                   :status (:run/status result)
                   :started-at started-at
                   :elapsed-ms elapsed-ms
-                  :metrics (assoc metrics
+                  ;; Host-supplied metrics (e.g. an experiment's cell
+                  ;; identity) never override what the evaluation measured.
+                  :metrics (assoc (merge extra-metrics metrics)
                                   :timed-out? timeout?
                                   :verifier-trust (:tier evaluator))
                   :checks checks
@@ -378,11 +444,15 @@
   ([room team agent-ref definition evaluator]
    (evaluate room team agent-ref definition evaluator {}))
   ([room team agent-ref definition evaluator
-    {:keys [from parent-run world-setup]
+    {:keys [from parent-run world-setup protocol metrics]
      :or {from :environment} :as opts}]
    (environment/validate-environment definition)
    (require-matching-evaluator! definition evaluator)
+   (when-not (or (nil? metrics) (and (map? metrics) (roster/data-value? metrics)))
+     (throw (ex-info "Evaluation :metrics must be a portable map"
+                     {:type ::invalid-metrics :metrics metrics})))
    (let [world-setup (require-matching-setup! definition world-setup)
+         protocol (require-matching-protocol! definition protocol)
          agent (roster/agent team agent-ref)
          {:keys [timeout-ms cancel-timeout-ms]
           :or {timeout-ms 120000 cancel-timeout-ms 10000}}
@@ -390,8 +460,9 @@
          {:keys [settlement resources]
           :or {settlement :review}}
          (:environment/world definition)
-         model-limits (when agent (require-supported-policy! definition agent))]
-     (when-let [unknown (seq (remove #{:from :parent-run :world-setup}
+         model-limits (when agent (require-supported-policy! definition agent protocol))]
+     (when-let [unknown (seq (remove #{:from :parent-run :world-setup :protocol
+                                       :metrics}
                                      (keys opts)))]
        (throw (ex-info "Evaluation contains unknown options"
                        {:type ::unknown-evaluation-options
@@ -436,8 +507,15 @@
                                     {:type ::non-portable-setup-evidence
                                      :setup (:ref world-setup)})))
                   (reset! setup-evidence evidence))))
+            ;; Like the world setup, the protocol is told which exact
+            ;; environment it is hosting.
+            hosted-protocol
+            (when protocol
+              (update protocol :run
+                      (fn [run] (fn [context]
+                                  (run (assoc context :environment definition))))))
             handle (program/hire-prepared-in! room room team agent-ref hire-opts
-                                              prepare-world!)
+                                              prepare-world! hosted-protocol)
             timed-out ::timed-out
             initial (sp/await
                      (comb/timeout (program/owned-result-spin handle)
@@ -540,7 +618,7 @@
                              :setup-evidence @setup-evidence
                              :result result :durable durable
                              :started-at started-at :started-nanos started-nanos
-                             :timeout? timeout?})
+                             :timeout? timeout? :extra-metrics metrics})
                            certified-attempt
                            (attempt/make-attempt definition agent receipt evidence
                                                  settlement)]
