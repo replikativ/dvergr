@@ -451,17 +451,33 @@
                        :justification (get r "reasoning")})
               results)))))
 
-(defn grade
-  "tau2 `evaluate_simulation` with EvaluationType.ALL for one episode.
-   `judge` may be nil when no task in scope needs NL assertions."
-  [domain task {:keys [messages termination world db]} {:keys [judge]}]
+(defn world-facts
+  "The part of grading that needs the final world: whether it matches the
+   world produced by the gold actions, and the domain's environment
+   assertions when the task is graded on them. Portable data."
+  [domain task {:keys [world db]}]
+  (let [basis (set (get-in task ["evaluation_criteria" "reward_basis"]))
+        hash-fn (or (:world-hash domain) (:db-hash domain))
+        final (if (some? world) world db)]
+    (cond-> {:db-match (= (hash-fn (gold-world domain task)) (hash-fn final))}
+      ;; Telecom grades the final world (agent DB + user device) with the
+      ;; domain's own environment assertions.
+      (contains? basis "ENV_ASSERTION")
+      (assoc :env-assertion-checks
+             ((or (:env-assertion-checks domain)
+                  (throw (ex-info "Domain has no environment assertions"
+                                  {:domain (:domain domain)})))
+              task final)))))
+
+(defn grade-facts
+  "tau2 `evaluate_simulation` with EvaluationType.ALL from an episode's
+   messages and its `world-facts`. `judge` may be nil when no task in scope
+   needs NL assertions."
+  [task {:keys [messages termination]} {:keys [db-match env-assertion-checks]} {:keys [judge]}]
   (if-not (#{:agent-stop :user-stop} termination)
     {:reward 0.0 :termination termination
      :note "Simulation terminated prematurely"}
     (let [basis (set (get-in task ["evaluation_criteria" "reward_basis"]))
-          hash-fn (or (:world-hash domain) (:db-hash domain))
-          final (if (some? world) world db)
-          db-match (= (hash-fn (gold-world domain task)) (hash-fn final))
           comm (communicate-checks task messages)
           actions (action-checks task messages)
           nl (when (contains? basis "NL_ASSERTION")
@@ -470,12 +486,7 @@
                  (throw (ex-info "Task requires an NL assertion judge"
                                  {:type ::judge-required
                                   :task (get task "id")}))))
-          ;; Telecom grades the final world (agent DB + user device) with
-          ;; the domain's own environment assertions.
-          env (when (contains? basis "ENV_ASSERTION")
-                ((or (:env-assertion-checks domain)
-                     (throw (ex-info "Domain has no environment assertions" {:domain (:domain domain)})))
-                 task final))
+          env env-assertion-checks
           components (cond-> {}
                        (contains? basis "DB") (assoc :db (if db-match 1.0 0.0))
                        (contains? basis "ACTION")
@@ -496,3 +507,12 @@
        :communicate-checks comm
        :nl-assertions nl
        :env-assertion-checks env})))
+
+(defn grade
+  "tau2 `evaluate_simulation` with EvaluationType.ALL for one episode.
+   `judge` may be nil when no task in scope needs NL assertions."
+  [domain task {:keys [termination] :as episode} opts]
+  (if-not (#{:agent-stop :user-stop} termination)
+    {:reward 0.0 :termination termination
+     :note "Simulation terminated prematurely"}
+    (grade-facts task episode (world-facts domain task episode) opts)))

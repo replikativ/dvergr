@@ -691,6 +691,77 @@
                       :data {:room (:id room) :error (.getMessage t)}}
                      "episode Room teardown failed")))))
 
+(defn episode-snapshot
+  "The tau2 world and episode state of `room`, read under its context:
+   `{:world :log :steps :errors :usage}`."
+  [room]
+  (let [st @(ctx-atom room :state)]
+    (assoc (select-keys st [:log :steps :errors :usage])
+           :world (world room))))
+
+(defn prepare-world!
+  "Install `task`'s initial world in `room` (the trusted world setup)."
+  [room domain task]
+  (set-world! room ((:initial-world domain) task))
+  nil)
+
+(defn converse!
+  "Run one tau2 conversation to its end inside `room`, whose world was
+   prepared with `prepare-world!`: join the candidate and the simulated
+   customer, deliver the greeting, wait for termination (or `cancelled?`),
+   then cancel and await candidate Runs and leave the Room quiescent.
+
+   Blocking host work. Returns portable data:
+   `{:termination :steps :errors :usage :failure :agent-runs}`; the graded log
+   and final world stay in the Room's context (`episode-snapshot`). An
+   infrastructure fault is returned under `:failure`, never thrown, so the
+   caller decides how to certify it."
+  [{:keys [room domain task agent agent-generate user limits timeout-ms cancelled?]
+    :or {limits {:max-steps 200 :max-errors 10} timeout-ms (* 30 60 1000)
+         cancelled? (constantly false)}}]
+  (let [room-id (:id room)
+        episode (new-episode domain task limits room nil)
+        _ (reset! (:state episode) {:seq 0 :steps 0 :errors 0 :log [] :usage {}})
+        _ (watch-candidate-runs! episode)
+        candidate* (volatile! nil)]
+    (try
+      (try
+        (let [candidate (attach! episode agent agent-generate user)]
+          (vreset! candidate* candidate)
+          (binding [ec/*execution-context* (:ctx room)]
+            ;; The customer logs the greeting on arrival like every candidate
+            ;; message, which counts a step; the greeting is not a tau2 step.
+            (swap! (:state episode) update :steps dec)
+            (d/post! room (d/message :agent :customer t2/first-agent-message)))
+          ((:after-greeting candidate))
+          ;; `:timeout-ms nil`: the caller bounds the conversation itself.
+          (let [deadline (when timeout-ms (+ (System/currentTimeMillis) timeout-ms))]
+            (loop []
+              (cond
+                (ended? episode) nil
+                (cancelled?) (end! episode :cancelled)
+                (and deadline (> (System/currentTimeMillis) deadline)) (end! episode :timeout)
+                :else (do (deref (:ended episode) 100 nil) (recur))))))
+        (catch InterruptedException e (end! episode :cancelled) (throw e))
+        (catch Throwable t (fault! episode :setup t)))
+      (run/cancel-room-runs! room-id)
+      (let [quiescent? (await-quiescence! room-id 60000)
+            {:keys [steps errors usage]} @(:state episode)
+            failure (or @(:failure episode)
+                        (when-not quiescent?
+                          {:source :teardown :message "candidate Runs did not quiesce"}))]
+        {:termination @(:ended episode)
+         :steps steps :errors errors
+         :usage (cond-> usage
+                  @candidate* (assoc :agent ((:usage @candidate*))))
+         :agent-runs (mapv (juxt :run/id :run/status) (run/runs room {:limit 100000}))
+         :failure failure})
+      (finally
+        (run/unwatch-runs! room-id)
+        ;; Settlement requires a world with no participants.
+        (doseq [id [:agent :customer]]
+          (try (d/leave room id) (catch Throwable _ nil)))))))
+
 (defn run!
   "Run one certified episode on the calling (host) thread. Returns
    `{:attempt :episode-room-id :termination :grade :failure}`.
