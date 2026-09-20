@@ -297,17 +297,32 @@ of unavailable variants (task 3, judged) and a wrong exchange variant (task 6).
 At this sample size the candidates are indistinguishable; the comparison
 proves the plumbing, not a ranking.
 
-### Certified runs inside Rooms
+### Certified experiments
 
-Experiments normally run as certified conversational episodes inside
-Dvergr's programming model; see `doc/conversation-evaluation.md` for the
-design. Each experiment directory holds one durable store with:
+Experiments run on Dvergr's generic evaluation path
+(`doc/evaluation-model.md`): every cell is one
+`dvergr.agent.evaluation/evaluate`, folded by `dvergr.agent.experiment/run`.
+tau2 brings only what is its own (`dvergr.benchmarks.tau2.provider`):
 
-- the experiment Room;
-- one episode Room per cell, containing the dialogue, the candidate's
-  `:agent-turn` Runs and tool activity, and the environment's effect rows;
-- a certified Attempt per cell;
-- a Scorecard once the experiment is complete and fault-free.
+- a **world setup**: the task's initial world, installed in the Run's forked
+  world;
+- a **protocol**: the conversation with the simulated customer, hosted by the
+  Run inside that world;
+- a **verifier**: the grader behind the evaluator boundary. The trusted
+  observer reads the final world; the verifier sees portable evidence.
+
+Their references carry the upstream revision and the simulator and judge
+models, so those are part of every EnvironmentDef's content id. The forked
+world is discarded after certification, so the certified evidence is the
+record: the graded log, the candidate's own transcript (REPL code and tool
+results), its per-turn Runs and, for a failed Run, what failed. Every Attempt
+records its verifier's trust tier (`:verifier-trust`) and its experiment cell.
+
+Each experiment directory holds one durable store with the experiment Room,
+a certified Attempt per cell, and a Scorecard once every cell completed (an
+infrastructure fault is not a verdict; re-running resumes and re-runs exactly
+those cells). Records made before 2026-09-20 used episode Rooms instead;
+`inspect` reads both shapes.
 
 Run it in a dedicated JVM, because it isolates Dvergr's home to the
 experiment directory:
@@ -331,7 +346,7 @@ experiment directory:
 (def e (insp/episode xs :tau2/retail-cmp attempt-id))
 (insp/print-transcript e)                        ; dialogue, REPL code, effects
 (insp/verify-world dom task e)                   ; replay reproduces the certified hash
-(insp/verify-episode e)                          ; graded log equals the Room rows
+(insp/verify-episode e)                          ; Room-path records only
 ```
 
 The host runner (`dvergr.benchmarks.tau2.runner`) remains available for

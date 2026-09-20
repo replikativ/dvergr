@@ -1,7 +1,7 @@
 # The evaluation model: attempts as a first-class verb
 
-Status: design, agreed direction (2026-09-20). Nothing here is built unless a
-section says so. It follows a systematic map of the current harness; every
+Status: design, agreed direction (2026-09-20), partly built; see *Order of
+work* for what exists. It follows a systematic map of the current harness; every
 claim about existing code names its namespace.
 
 ## Why
@@ -287,20 +287,31 @@ has most of the first half.
 
 Refactor first. Each step keeps the suite green.
 
-1. **Fold tau2 into `evaluate`.** The grader becomes a registered
-   Evaluator, the initial world a WorldSetup, the customer a driver. Widen
-   the two rejections in `evaluate` (world isolation, limits). Port resume
-   into `experiment/run`. Remove the duplicate certification in
-   `dvergr.agent.conversation`. Rename the tau2 runner namespace. Equivalence
-   with upstream and recorded results must not change.
+1. **Fold tau2 into `evaluate`.** DONE (2026-09-20), except the last item.
+   - Verifier registry with trust tiers in `src/` (`dvergr.agent.verifiers`);
+     the tier is recorded on every receipt.
+   - Environment protocols (`evaluation/make-protocol`): a Run hosts a
+     trusted interaction in its world, under its own supervisor.
+   - `experiment/run`: protocols, each Attempt's cell identity, `:resume?`,
+     `:complete-only?`.
+   - `dvergr.benchmarks.tau2.provider`: world setup, conversation protocol,
+     grader as Evaluator. `tx/run!` is `experiment/run`; its own runner is
+     gone. All four domains and all three candidates verified on it.
+   - OPEN: checkpoints and branches (`episode/run!`, `branch!`) still use the
+     Room path, which keeps `dvergr.agent.conversation`'s certification
+     alive. They move with step 3. The tau2 episode namespace is not renamed
+     yet.
 2. **Widen the primitive.** First the prerequisite: debit model spend from
    Run wallets (`consume!`, effectively once), then attempt wallets with
    per-role sub-grants; this is also what lets `:provider-effects?` open for
-   delegation generally. Then `:fn` candidates; the verifier registry with
-   tiers; `attempt!`, `evaluate!` and reading the subtree's Attempts in the
-   sandbox, with the attenuation `hire!` already applies.
+   delegation generally. Then `:fn` candidates; agent-authored verifiers in
+   the `:room` and `:ad-hoc` tiers; a minimum tier for Scorecards;
+   `attempt!`, `evaluate!` and reading the subtree's Attempts in the sandbox,
+   with the attenuation `hire!` already applies.
 3. **Run-level snapshot and branch** in `dvergr.agent.world`, replacing
-   tau2's, and the step log with prefix ids.
+   tau2's. The seam exists: `hire-prepared-in!` already separates the control
+   Room from the world parent, so a branch is an evaluation whose world
+   parent is a retained snapshot world. Then the step log with prefix ids.
 4. **Policies.** Best-of-N and retries from a snapshot; per-turn value
    curves; partial verifiers; then search, which needs `factor` and a
    barrier that tolerates uneven episode lengths in spindel.
