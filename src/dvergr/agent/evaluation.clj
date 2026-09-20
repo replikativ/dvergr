@@ -19,7 +19,14 @@
             [org.replikativ.spindel.spin.core :as spin-core]
             [org.replikativ.spindel.spin.sync :as sync]))
 
-(defrecord Evaluator [ref observe verify])
+(defrecord Evaluator [ref observe verify tier])
+
+(def trust-tiers
+  "Who vouches for a verifier, weakest last. `:trusted` verifiers ship with
+   the host; `:room` verifiers were authored in a Room and vetted; `:ad-hoc`
+   ones are unvetted. The tier is recorded on every receipt
+   (`:verifier-trust` in its metrics), so a reward is never read without it."
+  [:trusted :room :ad-hoc])
 (defrecord WorldSetup [ref prepare])
 
 (defonce ^:private pending-tasks (atom {}))
@@ -120,9 +127,16 @@
    EnvironmentDef verifier reference. `observe` receives durable execution
    facts and returns portable evidence. `verify` receives the EnvironmentDef
    plus that evidence and returns `{:checks {keyword boolean} :reward number}`.
-   Evaluators are deliberately not portable and are never exposed to SCI."
-  [{:keys [id version basis observe verify]
-    :or {version 1}}]
+   `tier` is one of `trust-tiers` (default `:trusted`: only host code can
+   construct an Evaluator; hosts building one from agent-authored source pass
+   the weaker tier). Evaluators are deliberately not portable and are never
+   exposed to SCI."
+  [{:keys [id version basis observe verify tier]
+    :or {version 1 tier :trusted}}]
+  (when-not (some #{tier} trust-tiers)
+    (throw (ex-info "Evaluator :tier must be a trust tier"
+                    {:type ::invalid-evaluator-tier :tier tier
+                     :allowed trust-tiers})))
   (when-not (keyword? id)
     (throw (ex-info "Evaluator :id must be a keyword"
                     {:type ::invalid-evaluator-id :id id})))
@@ -140,7 +154,7 @@
                     {:type ::invalid-evaluator-basis :basis basis})))
   (->Evaluator (cond-> {:verifier/id id :verifier/version version}
                  (some? basis) (assoc :verifier/basis basis))
-               observe verify))
+               observe verify tier))
 
 (defn make-world-setup
   "Create a process-local trusted preparer for one exact world setup.
@@ -174,6 +188,11 @@
   "Return the portable verifier reference named by an Evaluator capability."
   [evaluator]
   (:ref evaluator))
+
+(defn evaluator-tier
+  "The trust tier an Evaluator capability was constructed with."
+  [evaluator]
+  (:tier evaluator))
 
 (defn world-setup-ref
   "Return the portable exact reference named by a WorldSetup capability."
@@ -333,7 +352,9 @@
                   :status (:run/status result)
                   :started-at started-at
                   :elapsed-ms elapsed-ms
-                  :metrics (assoc metrics :timed-out? timeout?)
+                  :metrics (assoc metrics
+                                  :timed-out? timeout?
+                                  :verifier-trust (:tier evaluator))
                   :checks checks
                   :reward reward}
            (contains? evidence :result) (assoc :result (:result evidence))
