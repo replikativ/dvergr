@@ -51,7 +51,10 @@
         ;; restart.
         ;; 0.1.44 includes structured work admission, cancellation hand-back,
         ;; canonical inference worlds, and forkable SCI world components.
-        org.replikativ/spindel     {:mvn/version "0.1.44"}
+        ;; 0.1.48 adds falsey deferred values (#50), spawn success
+        ;; observation (#49), reusable affine world scopes (#51), and seeded
+        ;; inference draws with correct MCMC replay (#54).
+        org.replikativ/spindel     {:mvn/version "0.1.48"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context
