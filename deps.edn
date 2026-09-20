@@ -54,7 +54,8 @@
         ;; 0.1.48 adds falsey deferred values (#50), spawn success
         ;; observation (#49), reusable affine world scopes (#51), and seeded
         ;; inference draws with correct MCMC replay (#54).
-        org.replikativ/spindel     {:mvn/version "0.1.48"}
+        ;; 0.1.49 adds world-backed finite MCTS (`spindel.search.mcts`, #52).
+        org.replikativ/spindel     {:mvn/version "0.1.49"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context
