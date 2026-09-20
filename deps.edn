@@ -55,7 +55,10 @@
         ;; observation (#49), reusable affine world scopes (#51), and seeded
         ;; inference draws with correct MCMC replay (#54).
         ;; 0.1.49 adds world-backed finite MCTS (`spindel.search.mcts`, #52).
-        org.replikativ/spindel     {:mvn/version "0.1.49"}
+        ;; 0.1.52 fixes overlay tombstones reviving as {} instead of nil in a
+        ;; fork (#53): a reaped spin node re-registered under the same id threw
+        ;; at settlement and left the room unable to heal.
+        org.replikativ/spindel     {:mvn/version "0.1.52"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context
@@ -71,7 +74,7 @@
         ;; Geschichte — authoritative virtual filesystem + Git compatibility.
         ;; Geschichte remains the authoritative virtual filesystem; its
         ;; Yggdrasil adapter lives only in Yggdrasil.
-        org.replikativ/geschichte  {:mvn/version "0.1.15"}
+        org.replikativ/geschichte  {:mvn/version "0.1.17"}
 
         ;; rewrite-clj for structural editing
         rewrite-clj/rewrite-clj    {:mvn/version "1.1.48"}
