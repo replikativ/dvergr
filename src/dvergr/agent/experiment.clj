@@ -588,12 +588,17 @@
    With `:resume? true`, cells that already have a completed Attempt of this
    exact ExperimentDef in `room` are not run again; their Attempts enter the
    Scorecard. Every Attempt records its cell in its receipt metrics, so an
-   interrupted experiment continues where it stopped."
+   interrupted experiment continues where it stopped.
+
+   With `:complete-only? true` no Scorecard is persisted while any cell's
+   Attempt is not `:completed` (an infrastructure fault is not a verdict);
+   the result carries `:incomplete {:cells n}` instead, and a resumed run
+   re-runs exactly those cells."
   ([room team experiment evaluators]
    (run room team experiment evaluators {}))
   ([room team experiment evaluators
     {:keys [parallelism max-parallelism max-attempts world-setups protocols
-            resume?]
+            resume? complete-only?]
      :or {parallelism 1 max-parallelism 16 max-attempts 256 world-setups {}
           protocols {}}
      :as opts}]
@@ -620,7 +625,8 @@
                                       [:environment/world :settlement])})))
    (when-let [unknown (seq (remove #{:from :parent-run :parallelism
                                      :max-parallelism :max-attempts
-                                     :world-setups :protocols :resume?}
+                                     :world-setups :protocols :resume?
+                                     :complete-only?}
                                    (keys opts)))]
      (invalid! "Experiment contains unknown run options"
                ::unknown-run-options {:unknown (set unknown)}))
@@ -671,9 +677,14 @@
      (sp/spin
       (let [results (into (vec resumed)
                           (sp/await (run-batches spins parallelism)))]
-        (let [scorecard (->> results
-                             (make-scorecard experiment)
-                             (persist-scorecard! room))]
+        (let [unfinished (count (remove #(= :completed
+                                            (get-in % [:attempt :attempt/receipt :attempt/status]))
+                                        results))
+              scorecard (if (and complete-only? (pos? unfinished))
+                          {:incomplete {:cells unfinished}}
+                          (->> results
+                               (make-scorecard experiment)
+                               (persist-scorecard! room)))]
           {:experiment experiment
            :execution {:parallelism parallelism
                        :attempt-count attempt-count}

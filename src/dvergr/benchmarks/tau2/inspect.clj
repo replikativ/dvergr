@@ -37,8 +37,12 @@
      :status (:attempt/status r)
      :reward (:attempt/reward r)
      :checks (:attempt/checks r)
-     :termination (get-in r [:attempt/metrics :termination])
-     :steps (get-in r [:attempt/metrics :steps])
+     ;; Room-path records keep these in metrics, evaluation-path records in
+     ;; the evidence the trusted observer produced.
+     :termination (or (get-in r [:attempt/metrics :termination])
+                      (get-in a [:attempt/evidence :result :termination]))
+     :steps (or (get-in r [:attempt/metrics :steps])
+                (get-in a [:attempt/evidence :episode :steps]))
      :elapsed-s (quot (:attempt/elapsed-ms r) 1000)
      :episode-room (get-in a [:attempt/evidence :episode :room])}))
 
@@ -46,10 +50,11 @@
   "Drop :failed Attempts superseded by a completed Attempt of the same cell
    (a resumed experiment re-runs its failed cells)."
   [attempts]
-  (let [cell (fn [a] [(get-in a [:attempt/receipt :attempt/metrics :experiment-content-id])
-                      (:attempt/agent-def-hash a)
-                      (get-in a [:attempt/environment :environment/content-id])
-                      (get-in a [:attempt/receipt :attempt/metrics :repetition])])
+  (let [cell (fn [a] (let [m (get-in a [:attempt/receipt :attempt/metrics])]
+                       [(:experiment-content-id m)
+                        (:attempt/agent-def-hash a)
+                        (get-in a [:attempt/environment :environment/content-id])
+                        (or (:experiment-repetition m) (:repetition m))]))
         completed (set (map cell (filter #(= :completed (get-in % [:attempt/receipt :attempt/status]))
                                          attempts)))]
     (vec (remove #(and (not= :completed (get-in % [:attempt/receipt :attempt/status]))
@@ -76,11 +81,51 @@
        (sort-by (comp str :candidate))
        vec))
 
+(declare room-episode)
+
+(defn- evidence-episode
+  "An episode from an evaluation-path Attempt. Its world was a fork that was
+   discarded after certification, so the certified evidence is the record:
+   the graded log (dialogue and effects) and the candidate's transcript."
+  [store experiment-room-id a]
+  (let [log (sort-by :seq (get-in a [:attempt/evidence :trajectory]))]
+    {:attempt a
+     :episode-run (store/-load-run store experiment-room-id (:attempt/id a))
+     :room nil
+     :runs []
+     :dialogue (vec (for [{:keys [kind role content seq]} log :when (= :message kind)]
+                      {:from (if (= :assistant role) :agent :customer)
+                       :to (if (= :assistant role) :customer :agent)
+                       :content content :ts seq}))
+     ;; The candidate's tool uses, placed after the customer message they
+     ;; answer: each :user message of the transcript is the next customer
+     ;; message of the log.
+     :activities (let [user-seqs (atom (map :seq (filter #(and (= :message (:kind %)) (= :user (:role %))) log)))
+                       last-seq (atom 0)]
+                   (vec (keep-indexed
+                         (fn [i m]
+                           (when (= :user (:role m))
+                             (when-let [s (first @user-seqs)] (reset! last-seq s) (swap! user-seqs rest)))
+                           (when (seq (:tool-uses m))
+                             {:from :agent :to :_activity :ts (+ @last-seq 0.5 (* i 0.0001))
+                              :tool-uses (mapv (fn [tu] {:name (:name tu) :input (:input tu)})
+                                               (:tool-uses m))}))
+                         (get-in a [:attempt/evidence :transcript]))))
+     :effects (vec (for [e log :when (= :tool (:kind e))]
+                     (select-keys e [:seq :requestor :tool :arguments :content :error])))}))
+
 (defn episode
   "Reconstruct one episode from the store."
   [{:keys [store]} experiment-room-id attempt-id]
   (let [a (store/-load-attempt store experiment-room-id attempt-id)
-        room-id (get-in a [:attempt/evidence :episode :room])
+        room-id (get-in a [:attempt/evidence :episode :room])]
+    (if-not room-id
+      (evidence-episode store experiment-room-id a)
+      (room-episode store experiment-room-id a room-id))))
+
+(defn- room-episode
+  [store experiment-room-id a room-id]
+  (let [attempt-id (:attempt/id a)
         messages (conv/room-messages store room-id)]
     {:attempt a
      :episode-run (store/-load-run store experiment-room-id attempt-id)
@@ -111,9 +156,9 @@
        (case (::k m)
          :dialogue (println (str "\n[" (name (:from m)) " → " (name (:to m)) "] " (clip (:content m))))
          :activity (doseq [tu (get-in m [:metadata :tool-uses] (:tool-uses m))]
-                     (println (str "  ⚙ " (or (:tool-use/name tu) (:name tu)) " "
-                                   (clip (pr-str (dissoc (or (:tool-use/input tu) (:input tu))
-                                                         :db/id))))))))
+                     (let [input (or (:tool-use/input tu) (:input tu))]
+                       (println (str "  ⚙ " (or (:tool-use/name tu) (:name tu)) " "
+                                     (clip (if (map? input) (pr-str (dissoc input :db/id)) input))))))))
      (println "\nEnvironment effects:")
      (doseq [{:keys [seq requestor tool arguments content error]} effects]
        (println (str "  #" seq " " (name requestor) " " tool " " (pr-str arguments)
@@ -135,7 +180,12 @@
   "Cross-check a certified episode against the durable Room rows: the graded
    trajectory's tool entries equal the effect rows, its dialogue equals the
    Room dialogue, and every recorded candidate Run exists and is terminal."
-  [{:keys [attempt dialogue effects runs]}]
+  [{:keys [attempt dialogue effects runs room]}]
+  (if-not room
+    ;; An evaluation-path episode ran in a fork that was discarded; its
+    ;; certified evidence is the only record, so there is nothing to
+    ;; cross-check it against. `verify-world` still applies.
+    {:applicable? false}
   (let [log (get-in attempt [:attempt/evidence :trajectory])
         logged-tools (mapv #(select-keys % [:seq :requestor :tool :arguments :content :error])
                            (filter #(= :tool (:kind %)) log))
@@ -145,4 +195,4 @@
                                            effects))
      :dialogue-match? (= logged-dialogue (mapv :content dialogue))
      :runs-recorded? (= recorded-runs (set (map :run/id runs)))
-     :runs-terminal? (every? #(not= :running (:run/status %)) runs)}))
+     :runs-terminal? (every? #(not= :running (:run/status %)) runs)})))

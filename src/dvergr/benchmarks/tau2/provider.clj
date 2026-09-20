@@ -82,14 +82,21 @@
      :evaluator
      (evaluation/make-evaluator
       {:id :tau2/grader :version version :basis (basis domain judge) :tier :trusted
-       :observe (fn [{:keys [environment result] room :world/room}]
+       :observe (fn [{:keys [environment result durable] room :world/room}]
                   (let [task (task-of domain environment)
                         outcome (:run/value result)
                         {:keys [world log]} (when room (episode/episode-snapshot room))
-                        termination (:termination outcome)]
+                        ;; A Run that did not complete has no outcome: an
+                        ;; infrastructure fault, never a model verdict.
+                        termination (or (:termination outcome) :infrastructure-error)]
                     {:result {:termination termination}
+                     :failure (when-not (= :completed (:run/status result))
+                                {:status (:run/status result)
+                                 :reason (:run/reason durable)
+                                 :message (:run/error durable)})
                      :trajectory (vec log)
                      :episode (select-keys outcome [:steps :errors :usage :agent-runs])
+                     :transcript (:transcript outcome)
                      :world (when world {:final-hash ((:world-hash domain) world)})
                      :facts (when (and world (#{:agent-stop :user-stop} termination))
                               (t2/world-facts domain task {:world world}))

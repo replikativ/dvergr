@@ -422,7 +422,23 @@
            (install-tau2-namespace! (cc/sci-context chat-ctx) episode))))
      :usage (fn []
               (some-> (room-context/ensure-ctx! room :agent ctx-opts) cc/get-budget
-                      (select-keys [:used :by-type])))}))
+                      (select-keys [:used :by-type])))
+     ;; The harness's own view, as portable data: every model message with
+     ;; its tool uses (e.g. the clojure_eval code) and each tool result. The
+     ;; system prompt is recorded by hash, not repeated here.
+     :transcript (fn []
+                   (->> (cc/get-messages (room-context/ensure-ctx! room :agent ctx-opts))
+                        (remove #(= :system (:message/role %)))
+                        (mapv (fn [m]
+                                (cond-> {:role (:message/role m)
+                                         :content (str (:message/content m))}
+                                  (:message/tool-use-id m) (assoc :tool-use-id (str (:message/tool-use-id m)))
+                                  (seq (:message/tool-uses m))
+                                  (assoc :tool-uses
+                                         (mapv (fn [tu] {:id (str (:tool-use/id tu))
+                                                         :name (:tool-use/name tu)
+                                                         :input (pr-str (dissoc (:tool-use/input tu) :db/id))})
+                                               (:message/tool-uses m))))))))}))
 
 (defn- generate-loop
   "Model steps until a text message: tool calls go through the effect
@@ -489,7 +505,9 @@
                   (when-not (ended? episode) (end! episode :agent-error))
                   nil)))))})
      :after-greeting (fn [])
-     :usage (fn [] (get-in @(:state episode) [:usage :agent]))}))
+     :usage (fn [] (get-in @(:state episode) [:usage :agent]))
+     ;; The reference loop has no state beyond the graded log.
+     :transcript (fn [] nil)}))
 
 (defn- customer-message-count [episode]
   (count (filter #(and (= :message (:kind %)) (= :user (:role %))) (:log @(:state episode)))))
@@ -596,17 +614,22 @@
 (defn- new-episode [domain task limits room checkpoint-at]
   {:domain domain :task task :limits limits :room room
    :state (ctx-atom room :state)
-   :lock (Object.) :ended (promise) :failure (atom nil)
+   :lock (Object.) :ended (promise) :failure (atom nil) :turns (atom [])
    :checkpoint-at checkpoint-at})
 
 (defn- watch-candidate-runs!
   "A candidate turn that fails, is cancelled, or stops on its budget posts no
    reply; end the episode. The callback runs under the Run lifecycle lock and
-   only delivers."
+   only delivers. Finished candidate Runs are also collected in `:turns`: a
+   forked world has no store to list them from."
   [episode]
   (let [room-id (:id (:room episode))]
     (run/watch-runs! room-id
                      (fn [{:keys [type run]}]
+                       (when (and (= :run/finished type)
+                                  (= room-id (:run/room run))
+                                  (= :agent (:run/actor run)))
+                         (swap! (:turns episode) conj [(:run/id run) (:run/status run)]))
                        (when (and (= :run/finished type)
                                   (= room-id (:run/room run))
                                   (= :agent (:run/actor run))
@@ -712,7 +735,7 @@
    then cancel and await candidate Runs and leave the Room quiescent.
 
    Blocking host work. Returns portable data:
-   `{:termination :steps :errors :usage :failure :agent-runs}`; the graded log
+   `{:termination :steps :errors :usage :failure :agent-runs :transcript}`; the graded log
    and final world stay in the Room's context (`episode-snapshot`). An
    infrastructure fault is returned under `:failure`, never thrown, so the
    caller decides how to certify it."
@@ -754,7 +777,8 @@
          :steps steps :errors errors
          :usage (cond-> usage
                   @candidate* (assoc :agent ((:usage @candidate*))))
-         :agent-runs (mapv (juxt :run/id :run/status) (run/runs room {:limit 100000}))
+         :agent-runs @(:turns episode)
+         :transcript (when @candidate* ((:transcript @candidate*)))
          :failure failure})
       (finally
         (run/unwatch-runs! room-id)

@@ -72,12 +72,12 @@
                   :let [e (insp/episode xs room-id (:attempt/id a))
                         task (get-in dom [:tasks (get-in a [:attempt/environment :environment/task :task-id])])]]
             (is (= :completed (:run/status (:episode-run e))))
-            (is (every? #(= :completed (:run/status %)) (:runs e)))
+            (is (every? #(= :completed (second %))
+                        (get-in a [:attempt/evidence :episode :agent-runs])))
             (is (seq (:dialogue e)))
             (is (:match? (insp/verify-world dom task e)))
-            (is (= {:effects-match? true :dialogue-match? true
-                    :runs-recorded? true :runs-terminal? true}
-                   (insp/verify-episode e)))))
+            (is (= {:applicable? false} (insp/verify-episode e))
+                "the episode's world was a discarded fork: the evidence is the record")))
         (finally (conv/close-store! xs))))))
 
 (defn- gold-through-rooms
@@ -215,8 +215,10 @@
         (let [[a] (insp/attempts xs (:experiment-room r))
               e (insp/episode xs (:experiment-room r) (:attempt/id a))]
           (is (= :failed (get-in a [:attempt/receipt :attempt/status])))
-          (is (= :infrastructure-error (get-in a [:attempt/receipt :attempt/metrics :termination])))
-          (is (= :user-model (get-in a [:attempt/evidence :failure :source])))
+          (is (= :infrastructure-error (:termination (insp/attempt-row a))))
+          (is (re-find #"user-model.*provider 529"
+                       (str (get-in a [:attempt/evidence :failure :message])))
+              "the evidence names what failed")
           (is (= :failed (:run/status (:episode-run e))))
           (is (contains? (:scorecard r) :incomplete) "no Scorecard for a faulted experiment")
           (is (= [{:candidate :gold :attempts 1 :failed 1 :episodes 0}]
@@ -240,10 +242,11 @@
         (let [[a] (insp/attempts xs (:experiment-room r))
               e (insp/episode xs (:experiment-room r) (:attempt/id a))]
           (is (= :completed (get-in a [:attempt/receipt :attempt/status])) "a model outcome, scored")
-          (is (= :max-steps (get-in a [:attempt/receipt :attempt/metrics :termination])))
+          (is (= :max-steps (:termination (insp/attempt-row a))))
           (is (= 0.0 (get-in a [:attempt/receipt :attempt/reward])))
-          (is (= 1 (count (:runs e))) "no further candidate turn after the bound")
-          (is (every? #(not= :running (:run/status %)) (:runs e)))
+          (let [turns (get-in a [:attempt/evidence :episode :agent-runs])]
+            (is (= 1 (count turns)) "no further candidate turn after the bound")
+            (is (every? #(not= :running (second %)) turns)))
           (is (= 4 (count (:effects e))) "1 message + 4 batches x 2 steps reaches 9"))
         (finally (conv/close-store! xs))))))
 

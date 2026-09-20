@@ -15,6 +15,7 @@
             [dvergr.benchmarks.tau2.experiment :as tx]
             [dvergr.benchmarks.tau2.provider :as provider]
             [dvergr.discourse :as d]
+            [dvergr.model.chat :as model-chat]
             [dvergr.room.registry :as registry]
             [dvergr.room.store.memory :as memory]
             [org.replikativ.spindel.engine.core :as ec]))
@@ -133,3 +134,49 @@
                      (set (map :attempt/id (:attempts second-run)))))
               (is (= 2 (count (attempts/attempts room {:limit 100})))))))
         (finally (d/close-room! room))))))
+
+(def ^:private usage {:input-tokens 1 :output-tokens 1})
+
+(defn- scripted-chat [responses]
+  (let [n (atom -1)]
+    (fn [_ _] (nth responses (min (swap! n inc) (dec (count responses)))))))
+
+(deftest dvergr-candidates-through-evaluate
+  (if-not checkout?
+    (println "SKIP dvergr-candidates-through-evaluate: no ../tau2-bench checkout")
+    (let [dom (without-nl (t2/load-domain "retail"))
+          gold (get-in dom [:tasks "0" "evaluation_criteria" "actions"])
+          tool-responses (conj (mapv (fn [{:strs [name arguments action_id]}]
+                                       {:content "" :usage usage
+                                        :tool-calls [{:id action_id :name name :input arguments}]})
+                                     gold)
+                               {:content "Done. ###STOP###" :usage usage})
+          code (str "(doseq [[n a] " (pr-str (mapv (fn [{:strs [name arguments]}] [name arguments]) gold))
+                    "] ((ns-resolve 'tau2 (symbol n)) a))")
+          repl-responses [{:content "" :usage usage
+                           :tool-calls [{:id "e1" :name "clojure_eval" :input {:code code}}]}
+                          {:content "Done. ###STOP###" :usage usage}]]
+      (doseq [[action-space responses] [[:tools tool-responses] [:repl repl-responses]]]
+        (testing (str action-space)
+          (let [caps (provider/capabilities dom {:user-fn (constantly {:content "I need help with an exchange."})})
+                env (provider/environment-def dom "0" caps {:timeout-ms 120000})
+                team (tx/candidate-roster [{:id :dv :harness :dvergr :action-space action-space
+                                            :model "claude-code-sonnet"}] dom)
+                room (d/make-room {:id (keyword "tau2" (str "provider-dv-" (name action-space)))
+                                   :store (memory/make)})]
+            (try
+              (with-redefs [model-chat/chat (scripted-chat responses)]
+                (binding [ec/*execution-context* (:ctx room)]
+                  (let [result @(evaluation/evaluate room team :dv env (:evaluator caps)
+                                                     {:world-setup (:world-setup caps)
+                                                      :protocol (:protocol caps)})
+                        receipt (:attempt-receipt result)
+                        attempt (first (attempts/attempts room {:limit 10}))]
+                    (is (= :completed (:attempt/status receipt)) (pr-str (:run/result result)))
+                    (is (= 1.0 (:attempt/reward receipt)))
+                    (is (= (count gold)
+                           (count (filter #(= :tool (:kind %))
+                                          (get-in attempt [:attempt/evidence :trajectory]))))
+                        "every tool call, including those made inside clojure_eval, is in the graded log")
+                    (is (empty? (run/active-runs (:id room)))))))
+              (finally (d/close-room! room)))))))))
