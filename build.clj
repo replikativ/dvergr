@@ -9,6 +9,9 @@
                              #   web + Telegram (main dvergr.cli.main, :cli deps)
      clj -T:build install    # Install the library jar to ~/.m2
      clj -T:build deploy     # Deploy to Clojars (needs CLOJARS_USERNAME/PASSWORD)
+     clj -T:build benchmarks-jar      # org.replikativ/dvergr-benchmarks (benchmarks/)
+     clj -T:build benchmarks-install  # ... to ~/.m2
+     clj -T:build benchmarks-deploy   # ... to Clojars
      clj -T:build clean      # Remove target/
 
    NOTE: dvergr depends on a fork of SCI via a git dep (whilo/sci, see
@@ -18,7 +21,8 @@
      - the uberjar bundles SCI fine.
      - a Clojars consumer must add the SCI git dep themselves until the fork
        lands on Maven (upstream PR) or we publish it under our own group."
-  (:require [clojure.tools.build.api :as b]))
+  (:require [clojure.edn :as edn]
+            [clojure.tools.build.api :as b]))
 
 (def lib 'org.replikativ/dvergr)
 (def version (format "0.1.%s" (b/git-count-revs nil)))
@@ -30,6 +34,13 @@
 ;; entry — plus the web + mail + nREPL deps).
 (def harness-basis (delay (b/create-basis {:project "deps.edn" :aliases [:cli]})))
 (def harness-file  (format "target/%s-%s-harness.jar" (name lib) version))
+
+;; The benchmark providers (benchmarks/): their own artefact, same version,
+;; depending on the library jar. Its class dir is its own, so building it
+;; does not disturb the library jar in target/.
+(def benchmarks-lib 'org.replikativ/dvergr-benchmarks)
+(def benchmarks-class-dir "target/benchmarks-classes")
+(def benchmarks-jar-file (format "target/%s-%s.jar" (name benchmarks-lib) version))
 
 (defn clean [_]
   (b/delete {:path "target"}))
@@ -114,3 +125,59 @@
    {:installer :remote
     :artifact  (b/resolve-path jar-file)
     :pom-file  (b/pom-path {:lib lib :class-dir class-dir})}))
+
+
+;; ---------------------------------------------------------------------------
+;; org.replikativ/dvergr-benchmarks
+
+(defn- benchmarks-basis
+  "The artefact's one dependency is the library at this version, which has to
+   be resolvable: the library jar is installed to ~/.m2 first."
+  []
+  (b/create-basis
+   {:project {:deps {'org.clojure/clojure (get-in (edn/read-string (slurp "deps.edn"))
+                                                   [:deps 'org.clojure/clojure])
+                     lib {:mvn/version version}}}}))
+
+(defn benchmarks-jar
+  "Build the benchmarks jar (benchmarks/src + benchmarks/resources) + pom."
+  [_]
+  (install nil)
+  (b/delete {:path benchmarks-class-dir})
+  (b/write-pom {:class-dir benchmarks-class-dir
+                :lib       benchmarks-lib
+                :version   version
+                :basis     (benchmarks-basis)
+                :src-dirs  ["benchmarks/src"]
+                :scm       {:url "https://github.com/replikativ/dvergr"
+                            :connection "scm:git:git://github.com/replikativ/dvergr.git"
+                            :developerConnection "scm:git:ssh://git@github.com/replikativ/dvergr.git"
+                            :tag (str "v" version)}
+                :pom-data  [[:description "Benchmark providers for dvergr's evaluation path: tau2 and BFCL, transcribed and checked against upstream."]
+                            [:url "https://github.com/replikativ/dvergr/tree/main/benchmarks"]
+                            [:licenses
+                             [:license
+                              [:name "Apache License 2.0"]
+                              [:url "https://www.apache.org/licenses/LICENSE-2.0"]]]]})
+  (b/copy-dir {:src-dirs ["benchmarks/src" "benchmarks/resources"] :target-dir benchmarks-class-dir})
+  (b/copy-file {:src "benchmarks/NOTICE" :target (str benchmarks-class-dir "/META-INF/NOTICE")})
+  (b/jar {:class-dir benchmarks-class-dir :jar-file benchmarks-jar-file})
+  (println (str "JAR: " benchmarks-jar-file " (version " version ")")))
+
+(defn benchmarks-install [_]
+  (benchmarks-jar nil)
+  (b/install {:basis (benchmarks-basis)
+              :lib benchmarks-lib
+              :version version
+              :jar-file benchmarks-jar-file
+              :class-dir benchmarks-class-dir})
+  (println (str "Installed " benchmarks-lib " " version " to ~/.m2")))
+
+(defn benchmarks-deploy
+  "Deploy the benchmarks jar to Clojars, after `deploy` (the library it depends on)."
+  [_]
+  (benchmarks-jar nil)
+  ((requiring-resolve 'deps-deploy.deps-deploy/deploy)
+   {:installer :remote
+    :artifact  (b/resolve-path benchmarks-jar-file)
+    :pom-file  (b/pom-path {:lib benchmarks-lib :class-dir benchmarks-class-dir})}))

@@ -759,7 +759,60 @@
                :else
                (recur (inc model-step))))))))))
 
+(declare execute-agent-program)
+
+(defn- execute-protocol-program
+  "Run an environment protocol as this Run's program.
+
+   A protocol is a trusted host capability (see
+   `dvergr.agent.evaluation/make-protocol`): instead of interpreting the
+   AgentDef's program against one task, the Run hosts an interaction inside
+   its isolated work Room, e.g. a conversation between the candidate and an
+   environment driver. `:run` is blocking host work, so it executes under a
+   supervised worker and is interrupted by cancellation. It returns the Run's
+   portable value."
+  [control-room work-room run-id agent task supervisor protocol]
+  (sp/spin
+   (let [call (start-worker!
+               supervisor
+               (fn []
+                 ((:run protocol)
+                  {:control-room control-room
+                   :room work-room
+                   :run/id run-id
+                   :agent (dissoc agent ::limits ::protocol)
+                   :task task
+                   :limits (::limits agent)
+                   :cancelled? (fn [] (run/cancel-requested? run-id))})))
+         outcome (sp/await (worker-result-spin call))]
+     (cond
+       (or (= ::worker-cancelled outcome)
+           (run/cancel-requested? run-id))
+       (cancelled! run-id)
+
+       (worker-error? outcome)
+       (throw (ex-info (str "Environment protocol failed: "
+                            (ex-message (::worker-error outcome)))
+                       {:type ::protocol-failed
+                        :agent/id (:agent/id agent)}
+                       (::worker-error outcome)))
+
+       (not (roster/data-value? outcome))
+       (throw (ex-info "Environment protocol must return portable data"
+                       {:type ::non-portable-protocol-value
+                        :agent/id (:agent/id agent)}))
+
+       :else (program-result :completed outcome)))))
+
 (defn- execute-program
+  [control-room work-room run-id chat-id agent task trigger supervisor]
+  (if-let [protocol (::protocol agent)]
+    (execute-protocol-program control-room work-room run-id agent task
+                              supervisor protocol)
+    (execute-agent-program control-room work-room run-id chat-id agent task
+                           trigger supervisor)))
+
+(defn- execute-agent-program
   [control-room work-room run-id chat-id agent task trigger supervisor]
   (case (get-in agent [:agent/program :kind])
     :llm (execute-llm-program control-room work-room run-id chat-id agent task
@@ -1249,10 +1302,13 @@
    {:keys [task from parent-run settlement resources limits]
     :or {from :repl settlement :automatic}
     :as raw-opts}
-   prepare-world!]
+   prepare-world! & [protocol]]
   (when-not (or (nil? prepare-world!) (fn? prepare-world!))
     (throw (ex-info "Run world preparer must be a function"
                     {:type ::invalid-world-preparer})))
+  (when-not (or (nil? protocol) (fn? (:run protocol)))
+    (throw (ex-info "Run protocol must be a host capability with a :run function"
+                    {:type ::invalid-protocol})))
   (let [opts      (assoc raw-opts :from from)
         agent     (validate-hire! roster agent-ref opts)
         actor     (:agent/id agent)
@@ -1332,13 +1388,16 @@
       (let [completion (sync/deferred)
             outcome-promise (promise)
             worker-execution
-            (if prepare-world!
-              (prepared-execution-spin control-room work-room agent task trigger
-                                       id chat-id parent-run resources supervisor
-                                       allocation-state limits outcome-promise
-                                       prepare-world!)
-              (execution-spin control-room work-room agent task trigger id chat-id
-                              supervisor limits outcome-promise))
+            ;; The protocol rides on the agent value like `::limits`; it
+            ;; is attached after the provenance hash above was taken.
+            (let [agent (cond-> agent protocol (assoc ::protocol protocol))]
+              (if prepare-world!
+                (prepared-execution-spin control-room work-room agent task trigger
+                                         id chat-id parent-run resources supervisor
+                                         allocation-state limits outcome-promise
+                                         prepare-world!)
+                (execution-spin control-room work-room agent task trigger id chat-id
+                                supervisor limits outcome-promise)))
             execution-terminal (promise)
             execution (sp/spin (sp/await completion))
             owner-fork-id (:fork-id (ec/current-execution-context))

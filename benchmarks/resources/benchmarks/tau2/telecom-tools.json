@@ -1,0 +1,1093 @@
+{
+ "initial_db_hash": "304cf5ef059852e117ea801ab9a5efc24c9713ec887679dc2e30acceb4b6742d",
+ "initial_user_db_hash": "e1f3a8637388808221228ff3f87294444e6b64caf721f5eb243a85d0a9380b28",
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "get_customer_by_phone",
+    "description": "Finds a customer by their primary contact or line phone number.",
+    "parameters": {
+     "properties": {
+      "phone_number": {
+       "description": "The phone number to search for.",
+       "title": "Phone Number",
+       "type": "string"
+      }
+     },
+     "required": [
+      "phone_number"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "get_customer_by_id",
+    "description": "Retrieves a customer directly by their unique ID.",
+    "parameters": {
+     "properties": {
+      "customer_id": {
+       "description": "The unique identifier of the customer.",
+       "title": "Customer Id",
+       "type": "string"
+      }
+     },
+     "required": [
+      "customer_id"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "get_customer_by_name",
+    "description": "Searches for customers by name and DOB. May return multiple matches if names are similar,\n\nDOB helps disambiguate.",
+    "parameters": {
+     "properties": {
+      "full_name": {
+       "description": "The full name of the customer.",
+       "title": "Full Name",
+       "type": "string"
+      },
+      "dob": {
+       "description": "Date of birth for verification, in the format YYYY-MM-DD.",
+       "title": "Dob",
+       "type": "string"
+      }
+     },
+     "required": [
+      "full_name",
+      "dob"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "get_details_by_id",
+    "description": "Retrieves the details for a given ID.\n\nThe ID must be a valid ID for a Customer, Line, Device, Bill, or Plan.",
+    "parameters": {
+     "properties": {
+      "id": {
+       "description": "The ID of the object to retrieve.",
+       "title": "Id",
+       "type": "string"
+      }
+     },
+     "required": [
+      "id"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "suspend_line",
+    "description": "Suspends a specific line (max 6 months).\n\nChecks: Line status must be Active.\nLogic: Sets line status to Suspended, records suspension_start_date.",
+    "parameters": {
+     "properties": {
+      "customer_id": {
+       "description": "ID of the customer who owns the line.",
+       "title": "Customer Id",
+       "type": "string"
+      },
+      "line_id": {
+       "description": "ID of the line to suspend.",
+       "title": "Line Id",
+       "type": "string"
+      },
+      "reason": {
+       "description": "Reason for suspension.",
+       "title": "Reason",
+       "type": "string"
+      }
+     },
+     "required": [
+      "customer_id",
+      "line_id",
+      "reason"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "resume_line",
+    "description": "Resumes a suspended line.\n\nChecks: Line status must be Suspended or Pending Activation.\nLogic: Sets line status to Active, clears suspension_start_date.",
+    "parameters": {
+     "properties": {
+      "customer_id": {
+       "description": "ID of the customer who owns the line.",
+       "title": "Customer Id",
+       "type": "string"
+      },
+      "line_id": {
+       "description": "ID of the line to resume.",
+       "title": "Line Id",
+       "type": "string"
+      }
+     },
+     "required": [
+      "customer_id",
+      "line_id"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "get_bills_for_customer",
+    "description": "Retrieves a list of the customer's bills, most recent first.",
+    "parameters": {
+     "properties": {
+      "customer_id": {
+       "description": "ID of the customer.",
+       "title": "Customer Id",
+       "type": "string"
+      },
+      "limit": {
+       "default": 12,
+       "description": "Maximum number of bills to return.",
+       "title": "Limit",
+       "type": "integer"
+      }
+     },
+     "required": [
+      "customer_id"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "send_payment_request",
+    "description": "Sends a payment request to the customer for a specific bill.\n\nChecks:\n    - Customer exists\n    - Bill exists and belongs to the customer\n    - No other bills are already awaiting payment for this customer\nLogic: Sets bill status to AWAITING_PAYMENT and notifies customer.\nWarning: This method does not check if the bill is already PAID.\nAlways check the bill status before calling this method.",
+    "parameters": {
+     "properties": {
+      "customer_id": {
+       "description": "ID of the customer who owns the bill.",
+       "title": "Customer Id",
+       "type": "string"
+      },
+      "bill_id": {
+       "description": "ID of the bill to send payment request for.",
+       "title": "Bill Id",
+       "type": "string"
+      }
+     },
+     "required": [
+      "customer_id",
+      "bill_id"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "get_data_usage",
+    "description": "Retrieves current billing cycle data usage for a line, including data\n\nrefueling amount, data limit, and cycle end date.",
+    "parameters": {
+     "properties": {
+      "customer_id": {
+       "description": "ID of the customer who owns the line.",
+       "title": "Customer Id",
+       "type": "string"
+      },
+      "line_id": {
+       "description": "ID of the line to check usage for.",
+       "title": "Line Id",
+       "type": "string"
+      }
+     },
+     "required": [
+      "customer_id",
+      "line_id"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "enable_roaming",
+    "description": "Enables international roaming on a line.",
+    "parameters": {
+     "properties": {
+      "customer_id": {
+       "description": "ID of the customer who owns the line.",
+       "title": "Customer Id",
+       "type": "string"
+      },
+      "line_id": {
+       "description": "ID of the line to enable roaming for.",
+       "title": "Line Id",
+       "type": "string"
+      }
+     },
+     "required": [
+      "customer_id",
+      "line_id"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "disable_roaming",
+    "description": "Disables international roaming on a line.",
+    "parameters": {
+     "properties": {
+      "customer_id": {
+       "description": "ID of the customer who owns the line.",
+       "title": "Customer Id",
+       "type": "string"
+      },
+      "line_id": {
+       "description": "ID of the line to disable roaming for.",
+       "title": "Line Id",
+       "type": "string"
+      }
+     },
+     "required": [
+      "customer_id",
+      "line_id"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "transfer_to_human_agents",
+    "description": "Transfer the user to a human agent, with a summary of the user's issue.\n\nOnly transfer if\n -  the user explicitly asks for a human agent\n -  given the policy and the available tools, you cannot solve the user's issue.",
+    "parameters": {
+     "properties": {
+      "summary": {
+       "description": "A summary of the user's issue.",
+       "title": "Summary",
+       "type": "string"
+      }
+     },
+     "required": [
+      "summary"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "refuel_data",
+    "description": "Refuels data for a specific line, adding to the customer's bill.\n\nChecks: Line status must be Active, Customer owns the line.\nLogic: Adds data to the line and charges customer based on the plan's refueling rate.",
+    "parameters": {
+     "properties": {
+      "customer_id": {
+       "description": "ID of the customer who owns the line.",
+       "title": "Customer Id",
+       "type": "string"
+      },
+      "line_id": {
+       "description": "ID of the line to refuel data for.",
+       "title": "Line Id",
+       "type": "string"
+      },
+      "gb_amount": {
+       "description": "Amount of data to add in gigabytes.",
+       "title": "Gb Amount",
+       "type": "number"
+      }
+     },
+     "required": [
+      "customer_id",
+      "line_id",
+      "gb_amount"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  }
+ ],
+ "user_tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "check_status_bar",
+    "description": "Shows what icons are currently visible in your phone's status bar (the area at the top of the screen). Displays network signal strength, mobile data status (enabled, disabled, data saver), Wi-Fi status, and battery level.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "check_network_status",
+    "description": "Checks your phone's connection status to cellular networks and Wi-Fi. Shows airplane mode status, signal strength, network type, whether mobile data is enabled, and whether data roaming is enabled.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "check_network_mode_preference",
+    "description": "Shows the current network mode preference.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "set_network_mode_preference",
+    "description": "Changes the type of cellular network your phone prefers to connect to (e.g., 5G, LTE/4G, 3G). Higher-speed networks (LTE/5G) provide faster data but may use more battery.",
+    "parameters": {
+     "$defs": {
+      "NetworkModePreference": {
+       "enum": [
+        "4g_5g_preferred",
+        "4g_only",
+        "3g_only",
+        "2g_only"
+       ],
+       "title": "NetworkModePreference",
+       "type": "string"
+      }
+     },
+     "properties": {
+      "mode": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/NetworkModePreference"
+        },
+        {
+         "type": "string"
+        }
+       ],
+       "title": "Mode"
+      }
+     },
+     "required": [
+      "mode"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "run_speed_test",
+    "description": "Measures your current internet connection speed (download speed). Provides information about connection quality and what activities it can support.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "toggle_airplane_mode",
+    "description": "Toggles Airplane Mode ON or OFF. When ON, it disconnects all wireless communications including cellular, Wi-Fi, and Bluetooth.\n\nReturns the new state of airplane_mode.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "check_sim_status",
+    "description": "Checks if your SIM card is working correctly and displays its current status. Shows if the SIM is active, missing, or locked with a PIN or PUK code.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "reseat_sim_card",
+    "description": "Simulates removing and reinserting your SIM card. This can help resolve recognition issues.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "toggle_data",
+    "description": "Toggles your phone's mobile data connection ON or OFF. Controls whether your phone can use cellular data for internet access when Wi-Fi is unavailable.\n\nReturns the new data connection status.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "toggle_roaming",
+    "description": "Toggles Data Roaming ON or OFF. When ON, your phone can use data networks in areas outside your carrier's coverage.\n\nReturns the new data roaming status.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "check_data_restriction_status",
+    "description": "Checks if your phone has any data-limiting features active. Shows if Data Saver mode is on.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "toggle_data_saver_mode",
+    "description": "Toggles Data Saver mode ON or OFF. When ON, it reduces data usage, which may affect data speed.\n\nReturns the new data saver mode status.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "check_apn_settings",
+    "description": "Checks the technical APN settings your phone uses to connect to your carrier's mobile data network. Shows current APN name and MMSC URL for picture messaging.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "set_apn_settings",
+    "description": "Sets the APN settings for the phone.",
+    "parameters": {
+     "$defs": {
+      "APNNames": {
+       "enum": [
+        "internet",
+        "broken"
+       ],
+       "title": "APNNames",
+       "type": "string"
+      },
+      "APNSettings": {
+       "additionalProperties": false,
+       "description": "Represents the configuration for a single Access Point Name (APN).",
+       "properties": {
+        "apn_name": {
+         "$ref": "#/$defs/APNNames",
+         "default": "internet",
+         "description": "The name identifier for the APN connection."
+        },
+        "reset_at_reboot": {
+         "default": false,
+         "description": "Whether the APN settings will be reset at the next reboot.",
+         "title": "Reset At Reboot",
+         "type": "boolean"
+        },
+        "mms_apn": {
+         "anyOf": [
+          {
+           "type": "string"
+          },
+          {
+           "type": "null"
+          }
+         ],
+         "default": "mms",
+         "description": "Specific APN name used for MMS traffic, if different from general data.",
+         "title": "Mms Apn"
+        },
+        "mmsc_url": {
+         "anyOf": [
+          {
+           "type": "string"
+          },
+          {
+           "type": "null"
+          }
+         ],
+         "default": "http://mms.carrier.com/mms/wapenc",
+         "description": "The URL of the Multimedia Messaging Service Center (MMSC). Crucial for MMS.",
+         "title": "Mmsc Url"
+        },
+        "mms_proxy": {
+         "anyOf": [
+          {
+           "type": "string"
+          },
+          {
+           "type": "null"
+          }
+         ],
+         "default": null,
+         "description": "The proxy server address required for MMS traffic on some networks.",
+         "title": "Mms Proxy"
+        },
+        "mms_port": {
+         "anyOf": [
+          {
+           "type": "integer"
+          },
+          {
+           "type": "null"
+          }
+         ],
+         "default": null,
+         "description": "The proxy server port required for MMS traffic on some networks.",
+         "title": "Mms Port"
+        }
+       },
+       "title": "APNSettings",
+       "type": "object"
+      }
+     },
+     "properties": {
+      "apn_settings": {
+       "anyOf": [
+        {
+         "$ref": "#/$defs/APNSettings"
+        },
+        {
+         "additionalProperties": true,
+         "type": "object"
+        }
+       ],
+       "title": "Apn Settings"
+      }
+     },
+     "required": [
+      "apn_settings"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "reset_apn_settings",
+    "description": "Resets your APN settings to the default settings.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "check_wifi_status",
+    "description": "Checks your Wi-Fi connection status. Shows if Wi-Fi is turned on, which network you're connected to (if any), and the signal strength.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "toggle_wifi",
+    "description": "Toggles your phone's Wi-Fi radio ON or OFF. Controls whether your phone can discover and connect to wireless networks for internet access.\n\nReturns the new Wi-Fi status.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "check_wifi_calling_status",
+    "description": "Checks if Wi-Fi Calling is enabled on your device. This feature allows you to make and receive calls over a Wi-Fi network instead of using the cellular network.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "toggle_wifi_calling",
+    "description": "Toggles Wi-Fi Calling ON or OFF. This feature allows you to make and receive calls over Wi-Fi instead of the cellular network, which can help in areas with weak cellular signal.\n\nReturns the new Wi-Fi Calling status.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "check_vpn_status",
+    "description": "Checks if you're using a VPN (Virtual Private Network) connection. Shows if a VPN is active, connected, and displays any available connection details.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "connect_vpn",
+    "description": "Connects to your VPN (Virtual Private Network).",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "disconnect_vpn",
+    "description": "Disconnects any active VPN (Virtual Private Network) connection. Stops routing your internet traffic through a VPN server, which might affect connection speed or access to content.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "check_installed_apps",
+    "description": "Returns the name of all installed apps on the phone.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "check_app_status",
+    "description": "Checks detailed information about a specific app. Shows its permissions and background data usage settings.",
+    "parameters": {
+     "properties": {
+      "app_name": {
+       "title": "App Name",
+       "type": "string"
+      }
+     },
+     "required": [
+      "app_name"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "check_app_permissions",
+    "description": "Checks what permissions a specific app currently has. Shows if the app has access to features like storage, camera, location, etc.",
+    "parameters": {
+     "properties": {
+      "app_name": {
+       "title": "App Name",
+       "type": "string"
+      }
+     },
+     "required": [
+      "app_name"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "grant_app_permission",
+    "description": "Gives a specific permission to an app (like access to storage, camera, or location). Required for some app functions to work properly.",
+    "parameters": {
+     "properties": {
+      "app_name": {
+       "description": "The name of the app to grant the permission to.",
+       "title": "App Name",
+       "type": "string"
+      },
+      "permission": {
+       "description": "The permission to grant, should be lowercase.",
+       "title": "Permission",
+       "type": "string"
+      }
+     },
+     "required": [
+      "app_name",
+      "permission"
+     ],
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "can_send_mms",
+    "description": "Checks if the default messaging app can send MMS messages.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "reboot_device",
+    "description": "Restarts your phone completely. This can help resolve many temporary software glitches by refreshing all running services and connections.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "check_payment_request",
+    "description": "Checks if the agent has sent you a payment request.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "make_payment",
+    "description": "Makes a payment for the bill that the agent has sent you.",
+    "parameters": {
+     "properties": {},
+     "title": "parameters",
+     "type": "object"
+    }
+   }
+  }
+ ],
+ "mutating": {
+  "get_customer_by_phone": false,
+  "get_customer_by_id": false,
+  "get_customer_by_name": false,
+  "get_details_by_id": false,
+  "suspend_line": true,
+  "resume_line": true,
+  "get_bills_for_customer": false,
+  "send_payment_request": true,
+  "get_data_usage": false,
+  "enable_roaming": true,
+  "disable_roaming": true,
+  "transfer_to_human_agents": false,
+  "refuel_data": true,
+  "check_status_bar": false,
+  "check_network_status": false,
+  "check_network_mode_preference": false,
+  "set_network_mode_preference": true,
+  "run_speed_test": false,
+  "toggle_airplane_mode": true,
+  "check_sim_status": false,
+  "reseat_sim_card": true,
+  "toggle_data": true,
+  "toggle_roaming": true,
+  "check_data_restriction_status": false,
+  "toggle_data_saver_mode": true,
+  "check_apn_settings": false,
+  "set_apn_settings": true,
+  "reset_apn_settings": true,
+  "check_wifi_status": false,
+  "toggle_wifi": true,
+  "check_wifi_calling_status": false,
+  "toggle_wifi_calling": true,
+  "check_vpn_status": false,
+  "connect_vpn": true,
+  "disconnect_vpn": true,
+  "check_installed_apps": false,
+  "check_app_status": false,
+  "check_app_permissions": false,
+  "grant_app_permission": true,
+  "can_send_mms": false,
+  "reboot_device": true,
+  "check_payment_request": false,
+  "make_payment": true
+ },
+ "agent_tool_params": {
+  "get_customer_by_phone": [
+   [
+    "phone_number",
+    true
+   ]
+  ],
+  "get_customer_by_id": [
+   [
+    "customer_id",
+    true
+   ]
+  ],
+  "get_customer_by_name": [
+   [
+    "full_name",
+    true
+   ],
+   [
+    "dob",
+    true
+   ]
+  ],
+  "get_details_by_id": [
+   [
+    "id",
+    true
+   ]
+  ],
+  "suspend_line": [
+   [
+    "customer_id",
+    true
+   ],
+   [
+    "line_id",
+    true
+   ],
+   [
+    "reason",
+    true
+   ]
+  ],
+  "resume_line": [
+   [
+    "customer_id",
+    true
+   ],
+   [
+    "line_id",
+    true
+   ]
+  ],
+  "get_bills_for_customer": [
+   [
+    "customer_id",
+    true
+   ],
+   [
+    "limit",
+    false
+   ]
+  ],
+  "send_payment_request": [
+   [
+    "customer_id",
+    true
+   ],
+   [
+    "bill_id",
+    true
+   ]
+  ],
+  "get_data_usage": [
+   [
+    "customer_id",
+    true
+   ],
+   [
+    "line_id",
+    true
+   ]
+  ],
+  "enable_roaming": [
+   [
+    "customer_id",
+    true
+   ],
+   [
+    "line_id",
+    true
+   ]
+  ],
+  "disable_roaming": [
+   [
+    "customer_id",
+    true
+   ],
+   [
+    "line_id",
+    true
+   ]
+  ],
+  "transfer_to_human_agents": [
+   [
+    "summary",
+    true
+   ]
+  ],
+  "refuel_data": [
+   [
+    "customer_id",
+    true
+   ],
+   [
+    "line_id",
+    true
+   ],
+   [
+    "gb_amount",
+    true
+   ]
+  ]
+ },
+ "user_tool_params": {
+  "check_status_bar": [],
+  "check_network_status": [],
+  "check_network_mode_preference": [],
+  "set_network_mode_preference": [
+   [
+    "mode",
+    true
+   ]
+  ],
+  "run_speed_test": [],
+  "toggle_airplane_mode": [],
+  "check_sim_status": [],
+  "reseat_sim_card": [],
+  "toggle_data": [],
+  "toggle_roaming": [],
+  "check_data_restriction_status": [],
+  "toggle_data_saver_mode": [],
+  "check_apn_settings": [],
+  "set_apn_settings": [
+   [
+    "apn_settings",
+    true
+   ]
+  ],
+  "reset_apn_settings": [],
+  "check_wifi_status": [],
+  "toggle_wifi": [],
+  "check_wifi_calling_status": [],
+  "toggle_wifi_calling": [],
+  "check_vpn_status": [],
+  "connect_vpn": [],
+  "disconnect_vpn": [],
+  "check_installed_apps": [],
+  "check_app_status": [
+   [
+    "app_name",
+    true
+   ]
+  ],
+  "check_app_permissions": [
+   [
+    "app_name",
+    true
+   ]
+  ],
+  "grant_app_permission": [
+   [
+    "app_name",
+    true
+   ],
+   [
+    "permission",
+    true
+   ]
+  ],
+  "can_send_mms": [],
+  "reboot_device": [],
+  "check_payment_request": [],
+  "make_payment": []
+ },
+ "generated_by": "benchmarks/dev/tau2/telecom/oracle_telecom.py schema"
+}

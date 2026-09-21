@@ -1,0 +1,246 @@
+"""Reference oracle for Dvergr's Clojure transcription of tau2-bench domains.
+
+This is NOT part of Dvergr's runtime. It runs the upstream Python environment
+once per port version so the Clojure port can be checked for equivalence:
+identical tool outputs, error flags, and final database hashes for the same
+call sequences.
+
+Run from a tau2-bench checkout:
+
+    uv run python /path/to/dvergr/benchmarks/dev/tau2/oracle.py \
+        retail replay input.json output.json
+    uv run python .../oracle.py retail schema output.json
+
+`input.json` is a list of {"id": str, "task": optional task id,
+"inject": optional [[table, id, record], ...], "calls": [{"name": str,
+"arguments": {...}, "requestor": "assistant"|"user"}]}. Every sequence
+starts from a fresh database (plus the task's initialization data).
+"""
+
+import inspect
+import json
+import sys
+
+from tau2.data_model.message import ToolCall
+import importlib
+
+
+BANKING_VARIANT = "bm25"
+
+
+def domain_module(domain):
+    # Import the domain directly: tau2.registry also imports optional voice
+    # providers that the text environments do not need.
+    return importlib.import_module(f"tau2.domains.{domain}.environment")
+
+
+def domain_tasks(domain):
+    return {t.id: t for t in domain_module(domain).get_tasks(None)}
+
+
+def fresh_env(domain, task=None):
+    """Fresh environment; for banking_knowledge with the `bm25` retrieval
+    variant, the task's read-log allowlist, and its initialization data."""
+    module = domain_module(domain)
+    if domain != "banking_knowledge":
+        return module.get_environment()
+    from tau2.runner.build import _derive_read_log_allowlist
+
+    env = module.get_environment(
+        retrieval_variant=BANKING_VARIANT,
+        task=task,
+        read_log_allowlist=_derive_read_log_allowlist(task) if task else None,
+    )
+    if task is not None and task.initial_state is not None:
+        env.set_state(
+            initialization_data=task.initial_state.initialization_data,
+            initialization_actions=task.initial_state.initialization_actions,
+            message_history=[],
+        )
+    return env
+
+
+def entity_snapshot(db):
+    """Top-level collections as plain JSON data, for localized diffs."""
+    return db.model_dump()
+
+
+def changed_entities(before, after):
+    changed = {}
+    for coll, entries in after.items():
+        if not isinstance(entries, dict):
+            continue
+        for key, value in entries.items():
+            if before.get(coll, {}).get(key) != value:
+                changed.setdefault(coll, {})[key] = value
+    return changed
+
+
+def replay(domain, sequences):
+    tasks = domain_tasks(domain) if domain == "banking_knowledge" else {}
+    results = []
+    for seq in sequences:
+        env = fresh_env(domain, tasks.get(seq.get("task")))
+        # Optional fixture records reaching branches no shipped data reaches:
+        # "inject": [[table, record_id, record], ...] (banking tables).
+        for table, record_id, record in seq.get("inject", []):
+            getattr(env.tools.db, table).data[record_id] = record
+        before = entity_snapshot(env.tools.db)
+        outputs = []
+        for i, call in enumerate(seq["calls"]):
+            msg = env.get_response(
+                ToolCall(
+                    id=f"{seq['id']}-{i}",
+                    name=call["name"],
+                    arguments=call["arguments"],
+                    requestor=call.get("requestor", "assistant"),
+                )
+            )
+            outputs.append({"content": msg.content, "error": msg.error})
+        after = entity_snapshot(env.tools.db)
+        results.append(
+            {
+                "id": seq["id"],
+                "outputs": outputs,
+                "db_hash": env.get_db_hash(),
+                "changed": changed_entities(before, after),
+            }
+        )
+    return results
+
+
+def schema(domain):
+    env = fresh_env(domain)
+    out = {
+        "policy": env.policy,
+        "initial_db_hash": env.get_db_hash(),
+        "tools": [t.openai_schema for t in env.get_tools()],
+    }
+    if env.user_tools is not None:
+        from tau2.domains.banking_knowledge.tools import (
+            parse_discoverable_tool_docstring,
+        )
+
+        out["user_tools"] = [t.openai_schema for t in env.get_user_tools()]
+        out["mutating"] = {
+            name: env._is_mutating_tool(name)
+            for name in list(env.tools.tools) + list(env.user_tools.tools)
+        }
+        out["agent_discoverable"] = {
+            name: parse_discoverable_tool_docstring(fn)
+            for name, fn in env.tools.get_discoverable_tools().items()
+        }
+        out["user_discoverable"] = {
+            name: parse_discoverable_tool_docstring(fn)
+            for name, fn in env.user_tools.get_discoverable_tools().items()
+        }
+        out["agent_tool_params"] = {
+            name: [[p.name, p.default is inspect.Parameter.empty]
+                   for p in inspect.signature(fn).parameters.values()]
+            for name, fn in env.tools.tools.items()
+        }
+        # glob() order of the documents directory: filesystem-dependent
+        # upstream; pinned here because BM25 breaks score ties by it.
+        out["kb_doc_order"] = list(domain_module(domain).get_knowledge_base().documents)
+        out["user_tool_params"] = {
+            name: [[p.name, p.default is inspect.Parameter.empty]
+                   for p in inspect.signature(fn).parameters.values()]
+            for name, fn in env.user_tools.tools.items()
+        }
+    return out
+
+
+def prompts(domain):
+    """Exact agent/user-simulator system prompts for every task."""
+    from tau2.agent.llm_agent import LLMAgent
+    from tau2.orchestrator.orchestrator import DEFAULT_FIRST_AGENT_MESSAGE
+    from tau2.user.user_simulator import UserSimulator
+
+    module = domain_module(domain)
+    env = fresh_env(domain)
+    agent = LLMAgent(tools=env.get_tools(), domain_policy=env.policy, llm="none")
+    users = {}
+    user_tools = {}
+    for task in module.get_tasks(None):
+        tools = None
+        if env.user_tools is not None:
+            tools = env.get_user_tools(include=task.user_tools) or None
+            user_tools[task.id] = [t.name for t in tools or []]
+        user = UserSimulator(llm="none", instructions=task.user_scenario, tools=tools)
+        users[task.id] = user.system_prompt
+    return {
+        "agent_system": agent.system_prompt,
+        "first_agent_message": DEFAULT_FIRST_AGENT_MESSAGE.content,
+        "user_system": users,
+        "user_tools": user_tools,
+    }
+
+
+def judge_prompts(cases):
+    """Capture the exact NL-assertion judge request through upstream code by
+    replacing its `generate` call. `cases`: [{"id", "messages", "assertions"}]
+    with tau2-shaped messages (role, content, tool_calls, id)."""
+    import tau2.evaluator.evaluator_nl_assertions as nl
+    from tau2.data_model.message import (
+        AssistantMessage,
+        ToolMessage,
+        UserMessage,
+    )
+
+    captured = {}
+
+    class Fake:
+        content = '{"results": []}'
+
+    def fake_generate(model, messages, **kwargs):
+        captured["system"] = messages[0].content
+        captured["user"] = messages[1].content
+        return Fake()
+
+    nl.generate = fake_generate
+
+    def to_message(m):
+        if m["role"] == "assistant":
+            calls = [
+                ToolCall(id=c["id"], name=c["name"], arguments=c["arguments"])
+                for c in (m.get("tool_calls") or [])
+            ] or None
+            return AssistantMessage(role="assistant", content=m.get("content"), tool_calls=calls)
+        if m["role"] == "user":
+            return UserMessage(role="user", content=m.get("content"))
+        return ToolMessage(id=m["id"], role="tool", content=m.get("content"), requestor="assistant")
+
+    out = {}
+    for case in cases:
+        nl.NLAssertionsEvaluator.evaluate_nl_assertions(
+            [to_message(m) for m in case["messages"]], case["assertions"]
+        )
+        out[case["id"]] = dict(captured)
+    return out
+
+
+def main():
+    domain, mode = sys.argv[1], sys.argv[2]
+    if mode == "replay":
+        with open(sys.argv[3]) as fp:
+            sequences = json.load(fp)
+        out = replay(domain, sequences)
+        target = sys.argv[4]
+    elif mode == "judge-prompts":
+        with open(sys.argv[3]) as fp:
+            out = judge_prompts(json.load(fp))
+        target = sys.argv[4]
+    elif mode == "prompts":
+        out = prompts(domain)
+        target = sys.argv[3]
+    elif mode == "schema":
+        out = schema(domain)
+        target = sys.argv[3]
+    else:
+        raise SystemExit(f"unknown mode {mode}")
+    with open(target, "w") as fp:
+        json.dump(out, fp, indent=1)
+
+
+if __name__ == "__main__":
+    main()

@@ -30,7 +30,8 @@
                          (throw (ex-info
                                  "LLM provider effects exceed this sandbox's delegation ceiling"
                                  {:type ::provider-effects-disallowed})))
-                       (apply raw-call-fn args))
+                       ;; The documented 2-arity: default opts.
+                       (apply raw-call-fn (cond-> (vec args) (= 2 (count args)) (conj {}))))
         summarize-fn (fn [content & [opts]]
                        (call-fn "Summarize the key points concisely:"
                                 content (or opts {})))]
@@ -38,8 +39,20 @@
                         (doc/with-docs
                           {'call      call-fn
                            'summarize summarize-fn}
-                          '{call      [([system-prompt content] [system-prompt content opts]) "One-shot call to a CHEAP model — for mechanical language work (extract, classify, rewrite) inside a larger job, not for reasoning you should do yourself. `opts` takes :max-tokens. Available only when this sandbox has provider-effect authority."]
-                            summarize [([content] [content opts]) "Summarize text with the cheap model. `opts` takes :max-tokens, e.g. (llm/summarize page {:max-tokens 300})."]}))))
+                          '{call      [([system-prompt content] [system-prompt content opts]) "One-shot call to a CHEAP model — for mechanical language work (extract, classify, rewrite) inside a larger job, not for reasoning you should do yourself. `opts` takes :max-tokens. Available only when this sandbox has provider-effect authority."
+                                       [:=> [:cat :string [:maybe :string]
+                                             [:? [:map [:max-tokens {:optional true} :int]
+                                                  [:model {:optional true} :string]
+                                                  [:system {:optional true} :string]]]]
+                                        [:or [:map [:text :string] [:usage [:maybe :map]] [:model :string]]
+                                         [:map [:error [:maybe :string]]]]]]
+                            summarize [([content] [content opts]) "Summarize text with the cheap model. `opts` takes :max-tokens, e.g. (llm/summarize page {:max-tokens 300})."
+                                       [:=> [:cat [:maybe :string]
+                                             [:? [:maybe [:map [:max-tokens {:optional true} :int]
+                                                          [:model {:optional true} :string]
+                                                          [:system {:optional true} :string]]]]]
+                                        [:or [:map [:text :string] [:usage [:maybe :map]] [:model :string]]
+                                         [:map [:error [:maybe :string]]]]]]}))))
 
 ;; (RF5: the calendar folded into the per-room scheduler — see `scheduler/*` +
 ;; `dvergr.room/schedules`. The standalone calendar subsystem is gone.)
@@ -93,6 +106,14 @@
                               (keyword? ref) (rreg-lookup* ref)
                               (string? ref)  (or (rreg-lookup* ref)
                                                  (rreg-lookup* (slug->id* ref))))))
+        ;; For ops that act on a Room VALUE the caller may already hold (merge!/
+        ;; discard!/participants): resolve refs (slug/id) like fork! does, and
+        ;; fall back to a live Room value that is no longer registered (e.g. a
+        ;; second, idempotent discard!) rather than rejecting it.
+        room-value      (fn [ref]
+                          (or (resolve-room ref)
+                              (when (and (map? ref) (:ctx ref) (:participants ref))
+                                ref)))
         ;; ---------- API ----------
         create-fn   (fn [{:keys [title slug type telegram-chat-id agents
                                  agent-ids parent-id]
@@ -169,19 +190,32 @@
                                                  :room-id (:id room)
                                                  :error (:error result)})))))
                           {:error (str "Room not found: " ref)})))
+        ;; The sandbox fork is ISOLATED by default (`:isolation :ctx` — its
+        ;; own branched git repo, databases and execution state), which is what
+        ;; the documented fork→work→merge!/discard! loop needs. `fork-room`'s
+        ;; own default (`:none`, shared ctx) is for message-only probes; an
+        ;; agent can still ask for it explicitly — explicit opts win.
         fork-fn     (fn fork-fn
                       ([ref] (fork-fn ref {}))
                       ([ref opts]
                        (binding [rtc/*execution-context* (selected-ctx)]
                          (when-let [room (resolve-room ref)]
                            (binding [rtc/*execution-context* (:ctx room)]
-                             (fork-room* room opts))))))
-        merge-fn    (fn [parent fork]
-                      (binding [rtc/*execution-context* (:ctx fork)]
-                        (merge-room* parent fork)))
-        discard-fn  (fn [fork]
-                      (binding [rtc/*execution-context* (:ctx fork)]
-                        (discard* fork)))
+                             (fork-room* room (merge {:isolation :ctx} opts)))))))
+        merge-fn    (fn [parent-ref fork-ref]
+                      (let [[parent fork] (binding [rtc/*execution-context* (selected-ctx)]
+                                            [(room-value parent-ref) (room-value fork-ref)])]
+                        (cond
+                          (nil? parent) {:error (str "Room not found: " parent-ref)}
+                          (nil? fork)   {:error (str "Room not found: " fork-ref)}
+                          :else (binding [rtc/*execution-context* (:ctx fork)]
+                                  (merge-room* parent fork)))))
+        discard-fn  (fn [fork-ref]
+                      (if-let [fork (binding [rtc/*execution-context* (selected-ctx)]
+                                      (room-value fork-ref))]
+                        (binding [rtc/*execution-context* (:ctx fork)]
+                          (discard* fork))
+                        {:error (str "Room not found: " fork-ref)}))
         ;; Merge review — the per-system diff + tier the agent reads to decide.
         diff-fn     (fn [fork-ref]
                       (binding [rtc/*execution-context* (selected-ctx)]
@@ -192,8 +226,10 @@
         forks-fn    (fn []
                       (binding [rtc/*execution-context* (selected-ctx)]
                         (rreg-list* :where #(some? (:forked-from @(:meta %))))))
-        participants-fn (fn [room]
-                          (when room (vec (keys @(:participants room)))))
+        participants-fn (fn [ref]
+                          (when-let [room (binding [rtc/*execution-context* (selected-ctx)]
+                                            (room-value ref))]
+                            (vec (keys @(:participants room)))))
         root-fn     (fn []
                       (binding [rtc/*execution-context* (selected-ctx)]
                         (or (rreg-lookup* :daemon)
@@ -221,19 +257,19 @@
       '{create!      [([opts]) "Create a persistent room. `opts` takes :slug :title :agents. Rooms are the unit of work: each has its own git repo, knowledge base and schedules."]
         list         [([]) "Every room you can see, as maps."]
         get          [([ref]) "One room by slug or id, or nil."]
-        post!        [([ref content]) "Post a message into a room — how you talk to the people and agents in it. `ref` is a slug or id."]
-        messages     [([ref] [ref opts]) "Recent messages in a room, newest first."]
+        post!        [([ref {:keys [content]}]) "Post a message into a room — how you talk to the people and agents in it. `ref` is a slug or id; the message is a map, e.g. (dvergr.room/post! \"ops\" {:content \"deploy done\"})."]
+        messages     [([ref] [ref opts]) "Recent messages in a room, OLDEST first (chronological; the last element is the newest). `opts` takes :limit (default 100 — the most recent n) and :since (a java.util.Date)."]
         children     [([ref]) "Rooms whose parent is this one."]
         set-parent!  [([child parent]) "Re-parent a room, building the room tree."]
-        join!        [([ref] [ref who]) "Join a room so you receive its messages."]
-        leave!       [([ref] [ref who]) "Stop receiving a room's messages."]
+        join!        [([ref who]) "Join a room so `who` (an agent id) receives its messages."]
+        leave!       [([ref who]) "Stop `who` (an agent id) receiving a room's messages."]
         delete!      [([ref]) "Delete a room. Destructive — prefer discard! on a fork, or archiving."]
-        fork!        [([ref]) "Branch a room into an ISOLATED copy — its own git repo AND database — so you can experiment freely. This is the safe way to attempt a substantial or risky change: fork, work, then merge! or discard!."]
-        merge!       [([parent fork]) "Collapse a fork's work back into its parent, surfacing a git + database diff for review. The other half of the fork→test→merge loop."]
-        discard!     [([fork]) "Throw a fork away, keeping the parent untouched."]
+        fork!        [([ref] [ref opts]) "Branch a room into an ISOLATED copy — its own git repo AND database — so you can experiment freely. This is the safe way to attempt a substantial or risky change: fork, work, then merge! or discard!. Returns the fork Room. `opts` defaults to {:isolation :ctx}; pass {:isolation :none} only for a message-only probe that shares the parent's state."]
+        merge!       [([parent fork]) "Collapse a fork's work (git + databases + messages) back into its parent — the other half of the fork→test→merge loop. `parent` and `fork` are each a slug, id or Room. Read `diff`/`review` first to judge it. Returns the PARENT Room, or {:error …} if either room is not found."]
+        discard!     [([fork]) "Throw a fork away, keeping the parent untouched. `fork` is a slug, id or Room. Returns the fork Room, or {:error …} if it is not found."]
         diff         [([fork]) "What a fork CHANGED versus its parent — code and data — so you can judge it before merging."]
-        review       [([fork]) "An agent review of a fork's changes: the fork tiering + review pipeline, not just a raw diff."]
-        classify     [([fork]) "How mergeable a fork is (its tier) — used to route it as a task vs a proposal."]
-        forks        [([ref]) "Every fork of a room."]
-        participants [([ref]) "Who is in a room — agents and humans."]
+        review       [([fork]) "The merge-review data for a fork, as {:tier :diff :conflicts}: `:tier` is how mergeable it is (:trivial/:reviewable/:conflict, see `classify`), `:diff` the per-system changes (as `diff`), `:conflicts` concurrent edits with the parent. Pure data — no agent is consulted; nil for a fork that is not isolated."]
+        classify     [([diff conflicts]) "How mergeable a fork's diff is (its tier) — used to route it as a task vs a proposal."]
+        forks        [([]) "Every fork of this room."]
+        participants [([ref]) "Who is in a room (a slug, id or Room) — agents and humans, as a vector of ids; nil if the room is not found."]
         root         [([]) "The root room of the tree. Delegate work through dvergr.agent/hire! so it remains Run-backed and Spindel-composable."]})))
