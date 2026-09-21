@@ -6,6 +6,14 @@ replay is a reduction, so resetting and branching an environment costs nothing.
 A transcription counts as the benchmark only after it has been shown
 equivalent to the upstream implementation (see *Equivalence method* below).
 
+The providers are not part of the `dvergr` jar. They live in
+[`benchmarks/`](../benchmarks/README.md) and ship as
+`org.replikativ/dvergr-benchmarks` (in this repo: `clj -A:benchmarks`; the
+suite, `clojure -M:test`, includes them). `dvergr` itself keeps what a
+benchmark is built with, so that a benchmark of your own is one more provider
+in your own repo: `dvergr.agent.evaluation`, `environment`, `experiment`,
+`experiment.runner`, `verifiers`, `roster`.
+
 | Tier | Meaning | Status |
 | --- | --- | --- |
 | 0 | Fully native, in-memory, forkable | tau2-bench retail, airline, banking_knowledge (bm25), telecom; BFCL v4 single-turn (Python) |
@@ -55,7 +63,7 @@ A provider is a namespace (`dvergr.benchmarks.<name>.provider`) with:
    a scripted candidate that replays gold answers, so the whole path is tested
    end to end without a model.
 
-`dvergr.benchmarks.runner/run!` is everything else: the experiment directory
+`dvergr.agent.experiment.runner/run!` is everything else: the experiment directory
 and Room, Claude Code settings for the run, waiting out subscription usage
 windows, resume, the Scorecard. A provider's `experiment/run!` is a call to it.
 
@@ -95,7 +103,7 @@ parameter). Irrelevance tasks expect no call, relevance tasks at least one.
 
 ### Equivalence
 
-`dev/benchmarks/bfcl/oracle.py` runs **upstream's own code**: the checker is
+`benchmarks/dev/bfcl/oracle.py` runs **upstream's own code**: the checker is
 imported with `model_config` stubbed, and the helper functions of `utils.py`
 and `model_handler/utils.py` are executed from their source text, so no
 provider SDK is needed. Verified on 2026-09-21:
@@ -106,7 +114,7 @@ provider SDK is needed. Verified on 2026-09-21:
 | A seeded corpus of 37403 candidate answers (gold answers and mutations of type, value, string format, parameters, function names, call order and count) | every verdict and error type identical |
 | Branches reached | 3100 type errors, 1699 string mismatches, 2472 parallel match failures, nested-type, dict and list-of-dict errors |
 
-`test/dvergr/benchmarks/bfcl_test.clj` pins the digests of the oracle's
+`benchmarks/test/dvergr/benchmarks/bfcl_test.clj` pins the digests of the oracle's
 outputs, so the suite proves this without Python whenever the checkout is
 present. Grading the corpus takes 1.6 s here and 1.5 s upstream.
 
@@ -237,10 +245,10 @@ Upstream: `sierra-research/tau2-bench` at the revision pinned in
 
 | Namespace | Role |
 | --- | --- |
-| `dvergr.benchmarks.tau2.pyjson` | Python `json.dumps`, float `repr`, and `round`, which DB hashing and tool output need to match exactly |
+| `dvergr.benchmarks.pyjson` | Python `json.dumps`, float `repr`, and `round`, which DB hashing and tool output need to match exactly |
 | `dvergr.benchmarks.tau2.retail` | Pure retail tools: `(respond db name args) -> {:db :content :error}` |
 | `dvergr.benchmarks.tau2.core` | Data loading, upstream prompts, the half-duplex episode protocol, grading |
-| `dvergr.benchmarks.tau2.live` | Generate functions over Dvergr providers (Claude Code, Anthropic, OpenAI, …) |
+| `dvergr.benchmarks.live` | Generate functions over Dvergr providers (Claude Code, Anthropic, OpenAI, …) |
 | `dvergr.benchmarks.tau2.runner` | Headless batch runs, resumable EDN episode logs, pass^k |
 | `dvergr.benchmarks.tau2.equivalence` | Differential replay against the Python oracle, plus a seeded fuzz corpus |
 
@@ -579,7 +587,7 @@ and needs no embedding API.
 
 | Namespace | Role |
 | --- | --- |
-| `dvergr.benchmarks.tau2.python` | Python 3.12 semantics that tool outputs expose: `repr`/`str`, `format(x, '.2f')`, `json.loads` with CPython's error messages, `json.dumps(indent=2)`, `str.title`, `float()`/`int()`, and comparisons that raise `TypeError` |
+| `dvergr.benchmarks.python` | Python 3.12 semantics that tool outputs expose: `repr`/`str`, `format(x, '.2f')`, `json.loads` with CPython's error messages, `json.dumps(indent=2)`, `str.title`, `float()`/`int()`, and comparisons that raise `TypeError` |
 | `dvergr.benchmarks.tau2.banking.db` | The TransactionalDB value, `db_query`, deterministic ids, validation helpers, Python keyword binding, and the tool-definition format |
 | `dvergr.benchmarks.tau2.banking` | BM25, the 15 agent tools, the unlock/give/call discoverable-tool mechanics, user tools, and the environment dispatcher |
 | `dvergr.benchmarks.tau2.banking.tools-{a,b,c}` | The 43 agent-discoverable tools (plus the upstream example tool) |
@@ -597,7 +605,7 @@ Faithfulness choices:
 
 - **Knowledge-base document order.** Upstream takes it from `glob()`, which
   depends on the filesystem, and it breaks BM25 score ties. The order is
-  pinned from the oracle in `resources/benchmarks/tau2/banking-tools.json`.
+  pinned from the oracle in `benchmarks/resources/benchmarks/tau2/banking-tools.json`.
 - **Task source.** Tasks load from `tasks/task_*.json`, as upstream's
   `get_tasks` does. The combined `tasks.json` next to them is stale upstream:
   13 tasks differ.
@@ -627,9 +635,9 @@ Verified on 2026-09-18 against upstream `b7ea907`, with 0 mismatches:
 | Agent prompt, 97 user-simulator prompts, per-task user tool sets, tool signatures, mutation flags | identical |
 | Gold agent and user through the dual-control episode protocol | 97/97 reward 1.0 |
 
-`test/dvergr/benchmarks/tau2_banking_test.clj` pins all of this as digests.
+`benchmarks/test/dvergr/benchmarks/tau2_banking_test.clj` pins all of this as digests.
 The directly-called corpus is vendored as `banking_corpus.json`, and its
-generators live in `dev/benchmarks/tau2/banking/`.
+generators live in `benchmarks/dev/tau2/banking/`.
 
 ## tau2-bench (airline)
 
@@ -644,8 +652,8 @@ tools. Every task's `reward_basis` is DB plus COMMUNICATE.
 | `dvergr.benchmarks.tau2.airline.corpus` | The seeded differential corpus: random calls plus hand-shaped scenarios |
 
 Tool schemas are vendored from the oracle as
-`resources/benchmarks/tau2/airline-tools.json`. The oracle is
-`dev/benchmarks/tau2/airline/oracle_airline.py`. It drives the real upstream
+`benchmarks/resources/benchmarks/tau2/airline-tools.json`. The oracle is
+`benchmarks/dev/tau2/airline/oracle_airline.py`. It drives the real upstream
 `Environment.get_response` and can record a DB hash after every call.
 
 The port reproduces these upstream quirks deliberately:
@@ -683,7 +691,7 @@ mismatches in tool content, error flags, and final DB hashes:
 | Agent prompt, 50 user-simulator prompts, tool schemas, mutation flags | identical |
 | Gold agent through the episode protocol | 50/50 reward 1.0 |
 
-`test/dvergr/benchmarks/tau2_airline_test.clj` pins all of this as digests
+`benchmarks/test/dvergr/benchmarks/tau2_airline_test.clj` pins all of this as digests
 in `airline_oracle_digests.edn`. The corpus is regenerated from its seed, so
 no corpus file is vendored. Environment replay of the pinned corpus takes
 about 8.5 minutes in Python and about 60 s in Clojure. The Clojure time is
@@ -824,13 +832,13 @@ pydantic 2.13.5). Every check below has 0 mismatches.
 
 The replays compare tool content, error flags, both database hashes,
 initialization-call results and assertion results. Digests are pinned in
-`test/dvergr/benchmarks/tau2/telecom_oracle_digests.edn`, and
-`test/dvergr/benchmarks/tau2_telecom_test.clj` rechecks all of it without
+`benchmarks/test/dvergr/benchmarks/tau2/telecom_oracle_digests.edn`, and
+`benchmarks/test/dvergr/benchmarks/tau2_telecom_test.clj` rechecks all of it without
 Python (6 tests, 567 assertions, about 80 s including JVM start). The corpora
 are regenerated from their seeds by `telecom.corpus`, and the tool schemas are
-vendored in `resources/benchmarks/tau2/telecom-tools.json`.
+vendored in `benchmarks/resources/benchmarks/tau2/telecom-tools.json`.
 
-Oracle: `dev/benchmarks/tau2/telecom/oracle_telecom.py`
+Oracle: `benchmarks/dev/tau2/telecom/oracle_telecom.py`
 (`replay | schema | prompts | gold-eval | grade`), run in the checkout with
 `uv run --no-sync python …`.
 
@@ -845,12 +853,12 @@ Oracle: `dev/benchmarks/tau2/telecom/oracle_telecom.py`
 
 ## Equivalence method
 
-`dev/benchmarks/tau2/oracle.py` is the only Python involved, and it runs
+`benchmarks/dev/tau2/oracle.py` is the only Python involved, and it runs
 against the upstream checkout (`uv run python …`), never inside Dvergr. It
 exports:
 
 - `replay`: tool content, error flag, and final DB hash for any call sequence;
-- `schema`: tool schemas (vendored as `resources/benchmarks/tau2/retail-tools.json`);
+- `schema`: tool schemas (vendored as `benchmarks/resources/benchmarks/tau2/retail-tools.json`);
 - `prompts`: exact agent and user-simulator system prompts for every task;
 - `judge-prompts`: the exact NL-judge request, captured by stubbing upstream's
   `generate`.
@@ -871,7 +879,7 @@ state. For example, `modify_pending_order_items` gives every modified item the
 last requested variant's price and options, and a failing tool call can leave
 the partial writes that happened before the failure.
 
-`test/dvergr/benchmarks/tau2_test.clj` pins the oracle results as per-sequence
+`benchmarks/test/dvergr/benchmarks/tau2_test.clj` pins the oracle results as per-sequence
 digests (`retail_oracle_digests.edn`), so CI rechecks equivalence without
 Python whenever the checkout is present.
 

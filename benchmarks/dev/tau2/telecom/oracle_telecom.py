@@ -7,7 +7,7 @@ database hashes (agent DB and user/device DB) and env-assertion results.
 
 Run from the pinned tau2-bench checkout:
 
-    uv run --no-sync python /path/to/dvergr/dev/benchmarks/tau2/telecom/oracle_telecom.py \
+    uv run --no-sync python /path/to/dvergr/benchmarks/dev/tau2/telecom/oracle_telecom.py \
         replay input.json output.json
     ... schema output.json
     ... prompts output.json

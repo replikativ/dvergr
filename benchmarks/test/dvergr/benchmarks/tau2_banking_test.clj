@@ -1,7 +1,7 @@
 (ns dvergr.benchmarks.tau2-banking-test
   "Provider-free contracts for the tau2 `banking_knowledge` transcription
    (bm25 retrieval). Expected values are digests of upstream Python replays
-   (`dev/benchmarks/tau2/oracle.py`); tests need the pinned `../tau2-bench`
+   (`benchmarks/dev/tau2/oracle.py`); tests need the pinned `../tau2-bench`
    checkout and are skipped with a note when it is absent."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
@@ -11,7 +11,7 @@
             [dvergr.benchmarks.tau2.banking.db :as db]
             [dvergr.benchmarks.tau2.core :as t2]
             [dvergr.benchmarks.tau2.equivalence :as eqv]
-            [dvergr.benchmarks.tau2.pyjson :as pj]))
+            [dvergr.benchmarks.pyjson :as pj]))
 
 (def ^:private checkout?
   (.exists (io/file t2/default-root "data/tau2/domains/banking_knowledge/db.json")))

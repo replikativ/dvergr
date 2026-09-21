@@ -7,7 +7,7 @@ call sequences.
 
 Run from a tau2-bench checkout:
 
-    uv run python /path/to/dvergr/dev/benchmarks/tau2/oracle.py \
+    uv run python /path/to/dvergr/benchmarks/dev/tau2/oracle.py \
         retail replay input.json output.json
     uv run python .../oracle.py retail schema output.json
 

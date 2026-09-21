@@ -2,7 +2,7 @@
  {:repository "https://github.com/sierra-research/tau2-bench",
   :revision "b7ea9074c1cba482b30687fecdb5c8425fd6f619",
   :version "1.0.1"},
- :generated-by "dev/benchmarks/tau2/airline/oracle_airline.py",
+ :generated-by "benchmarks/dev/tau2/airline/oracle_airline.py",
  :pydantic "2.13.5",
  :initial-db-hash
  "124e39a664b56402bcd09cb8a6a9cece6acb8462337c969799d5658e3250f263",

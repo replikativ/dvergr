@@ -20,7 +20,7 @@
 
    Upstream: `src/tau2/domains/telecom/user_tools.py`, `user_data_model.py`."
   (:require [clojure.string :as str]
-            [dvergr.benchmarks.tau2.python :as py]
+            [dvergr.benchmarks.python :as py]
             [dvergr.benchmarks.tau2.telecom.agent :as agent :refer [raise-w]]
             [dvergr.benchmarks.tau2.telecom.db :as tdb]))
 

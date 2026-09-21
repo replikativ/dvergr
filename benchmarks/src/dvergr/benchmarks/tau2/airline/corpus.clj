@@ -9,7 +9,7 @@
    variants (wrong JSON types, missing or extra fields, mixed lists, unknown
    ids, repeated payment ids) so pydantic validation text, Python TypeErrors,
    and partial effects are compared too. The corpus is a pure function of the
-   base database and the seed; `dev/benchmarks/tau2/airline/oracle_airline.py`
+   base database and the seed; `benchmarks/dev/tau2/airline/oracle_airline.py`
    replays it upstream."
   (:require [clojure.string :as str]))
 

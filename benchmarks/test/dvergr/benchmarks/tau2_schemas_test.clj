@@ -9,7 +9,7 @@
             [dvergr.benchmarks.tau2.core :as t2]
             [dvergr.benchmarks.tau2.episode :as ep]
             [dvergr.benchmarks.tau2.equivalence :as eqv]
-            [dvergr.benchmarks.tau2.pyjson :as pj]
+            [dvergr.benchmarks.pyjson :as pj]
             [dvergr.benchmarks.tau2.schemas :as schemas]
             [malli.core :as m]
             [malli.error :as me]))

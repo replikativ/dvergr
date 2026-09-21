@@ -27,8 +27,8 @@
             [org.replikativ.spindel.engine.context :as ectx]
             [dvergr.agent.run :as run]
             [dvergr.benchmarks.tau2.core :as t2]
-            [dvergr.benchmarks.tau2.live :as live]
-            [dvergr.benchmarks.tau2.pyjson :as pj]
+            [dvergr.benchmarks.live :as live]
+            [dvergr.benchmarks.pyjson :as pj]
             [dvergr.benchmarks.tau2.schemas :as schemas]
             [dvergr.chat.agent :as chat-agent]
             [dvergr.chat.context :as cc]
@@ -149,7 +149,7 @@
   (locking lock
     (if (ended? episode)
       "Error: The conversation has ended."
-      (let [args (if (map? args) (t2/stringify-keys args) args)
+      (let [args (if (map? args) (pj/stringify-keys args) args)
             {w :world :keys [content error]} ((:respond domain) (world room) requestor tool-name args)
             _ (set-world! room w)
             _ (when error (swap! state update :errors inc))

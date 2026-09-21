@@ -1,8 +1,8 @@
-(ns dvergr.benchmarks.tau2.live
-  "Model-backed generate functions for tau2 episodes over Dvergr's provider
+(ns dvergr.benchmarks.live
+  "Model-backed generate functions for benchmark protocols over Dvergr's provider
    layer (Anthropic, OpenAI, Fireworks, Claude Code, Codex, ...).
 
-   tau2 messages are translated into Dvergr's chat message entities and then
+   Benchmark messages (tau2's shape) are translated into Dvergr's chat message entities and then
    through each provider's own MessageFormatter, so provider quirks (tool-call
    replay, the Claude Code text protocol) are handled in exactly one place."
   (:require [dvergr.chat.agent :as chat-agent]
@@ -29,7 +29,7 @@
      :input_schema parameters :parameters parameters}))
 
 (defn model-generate
-  "Return a tau2 generate fn backed by `dvergr.model.chat/chat`.
+  "Return a generate fn backed by `dvergr.model.chat/chat`.
    `spec` is `{:model id-or-alias :provider kw? :temperature n? :max-tokens n?
    :parallel-tool-calls bool?}`."
   [{:keys [model provider temperature max-tokens parallel-tool-calls]}]

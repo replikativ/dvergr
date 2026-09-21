@@ -33,9 +33,9 @@
             [dvergr.agent.roster :as roster]
             [dvergr.benchmarks.tau2.core :as t2]
             [dvergr.benchmarks.tau2.episode :as episode]
-            [dvergr.benchmarks.runner :as runner]
+            [dvergr.agent.experiment.runner :as runner]
             [dvergr.benchmarks.tau2.provider :as provider]
-            [dvergr.benchmarks.tau2.pyjson :as pj]
+            [dvergr.benchmarks.pyjson :as pj]
             [dvergr.model.registry :as registry]
             [hasch.core :as hasch]))
 

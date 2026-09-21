@@ -1,5 +1,5 @@
-(ns dvergr.benchmarks.tau2.pyjson
-  "Python-compatible JSON for transcribed tau2 environments.
+(ns dvergr.benchmarks.pyjson
+  "Python-compatible JSON for transcribed benchmarks (tau2, BFCL).
 
    tau2 grades by hashing `json.dumps(db, sort_keys=True)` and shows agents
    `json.dumps(model_dump())` tool results. Byte equality with the upstream
@@ -144,6 +144,15 @@
 
 ;; ---------------------------------------------------------------------------
 ;; Decoding (order preserving)
+
+(defn stringify-keys
+  "Keyword keys to strings, recursively (tool arguments are JSON objects)."
+  [x]
+  (cond
+    (map? x) (into (array-map) (map (fn [[k v]] [(if (keyword? k) (name k) k)
+                                                 (stringify-keys v)])) x)
+    (sequential? x) (mapv stringify-keys x)
+    :else x))
 
 (def ^:private ^ObjectMapper mapper (ObjectMapper.))
 

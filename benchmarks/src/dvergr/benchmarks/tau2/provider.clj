@@ -23,8 +23,8 @@
             [dvergr.agent.verifiers :as verifiers]
             [dvergr.benchmarks.tau2.core :as t2]
             [dvergr.benchmarks.tau2.episode :as episode]
-            [dvergr.benchmarks.tau2.live :as live]
-            [dvergr.benchmarks.tau2.pyjson :as pj]))
+            [dvergr.benchmarks.live :as live]
+            [dvergr.benchmarks.pyjson :as pj]))
 
 (def version 1)
 

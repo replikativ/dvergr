@@ -1,15 +1,15 @@
 (ns dvergr.benchmarks.tau2-telecom-test
   "Provider-free contracts for the tau2 `telecom` transcription. Expected
    values are digests of upstream Python replays
-   (`dev/benchmarks/tau2/telecom/oracle_telecom.py`); tests needing the
+   (`benchmarks/dev/tau2/telecom/oracle_telecom.py`); tests needing the
    pinned `../tau2-bench` checkout are skipped with a note when it is absent."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [dvergr.benchmarks.tau2.core :as t2]
-            [dvergr.benchmarks.tau2.pyjson :as pj]
-            [dvergr.benchmarks.tau2.python :as py]
+            [dvergr.benchmarks.pyjson :as pj]
+            [dvergr.benchmarks.python :as py]
             [dvergr.benchmarks.tau2.telecom :as tc]
             [dvergr.benchmarks.tau2.telecom.agent :as agent]
             [dvergr.benchmarks.tau2.telecom.corpus :as cp]

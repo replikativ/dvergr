@@ -11,7 +11,7 @@
    `input_value` reprs. Behavior was pinned against pydantic 2.13.5 /
    pydantic-core 2.46.5 through the oracle."
   (:require [clojure.string :as str]
-            [dvergr.benchmarks.tau2.python :as py]))
+            [dvergr.benchmarks.python :as py]))
 
 (def docs-version
   "Version segment of the error URLs (`https://errors.pydantic.dev/<v>/v/<type>`)."

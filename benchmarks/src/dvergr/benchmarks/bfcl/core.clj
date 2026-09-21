@@ -21,8 +21,8 @@
    web search)."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
-            [dvergr.benchmarks.tau2.pyjson :as pj]
-            [dvergr.benchmarks.tau2.python :as py]))
+            [dvergr.benchmarks.pyjson :as pj]
+            [dvergr.benchmarks.python :as py]))
 
 ;; ---------------------------------------------------------------------------
 ;; Provenance and data

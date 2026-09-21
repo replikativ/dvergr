@@ -1089,5 +1089,5 @@
   "check_payment_request": [],
   "make_payment": []
  },
- "generated_by": "dev/benchmarks/tau2/telecom/oracle_telecom.py schema"
+ "generated_by": "benchmarks/dev/tau2/telecom/oracle_telecom.py schema"
 }

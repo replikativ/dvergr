@@ -5,14 +5,14 @@
    tau2-bench checkout at `../tau2-bench` (see `dvergr.benchmarks.tau2.core/
    upstream`) and are skipped with a note when it is absent. Their expected
    values are digests of upstream Python replays produced by
-   `dev/benchmarks/tau2/oracle.py`."
+   `benchmarks/dev/tau2/oracle.py`."
   (:require [dvergr.test-support :as support]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [dvergr.benchmarks.tau2.core :as t2]
             [dvergr.benchmarks.tau2.equivalence :as eqv]
-            [dvergr.benchmarks.tau2.pyjson :as pj]
+            [dvergr.benchmarks.pyjson :as pj]
             [dvergr.benchmarks.tau2.retail :as retail]
             [dvergr.benchmarks.tau2.runner :as runner]))
 

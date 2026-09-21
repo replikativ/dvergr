@@ -10,9 +10,9 @@
    item, and its payment amount is not rounded.
 
    Upstream: sierra-research/tau2-bench `src/tau2/domains/retail/tools.py`,
-   checked for equivalence by `dev/benchmarks/tau2/oracle.py`."
+   checked for equivalence by `benchmarks/dev/tau2/oracle.py`."
   (:require [clojure.string :as str]
-            [dvergr.benchmarks.tau2.pyjson :as pj]))
+            [dvergr.benchmarks.pyjson :as pj]))
 
 ;; ---------------------------------------------------------------------------
 ;; Python-compatible errors

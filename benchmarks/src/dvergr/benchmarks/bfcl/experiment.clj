@@ -1,6 +1,6 @@
 (ns dvergr.benchmarks.bfcl.experiment
   "BFCL experiments as certified Dvergr experiments
-   (`dvergr.benchmarks.runner`).
+   (`dvergr.agent.experiment.runner`).
 
      (run! {:dir \".dvergr/benchmarks/bfcl-smoke\"
             :categories [\"simple_python\" \"parallel\" \"irrelevance\"]
@@ -13,7 +13,7 @@
   (:refer-clojure :exclude [run!])
   (:require [dvergr.benchmarks.bfcl.core :as bfcl]
             [dvergr.benchmarks.bfcl.provider :as provider]
-            [dvergr.benchmarks.runner :as runner]
+            [dvergr.agent.experiment.runner :as runner]
             [hasch.core :as hasch])
   (:import [java.util ArrayList Collections Random]))
 
@@ -40,7 +40,7 @@
           categories)))
 
 (defn run!
-  "Run (or resume) a BFCL experiment; see `dvergr.benchmarks.runner/run!` for
+  "Run (or resume) a BFCL experiment; see `dvergr.agent.experiment.runner/run!` for
    the directory, resume and Claude Code options. `:agent-generate`
    `(fn [task]) -> generate fn` replaces the candidates' models."
   [{:keys [candidates agent-generate timeout-ms] :or {timeout-ms (* 5 60 1000)} :as opts}]

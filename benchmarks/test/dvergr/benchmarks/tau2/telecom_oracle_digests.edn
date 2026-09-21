@@ -6053,7 +6053,7 @@
   :user-db-hash
   "e1f3a8637388808221228ff3f87294444e6b64caf721f5eb243a85d0a9380b28"},
  :generated-by
- "dev/benchmarks/tau2/telecom/oracle_telecom.py (replay, prompts, grade, gold-eval)",
+ "benchmarks/dev/tau2/telecom/oracle_telecom.py (replay, prompts, grade, gold-eval)",
  :upstream
  {:repository "https://github.com/sierra-research/tau2-bench",
   :revision "b7ea9074c1cba482b30687fecdb5c8425fd6f619",

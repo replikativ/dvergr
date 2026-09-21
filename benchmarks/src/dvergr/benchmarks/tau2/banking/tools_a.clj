@@ -9,7 +9,7 @@
    JSON` result (an id containing a quote) as \"found\" and go on to write."
   (:require [clojure.string :as str]
             [dvergr.benchmarks.tau2.banking.db :as db]
-            [dvergr.benchmarks.tau2.python :as py]))
+            [dvergr.benchmarks.python :as py]))
 
 ;; ---------------------------------------------------------------------------
 ;; Private Python helpers

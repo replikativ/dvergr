@@ -26,12 +26,12 @@
      place before raising).
 
    Upstream: sierra-research/tau2-bench `src/tau2/domains/airline/`, checked
-   for equivalence by `dev/benchmarks/tau2/airline/oracle_airline.py`."
+   for equivalence by `benchmarks/dev/tau2/airline/oracle_airline.py`."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [dvergr.benchmarks.tau2.airline.pydantic :as pd]
-            [dvergr.benchmarks.tau2.pyjson :as pj]
-            [dvergr.benchmarks.tau2.python :as py]
+            [dvergr.benchmarks.pyjson :as pj]
+            [dvergr.benchmarks.python :as py]
             [dvergr.benchmarks.tau2.retail :as retail]))
 
 ;; ---------------------------------------------------------------------------

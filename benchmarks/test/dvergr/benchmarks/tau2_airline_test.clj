@@ -1,7 +1,7 @@
 (ns dvergr.benchmarks.tau2-airline-test
   "Provider-free contracts for the tau2 `airline` transcription. Expected
    values are digests of upstream Python replays
-   (`dev/benchmarks/tau2/airline/oracle_airline.py`); data-dependent tests
+   (`benchmarks/dev/tau2/airline/oracle_airline.py`); data-dependent tests
    need the pinned `../tau2-bench` checkout and are skipped with a note when
    it is absent."
   (:require [clojure.edn :as edn]
@@ -13,7 +13,7 @@
             [dvergr.benchmarks.tau2.airline.pydantic :as pd]
             [dvergr.benchmarks.tau2.core :as t2]
             [dvergr.benchmarks.tau2.equivalence :as eqv]
-            [dvergr.benchmarks.tau2.pyjson :as pj]))
+            [dvergr.benchmarks.pyjson :as pj]))
 
 (def ^:private checkout?
   (.exists (io/file t2/default-root "data/tau2/domains/airline/db.json")))

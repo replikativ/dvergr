@@ -1,14 +1,14 @@
 (ns dvergr.benchmarks.tau2.telecom.corpus
   "Equivalence corpora for the telecom transcription and their Clojure
-   replay, in the shape `dev/benchmarks/tau2/telecom/oracle_telecom.py
+   replay, in the shape `benchmarks/dev/tau2/telecom/oracle_telecom.py
    replay` produces.
 
    A sequence is `{\"id\" \"task\"? \"env_calls\"? \"calls\" \"assertions\"?}`:
    the task's initial state, optional initialization-function calls, tool
    calls with requestors, and env assertions evaluated at the end."
   (:require [clojure.string :as str]
-            [dvergr.benchmarks.tau2.pyjson :as pj]
-            [dvergr.benchmarks.tau2.python :as py]
+            [dvergr.benchmarks.pyjson :as pj]
+            [dvergr.benchmarks.python :as py]
             [dvergr.benchmarks.tau2.telecom :as tc]
             [dvergr.benchmarks.tau2.telecom.agent :as agent]
             [dvergr.benchmarks.tau2.telecom.db :as tdb]))

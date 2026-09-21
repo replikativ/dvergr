@@ -15,6 +15,7 @@
    tool calls for :tools, one `(tau2/<tool> args)` evaluation per call for
    :repl. Probes are diagnostics, never certified results."
   (:require [clojure.string :as str]
+            [dvergr.benchmarks.pyjson :as pj]
             [dvergr.benchmarks.tau2.core :as t2]
             [dvergr.benchmarks.tau2.episode :as ep]
             [dvergr.chat.agent :as chat-agent]
@@ -84,7 +85,7 @@
                                         :budget-dollars 5.0 :durable? false})
         state (atom {:world world :calls []})
         call! (fn [tool-name args]
-                (let [args (t2/stringify-keys (or args {}))
+                (let [args (pj/stringify-keys (or args {}))
                       {w :world :keys [content error]} ((:respond domain) (:world @state) :assistant tool-name args)]
                   (swap! state #(-> % (assoc :world w)
                                     (update :calls conj {:tool tool-name :arguments args :error error})))

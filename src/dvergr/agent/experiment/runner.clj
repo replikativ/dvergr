@@ -1,8 +1,9 @@
-(ns dvergr.benchmarks.runner
-  "Run a benchmark experiment: what every provider shares.
+(ns dvergr.agent.experiment.runner
+  "Run an experiment durably: what every benchmark provider shares.
 
-   A provider (`dvergr.benchmarks.tau2.provider`, `...bfcl.provider`) brings
-   its capabilities, EnvironmentDefs and candidates. This namespace brings the
+   A provider brings its capabilities, EnvironmentDefs and candidates (the
+   `org.replikativ/dvergr-benchmarks` artefact has two, tau2 and BFCL; a
+   user's own benchmark is a third: doc/benchmarks.md). This namespace brings the
    rest: the durable experiment directory, the experiment Room, Claude Code
    settings for the run, waiting out subscription usage windows, resume, and
    the Scorecard. Every cell (candidate x environment x repetition) is one

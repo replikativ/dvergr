@@ -16,7 +16,7 @@
    approval record id already exists."
   (:require [clojure.string :as str]
             [dvergr.benchmarks.tau2.banking.db :as db]
-            [dvergr.benchmarks.tau2.python :as py])
+            [dvergr.benchmarks.python :as py])
   (:import [java.time LocalDateTime]
            [java.time.temporal ChronoUnit]
            [java.util.regex Matcher Pattern]))

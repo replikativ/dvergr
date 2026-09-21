@@ -23,9 +23,8 @@
             [dvergr.agent.verifiers :as verifiers]
             [dvergr.benchmarks.bfcl.core :as bfcl]
             [dvergr.benchmarks.bfcl.harness :as harness]
-            [dvergr.benchmarks.tau2.core :as t2]
-            [dvergr.benchmarks.tau2.live :as live]
-            [dvergr.benchmarks.tau2.pyjson :as pj]
+            [dvergr.benchmarks.live :as live]
+            [dvergr.benchmarks.pyjson :as pj]
             [dvergr.model.registry :as registry]))
 
 (def version 1)
@@ -71,7 +70,7 @@
    `[{tool-name arguments}]` with string keys."
   [tool-calls]
   (mapv (fn [{:keys [name arguments]}]
-          {name (t2/stringify-keys (or arguments {}))})
+          {name (pj/stringify-keys (or arguments {}))})
         tool-calls))
 
 (defn- basis []

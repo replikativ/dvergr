@@ -1,7 +1,7 @@
 """Generator for a banking_knowledge differential corpus (provenance only).
 
-The generated corpus is vendored in test/dvergr/benchmarks/tau2/banking_corpus.json;
-regenerate + re-run dev/benchmarks/tau2/oracle.py only when porting a new upstream
+The generated corpus is vendored in benchmarks/test/dvergr/benchmarks/tau2/banking_corpus.json;
+regenerate + re-run benchmarks/dev/tau2/oracle.py only when porting a new upstream
 revision. Paths below are those of the original run.
 """
 import json, sys

@@ -1,4 +1,4 @@
-(ns dvergr.benchmarks.tau2.python
+(ns dvergr.benchmarks.python
   "Python 3.12 value semantics that transcribed tau2 tools expose to agents.
 
    Tool outputs are Python strings built with f-strings, `str()`/`repr()`,
@@ -8,7 +8,7 @@
    strings, longs/BigInts (Python int), doubles (Python float), booleans,
    nil (None), vectors (list), and insertion-ordered maps (dict)."
   (:require [clojure.string :as str]
-            [dvergr.benchmarks.tau2.pyjson :as pj])
+            [dvergr.benchmarks.pyjson :as pj])
   (:import [java.math BigDecimal RoundingMode]))
 
 ;; ---------------------------------------------------------------------------

@@ -4,11 +4,11 @@
 
    A corpus is a vector of `{\"id\" str \"calls\" [{\"name\" str \"arguments\" map}]}`.
    The upstream side is produced once per port version by
-   `dev/benchmarks/tau2/oracle.py`; this namespace replays the same corpus in
+   `benchmarks/dev/tau2/oracle.py`; this namespace replays the same corpus in
    Clojure and reports every divergence in tool content, error flag, or final
    database hash."
   (:require [clojure.string :as str]
-            [dvergr.benchmarks.tau2.pyjson :as pj]))
+            [dvergr.benchmarks.pyjson :as pj]))
 
 (defn replay
   "Replay one call sequence from `db` with `respond-fn`

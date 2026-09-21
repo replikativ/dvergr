@@ -23,12 +23,12 @@
 
    Upstream: `src/tau2/domains/telecom/{environment,tools,user_tools}.py`,
    `src/tau2/environment/environment.py`, `src/tau2/evaluator/evaluator_env.py`,
-   checked by `dev/benchmarks/tau2/telecom/oracle_telecom.py`."
+   checked by `benchmarks/dev/tau2/telecom/oracle_telecom.py`."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [dvergr.benchmarks.tau2.banking.db :as bdb]
-            [dvergr.benchmarks.tau2.pyjson :as pj]
-            [dvergr.benchmarks.tau2.python :as py]
+            [dvergr.benchmarks.pyjson :as pj]
+            [dvergr.benchmarks.python :as py]
             [dvergr.benchmarks.tau2.telecom.agent :as agent]
             [dvergr.benchmarks.tau2.telecom.db :as tdb]
             [dvergr.benchmarks.tau2.telecom.device :as device]))

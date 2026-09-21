@@ -14,12 +14,12 @@
       :fn (fn [db args] -> string | {:db db' :result string})}
 
    `args` contains every parameter (defaults filled) under its string name.
-   Python exceptions are raised with `dvergr.benchmarks.tau2.python/raise`.
+   Python exceptions are raised with `dvergr.benchmarks.python/raise`.
 
    Upstream: `src/tau2/domains/banking_knowledge/{data_model,db_query,utils,tools}.py`."
   (:require [clojure.string :as str]
-            [dvergr.benchmarks.tau2.pyjson :as pj]
-            [dvergr.benchmarks.tau2.python :as py]))
+            [dvergr.benchmarks.pyjson :as pj]
+            [dvergr.benchmarks.python :as py]))
 
 ;; ---------------------------------------------------------------------------
 ;; Schema

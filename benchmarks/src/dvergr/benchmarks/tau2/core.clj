@@ -20,8 +20,8 @@
             [dvergr.benchmarks.tau2.airline :as airline]
             [dvergr.benchmarks.tau2.banking :as banking]
             [dvergr.benchmarks.tau2.banking.db :as banking-db]
-            [dvergr.benchmarks.tau2.pyjson :as pj]
-            [dvergr.benchmarks.tau2.python :as py]
+            [dvergr.benchmarks.pyjson :as pj]
+            [dvergr.benchmarks.python :as py]
             [dvergr.benchmarks.tau2.retail :as retail]
             [dvergr.benchmarks.tau2.telecom :as telecom]))
 
@@ -207,15 +207,6 @@
 
 (defn- has-text? [content] (and (string? content) (not (str/blank? content))))
 
-(defn stringify-keys
-  "Keyword keys to strings, recursively (tool arguments are JSON objects)."
-  [x]
-  (cond
-    (map? x) (into (array-map) (map (fn [[k v]] [(if (keyword? k) (name k) k)
-                                                 (stringify-keys v)])) x)
-    (sequential? x) (mapv stringify-keys x)
-    :else x))
-
 (defn- execute-calls
   "Run tool calls in order for `requestor`; returns `[world tool-messages]`."
   [respond world requestor tool-calls]
@@ -227,7 +218,7 @@
           tool-calls))
 
 (defn- normalize-calls [tool-calls]
-  (not-empty (mapv #(update % :arguments stringify-keys) tool-calls)))
+  (not-empty (mapv #(update % :arguments pj/stringify-keys) tool-calls)))
 
 (defn run-episode
   "Run one task and return `{:messages :termination :world :db :usage}`.

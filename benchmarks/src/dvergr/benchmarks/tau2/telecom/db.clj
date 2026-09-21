@@ -9,8 +9,8 @@
    `YYYY-MM-DD` strings and `datetime` fields `YYYY-MM-DD HH:MM:SS` strings
    (Python `str()` of the value), floats are doubles."
   (:require [clojure.string :as str]
-            [dvergr.benchmarks.tau2.pyjson :as pj]
-            [dvergr.benchmarks.tau2.python :as py]))
+            [dvergr.benchmarks.pyjson :as pj]
+            [dvergr.benchmarks.python :as py]))
 
 ;; ---------------------------------------------------------------------------
 ;; Ordered maps

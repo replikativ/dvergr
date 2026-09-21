@@ -2,7 +2,7 @@
  {:repository "https://github.com/sierra-research/tau2-bench",
   :revision "b7ea9074c1cba482b30687fecdb5c8425fd6f619",
   :version "1.0.1"},
- :generated-by "dev/benchmarks/tau2/oracle.py",
+ :generated-by "benchmarks/dev/tau2/oracle.py",
  :gold
  {"0"
   "b532831f927f6fe1204146bda37e4dd77fa1401ca2b96786f79bff80d5c73d1d",

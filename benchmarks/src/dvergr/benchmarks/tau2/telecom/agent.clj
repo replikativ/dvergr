@@ -4,7 +4,7 @@
    Every function takes the whole world `{:db :user :vpn-performance
    :bill-seq}` and returns `{:world w :result r}` where `r` is already the
    string `Environment.to_json_str` produces. Python exceptions are raised
-   with `dvergr.benchmarks.tau2.python/raise` (the environment renders them as
+   with `dvergr.benchmarks.python/raise` (the environment renders them as
    `Error: <message>`); `raise-w` carries a partially mutated world, like an
    upstream method that mutates before it raises.
 
@@ -12,7 +12,7 @@
    draft bills are named `B%08x` from a per-world counter instead of
    `B{uuid4().hex[:8]}` (the oracle pins uuid4 to the same counter)."
   (:require [clojure.string :as str]
-            [dvergr.benchmarks.tau2.python :as py]
+            [dvergr.benchmarks.python :as py]
             [dvergr.benchmarks.tau2.telecom.db :as tdb]))
 
 (def today "2025-02-25")

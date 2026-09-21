@@ -7,7 +7,7 @@
    Byte-faithful transcription of `KnowledgeTools` methods
    `order_debit_card_5739` .. `request_temporary_debit_card_limit_increase_8374`
    in upstream `src/tau2/domains/banking_knowledge/tools.py`; verified
-   differentially against the Python oracle (`dev/benchmarks/tau2/oracle.py`).
+   differentially against the Python oracle (`benchmarks/dev/tau2/oracle.py`).
 
    Deliberately reproduced upstream behaviour:
    - PIN/CVV/last-4 arguments sent as numbers raise Python's
@@ -20,7 +20,7 @@
      expiration date."
   (:require [clojure.string :as str]
             [dvergr.benchmarks.tau2.banking.db :as db]
-            [dvergr.benchmarks.tau2.python :as py])
+            [dvergr.benchmarks.python :as py])
   (:import [java.time LocalDate]
            [java.time.temporal ChronoUnit]
            [java.util Locale]))

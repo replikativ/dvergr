@@ -7,7 +7,7 @@ flags, and database hashes on the same call sequences.
 
 Run from the pinned tau2-bench checkout:
 
-    uv run --no-sync python /path/to/dvergr/dev/benchmarks/tau2/airline/oracle_airline.py \
+    uv run --no-sync python /path/to/dvergr/benchmarks/dev/tau2/airline/oracle_airline.py \
         replay corpus.json out.json [--per-call-hash]
     uv run --no-sync python .../oracle_airline.py schema out.json
     uv run --no-sync python .../oracle_airline.py prompts out.json
@@ -26,7 +26,7 @@ import sys
 from loguru import logger
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-import oracle as shared  # noqa: E402  (dev/benchmarks/tau2/oracle.py)
+import oracle as shared  # noqa: E402  (benchmarks/dev/tau2/oracle.py)
 
 from tau2.data_model.message import ToolCall  # noqa: E402
 

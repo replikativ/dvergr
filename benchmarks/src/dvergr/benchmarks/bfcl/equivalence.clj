@@ -6,7 +6,7 @@
    it that a model plausibly (or implausibly) emits: another accepted value, a
    wrong type, a reformatted string, a missing or an unexpected parameter, a
    wrong or renamed function, reordered, dropped or duplicated calls, no call.
-   `dev/benchmarks/bfcl/oracle.py` grades the corpus with upstream's own code;
+   `benchmarks/dev/bfcl/oracle.py` grades the corpus with upstream's own code;
    `compare` grades it here and reports every disagreement.
 
    The test suite does not need Python: it regenerates the corpus, grades it
@@ -15,7 +15,7 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [dvergr.benchmarks.bfcl.core :as bfcl]
-            [dvergr.benchmarks.tau2.pyjson :as pj])
+            [dvergr.benchmarks.pyjson :as pj])
   (:import [java.util Random]))
 
 ;; ---------------------------------------------------------------------------

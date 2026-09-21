@@ -1,7 +1,7 @@
 (ns dvergr.benchmarks.bfcl-test
   "BFCL transcription against the pinned upstream revision.
 
-   The digests below are of UPSTREAM's outputs (`dev/benchmarks/bfcl/oracle.py`
+   The digests below are of UPSTREAM's outputs (`benchmarks/dev/bfcl/oracle.py`
    running upstream's own checker and tool compiler), so these tests prove
    equivalence without Python. To re-pin after an upstream bump: regenerate
    the corpus (`equivalence/write-corpus!`), run `oracle.py <root> check` and
@@ -13,7 +13,7 @@
             [clojure.test :refer [deftest is testing]]
             [dvergr.benchmarks.bfcl.core :as bfcl]
             [dvergr.benchmarks.bfcl.equivalence :as eq]
-            [dvergr.benchmarks.tau2.pyjson :as pj]))
+            [dvergr.benchmarks.pyjson :as pj]))
 
 (def ^:private categories (vec (sort (keys bfcl/categories))))
 

@@ -18,7 +18,7 @@
             [clojure.string :as str]
             [dvergr.benchmarks.tau2.core :as t2]
             [dvergr.benchmarks.tau2.harness :as harness]
-            [dvergr.benchmarks.tau2.live :as live])
+            [dvergr.benchmarks.live :as live])
   (:import [java.util.concurrent Executors TimeUnit]))
 
 (def default-dir ".dvergr/benchmarks/tau2")

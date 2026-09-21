@@ -18,7 +18,7 @@
   (:require [clojure.string :as str]
             [dvergr.agent.turn :as turn]
             [dvergr.benchmarks.bfcl.core :as bfcl]
-            [dvergr.benchmarks.tau2.core :as t2]
+            [dvergr.benchmarks.pyjson :as pj]
             [dvergr.chat.agent :as chat-agent]
             [dvergr.chat.context :as chat-context]
             [dvergr.sandbox :as sandbox]
@@ -120,7 +120,7 @@
   (let [tools (bfcl/compile-tools (:functions task))
         calls (atom [])
         record! (fn [tool-name args]
-                  (swap! calls conj {tool-name (t2/stringify-keys (dissoc (or args {}) :db/id))}))
+                  (swap! calls conj {tool-name (pj/stringify-keys (dissoc (or args {}) :db/id))}))
         chat-ctx (turn/new-working-ctx {:execution-ctx (:ctx room)
                                         :title "bfcl candidate"
                                         :budget-dollars budget-dollars})

@@ -72,6 +72,10 @@ dvergr.chat.agent - Agent loop, turn execution
 dvergr.model.*    - LLM API calls, SSE streaming, retries (model/api/{anthropic,openai,claude_code})
 dvergr.tools      - Tool registry, execution
 dvergr.chat.context - Per-chat state (signals + datahike + sci)
+dvergr.agent.*    - Evaluation path: evaluation, environment, experiment(.runner), verifiers, roster
+benchmarks/       - tau2 + BFCL providers (dvergr.benchmarks.*): a SEPARATE artefact
+                    (org.replikativ/dvergr-benchmarks), not on the default classpath.
+                    REPL: add -A:benchmarks (or -M:test:nrepl); suite: clojure -M:test runs both
 ```
 
 ## Provider Support

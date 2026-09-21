@@ -7,7 +7,7 @@
             [dvergr.benchmarks.tau2.core :as t2]
             [dvergr.benchmarks.tau2.episode :as ep]
             [dvergr.benchmarks.tau2.probe :as probe]
-            [dvergr.benchmarks.tau2.pyjson :as pj]))
+            [dvergr.benchmarks.pyjson :as pj]))
 
 (def ^:private checkout?
   (.exists (io/file t2/default-root "data/tau2/domains/retail/db.json")))

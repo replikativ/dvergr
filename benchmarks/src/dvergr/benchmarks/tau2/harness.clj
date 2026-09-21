@@ -1,7 +1,7 @@
 (ns dvergr.benchmarks.tau2.harness
   "Dvergr's own agent loop as a tau2 candidate.
 
-   The reference candidate (`dvergr.benchmarks.tau2.live/model-generate`)
+   The reference candidate (`dvergr.benchmarks.live/model-generate`)
    reproduces tau2's LLMAgent: one model step per protocol step. A harness
    candidate instead answers each user message with a complete Dvergr agent
    turn (`dvergr.chat.agent/run-agent-turn!`: provider formatting, tool
@@ -18,7 +18,7 @@
              compose lookups, filter records, and compute in Clojure."
   (:require [clojure.string :as str]
             [dvergr.benchmarks.tau2.core :as t2]
-            [dvergr.benchmarks.tau2.pyjson :as pj]
+            [dvergr.benchmarks.pyjson :as pj]
             [dvergr.chat.agent :as chat-agent]
             [dvergr.chat.context :as chat-context]
             [dvergr.agent.turn :as turn]
@@ -29,19 +29,13 @@
             [dvergr.sandbox :as sandbox]
             [org.replikativ.spindel.engine.core :as ec]))
 
-(defn- stringify-keys [x]
-  (cond
-    (map? x) (into (array-map) (map (fn [[k v]] [(if (keyword? k) (name k) k) (stringify-keys v)])) x)
-    (sequential? x) (mapv stringify-keys x)
-    :else x))
-
 (defn- call-recorder
   "A function executing one tool call against the shared world, logging the
    tau2 messages (assistant tool call + tool result)."
   [domain state]
   (fn [tool-name args]
     (let [id (str "call_" (count (:log @state)))
-          args (stringify-keys (or args {}))
+          args (pj/stringify-keys (or args {}))
           {:keys [world content error]} ((:respond domain) (:world @state) :assistant tool-name args)]
       (swap! state (fn [s] (-> s
                                (assoc :world world)

@@ -22,15 +22,15 @@
 
    Upstream: `src/tau2/domains/banking_knowledge/` and
    `src/tau2/knowledge/{pipeline,retrievers/bm25_retriever}.py`, checked by
-   `dev/benchmarks/tau2/oracle.py`."
+   `benchmarks/dev/tau2/oracle.py`."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [dvergr.benchmarks.tau2.banking.db :as db]
             [dvergr.benchmarks.tau2.banking.tools-a :as tools-a]
             [dvergr.benchmarks.tau2.banking.tools-b :as tools-b]
             [dvergr.benchmarks.tau2.banking.tools-c :as tools-c]
-            [dvergr.benchmarks.tau2.pyjson :as pj]
-            [dvergr.benchmarks.tau2.python :as py]))
+            [dvergr.benchmarks.pyjson :as pj]
+            [dvergr.benchmarks.python :as py]))
 
 ;; ---------------------------------------------------------------------------
 ;; Vendored upstream metadata (oracle `schema` export)

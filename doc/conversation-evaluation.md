@@ -285,7 +285,7 @@ The review's hardening changes are also in:
 - per-role usage is recorded;
 - step accounting counts one step per message and two per tool batch.
 
-`test/dvergr/benchmarks/tau2_rooms_test.clj` covers:
+`benchmarks/test/dvergr/benchmarks/tau2_rooms_test.clj` covers:
 
 - retail gold plus resume, with store-only reconstruction;
 - banking dual-control gold;
