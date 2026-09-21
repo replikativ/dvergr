@@ -181,7 +181,12 @@
 (defn- start-worker!
   "Register and start blocking/native work under the process-local supervisor.
    Cancellation is sticky: registration and the cancellation check share the
-   supervisor lock, closing the cancel-before-start and between-step races."
+   supervisor lock, closing the cancel-before-start and between-step races.
+
+   `kind`: `:normal` work is refused after the seal and interrupted by
+   cancellation; `:critical` work (a store transaction the Run's accounting
+   depends on) and `:cleanup` work are neither, and quiescence waits for all
+   three."
   ([supervisor f] (start-worker! supervisor f :normal))
   ([supervisor f kind]
    (let [done       (sync/deferred)
@@ -304,34 +309,8 @@
   (advance-supervisor! supervisor)
   (:quiesced supervisor))
 
-(defn- off-caller-spin
-  "A Spin that resolves `value` on the native executor, never on the thread
-   that awaits it."
-  [value]
-  (let [ctx (ec/current-execution-context)]
-    (spin-core/make-spin
-     (fn [resolve reject]
-       (try
-         (.execute native-executor
-                   (fn []
-                     (binding [ec/*execution-context* ctx]
-                       (spin-core/resume resolve value))))
-         (catch Throwable t
-           (spin-core/resume reject t)))))))
-
-(defn- worker-result-spin
-  "The worker's result, continued on a native thread.
-
-   A deferred resumes its awaiter on whichever thread comes second: the
-   worker's, inside its own `finally` (so its lease outlives its work by the
-   body's next step), or, when the worker was faster than the body reached its
-   await, the thread that is hiring, which then runs resource allocation and
-   whatever else blocks before the body suspends again. The hop makes neither
-   happen: a worker ends when its work does, and hiring returns."
-  [worker]
-  (sp/spin
-   (let [result (sp/await (:done worker))]
-     (sp/await (off-caller-spin result)))))
+(defn- worker-result-spin [worker]
+  (sp/spin (sp/await (:done worker))))
 
 (defn- worker-error? [value]
   (and (map? value) (contains? value ::worker-error)))
@@ -1248,12 +1227,22 @@
          (throw (ex-info (str "Run world setup failed: " (ex-message cause))
                          {:type ::world-setup-failed :run/id id}
                          cause))))
-     (try
-       (resource/allocate-run! control-room id parent-run resources)
-       (catch Throwable t
+     ;; Allocation blocks (a store transaction), so it is a worker too. What a
+     ;; Spin body does between two awaits runs on whichever thread resumed it:
+     ;; the engine's drain, or, when the awaited worker was already done, the
+     ;; thread that is hiring. Neither may block. `:critical` work is
+     ;; supervised but never interrupted: cancellation waits for the
+     ;; transaction instead of tearing it.
+     (let [allocation (sp/await
+                       (worker-result-spin
+                        (start-worker!
+                         supervisor
+                         #(resource/allocate-run! control-room id parent-run resources)
+                         :critical)))]
+       (when (worker-error? allocation)
          (throw (ex-info "Run resource allocation failed"
                          {:type ::resource-allocation-failed :run/id id}
-                         t))))
+                         (::worker-error allocation)))))
      (when (run/cancel-requested? id)
        (throw (ex-info "Run cancelled after world setup"
                        {:type ::world-setup-cancelled :run/id id})))
