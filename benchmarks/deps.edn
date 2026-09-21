@@ -1,0 +1,5 @@
+;; org.replikativ/dvergr-benchmarks as a git dep:
+;;   {:git/url "https://github.com/replikativ/dvergr" :git/sha "..." :deps/root "benchmarks"}
+;; In this repo use the root deps.edn (`-A:benchmarks`, `-M:test`).
+{:paths ["src" "resources"]
+ :deps {org.replikativ/dvergr {:local/root ".."}}}

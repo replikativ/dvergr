@@ -59,3 +59,4 @@ doc/related-work/pdfs/
 
 # Claude Code local state (settings, locks)
 .claude/
+__pycache__/

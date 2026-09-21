@@ -1,0 +1,24 @@
+dvergr-benchmarks
+Copyright (c) the dvergr authors. Apache License 2.0.
+
+This artefact contains Clojure transcriptions of, and data derived from:
+
+  tau2-bench (https://github.com/sierra-research/tau2-bench)
+    Copyright (c) 2025 Sierra Research. MIT License.
+    Transcribed: the tools, the episode protocol and the grading of the
+    retail, banking, airline and telecom domains.
+    resources/benchmarks/tau2/*.json are tool schemas emitted by upstream's
+    code.
+
+  Berkeley Function Calling Leaderboard, part of Gorilla
+  (https://github.com/ShishirPatil/gorilla)
+    Apache License 2.0.
+    Transcribed: the AST checker and the tool compilation of the Python
+    single-turn categories.
+
+  resources/benchmarks/rss and resources/benchmarks/permutation are pinned
+  snapshots of replikativ sources (dvergr-sandbox, spindel), Apache License
+  2.0; each directory carries its LICENSE and a README with the exact commit.
+
+tau2 and BFCL task data is not included: it is read from pinned upstream checkouts
+(../tau2-bench, ../gorilla).
