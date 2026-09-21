@@ -179,6 +179,32 @@
            (get-in body [:input 2 :content 0 :text])))
     (is (= {:effort "high" :context "all_turns"} (:reasoning body)))))
 
+(deftest parallel-tool-calls-leave-responses-lite
+  ;; the endpoint answers 400 to `parallel_tool_calls` in a lite request, so a
+  ;; request for parallel calls goes out in the full Responses shape
+  (let [codex-provider (codex/create {:credentials ::fake})
+        build (fn [opts]
+                (provider/build-request
+                 codex-provider
+                 [{:role :system :content "Be brief."}
+                  {:role :user :content "Weather in Oslo and Bergen?"}]
+                 (merge {:model "codex-subscription-luna"
+                         :tools [{:name "weather"
+                                  :description "Weather of a city"
+                                  :parameters {:type "object"
+                                               :properties {:city {:type "string"}}}}]}
+                        opts)))
+        lite (build {})
+        parallel (build {:parallel-tool-calls true})]
+    (is (false? (get-in lite [:body :parallel_tool_calls])))
+    (is (= "true" (get-in lite [:headers "x-openai-internal-codex-responses-lite"])))
+    (is (true? (get-in parallel [:body :parallel_tool_calls])))
+    (is (nil? (get-in parallel [:headers "x-openai-internal-codex-responses-lite"])))
+    (is (= "Be brief." (get-in parallel [:body :instructions])))
+    (is (= "weather" (get-in parallel [:body :tools 0 :name])))
+    (is (= "user" (get-in parallel [:body :input 0 :role])))
+    (is (= {:effort "medium"} (get-in parallel [:body :reasoning])))))
+
 (deftest native-provider-accumulates-text-tools-and-usage
   (let [codex-provider (codex/create {:credentials ::fake})
         model-def {:id "codex-subscription-sol"}

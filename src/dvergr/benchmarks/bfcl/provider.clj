@@ -95,19 +95,24 @@
      :limit-keys #{}
      :run (fn [{:keys [room agent environment]}]
             (let [task (task-of tasks environment)
-                  {:bfcl/keys [harness action-space]} (:agent/metadata agent)]
+                  {:bfcl/keys [harness action-space repl-guidance parallel-tool-calls]}
+                  (:agent/metadata agent)
+                  policy (cond-> (:agent/model-policy agent)
+                           (some? parallel-tool-calls)
+                           (assoc :parallel-tool-calls parallel-tool-calls))]
               (if (and (= :dvergr harness) (not agent-generate))
                 ;; one step of Dvergr's agent loop, with recording functions
                 (let [{:keys [calls content usage outcome]}
                       (harness/step room task (request task)
-                                    (assoc (:agent/model-policy agent)
+                                    (assoc policy
                                            :action-space action-space
+                                           :guidance (or repl-guidance :neutral)
                                            :budget-dollars (get-in agent [:agent/program :budget-dollars])))]
                   {:termination :completed :calls calls :content content
                    :stop-reason outcome :usage usage})
                 (let [generate (if agent-generate
                                  (agent-generate task)
-                                 (live/model-generate (:agent/model-policy agent)))
+                                 (live/model-generate policy))
                       {:keys [content tool-calls usage stop-reason]} (generate (request task))]
                   {:termination :completed
                    :calls (decode tool-calls)
@@ -170,13 +175,19 @@
 
 (defn candidate-roster
   "AgentDefs for candidate specs `{:id :model :provider :harness :action-space
-   :budget-dollars}`. `:harness :reference` (default) is the model behind one
+   :repl-guidance :parallel-tool-calls :budget-dollars}`. `:harness :reference` (default) is the model behind one
    API call; `:dvergr` is one step of Dvergr's agent loop with `:action-space
    :tools` or `:repl` (`bfcl.harness`). The prompt is the task's."
   [specs]
-  (reduce (fn [team {:keys [id model provider budget-dollars harness action-space]
-                     :or {budget-dollars 1.0 harness :reference action-space :tools}}]
+  (reduce (fn [team {:keys [id model provider budget-dollars harness action-space repl-guidance
+                            parallel-tool-calls]
+                     :or {budget-dollars 1.0 harness :reference action-space :tools
+                          repl-guidance :neutral}}]
             (let [model-id (registry/resolve-alias model)]
+              (when-not (contains? harness/repl-guidance repl-guidance)
+                (throw (ex-info "Unknown :repl-guidance"
+                                {:type ::unknown-repl-guidance :repl-guidance repl-guidance
+                                 :known (set (keys harness/repl-guidance))})))
               (roster/make-agent
                team
                {:id id
@@ -186,6 +197,10 @@
                                :model model-id}
                 :program {:kind :llm :max-model-steps 1 :budget-dollars budget-dollars}
                 :metadata (cond-> {:bfcl/harness harness}
-                            (= :dvergr harness) (assoc :bfcl/action-space action-space))})))
+                            (some? parallel-tool-calls)
+                            (assoc :bfcl/parallel-tool-calls parallel-tool-calls)
+                            (= :dvergr harness) (assoc :bfcl/action-space action-space)
+                            (and (= :dvergr harness) (= :repl action-space))
+                            (assoc :bfcl/repl-guidance repl-guidance))})))
           (roster/make-roster {:id :bfcl/candidates})
           specs))

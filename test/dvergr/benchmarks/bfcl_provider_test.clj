@@ -1,12 +1,14 @@
 (ns dvergr.benchmarks.bfcl-provider-test
   "BFCL on the generic evaluation path, with scripted candidates (no model)."
   (:require [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [dvergr.agent.episode :as attempts]
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.run :as run]
             [dvergr.benchmarks.bfcl.core :as bfcl]
             [dvergr.benchmarks.bfcl.equivalence :as eq]
+            [dvergr.benchmarks.bfcl.harness :as harness]
             [dvergr.benchmarks.bfcl.provider :as provider]
             [dvergr.discourse :as d]
             [dvergr.model.chat :as model-chat]
@@ -148,6 +150,7 @@
           (let [caps (provider/capabilities tasks {})
                 env (provider/environment-def task caps {:timeout-ms 60000})
                 team (provider/candidate-roster [{:id :dv :harness :dvergr :action-space action-space
+                                                  :parallel-tool-calls true
                                                   :model "claude-code-sonnet"}])
                 room (d/make-room {:id (keyword "bfcl" (str "dv-" (name action-space)))
                                    :store (memory/make)})
@@ -155,7 +158,8 @@
             (try
               (with-redefs [model-chat/chat (fn [messages opts]
                                               (swap! steps inc)
-                                              (swap! requests conj {:action-space action-space :opts opts})
+                                              (swap! requests conj {:action-space action-space :opts opts
+                                                                    :messages messages})
                                               (get responses action-space))]
                 (binding [ec/*execution-context* (:ctx room)]
                   (let [result @(evaluation/evaluate room team :dv env (:evaluator caps)
@@ -171,5 +175,13 @@
                     (is (empty? (run/active-runs (:id room)))))))
               (finally (d/close-room! room))))))
       (testing "the REPL candidate is given one tool, and the functions in its prompt"
-        (let [repl-request (:opts (first (filter #(= :repl (:action-space %)) @requests)))]
-          (is (= ["clojure_eval"] (mapv :name (:tools repl-request)))))))))
+        (let [{repl-request :opts :keys [messages]} (first (filter #(= :repl (:action-space %)) @requests))]
+          (is (= ["clojure_eval"] (mapv :name (:tools repl-request))))
+          (is (str/includes? (pr-str messages) (:neutral harness/repl-guidance))
+              "the default guidance does not tell the model to always call")))
+      (testing "a candidate's :parallel-tool-calls reaches the model call"
+        (is (every? #(true? (get-in % [:opts :parallel-tool-calls])) @requests)))
+      (testing "an unknown guidance is refused, not defaulted"
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (provider/candidate-roster [{:id :x :harness :dvergr :action-space :repl
+                                                  :repl-guidance :nope :model "claude-code-sonnet"}])))))))

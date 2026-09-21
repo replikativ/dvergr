@@ -30,8 +30,9 @@
 
 (defn model-generate
   "Return a tau2 generate fn backed by `dvergr.model.chat/chat`.
-   `spec` is `{:model id-or-alias :provider kw? :temperature n? :max-tokens n?}`."
-  [{:keys [model provider temperature max-tokens]}]
+   `spec` is `{:model id-or-alias :provider kw? :temperature n? :max-tokens n?
+   :parallel-tool-calls bool?}`."
+  [{:keys [model provider temperature max-tokens parallel-tool-calls]}]
   (providers/ensure-initialized!)
   (let [model-id (registry/resolve-alias model)
         provider (or provider (:provider (registry/get-model! model-id)))
@@ -43,6 +44,8 @@
                                 (cond-> {:model model-id :provider provider
                                          :system system}
                                   (seq tools) (assoc :tools (mapv ->tool-def tools))
+                                  (some? parallel-tool-calls)
+                                  (assoc :parallel-tool-calls parallel-tool-calls)
                                   temperature (assoc :temperature temperature)
                                   max-tokens (assoc :max-tokens max-tokens)))]
         {:content (:content response)

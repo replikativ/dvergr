@@ -137,6 +137,9 @@ string-encoded literals with converters of their own).
 | `:dvergr` + `:tools` | one step of Dvergr's agent loop, the functions as JSON-schema tools |
 | `:dvergr` + `:repl` | one step with a single `clojure_eval` tool; the functions are `bfcl/<name>` in the sandbox, each taking one map |
 
+Candidate options: `:parallel-tool-calls` (any candidate) and `:repl-guidance`
+(the REPL candidate), both recorded in the AgentDef's metadata.
+
 The functions of a `:dvergr` candidate are recorders: they note the call and
 return a stub, and the step is never followed by a second one
 (`bfcl.harness`). The REPL candidate gets the functions' parameters in its
@@ -177,9 +180,46 @@ failed cell, about 22 k input tokens for the reference candidate):
 | `:dvergr` `:tools` | 29/55 | 0/20 | 4/5 |
 | `:dvergr` `:repl` | 44/55 | 16/20 | 2/5 |
 
-The REPL candidate is more eager to call something when nothing fits (three
-irrelevance tasks lost to one call each). That is a prompt to tune, on a slice
-with another `:seed` than the one reported; BFCL has no train split.
+The two findings of that slice, and what was done about them (the slices below
+use `:seed 7`, not the seed reported above; BFCL has no train split).
+
+**Parallel calls on the Codex backend.** The endpoint answers 400 to
+`parallel_tool_calls: true` in a `responses-lite` request, and the Codex client
+itself sends `parallel && !use_responses_lite`; every GPT-5.6 model is lite
+there. The provider used to drop a request for parallel calls silently. It now
+honours `:parallel-tool-calls true` by sending that request in the full
+Responses shape (measured on Luna: two to three calls per response, fewer input
+tokens than lite, similar latency); lite stays the default otherwise. What the
+full shape costs in subscription quota is not known. A candidate asks with
+`:parallel-tool-calls true`; the agent loop passes it as `:model-opts`. Six
+tasks per category:
+
+| Candidate | Passed | `parallel` | `parallel_multiple` |
+| --- | --- | --- | --- |
+| `:reference`, parallel | 20/24 | 6/6 | 3/6 |
+| `:dvergr` `:tools`, parallel | 21/24 | 6/6 | 3/6 |
+| `:dvergr` `:tools`, default | 11/24 | 0/6 | 0/6 |
+
+The three `parallel_multiple` tasks still lost are value mismatches (a rate of
+`4` for `0.04`, `"New York City"` for `"New York"`), the same for both.
+
+**The REPL candidate's eagerness.** The prompt said "You answer by calling
+functions", so the model called a near-miss function on irrelevance tasks that
+the JSON candidates left alone. `:repl-guidance` selects the wording
+(`bfcl.harness/repl-guidance`); eight tasks per category:
+
+| Guidance | Passed | `irrelevance` | `live_irrelevance` | `live_relevance` |
+| --- | --- | --- | --- | --- |
+| `:direct` (the old wording) | 33/40 | 4/8 | 6/8 | 7/8 |
+| `:cautious` (also: answer in text when the request lacks a required value) | 33/40 | 8/8 | 7/8 | 3/8 |
+| `:neutral` (call when a function fits, else text; the default) | 35/40 | 6/8 | 7/8 | 6/8 |
+| `:dvergr` `:tools`, for comparison | 28/40 | 7/8 | 7/8 | 6/8 |
+
+`:cautious` asks the user for the missing value where BFCL's relevance tasks
+expect a call; it is kept as a measured negative. With `:neutral` the REPL
+candidate is where the JSON candidate is on relevance and irrelevance. At eight
+tasks per category these are directions, not scores.
+
 `bfcl.inspect` reads an experiment directory: `report`, `failures`,
 `print-report`.
 

@@ -81,6 +81,23 @@
                              (pr-str (:value result))
                              (str "Error: " (get-in result [:error :message])))}))}})
 
+(def repl-guidance
+  "What the REPL candidate is told about its action space, by variant. The
+   `:direct` wording (\"you answer by calling functions\") made a model call a
+   near-miss function on irrelevance tasks that the JSON-tool candidates left
+   alone; `:neutral` says what a tool schema says: the functions exist, use
+   them when they fit."
+  {:direct "You answer by calling functions through the `clojure_eval` tool."
+   :neutral (str "Functions are available through the `clojure_eval` tool. Call them when one of "
+                 "them does what the request asks for; when none does, answer in text and "
+                 "evaluate nothing.")
+   ;; measured and rejected: also telling the model to answer in text when
+   ;; \"the request lacks something a function requires\" makes it ask for
+   ;; clarification where BFCL's relevance tasks expect a call
+   :cautious (str "Functions are available through the `clojure_eval` tool. Use them only when "
+                  "one of them does what the request asks for; when none does, or the request "
+                  "lacks something a function requires, answer in text and evaluate nothing.")})
+
 (defn- function-docs
   "The functions with their parameters, for the REPL candidate's prompt: the
    JSON-tool candidate gets the same information as tool schemas."
@@ -97,8 +114,9 @@
    :model :action-space :budget-dollars}`. Returns `{:calls :content :usage
    :outcome}`; `:calls` is upstream's decoded shape, `[{tool-name args}]`, in
    the order the candidate made them."
-  [room task {:keys [system messages]} {:keys [provider model action-space budget-dollars]
-                                        :or {action-space :tools budget-dollars 1.0}}]
+  [room task {:keys [system messages]} {:keys [provider model action-space budget-dollars guidance
+                                               parallel-tool-calls]
+                                        :or {action-space :tools budget-dollars 1.0 guidance :neutral}}]
   (let [tools (bfcl/compile-tools (:functions task))
         calls (atom [])
         record! (fn [tool-name args]
@@ -114,7 +132,9 @@
         system (case action-space
                  :tools system
                  :repl (str (when system (str system "\n\n"))
-                            "You answer by calling functions through the `clojure_eval` tool.\n\n"
+                            (or (repl-guidance guidance)
+                                (throw (ex-info "Unknown REPL guidance" {:guidance guidance})))
+                            "\n\n"
                             (function-docs tools)))]
     (try
       (when-not (str/blank? system)
@@ -126,6 +146,8 @@
                        chat-ctx {:provider provider :model model
                                  :tools tool-map
                                  :tool-ctx {:chat-ctx chat-ctx :tools tool-map :sci-ctx sci-ctx}
+                                 :model-opts (when (some? parallel-tool-calls)
+                                               {:parallel-tool-calls parallel-tool-calls})
                                  :auto-compact? false :turn-number 0}))
             reply (->> (chat-context/get-messages chat-ctx)
                        reverse
