@@ -131,24 +131,48 @@ string-encoded literals with converters of their own).
 
 ### Candidates
 
-`:reference` only so far: the candidate's model behind one step with the
-compiled tools, which is what upstream's function-calling handlers do. A
-Dvergr agent turn as a candidate (JSON tools or the REPL) needs a cut after
-the first model step and is the next step here.
+| Candidate | What runs |
+| --- | --- |
+| `:reference` | the model behind one API call with the compiled tools, as upstream's function-calling handlers do |
+| `:dvergr` + `:tools` | one step of Dvergr's agent loop, the functions as JSON-schema tools |
+| `:dvergr` + `:repl` | one step with a single `clojure_eval` tool; the functions are `bfcl/<name>` in the sandbox, each taking one map |
 
-### Live check
+The functions of a `:dvergr` candidate are recorders: they note the call and
+return a stub, and the step is never followed by a second one
+(`bfcl.harness`). The REPL candidate gets the functions' parameters in its
+prompt, which is the information the others get as tool schemas.
 
-2026-09-21, six tasks (two each of `simple_python`, `parallel`,
-`irrelevance`), Sonnet through `claude -p` with the isolated token: 6/6,
-parallel calls recorded as emitted, about 900 input tokens per task (the CLI's
-own system prompt is most of it). A full pass is therefore roughly 3 M input
-tokens per candidate. Not a score; a wiring check.
+### Live checks
+
+Wiring checks on stable ten-task slices, not scores.
+
+2026-09-21, Sonnet through `claude -p` (isolated token), six tasks,
+`:reference`: 6/6; about 900 input tokens per task, most of it the CLI's own
+system prompt, so a full pass is roughly 3 M input tokens per candidate.
+
+2026-09-21, GPT-5.6 Luna through the Codex subscription provider
+(`codex-subscription-luna`), ten tasks (two each of `simple_python`,
+`parallel`, `parallel_multiple`, `irrelevance`, `live_multiple`), 200 to 500
+input tokens per task:
+
+| Candidate | Passed | Lost on |
+| --- | --- | --- |
+| `:reference` | 5/10 | all four parallel tasks (one call emitted), one string value |
+| `:dvergr` `:tools` | 5/10 | the same |
+| `:dvergr` `:repl` | 9/10 | the string value |
+
+The four parallel tasks are lost by construction, not by the model: the Codex
+provider sends `parallel_tool_calls: false` in its default (`responses-lite`)
+mode, so one response carries one call. The REPL candidate writes every call
+into one evaluation and is not affected. This is the first thing the benchmark
+found about the harness itself: on that backend, JSON tools cannot express a
+parallel action and the REPL can.
 
 ### Not done
 
 Java and JavaScript categories, multi-turn (eight stateful API simulations:
 the natural tier-0 follow-up, as forkable worlds), agentic (memory; web search
-needs the network and stays out), Dvergr agent-turn candidates, a full run.
+needs the network and stays out), a full run.
 
 ## tau2-bench (retail)
 

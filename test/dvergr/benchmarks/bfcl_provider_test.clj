@@ -9,6 +9,7 @@
             [dvergr.benchmarks.bfcl.equivalence :as eq]
             [dvergr.benchmarks.bfcl.provider :as provider]
             [dvergr.discourse :as d]
+            [dvergr.model.chat :as model-chat]
             [dvergr.room.store.memory :as memory]
             [org.replikativ.spindel.engine.core :as ec]))
 
@@ -114,3 +115,61 @@
       (testing "the sample is stable, so a second pass resumes into it"
         (is (= 6 (:results (run-it))))
         (is (= 6 @calls) "no cell ran again")))))
+
+;; -----------------------------------------------------------------------------
+;; Dvergr's agent step as the candidate (the model is stubbed)
+
+(def ^:private usage {:input-tokens 10 :output-tokens 5})
+
+(deftest dvergr-agent-step-candidates
+  (if-not checkout?
+    (println "SKIP dvergr-agent-step-candidates: no ../gorilla checkout")
+    (let [tasks (provider/tasks ["parallel"])
+          task (get tasks "parallel_0")
+          gold (eq/gold-calls task)
+          requests (atom [])
+          ;; the model's ONE response per action space: parallel JSON tool
+          ;; calls, or one evaluation holding every call
+          responses {:tools {:content "" :usage usage
+                             :tool-calls (map-indexed (fn [i call]
+                                                        (let [[n args] (first call)]
+                                                          {:id (str "c" i) :name n :input args}))
+                                                      gold)}
+                     :repl {:content "" :usage usage
+                            :tool-calls [{:id "e1" :name "clojure_eval"
+                                          :input {:code (str "(do "
+                                                             (apply str (map (fn [call]
+                                                                               (let [[n args] (first call)]
+                                                                                 (str "(bfcl/" n " " (pr-str args) ") ")))
+                                                                             gold))
+                                                             ")")}}]}}]
+      (doseq [action-space [:tools :repl]]
+        (testing (str action-space)
+          (let [caps (provider/capabilities tasks {})
+                env (provider/environment-def task caps {:timeout-ms 60000})
+                team (provider/candidate-roster [{:id :dv :harness :dvergr :action-space action-space
+                                                  :model "claude-code-sonnet"}])
+                room (d/make-room {:id (keyword "bfcl" (str "dv-" (name action-space)))
+                                   :store (memory/make)})
+                steps (atom 0)]
+            (try
+              (with-redefs [model-chat/chat (fn [messages opts]
+                                              (swap! steps inc)
+                                              (swap! requests conj {:action-space action-space :opts opts})
+                                              (get responses action-space))]
+                (binding [ec/*execution-context* (:ctx room)]
+                  (let [result @(evaluation/evaluate room team :dv env (:evaluator caps)
+                                                     {:world-setup (:world-setup caps)
+                                                      :protocol (:protocol caps)})
+                        receipt (:attempt-receipt result)
+                        attempt (first (attempts/attempts room {:limit 10}))]
+                    (is (= :completed (:attempt/status receipt)) (pr-str (:run/result result)))
+                    (is (= 1.0 (:attempt/reward receipt)))
+                    (is (= 1 @steps) "the step is never followed by a second one")
+                    (is (= (set gold) (set (get-in attempt [:attempt/evidence :calls])))
+                        "every call is recorded, also those made inside clojure_eval")
+                    (is (empty? (run/active-runs (:id room)))))))
+              (finally (d/close-room! room))))))
+      (testing "the REPL candidate is given one tool, and the functions in its prompt"
+        (let [repl-request (:opts (first (filter #(= :repl (:action-space %)) @requests)))]
+          (is (= ["clojure_eval"] (mapv :name (:tools repl-request)))))))))

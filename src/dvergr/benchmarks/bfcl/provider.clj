@@ -22,6 +22,7 @@
             [dvergr.agent.roster :as roster]
             [dvergr.agent.verifiers :as verifiers]
             [dvergr.benchmarks.bfcl.core :as bfcl]
+            [dvergr.benchmarks.bfcl.harness :as harness]
             [dvergr.benchmarks.tau2.core :as t2]
             [dvergr.benchmarks.tau2.live :as live]
             [dvergr.benchmarks.tau2.pyjson :as pj]
@@ -92,17 +93,27 @@
    (evaluation/make-protocol
     {:id :bfcl/single-turn :version version :basis (basis)
      :limit-keys #{}
-     :run (fn [{:keys [agent environment]}]
+     :run (fn [{:keys [room agent environment]}]
             (let [task (task-of tasks environment)
-                  generate (if agent-generate
-                             (agent-generate task)
-                             (live/model-generate (:agent/model-policy agent)))
-                  {:keys [content tool-calls usage stop-reason]} (generate (request task))]
-              {:termination :completed
-               :calls (decode tool-calls)
-               :content (when-not (str/blank? (str content)) (str content))
-               :stop-reason stop-reason
-               :usage usage}))})
+                  {:bfcl/keys [harness action-space]} (:agent/metadata agent)]
+              (if (and (= :dvergr harness) (not agent-generate))
+                ;; one step of Dvergr's agent loop, with recording functions
+                (let [{:keys [calls content usage outcome]}
+                      (harness/step room task (request task)
+                                    (assoc (:agent/model-policy agent)
+                                           :action-space action-space
+                                           :budget-dollars (get-in agent [:agent/program :budget-dollars])))]
+                  {:termination :completed :calls calls :content content
+                   :stop-reason outcome :usage usage})
+                (let [generate (if agent-generate
+                                 (agent-generate task)
+                                 (live/model-generate (:agent/model-policy agent)))
+                      {:keys [content tool-calls usage stop-reason]} (generate (request task))]
+                  {:termination :completed
+                   :calls (decode tool-calls)
+                   :content (when-not (str/blank? (str content)) (str content))
+                   :stop-reason stop-reason
+                   :usage usage}))))})
 
    :evaluator
    (evaluation/make-evaluator
@@ -158,10 +169,13 @@
                  :unsatisfiable? (contains? bfcl/unsatisfiable (:id task))}})))
 
 (defn candidate-roster
-  "AgentDefs for candidate specs `{:id :model :provider :budget-dollars}`. A
-   BFCL candidate is a model behind one step; its prompt is the task's."
+  "AgentDefs for candidate specs `{:id :model :provider :harness :action-space
+   :budget-dollars}`. `:harness :reference` (default) is the model behind one
+   API call; `:dvergr` is one step of Dvergr's agent loop with `:action-space
+   :tools` or `:repl` (`bfcl.harness`). The prompt is the task's."
   [specs]
-  (reduce (fn [team {:keys [id model provider budget-dollars] :or {budget-dollars 1.0}}]
+  (reduce (fn [team {:keys [id model provider budget-dollars harness action-space]
+                     :or {budget-dollars 1.0 harness :reference action-space :tools}}]
             (let [model-id (registry/resolve-alias model)]
               (roster/make-agent
                team
@@ -171,6 +185,7 @@
                 :model-policy {:provider (or provider (:provider (registry/get-model! model-id)))
                                :model model-id}
                 :program {:kind :llm :max-model-steps 1 :budget-dollars budget-dollars}
-                :metadata {:bfcl/harness :reference}})))
+                :metadata (cond-> {:bfcl/harness harness}
+                            (= :dvergr harness) (assoc :bfcl/action-space action-space))})))
           (roster/make-roster {:id :bfcl/candidates})
           specs))
