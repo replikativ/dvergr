@@ -121,10 +121,12 @@ jobs:
             - v1-deps-
       - install-clojure
       - run:
-          name: Deploy library jar to Clojars
+          name: Deploy library jar and benchmarks jar to Clojars
           command: |
             if [ "${CIRCLE_BRANCH}" = "main" ] && [ -n "${CLOJARS_USERNAME}" ]; then
               clojure -T:build deploy
+              # the benchmark providers, their own artefact at the same version
+              clojure -T:build benchmarks-deploy
             else
               echo "Skipping Clojars deploy (not main, or no credentials)."
             fi
