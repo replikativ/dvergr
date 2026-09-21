@@ -8,9 +8,147 @@ equivalent to the upstream implementation (see *Equivalence method* below).
 
 | Tier | Meaning | Status |
 | --- | --- | --- |
-| 0 | Fully native, in-memory, forkable | tau2-bench retail, airline, banking_knowledge (bm25), telecom |
+| 0 | Fully native, in-memory, forkable | tau2-bench retail, airline, banking_knowledge (bm25), telecom; BFCL v4 single-turn (Python) |
 | 1 | Frozen/recorded IO, no containers | planned |
 | 2 | Container-bound public leaderboards (Terminal-Bench, SWE-bench) | calibration only, via an external adapter |
+
+## What a benchmark brings
+
+Every benchmark is a *provider* on one evaluation path
+(`doc/evaluation-model.md`): each cell of an experiment is one
+`dvergr.agent.evaluation/evaluate`, a certified Attempt in a forked world that
+is discarded afterwards. Two benchmarks of opposite shape run on it without a
+change to the path, which is the evidence that the contract is general:
+
+| | tau2 | BFCL |
+| --- | --- | --- |
+| Shape | multi-turn conversation with a simulated customer | one question, one response |
+| World | a database that tools mutate | none |
+| Driver | yes (the customer, a paid model) | no |
+| Judge | an LLM for natural-language assertions | none |
+| Grade | final world, actions, communicated facts | the structure of the emitted calls |
+| Tokens to validate the transcription | none | none |
+
+A provider is a namespace (`dvergr.benchmarks.<name>.provider`) with:
+
+1. **`capabilities`**: `{:world-setup :protocol :evaluator}`, trusted closures
+   made with `evaluation/make-world-setup`, `make-protocol` and
+   `make-evaluator`.
+   - *World setup* installs the task's initial world in the Run's forked world
+     and returns evidence about it (tau2: the initial DB hash; BFCL: the digest
+     of the tool specs the candidate is given).
+   - *Protocol* is the interaction the Run hosts: tau2's conversation, BFCL's
+     single model step. It returns portable data, never the grade.
+   - *Evaluator* observes the finished Run and verifies the evidence. It
+     carries a trust tier, recorded on every receipt. One boolean check per
+     reason a candidate can lose makes a Scorecard say *why*.
+2. **Private data stays in the closures.** Gold actions and possible answers
+   never appear in an EnvironmentDef, which names a task by id only. The same
+   boundary serves a benchmark one agent writes for another.
+3. **`environment-def`**: the content-addressed EnvironmentDef of one task. The
+   upstream revision and every model that is part of what a score means
+   (driver, judge) are in the capability references, hence in its content id.
+4. **A candidate roster**: AgentDefs; what varies (model, action space, prompt
+   digest) is in the AgentDef so that a change is a new candidate, never
+   resumed into old cells.
+5. **An equivalence proof** when the benchmark is a transcription (below), and
+   a scripted candidate that replays gold answers, so the whole path is tested
+   end to end without a model.
+
+`dvergr.benchmarks.runner/run!` is everything else: the experiment directory
+and Room, Claude Code settings for the run, waiting out subscription usage
+windows, resume, the Scorecard. A provider's `experiment/run!` is a call to it.
+
+Still shared by accident, not by design: the Python-semantics layer and the
+JSON reader live under `dvergr.benchmarks.tau2` (`python`, `pyjson`) and BFCL
+requires them from there.
+
+## BFCL v4 (single-turn, Python)
+
+The Berkeley Function Calling Leaderboard, pinned at gorilla `6ea5797`
+(Apache-2.0; a checkout at `../gorilla`, data verified by digest on load).
+Eleven categories, 3491 tasks: `simple_python`, `multiple`, `parallel`,
+`parallel_multiple`, `irrelevance`, and the user-contributed `live_*`
+counterparts plus `live_relevance`.
+
+A task is a question and a set of function docs. The answer is the function
+call(s) in the model's **first** response; nothing is executed. The grade is
+structural: upstream's AST checker compares the calls with the task's possible
+answers (per parameter, a list of accepted values; `""` marks an optional
+parameter). Irrelevance tasks expect no call, relevance tasks at least one.
+
+- `bfcl.core`: data, tool compilation (upstream's Python pre-processing and
+  `convert_to_tool`, Anthropic style: `.` in a function name becomes `_`), the
+  checker with Python's semantics (`type(x) ==` is exact, `bool` is not `int`,
+  `1 == 1.0 == True` under `in`) and upstream's quirks (the second loop of
+  `dict_checker` overrides the first one's error type; `type_checker` falls
+  through after a nested failure).
+- `bfcl.provider`, `bfcl.experiment`: the provider and its experiments.
+  `:sample n` takes a stable, seeded slice per category.
+
+```clojure
+(require '[dvergr.benchmarks.bfcl.experiment :as bx])
+(bx/run! {:dir ".dvergr/benchmarks/bfcl-smoke"
+          :categories ["simple_python" "parallel" "irrelevance"] :sample 5
+          :candidates [{:id :sonnet :model "claude-code-sonnet"}]})
+```
+
+### Equivalence
+
+`dev/benchmarks/bfcl/oracle.py` runs **upstream's own code**: the checker is
+imported with `model_config` stubbed, and the helper functions of `utils.py`
+and `model_handler/utils.py` are executed from their source text, so no
+provider SDK is needed. Verified on 2026-09-21:
+
+| Check | Result |
+| --- | --- |
+| Compiled tool specs, all 3491 tasks | identical |
+| A seeded corpus of 37403 candidate answers (gold answers and mutations of type, value, string format, parameters, function names, call order and count) | every verdict and error type identical |
+| Branches reached | 3100 type errors, 1699 string mismatches, 2472 parallel match failures, nested-type, dict and list-of-dict errors |
+
+`test/dvergr/benchmarks/bfcl_test.clj` pins the digests of the oracle's
+outputs, so the suite proves this without Python whenever the checkout is
+present. Grading the corpus takes 1.6 s here and 1.5 s upstream.
+
+### Upstream data faults
+
+Building an accepted answer for every task from its own possible answers found
+four tasks that **no answer can pass** (`bfcl/unsatisfiable`, pinned by a
+test): `live_multiple_862-181-3` and `live_multiple_964-207-0` (the possible
+answers and the function's parameters disagree), `live_simple_106-63-0` and
+`live_simple_112-68-0` (required array parameters with an empty list of
+accepted values). They cap `live_simple` at 256/258 and `live_multiple` at
+1051/1053 for every model. EnvironmentDefs mark them (`:unsatisfiable?`).
+
+### What is comparable
+
+Per-category accuracies are comparable with upstream's columns of the same
+name for a function-calling model with `underscore_to_dot`. `bfcl/summary`
+also gives upstream's two aggregates over these categories. Not comparable:
+upstream's "simple" and non-live overall columns average in the Java and
+JavaScript categories, which are not transcribed (their values are
+string-encoded literals with converters of their own).
+
+### Candidates
+
+`:reference` only so far: the candidate's model behind one step with the
+compiled tools, which is what upstream's function-calling handlers do. A
+Dvergr agent turn as a candidate (JSON tools or the REPL) needs a cut after
+the first model step and is the next step here.
+
+### Live check
+
+2026-09-21, six tasks (two each of `simple_python`, `parallel`,
+`irrelevance`), Sonnet through `claude -p` with the isolated token: 6/6,
+parallel calls recorded as emitted, about 900 input tokens per task (the CLI's
+own system prompt is most of it). A full pass is therefore roughly 3 M input
+tokens per candidate. Not a score; a wiring check.
+
+### Not done
+
+Java and JavaScript categories, multi-turn (eight stateful API simulations:
+the natural tier-0 follow-up, as forkable worlds), agentic (memory; web search
+needs the network and stays out), Dvergr agent-turn candidates, a full run.
 
 ## tau2-bench (retail)
 
