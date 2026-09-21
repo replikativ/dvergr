@@ -765,7 +765,9 @@
       (let [first-reply
             (future (await-spin r #(d/ask % :policy-suspend-worker {:content "start"})
                                 2500))]
-        (is (true? (deref entered 3000 ::timeout)))
+        ;; Generous: run alone, this is the JVM's first llm-agent turn and
+        ;; pays one-time system-DB and sandbox initialization.
+        (is (true? (deref entered 30000 ::timeout)))
         (let [trigger (some #(when (= "start" (:content %)) %) (d/log r))]
           (d/post! r (d/reply :reviewer :policy-suspend-worker
                               "remember before waiting" trigger)))
