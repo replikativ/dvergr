@@ -26,6 +26,7 @@
             [org.replikativ.spindel.effects.await :refer [await]]
             [org.replikativ.spindel.engine.context :as context]
             [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.spin.core :as spin-core]
             [org.replikativ.spindel.engine.impl.simple :as simple]
             [org.replikativ.spindel.spin.combinators :as comb]
             [org.replikativ.spindel.yggdrasil :as ygg])
@@ -1641,6 +1642,28 @@
           (let [handle (program/hire! room team :slow {:task "race"})
                 winner (sp/spin :winner)]
             (is (= :winner @(comb/race winner (program/owned-result-spin handle))))
+            (is (wait-until #(= :cancelled
+                                (:run/status (program/observe room handle)))
+                            1000))))
+        (is (empty? (run/active-runs (:id room)))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest an-owning-consumer-cancelled-before-it-starts-cancels-its-run
+  ;; The window a decided race leaves: the consumer form of `owned-result-spin`
+  ;; is cancelled before its body awaits anything, so there is no await-cont to
+  ;; cascade through. Lost, the Run finishes and settles as if it had won.
+  (let [room (test-room :program-owned-consumer-window)
+        team (roster/make-agent
+              (roster/make-roster)
+              {:id :slow
+               :program {:kind :scripted :delay-ms 2000 :reply "too late"}})]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (dotimes [_ 5]
+          (let [handle (program/hire! room team :slow {:task "race"})
+                consumer (program/owned-result-spin (random-uuid) handle)]
+            (spin-core/cancel-spin! consumer)
             (is (wait-until #(= :cancelled
                                 (:run/status (program/observe room handle)))
                             1000))))
