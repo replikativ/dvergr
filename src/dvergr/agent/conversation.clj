@@ -29,6 +29,7 @@
             [dvergr.discourse :as d]
             [dvergr.room.store :as store]
             [dvergr.room.store.datahike :as dhs]
+            [dvergr.substrate.datahike :as sdh]
             [dvergr.substrate.paths :as paths]
             [dvergr.system.db :as sdb]
             [hasch.core :as hasch])
@@ -83,9 +84,17 @@
    a file-backed Datahike database with the chat schema plus an
    experiment-local artifact store. Returns `{:dir :cfg :conn :store}`."
   [dir]
-  (let [cfg (store-config dir)]
+  (let [base (store-config dir)
+        fresh? (not (dh/database-exists? base))
+        ;; Every Attempt is its own small commit, so an experiment store is the
+        ;; write pattern diff buffering is for (`substrate.datahike/
+        ;; diff-buf-size`; without it a 2000-commit store is several hundred MB).
+        ;; Create-time-fixed: an existing store keeps what it was created with,
+        ;; and datahike raises on a conflicting value at connect.
+        cfg (cond-> base
+              fresh? (assoc :index-config {:diff-buf-size sdh/diff-buf-size}))]
     ;; Datahike creates the directory itself; it must not pre-exist.
-    (when-not (dh/database-exists? cfg)
+    (when fresh?
       (dh/create-database cfg))
     (let [conn (dh/connect cfg)]
       (schema/ensure-full-schema! conn)

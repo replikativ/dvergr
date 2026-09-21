@@ -47,6 +47,12 @@ A provider is a namespace (`dvergr.benchmarks.<name>.provider`) with:
      of the tool specs the candidate is given).
    - *Protocol* is the interaction the Run hosts: tau2's conversation, BFCL's
      single model step. It returns portable data, never the grade.
+     Its model calls are the Run's: the protocol worker runs under the Run's
+     `resource/*model-scope*`, and the protocol is given the scope as
+     `:model-scope` for calls that happen on other threads (`live/scoped`
+     wraps a generate fn with it). An environment that declares
+     `model-dispatches` resources therefore bounds the candidate AND the
+     driver; the judge runs in verification, outside the Run's wallet.
    - *Evaluator* observes the finished Run and verifies the evidence. It
      carries a trust tier, recorded on every receipt. One boolean check per
      reason a candidate can lose makes a Scorecard say *why*.

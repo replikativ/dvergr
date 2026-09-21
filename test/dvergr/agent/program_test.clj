@@ -1004,6 +1004,71 @@
               (is (= :discarded (:run/settlement-status result))))))
         (finally (close-resource-test-room! room conn))))))
 
+(deftest a-protocol-run-spends-its-own-dispatch-admissions
+  ;; A protocol (an environment's conversation, a benchmark's model step) is
+  ;; the Run's program, so its model calls are governed like an LLM program's:
+  ;; under the worker's binding, and on any other thread through the explicit
+  ;; `:model-scope` the protocol is given.
+  (let [[room conn] (resource-test-room (keyword (str "dispatch-protocol-" (random-uuid))))
+        called (atom 0)
+        seen (atom nil)
+        team (roster/make-agent (roster/make-roster)
+                                {:id :candidate :model-policy {:provider :test :model "stub"}
+                                 :program {:kind :llm :max-model-steps 1}})
+        request! (fn []
+                   (binding [gateway/*request-fn* (fn [_] (swap! called inc) {:status 200})]
+                     (gateway/request! {:url "https://model.test/responses"
+                                        :credentials (gateway/static-credentials
+                                                      :test {} #{"https://model.test"})})))
+        protocol {:run (fn [{:keys [model-scope]}]
+                         (reset! seen {:bound resource/*model-scope* :given model-scope})
+                         (request!)
+                         ;; a Room participant or a future: no conveyed binding
+                         (let [failure (promise)
+                               t (Thread. (fn []
+                                            (try (binding [resource/*model-scope* model-scope]
+                                                   (request!))
+                                                 (deliver failure nil)
+                                                 (catch Throwable e (deliver failure e)))))]
+                           (.start t)
+                           (when-let [e @failure] (throw e)))
+                         {:done true})}
+        run! (fn [opts]
+               (let [handle (binding [ec/*execution-context* (:ctx room)]
+                              (program/hire-prepared-in! room room team :candidate
+                                                         (merge {:task "protocol" :settlement :discard} opts)
+                                                         nil protocol))
+                     finished (promise)]
+                 (binding [ec/*execution-context* (:ctx room)]
+                   ((program/owned-result-spin handle) #(deliver finished %) #(deliver finished %)))
+                 (deref finished 30000 ::timeout)))]
+    (try
+      (resource/install-unit! room {:symbol resource/model-dispatches
+                                    :name "Dispatch admission" :precision 0})
+      (resource/mint! room {:id (random-uuid) :resources {resource/model-dispatches 5M}})
+      (testing "with a wallet, both calls are admitted against it"
+        (let [result (run! {:resources {resource/model-dispatches 3M}})]
+          (is (= :completed (:run/status result)) (pr-str result))
+          (is (= {:done true} (:run/value result)))
+          (is (some? (:bound @seen)))
+          (is (= (:run-id (:bound @seen)) (:run-id (:given @seen))))
+          (is (= 2 @called))
+          (is (= {resource/model-dispatches 3M} (resource/balance room))
+              "two of three allocated admissions were spent, one came back")))
+      (testing "a third call is refused before it reaches the provider"
+        (reset! called 0)
+        (let [result (run! {:resources {resource/model-dispatches 1M}})]
+          (is (= 1 @called) "the second request was not admitted")
+          (is (= :failed (:run/status result)))))
+      (testing "without a wallet the protocol is unscoped, as an LLM program is"
+        (reset! called 0)
+        (let [result (run! {})]
+          (is (= :completed (:run/status result)))
+          (is (nil? (:bound @seen)))
+          (is (nil? (:given @seen)))
+          (is (= 2 @called))))
+      (finally (close-resource-test-room! room conn)))))
+
 (deftest llm-program-cancellation-aborts-the-live-turn
   (let [room (test-room :program-llm-cancel)
         team (roster/make-agent
