@@ -7,7 +7,14 @@
    Supports streaming via --output-format stream-json --verbose --include-partial-messages.
 
    Tool calling is implemented by embedding tool definitions in the system prompt
-   and parsing structured <tool_call> blocks from the response text."
+   and parsing structured <tool_call> blocks from the response text.
+
+   Subscription usage limits are tracked from the CLI's `rate_limit_event`s:
+   `rate-limit-status`, `usage-limited?` and `await-usage-window!` let long
+   runs pause until a window resets instead of failing call after call.
+   `configure!` pins the CLI binary and appends an optional note to every
+   system prompt (the CLI injects host context -- the account email and the
+   current date -- that cannot be switched off)."
   (:require [dvergr.model.provider :as p]
             [dvergr.model.quirks :as quirks]
             [dvergr.chat.tool-schema :as tool-schema]
@@ -16,6 +23,119 @@
             [taoensso.telemere :as tel])
   (:import [java.io BufferedReader Closeable InputStreamReader]
            [java.util.concurrent CancellationException TimeUnit]))
+
+;; ============================================================================
+;; Settings
+;; ============================================================================
+
+(defonce ^:private settings
+  (atom {:cli "claude" :system-note nil :env nil}))
+
+(defn configure!
+  "Process-wide CLI settings, merged into the current ones:
+     :cli          executable to run (a versioned binary pins the CLI)
+     :system-note  text appended to every system prompt, or nil
+     :env          environment entries added to the CLI process, e.g.
+                   {\"CLAUDE_CONFIG_DIR\" dir \"CLAUDE_CODE_OAUTH_TOKEN\" token}"
+  [m]
+  (swap! settings merge (select-keys m [:cli :system-note :env])))
+
+(defn settings-snapshot [] @settings)
+
+(defn token-env
+  "CLI environment for an isolated, token-authenticated CLI: an empty config
+   directory (no stored account profile, hence no injected account email) and
+   a long-lived inference token from `claude setup-token`, which never
+   refreshes and so cannot disturb the interactive login."
+  [config-dir token]
+  (.mkdirs (java.io.File. (str config-dir)))
+  {"CLAUDE_CONFIG_DIR" (.getAbsolutePath (java.io.File. (str config-dir)))
+   "CLAUDE_CODE_OAUTH_TOKEN" (str/trim (str token))})
+
+(def ^:private cli-version*
+  (memoize
+   (fn [cli]
+     (try
+       (let [process (.start (ProcessBuilder. ^java.util.List [cli "--version"]))
+             out (slurp (.getInputStream process))]
+         (when (zero? (.waitFor process))
+           (first (str/split (str/trim out) #"\s+"))))
+       (catch Exception _ nil)))))
+
+(defn cli-version
+  "Version reported by the configured CLI binary, or nil when unavailable."
+  []
+  (cli-version* (:cli @settings)))
+
+;; ============================================================================
+;; Usage Limits
+;; ============================================================================
+
+(defonce ^:private rate-limits (atom nil))
+
+(defn- epoch-ms [seconds] (when seconds (* 1000 (long seconds))))
+
+(defn- record-rate-limit! [{:keys [status resetsAt rateLimitType utilization unifiedWindows]}]
+  (reset! rate-limits
+          {:status (keyword status)
+           :type (some-> rateLimitType keyword)
+           :utilization utilization
+           :resets-at-ms (epoch-ms resetsAt)
+           :windows (into {} (map (fn [[k {:keys [utilization resetsAt]}]]
+                                    [k {:utilization utilization :resets-at-ms (epoch-ms resetsAt)}]))
+                          unifiedWindows)
+           :observed-at-ms (System/currentTimeMillis)}))
+
+(defn rate-limit-status
+  "The most recent subscription usage report from the CLI, or nil."
+  []
+  @rate-limits)
+
+(defn usage-limited?
+  "True while the last report rejected calls and its window has not reset."
+  []
+  (let [{:keys [status resets-at-ms]} @rate-limits]
+    (and (= :rejected status)
+         (or (nil? resets-at-ms) (> resets-at-ms (System/currentTimeMillis))))))
+
+(defn- usage-limit-error [message data]
+  (ex-info message (merge {:claude-code/usage-limit true
+                           :resets-at-ms (:resets-at-ms @rate-limits)}
+                          data)))
+
+(defn usage-limit-error?
+  "True when `e` (or a cause) is a Claude Code usage-limit failure."
+  [e]
+  (boolean (some #(:claude-code/usage-limit (ex-data %))
+                 (take-while some? (iterate #(.getCause ^Throwable %) e)))))
+
+(defn usage-wait-ms
+  "Milliseconds until every window that is rejected or at least `threshold`
+   utilized has reset (plus `margin-ms`); 0 when no pause is needed."
+  ([threshold] (usage-wait-ms threshold 60000))
+  ([threshold margin-ms]
+   (let [now (System/currentTimeMillis)
+         {:keys [status resets-at-ms windows]} @rate-limits
+         blocked (concat
+                  (when (= :rejected status) [resets-at-ms])
+                  (keep (fn [[_ {:keys [utilization resets-at-ms]}]]
+                          (when (and utilization (>= utilization threshold)) resets-at-ms))
+                        windows))
+         until (reduce max 0 (keep #(when (and % (> % now)) %) blocked))]
+     (if (pos? until) (+ (- until now) margin-ms) 0))))
+
+(defn await-usage-window!
+  "Block the calling (host) thread while the subscription is rate limited or
+   a window is at least `threshold` utilized. Returns the milliseconds waited.
+   Never call on the Spindel drain."
+  [{:keys [threshold max-wait-ms] :or {threshold 0.97 max-wait-ms (* 8 24 3600 1000)}}]
+  (let [wait (min (usage-wait-ms threshold) max-wait-ms)]
+    (when (pos? wait)
+      (tel/log! {:level :warn :id :claude-code/usage-pause
+                 :data {:wait-ms wait :status (rate-limit-status)}}
+                "Pausing until the Claude subscription usage window resets")
+      (Thread/sleep (long wait)))
+    wait))
 
 ;; ============================================================================
 ;; Message Formatting
@@ -99,50 +219,82 @@
   [text]
   (str/replace text tool-result-pattern ""))
 
+(def ^:private bare-call-pattern
+  "A whole response that is only a JSON object, optionally fenced."
+  #"(?s)\A\s*(?:```(?:json)?\s*)?(\{.*\})\s*(?:```)?\s*\z")
+
+(defn- bare-tool-call
+  "Recover a tool call the model emitted without its <tool_use> wrapper.
+
+   Only a response consisting of exactly one JSON object with a string
+   `name` naming an OFFERED tool and a map (or absent) `input` qualifies.
+   Anything else stays text: prose that merely contains JSON, unknown names,
+   or extra keys are never executed."
+  [text tool-names]
+  (when-let [[_ json-str] (re-matches bare-call-pattern text)]
+    (let [parsed (try (json/read-value json-str json/keyword-keys-object-mapper)
+                      (catch Exception _ nil))]
+      (when (and (map? parsed)
+                 (string? (:name parsed))
+                 (contains? tool-names (:name parsed))
+                 (every? #{:name :input} (keys parsed))
+                 (or (nil? (:input parsed)) (map? (:input parsed))))
+        (tel/log! {:level :info :id :claude-code/bare-tool-call-recovered
+                   :data {:name (:name parsed)}}
+                  "Recovered unwrapped tool call")
+        {:id (str "tc_" (java.util.UUID/randomUUID))
+         :name (:name parsed)
+         :input (or (:input parsed) {})}))))
+
 (defn- parse-tool-calls
   "Parse <tool_use> blocks from response text.
    Strips hallucinated <tool_result> blocks first to avoid matching old content.
-   Deduplicates file-writing tools by path (last writer wins).
+   Deduplicates file-writing tools by path (last writer wins). When no block
+   is present, a response that is solely one well-formed call of an offered
+   tool is recovered (see `bare-tool-call`).
    Returns {:text stripped-text, :tool-calls [{:id :name :input}]}."
-  [text]
-  (if (str/blank? text)
-    {:text "" :tool-calls nil}
-    (let [;; Strip hallucinated tool_results FIRST — they may contain old tool_use blocks
-          cleaned (clean-response-text text)
-          matches (re-seq tool-call-pattern cleaned)]
-      (if (empty? matches)
-        {:text (str/trim cleaned) :tool-calls nil}
-        (let [raw-calls
-              (into []
-                    (comp
-                     (map second)
-                     (keep (fn [json-str]
-                             (try
-                               (let [parsed (json/read-value json-str json/keyword-keys-object-mapper)]
-                                 {:id (or (:id parsed) (str "tc_" (java.util.UUID/randomUUID)))
-                                  :name (:name parsed)
-                                  :input (or (:input parsed) {})})
-                               (catch Exception e
-                                 (tel/log! {:level :warn :id :claude-code/tool-call-parse-error
-                                            :data {:json json-str :error (.getMessage e)}}
-                                           "Failed to parse tool call JSON")
-                                 nil)))))
-                    matches)
+  ([text] (parse-tool-calls text #{}))
+  ([text tool-names]
+   (if (str/blank? text)
+     {:text "" :tool-calls nil}
+     (let [;; Strip hallucinated tool_results FIRST — they may contain old tool_use blocks
+           cleaned (clean-response-text text)
+           matches (re-seq tool-call-pattern cleaned)]
+       (if (empty? matches)
+         (if-let [call (bare-tool-call cleaned tool-names)]
+           {:text "" :tool-calls [call]}
+           {:text (str/trim cleaned) :tool-calls nil})
+         (let [raw-calls
+               (into []
+                     (comp
+                      (map second)
+                      (keep (fn [json-str]
+                              (try
+                                (let [parsed (json/read-value json-str json/keyword-keys-object-mapper)]
+                                  {:id (or (:id parsed) (str "tc_" (java.util.UUID/randomUUID)))
+                                   :name (:name parsed)
+                                   :input (or (:input parsed) {})})
+                                (catch Exception e
+                                  (tel/log! {:level :warn :id :claude-code/tool-call-parse-error
+                                             :data {:json json-str :error (.getMessage e)}}
+                                            "Failed to parse tool call JSON")
+                                  nil)))))
+                     matches)
               ;; Deduplicate file-writing tools: last write to same path wins
-              file-tools #{"write_file" "edit_file"}
-              tool-calls (let [{file-writes true others false}
-                               (group-by #(contains? file-tools (:name %)) raw-calls)
+               file-tools #{"write_file" "edit_file"}
+               tool-calls (let [{file-writes true others false}
+                                (group-by #(contains? file-tools (:name %)) raw-calls)
                                ;; For file writes, group by path, keep last
-                               deduped-writes (->> file-writes
-                                                   (group-by #(get-in % [:input :path]))
-                                                   vals
-                                                   (map last))]
-                           (vec (concat others deduped-writes)))
-              stripped (-> cleaned
-                           (str/replace tool-call-pattern "")
-                           str/trim)]
-          {:text stripped
-           :tool-calls (when (seq tool-calls) tool-calls)})))))
+                                deduped-writes (->> file-writes
+                                                    (group-by #(get-in % [:input :path]))
+                                                    vals
+                                                    (map last))]
+                            (vec (concat others deduped-writes)))
+               stripped (-> cleaned
+                            (str/replace tool-call-pattern "")
+                            str/trim)]
+           {:text stripped
+            :tool-calls (when (seq tool-calls) tool-calls)}))))))
 
 ;; ============================================================================
 ;; Model Mapping
@@ -189,7 +341,7 @@
   (let [model (resolve-cli-model (:model opts))
         system (extract-system-prompt [] opts)
         effort (resolve-effort opts)]
-    (cond-> ["claude" "-p"
+    (cond-> [(:cli @settings) "-p"
              "--output-format" "stream-json"
              "--verbose"
              "--include-partial-messages"
@@ -224,8 +376,11 @@
 (def ^:private process-exit-grace-ms 100)
 
 (defn- start-process [cmd]
-  (.start (doto (ProcessBuilder. ^java.util.List cmd)
-            (.redirectErrorStream false))))
+  (let [pb (doto (ProcessBuilder. ^java.util.List cmd)
+             (.redirectErrorStream false))]
+    (when-let [env (:env @settings)]
+      (.putAll (.environment pb) ^java.util.Map env))
+    (.start pb)))
 
 (defn- close-quietly! [resource]
   (when (instance? Closeable resource)
@@ -277,12 +432,9 @@
         ;; Append tool definitions to system prompt if tools provided
         tools (:tools opts)
         tools-prompt (build-tools-prompt tools)
-        effective-system (cond
-                           (and system-prompt tools-prompt)
-                           (str system-prompt tools-prompt)
-                           system-prompt system-prompt
-                           tools-prompt tools-prompt
-                           :else nil)
+        note (:system-note @settings)
+        effective-system (some->> [system-prompt tools-prompt (when note (str "\n\n" note))]
+                                  (remove nil?) seq (apply str) not-empty)
         opts-with-system (if effective-system
                            (assoc opts :system effective-system)
                            opts)
@@ -338,6 +490,8 @@
                            (if (nil? line)
                              result
                              (let [event (parse-json-line line)]
+                               (when (= "rate_limit_event" (:type event))
+                                 (record-rate-limit! (:rate_limit_info event)))
                                (when event
                                  (when on-text
                                    (when-let [text (extract-text-delta event)]
@@ -350,13 +504,23 @@
             stderr @stderr-future]
         (when @cancelled?
           (throw (CancellationException. "LLM call cancelled")))
-        (if (and result-event (or (zero? exit-code) result-event))
+        ;; An error result carries an error message, never a model reply.
+        (when (:is_error result-event)
+          (let [text (str (:result result-event))
+                data {:exit-code exit-code :subtype (:subtype result-event)
+                      :result text :stderr stderr}]
+            (throw (if (or (usage-limited?)
+                           (re-find #"(?i)usage limit|hit your .*limit|rate limit" text))
+                     (usage-limit-error (str "Claude subscription usage limit: " text) data)
+                     (ex-info (str "claude CLI error: " text) data)))))
+        (if result-event
           (let [model-usage (:modelUsage result-event)
                 model-key (first (keys model-usage))
                 raw-content (or (:result result-event) "")
                 ;; Parse tool calls from response text
                 {:keys [text tool-calls]} (if (seq tools)
-                                            (parse-tool-calls raw-content)
+                                            (parse-tool-calls raw-content
+                                                              (set (keep :name tools)))
                                             {:text raw-content :tool-calls nil})]
             {:content text
              :tool-calls tool-calls
@@ -418,6 +582,9 @@
                       :tools (count (:tools opts))
                       :streaming? (some? (:on-text opts))}}
               "Claude Code CLI chat")
+    ;; Don't spend a subprocess on a call the subscription will reject.
+    (when (usage-limited?)
+      (throw (usage-limit-error "Claude subscription usage limit active" {})))
     (let [parsed (run-claude-streaming messages opts)]
       (tel/log! {:id :claude-code/chat-complete
                  :data {:model (:model parsed)

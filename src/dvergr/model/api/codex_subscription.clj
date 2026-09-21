@@ -430,7 +430,12 @@
 
 (defn- native-request [config credentials messages opts]
   (let [model (resolve-native-model (:model opts))
-        responses-lite? (not= false (:responses-lite? config))
+        ;; The endpoint refuses `parallel_tool_calls` in responses-lite mode
+        ;; (400), as the Codex client knows (`parallel && !use_responses_lite`).
+        ;; A caller that asks for parallel calls gets them: that request goes
+        ;; out in the full Responses shape.
+        parallel? (boolean (:parallel-tool-calls opts))
+        responses-lite? (and (not= false (:responses-lite? config)) (not parallel?))
         instructions (or (extract-system messages opts) "")
         messages (remove #(= "system" (role-name (:role %))) messages)
         tools (native-tools (:tools opts) responses-lite?)
@@ -445,8 +450,7 @@
                             (into (native-prefix instructions tools) input)
                             input)
                    :tool_choice "auto"
-                   :parallel_tool_calls (and (boolean (:parallel-tool-calls opts))
-                                             (not responses-lite?))
+                   :parallel_tool_calls parallel?
                    :reasoning (cond-> {:effort effort}
                                 responses-lite? (assoc :context "all_turns"))
                    :store false

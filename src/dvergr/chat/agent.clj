@@ -145,13 +145,15 @@
    - :auto-compact? - Enable automatic compaction (default true)
    - :compaction-model - Model for summarization
    - :turn-number - Current turn number (for message grouping)
+   - :model-opts - further options of the model call, as `model.chat/chat`
+                   takes them (`:parallel-tool-calls`, `:effort`, ...)
 
    Returns:
    - :continue if more turns needed (tool calls made)
    - :complete if agent is done (no tool calls)
    - :error if something failed"
   [chat-ctx {:keys [provider model tools tool-ctx on-text auto-compact? compaction-model turn-number cancel?
-                    system-suffix on-reply run-id]
+                    system-suffix on-reply run-id model-opts]
              :or {auto-compact? true}}]
   (try
     ;; Check for automatic compaction before turn
@@ -196,13 +198,15 @@
           ;; socket mid-stream and stops billed-token generation.
           response (model-chat/chat
                     api-messages
-                    {:model model
-                     :provider provider
-                     :tools (if tools
-                              (tools/tool-definitions tools)
-                              (tools/tool-definitions))
-                     :on-text (or on-text (fn [_]))
-                     :cancel? cancel?})
+                    (merge
+                     model-opts
+                     {:model model
+                      :provider provider
+                      :tools (if tools
+                               (tools/tool-definitions tools)
+                               (tools/tool-definitions))
+                      :on-text (or on-text (fn [_]))
+                      :cancel? cancel?}))
 
           ;; Extract from new response format
           {:keys [content tool-calls usage stop-reason reasoning]} response

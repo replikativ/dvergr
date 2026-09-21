@@ -29,7 +29,8 @@
    group-id matches one of the patterns, auto-approve; else return
    `:ask-human`. The allowlist lives in `(ec/get-state [:dvergr/deps-policy :allowlist])`
    (a vector of regex patterns); install via `set-allowlist!`."
-  (:require [clojure.edn :as edn]
+  (:require [dvergr.substrate.load :as load]
+            [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [dvergr.sandbox.workspace :as workspace]
@@ -443,7 +444,7 @@
    Used by both `mirror-namespaces-into-sci!` (post-add-libs walk)
    and the `:load-fn` interceptor (lazy on require)."
   [sci-ctx ns-sym]
-  (require 'sci.core)
+  (load/require! 'sci.core)
   (let [add-namespace! @(resolve 'sci.core/add-namespace!)]
     (cond
       (not (namespace-mirrorable? ns-sym))
@@ -565,7 +566,7 @@
    or a vector of coords:
      '[io.foo/bar io.baz/qux]"
   [sci-ctx libs]
-  (require 'clojure.repl.deps)
+  (load/require! 'clojure.repl.deps)
   (let [host-add-libs (or (resolve 'clojure.repl.deps/add-libs)
                           (throw (ex-info "clojure.repl.deps/add-libs not available — needs Clojure 1.12+"
                                           {:type :dvergr/deps-arg})))

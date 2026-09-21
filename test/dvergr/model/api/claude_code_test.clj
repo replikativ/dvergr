@@ -113,3 +113,66 @@
       (is (not= ::timeout outcome))
       (is (= "callback failed" (ex-message throwable)))
       (is (false? (.isAlive ^Process process))))))
+
+(deftest unwrapped-tool-calls-are-recovered-only-when-unambiguous
+  (let [parse #(@#'claude-code/parse-tool-calls %1 #{"cancel_pending_order"})
+        call "{\"name\":\"cancel_pending_order\",\"input\":{\"order_id\":\"#W1\",\"reason\":\"ordered by mistake\"}}"]
+    (testing "a response that is solely one offered call becomes a tool call"
+      (let [{:keys [text tool-calls]} (parse call)]
+        (is (= "" text))
+        (is (= [["cancel_pending_order" {:order_id "#W1" :reason "ordered by mistake"}]]
+               (mapv (juxt :name :input) tool-calls))))
+      (is (= "cancel_pending_order"
+             (-> (parse (str "```json\n" call "\n```")) :tool-calls first :name))))
+    (testing "everything else stays text"
+      (doseq [text [(str "Here is the call: " call)
+                    "{\"name\":\"delete_everything\",\"input\":{}}"
+                    "{\"name\":\"cancel_pending_order\",\"input\":{},\"extra\":1}"
+                    "{\"name\":\"cancel_pending_order\",\"input\":\"x\"}"
+                    "{\"order_id\":\"#W1\"}"
+                    "{not json}"]]
+        (is (nil? (:tool-calls (parse text))) text)))
+    (testing "wrapped calls keep precedence"
+      (is (= 1 (count (:tool-calls (parse (str "<tool_use>\n" call "\n</tool_use>")))))))))
+
+(defn- emit-lines [& lines]
+  ["sh" "-c" (apply str "cat >/dev/null\n"
+                    (map #(str "printf '%s\\n' '" % "'\n") lines))])
+
+(deftest usage-limits-are-tracked-and-error-results-are-not-replies
+  (let [rate-limits @#'claude-code/rate-limits
+        resets (+ 3600 (quot (System/currentTimeMillis) 1000))
+        event (fn [status]
+                (str "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"" status "\","
+                     "\"resetsAt\":" resets ",\"rateLimitType\":\"seven_day\",\"utilization\":0.99,"
+                     "\"unifiedWindows\":{\"five_hour\":{\"utilization\":0.1,\"resetsAt\":" resets "},"
+                     "\"seven_day\":{\"utilization\":0.99,\"resetsAt\":" resets "}}}}"))]
+    (try
+      (testing "a reply records the latest usage report"
+        (reset! rate-limits nil)
+        (is (= "transport ok" (:content (run-with-command (emit-lines (event "allowed_warning") result-json) {}))))
+        (is (= :allowed_warning (:status (claude-code/rate-limit-status))))
+        (is (not (claude-code/usage-limited?)))
+        (is (zero? (claude-code/usage-wait-ms 0.995)) "below the threshold: no pause")
+        (is (< 3600000 (claude-code/usage-wait-ms 0.97)) "a window over the threshold pauses until it resets"))
+      (testing "an error result is thrown, classified as a usage limit when rejected"
+        (reset! rate-limits nil)
+        (let [e (try (run-with-command
+                      (emit-lines (event "rejected")
+                                  "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"You have hit your limit\"}")
+                      {})
+                     nil
+                     (catch Exception e e))]
+          (is (claude-code/usage-limit-error? e))
+          (is (claude-code/usage-limited?))
+          (is (= (* 1000 resets) (:resets-at-ms (ex-data e))))))
+      (testing "other error results are errors, not usage limits"
+        (reset! rate-limits nil)
+        (let [e (try (run-with-command
+                      (emit-lines "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"Invalid API key\"}")
+                      {})
+                     nil
+                     (catch Exception e e))]
+          (is (some? e))
+          (is (not (claude-code/usage-limit-error? e)))))
+      (finally (reset! rate-limits nil)))))

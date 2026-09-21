@@ -2,7 +2,8 @@
   "SCI injectors — the agent dev kit: clojure.repl, clojure.repl.deps (gated
    add-libs via dvergr.sandbox.deps, inline-required), and hiccup HTML. Split out
    of dvergr.sandbox (Phase 4 decomposition)."
-  (:require [clojure.string :as str]
+  (:require [dvergr.substrate.load :as load]
+            [clojure.string :as str]
             [sci.core :as sci]
             [hiccup.compiler :as hc]
             [hiccup.util :as hu]
@@ -319,7 +320,7 @@
 
    On deny, throws `ex-info` with :type :dvergr/dep-denied, :coord, :reason."
   [sci-ctx]
-  (require 'dvergr.sandbox.deps)
+  (load/require! 'dvergr.sandbox.deps)
   (let [add-libs!     @(ns-resolve 'dvergr.sandbox.deps 'add-libs!)
         sync-deps!    @(ns-resolve 'dvergr.sandbox.deps 'sync-deps!)
         make-load-fn* @(ns-resolve 'dvergr.sandbox.deps 'make-load-fn)]
