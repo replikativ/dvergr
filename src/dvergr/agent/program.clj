@@ -304,8 +304,34 @@
   (advance-supervisor! supervisor)
   (:quiesced supervisor))
 
-(defn- worker-result-spin [worker]
-  (sp/spin (sp/await (:done worker))))
+(defn- off-caller-spin
+  "A Spin that resolves `value` on the native executor, never on the thread
+   that awaits it."
+  [value]
+  (let [ctx (ec/current-execution-context)]
+    (spin-core/make-spin
+     (fn [resolve reject]
+       (try
+         (.execute native-executor
+                   (fn []
+                     (binding [ec/*execution-context* ctx]
+                       (spin-core/resume resolve value))))
+         (catch Throwable t
+           (spin-core/resume reject t)))))))
+
+(defn- worker-result-spin
+  "The worker's result, continued on a native thread.
+
+   A deferred resumes its awaiter on whichever thread comes second: the
+   worker's, inside its own `finally` (so its lease outlives its work by the
+   body's next step), or, when the worker was faster than the body reached its
+   await, the thread that is hiring, which then runs resource allocation and
+   whatever else blocks before the body suspends again. The hop makes neither
+   happen: a worker ends when its work does, and hiring returns."
+  [worker]
+  (sp/spin
+   (let [result (sp/await (:done worker))]
+     (sp/await (off-caller-spin result)))))
 
 (defn- worker-error? [value]
   (and (map? value) (contains? value ::worker-error)))
