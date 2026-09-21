@@ -242,10 +242,29 @@
                   {:setup ref
                    :environment (environment/environment-ref definition)}))))
 
-(defn- cell-evaluation-opts [world-setups opts definition]
-  (if-let [setup (world-setup! world-setups definition)]
-    (assoc opts :world-setup setup)
-    opts))
+(defn- protocol! [protocols definition]
+  (when-let [ref (get-in definition [:environment/world :protocol])]
+    (or (get protocols ref)
+        (invalid! "Experiment has no exact host Protocol for an environment"
+                  ::missing-protocol
+                  {:protocol ref
+                   :environment (environment/environment-ref definition)}))))
+
+(defn- cell-evaluation-opts [{:keys [world-setups protocols]} opts definition]
+  (let [setup (world-setup! world-setups definition)
+        protocol (protocol! protocols definition)]
+    (cond-> opts
+      setup (assoc :world-setup setup)
+      protocol (assoc :protocol protocol))))
+
+(defn- cell-metrics
+  "The cell's identity, recorded in the Attempt's receipt metrics so a later
+   run of the same ExperimentDef can find it (resume) before any Scorecard
+   exists."
+  [experiment job]
+  {:experiment-content-id (:experiment/content-id experiment)
+   :experiment-candidate (get-in job [:candidate :candidate/id])
+   :experiment-repetition (:repetition job)})
 
 (defn- jobs [experiment]
   (for [candidate (:experiment/candidates experiment)
@@ -256,22 +275,45 @@
      :environment definition
      :repetition repetition}))
 
-(defn- result-spin [room team evaluators world-setups opts job]
+(defn- experiment-job [job]
+  (let [candidate (:candidate job)]
+    {:candidate/id (:candidate/id candidate)
+     :candidate/agent (:candidate/agent candidate)
+     :candidate/agent-content-id (:candidate/agent-content-id candidate)
+     :environment (environment/environment-ref (:environment job))
+     :repetition (:repetition job)}))
+
+(defn- result-spin [room team evaluators capabilities opts experiment job]
   (let [definition (:environment job)
         candidate (:candidate job)
         evaluation-spin
         (evaluation/evaluate room team (:candidate/agent candidate)
                              definition (evaluator! evaluators definition)
-                             (cell-evaluation-opts world-setups opts definition))]
+                             (assoc (cell-evaluation-opts capabilities opts definition)
+                                    :metrics (cell-metrics experiment job)))]
     (sp/spin
      (let [result (sp/await evaluation-spin)]
-       (assoc result :experiment/job
-              {:candidate/id (:candidate/id candidate)
-               :candidate/agent (:candidate/agent candidate)
-               :candidate/agent-content-id
-               (:candidate/agent-content-id candidate)
-               :environment (environment/environment-ref definition)
-               :repetition (:repetition job)})))))
+       (assoc result :experiment/job (experiment-job job))))))
+
+(defn- completed-cells
+  "`{[candidate-id environment-content-id repetition] Attempt}` for the
+   completed Attempts this exact ExperimentDef already has in `room`."
+  [room experiment]
+  (let [room-store (:store room)]
+    (if-not (satisfies? store/PAttemptStore room-store)
+      {}
+      (into {}
+            (keep (fn [a]
+                    (let [r (:attempt/receipt a)
+                          m (:attempt/metrics r)]
+                      (when (and (= :completed (:attempt/status r))
+                                 (= (:experiment/content-id experiment)
+                                    (:experiment-content-id m)))
+                        [[(:experiment-candidate m)
+                          (get-in r [:attempt/environment :environment/content-id])
+                          (:experiment-repetition m)]
+                         a]))))
+            (store/-list-attempts room-store (:id room) {:limit 1000000})))))
 
 (defn- run-batches [spins parallelism]
   (if (seq spins)
@@ -547,19 +589,31 @@
    evaluation Spins are realized one bounded batch at a time. Options include
    ordinary evaluation `:from`/`:parent-run` plus host-owned `:parallelism`,
    `:max-parallelism`, `:max-attempts`, an optional process-local
-   `:cleanup-group`, and an exact `:world-setups` capability map for environments
-   that name setup references. A caller-supplied cleanup group is known before
-   realization and can be joined with `evaluation/await-cleanups-for!` after a
-   failed or cancelled operation. When omitted, detached cleanup remains owned
-   by the Room and must be joined with `evaluation/await-cleanups!` at teardown.
-   Experiment batches
-   initially require discard settlement; retained partial experiments need
-   durable execution identity and recovery first."
+   `:cleanup-group`, an exact `:world-setups` capability map for environments
+   that name setup references, and `:protocols` likewise for protocol
+   references. A caller-supplied cleanup group is known before realization and
+   can be joined with `evaluation/await-cleanups-for!` after a failed or
+   cancelled operation. When omitted, detached cleanup remains owned by the
+   Room and must be joined with `evaluation/await-cleanups!` at teardown.
+   Experiment batches initially require discard settlement; retained partial
+   experiments need durable execution identity and recovery first.
+
+   With `:resume? true`, cells that already have a completed Attempt of this
+   exact ExperimentDef in `room` are not run again; their Attempts enter the
+   Scorecard. Every Attempt records its cell in its receipt metrics, so an
+   interrupted experiment continues where it stopped.
+
+   With `:complete-only? true` no Scorecard is persisted while any cell's
+   Attempt is not `:completed` (an infrastructure fault is not a verdict);
+   the result carries `:incomplete {:cells n}` instead, and a resumed run
+   re-runs exactly those cells."
   ([room team experiment evaluators]
    (run room team experiment evaluators {}))
   ([room team experiment evaluators
-    {:keys [parallelism max-parallelism max-attempts world-setups cleanup-group]
-     :or {parallelism 1 max-parallelism 16 max-attempts 256 world-setups {}}
+    {:keys [parallelism max-parallelism max-attempts world-setups protocols
+            cleanup-group resume? complete-only?]
+     :or {parallelism 1 max-parallelism 16 max-attempts 256 world-setups {}
+          protocols {}}
      :as opts}]
    (validate-experiment experiment)
    (when-not (map? evaluators)
@@ -574,6 +628,7 @@
                               [:experiment/dataset :dataset/environments])]
      (evaluator! evaluators definition)
      (world-setup! world-setups definition)
+     (protocol! protocols definition)
      (when-not (= :discard (get-in definition
                                    [:environment/world :settlement]))
        (invalid! "Experiment batches currently require :discard settlement"
@@ -583,7 +638,8 @@
                                       [:environment/world :settlement])})))
    (when-let [unknown (seq (remove #{:from :parent-run :parallelism
                                      :max-parallelism :max-attempts
-                                     :world-setups :cleanup-group}
+                                     :world-setups :protocols :cleanup-group
+                                     :resume? :complete-only?}
                                    (keys opts)))]
      (invalid! "Experiment contains unknown run options"
                ::unknown-run-options {:unknown (set unknown)}))
@@ -607,6 +663,7 @@
                         :max-attempts max-attempts}))
          base-evaluation-opts (assoc (select-keys opts [:from :parent-run])
                                      :cleanup-group cleanup-group)
+         capabilities {:world-setups world-setups :protocols protocols}
          ;; Validate every distinct candidate/environment pairing once before
          ;; execution. Repetitions are constructed lazily per bounded batch.
          _ (doseq [candidate (:experiment/candidates experiment)
@@ -616,16 +673,32 @@
              (evaluation/evaluate
               room team (:candidate/agent candidate)
               definition (evaluator! evaluators definition)
-              (cell-evaluation-opts world-setups base-evaluation-opts
+              (cell-evaluation-opts capabilities base-evaluation-opts
                                     definition)))
-         spins (map #(result-spin room team evaluators world-setups
-                                  base-evaluation-opts %)
-                    (jobs experiment))]
+         done (if resume? (completed-cells room experiment) {})
+         cell-key (fn [job] [(get-in job [:candidate :candidate/id])
+                             (get-in job [:environment :environment/content-id])
+                             (:repetition job)])
+         all-jobs (jobs experiment)
+         resumed (keep (fn [job]
+                         (when-let [a (get done (cell-key job))]
+                           {:attempt a :experiment/job (experiment-job job)
+                            :resumed? true}))
+                       all-jobs)
+         spins (map #(result-spin room team evaluators capabilities
+                                  base-evaluation-opts experiment %)
+                    (remove #(contains? done (cell-key %)) all-jobs))]
      (sp/spin
-      (let [results (sp/await (run-batches spins parallelism))]
-        (let [scorecard (->> results
-                             (make-scorecard experiment)
-                             (persist-scorecard! room))]
+      (let [results (into (vec resumed)
+                          (sp/await (run-batches spins parallelism)))]
+        (let [unfinished (count (remove #(= :completed
+                                            (get-in % [:attempt :attempt/receipt :attempt/status]))
+                                        results))
+              scorecard (if (and complete-only? (pos? unfinished))
+                          {:incomplete {:cells unfinished}}
+                          (->> results
+                               (make-scorecard experiment)
+                               (persist-scorecard! room)))]
           {:experiment experiment
            :execution {:parallelism parallelism
                        :attempt-count attempt-count

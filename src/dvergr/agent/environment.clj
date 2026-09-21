@@ -71,6 +71,32 @@
     (some? (:setup/basis setup))
     (assoc :setup/basis (:setup/basis setup))))
 
+(def ^:private protocol-ref-keys
+  #{:protocol/id :protocol/version :protocol/basis})
+
+(defn- protocol-ref!
+  "An exact reference to the trusted interaction protocol the Run hosts in its
+   world (e.g. a conversation with an environment driver). Absent means the
+   default: the AgentDef's program answers the task."
+  [protocol]
+  (when-not (map? protocol)
+    (invalid! "Environment world :protocol must be an exact reference map"
+              ::invalid-protocol {:protocol protocol}))
+  (when-let [unknown (seq (remove protocol-ref-keys (keys protocol)))]
+    (invalid! "Environment world :protocol contains unknown keys"
+              ::unknown-protocol-keys {:unknown (set unknown)}))
+  (when-not (keyword? (:protocol/id protocol))
+    (invalid! "World protocol :protocol/id must be a keyword"
+              ::invalid-protocol-id {:id (:protocol/id protocol)}))
+  (positive-version! "World protocol :protocol/version" (:protocol/version protocol))
+  (when-not (roster/data-value? (:protocol/basis protocol))
+    (invalid! "World protocol :protocol/basis must contain only portable data"
+              ::non-portable-protocol-basis {:basis (:protocol/basis protocol)}))
+  (cond-> {:protocol/id (:protocol/id protocol)
+           :protocol/version (:protocol/version protocol)}
+    (some? (:protocol/basis protocol))
+    (assoc :protocol/basis (:protocol/basis protocol))))
+
 (defn make-environment
   "Construct a portable, content-addressed EnvironmentDef.
 
@@ -103,9 +129,11 @@
   (when-not (map? world)
     (invalid! "Environment :world must be a map"
               ::invalid-world {:world world}))
-  (let [world (if (contains? world :setup)
-                (assoc world :setup (setup-ref! (:setup world)))
-                world)]
+  (let [world (cond-> world
+                (contains? world :setup)
+                (assoc :setup (setup-ref! (:setup world)))
+                (contains? world :protocol)
+                (assoc :protocol (protocol-ref! (:protocol world))))]
     (when (and metadata (not (map? metadata)))
       (invalid! "Environment :metadata must be a map"
                 ::invalid-metadata {:metadata metadata}))
