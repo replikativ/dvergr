@@ -99,6 +99,9 @@
                          :metadata (cond-> (or metadata {})
                                      host (assoc :host host))})
         cells (* (count (roster/agents team)) (count environments) repetitions)
+        ;; Detached evaluation cleanup of this operation is joined before the
+        ;; Room and its store are closed.
+        cleanup-group (evaluation/cleanup-group)
         run-once (fn []
                    ;; Wait outside the Runs: inside one, the wait would count
                    ;; against the evaluation's own timeout.
@@ -112,6 +115,7 @@
                         :parallelism parallelism
                         :max-parallelism (max 16 parallelism)
                         :max-attempts (max 256 cells)
+                        :cleanup-group cleanup-group
                         :resume? true
                         :complete-only? true})))]
     (try
@@ -128,6 +132,8 @@
          :results (count (:results result)) :failed-cells failed-cells
          :scorecard (:scorecard result)})
       (finally
+        (try (evaluation/await-cleanups-for! room cleanup-group) (catch Throwable _ nil))
+        (try (evaluation/await-cleanups! room) (catch Throwable _ nil))
         (try (d/close-room! room) (catch Throwable _ nil))
         (conv/close-store! xs)
         (cc/configure! cc-before)))))

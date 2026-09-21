@@ -60,15 +60,20 @@
      (evaluation/make-protocol
       {:id :tau2/conversation :version version :basis (basis domain user)
        :limit-keys #{:max-steps :max-errors}
-       :run (fn [{:keys [room agent environment cancelled?]}]
+       :run (fn [{:keys [room agent environment cancelled? model-scope]}]
               (let [task (task-of domain environment)
                     limits (merge {:max-steps 200 :max-errors 10}
                                   (select-keys (:environment/limits environment)
                                                [:max-steps :max-errors]))
                     outcome (episode/converse!
                              {:room room :domain domain :task task :agent agent
-                              :agent-generate (when agent-generate (agent-generate task))
-                              :user (if user-generate (user-generate task) user-gen)
+                              ;; the customer's and the candidate's model
+                              ;; calls are this Run's, on whatever thread
+                              :model-scope model-scope
+                              :agent-generate (when agent-generate
+                                                (live/scoped (agent-generate task) model-scope))
+                              :user (live/scoped (if user-generate (user-generate task) user-gen)
+                                                 model-scope)
                               :limits limits :cancelled? cancelled?
                               ;; The evaluation's own timeout cancels the Run.
                               :timeout-ms nil})]

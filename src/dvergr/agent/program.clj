@@ -770,20 +770,31 @@
    its isolated work Room, e.g. a conversation between the candidate and an
    environment driver. `:run` is blocking host work, so it executes under a
    supervised worker and is interrupted by cancellation. It returns the Run's
-   portable value."
+   portable value.
+
+   Model calls a protocol makes are the Run's: the worker runs under the same
+   `resource/*model-scope*` as an LLM program's turns (nil when the Run was
+   allocated no `model-dispatches`), so they spend the Run's admissions. The
+   binding is the worker thread's; a protocol whose model calls happen on
+   other threads (Room participants, futures) gets the scope as `:model-scope`
+   and binds it there."
   [control-room work-room run-id agent task supervisor protocol]
   (sp/spin
    (let [call (start-worker!
                supervisor
                (fn []
-                 ((:run protocol)
-                  {:control-room control-room
-                   :room work-room
-                   :run/id run-id
-                   :agent (dissoc agent ::limits ::protocol)
-                   :task task
-                   :limits (::limits agent)
-                   :cancelled? (fn [] (run/cancel-requested? run-id))})))
+                 (let [scope (some-> (resource/model-scope control-room run-id)
+                                     (assoc :cancel? #(run/cancel-requested? run-id)))]
+                   (binding [resource/*model-scope* scope]
+                     ((:run protocol)
+                      {:control-room control-room
+                       :room work-room
+                       :run/id run-id
+                       :agent (dissoc agent ::limits ::protocol)
+                       :task task
+                       :limits (::limits agent)
+                       :model-scope scope
+                       :cancelled? (fn [] (run/cancel-requested? run-id))})))))
          outcome (sp/await (worker-result-spin call))]
      (cond
        (or (= ::worker-cancelled outcome)

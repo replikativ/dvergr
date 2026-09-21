@@ -8,7 +8,8 @@
   (:require [dvergr.chat.agent :as chat-agent]
             [dvergr.model.chat :as chat]
             [dvergr.model.providers :as providers]
-            [dvergr.model.registry :as registry]))
+            [dvergr.model.registry :as registry]
+            [dvergr.resource :as resource]))
 
 (defn- ->entity [{:keys [role content tool-calls id]}]
   (case role
@@ -27,6 +28,16 @@
   (let [{:strs [name description parameters]} function]
     {:name name :description description
      :input_schema parameters :parameters parameters}))
+
+(defn scoped
+  "`generate` under a Run's model scope (the `:model-scope` a protocol is
+   given): its calls spend the Run's dispatch admissions wherever they happen.
+   A protocol's driver and reference candidate run on Room participant threads,
+   where the protocol worker's own binding does not reach. nil scope: as is."
+  [generate scope]
+  (if scope
+    (fn [request] (binding [resource/*model-scope* scope] (generate request)))
+    generate))
 
 (defn model-generate
   "Return a generate fn backed by `dvergr.model.chat/chat`.

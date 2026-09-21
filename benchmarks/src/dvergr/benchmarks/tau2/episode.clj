@@ -31,6 +31,7 @@
             [dvergr.benchmarks.pyjson :as pj]
             [dvergr.benchmarks.tau2.schemas :as schemas]
             [dvergr.chat.agent :as chat-agent]
+            [dvergr.resource :as resource]
             [dvergr.chat.context :as cc]
             [dvergr.discourse :as d]
             [dvergr.discourse.attention :as attention]
@@ -410,7 +411,8 @@
        :run-turn-fn (fn [chat-ctx opts]
                       (if (> (swap! model-steps (fnil inc 0)) (or max-model-steps 100))
                         (do (end! episode :max-model-steps) :error)
-                        (let [outcome (chat-agent/run-agent-turn! chat-ctx (dissoc opts :system-suffix))]
+                        (let [outcome (binding [resource/*model-scope* (:model-scope episode)]
+                                        (chat-agent/run-agent-turn! chat-ctx (dissoc opts :system-suffix)))]
                           (when (= :continue outcome) (add-steps! episode 2))
                           outcome)))})
      ;; The working ctx hydrates from the store on first use, so it is
@@ -466,7 +468,9 @@
    `:agent-turn` Run whose cancellation interrupts the model call."
   [episode agent agent-generate]
   (let [{:keys [domain room]} episode
-        generate (or agent-generate (live/model-generate (:agent/model-policy agent)))
+        generate (or agent-generate
+                     (live/scoped (live/model-generate (:agent/model-policy agent))
+                                  (:model-scope episode)))
         system (t2/agent-system-prompt domain)
         tools (:tool-schemas domain)
         history (doto (ctx-atom room :agent-history)
@@ -739,11 +743,11 @@
    and final world stay in the Room's context (`episode-snapshot`). An
    infrastructure fault is returned under `:failure`, never thrown, so the
    caller decides how to certify it."
-  [{:keys [room domain task agent agent-generate user limits timeout-ms cancelled?]
+  [{:keys [room domain task agent agent-generate user limits timeout-ms cancelled? model-scope]
     :or {limits {:max-steps 200 :max-errors 10} timeout-ms (* 30 60 1000)
          cancelled? (constantly false)}}]
   (let [room-id (:id room)
-        episode (new-episode domain task limits room nil)
+        episode (assoc (new-episode domain task limits room nil) :model-scope model-scope)
         _ (reset! (:state episode) {:seq 0 :steps 0 :errors 0 :log [] :usage {}})
         _ (watch-candidate-runs! episode)
         candidate* (volatile! nil)]
