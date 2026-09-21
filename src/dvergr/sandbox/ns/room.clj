@@ -26,6 +26,152 @@
 
 (defn- safe [f] (try (f) (catch Throwable t {:error (.getMessage t)})))
 
+;; ---------------------------------------------------------------------------
+;; malli function schemas for `dvergr.room`
+;;
+;; The Room ops come from `ns-kb/room-ops-map` (documented there); the DB
+;; helpers are documented below. Both are merged into one namespace, so their
+;; schemas live in one table here, built from the shared shapes they return.
+;; `doc/documented` with nil arglists/doc only adds `:malli/schema`, keeping
+;; the arglists/doc each fn already carries.
+;; ---------------------------------------------------------------------------
+
+(def ^:private ErrorResult
+  "What `safe` returns when the wrapped query/op throws."
+  [:map [:error [:maybe :string]]])
+
+(def ^:private RoomRef
+  "How the Room ops address a room: slug string, room-id keyword, or a Room."
+  [:or :string :keyword [:map [:id :keyword]]])
+
+(def ^:private Room
+  "A live `dvergr.discourse/Room` record (open map; also carries the bus,
+   participants atom, execution ctx, store and meta atom)."
+  [:map [:id :keyword] [:slug :string] [:title [:maybe :string]]
+   [:parent-id [:maybe :keyword]]])
+
+(def ^:private AgentId [:or :keyword :string])
+
+(def ^:private Message
+  "A Room message in the unified shape (store- or bus-backed)."
+  [:map
+   [:id :uuid]
+   [:from [:maybe :keyword]]
+   [:content :any]
+   [:ts [:maybe :int]]
+   [:to {:optional true} :any]
+   [:role {:optional true} [:maybe :keyword]]
+   [:metadata {:optional true} [:maybe :map]]
+   [:in-reply-to {:optional true} [:maybe :uuid]]
+   [:thread-root-id {:optional true} [:maybe :uuid]]])
+
+(def ^:private MessageRow
+  "A `:message/*` row pulled straight from the room's messages store."
+  [:map
+   [:message/content :string]
+   [:message/role {:optional true} :keyword]
+   [:message/created-at {:optional true} 'inst?]])
+
+(def ^:private KbHit
+  [:map [:title :string] [:summary :string] [:kb :string]])
+
+(def ^:private Tier [:enum :trivial :reviewable :conflict])
+
+(def ^:private ForkDiff
+  "{system-id → typed yggdrasil delta (GitDiff / DatahikeDiff / DiffError)}."
+  [:map-of :any :any])
+
+(def ^:private room-schemas
+  {;; ---- Room ops (dvergr.sandbox.ns.kb/room-ops-map) ----
+   'create!      [:=> [:cat [:map
+                             [:slug :string]
+                             [:title {:optional true} [:maybe :string]]
+                             [:type {:optional true} [:enum :internal :telegram-mirror]]
+                             [:agents {:optional true} [:sequential AgentId]]
+                             [:agent-ids {:optional true} [:sequential AgentId]]
+                             [:telegram-chat-id {:optional true} :int]
+                             [:parent-id {:optional true} [:or :keyword :string]]]]
+                  [:map [:slug :string] [:title [:maybe :string]]
+                   [:agents [:set AgentId]] [:room [:maybe Room]]]]
+   'list         [:=> [:cat [:alt [:cat [:map [:where {:optional true} 'ifn?]]]
+                             [:* [:cat [:= :where] 'ifn?]]]]
+                  [:vector Room]]
+   'get          [:=> [:cat RoomRef] [:maybe Room]]
+   'post!        [:=> [:cat RoomRef [:map
+                                     [:content :string]
+                                     [:from {:optional true} :keyword]
+                                     [:source-user {:optional true} :string]
+                                     [:source-username {:optional true} :string]
+                                     [:source-user-id {:optional true} :int]]]
+                  [:or [:map [:posted-to :keyword] [:content :string]] ErrorResult]]
+   'messages     [:=> [:cat RoomRef [:alt [:cat [:map [:limit {:optional true} :int]
+                                                 [:since {:optional true} 'inst?]]]
+                                     [:* [:alt [:cat [:= :limit] :int]
+                                          [:cat [:= :since] 'inst?]]]]]
+                  [:maybe [:vector Message]]]
+   'children     [:=> [:cat RoomRef] [:maybe [:vector Room]]]
+   'set-parent!  [:=> [:cat RoomRef RoomRef]
+                  [:or [:map [:child :keyword] [:parent :keyword]] ErrorResult]]
+   'join!        [:=> [:cat RoomRef AgentId]
+                  [:maybe [:map [:joined AgentId] [:room :keyword]]]]
+   'leave!       [:=> [:cat RoomRef AgentId]
+                  [:maybe [:map [:left AgentId] [:room :keyword]]]]
+   'delete!      [:=> [:cat RoomRef] [:or [:map [:deleted :keyword]] ErrorResult]]
+   'fork!        [:function
+                  [:=> [:cat RoomRef] [:maybe Room]]
+                  [:=> [:cat RoomRef [:map
+                                      [:isolation {:optional true} [:enum :none :ctx]]
+                                      [:clone-participants? {:optional true} :boolean]
+                                      [:fork-opts {:optional true} :map]]]
+                   [:maybe Room]]]
+   'merge!       [:=> [:cat RoomRef RoomRef] [:or Room ErrorResult]]
+   'discard!     [:=> [:cat RoomRef] [:or Room ErrorResult]]
+   'diff         [:=> [:cat RoomRef] [:maybe ForkDiff]]
+   'review       [:=> [:cat RoomRef]
+                  [:maybe [:map [:tier Tier] [:diff [:maybe ForkDiff]]
+                           [:conflicts [:maybe [:sequential :map]]]]]]
+   'classify     [:=> [:cat [:maybe ForkDiff] [:maybe [:sequential :any]]] Tier]
+   'forks        [:=> :cat [:vector Room]]
+   'participants [:=> [:cat [:maybe RoomRef]] [:maybe [:vector :keyword]]]
+   'root         [:=> :cat [:maybe Room]]
+   ;; ---- DB surface (below) ----
+   'kbs             [:=> :cat [:or [:vector [:map [:name :string] [:permission :keyword]
+                                             [:default? :boolean]]]
+                               ErrorResult]]
+   'kb              [:=> [:cat :string] :any]
+   'databases       [:=> :cat [:or [:maybe [:vector [:map [:name :string]
+                                                     [:type [:enum :kb :msgs :data]]
+                                                     [:permission :keyword]]]]
+                               ErrorResult]]
+   'db              [:=> [:cat [:or :string :keyword :symbol]] :any]
+   'kb-find         [:=> [:cat :string] [:or [:maybe KbHit] ErrorResult]]
+   'kb-by-type      [:=> [:cat [:or :string :keyword]]
+                     [:or [:vector [:map [:entity/title {:optional true} :string]
+                                    [:entity/summary {:optional true} :string]
+                                    [:entity/type {:optional true} :keyword]
+                                    [:kb :string]]]
+                      ErrorResult]]
+   'kb-search       [:=> [:cat :any] [:or [:vector KbHit] ErrorResult]]
+   'recent-messages [:=> [:cat [:? [:maybe :int]]] [:or [:maybe [:vector MessageRow]] ErrorResult]]
+   'search-messages [:=> [:cat :any] [:or [:maybe [:vector MessageRow]] ErrorResult]]
+   'schedules       [:=> :cat [:or [:maybe [:sequential [:map [:schedule/id :any]]]] ErrorResult]]
+   'gc!             [:function
+                     [:=> :cat [:or [:maybe [:map-of :any :any]] ErrorResult]]
+                     [:=> [:cat [:map [:remove-before {:optional true} 'inst?]
+                                 [:grace-period-ms {:optional true} :int]
+                                 [:dry-run? {:optional true} :boolean]]]
+                      [:or [:maybe [:map-of :any :any]] ErrorResult]]]})
+
+(defn- with-schemas
+  "Attach `room-schemas` as `:malli/schema` to the injected fns of `ns-map`,
+   leaving their arglists/doc untouched."
+  [ns-map]
+  (reduce-kv (fn [m sym schema]
+               (cond-> m
+                 (contains? m sym) (update sym #(doc/documented sym nil nil schema %))))
+             ns-map
+             room-schemas))
+
 (defn add-room-ns!
   "Mount the ONE `dvergr.room` namespace the agent sees: the Room OPS (create!/
    fork!/merge!/post!/messages/… via `ns-kb/room-ops-map`) MERGED with the room's
@@ -106,12 +252,14 @@
                                                         lc)))
                                        (take 25) vec))))
         msg-time       (fn [m] (or (some-> ^java.util.Date (:message/created-at m) .getTime) 0))
-        recent-msgs    (fn [n]
-                         (safe #(when room-view
-                                  (->> (d/q '[:find [(pull ?m [:message/content :message/role :message/created-at]) ...]
-                                              :where [?m :message/content _]] @room-view)
-                                       (sort-by msg-time >)
-                                       (take (or n 20)) vec))))
+        recent-msgs    (fn recent
+                         ([] (recent 20))
+                         ([n]
+                          (safe #(when room-view
+                                   (->> (d/q '[:find [(pull ?m [:message/content :message/role :message/created-at]) ...]
+                                               :where [?m :message/content _]] @room-view)
+                                        (sort-by msg-time >)
+                                        (take (or n 20)) vec)))))
         search-msgs    (fn [term]
                          (safe #(when room-view
                                   (let [lc (str/lower-case (str term))]
@@ -192,4 +340,4 @@
                             search-messages [([term]) "Messages in THIS room whose content contains `term` (max 50)."]
                             schedules       [([]) "The schedules registered on THIS room — what runs, and when."]
                             gc!             [([] [opts]) "Reclaim unreachable storage for this room/fork — datahike index blobs and git objects. Default collects orphan garbage only and KEEPS all history; pass {:remove-before <Date>} to collapse history older than that."]}))]
-    (sci/add-namespace! sci-ctx 'dvergr.room room-map)))
+    (sci/add-namespace! sci-ctx 'dvergr.room (with-schemas room-map))))

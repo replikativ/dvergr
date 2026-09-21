@@ -26,17 +26,26 @@
   (try ((requiring-resolve 'dvergr.substrate.geschichte/current-workspace))
        (catch Throwable _ nil)))
 
-(defn workspace-root
-  "The primary workspace root. Geschichte workspaces return a virtual root
-  descriptor; explicit test overrides and the transitional fallback remain
-  physical paths."
+(defn room-workspace-root
+  "The workspace root of the bound ROOM (or fork), or nil when none is in scope:
+  the explicit `*workspace-dir*` override, else the Geschichte workspace
+  registered in the bound execution context (a virtual root descriptor). Unlike
+  `workspace-root` it never falls back to the shared `.dvergr/workspace`, so
+  callers that must write into the room's own versioned repo can tell."
   []
   (or (some-> *workspace-dir* io/file)
       (when-let [workspace (current-virtual-workspace)]
         {:id (:id workspace)
          :root "/"
          :fs ((requiring-resolve 'dvergr.substrate.geschichte/filesystem)
-              workspace)})
+              workspace)})))
+
+(defn workspace-root
+  "The primary workspace root. Geschichte workspaces return a virtual root
+  descriptor; explicit test overrides and the transitional fallback remain
+  physical paths. Never nil — see `room-workspace-root` for the room-only view."
+  []
+  (or (room-workspace-root)
       (io/file (paths/workspace-dir))))
 
 (def ^:dynamic *workspace-roots*

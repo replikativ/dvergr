@@ -7,6 +7,8 @@
    - Integration with yggdrasil for CoW branching
    - Integration with spindel for async execution (CPS works through SCI)"
   (:require [dvergr.substrate.load :as load]
+            [clojure.walk :as walk]
+            [dvergr.sandbox.ns.malli :as ns-malli]
             [sci.core :as sci]
             [sci.ctx-store :as sci-ctx-store]
             [sci.impl.utils :refer [clojure-core-ns]]
@@ -765,11 +767,14 @@
    {:ns \"intake.hn\" :fns [\"search\" \"top\"]}. Drift-free: it reflects exactly
    what `setup-agent-namespaces!` injected (plus the agent's own defs), not a
    hand-maintained list."
-  [sci-ctx]
-  (->> (:namespaces @(:env sci-ctx))
-       (filter (fn [[ns-sym _]] (interesting-ns? ns-sym)))
-       (keep (fn [[ns-sym vars]]
-               (let [fns  (->> (keys vars) (filter symbol?) (map str) sort vec)
+  [sci-ctx & {:keys [only]}]
+  (let [registered (ns-malli/fn-schemas)]
+    (->> (:namespaces @(:env sci-ctx))
+       ;; An explicitly requested namespace is shown even when the overview
+       ;; hides it (e.g. `user`, where the agent's own defs live).
+         (filter (fn [[ns-sym _]] (if only (= (str only) (str ns-sym)) (interesting-ns? ns-sym))))
+         (keep (fn [[ns-sym vars]]
+                 (let [fns  (->> (keys vars) (filter symbol?) (map str) sort vec)
                      ;; Signatures too, not just names. `sci/copy-var` carries a
                      ;; var's :doc and :arglists across (45 core vars already do),
                      ;; but this fn used to take `(keys vars)` and throw the
@@ -777,21 +782,26 @@
                      ;; as nothing and an agent had no way to learn an arity
                      ;; except by calling and reading the error. Keeping the
                      ;; values is what makes documenting anything worthwhile.
-                     sigs (into (sorted-map)
-                                (keep (fn [[sym v]]
-                                        (when (symbol? sym)
-                                          (let [m (meta v)]
-                                            (when (or (:doc m) (:arglists m))
-                                              [(str sym)
-                                               (cond-> {}
-                                                 (:arglists m) (assoc :arglists (:arglists m))
-                                                 (:doc m) (assoc :doc (first (str/split-lines (str (:doc m))))))])))))
-                                vars)]
-                 (when (seq fns)
-                   (cond-> {:ns (str ns-sym) :fns fns}
-                     (seq sigs) (assoc :sigs sigs))))))
-       (sort-by :ns)
-       vec))
+                       sigs (into (sorted-map)
+                                  (keep (fn [[sym v]]
+                                          (when (symbol? sym)
+                                            (let [m (meta v)
+                                                ;; m/=> registrations (world state) or
+                                                ;; :malli/schema metadata
+                                                  schema (or (get-in registered [ns-sym sym :form])
+                                                             (:malli/schema m))]
+                                              (when (or (:doc m) (:arglists m) schema)
+                                                [(str sym)
+                                                 (cond-> {}
+                                                   (:arglists m) (assoc :arglists (:arglists m))
+                                                   (:doc m) (assoc :doc (first (str/split-lines (str (:doc m)))))
+                                                   schema (assoc :schema schema))])))))
+                                  vars)]
+                   (when (seq fns)
+                     (cond-> {:ns (str ns-sym) :fns fns}
+                       (seq sigs) (assoc :sigs sigs))))))
+         (sort-by :ns)
+         vec)))
 
 (defn ns-overview-md
   "A markdown overview of the sandbox: curated Core namespaces (purpose + a real
@@ -830,11 +840,56 @@
      "here under their namespace — that's how you grow your own helpers/tools. "
      "Use `(sandbox/doc 'some-ns)` for one namespace at a time.")))
 
+(defn- schema-form? [x]
+  (and (vector? x) (keyword? (first x)) (nil? (namespace (first x)))))
+
+(defn- named-schemas
+  "`{schema-form display-name}` for the public, non-fn vars in the sandbox
+   holding a malli vector schema (e.g. `dvergr.intake.hn/Story`), so a doc can
+   print the name instead of the expansion. Names are unqualified inside
+   `home-ns`, qualified elsewhere. A form claimed by several names outside
+   `home-ns` stays expanded (no arbitrary pick), and tiny forms are never
+   replaced (a name would not read better than `[:or :int :double]`)."
+  [sci-ctx home-ns]
+  (let [candidates (for [[ns-sym vars] (:namespaces @(:env sci-ctx))
+                         [sym v] vars
+                         :when (symbol? sym)
+                         :when (not (:private (meta v)))
+                         :let [x (try (deref v) (catch Throwable _ nil))]
+                         :when (and (schema-form? x) (not (fn? x))
+                                    (> (count (pr-str x)) 40))]
+                     {:form x :home? (= (str ns-sym) (str home-ns))
+                      :name (if (= (str ns-sym) (str home-ns)) (str sym) (str ns-sym "/" sym))})]
+    (into {}
+          (keep (fn [[form cs]]
+                  (let [home (filter :home? cs)]
+                    (cond (= 1 (count home)) [form (:name (first home))]
+                          (and (empty? home) (= 1 (count cs))) [form (:name (first cs))]))))
+          (group-by :form candidates))))
+
+(defn compact-schema
+  "A malli form for reading: named schemas print by name, keyword-argument
+   patterns `[:* [:alt [:cat [:= k] s] ...]]` as `& {k s ...}`."
+  [form names]
+  (walk/prewalk
+   (fn [x]
+     (cond
+       (and (schema-form? x) (contains? names x)) (symbol (names x))
+       (and (vector? x) (= :* (first x)) (= 2 (count x))
+            (vector? (second x)) (= :alt (first (second x)))
+            (every? #(and (vector? %) (= :cat (first %)) (= 3 (count %))
+                          (vector? (second %)) (= := (first (second %))))
+                    (rest (second x))))
+       (list '& (into (array-map) (map (fn [[_ [_ k] s]] [k s])) (rest (second x))))
+       :else x))
+   form))
+
 (defn ns-doc-md
   "Focused help for ONE namespace (token-cheaper than the whole overview)."
   [sci-ctx ns-name]
   (let [n     (name ns-name)
-        entry (first (filter #(= n (:ns %)) (ns-overview-data sci-ctx)))]
+        entry (first (ns-overview-data sci-ctx :only n))
+        names (named-schemas sci-ctx n)]
     (if-not entry
       (str "No sandbox namespace `" n "`. Run `(sandbox/overview)` for the list.")
       (let [[purpose eg] (ns-guide n)]
@@ -844,11 +899,12 @@
              ;; that can read an arity does not have to discover it by calling.
              (if-let [sigs (seq (:sigs entry))]
                (str/join "\n"
-                         (for [[sym {:keys [arglists doc]}] sigs]
+                         (for [[sym {:keys [arglists doc schema]}] sigs]
                            (str "  (" sym (when (seq arglists)
                                             (str " " (str/join " | "
                                                                (map #(str/join " " %) arglists))))
-                                ")" (when doc (str "  — " doc)))))
+                                ")" (when doc (str "  — " doc))
+                                (when schema (str "\n      schema: " (pr-str (compact-schema schema names)))))))
                (str "fns: " (str/join " " (:fns entry)))))))))
 
 (def sandbox-prompt-pointer
@@ -932,6 +988,10 @@
        "usual `clojure.repl` tools work too and answer about THIS sandbox — "
        "`(clojure.repl/doc dvergr.room/kb-search)`, `(clojure.repl/dir dvergr.room)`, "
        "`(clojure.repl/apropos \"schedule\")`, `(clojure.repl/find-doc \"knowledge\")`.\n\n"
+       "**Types:** `malli.core` (validate/explain, `malli.error/humanize`, "
+       "`malli.provider/provide` to infer a schema from sample data) is loaded. Annotate "
+       "your fns with `(m/=> f [:=> [:cat …] ret])` or `{:malli/schema …}` metadata; "
+       "schemas belong to your room (they fork with it) and `sandbox/doc` shows them.\n\n"
        "**Your workspace is the room** — a persistent project with its OWN git repo "
        "(your code), knowledge base, and schedules. Read/write code with `fs`/`git`/"
        "shell (changes live in the room's repo); recall/save facts with the "
@@ -970,10 +1030,11 @@
                          'overview   (fn [] (ns-overview-md sci-ctx))
                          'help       (fn [] (ns-overview-md sci-ctx))
                          'doc        (fn [ns-name] (ns-doc-md sci-ctx ns-name))}
-                        '{namespaces [([]) "What is loaded, as DATA: a seq of {:ns \"dvergr.room\" :fns [\"kb-search\" …]}. Derived from the live context, so it never drifts from what was actually injected."]
-                          overview   [([]) "The same inventory as readable markdown — what each namespace is for plus one real call. Start here when you do not know what you can do."]
-                          help       [([]) "Alias for `overview`."]
-                          doc        [([ns-name]) "Markdown for ONE namespace: its purpose, an example, and its fns with signatures — e.g. (sandbox/doc 'dvergr.room). For a single fn use (clojure.repl/doc dvergr.room/kb-search)."]})))
+                        '{namespaces [([]) "What is loaded, as DATA: a seq of {:ns \"dvergr.room\" :fns [\"kb-search\" …]}. Derived from the live context, so it never drifts from what was actually injected."
+                                      [:=> [:cat] [:sequential [:map [:ns :string] [:fns [:vector :string]] [:sigs {:optional true} [:map-of :string [:map [:arglists {:optional true} :any] [:doc {:optional true} :string] [:schema {:optional true} :any]]]]]]]]
+                          overview   [([]) "The same inventory as readable markdown — what each namespace is for plus one real call. Start here when you do not know what you can do." [:=> [:cat] :string]]
+                          help       [([]) "Alias for `overview`." [:=> [:cat] :string]]
+                          doc        [([ns-name]) "Markdown for ONE namespace: its purpose, an example, and its fns with signatures — e.g. (sandbox/doc 'dvergr.room). For a single fn use (clojure.repl/doc dvergr.room/kb-search)." [:=> [:cat [:or :symbol :string]] :string]]})))
 
 (defn lock-interop!
   "Remove `:allow :all` from a sandbox context's class config, so JVM interop is
@@ -1174,6 +1235,7 @@
            (catch Throwable e
              (binding [*out* *err*] (println "ns-injector failed:" (.getMessage e))))))
     ;; Self-reflection LAST, so (sandbox/overview) sees every ns injected above.
+    (ns-malli/add-malli-ns! sci-ctx)
     (add-reflection-ns! sci-ctx)
     ;; SECURITY, last of all: lock JVM interop to the class allowlist.
     (lock-interop! sci-ctx)

@@ -14,7 +14,7 @@
             [dvergr.sandbox.ns.doc :as doc])
   (:import [java.io File]))
 
-(declare fs-safe-resolve git-run* parse-porcelain-status parse-git-log)
+(declare fs-safe-resolve git-run* parse-porcelain-status parse-git-log git-log-format)
 
 (defn install-http-fixture!
   "Host-only world setup: install an immutable offline capability in the current
@@ -553,7 +553,7 @@
         log-fn    (fn [& [opts]]
                     (let [n (str "-" (or (:n opts) 10))]
                       (parse-git-log
-                       (run! "log" "--format=%H|%s|%an|%ai" n))))
+                       (run! "log" git-log-format n))))
 
         diff-fn   (fn [& args]
                     (if (seq args)
@@ -578,11 +578,18 @@
                            'diff   diff-fn
                            'add    add-fn
                            'commit commit-fn}
-                          '{status [([]) "Working-tree status of YOUR room's repo, PARSED into a map (not porcelain text) — branch plus changed paths."]
-                            log    [([] [opts]) "Recent commits as maps of :hash/:subject/:author/:date. `opts` takes :n (default 10)."]
-                            diff   [([] [& args]) "Unified diff text. No args = unstaged changes; extra args pass through to `git diff` (e.g. \"--staged\", a path)."]
-                            add    [([& paths]) "Stage paths for commit. Audited. Returns :ok."]
-                            commit [([message] [message opts]) "Commit staged changes with `message`, returning the trimmed git output. `opts` takes :author. Audited."]}))))
+                          '{status [([]) "Working-tree status of YOUR room's repo, PARSED into a map (not porcelain text) — branch plus changed paths."
+                                    [:=> :cat [:map [:branch :string] [:staged [:vector :string]]
+                                               [:unstaged [:vector :string]] [:untracked [:vector :string]]]]]
+                            log    [([] [opts]) "Recent commits as maps of :hash/:message/:author/:date. `opts` takes :n (default 10)."
+                                    [:=> [:cat [:? [:maybe [:map [:n {:optional true} :int]]]]]
+                                     [:vector [:map [:hash :string] [:message :string] [:author :string] [:date :string]]]]]
+                            diff   [([] [& args]) "Unified diff text. No args = unstaged changes; extra args pass through to `git diff` (e.g. \"--staged\", a path)."
+                                    [:=> [:cat [:* :string]] :string]]
+                            add    [([& paths]) "Stage paths for commit. Audited. Returns :ok."
+                                    [:=> [:cat [:+ :string]] [:= :ok]]]
+                            commit [([message] [message opts]) "Commit staged changes with `message`, returning the trimmed git output. `opts` takes :author. Audited."
+                                    [:=> [:cat :string [:? [:maybe [:map [:author {:optional true} :string]]]]] :string]]}))))
 
 (defn add-env-ns!
   "Expose config-scoped key access as the 'env namespace in SCI. Resolves ONLY from
@@ -622,16 +629,25 @@
                    (config-swap! assoc (str key) value)
                    (swap! config-atom assoc (str key) value))
                  :ok)
-        keys-fn (fn [] (vec (distinct (concat (map str (keys (config)))
+        ;; List names `env/get` resolves: a keyword config key `:foo` is listed
+        ;; as "foo" (a namespaced `:a/b` as "a/b"), not ":foo" — `get-1` finds
+        ;; it again through `(keyword key)`.
+        key-name (fn [k] (if (keyword? k) (subs (str k) 1) (str k)))
+        keys-fn (fn [] (vec (distinct (concat (map key-name (keys (config)))
                                               (keys (or secrets {}))))))]
     (sci/add-namespace! sci-ctx 'env
                         (doc/with-docs
                           {'get  get-fn
                            'set  set-fn
                            'keys keys-fn}
-                          '{get  [([key] [key default]) "Read a config key granted to YOU. This is NOT the host process environment — System/getenv is unreachable, so the daemon's own secrets are not visible here. A key configured as an injected secret returns an opaque PLACEHOLDER, never the real value; HTTP egress substitutes the real one at the destination."]
-                            set  [([key value]) "Set a config key for this sandbox session. Returns :ok."]
-                            keys [([]) "Every config key readable here, including the names of injected secrets (whose values stay placeholders)."]}))))
+                          '{get  [([key] [key default]) "Read a config key granted to YOU. This is NOT the host process environment — System/getenv is unreachable, so the daemon's own secrets are not visible here. A key configured as an injected secret returns an opaque PLACEHOLDER, never the real value; HTTP egress substitutes the real one at the destination."
+                                  [:function
+                                   [:=> [:cat [:or :string :keyword :symbol]] [:maybe :any]]
+                                   [:=> [:cat [:or :string :keyword :symbol] :any] :any]]]
+                            set  [([key value]) "Set a config key for this sandbox session. Returns :ok."
+                                  [:=> [:cat [:or :string :keyword :symbol] :any] [:= :ok]]]
+                            keys [([]) "Every config key readable here, as names `env/get` accepts, including the names of injected secrets (whose values stay placeholders)."
+                                  [:=> :cat [:vector :string]]]}))))
 
 (defn add-http-ns!
   "Expose HTTP client as 'http namespace in SCI.
@@ -884,13 +900,23 @@
      :unstaged  (mapv :path (filter :unstaged? entries))
      :untracked (mapv :path (filter :untracked? entries))}))
 
+(def ^:private git-log-format
+  "`git log --format` for `parse-git-log`: each record STARTS with the ASCII
+   record separator (U+001E) and its fields are split by the unit separator
+   (U+001F) — control characters that cannot occur in a subject or author name,
+   unlike `|`. The separators are passed LITERALLY (not as `%x1e`/`%x1f`) so the
+   virtual Geschichte git, which expands only the placeholders themselves,
+   emits them unchanged; record-splitting also survives a multi-line message."
+  "--format=\u001e%H\u001f%s\u001f%an\u001f%ai")
+
 (defn- parse-git-log
-  "Parse `git log --format=%H|%s|%an|%ai` output into vector of maps."
+  "Parse `git log` output written with `git-log-format` into a vector of
+   {:hash :message :author :date} maps."
   [output]
-  (->> (str/split-lines output)
+  (->> (str/split (str output) #"\x1e")
        (remove str/blank?)
-       (mapv (fn [line]
-               (let [[hash msg author date] (str/split line #"\|" 4)]
+       (mapv (fn [record]
+               (let [[hash msg author date] (str/split record #"\x1f" 4)]
                  {:hash    (str/trim (str hash))
                   :message (str/trim (str msg))
                   :author  (str/trim (str author))
