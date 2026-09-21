@@ -756,12 +756,12 @@
    hand-maintained list."
   [sci-ctx & {:keys [only]}]
   (let [registered (ns-malli/fn-schemas)]
-  (->> (:namespaces @(:env sci-ctx))
+    (->> (:namespaces @(:env sci-ctx))
        ;; An explicitly requested namespace is shown even when the overview
        ;; hides it (e.g. `user`, where the agent's own defs live).
-       (filter (fn [[ns-sym _]] (if only (= (str only) (str ns-sym)) (interesting-ns? ns-sym))))
-       (keep (fn [[ns-sym vars]]
-               (let [fns  (->> (keys vars) (filter symbol?) (map str) sort vec)
+         (filter (fn [[ns-sym _]] (if only (= (str only) (str ns-sym)) (interesting-ns? ns-sym))))
+         (keep (fn [[ns-sym vars]]
+                 (let [fns  (->> (keys vars) (filter symbol?) (map str) sort vec)
                      ;; Signatures too, not just names. `sci/copy-var` carries a
                      ;; var's :doc and :arglists across (45 core vars already do),
                      ;; but this fn used to take `(keys vars)` and throw the
@@ -769,26 +769,26 @@
                      ;; as nothing and an agent had no way to learn an arity
                      ;; except by calling and reading the error. Keeping the
                      ;; values is what makes documenting anything worthwhile.
-                     sigs (into (sorted-map)
-                                (keep (fn [[sym v]]
-                                        (when (symbol? sym)
-                                          (let [m (meta v)
+                       sigs (into (sorted-map)
+                                  (keep (fn [[sym v]]
+                                          (when (symbol? sym)
+                                            (let [m (meta v)
                                                 ;; m/=> registrations (world state) or
                                                 ;; :malli/schema metadata
-                                                schema (or (get-in registered [ns-sym sym :form])
-                                                           (:malli/schema m))]
-                                            (when (or (:doc m) (:arglists m) schema)
-                                              [(str sym)
-                                               (cond-> {}
-                                                 (:arglists m) (assoc :arglists (:arglists m))
-                                                 (:doc m) (assoc :doc (first (str/split-lines (str (:doc m)))))
-                                                 schema (assoc :schema schema))])))))
-                                vars)]
-                 (when (seq fns)
-                   (cond-> {:ns (str ns-sym) :fns fns}
-                     (seq sigs) (assoc :sigs sigs))))))
-       (sort-by :ns)
-       vec)))
+                                                  schema (or (get-in registered [ns-sym sym :form])
+                                                             (:malli/schema m))]
+                                              (when (or (:doc m) (:arglists m) schema)
+                                                [(str sym)
+                                                 (cond-> {}
+                                                   (:arglists m) (assoc :arglists (:arglists m))
+                                                   (:doc m) (assoc :doc (first (str/split-lines (str (:doc m)))))
+                                                   schema (assoc :schema schema))])))))
+                                  vars)]
+                   (when (seq fns)
+                     (cond-> {:ns (str ns-sym) :fns fns}
+                       (seq sigs) (assoc :sigs sigs))))))
+         (sort-by :ns)
+         vec)))
 
 (defn ns-overview-md
   "A markdown overview of the sandbox: curated Core namespaces (purpose + a real

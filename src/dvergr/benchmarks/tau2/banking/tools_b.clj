@@ -97,8 +97,8 @@
                      (.append sb ^String (strptime-directives d))
                      (recur (+ i 2) (conj fields d) sb))
           (Character/isWhitespace c) (let [j (loop [j i] (if (and (< j (count fmt))
-                                                                    (Character/isWhitespace (.charAt fmt j)))
-                                                             (recur (inc j)) j))]
+                                                                  (Character/isWhitespace (.charAt fmt j)))
+                                                           (recur (inc j)) j))]
                                        (.append sb "\\s+")
                                        (recur j fields sb))
           :else (do (.append sb (Pattern/quote (str c)))

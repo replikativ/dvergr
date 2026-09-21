@@ -109,7 +109,7 @@
         (doseq [task (t2/split-tasks dom "base")]
           (is (= 0.0 (:reward (t2/grade dom task (t2/run-episode dom task {:agent (fn [_] {:content "Bye ###STOP###"})
                                                                            :user (fn [_] {:content "hi"})})
-                                         {})))
+                                        {})))
               (get task "id")))))))
 
 (deftest telecom-grading-matches-upstream-evaluators

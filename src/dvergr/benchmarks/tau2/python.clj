@@ -295,7 +295,7 @@
   (let [begin (dec end) sb (StringBuilder.) n (count s)]
     (loop [i end]
       (let [j (loop [j i] (if (and (< j n) (let [c (.charAt s j)]
-                                              (not (or (= c \") (= c \\) (< (int c) 0x20)))))
+                                             (not (or (= c \") (= c \\) (< (int c) 0x20)))))
                             (recur (inc j)) j))]
         (when (>= j n) (decode-error "Unterminated string starting at" s begin))
         (.append sb (subs s i j))

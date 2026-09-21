@@ -255,46 +255,46 @@
    Returns {:text stripped-text, :tool-calls [{:id :name :input}]}."
   ([text] (parse-tool-calls text #{}))
   ([text tool-names]
-  (if (str/blank? text)
-    {:text "" :tool-calls nil}
-    (let [;; Strip hallucinated tool_results FIRST — they may contain old tool_use blocks
-          cleaned (clean-response-text text)
-          matches (re-seq tool-call-pattern cleaned)]
-      (if (empty? matches)
-        (if-let [call (bare-tool-call cleaned tool-names)]
-          {:text "" :tool-calls [call]}
-          {:text (str/trim cleaned) :tool-calls nil})
-        (let [raw-calls
-              (into []
-                    (comp
-                     (map second)
-                     (keep (fn [json-str]
-                             (try
-                               (let [parsed (json/read-value json-str json/keyword-keys-object-mapper)]
-                                 {:id (or (:id parsed) (str "tc_" (java.util.UUID/randomUUID)))
-                                  :name (:name parsed)
-                                  :input (or (:input parsed) {})})
-                               (catch Exception e
-                                 (tel/log! {:level :warn :id :claude-code/tool-call-parse-error
-                                            :data {:json json-str :error (.getMessage e)}}
-                                           "Failed to parse tool call JSON")
-                                 nil)))))
-                    matches)
+   (if (str/blank? text)
+     {:text "" :tool-calls nil}
+     (let [;; Strip hallucinated tool_results FIRST — they may contain old tool_use blocks
+           cleaned (clean-response-text text)
+           matches (re-seq tool-call-pattern cleaned)]
+       (if (empty? matches)
+         (if-let [call (bare-tool-call cleaned tool-names)]
+           {:text "" :tool-calls [call]}
+           {:text (str/trim cleaned) :tool-calls nil})
+         (let [raw-calls
+               (into []
+                     (comp
+                      (map second)
+                      (keep (fn [json-str]
+                              (try
+                                (let [parsed (json/read-value json-str json/keyword-keys-object-mapper)]
+                                  {:id (or (:id parsed) (str "tc_" (java.util.UUID/randomUUID)))
+                                   :name (:name parsed)
+                                   :input (or (:input parsed) {})})
+                                (catch Exception e
+                                  (tel/log! {:level :warn :id :claude-code/tool-call-parse-error
+                                             :data {:json json-str :error (.getMessage e)}}
+                                            "Failed to parse tool call JSON")
+                                  nil)))))
+                     matches)
               ;; Deduplicate file-writing tools: last write to same path wins
-              file-tools #{"write_file" "edit_file"}
-              tool-calls (let [{file-writes true others false}
-                               (group-by #(contains? file-tools (:name %)) raw-calls)
+               file-tools #{"write_file" "edit_file"}
+               tool-calls (let [{file-writes true others false}
+                                (group-by #(contains? file-tools (:name %)) raw-calls)
                                ;; For file writes, group by path, keep last
-                               deduped-writes (->> file-writes
-                                                   (group-by #(get-in % [:input :path]))
-                                                   vals
-                                                   (map last))]
-                           (vec (concat others deduped-writes)))
-              stripped (-> cleaned
-                           (str/replace tool-call-pattern "")
-                           str/trim)]
-          {:text stripped
-           :tool-calls (when (seq tool-calls) tool-calls)}))))))
+                                deduped-writes (->> file-writes
+                                                    (group-by #(get-in % [:input :path]))
+                                                    vals
+                                                    (map last))]
+                            (vec (concat others deduped-writes)))
+               stripped (-> cleaned
+                            (str/replace tool-call-pattern "")
+                            str/trim)]
+           {:text stripped
+            :tool-calls (when (seq tool-calls) tool-calls)}))))))
 
 ;; ============================================================================
 ;; Model Mapping

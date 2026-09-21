@@ -214,13 +214,13 @@
       7 ["transfer_to_human_agents" {"summary" "Customer wants a refund."}]
       8 ["send_certificate" {"user_id" (if (chance 0.1) "nobody_1" uid)
                              "amount" (if (chance 0.25) (pick [100.0 "150" "abc" nil true 12.5 "1e3" [50]])
-                                        (pick [50 100 150 200 250 400]))}]
+                                          (pick [50 100 150 200 250 400]))}]
       9 ["cancel_reservation" {"reservation_id" rid}]
       10 ["update_reservation_baggages"
           {"reservation_id" rid
            "total_baggages" (if (chance 0.1) (pick ["3" 2.5 nil]) (int 5))
            "nonfree_baggages" (if (chance 0.15) (pick [1.5 2.3 "2" nil true 0.0 -1])
-                                (int 4))
+                                  (int 4))
            "payment_id" pm}]
       11 (if res (flights-update-call r db ix res-id res)
              ["update_reservation_flights" {"reservation_id" rid "cabin" "economy"

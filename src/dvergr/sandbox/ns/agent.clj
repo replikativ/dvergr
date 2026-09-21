@@ -641,51 +641,51 @@
         'result-spin  result-spin-fn
         'owned-result-spin owned-result-spin-fn}
        (with-schemas
-       '{roster      [([] [opts]) "Create an immutable Roster value. Options may include portable :id, :defaults, :scope, and :metadata data."]
-         make-agent   [([roster spec]) "Return a NEW Roster containing `spec`. Programs are {:kind :echo :delay-ms n}, {:kind :scripted :delay-ms n :reply value}, or {:kind :llm :max-model-steps n :budget-dollars n} plus :model-policy and :tools. Pure: input unchanged."]
-         revise-agent [([roster id patch]) "Return a NEW Roster with AgentDef `id` revised and its version incremented."]
-         lookup       [([roster id-or-ref]) "Resolve an AgentDef by keyword id or versioned AgentRef. A stale versioned ref is an error."]
-         ref          [([agent-def]) "Return the stable {:agent/id :agent/version} reference for an AgentDef."]
-         list         [([roster]) "All AgentDefs in a Roster, deterministically ordered by id."]
-         select       [([roster selector]) "Select AgentDefs by :id, :status, :skill/:skills, and exact portable :where data."]
-         environment  [([spec]) "Create a portable, content-addressed EnvironmentDef. Requires :id, :task, and trusted verifier ref {:id keyword :version n}; optional :limits/:world/:metadata stay data, never live functions or handles."]
-         environment-ref [([environment]) "Return the stable logical/version/content reference for one exact EnvironmentDef. Individual execution Run IDs remain unique."]
-         dataset      [([spec]) "Create a portable DatasetDef from a non-empty vector of exact EnvironmentDefs. Dataset construction is pure and content-addressed."]
-         dataset-ref  [([dataset]) "Return the stable logical/version/content reference for one exact DatasetDef."]
-         experiment   [([spec]) "Create a portable full-factorial ExperimentDef. Requires a DatasetDef and a non-empty vector of AgentDefs; repetitions default to one. Candidates bind exact AgentDef content. Concurrency and admission ceilings remain host policy."]
-         experiment-ref [([experiment]) "Return the stable logical/version/content reference for one exact ExperimentDef. Running and trusted scoring remain host-owned capabilities."]
-         room-id      [([]) "Return the live identity of the current Room/world. In an isolated fork this is the child Room, not its parent."]
-         hire!        [([roster agent-ref opts]) "Durably start one owned AgentDef in the current Room: (hire! team :a {:task value :resources {\"microUSD\" 1000}}). Returns a RunHandle. The current Run remains responsible for the child even if the handle is ignored. opts: :task (required); :from (a keyword sender); :settlement (:automatic, :review or :discard); :resources, a MAP of resource coordinate → positive amount (e.g. {\"microUSD\" 1000}) split from the current Run/Room's conserved balance; :limits {:max-model-steps n :budget-dollars x}, which can only TIGHTEN the agent's own limits for this Run; :parent-run, the parent Run's uuid (defaults to the current Run and, when one is ambient, must equal it). Unknown keys are rejected."]
-         observe      [([handle-or-run-id]) "Read the current Room's durable Run projection for a RunHandle or UUID."]
-         inspect      [([] [opts]) "Inspect the current Run and its structural descendants as one bounded snapshot of Runs, frontier, correlated messages, semantic activities, failures, and conserved balances. Inside a hired agent this cannot see parent or sibling Runs, and inspection without an ambient Run fails closed. A durable semantic receipt identifies the inspection. Options: :run-limit, :message-limit, :content-limit, :content-budget, :detail-limit."]
-         cancel!      [([handle-or-run-id]) "Request cooperative cancellation of exactly one live Run. Returns true when the Run was found."]
-         balance      [([]) "Return the conserved resource vector available to the current Run, or the Room root at top level."]
-         run-id       [([handle]) "Return the durable Run UUID represented by a RunHandle."]
-         result-spin  [([handle]) "Return a passive Spindel observer Spin for a RunHandle. On resolution the current Run durably records the child as a causal input. Multiple observers may await it; cancelling an observer does not cancel the Run. The Spin resolves to the result map {:run/id uuid :run/status :completed|:waiting|:cancelled|:failed :run/value … :run/world … :run/settlement-status …} (plus :run/output/:run/reason/:run/error/:run/metrics as applicable)."]
-         owned-result-spin [([handle]) "Return an ownership-coupled result Spin. On resolution the current Run durably records the child as a causal input. Cancelling this observer also cancels the underlying Run; use only when the observer owns that child execution. Resolves to the same result map as `result-spin`."]}
-       {'roster          [:function [:=> [:cat] Roster] [:=> [:cat RosterOpts] Roster]]
-        'make-agent      [:=> [:cat Roster AgentSpec] Roster]
-        'revise-agent    [:=> [:cat Roster :keyword [:map-of :keyword :any]] Roster]
-        'lookup          [:=> [:cat Roster AgentIdOrRef] [:maybe AgentDef]]
-        'ref             [:=> [:cat AgentDef] AgentRef]
-        'list            [:=> [:cat Roster] [:vector AgentDef]]
-        'select          [:=> [:cat Roster AgentSelector] [:vector AgentDef]]
-        'environment     [:=> [:cat EnvironmentSpec] EnvironmentDef]
-        'environment-ref [:=> [:cat EnvironmentDef] EnvironmentRef]
-        'dataset         [:=> [:cat DatasetSpec] DatasetDef]
-        'dataset-ref     [:=> [:cat DatasetDef] DatasetRef]
-        'experiment      [:=> [:cat ExperimentSpec] ExperimentDef]
-        'experiment-ref  [:=> [:cat ExperimentDef] ExperimentRef]
-        'room-id         [:=> [:cat] :keyword]
-        'hire!           [:=> [:cat Roster AgentIdOrRef HireOpts] RunHandle]
-        'observe         [:=> [:cat [:or :uuid RunHandle]] [:maybe Run]]
-        'inspect         [:function [:=> [:cat] Observation]
-                          [:=> [:cat InspectOpts] Observation]]
-        'cancel!         [:=> [:cat [:or :uuid RunHandle]] :boolean]
-        'balance         [:=> [:cat] Balance]
-        'run-id          [:=> [:cat RunHandle] :uuid]
-        'result-spin     [:=> [:cat RunHandle] :any]
-        'owned-result-spin [:=> [:cat RunHandle] :any]})))))
+         '{roster      [([] [opts]) "Create an immutable Roster value. Options may include portable :id, :defaults, :scope, and :metadata data."]
+           make-agent   [([roster spec]) "Return a NEW Roster containing `spec`. Programs are {:kind :echo :delay-ms n}, {:kind :scripted :delay-ms n :reply value}, or {:kind :llm :max-model-steps n :budget-dollars n} plus :model-policy and :tools. Pure: input unchanged."]
+           revise-agent [([roster id patch]) "Return a NEW Roster with AgentDef `id` revised and its version incremented."]
+           lookup       [([roster id-or-ref]) "Resolve an AgentDef by keyword id or versioned AgentRef. A stale versioned ref is an error."]
+           ref          [([agent-def]) "Return the stable {:agent/id :agent/version} reference for an AgentDef."]
+           list         [([roster]) "All AgentDefs in a Roster, deterministically ordered by id."]
+           select       [([roster selector]) "Select AgentDefs by :id, :status, :skill/:skills, and exact portable :where data."]
+           environment  [([spec]) "Create a portable, content-addressed EnvironmentDef. Requires :id, :task, and trusted verifier ref {:id keyword :version n}; optional :limits/:world/:metadata stay data, never live functions or handles."]
+           environment-ref [([environment]) "Return the stable logical/version/content reference for one exact EnvironmentDef. Individual execution Run IDs remain unique."]
+           dataset      [([spec]) "Create a portable DatasetDef from a non-empty vector of exact EnvironmentDefs. Dataset construction is pure and content-addressed."]
+           dataset-ref  [([dataset]) "Return the stable logical/version/content reference for one exact DatasetDef."]
+           experiment   [([spec]) "Create a portable full-factorial ExperimentDef. Requires a DatasetDef and a non-empty vector of AgentDefs; repetitions default to one. Candidates bind exact AgentDef content. Concurrency and admission ceilings remain host policy."]
+           experiment-ref [([experiment]) "Return the stable logical/version/content reference for one exact ExperimentDef. Running and trusted scoring remain host-owned capabilities."]
+           room-id      [([]) "Return the live identity of the current Room/world. In an isolated fork this is the child Room, not its parent."]
+           hire!        [([roster agent-ref opts]) "Durably start one owned AgentDef in the current Room: (hire! team :a {:task value :resources {\"microUSD\" 1000}}). Returns a RunHandle. The current Run remains responsible for the child even if the handle is ignored. opts: :task (required); :from (a keyword sender); :settlement (:automatic, :review or :discard); :resources, a MAP of resource coordinate → positive amount (e.g. {\"microUSD\" 1000}) split from the current Run/Room's conserved balance; :limits {:max-model-steps n :budget-dollars x}, which can only TIGHTEN the agent's own limits for this Run; :parent-run, the parent Run's uuid (defaults to the current Run and, when one is ambient, must equal it). Unknown keys are rejected."]
+           observe      [([handle-or-run-id]) "Read the current Room's durable Run projection for a RunHandle or UUID."]
+           inspect      [([] [opts]) "Inspect the current Run and its structural descendants as one bounded snapshot of Runs, frontier, correlated messages, semantic activities, failures, and conserved balances. Inside a hired agent this cannot see parent or sibling Runs, and inspection without an ambient Run fails closed. A durable semantic receipt identifies the inspection. Options: :run-limit, :message-limit, :content-limit, :content-budget, :detail-limit."]
+           cancel!      [([handle-or-run-id]) "Request cooperative cancellation of exactly one live Run. Returns true when the Run was found."]
+           balance      [([]) "Return the conserved resource vector available to the current Run, or the Room root at top level."]
+           run-id       [([handle]) "Return the durable Run UUID represented by a RunHandle."]
+           result-spin  [([handle]) "Return a passive Spindel observer Spin for a RunHandle. On resolution the current Run durably records the child as a causal input. Multiple observers may await it; cancelling an observer does not cancel the Run. The Spin resolves to the result map {:run/id uuid :run/status :completed|:waiting|:cancelled|:failed :run/value … :run/world … :run/settlement-status …} (plus :run/output/:run/reason/:run/error/:run/metrics as applicable)."]
+           owned-result-spin [([handle]) "Return an ownership-coupled result Spin. On resolution the current Run durably records the child as a causal input. Cancelling this observer also cancels the underlying Run; use only when the observer owns that child execution. Resolves to the same result map as `result-spin`."]}
+         {'roster          [:function [:=> [:cat] Roster] [:=> [:cat RosterOpts] Roster]]
+          'make-agent      [:=> [:cat Roster AgentSpec] Roster]
+          'revise-agent    [:=> [:cat Roster :keyword [:map-of :keyword :any]] Roster]
+          'lookup          [:=> [:cat Roster AgentIdOrRef] [:maybe AgentDef]]
+          'ref             [:=> [:cat AgentDef] AgentRef]
+          'list            [:=> [:cat Roster] [:vector AgentDef]]
+          'select          [:=> [:cat Roster AgentSelector] [:vector AgentDef]]
+          'environment     [:=> [:cat EnvironmentSpec] EnvironmentDef]
+          'environment-ref [:=> [:cat EnvironmentDef] EnvironmentRef]
+          'dataset         [:=> [:cat DatasetSpec] DatasetDef]
+          'dataset-ref     [:=> [:cat DatasetDef] DatasetRef]
+          'experiment      [:=> [:cat ExperimentSpec] ExperimentDef]
+          'experiment-ref  [:=> [:cat ExperimentDef] ExperimentRef]
+          'room-id         [:=> [:cat] :keyword]
+          'hire!           [:=> [:cat Roster AgentIdOrRef HireOpts] RunHandle]
+          'observe         [:=> [:cat [:or :uuid RunHandle]] [:maybe Run]]
+          'inspect         [:function [:=> [:cat] Observation]
+                            [:=> [:cat InspectOpts] Observation]]
+          'cancel!         [:=> [:cat [:or :uuid RunHandle]] :boolean]
+          'balance         [:=> [:cat] Balance]
+          'run-id          [:=> [:cat RunHandle] :uuid]
+          'result-spin     [:=> [:cat RunHandle] :any]
+          'owned-result-spin [:=> [:cat RunHandle] :any]})))))
 
 (defn add-agents-ns!
   "Expose the agent registry as 'agents namespace in SCI.
@@ -716,14 +716,14 @@
                            'online? online?-fn
                            'by-tag  by-tag-fn}
                           (with-schemas
-                          '{list    [([]) "Every agent currently ONLINE in this daemon, as a vector of entries. Ground-truth for who can actually take work right now — a profile mentioning an agent does not mean it is running."]
-                            lookup  [([id]) "The full entry for one agent id (e.g. :skald), or nil if it is not online."]
-                            online? [([id]) "Whether an agent id is running right now. Check before dispatching work to it."]
-                            by-tag  [([tag]) "Online agents whose :tags contain `tag` (e.g. :coding) — a vector, possibly empty."]}
-                           {'list    [:=> [:cat] [:vector OnlineAgent]]
-                            'lookup  [:=> [:cat :keyword] [:maybe OnlineAgent]]
-                            'online? [:=> [:cat :keyword] :boolean]
-                            'by-tag  [:=> [:cat :keyword] [:vector OnlineAgent]]})))))
+                            '{list    [([]) "Every agent currently ONLINE in this daemon, as a vector of entries. Ground-truth for who can actually take work right now — a profile mentioning an agent does not mean it is running."]
+                              lookup  [([id]) "The full entry for one agent id (e.g. :skald), or nil if it is not online."]
+                              online? [([id]) "Whether an agent id is running right now. Check before dispatching work to it."]
+                              by-tag  [([tag]) "Online agents whose :tags contain `tag` (e.g. :coding) — a vector, possibly empty."]}
+                            {'list    [:=> [:cat] [:vector OnlineAgent]]
+                             'lookup  [:=> [:cat :keyword] [:maybe OnlineAgent]]
+                             'online? [:=> [:cat :keyword] :boolean]
+                             'by-tag  [:=> [:cat :keyword] [:vector OnlineAgent]]})))))
 
 (defn add-skills-ns!
   "Expose the skill registry + dispatch as 'skills namespace in SCI.
@@ -809,31 +809,31 @@
                                             :else
                                             (do (promote* definition (str by) (str date)) true))))}
                           (with-schemas
-                          '{all       [([]) "Every skill visible here — on disk plus any this room defines (the room's own take precedence). A map of skill-name → definition."]
-                            read      [([skill-name]) "The FULL instructions for one skill. The system prompt carries only a brief index; pull the body with this before following a skill."]
-                            find      [([provides-tag]) "Skill definitions that provide `provides-tag` (e.g. :research) — a vector, possibly empty. Includes this room's own skills (as `all` does)."]
-                            providers [([skill]) "Actor-ids that declare they can perform `skill`, whether or not they are online."]
-                            rank      [([skill]) "Providers of `skill` ranked by suitability, ONLINE ones only."]
-                            dispatch  [([skill]) "The single best online provider for `skill` (an actor map), or nil if nobody can take it."]
-                            dispatch! [([skill opts]) "Actually hand `skill` to its best provider. `opts` carries the payload for the receiving actor."]
-                            author!   [([skill-name frontmatter body]) "Write a NEW skill into this room's repo (versioned, forkable, mergeable). Lands `vetted: false`, so it stays out of prompts until a reviewer promotes it. Throws if no room workspace is bound."]
-                            lift!     [([skill-name source body]) "Import external content (another agent's skill, a fetched URL) into the room as an UNVETTED skill, recording `source`. Throws if no room workspace is bound."]
-                            promote!  [([skill-name by date]) "Mark one of THIS room's skills vetted — a REVIEWER action; this is what lets it appear in prompts. Throws if there is no such skill, if it is not a room skill (user/project/built-in skills are not promotable from here), or if no room workspace is bound."]}
-                           {'all       [:=> [:cat] [:map-of :string SkillDef]]
-                            'read      [:=> [:cat SkillName] [:maybe :string]]
-                            'find      [:=> [:cat :keyword] [:vector SkillDef]]
-                            'providers [:=> [:cat :keyword] [:vector :keyword]]
-                            'rank      [:=> [:cat :keyword] [:vector Actor]]
-                            'dispatch  [:=> [:cat :keyword] [:maybe Actor]]
-                            'dispatch! [:=> [:cat :keyword
-                                             [:map
-                                              [:task :string]
-                                              [:room-id {:optional true} :keyword]
-                                              [:from-actor {:optional true} [:maybe :keyword]]]]
-                                        DispatchResult]
-                            'author!   [:=> [:cat SkillName [:map-of :keyword :any] :any] :string]
-                            'lift!     [:=> [:cat SkillName :any :any] :string]
-                            'promote!  [:=> [:cat SkillName :any :any] [:= true]]})))))
+                            '{all       [([]) "Every skill visible here — on disk plus any this room defines (the room's own take precedence). A map of skill-name → definition."]
+                              read      [([skill-name]) "The FULL instructions for one skill. The system prompt carries only a brief index; pull the body with this before following a skill."]
+                              find      [([provides-tag]) "Skill definitions that provide `provides-tag` (e.g. :research) — a vector, possibly empty. Includes this room's own skills (as `all` does)."]
+                              providers [([skill]) "Actor-ids that declare they can perform `skill`, whether or not they are online."]
+                              rank      [([skill]) "Providers of `skill` ranked by suitability, ONLINE ones only."]
+                              dispatch  [([skill]) "The single best online provider for `skill` (an actor map), or nil if nobody can take it."]
+                              dispatch! [([skill opts]) "Actually hand `skill` to its best provider. `opts` carries the payload for the receiving actor."]
+                              author!   [([skill-name frontmatter body]) "Write a NEW skill into this room's repo (versioned, forkable, mergeable). Lands `vetted: false`, so it stays out of prompts until a reviewer promotes it. Throws if no room workspace is bound."]
+                              lift!     [([skill-name source body]) "Import external content (another agent's skill, a fetched URL) into the room as an UNVETTED skill, recording `source`. Throws if no room workspace is bound."]
+                              promote!  [([skill-name by date]) "Mark one of THIS room's skills vetted — a REVIEWER action; this is what lets it appear in prompts. Throws if there is no such skill, if it is not a room skill (user/project/built-in skills are not promotable from here), or if no room workspace is bound."]}
+                            {'all       [:=> [:cat] [:map-of :string SkillDef]]
+                             'read      [:=> [:cat SkillName] [:maybe :string]]
+                             'find      [:=> [:cat :keyword] [:vector SkillDef]]
+                             'providers [:=> [:cat :keyword] [:vector :keyword]]
+                             'rank      [:=> [:cat :keyword] [:vector Actor]]
+                             'dispatch  [:=> [:cat :keyword] [:maybe Actor]]
+                             'dispatch! [:=> [:cat :keyword
+                                              [:map
+                                               [:task :string]
+                                               [:room-id {:optional true} :keyword]
+                                               [:from-actor {:optional true} [:maybe :keyword]]]]
+                                         DispatchResult]
+                             'author!   [:=> [:cat SkillName [:map-of :keyword :any] :any] :string]
+                             'lift!     [:=> [:cat SkillName :any :any] :string]
+                             'promote!  [:=> [:cat SkillName :any :any] [:= true]]})))))
 
 (defn add-actors-ns!
   "Expose the durable actor table as 'actors namespace in SCI.
@@ -883,31 +883,31 @@
                            'add-skill!    (fn [id skill] (add-skill-fn conn id skill))
                            'remove-skill! (fn [id skill] (remove-skill-fn conn id skill))}
                           (with-schemas
-                          '{list          [([] [& {:keys [kind status]}]) "Every DURABLE actor the system knows — including offline and retired ones (contrast dvergr.agents/list, which is who is alive now). Filter with :kind (:agent/:human) and :status (e.g. :online, :retired)."]
-                            lookup        [([id]) "The durable row for one actor id, or nil. Persisted state, not runtime state."]
-                            online?       [([id]) "Runtime check — is this actor actually running now?"]
-                            spawn-agent!  [([opts]) "Create a NEW agent, persisted to Datahike. `opts` takes :id :name :profile-ref :skills :config (provider/model). This grows the roster; prefer an existing agent when one fits."]
-                            spawn-human!  [([opts]) "Register a HUMAN participant as an actor, so work can be assigned to and tracked for them."]
-                            dismiss!      [([id]) "Retire an actor — flags :status :retired rather than deleting, so its history survives."]
-                            update!       [([id patch]) "Merge `patch` into an actor's durable row (e.g. {:skills #{:prose :writing}})."]
-                            add-skill!    [([id skill]) "Declare that an actor can perform `skill` — this is what makes it show up in dvergr.skills/providers."]
-                            remove-skill! [([id skill]) "Withdraw a skill declaration from an actor."]}
-                           {'list          [:=> [:cat [:* [:alt [:cat [:= :kind] :keyword]
+                            '{list          [([] [& {:keys [kind status]}]) "Every DURABLE actor the system knows — including offline and retired ones (contrast dvergr.agents/list, which is who is alive now). Filter with :kind (:agent/:human) and :status (e.g. :online, :retired)."]
+                              lookup        [([id]) "The durable row for one actor id, or nil. Persisted state, not runtime state."]
+                              online?       [([id]) "Runtime check — is this actor actually running now?"]
+                              spawn-agent!  [([opts]) "Create a NEW agent, persisted to Datahike. `opts` takes :id :name :profile-ref :skills :config (provider/model). This grows the roster; prefer an existing agent when one fits."]
+                              spawn-human!  [([opts]) "Register a HUMAN participant as an actor, so work can be assigned to and tracked for them."]
+                              dismiss!      [([id]) "Retire an actor — flags :status :retired rather than deleting, so its history survives."]
+                              update!       [([id patch]) "Merge `patch` into an actor's durable row (e.g. {:skills #{:prose :writing}})."]
+                              add-skill!    [([id skill]) "Declare that an actor can perform `skill` — this is what makes it show up in dvergr.skills/providers."]
+                              remove-skill! [([id skill]) "Withdraw a skill declaration from an actor."]}
+                            {'list          [:=> [:cat [:* [:alt [:cat [:= :kind] :keyword]
                                                             [:cat [:= :status] :keyword]
                                                             [:cat [:= :skill] :keyword]]]]
-                                            [:vector Actor]]
-                            'lookup        [:=> [:cat :keyword] [:maybe Actor]]
-                            'online?       [:=> [:cat :keyword] :boolean]
-                            'spawn-agent!  [:=> [:cat (into [:map [:id :keyword]] (rest ActorFields))] Actor]
-                            'spawn-human!  [:=> [:cat (into [:map [:id :keyword]
-                                                             [:external-refs [:map-of {:min 1} :keyword :any]]]
-                                                            (remove #(= :external-refs (first %)))
-                                                            (rest ActorFields))]
-                                            Actor]
-                            'dismiss!      [:=> [:cat :keyword] [:maybe [:= :dismissed]]]
-                            'update!       [:=> [:cat :keyword ActorFields] [:maybe Actor]]
-                            'add-skill!    [:=> [:cat :keyword :keyword] Actor]
-                            'remove-skill! [:=> [:cat :keyword :keyword] Actor]})))))
+                                             [:vector Actor]]
+                             'lookup        [:=> [:cat :keyword] [:maybe Actor]]
+                             'online?       [:=> [:cat :keyword] :boolean]
+                             'spawn-agent!  [:=> [:cat (into [:map [:id :keyword]] (rest ActorFields))] Actor]
+                             'spawn-human!  [:=> [:cat (into [:map [:id :keyword]
+                                                              [:external-refs [:map-of {:min 1} :keyword :any]]]
+                                                             (remove #(= :external-refs (first %)))
+                                                             (rest ActorFields))]
+                                             Actor]
+                             'dismiss!      [:=> [:cat :keyword] [:maybe [:= :dismissed]]]
+                             'update!       [:=> [:cat :keyword ActorFields] [:maybe Actor]]
+                             'add-skill!    [:=> [:cat :keyword :keyword] Actor]
+                             'remove-skill! [:=> [:cat :keyword :keyword] Actor]})))))
 
 (defn add-tasks-ns!
   "Expose the task ledger as 'tasks namespace in SCI.
@@ -939,18 +939,18 @@
                            'complete! (fn [id r]  (complete-fn conn id r))
                            'ignore!   (fn [id]    (ignore-fn conn id))}
                           (with-schemas
-                          '{list      [([] [& {:keys [actor-id status]}]) "The shared task ledger — persistent rows for work dispatched to non-agent actors (humans). Filter with :actor-id and :status (e.g. :pending). Agents themselves just react to inbox messages and need no task row."]
-                            lookup    [([id]) "One task by its uuid, or nil."]
-                            accept!   [([id]) "Claim a task — marks it accepted so nobody else picks it up."]
-                            complete! [([id result]) "Finish a task, recording `result` (a string describing what was done/found)."]
-                            ignore!   [([id]) "Decline a task, leaving it for someone else."]}
-                           {'list      [:=> [:cat [:* [:alt [:cat [:= :actor-id] :keyword]
+                            '{list      [([] [& {:keys [actor-id status]}]) "The shared task ledger — persistent rows for work dispatched to non-agent actors (humans). Filter with :actor-id and :status (e.g. :pending). Agents themselves just react to inbox messages and need no task row."]
+                              lookup    [([id]) "One task by its uuid, or nil."]
+                              accept!   [([id]) "Claim a task — marks it accepted so nobody else picks it up."]
+                              complete! [([id result]) "Finish a task, recording `result` (a string describing what was done/found)."]
+                              ignore!   [([id]) "Decline a task, leaving it for someone else."]}
+                            {'list      [:=> [:cat [:* [:alt [:cat [:= :actor-id] :keyword]
                                                         [:cat [:= :status] :keyword]]]]
-                                        [:vector Task]]
-                            'lookup    [:=> [:cat :uuid] [:maybe Task]]
-                            'accept!   [:=> [:cat :uuid] [:maybe Task]]
-                            'complete! [:=> [:cat :uuid :any] [:maybe Task]]
-                            'ignore!   [:=> [:cat :uuid] [:maybe Task]]})))))
+                                         [:vector Task]]
+                             'lookup    [:=> [:cat :uuid] [:maybe Task]]
+                             'accept!   [:=> [:cat :uuid] [:maybe Task]]
+                             'complete! [:=> [:cat :uuid :any] [:maybe Task]]
+                             'ignore!   [:=> [:cat :uuid] [:maybe Task]]})))))
 
 (defn add-scheduler-ns!
   "Expose scheduling as 'scheduler namespace in SCI.

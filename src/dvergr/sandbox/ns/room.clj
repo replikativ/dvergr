@@ -105,7 +105,7 @@
                                      [:source-user-id {:optional true} :int]]]
                   [:or [:map [:posted-to :keyword] [:content :string]] ErrorResult]]
    'messages     [:=> [:cat RoomRef [:alt [:cat [:map [:limit {:optional true} :int]
-                                                  [:since {:optional true} 'inst?]]]
+                                                 [:since {:optional true} 'inst?]]]
                                      [:* [:alt [:cat [:= :limit] :int]
                                           [:cat [:= :since] 'inst?]]]]]
                   [:maybe [:vector Message]]]
@@ -136,7 +136,7 @@
    'root         [:=> :cat [:maybe Room]]
    ;; ---- DB surface (below) ----
    'kbs             [:=> :cat [:or [:vector [:map [:name :string] [:permission :keyword]
-                                                 [:default? :boolean]]]
+                                             [:default? :boolean]]]
                                ErrorResult]]
    'kb              [:=> [:cat :string] :any]
    'databases       [:=> :cat [:or [:maybe [:vector [:map [:name :string]
@@ -255,11 +255,11 @@
         recent-msgs    (fn recent
                          ([] (recent 20))
                          ([n]
-                         (safe #(when room-view
-                                  (->> (d/q '[:find [(pull ?m [:message/content :message/role :message/created-at]) ...]
-                                              :where [?m :message/content _]] @room-view)
-                                       (sort-by msg-time >)
-                                       (take (or n 20)) vec)))))
+                          (safe #(when room-view
+                                   (->> (d/q '[:find [(pull ?m [:message/content :message/role :message/created-at]) ...]
+                                               :where [?m :message/content _]] @room-view)
+                                        (sort-by msg-time >)
+                                        (take (or n 20)) vec)))))
         search-msgs    (fn [term]
                          (safe #(when room-view
                                   (let [lc (str/lower-case (str term))]

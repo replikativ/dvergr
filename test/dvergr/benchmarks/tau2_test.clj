@@ -20,7 +20,7 @@
                         [100.0 "100.0"] [1e16 "1e+16"] [1.5e-5 "1.5e-05"]
                         [0.0001 "0.0001"] [123456789012345.6 "123456789012345.6"]
                         [-0.0 "-0.0"] [5e-324 "5e-324"] [1.7976931348623157e308
-                                                          "1.7976931348623157e+308"]]]
+                                                         "1.7976931348623157e+308"]]]
     (is (= expected (pj/py-float-repr x)) (str x))))
 
 (deftest python-round-and-json
@@ -130,7 +130,7 @@
         (is (= 0.0 (:reward (t2/grade dom task episode {})))))
       (testing "mixed text+tool messages route to the environment unless enforced"
         (let [mixed (constantly {:content "Checking." :tool-calls [{:id "x" :name "calculate"
-                                                                     :arguments {"expression" "1+1"}}]})]
+                                                                    :arguments {"expression" "1+1"}}]})]
           (is (= :max-steps (:termination (run {:agent mixed :max-steps 10})))
               "accepted: the episode only ends at the step bound")
           (is (= :agent-error (:termination (run {:agent mixed :enforce-protocol? true})))))))))

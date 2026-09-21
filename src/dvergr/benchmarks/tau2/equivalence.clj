@@ -82,7 +82,7 @@
         pms (keys (get user "payment_methods"))
         pm (cond (chance rng 0.05) "credit_card_0000000"
                  (chance rng 0.1) (pick rng (mapcat #(keys (get % "payment_methods"))
-                                                   (take 20 (vals (get db "users")))))
+                                                    (take 20 (vals (get db "users")))))
                  :else (pick rng pms))
         items (mapv #(get % "item_id") (get order "items"))
         chosen (vec (take (inc (.nextInt rng (max 1 (count items)))) (seeded-shuffle rng items)))
@@ -147,11 +147,11 @@
                           oid (get-in first-call ["arguments" "order_id"])]
                       (into [first-call]
                             (mapv (fn [_]
-                              (let [c (retail-call rng db)]
-                                (if (and oid (contains? (get c "arguments") "order_id")
-                                         (chance rng 0.7))
-                                  (assoc-in c ["arguments" "order_id"] oid)
-                                  c)))
+                                    (let [c (retail-call rng db)]
+                                      (if (and oid (contains? (get c "arguments") "order_id")
+                                               (chance rng 0.7))
+                                        (assoc-in c ["arguments" "order_id"] oid)
+                                        c)))
                                   (range (.nextInt rng 8)))))}))))
 
 ;; ---------------------------------------------------------------------------

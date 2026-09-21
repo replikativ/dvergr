@@ -186,13 +186,13 @@
     ;; certified evidence is the only record, so there is nothing to
     ;; cross-check it against. `verify-world` still applies.
     {:applicable? false}
-  (let [log (get-in attempt [:attempt/evidence :trajectory])
-        logged-tools (mapv #(select-keys % [:seq :requestor :tool :arguments :content :error])
-                           (filter #(= :tool (:kind %)) log))
-        logged-dialogue (mapv :content (filter #(= :message (:kind %)) log))
-        recorded-runs (set (map first (get-in attempt [:attempt/evidence :episode :agent-runs])))]
-    {:effects-match? (= logged-tools (mapv #(select-keys % [:seq :requestor :tool :arguments :content :error])
-                                           effects))
-     :dialogue-match? (= logged-dialogue (mapv :content dialogue))
-     :runs-recorded? (= recorded-runs (set (map :run/id runs)))
-     :runs-terminal? (every? #(not= :running (:run/status %)) runs)})))
+    (let [log (get-in attempt [:attempt/evidence :trajectory])
+          logged-tools (mapv #(select-keys % [:seq :requestor :tool :arguments :content :error])
+                             (filter #(= :tool (:kind %)) log))
+          logged-dialogue (mapv :content (filter #(= :message (:kind %)) log))
+          recorded-runs (set (map first (get-in attempt [:attempt/evidence :episode :agent-runs])))]
+      {:effects-match? (= logged-tools (mapv #(select-keys % [:seq :requestor :tool :arguments :content :error])
+                                             effects))
+       :dialogue-match? (= logged-dialogue (mapv :content dialogue))
+       :runs-recorded? (= recorded-runs (set (map :run/id runs)))
+       :runs-terminal? (every? #(not= :running (:run/status %)) runs)})))

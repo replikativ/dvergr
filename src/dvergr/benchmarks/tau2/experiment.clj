@@ -70,26 +70,26 @@
    candidate (never resumed into old cells)."
   ([specs] (candidate-roster specs nil))
   ([specs domain]
-  (reduce (fn [team {:keys [id harness action-space model provider max-model-steps budget-dollars
-                            repl-guidance]
-                     :or {harness :dvergr action-space :tools max-model-steps 100 budget-dollars 5.0}}]
-            (let [model-id (registry/resolve-alias model)]
-              (roster/make-agent
-               team
-               {:id id
-                :prompt "tau2 environment agent prompt (see EnvironmentDef)"
-                :tools #{}
-                :model-policy {:provider (or provider (:provider (registry/get-model! model-id)))
-                               :model model-id}
-                :program {:kind :llm :max-model-steps max-model-steps :budget-dollars budget-dollars}
-                :metadata (let [m (cond-> {:conversation/harness harness}
-                                    (= :dvergr harness) (assoc :conversation/action-space action-space))]
-                            (cond-> m
-                              domain (assoc :conversation/system-prompt-sha256
-                                            (pj/sha256-hex (episode/agent-system-prompt
-                                                            domain {:agent/metadata m})))))})))
-          (roster/make-roster {:id :tau2/candidates})
-          specs)))
+   (reduce (fn [team {:keys [id harness action-space model provider max-model-steps budget-dollars
+                             repl-guidance]
+                      :or {harness :dvergr action-space :tools max-model-steps 100 budget-dollars 5.0}}]
+             (let [model-id (registry/resolve-alias model)]
+               (roster/make-agent
+                team
+                {:id id
+                 :prompt "tau2 environment agent prompt (see EnvironmentDef)"
+                 :tools #{}
+                 :model-policy {:provider (or provider (:provider (registry/get-model! model-id)))
+                                :model model-id}
+                 :program {:kind :llm :max-model-steps max-model-steps :budget-dollars budget-dollars}
+                 :metadata (let [m (cond-> {:conversation/harness harness}
+                                     (= :dvergr harness) (assoc :conversation/action-space action-space))]
+                             (cond-> m
+                               domain (assoc :conversation/system-prompt-sha256
+                                             (pj/sha256-hex (episode/agent-system-prompt
+                                                             domain {:agent/metadata m})))))})))
+           (roster/make-roster {:id :tau2/candidates})
+           specs)))
 
 (def host-context-note
   "Appended to every Claude Code system prompt in an experiment."

@@ -61,7 +61,7 @@
     (println "SKIP repl-prompt-and-docs-carry-the-types: no ../tau2-bench checkout")
     (let [dom (t2/load-domain "retail")
           prompt (fn [g] (ep/agent-system-prompt dom {:agent/metadata {:conversation/action-space :repl
-                                                                        :conversation/repl-guidance g}}))]
+                                                                       :conversation/repl-guidance g}}))]
       (testing "the default names each result type and points at the runtime helpers"
         (is (str/includes? (prompt :shape) "returns (after tau2/parse): :tau2.retail/order"))
         (is (str/includes? (prompt :shape) "(tau2/types)"))

@@ -22,5 +22,5 @@
                         ;; signature to state, so it carries no entry here; the
                         ;; ns-guide overview describes it.
                         '{inbox [([]) "The datahike conn for YOUR room's attached mailbox, resolved LIVE — call it per access so a fork, or a mailbox attached after this sandbox was built, is reflected. nil when no mailbox is attached. Read helpers (recent/search/unread) are readable source: (require '[dvergr.mail.inbox])."
-                                [:=> :cat :any]]}))
+                                 [:=> :cat :any]]}))
   sci-ctx)

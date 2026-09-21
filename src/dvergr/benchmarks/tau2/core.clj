@@ -98,7 +98,7 @@
                                     (.listFiles (io/file dir "tasks"))))
         task-texts (mapv slurp task-files)
         tasks-digest (pj/sha256-hex (str/join "\n" (map (fn [f t] (str (.getName ^java.io.File f) ":" (pj/sha256-hex t)))
-                                                         task-files task-texts)))
+                                                        task-files task-texts)))
         _ (when (not= tasks-digest (get digests "tasks/"))
             (throw (ex-info "tau2 data file does not match the pinned upstream revision"
                             {:type ::data-digest-mismatch :path (str (io/file dir "tasks"))

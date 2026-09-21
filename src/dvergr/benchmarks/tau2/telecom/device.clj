@@ -166,7 +166,7 @@
     [(set-dev w "vpn_connected" true "vpn_details" (vpn-details w)) true]))
 
 (defn- perm-names [perms] (for [[k v] perms :when (py/truthy? v)]
-    (.toLowerCase ^String (str/replace k "_" " ") java.util.Locale/ROOT)))
+                            (.toLowerCase ^String (str/replace k "_" " ") java.util.Locale/ROOT)))
 
 ;; ---------------------------------------------------------------------------
 ;; APNSettings(**d) validation (pydantic 2.13, lax mode, extra=forbid)

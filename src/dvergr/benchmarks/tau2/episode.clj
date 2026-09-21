@@ -220,18 +220,18 @@
    the type of the parsed result -- as `doc` and the prompt show it."
   [domain-name {:strs [name description parameters]}]
   (str/join "\n" (concat [(str/trim (str description))]
-                          (for [[k t req? d] (tool-args parameters)]
-                            (str "  " k " (" t (when-not req? ", optional") ")"
-                                 (when d (str ": " d))))
-                          (when-let [t (schemas/returns domain-name name)]
-                            [(str "  returns (after tau2/parse): " t)]))))
+                         (for [[k t req? d] (tool-args parameters)]
+                           (str "  " k " (" t (when-not req? ", optional") ")"
+                                (when d (str ": " d))))
+                         (when-let [t (schemas/returns domain-name name)]
+                           [(str "  returns (after tau2/parse): " t)]))))
 
 (defn types-doc
   "The domain's named malli types, one per line, or nil."
   [domain-name]
   (when-let [reg (schemas/registry domain-name)]
     (str/join "\n" (for [[k form] (sort-by (comp str key) reg)]
-                      (str k " " (pr-str form))))))
+                     (str k " " (pr-str form))))))
 
 (defn tool-signatures
   "The domain tools as Clojure calls with their full descriptions: the same
@@ -240,7 +240,7 @@
   ([domain] (tool-signatures domain false))
   ([domain with-types?]
    (str (str/join "\n\n" (for [{:strs [function]} (:tool-schemas domain)]
-                             (str (tool-call-shape function) "\n" (tool-doc (:domain domain) function))))
+                           (str (tool-call-shape function) "\n" (tool-doc (:domain domain) function))))
         (if-let [types (and with-types? (types-doc (:domain domain)))]
           (str "\n\nResult types (malli; string keys; `(tau2/check type x)` validates):\n" types)
           (when (types-doc (:domain domain))
