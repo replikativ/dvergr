@@ -89,3 +89,28 @@
         (testing "no Run is left alive"
           (is (empty? (run/active-runs (:id room)))))
         (finally (d/close-room! room))))))
+
+(deftest an-experiment-through-the-shared-runner
+  (if-not checkout?
+    (println "SKIP an-experiment-through-the-shared-runner: no ../gorilla checkout")
+    (let [dir (str (java.nio.file.Files/createTempDirectory
+                    "bfcl-exp" (make-array java.nio.file.attribute.FileAttribute 0)))
+          calls (atom 0)
+          opts {:dir dir
+                :categories ["simple_python" "irrelevance"] :sample 3
+                :candidates [{:id :scripted :model "claude-code-sonnet"}]
+                :host-context-note nil
+                ;; right on AST tasks, wrong on irrelevance (it always calls)
+                :agent-generate (scripted (fn [task request]
+                                            (swap! calls inc)
+                                            (if (= :ast (:kind task))
+                                              (eq/gold-calls task)
+                                              [{(get-in (first (:tools request)) ["function" "name"]) {}}])))}
+          run-it #((requiring-resolve 'dvergr.benchmarks.bfcl.experiment/run!) opts)
+          first-pass (run-it)]
+      (is (= 6 (:results first-pass)))
+      (is (zero? (:failed-cells first-pass)))
+      (is (= 6 @calls))
+      (testing "the sample is stable, so a second pass resumes into it"
+        (is (= 6 (:results (run-it))))
+        (is (= 6 @calls) "no cell ran again")))))

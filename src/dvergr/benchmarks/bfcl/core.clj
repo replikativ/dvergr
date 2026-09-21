@@ -547,3 +547,33 @@
         {:valid false :error ["Did not output in the specified format."]
          :error-type "ast_decoder:decoder_wrong_output_format"}
         (ast-checker category functions decoded ground-truth)))))
+
+;; ---------------------------------------------------------------------------
+;; Scores (upstream `eval_runner_helper.py`)
+
+(defn summary
+  "Accuracies from `results`, `{category {:correct n :total n}}`:
+
+     :categories    accuracy per category
+     :non-live-ast  UNWEIGHTED mean of simple_python, multiple, parallel and
+                    parallel_multiple, present or not (upstream counts a
+                    missing category as 0)
+     :live-ast      mean of the four live AST categories WEIGHTED by their
+                    task counts
+
+   Upstream's leaderboard \"simple\" column is the mean of the Python, Java and
+   JavaScript simple categories; only Python is transcribed, so `:non-live-ast`
+   is comparable with upstream's \"Python simple\", multiple, parallel and
+   parallel-multiple columns, not with its non-live overall."
+  [results]
+  (let [accuracy (fn [{:keys [correct total]}] (if (pos? (or total 0)) (/ (double correct) total) 0.0))
+        of (fn [category] (get results category))
+        live ["live_simple" "live_multiple" "live_parallel" "live_parallel_multiple"]
+        live-total (reduce + (map #(:total (of %) 0) live))]
+    {:categories (into (sorted-map) (map (fn [[c r]] [c (accuracy r)])) results)
+     :non-live-ast (/ (reduce + (map #(accuracy (of %))
+                                     ["simple_python" "multiple" "parallel" "parallel_multiple"]))
+                      4.0)
+     :live-ast (if (pos? live-total)
+                 (/ (reduce + (map #(:correct (of %) 0) live)) (double live-total))
+                 0.0)}))
