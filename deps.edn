@@ -31,7 +31,7 @@
 
         ;; Dvergr uses the async sequence/CPS namespaces directly; keep this a
         ;; direct dependency instead of relying on Spindel's implementation deps.
-        is.simm/partial-cps        {:mvn/version "0.1.60"}
+        is.simm/partial-cps        {:mvn/version "0.1.63"}
 
         ;; Spindel — Reactive runtime with CoW forking.
         ;; 0.1.35 (#27 lost-wakeup redesign + follow-ups): continuation
@@ -55,10 +55,14 @@
         ;; observation (#49), reusable affine world scopes (#51), and seeded
         ;; inference draws with correct MCMC replay (#54).
         ;; 0.1.49 adds world-backed finite MCTS (`spindel.search.mcts`, #52).
+        ;; 0.1.53 adds savepoints, traces and replay, portable savepoints, a
+        ;; resource authority on world.scope, pinned components; MCMC on traces;
+        ;; pubsub pulls from the first demand (`start-mult!`/`start-pub!` for
+        ;; buffer-only taps); needs partial-cps 0.1.63 (lost-continuation fixes).
         ;; 0.1.52 fixes overlay tombstones reviving as {} instead of nil in a
         ;; fork (#53): a reaped spin node re-registered under the same id threw
         ;; at settlement and left the room unable to heal.
-        org.replikativ/spindel     {:mvn/version "0.1.52"}
+        org.replikativ/spindel     {:mvn/version "0.1.53"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context
