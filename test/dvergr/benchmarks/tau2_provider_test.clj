@@ -3,7 +3,8 @@
    boundary, the conversation hosted by the Run in a forked world that is
    discarded after certification, experiments through `experiment/run` with
    resume. Scripted models replay the gold actions."
-  (:require [clojure.java.io :as io]
+  (:require [dvergr.test-support :as support]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [dvergr.agent.episode :as attempts]
@@ -64,7 +65,7 @@
 
 (deftest retail-gold-through-evaluate
   (if-not checkout?
-    (println "SKIP retail-gold-through-evaluate: no ../tau2-bench checkout")
+    (support/skip! "retail-gold-through-evaluate: no ../tau2-bench checkout")
     (let [dom (without-nl (t2/load-domain "retail"))
           task (get-in dom [:tasks "0"])
           {:keys [agent-generate user-fn-for]} (gold-pair)
@@ -96,7 +97,7 @@
 
 (deftest telecom-experiment-resumes
   (if-not checkout?
-    (println "SKIP telecom-experiment-resumes: no ../tau2-bench checkout")
+    (support/skip! "telecom-experiment-resumes: no ../tau2-bench checkout")
     (let [dom (without-nl (t2/load-domain "telecom"))
           ids (->> (get-in dom [:splits "base"])
                    (filter #(some (fn [a] (= "user" (get a "requestor")))
@@ -143,7 +144,7 @@
 
 (deftest dvergr-candidates-through-evaluate
   (if-not checkout?
-    (println "SKIP dvergr-candidates-through-evaluate: no ../tau2-bench checkout")
+    (support/skip! "dvergr-candidates-through-evaluate: no ../tau2-bench checkout")
     (let [dom (without-nl (t2/load-domain "retail"))
           gold (get-in dom [:tasks "0" "evaluation_criteria" "actions"])
           tool-responses (conj (mapv (fn [{:strs [name arguments action_id]}]

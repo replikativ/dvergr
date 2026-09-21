@@ -4,7 +4,8 @@
    control), Dvergr's production participant works in both action spaces,
    experiments resume from their Attempts, and the durable store alone
    reconstructs each episode (world replay reproduces the certified hash)."
-  (:require [clojure.java.io :as io]
+  (:require [dvergr.test-support :as support]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [dvergr.agent.conversation :as conv]
@@ -49,7 +50,7 @@
 
 (deftest retail-gold-through-rooms-with-resume
   (if-not checkout?
-    (println "SKIP retail-gold-through-rooms-with-resume: no ../tau2-bench checkout")
+    (support/skip! "retail-gold-through-rooms-with-resume: no ../tau2-bench checkout")
     (let [dom (without-nl (t2/load-domain "retail"))
           dir (temp-dir)
           cfg {:dir dir :domain dom :task-ids ["0" "1" "5"] :repetitions 2 :parallelism 2
@@ -128,7 +129,7 @@
 
 (deftest banking-dual-control-gold-through-rooms
   (if-not checkout?
-    (println "SKIP banking-dual-control-gold-through-rooms: no ../tau2-bench checkout")
+    (support/skip! "banking-dual-control-gold-through-rooms: no ../tau2-bench checkout")
     (let [dom (without-nl (t2/load-domain "banking_knowledge"))]
       (doseq [{:keys [attempt episode task]} (gold-through-rooms dom :tau2/banking-gold ["task_001" "task_026"])]
         (is (= 1.0 (get-in attempt [:attempt/receipt :attempt/reward])))
@@ -137,7 +138,7 @@
 
 (deftest airline-gold-through-rooms
   (if-not checkout?
-    (println "SKIP airline-gold-through-rooms: no ../tau2-bench checkout")
+    (support/skip! "airline-gold-through-rooms: no ../tau2-bench checkout")
     (let [dom (without-nl (t2/load-domain "airline"))
           ids (->> (get-in dom [:splits "base"])
                    (filter #(seq (get-in dom [:tasks % "evaluation_criteria" "actions"])))
@@ -150,7 +151,7 @@
 
 (deftest telecom-dual-control-gold-through-rooms
   (if-not checkout?
-    (println "SKIP telecom-dual-control-gold-through-rooms: no ../tau2-bench checkout")
+    (support/skip! "telecom-dual-control-gold-through-rooms: no ../tau2-bench checkout")
     (let [dom (without-nl (t2/load-domain "telecom"))
           ids (tasks-with-user-actions dom "base" 3)
           results (gold-through-rooms dom :tau2/telecom-gold ids)]
@@ -170,7 +171,7 @@
 
 (deftest dvergr-participant-in-both-action-spaces
   (if-not checkout?
-    (println "SKIP dvergr-participant-in-both-action-spaces: no ../tau2-bench checkout")
+    (support/skip! "dvergr-participant-in-both-action-spaces: no ../tau2-bench checkout")
     (let [dom (without-nl (t2/load-domain "retail"))
           gold (get-in dom [:tasks "0" "evaluation_criteria" "actions"])
           tool-responses (conj (mapv (fn [{:strs [name arguments action_id]}]
@@ -203,7 +204,7 @@
 
 (deftest faults-are-certified-but-never-scored
   (if-not checkout?
-    (println "SKIP faults-are-certified-but-never-scored: no ../tau2-bench checkout")
+    (support/skip! "faults-are-certified-but-never-scored: no ../tau2-bench checkout")
     (let [dom (without-nl (t2/load-domain "retail"))
           dir (temp-dir)
           r (tx/run! {:dir dir :domain dom :task-ids ["0"]
@@ -228,7 +229,7 @@
 
 (deftest step-bound-ends-the-episode-without-another-turn
   (if-not checkout?
-    (println "SKIP step-bound-ends-the-episode-without-another-turn: no ../tau2-bench checkout")
+    (support/skip! "step-bound-ends-the-episode-without-another-turn: no ../tau2-bench checkout")
     (let [dom (without-nl (t2/load-domain "retail"))
           dir (temp-dir)
           ;; The agent looks up forever; tau2 counts two steps per tool batch.
@@ -252,7 +253,7 @@
 
 (deftest repl-candidate-discovers-documented-tools
   (if-not checkout?
-    (println "SKIP repl-candidate-discovers-documented-tools: no ../tau2-bench checkout")
+    (support/skip! "repl-candidate-discovers-documented-tools: no ../tau2-bench checkout")
     (let [dom (without-nl (t2/load-domain "retail"))
           seen (atom [])
           code (str "[(with-out-str (clojure.repl/doc tau2/cancel_pending_order)) "

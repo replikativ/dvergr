@@ -2,7 +2,8 @@
   "The curated tau2 result types match every result the verified
    transcription produces on the gold trajectories and a seeded fuzz corpus,
    every JSON-returning tool has one, and the REPL candidate sees them."
-  (:require [clojure.java.io :as io]
+  (:require [dvergr.test-support :as support]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [dvergr.benchmarks.tau2.core :as t2]
@@ -32,7 +33,7 @@
 
 (deftest retail-results-match-the-curated-types
   (if-not checkout?
-    (println "SKIP retail-results-match-the-curated-types: no ../tau2-bench checkout")
+    (support/skip! "retail-results-match-the-curated-types: no ../tau2-bench checkout")
     (let [dom (t2/load-domain "retail")
           w0 ((:initial-world dom) (first (vals (:tasks dom))))
           db (if (and (map? w0) (contains? w0 :db)) (:db w0) w0)
@@ -58,7 +59,7 @@
 
 (deftest repl-prompt-and-docs-carry-the-types
   (if-not checkout?
-    (println "SKIP repl-prompt-and-docs-carry-the-types: no ../tau2-bench checkout")
+    (support/skip! "repl-prompt-and-docs-carry-the-types: no ../tau2-bench checkout")
     (let [dom (t2/load-domain "retail")
           prompt (fn [g] (ep/agent-system-prompt dom {:agent/metadata {:conversation/action-space :repl
                                                                        :conversation/repl-guidance g}}))]

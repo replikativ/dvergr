@@ -6,7 +6,8 @@
    upstream`) and are skipped with a note when it is absent. Their expected
    values are digests of upstream Python replays produced by
    `dev/benchmarks/tau2/oracle.py`."
-  (:require [clojure.edn :as edn]
+  (:require [dvergr.test-support :as support]
+            [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [dvergr.benchmarks.tau2.core :as t2]
@@ -75,7 +76,7 @@
 
 (deftest retail-equivalence-with-upstream
   (if-not checkout?
-    (println "SKIP retail-equivalence-with-upstream: no ../tau2-bench checkout")
+    (support/skip! "retail-equivalence-with-upstream: no ../tau2-bench checkout")
     (let [dom @domain
           fixture (oracle-fixture)]
       (is (= (:revision t2/upstream) (get-in fixture [:upstream :revision])))
@@ -102,7 +103,7 @@
 
 (deftest gold-agents-certify-every-task
   (if-not checkout?
-    (println "SKIP gold-agents-certify-every-task: no ../tau2-bench checkout")
+    (support/skip! "gold-agents-certify-every-task: no ../tau2-bench checkout")
     (let [dom @domain]
       (doseq [task (vals (:tasks dom))
               :let [task (update-in task ["evaluation_criteria" "reward_basis"]
@@ -114,7 +115,7 @@
 
 (deftest episode-protocol-terminations
   (if-not checkout?
-    (println "SKIP episode-protocol-terminations: no ../tau2-bench checkout")
+    (support/skip! "episode-protocol-terminations: no ../tau2-bench checkout")
     (let [dom @domain
           task (get-in dom [:tasks "0"])
           run #(t2/run-episode dom task (merge {:user (constantly {:content "Hi."})} %))]
@@ -146,7 +147,7 @@
 
 (deftest episode-usage-is-logged-per-model-call
   (if-not checkout?
-    (println "SKIP episode-usage-is-logged-per-model-call: no ../tau2-bench checkout")
+    (support/skip! "episode-usage-is-logged-per-model-call: no ../tau2-bench checkout")
     (let [dom @domain
           n (atom 0)
           ep (t2/run-episode dom (get-in dom [:tasks "0"])

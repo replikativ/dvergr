@@ -7,7 +7,8 @@
    the corpus (`equivalence/write-corpus!`), run `oracle.py <root> check` and
    `oracle.py <root> tools`, and take `equivalence/verdict-digest` of the
    oracle's verdicts."
-  (:require [clojure.java.io :as io]
+  (:require [dvergr.test-support :as support]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [dvergr.benchmarks.bfcl.core :as bfcl]
@@ -30,6 +31,8 @@
   "f5d212ec48b73100b23803036ed89cb0c71742b63bdc554039b150dba3bfff36")
 
 (deftest data-is-the-pinned-revision
+  (when-not (upstream-present?)
+    (support/skip! "data-is-the-pinned-revision: no ../gorilla checkout"))
   (when (upstream-present?)
     (let [counts (into {} (map (fn [c] [c (count (bfcl/load-category c))])) categories)]
       (is (= {"simple_python" 400 "multiple" 200 "parallel" 200 "parallel_multiple" 200
@@ -39,6 +42,8 @@
       (is (= 3491 (reduce + (vals counts)))))))
 
 (deftest every-task-but-the-known-faults-has-a-valid-answer
+  (when-not (upstream-present?)
+    (support/skip! "every-task-but-the-known-faults-has-a-valid-answer: no ../gorilla checkout"))
   (when (upstream-present?)
     (let [rejected (for [category categories
                          task (bfcl/load-category category)
@@ -48,6 +53,8 @@
       (is (= bfcl/unsatisfiable (set rejected))))))
 
 (deftest the-checker-gives-upstreams-verdicts
+  (when-not (upstream-present?)
+    (support/skip! "the-checker-gives-upstreams-verdicts: no ../gorilla checkout"))
   (when (upstream-present?)
     (let [corpus (eq/corpus categories {})
           path (java.io.File/createTempFile "bfcl-corpus" ".jsonl")]
@@ -61,6 +68,8 @@
         (finally (.delete path))))))
 
 (deftest tools-are-compiled-as-upstream-compiles-them
+  (when-not (upstream-present?)
+    (support/skip! "tools-are-compiled-as-upstream-compiles-them: no ../gorilla checkout"))
   (when (upstream-present?)
     (is (= oracle-tools-digest
            (pj/sha256-hex

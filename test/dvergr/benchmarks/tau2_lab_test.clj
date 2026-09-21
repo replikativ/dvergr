@@ -3,7 +3,8 @@
    forks copy-on-write into independent certified continuations. Branches
    inherit the world, dialogue, customer history and the candidate's REPL
    heap, never see each other, and leave the checkpoint unchanged."
-  (:require [clojure.java.io :as io]
+  (:require [dvergr.test-support :as support]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [dvergr.agent.conversation :as conv]
@@ -58,7 +59,7 @@
 
 (deftest reference-branches-diverge-from-one-checkpoint
   (if-not checkout?
-    (println "SKIP reference-branches-diverge-from-one-checkpoint: no ../tau2-bench checkout")
+    (support/skip! "reference-branches-diverge-from-one-checkpoint: no ../tau2-bench checkout")
     (let [dom (without-nl (t2/load-domain "retail"))
           {:keys [xs room team definition task] :as l}
           (lab (temp-dir) dom "0" [{:id :ref :harness :reference :model "claude-code-sonnet"}])
@@ -112,7 +113,7 @@
 
 (deftest dvergr-branches-inherit-and-isolate-the-repl-heap
   (if-not checkout?
-    (println "SKIP dvergr-branches-inherit-and-isolate-the-repl-heap: no ../tau2-bench checkout")
+    (support/skip! "dvergr-branches-inherit-and-isolate-the-repl-heap: no ../tau2-bench checkout")
     (let [dom (without-nl (t2/load-domain "retail"))
           {:keys [xs room team definition task] :as l}
           (lab (temp-dir) dom "0" [{:id :dv :harness :dvergr :action-space :repl :model "claude-code-sonnet"}])

@@ -1,6 +1,7 @@
 (ns dvergr.benchmarks.bfcl-provider-test
   "BFCL on the generic evaluation path, with scripted candidates (no model)."
-  (:require [clojure.java.io :as io]
+  (:require [dvergr.test-support :as support]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [dvergr.agent.episode :as attempts]
@@ -50,7 +51,7 @@
 
 (deftest a-task-through-evaluate
   (if-not checkout?
-    (println "SKIP a-task-through-evaluate: no ../gorilla checkout")
+    (support/skip! "a-task-through-evaluate: no ../gorilla checkout")
     (let [tasks (provider/tasks ["parallel" "irrelevance"])
           room (d/make-room {:id :bfcl/provider-test :store (memory/make)})
           seen (atom nil)]
@@ -95,7 +96,7 @@
 
 (deftest an-experiment-through-the-shared-runner
   (if-not checkout?
-    (println "SKIP an-experiment-through-the-shared-runner: no ../gorilla checkout")
+    (support/skip! "an-experiment-through-the-shared-runner: no ../gorilla checkout")
     (let [dir (str (java.nio.file.Files/createTempDirectory
                     "bfcl-exp" (make-array java.nio.file.attribute.FileAttribute 0)))
           calls (atom 0)
@@ -125,7 +126,7 @@
 
 (deftest dvergr-agent-step-candidates
   (if-not checkout?
-    (println "SKIP dvergr-agent-step-candidates: no ../gorilla checkout")
+    (support/skip! "dvergr-agent-step-candidates: no ../gorilla checkout")
     (let [tasks (provider/tasks ["parallel"])
           task (get tasks "parallel_0")
           gold (eq/gold-calls task)

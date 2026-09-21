@@ -5,7 +5,8 @@
 
    The ratchet mirrors `doc-coverage-test`: attach schemas as the third
    element of a `dvergr.sandbox.ns.doc/with-docs` entry."
-  (:require [clojure.string :as str]
+  (:require [dvergr.test-support :as support]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [dvergr.sandbox :as sandbox]
             [dvergr.sandbox.workspace]
@@ -50,7 +51,7 @@
   ;; them where agents run them (SCI, whose `inst?`/`ifn?` malli rejects).
   (let [root (java.io.File. "../dvergr-sandbox")]
     (if-not (.exists (java.io.File. root "dvergr/intake/schema.clj"))
-      (println "SKIP sandbox-stdlib-schemas-compile-in-sci: no ../dvergr-sandbox checkout with schemas")
+      (support/skip! "sandbox-stdlib-schemas-compile-in-sci: no ../dvergr-sandbox checkout with schemas")
       (let [ec (ctx/create-execution-context)
             sci-ctx (sandbox/fork-for-session ec)
             nss (->> (concat (.listFiles (java.io.File. root "dvergr/intake"))

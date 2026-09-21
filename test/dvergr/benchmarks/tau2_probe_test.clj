@@ -1,7 +1,8 @@
 (ns dvergr.benchmarks.tau2-probe-test
   "Decision-point probes rebuild a recorded episode's world and the
    candidate's history exactly; `tau2/shape` describes tool results."
-  (:require [clojure.java.io :as io]
+  (:require [dvergr.test-support :as support]
+            [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [dvergr.benchmarks.tau2.core :as t2]
             [dvergr.benchmarks.tau2.episode :as ep]
@@ -24,7 +25,7 @@
 
 (deftest probe-prefix-replays-the-recorded-episode
   (if-not checkout?
-    (println "SKIP probe-prefix-replays-the-recorded-episode: no ../tau2-bench checkout")
+    (support/skip! "probe-prefix-replays-the-recorded-episode: no ../tau2-bench checkout")
     (let [dom (t2/load-domain "retail")
           task (get-in dom [:tasks "0"])
           w0 ((:initial-world dom) task)

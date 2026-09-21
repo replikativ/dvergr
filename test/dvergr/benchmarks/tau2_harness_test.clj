@@ -2,7 +2,8 @@
   "Dvergr's agent loop as a tau2 candidate, with a scripted model: tool
    traffic reaches the benchmark world and the graded trajectory in both
    action spaces."
-  (:require [clojure.java.io :as io]
+  (:require [dvergr.test-support :as support]
+            [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [dvergr.benchmarks.tau2.core :as t2]
             [dvergr.benchmarks.tau2.harness :as harness]
@@ -33,7 +34,7 @@
 
 (deftest harness-turns-act-on-the-benchmark-world
   (if-not checkout?
-    (println "SKIP harness-turns-act-on-the-benchmark-world: no ../tau2-bench checkout")
+    (support/skip! "harness-turns-act-on-the-benchmark-world: no ../tau2-bench checkout")
     (let [dom (t2/load-domain "retail")
           task (-> (get-in dom [:tasks "0"])
                    (assoc-in ["evaluation_criteria" "actions"]
