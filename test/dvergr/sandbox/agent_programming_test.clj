@@ -556,7 +556,16 @@
             (pr-str (:error result)))
         (is (:success result) (pr-str (:error result)))
         (is (= :fast (:value result)))
-        (is (wait-until #(= 1 (count (run/active-runs (:id room)))) 1000))
+        ;; The property is liveness: the loser IS cancelled and its world
+        ;; discarded. Settlement runs off the drain on host threads, so its
+        ;; latency depends on the machine; a slow settle is reported, a lost
+        ;; one fails. (Seen once at >1 s under memory pressure, 2026-09-20.)
+        (let [t0 (System/nanoTime)
+              settled? (wait-until #(= 1 (count (run/active-runs (:id room)))) 15000)
+              ms (quot (- (System/nanoTime) t0) 1000000)]
+          (when (> ms 1000)
+            (println "WARNING: owned race loser took" ms "ms to settle"))
+          (is settled? "the race loser's Run is cancelled and leaves the active set"))
         (let [children (remove #(= parent-id (:run/id %)) (run/runs room))
               by-actor (into {} (map (juxt :run/actor identity)) children)]
           (is (= parent-id (get-in by-actor [:fast :run/parent])))
