@@ -21,6 +21,7 @@
             [dvergr.benchmarks.pyjson :as pj]
             [dvergr.chat.agent :as chat-agent]
             [dvergr.chat.context :as chat-context]
+            [dvergr.model.providers :as providers]
             [dvergr.sandbox :as sandbox]
             [dvergr.sandbox.ns.doc :as ns-doc]
             [org.replikativ.spindel.engine.core :as ec]))
@@ -137,6 +138,8 @@
                             "\n\n"
                             (function-docs tools)))]
     (try
+      ;; the turn formats its messages with the provider's formatter
+      (providers/ensure-initialized!)
       (when-not (str/blank? system)
         (chat-context/add-message! chat-ctx {:role :system :content system}))
       (doseq [{:keys [role content]} messages]
