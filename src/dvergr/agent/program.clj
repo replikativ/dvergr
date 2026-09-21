@@ -422,11 +422,17 @@
      observer))
   ([consumer-run-id ^RunHandle handle]
    (let [observer (owned-result-spin handle)
-         cause-run-id (run-id handle)]
-     (sp/spin
-      (let [result (sp/await observer)]
-        (run/record-cause! consumer-run-id cause-run-id)
-        result)))))
+         cause-run-id (run-id handle)
+         consumer (sp/spin
+                   (let [result (sp/await observer)]
+                     (run/record-cause! consumer-run-id cause-run-id)
+                     result))]
+     ;; The same initial window one level up: a race that is decided before
+     ;; this body awaits `observer` cancels a Spin with no await-cont, and
+     ;; without this edge the cancellation stops here. The hired Run then
+     ;; finishes and settles as if it had won.
+     (spin-core/set-owned-spins! (spin-core/spin-id consumer) [observer])
+     consumer)))
 
 (defn- child-finished! [supervisor lease-id]
   (locking supervisor
