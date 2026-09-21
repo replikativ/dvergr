@@ -168,6 +168,21 @@ into one evaluation and is not affected. This is the first thing the benchmark
 found about the harness itself: on that backend, JSON tools cannot express a
 parallel action and the REPL can.
 
+The same three candidates on five tasks per category (55 tasks, 165 cells, no
+failed cell, about 22 k input tokens for the reference candidate):
+
+| Candidate | Passed | parallel (4 categories, 20 tasks) | irrelevance (non-live) |
+| --- | --- | --- | --- |
+| `:reference` | 29/55 | 0/20 | 4/5 |
+| `:dvergr` `:tools` | 29/55 | 0/20 | 4/5 |
+| `:dvergr` `:repl` | 44/55 | 16/20 | 2/5 |
+
+The REPL candidate is more eager to call something when nothing fits (three
+irrelevance tasks lost to one call each). That is a prompt to tune, on a slice
+with another `:seed` than the one reported; BFCL has no train split.
+`bfcl.inspect` reads an experiment directory: `report`, `failures`,
+`print-report`.
+
 ### Not done
 
 Java and JavaScript categories, multi-turn (eight stateful API simulations:
