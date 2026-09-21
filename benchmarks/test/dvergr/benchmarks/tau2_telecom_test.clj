@@ -3,7 +3,8 @@
    values are digests of upstream Python replays
    (`benchmarks/dev/tau2/telecom/oracle_telecom.py`); tests needing the
    pinned `../tau2-bench` checkout are skipped with a note when it is absent."
-  (:require [clojure.edn :as edn]
+  (:require [dvergr.test-support :as support]
+            [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
@@ -28,7 +29,7 @@
 
 (defmacro ^:private with-checkout [test-name & body]
   `(if-not checkout?
-     (println ~(str "SKIP " test-name ": no ../tau2-bench checkout"))
+     (support/skip! ~(str test-name ": no ../tau2-bench checkout"))
      (do ~@body)))
 
 (deftest telecom-equivalence-with-upstream
