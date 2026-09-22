@@ -9,6 +9,7 @@
             [dvergr.agent.environment :as environment]
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.roster :as roster]
+            [dvergr.agent.spend :as spend]
             [dvergr.room.store :as store]
             [hasch.core :as hasch]
             [org.replikativ.spindel.core :as sp]
@@ -346,19 +347,27 @@
      :attempt/id (:attempt/id attempt)
      :attempt/content-id (:attempt/content-id attempt)
      :reward (:attempt/reward receipt)
-     :passed? (passed? receipt)}))
+     :passed? (passed? receipt)
+     :spend (get-in receipt [:attempt/metrics :spend])}))
 
 (defn- summarize [entries]
   (->> entries
        (group-by :candidate/id)
        (map (fn [[candidate-id xs]]
               (let [rewards (map :reward xs)
-                    n (count xs)]
+                    n (count xs)
+                    passed (count (filter :passed? xs))
+                    spent (spend/total (map :spend xs))
+                    md (:microdollars spent)]
                 {:candidate/id candidate-id
                  :attempt-count n
-                 :passed-count (count (filter :passed? xs))
+                 :passed-count passed
                  :reward-sum (reduce + 0 rewards)
-                 :reward-mean (double (/ (reduce + 0 rewards) n))})))
+                 :reward-mean (double (/ (reduce + 0 rewards) n))
+                 ;; the bill next to the reward: the leaderboard's other axis
+                 :spend spent
+                 :microdollars-per-attempt (long (quot md n))
+                 :microdollars-per-pass (when (pos? passed) (long (quot md passed)))})))
        (sort-by (comp str :candidate/id))
        vec))
 
@@ -443,8 +452,12 @@
         (when-not (and
                    (= #{:candidate/id :candidate/agent
                         :candidate/agent-content-id :environment :repetition
-                        :attempt/id :attempt/content-id :reward :passed?}
+                        :attempt/id :attempt/content-id :reward :passed? :spend}
                       (set (keys entry)))
+                   (let [sp (:spend entry)]
+                     (or (nil? sp)
+                         (and (map? sp) (integer? (:microdollars sp))
+                              (boolean? (:priced? sp)))))
                    (= (select-keys candidate
                                    [:candidate/id :candidate/agent
                                     :candidate/agent-content-id])

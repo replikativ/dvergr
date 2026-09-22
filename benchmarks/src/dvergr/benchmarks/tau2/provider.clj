@@ -20,6 +20,7 @@
   (:require [clojure.string :as str]
             [dvergr.agent.environment :as environment]
             [dvergr.agent.evaluation :as evaluation]
+            [dvergr.agent.spend :as spend]
             [dvergr.agent.verifiers :as verifiers]
             [dvergr.benchmarks.tau2.core :as t2]
             [dvergr.benchmarks.tau2.episode :as episode]
@@ -87,9 +88,14 @@
      :evaluator
      (evaluation/make-evaluator
       {:id :tau2/grader :version version :basis (basis domain judge) :tier :trusted
-       :observe (fn [{:keys [environment result durable] room :world/room}]
+       :observe (fn [{:keys [environment result durable agent] room :world/room}]
                   (let [task (task-of domain environment)
                         outcome (:run/value result)
+                        ;; the bill of the episode: the candidate (its chat
+                        ;; budget, or the reference harness's raw counts under
+                        ;; the candidate's model) and the customer
+                        role-models {:agent (get-in agent [:agent/model-policy :model])
+                                     :customer (:model user)}
                         {:keys [world log]} (when room (episode/episode-snapshot room))
                         ;; A Run that did not complete has no outcome: an
                         ;; infrastructure fault, never a model verdict.
@@ -101,6 +107,7 @@
                                  :message (:run/error durable)})
                      :trajectory (vec log)
                      :episode (select-keys outcome [:steps :errors :usage :agent-runs])
+                     :spend (spend/of-roles role-models (:usage outcome))
                      :transcript (:transcript outcome)
                      :world (when world {:final-hash ((:world-hash domain) world)})
                      :facts (when (and world (#{:agent-stop :user-stop} termination))

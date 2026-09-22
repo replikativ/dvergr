@@ -173,6 +173,11 @@
                     (is (= 1 @steps) "the step is never followed by a second one")
                     (is (= (set gold) (set (get-in attempt [:attempt/evidence :calls])))
                         "every call is recorded, also those made inside clojure_eval")
+                    (let [sp (get-in attempt [:attempt/receipt :attempt/metrics :spend])]
+                      (is (map? sp) "the receipt carries the Attempt's bill")
+                      (is (= {:input 10 :output 5} (:tokens sp))
+                          "the stubbed model's usage, folded")
+                      (is (contains? sp :priced?)))
                     (is (empty? (run/active-runs (:id room)))))))
               (finally (d/close-room! room))))))
       (testing "the REPL candidate is given one tool, and the functions in its prompt"

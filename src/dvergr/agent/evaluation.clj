@@ -10,6 +10,7 @@
             [dvergr.agent.attempt :as attempt]
             [dvergr.agent.program :as program]
             [dvergr.agent.roster :as roster]
+            [dvergr.agent.spend :as spend]
             [dvergr.room.registry :as registry]
             [dvergr.rooms.forks :as forks]
             [hasch.core :as hasch]
@@ -167,7 +168,10 @@
 
    `id`, `version`, and optional portable `basis` must exactly match an
    EnvironmentDef verifier reference. `observe` receives durable execution
-   facts and returns portable evidence. `verify` receives the EnvironmentDef
+   facts (`:result :durable :room :world/room :run-id :environment :agent`
+   and the setup and execution evidence) and returns portable evidence; a
+   `:spend` it returns (`dvergr.agent.spend`) is the Attempt's bill on the
+   receipt, else the Run's own metrics are. `verify` receives the EnvironmentDef
    plus that evidence and returns `{:checks {keyword boolean} :reward number}`.
    Optional `capture` receives `{:room control-room :world/room work-room
    :run-id uuid :environment EnvironmentDef}` after candidate work and owned
@@ -447,6 +451,7 @@
            result durable started-at started-nanos timeout? extra-metrics]}]
   (let [evidence ((:observe evaluator)
                   {:room room
+                   :agent agent
                    :world/room world-room
                    :setup/evidence setup-evidence
                    :execution/evidence execution-evidence
@@ -461,6 +466,11 @@
                             {:type ::invalid-evidence :evidence evidence})))
         {:keys [checks reward]} ((:verify evaluator) definition evidence)
         {:keys [provider model metrics]} (execution-identity agent result durable)
+        ;; What the Attempt cost, on every receipt: an LLM program's Run
+        ;; carries its chat budget in :run/metrics; a protocol Run's observer
+        ;; puts its provider's usage, folded by `spend`, under :spend.
+        attempt-spend (or (:spend evidence)
+                          (spend/of-metrics (:run/metrics result)))
         elapsed-ms (long (/ (- (System/nanoTime) started-nanos) 1000000))
         receipt
         (environment/make-attempt-receipt
@@ -475,7 +485,8 @@
                   ;; identity) never override what the evaluation measured.
                   :metrics (assoc (merge extra-metrics metrics)
                                   :timed-out? timeout?
-                                  :verifier-trust (:tier evaluator))
+                                  :verifier-trust (:tier evaluator)
+                                  :spend attempt-spend)
                   :checks checks
                   :reward reward}
            (contains? evidence :result) (assoc :result (:result evidence))
