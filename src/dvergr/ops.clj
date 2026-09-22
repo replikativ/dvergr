@@ -25,7 +25,10 @@
    Op key → binding name: `:room/post` → `room_post` (MCP tool), etc."
   (:require [clojure.string :as str]
             [malli.json-schema :as mjs]
+            [dvergr.agent.episode :as attempts]
+            [dvergr.agent.experiment :as experiment]
             [dvergr.agent.ops :as aops]
+            [dvergr.agent.run :as run]
             [dvergr.agent.fields :as fields]
             [dvergr.rooms :as rooms]
             [dvergr.rooms.forks :as forks]
@@ -82,6 +85,115 @@
   [daemon x]
   (in-ctx daemon (room-data (if (record? x) x (rreg/lookup x)))))
 
+(defn- kw->str
+  "A namespaced keyword in full (`:bfcl.simple_python/task-3`), a bare one by name."
+  [k]
+  (cond (keyword? k) (if (namespace k) (str (namespace k) "/" (name k)) (name k))
+        (some? k) (str k)
+        :else nil))
+
+(defn- uuid-arg [x]
+  (cond (uuid? x) x
+        (string? x) (try (java.util.UUID/fromString x) (catch Throwable _ nil))
+        :else nil))
+
+;; ---- the evaluation read model: what the MCP tool and the web view share ----
+
+(defn- spend-data [spend]
+  (when spend
+    {:microdollars (:microdollars spend 0)
+     :dollars      (/ (double (:microdollars spend 0)) 1e6)
+     :priced?      (:priced? spend true)
+     :tokens       (:tokens spend {})
+     :by-model     (into {} (map (fn [[m sp]] [(str m) {:microdollars (:microdollars sp 0)
+                                                        :tokens (:tokens sp {})}]))
+                         (:by-model spend {}))}))
+
+(defn- run-data [r]
+  (when r
+    {:id             (some-> (:run/id r) str)
+     :parent         (some-> (:run/parent r) str)
+     :actor          (id->str (:run/actor r))
+     :kind           (some-> (:run/kind r) name)
+     :status         (some-> (:run/status r) name)
+     :reason         (some-> (:run/reason r) name)
+     :error          (:run/error r)
+     :settlement     (some-> (:run/settlement-status r) name)
+     :world          (some-> (:run/world r) str)
+     :program-kind   (some-> (:run/program-kind r) name)
+     :created-at     (:run/created-at r)
+     :started-at     (:run/started-at r)
+     :ended-at       (:run/ended-at r)}))
+
+(defn- attempt-data
+  "One certified Attempt as a leaderboard row: who, on what, reward, checks,
+   the bill. With `:full?`, also the evidence (transcripts, calls, traces)."
+  [a & [{:keys [full?]}]]
+  (when a
+    (let [receipt (:attempt/receipt a)
+          env (:attempt/environment a)
+          metrics (:attempt/metrics receipt)]
+      (cond-> {:id           (some-> (:attempt/id a) str)
+               :content-id   (some-> (:attempt/content-id a) str)
+               :run-id       (some-> (:attempt/run-id a) str)
+               :agent        (kw->str (get-in a [:attempt/agent :agent/id]))
+               :agent-hash   (some-> (:attempt/agent-def-hash a) str)
+               :environment  {:id (kw->str (:environment/id env))
+                              :content-id (some-> (:environment/content-id env) str)
+                              :task (:environment/task env)}
+               :provider     (id->str (:attempt/provider receipt))
+               :model        (:attempt/model receipt)
+               :status       (some-> (:attempt/status receipt) name)
+               :started-at   (:attempt/started-at receipt)
+               :elapsed-ms   (:attempt/elapsed-ms receipt)
+               :reward       (:attempt/reward receipt)
+               :checks       (:attempt/checks receipt)
+               :verifier-trust (some-> (:verifier-trust metrics) name)
+               :spend        (spend-data (:spend metrics))
+               :metrics      (dissoc metrics :spend)
+               :certified-at (:attempt/certified-at a)}
+        full? (assoc :evidence (:attempt/evidence a)
+                     :result (:attempt/result receipt))))))
+
+(defn- scorecard-data
+  "A Scorecard as a leaderboard: one row per candidate, ranked by reward mean
+   then by cost per pass. With `:full?`, also every cell."
+  [sc & [{:keys [full?]}]]
+  (when sc
+    (let [exp (:scorecard/experiment sc)
+          rows (->> (:scorecard/summary sc)
+                    (map (fn [s]
+                           {:candidate       (kw->str (:candidate/id s))
+                            :attempts        (:attempt-count s)
+                            :passed          (:passed-count s)
+                            :pass-rate       (when (pos? (:attempt-count s 0))
+                                               (/ (double (:passed-count s)) (:attempt-count s)))
+                            :reward-mean     (:reward-mean s)
+                            :spend           (spend-data (:spend s))
+                            :microdollars-per-attempt (:microdollars-per-attempt s)
+                            :microdollars-per-pass    (:microdollars-per-pass s)}))
+                    (sort-by (juxt #(- (or (:reward-mean %) 0))
+                                   #(or (:microdollars-per-pass %) Long/MAX_VALUE)))
+                    vec)]
+      (cond-> {:id             (some-> (:scorecard/content-id sc) str)
+               :experiment     {:id (kw->str (:experiment/id exp))
+                                :version (:experiment/version exp)
+                                :content-id (some-> (:experiment/content-id exp) str)
+                                :candidates (mapv #(kw->str (:candidate/id %)) (:experiment/candidates exp))
+                                :environments (count (get-in exp [:experiment/dataset :dataset/environments]))
+                                :repetitions (:experiment/repetitions exp)}
+               :leaderboard    rows
+               :cells          (count (:scorecard/entries sc))}
+        full? (assoc :entries (mapv (fn [e]
+                                      {:candidate (kw->str (:candidate/id e))
+                                       :environment (some-> (get-in e [:environment :environment/content-id]) str)
+                                       :repetition (:repetition e)
+                                       :attempt-id (some-> (:attempt/id e) str)
+                                       :reward (:reward e)
+                                       :passed? (:passed? e)
+                                       :spend (spend-data (:spend e))})
+                                    (:scorecard/entries sc)))))))
+
 (defn- msg-data [m]
   {:id             (some-> (:id m) str)
    :from           (some-> (:from m) name)
@@ -120,6 +232,79 @@
     :impl (fn [daemon {:keys [room limit]}]
             (when-let [r (resolve-room daemon room)]
               (in-ctx daemon (mapv msg-data (d/messages r {:limit (or limit 50)})))))}
+
+   ;; ---- the evaluation read model ----
+   :run/list
+   {:doc "Durable Runs of a room, newest first: status, settlement, actor, lineage."
+    :kind :read
+    :schema [:map [:room Room]
+             [:limit {:optional true} [:int {:description "max runs (default 50)"}]]
+             [:status {:optional true} [:string {:description "running | completed | failed | cancelled"}]]
+             [:root {:optional true} [:string {:description "a root run id: that Run and its descendants"}]]]
+    :impl (fn [daemon {:keys [room limit status root]}]
+            (when-let [r (resolve-room daemon room)]
+              (in-ctx daemon
+                      (mapv run-data
+                            (run/runs r (cond-> {:limit (or limit 50)}
+                                          status (assoc :status (keyword status))
+                                          root (assoc :root-run-id (uuid-arg root))))))))}
+
+   :run/detail
+   {:doc "One durable Run: status, settlement, error, world, timestamps."
+    :kind :read
+    :schema [:map [:room Room] [:id [:string {:description "run id"}]]]
+    :impl (fn [daemon {:keys [room id]}]
+            (when-let [r (resolve-room daemon room)]
+              (in-ctx daemon (run-data (run/run r (uuid-arg id))))))}
+
+   :attempt/list
+   {:doc "Certified Attempts of a room, newest first — each a leaderboard row: agent, environment, reward, checks, the bill."
+    :kind :read
+    :schema [:map [:room Room]
+             [:limit {:optional true} [:int {:description "max attempts (default 50)"}]]
+             [:environment {:optional true} [:string {:description "environment id"}]]
+             [:model {:optional true} [:string {:description "model id"}]]
+             [:status {:optional true} [:string {:description "completed | failed | cancelled"}]]]
+    :impl (fn [daemon {:keys [room limit environment model status]}]
+            (when-let [r (resolve-room daemon room)]
+              (in-ctx daemon
+                      (mapv attempt-data
+                            (attempts/attempts r (cond-> {:limit (or limit 50)}
+                                                   environment (assoc :environment-id (keyword environment))
+                                                   model (assoc :model model)
+                                                   status (assoc :status (keyword status))))))))}
+
+   :attempt/detail
+   {:doc "One certified Attempt with its evidence: transcript, calls, traces, result."
+    :kind :read
+    :schema [:map [:room Room] [:id [:string {:description "attempt id"}]]]
+    :impl (fn [daemon {:keys [room id]}]
+            (when-let [r (resolve-room daemon room)]
+              (in-ctx daemon
+                      (attempt-data (some-> (:store r)
+                                            (rstore/-load-attempt (:id r) (uuid-arg id)))
+                                    {:full? true}))))}
+
+   :scorecard/list
+   {:doc "Completed Scorecards of a room, newest first, each with its leaderboard (candidates ranked by reward, then cost per pass)."
+    :kind :read
+    :schema [:map [:room Room]
+             [:limit {:optional true} [:int {:description "max scorecards (default 20)"}]]
+             [:experiment {:optional true} [:string {:description "experiment id"}]]]
+    :impl (fn [daemon {:keys [room limit experiment]}]
+            (when-let [r (resolve-room daemon room)]
+              (in-ctx daemon
+                      (mapv scorecard-data
+                            (experiment/scorecards r (cond-> {:limit (or limit 20)}
+                                                       experiment (assoc :experiment-id (keyword experiment))))))))}
+
+   :scorecard/detail
+   {:doc "One Scorecard with every cell: candidate x environment x repetition, reward, pass, spend."
+    :kind :read
+    :schema [:map [:room Room] [:id [:string {:description "scorecard content id"}]]]
+    :impl (fn [daemon {:keys [room id]}]
+            (when-let [r (resolve-room daemon room)]
+              (in-ctx daemon (scorecard-data (experiment/scorecard r (uuid-arg id)) {:full? true}))))}
 
    :agent/list
    {:doc "List all agents (durable — includes offline), with model/provider/status."
