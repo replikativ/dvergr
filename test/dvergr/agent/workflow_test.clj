@@ -11,6 +11,7 @@
             [dvergr.room.registry :as rreg]
             [dvergr.room.store.memory :as memory]
             [dvergr.rooms.forks :as forks]
+            [org.replikativ.spindel.engine.context :as sctx]
             [org.replikativ.spindel.engine.core :as ec]))
 
 (def ^:private models ["claude-sonnet-4-5" "claude-haiku-4-5"])
@@ -171,3 +172,26 @@
       (with-redefs [forks/reconcile-merge! (fn [_] {:ok? false :error "parent is gone"})]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"failed: parent is gone"
                               (ops/invoke daemon :room/merge {:room (name (:id fork))})))))))
+
+(deftest a-daemon-room-is-evaluated-in-its-own-context
+  ;; A daemon room's context is a fork of the daemon's (dvergr.system.rooms).
+  ;; Evaluating it in the daemon's context loses the Run's wakeups: it hung
+  ;; until its timeout. The ops pass the daemon; the workflow must use the room.
+  (let [host (d/make-room {:id :workflow-host :store (memory/make)})
+        daemon {:execution-ctx (:ctx host)}
+        room-ctx (binding [ec/*execution-context* (:ctx host)] (sctx/fork-context (:ctx host)))
+        room (d/make-room {:id :workflow-child :store (memory/make) :ctx room-ctx})
+        calls (atom [])]
+    (try
+      (binding [ec/*execution-context* (:ctx host)] (rreg/register! room))
+      (with-stub-model calls
+        (let [job (:id (ops/invoke daemon :workflow/start
+                                   {:room "workflow-child" :task "summarise" :attempts 2
+                                    :models ["claude-haiku-4-5"] :timeout-ms 20000}))
+              done (ops/invoke daemon :job/status {:job job :wait-ms 25000})]
+          (is (= "completed" (:status done)) (pr-str (dissoc done :result)))
+          (is (= ["completed" "completed"] (mapv :status (get-in done [:result :attempts]))))))
+      (finally
+        (try (binding [ec/*execution-context* (:ctx host)] (rreg/unregister! (:id room))) (catch Throwable _ nil))
+        (d/close-room! room)
+        (d/close-room! host)))))

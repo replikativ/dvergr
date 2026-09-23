@@ -24,8 +24,8 @@
             [dvergr.rooms.forks :as forks]
             [dvergr.tools :as tools]
             [hasch.core :as hasch]
-            [org.replikativ.spindel.engine.core :as ec]
-            [org.replikativ.spindel.spin.combinators :as comb]))
+            [org.replikativ.spindel.core :as sp]
+            [org.replikativ.spindel.engine.core :as ec]))
 
 (def max-attempts
   "Attempts per model, and models per call: bounded, since every attempt is a
@@ -118,11 +118,18 @@
        :state state})))
 
 (defn start
-  "Start `task` `attempts` times for each of `models` on forks of `room`,
-   with `room`'s context bound or given as `ctx`. Returns `{:spin s :ctx c
-   :finish f}`: `s` yields the evaluations (deref or cancel it with `c` bound),
-   `(f evaluations)` the rows `attempt!` returns. Validates before starting
-   anything."
+  "Start `task` `attempts` times for each of `models` on forks of `room`.
+   Returns `{:spin s :ctx c :finish f}`: `s` yields the evaluations (deref or
+   cancel it with `c` bound), `(f evaluations)` the rows `attempt!` returns.
+   Validates before starting anything.
+
+   The evaluations run in `room`'s own context (`c`), never a caller's: a Run's
+   supervisor delivers into its room's context, and a daemon room's context is
+   a child of the daemon's, so evaluating in the latter loses every wakeup.
+
+   Attempts run one after another. Concurrent Runs on one durable room can
+   kill its Datahike writer (Scriptum \"generation already has a publication
+   owner\", datahike 0.8.1865); a job keeps the caller from waiting anyway."
   [room {:keys [task attempts] :as opts}]
   (when (str/blank? (str task))
     (throw (ex-info "A workflow attempt needs a task" {:type ::no-task})))
@@ -133,12 +140,17 @@
             (throw (ex-info "at most 4 models per call" {:type ::models})))
         {:keys [team ids]} (candidates opts)
         env (environment-def task opts)
-        ctx (or (:ctx opts) (:ctx room))]
+        ctx (:ctx room)
+        order (vec (for [id ids _ (range n)] id))]
     {:ctx ctx
      :spin (binding [ec/*execution-context* ctx]
-             (apply comb/parallel
-                    (for [id ids _ (range n)]
-                      (evaluation/evaluate room team id env completion-evaluator {}))))
+             (sp/spin
+              (loop [todo order acc []]
+                (if (seq todo)
+                  (recur (rest todo)
+                         (conj acc (sp/await (evaluation/evaluate room team (first todo) env
+                                                                  completion-evaluator {}))))
+                  acc))))
      :finish (fn [results]
                (binding [ec/*execution-context* ctx]
                  (mapv (fn [r]
@@ -150,8 +162,7 @@
 
 (defn attempt!
   "Run `task` `attempts` times for each of `models` on forks of `room` and
-   block until all are certified. Call at a boundary (not inside a Spin), with
-   `room`'s context bound or given as `ctx`.
+   block until all are certified. Call at a boundary (not inside a Spin).
 
    Returns `[{:attempt certified-Attempt :world world-id :review review-map}]`,
    the retained worlds still open: adopt one with `forks/merge!`, drop the rest
