@@ -95,8 +95,8 @@
         fork (:id (ops/invoke *daemon* :room/fork {:room room}))
         f (ops/resolve-room *daemon* fork)]
     ;; A raw write, as a tool leaves it: not committed.
-    (#'catalog/room-fs f)
-    (muschel.fs/write-string! (#'catalog/room-fs f) "/notes.md" "A note." false)
+    (dvergr.catalog.workspace/room-fs f)
+    (muschel.fs/write-string! (dvergr.catalog.workspace/room-fs f) "/notes.md" "A note." false)
     (let [rev (ops/invoke *daemon* :room/review {:room fork})]
       (is (= :reviewable (:tier rev)) "uncommitted work is not trivial")
       (is (some #(str/includes? % "notes.md") (:uncommitted rev)))
@@ -110,12 +110,12 @@
   (let [room (:id (ops/invoke *daemon* :room/create {:title "dirty parent" :slug "dirty-parent"}))
         fork (:id (ops/invoke *daemon* :room/fork {:room room}))
         parent (ops/resolve-room *daemon* room)]
-    (muschel.fs/write-string! (#'catalog/room-fs (ops/resolve-room *daemon* fork)) "/fork.md" "Fork work." false)
-    (muschel.fs/write-string! (#'catalog/room-fs parent) "/parent.md" "Parent work." false)
+    (muschel.fs/write-string! (dvergr.catalog.workspace/room-fs (ops/resolve-room *daemon* fork)) "/fork.md" "Fork work." false)
+    (muschel.fs/write-string! (dvergr.catalog.workspace/room-fs parent) "/parent.md" "Parent work." false)
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"has uncommitted changes \(\?\? parent.md\)"
                           (ops/invoke *daemon* :room/merge {:room fork})))
     (testing "the fork stays mergeable once the parent is clean"
-      (muschel.fs/delete (#'catalog/room-fs parent) "/parent.md")
+      (muschel.fs/delete (dvergr.catalog.workspace/room-fs parent) "/parent.md")
       (is (nil? (forks/workspace-changes parent)))
       (is (= fork (:merged (ops/invoke *daemon* :room/merge {:room fork}))))
       (is (= "Fork work." (get (catalog/read-tree parent "/") "/fork.md"))))))
