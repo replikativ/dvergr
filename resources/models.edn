@@ -43,12 +43,47 @@
             :kimi-tool-id-format? true
             :default-top-p 0.95}}
 
+  ;; Kimi K3 (2026-09): prices from models.dev / Fireworks serverless docs.
+  ;; Quirks carried from the K2 family until a probe says otherwise.
+  "accounts/fireworks/models/kimi-k3"
+  {:name "Kimi K3"
+   :provider :fireworks
+   :api-type :openai-chat
+   :capabilities #{:tools :streaming}
+   :context 1048576
+   :max-output 16384
+   :pricing {:input 3.00 :cache-read 0.30 :output 15.00}
+   :quirks {:tool-id-in-every-chunk? true
+            :kimi-tool-id-format? true
+            :default-top-p 0.95}}
+
   ;; ─── GLM ───────────────────────────────────────────────────────────────────
   ;; GLM's native tool format is an <arg_key>/<arg_value> XML envelope; Fireworks
   ;; intermittently leaks it into `content` with empty tool_calls (stranded Vár's
   ;; intake run on 5.1). `:glm-tool-format?` turns on recovery+scrub in the
   ;; openai adapter (dvergr.model.quirks). 5.2 runs the structured path more
   ;; reliably but the leak is intermittent, so the defense stays on for both.
+
+  "accounts/fireworks/models/glm-5p3"
+  {:name "GLM 5.3"
+   :provider :fireworks
+   :api-type :openai-chat
+   :capabilities #{:tools :streaming}
+   :context 1048573
+   :max-output 16384
+   :pricing {:input 1.40 :cache-read 0.26 :output 4.40}
+   :quirks {:glm-tool-format? true}}
+
+  ;; The cheapest tool-capable model on Fireworks (2026-09).
+  "accounts/fireworks/models/glm-5p3-flash"
+  {:name "GLM 5.3 Flash"
+   :provider :fireworks
+   :api-type :openai-chat
+   :capabilities #{:tools :streaming}
+   :context 1048573
+   :max-output 16384
+   :pricing {:input 0.15 :cache-read 0.03 :output 0.50}
+   :quirks {:glm-tool-format? true}}
 
   "accounts/fireworks/models/glm-5p2"
   {:name "GLM 5.2"
@@ -79,8 +114,22 @@
    :capabilities #{:tools :streaming}
    :context 196608
    :max-output 8192
-   :pricing {:input 0.30 :cache-read 0.03 :output 1.20}
+   ;; Repriced 2026-09 (models.dev): prefer minimax-m3.
+   :pricing {:input 1.20 :cache-read 0.60 :output 1.20}
    :quirks {:default-temperature 1.0   ; MiniMax M2 recommended sampling
+            :default-top-p       0.95
+            :default-top-k       40}}
+
+  ;; M3 (2026-09): M2.7 was repriced to $1.20 in / $1.20 out; M3 is $0.30 / $1.20.
+  "accounts/fireworks/models/minimax-m3"
+  {:name "MiniMax M3"
+   :provider :fireworks
+   :api-type :openai-chat
+   :capabilities #{:tools :streaming}
+   :context 512000
+   :max-output 16384
+   :pricing {:input 0.30 :cache-read 0.06 :output 1.20}
+   :quirks {:default-temperature 1.0
             :default-top-p       0.95
             :default-top-k       40}}
 
@@ -102,6 +151,16 @@
   ;; ─── DeepSeek (1M context, worth knowing about) ────────────────────────────
   ;; Add a confirmed cache-read price once Fireworks publishes one.
 
+  "accounts/fireworks/models/deepseek-v4p1-flash"
+  {:name "DeepSeek V4.1 Flash"
+   :provider :fireworks
+   :api-type :openai-chat
+   :capabilities #{:tools :streaming}
+   :context 1000000
+   :max-output 16384
+   :pricing {:input 0.22 :cache-read 0.007 :output 0.66}
+   :quirks {}}
+
   "accounts/fireworks/models/deepseek-v4-pro"
   {:name "DeepSeek V4 Pro"
    :provider :fireworks
@@ -109,7 +168,7 @@
    :capabilities #{:tools :streaming}
    :context 1048576
    :max-output 8192
-   :pricing {}
+   :pricing {:input 1.20 :cache-read 0.60 :output 1.20}
    :quirks {}}
 
   ;; ─── Cheapest open-source — summarization, classification, stats ──────────
@@ -131,7 +190,7 @@
   {:name "GPT-OSS 120B"
    :provider :fireworks
    :api-type :openai-chat
-   :capabilities #{:streaming}
+   :capabilities #{:tools :streaming}
    :context 131072
    :max-output 8192
    :pricing {:input 0.15 :output 0.60}
@@ -156,20 +215,26 @@
 
  :aliases
  {"kimi"        "accounts/fireworks/models/kimi-k2p6"
+  "kimi-k3"     "accounts/fireworks/models/kimi-k3"
+  "glm-flash"   "accounts/fireworks/models/glm-5p3-flash"
+  "glm-5p3"     "accounts/fireworks/models/glm-5p3"
+  "minimax-m3"  "accounts/fireworks/models/minimax-m3"
+  "deepseek-flash" "accounts/fireworks/models/deepseek-v4p1-flash"
   "kimi-k2p5"   "accounts/fireworks/models/kimi-k2p5"
   "glm"         "accounts/fireworks/models/glm-5p2"
-  "minimax"     "accounts/fireworks/models/minimax-m2p7"
+  "minimax"     "accounts/fireworks/models/minimax-m3"
   "qwen"        "accounts/fireworks/models/qwen3p6-plus"
   "deepseek"    "accounts/fireworks/models/deepseek-v4-pro"
   "gpt-oss"     "accounts/fireworks/models/gpt-oss-20b"
   "gpt-oss-120b" "accounts/fireworks/models/gpt-oss-120b"}
 
  ;; ── Defaults ────────────────────────────────────────────────────────────────
- ;; Keeping MiniMax as primary + compaction — cheapest tool-capable option
- ;; at $0.30 in / $1.20 out, bumped to the latest M2.7. gpt-oss-20b stays
+ ;; MiniMax as primary + compaction — M3 at $0.30 in / $1.20 out (M2.7 was
+ ;; repriced to $1.20 in, 2026-09). GLM 5.3 Flash ($0.15 / $0.50) is cheaper
+ ;; still; switch once a benchmark shows it holds up as the primary. gpt-oss-20b stays
  ;; the cheapest one-off summary model.
 
  :defaults
- {:compaction-model "accounts/fireworks/models/minimax-m2p7"
-  :primary-model    "accounts/fireworks/models/minimax-m2p7"
+ {:compaction-model "accounts/fireworks/models/minimax-m3"
+  :primary-model    "accounts/fireworks/models/minimax-m3"
   :summary-model    "accounts/fireworks/models/gpt-oss-20b"}}

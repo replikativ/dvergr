@@ -186,3 +186,13 @@
       (finally
         (providers/clear-all!)
         (original #(System/getenv %))))))
+
+(deftest fireworks-is-available-through-an-openai-compatible-setup
+  ;; Many tools share one OpenAI-compatible key: OPENAI_API_KEY with
+  ;; OPENAI_BASE_URL pointing at Fireworks. That is a Fireworks key.
+  (let [create @#'dvergr.model.api.openai/create-fireworks-if-available]
+    (is (some? (create {} {"FIREWORKS_API_KEY" "k"})))
+    (is (some? (create {} {"OPENAI_API_KEY" "k"
+                           "OPENAI_BASE_URL" "https://api.fireworks.ai/inference/v1"})))
+    (is (nil? (create {} {"OPENAI_API_KEY" "k" "OPENAI_BASE_URL" "https://api.openai.com/v1"})))
+    (is (nil? (create {} {"OPENAI_API_KEY" "k"})))))

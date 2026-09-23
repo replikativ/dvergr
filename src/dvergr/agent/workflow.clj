@@ -49,6 +49,7 @@
    room's files and data. Say briefly what you changed.")
 
 (defn- model-policy [model]
+  (registry/ensure-models-loaded!)
   (let [id (registry/resolve-alias model)]
     {:provider (:provider (registry/get-model! id)) :model id}))
 
