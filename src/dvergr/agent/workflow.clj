@@ -106,23 +106,23 @@
 
 (defn review
   "What a reviewer decides on for a retained attempt world:
-   `{:tier :trivial|:reviewable|:conflict :systems {system {...}} :conflicts n}`,
-   or nil when the world is gone."
+   `{:tier :trivial|:reviewable|:conflict :systems {system {...}} :conflicts n
+     :state token}` (`:state` pins a merge to this review), or nil when the
+   world is gone."
   [world-id]
   (when-let [fork (and world-id (rreg/lookup world-id))]
-    (when-let [{:keys [tier diff conflicts]} (forks/review fork)]
+    (when-let [{:keys [tier diff conflicts state]} (forks/review fork)]
       {:tier tier
        :systems (into {} (map (fn [[k v]] [(str k) (delta-summary v)])) diff)
-       :conflicts (count conflicts)})))
+       :conflicts (count conflicts)
+       :state state})))
 
-(defn attempt!
-  "Run `task` `attempts` times for each of `models` on forks of `room` and
-   block until all are certified. Call at a boundary (not inside a Spin), with
-   `room`'s context bound or given as `ctx`.
-
-   Returns `[{:attempt certified-Attempt :world world-id :review review-map}]`,
-   the retained worlds still open: adopt one with `forks/merge!`, drop the rest
-   with `forks/discard!`."
+(defn start
+  "Start `task` `attempts` times for each of `models` on forks of `room`,
+   with `room`'s context bound or given as `ctx`. Returns `{:spin s :ctx c
+   :finish f}`: `s` yields the evaluations (deref or cancel it with `c` bound),
+   `(f evaluations)` the rows `attempt!` returns. Validates before starting
+   anything."
   [room {:keys [task attempts] :as opts}]
   (when (str/blank? (str task))
     (throw (ex-info "A workflow attempt needs a task" {:type ::no-task})))
@@ -133,14 +133,29 @@
             (throw (ex-info "at most 4 models per call" {:type ::models})))
         {:keys [team ids]} (candidates opts)
         env (environment-def task opts)
-        results (binding [ec/*execution-context* (or (:ctx opts) (:ctx room))]
-                  @(apply comb/parallel
-                          (for [id ids _ (range n)]
-                            (evaluation/evaluate room team id env completion-evaluator {}))))]
-    (binding [ec/*execution-context* (or (:ctx opts) (:ctx room))]
-      (mapv (fn [r]
-              (let [world (get-in r [:run/result :run/world])]
-                {:attempt (:attempt r)
-                 :world world
-                 :review (review world)}))
-            results))))
+        ctx (or (:ctx opts) (:ctx room))]
+    {:ctx ctx
+     :spin (binding [ec/*execution-context* ctx]
+             (apply comb/parallel
+                    (for [id ids _ (range n)]
+                      (evaluation/evaluate room team id env completion-evaluator {}))))
+     :finish (fn [results]
+               (binding [ec/*execution-context* ctx]
+                 (mapv (fn [r]
+                         (let [world (get-in r [:run/result :run/world])]
+                           {:attempt (:attempt r)
+                            :world world
+                            :review (review world)}))
+                       results)))}))
+
+(defn attempt!
+  "Run `task` `attempts` times for each of `models` on forks of `room` and
+   block until all are certified. Call at a boundary (not inside a Spin), with
+   `room`'s context bound or given as `ctx`.
+
+   Returns `[{:attempt certified-Attempt :world world-id :review review-map}]`,
+   the retained worlds still open: adopt one with `forks/merge!`, drop the rest
+   with `forks/discard!`."
+  [room opts]
+  (let [{:keys [spin ctx finish]} (start room opts)]
+    (finish (binding [ec/*execution-context* ctx] @spin))))

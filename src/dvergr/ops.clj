@@ -30,6 +30,7 @@
             [dvergr.agent.ops :as aops]
             [dvergr.agent.run :as run]
             [dvergr.agent.workflow :as workflow]
+            [dvergr.jobs :as jobs]
             [dvergr.resource :as resource]
             [dvergr.agent.fields :as fields]
             [dvergr.rooms :as rooms]
@@ -40,6 +41,7 @@
             [dvergr.discourse :as d]
             [dvergr.model.registry :as reg]
             [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.spin.core :as spin-core]
             [org.replikativ.spindel.yggdrasil :as ygg]))
 
 ;; ============================================================================
@@ -212,6 +214,61 @@
 
 (def ^:private Room    [:string {:description "room id or slug"}])
 (def ^:private Fork    [:string {:description "fork room id/slug"}])
+
+(def ^:private WorkflowArgs
+  [:map [:room Room]
+   [:task [:string {:description "what the agent should do"}]]
+   [:attempts {:optional true} [:int {:min 1 :max 8 :description "attempts per model (default 1)"}]]
+   [:models {:optional true} [:vector {:description "model ids or aliases (default: the configured default)"} :string]]
+   [:budget-dollars {:optional true} [:double {:description "budget per attempt in USD (default 0.50)"}]]
+   [:profile {:optional true} [:enum {:description "developer = may edit files; worker = read-only (default)"} "developer" "worker"]]
+   [:timeout-ms {:optional true} [:int {:description "per attempt (default 10 minutes)"}]]])
+
+(defn- wallet-data
+  "A room's (or one Run's) conserved resources as plain data."
+  [room run-id]
+  (let [bal (try (if run-id
+                   (resource/run-balance room run-id)
+                   (resource/balance room))
+                 (catch Throwable e {::unavailable (ex-message e)}))]
+    (if-let [why (::unavailable bal)]
+      {:available false :reason why}
+      {:available true
+       :resources (into (sorted-map)
+                        (map (fn [[k v]] [(str k) (if (number? v) (double v) v)]))
+                        bal)})))
+
+(defn- job-data [job]
+  (-> job
+      (update :status name)
+      (update :started-at #(some-> % java.util.Date.))
+      (update :finished-at #(some-> % java.util.Date.))))
+
+(defn- workflow-result
+  "A workflow's rows as the data every binding shows: the attempts with their
+   worlds and reviews, the per-model table, and the room's wallet after."
+  [daemon room task rows]
+  (let [attempts (mapv (fn [{:keys [attempt world review]}]
+                         (assoc (attempt-data attempt)
+                                :world (id->str world)
+                                :review review))
+                       rows)]
+    {:task task
+     :attempts attempts
+     :by-model
+     (->> attempts
+          (group-by :model)
+          (mapv (fn [[model xs]]
+                  (let [md (reduce + 0 (keep #(get-in % [:spend :microdollars]) xs))
+                        ok (count (filter #(= 1.0 (:reward %)) xs))]
+                    {:model model :attempts (count xs) :completed ok
+                     :microdollars md
+                     :microdollars-per-completion (when (pos? ok) (quot md ok))})))
+          (sort-by (juxt #(- (:completed %)) :microdollars))
+          vec)
+     :wallet (in-ctx daemon (wallet-data room nil))
+     :adopt (str "room_merge {room: <world>, expect-state: <review.state>} adopts one attempt; "
+                 "room_discard {room: <world>} drops one")}))
 (def ^:private AgentId [:string {:description "agent id"}])
 
 ;; ============================================================================
@@ -266,17 +323,26 @@
              [:run {:optional true} [:string {:description "a run id: that Run's wallet"}]]]
     :impl (fn [daemon {:keys [room run]}]
             (when-let [r (resolve-room daemon room)]
-              (in-ctx daemon
-                      (let [bal (try (if run
-                                       (resource/run-balance r (uuid-arg run))
-                                       (resource/balance r))
-                                     (catch Throwable e {::unavailable (ex-message e)}))]
-                        (if-let [why (::unavailable bal)]
-                          {:available false :reason why}
-                          {:available true
-                           :resources (into (sorted-map)
-                                            (map (fn [[k v]] [(str k) (if (number? v) (double v) v)]))
-                                            bal)})))))}
+              (in-ctx daemon (wallet-data r (some-> run uuid-arg)))))}
+
+   :job/status
+   {:doc (str "A job's status, and its result once completed. `wait-ms` (at most 25000) "
+              "waits that long for it to finish before answering.")
+    :kind :read
+    :schema [:map [:job [:string {:description "job id"}]]
+             [:wait-ms {:optional true} [:int {:min 0 :max 25000 :description "wait up to this long (default 0)"}]]]
+    :impl (fn [_daemon {:keys [job wait-ms]}]
+            (or (some-> (jobs/status job (or wait-ms 0)) job-data)
+                (throw (ex-info (str "No job " job " (jobs live in the daemon; a restart drops them)")
+                                {:type ::no-job}))))}
+
+   :job/list
+   {:doc "Jobs, newest first (running and recently finished), optionally of one room; results omitted."
+    :kind :read
+    :schema [:map [:room {:optional true} Room]]
+    :impl (fn [daemon {:keys [room]}]
+            (let [rid (when room (some-> (resolve-room daemon room) :id id->str))]
+              (mapv #(dissoc (job-data %) :result) (jobs/jobs rid))))}
 
    :attempt/list
    {:doc "Certified Attempts of a room, newest first — each a leaderboard row: agent, environment, reward, checks, the bill."
@@ -430,35 +496,39 @@
               "every attempt's outcome, score, bill and diff, with the world to adopt: "
               "room_merge one world, room_discard the others.")
     :kind :write
-    :schema [:map [:room Room]
-             [:task [:string {:description "what the agent should do"}]]
-             [:attempts {:optional true} [:int {:min 1 :max 8 :description "attempts per model (default 1)"}]]
-             [:models {:optional true} [:vector {:description "model ids or aliases (default: the configured default)"} :string]]
-             [:budget-dollars {:optional true} [:double {:description "budget per attempt in USD (default 0.50)"}]]
-             [:profile {:optional true} [:enum {:description "developer = may edit files; worker = read-only (default)"} "developer" "worker"]]
-             [:timeout-ms {:optional true} [:int {:description "per attempt (default 10 minutes)"}]]]
+    :schema WorkflowArgs
     :impl (fn [daemon {:keys [room] :as args}]
             (when-let [r (resolve-room daemon room)]
-              (let [rows (workflow/attempt! r (assoc (dissoc args :room) :ctx (dctx daemon)))
-                    attempts (mapv (fn [{:keys [attempt world review]}]
-                                     (assoc (attempt-data attempt)
-                                            :world (id->str world)
-                                            :review review))
-                                   rows)]
-                {:task (:task args)
-                 :attempts attempts
-                 :by-model
-                 (->> attempts
-                      (group-by :model)
-                      (mapv (fn [[model xs]]
-                              (let [md (reduce + 0 (keep #(get-in % [:spend :microdollars]) xs))
-                                    ok (count (filter #(= 1.0 (:reward %)) xs))]
-                                {:model model :attempts (count xs) :completed ok
-                                 :microdollars md
-                                 :microdollars-per-completion (when (pos? ok) (quot md ok))})))
-                      (sort-by (juxt #(- (:completed %)) :microdollars))
-                      vec)
-                 :adopt "room_merge {room: <world>} adopts one attempt; room_discard {room: <world>} drops one"})))}
+              (workflow-result daemon r (:task args)
+                               (workflow/attempt! r (assoc (dissoc args :room) :ctx (dctx daemon))))))}
+
+   :workflow/start
+   {:doc (str "Start workflow_attempt as a job and return at once: run a task several times "
+              "per model, each attempt on its own fork of the room, each with its own budget. "
+              "Poll job_status {job, wait-ms} until it is completed; its result lists every "
+              "attempt's outcome, bill and review, the per-model table and the room's wallet. "
+              "Adopt one world with room_merge {room: world, expect-state: review.state}, "
+              "room_discard the others. job_cancel stops it.")
+    :kind :write
+    :schema WorkflowArgs
+    :impl (fn [daemon {:keys [room] :as args}]
+            (when-let [r (resolve-room daemon room)]
+              (let [{:keys [spin ctx finish]} (workflow/start r (assoc (dissoc args :room) :ctx (dctx daemon)))]
+                (-> (jobs/start! {:op "workflow/start" :room (id->str (:id r)) :task (:task args)}
+                                 #(workflow-result daemon r (:task args)
+                                                   (finish (binding [ec/*execution-context* ctx] @spin)))
+                                 :cancel #(binding [ec/*execution-context* ctx]
+                                            (spin-core/cancel-spin! spin)))
+                    job-data
+                    (assoc :poll-after-ms 10000)))))}
+
+   :job/cancel
+   {:doc "Cancel a running job (e.g. a workflow_start): its attempts are stopped."
+    :kind :write
+    :schema [:map [:job [:string {:description "job id"}]]]
+    :impl (fn [_daemon {:keys [job]}]
+            (or (some-> (jobs/cancel! job) job-data)
+                (throw (ex-info (str "No job " job) {:type ::no-job}))))}
 
    :room/fork
    {:doc "Fork a room for speculative work (O(1) copy-on-write); merge or discard later."
@@ -469,12 +539,35 @@
               (room-result daemon (in-ctx daemon (forks/fork! r)))))}
 
    :room/merge
-   {:doc "Reconcile-merge a fork back into its parent."
+   {:doc "Reconcile-merge a fork back into its parent. Pass `expect-state` (from room_review or a workflow attempt's review) to merge only the state that was reviewed: a fork that changed since is refused."
     :kind :write
+    :schema [:map [:room Fork]
+             [:expect-state {:optional true}
+              [:string {:description "the fork state token the merge was decided on"}]]]
+    :impl (fn [daemon {:keys [room expect-state]}]
+            (when-let [r (resolve-room daemon room)]
+              (in-ctx daemon
+                      (when expect-state
+                        (let [now (forks/state-token r)]
+                          (when (not= expect-state now)
+                            (throw (ex-info (str "Fork " (id->str (:id r)) " changed since it was reviewed"
+                                                 " (reviewed " expect-state ", now " now "); review it again")
+                                            {:type ::fork-changed :expected expect-state :actual now})))))
+                      (let [{:keys [ok? error] :as res} (forks/reconcile-merge! r)]
+                        (when-not ok?
+                          (throw (ex-info (str "Merge of " (id->str (:id r)) " failed: " error)
+                                          {:type ::merge-failed :error error})))
+                        (cond-> {:merged (id->str (:id r))}
+                          (:parent-slug res) (assoc :into (:parent-slug res))
+                          (:reconciled res) (assoc :reconciled (:reconciled res)))))))}
+
+   :room/review
+   {:doc "What a reviewer decides a merge on: the fork's tier (trivial, reviewable, conflict), a per-system summary of its changes, the conflict count, and its state token for room_merge's expect-state."
+    :kind :read
     :schema [:map [:room Fork]]
     :impl (fn [daemon {:keys [room]}]
             (when-let [r (resolve-room daemon room)]
-              (in-ctx daemon (forks/reconcile-merge! r) {:merged (id->str (:id r))})))}
+              (in-ctx daemon (workflow/review (:id r)))))}
 
    :room/discard
    {:doc "Discard a fork without merging."

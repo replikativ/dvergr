@@ -14,8 +14,10 @@
             [dvergr.discourse :as d]
             [dvergr.substrate.geschichte :as git]
             [clojure.string :as str]
+            [hasch.core :as hasch]
             [org.replikativ.spindel.engine.core :as ec]
-            [org.replikativ.spindel.yggdrasil :as ygg]))
+            [org.replikativ.spindel.yggdrasil :as ygg]
+            [yggdrasil.protocols :as yp]))
 
 (declare fork-diff)
 
@@ -238,15 +240,30 @@
     (every? delta-trivial? (vals diff-map))  :trivial
     :else                                    :reviewable))
 
-(defn review
-  "Everything a reviewer (agent or human) needs to decide a merge:
-   {:tier :trivial|:reviewable|:conflict :diff {system-id → delta} :conflicts [...]}.
-   nil for non-`:ctx` forks."
+(defn state-token
+  "A content hash of `fork`'s state: its mergeable systems' snapshot ids (git
+   commit, datahike commit, …). It changes whenever the fork does, so a merge
+   can be pinned to the state that was reviewed (`merge-reviewed!`). nil for
+   non-`:ctx` forks."
   [fork]
   (when (ctx-fork? fork)
-    (let [diff (fork-diff fork)
+    (binding [ec/*execution-context* (:ctx fork)]
+      (str (hasch/uuid
+            (into (sorted-map)
+                  (for [[sid sys] (ygg/registered-systems)
+                        :when (satisfies? yp/Mergeable sys)]
+                    [(str sid) (str (yp/snapshot-id sys))])))))))
+
+(defn review
+  "Everything a reviewer (agent or human) needs to decide a merge:
+   {:tier :trivial|:reviewable|:conflict :diff {system-id → delta} :conflicts [...]
+    :state token}. nil for non-`:ctx` forks."
+  [fork]
+  (when (ctx-fork? fork)
+    (let [state (state-token fork)
+          diff (fork-diff fork)
           conf (fork-conflicts fork)]
-      {:tier (classify diff conf) :diff diff :conflicts conf})))
+      {:tier (classify diff conf) :diff diff :conflicts conf :state state})))
 
 (defn merge!
   "Merge a fork into its parent (`discourse/merge-room`). Returns

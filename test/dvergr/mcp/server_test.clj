@@ -87,8 +87,9 @@
 (deftest the-default-profile-is-small-and-leaves-out-host-tools
   (let [names (set (map :name (list-tools (session))))]
     (is (<= (count names) 22) "fits clients that cap tools around 40, with room for others")
-    (is (every? names ["workflow_attempt" "room_fork" "room_merge" "room_discard"
-                       "room_wallet" "clojure_eval" "room_list"]))
+    (is (every? names ["workflow_start" "job_status" "job_cancel" "room_fork" "room_review"
+                       "room_merge" "room_discard" "room_wallet" "clojure_eval" "room_list"]))
+    (is (not (names "workflow_attempt")) "the blocking form outlasts client timeouts; opt-in")
     (is (not-any? names ["shell" "read_file" "write_file" "agent_delete" "system_stats"])
         "file/shell tools duplicate the host's; admin ops are opt-in")))
 
@@ -98,10 +99,11 @@
         ro (list-tools (session {:dvergr/profile "readonly"}))]
     (is (contains? admin "shell"))
     (is (= (count admin) (count @server/tool-definitions)) "admin sees every tool")
-    (is (and (contains? plus-code "read_file") (contains? plus-code "workflow_attempt")))
+    (is (and (contains? plus-code "read_file") (contains? plus-code "workflow_start")))
     (is (seq ro))
     (is (every? #(true? (get-in % [:annotations :readOnlyHint])) ro))
-    (is (not-any? #{"room_post" "workflow_attempt" "clojure_eval"} (map :name ro)))))
+    (is (not-any? #{"room_post" "workflow_start" "clojure_eval"} (map :name ro)))
+    (is (some #{"job_status"} (map :name ro)))))
 
 (deftest an-unknown-profile-fails-at-connect
   (let [c (server/session-context (fn [_] nil) (surface/selection {}))
