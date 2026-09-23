@@ -86,7 +86,7 @@
 
 (deftest the-default-profile-is-small-and-leaves-out-host-tools
   (let [names (set (map :name (list-tools (session))))]
-    (is (<= (count names) 22) "fits clients that cap tools around 40, with room for others")
+    (is (<= (count names) 24) "fits clients that cap tools around 40, with room for others")
     (is (every? names ["workflow_start" "job_status" "job_cancel" "room_fork" "room_review"
                        "room_merge" "room_discard" "room_wallet" "clojure_eval" "room_list"]))
     (is (not (names "workflow_attempt")) "the blocking form outlasts client timeouts; opt-in")

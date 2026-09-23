@@ -52,7 +52,7 @@ neither listed nor callable.
 
 | Profile | Toolsets | Tools |
 | --- | --- | --- |
-| `offload` (default) | rooms, worlds, attempts, wallets, repl | 22 |
+| `offload` (default) | rooms, worlds, attempts, catalog, wallets, repl | 24 |
 | `readonly` | every read op | read-only only |
 | `admin` | everything | all |
 
@@ -62,6 +62,7 @@ neither listed nor callable.
 | `worlds` | fork, review, diff, merge, discard |
 | `attempts` | `workflow_start` and the job tools; Attempts, Scorecards |
 | `runs` | the blocking `workflow_attempt`; Runs |
+| `catalog` | `catalog_list`, `catalog_start`: workflows with their own checker |
 | `wallets` | `room_wallet`, `models_list` |
 | `repl` | `clojure_eval` in the room's SCI sandbox |
 | `agents` | agent administration, `room_invite` |
@@ -97,6 +98,14 @@ around 40, and every definition costs context in every session.
 - **Merges are pinned to the review.** `room_review` (and every workflow attempt's review)
   carries the fork's `state`, a hash of its systems' snapshot ids; `room_merge {room,
   expect-state}` refuses a fork that changed since. A failed merge is an error, not a success.
+- **A merge adopts a fork's files.** A workspace change is only in the diff once committed; an
+  attempt's world is committed when its Run ends, and `room_merge` commits a fork's remaining
+  changes before merging (`room_review` lists them as `uncommitted`, and they make a fork
+  reviewable). Without this a merge silently dropped uncommitted files.
+- **Catalog workflows are scored by their own checker.** `catalog_start {workflow: "wiki/v1"}`
+  without a room runs on the benchmark set (fixtures seeded into a new room, ten known facts);
+  with a room, on its own `/docs`, scored by citations, links and structure. Each attempt's
+  `checks` say what it got right (one per fact), `reward` weighs them.
 - **Money is in the result.** A workflow result has each attempt's spend, the per-model table
   (cost per completed attempt) and the room's wallet afterwards.
 - REPL definitions live in the daemon's memory: they do not survive a daemon restart. Keep
