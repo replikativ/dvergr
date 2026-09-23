@@ -555,9 +555,14 @@
                         (:cache_write cost) (assoc :cache-write (:cache_write cost)))}
       (seq reasoning-efforts) (assoc :reasoning-efforts reasoning-efforts))))
 
+(def ^:private models-dev-providers
+  "dvergr provider → its key in models.dev."
+  {:anthropic :anthropic :openai :openai :fireworks :fireworks-ai})
+
 (defn refresh-from-models-dev!
   "Fetch <https://models.dev/api.json> and overlay all entries from the
-   given providers into the registry. Default: just :anthropic.
+   given dvergr providers (`:anthropic`, `:openai`, `:fireworks`) into the
+   registry. Default: :anthropic and :openai.
 
    Hardcoded `default-models` is the offline fallback. Calling this
    updates pricing + adds any newer models that have shipped since the
@@ -569,7 +574,7 @@
    (when-let [data (models-dev-fetch)]
      (let [n (atom 0)]
        (doseq [prov-key providers
-               :let [prov (get data prov-key)
+               :let [prov (get data (get models-dev-providers prov-key prov-key))
                      models (:models prov)]
                :when (some? prov)
                [mid m] models]

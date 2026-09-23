@@ -35,7 +35,7 @@ clj -Sdeps '{:deps {nrepl/nrepl {:mvn/version "1.3.0"}}}' -M -m nrepl.cmdline --
 ;; Simple task
 (r/run "List all Clojure files and count them"
        :provider :fireworks
-       :model "accounts/fireworks/models/qwen3-coder-480b-a35b-instruct"
+       :model "accounts/fireworks/models/minimax-m3"
        :max-turns 5)
 
 ;; With Anthropic
@@ -49,20 +49,27 @@ clj -Sdeps '{:deps {nrepl/nrepl {:mvn/version "1.3.0"}}}' -M -m nrepl.cmdline --
 ```clojure
 ;; Quick test
 (require '[dvergr.core :as r] :reload)
-(r/run "Say hello" :provider :fireworks :model "accounts/fireworks/models/qwen3-coder-480b-a35b-instruct")
+(r/run "Say hello" :provider :fireworks :model "accounts/fireworks/models/minimax-m3")
 ```
 
 ## Recommended Models
 
-### Fireworks.ai (tested, fast, cost-effective)
+### Fireworks.ai
+
+`resources/models.edn` is the registry (ids, prices, quirks); `(registry/refresh-from-models-dev! #{:fireworks})`
+overlays current prices and new models from models.dev. Probed 2026-09-23, all with structured tool calls:
 
 ```clojure
-;; Qwen3 Coder 480B - Best for code tasks
-:model "accounts/fireworks/models/qwen3-coder-480b-a35b-instruct"
-
-;; Kimi K2 Thinking - Advanced reasoning
-:model "accounts/fireworks/models/kimi-k2-thinking"
+:model "accounts/fireworks/models/minimax-m3"          ; default primary, $0.30 / $1.20 per 1M
+:model "accounts/fireworks/models/glm-5p3-flash"       ; cheapest, $0.15 / $0.50
+:model "accounts/fireworks/models/deepseek-v4p1-flash" ; $0.22 / $0.66, 1M context
+:model "accounts/fireworks/models/glm-5p3"             ; $1.40 / $4.40
+:model "accounts/fireworks/models/kimi-k3"             ; strongest, $3.00 / $15.00
 ```
+
+The Fireworks key is `OPENAI_API_KEY` with `OPENAI_BASE_URL=https://api.fireworks.ai/inference/v1`
+(or `FIREWORKS_API_KEY`). Benchmark candidates can also use the Codex subscription
+(`codex-subscription-luna`, no per-token cost).
 
 ## Architecture
 
