@@ -681,6 +681,25 @@
 (defn- stop-gc-loop! []
   (when-let [t @gc-thread] (.interrupt t) (reset! gc-thread nil)))
 
+(defn- start-mcp!
+  "Start the MCP server on the daemon's loopback TCP port when `mcp-config` is
+   given (`{:port 17888 :bind \"127.0.0.1\" :profile \"offload\" :toolsets …}`).
+   Clients reach it through the stdio relay `bin/dvergr-mcp`. A port already
+   in use is logged, not fatal."
+  [daemon mcp-config]
+  (if-not mcp-config
+    daemon
+    (let [start-fn (requiring-resolve 'dvergr.mcp.server/start!)
+          {:keys [port bind profile toolsets] :or {port 17888 bind "127.0.0.1"}} mcp-config]
+      (try
+        (assoc daemon :mcp-server (start-fn :port port :bind bind
+                                            :profile profile :toolsets toolsets))
+        (catch java.net.BindException e
+          (tel/log! {:level :warn :id :daemon/mcp-bind-failed
+                     :data {:port port :error (.getMessage e)}}
+                    "MCP server bind failed; continuing without MCP")
+          daemon)))))
+
 (defn start!
   "Start the daemon with the given configuration.
 
@@ -1000,10 +1019,11 @@
               (tel/log! {:level :warn :id :mail/integration-failed :data {:error (.getMessage e)}}
                         "Mail integration failed to start"))))
 
-        (reset! status-a :running)
-        (reset! current-daemon daemon-with-http)
-        (tel/log! {:id :daemon/started :data {:agent-count (count (:agents config))}} "Daemon started")
-        daemon-with-http))))
+        (let [daemon-final (start-mcp! daemon-with-http (:mcp config))]
+          (reset! status-a :running)
+          (reset! current-daemon daemon-final)
+          (tel/log! {:id :daemon/started :data {:agent-count (count (:agents config))}} "Daemon started")
+          daemon-final)))))
 
 (defn stop!
   "Orderly shutdown of the daemon.
@@ -1044,6 +1064,9 @@
                             (catch Throwable _ nil))]
       (stop-fn)))
 
+  (when (:mcp-server daemon)
+    (try ((requiring-resolve 'dvergr.mcp.server/stop!)) (catch Throwable _ nil)))
+
   ;; Stop the mail IMAP sync loop (if running)
   (mail/stop-sync!)
 
@@ -1077,8 +1100,9 @@
 
    (def d (start-from-config!))
    (daemon-status d)"
-  []
-  (start! (config/daemon-config)))
+  ([] (start-from-config! nil))
+  ([overrides]
+   (start! (merge (config/daemon-config) overrides))))
 
 ;; ============================================================================
 

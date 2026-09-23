@@ -1,6 +1,7 @@
 (ns dvergr.mcp.json-rpc
   "Clean-room JSON-RPC 2.0 dispatch and MCP protocol handlers.
-   Implements MCP spec (2024-11-05 and 2025-11-25) with synchronous dispatch.
+   Implements the MCP handshake protocols 2024-11-05 through 2025-11-25 with
+   synchronous dispatch.
 
    All handlers are plain fns: (fn [context message] -> result-map | nil).
    handle-message returns a response map directly (no promises).")
@@ -39,25 +40,37 @@
 (defn- ping-handler [_context _message]
   {})
 
-(def ^:private supported-versions #{"2024-11-05" "2025-11-25"})
+(def supported-versions
+  "Handshake protocol versions, oldest first."
+  ["2024-11-05" "2025-03-26" "2025-06-18" "2025-11-25"])
+
+(defn negotiate-version
+  "The version to answer `requested` with: the same when supported, else the
+   latest this server speaks (the spec's rule; the client then decides whether
+   it can continue)."
+  [requested]
+  (if (some #{requested} supported-versions)
+    requested
+    (peek supported-versions)))
 
 (defn- initialize-handler
-  "Negotiate protocol version, store client info, return server capabilities."
+  "Negotiate protocol version, store client info, return server capabilities.
+   `(:on-initialize context)`, when present, sees the params first (the server
+   reads its per-session profile from `_meta` there)."
   [context message]
   (let [session-atom (:session context)
         params (:params message)
-        requested-version (:protocolVersion params)
-        version (if (supported-versions requested-version)
-                  requested-version
-                  "2024-11-05")]
+        version (negotiate-version (:protocolVersion params))]
     (swap! session-atom assoc
            :client-info (:clientInfo params)
            :client-capabilities (:capabilities params)
            :protocol-version version)
-    {:protocolVersion version
-     :serverInfo (:server-info @session-atom)
-     :capabilities {:tools {:listChanged true}
-                    :resources {:subscribe true :listChanged true}}}))
+    (when-let [f (:on-initialize context)] (f params))
+    (cond-> {:protocolVersion version
+             :serverInfo (:server-info @session-atom)
+             :capabilities {:tools {:listChanged true}
+                            :resources {:subscribe true :listChanged true}}}
+      (:instructions @session-atom) (assoc :instructions (:instructions @session-atom)))))
 
 (defn- initialized-notification-handler
   "Client confirms initialization. Switch to post-init handler map."
@@ -68,11 +81,19 @@
            :handler-by-method (post-init-handlers context))
     nil))
 
+(def ^:private tool-def-keys [:name :title :description :inputSchema :outputSchema :annotations])
+
+(defn- session-tool-defs
+  "The tool definitions this session may see and call: all of them, or those
+   `(:tool-visible? context)` admits."
+  [context]
+  (let [visible? (or (:tool-visible? context) (constantly true))]
+    (filterv visible? @(:tool-defs context))))
+
 (defn- tools-list-handler
-  "Return current tool definitions from the dynamic registry."
+  "Return the session's tool definitions from the dynamic registry."
   [context _message]
-  (let [tool-defs @(:tool-defs context)]
-    {:tools (mapv #(select-keys % [:name :description :inputSchema]) tool-defs)}))
+  {:tools (mapv #(select-keys % tool-def-keys) (session-tool-defs context))})
 
 (defn- stub-handler
   "Default stub handler for tools without explicit implementations."
@@ -90,10 +111,10 @@
   (let [params (:params message)
         tool-name (:name params)
         arguments (or (:arguments params) {})
-        tool-defs @(:tool-defs context)
-        tool-exists? (some #(= (:name %) tool-name) tool-defs)]
+        tool-exists? (some #(= (:name %) tool-name) (session-tool-defs context))]
     (if-not tool-exists?
-      (throw (ex-info (str "Unknown tool: " tool-name) {:tool-name tool-name}))
+      (throw (ex-info (str "Unknown tool: " tool-name)
+                      {:tool-name tool-name :json-rpc/code -32602}))
       (let [handler (get @(:tool-handlers context) tool-name)]
         (try
           (if handler
@@ -165,10 +186,11 @@
 (defn create-session
   "Create a fresh MCP session state map.
    Options:
-     :server-info - {:name \"...\" :version \"...\"}
-     :protocol-version - initial version string"
-  [{:keys [server-info]}]
+     :server-info  - {:name \"...\" :version \"...\"}
+     :instructions - text returned from initialize (optional)"
+  [{:keys [server-info instructions]}]
   {:initialized false
+   :instructions instructions
    :handler-by-method nil ;; set during first handle-message
    :server-info (or server-info {:name "mcp-server" :version "0.1.0"})
    :protocol-version nil
@@ -226,4 +248,6 @@
            :id id
            :result result})
         (catch Exception e
-          (internal-error-response id (.getMessage e)))))))
+          (if (= -32602 (:json-rpc/code (ex-data e)))
+            (invalid-params-response id (.getMessage e))
+            (internal-error-response id (.getMessage e))))))))
