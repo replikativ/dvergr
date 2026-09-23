@@ -754,3 +754,50 @@
            :results results
            :attempts (mapv :attempt results)
            :scorecard scorecard}))))))
+
+;; ============================================================================
+;; Progress: derived from the Room's store
+;; ============================================================================
+
+(defn- candidate-progress [attempts]
+  (let [verdicts (filter verdict? attempts)
+        rewards (keep #(get-in % [:attempt/receipt :attempt/reward]) verdicts)
+        metrics #(get-in % [:attempt/receipt :attempt/metrics])]
+    {:done (count attempts)
+     :verdicts (count verdicts)
+     :faults (- (count attempts) (count verdicts))
+     :reward-mean (when (seq rewards) (/ (reduce + rewards) (count rewards)))
+     :microdollars (reduce + 0 (keep #(get-in (metrics %) [:spend :microdollars]) attempts))
+     :failures (frequencies (keep #(get-in (metrics %) [:failure :cause]) attempts))}))
+
+(defn progress
+  "What the experiments in `room` have done so far, from its store alone:
+   for each ExperimentDef (by content id) and candidate, the certified cells,
+   verdicts (completed, or failed by the model itself), faults (failures of
+   the path to the model, re-run on resume), mean reward over verdicts, spend
+   and failure causes; and the Room's Runs still running. The facts are the
+   Attempts and Runs the experiment certified and started, so this is the same
+   view while it runs, after it stops, and from any process holding the store."
+  [room]
+  (let [room-store (:store room)
+        attempts (if (satisfies? store/PAttemptStore room-store)
+                   (store/-list-attempts room-store (:id room) {:limit 1000000})
+                   [])
+        mine (filter #(get-in % [:attempt/receipt :attempt/metrics :experiment-content-id]) attempts)
+        running (if (satisfies? store/PRoomStore room-store)
+                  (try (store/-list-runs room-store (:id room) {:status :running :limit 1000})
+                       (catch Throwable _ []))
+                  [])]
+    {:experiments
+     (->> mine
+          (group-by #(get-in % [:attempt/receipt :attempt/metrics :experiment-content-id]))
+          (mapv (fn [[content-id xs]]
+                  {:experiment/content-id content-id
+                   :candidates
+                   (->> xs
+                        (group-by #(get-in % [:attempt/receipt :attempt/metrics :experiment-candidate]))
+                        (mapv (fn [[c ys]] (assoc (candidate-progress ys) :candidate/id c)))
+                        (sort-by (comp str :candidate/id))
+                        vec)})))
+     :running (mapv #(select-keys % [:run/id :run/actor :run/started-at]) running)
+     :microdollars (reduce + 0 (keep #(get-in % [:attempt/receipt :attempt/metrics :spend :microdollars]) mine))}))

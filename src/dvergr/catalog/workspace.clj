@@ -61,11 +61,22 @@
     (forks/commit-workspace! room (str "Seed " (count files) " files"))
     (count files)))
 
+(declare open-memory-workspace!)
+
+(defn ensure-workspace!
+  "`room`'s workspace: the one it has (a daemon room's forked repository), or
+   a fresh in-memory one registered in its context when its store has none
+   (an experiment store). The in-memory repository is not deleted afterwards:
+   the evaluator's capture reads it after the Run's cleanups, so a cleanup
+   cannot release it; it is the size of the fixtures."
+  [room]
+  (or (binding [ec/*execution-context* (:ctx room)] (gs/current-workspace))
+      (do (open-memory-workspace! room)
+          (binding [ec/*execution-context* (:ctx room)] (gs/current-workspace)))))
+
 (defn open-memory-workspace!
-  "Give `room` (a benchmark attempt's world) a fresh in-memory workspace,
-   registered in its context, where a room store has none. The repository is
-   not deleted afterwards: the evaluator's capture reads it after the Run's
-   cleanups, so a cleanup cannot release it; it is the size of the fixtures."
+  "Register a fresh in-memory workspace in `room`'s context (see
+   `ensure-workspace!`)."
   [room]
   (let [cfg (assoc (gs/repository-config (str "/memory/" (random-uuid)))
                    :store {:backend :memory :id (random-uuid)})]

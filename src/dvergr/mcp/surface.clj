@@ -33,6 +33,8 @@
 
    :catalog/list :catalog, :catalog/start :catalog
 
+   :catalog/benchmark :bench, :experiment/progress :bench
+
    :room/wallet :wallets, :models/list :wallets
 
    :agent/list :agents, :agent/config :agents, :agent/create :agents,
@@ -54,6 +56,7 @@
    :attempts "Run a task N times per model on forks, as a job; Attempts, Scorecards"
    :runs     "The blocking workflow_attempt, and Runs (lower level)"
    :catalog  "Workflows with their own checker and benchmark set"
+   :bench    "Benchmark models on a workflow's benchmark set; experiment progress"
    :wallets  "Budgets and model prices"
    :repl     "The room's Clojure REPL (SCI sandbox) with dvergr's programming model"
    :agents   "Agent administration"
@@ -64,7 +67,8 @@
 (def profiles
   "Named selections. `:read-only?` keeps only tools annotated read-only."
   {:offload  {:toolsets #{:rooms :worlds :attempts :catalog :wallets :repl}}
-   :readonly {:toolsets #{:rooms :worlds :attempts :catalog :wallets :agents :system}
+   :bench    {:toolsets #{:rooms :attempts :catalog :bench :wallets}}
+   :readonly {:toolsets #{:rooms :worlds :attempts :catalog :bench :wallets :agents :system}
               :read-only? true}
    :admin    {:toolsets (set (keys toolsets))}})
 
@@ -132,6 +136,7 @@
    :workflow/start   {:destructiveHint false :idempotentHint false :openWorldHint true}
    :job/cancel       {:destructiveHint true  :idempotentHint true  :openWorldHint false}
    :catalog/start    {:destructiveHint false :idempotentHint false :openWorldHint true}
+   :catalog/benchmark {:destructiveHint false :idempotentHint false :openWorldHint true}
    :room/fork        {:destructiveHint false :idempotentHint false :openWorldHint false}
    :room/merge       {:destructiveHint true  :idempotentHint false :openWorldHint false}
    :room/discard     {:destructiveHint true  :idempotentHint true  :openWorldHint false}

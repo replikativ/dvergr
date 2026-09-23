@@ -119,3 +119,23 @@
       (is (nil? (forks/workspace-changes parent)))
       (is (= fork (:merged (ops/invoke *daemon* :room/merge {:room fork}))))
       (is (= "Fork work." (get (catalog/read-tree parent "/") "/fork.md"))))))
+
+(deftest a-benchmark-runs-as-an-experiment-in-a-daemon-room
+  ;; No separate process: the experiment is a job in a durable daemon room,
+  ;; its progress a query over that room's store.
+  (let [calls (atom 0)]
+    (with-redefs [providers/ensure-initialized! (constantly nil)
+                  chat-agent/messages->api-format (fn [messages _ _] messages)
+                  model-chat/chat (wiki-writer calls)]
+      (let [started (ops/invoke *daemon* :catalog/benchmark
+                                {:workflow "wiki/v1" :models ["claude-haiku-4-5"] :repetitions 2})
+            done (loop [n 0]
+                   (let [st (ops/invoke *daemon* :job/status {:job (:id started) :wait-ms 20000})]
+                     (if (or (not= "running" (:status st)) (< 8 n)) st (recur (inc n)))))
+            progress (ops/invoke *daemon* :experiment/progress {:room (:room started)})
+            [cand] (get-in progress [:experiments 0 :candidates])]
+        (is (= "completed" (:status done)) (pr-str (dissoc done :result)))
+        (is (= 1.0 (get-in done [:result :summary 0 :reward-mean])))
+        (is (= 2 (:done cand) (:verdicts cand)))
+        (is (pos? (:microdollars cand)))
+        (is (empty? (:running progress)) "nothing left running")))))

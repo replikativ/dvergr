@@ -425,7 +425,7 @@
     (evaluation/make-world-setup
      {:id :catalog/wiki-fixtures :version 1 :basis {:fixtures digest}
       :prepare (fn [{world :room}]
-                 (ws/open-memory-workspace! world)
+                 (ws/ensure-workspace! world)
                  (ws/seed! world files)
                  {:fixtures digest :files (count files)})})))
 
@@ -442,14 +442,11 @@
       :world {:isolation :ctx :settlement :discard
               :setup (evaluation/world-setup-ref setup)}})))
 
-(defn experiment!
-  "Run a benchmark set (`version` 1, the default, or 2) as an experiment:
-   `repetitions` attempts per
-   model in `models`, each in a discarded world, folded into a Scorecard.
-   `dir` is the experiment directory. Call from a dedicated JVM or REPL (the
-   runner moves Dvergr's state root into `dir`)."
-  [{:keys [dir models repetitions budget-dollars timeout-ms prompt parallelism version]
-    :or {repetitions 1 version 1}}]
+(defn experiment-plan
+  "What running a benchmark set (`version` 1, the default, or 2) needs,
+   wherever it runs: capabilities, environments, the candidate team (one per
+   model), the model specs, the dataset."
+  [{:keys [models budget-dollars timeout-ms prompt version] :or {version 1}}]
   (let [v2? (= 2 version)
         files (if v2? (fixtures-v2) (fixtures))
         setup (world-setup files)
@@ -458,14 +455,23 @@
              (evaluator (assoc params :gold (gold))))
         {:keys [team ids]} (workflow/candidates {:models models :profile "developer"
                                                  :budget-dollars budget-dollars :prompt prompt})]
-    ((requiring-resolve 'dvergr.agent.experiment.runner/run!)
-     {:dir dir
-      :benchmark :catalog-wiki
-      :capabilities {:world-setup setup :evaluator ev}
-      :environments [(environment setup ev {:timeout-ms timeout-ms :version version})]
-      :team team
-      :models (mapv #(:agent/model-policy (roster/agent team %)) ids)
-      :dataset {:id (keyword "catalog" (str "wiki-v" version))
-                :metadata {:fixtures (str (hasch/uuid files))}}
-      :repetitions repetitions
-      :parallelism (or parallelism 1)})))
+    {:benchmark :catalog-wiki
+     :capabilities {:world-setup setup :evaluator ev}
+     :environments [(environment setup ev {:timeout-ms timeout-ms :version version})]
+     :team team
+     :models (mapv #(:agent/model-policy (roster/agent team %)) ids)
+     :dataset {:id (keyword "catalog" (str "wiki-v" version))
+               :metadata {:fixtures (str (hasch/uuid files))}}}))
+
+(defn experiment!
+  "Run a benchmark set as an experiment in its own process: `repetitions`
+   attempts per model in `models`, each in a discarded world, folded into a
+   Scorecard, stored under `dir` (the runner moves Dvergr's state root into
+   `dir`: a dedicated JVM or REPL). In a daemon, use the `catalog/benchmark`
+   op instead, which runs the same plan in one of its rooms."
+  [{:keys [dir repetitions parallelism] :or {repetitions 1} :as opts}]
+  ((requiring-resolve 'dvergr.agent.experiment.runner/run!)
+   (assoc (experiment-plan opts)
+          :dir dir
+          :repetitions repetitions
+          :parallelism (or parallelism 1))))
