@@ -20,6 +20,7 @@
             [dvergr.agent.environment :as environment]
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.roster :as roster]
+            [dvergr.agent.spend :as spend]
             [dvergr.agent.verifiers :as verifiers]
             [dvergr.benchmarks.bfcl.core :as bfcl]
             [dvergr.benchmarks.bfcl.harness :as harness]
@@ -122,8 +123,10 @@
    :evaluator
    (evaluation/make-evaluator
     {:id :bfcl/ast-checker :version version :basis (basis) :tier :trusted
-     :observe (fn [{:keys [result durable]}]
-                (let [outcome (:run/value result)]
+     :observe (fn [{:keys [result durable agent]}]
+                (let [outcome (:run/value result)
+                      model (get-in agent [:agent/model-policy :model])
+                      usage (:usage outcome)]
                   {:result {:termination (or (:termination outcome) :infrastructure-error)}
                    :failure (when-not (= :completed (:run/status result))
                               {:status (:run/status result)
@@ -131,7 +134,13 @@
                                :message (:run/error durable)})
                    :calls (:calls outcome)
                    :content (:content outcome)
-                   :episode (select-keys outcome [:usage :stop-reason])}))
+                   :episode (select-keys outcome [:usage :stop-reason])
+                   ;; the Dvergr step reports its chat budget, the reference
+                   ;; call the provider's raw counts
+                   :spend (cond
+                            (and (map? usage) (contains? usage :used)) (spend/of-budget model usage)
+                            (map? usage) (spend/of-usage model usage)
+                            :else spend/zero)}))
      :verify (fn [definition {:keys [calls] :as evidence}]
                (let [task (task-of tasks definition)
                      completed? (= :completed (get-in evidence [:result :termination]))

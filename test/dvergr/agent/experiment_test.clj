@@ -288,7 +288,11 @@
                        :passed-count 4 :reward-sum 4.0 :reward-mean 1.0}
                       {:candidate/id :beta :attempt-count 4
                        :passed-count 4 :reward-sum 4.0 :reward-mean 1.0}]
-                     (:scorecard/summary scorecard)))
+                     (mapv #(dissoc % :spend :microdollars-per-attempt :microdollars-per-pass)
+                           (:scorecard/summary scorecard))))
+              (is (every? #(and (map? (:spend %)) (integer? (:microdollars (:spend %))))
+                          (:scorecard/summary scorecard))
+                  "every candidate's summary carries its bill")
               (is (= scorecard (experiment/validate-scorecard scorecard)))
               (is (= scorecard
                      (experiment/scorecard room
@@ -667,7 +671,8 @@
             (is (= [{:candidate/id :simulated-model
                      :attempt-count 1 :passed-count 1
                      :reward-sum 1.0 :reward-mean 1.0}]
-                   (:scorecard/summary scorecard)))
+                   (mapv #(dissoc % :spend :microdollars-per-attempt :microdollars-per-pass)
+                         (:scorecard/summary scorecard))))
             (is (empty? (run/active-runs (:id room))))
             (is (every? #(nil? (registry/lookup (:run/world %))) runs)
                 "all discarded/merged Run worlds release their registry handles"))))

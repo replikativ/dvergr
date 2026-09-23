@@ -129,12 +129,13 @@
                              #(mapv (fn [entry]
                                       (assoc entry :reward Double/MAX_VALUE))
                                     %))
-                     (assoc :scorecard/summary
-                            [{:candidate/id :overflow-candidate
-                              :attempt-count 2
-                              :passed-count 2
-                              :reward-sum ##Inf
-                              :reward-mean ##Inf}])
+                     ;; the summary the entries WOULD produce, its reward
+                     ;; aggregates overflowed; the other aggregates (spend)
+                     ;; stay what the entries say
+                     (update :scorecard/summary
+                             #(mapv (fn [summary]
+                                      (assoc summary :reward-sum ##Inf :reward-mean ##Inf))
+                                    %))
                      (dissoc :scorecard/content-id))]
     (assoc overflow :scorecard/content-id
            (hasch/uuid [:dvergr/experiment-scorecard overflow]))))
