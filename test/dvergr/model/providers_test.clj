@@ -165,3 +165,24 @@
           (is (= "Bearer fireworks-shared-url-credential" (bearer fireworks-request)))
           (is (not (contains? (:body openai-request) :reasoning_effort)))
           (is (not (contains? (:body fireworks-request) :reasoning_effort))))))))
+
+(deftest concurrent-initialization-never-sees-a-partial-registry
+  ;; parallel workflow attempts each call ensure-initialized!; a caller that
+  ;; arrived while another was still registering providers used to see e.g.
+  ;; only :openai and fail with "Provider not registered"
+  (let [registered (atom [])
+        original @#'providers/init-defaults!]
+    (providers/clear-all!)
+    (try
+      (with-redefs [providers/init-defaults!
+                    (fn [_]
+                      (doseq [k [:a :b :c]]
+                        (providers/register! k {:stub k})
+                        (Thread/sleep 30)))]
+        (let [seen (doall (pmap (fn [_] (providers/ensure-initialized! (constantly nil))
+                                  (set (providers/list-providers)))
+                                (range 6)))]
+          (is (every? #(= #{:a :b :c} %) seen) (str seen))))
+      (finally
+        (providers/clear-all!)
+        (original #(System/getenv %))))))

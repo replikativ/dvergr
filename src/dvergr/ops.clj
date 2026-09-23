@@ -29,6 +29,8 @@
             [dvergr.agent.experiment :as experiment]
             [dvergr.agent.ops :as aops]
             [dvergr.agent.run :as run]
+            [dvergr.agent.workflow :as workflow]
+            [dvergr.resource :as resource]
             [dvergr.agent.fields :as fields]
             [dvergr.rooms :as rooms]
             [dvergr.rooms.forks :as forks]
@@ -257,6 +259,25 @@
             (when-let [r (resolve-room daemon room)]
               (in-ctx daemon (run-data (run/run r (uuid-arg id))))))}
 
+   :room/wallet
+   {:doc "Conserved resources of a room's wallet, or of one Run's wallet: what is left to spend."
+    :kind :read
+    :schema [:map [:room Room]
+             [:run {:optional true} [:string {:description "a run id: that Run's wallet"}]]]
+    :impl (fn [daemon {:keys [room run]}]
+            (when-let [r (resolve-room daemon room)]
+              (in-ctx daemon
+                      (let [bal (try (if run
+                                       (resource/run-balance r (uuid-arg run))
+                                       (resource/balance r))
+                                     (catch Throwable e {::unavailable (ex-message e)}))]
+                        (if-let [why (::unavailable bal)]
+                          {:available false :reason why}
+                          {:available true
+                           :resources (into (sorted-map)
+                                            (map (fn [[k v]] [(str k) (if (number? v) (double v) v)]))
+                                            bal)})))))}
+
    :attempt/list
    {:doc "Certified Attempts of a room, newest first — each a leaderboard row: agent, environment, reward, checks, the bill."
     :kind :read
@@ -402,6 +423,42 @@
     :impl (fn [daemon {:keys [room]}]
             (when-let [r (resolve-room daemon room)]
               (in-ctx daemon (rooms/delete-room! r) {:deleted (id->str (:id r))})))}
+
+   :workflow/attempt
+   {:doc (str "Run a task several times per model, each attempt on its own copy-on-write "
+              "fork of the room (data, files, REPL), each with its own budget. Returns "
+              "every attempt's outcome, score, bill and diff, with the world to adopt: "
+              "room_merge one world, room_discard the others.")
+    :kind :write
+    :schema [:map [:room Room]
+             [:task [:string {:description "what the agent should do"}]]
+             [:attempts {:optional true} [:int {:min 1 :max 8 :description "attempts per model (default 1)"}]]
+             [:models {:optional true} [:vector {:description "model ids or aliases (default: the configured default)"} :string]]
+             [:budget-dollars {:optional true} [:double {:description "budget per attempt in USD (default 0.50)"}]]
+             [:profile {:optional true} [:enum {:description "developer = may edit files; worker = read-only (default)"} "developer" "worker"]]
+             [:timeout-ms {:optional true} [:int {:description "per attempt (default 10 minutes)"}]]]
+    :impl (fn [daemon {:keys [room] :as args}]
+            (when-let [r (resolve-room daemon room)]
+              (let [rows (workflow/attempt! r (assoc (dissoc args :room) :ctx (dctx daemon)))
+                    attempts (mapv (fn [{:keys [attempt world review]}]
+                                     (assoc (attempt-data attempt)
+                                            :world (id->str world)
+                                            :review review))
+                                   rows)]
+                {:task (:task args)
+                 :attempts attempts
+                 :by-model
+                 (->> attempts
+                      (group-by :model)
+                      (mapv (fn [[model xs]]
+                              (let [md (reduce + 0 (keep #(get-in % [:spend :microdollars]) xs))
+                                    ok (count (filter #(= 1.0 (:reward %)) xs))]
+                                {:model model :attempts (count xs) :completed ok
+                                 :microdollars md
+                                 :microdollars-per-completion (when (pos? ok) (quot md ok))})))
+                      (sort-by (juxt #(- (:completed %)) :microdollars))
+                      vec)
+                 :adopt "room_merge {room: <world>} adopts one attempt; room_discard {room: <world>} drops one"})))}
 
    :room/fork
    {:doc "Fork a room for speculative work (O(1) copy-on-write); merge or discard later."
