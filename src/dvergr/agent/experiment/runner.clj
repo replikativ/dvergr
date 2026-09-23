@@ -28,7 +28,9 @@
             [dvergr.discourse :as d]
             [dvergr.model.api.claude-code :as cc]
             [dvergr.model.registry :as registry]
+            [dvergr.room.store :as store]
             [hasch.core :as hasch]
+            [taoensso.telemere :as tel]
             [org.replikativ.spindel.engine.core :as ec]))
 
 (def host-context-note
@@ -42,55 +44,73 @@
 (defn- model-provider [{:keys [model provider]}]
   (or provider (when model (:provider (registry/get-model! (registry/resolve-alias model))))))
 
-(def ^:private progress-file "progress.edn")
+(defn experiment-def
+  "The ExperimentDef of a provider's pieces: `benchmark` (namespaces the ids),
+   `id`, `environments`, the candidate `team`, `dataset` `{:id :metadata}`,
+   `metadata`, `repetitions`."
+  [{:keys [benchmark id environments team dataset metadata repetitions]
+    :or {repetitions 1}}]
+  (experiment/make-experiment
+   {:id (keyword (name benchmark) (name id))
+    :dataset (experiment/make-dataset
+              {:id (:id dataset)
+               :environments environments
+               :metadata (:metadata dataset)})
+    :candidates (roster/agents team)
+    :repetitions repetitions
+    :metadata (or metadata {})}))
 
-(defn- progress-line
-  "One finished cell as a progress record: what a watcher needs without the
-   store (who, which repetition, status, reward, bill, why it failed)."
-  [started-ms {:keys [attempt error] job :experiment/job}]
+(defn- log-cell [benchmark {:keys [attempt error] job :experiment/job}]
   (let [r (:attempt/receipt attempt)
         m (:attempt/metrics r)]
-    (cond-> {:at (java.util.Date.)
-             :candidate (:candidate/id job)
-             :repetition (:repetition job)
-             :elapsed-s (quot (- (System/currentTimeMillis) started-ms) 1000)}
-      attempt (assoc :status (:attempt/status r)
-                     :reward (:attempt/reward r)
-                     :verdict? (experiment/verdict? attempt)
-                     :microdollars (get-in m [:spend :microdollars])
-                     :tokens (get-in m [:spend :tokens])
-                     :model-steps (:model-steps m)
-                     :attempt-seconds (some-> (:attempt/elapsed-ms r) (quot 1000)))
-      (:failure m) (assoc :failure (:failure m))
-      error (assoc :status :error :error error))))
+    (tel/log! {:id :experiment/cell
+               :data (cond-> {:benchmark benchmark
+                              :candidate (:candidate/id job)
+                              :repetition (:repetition job)}
+                       attempt (assoc :status (:attempt/status r) :reward (:attempt/reward r)
+                                      :microdollars (get-in m [:spend :microdollars]))
+                       (:failure m) (assoc :failure (:failure m))
+                       error (assoc :error error))}
+              "Experiment cell finished")))
+
+(defn run-in
+  "The experiment `experiment` (an ExperimentDef) of `team` in `room`, as a
+   Spin: every cell an evaluation in a fork of `room`, certified into its
+   store, resumable. Evaluates in `room`'s own context, whoever calls: a
+   daemon room's context is a fork of the daemon's, and an evaluation in the
+   latter loses its Run's wakeups. `capabilities` is
+   `{:world-setup :protocol :evaluator}` (setup and protocol when named)."
+  [room {:keys [capabilities team experiment parallelism cleanup-group benchmark]
+         :or {parallelism 1}}]
+  (let [{:keys [world-setup protocol evaluator]} capabilities
+        cells (* (count (:experiment/candidates experiment))
+                 (count (get-in experiment [:experiment/dataset :dataset/environments]))
+                 (:experiment/repetitions experiment))]
+    (binding [ec/*execution-context* (:ctx room)]
+      (experiment/run
+       room team experiment
+       {(evaluation/evaluator-ref evaluator) evaluator}
+       {:world-setups (if world-setup
+                        {(evaluation/world-setup-ref world-setup) world-setup}
+                        {})
+        :protocols (if protocol {(evaluation/protocol-ref protocol) protocol} {})
+        :parallelism parallelism
+        :max-parallelism (max 16 parallelism)
+        :max-attempts (max 256 cells)
+        :cleanup-group cleanup-group
+        :resume? true
+        :complete-only? true
+        :on-result #(log-cell benchmark %)}))))
 
 (defn progress
-  "The progress of the experiment in `dir`, from its progress file: every
-   finished cell, and per candidate the cells done, verdicts, faults, mean
-   reward and spend so far. Readable while the experiment runs."
+  "The progress of the experiment stored in `dir` (a `run!` directory),
+   derived from its store: see `dvergr.agent.experiment/progress`."
   [dir]
-  (let [f (io/file dir progress-file)
-        cells (if (.exists f)
-                (with-open [r (java.io.PushbackReader. (io/reader f))]
-                  (vec (take-while some? (repeatedly #(read {:eof nil} r)))))
-                [])]
-    {:cells cells
-     :by-candidate
-     (->> cells
-          (group-by :candidate)
-          (map (fn [[c xs]]
-                 (let [verdicts (filter :verdict? xs)
-                       rewards (keep :reward verdicts)]
-                   {:candidate c
-                    :done (count xs)
-                    :verdicts (count verdicts)
-                    :faults (count (remove :verdict? xs))
-                    :reward-mean (when (seq rewards) (/ (reduce + rewards) (count rewards)))
-                    :dollars (/ (reduce + 0 (keep :microdollars xs)) 1e6)
-                    :failures (frequencies (keep #(get-in % [:failure :cause]) xs))})))
-          (sort-by (comp str :candidate))
-          vec)
-     :dollars (/ (reduce + 0 (keep :microdollars cells)) 1e6)}))
+  (let [xs (conv/open-store! dir)]
+    (try
+      (let [room-id (some->> (store/-list-rooms (:store xs)) first :id)]
+        (experiment/progress {:id room-id :store (:store xs)}))
+      (finally (conv/close-store! xs)))))
 
 (defn run!
   "Run (or resume) an experiment. Returns `{:dir :experiment-room :experiment
@@ -113,8 +133,9 @@
      :usage-pause-threshold :usage-retries
 
    Calls `conv/isolate-home!`: Dvergr's state root becomes `<dir>/home` for
-   the whole process. Run experiments in a dedicated JVM or REPL, never in a
-   daemon process."
+   the whole process. This is the separate-process host (a dedicated JVM or
+   REPL, never a daemon); in a daemon, run an experiment in one of its rooms
+   with `run-in` (e.g. the `catalog/benchmark` op)."
   [{:keys [dir benchmark capabilities environments team models dataset metadata
            repetitions parallelism experiment-id claude-cli claude-env
            usage-pause-threshold usage-retries]
@@ -139,54 +160,22 @@
         room-id (or experiment-id (keyword (name benchmark) (.getName (io/file dir))))
         room (d/make-room {:id room-id :store (:store xs)
                            :title (str (name benchmark) " experiment " (name room-id))})
-        {:keys [world-setup protocol evaluator]} capabilities
-        experiment-def (experiment/make-experiment
-                        {:id (keyword (name benchmark) (name room-id))
-                         :dataset (experiment/make-dataset
-                                   {:id (:id dataset)
-                                    :environments environments
-                                    :metadata (:metadata dataset)})
-                         :candidates (roster/agents team)
-                         :repetitions repetitions
-                         :metadata (cond-> (or metadata {})
-                                     host (assoc :host host))})
-        cells (* (count (roster/agents team)) (count environments) repetitions)
+        experiment-def (experiment-def {:benchmark benchmark :id room-id
+                                        :environments environments :team team
+                                        :dataset dataset :repetitions repetitions
+                                        :metadata (cond-> (or metadata {})
+                                                    host (assoc :host host))})
         ;; Detached evaluation cleanup of this operation is joined before the
         ;; Room and its store are closed.
         cleanup-group (evaluation/cleanup-group)
-        started-ms (System/currentTimeMillis)
-        ;; Visible while it runs: one line per finished cell in <dir>/progress.edn
-        ;; (read it with `progress`), and a short line on stderr.
-        on-result (fn [result]
-                    (let [line (progress-line started-ms result)]
-                      (locking progress-file
-                        (spit (io/file dir progress-file) (str (pr-str line) "\n") :append true))
-                      (binding [*out* *err*]
-                        (println (str "[experiment " (name benchmark) "] "
-                                      (:candidate line) " #" (:repetition line) " "
-                                      (name (:status line)) " reward " (:reward line)
-                                      " $" (some-> (:microdollars line) (/ 1e6))
-                                      (when-let [f (:failure line)] (str " (" (name (:kind f)) ": " (:cause f) ")"))
-                                      (when-let [e (:error line)] (str " error: " e)))))))
         run-once (fn []
                    ;; Wait outside the Runs: inside one, the wait would count
                    ;; against the evaluation's own timeout.
                    (when uses-cc? (cc/await-usage-window! {:threshold usage-pause-threshold}))
-                   (binding [ec/*execution-context* (:ctx room)]
-                     @(experiment/run
-                       room team experiment-def
-                       {(evaluation/evaluator-ref evaluator) evaluator}
-                       {:world-setups (if world-setup
-                                        {(evaluation/world-setup-ref world-setup) world-setup}
-                                        {})
-                        :protocols (if protocol {(evaluation/protocol-ref protocol) protocol} {})
-                        :parallelism parallelism
-                        :max-parallelism (max 16 parallelism)
-                        :max-attempts (max 256 cells)
-                        :cleanup-group cleanup-group
-                        :resume? true
-                        :complete-only? true
-                        :on-result on-result})))]
+                   (let [spin (run-in room {:capabilities capabilities :team team
+                                            :experiment experiment-def :parallelism parallelism
+                                            :cleanup-group cleanup-group :benchmark benchmark})]
+                     (binding [ec/*execution-context* (:ctx room)] @spin)))]
     (try
       (let [result (loop [n 0]
                      (let [r (run-once)]

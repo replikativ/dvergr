@@ -31,6 +31,7 @@
             [dvergr.agent.run :as run]
             [dvergr.agent.workflow :as workflow]
             [dvergr.catalog :as catalog]
+            [dvergr.agent.experiment.runner :as runner]
             [dvergr.jobs :as jobs]
             [dvergr.resource :as resource]
             [dvergr.agent.fields :as fields]
@@ -344,6 +345,16 @@
             (when-let [r (resolve-room daemon room)]
               (in-ctx daemon (wallet-data r (some-> run uuid-arg)))))}
 
+   :experiment/progress
+   {:doc (str "What the experiments in a room have done so far, from its store: per experiment and "
+              "candidate the certified cells, verdicts, faults, mean reward, spend and failure causes, "
+              "and the Runs still running. The same while it runs and after.")
+    :kind :read
+    :schema [:map [:room Room]]
+    :impl (fn [daemon {:keys [room]}]
+            (when-let [r (resolve-room daemon room)]
+              (in-ctx daemon (experiment/progress r))))}
+
    :catalog/list
    {:doc "Workflows that come with their own checker and benchmark set; run one with catalog_start."
     :kind :read
@@ -574,6 +585,40 @@
                                                 :environment-id environment-id}))
                     (assoc :workflow (subs (str (:id wf)) 1)
                            :mode (if benchmark? "benchmark" "room"))))))}
+
+   :catalog/benchmark
+   {:doc (str "Benchmark models on a catalog workflow's benchmark set, as an experiment in a new "
+              "room: each attempt in a discarded world with the fixtures, scored by the workflow's "
+              "checker, folded into a Scorecard with the bill. Returns a job; experiment_progress "
+              "{room} shows every certified cell while it runs.")
+    :kind :write
+    :schema [:map
+             [:workflow [:string {:description "catalog workflow id, e.g. wiki/v2"}]]
+             [:models [:vector {:description "model ids or aliases"} :string]]
+             [:repetitions {:optional true} [:int {:min 1 :max 10 :description "attempts per model (default 1)"}]]
+             [:budget-dollars {:optional true} [:double {:description "budget per attempt in USD (default 0.50)"}]]
+             [:timeout-ms {:optional true} [:int {:description "per attempt (default 10 minutes)"}]]]
+    :impl (fn [daemon {:keys [workflow models repetitions] :as args}]
+            (let [wf (catalog/lookup workflow)
+                  plan-fn (or (:experiment-plan wf)
+                              (throw (ex-info (str workflow " has no benchmark set") {:type ::no-benchmark})))
+                  plan (plan-fn (select-keys args [:models :budget-dollars :timeout-ms]))
+                  slug (str "bench-" (slugify (subs (str (:id wf)) 1)) "-" (subs (str (random-uuid)) 0 8))
+                  r (in-ctx daemon
+                            (rooms/create-room! {:title (str (:title wf) " (benchmark)") :slug slug})
+                            (rreg/lookup (keyword slug)))
+                  exp (runner/experiment-def (assoc plan :id (keyword slug) :repetitions (or repetitions 1)))
+                  spin (runner/run-in r (assoc plan :experiment exp))]
+              (-> (jobs/start! {:op "catalog/benchmark" :room slug :task workflow}
+                               #(let [{:keys [scorecard]} (binding [ec/*execution-context* (:ctx r)] @spin)]
+                                  (merge {:room slug :models models}
+                                         (if (:incomplete scorecard)
+                                           {:incomplete (:incomplete scorecard)}
+                                           {:summary (:scorecard/summary scorecard)})))
+                               :cancel #(binding [ec/*execution-context* (:ctx r)]
+                                          (spin-core/cancel-spin! spin)))
+                  job-data
+                  (assoc :room slug :poll-after-ms 30000))))}
 
    :job/cancel
    {:doc "Cancel a running job (e.g. a workflow_start): its attempts are stopped."

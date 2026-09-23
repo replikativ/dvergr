@@ -425,6 +425,28 @@
         ;; turn loop is bounded by BUDGET, not by a turn cap, so one corrective
         ;; turn costs a few cents and rescues the work.
         (cond
+          ;; Cut off at the output limit before any answer or tool call (a
+          ;; reasoning model can spend the whole limit thinking): not an empty
+          ;; answer, and a nudge to take smaller steps usually fixes it.
+          (and (str/blank? content) (#{:length :max-tokens} stop-reason))
+          (let [note (str "Your previous reply was cut off at the output limit before it "
+                          "produced an answer or a tool call. Take smaller steps: think "
+                          "briefly, and write one file per tool call.")]
+            (if-not (has-system-note? chat-ctx note)
+              (do
+                (tel/log! {:level :warn :id :agent/output-truncated
+                           :data {:turn turn-number :run-id run-id}}
+                          "Model output cut off at the token limit — requesting smaller steps")
+                (chat-ctx/add-system-note! chat-ctx note :important? true)
+                :continue)
+              (do
+                (tel/log! {:level :error :id :agent/repeated-output-truncation
+                           :data {:turn turn-number :run-id run-id}}
+                          "Model output cut off at the token limit again")
+                (record-failure! {:kind :model
+                                  :cause "output cut off at the output-token limit"})
+                :error)))
+
           (str/blank? content)
           (let [note (empty-response-note chat-ctx run-id)]
             (if-not (has-system-note? chat-ctx note)

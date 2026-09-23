@@ -265,3 +265,12 @@
             {:role "tool" :tool_call_id "call_123" :content "18 C"}]
            (:messages body)))
     (is (= "none" (:reasoning_effort body)))))
+
+(deftest the-output-limit-defaults-to-the-model-s
+  ;; A fixed 8192 cut reasoning models off before they answered.
+  (dvergr.model.registry/load-models-resource!)
+  (let [provider (dvergr.model.api.openai/create-fireworks {:api-key "k"} (constantly nil))
+        body #(:body (dvergr.model.provider/build-request provider [{:role :user :content "hi"}] %))]
+    (is (= 16384 (:max_completion_tokens (body {:model "accounts/fireworks/models/glm-5p3"}))))
+    (is (= 100 (:max_completion_tokens (body {:model "accounts/fireworks/models/glm-5p3" :max-tokens 100}))))
+    (is (= 8192 (:max_completion_tokens (body {:model "no-such-model"}))))))

@@ -32,7 +32,8 @@
     :profile "developer"
     :task wiki/task
     :evaluator (fn [params gold] (wiki/evaluator (assoc params :gold gold)))
-    :benchmark {:fixtures wiki/fixtures :gold wiki/gold}}
+    :benchmark {:fixtures wiki/fixtures :gold wiki/gold}
+    :experiment-plan #(wiki/experiment-plan (assoc % :version 1))}
 
    :wiki/v2
    {:id :wiki/v2
@@ -48,7 +49,8 @@
                  (if gold
                    (wiki/evaluator-v2 (assoc params :gold gold))
                    (wiki/evaluator params)))
-    :benchmark {:fixtures wiki/fixtures-v2 :gold wiki/gold-v2}}})
+    :benchmark {:fixtures wiki/fixtures-v2 :gold wiki/gold-v2}
+    :experiment-plan #(wiki/experiment-plan (assoc % :version 2))}})
 
 (defn lookup
   "The catalog workflow `id` (keyword or \"ns/name\" string), or throws."

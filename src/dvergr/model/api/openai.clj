@@ -90,7 +90,12 @@
                        (:extra-headers config))
        :credentials (:credentials config)
        :body (cond-> {:model (:model opts "gpt-4o")
-                      :max_completion_tokens (:max-tokens opts 8192)
+                      ;; The model's own output limit when the caller sets none: a
+                      ;; reasoning model can spend a fixed 8192 on thinking alone
+                      ;; and be cut off with no answer (GLM 5.3 on wiki/v2).
+                      :max_completion_tokens (or (:max-tokens opts)
+                                                 (:max-output (registry/get-model (:model opts)))
+                                                 8192)
                       :stream true
                       :stream_options {:include_usage true}
                       :messages (format-messages
