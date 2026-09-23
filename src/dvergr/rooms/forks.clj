@@ -266,6 +266,19 @@
                             {:type ::workspace-commit-failed :room (:id room) :argv argv}))))))
     changes))
 
+(defn- prepare-workspaces!
+  "Make `fork` mergeable into `parent`: commit the fork's work (a merge adopts
+   commits only), and refuse a parent with uncommitted changes here, before
+   the merge fences the fork (geschichte refuses a merge into a dirty
+   workspace, and that refusal left the fork fenced, unmergeable)."
+  [parent fork]
+  (when-let [dirty (workspace-changes parent)]
+    (throw (ex-info (str "The parent " (name (:id parent)) " has uncommitted changes ("
+                         (str/join ", " (take 5 dirty)) (when (< 5 (count dirty)) ", …")
+                         "); commit or discard them before merging a fork into it")
+                    {:type ::parent-dirty :parent (:id parent) :uncommitted dirty})))
+  (commit-workspace! fork (str "Work of fork " (name (:id fork)))))
+
 (defn state-token
   "A content hash of `fork`'s state: its mergeable systems' snapshot ids (git
    commit, datahike commit, …). It changes whenever the fork does, so a merge
@@ -304,7 +317,7 @@
     (require-settleable! fork :merge)
     (if-let [parent (rreg/lookup (:parent-id fork))]
       (let [run-id (some-> fork :meta deref :run-id)]
-        (commit-workspace! fork (str "Work of fork " (name (:id fork))))
+        (prepare-workspaces! parent fork)
         (d/merge-room parent fork)
         (when run-id
           (agent-run/update-durable-settlement! parent run-id :merged :review-approved))
@@ -434,7 +447,7 @@
       (merge! fork)
       (if-let [parent (rreg/lookup (:parent-id fork))]
         (try
-          (commit-workspace! fork (str "Work of fork " (name (:id fork))))
+          (prepare-workspaces! parent fork)
           (let [call        (requiring-resolve 'dvergr.tools.llm-call/cheap-llm-call)
                 resp        (call reconcile-instruction (reconcile-prompt conflicts) {})
                 resolutions (parse-resolutions (:text resp) conflicts)]
