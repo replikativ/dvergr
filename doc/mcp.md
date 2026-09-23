@@ -52,15 +52,16 @@ neither listed nor callable.
 
 | Profile | Toolsets | Tools |
 | --- | --- | --- |
-| `offload` (default) | rooms, worlds, attempts, wallets, repl | 20 |
+| `offload` (default) | rooms, worlds, attempts, wallets, repl | 22 |
 | `readonly` | every read op | read-only only |
 | `admin` | everything | all |
 
 | Toolset | What |
 | --- | --- |
 | `rooms` | create, list, detail, delete, messages, post |
-| `worlds` | fork, diff, merge, discard |
-| `attempts` | `workflow_attempt`; Runs, Attempts, Scorecards |
+| `worlds` | fork, review, diff, merge, discard |
+| `attempts` | `workflow_start` and the job tools; Attempts, Scorecards |
+| `runs` | the blocking `workflow_attempt`; Runs |
 | `wallets` | `room_wallet`, `models_list` |
 | `repl` | `clojure_eval` in the room's SCI sandbox |
 | `agents` | agent administration, `room_invite` |
@@ -87,6 +88,15 @@ around 40, and every definition costs context in every session.
 - **Schemas** are flat and closed (`additionalProperties: false`, no `oneOf`/`anyOf`/`$ref`) and
   names match `^[a-z][a-z0-9_]{0,39}$`, so strict model APIs accept them; `server_test` checks
   every tool.
+- **Long work is a job.** `workflow_start` returns a job at once; `job_status {job, wait-ms}`
+  answers when it finishes or after at most 25 s (below every common client timeout), and
+  `job_cancel` stops it. Jobs belong to the daemon: a client can restart and poll again
+  (`job_list`); a daemon restart drops them, while their Attempts stay recorded.
+- **Merges are pinned to the review.** `room_review` (and every workflow attempt's review)
+  carries the fork's `state`, a hash of its systems' snapshot ids; `room_merge {room,
+  expect-state}` refuses a fork that changed since. A failed merge is an error, not a success.
+- **Money is in the result.** A workflow result has each attempt's spend, the per-model table
+  (cost per completed attempt) and the room's wallet afterwards.
 - REPL definitions live in the daemon's memory: they do not survive a daemon restart. Keep
   lasting code in the room's workspace.
 
@@ -98,12 +108,9 @@ answered with the latest. Tools, resources (derived from the read ops) with subs
 
 ## Next
 
-1. Jobs for long calls: `workflow_attempt` can exceed client timeouts (Codex 60 s by default,
-   Claude Code backgrounds after 2 min); start / status / wait / cancel, owned by the daemon.
-   Spend and wallet on every result; `room_merge` pinned to the tested commit.
-2. `repl_describe` (search the bound API) next to `clojure_eval`; evals metered to the wallet;
+1. `repl_describe` (search the bound API) next to `clojure_eval`; evals metered to the wallet;
    a `code-mode` profile.
-3. MCP 2026-07-28 (stateless, `server/discover`, `_meta` per request) and Streamable HTTP for
+2. MCP 2026-07-28 (stateless, `server/discover`, `_meta` per request) and Streamable HTTP for
    hosted use, then OAuth.
-4. A `data` toolset over pg-datahike (load a `pg_dump`, migrate on a fork, merge), and a client
+3. A `data` toolset over pg-datahike (load a `pg_dump`, migrate on a fork, merge), and a client
    test pass over Cursor, VS Code, Gemini CLI, n8n and ChatGPT.

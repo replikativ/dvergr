@@ -22,11 +22,14 @@
   {:room/list :rooms, :room/detail :rooms, :room/create :rooms,
    :room/delete :rooms, :room/messages :rooms, :room/post :rooms
 
-   :room/fork :worlds, :room/diff :worlds, :room/merge :worlds, :room/discard :worlds
+   :room/fork :worlds, :room/diff :worlds, :room/review :worlds,
+   :room/merge :worlds, :room/discard :worlds
 
-   :workflow/attempt :attempts, :run/list :attempts, :run/detail :attempts,
-   :attempt/list :attempts, :attempt/detail :attempts,
+   :workflow/start :attempts, :job/status :attempts, :job/list :attempts,
+   :job/cancel :attempts, :attempt/list :attempts, :attempt/detail :attempts,
    :scorecard/list :attempts, :scorecard/detail :attempts
+
+   :workflow/attempt :runs, :run/list :runs, :run/detail :runs
 
    :room/wallet :wallets, :models/list :wallets
 
@@ -46,7 +49,8 @@
   "Every toolset, with what it is for."
   {:rooms    "Rooms: create, list, read messages, post a task"
    :worlds   "Forks of a room: fork, diff, merge, discard"
-   :attempts "Run a task N times per model on forks; Runs, Attempts, Scorecards"
+   :attempts "Run a task N times per model on forks, as a job; Attempts, Scorecards"
+   :runs     "The blocking workflow_attempt, and Runs (lower level)"
    :wallets  "Budgets and model prices"
    :repl     "The room's Clojure REPL (SCI sandbox) with dvergr's programming model"
    :agents   "Agent administration"
@@ -122,6 +126,8 @@
    :room/create      {:destructiveHint false :idempotentHint false :openWorldHint false}
    :room/delete      {:destructiveHint true  :idempotentHint true  :openWorldHint false}
    :workflow/attempt {:destructiveHint false :idempotentHint false :openWorldHint true}
+   :workflow/start   {:destructiveHint false :idempotentHint false :openWorldHint true}
+   :job/cancel       {:destructiveHint true  :idempotentHint true  :openWorldHint false}
    :room/fork        {:destructiveHint false :idempotentHint false :openWorldHint false}
    :room/merge       {:destructiveHint true  :idempotentHint false :openWorldHint false}
    :room/discard     {:destructiveHint true  :idempotentHint true  :openWorldHint false}
@@ -228,8 +234,10 @@
     ""
     "- Forks: `room_fork` makes an isolated copy-on-write world of a room; `room_diff` shows what changed;"
     "  `room_merge` adopts it into its parent; `room_discard` drops it."
-    "- Attempts: `workflow_attempt` runs a task several times per model, each on its own fork, and returns"
-    "  per-attempt status, spend and a review of each world. Adopt one with `room_merge`, discard the rest."
+    "- Attempts: `workflow_start` runs a task several times per model, each on its own fork, as a job;"
+    "  poll `job_status {job, wait-ms}`. The result has per-attempt status, spend and a review of each world."
+    "  Adopt one with `room_merge {room: world, expect-state: review.state}`, `room_discard` the rest."
+    "- Long work is a job: start it, then `job_status` (waits up to 25 s per call), `job_cancel`."
     "- Money: every model call is billed to the room's wallet (`room_wallet`); a spent wallet refuses work."
     "- REPL: `clojure_eval` evaluates Clojure in the room's sandbox (SCI). State persists per room."
     "- Results are JSON. Large results are cut; ask for less (limits, detail ops) rather than more."

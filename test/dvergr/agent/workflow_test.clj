@@ -79,7 +79,7 @@
           (is (pos? (:microdollars-per-completion (first (:by-model out)))))
           (testing "adoption goes through the existing fork ops"
             (let [[a b] (map :world (:attempts out))]
-              (is (= {:merged a} (ops/invoke {:execution-ctx (:ctx room)} :room/merge {:room a})))
+              (is (= a (:merged (ops/invoke {:execution-ctx (:ctx room)} :room/merge {:room a}))))
               (is (= {:discarded b} (ops/invoke {:execution-ctx (:ctx room)} :room/discard {:room b})))))))
       (finally
         (try (binding [ec/*execution-context* (:ctx room)] (rreg/unregister! (:id room))) (catch Throwable _ nil))
@@ -95,3 +95,79 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"at most 4 models"
                             (workflow/attempt! room {:task "x" :models ["a" "b" "c" "d" "e"]})))
       (finally (d/close-room! room)))))
+
+(defmacro ^:private with-room [[sym id] & body]
+  `(let [~sym (d/make-room {:id ~id :store (memory/make)})]
+     (try
+       (binding [ec/*execution-context* (:ctx ~sym)] (rreg/register! ~sym))
+       ~@body
+       (finally
+         (try (binding [ec/*execution-context* (:ctx ~sym)] (rreg/unregister! (:id ~sym)))
+              (catch Throwable _# nil))
+         (d/close-room! ~sym)))))
+
+(deftest a-workflow-runs-as-a-job-a-client-polls
+  (with-room [room :workflow-job-test]
+    (let [daemon {:execution-ctx (:ctx room)} calls (atom [])]
+      (with-stub-model calls
+        (let [started (ops/invoke daemon :workflow/start
+                                  {:room "workflow-job-test" :task "summarise" :attempts 2
+                                   :models ["claude-haiku-4-5"]})
+              job (:id started)]
+          (is (= "running" (:status started)) "returns at once")
+          (is (pos? (:poll-after-ms started)))
+          (let [done (loop [n 0]
+                       (let [st (ops/invoke daemon :job/status {:job job :wait-ms 5000})]
+                         (if (or (not= "running" (:status st)) (< 20 n)) st (recur (inc n)))))
+                result (:result done)]
+            (is (= "completed" (:status done)) (pr-str (dissoc done :result)))
+            (is (= 2 (count (:attempts result))))
+            (is (every? #(string? (get-in % [:review :state])) (:attempts result))
+                "each attempt's review carries the state to pin a merge to")
+            (is (contains? result :wallet) "the result says what is left to spend")
+            (is (some #(= job (:id %)) (ops/invoke daemon :job/list {:room "workflow-job-test"})))
+            (is (not-any? :result (ops/invoke daemon :job/list {})) "lists stay small")
+            (let [[a b] (:attempts result)]
+              (is (= (:world a) (:merged (ops/invoke daemon :room/merge
+                                                     {:room (:world a)
+                                                      :expect-state (get-in a [:review :state])}))))
+              (ops/invoke daemon :room/discard {:room (:world b)}))))))))
+
+(deftest a-job-can-be-cancelled
+  (with-room [room :workflow-cancel-test]
+    (let [daemon {:execution-ctx (:ctx room)} release (promise)]
+      (with-redefs [providers/ensure-initialized! (constantly nil)
+                    chat-agent/messages->api-format (fn [messages _ _] messages)
+                    model-chat/chat (fn [_ _]
+                                      (deref release 20000 nil)
+                                      {:content "late" :tool-calls nil
+                                       :usage {:input-tokens 1 :output-tokens 1} :stop-reason :end-turn})]
+        (let [job (:id (ops/invoke daemon :workflow/start
+                                   {:room "workflow-cancel-test" :task "slow" :models ["claude-haiku-4-5"]}))
+              cancelled (ops/invoke daemon :job/cancel {:job job})]
+          (is (= "cancelled" (:status cancelled)))
+          (deliver release true)
+          (Thread/sleep 500)
+          (is (= "cancelled" (:status (ops/invoke daemon :job/status {:job job})))
+              "work finishing after the cancel does not revive the job"))))))
+
+(deftest a-merge-is-pinned-to-the-reviewed-state
+  (with-room [room :workflow-pin-test]
+    (let [daemon {:execution-ctx (:ctx room)}
+          fork (binding [ec/*execution-context* (:ctx room)] (forks/fork! room))
+          fid (name (:id fork))]
+      (with-redefs [forks/state-token (fn [_] "state-now")]
+        (is (= "state-now" (:state (ops/invoke daemon :room/review {:room fid}))))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"changed since it was reviewed"
+                              (ops/invoke daemon :room/merge {:room fid :expect-state "state-then"})))
+        (is (some? (binding [ec/*execution-context* (:ctx room)] (rreg/lookup (:id fork))))
+            "a refused merge leaves the fork open")
+        (is (= fid (:merged (ops/invoke daemon :room/merge {:room fid :expect-state "state-now"}))))))))
+
+(deftest a-failed-merge-is-reported-as-a-failure
+  (with-room [room :workflow-merge-fail-test]
+    (let [daemon {:execution-ctx (:ctx room)}
+          fork (binding [ec/*execution-context* (:ctx room)] (forks/fork! room))]
+      (with-redefs [forks/reconcile-merge! (fn [_] {:ok? false :error "parent is gone"})]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"failed: parent is gone"
+                              (ops/invoke daemon :room/merge {:room (name (:id fork))})))))))
