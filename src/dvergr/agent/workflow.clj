@@ -90,7 +90,8 @@
     :task task
     :verifier (let [ref (evaluation/evaluator-ref (or evaluator completion-evaluator))]
                 {:id (:verifier/id ref) :version (:verifier/version ref)})
-    :limits {:timeout-ms (or timeout-ms (* 10 60 1000)) :cancel-timeout-ms 30000}
+    :limits {:timeout-ms (or timeout-ms (* 10 60 1000)) :cancel-timeout-ms 30000
+             :on-timeout :verdict}
     :world {:isolation :ctx :settlement :review}}))
 
 (defn- delta-summary

@@ -438,7 +438,9 @@
      {:id (keyword "catalog" (str "wiki-v" version))
       :task (if (= 2 version) (task-v2 params) (task params))
       :verifier {:id (:verifier/id ref) :version (:verifier/version ref)}
-      :limits {:timeout-ms (or timeout-ms (* 10 60 1000)) :cancel-timeout-ms 30000}
+      ;; Not finishing in time is the candidate's verdict, not a fault.
+      :limits {:timeout-ms (or timeout-ms (* 10 60 1000)) :cancel-timeout-ms 30000
+               :on-timeout :verdict}
       :world {:isolation :ctx :settlement :discard
               :setup (evaluation/world-setup-ref setup)}})))
 

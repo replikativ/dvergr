@@ -14,7 +14,7 @@
             [dvergr.system.db :as sdb]
             [org.replikativ.spindel.core :as sp]))
 
-(defn- run-with [model-fn & {:keys [repetitions dir] :or {repetitions 2}}]
+(defn- run-with [model-fn & {:keys [repetitions dir timeout-ms] :or {repetitions 2 timeout-ms 60000}}]
   (let [prev (paths/home)
         dir (or dir (str (System/getProperty "java.io.tmpdir") "/dvergr-visibility-" (random-uuid)))]
     (try
@@ -22,7 +22,7 @@
                     chat-agent/messages->api-format (fn [messages _ _] messages)
                     model-chat/chat model-fn]
         (assoc (wiki/experiment! {:dir dir :version 2 :models ["claude-haiku-4-5"]
-                                  :repetitions repetitions :timeout-ms 60000})
+                                  :repetitions repetitions :timeout-ms timeout-ms})
                :dir dir))
       (finally
         (paths/set-home! prev)
@@ -113,3 +113,17 @@
   ;; 8192-token default, which the harness mistook for an empty answer.
   (let [{:keys [dir]} (run-with truncated-model :repetitions 1)]
     (is (= {"output cut off at the output-token limit" 1} (:failures (cand dir))))))
+
+(defn- stalling-model [_ _]
+  (Thread/sleep 8000)
+  {:content "late" :tool-calls nil :usage {:input-tokens 10 :output-tokens 1} :stop-reason :end-turn})
+
+(deftest a-timeout-counts-against-the-candidate-where-the-environment-says-so
+  ;; wiki/v2 declares {:on-timeout :verdict}: not finishing in time is the
+  ;; candidate's failure, scored 0, not a fault that resume would re-run.
+  (let [{:keys [scorecard dir]} (run-with stalling-model :repetitions 1 :timeout-ms 2000)
+        p (cand dir)]
+    (is (nil? (:incomplete scorecard)) (pr-str (:incomplete scorecard)))
+    (is (= 0.0 (get-in scorecard [:scorecard/summary 0 :reward-mean])))
+    (is (= {"timed out after 2000 ms" 1} (:failures p)))
+    (is (= 1 (:verdicts p)))))
