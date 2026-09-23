@@ -368,6 +368,14 @@
 ;; Fireworks Provider (OpenAI-compatible)
 ;; ============================================================================
 
+(defn- fireworks-key
+  "The Fireworks key: FIREWORKS_API_KEY, or OPENAI_API_KEY when OPENAI_BASE_URL
+   points at Fireworks (an OpenAI-compatible setup that many tools share)."
+  [env-lookup]
+  (or (env-lookup "FIREWORKS_API_KEY")
+      (when (some-> (env-lookup "OPENAI_BASE_URL") (str/includes? "fireworks.ai"))
+        (env-lookup "OPENAI_API_KEY"))))
+
 (defn create-fireworks
   "Create a Fireworks provider (uses OpenAI-compatible API).
 
@@ -379,7 +387,7 @@
    (create-fireworks config system-env))
   ([config env-lookup]
    (let [api-key (or (:api-key config)
-                     (env-lookup "FIREWORKS_API_KEY"))
+                     (fireworks-key env-lookup))
          base-url (normalize-base-url
                    (or (:base-url config)
                        (env-lookup "FIREWORKS_BASE_URL")
@@ -408,5 +416,5 @@
   ([config env-lookup]
    (when (or (:credentials config)
              (:api-key config)
-             (env-lookup "FIREWORKS_API_KEY"))
+             (fireworks-key env-lookup))
      (create-fireworks config env-lookup))))
