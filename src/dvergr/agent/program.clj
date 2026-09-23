@@ -1353,7 +1353,10 @@
                   (cond-> {:id id :kind :agent-task :provenance provenance}
                     parent-run (assoc :parent parent-run)))
       (catch Throwable t
-        (d/discard work-room)
+        ;; Drop the world the Run never owned, by its own policy (a deferred
+        ;; world refuses a plain discard), and keep the admission error.
+        (try ((if (= :deferred settlement) d/discard-deferred d/discard) work-room)
+             (catch Throwable _ nil))
         (throw t)))
     (run/register-cancel-hook! id ::native-worker
                                #(cancel-supervisor! supervisor))

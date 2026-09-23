@@ -91,7 +91,9 @@ around 40, and every definition costs context in every session.
 - **Long work is a job.** `workflow_start` returns a job at once; `job_status {job, wait-ms}`
   answers when it finishes or after at most 25 s (below every common client timeout), and
   `job_cancel` stops it. Jobs belong to the daemon: a client can restart and poll again
-  (`job_list`); a daemon restart drops them, while their Attempts stay recorded.
+  (`job_list`); a daemon restart drops them, while their Attempts stay recorded. A workflow's
+  attempts run one after another for now: concurrent Runs on one durable room can kill its
+  Datahike writer (a Scriptum publication-ownership race, reported upstream).
 - **Merges are pinned to the review.** `room_review` (and every workflow attempt's review)
   carries the fork's `state`, a hash of its systems' snapshot ids; `room_merge {room,
   expect-state}` refuses a fork that changed since. A failed merge is an error, not a success.

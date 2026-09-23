@@ -500,7 +500,7 @@
     :impl (fn [daemon {:keys [room] :as args}]
             (when-let [r (resolve-room daemon room)]
               (workflow-result daemon r (:task args)
-                               (workflow/attempt! r (assoc (dissoc args :room) :ctx (dctx daemon))))))}
+                               (workflow/attempt! r (dissoc args :room)))))}
 
    :workflow/start
    {:doc (str "Start workflow_attempt as a job and return at once: run a task several times "
@@ -513,7 +513,7 @@
     :schema WorkflowArgs
     :impl (fn [daemon {:keys [room] :as args}]
             (when-let [r (resolve-room daemon room)]
-              (let [{:keys [spin ctx finish]} (workflow/start r (assoc (dissoc args :room) :ctx (dctx daemon)))]
+              (let [{:keys [spin ctx finish]} (workflow/start r (dissoc args :room))]
                 (-> (jobs/start! {:op "workflow/start" :room (id->str (:id r)) :task (:task args)}
                                  #(workflow-result daemon r (:task args)
                                                    (finish (binding [ec/*execution-context* ctx] @spin)))
