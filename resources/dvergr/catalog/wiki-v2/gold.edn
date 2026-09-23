@@ -1,0 +1,60 @@
+;; wiki/v2 gold: what a correct wiki of docs/ says, derived from the world the
+;; documents were written from, not from their text (a test checks that each
+;; fact is stated in the documents it names).
+;;
+;; A term is a string or a vector of alternatives. A fact counts on a page that
+;; contains all its terms, cites one of its :sources, and is not a copy of a
+;; source (see dvergr.catalog.wiki/score-wiki-v2).
+{:entities
+ {:cooperative          ["Morrow Valley Water Cooperative"]
+  :ada-lindqvist        ["Ada Lindqvist"]
+  :rowan-achebe         ["Rowan Achebe"]
+  :mira-szabo           ["Mira Szabo"]
+  :kessel-works         ["Kessel Works"]
+  :heron-ridge-pipeline ["Heron Ridge pipeline" "Heron Ridge Pipeline"]
+  :jonas-kessel         ["Jonas Kessel"]
+  :boil-water-notice    ["boil-water notice" "boil water notice" "Boil-water notice" "Boil-Water Notice"]
+  :tallow-river-trust   ["Tallow River Trust"]}
+
+ :facts
+ [{:id :founded          :terms ["1953"] :sources ["charter-1953.md"]}
+  {:id :founders         :terms [["forty-two" "42"] ["households" "farming"]] :sources ["charter-1953.md"]}
+  {:id :governance       :terms [["seven" "7"] "board"] :sources ["charter-1953.md"]}
+  {:id :gm-lindqvist     :terms ["Ada Lindqvist"] :sources ["annual-report-2010.md"]}
+  {:id :gm-achebe        :terms ["Rowan Achebe" "2008"] :sources ["annual-report-2010.md" "board-minutes-2019.md"]}
+  {:id :gm-szabo         :terms ["Mira Szabo" "2019"] :sources ["board-minutes-2019.md" "annual-report-2022.md"]}
+  {:id :szabo-before     :terms ["Mira Szabo" ["head of operations" "operations"]] :sources ["board-minutes-2019.md"]}
+  {:id :members          :terms [["5,050" "5050"]] :sources ["annual-report-2022.md"]}
+  {:id :pipeline-opened  :terms ["Heron Ridge" "2014"] :sources ["annual-report-2014.md"]}
+  {:id :pipeline-delay   :terms ["landslide"] :sources ["annual-report-2014.md"]}
+  {:id :pipeline-length  :terms [["23 kilometres" "23 km" "23-kilometre" "23 kilometers"]] :sources ["newsletter-2012.md"]}
+  {:id :pipeline-flow    :terms ["6 million"] :sources ["annual-report-2014.md" "annual-report-2022.md"]}
+  {:id :plant-renamed    :terms ["Kessel Works" "Eastbank" "2015"] :sources ["press-release-rename.md" "press-release-rename-copy.md"]}
+  {:id :plant-designer   :terms ["Jonas Kessel" "1958"] :sources ["press-release-rename.md" "press-release-rename-copy.md"]}
+  {:id :plant-flow       :terms ["11 million"] :sources ["annual-report-2022.md"]}
+  {:id :notice-dates     :terms ["3 May" "17 May"] :sources ["incident-2018.md"]}
+  {:id :notice-cause     :terms [["faulty" "false alarm" "no contamination"] "sensor"] :sources ["incident-2018.md"]}
+  {:id :notice-duration  :terms [["14 days" "fourteen days" "two weeks"]] :sources ["incident-2018.md"] :synthesis true}
+  {:id :drought          :terms ["2011" ["eleven weeks" "11 weeks"]] :sources ["newsletter-2012.md"]}
+  {:id :partnership      :terms ["Tallow River Trust"] :sources ["annual-report-2022.md"]}
+  {:id :achebe-tenure    :terms ["Rowan Achebe" ["eleven years" "11 years" "2008 to 2019" "2008–2019" "2008-2019"]] :sources ["board-minutes-2019.md" "annual-report-2010.md"]}]
+
+ ;; Values that are wrong or no longer current. Each occurrence must sit near a
+ ;; qualifier (within 120 characters) or it counts as stated as current.
+ :stale
+ [{:id :founded-1951   :value ["1951"] :ok-near ["blog" "unofficial" "claim" "incorrect" "mistaken" "some accounts" "sometimes" "erroneous" "contradict" "however"]}
+  {:id :members-4200   :value ["4,200" "4200"] :ok-near ["2010" "was" "had" "earlier" "previously" "grew" "from" "then"]}
+  {:id :plant-9m       :value ["9 million"] :ok-near ["2010" "was" "before" "earlier" "previously" "upgrade" "from" "then"]}
+  {:id :pipeline-2013  :value ["2013"] :ok-near ["expected" "planned" "scheduled" "originally" "delay" "late" "later than"]}
+  {:id :eastbank-name  :value ["Eastbank"] :ok-near ["former" "formerly" "renamed" "originally" "known as" "previously" "until" "was" "old" "called"]}]
+
+ :relations
+ [[:mira-szabo :kessel-works]
+  [:jonas-kessel :kessel-works]
+  [:rowan-achebe :heron-ridge-pipeline]
+  [:cooperative :kessel-works]
+  [:cooperative :tallow-river-trust]
+  [:boil-water-notice :kessel-works]]
+
+ ;; Facts of a different organisation in morrow-ridge.md.
+ :distractors ["Colm Hartigan" "Lark Hollow" "310 farms"]}
