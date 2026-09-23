@@ -48,7 +48,9 @@
 
      :dir           the experiment directory
      :benchmark     keyword; namespaces the experiment and dataset ids
-     :capabilities  `{:world-setup :protocol :evaluator}`
+     :capabilities  `{:world-setup :protocol :evaluator}`; the setup and the
+                    protocol only when the environments name them (an
+                    ordinary agent program has no protocol)
      :environments  EnvironmentDefs, one per task
      :team          roster of candidate AgentDefs
      :models        every model spec `{:model :provider}` a cell may call
@@ -110,8 +112,10 @@
                      @(experiment/run
                        room team experiment-def
                        {(evaluation/evaluator-ref evaluator) evaluator}
-                       {:world-setups {(evaluation/world-setup-ref world-setup) world-setup}
-                        :protocols {(evaluation/protocol-ref protocol) protocol}
+                       {:world-setups (if world-setup
+                                        {(evaluation/world-setup-ref world-setup) world-setup}
+                                        {})
+                        :protocols (if protocol {(evaluation/protocol-ref protocol) protocol} {})
                         :parallelism parallelism
                         :max-parallelism (max 16 parallelism)
                         :max-attempts (max 256 cells)
