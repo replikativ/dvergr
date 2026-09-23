@@ -137,18 +137,36 @@
 
    (tel/log! {:id :providers/init-complete :data {:count (count @providers)}} "Providers ready")))
 
+(defonce ^:private init-lock (Object.))
+(defonce ^:private initialized? (atom false))
+
 (defn clear-all!
-  "Clear all registered providers."
+  "Clear all registered providers. The next `ensure-initialized!` initializes
+   again."
   []
-  (clojure.core/reset! providers {}))
+  (locking init-lock
+    (clojure.core/reset! initialized? false)
+    (clojure.core/reset! providers {})))
 
 (defn ensure-initialized!
-  "Ensure providers are initialized. Safe to call multiple times."
+  "Ensure providers are initialized. Safe to call multiple times, and from
+   several threads at once: a caller waits for an initialization in progress.
+   (Checking only that the registry is non-empty let a second caller through
+   while the first was still registering providers one by one; it then saw a
+   partial registry, e.g. only :openai, and its model call failed with
+   \"Provider not registered\". Parallel attempts hit it.)"
   ([]
    (ensure-initialized! #(System/getenv %)))
   ([env-lookup]
-   (when (empty? @providers)
-     (init-defaults! env-lookup))))
+   ;; `initialized?` flips only after `init-defaults!` returned, so a caller
+   ;; that arrives mid-initialization takes the lock and waits, rather than
+   ;; reading the half-filled registry. An empty registry (`clear-all!`) is
+   ;; initialized again; a registry filled by hand (tests) is left alone.
+   (when-not (and @initialized? (seq @providers))
+     (locking init-lock
+       (when (empty? @providers)
+         (init-defaults! env-lookup))
+       (reset! initialized? true)))))
 
 (def ^:private preferred-default-model
   "Best default model per provider for auto-config. Fireworks ids must exist in
