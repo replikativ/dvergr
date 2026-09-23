@@ -395,13 +395,17 @@
   (let [limits (:environment/limits definition)
         world (:environment/world definition)
         model-limits (select-keys limits [:max-model-steps :budget-dollars])]
-    (when-let [unknown (seq (remove (into #{:timeout-ms :cancel-timeout-ms
+    (when-let [unknown (seq (remove (into #{:timeout-ms :cancel-timeout-ms :on-timeout
                                             :max-model-steps :budget-dollars}
                                           (:limit-keys protocol))
                                     (keys limits)))]
       (throw (ex-info "Evaluation environment contains unsupported limits"
                       {:type ::unsupported-evaluation-limits
                        :unknown (set unknown)})))
+    ;; :fault (default): a timed-out Attempt is re-run; :verdict: it is scored.
+    (when-not (contains? #{nil :fault :verdict} (:on-timeout limits))
+      (throw (ex-info "Environment :on-timeout must be :fault or :verdict"
+                      {:type ::invalid-on-timeout :on-timeout (:on-timeout limits)})))
     (when-let [unknown (seq (remove #{:isolation :settlement :resources :setup
                                       :protocol}
                                     (keys world)))]
@@ -483,10 +487,20 @@
                   :elapsed-ms elapsed-ms
                   ;; Host-supplied metrics (e.g. an experiment's cell
                   ;; identity) never override what the evaluation measured.
-                  :metrics (assoc (merge extra-metrics metrics)
-                                  :timed-out? timeout?
-                                  :verifier-trust (:tier evaluator)
-                                  :spend attempt-spend)
+                  :metrics (cond-> (assoc (merge extra-metrics metrics)
+                                          :timed-out? timeout?
+                                          :verifier-trust (:tier evaluator)
+                                          :spend attempt-spend)
+                             ;; An environment may count a timeout against the
+                             ;; candidate (a verdict: it did not finish in time)
+                             ;; rather than as a fault to re-run.
+                             (and timeout?
+                                  (= :verdict (get-in definition [:environment/limits :on-timeout]))
+                                  (not (:failure metrics)))
+                             (assoc :failure {:kind :model
+                                              :cause (str "timed out after "
+                                                          (get-in definition [:environment/limits :timeout-ms])
+                                                          " ms")}))
                   :checks checks
                   :reward reward}
            (contains? evidence :result) (assoc :result (:result evidence))

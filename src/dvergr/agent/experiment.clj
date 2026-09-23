@@ -286,13 +286,14 @@
 
 (defn verdict?
   "Whether `attempt` says something about its candidate: it completed, or it
-   failed through the model's own failure (`:failure {:kind :model}`, e.g. no
-   answer after a corrective retry), which is scored like any other. A failure
-   of the path to the model (transport, provider limits) is a fault to re-run."
+   ended through the candidate's own failure (`:failure {:kind :model}`: no
+   answer after a corrective retry, budget or step bound, a timeout where the
+   environment counts one), which is scored like any other. A failure of the
+   path to the model (transport, provider limits) is a fault to re-run."
   [attempt]
   (let [r (:attempt/receipt attempt)]
     (or (= :completed (:attempt/status r))
-        (and (= :failed (:attempt/status r))
+        (and (#{:failed :cancelled} (:attempt/status r))
              (= :model (get-in r [:attempt/metrics :failure :kind]))))))
 
 (defn- result-spin
