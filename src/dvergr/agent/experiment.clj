@@ -284,7 +284,23 @@
      :environment (environment/environment-ref (:environment job))
      :repetition (:repetition job)}))
 
-(defn- result-spin [room team evaluators capabilities opts experiment job]
+(defn verdict?
+  "Whether `attempt` says something about its candidate: it completed, or it
+   failed through the model's own failure (`:failure {:kind :model}`, e.g. no
+   answer after a corrective retry), which is scored like any other. A failure
+   of the path to the model (transport, provider limits) is a fault to re-run."
+  [attempt]
+  (let [r (:attempt/receipt attempt)]
+    (or (= :completed (:attempt/status r))
+        (and (= :failed (:attempt/status r))
+             (= :model (get-in r [:attempt/metrics :failure :kind]))))))
+
+(defn- result-spin
+  "One cell. With `contain?` (complete-only experiments) a cell whose
+   evaluation fails to certify becomes an `:error` result, so the other cells
+   run and the experiment reports it; otherwise the failure propagates and the
+   experiment fails fast."
+  [room team evaluators capabilities opts experiment job on-result contain?]
   (let [definition (:environment job)
         candidate (:candidate job)
         evaluation-spin
@@ -293,8 +309,17 @@
                              (assoc (cell-evaluation-opts capabilities opts definition)
                                     :metrics (cell-metrics experiment job)))]
     (sp/spin
-     (let [result (sp/await evaluation-spin)]
-       (assoc result :experiment/job (experiment-job job))))))
+     ;; One cell's failure to certify is that cell's, not the experiment's.
+     (let [result (try
+                    (assoc (sp/await evaluation-spin) :experiment/job (experiment-job job))
+                    (catch Throwable t
+                      (if contain?
+                        {:experiment/job (experiment-job job)
+                         :error (or (ex-message t) (str t))}
+                        (throw t))))]
+       (when on-result
+         (try (on-result result) (catch Throwable _ nil)))
+       result))))
 
 (defn- completed-cells
   "`{[candidate-id environment-content-id repetition] Attempt}` for the
@@ -307,7 +332,7 @@
             (keep (fn [a]
                     (let [r (:attempt/receipt a)
                           m (:attempt/metrics r)]
-                      (when (and (= :completed (:attempt/status r))
+                      (when (and (verdict? a)
                                  (= (:experiment/content-id experiment)
                                     (:experiment-content-id m)))
                         [[(:experiment-candidate m)
@@ -624,7 +649,7 @@
    (run room team experiment evaluators {}))
   ([room team experiment evaluators
     {:keys [parallelism max-parallelism max-attempts world-setups protocols
-            cleanup-group resume? complete-only?]
+            cleanup-group resume? complete-only? on-result]
      :or {parallelism 1 max-parallelism 16 max-attempts 256 world-setups {}
           protocols {}}
      :as opts}]
@@ -652,7 +677,7 @@
    (when-let [unknown (seq (remove #{:from :parent-run :parallelism
                                      :max-parallelism :max-attempts
                                      :world-setups :protocols :cleanup-group
-                                     :resume? :complete-only?}
+                                     :resume? :complete-only? :on-result}
                                    (keys opts)))]
      (invalid! "Experiment contains unknown run options"
                ::unknown-run-options {:unknown (set unknown)}))
@@ -699,16 +724,26 @@
                             :resumed? true}))
                        all-jobs)
          spins (map #(result-spin room team evaluators capabilities
-                                  base-evaluation-opts experiment %)
+                                  base-evaluation-opts experiment % on-result
+                                  (boolean complete-only?))
                     (remove #(contains? done (cell-key %)) all-jobs))]
      (sp/spin
       (let [results (into (vec resumed)
-                          (sp/await (run-batches spins parallelism)))]
-        (let [unfinished (count (remove #(= :completed
-                                            (get-in % [:attempt :attempt/receipt :attempt/status]))
-                                        results))
+                          (sp/await (run-batches spins parallelism)))
+            errors (filterv :error results)]
+        (when (and (seq errors) (not complete-only?))
+          (throw (ex-info (str "Experiment cell failed: " (:error (first errors)))
+                          {:type ::cell-failed :errors (mapv #(select-keys % [:experiment/job :error]) errors)})))
+        (let [unfinished (count (remove #(and (:attempt %) (verdict? (:attempt %))) results))
               scorecard (if (and complete-only? (pos? unfinished))
-                          {:incomplete {:cells unfinished}}
+                          {:incomplete {:cells unfinished
+                                        :errors (mapv (fn [{:keys [error] job :experiment/job}]
+                                                        {:candidate (get-in job [:candidate/id])
+                                                         :repetition (:repetition job)
+                                                         :error error})
+                                                      errors)
+                                        :faults (count (filter #(and (:attempt %) (not (verdict? (:attempt %))))
+                                                               results))}}
                           (->> results
                                (make-scorecard experiment)
                                (persist-scorecard! room)))]

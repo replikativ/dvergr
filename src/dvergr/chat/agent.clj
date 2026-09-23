@@ -119,6 +119,28 @@
 ;; Agent Turn (Non-Reactive Core)
 ;; ============================================================================
 
+(def ^:dynamic *turn-failure*
+  "When bound to a volatile, a turn that ends in `:error` records why:
+   `{:kind :model|:infrastructure :cause text}`. `:model` is the model's own
+   failure (it gave no answer), a verdict about the model; `:infrastructure`
+   is the path to it failing (transport, provider limits), not a verdict."
+  nil)
+
+(def ^:private infrastructure-error
+  #"(?i)max retries|rate.?limit|too many requests|usage limit|quota|timed? ?out|timeout|connection|connect|unavailable|overloaded|provider not registered|http (5\d\d|40[18])|status (5\d\d|40[18])|interrupted|reset by peer|eof")
+
+(defn- failure-of-exception
+  "Classify a turn exception: transport and provider failures are
+   infrastructure; anything else is a harness error, also not a verdict."
+  [^Throwable e]
+  (let [msgs (->> (iterate ex-cause e) (take-while some?) (keep ex-message) (str/join " | "))]
+    {:kind :infrastructure
+     :cause (subs msgs 0 (min 300 (count msgs)))
+     :harness? (not (re-find infrastructure-error msgs))}))
+
+(defn- record-failure! [failure]
+  (when-let [v *turn-failure*] (vreset! v failure)))
+
 (defn run-agent-turn!
   "Execute a single agent turn.
 
@@ -416,6 +438,8 @@
                 (tel/log! {:level :error :id :agent/repeated-empty-response
                            :data {:turn turn-number :run-id run-id}}
                           "Model returned an empty response after corrective retry")
+                (record-failure! {:kind :model
+                                  :cause "empty response after a corrective retry"})
                 :error)))
 
           (and (quirks/code-fragment? content)
@@ -436,4 +460,5 @@
       :cancelled)
     (catch Exception e
       (tel/log! {:level :error :id :agent/turn-error :error e} "Agent turn error")
+      (record-failure! (failure-of-exception e))
       :error)))

@@ -681,11 +681,13 @@
          (loop [model-step 0]
            (when (run/cancel-requested? run-id)
              (cancelled! run-id))
-           (let [call
+           (let [failure (volatile! nil)
+                 call
                  (start-worker!
                   supervisor
                   (fn []
-                    (binding [resource/*model-scope*
+                    (binding [chat-agent/*turn-failure* failure
+                              resource/*model-scope*
                               (some-> (resource/model-scope control-room run-id)
                                       (assoc :cancel? #(run/cancel-requested? run-id)))]
                       (chat-agent/run-agent-turn!
@@ -719,20 +721,32 @@
                (cancelled! run-id)
 
                (worker-error? outcome)
-               (throw (ex-info "LLM model step failed"
-                               {:type ::llm-model-step-failed
-                                :agent/id (:agent/id agent)
-                                :model-step model-step}
-                               (::worker-error outcome)))
+               (let [e (::worker-error outcome)
+                     f {:kind :infrastructure
+                        :cause (str (ex-message e))
+                        :model-step model-step}]
+                 (update-llm-metrics! supervisor assoc :failure f)
+                 (throw (ex-info (str "LLM model step failed: " (:cause f))
+                                 {:type ::llm-model-step-failed
+                                  :agent/id (:agent/id agent)
+                                  :model-step model-step
+                                  :failure f}
+                                 e)))
 
                (= :cancelled outcome)
                (cancelled! run-id)
 
                (= :error outcome)
-               (throw (ex-info "LLM model step failed"
-                               {:type ::llm-model-step-failed
-                                :agent/id (:agent/id agent)
-                                :model-step model-step}))
+               ;; Why the turn failed, as the turn recorded it: the model's own
+               ;; failure is a verdict about the model, not a fault to retry.
+               (let [f (assoc (or @failure {:kind :infrastructure :cause "unknown turn error"})
+                              :model-step model-step)]
+                 (update-llm-metrics! supervisor assoc :failure f)
+                 (throw (ex-info (str "LLM model step failed (" (name (:kind f)) "): " (:cause f))
+                                 {:type ::llm-model-step-failed
+                                  :agent/id (:agent/id agent)
+                                  :model-step model-step
+                                  :failure f})))
 
                (= :complete outcome)
                (if-let [value (last-assistant-content chat-ctx)]
@@ -748,13 +762,27 @@
                                 :model-step model-step}))
 
                (chat-context/budget-exceeded? chat-ctx)
-               (program-result :waiting nil :budget-exhausted)
+               ;; An interactive Run waits for more budget. A Run under
+               ;; verification (deferred settlement: an evaluation) has no one
+               ;; to extend it, and a waiting Run cannot be certified: running
+               ;; out of budget is then its verdict, scored like any failure.
+               (if (= :deferred (some-> work-room :meta deref :settlement-policy))
+                 (let [f {:kind :model :cause "budget exhausted" :model-step model-step}]
+                   (update-llm-metrics! supervisor assoc :failure f)
+                   (throw (ex-info "LLM program exhausted its budget"
+                                   {:type ::budget-exhausted
+                                    :agent/id (:agent/id agent)
+                                    :failure f})))
+                 (program-result :waiting nil :budget-exhausted))
 
                (>= (inc model-step) max-model-steps)
-               (throw (ex-info "LLM program exceeded its model-step bound"
-                               {:type ::model-step-limit-exceeded
-                                :agent/id (:agent/id agent)
-                                :max-model-steps max-model-steps}))
+               (do (update-llm-metrics! supervisor assoc :failure
+                                        {:kind :model :cause "model-step bound reached"
+                                         :model-step model-step})
+                   (throw (ex-info "LLM program exceeded its model-step bound"
+                                   {:type ::model-step-limit-exceeded
+                                    :agent/id (:agent/id agent)
+                                    :max-model-steps max-model-steps})))
 
                :else
                (recur (inc model-step))))))))))

@@ -42,6 +42,56 @@
 (defn- model-provider [{:keys [model provider]}]
   (or provider (when model (:provider (registry/get-model! (registry/resolve-alias model))))))
 
+(def ^:private progress-file "progress.edn")
+
+(defn- progress-line
+  "One finished cell as a progress record: what a watcher needs without the
+   store (who, which repetition, status, reward, bill, why it failed)."
+  [started-ms {:keys [attempt error] job :experiment/job}]
+  (let [r (:attempt/receipt attempt)
+        m (:attempt/metrics r)]
+    (cond-> {:at (java.util.Date.)
+             :candidate (:candidate/id job)
+             :repetition (:repetition job)
+             :elapsed-s (quot (- (System/currentTimeMillis) started-ms) 1000)}
+      attempt (assoc :status (:attempt/status r)
+                     :reward (:attempt/reward r)
+                     :verdict? (experiment/verdict? attempt)
+                     :microdollars (get-in m [:spend :microdollars])
+                     :tokens (get-in m [:spend :tokens])
+                     :model-steps (:model-steps m)
+                     :attempt-seconds (some-> (:attempt/elapsed-ms r) (quot 1000)))
+      (:failure m) (assoc :failure (:failure m))
+      error (assoc :status :error :error error))))
+
+(defn progress
+  "The progress of the experiment in `dir`, from its progress file: every
+   finished cell, and per candidate the cells done, verdicts, faults, mean
+   reward and spend so far. Readable while the experiment runs."
+  [dir]
+  (let [f (io/file dir progress-file)
+        cells (if (.exists f)
+                (with-open [r (java.io.PushbackReader. (io/reader f))]
+                  (vec (take-while some? (repeatedly #(read {:eof nil} r)))))
+                [])]
+    {:cells cells
+     :by-candidate
+     (->> cells
+          (group-by :candidate)
+          (map (fn [[c xs]]
+                 (let [verdicts (filter :verdict? xs)
+                       rewards (keep :reward verdicts)]
+                   {:candidate c
+                    :done (count xs)
+                    :verdicts (count verdicts)
+                    :faults (count (remove :verdict? xs))
+                    :reward-mean (when (seq rewards) (/ (reduce + rewards) (count rewards)))
+                    :dollars (/ (reduce + 0 (keep :microdollars xs)) 1e6)
+                    :failures (frequencies (keep #(get-in % [:failure :cause]) xs))})))
+          (sort-by (comp str :candidate))
+          vec)
+     :dollars (/ (reduce + 0 (keep :microdollars cells)) 1e6)}))
+
 (defn run!
   "Run (or resume) an experiment. Returns `{:dir :experiment-room :experiment
    :results :failed-cells :scorecard}`.
@@ -104,6 +154,20 @@
         ;; Detached evaluation cleanup of this operation is joined before the
         ;; Room and its store are closed.
         cleanup-group (evaluation/cleanup-group)
+        started-ms (System/currentTimeMillis)
+        ;; Visible while it runs: one line per finished cell in <dir>/progress.edn
+        ;; (read it with `progress`), and a short line on stderr.
+        on-result (fn [result]
+                    (let [line (progress-line started-ms result)]
+                      (locking progress-file
+                        (spit (io/file dir progress-file) (str (pr-str line) "\n") :append true))
+                      (binding [*out* *err*]
+                        (println (str "[experiment " (name benchmark) "] "
+                                      (:candidate line) " #" (:repetition line) " "
+                                      (name (:status line)) " reward " (:reward line)
+                                      " $" (some-> (:microdollars line) (/ 1e6))
+                                      (when-let [f (:failure line)] (str " (" (name (:kind f)) ": " (:cause f) ")"))
+                                      (when-let [e (:error line)] (str " error: " e)))))))
         run-once (fn []
                    ;; Wait outside the Runs: inside one, the wait would count
                    ;; against the evaluation's own timeout.
@@ -121,7 +185,8 @@
                         :max-attempts (max 256 cells)
                         :cleanup-group cleanup-group
                         :resume? true
-                        :complete-only? true})))]
+                        :complete-only? true
+                        :on-result on-result})))]
     (try
       (let [result (loop [n 0]
                      (let [r (run-once)]
