@@ -165,6 +165,255 @@
   (edn/read-string (slurp (io/resource "dvergr/catalog/wiki-v1/gold.edn"))))
 
 ;; ============================================================================
+;; v2: facts attributed to their source, currency, grounding, entities
+;; ============================================================================
+;;
+;; v1 counted a fact wherever its terms appeared, so a page that pasted every
+;; source scored full marks, and nothing penalised an invented number or a
+;; value that is no longer true. v2 scores what a reader relies on:
+;;
+;;   coverage    a fact counts on a page that states it AND cites a document
+;;               it comes from, and that is not a copy of a source.
+;;   currency    a superseded or wrong value (an old name, an old count, a
+;;               blog's wrong year) only near a qualifier ("formerly", "in
+;;               2010", "the blog claims").
+;;   grounding   every number of two or more digits on a page appears in a
+;;               source the page cites (or is a gold synthesis value).
+;;   entities    a page per gold entity; relations as links between them.
+;;   distractors nothing of the unrelated organisation in the corpus.
+;;
+;; Calibration (test/dvergr/catalog/wiki_calibration_test.clj) pins that a
+;; hand-written reference wiki scores top and that each damaged variant (a
+;; dump, stale values, invented numbers, no citations, ...) loses the checks
+;; it should.
+
+(def ^:private v2-docs
+  ["charter-1953.md" "blog-history.md" "annual-report-2010.md" "newsletter-2012.md"
+   "annual-report-2014.md" "press-release-rename.md" "press-release-rename-copy.md"
+   "incident-2018.md" "board-minutes-2019.md" "annual-report-2022.md" "agenda-2023.md"
+   "morrow-ridge.md"])
+
+(defn fixtures-v2 [] (resource-tree "dvergr/catalog/wiki-v2" v2-docs))
+
+(defn gold-v2 [] (edn/read-string (slurp (io/resource "dvergr/catalog/wiki-v2/gold.edn"))))
+
+(defn- lower [s] (str/lower-case (str s)))
+
+(defn- term-in? [text term]
+  (let [t (lower text)]
+    (if (string? term)
+      (str/includes? t (lower term))
+      (boolean (some #(str/includes? t (lower %)) term)))))
+
+(defn- strip-link-targets
+  "Page text without link targets (`](…)`): a cited file name is not a claim."
+  [text]
+  (str/replace text #"\]\([^)]*\)" "]"))
+
+(defn- words [text] (re-seq #"[a-z0-9']+" (lower text)))
+
+(defn- shingles [text n]
+  (into #{} (map #(str/join " " %)) (partition n 1 (words text))))
+
+(defn- numbers
+  "The numbers of two or more digits in `text`, normalised (`5,050` → `5050`)."
+  [text]
+  (into #{}
+        (comp (map #(str/replace % #"[,.]" ""))
+              (filter #(<= 2 (count %))))
+        (re-seq #"\d[\d,.]*\d|\d" (strip-link-targets text))))
+
+(def ^:private number-words
+  (let [ones ["zero" "one" "two" "three" "four" "five" "six" "seven" "eight" "nine" "ten"
+              "eleven" "twelve" "thirteen" "fourteen" "fifteen" "sixteen" "seventeen"
+              "eighteen" "nineteen"]
+        tens {"twenty" 20 "thirty" 30 "forty" 40 "fifty" 50 "sixty" 60 "seventy" 70
+              "eighty" 80 "ninety" 90}]
+    (merge (zipmap ones (range))
+           tens
+           (into {} (for [[t n] tens [o i] (map vector (rest (take 10 ones)) (range 1 10))]
+                      [(str t "-" o) (+ n i)])))))
+
+(defn- source-numbers
+  "The numbers a source states, in digits or in words (forty-two is 42): a
+   page may write either."
+  [text]
+  (into (numbers text)
+        (comp (keep number-words) (map str) (filter #(<= 2 (count %))))
+        (re-seq #"[a-z]+(?:-[a-z]+)?" (lower text))))
+
+(defn- file-name [path] (last (str/split path #"/")))
+
+(defn- page-title [path text]
+  (or (some->> (re-find #"(?m)^#\s+(.+)$" text) second str/trim)
+      (file-name path)))
+
+(defn- slug [s] (-> (lower s) (str/replace #"[^a-z0-9]+" "-") (str/replace #"(^-|-$)" "")))
+
+(defn- entity-page
+  "The page for an entity named by `aliases`: its title or file name names it."
+  [pages aliases]
+  (some (fn [[path text]]
+          (let [title (lower (page-title path text))
+                fname (file-name path)]
+            (when (some #(or (str/includes? title (lower %))
+                             (str/includes? fname (slug %)))
+                        aliases)
+              path)))
+        (sort pages)))
+
+(defn- qualified?
+  "Whether the occurrence of `value` at `idx` in `text` sits near a qualifier."
+  [text idx value ok-near]
+  (let [t (lower text)
+        from (max 0 (- idx 120))
+        to (min (count t) (+ idx (count value) 120))
+        window (str (subs t from idx) " " (subs t (min to (+ idx (count value))) to))]
+    (boolean (some #(str/includes? window (lower %)) ok-near))))
+
+(defn- occurrences [text value]
+  (let [t (lower text) v (lower value)]
+    (loop [from 0 acc []]
+      (let [i (str/index-of t v from)]
+        (if (nil? i) acc (recur (+ i (count v)) (conj acc i)))))))
+
+(defn- ratio* [n d] (if (pos? d) (double (/ n d)) 1.0))
+
+(defn score-wiki-v2
+  "Score a wiki against the v2 gold (`dvergr/catalog/wiki-v2/gold.edn`).
+   `pages` and `sources` are `{path text}` (`sources` may be the paths only
+   when coverage and grounding are not needed). Returns `{:scores :checks
+   :reward}`; see the section comment."
+  [{:keys [pages sources gold target source]}]
+  (let [{:keys [entities facts stale relations distractors]} gold
+        pages (into {} (filter (fn [[p _]] (str/ends-with? p ".md"))) pages)
+        index-path (str target "/index.md")
+        content (into {} (remove #(= index-path (key %))) pages)
+        source-text (fn [path] (get sources path ""))
+        links (into {} (map (fn [[p t]] [p (links-of p t)])) pages)
+        cited (fn [page] (into #{} (filter #(contains? sources %)) (get links page)))
+        cites (for [[p ls] links l ls :when (str/starts-with? l (str source "/"))] [p l])
+        internal (for [[p ls] links l ls :when (str/starts-with? l (str target "/"))] [p l])
+        ;; copies: a page most of whose 8-word shingles are a source's
+        source-shingles (reduce into #{} (map #(shingles % 8) (vals sources)))
+        copied (into #{}
+                     (keep (fn [[p t]]
+                             (let [sh (shingles (strip-link-targets t) 8)]
+                               (when (and (<= 40 (count sh))
+                                          (<= 0.75 (ratio* (count (filter source-shingles sh)) (count sh))))
+                                 p))))
+                     content)
+        own (apply dissoc content copied)
+        found (into #{}
+                    (keep (fn [{:keys [id terms] srcs :sources}]
+                            (let [wanted (set (map #(str source "/" %) srcs))]
+                              (when (some (fn [[p t]]
+                                            (and (every? #(term-in? (strip-link-targets t) %) terms)
+                                                 (some wanted (cited p))))
+                                          own)
+                                id))))
+                    facts)
+        stale-hits (into #{}
+                         (keep (fn [{:keys [id value ok-near]}]
+                                 (when (some (fn [[_ t]]
+                                               (let [t (strip-link-targets t)]
+                                                 (some (fn [v] (some #(not (qualified? t % v ok-near))
+                                                                     (occurrences t v)))
+                                                       value)))
+                                             pages)
+                                   id)))
+                         stale)
+        allowed (into #{} (comp (filter :synthesis) (mapcat :terms) (mapcat #(if (string? %) [%] %))
+                                (mapcat numbers))
+                      facts)
+        number-claims (for [[p t] content n (numbers t)] [p n])
+        unsupported (vec (for [[p n] number-claims
+                               :when (not (or (contains? allowed n)
+                                              (some #(contains? (source-numbers (source-text %)) n) (cited p))))]
+                           {:page p :number n}))
+        entity-pages (into {} (for [[id aliases] entities] [id (entity-page content aliases)]))
+        linked? (fn [a b] (let [pa (entity-pages a) pb (entity-pages b)]
+                            (boolean (and pa pb (or (some #{pb} (get links pa))
+                                                    (some #{pa} (get links pb)))))))
+        rels (filter (fn [[a b]] (linked? a b)) relations)
+        text (lower (str/join "\n" (vals pages)))
+        contamination (filterv #(str/includes? text (lower %)) distractors)
+        cited-pages (count (filter #(seq (cited (key %))) content))
+        index-links (set (get links index-path))
+        index? (and (contains? pages index-path)
+                    (<= 0.8 (ratio* (count (filter #(contains? index-links (key %)) content)) (count content))))
+        scores {:pages (count pages)
+                :coverage (ratio* (count found) (count facts))
+                :currency (ratio* (- (count stale) (count stale-hits)) (count stale))
+                :grounding (ratio* (- (count number-claims) (count unsupported)) (count number-claims))
+                :entities (ratio* (count (filter val entity-pages)) (count entities))
+                :relations (ratio* (count rels) (count relations))
+                :pages-cited (ratio* cited-pages (count content))
+                :citations-valid (ratio* (count (filter (fn [[_ l]] (contains? sources l)) cites)) (count cites))
+                :links-valid (ratio* (count (filter (fn [[_ l]] (contains? pages l)) internal)) (count internal))
+                :copied-pages (vec (sort copied))
+                :stale-values (vec (sort stale-hits))
+                :unsupported-numbers (vec (take 10 unsupported))
+                :distractor-terms contamination}
+        checks (-> {:has-pages? (boolean (seq content))
+                    :index? (boolean index?)
+                    :every-page-cited? (= (count content) cited-pages)
+                    :citations-valid? (= 1.0 (:citations-valid scores))
+                    :links-valid? (= 1.0 (:links-valid scores))
+                    :grounded? (<= 0.95 (:grounding scores))
+                    :no-copied-pages? (empty? copied)
+                    :no-distractor-facts? (empty? contamination)}
+                   (into (for [{:keys [id]} facts] [(keyword "fact" (name id)) (contains? found id)]))
+                   (into (for [{:keys [id]} stale] [(keyword "current" (name id)) (not (contains? stale-hits id))]))
+                   (into (for [[id p] entity-pages] [(keyword "entity" (name id)) (some? p)])))
+        ;; An invented number is the error a reader cannot see: each 1% of
+        ;; unsupported numbers costs 5% of the grounding weight.
+        grounding-credit (max 0.0 (- 1.0 (* 5.0 (- 1.0 (:grounding scores)))))
+        reward (if (empty? content)
+                 0.0
+                 (+ (* 0.25 (:coverage scores))
+                    (* 0.15 (:currency scores))
+                    (* 0.20 grounding-credit)
+                    (* 0.10 (:entities scores))
+                    (* 0.05 (:relations scores))
+                    (* 0.05 (:pages-cited scores))
+                    (* 0.05 (:citations-valid scores))
+                    (* 0.05 (:links-valid scores))
+                    (* 0.05 (if index? 1.0 0.0))
+                    (* 0.05 (if (empty? contamination) 1.0 0.0))))]
+    {:scores scores :checks checks :reward (/ (Math/round (* 1000 reward)) 1000.0)}))
+
+(defn evaluator-v2
+  "The v2 checker as an Evaluator. Sources are captured with their text:
+   grounding needs it."
+  [{:keys [source target gold]}]
+  (evaluation/make-evaluator
+   {:id :catalog/wiki :version 2
+    :capture (fn [{world :world/room}]
+               {:pages (ws/read-tree world target)
+                :sources (ws/read-tree world source)})
+    :observe (fn [{:keys [default result] captured :execution/evidence}]
+               (let [scored (score-wiki-v2 {:pages (:pages captured) :sources (:sources captured)
+                                            :gold gold :target target :source source})]
+                 (assoc default
+                        :run-status (:run/status result)
+                        :pages (:pages captured)
+                        :scores (:scores scored)
+                        :checks (:checks scored)
+                        :reward (:reward scored))))
+    :verify (fn [_ {:keys [run-status checks reward]}]
+              {:checks (assoc checks :completed? (= :completed run-status))
+               :reward (if (= :completed run-status) reward 0.0)})}))
+
+(defn task-v2
+  "The v2 instruction: v1's, plus what v2 scores."
+  [p]
+  (str (task p) "\n"
+       "The documents differ in authority and date; some are outdated or wrong. State the "
+       "current value and mark older ones as former. Do not copy documents verbatim, and "
+       "do not include facts about organisations other than the one the documents are about."))
+
+;; ============================================================================
 ;; As an experiment
 ;; ============================================================================
 
@@ -181,36 +430,42 @@
                  {:fixtures digest :files (count files)})})))
 
 (defn environment
-  "The EnvironmentDef of the v1 benchmark set under `setup` and `ev`."
-  [setup ev {:keys [timeout-ms]}]
+  "The EnvironmentDef of a benchmark set (`version` 1 or 2) under `setup` and
+   `ev`."
+  [setup ev {:keys [timeout-ms version] :or {version 1}}]
   (let [ref (evaluation/evaluator-ref ev)]
     (environment/make-environment
-     {:id :catalog/wiki-v1
-      :task (task params)
+     {:id (keyword "catalog" (str "wiki-v" version))
+      :task (if (= 2 version) (task-v2 params) (task params))
       :verifier {:id (:verifier/id ref) :version (:verifier/version ref)}
       :limits {:timeout-ms (or timeout-ms (* 10 60 1000)) :cancel-timeout-ms 30000}
       :world {:isolation :ctx :settlement :discard
               :setup (evaluation/world-setup-ref setup)}})))
 
 (defn experiment!
-  "Run the v1 benchmark set as an experiment: `repetitions` attempts per
+  "Run a benchmark set (`version` 1, the default, or 2) as an experiment:
+   `repetitions` attempts per
    model in `models`, each in a discarded world, folded into a Scorecard.
    `dir` is the experiment directory. Call from a dedicated JVM or REPL (the
    runner moves Dvergr's state root into `dir`)."
-  [{:keys [dir models repetitions budget-dollars timeout-ms prompt parallelism]
-    :or {repetitions 1}}]
-  (let [files (fixtures)
+  [{:keys [dir models repetitions budget-dollars timeout-ms prompt parallelism version]
+    :or {repetitions 1 version 1}}]
+  (let [v2? (= 2 version)
+        files (if v2? (fixtures-v2) (fixtures))
         setup (world-setup files)
-        ev (evaluator (assoc params :gold (gold)))
+        ev (if v2?
+             (evaluator-v2 (assoc params :gold (gold-v2)))
+             (evaluator (assoc params :gold (gold))))
         {:keys [team ids]} (workflow/candidates {:models models :profile "developer"
                                                  :budget-dollars budget-dollars :prompt prompt})]
     ((requiring-resolve 'dvergr.agent.experiment.runner/run!)
      {:dir dir
       :benchmark :catalog-wiki
       :capabilities {:world-setup setup :evaluator ev}
-      :environments [(environment setup ev {:timeout-ms timeout-ms})]
+      :environments [(environment setup ev {:timeout-ms timeout-ms :version version})]
       :team team
       :models (mapv #(:agent/model-policy (roster/agent team %)) ids)
-      :dataset {:id :catalog/wiki-v1 :metadata {:fixtures (str (hasch/uuid files))}}
+      :dataset {:id (keyword "catalog" (str "wiki-v" version))
+                :metadata {:fixtures (str (hasch/uuid files))}}
       :repetitions repetitions
       :parallelism (or parallelism 1)})))

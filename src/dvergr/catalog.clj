@@ -32,7 +32,23 @@
     :profile "developer"
     :task wiki/task
     :evaluator (fn [params gold] (wiki/evaluator (assoc params :gold gold)))
-    :benchmark {:fixtures wiki/fixtures :gold wiki/gold}}})
+    :benchmark {:fixtures wiki/fixtures :gold wiki/gold}}
+
+   :wiki/v2
+   {:id :wiki/v2
+    :title "Wiki from a folder of documents (v2)"
+    :doc (str "The wiki workflow scored on a harder set: dated sources of different authority, "
+              "outdated and wrong values, a distractor. Measures facts attributed to their source, "
+              "currency, grounded numbers, entity pages and relations. On your own room: v1's "
+              "structural checks.")
+    :params wiki/params
+    :profile "developer"
+    :task wiki/task-v2
+    :evaluator (fn [params gold]
+                 (if gold
+                   (wiki/evaluator-v2 (assoc params :gold gold))
+                   (wiki/evaluator params)))
+    :benchmark {:fixtures wiki/fixtures-v2 :gold wiki/gold-v2}}})
 
 (defn lookup
   "The catalog workflow `id` (keyword or \"ns/name\" string), or throws."

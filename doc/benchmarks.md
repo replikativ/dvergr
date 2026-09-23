@@ -77,6 +77,61 @@ Still shared by accident, not by design: the Python-semantics layer and the
 JSON reader live under `dvergr.benchmarks.tau2` (`python`, `pyjson`) and BFCL
 requires them from there.
 
+## Wiki (a catalog workflow, not a transcription)
+
+`dvergr.catalog.wiki`: turn a folder of documents (`/docs`) into a linked wiki
+(`/wiki`). Unlike tau2 and BFCL it is our own task, so there is no upstream to be
+equivalent to; the checker is argued valid by **calibration** instead.
+
+| | tau2 / BFCL | wiki |
+| --- | --- | --- |
+| Tasks | transcribed, upstream pinned by sha256 | written here, `resources/dvergr/catalog/wiki-v*/` |
+| Validity | equivalence to upstream's checker | calibration: a reference wiki and damaged variants |
+| World | a DB (tau2), none (BFCL) | a workspace per attempt (in-memory Geschichte), fixtures seeded |
+| Candidate | tools or REPL, one step or a conversation | the LLM agent with file tools, many steps |
+| Grade | final state / emitted calls | the files left in the world |
+
+Two paths share task and checker: `experiment!` (discarded worlds, a Scorecard;
+`{:version 1|2}`) and `catalog_start` over MCP (worlds kept for review and
+adoption; without a room on the benchmark set, with one on the room's own `/docs`).
+
+**v1**: six documents, ten gold facts found by substring. Too easy (Luna 1.0 on
+both attempts) and gameable: a page pasting every source scores 1.0.
+
+**v2**: twelve dated documents of different authority (a charter, annual
+reports, a newsletter, board minutes, press releases incl. a duplicate, an
+unofficial blog that is wrong, an agenda with no facts, and an article about an
+unrelated organisation). The gold (`wiki-v2/gold.edn`) is derived from the world
+the documents were written from: 9 entities, 21 facts (one synthesis: the
+duration of the 2018 notice), 5 stale or wrong values, 6 relations, distractor
+terms. `score-wiki-v2` measures:
+
+- coverage: a fact counts on a page that states it, cites a document it comes
+  from, and is not a copy (8-word shingles, 75% threshold);
+- currency: a stale value only near a qualifier ("formerly", "in 2010", "the
+  blog claims");
+- grounding: every number of two or more digits appears in a source the page
+  cites (digits or words), or is a gold synthesis value; each 1% unsupported
+  costs 5% of the grounding weight;
+- entity pages, relations as links, citations and links valid, an index, no
+  distractor facts.
+
+Calibration (`test/dvergr/catalog/wiki_calibration_test.clj`): the hand-written
+reference wiki scores 1.0 with every check true; a dump of the sources 0.32, the
+wiki without citations 0.50, stale values 0.92, invented numbers 0.90, missing
+pages 0.77, the unrelated organisation's facts 0.95, each losing exactly the
+checks it damaged. A test pins that every gold fact is stated in the documents it
+names.
+
+First live run (Luna, two attempts): 0.937 and 0.894 (before spelled-out numbers were
+grounded; both lost a little for writing "42"); both missed the Tallow River
+Trust's own page and the derived duration; the weaker also the pipeline length,
+the drought and Achebe's tenure. Scores now separate attempts.
+
+Open: a private variant (the corpus is public in this repo); an LLM judge tier
+for prose faithfulness; attempts run one after another (a Datahike writer race
+on concurrent Runs in one durable room).
+
 ## BFCL v4 (single-turn, Python)
 
 The Berkeley Function Calling Leaderboard, pinned at gorilla `6ea5797`
