@@ -103,3 +103,19 @@
       (ops/invoke *daemon* :room/merge {:room fork :expect-state (:state rev)})
       (is (= {"/notes.md" "A note."} (select-keys (catalog/read-tree (ops/resolve-room *daemon* room) "/")
                                                   ["/notes.md"]))))))
+
+(deftest a-dirty-parent-refuses-a-merge-without-fencing-the-fork
+  ;; geschichte refuses a merge into a dirty workspace; refused inside the merge
+  ;; that left the fork fenced ("Room is already fenced for lifecycle work").
+  (let [room (:id (ops/invoke *daemon* :room/create {:title "dirty parent" :slug "dirty-parent"}))
+        fork (:id (ops/invoke *daemon* :room/fork {:room room}))
+        parent (ops/resolve-room *daemon* room)]
+    (muschel.fs/write-string! (#'catalog/room-fs (ops/resolve-room *daemon* fork)) "/fork.md" "Fork work." false)
+    (muschel.fs/write-string! (#'catalog/room-fs parent) "/parent.md" "Parent work." false)
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"has uncommitted changes \(\?\? parent.md\)"
+                          (ops/invoke *daemon* :room/merge {:room fork})))
+    (testing "the fork stays mergeable once the parent is clean"
+      (muschel.fs/delete (#'catalog/room-fs parent) "/parent.md")
+      (is (nil? (forks/workspace-changes parent)))
+      (is (= fork (:merged (ops/invoke *daemon* :room/merge {:room fork}))))
+      (is (= "Fork work." (get (catalog/read-tree parent "/") "/fork.md"))))))
