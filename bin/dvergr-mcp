@@ -1,0 +1,310 @@
+#!/usr/bin/env bb
+;; dvergr-mcp — the stdio MCP server a client launches. It relays to the
+;; long-lived dvergr daemon's loopback TCP port, so the client's server never
+;; dies when the daemon restarts:
+;;
+;;   - starts the daemon when none listens (unless --no-start), answering
+;;     `initialize` itself meanwhile (clients time out a slow start);
+;;   - reconnects after a daemon restart, replays the client's handshake, and
+;;     tells the client the tool list changed;
+;;   - a call in flight when the daemon goes away is answered with an error
+;;     result saying so, never left hanging.
+;;
+;; Usage (e.g. in a client's MCP config: command + args):
+;;   bin/dvergr-mcp [--profile offload|readonly|admin] [--toolsets a,b]
+;;                  [--port 17888] [--host 127.0.0.1] [--dir <dvergr checkout>]
+;;                  [--no-start] [--wait-s 120]
+;; Environment: DVERGR_MCP_PORT, DVERGR_MCP_PROFILE, DVERGR_MCP_TOOLSETS,
+;;              DVERGR_DIR, DVERGR_MCP_START (the daemon start command).
+(ns dvergr-mcp
+  (:require [babashka.fs :as fs]
+            [babashka.process :as p]
+            [cheshire.core :as json]
+            [clojure.string :as str])
+  (:import (java.io BufferedReader BufferedWriter InputStreamReader OutputStreamWriter)
+           (java.net InetSocketAddress Socket)))
+
+(defn- arg [flag]
+  (second (drop-while #(not= % flag) *command-line-args*)))
+(defn- flag? [flag] (some #{flag} *command-line-args*))
+(defn- env [k] (not-empty (System/getenv k)))
+
+(def host (or (arg "--host") "127.0.0.1"))
+(def port (parse-long (or (arg "--port") (env "DVERGR_MCP_PORT") "17888")))
+(def profile (or (arg "--profile") (env "DVERGR_MCP_PROFILE")))
+(def toolsets (or (arg "--toolsets") (env "DVERGR_MCP_TOOLSETS")))
+(def dir (str (or (arg "--dir") (env "DVERGR_DIR")
+                  (fs/parent (fs/parent (fs/canonicalize *file*))))))
+(def state-root
+  "The daemon's state root: DVERGR_HOME, else the checkout's .dvergr."
+  (str (or (env "DVERGR_HOME") (fs/file dir ".dvergr"))))
+(def start? (not (flag? "--no-start")))
+(def wait-ms (* 1000 (parse-long (or (arg "--wait-s") "120"))))
+(def start-cmd (or (env "DVERGR_MCP_START")
+                   (str "clojure -M:cli --no-tui --mcp --mcp-port " port
+                        " -p 0 --nrepl-port-file .dvergr/mcp-daemon.nrepl-port")))
+
+(def versions ["2024-11-05" "2025-03-26" "2025-06-18" "2025-11-25"])
+
+(defn- log [& xs]
+  (binding [*out* *err*] (apply println "dvergr-mcp:" xs) (flush)))
+
+;; ---- client side (stdout) ---------------------------------------------------
+
+(def ^:private out-lock (Object.))
+(defn- to-client! [msg]
+  (locking out-lock
+    (println (json/generate-string msg))
+    (flush)))
+
+(defn- error-response [id code message]
+  {:jsonrpc "2.0" :id id :error {:code code :message message}})
+
+;; ---- daemon side (TCP) ------------------------------------------------------
+
+(def state
+  (atom {:conn nil          ; {:socket :writer}
+         :init nil          ; the client's initialize request (with our _meta)
+         :initialized? false
+         :pending {}        ; id → request, forwarded and not yet answered
+         :starting? false
+         :daemon nil        ; the daemon process this relay started
+         :start-failed? false}))
+
+(defn- with-meta-selection
+  "The client's initialize with the connection's profile/toolsets in `_meta`."
+  [init]
+  (cond-> init
+    profile  (assoc-in [:params :_meta :dvergr/profile] profile)
+    toolsets (assoc-in [:params :_meta :dvergr/toolsets] toolsets)))
+
+(defn- send! [{:keys [^BufferedWriter writer]} msg]
+  (locking writer
+    (.write writer (json/generate-string msg))
+    (.write writer "\n")
+    (.flush writer)))
+
+(defn- shim-id? [id] (and (string? id) (str/starts-with? id "dvergr-shim-")))
+
+(defn- fail-pending!
+  "Answer every forwarded, unanswered request: the daemon went away."
+  []
+  (let [[old _] (swap-vals! state assoc :pending {})]
+    (doseq [[id req] (:pending old)]
+      (to-client!
+       (if (= "tools/call" (:method req))
+         {:jsonrpc "2.0" :id id
+          :result {:content [{:type "text"
+                              :text "dvergr daemon connection lost during this call (restart?). Retry if appropriate; a started job may still have run."}]
+                   :isError true}}
+         (error-response id -32000 "dvergr daemon connection lost; retry"))))))
+
+(declare connect! reconnect!)
+
+(def ^:private tools-cache
+  ;; The last tool list per selection, so a cold start can answer tools/list
+  ;; before the daemon is up (clients that ignore list_changed see tools).
+  (fs/file state-root "mcp" (str "tools-" (or profile "default") "-"
+                                    (str/replace (or toolsets "") #"[^a-z0-9]+" "_") ".json")))
+
+(defn- write-tools-cache! [result]
+  (try (fs/create-dirs (fs/parent tools-cache))
+       (spit tools-cache (json/generate-string result))
+       (catch Exception e (log "tool cache not written:" (.getMessage e)))))
+
+(defn- read-tools-cache []
+  (when (fs/exists? tools-cache)
+    (try (json/parse-string (slurp tools-cache) true) (catch Exception _ nil))))
+
+(defn- read-loop [conn ^BufferedReader reader]
+  (try
+    (loop []
+      (when-some [line (.readLine reader)]
+        (when-let [msg (try (json/parse-string line true) (catch Exception _ nil))]
+          (cond
+            (shim-id? (:id msg)) nil
+            (contains? msg :id)
+            (let [[old _] (swap-vals! state update :pending dissoc (:id msg))]
+              (when (and (= "tools/list" (get-in old [:pending (:id msg) :method]))
+                         (:result msg) (nil? (get-in old [:pending (:id msg) :params :cursor])))
+                (write-tools-cache! (:result msg)))
+              (to-client! msg))
+            :else (to-client! msg)))
+        (recur)))
+    (catch Exception _ nil))
+  (when (= conn (:conn @state))
+    (log "daemon connection closed; reconnecting")
+    (swap! state assoc :conn nil)
+    (fail-pending!)
+    (reconnect!)))
+
+(defn- try-connect []
+  (try
+    (let [s (Socket.)]
+      (.connect s (InetSocketAddress. ^String host (int port)) 1000)
+      s)
+    (catch Exception _ nil)))
+
+(defn- running-daemon-pid
+  "The pid of a live dvergr daemon on this state root (`.dvergr/daemon.pid`,
+   or DVERGR_HOME's), or nil."
+  []
+  (let [f (fs/file state-root "daemon.pid")]
+    (when (fs/exists? f)
+      (let [pid (parse-long (str/trim (slurp f)))]
+        (when (and pid (.isPresent (java.lang.ProcessHandle/of pid))
+                   (.isAlive (.get (java.lang.ProcessHandle/of pid))))
+          pid)))))
+
+(defn- running-daemon-after-shutdown
+  "A live daemon on this state, after giving one that is shutting down (its
+   connection just dropped) up to 30 s to exit."
+  []
+  (loop [n 150]
+    (let [pid (running-daemon-pid)]
+      (if (and pid (pos? n))
+        (do (Thread/sleep 200) (recur (dec n)))
+        pid))))
+
+(defn- start-daemon! []
+  (when-let [pid (and start? (not (:starting? @state)) (running-daemon-after-shutdown))]
+    (log "a dvergr daemon (pid" pid ") runs on this state without MCP on port" port
+         "- restart it with --mcp (or :mcp in its config); not starting a second one")
+    (swap! state assoc :starting? true))
+  (when (and start? (not (:starting? @state)))
+    (swap! state assoc :starting? true)
+    (let [logf (fs/file state-root "logs" "mcp-daemon.log")]
+      (fs/create-dirs (fs/parent logf))
+      (log "starting daemon:" start-cmd "(log:" (str logf) ")")
+      ;; setsid: the daemon outlives this relay (the client kills its server).
+      (swap! state assoc :daemon
+             (p/process {:dir dir :out :append :out-file (fs/file logf) :err :out}
+                        (str (if (fs/which "setsid") "setsid " "nohup ") start-cmd))))))
+
+(def ^:private log-file (str (fs/file state-root "logs" "mcp-daemon.log")))
+
+(defn- daemon-died?
+  "The daemon this relay started has exited (a failed start)."
+  []
+  (when-let [proc (:daemon @state)]
+    (not (.isAlive ^Process (:proc proc)))))
+
+(defn- handshake!
+  "Replay the client's handshake on a fresh connection (answers dropped)."
+  [conn]
+  (when-let [init (:init @state)]
+    (send! conn (assoc (with-meta-selection init) :id (str "dvergr-shim-init-" (random-uuid))))
+    (when (:initialized? @state)
+      (send! conn {:jsonrpc "2.0" :method "notifications/initialized"}))))
+
+(defn connect!
+  "Connect (starting the daemon when none listens) and replay the handshake.
+   `changed?` tells the client to re-list tools and resources afterwards."
+  [changed?]
+  (loop [started-at (System/currentTimeMillis) kicked? false]
+    (if-let [s (try-connect)]
+      (let [conn {:socket s
+                  :writer (BufferedWriter. (OutputStreamWriter. (.getOutputStream s) "UTF-8"))}
+            reader (BufferedReader. (InputStreamReader. (.getInputStream s) "UTF-8"))]
+        (handshake! conn)
+        (swap! state assoc :conn conn :starting? false :daemon nil)
+        (future (read-loop conn reader))
+        (log "connected to daemon" (str host ":" port))
+        (when changed?
+          (to-client! {:jsonrpc "2.0" :method "notifications/tools/list_changed"})
+          (to-client! {:jsonrpc "2.0" :method "notifications/resources/list_changed"}))
+        conn)
+      (if (daemon-died?)
+        (do (log "the daemon exited while starting; see" log-file)
+            (swap! state assoc :daemon nil :starting? false :start-failed? true)
+                nil)
+        (do (when-not kicked? (start-daemon!))
+            (Thread/sleep 1000)
+            (recur started-at true))))))
+
+(defn- reconnect!
+  "Connect in the background, logging a failure (a future would swallow it)."
+  []
+  (future
+    (try (connect! true)
+         (catch Throwable e (log "connect failed:" (str e))))))
+
+(defn- await-conn
+  "The live connection, waiting up to `wait-ms` for one."
+  []
+  (let [deadline (+ (System/currentTimeMillis) wait-ms)]
+    (loop []
+      (or (:conn @state)
+          (when (and (< (System/currentTimeMillis) deadline)
+                     (not (:start-failed? @state)))
+            (Thread/sleep 200)
+            (recur))))))
+
+;; ---- relay ------------------------------------------------------------------
+
+(defn- local-initialize
+  "Answer `initialize` without the daemon (it is starting)."
+  [{:keys [id params]}]
+  (let [v (:protocolVersion params)]
+    {:jsonrpc "2.0" :id id
+     :result {:protocolVersion (if (some #{v} versions) v (peek versions))
+              :serverInfo {:name "dvergr" :title "dvergr" :version "0.1.0"}
+              :capabilities {:tools {:listChanged true}
+                             :resources {:subscribe true :listChanged true}}
+              :instructions "dvergr is starting; its tools appear when the daemon is up (tools/list_changed follows)."}}))
+
+(defn- forward! [msg]
+  (when (:start-failed? @state)             ; try again on the next request
+    (swap! state assoc :start-failed? false)
+    (reconnect!))
+  (if-let [conn (await-conn)]
+    (do (when (contains? msg :id) (swap! state update :pending assoc (:id msg) msg))
+        (try (send! conn msg)
+             (catch Exception _ nil)))
+    (when (contains? msg :id)
+      (to-client! (if (= "tools/call" (:method msg))
+                    {:jsonrpc "2.0" :id (:id msg)
+                     :result {:content [{:type "text"
+                                         :text (str "dvergr daemon not reachable on " host ":" port
+                                                    "; see " log-file)}]
+                              :isError true}}
+                    (error-response (:id msg) -32000
+                                    (str "dvergr daemon not reachable on " host ":" port)))))))
+
+(defn- handle-client! [msg]
+  (case (:method msg)
+    "initialize"
+    ;; Connect before recording the request, so a fresh connection does not
+    ;; replay it; without a daemon, record it for the replay and answer here.
+    (if-let [conn (or (:conn @state)
+                      (when-let [s (try-connect)] (.close ^Socket s) (connect! false)))]
+      (do (swap! state #(-> % (assoc :init msg) (update :pending assoc (:id msg) msg)))
+          (send! conn (with-meta-selection msg)))
+      (do (swap! state assoc :init msg)
+          (to-client! (local-initialize msg))
+          (reconnect!)))
+
+    "notifications/initialized"
+    (do (swap! state assoc :initialized? true)
+        (when-let [conn (:conn @state)] (send! conn msg)))
+
+    "ping"
+    (when (contains? msg :id) (to-client! {:jsonrpc "2.0" :id (:id msg) :result {}}))
+
+    "tools/list"
+    (if-let [cached (and (nil? (:conn @state)) (nil? (get-in msg [:params :cursor]))
+                         (read-tools-cache))]
+      (to-client! {:jsonrpc "2.0" :id (:id msg) :result cached})
+      (forward! msg))
+
+    (forward! msg)))
+
+(let [in (BufferedReader. (InputStreamReader. System/in "UTF-8"))]
+  (loop []
+    (when-some [line (.readLine in)]
+      (when-not (str/blank? line)
+        (if-let [msg (try (json/parse-string line true) (catch Exception _ nil))]
+          (try (handle-client! msg)
+               (catch Exception e (log "relay error:" (.getMessage e))))
+          (to-client! {:jsonrpc "2.0" :id nil :error {:code -32700 :message "Parse error"}})))
+      (recur))))

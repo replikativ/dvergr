@@ -131,4 +131,6 @@
              :default-agent (default-agent)
              :allowed-users (allowed-users)}
       (telegram-token) (assoc :telegram {:token (telegram-token)})
-      (:http cfg)      (assoc :http (:http cfg)))))
+      (:http cfg)      (assoc :http (:http cfg))
+      (:gc cfg)        (assoc :gc (:gc cfg))
+      (:mcp cfg)       (assoc :mcp (:mcp cfg)))))

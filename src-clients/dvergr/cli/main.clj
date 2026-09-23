@@ -12,6 +12,7 @@
      clj -M:cli --web                 ; web dashboard on 127.0.0.1:17880 (loopback)
      clj -M:cli --no-tui --web        ; server box: daemon + nREPL + web, no TUI
      clj -M:cli --web --web-port 9090 ; web on a custom port
+     clj -M:cli --no-tui --mcp        ; MCP on 127.0.0.1:17888 (see bin/dvergr-mcp)
      clj -M:cli --help
 
    The nREPL server is the integration seam for Claude Code, Cursor,
@@ -25,7 +26,9 @@
    requested) alone."
   (:require [clojure.java.io :as io]
             [clojure.tools.cli :as cli]
+            [dvergr.substrate.paths :as paths]
             [dvergr.orchestration.daemon :as daemon]
+            [dvergr.substrate.config :as config]
             [dvergr.substrate.log :as dvergr-log]
             [nrepl.server :as nrepl])
   ;; AOT-compiled to a real Java entry class so the harness uberjar runs as
@@ -36,10 +39,16 @@
   [["-p" "--port PORT" "nREPL port"
     :default  7888
     :parse-fn #(Integer/parseInt %)]
+   [nil  "--nrepl-port-file PATH" "Where to write the nREPL port"
+    :default ".nrepl-port"]
    [nil  "--no-tui"     "Run without the TUI (daemon + nREPL only)"]
    [nil  "--web"        "Also start the web dashboard"]
    [nil  "--web-port PORT" "Web dashboard port (with --web)"
     :default  17880
+    :parse-fn #(Integer/parseInt %)]
+   [nil  "--mcp"        "Also serve MCP on loopback TCP (clients connect through bin/dvergr-mcp)"]
+   [nil  "--mcp-port PORT" "MCP port (with --mcp)"
+    :default  17888
     :parse-fn #(Integer/parseInt %)]
    [nil  "--web-bind IP" "Web dashboard bind address (with --web); the UI/API are unauthenticated, so default is loopback"
     :default  "127.0.0.1"]
@@ -68,13 +77,24 @@
     (catch Throwable _ nil)))
 
 (defn- write-nrepl-port-file!
-  "Write the nREPL port to `.nrepl-port` in the current working
-   directory so editors (CIDER, Calva, Cursive) and `clj-nrepl-eval`
+  "Write the nREPL port to `path` (default `.nrepl-port` in the current
+   working directory) so editors (CIDER, Calva, Cursive) and `clj-nrepl-eval`
    can auto-discover the connection without flags. Deletes on exit."
-  [port]
-  (let [f (io/file ".nrepl-port")]
+  [port path]
+  (let [f (io/file path)]
     (try
       (spit f (str port))
+      (.deleteOnExit f)
+      (catch Throwable _))))
+
+(defn- write-pid-file!
+  "Record this daemon's pid in the state root (`daemon.pid`), so that
+   `bin/dvergr-mcp` does not start a second daemon on the same state.
+   Deletes on exit."
+  []
+  (let [f (io/file (paths/path "daemon.pid"))]
+    (try
+      (spit f (str (.pid (java.lang.ProcessHandle/current))))
       (.deleteOnExit f)
       (catch Throwable _))))
 
@@ -92,12 +112,14 @@
       (do (println summary) (System/exit 0))
 
       :else
-      (let [{:keys [port no-tui web web-port web-bind]} options
+      (let [{:keys [port no-tui web web-port web-bind mcp mcp-port nrepl-port-file]} options
             tui-run        (when-not no-tui (resolve-tui-run))
             web-start      (when web (resolve-web-start))
             web-stop       (resolve-web-stop)
             nrepl-server   (nrepl/start-server :port port)
-            _              (write-nrepl-port-file! port)
+            port           (:port nrepl-server) ; the bound one, when -p 0
+            _              (write-nrepl-port-file! port nrepl-port-file)
+            _              (write-pid-file!)
             d-ref          (atom nil)
             ;; The REAL console PrintStream, captured BEFORE `dvergr-log/init!`
             ;; redirects System.out/err + *out*/*err* to the log file — so a boot
@@ -124,7 +146,8 @@
         (try
           (dvergr-log/init!)                 ; from here, console output goes to the log
           (let [d (try
-                    (daemon/start-from-config!)
+                    (daemon/start-from-config!
+                     (when mcp {:mcp (merge (:mcp (config/daemon-config)) {:port mcp-port})}))
                     (catch Throwable t
                       ;; Boot failed. `init!` has already redirected the console to
                       ;; the log, so the error would otherwise vanish and the
