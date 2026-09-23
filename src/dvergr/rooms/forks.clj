@@ -240,6 +240,32 @@
     (every? delta-trivial? (vals diff-map))  :trivial
     :else                                    :reviewable))
 
+(defn workspace-changes
+  "Uncommitted paths in `room`'s workspace (git porcelain status lines), or
+   nil when it has none or no workspace."
+  [room]
+  (binding [ec/*execution-context* (:ctx room)]
+    (try
+      (when (git/current-workspace)
+        (let [{:keys [stdout exit]} (git/execute-git ["status" "--porcelain"])]
+          (when (zero? exit)
+            (not-empty (vec (remove str/blank? (str/split-lines (str stdout))))))))
+      (catch Throwable _ nil))))
+
+(defn commit-workspace!
+  "Commit every change in `room`'s workspace with `message`. A merge adopts
+   commits only: uncommitted files in a fork are lost on merge, and a dirty
+   parent refuses one. Returns the changed paths, or nil when clean."
+  [room message]
+  (when-let [changes (workspace-changes room)]
+    (binding [ec/*execution-context* (:ctx room)]
+      (doseq [argv [["add" "."] ["commit" "-m" message]]]
+        (let [{:keys [exit stderr]} (git/execute-git argv)]
+          (when-not (zero? exit)
+            (throw (ex-info (str "git " (first argv) " failed in " (:id room) ": " stderr)
+                            {:type ::workspace-commit-failed :room (:id room) :argv argv}))))))
+    changes))
+
 (defn state-token
   "A content hash of `fork`'s state: its mergeable systems' snapshot ids (git
    commit, datahike commit, …). It changes whenever the fork does, so a merge
@@ -257,13 +283,18 @@
 (defn review
   "Everything a reviewer (agent or human) needs to decide a merge:
    {:tier :trivial|:reviewable|:conflict :diff {system-id → delta} :conflicts [...]
-    :state token}. nil for non-`:ctx` forks."
+    :uncommitted [paths] :state token}. Uncommitted workspace files are not in
+   the diff yet (`merge!` commits them first), so they make a fork reviewable.
+   nil for non-`:ctx` forks."
   [fork]
   (when (ctx-fork? fork)
     (let [state (state-token fork)
           diff (fork-diff fork)
-          conf (fork-conflicts fork)]
-      {:tier (classify diff conf) :diff diff :conflicts conf :state state})))
+          conf (fork-conflicts fork)
+          uncommitted (workspace-changes fork)
+          tier (classify diff conf)]
+      {:tier (if (and (= :trivial tier) (seq uncommitted)) :reviewable tier)
+       :diff diff :conflicts conf :uncommitted (vec uncommitted) :state state})))
 
 (defn merge!
   "Merge a fork into its parent (`discourse/merge-room`). Returns
@@ -273,6 +304,7 @@
     (require-settleable! fork :merge)
     (if-let [parent (rreg/lookup (:parent-id fork))]
       (let [run-id (some-> fork :meta deref :run-id)]
+        (commit-workspace! fork (str "Work of fork " (name (:id fork))))
         (d/merge-room parent fork)
         (when run-id
           (agent-run/update-durable-settlement! parent run-id :merged :review-approved))
@@ -402,6 +434,7 @@
       (merge! fork)
       (if-let [parent (rreg/lookup (:parent-id fork))]
         (try
+          (commit-workspace! fork (str "Work of fork " (name (:id fork))))
           (let [call        (requiring-resolve 'dvergr.tools.llm-call/cheap-llm-call)
                 resp        (call reconcile-instruction (reconcile-prompt conflicts) {})
                 resolutions (parse-resolutions (:text resp) conflicts)]

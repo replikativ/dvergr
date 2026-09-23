@@ -80,13 +80,14 @@
     {:team team :ids ids}))
 
 (defn environment-def
-  "The EnvironmentDef of `task`: its id is the task's content hash, so the
-   same task over time is one environment, and its Attempts line up."
-  [task {:keys [timeout-ms]}]
+  "The EnvironmentDef of `task`: its id is `environment-id` or the task's
+   content hash, so the same task over time is one environment, and its
+   Attempts line up. Verified by `evaluator` (default: completion)."
+  [task {:keys [timeout-ms evaluator environment-id]}]
   (environment/make-environment
-   {:id (keyword "workflow" (str "task-" (subs (str (hasch/uuid task)) 0 8)))
+   {:id (or environment-id (keyword "workflow" (str "task-" (subs (str (hasch/uuid task)) 0 8))))
     :task task
-    :verifier (let [ref (evaluation/evaluator-ref completion-evaluator)]
+    :verifier (let [ref (evaluation/evaluator-ref (or evaluator completion-evaluator))]
                 {:id (:verifier/id ref) :version (:verifier/version ref)})
     :limits {:timeout-ms (or timeout-ms (* 10 60 1000)) :cancel-timeout-ms 30000}
     :world {:isolation :ctx :settlement :review}}))
@@ -111,11 +112,12 @@
    world is gone."
   [world-id]
   (when-let [fork (and world-id (rreg/lookup world-id))]
-    (when-let [{:keys [tier diff conflicts state]} (forks/review fork)]
-      {:tier tier
-       :systems (into {} (map (fn [[k v]] [(str k) (delta-summary v)])) diff)
-       :conflicts (count conflicts)
-       :state state})))
+    (when-let [{:keys [tier diff conflicts state uncommitted]} (forks/review fork)]
+      (cond-> {:tier tier
+               :systems (into {} (map (fn [[k v]] [(str k) (delta-summary v)])) diff)
+               :conflicts (count conflicts)
+               :state state}
+        (seq uncommitted) (assoc :uncommitted uncommitted)))))
 
 (defn start
   "Start `task` `attempts` times for each of `models` on forks of `room`.
@@ -139,6 +141,7 @@
         _ (when (< (:models max-attempts) (count (:models opts)))
             (throw (ex-info "at most 4 models per call" {:type ::models})))
         {:keys [team ids]} (candidates opts)
+        evaluator (or (:evaluator opts) completion-evaluator)
         env (environment-def task opts)
         ctx (:ctx room)
         order (vec (for [id ids _ (range n)] id))]
@@ -149,12 +152,18 @@
                 (if (seq todo)
                   (recur (rest todo)
                          (conj acc (sp/await (evaluation/evaluate room team (first todo) env
-                                                                  completion-evaluator {}))))
+                                                                  evaluator {}))))
                   acc))))
      :finish (fn [results]
                (binding [ec/*execution-context* ctx]
                  (mapv (fn [r]
                          (let [world (get-in r [:run/result :run/world])]
+                           ;; The attempt's files, committed in its world: what
+                           ;; the review shows and a merge adopts.
+                           (when-let [w (and world (rreg/lookup world))]
+                             (forks/commit-workspace!
+                              w (str "Attempt " (get-in r [:attempt :attempt/receipt :attempt/run-id]
+                                                        (name world)))))
                            {:attempt (:attempt r)
                             :world world
                             :review (review world)}))

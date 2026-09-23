@@ -31,6 +31,8 @@
 
    :workflow/attempt :runs, :run/list :runs, :run/detail :runs
 
+   :catalog/list :catalog, :catalog/start :catalog
+
    :room/wallet :wallets, :models/list :wallets
 
    :agent/list :agents, :agent/config :agents, :agent/create :agents,
@@ -51,6 +53,7 @@
    :worlds   "Forks of a room: fork, diff, merge, discard"
    :attempts "Run a task N times per model on forks, as a job; Attempts, Scorecards"
    :runs     "The blocking workflow_attempt, and Runs (lower level)"
+   :catalog  "Workflows with their own checker and benchmark set"
    :wallets  "Budgets and model prices"
    :repl     "The room's Clojure REPL (SCI sandbox) with dvergr's programming model"
    :agents   "Agent administration"
@@ -60,8 +63,8 @@
 
 (def profiles
   "Named selections. `:read-only?` keeps only tools annotated read-only."
-  {:offload  {:toolsets #{:rooms :worlds :attempts :wallets :repl}}
-   :readonly {:toolsets #{:rooms :worlds :attempts :wallets :agents :system}
+  {:offload  {:toolsets #{:rooms :worlds :attempts :catalog :wallets :repl}}
+   :readonly {:toolsets #{:rooms :worlds :attempts :catalog :wallets :agents :system}
               :read-only? true}
    :admin    {:toolsets (set (keys toolsets))}})
 
@@ -128,6 +131,7 @@
    :workflow/attempt {:destructiveHint false :idempotentHint false :openWorldHint true}
    :workflow/start   {:destructiveHint false :idempotentHint false :openWorldHint true}
    :job/cancel       {:destructiveHint true  :idempotentHint true  :openWorldHint false}
+   :catalog/start    {:destructiveHint false :idempotentHint false :openWorldHint true}
    :room/fork        {:destructiveHint false :idempotentHint false :openWorldHint false}
    :room/merge       {:destructiveHint true  :idempotentHint false :openWorldHint false}
    :room/discard     {:destructiveHint true  :idempotentHint true  :openWorldHint false}
@@ -238,6 +242,8 @@
     "  poll `job_status {job, wait-ms}`. The result has per-attempt status, spend and a review of each world."
     "  Adopt one with `room_merge {room: world, expect-state: review.state}`, `room_discard` the rest."
     "- Long work is a job: start it, then `job_status` (waits up to 25 s per call), `job_cancel`."
+    "- Catalog: `catalog_list` shows workflows with their own checker; `catalog_start` runs one on its"
+    "  benchmark set (no room: compare models) or on your room's files, scored per attempt."
     "- Money: every model call is billed to the room's wallet (`room_wallet`); a spent wallet refuses work."
     "- REPL: `clojure_eval` evaluates Clojure in the room's sandbox (SCI). State persists per room."
     "- Results are JSON. Large results are cut; ask for less (limits, detail ops) rather than more."

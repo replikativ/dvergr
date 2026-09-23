@@ -30,6 +30,7 @@
             [dvergr.agent.ops :as aops]
             [dvergr.agent.run :as run]
             [dvergr.agent.workflow :as workflow]
+            [dvergr.catalog :as catalog]
             [dvergr.jobs :as jobs]
             [dvergr.resource :as resource]
             [dvergr.agent.fields :as fields]
@@ -238,6 +239,21 @@
                         (map (fn [[k v]] [(str k) (if (number? v) (double v) v)]))
                         bal)})))
 
+(declare workflow-result job-data)
+
+(defn- start-workflow-job
+  "Start `opts` (a `workflow/start` option map) on room `r` as a job; the job
+   data a client polls."
+  [daemon r op opts]
+  (let [{:keys [spin ctx finish]} (workflow/start r opts)]
+    (-> (jobs/start! {:op op :room (id->str (:id r)) :task (:task opts)}
+                     #(workflow-result daemon r (:task opts)
+                                       (finish (binding [ec/*execution-context* ctx] @spin)))
+                     :cancel #(binding [ec/*execution-context* ctx]
+                                (spin-core/cancel-spin! spin)))
+        job-data
+        (assoc :room (id->str (:id r)) :poll-after-ms 10000))))
+
 (defn- job-data [job]
   (-> job
       (update :status name)
@@ -260,11 +276,14 @@
           (group-by :model)
           (mapv (fn [[model xs]]
                   (let [md (reduce + 0 (keep #(get-in % [:spend :microdollars]) xs))
-                        ok (count (filter #(= 1.0 (:reward %)) xs))]
+                        ok (count (filter #(= 1.0 (:reward %)) xs))
+                        rewards (keep :reward xs)]
                     {:model model :attempts (count xs) :completed ok
+                     :mean-reward (when (seq rewards)
+                                    (/ (Math/round (* 1000 (/ (reduce + rewards) (count rewards)))) 1000.0))
                      :microdollars md
                      :microdollars-per-completion (when (pos? ok) (quot md ok))})))
-          (sort-by (juxt #(- (:completed %)) :microdollars))
+          (sort-by (juxt #(- (or (:mean-reward %) 0)) #(- (:completed %)) :microdollars))
           vec)
      :wallet (in-ctx daemon (wallet-data room nil))
      :adopt (str "room_merge {room: <world>, expect-state: <review.state>} adopts one attempt; "
@@ -324,6 +343,12 @@
     :impl (fn [daemon {:keys [room run]}]
             (when-let [r (resolve-room daemon room)]
               (in-ctx daemon (wallet-data r (some-> run uuid-arg)))))}
+
+   :catalog/list
+   {:doc "Workflows that come with their own checker and benchmark set; run one with catalog_start."
+    :kind :read
+    :schema [:map]
+    :impl (fn [_daemon _] (mapv catalog/describe (vals catalog/workflows)))}
 
    :job/status
    {:doc (str "A job's status, and its result once completed. `wait-ms` (at most 25000) "
@@ -513,14 +538,42 @@
     :schema WorkflowArgs
     :impl (fn [daemon {:keys [room] :as args}]
             (when-let [r (resolve-room daemon room)]
-              (let [{:keys [spin ctx finish]} (workflow/start r (dissoc args :room))]
-                (-> (jobs/start! {:op "workflow/start" :room (id->str (:id r)) :task (:task args)}
-                                 #(workflow-result daemon r (:task args)
-                                                   (finish (binding [ec/*execution-context* ctx] @spin)))
-                                 :cancel #(binding [ec/*execution-context* ctx]
-                                            (spin-core/cancel-spin! spin)))
-                    job-data
-                    (assoc :poll-after-ms 10000)))))}
+              (start-workflow-job daemon r "workflow/start" (dissoc args :room))))}
+
+   :catalog/start
+   {:doc (str "Run a catalog workflow (catalog_list) as a job, scored by its own checker. "
+              "Without `room`: on its benchmark set, in a new room seeded with the fixtures, "
+              "scored against known answers: compare models and prompts. With `room`: on "
+              "your room's own files, scored by what can be checked without answers. "
+              "Poll job_status; adopt a world with room_merge.")
+    :kind :write
+    :schema [:map
+             [:workflow [:string {:description "catalog workflow id, e.g. wiki/v1"}]]
+             [:room {:optional true} Room]
+             [:attempts {:optional true} [:int {:min 1 :max 8 :description "attempts per model (default 1)"}]]
+             [:models {:optional true} [:vector {:description "model ids or aliases (default: the configured default)"} :string]]
+             [:budget-dollars {:optional true} [:double {:description "budget per attempt in USD (default 0.50)"}]]
+             [:timeout-ms {:optional true} [:int {:description "per attempt (default 10 minutes)"}]]]
+    :impl (fn [daemon {:keys [workflow room] :as args}]
+            (let [wf (catalog/lookup workflow)
+                  benchmark? (nil? room)
+                  r (if room
+                      (resolve-room daemon room)
+                      (let [slug (str "bench-" (slugify (subs (str (:id wf)) 1)) "-"
+                                      (subs (str (random-uuid)) 0 8))]
+                        (in-ctx daemon
+                                (rooms/create-room! {:title (str (:title wf) " (benchmark)") :slug slug})
+                                (let [r (rreg/lookup (keyword slug))]
+                                  (catalog/seed! r ((get-in wf [:benchmark :fixtures])))
+                                  r))))
+                  {:keys [task profile evaluator environment-id]} (catalog/plan wf {:benchmark? benchmark?})]
+              (when r
+                (-> (start-workflow-job daemon r "catalog/start"
+                                        (merge (select-keys args [:attempts :models :budget-dollars :timeout-ms])
+                                               {:task task :profile profile :evaluator evaluator
+                                                :environment-id environment-id}))
+                    (assoc :workflow (subs (str (:id wf)) 1)
+                           :mode (if benchmark? "benchmark" "room"))))))}
 
    :job/cancel
    {:doc "Cancel a running job (e.g. a workflow_start): its attempts are stopped."

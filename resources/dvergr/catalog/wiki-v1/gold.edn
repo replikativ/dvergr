@@ -1,0 +1,12 @@
+;; Facts a complete wiki must state; each is found when all its terms appear
+;; (case-insensitive) somewhere in the wiki's pages.
+[{:id :founding     :terms ["1987" "Harrowgate Bay"]}
+ {:id :founders     :terms ["Ines Varga" "Tomas Oduya"]}
+ {:id :hq-move      :terms ["2004" "Calder Point"]}
+ {:id :quill-3      :terms ["Quill-3" "1991"]}
+ {:id :lantern      :terms ["Lantern" "1998"]}
+ {:id :meridian     :terms ["Meridian" "340"]}
+ {:id :succession   :terms ["Priya Hallam" "2009"]}
+ {:id :flood        :terms ["2016" "Wexmoor"]}
+ {:id :customer     :terms ["Northern Geological Survey" "2019"]}
+ {:id :research     :terms ["Asterholm" "Silent Ground"]}]
