@@ -131,7 +131,8 @@
    supervisor delivers into its room's context, and a daemon room's context is
    a child of the daemon's, so evaluating in the latter loses every wakeup.
 
-   At most `:parallelism` attempts (default 4) run at once."
+   At most `:parallelism` attempts (default 4) run at once. With `:parent-run`
+   every attempt's Run is that Run's child (a job, `dvergr.jobs`)."
   [room {:keys [task attempts] :as opts}]
   (when (str/blank? (str task))
     (throw (ex-info "A workflow attempt needs a task" {:type ::no-task})))
@@ -148,7 +149,9 @@
     {:ctx ctx
      :spin (binding [ec/*execution-context* ctx]
              (experiment/run-batches
-              (mapv #(evaluation/evaluate room team % env evaluator {}) order)
+              (mapv #(evaluation/evaluate room team % env evaluator
+                                          (select-keys opts [:parent-run]))
+                    order)
               (max 1 (or (:parallelism opts) 4))))
      :finish (fn [results]
                (binding [ec/*execution-context* ctx]

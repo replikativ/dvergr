@@ -43,7 +43,6 @@
             [dvergr.discourse :as d]
             [dvergr.model.registry :as reg]
             [org.replikativ.spindel.engine.core :as ec]
-            [org.replikativ.spindel.spin.core :as spin-core]
             [org.replikativ.spindel.yggdrasil :as ygg]))
 
 ;; ============================================================================
@@ -241,26 +240,74 @@
                         (map (fn [[k v]] [(str k) (if (number? v) (double v) v)]))
                         bal)})))
 
-(declare workflow-result job-data)
+(declare workflow-result)
+
+(defn- workflow-rows
+  "The attempts of the workflow job `job-id` as `workflow-result` rows, from
+   the store: the job Run's children, each with its certified Attempt, its
+   world and, while the world is open, its review."
+  [room job-id]
+  (let [children (->> (run/runs room {:root-run-id job-id :limit 1000})
+                      (filter #(= job-id (:run/parent %)))
+                      (sort-by #(some-> ^java.util.Date (:run/started-at %) .getTime)))]
+    (vec (for [c children
+               :let [a (attempts/attempt room (:run/id c))]
+               :when a
+               :let [world (:run/world c)]]
+           {:attempt a
+            :world world
+            :review (when (and world (rreg/lookup world))
+                      (workflow/review world))}))))
+
+(defn- job-result
+  "What a finished job produced, read from its room's store."
+  [daemon {:keys [id kind room-value status]}]
+  (when (and room-value (= :completed status))
+    (in-ctx daemon
+            (binding [ec/*execution-context* (:ctx room-value)]
+              (case kind
+                :workflow
+                (let [rows (workflow-rows room-value id)]
+                  (workflow-result daemon room-value
+                                   (get-in (first rows) [:attempt :attempt/environment :environment/task])
+                                   rows))
+                :experiment
+                (let [sc (first (experiment/scorecards room-value {:limit 1}))]
+                  (cond-> {:room (id->str (:id room-value))}
+                    sc (assoc :summary (:scorecard/summary sc))
+                    (nil? sc) (assoc :incomplete (experiment/progress room-value))))
+                nil)))))
+
+(defn- job-data
+  "A job as plain data; `result?` adds what it produced once completed."
+  ([daemon job] (job-data daemon job false))
+  ([daemon job result?]
+   (cond-> {:id (str (:id job))
+            :kind (some-> (:kind job) name)
+            :room (id->str (:room job))
+            :status (some-> (:status job) name)
+            :started-at (:started-at job)
+            :finished-at (:finished-at job)}
+     (:error job) (assoc :error (:error job))
+     (:reason job) (assoc :reason (name (:reason job)))
+     result? (assoc :result (job-result daemon job)))))
 
 (defn- start-workflow-job
-  "Start `opts` (a `workflow/start` option map) on room `r` as a job; the job
-   data a client polls."
+  "Start `opts` (a `workflow/start` option map) on room `r` as a job, a Run
+   whose children are the attempts; the job data a client polls."
   [daemon r op opts]
-  (let [{:keys [spin ctx finish]} (workflow/start r opts)]
-    (-> (jobs/start! {:op op :room (id->str (:id r)) :task (:task opts)}
-                     #(workflow-result daemon r (:task opts)
-                                       (finish (binding [ec/*execution-context* ctx] @spin)))
-                     :cancel #(binding [ec/*execution-context* ctx]
-                                (spin-core/cancel-spin! spin)))
-        job-data
-        (assoc :room (id->str (:id r)) :poll-after-ms 10000))))
-
-(defn- job-data [job]
-  (-> job
-      (update :status name)
-      (update :started-at #(some-> % java.util.Date.))
-      (update :finished-at #(some-> % java.util.Date.))))
+  (let [finish (promise)]
+    (-> (in-ctx daemon
+                (jobs/start! r {:kind :workflow}
+                             (fn [job-id]
+                               (let [{:keys [spin] :as started}
+                                     (workflow/start r (assoc opts :parent-run job-id))]
+                                 (deliver finish (:finish started))
+                                 spin))
+                             ;; The attempts' files, committed in their worlds.
+                             :finish #(@finish %)))
+        (->> (job-data daemon))
+        (assoc :op op :task (:task opts) :poll-after-ms 10000))))
 
 (defn- workflow-result
   "A workflow's rows as the data every binding shows: the attempts with their
@@ -368,18 +415,18 @@
     :kind :read
     :schema [:map [:job [:string {:description "job id"}]]
              [:wait-ms {:optional true} [:int {:min 0 :max 25000 :description "wait up to this long (default 0)"}]]]
-    :impl (fn [_daemon {:keys [job wait-ms]}]
-            (or (some-> (jobs/status job (or wait-ms 0)) job-data)
-                (throw (ex-info (str "No job " job " (jobs live in the daemon; a restart drops them)")
-                                {:type ::no-job}))))}
+    :impl (fn [daemon {:keys [job wait-ms]}]
+            (or (some-> (in-ctx daemon (jobs/status (uuid-arg job) (or wait-ms 0)))
+                        (#(job-data daemon % true)))
+                (throw (ex-info (str "No job " job) {:type ::no-job}))))}
 
    :job/list
    {:doc "Jobs, newest first (running and recently finished), optionally of one room; results omitted."
     :kind :read
     :schema [:map [:room {:optional true} Room]]
     :impl (fn [daemon {:keys [room]}]
-            (let [rid (when room (some-> (resolve-room daemon room) :id id->str))]
-              (mapv #(dissoc (job-data %) :result) (jobs/jobs rid))))}
+            (let [r (when room (resolve-room daemon room))]
+              (mapv #(job-data daemon %) (in-ctx daemon (if r (jobs/jobs r) (jobs/jobs))))))}
 
    :attempt/list
    {:doc "Certified Attempts of a room, newest first — each a leaderboard row: agent, environment, reward, checks, the bill."
@@ -609,25 +656,20 @@
                   r (in-ctx daemon
                             (rooms/create-room! {:title (str (:title wf) " (benchmark)") :slug slug})
                             (rreg/lookup (keyword slug)))
-                  exp (runner/experiment-def (assoc plan :id (keyword slug) :repetitions (or repetitions 1)))
-                  spin (runner/run-in r (assoc plan :experiment exp))]
-              (-> (jobs/start! {:op "catalog/benchmark" :room slug :task workflow}
-                               #(let [{:keys [scorecard]} (binding [ec/*execution-context* (:ctx r)] @spin)]
-                                  (merge {:room slug :models models}
-                                         (if (:incomplete scorecard)
-                                           {:incomplete (:incomplete scorecard)}
-                                           {:summary (:scorecard/summary scorecard)})))
-                               :cancel #(binding [ec/*execution-context* (:ctx r)]
-                                          (spin-core/cancel-spin! spin)))
-                  job-data
-                  (assoc :room slug :poll-after-ms 30000))))}
+                  exp (runner/experiment-def (assoc plan :id (keyword slug) :repetitions (or repetitions 1)))]
+              (-> (in-ctx daemon
+                          (jobs/start! r {:kind :experiment}
+                                       #(runner/run-in r (assoc plan :experiment exp :parent-run %))))
+                  (->> (job-data daemon))
+                  (assoc :op "catalog/benchmark" :task workflow :models models
+                         :room slug :poll-after-ms 30000))))}
 
    :job/cancel
    {:doc "Cancel a running job (e.g. a workflow_start): its attempts are stopped."
     :kind :write
     :schema [:map [:job [:string {:description "job id"}]]]
-    :impl (fn [_daemon {:keys [job]}]
-            (or (some-> (jobs/cancel! job) job-data)
+    :impl (fn [daemon {:keys [job]}]
+            (or (some->> (in-ctx daemon (jobs/cancel! (uuid-arg job))) (job-data daemon))
                 (throw (ex-info (str "No job " job) {:type ::no-job}))))}
 
    :room/fork
