@@ -80,11 +80,13 @@
   [id]
   (when-let [job (get @registry id)]
     (when (= :running (:status job))
+      ;; Cancelled first: stopping the work makes the job's own thread fail
+      ;; ("Spin cancelled"), and whichever finishes first decides the status.
+      (finish! id :cancelled :error "cancelled")
       (when-let [c (::cancel job)]
         (try (c) (catch Throwable t
                    (tel/log! {:level :warn :id ::cancel-failed :data {:job id :error (ex-message t)}}
-                             "Job cancel fn failed"))))
-      (finish! id :cancelled :error "cancelled"))
+                             "Job cancel fn failed")))))
     (status id)))
 
 (defn jobs

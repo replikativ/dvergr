@@ -21,10 +21,6 @@
     :run/world :run/isolation :run/settlement-policy
     :run/settlement-status :run/settlement-reason})
 
-(defn- store-room-id [room]
-  (or (some-> room :meta deref :conversation-id)
-      (:id room)))
-
 (defn- public-entry [entry]
   (:run entry))
 
@@ -189,7 +185,7 @@
                      ;; control capabilities, never durable Run state.
                      :cancel-hooks {}
                      :store (:store room)
-                     :store-room-id (store-room-id room)}]
+                     :store-room-id (store/conversation-id room)}]
      (locking lifecycle-lock
        (when (and (:ctx room)
                   (= :closed
@@ -366,7 +362,7 @@
     (throw (ex-info "Run settlement status must be a keyword"
                     {:type ::invalid-settlement-status :status status})))
   (when-let [room-store (:store room)]
-    (let [room-id (store-room-id room)
+    (let [room-id (store/conversation-id room)
           existing (store/-load-run room-store room-id run-id)]
       (when-not existing
         (throw (ex-info "Run settlement owner is not durable in this Room"
@@ -496,7 +492,7 @@
   "Load one durable Run from its Room store."
   [room run-id]
   (when-let [room-store (:store room)]
-    (store/-load-run room-store (store-room-id room) run-id)))
+    (store/-load-run room-store (store/conversation-id room) run-id)))
 
 (defn runs
   "List durable Runs from a Room store.
@@ -506,5 +502,5 @@
   ([room] (runs room {}))
   ([room opts]
    (if-let [room-store (:store room)]
-     (store/-list-runs room-store (store-room-id room) opts)
+     (store/-list-runs room-store (store/conversation-id room) opts)
      [])))

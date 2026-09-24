@@ -666,6 +666,15 @@
   (when slug
     (keyword (str/replace slug "/" "_fork_"))))
 
+(defn conversation-id
+  "The id `room`'s durable records live under: its messages, Runs, wallets,
+   Attempts and Scorecards. A fork branches its parent's conversation rather
+   than starting one, so it stores under the root of its fork chain (the
+   `:conversation-id` in its meta); the fork's own id names no chat entity,
+   and what a fork records must survive its merge into the parent."
+  [room]
+  (or (some-> room :meta deref :conversation-id) (:id room)))
+
 (defn room-id->slug
   "Inverse of slug->room-id."
   [room-id]

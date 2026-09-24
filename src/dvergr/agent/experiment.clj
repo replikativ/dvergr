@@ -340,7 +340,7 @@
                           (get-in r [:attempt/environment :environment/content-id])
                           (:experiment-repetition m)]
                          a]))))
-            (store/-list-attempts room-store (:id room) {:limit 1000000})))))
+            (store/-list-attempts room-store (store/conversation-id room) {:limit 1000000})))))
 
 (defn run-batches
   "A Spin yielding the values of `spins` in order, running at most
@@ -593,7 +593,7 @@
   (validate-scorecard scorecard)
   (if-let [room-store (:store room)]
     (if (satisfies? store/PScorecardStore room-store)
-      (or (store/-store-scorecard! room-store (:id room) scorecard)
+      (or (store/-store-scorecard! room-store (store/conversation-id room) scorecard)
           (invalid! "Scorecard was not durable"
                     ::scorecard-not-durable
                     {:scorecard/id (:scorecard/content-id scorecard)}))
@@ -606,7 +606,7 @@
   [room scorecard-id]
   (if-let [room-store (:store room)]
     (if (satisfies? store/PScorecardStore room-store)
-      (store/-load-scorecard room-store (:id room) scorecard-id)
+      (store/-load-scorecard room-store (store/conversation-id room) scorecard-id)
       (invalid! "Configured Room store does not support durable Scorecards"
                 ::unsupported-scorecard-store {:store (class room-store)}))
     nil))
@@ -617,7 +617,7 @@
   ([room opts]
    (if-let [room-store (:store room)]
      (if (satisfies? store/PScorecardStore room-store)
-       (store/-list-scorecards room-store (:id room) opts)
+       (store/-list-scorecards room-store (store/conversation-id room) opts)
        (invalid! "Configured Room store does not support durable Scorecards"
                  ::unsupported-scorecard-store {:store (class room-store)}))
      [])))
@@ -785,11 +785,11 @@
   [room]
   (let [room-store (:store room)
         attempts (if (satisfies? store/PAttemptStore room-store)
-                   (store/-list-attempts room-store (:id room) {:limit 1000000})
+                   (store/-list-attempts room-store (store/conversation-id room) {:limit 1000000})
                    [])
         mine (filter #(get-in % [:attempt/receipt :attempt/metrics :experiment-content-id]) attempts)
         running (if (satisfies? store/PRoomStore room-store)
-                  (try (store/-list-runs room-store (:id room) {:status :running :limit 1000})
+                  (try (store/-list-runs room-store (store/conversation-id room) {:status :running :limit 1000})
                        (catch Throwable _ []))
                   [])]
     {:experiments

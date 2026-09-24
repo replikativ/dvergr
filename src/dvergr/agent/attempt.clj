@@ -138,7 +138,7 @@
   (validate-attempt value)
   (if-let [room-store (:store room)]
     (if (satisfies? store/PAttemptStore room-store)
-      (or (store/-store-attempt! room-store (:id room) value)
+      (or (store/-store-attempt! room-store (store/conversation-id room) value)
           (invalid! "Attempt certification was not durable"
                     ::not-durable {:attempt/id (:attempt/id value)}))
       (invalid! "Configured Room store does not support durable Attempts"

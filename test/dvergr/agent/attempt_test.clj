@@ -126,3 +126,24 @@
     (swap! (:state st) update-in [:runs room-id] dissoc run-id)
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"missing Run"
                           (episode/export room run-id)))))
+
+(deftest an-attempt-in-a-fork-is-stored-with-its-conversation
+  ;; A fork persists under the root of its fork chain (its meta's
+  ;; `:conversation-id`): its Runs land there, so its Attempts must too. Keyed
+  ;; by the fork's own id, the Attempt found no evidence Run, and on Datahike
+  ;; no chat entity at all.
+  (let [{:keys [attempt run-id agent]} (fixture)
+        st (memory/make)
+        parent {:id :conversation-root :store st}
+        fork {:id :conversation-root_fork_ab12 :store st
+              :meta (atom {:conversation-id :conversation-root
+                           :forked-from :conversation-root})}]
+    (store/-store-room! st :conversation-root {:slug "conversation-root"})
+    (store/-store-run! st (store/conversation-id fork)
+                       (terminal-run run-id (:id fork) agent))
+    (is (= :conversation-root (store/conversation-id fork)))
+    (is (= attempt (attempt/persist! fork attempt)))
+    (testing "the fork and, after its merge, the parent read the same record"
+      (is (= [attempt] (episode/attempts fork {})))
+      (is (= [attempt] (episode/attempts parent {})))
+      (is (= attempt (:episode/attempt (episode/export fork run-id)))))))
