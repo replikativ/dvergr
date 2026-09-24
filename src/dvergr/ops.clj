@@ -224,7 +224,8 @@
    [:models {:optional true} [:vector {:description "model ids or aliases (default: the configured default)"} :string]]
    [:budget-dollars {:optional true} [:double {:description "budget per attempt in USD (default 0.50)"}]]
    [:profile {:optional true} [:enum {:description "developer = may edit files; worker = read-only (default)"} "developer" "worker"]]
-   [:timeout-ms {:optional true} [:int {:description "per attempt (default 10 minutes)"}]]])
+   [:timeout-ms {:optional true} [:int {:description "per attempt (default 10 minutes)"}]]
+   [:parallelism {:optional true} [:int {:min 1 :max 8 :description "attempts running at once (default 4)"}]]])
 
 (defn- wallet-data
   "A room's (or one Run's) conserved resources as plain data."
@@ -564,7 +565,8 @@
              [:attempts {:optional true} [:int {:min 1 :max 8 :description "attempts per model (default 1)"}]]
              [:models {:optional true} [:vector {:description "model ids or aliases (default: the configured default)"} :string]]
              [:budget-dollars {:optional true} [:double {:description "budget per attempt in USD (default 0.50)"}]]
-             [:timeout-ms {:optional true} [:int {:description "per attempt (default 10 minutes)"}]]]
+             [:timeout-ms {:optional true} [:int {:description "per attempt (default 10 minutes)"}]]
+             [:parallelism {:optional true} [:int {:min 1 :max 8 :description "attempts running at once (default 4)"}]]]
     :impl (fn [daemon {:keys [workflow room] :as args}]
             (let [wf (catalog/lookup workflow)
                   benchmark? (nil? room)
@@ -580,7 +582,7 @@
                   {:keys [task profile evaluator environment-id]} (catalog/plan wf {:benchmark? benchmark?})]
               (when r
                 (-> (start-workflow-job daemon r "catalog/start"
-                                        (merge (select-keys args [:attempts :models :budget-dollars :timeout-ms])
+                                        (merge (select-keys args [:attempts :models :budget-dollars :timeout-ms :parallelism])
                                                {:task task :profile profile :evaluator evaluator
                                                 :environment-id environment-id}))
                     (assoc :workflow (subs (str (:id wf)) 1)

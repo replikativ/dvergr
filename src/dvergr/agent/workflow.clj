@@ -17,6 +17,7 @@
   (:require [clojure.string :as str]
             [dvergr.agent.environment :as environment]
             [dvergr.agent.evaluation :as evaluation]
+            [dvergr.agent.experiment :as experiment]
             [dvergr.agent.roster :as roster]
             [dvergr.model.providers :as providers]
             [dvergr.model.registry :as registry]
@@ -24,7 +25,6 @@
             [dvergr.rooms.forks :as forks]
             [dvergr.tools :as tools]
             [hasch.core :as hasch]
-            [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]))
 
 (def max-attempts
@@ -131,9 +131,7 @@
    supervisor delivers into its room's context, and a daemon room's context is
    a child of the daemon's, so evaluating in the latter loses every wakeup.
 
-   Attempts run one after another. Concurrent Runs on one durable room can
-   kill its Datahike writer (Scriptum \"generation already has a publication
-   owner\", datahike 0.8.1865); a job keeps the caller from waiting anyway."
+   At most `:parallelism` attempts (default 4) run at once."
   [room {:keys [task attempts] :as opts}]
   (when (str/blank? (str task))
     (throw (ex-info "A workflow attempt needs a task" {:type ::no-task})))
@@ -149,13 +147,9 @@
         order (vec (for [id ids _ (range n)] id))]
     {:ctx ctx
      :spin (binding [ec/*execution-context* ctx]
-             (sp/spin
-              (loop [todo order acc []]
-                (if (seq todo)
-                  (recur (rest todo)
-                         (conj acc (sp/await (evaluation/evaluate room team (first todo) env
-                                                                  evaluator {}))))
-                  acc))))
+             (experiment/run-batches
+              (mapv #(evaluation/evaluate room team % env evaluator {}) order)
+              (max 1 (or (:parallelism opts) 4))))
      :finish (fn [results]
                (binding [ec/*execution-context* ctx]
                  (mapv (fn [r]
