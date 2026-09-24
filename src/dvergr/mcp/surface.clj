@@ -23,7 +23,8 @@
    :room/delete :rooms, :room/messages :rooms, :room/post :rooms
 
    :room/fork :worlds, :room/diff :worlds, :room/review :worlds,
-   :room/merge :worlds, :room/discard :worlds
+   :room/merge :worlds, :room/discard :worlds,
+   :room/import :worlds, :room/export :worlds
 
    :workflow/start :attempts, :job/status :attempts, :job/list :attempts,
    :job/cancel :attempts, :attempt/list :attempts, :attempt/detail :attempts,
@@ -140,6 +141,9 @@
    :room/fork        {:destructiveHint false :idempotentHint false :openWorldHint false}
    :room/merge       {:destructiveHint true  :idempotentHint false :openWorldHint false}
    :room/discard     {:destructiveHint true  :idempotentHint true  :openWorldHint false}
+   ;; Import reaches a local checkout or a remote over the network.
+   :room/import      {:destructiveHint false :idempotentHint false :openWorldHint true}
+   :room/export      {:destructiveHint false :idempotentHint true  :openWorldHint false}
    :agent/create     {:destructiveHint false :idempotentHint false :openWorldHint false}
    :agent/update     {:destructiveHint true  :idempotentHint true  :openWorldHint false}
    :agent/open       {:destructiveHint false :idempotentHint false :openWorldHint false}

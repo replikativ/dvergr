@@ -87,9 +87,12 @@
 
 (deftest the-default-profile-is-small-and-leaves-out-host-tools
   (let [names (set (map :name (list-tools (session))))]
-    (is (<= (count names) 24) "fits clients that cap tools around 40, with room for others")
+    ;; 24, plus room_import/room_export: bringing a client's code in and out
+    ;; is what offloading work needs.
+    (is (<= (count names) 26) "fits clients that cap tools around 40, with room for others")
     (is (every? names ["workflow_start" "job_status" "job_cancel" "room_fork" "room_review"
-                       "room_merge" "room_discard" "room_wallet" "clojure_eval" "room_list"]))
+                       "room_merge" "room_discard" "room_wallet" "clojure_eval" "room_list"
+                       "room_import" "room_export"]))
     (is (not (names "workflow_attempt")) "the blocking form outlasts client timeouts; opt-in")
     (is (not-any? names ["shell" "read_file" "write_file" "agent_delete" "system_stats"])
         "file/shell tools duplicate the host's; admin ops are opt-in")))
