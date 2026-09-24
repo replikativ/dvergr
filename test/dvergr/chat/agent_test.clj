@@ -165,3 +165,57 @@
                     count))))
       (finally
         (chat-ctx/close-chat! ctx)))))
+
+(defn- tool-call-rows [ctx]
+  (dh/q '[:find [(pull ?c [:tool-call/tool-use-id :tool-call/status :tool-call/started-at
+                           :tool-call/ended-at :tool-call/duration-ms :tool-call/result]) ...]
+          :where [?c :tool-call/id _]]
+        @(:db-conn ctx)))
+
+(deftest a-tool-call-is-recorded-while-it-runs
+  ;; Recorded when it starts, completed when it ends: a call in flight is
+  ;; visible, and timed from its real start (the record used to appear only
+  ;; afterwards, with the end time as its start).
+  (let [ctx (chat-ctx/create-chat-context {:title "tool-in-flight" :with-sci? false})
+        entered (promise)
+        release (promise)]
+    (try
+      (with-redefs [agent/messages->api-format (fn [messages _ _] messages)
+                    model-chat/chat (fn [& _] (assoc (response "")
+                                                     :tool-calls [{:id "call-slow" :name "fixture" :input {}}]))
+                    tools/execute (fn [_ _ _]
+                                    (deliver entered true)
+                                    (deref release 5000 nil)
+                                    {:type :success :content "done"})]
+        (let [turn (future (agent/run-agent-turn! ctx {:provider :test :model "stub" :tools {}
+                                                       :auto-compact? false :turn-number 0}))]
+          (is (true? (deref entered 5000 :timeout)))
+          (let [[row] (tool-call-rows ctx)]
+            (is (= :running (:tool-call/status row)) "visible while it runs")
+            (is (inst? (:tool-call/started-at row)))
+            (is (nil? (:tool-call/ended-at row))))
+          (Thread/sleep 50)
+          (deliver release true)
+          (is (= :continue (deref turn 5000 :timeout)))
+          (let [[row] (tool-call-rows ctx)]
+            (is (= :completed (:tool-call/status row)))
+            (is (= "call-slow" (:tool-call/tool-use-id row)))
+            (is (not (.before ^java.util.Date (:tool-call/ended-at row)
+                              ^java.util.Date (:tool-call/started-at row))))
+            (is (<= 50 (:tool-call/duration-ms row)) "timed from its real start"))))
+      (finally (chat-ctx/close-chat! ctx)))))
+
+(deftest a-tool-that-throws-still-closes-its-record
+  (let [ctx (chat-ctx/create-chat-context {:title "tool-throws" :with-sci? false})]
+    (try
+      (with-redefs [agent/messages->api-format (fn [messages _ _] messages)
+                    model-chat/chat (fn [& _] (assoc (response "")
+                                                     :tool-calls [{:id "call-bad" :name "fixture" :input {}}]))
+                    tools/execute (fn [& _] (throw (ex-info "tool exploded" {})))]
+        (try (agent/run-agent-turn! ctx {:provider :test :model "stub" :tools {}
+                                         :auto-compact? false :turn-number 0})
+             (catch Throwable _ nil))
+        (let [[row] (tool-call-rows ctx)]
+          (is (= :error (:tool-call/status row)) "not left :running")
+          (is (str/includes? (:tool-call/result row) "tool exploded"))))
+      (finally (chat-ctx/close-chat! ctx)))))

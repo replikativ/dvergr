@@ -464,6 +464,11 @@
     :db/cardinality :db.cardinality/one
     :db/doc "When execution started"}
 
+   {:db/ident :tool-call/ended-at
+    :db/valueType :db.type/instant
+    :db/cardinality :db.cardinality/one
+    :db/doc "When execution ended; absent while the call is :running"}
+
    ;; Tool use components (embedded in message/tool-uses)
    {:db/ident :tool-use/id
     :db/valueType :db.type/string
@@ -1686,6 +1691,25 @@
 ;; ============================================================================
 ;; Tool Call Queries (for UI rendering)
 ;; ============================================================================
+
+(defn close-orphaned-tool-calls!
+  "Mark every tool call `conn` records as `:running` as `:error`: nothing runs
+   when a room is opened at boot, so such a call's process stopped while it
+   ran. Returns how many it closed."
+  [conn]
+  (let [ids (d/q '[:find [?id ...]
+                   :where [?c :tool-call/status :running] [?c :tool-call/id ?id]]
+                 (d/db conn))]
+    (when (seq ids)
+      (let [now (java.util.Date.)]
+        (d/transact conn (mapv (fn [id]
+                                 {:tool-call/id id
+                                  :tool-call/status :error
+                                  :tool-call/error? true
+                                  :tool-call/result "{:type :error, :error \"the process stopped while this ran\"}"
+                                  :tool-call/ended-at now})
+                               ids))))
+    (count ids)))
 
 (defn get-tool-calls-for-message
   "Get tool-call analytics for a message's tool uses.

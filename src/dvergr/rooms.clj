@@ -23,6 +23,7 @@
             [dvergr.room.registry :as rreg]
             [org.replikativ.spindel.engine.core :as ec]
             [dvergr.agent.run :as agent-run]
+            [dvergr.chat.schema :as chat-schema]
             [taoensso.telemere :as tel]))
 
 ;; ============================================================================
@@ -182,6 +183,12 @@
                                                       telegram-chat-id (assoc :telegram-chat-id telegram-chat-id))})
                       ;; A Run the previous daemon left running has no owner
                       ;; now; mark it before the room admits new work.
+                      _ (try (some-> (srooms/msgs-conn-for-slug slug)
+                                     (chat-schema/close-orphaned-tool-calls!))
+                             (catch Throwable t
+                               (tel/log! {:level :warn :id :rooms/reconcile-tool-calls-failed
+                                          :data {:slug slug :error (ex-message t)}}
+                                         "Could not close orphaned tool calls")))
                       orphans (try (agent-run/reconcile-orphaned-runs! room)
                                    (catch Throwable t
                                      (tel/log! {:level :warn :id :rooms/reconcile-failed
