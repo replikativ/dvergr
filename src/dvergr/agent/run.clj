@@ -488,6 +488,35 @@
                        vec)]
      (unregister-live! run-id))))
 
+(def orphaned-reason
+  "The `:run/reason` of a Run that was still running when its process stopped."
+  :orphaned)
+
+(defn reconcile-orphaned-runs!
+  "Fail every Run `room`'s store records as `:running` that no live execution
+   in this process owns: its process stopped while it ran, so nothing will
+   finish it, and it would read as running forever. `:waiting` Runs are left
+   alone; waiting is a state a Run may rest in. Call when a durable Room is
+   opened, before it admits work. Returns the Runs it failed."
+  [room]
+  (if-let [room-store (:store room)]
+    (let [key (store/conversation-id room)]
+      (locking lifecycle-lock
+        (let [now (java.util.Date.)]
+          (->> (store/-list-runs room-store key {:status :running :limit 100000})
+               (remove #(contains? @active (:run/id %)))
+               (keep (fn [r]
+                       (let [failed (assoc r
+                                           :run/status :failed
+                                           :run/updated-at now
+                                           :run/ended-at now
+                                           :run/reason orphaned-reason
+                                           :run/error "The process stopped while this Run was running")]
+                         (when (store/-store-run! room-store key failed)
+                           failed))))
+               vec))))
+    []))
+
 (defn run
   "Load one durable Run from its Room store."
   [room run-id]
