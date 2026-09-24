@@ -22,6 +22,7 @@
             [dvergr.room.store.datahike :as datahike-store]
             [dvergr.room.registry :as rreg]
             [org.replikativ.spindel.engine.core :as ec]
+            [dvergr.agent.run :as agent-run]
             [taoensso.telemere :as tel]))
 
 ;; ============================================================================
@@ -169,16 +170,28 @@
                                 (catch Throwable _ nil))
                   room-ctx (or (:room-ctx prov) ctx)]
               (binding [ec/*execution-context* room-ctx]
-                (d/make-room {:id        id
-                              :slug      slug
-                              :title     (or name slug)
-                              :parent-id (some-> parent-slug rstore/slug->room-id)
-                              :ctx       room-ctx
-                              :store     (room-store slug)
-                              :meta      (cond-> {:chat-id (srooms/msgs-chat-id slug)}
-                                           type             (assoc :type type)
-                                           (seq agent-ids)  (assoc :agent-ids (set agent-ids))
-                                           telegram-chat-id (assoc :telegram-chat-id telegram-chat-id))}))))))
+                (let [room (d/make-room {:id        id
+                                         :slug      slug
+                                         :title     (or name slug)
+                                         :parent-id (some-> parent-slug rstore/slug->room-id)
+                                         :ctx       room-ctx
+                                         :store     (room-store slug)
+                                         :meta      (cond-> {:chat-id (srooms/msgs-chat-id slug)}
+                                                      type             (assoc :type type)
+                                                      (seq agent-ids)  (assoc :agent-ids (set agent-ids))
+                                                      telegram-chat-id (assoc :telegram-chat-id telegram-chat-id))})
+                      ;; A Run the previous daemon left running has no owner
+                      ;; now; mark it before the room admits new work.
+                      orphans (try (agent-run/reconcile-orphaned-runs! room)
+                                   (catch Throwable t
+                                     (tel/log! {:level :warn :id :rooms/reconcile-failed
+                                                :data {:slug slug :error (ex-message t)}}
+                                               "Could not reconcile orphaned Runs")
+                                     []))]
+                  (when (seq orphans)
+                    (tel/log! {:level :info :id :rooms/orphaned-runs
+                               :data {:slug slug :runs (count orphans)}}
+                              "Failed Runs the previous process left running"))))))))
       (tel/log! {:id :rooms/registry-hydrated :data {:count (count rooms)}}
                 "Hydrated room registry"))))
 

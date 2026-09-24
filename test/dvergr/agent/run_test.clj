@@ -289,3 +289,31 @@
       (finally
         (run/finish! run-id :failed)
         (d/close-room! room)))))
+
+(deftest runs-a-stopped-process-left-running-are-failed-when-the-room-opens
+  (let [[room st] (run-room :run-orphans)
+        at (java.util.Date. 1000)
+        durable (fn [status]
+                  (let [r {:run/id (random-uuid) :run/kind :agent-turn :run/room :run-orphans
+                           :run/actor :worker :run/trigger (random-uuid) :run/status status
+                           :run/created-at at :run/started-at at :run/updated-at at}]
+                    (store/-store-run! st :run-orphans r)
+                    r))
+        orphan (durable :running)
+        waiting (durable :waiting)
+        live (run/start! room :live (d/message :alice :live "go") (live-ctx))]
+    (try
+      (let [failed (run/reconcile-orphaned-runs! room)]
+        (is (= [(:run/id orphan)] (mapv :run/id failed)) "only the Run nothing owns")
+        (let [stored (store/-load-run st :run-orphans (:run/id orphan))]
+          (is (= :failed (:run/status stored)))
+          (is (= run/orphaned-reason (:run/reason stored)))
+          (is (inst? (:run/ended-at stored))))
+        (is (= :waiting (:run/status (store/-load-run st :run-orphans (:run/id waiting))))
+            "waiting is a state a Run may rest in")
+        (is (= :running (:run/status (store/-load-run st :run-orphans (:run/id live))))
+            "a Run this process still runs is not an orphan")
+        (is (empty? (run/reconcile-orphaned-runs! room)) "idempotent"))
+      (finally
+        (run/finish! (:run/id live) :completed)
+        (d/close-room! room)))))
