@@ -342,7 +342,10 @@
                          a]))))
             (store/-list-attempts room-store (:id room) {:limit 1000000})))))
 
-(defn- run-batches [spins parallelism]
+(defn run-batches
+  "A Spin yielding the values of `spins` in order, running at most
+   `parallelism` of them at a time."
+  [spins parallelism]
   (if (seq spins)
     (let [batch (vec (take parallelism spins))
           rest-spins (drop parallelism spins)]

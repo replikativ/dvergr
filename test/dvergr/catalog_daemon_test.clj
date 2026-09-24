@@ -33,22 +33,25 @@
 
 (defn- wiki-writer
   "A scripted model: its first call in each attempt writes a wiki that states
-   every fixture fact with citations, its second ends the turn."
+   every fixture fact with citations, its second (once the attempt's history
+   holds the tool results) ends the turn. Decided per attempt, since attempts
+   run at the same time."
   [calls]
   (let [fixtures ((get-in (catalog/lookup "wiki/v1") [:benchmark :fixtures]))
         page (str "# Tessellate Instruments\n\n" (str/join "\n\n" (vals fixtures))
                   "\n\n[source](../docs/company.md) [products](../docs/products.md)")]
-    (fn [_messages _opts]
-      (if (odd? (swap! calls inc))
-        {:content ""
-         :tool-calls [{:id (str "index-" @calls) :name "write_file"
-                       :input {:path "/wiki/index.md" :content "# Wiki\n\n- [Tessellate](tessellate.md)\n"}}
-                      {:id (str "page-" @calls) :name "write_file"
-                       :input {:path "/wiki/tessellate.md" :content page}}]
-         :usage {:input-tokens 1000 :output-tokens 400}
-         :stop-reason :tool-use}
-        {:content "Wrote the wiki." :tool-calls nil
-         :usage {:input-tokens 1200 :output-tokens 20} :stop-reason :end-turn}))))
+    (fn [messages _opts]
+      (let [n (swap! calls inc)]
+        (if (not-any? #(= :tool-result (:role %)) messages)
+          {:content ""
+           :tool-calls [{:id (str "index-" n) :name "write_file"
+                         :input {:path "/wiki/index.md" :content "# Wiki\n\n- [Tessellate](tessellate.md)\n"}}
+                        {:id (str "page-" n) :name "write_file"
+                         :input {:path "/wiki/tessellate.md" :content page}}]
+           :usage {:input-tokens 1000 :output-tokens 400}
+           :stop-reason :tool-use}
+          {:content "Wrote the wiki." :tool-calls nil
+           :usage {:input-tokens 1200 :output-tokens 20} :stop-reason :end-turn})))))
 
 (defn- run-job [args]
   (let [started (ops/invoke *daemon* :catalog/start args)]
@@ -64,7 +67,10 @@
                   chat-agent/messages->api-format (fn [messages _ _] messages)
                   model-chat/chat (wiki-writer calls)]
       (let [{:keys [status result room mode] :as done}
-            (run-job {:workflow "wiki/v1" :attempts 2 :models ["claude-haiku-4-5"]})
+            ;; Both attempts at once, on one durable room: concurrent Runs
+            ;; used to kill its Datahike writer (the Scriptum publication
+            ;; race, fixed in datahike 0.8.1899).
+            (run-job {:workflow "wiki/v1" :attempts 2 :parallelism 2 :models ["claude-haiku-4-5"]})
             [a b] (:attempts result)]
         (is (= "completed" status) (pr-str (dissoc done :result)))
         (is (= "benchmark" mode))
