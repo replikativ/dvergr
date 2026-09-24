@@ -54,10 +54,6 @@
                        :room-id (:id room)})))
     resource-store))
 
-(defn- store-room-id [room]
-  (or (some-> room :meta deref :conversation-id)
-      (:id room)))
-
 (defn install-connection!
   "Install the minimal Kontor kernel and the Room's root wallet on `conn`.
 
@@ -117,7 +113,7 @@
                           (run-wallet-id parent-run)
                           (room-wallet-id (:id room)))
           started-at (:run/started-at
-                      (store/-load-run resource-store (store-room-id room) run-id))
+                      (store/-load-run resource-store (store/conversation-id room) run-id))
           _ (when-not started-at
               (throw (ex-info "Run resource allocation requires a durable Run"
                               {:type ::run-not-durable :run/id run-id})))

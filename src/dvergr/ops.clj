@@ -406,7 +406,7 @@
             (when-let [r (resolve-room daemon room)]
               (in-ctx daemon
                       (attempt-data (some-> (:store r)
-                                            (rstore/-load-attempt (:id r) (uuid-arg id)))
+                                            (rstore/-load-attempt (rstore/conversation-id r) (uuid-arg id)))
                                     {:full? true}))))}
 
    :scorecard/list

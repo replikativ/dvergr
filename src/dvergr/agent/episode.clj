@@ -12,7 +12,7 @@
   [room attempt-id]
   (when-let [room-store (:store room)]
     (when (satisfies? store/PAttemptStore room-store)
-      (store/-load-attempt room-store (:id room) attempt-id))))
+      (store/-load-attempt room-store (store/conversation-id room) attempt-id))))
 
 (defn attempts
   "List exact certified Attempts using the store's bounded typed filters."
@@ -20,7 +20,7 @@
   ([room opts]
    (if-let [room-store (:store room)]
      (if (satisfies? store/PAttemptStore room-store)
-       (store/-list-attempts room-store (:id room) opts)
+       (store/-list-attempts room-store (store/conversation-id room) opts)
        [])
      [])))
 
@@ -53,7 +53,7 @@
   (when-let [certified (attempt room attempt-id)]
     (certified/validate-attempt certified)
     (let [room-store (:store room)
-          room-id (:id room)
+          room-id (store/conversation-id room)
           run-ids (sort-by str (:attempt/evidence-run-ids certified))]
       {:episode/id attempt-id
        :episode/attempt certified

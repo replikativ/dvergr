@@ -553,7 +553,7 @@
    fork's datahike branch isolates, and `merge-fork!` collapses natively
    (no out-of-band `append-log!`). See doc/unified-fork-conversation.md."
   [room]
-  (or (some-> room :meta deref :conversation-id) (:id room)))
+  (rstore/conversation-id room))
 
 (def ^:private fork-transfer-state-key :dvergr/fork-transfer-state)
 
