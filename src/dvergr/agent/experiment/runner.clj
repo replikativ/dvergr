@@ -76,11 +76,12 @@
 (defn run-in
   "The experiment `experiment` (an ExperimentDef) of `team` in `room`, as a
    Spin: every cell an evaluation in a fork of `room`, certified into its
-   store, resumable. Evaluates in `room`'s own context, whoever calls: a
+   store, resumable; `:parent-run` makes every cell's Run its child. Evaluates
+   in `room`'s own context, whoever calls: a
    daemon room's context is a fork of the daemon's, and an evaluation in the
    latter loses its Run's wakeups. `capabilities` is
    `{:world-setup :protocol :evaluator}` (setup and protocol when named)."
-  [room {:keys [capabilities team experiment parallelism cleanup-group benchmark]
+  [room {:keys [capabilities team experiment parallelism cleanup-group benchmark parent-run]
          :or {parallelism 1}}]
   (let [{:keys [world-setup protocol evaluator]} capabilities
         cells (* (count (:experiment/candidates experiment))
@@ -100,7 +101,8 @@
         :cleanup-group cleanup-group
         :resume? true
         :complete-only? true
-        :on-result #(log-cell benchmark %)}))))
+        :on-result #(log-cell benchmark %)
+        :parent-run parent-run}))))
 
 (defn progress
   "The progress of the experiment stored in `dir` (a `run!` directory),

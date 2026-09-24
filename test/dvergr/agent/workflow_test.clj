@@ -8,6 +8,7 @@
             [dvergr.model.chat :as model-chat]
             [dvergr.model.providers :as providers]
             [dvergr.ops :as ops]
+            [dvergr.agent.run :as run]
             [dvergr.room.registry :as rreg]
             [dvergr.room.store.memory :as memory]
             [dvergr.rooms.forks :as forks]
@@ -123,6 +124,16 @@
                 result (:result done)]
             (is (= "completed" (:status done)) (pr-str (dissoc done :result)))
             (is (= 2 (count (:attempts result))))
+            (testing "the job is a Run of the room, and its attempts are its children"
+              (let [job-id (java.util.UUID/fromString job)
+                    tree (binding [ec/*execution-context* (:ctx room)]
+                           (run/runs room {:root-run-id job-id}))]
+                (is (= :workflow (:run/kind (first (filter #(= job-id (:run/id %)) tree)))))
+                (is (= 2 (count (filter #(= job-id (:run/parent %)) tree)))
+                    "each attempt's Run is a child of the job")
+                (is (= (set (map :run-id (:attempts result)))
+                       (set (map (comp str :run/id) (filter #(= job-id (:run/parent %)) tree))))
+                    "the result lists exactly the job's attempts")))
             (is (every? #(string? (get-in % [:review :state])) (:attempts result))
                 "each attempt's review carries the state to pin a merge to")
             (is (contains? result :wallet) "the result says what is left to spend")
