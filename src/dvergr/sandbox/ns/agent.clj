@@ -12,6 +12,7 @@
             [sci.core :as sci]
             [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.sandbox.ns.doc :as doc]
+            [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]))
 
 ;; ============================================================================
@@ -425,6 +426,11 @@
              docs
              schemas))
 
+(defn ^:no-doc await-deferred
+  "A Spin yielding what `d` is delivered, with the job `job-id` it reports on."
+  [d job-id]
+  (sp/spin (assoc (sp/await d) :job job-id)))
+
 (defn add-programming-ns!
   "Expose immutable AgentDefs and Run-backed hiring as `dvergr.agent` in SCI.
 
@@ -492,6 +498,15 @@
         room-balance*  (requiring-resolve 'dvergr.resource/balance)
         run-balance*   (requiring-resolve 'dvergr.resource/run-balance)
         room-lookup*   (requiring-resolve 'dvergr.room.registry/lookup)
+        run-experiment* (requiring-resolve 'dvergr.agent.experiment/run)
+        capabilities-for* (requiring-resolve 'dvergr.agent.evaluators/capabilities-for)
+        offered*       (requiring-resolve 'dvergr.agent.evaluators/offered)
+        job-start*     (requiring-resolve 'dvergr.jobs/start!)
+        job-cancel*    (requiring-resolve 'dvergr.jobs/cancel!)
+        cancel-hook*   (requiring-resolve 'dvergr.agent.run/register-cancel-hook!)
+        deferred*      (requiring-resolve 'org.replikativ.spindel.core/deferred)
+        deliver*       (requiring-resolve 'org.replikativ.spindel.core/deliver!)
+
         selected-ctx   #(runtime-ctx/selected-context spindel-ctx)
         current-room-id #(or (when binding-resolver
                                (:room-runtime-id (binding-resolver)))
@@ -554,6 +569,57 @@
                                (if-let [own-child! (:own-child! agent-program-ceiling)]
                                  (own-child! admit-child!)
                                  (admit-child!))))))
+        run-experiment-fn
+        (fn run-experiment-fn
+          ([roster experiment] (run-experiment-fn roster experiment {}))
+          ([roster experiment {:keys [parallelism] :or {parallelism 1} :as opts}]
+           (when-let [unknown (seq (remove #{:parallelism} (keys opts)))]
+             (throw (ex-info "Unknown run-experiment! options"
+                             {:type ::unknown-experiment-options :unknown (set unknown)})))
+           (let [work-room (room!)
+                 control-room (control-room! work-room)
+                 allowed-kinds (:program-kinds agent-program-ceiling)
+                 ambient-parent (:parent-run agent-program-ceiling)
+                 kinds (->> (:experiment/candidates experiment)
+                            (map #(get-in (lookup-agent* roster (:candidate/agent %))
+                                          [:agent/program :kind])))]
+             (when-let [over (and allowed-kinds (seq (remove allowed-kinds kinds)))]
+               (throw (ex-info "A candidate exceeds this sandbox's delegation ceiling"
+                               {:type ::program-ceiling-exceeded
+                                :program-kinds (set over)
+                                :allowed-program-kinds allowed-kinds})))
+             ;; Scoring is host code: only verifiers this host offers.
+             (let [{:keys [evaluators world-setups]} (capabilities-for* experiment)
+                   ctx (:ctx work-room)
+                   result (binding [ec/*execution-context* ctx] (deferred*))
+                   job (job-start*
+                        control-room
+                        (cond-> {:kind :experiment :ctx ctx}
+                          ambient-parent (assoc :parent ambient-parent))
+                        (fn [job-id]
+                          ;; Worlds fork the current world; Runs and Attempts
+                          ;; are certified where this Run's are.
+                          (run-experiment* control-room roster experiment evaluators
+                                           {:world-setups world-setups
+                                            :parallelism parallelism
+                                            :parent-run job-id
+                                            :world-parent work-room
+                                            :complete-only? true}))
+                        :settled
+                        (fn [status v]
+                          (binding [ec/*execution-context* ctx]
+                            (deliver* result
+                                      (if (= :completed status)
+                                        {:status status :scorecard (:scorecard v)}
+                                        {:status status
+                                         :error (when (instance? Throwable v) (ex-message v))})))))]
+               ;; The sub-experiment is this Run's work: cancelling the Run
+               ;; stops it.
+               (when ambient-parent
+                 (cancel-hook* ambient-parent [::experiment (:id job)]
+                               #(job-cancel* (:id job))))
+               (binding [ec/*execution-context* ctx]
+                 (await-deferred result (:id job)))))))
         observe-fn     (fn [handle-or-id]
                          (let [work-room (room!)
                                control-room (control-room! work-room)]
@@ -633,6 +699,8 @@
         'experiment-ref (via-var experiment-ref*)
         'room-id      (fn [] (:id (room!)))
         'hire!        hire-fn
+        'run-experiment! run-experiment-fn
+        'offered      (fn [] (offered*))
         'observe      observe-fn
         'inspect      inspect-fn
         'cancel!      cancel-fn
@@ -656,6 +724,8 @@
            experiment-ref [([experiment]) "Return the stable logical/version/content reference for one exact ExperimentDef. Running and trusted scoring remain host-owned capabilities."]
            room-id      [([]) "Return the live identity of the current Room/world. In an isolated fork this is the child Room, not its parent."]
            hire!        [([roster agent-ref opts]) "Durably start one owned AgentDef in the current Room: (hire! team :a {:task value :resources {\"microUSD\" 1000}}). Returns a RunHandle. The current Run remains responsible for the child even if the handle is ignored. opts: :task (required); :from (a keyword sender); :settlement (:automatic, :review or :discard); :resources, a MAP of resource coordinate → positive amount (e.g. {\"microUSD\" 1000}) split from the current Run/Room's conserved balance; :limits {:max-model-steps n :budget-dollars x}, which can only TIGHTEN the agent's own limits for this Run; :parent-run, the parent Run's uuid (defaults to the current Run and, when one is ambient, must equal it). Unknown keys are rejected."]
+           run-experiment! [([roster experiment] [roster experiment opts]) "Run an ExperimentDef as a sub-experiment of the current Run: a job Run (its child) whose cells are attempts in worlds forked from the current Room/world, scored only by verifiers this host offers (see `offered`), certified with this Run's records. Candidates are held to the same program ceiling as `hire!`. Returns a Spin resolving to {:job uuid :status :completed|:failed|:cancelled :scorecard ScorecardDef (when completed) :error string}. Cancelling the current Run cancels it. opts: :parallelism (default 1)."]
+           offered      [([]) "The verifier and world-setup refs this host offers to experiments: {:evaluators [ref ...] :world-setups [ref ...]}."]
            observe      [([handle-or-run-id]) "Read the current Room's durable Run projection for a RunHandle or UUID."]
            inspect      [([] [opts]) "Inspect the current Run and its structural descendants as one bounded snapshot of Runs, frontier, correlated messages, semantic activities, failures, and conserved balances. Inside a hired agent this cannot see parent or sibling Runs, and inspection without an ambient Run fails closed. A durable semantic receipt identifies the inspection. Options: :run-limit, :message-limit, :content-limit, :content-budget, :detail-limit."]
            cancel!      [([handle-or-run-id]) "Request cooperative cancellation of exactly one live Run. Returns true when the Run was found."]
@@ -678,6 +748,8 @@
           'experiment-ref  [:=> [:cat ExperimentDef] ExperimentRef]
           'room-id         [:=> [:cat] :keyword]
           'hire!           [:=> [:cat Roster AgentIdOrRef HireOpts] RunHandle]
+          'run-experiment! [:function [:=> [:cat Roster :map] :any] [:=> [:cat Roster :map :map] :any]]
+          'offered         [:=> [:cat] :map]
           'observe         [:=> [:cat [:or :uuid RunHandle]] [:maybe Run]]
           'inspect         [:function [:=> [:cat] Observation]
                             [:=> [:cat InspectOpts] Observation]]

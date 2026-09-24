@@ -518,13 +518,16 @@
    `:cancel-timeout-ms`. A timeout requests targeted Run cancellation and no
    receipt is certified until the Run has physically quiesced.
 
-   Options may provide `:from` and structural `:parent-run`. The returned map
+   Options may provide `:from` and structural `:parent-run`. `:world-parent`
+   (default `room`) is the Room the attempt's world forks: a world inside
+   another Run's world, while `room` keeps the durable Run and Attempt. The
+   Spin must then run in `:world-parent`'s context. The returned map
    contains portable evidence/receipt plus the process-local RunHandle; callers
    settle a retained world through the existing room-fork APIs."
   ([room team agent-ref definition evaluator]
    (evaluate room team agent-ref definition evaluator {}))
   ([room team agent-ref definition evaluator
-    {:keys [from parent-run world-setup cleanup-group protocol metrics]
+    {:keys [from parent-run world-setup cleanup-group protocol metrics world-parent]
      :or {from :environment} :as opts}]
    (environment/validate-environment definition)
    (require-matching-evaluator! definition evaluator)
@@ -542,7 +545,7 @@
          (:environment/world definition)
          model-limits (when agent (require-supported-policy! definition agent protocol))]
      (when-let [unknown (seq (remove #{:from :parent-run :world-setup
-                                       :cleanup-group :protocol :metrics}
+                                       :cleanup-group :protocol :metrics :world-parent}
                                      (keys opts)))]
        (throw (ex-info "Evaluation contains unknown options"
                        {:type ::unknown-evaluation-options
@@ -617,8 +620,8 @@
               (update protocol :run
                       (fn [run] (fn [context]
                                   (run (assoc context :environment definition))))))
-            handle (program/hire-prepared-in! room room team agent-ref hire-opts
-                                              prepare-world! hosted-protocol)
+            handle (program/hire-prepared-in! room (or world-parent room) team agent-ref
+                                              hire-opts prepare-world! hosted-protocol)
             timed-out ::timed-out
             initial (sp/await
                      (comb/timeout (program/owned-result-spin handle)

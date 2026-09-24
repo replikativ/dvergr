@@ -852,3 +852,72 @@
                        (get-in result [:error :message])))))
       (finally
         (context/stop-context! ctx)))))
+
+(def ^:private nested-experiment-code
+  (str
+   "(require '[dvergr.agent :as agent] "
+   "         '[org.replikativ.spindel.spin.cps :refer [spin]] "
+   "         '[org.replikativ.spindel.effects.await :refer [await]]) "
+   "(defn nested-experiment [kind verifier] "
+   "  (let [team (agent/make-agent (agent/roster) {:id :cell :program {:kind kind}}) "
+   "        env (agent/environment {:id :nested/echo :task :work "
+   "                                :verifier verifier "
+   "                                :world {:isolation :ctx :settlement :discard}}) "
+   "        exp (agent/experiment {:id :nested/exp "
+   "                               :dataset (agent/dataset {:id :nested/set :environments [env]}) "
+   "                               :candidates [(agent/lookup team :cell)] "
+   "                               :repetitions 2})] "
+   "    [team exp])) "))
+
+(deftest an-agent-runs-a-sub-experiment-as-a-child-of-its-run
+  ;; Benchmarks inside benchmarks: agent code in a Run starts an experiment;
+  ;; the experiment is a job Run under the agent's Run, its cells are that
+  ;; job's children, their worlds fork the agent's world, and the Attempts are
+  ;; certified with the room's records. Scoring is the host's (the workflow
+  ;; completion check); nothing here calls a model.
+  (require 'dvergr.agent.workflow)
+  (let [room      (d/make-room {:id :sci-nested-experiment :store (memory/make)})
+        sci-ctx   (sandbox/fork-for-session (:ctx room))
+        parent-id (:run/id (run/start! room :outer (random-uuid) nil))]
+    (try
+      (binding [ec/*execution-context* (:ctx room)] (room-registry/register! room))
+      (agent-ns/add-programming-ns!
+       sci-ctx (:id room) (:ctx room)
+       {:program-kinds #{:echo :scripted}
+        :parent-run parent-id})
+      (binding [ec/*execution-context* (:ctx room)]
+        (is (:success (sandbox/eval-code sci-ctx nested-experiment-code)))
+        (let [result (sandbox/eval-code
+                      sci-ctx
+                      (str "(let [[team exp] (nested-experiment :echo {:id :workflow/completion :version 1})] "
+                           "  @(spin (await (agent/run-experiment! team exp))))"))
+              value (:value result)]
+          (is (:success result) (pr-str (:error result)))
+          (is (= :completed (:status value)) (pr-str value))
+          (is (= 2 (count (get-in value [:scorecard :scorecard/entries])))
+              "both cells are in the Scorecard")
+          (testing "the Run tree nests: the agent's Run, the experiment, its cells"
+            (let [tree (run/runs room {:root-run-id parent-id})
+                  job (first (filter #(= (:job value) (:run/id %)) tree))]
+              (is (= :experiment (:run/kind job)))
+              (is (= parent-id (:run/parent job)))
+              (is (= 2 (count (filter #(= (:job value) (:run/parent %)) tree))))))
+          (testing "a verifier the host does not offer is refused before any Run starts"
+            (let [r (sandbox/eval-code
+                     sci-ctx
+                     (str "(let [[team exp] (nested-experiment :echo {:id :agent/own-scorer :version 1})] "
+                          "  (agent/run-experiment! team exp))"))]
+              (is (not (:success r)))
+              (is (re-find #"does not offer" (str (:error r))))))
+          (testing "a paid candidate exceeds the ceiling of a Run's sandbox"
+            (let [r (sandbox/eval-code
+                     sci-ctx
+                     (str "(let [[team exp] (nested-experiment :llm {:id :workflow/completion :version 1})] "
+                          "  (agent/run-experiment! team exp))"))]
+              (is (not (:success r)))
+              (is (re-find #"ceiling" (str (:error r))))))))
+      (finally
+        (run/finish! parent-id :completed)
+        (try (binding [ec/*execution-context* (:ctx room)] (room-registry/unregister! (:id room)))
+             (catch Throwable _ nil))
+        (d/close-room! room)))))

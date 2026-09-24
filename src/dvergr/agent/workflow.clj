@@ -17,6 +17,7 @@
   (:require [clojure.string :as str]
             [dvergr.agent.environment :as environment]
             [dvergr.agent.evaluation :as evaluation]
+            [dvergr.agent.evaluators :as evaluators]
             [dvergr.agent.experiment :as experiment]
             [dvergr.agent.roster :as roster]
             [dvergr.model.providers :as providers]
@@ -43,6 +44,8 @@
                     done? (= :completed status)]
                 {:checks {:completed? done?}
                  :reward (if done? 1.0 0.0)}))}))
+
+(evaluators/register-evaluator! completion-evaluator)
 
 (def ^:private default-prompt
   "You are a capable AI worker. Complete the given task thoroughly, in this

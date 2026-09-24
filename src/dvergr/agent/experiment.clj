@@ -629,7 +629,7 @@
    capabilities. All candidates, evaluators, environment policies, and host
    admission ceilings are preflighted before the Spin can admit a Run. Jobs and
    evaluation Spins are realized one bounded batch at a time. Options include
-   ordinary evaluation `:from`/`:parent-run` plus host-owned `:parallelism`,
+   ordinary evaluation `:from`/`:parent-run`/`:world-parent` plus host-owned `:parallelism`,
    `:max-parallelism`, `:max-attempts`, an optional process-local
    `:cleanup-group`, an exact `:world-setups` capability map for environments
    that name setup references, and `:protocols` likewise for protocol
@@ -678,7 +678,7 @@
                  {:environment (environment/environment-ref definition)
                   :settlement (get-in definition
                                       [:environment/world :settlement])})))
-   (when-let [unknown (seq (remove #{:from :parent-run :parallelism
+   (when-let [unknown (seq (remove #{:from :parent-run :world-parent :parallelism
                                      :max-parallelism :max-attempts
                                      :world-setups :protocols :cleanup-group
                                      :resume? :complete-only? :on-result}
@@ -703,7 +703,7 @@
                        ::attempts-exceed-ceiling
                        {:attempt-count attempt-count
                         :max-attempts max-attempts}))
-         base-evaluation-opts (assoc (select-keys opts [:from :parent-run])
+         base-evaluation-opts (assoc (select-keys opts [:from :parent-run :world-parent])
                                      :cleanup-group cleanup-group)
          capabilities {:world-setups world-setups :protocols protocols}
          ;; Validate every distinct candidate/environment pairing once before
