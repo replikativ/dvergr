@@ -95,6 +95,10 @@ around 40, and every definition costs context in every session.
   child Runs, so a client can restart and poll again (`job_list`), and a job outlives the
   daemon: after a restart it reads as it finished, or `failed` with reason `orphaned` if the
   daemon stopped while it ran. A workflow runs up to `parallelism` attempts at once (default 4).
+- **A room's reads are live.** Every read op is also a resource (`room://{room}/messages`,
+  `experiment://{room}/progress`, …). Subscribing to one about a room sends
+  `notifications/resources/updated` after every durable change of that room (a message, a Run,
+  a tool call, an Attempt), at most a few times a second; re-read the resource for what changed.
 - **Merges are pinned to the review.** `room_review` (and every workflow attempt's review)
   carries the fork's `state`, a hash of its systems' snapshot ids; `room_merge {room,
   expect-state}` refuses a fork that changed since. A failed merge is an error, not a success.

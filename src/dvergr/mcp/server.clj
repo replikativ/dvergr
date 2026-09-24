@@ -24,7 +24,7 @@
             [dvergr.mcp.json-rpc :as json-rpc]
             [dvergr.mcp.surface :as surface]
             [dvergr.ops :as ops]
-            [dvergr.discourse :as d]
+            [dvergr.rooms.facts :as facts]
             [dvergr.chat.context :as chat-context]
             [org.replikativ.spindel.engine.core :as ec]
             [jsonista.core :as json])
@@ -171,9 +171,10 @@
 ;;
 ;; A read with no required args → a fixed resource (room://list); a read with a
 ;; required arg → a resource TEMPLATE (room://{room}/messages). `resources/read`
-;; maps a URI back to op + args and invokes it. `resources/subscribe` on a room://
-;; uri attaches a per-room on-each-message listener that pushes
-;; notifications/resources/updated — so a room is a LIVE resource.
+;; maps a URI back to op + args and invokes it. `resources/subscribe` on a uri about
+;; a room (room://, experiment://…/progress, …) attaches the room's facts feed
+;; (dvergr.rooms.facts), which pushes notifications/resources/updated after
+;; every durable change — so a room's reads are LIVE resources.
 
 (defn- op->resource [op {:keys [doc]}]
   (let [scheme (namespace op) rname (name op)
@@ -220,36 +221,55 @@
       {:contents [] :isError true})
     {:contents []}))
 
-(defonce ^:private resource-subs (atom {}))             ; uri -> #{send-fn}
-(defonce ^:private listened-rooms (atom #{}))  ; room-id with a live message listener
+(defonce ^:private resource-subs (atom {}))  ; uri -> #{send-fn}
+(defonce ^:private room-uris (atom {}))      ; room-id -> #{uri} with a live facts watcher
 
-(defn- id-name [id] (if (keyword? id) (name id) (str id)))
+(defn- notify-room! [room-id]
+  (doseq [u (get @room-uris room-id)
+          sf (get @resource-subs u)]
+    (try (sf {:jsonrpc "2.0" :method "notifications/resources/updated" :params {:uri u}})
+         (catch Throwable _ nil))))
+
+(defn- uri-room
+  "The room a resource URI reads (`room://<room>/…`, `experiment://<room>/progress`, …)."
+  [dmn uri]
+  (when-let [{:keys [args]} (uri->op+args uri)]
+    (some->> (:room args) (ops/resolve-room dmn))))
 
 (defn- subscribe-resource! [uri send-fn]
   (swap! resource-subs update uri (fnil conj #{}) send-fn)
-  ;; For a room:// uri, attach a message listener ONCE per room: on a new
-  ;; message, notify every subscribed room://<slug>/* uri for that room.
+  ;; A resource about a room is live: the room's facts feed (every durable
+  ;; change: messages, Runs, tool calls, Attempts) notifies each subscribed uri
+  ;; of that room, at a bounded rate. One watcher per room.
   (when-let [dmn (current-daemon)]
-    (let [[scheme rst] (str/split uri #"://" 2)]
-      (when (and (= "room" scheme) rst)
-        (when-let [room (ops/resolve-room dmn (first (str/split rst #"/")))]
-          (let [rid (:id room) slug (id-name rid)]
-            (when-not (contains? @listened-rooms rid)
-              (swap! listened-rooms conj rid)
-              (d/on-each-message room
-                                 (fn [_m]
-                                   (doseq [[u sfs] @resource-subs
-                                           :when (str/starts-with? u (str "room://" slug "/"))
-                                           sf   sfs]
-                                     (try (sf {:jsonrpc "2.0" :method "notifications/resources/updated"
-                                               :params {:uri u}})
-                                          (catch Throwable _ nil))))))))))))
+    (when-let [room (uri-room dmn uri)]
+      (let [rid (:id room)
+            [old _] (swap-vals! room-uris update rid (fnil conj #{}) uri)]
+        (when (empty? (get old rid))
+          (facts/watch! room [::mcp rid] #(notify-room! rid)))))))
+
+(defn- release-uri!
+  "Forget `uri` once nobody subscribes to it; stop its room's watcher with its
+   last uri."
+  [uri]
+  (when (empty? (get @resource-subs uri))
+    (swap! resource-subs dissoc uri)
+    (doseq [[rid uris] @room-uris
+            :when (contains? uris uri)]
+      (let [left (disj uris uri)]
+        (if (empty? left)
+          (do (swap! room-uris dissoc rid)
+              (facts/unwatch! rid [::mcp rid]))
+          (swap! room-uris assoc rid left))))))
 
 (defn- unsubscribe-resource! [uri send-fn]
-  (swap! resource-subs update uri disj send-fn))
+  (swap! resource-subs update uri disj send-fn)
+  (release-uri! uri))
 
 (defn- drop-subscriber! [send-fn]
-  (swap! resource-subs (fn [m] (into {} (map (fn [[u s]] [u (disj s send-fn)])) m))))
+  (let [uris (keys @resource-subs)]
+    (swap! resource-subs (fn [m] (into {} (map (fn [[u s]] [u (disj s send-fn)])) m)))
+    (run! release-uri! uris)))
 
 ;; ============================================================================
 ;; Connected clients (for server-initiated notifications)

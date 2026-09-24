@@ -151,6 +151,15 @@
      :environment-id, :environment-content-id, :provider, :model, and :status;
      :limit is applied after filtering."))
 
+(defprotocol PFactFeed
+  "Notification of durable change: every message, Run, tool call, Attempt,
+   Scorecard or ledger entry a store records. The one change feed views of a
+   room's facts (progress, the Run tree, dashboards) re-read on."
+  (-listen! [this key f]
+    "Call `(f)` after every durable change. `key` is idempotent.")
+  (-unlisten! [this key]
+    "Stop calling the listener registered under `key`."))
+
 (defprotocol PScorecardStore
   "Durable immutable projection of completed certified Experiments.
 
