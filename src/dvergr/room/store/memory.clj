@@ -403,6 +403,15 @@
            (take-last (or limit 1000))
            vec))))
 
+(extend-protocol store/PFactFeed
+  MemoryStore
+  (-listen! [this key f]
+    (add-watch (:state this) key (fn [_ _ old new] (when-not (identical? old new) (f))))
+    nil)
+  (-unlisten! [this key]
+    (remove-watch (:state this) key)
+    nil))
+
 (defn make
   "Create a fresh in-memory store."
   []

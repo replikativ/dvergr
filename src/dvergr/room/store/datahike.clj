@@ -1496,6 +1496,15 @@
   (-resource-receipt [_ transfer-id]
     (resource/receipt conn transfer-id)))
 
+(extend-protocol store/PFactFeed
+  DatahikeStore
+  (-listen! [this key f]
+    (dh/listen (:conn this) key (fn [_tx-report] (f)))
+    nil)
+  (-unlisten! [this key]
+    (dh/unlisten (:conn this) key)
+    nil))
+
 (defn make
   "Create a DatahikeStore. `conn` must be an existing Datahike
    connection whose db includes the dvergr.chat.schema attributes. An optional

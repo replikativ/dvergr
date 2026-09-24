@@ -4,6 +4,7 @@
    JSON-RPC protocol shape in-process (no live daemon, no network). Live tool/
    resource round-trips against a running daemon are exercised from the REPL."
   (:require [clojure.test :refer [deftest is testing]]
+            [dvergr.agent.run :as run]
             [dvergr.discourse :as d]
             [dvergr.mcp.server :as server]
             [dvergr.mcp.json-rpc :as json-rpc]
@@ -203,4 +204,36 @@
                 "text and structuredContent carry the same value"))))
       (finally
         (try (rreg/unregister! (:id room)) (catch Throwable _ nil))
+        (d/close-room! room)))))
+
+(deftest a-subscribed-room-resource-is-notified-on-every-kind-of-change
+  ;; Not just messages: a Run (like an Attempt or a tool call) is a durable
+  ;; change of the room, and experiment progress is a read of the room.
+  (let [room (d/make-room {:id :mcp-sub-test :store (memory/make)})
+        sent (atom [])
+        c (server/session-context #(swap! sent conj %) (surface/selection {:profile "admin"}))
+        uri "experiment://mcp-sub-test/progress"
+        updates #(filter (fn [m] (and (= "notifications/resources/updated" (:method m))
+                                      (= uri (get-in m [:params :uri]))))
+                         @sent)]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (rreg/register! room)
+        (with-redefs [server/current-daemon (fn [] {:execution-ctx (:ctx room)})]
+          (init! c)
+          (json-rpc/handle-message c {:jsonrpc "2.0" :id 7 :method "resources/subscribe"
+                                      :params {:uri uri}})
+          (run/finish! (:run/id (run/start! room :worker (random-uuid) nil)) :completed)
+          (is (loop [n 0] (cond (seq (updates)) true (< n 100) (do (Thread/sleep 20) (recur (inc n))) :else false))
+              "a Run notifies the progress resource")
+          (json-rpc/handle-message c {:jsonrpc "2.0" :id 8 :method "resources/unsubscribe"
+                                      :params {:uri uri}})
+          (Thread/sleep 400)
+          (let [n (count (updates))]
+            (run/finish! (:run/id (run/start! room :worker (random-uuid) nil)) :completed)
+            (Thread/sleep 400)
+            (is (= n (count (updates))) "nothing after the last unsubscribe"))))
+      (finally
+        (try (binding [ec/*execution-context* (:ctx room)] (rreg/unregister! (:id room)))
+             (catch Throwable _ nil))
         (d/close-room! room)))))
