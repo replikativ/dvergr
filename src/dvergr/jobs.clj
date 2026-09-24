@@ -18,6 +18,7 @@
   (:require [dvergr.agent.run :as run]
             [dvergr.room.registry :as rreg]
             [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.engine.impl.simple :as simple]
             [org.replikativ.spindel.spin.core :as spin-core]
             [taoensso.telemere :as tel]))
 
@@ -57,14 +58,19 @@
   "Start `(work job-id)`, a Spin, in `room` as a job and return the job at
    once. The job is a durable Run of `kind` (one of `kinds`), stored before
    `work` is called; pass its id to the evaluations `work` starts as their
-   `:parent-run`. `finish`, a fn of the Spin's value, runs before the Run
-   completes."
-  [room {:keys [kind]} work & {:keys [finish]}]
+   `:parent-run`. `:parent` makes the job itself a child Run (a sub-experiment
+   of the Run that started it); `:ctx` is the context `work`'s Spin runs in
+   (default `room`'s, where the job Run is stored). `finish`, a fn of the
+   Spin's value, runs before the Run completes; `settled`, a fn of the final
+   status and the value (or the error), after it has settled, whatever the
+   outcome."
+  [room {:keys [kind parent ctx]} work & {:keys [finish settled]}]
   (when-not (contains? kinds kind)
     (throw (ex-info "Unknown job kind" {:type ::unknown-kind :kind kind :kinds kinds})))
-  (let [ctx (:ctx room)
-        r (binding [ec/*execution-context* ctx]
-            (run/start! room :dvergr (random-uuid) nil {:kind kind}))
+  (let [ctx (or ctx (:ctx room))
+        r (binding [ec/*execution-context* (:ctx room)]
+            (run/start! room :dvergr (random-uuid) nil
+                        (cond-> {:kind kind} parent (assoc :parent parent))))
         id (:run/id r)
         done (promise)]
     (swap! live assoc id {:room room :done done})
@@ -74,27 +80,39 @@
                                    #(binding [ec/*execution-context* ctx]
                                       (spin-core/cancel-spin! spin)))
         (future
-          (let [[status error]
-                (try
-                  (let [v (binding [ec/*execution-context* ctx] @spin)]
-                    (when finish (finish v))
-                    [:completed nil])
-                  (catch Throwable t
-                    (if (run/cancel-requested? id)
-                      [:cancelled nil]
-                      (do (tel/log! {:level :warn :id ::failed
-                                     :data {:job id :kind kind :error (ex-message t)}}
-                                    "Job failed")
-                          [:failed t]))))]
-            (try
-              (binding [ec/*execution-context* ctx]
-                (run/finish! id status (cond-> {} error (assoc :error error))))
-              (catch Throwable t
-                (tel/log! {:level :error :id ::finish-failed
-                           :data {:job id :status status :error (ex-message t)}}
-                          "Job Run could not be finished")))
-            (deliver done true)
-            (swap! live dissoc id))))
+          ;; A future conveys its caller's bindings; a job started from
+          ;; inside a Spin (a sub-experiment) must not look like a drain.
+          (binding [simple/*in-drain?* false
+                    ec/*spin-id* nil]
+            (let [value (volatile! nil)
+                  [status error]
+                  (try
+                    (let [v (binding [ec/*execution-context* ctx] @spin)]
+                      (vreset! value v)
+                      (when finish (finish v))
+                      [:completed nil])
+                    (catch Throwable t
+                      (if (run/cancel-requested? id)
+                        [:cancelled nil]
+                        (do (tel/log! {:level :warn :id ::failed
+                                       :data {:job id :kind kind :error (ex-message t)}}
+                                      "Job failed")
+                            [:failed t]))))]
+              (try
+                (binding [ec/*execution-context* ctx]
+                  (run/finish! id status (cond-> {} error (assoc :error error))))
+                (catch Throwable t
+                  (tel/log! {:level :error :id ::finish-failed
+                             :data {:job id :status status :error (ex-message t)}}
+                            "Job Run could not be finished")))
+              (deliver done true)
+              (swap! live dissoc id)
+              (when settled
+                (try (settled status (or error @value))
+                     (catch Throwable t
+                       (tel/log! {:level :warn :id ::settled-failed
+                                  :data {:job id :error (ex-message t)}}
+                                 "Job settled callback failed"))))))))
       (catch Throwable t
         ;; `work` itself failed (validation, say): the Run must not stay open.
         (binding [ec/*execution-context* ctx]

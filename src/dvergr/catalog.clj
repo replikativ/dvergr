@@ -13,6 +13,7 @@
    Workflows:
      :wiki/v1 — a wiki from a folder of documents (`dvergr.catalog.wiki`)."
   (:require [clojure.string :as str]
+            [dvergr.agent.evaluators :as evaluators]
             [dvergr.catalog.wiki :as wiki]
             [dvergr.catalog.workspace :as ws]))
 
@@ -75,3 +76,10 @@
      :evaluator ((:evaluator wf) params gold)
      :environment-id (keyword "catalog" (str (namespace (:id wf)) "-" (name (:id wf))
                                              (when benchmark? "-bench")))}))
+
+;; The benchmark sets' checkers and fixtures, offered to experiments agents
+;; start (`dvergr.agent/run-experiment!`): scored against the gold facts.
+(evaluators/register-evaluator! (wiki/evaluator (assoc wiki/params :gold (wiki/gold))))
+(evaluators/register-evaluator! (wiki/evaluator-v2 (assoc wiki/params :gold (wiki/gold-v2))))
+(evaluators/register-world-setup! (wiki/world-setup (wiki/fixtures)))
+(evaluators/register-world-setup! (wiki/world-setup (wiki/fixtures-v2)))
