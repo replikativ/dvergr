@@ -141,6 +141,54 @@
 (defn- record-failure! [failure]
   (when-let [v *turn-failure*] (vreset! v failure)))
 
+(defn- record-tool-call-start!
+  "Record a tool call as `:running` before it executes, so a call in flight is
+   visible (and timed from its real start). Returns its id, or nil when the
+   record could not be written; analytics never fail a turn."
+  [conn {:keys [name input tool-use-id run-id started-at]}]
+  (let [call-id (java.util.UUID/randomUUID)]
+    (try
+      (dh/transact conn [(cond-> {:tool-call/id call-id
+                                  :tool-call/name name
+                                  :tool-call/input (pr-str input)
+                                  :tool-call/tool-use-id tool-use-id
+                                  :tool-call/status :running
+                                  :tool-call/started-at (java.util.Date. (long started-at))}
+                           run-id (assoc :tool-call/run-id run-id))])
+      call-id
+      (catch Exception e
+        (tel/log! {:level :warn :id :agent/tool-call-persist-error :error e}
+                  "Failed to persist tool-call start")
+        nil))))
+
+(defn- record-tool-call-end!
+  "Complete the record `call-id` with the call's `result`: status, outcome,
+   duration, authorization, and when it ended."
+  [conn call-id result duration-ms]
+  (try
+    (let [error? (= :error (:type result))
+          {:keys [decision sources subject-type subject-id action
+                  resource-type resource-id grant-id]}
+          (:authorization result)]
+      (dh/transact conn
+                   [(cond-> {:tool-call/id call-id
+                             :tool-call/result (pr-str (select-keys result [:type :content :error]))
+                             :tool-call/duration-ms duration-ms
+                             :tool-call/error? error?
+                             :tool-call/status (if error? :error :completed)
+                             :tool-call/ended-at (java.util.Date.)}
+                      decision (assoc :tool-call/authorization-decision decision)
+                      sources (assoc :tool-call/authorization-source sources)
+                      subject-type (assoc :tool-call/authorization-subject-type subject-type)
+                      subject-id (assoc :tool-call/authorization-subject-id (str subject-id))
+                      action (assoc :tool-call/authorization-action action)
+                      resource-type (assoc :tool-call/authorization-resource-type resource-type)
+                      resource-id (assoc :tool-call/authorization-resource-id (str resource-id))
+                      grant-id (assoc :tool-call/authorization-grant-id (str grant-id)))]))
+    (catch Exception e
+      (tel/log! {:level :warn :id :agent/tool-call-persist-error :error e}
+                "Failed to persist tool-call result"))))
+
 (defn run-agent-turn!
   "Execute a single agent turn.
 
@@ -337,40 +385,26 @@
                                                  :error "cancelled"}
                                         :duration-ms 0})
                              (let [start-time (System/currentTimeMillis)
+                                   conn (:db-conn chat-ctx)
+                                   call-id (when conn
+                                             (record-tool-call-start! conn {:name name :input input
+                                                                            :tool-use-id id :run-id run-id
+                                                                            :started-at start-time}))
                                     ;; P2c: resolve clojure_eval's (require …) against
                                     ;; the room's own + attached repos (load-fn falls
                                     ;; back to the base workspace if absent).
-                                   result (binding [workspace/*workspace-roots* (:workspace-roots ctx)]
-                                            (tools/execute name input (assoc ctx :tool-use-id id)))
-                                   duration-ms (- (System/currentTimeMillis) start-time)
-                                   error? (= :error (:type result))]
-                               (when-let [conn (:db-conn chat-ctx)]
-                                 (try
-                                   (let [{:keys [decision sources subject-type subject-id action
-                                                 resource-type resource-id grant-id]}
-                                         (:authorization result)]
-                                     (dh/transact conn
-                                                  [(cond-> {:tool-call/id (java.util.UUID/randomUUID)
-                                                            :tool-call/name name
-                                                            :tool-call/input (pr-str input)
-                                                            :tool-call/result (pr-str (select-keys result [:type :content :error]))
-                                                            :tool-call/duration-ms duration-ms
-                                                            :tool-call/error? error?
-                                                            :tool-call/status (if error? :error :completed)
-                                                            :tool-call/authorization-decision decision
-                                                            :tool-call/authorization-source sources
-                                                            :tool-call/tool-use-id id
-                                                            :tool-call/started-at (java.util.Date.)}
-                                                     subject-type (assoc :tool-call/authorization-subject-type subject-type)
-                                                     subject-id (assoc :tool-call/authorization-subject-id (str subject-id))
-                                                     action (assoc :tool-call/authorization-action action)
-                                                     resource-type (assoc :tool-call/authorization-resource-type resource-type)
-                                                     resource-id (assoc :tool-call/authorization-resource-id (str resource-id))
-                                                     grant-id (assoc :tool-call/authorization-grant-id (str grant-id))
-                                                     run-id (assoc :tool-call/run-id run-id))]))
-                                   (catch Exception e
-                                     (tel/log! {:level :warn :id :agent/tool-call-persist-error :error e}
-                                               "Failed to persist tool-call analytics"))))
+                                   result (try
+                                            (binding [workspace/*workspace-roots* (:workspace-roots ctx)]
+                                              (tools/execute name input (assoc ctx :tool-use-id id)))
+                                            (catch Throwable t
+                                              (when call-id
+                                                (record-tool-call-end! conn call-id
+                                                                       {:type :error :error (or (ex-message t) (str t))}
+                                                                       (- (System/currentTimeMillis) start-time)))
+                                              (throw t)))
+                                   duration-ms (- (System/currentTimeMillis) start-time)]
+                               (when call-id
+                                 (record-tool-call-end! conn call-id result duration-ms))
                                (conj acc {:id id :result result :duration-ms duration-ms})))))
                        []
                        tool-calls)
