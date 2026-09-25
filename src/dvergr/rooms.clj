@@ -161,6 +161,23 @@
     {:ok? true}
     (catch Throwable t {:ok? false :error (.getMessage t)})))
 
+(defn remove-room!
+  "Delete `room` and everything it owns: close it, then its own stores
+   (messages, KB, repository), its registry row and its grants, so it is not
+   hydrated again at the next boot. For rooms that exist only for their work,
+   such as a benchmark's fixture room. The stores are deleted whole: retracting
+   the conversation first would be refused in a store whose conserved resource
+   history (a wallet's ledger) is immutable. Returns {:ok? true} or
+   {:ok? false :error …}."
+  [room]
+  (try
+    (when room
+      (d/close-room! room)
+      (when-let [row (sdb/room-by-slug (:slug room))]
+        (srooms/delete-room! (:room/id row))))
+    {:ok? true}
+    (catch Throwable t {:ok? false :error (.getMessage t)})))
+
 (defn hydrate-registry!
   "For each room in the system-db registry (RF5 S4), build a discourse.Room
    backed by its OWN per-room messages store and register it. Idempotent —

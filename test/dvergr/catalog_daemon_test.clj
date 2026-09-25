@@ -173,9 +173,12 @@
         (is (= 1.0 (get-in done [:result :summary 0 :reward-mean])))
         (is (= 2 (count mine)) "both experiments are the room's")
         (is (= [1 1] (map #(get-in % [:candidates 0 :done]) mine)))
-        (is (empty? (:experiments (ops/invoke *daemon* :experiment/progress
-                                              {:room (:fixture-room started)})))
-            "the fixture room keeps no records")))))
+        (is (loop [n 0]
+              (cond (and (nil? (ops/resolve-room *daemon* (:fixture-room started)))
+                         (nil? (sdb/room-by-slug (:fixture-room started)))) true
+                    (< 50 n) false
+                    :else (do (Thread/sleep 100) (recur (inc n)))))
+            "the fixture room is removed once the job is over, and not hydrated again")))))
 
 (deftest an-llm-experiment-can-fork-a-fork-of-the-room-keeping-its-records
   ;; The shape of a sub-experiment started inside a Run: the worlds fork the
