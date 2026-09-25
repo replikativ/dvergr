@@ -12,18 +12,20 @@
 (defrecord RunWorld [id parent work policy settlement])
 
 (defn open!
-  "Open an isolated work plane for `run-id`. The returned world is visible in
-   the Room registry while open, so an explicitly reviewed world remains
-   inspectable after its executor has quiesced."
-  [parent run-id policy]
-  (when-not (contains? settlement-policies policy)
-    (throw (ex-info "Unknown Run settlement policy"
-                    {:type ::invalid-settlement-policy
-                     :policy policy
-                     :allowed settlement-policies})))
-  (let [work (d/fork-room parent {:isolation :ctx
-                                  :fork-opts {:purpose :run
-                                              :owner run-id
+  "Open an isolated work plane for `run-id`, a fork of `parent`. The returned
+   world is visible in the Room registry while open, so an explicitly reviewed
+   world remains inspectable after its executor has quiesced. `record-room`
+   (default `parent`) is the Room that keeps the Run."
+  ([parent run-id policy] (open! parent run-id policy parent))
+  ([parent run-id policy record-room]
+   (when-not (contains? settlement-policies policy)
+     (throw (ex-info "Unknown Run settlement policy"
+                     {:type ::invalid-settlement-policy
+                      :policy policy
+                      :allowed settlement-policies})))
+   (let [work (d/fork-room parent {:isolation :ctx
+                                   :fork-opts {:purpose :run
+                                               :owner run-id
                                               ;; A hired agent receives the
                                               ;; durable substrate of its
                                               ;; parent world, but constructs
@@ -33,16 +35,19 @@
                                               ;; to fork the interpreter that
                                               ;; is currently evaluating the
                                               ;; hire! call.
-                                              :forkable-components #{}}
+                                               :forkable-components #{}}
                                   ;; A Run world is an internal transaction, not
                                   ;; a child conversation. Nested agents enter
                                   ;; only through explicit hire/tool effects.
-                                  :clone-participants? false})]
-    (swap! (:meta work) assoc
-           :run-world? true
-           :run-id run-id
-           :settlement-policy policy)
-    (->RunWorld (:id work) parent work policy (atom nil))))
+                                   :clone-participants? false})]
+     (swap! (:meta work) assoc
+            :run-world? true
+            :run-id run-id
+           ;; Where the Run is recorded, which settlement updates: the
+           ;; parent, or the control room of a Run whose world forks another.
+            :record-room-id (:id record-room)
+            :settlement-policy policy)
+     (->RunWorld (:id work) parent work policy (atom nil)))))
 
 (defn- settle-once! [world f]
   (locking (:settlement world)
