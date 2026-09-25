@@ -672,6 +672,14 @@
                       cleanup)
                     @cleanup-result)))
               done (sync/deferred)
+              ;; `done` lives in this evaluation's context. The certification
+              ;; worker below binds the control room's, which differs when the
+              ;; world parent is another Room (or a fork of it): delivering
+              ;; there would reach none of the readers awaiting here.
+              done-ctx (ec/current-execution-context)
+              deliver-done! (fn [value]
+                              (binding [ec/*execution-context* done-ctx]
+                                (sync/deliver! done value)))
               certification-failure!
               (fn [error]
                 (if (cancelled-externally?)
@@ -682,8 +690,7 @@
                        (if (= :cancelled @state)
                          :evaluation-cancelled
                          :evaluation-certification-failed))]
-                  (sync/deliver!
-                   done
+                  (deliver-done!
                    {:error
                     (ex-info "Evaluation certification failed"
                              {:type ::certification-failed
@@ -694,8 +701,7 @@
                   cleanup))
               settlement-failure!
               (fn [error]
-                (sync/deliver!
-                 done
+                (deliver-done!
                  {:error
                   (ex-info "Evaluation was certified but world settlement requires recovery"
                            {:type ::settlement-recovery-required
@@ -767,8 +773,7 @@
                                                  :review :review
                                                  final-settlement))]
                              (reset! state :certified)
-                             (sync/deliver!
-                              done
+                             (deliver-done!
                               {:ok {:environment definition
                                     :attempt @persisted-attempt
                                     :attempt-receipt receipt
