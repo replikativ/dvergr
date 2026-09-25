@@ -42,7 +42,7 @@
       :run/started-at now
       :run/updated-at now})))
 
-(defn- certified-attempt [run-id agent]
+(defn- certified-attempt [run-id agent & [extra-metrics]]
   (let [definition
         (environment/make-environment
          {:id :datahike/exact :task {:answer 42}
@@ -53,9 +53,10 @@
          definition
          {:run-id run-id :provider :dvergr :model "echo"
           :status :completed :started-at 1000 :elapsed-ms 10
-          :metrics {:program-kind :echo :model-resolution :not-applicable
-                    :agent-version 1 :agent-def-hash (hasch/uuid agent)
-                    :interpreter-version 5}
+          :metrics (merge {:program-kind :echo :model-resolution :not-applicable
+                           :agent-version 1 :agent-def-hash (hasch/uuid agent)
+                           :interpreter-version 5}
+                          extra-metrics)
           :checks {:exact? true :portable? true} :reward 1.0
           :trace {:runs [{:run/id run-id :run/status :completed}]}})]
     (attempt/make-attempt definition agent receipt
@@ -274,6 +275,44 @@
       (is (zero? (or (dh/q '[:find (count ?check) .
                              :where [?a :attempt/checks ?check]] @conn)
                      0))))))
+
+(deftest an-attempts-spend-and-experiment-cell-are-typed
+  (let [[conn _] (mem-store)
+        st (dhs/make conn (artifact/memory-store))
+        room-id :datahike-attempt-cell
+        [cell plain] [(random-uuid) (random-uuid)]
+        experiment-id (random-uuid)
+        agent (-> (roster/make-roster)
+                  (roster/make-agent {:id :candidate :program {:kind :echo}})
+                  (roster/agent :candidate))
+        now (java.util.Date. 1000)]
+    (store/-store-room! st room-id {:slug (name room-id)})
+    (doseq [run-id [cell plain]]
+      (store/-store-run!
+       st room-id
+       {:run/id run-id :run/kind :agent-task :run/room room-id
+        :run/actor :candidate :run/trigger (random-uuid)
+        :run/status :completed :run/created-at now :run/started-at now
+        :run/updated-at now :run/ended-at (java.util.Date. 1010)
+        :run/agent-version 1 :run/program-kind :echo
+        :run/interpreter-version 5 :run/agent-def-hash (hasch/uuid agent)}))
+    (let [value (certified-attempt cell agent
+                                   {:spend {:microdollars 1234 :priced? true}
+                                    :experiment-content-id experiment-id
+                                    :experiment-candidate :candidate
+                                    :experiment-repetition 0})]
+      (store/-store-attempt! st room-id value)
+      (is (= value (store/-load-attempt st room-id cell))))
+    (store/-store-attempt! st room-id (certified-attempt plain agent))
+    (is (some? (store/-load-attempt st room-id plain)) "an Attempt without them still reads")
+    (is (= #{[cell 1234 experiment-id :candidate]}
+           (dh/q '[:find ?run-id ?md ?exp ?candidate
+                   :where
+                   [?a :attempt/microdollars ?md]
+                   [?a :attempt/experiment-content-id ?exp]
+                   [?a :attempt/experiment-candidate ?candidate]
+                   [?a :attempt/run ?r]
+                   [?r :run/id ?run-id]] @conn)))))
 
 (deftest legacy-artifact-injection-and-domain-readers-remain-compatible
   (let [[conn _] (mem-store)

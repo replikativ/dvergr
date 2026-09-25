@@ -418,6 +418,7 @@
     :attempt/interpreter-version :attempt/prompt-id
     :attempt/model-resolution :attempt/model-steps
     :attempt/evidence-content-id :attempt/settlement-intent
+    :attempt/microdollars :attempt/experiment-content-id :attempt/experiment-candidate
     {:attempt/run [:run/id]}
     {:attempt/evidence-runs [:run/id]}
     {:attempt/evidence-messages [:message/id]}
@@ -524,6 +525,12 @@
       (:model-resolution metrics)
       (assoc :attempt/model-resolution (:model-resolution metrics))
       (:model-steps metrics) (assoc :attempt/model-steps (long (:model-steps metrics)))
+      (get-in metrics [:spend :microdollars])
+      (assoc :attempt/microdollars (long (get-in metrics [:spend :microdollars])))
+      (:experiment-content-id metrics)
+      (assoc :attempt/experiment-content-id (:experiment-content-id metrics))
+      (:experiment-candidate metrics)
+      (assoc :attempt/experiment-candidate (:experiment-candidate metrics))
       (seq (:attempt/evidence-message-ids value))
       (assoc :attempt/evidence-messages
              (mapv (fn [id] [:message/id id])
@@ -590,7 +597,14 @@
                           :attempt/evidence-message-ids
                           (into #{} (map :message/id)
                                 (:attempt/evidence-messages entity)))]
-        (doseq [[k expected] projected]
+        (doseq [[k expected] (merge projected
+                                    ;; Projected since these attributes exist;
+                                    ;; checked where an Attempt has them.
+                                    (select-keys
+                                     {:attempt/microdollars (get-in metrics [:spend :microdollars])
+                                      :attempt/experiment-content-id (:experiment-content-id metrics)
+                                      :attempt/experiment-candidate (:experiment-candidate metrics)}
+                                     (keys entity)))]
           (when-not (= expected (get actual k))
             (throw (ex-info "Attempt typed projection differs from exact payload"
                             {:type :room-store/corrupt-attempt-projection
