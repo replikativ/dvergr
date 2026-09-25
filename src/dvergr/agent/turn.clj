@@ -244,10 +244,14 @@
                                        (:message/tool-use-id message))
                                    (or (:content message)
                                        (:message/content message))])))
-                        messages)]
-     (when (> (count tool-msgs) @posted)
+                        messages)
+         ;; `posted` may be context-scoped state of the caller's context (an
+         ;; interpreter's world): read and reset it there, not in `room`'s,
+         ;; which is another context when the Run records into a control room.
+         n @posted]
+     (when (> (count tool-msgs) n)
        (binding [rtc/*execution-context* (:ctx room)]
-         (doseq [m (subvec tool-msgs @posted)]
+         (doseq [m (subvec tool-msgs n)]
            (let [uses    (vec (or (:message/tool-uses m) (:tool-uses m)))
                  names   (keep #(or (:tool-use/name %) (:name %)) uses)
                  summary (str "🔧 " (str/join ", " names))

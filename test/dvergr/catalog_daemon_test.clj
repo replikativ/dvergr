@@ -8,10 +8,12 @@
             [clojure.java.shell :as sh]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
+            [dvergr.agent.experiment.runner :as runner]
             [dvergr.catalog :as catalog]
             [dvergr.chat.agent :as chat-agent]
             [dvergr.model.chat :as model-chat]
             [dvergr.model.providers :as providers]
+            [dvergr.jobs :as jobs]
             [dvergr.ops :as ops]
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.rooms.forks :as forks]
@@ -147,6 +149,35 @@
         (is (= 2 (:done cand) (:verdicts cand)))
         (is (pos? (:microdollars cand)))
         (is (empty? (:running progress)) "nothing left running")))))
+
+(deftest an-llm-experiment-can-fork-a-fork-of-the-room-keeping-its-records
+  ;; The shape of a sub-experiment started inside a Run: the worlds fork the
+  ;; Run's world (a fork of the room), the records stay in the room. The two
+  ;; contexts differ, so interpreter state (the activity counter) and the
+  ;; evaluation's completion must stay in the context that owns them.
+  (let [calls (atom 0)
+        wf (catalog/lookup "wiki/v1")
+        plan ((:experiment-plan wf) {:models ["claude-haiku-4-5"]})
+        exp (runner/experiment-def (assoc plan :id :test/fork-of-room :repetitions 1))
+        _ (ops/invoke *daemon* :room/create {:slug "fork-parent"})
+        room (ops/resolve-room *daemon* "fork-parent")
+        world (forks/fork! room)]
+    (try
+      (with-redefs [providers/ensure-initialized! (constantly nil)
+                    chat-agent/messages->api-format (fn [messages _ _] messages)
+                    model-chat/chat (wiki-writer calls)]
+        (let [job (jobs/start! room {:kind :experiment :ctx (:ctx world)}
+                               #(runner/run-in room (assoc plan :experiment exp :parent-run %
+                                                           :world-parent world)))
+              done (loop [n 0]
+                     (let [st (ops/invoke *daemon* :job/status {:job (str (:id job)) :wait-ms 20000})]
+                       (if (or (not= "running" (:status st)) (< 8 n)) st (recur (inc n)))))
+              [cand] (get-in (ops/invoke *daemon* :experiment/progress {:room "fork-parent"})
+                             [:experiments 0 :candidates])]
+          (is (= "completed" (:status done)) (pr-str (dissoc done :result)))
+          (is (= 1 (:done cand) (:verdicts cand)) "the cell is certified in the room")
+          (is (= 1.0 (:reward-mean cand)) "the wiki was written: the model ran past its first tool round")))
+      (finally (forks/discard! world)))))
 
 (deftest a-checkout-becomes-a-room-and-its-changes-a-patch
   ;; A daemon room's repository starts as a clone of the sandbox stdlib; an
