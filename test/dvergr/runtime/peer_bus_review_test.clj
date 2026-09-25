@@ -36,7 +36,7 @@
 (def ^:dynamic *base-ctx* nil)
 
 (defn- with-sandbox [test-fn]
-  (let [dir (str "/tmp/dvergr-pb-" (System/nanoTime))]
+  (let [dir (str (System/getProperty "java.io.tmpdir") "/dvergr-pb-" (System/nanoTime))]
     (try
       (let [ctx (daemon/create-shared-context
                  :repo-path (str dir "/repository")
