@@ -115,6 +115,9 @@ around 40, and every definition costs context in every session.
   without a room runs on the benchmark set (fixtures seeded into a new room, ten known facts);
   with a room, on its own `/docs`, scored by citations, links and structure. Each attempt's
   `checks` say what it got right (one per fact), `reward` weighs them.
+- **A benchmark can report into your room.** `catalog_benchmark {workflow, models, room}` still
+  runs every cell in a world forked from a new fixture room, but keeps the job, its Attempts and
+  the Scorecard in `room`, where its dashboards (and `experiment_progress {room}`) show them.
 - **Money is in the result.** A workflow result has each attempt's spend, the per-model table
   (cost per completed attempt) and the room's wallet afterwards.
 - REPL definitions live in the daemon's memory: they do not survive a daemon restart. Keep

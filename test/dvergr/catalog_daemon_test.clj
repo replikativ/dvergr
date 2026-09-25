@@ -150,6 +150,33 @@
         (is (pos? (:microdollars cand)))
         (is (empty? (:running progress)) "nothing left running")))))
 
+(deftest a-benchmark-can-report-into-a-room-of-your-own
+  ;; The fixture room is still new and clean (every cell forks it); the job,
+  ;; its Attempts and the Scorecard are kept where the caller looks.
+  (let [calls (atom 0)
+        bench! (fn [room]
+                 (let [started (ops/invoke *daemon* :catalog/benchmark
+                                           {:workflow "wiki/v1" :models ["claude-haiku-4-5"] :room room})]
+                   [started (loop [n 0]
+                              (let [st (ops/invoke *daemon* :job/status {:job (:id started) :wait-ms 20000})]
+                                (if (or (not= "running" (:status st)) (< 8 n)) st (recur (inc n)))))]))]
+    (ops/invoke *daemon* :room/create {:slug "my-benchmarks"})
+    (with-redefs [providers/ensure-initialized! (constantly nil)
+                  chat-agent/messages->api-format (fn [messages _ _] messages)
+                  model-chat/chat (wiki-writer calls)]
+      (let [[started done] (bench! "my-benchmarks")
+            [_ again] (bench! "my-benchmarks")
+            mine (:experiments (ops/invoke *daemon* :experiment/progress {:room "my-benchmarks"}))]
+        (is (= "my-benchmarks" (:room started)))
+        (is (not= (:room started) (:fixture-room started)))
+        (is (= "completed" (:status done) (:status again)) (pr-str (dissoc done :result)))
+        (is (= 1.0 (get-in done [:result :summary 0 :reward-mean])))
+        (is (= 2 (count mine)) "both experiments are the room's")
+        (is (= [1 1] (map #(get-in % [:candidates 0 :done]) mine)))
+        (is (empty? (:experiments (ops/invoke *daemon* :experiment/progress
+                                              {:room (:fixture-room started)})))
+            "the fixture room keeps no records")))))
+
 (deftest an-llm-experiment-can-fork-a-fork-of-the-room-keeping-its-records
   ;; The shape of a sub-experiment started inside a Run: the worlds fork the
   ;; Run's world (a fork of the room), the records stay in the room. The two

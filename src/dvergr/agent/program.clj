@@ -1353,7 +1353,7 @@
         actor     (:agent/id agent)
         id        (random-uuid)
         chat-id   (run-chat-id id)
-        run-world (world/open! world-parent id settlement)
+        run-world (world/open! world-parent id settlement control-room)
         work-room (:work run-world)
         supervisor (make-supervisor (:ctx world-parent) (:ctx work-room))
         allocation-state

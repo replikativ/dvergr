@@ -21,6 +21,13 @@
 
 (declare fork-diff)
 
+(defn- run-record-room
+  "The Room whose store keeps the Run a Run world belongs to. That is the
+   world's parent, unless the Run was recorded elsewhere: a benchmark's cells
+   fork its fixture room while their Runs are kept in the room it reports to."
+  [fork parent]
+  (or (some-> fork :meta deref :record-room-id rreg/lookup) parent))
+
 (defn deferred?
   "True when a Run world is retained behind its host-owned settlement gate."
   [fork]
@@ -57,7 +64,7 @@
          (throw (ex-info "Deferred release lost its settlement race"
                          {:type ::deferred-settlement-aborted
                           :fork/id (:id fork)})))
-       (agent-run/update-durable-settlement! parent run-id :review reason)
+       (agent-run/update-durable-settlement! (run-record-room fork parent) run-id :review reason)
        (swap! (:meta fork) assoc :settlement-released? true
               :settlement-claim :release)
        {:ok? true :status :review :run/id run-id :fork/id (:id fork)}))))
@@ -79,7 +86,7 @@
          (fn []
            (when (claim!)
              (when (and parent run-id)
-               (agent-run/update-durable-settlement! parent run-id :discarded
+               (agent-run/update-durable-settlement! (run-record-room fork parent) run-id :discarded
                                                      reason))
              (reset! prepared? true)
              true))
@@ -87,7 +94,7 @@
          (fn []
            (when (and @prepared? parent run-id)
              (agent-run/update-durable-settlement!
-              parent run-id :deferred :discard-failed)))]
+              (run-record-room fork parent) run-id :deferred :discard-failed)))]
      (try
        (d/discard-deferred fork durable-claim! durable-abort!)
        {:ok? true}
@@ -109,7 +116,7 @@
         (throw (ex-info "Fork has no current deferred discard recovery"
                         {:type ::no-discard-recovery
                          :fork/id (:id fork)})))
-      (agent-run/update-durable-settlement! parent run-id :deferred
+      (agent-run/update-durable-settlement! (run-record-room fork parent) run-id :deferred
                                             :discard-failed)
       (swap! (:meta fork) dissoc :settlement-claim)
       {:ok? true :status :deferred :run/id run-id :fork/id (:id fork)})))
@@ -320,7 +327,7 @@
         (prepare-workspaces! parent fork)
         (d/merge-room parent fork)
         (when run-id
-          (agent-run/update-durable-settlement! parent run-id :merged :review-approved))
+          (agent-run/update-durable-settlement! (run-record-room fork parent) run-id :merged :review-approved))
         {:ok? true :parent-slug (:slug parent) :parent-id (:id parent)})
       {:ok? false :error "fork has no live parent in the registry"})
     (catch Throwable t {:ok? false :error (.getMessage t)})))
@@ -503,7 +510,7 @@
            run-id (some-> fork :meta deref :run-id)]
        (d/discard fork)
        (when (and parent run-id)
-         (agent-run/update-durable-settlement! parent run-id :discarded reason))
+         (agent-run/update-durable-settlement! (run-record-room fork parent) run-id :discarded reason))
        {:ok? true})
      (catch Throwable t {:ok? false :error (.getMessage t)}))))
 
@@ -528,7 +535,7 @@
           projection-error
           (when (and parent run-id)
             (try
-              (agent-run/update-durable-settlement! parent run-id :adopted
+              (agent-run/update-durable-settlement! (run-record-room fork parent) run-id :adopted
                                                     :governance-transfer)
               nil
               (catch Throwable error error)))]

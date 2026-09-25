@@ -273,7 +273,14 @@
                                    (get-in (first rows) [:attempt :attempt/environment :environment/task])
                                    rows))
                 :experiment
-                (let [sc (first (experiment/scorecards room-value {:limit 1}))]
+                ;; The Scorecard of this job's experiment: a room may keep several.
+                (let [exps (->> (run/runs room-value {:root-run-id id :limit 1000})
+                                (filter #(= id (:run/parent %)))
+                                (keep #(attempts/attempt room-value (:run/id %)))
+                                (keep #(get-in % [:attempt/receipt :attempt/metrics :experiment-content-id]))
+                                set)
+                      sc (some #(first (experiment/scorecards room-value {:experiment-content-id % :limit 1}))
+                               exps)]
                   (cond-> {:room (id->str (:id room-value))}
                     sc (assoc :summary (:scorecard/summary sc))
                     (nil? sc) (assoc :incomplete (experiment/progress room-value))))
@@ -639,19 +646,25 @@
    :catalog/benchmark
    {:doc (str "Benchmark models on a catalog workflow's benchmark set, as an experiment in a new "
               "room: each attempt in a discarded world with the fixtures, scored by the workflow's "
-              "checker, folded into a Scorecard with the bill. Returns a job; experiment_progress "
+              "checker, folded into a Scorecard with the bill. With `room`, the job, its Attempts "
+              "and the Scorecard are kept in that room (its dashboards show them) while the "
+              "attempts still fork the new fixture room. Returns a job; experiment_progress "
               "{room} shows every certified cell while it runs.")
     :kind :write
     :schema [:map
              [:workflow [:string {:description "catalog workflow id, e.g. wiki/v2"}]]
              [:models [:vector {:description "model ids or aliases"} :string]]
+             [:room {:optional true} [:string {:description "room id or slug that keeps the results (default: the new fixture room)"}]]
              [:repetitions {:optional true} [:int {:min 1 :max 10 :description "attempts per model (default 1)"}]]
              [:budget-dollars {:optional true} [:double {:description "budget per attempt in USD (default 0.50)"}]]
              [:timeout-ms {:optional true} [:int {:description "per attempt (default 10 minutes)"}]]]
-    :impl (fn [daemon {:keys [workflow models repetitions] :as args}]
+    :impl (fn [daemon {:keys [workflow models repetitions room] :as args}]
             (let [wf (catalog/lookup workflow)
                   plan-fn (or (:experiment-plan wf)
                               (throw (ex-info (str workflow " has no benchmark set") {:type ::no-benchmark})))
+                  control (when room
+                            (or (resolve-room daemon room)
+                                (throw (ex-info (str "No room " room) {:type ::no-room :room room}))))
                   plan (plan-fn (select-keys args [:models :budget-dollars :timeout-ms]))
                   slug (str "bench-" (slugify (subs (str (:id wf)) 1)) "-" (subs (str (random-uuid)) 0 8))
                   r (in-ctx daemon
@@ -659,11 +672,17 @@
                             (rreg/lookup (keyword slug)))
                   exp (runner/experiment-def (assoc plan :id (keyword slug) :repetitions (or repetitions 1)))]
               (-> (in-ctx daemon
-                          (jobs/start! r {:kind :experiment}
-                                       #(runner/run-in r (assoc plan :experiment exp :parent-run %))))
+                          (if control
+                            ;; The records in `control`, the worlds forked from `r`.
+                            (jobs/start! control {:kind :experiment :ctx (:ctx r)}
+                                         #(runner/run-in control (assoc plan :experiment exp :parent-run %
+                                                                        :world-parent r)))
+                            (jobs/start! r {:kind :experiment}
+                                         #(runner/run-in r (assoc plan :experiment exp :parent-run %)))))
                   (->> (job-data daemon))
                   (assoc :op "catalog/benchmark" :task workflow :models models
-                         :room slug :poll-after-ms 30000))))}
+                         :room (if control (id->str (:id control)) slug)
+                         :fixture-room slug :poll-after-ms 30000))))}
 
    :job/cancel
    {:doc "Cancel a running job (e.g. a workflow_start): its attempts are stopped."
