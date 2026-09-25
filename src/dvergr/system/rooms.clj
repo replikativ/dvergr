@@ -31,8 +31,7 @@
             [dvergr.substrate.paths :as paths]
             [dvergr.substrate.datahike :as sdh]
             [org.replikativ.spindel.yggdrasil :as ygg]
-            [org.replikativ.spindel.engine.core :as ec]
-            [org.replikativ.spindel.engine.context :as sctx]))
+            [org.replikativ.spindel.engine.core :as ec]))
 
 ;; room-id → the room's OWN execution context (RF5 S2). A `fork-context` of the
 ;; daemon root whose composite holds ONLY this room's systems (msgs/kb/repo), so
@@ -237,6 +236,17 @@
                         error)))
       nil)))
 
+(defn- fork-room-ctx
+  "A new room's own execution context: a fork of the daemon root that sees NONE
+   of the root's systems. A raw `fork-context` would fork every system registered
+   on the root, and an embedder may register there (simmis registers each room's
+   store as a `kb:` system for its own branching), so every room, and every Run
+   world forked from it, would branch other rooms' stores. The room registers its
+   own systems into this context afterwards."
+  []
+  (binding [ec/*execution-context* (rctx/current-root)]
+    (:child-ctx (ygg/fork! {:systems :none :purpose :room}))))
+
 (defn hydrate-rooms!
   "Recreate each room's OWN execution context (RF5 S2) on daemon boot and
    register that room's systems INTO it — so per-room msgs/KB/repo survive a
@@ -246,7 +256,7 @@
    Best-effort per room."
   []
   (doseq [{:room/keys [id]} (sdb/all-rooms)]
-    (let [room-ctx (sctx/fork-context (rctx/current-root))]
+    (let [room-ctx (fork-room-ctx)]
       (try
         (binding [ec/*execution-context* room-ctx]
           ;; The mandatory messages/accounting system is always first. If it
@@ -322,7 +332,7 @@
                                                 :db-scope (str (random-uuid))} reg))
           ;; The room's OWN ctx — a fork of the daemon root. Register its systems
           ;; INTO it so its composite holds only them (scoped forks).
-            room-ctx  (sctx/fork-context (rctx/current-root))]
+            room-ctx  (fork-room-ctx)]
         (binding [ec/*execution-context* room-ctx]
           (register-room-systems! msgs-path kb-path repo-path))
         (swap! room-ctxs assoc room-id room-ctx)
