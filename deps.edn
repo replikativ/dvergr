@@ -62,7 +62,9 @@
         ;; resource authority on world.scope, pinned components; MCMC on traces;
         ;; pubsub pulls from the first demand (`start-mult!`/`start-pub!` for
         ;; buffer-only taps); needs partial-cps 0.1.63 (lost-continuation fixes).
-        org.replikativ/spindel     {:mvn/version "0.1.53"}
+        ;; 0.1.54 signals an access to a runtime atom, deferred or mailbox from
+        ;; a world with no state for it (`spindel.missing-state`; the tests throw).
+        org.replikativ/spindel     {:mvn/version "0.1.54"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context
@@ -163,6 +165,9 @@
                        io.forward/clojure-mail {:mvn/version "1.0.8"} ; mail intake
                        org.replikativ/briefkasten {:mvn/version "0.1.2"} ; briefkasten (mail)
                        org.replikativ/spindel-tui {:mvn/version "0.1.14"}}
+         ;; State touched from another world (e.g. a control room's context)
+         ;; fails the test instead of warning; see spindel's missing-state-mode.
+         :jvm-opts    ["-Dspindel.missing-state=throw"]
          :main-opts   ["-m" "kaocha.runner"]}
 
   ;; The benchmarks (`dvergr.benchmarks.*`: tau2, BFCL, the coding, discovery
