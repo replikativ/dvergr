@@ -1029,20 +1029,38 @@
    This must not construct a Spin: it runs specifically after its owning graph
    was cancelled, and re-entering the same execution context through another
    graph node can inherit/reuse cancellation bookkeeping. The watcher already
-   runs off the drain thread, so a short blocking durability backoff is safe."
+   runs off the drain thread, so a short blocking durability backoff is safe.
+
+   The result is published only once its terminal state is durable, so a store
+   that refuses the write (a full disk, say) is retried rather than given up on.
+   It is logged when it starts failing and every minute it goes on failing, with
+   a backoff from 25 ms to 5 s: otherwise it would look exactly like a hang."
   [id completion result finish-opts]
-  (loop []
+  (loop [attempt 0 delay-ms 25 failing-since nil logged-at nil]
     (let [retained (try
                      (run/retain-finished! id (:run/status result) finish-opts)
                      (catch Throwable t t))]
       (cond
         (instance? Throwable retained)
-        (do
-          (Thread/sleep 25)
-          (recur))
+        (let [now (System/currentTimeMillis)
+              since (or failing-since now)
+              log? (or (nil? logged-at) (<= 60000 (- now logged-at)))]
+          (when log?
+            (tel/log! {:level (if (zero? attempt) :warn :error)
+                       :id ::terminal-write-failing
+                       :data {:run/id id :run/status (:run/status result)
+                              :attempts (inc attempt) :failing-ms (- now since)
+                              :error (ex-message retained)}}
+                      "A finished Run's terminal state could not be written; retrying"))
+          (Thread/sleep (long delay-ms))
+          (recur (inc attempt) (min 5000 (* 2 delay-ms)) since (if log? now logged-at)))
 
         retained
-        (run/publish-finished! id completion result)
+        (do (when failing-since
+              (tel/log! {:level :info :id ::terminal-write-recovered
+                         :data {:run/id id :attempts (inc attempt)}}
+                        "A finished Run's terminal state was written after retries"))
+            (run/publish-finished! id completion result))
 
         :else nil)))
   result)
