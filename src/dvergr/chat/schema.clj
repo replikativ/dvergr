@@ -861,6 +861,23 @@
     :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/one}
 
+   {:db/ident :attempt/microdollars
+    :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one
+    :db/doc "What the Attempt's model calls cost, in microdollars (0 when unpriced)"}
+
+   {:db/ident :attempt/experiment-content-id
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/index true
+    :db/doc "The ExperimentDef this Attempt is a cell of, when it is one"}
+
+   {:db/ident :attempt/experiment-candidate
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true
+    :db/doc "The experiment candidate this Attempt ran, when it is a cell"}
+
    {:db/ident :attempt/checks
     :db/valueType :db.type/ref
     :db/cardinality :db.cardinality/many
