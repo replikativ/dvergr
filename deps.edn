@@ -167,7 +167,9 @@
                        org.replikativ/spindel-tui {:mvn/version "0.1.14"}}
          ;; State touched from another world (e.g. a control room's context)
          ;; fails the test instead of warning; see spindel's missing-state-mode.
-         :jvm-opts    ["-Dspindel.missing-state=throw"]
+         ;; Tests' temporary files go to target/test-tmp, emptied after the run
+         ;; (dvergr.test-tmp), not to /tmp.
+         :jvm-opts    ["-Dspindel.missing-state=throw" "-Djava.io.tmpdir=target/test-tmp"]
          :main-opts   ["-m" "kaocha.runner"]}
 
   ;; The benchmarks (`dvergr.benchmarks.*`: tau2, BFCL, the coding, discovery

@@ -12,4 +12,9 @@
           ;;   clojure -M:test --focus-meta :security-open
           :skip-meta   [:integration :security-open]}]
  ;; A bit more output during long runs so we can tell which ns is in flight.
- :reporter [kaocha.report/dots]}
+ :reporter [kaocha.report/dots]
+ ;; Tests write under java.io.tmpdir (target/test-tmp, see the :test alias);
+ ;; dvergr.test-tmp creates it before the run and empties it after.
+ :plugins [:kaocha.plugin/hooks]
+ :kaocha.hooks/pre-load [dvergr.test-tmp/pre-load]
+ :kaocha.hooks/post-run [dvergr.test-tmp/post-run]}
