@@ -37,6 +37,7 @@
             [dvergr.agent.fields :as fields]
             [dvergr.rooms :as rooms]
             [dvergr.rooms.forks :as forks]
+            [dvergr.rooms.repo :as room-repo]
             [dvergr.rooms.stats :as stats]
             [dvergr.room.registry :as rreg]
             [dvergr.room.store :as rstore]
@@ -710,6 +711,28 @@
     :impl (fn [daemon {:keys [room]}]
             (when-let [r (resolve-room daemon room)]
               (in-ctx daemon (workflow/review (:id r)))))}
+
+   :room/import
+   {:doc (str "Create a room from a Git repository: its workspace is a clone of a local checkout "
+              "(path; its committed state) or a remote URL (https, ssh), with history. Its agents then "
+              "work on it in forks (workflow_start), reviewed and merged as usual; room_export returns "
+              "the changes as a patch.")
+    :kind :write
+    :schema [:map [:room [:string {:description "slug of the NEW room"}]]
+             [:source [:string {:description "local checkout path, or https/ssh Git URL"}]]
+             [:title {:optional true} :string]
+             [:branch {:optional true} [:string {:description "branch of a local checkout (default: its current one)"}]]]
+    :impl (fn [daemon {:keys [room source title branch]}]
+            (in-ctx daemon (room-repo/import-room! {:slug room :title title :source source :branch branch})))}
+
+   :room/export
+   {:doc (str "The room's changes since room_import, as a patch for `git apply` in the source checkout "
+              "(after adopting an attempt with room_merge). Commits the room's pending work first.")
+    :kind :write
+    :schema [:map [:room Room]]
+    :impl (fn [daemon {:keys [room]}]
+            (when-let [r (resolve-room daemon room)]
+              (in-ctx daemon (room-repo/export r))))}
 
    :room/discard
    {:doc "Discard a fork without merging."

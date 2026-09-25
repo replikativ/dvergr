@@ -52,7 +52,7 @@ neither listed nor callable.
 
 | Profile | Toolsets | Tools |
 | --- | --- | --- |
-| `offload` (default) | rooms, worlds, attempts, catalog, wallets, repl | 24 |
+| `offload` (default) | rooms, worlds, attempts, catalog, wallets, repl | 26 |
 | `readonly` | every read op | read-only only |
 | `admin` | everything | all |
 
@@ -99,6 +99,11 @@ around 40, and every definition costs context in every session.
   `experiment://{room}/progress`, …). Subscribing to one about a room sends
   `notifications/resources/updated` after every durable change of that room (a message, a Run,
   a tool call, an Attempt), at most a few times a second; re-read the resource for what changed.
+- **Your code in, a patch out.** `room_import {room, source}` creates a room whose workspace is a
+  clone of a local checkout (its committed state, with history) or an https remote. Work on it with
+  `workflow_start`, adopt an attempt with `room_merge`, then `room_export {room}` returns the changes
+  since the import as a patch: `git apply` it in your checkout. Only these two ops reach a
+  repository outside the room; a room's own sandbox Git has no network transport.
 - **Merges are pinned to the review.** `room_review` (and every workflow attempt's review)
   carries the fork's `state`, a hash of its systems' snapshot ids; `room_merge {room,
   expect-state}` refuses a fork that changed since. A failed merge is an error, not a success.

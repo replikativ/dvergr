@@ -4,7 +4,9 @@
    reviewed with the files they changed, one adopted by a pinned merge. Durable
    rooms matter here: a memory room has no workspace, and a fork's uncommitted
    files were silently lost on merge."
-  (:require [clojure.string :as str]
+  (:require [clojure.java.io :as io]
+            [clojure.java.shell :as sh]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [dvergr.catalog :as catalog]
             [dvergr.chat.agent :as chat-agent]
@@ -145,3 +147,32 @@
         (is (= 2 (:done cand) (:verdicts cand)))
         (is (pos? (:microdollars cand)))
         (is (empty? (:running progress)) "nothing left running")))))
+
+(deftest a-checkout-becomes-a-room-and-its-changes-a-patch
+  ;; A daemon room's repository starts as a clone of the sandbox stdlib; an
+  ;; imported room's starts as a clone of the client's checkout instead.
+  (let [src (io/file (System/getProperty "java.io.tmpdir") (str "dvergr-import-" (random-uuid)))
+        git! (fn [& args] (let [{:keys [exit err]} (apply sh/sh "git" (concat args [:dir src]))]
+                            (when-not (zero? exit) (throw (ex-info err {})))))]
+    (.mkdirs (io/file src "src"))
+    (try
+      (git! "init" "-q" "-b" "main")
+      (git! "config" "user.email" "t@example.invalid")
+      (git! "config" "user.name" "T")
+      (spit (io/file src "src" "core.clj") "(ns core)\n\n(defn answer [] 41)\n")
+      (git! "add" ".")
+      (git! "commit" "-q" "-m" "Initial")
+      (let [imp (ops/invoke *daemon* :room/import {:room "imported-repo" :source (.getPath src)})
+            r (ops/resolve-room *daemon* "imported-repo")]
+        (is (= 1 (:files imp)) "the checkout's files, and not the stdlib's")
+        (is (= {"/src/core.clj" "(ns core)\n\n(defn answer [] 41)\n"} (catalog/read-tree r "/src")))
+        (is (thrown-with-msg? Exception #"exists"
+                              (ops/invoke *daemon* :room/import {:room "imported-repo" :source (.getPath src)})))
+        (muschel.fs/write-string! (dvergr.catalog.workspace/room-fs r) "/src/core.clj"
+                                  "(ns core)\n\n(defn answer [] 42)\n" false)
+        (let [{:keys [patch files]} (ops/invoke *daemon* :room/export {:room "imported-repo"})]
+          (is (= [{:status "M" :path "src/core.clj"}] files))
+          (spit (io/file src "room.patch") patch)
+          (git! "apply" "room.patch")
+          (is (= "(ns core)\n\n(defn answer [] 42)\n" (slurp (io/file src "src" "core.clj"))))))
+      (finally (sh/sh "rm" "-rf" (.getPath src))))))
