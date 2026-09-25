@@ -12,6 +12,9 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [dvergr.catalog.workspace :as ws]
+            [dvergr.room.registry :as rreg]
+            [dvergr.room.store :as rstore]
+            [dvergr.rooms :as rooms]
             [dvergr.rooms.forks :as forks]
             [dvergr.substrate.geschichte :as gs]
             [geschichte.git.command :as command]
@@ -87,6 +90,36 @@
       {:source (str source)
        :commit commit
        :files (count (str/split-lines (:stdout (git! room ["ls-files"]))))})))
+
+(defn- check-source! [source]
+  (when-not (or (local-source source)
+                (re-find #"^(https?://|ssh://|[\w.-]+@[\w.-]+:)" (str source)))
+    (throw (ex-info (str "Not a local Git checkout or a remote URL: " source)
+                    {:type ::unknown-source :source source}))))
+
+(defn import-room!
+  "Create the room `slug` (titled `title`) with its workspace cloned from
+   `source`, a local checkout (with `:branch`) or a remote URL, instead of the
+   sandbox stdlib a new room starts from; tag the imported commit. Must be
+   called with the context rooms are created in bound (the daemon's). Returns
+   `{:room :source :commit :files n}`."
+  [{:keys [slug title source branch]}]
+  (check-source! source)
+  (when (rreg/lookup (rstore/slug->room-id slug))
+    (throw (ex-info (str "Room " slug " exists; import creates a new room")
+                    {:type ::room-exists :room slug})))
+  (let [source (or (local-source source) (str source))
+        room-id (rooms/create-room! (cond-> {:slug slug :title (or title slug) :repo-source source}
+                                      branch (assoc :repo-branch branch)))
+        room (or (rreg/lookup room-id)
+                 (throw (ex-info "The imported room was not created" {:type ::not-created :room slug})))
+        commit (or (head room)
+                   (throw (ex-info "The source has no commit to import" {:type ::empty-source :source source})))]
+    (git! room ["tag" import-tag])
+    {:room (name room-id)
+     :source source
+     :commit commit
+     :files (count (str/split-lines (:stdout (git! room ["ls-files"]))))}))
 
 (defn export
   "The room's changes since its import, as a patch: commits the workspace's

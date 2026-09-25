@@ -85,17 +85,22 @@
   (repo/commit! conn {:message "workspace: empty (stdlib source unreachable)"
                       :author "dvergr <agent@dvergr.local>"}))
 
-(defn- import-seed! [conn source]
+(defn- import-seed! [conn source remote branch]
   (if-let [local-source (git-local/source-file (io/file ".") source)]
     (git-local/import! conn local-source
-                       {:remote "upstream" :clone? true})
-    (git-http/clone! conn "upstream" source)))
+                       (cond-> {:remote remote :clone? true} branch (assoc :branch branch)))
+    (git-http/clone! conn remote source)))
 
 (defn ensure-repository!
   "Create and seed a persistent Geschichte repository at `scope`. Existing
-  repositories are left untouched. Returns the Datahike config."
+  repositories are left untouched. Returns the Datahike config.
+
+  `:source` (default the sandbox stdlib) is a local checkout or a Git URL, with
+  `:branch` for a local one. When the stdlib seed cannot be imported the
+  repository starts empty; with `:fallback? false` (a user's repository) the
+  failure is an error and nothing is created."
   ([scope] (ensure-repository! scope {}))
-  ([scope {:keys [source] :or {source (sandbox-repo)}}]
+  ([scope {:keys [source branch fallback? remote] :or {fallback? true}}]
    (let [cfg (repository-config scope)]
      (when-not (d/database-exists? cfg)
        (when-let [parent (.getParentFile (io/file scope))]
@@ -104,11 +109,18 @@
        (let [conn (d/connect cfg)]
          (try
            (repo/init! conn {:name "dvergr workspace"})
-           (try
-             (import-seed! conn source)
-             (catch Throwable error
-               (fallback-workspace! conn source error)))
-           (finally (d/release conn)))))
+           (let [source (or source (sandbox-repo))]
+             (try
+               (import-seed! conn source (or remote (if fallback? "upstream" "origin")) branch)
+               (catch Throwable error
+                 (if fallback?
+                   (fallback-workspace! conn source error)
+                   (do (d/release conn)
+                       (d/delete-database cfg)
+                       (throw (ex-info (str "Could not import " source ": " (ex-message error))
+                                       {:type ::import-failed :source source}
+                                       error)))))))
+           (finally (try (d/release conn) (catch Throwable _ nil))))))
      cfg)))
 
 (defn create-system

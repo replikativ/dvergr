@@ -278,10 +278,13 @@
    `slug`. Requires a bound ctx (whose `current-root` is the fork parent).
    Returns `{:room-id … :room-ctx …}` (`:existing? true` if already provisioned).
 
+   `:repo-source` (a local checkout or Git URL, with `:repo-branch`) makes the
+   room's repository a clone of it rather than of the sandbox stdlib.
+
    RF5 S4: the registry fields (`type`/`telegram-chat-id`/`agent-ids`/`parent-slug`)
    are stored on the system-db room row — the sole registry. On an already-provisioned
    room they're upserted (so re-create refreshes participants/parent)."
-  [{:keys [slug name owner-id type telegram-chat-id agent-ids parent-slug] :as opts}]
+  [{:keys [slug name owner-id type telegram-chat-id agent-ids parent-slug repo-source repo-branch] :as opts}]
   (let [reg (select-keys opts [:type :telegram-chat-id :agent-ids :parent-slug])]
     (if-let [existing (sdb/room-by-slug slug)]
       (do (when (seq (filter val reg))
@@ -292,7 +295,14 @@
       (let [repo-path (scope-path (str (random-uuid)))
             kb-path   (scope-path (str (random-uuid)))
             msgs-path (scope-path (str (random-uuid)))
-            _         (geschichte/ensure-repository! repo-path)
+            ;; A room imported from a repository (`:repo-source`) starts as a
+            ;; clone of it instead of the sandbox stdlib, and fails loudly.
+            _         (geschichte/ensure-repository!
+                       repo-path
+                       (if repo-source
+                         (cond-> {:source repo-source :fallback? false}
+                           repo-branch (assoc :branch repo-branch))
+                         {}))
             ;; KB store carries ONLY the knowledge schema (not the chat schema).
             _         (sdh/provision! {:cfg (kb-cfg kb-path) :schema? false
                                        :extra-schema (kbs/knowledge-datahike-schema)

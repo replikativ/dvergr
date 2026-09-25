@@ -73,10 +73,13 @@
                           Pass false to opt out.
      :ctx              - Execution context for the discourse Room
                           (default: current bound ctx)
+     :repo-source      - Local checkout or Git URL the room's repository is
+                          cloned from (default: the sandbox stdlib);
+                          :repo-branch picks a local checkout's branch
 
    Returns the room-id (slug keyword) of the created room. Callers who need the
    discourse Room can look it up via `(dvergr.room.registry/lookup room-id)`."
-  [{:keys [title slug type telegram-chat-id agent-ids parent-id ctx]
+  [{:keys [title slug type telegram-chat-id agent-ids parent-id ctx repo-source repo-branch]
     :or   {parent-id :default}}]
   (let [ctx (or ctx (try (ec/current-execution-context) (catch Throwable _ nil)))
         global-slug (or (:global-room-slug (config/config)) "boardroom")
@@ -105,8 +108,12 @@
                                       :type (or type :internal)}
                                telegram-chat-id (assoc :telegram-chat-id telegram-chat-id)
                                (seq agent-ids)  (assoc :agent-ids (set agent-ids))
-                               parent-slug      (assoc :parent-slug parent-slug))))
-                          (catch Throwable _ nil)))
+                               parent-slug      (assoc :parent-slug parent-slug)
+                               repo-source      (assoc :repo-source repo-source)
+                               repo-branch      (assoc :repo-branch repo-branch))))
+                          ;; An import that fails must say so, not leave a room
+                          ;; without the repository it was made for.
+                          (catch Throwable t (when repo-source (throw t)) nil)))
           room-ctx (or (:room-ctx prov) ctx)]
       (tel/log! {:id :rooms/created :data {:slug slug}} "Room created")
       ;; Build the discourse Room ON its own ctx, with its per-room store.
