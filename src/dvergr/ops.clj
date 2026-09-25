@@ -44,7 +44,8 @@
             [dvergr.discourse :as d]
             [dvergr.model.registry :as reg]
             [org.replikativ.spindel.engine.core :as ec]
-            [org.replikativ.spindel.yggdrasil :as ygg]))
+            [org.replikativ.spindel.yggdrasil :as ygg]
+            [taoensso.telemere :as tel]))
 
 ;; ============================================================================
 ;; Context + handle resolution
@@ -676,13 +677,23 @@
                             ;; The records in `control`, the worlds forked from `r`.
                             (jobs/start! control {:kind :experiment :ctx (:ctx r)}
                                          #(runner/run-in control (assoc plan :experiment exp :parent-run %
-                                                                        :world-parent r)))
+                                                                        :world-parent r))
+                                         ;; The fixture room holds nothing once the job is
+                                         ;; over: every cell's world is settled and every
+                                         ;; record is in `control`.
+                                         :settled (fn [_ _]
+                                                    (let [{:keys [ok? error]} (in-ctx daemon (rooms/remove-room! r))]
+                                                      (when-not ok?
+                                                        (tel/log! {:level :warn :id ::fixture-room-not-removed
+                                                                   :data {:room (id->str (:id r)) :error error}}
+                                                                  "A benchmark's fixture room could not be removed")))))
                             (jobs/start! r {:kind :experiment}
                                          #(runner/run-in r (assoc plan :experiment exp :parent-run %)))))
                   (->> (job-data daemon))
                   (assoc :op "catalog/benchmark" :task workflow :models models
                          :room (if control (id->str (:id control)) slug)
-                         :fixture-room slug :poll-after-ms 30000))))}
+                         :poll-after-ms 30000)
+                  (cond-> control (assoc :fixture-room slug)))))}
 
    :job/cancel
    {:doc "Cancel a running job (e.g. a workflow_start): its attempts are stopped."
