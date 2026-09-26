@@ -157,13 +157,46 @@ plant name) are chosen so that no other document states them.
   uses world 1. End to end (`catalog_daemon_test`): a perfect wiki of each world
   scores 1.0 against that world's gold.
 
+**A real corpus next to the generated worlds** (split `:real`). `mondragon`: six
+dated snapshots (infobox and lead, 2010–2025) of the Wikipedia article on the
+Mondragon Corporation, in `resources/dvergr/catalog/wiki-real/mondragon/`
+(CC BY-SA 4.0; `LICENSE.md` links every revision and lists what was changed). What
+is hard in it is real, not planted: the head of the federation changes four times;
+the employee count moves (92,773 in 2008; 80,321 or 83,321 for 2012, both in the
+same revision; 74,335 in 2015; 81,507 in 2019; over 70,000 in 2024); revenue and
+assets stop at 2015 and 2014 while the text goes on to 2025; revisions contradict
+each other (seventh- vs tenth-largest company, 74,117 employees at the end of 2014
+or of 2016). The gold (13 facts, 8 stale values) is curated from the documents,
+and a hand-written reference wiki calibrates it like v2's
+(`test/dvergr/catalog/wiki_real_test.clj`). Run it with
+`catalog_benchmark {workflow: "wiki/v3", split: "real", …}`: scores for real corpora
+are a separate Scorecard, not averaged into the generated worlds.
+
+A finding from it: currency's weight (15%) is shared by a world's stale values, so
+the cost of one stale value shrinks as a world has more of them. Stating two former
+heads as current costs 0.04 here (8 stale values) and would cost 0.06 in v2 (5).
+For a reader "who runs it now" is not a small error; a fixed cost per stale value
+(or a gate on the current head) is a scorer change to decide, not done, since it
+would change v2's and v3's scores.
+
+**The anchor for article shape: FreshWiki** (the STORM paper's set, NAACL 2024;
+100 recent Wikipedia articles rated B-class or better, CC BY-SA 4.0; measured on its
+per-sentence citation data). Median article: 8 sections, 28 sentences, 634 words;
+43% of sentences carry a citation (p10–p90 0–71%); 71.5 distinct references
+(22–131); 41% of sentences contain a number, and 41% of those are cited; references
+are 25% news, 3% government, 71% other (organisations, archives, video, books) over
+2,370 domains. Two consequences: a real source set is an order of magnitude larger
+than a generated world's twelve documents (hence the scale knobs below), and good
+encyclopedic writing cites fewer than half its sentences, so our per-page citation
+and grounding checks are stricter than Wikipedia practice (defensible for an
+internal wiki, whose reader must be able to check every number).
+
 Next for the wiki benchmark:
 
-- **Anchor on real data.** FreshWiki (STORM, NAACL 2024; 100 B-class-or-better
-  Wikipedia articles, CC BY-SA, about 2,160 words and 90 references each) as the
-  reference for how a good article is shaped and sourced, and Wikipedia revision
-  histories or SEC filings for how values really go stale; then a small real-data
-  environment reported next to the generated ones. Licences to be verified first.
+- **More real corpora.** Wikipedia revision histories of other organisations (the
+  same shape as `mondragon`), and SEC EDGAR filings (sec.gov: "may be copied or
+  further distributed … without the SEC's permission") for documents of different
+  genre and authority about one company.
 - **Scale knobs.** Documents per world and their length are far below a real dump
   (12 documents, about 700 words); add more documents per genre and noise.
 - **Incremental update.** New documents arrive; score the updated wiki and its cost.

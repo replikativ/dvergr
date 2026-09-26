@@ -458,9 +458,30 @@
 ;; environment's metadata (and so in its content id); the dev split is public,
 ;; the test split is derived from a key the host keeps.
 
-(defn- seed-of [environment]
-  (or (get-in environment [:environment/metadata :seed])
-      (throw (ex-info "A wiki/v3 environment names its seed" {:type ::no-seed}))))
+(def real-corpora
+  "Real corpora reported next to the generated worlds (split `:real`): dated
+   documents of a real organisation with curated gold, under
+   `resources/dvergr/catalog/wiki-real/<name>/` (each with its LICENSE.md)."
+  {:mondragon {:dir "dvergr/catalog/wiki-real/mondragon"
+               :docs ["mondragon-2010.md" "mondragon-2013.md" "mondragon-2016.md"
+                      "mondragon-2019.md" "mondragon-2022.md" "mondragon-2025.md"]}})
+
+(defn real-documents [corpus]
+  (let [{:keys [dir docs]} (or (real-corpora corpus)
+                               (throw (ex-info (str "No real corpus " corpus) {:type ::no-corpus :corpus corpus})))]
+    (resource-tree dir docs)))
+
+(defn real-gold [corpus]
+  (edn/read-string (slurp (io/resource (str (:dir (real-corpora corpus)) "/gold.edn")))))
+
+(defn- world-of
+  "`{:docs :gold}` of a wiki/v3 environment: a generated world (`:seed`) or a
+   real corpus (`:corpus`)."
+  [environment]
+  (let [{:keys [seed corpus]} (:environment/metadata environment)]
+    (cond corpus {:docs (real-documents corpus) :gold (real-gold corpus) :id corpus}
+          seed (let [w (gen/world seed)] {:docs (gen/documents w) :gold (gen/gold w) :id seed})
+          :else (throw (ex-info "A wiki/v3 environment names its seed or corpus" {:type ::no-world})))))
 
 (defn world-setup-v3
   "Writes the documents of the environment's world into /docs of each
@@ -469,11 +490,10 @@
   (evaluation/make-world-setup
    {:id :catalog/wiki-generated :version 1 :basis {:generator gen/version}
     :prepare (fn [{world :room environment :environment}]
-               (let [seed (seed-of environment)
-                     docs (gen/documents (gen/world seed))]
+               (let [{:keys [docs id]} (world-of environment)]
                  (ws/ensure-workspace! world)
                  (ws/seed! world docs)
-                 {:seed seed :files (count docs) :fixtures (str (hasch/uuid docs))}))}))
+                 {:world (str id) :files (count docs) :fixtures (str (hasch/uuid docs))}))}))
 
 (defn evaluator-v3
   "v2's checker, against the gold of the environment's world."
@@ -485,7 +505,7 @@
                 :sources (ws/read-tree world source)})
     :observe (fn [{:keys [default result environment] captured :execution/evidence}]
                (let [scored (score-wiki-v2 {:pages (:pages captured) :sources (:sources captured)
-                                            :gold (gen/gold (gen/world (seed-of environment)))
+                                            :gold (:gold (world-of environment))
                                             :target target :source source})]
                  (assoc default
                         :run-status (:run/status result)
@@ -498,26 +518,31 @@
                :reward (if (= :completed run-status) reward 0.0)})}))
 
 (defn environments-v3
-  "One EnvironmentDef per seed of `split` (`:dev`, or `:test` with `test-key`)."
-  [setup ev {:keys [timeout-ms split n seeds test-key] :or {split :dev n 6}}]
-  (let [ref (evaluation/evaluator-ref ev)]
-    (mapv (fn [seed]
-            (environment/make-environment
-             {:id :catalog/wiki-v3
-              :task (task-v2 params)
-              :verifier {:id (:verifier/id ref) :version (:verifier/version ref)}
-              :limits {:timeout-ms (or timeout-ms (* 10 60 1000)) :cancel-timeout-ms 30000
-                       :on-timeout :verdict}
-              :world {:isolation :ctx :settlement :discard
-                      :setup (evaluation/world-setup-ref setup)}
-              :metadata {:seed seed :split split :generator gen/version}}))
-          (or seeds (gen/seeds split n test-key)))))
+  "The EnvironmentDefs of `split`: one per seed of `:dev`, or of `:test` with
+   `test-key`; one per real corpus of `:real` (`:corpora`, default all)."
+  [setup ev {:keys [timeout-ms split n seeds test-key corpora] :or {split :dev n 6}}]
+  (let [ref (evaluation/evaluator-ref ev)
+        env (fn [metadata]
+              (environment/make-environment
+               {:id :catalog/wiki-v3
+                :task (task-v2 params)
+                :verifier {:id (:verifier/id ref) :version (:verifier/version ref)}
+                :limits {:timeout-ms (or timeout-ms (* 10 60 1000)) :cancel-timeout-ms 30000
+                         :on-timeout :verdict}
+                :world {:isolation :ctx :settlement :discard
+                        :setup (evaluation/world-setup-ref setup)}
+                :metadata metadata}))]
+    (if (= :real split)
+      (mapv #(env {:corpus % :split :real}) (or corpora (sort (keys real-corpora))))
+      (mapv #(env {:seed % :split split :generator gen/version})
+            (or seeds (gen/seeds split n test-key))))))
 
 (defn experiment-plan
   "What running a benchmark set (`version` 1, the default, 2 or 3) needs,
    wherever it runs: capabilities, environments, the candidate team (one per
    model), the model specs, the dataset. v3 takes `:split` (`:dev`, the
-   default, or `:test`), `:n` worlds (default 6), explicit `:seeds`, and the
+   default, `:test`, or `:real` for the real corpora), `:n` worlds (default
+   6), explicit `:seeds` or `:corpora`, and the
    held-out split's key (`:test-key`, default the environment variable
    DVERGR_WIKI_TEST_KEY)."
   [{:keys [models budget-dollars timeout-ms prompt version] :or {version 1} :as opts}]
@@ -534,7 +559,7 @@
        :models (mapv #(:agent/model-policy (roster/agent team %)) ids)
        :dataset {:id :catalog/wiki-v3
                  :metadata {:generator gen/version :split (or (:split opts) :dev)
-                            :seeds (mapv #(get-in % [:environment/metadata :seed]) envs)}}})
+                            :worlds (mapv #(let [m (:environment/metadata %)] (or (:seed m) (:corpus m))) envs)}}})
     (experiment-plan-v1-v2 opts)))
 
 (defn- experiment-plan-v1-v2

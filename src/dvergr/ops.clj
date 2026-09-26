@@ -657,7 +657,7 @@
              [:models [:vector {:description "model ids or aliases"} :string]]
              [:room {:optional true} [:string {:description "room id or slug that keeps the results (default: the new fixture room)"}]]
              [:environments {:optional true} [:int {:min 1 :max 50 :description "generated worlds, for workflows that generate them (wiki/v3; default 6)"}]]
-             [:split {:optional true} [:enum {:description "dev (public, the default) or test (held out: the host's key)"} "dev" "test"]]
+             [:split {:optional true} [:enum {:description "dev (public, the default), test (held out: the host's key) or real (real corpora)"} "dev" "test" "real"]]
              [:repetitions {:optional true} [:int {:min 1 :max 10 :description "attempts per model (default 1)"}]]
              [:budget-dollars {:optional true} [:double {:description "budget per attempt in USD (default 0.50)"}]]
              [:timeout-ms {:optional true} [:int {:description "per attempt (default 10 minutes)"}]]]
