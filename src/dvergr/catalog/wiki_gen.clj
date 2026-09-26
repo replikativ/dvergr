@@ -254,17 +254,52 @@
                      :site (str (pick r ["Heath" "Mill" "Stone" "Ash"]) " " (pick r ["Farm" "Lane" "Point" "Row"]))
                      :count (between r 40 900) :unit (pick r ["hectares" "customers" "wells"])}))}))
 
+;; ----------------------------------------------------------------------------
+;; Noise: documents as they arrive, not as they were written
+;; ----------------------------------------------------------------------------
+;;
+;; `:noise` n adds the first n of three kinds, each measured by the checker:
+;;
+;; 1. Scan artefacts. Paper genres (charter, annual reports, board minutes,
+;;    incident reports) read like text extracted from a PDF: lines wrapped hard,
+;;    words hyphenated across line ends, a running footer per page. Their facts
+;;    are there once the artefacts are undone (`unscan`); a wiki that copies
+;;    "Thorn- bury Works" states neither the fact nor the entity.
+;; 2. An erratum. The latest annual report misprints the member count (two
+;;    digits swapped); a later erratum notice gives the correct figure. The
+;;    misprint is one more stale value, and the current count is stated only in
+;;    the erratum.
+;; 3. Short names. The board minutes name the general managers by initial and
+;;    surname; the full names are stated in other documents, so the gold of what
+;;    the minutes say names those documents too.
+
+(defn- misprint
+  "The latest member count with two digits swapped, a value no document states
+   otherwise."
+  [w]
+  (let [v (:members-2 w)
+        taken (into #{(:members-1 w) v} (map :members) (get-in w [:extra :reports]))
+        swap (fn [i j] (let [s (vec (str v))]
+                         (when (and (< j (count s)) (not= (s i) (s j)) (or (pos? i) (not= \0 (s j))))
+                           (parse-long (apply str (assoc s i (s j) j (s i)))))))]
+    (or (first (remove (some-fn nil? taken) [(swap 1 2) (swap 0 1) (swap 2 3)]))
+        (first (remove taken (iterate #(+ % 900) (+ v 900)))))))
+
 (defn world
   "The world of `seed`: a map of everything its documents and its gold say.
    With `:scale` s > 1, also `:extra`: s-1 times more reports, newsletters and
    other organisations (see above); scale 1 is the base world. With `:prose` p
-   > 0, every document carries p paragraphs of routine text (`with-prose`)."
+   > 0, every document carries p paragraphs of routine text (`with-prose`).
+   With `:noise` n > 0, the documents carry n kinds of noise (see Noise)."
   ([seed] (world seed {}))
-  ([seed {:keys [scale prose] :or {scale 1 prose 0}}]
-   (let [base (base-world seed)]
-     (cond-> base
-       (< 1 scale) (assoc :scale scale :extra (extra base scale))
-       (pos? prose) (assoc :prose prose)))))
+  ([seed {:keys [scale prose noise] :or {scale 1 prose 0 noise 0}}]
+   (let [base (base-world seed)
+         w (cond-> base
+             (< 1 scale) (assoc :scale scale :extra (extra base scale))
+             (pos? prose) (assoc :prose prose))]
+     (cond-> w
+       (pos? noise) (assoc :noise noise)
+       (<= 2 noise) (assoc :misprint (misprint w))))))
 
 (defn- k [w key] (get-in kinds [(:kind w) key]))
 
@@ -278,18 +313,20 @@
 (defn document-names
   "The file names of `w`'s documents, in /docs."
   [w]
-  {:charter (str "charter-" (:founded w) ".md")
-   :blog "blog-history.md"
-   :report-1 (str "annual-report-" (:report-1 w) ".md")
-   :newsletter (str "newsletter-" (:newsletter w) ".md")
-   :report-opened (str "annual-report-" (:opened w) ".md")
-   :rename "press-release-rename.md"
-   :rename-copy "press-release-rename-copy.md"
-   :incident (str "incident-" (:incident w) ".md")
-   :minutes (str "board-minutes-" (:gm3-from w) ".md")
-   :report-latest (str "annual-report-" (:latest w) ".md")
-   :agenda (str "agenda-" (inc (:latest w)) ".md")
-   :other (str (-> (:other-place w) str/lower-case (str/replace " " "-")) ".md")})
+  (cond->
+   {:charter (str "charter-" (:founded w) ".md")
+    :blog "blog-history.md"
+    :report-1 (str "annual-report-" (:report-1 w) ".md")
+    :newsletter (str "newsletter-" (:newsletter w) ".md")
+    :report-opened (str "annual-report-" (:opened w) ".md")
+    :rename "press-release-rename.md"
+    :rename-copy "press-release-rename-copy.md"
+    :incident (str "incident-" (:incident w) ".md")
+    :minutes (str "board-minutes-" (:gm3-from w) ".md")
+    :report-latest (str "annual-report-" (:latest w) ".md")
+    :agenda (str "agenda-" (inc (:latest w)) ".md")
+    :other (str (-> (:other-place w) str/lower-case (str/replace " " "-")) ".md")}
+    (:misprint w) (assoc :erratum (str "erratum-" (:latest w) ".md"))))
 
 ;; ----------------------------------------------------------------------------
 ;; Prose: routine text around the facts
@@ -329,12 +366,69 @@
    when it is an annual report; `name` seeds the choice."
   [w name text p]
   (let [r (rng (bit-xor (long (:seed w)) (* 104729 (long p)) (long (hash name))))
-        paras (for [_ (range p)] (str/join " " (pick-distinct r 3 routine)))
+        ;; one shuffle of the bank, so a document repeats no sentence before it is used up
+        paras (map #(str/join " " %) (take p (partition 3 (cycle (pick-distinct r (count routine) routine)))))
         table (when (str/starts-with? name "annual-report")
                 (str "| Quarter | Service calls | Planned jobs |\n| --- | --- | --- |\n"
                      (str/join "\n" (for [q ["Q1" "Q2" "Q3" "Q4"]]
                                       (str "| " q " | " (between r 10 60) " | " (between r 10 60) " |")))))]
     (str (str/trimr text) "\n\n" (str/join "\n\n" (cond-> (vec paras) table (conj table))) "\n")))
+
+;; ----------------------------------------------------------------------------
+;; Scan artefacts (noise 1)
+;; ----------------------------------------------------------------------------
+
+(defn- paper? [name]
+  (some #(str/starts-with? name %) ["charter-" "annual-report-" "board-minutes-" "incident-"]))
+
+(def ^:private line-width 64)
+
+(defn- wrap
+  "`para` wrapped at `line-width`, a long word now and then hyphenated across
+   the line end as a typesetter would."
+  [^java.util.Random r para]
+  (loop [ws (str/split para #" ") line "" lines []]
+    (if-let [[wd & more] (seq ws)]
+      (let [joined (if (empty? line) wd (str line " " wd))
+            room (- line-width (count line) 2)]
+        (cond (<= (count joined) line-width) (recur more joined lines)
+              ;; two letters or more before the hyphen, three or more after it
+              (and (seq line) (re-matches #"\p{L}{6,}\p{Punct}?" wd) (<= 2 room) (< (.nextDouble r) 0.8))
+              (let [cut (min room (- (count (re-find #"\p{L}+" wd)) 3))]
+                (recur (cons (subs wd cut) more) "" (conj lines (str line " " (subs wd 0 cut) "-"))))
+              (empty? line) (recur more "" (conj lines wd))
+              :else (recur ws "" (conj lines line))))
+      (cond-> lines (seq line) (conj line)))))
+
+(defn- footer [title page pages] (str title " — page " page " of " pages))
+
+(defn- scan
+  "`text` as text extracted from a scanned document: body lines wrapped hard
+   (tables kept), words hyphenated across line ends, a footer every
+   fourteen lines. The front matter and the title stay."
+  [w name text]
+  (let [r (rng (bit-xor (long (:seed w)) 15485863 (long (hash name))))
+        [_ front title body] (re-find #"(?s)^(---\n.*?\n---\n)# ([^\n]*)\n\n(.*)$" text)
+        lines (butlast (mapcat (fn [para] (concat (if (str/starts-with? para "|")
+                                                    (str/split-lines para)
+                                                    (wrap r para))
+                                                  [""]))
+                               (str/split (str/trimr body) #"\n\n")))
+        pages (partition-all 14 lines)]
+    (str front "# " title "\n\n"
+         (str/join "\n\n" (map-indexed (fn [i ls] (str (str/join "\n" ls) "\n\n" (footer title (inc i) (count pages))))
+                                       pages))
+         "\n")))
+
+(defn unscan
+  "`text` with scan artefacts undone: footers dropped, hyphenated words
+   rejoined, wrapped lines joined. Other documents pass through, except
+   that their single line breaks become spaces."
+  [text]
+  (-> text
+      (str/replace #"\n*\n[^\n]* — page \d+ of \d+\n*" "\n")
+      (str/replace #"(\p{L})-\n(\p{L})" "$1$2")
+      (str/replace #"(?<!\n)\n(?!\n)" " ")))
 
 (declare extra-documents)
 
@@ -349,7 +443,11 @@
                     (str "The cooperative's " plant " on the " (:river w) " River, known since its construction as the "
                          (:plant-old w) " plant, is renamed " (:plant-new w) " in honour of " (:designer w)
                          ", the engineer who designed it in " (:designed w) "."))
-        prose (:prose w 0)]
+        prose (:prose w 0)
+        ;; the minutes' way of naming people, at noise 3
+        named (fn [person] (if (<= 3 (:noise w 0))
+                             (let [[first-name surname] (str/split person #" ")] (str (subs first-name 0 1) ". " surname))
+                             person))]
     (cond->
      (merge
       (update-keys
@@ -401,13 +499,13 @@
 
         (:minutes n)
         (doc "board minutes" (format "%d-02-08" (:gm3-from w)) (str "Board minutes, 8 February " (:gm3-from w))
-             (str (:gm2 w) " announced a retirement as general manager after " (words (- (:gm3-from w) (:gm2-from w)))
-                  " years. The board appointed " (:gm3 w) ", head of operations at " (:plant-new w) " since "
+             (str (named (:gm2 w)) " announced a retirement as general manager after " (words (- (:gm3-from w) (:gm2-from w)))
+                  " years. The board appointed " (named (:gm3 w)) ", head of operations at " (:plant-new w) " since "
                   (:gm3-ops-from w) ", as general manager from 1 " (:gm3-month w) " " (:gm3-from w) "."))
 
         (:report-latest n)
         (doc "annual report" (format "%d-12-09" (:latest w)) (str "Annual report " (:latest w))
-             (str "The cooperative now serves " (thousands (:members-2 w)) " member households. " (:plant-new w) " "
+             (str "The cooperative now serves " (thousands (or (:misprint w) (:members-2 w))) " member households. " (:plant-new w) " "
                   (k w :plant-verb) " " (:cap-2 w) " " unit " after its " (:upgraded w) " upgrade, and the "
                   (:project w) " supplies up to " (:project-cap w) " " unit " at peak.")
              (str "General manager " (:gm3 w) " signed a partnership with the " (:trust w) " " (k w :trust-work) " "
@@ -424,9 +522,19 @@
                   " farms need a new pumping station at " (:other-site w) "."))}
        #(str "/docs/" %))
       (update-keys (extra-documents w) #(str "/docs/" %)))
+      (:misprint w)
+      (assoc (str "/docs/" (:erratum n))
+             (doc "erratum" (format "%d-02-20" (inc (:latest w))) (str "Erratum: annual report " (:latest w))
+                  (str "The annual report " (:latest w) " gave the number of member households as "
+                       (thousands (:misprint w)) ". The correct figure is " (thousands (:members-2 w))
+                       "; we apologise for the error.")))
       (pos? prose)
       (as-> docs (into {} (for [[path text] docs]
-                            [path (with-prose w (last (str/split path #"/")) text prose)]))))))
+                            [path (with-prose w (last (str/split path #"/")) text prose)])))
+      (pos? (:noise w 0))
+      (as-> docs (into {} (for [[path text] docs
+                                :let [name (last (str/split path #"/"))]]
+                            [path (if (paper? name) (scan w name text) text)]))))))
 
 (defn- extra-documents
   "The documents scale adds (none at scale 1), by file name."
@@ -480,8 +588,11 @@
       {:id :gm1 :terms [(:gm1 w)] :sources [(:report-1 n)]}
       {:id :gm2 :terms [(:gm2 w) (str (:gm2-from w))] :sources [(:report-1 n) (:minutes n)]}
       {:id :gm3 :terms [(:gm3 w) (str (:gm3-from w))] :sources [(:minutes n) (:report-latest n)]}
-      {:id :gm3-before :terms [(:gm3 w) ["head of operations" "operations"]] :sources [(:minutes n)]}
-      {:id :members :terms [[(thousands (:members-2 w)) (str (:members-2 w))]] :sources [(:report-latest n)]}
+      {:id :gm3-before :terms [(:gm3 w) ["head of operations" "operations"]]
+       ;; at noise 3 the minutes name "J. Surname": the full name is elsewhere
+       :sources (cond-> [(:minutes n)] (<= 3 (:noise w 0)) (conj (:report-latest n)))}
+      {:id :members :terms [[(thousands (:members-2 w)) (str (:members-2 w))]]
+       :sources [(if (:misprint w) (:erratum n) (:report-latest n))]}
       {:id :project-opened :terms [(:project w) (str (:opened w))] :sources [(:report-opened n)]}
       {:id :project-delay :terms [(delay-terms (:delay w))] :sources [(:report-opened n)]}
       {:id :project-length :terms [(let [km (:project-km w)]
@@ -516,9 +627,13 @@
         :ok-near ["expected" "planned" "scheduled" "originally" "delay" "late" "later than"]}
        {:id :plant-old-name :value [(:plant-old w)]
         :ok-near ["former" "formerly" "renamed" "originally" "known as" "previously" "until" "was" "old" "called"]}]
-      (for [{:keys [year members]} (get-in w [:extra :reports])]
-        {:id (keyword (str "members-" year)) :value [(thousands members) (str members)]
-         :ok-near [(str year) "was" "had" "earlier" "previously" "grew" "from" "then"]}))
+      (concat
+       (for [{:keys [year members]} (get-in w [:extra :reports])]
+         {:id (keyword (str "members-" year)) :value [(thousands members) (str members)]
+          :ok-near [(str year) "was" "had" "earlier" "previously" "grew" "from" "then"]})
+       (when-let [m (:misprint w)]
+         [{:id :members-misprint :value [(thousands m) (str m)]
+           :ok-near ["misprint" "erratum" "error" "incorrect" "wrongly" "mistaken" "corrected" "correction"]}])))
 
      :relations
      [[:gm3 :plant] [:designer :plant] [:gm2 :project] [:cooperative :plant]
@@ -553,7 +668,9 @@
               (src "blog" :blog) ".\n\n"
               "It is owned by its members: each member household has one vote, and the annual meeting elects a board of "
               (words (:board w)) ", which appoints the general manager " (src "charter" :charter) ". It serves "
-              (thousands (:members-2 w)) " member households " (src (str "annual report " (:latest w)) :report-latest)
+              (thousands (:members-2 w)) " member households " (if (:misprint w)
+                                                                 (src "erratum" :erratum)
+                                                                 (src (str "annual report " (:latest w)) :report-latest))
               ", up from " (thousands (:members-1 w)) " in " (:report-1 w) " " (src (str "annual report " (:report-1 w)) :report-1) ".\n\n"
               "General managers: " (link (:gm1 w)) ", " (link (:gm2 w)) " (" (:gm2-from w) " to " (:gm3-from w) ") and "
               (link (:gm3 w)) " (since " (:gm3-from w) ") " (src (str "board minutes " (:gm3-from w)) :minutes) ". "
