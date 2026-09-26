@@ -176,3 +176,34 @@
           (is (some? e))
           (is (not (claude-code/usage-limit-error? e)))))
       (finally (reset! rate-limits nil)))))
+
+(deftest native-invoke-calls-are-parsed
+  ;; What claude-code-haiku emitted on a wiki task, instead of <tool_use> JSON
+  ;; (2026-09-26): nothing was parsed, no tool ran, the Attempt scored 0.
+  (let [parse #(@#'claude-code/parse-tool-calls %1 #{"shell" "read_file" "write_file"})
+        haiku (str "<function_calls>\n<invoke name=\"shell\">\n<parameter name=\"command\">ls -la /docs/</parameter>\n"
+                   "</invoke>\n</function_calls>\n<function_calls>\n<invoke name=\"read_file\">\n"
+                   "<parameter name=\"path\">/docs/blog-history.md</parameter>\n</invoke>\n</tool_use>\n\n"
+                   "Let me check the rest.")]
+    (testing "every offered call, in order, and the prose around them as text"
+      (let [{:keys [text tool-calls]} (parse haiku)]
+        (is (= [["shell" {:command "ls -la /docs/"}] ["read_file" {:path "/docs/blog-history.md"}]]
+               (mapv (juxt :name :input) tool-calls)))
+        (is (= "Let me check the rest." text))))
+    (testing "multi-line values keep their lines, JSON values are parsed, writes dedupe by path"
+      (let [{:keys [tool-calls]}
+            (parse (str "<function_calls><invoke name=\"write_file\"><parameter name=\"path\">/wiki/a.md</parameter>"
+                        "<parameter name=\"content\">\n# A\n\nfirst\n</parameter></invoke>"
+                        "<invoke name=\"write_file\"><parameter name=\"path\">/wiki/a.md</parameter>"
+                        "<parameter name=\"content\">\n# A\n\nsecond\n</parameter></invoke>"
+                        "<invoke name=\"shell\"><parameter name=\"command\">[\"ls\", \"-la\"]</parameter></invoke>"
+                        "</function_calls>"))]
+        (is (= #{["write_file" {:path "/wiki/a.md" :content "# A\n\nsecond"}]
+                 ["shell" {:command ["ls" "-la"]}]}
+               (set (map (juxt :name :input) tool-calls))))))
+    (testing "an unoffered tool is never called"
+      (is (nil? (:tool-calls (parse "<function_calls><invoke name=\"delete_everything\"></invoke></function_calls>")))))
+    (testing "<tool_use> JSON keeps precedence"
+      (is (= ["read_file"]
+             (mapv :name (:tool-calls (parse (str "<tool_use>{\"name\":\"read_file\",\"input\":{\"path\":\"/x\"}}</tool_use>"
+                                                  "<invoke name=\"shell\"><parameter name=\"command\">ls</parameter></invoke>")))))))))
