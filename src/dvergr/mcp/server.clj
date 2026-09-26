@@ -87,10 +87,12 @@
             :annotations annotations
             :dvergr/toolset (surface/tool-toolset tname op false)}
      :handler
-     (fn [_context arguments]
+     (fn [context arguments]
        (if-let [dmn (current-daemon)]
          (try
-           (surface/data-result (ops/invoke dmn op (keywordize arguments)))
+           (surface/data-result (ops/invoke dmn op (cond->> (keywordize arguments)
+                                                     (:room (some-> context :selection deref))
+                                                     (surface/pinned-args @(:selection context)))))
            (catch Throwable e
              (surface/error-result (str "Error: " (.getMessage e)))))
          (surface/error-result no-daemon)))}))
@@ -146,7 +148,7 @@
      :handler
      (fn [context arguments]
        (if-let [dmn (current-daemon)]
-         (let [args  (keywordize arguments)
+         (let [args  (surface/pinned-args (some-> context :selection deref) (keywordize arguments))
                input (dissoc args :room)
                room  (when-not (str/blank? (str (:room args)))
                        (ops/resolve-room dmn (:room args)))]
@@ -407,9 +409,12 @@
   [default params]
   (let [m (:_meta params)
         profile (or (get m :dvergr/profile) (get m (keyword "dvergr/profile")))
-        toolsets (or (get m :dvergr/toolsets) (get m (keyword "dvergr/toolsets")))]
-    (if (or profile toolsets)
-      (surface/selection {:profile (or profile (:profile default)) :toolsets toolsets})
+        toolsets (or (get m :dvergr/toolsets) (get m (keyword "dvergr/toolsets")))
+        room (or (get m :dvergr/room) (get m (keyword "dvergr/room")))
+        tools (or (get m :dvergr/tools) (get m (keyword "dvergr/tools")))]
+    (if (or profile toolsets room tools)
+      (surface/selection {:profile (or profile (:profile default)) :toolsets toolsets
+                          :room room :tools tools})
       default)))
 
 (defn session-context
@@ -423,6 +428,7 @@
      :tool-defs tool-definitions
      :tool-handlers tool-handlers
      :tool-visible? (fn [td] (surface/visible? @sel td))
+     :tool-view (fn [td] (surface/pinned-view @sel td))
      :on-initialize (fn [params] (reset! sel (meta-selection selection params)))
      :selection sel
      :resource-defs resource-definitions
@@ -520,10 +526,19 @@
     (.start accept-thread)
     (reset! server-state {:server-socket server-socket
                           :accept-thread accept-thread
-                          :port port})
-    (.println *err* (str "dvergr-mcp: TCP server listening on " bind ":" port))
+                          :port (.getLocalPort server-socket)})
+    (.println *err* (str "dvergr-mcp: TCP server listening on " bind ":" (.getLocalPort server-socket)))
     (.flush *err*)
-    {:port port :bind bind}))
+    {:port (.getLocalPort server-socket) :bind bind}))
+
+(defn listening-port
+  "The port of this process's MCP server: the daemon's when it runs one, else
+   a loopback server started on an ephemeral port (an external agent, e.g.
+   `claude -p` as a benchmark candidate, reaches a room through it)."
+  []
+  (locking server-state
+    (or (:port @server-state)
+        (:port (start! :port 0 :bind "127.0.0.1")))))
 
 (defn stop!
   "Stop the TCP MCP server."

@@ -707,7 +707,12 @@
                       ;; trace field `turn-number`; semantically it is a model
                       ;; integration step, not a conversational turn.
                         :turn-number model-step
-                        :run-id run-id}))))
+                        :run-id run-id
+                        ;; The world this Run works in, for an adapter whose
+                        ;; model is an external agent (claude -p): it invokes
+                        ;; that agent INTO this room over MCP.
+                        :model-opts {:room-id (let [id (:id work-room)]
+                                                (if (keyword? id) (subs (str id) 1) (str id)))}}))))
                  outcome (sp/await (worker-result-spin call))
                  budget (chat-context/get-budget chat-ctx)]
              (update-llm-metrics!

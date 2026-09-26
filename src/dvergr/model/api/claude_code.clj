@@ -393,18 +393,58 @@
 ;; CLI Command Building
 ;; ============================================================================
 
+(def ^:private agent-max-turns
+  "Turns an external CLI agent may take in one call before it must answer."
+  60)
+
+(defn- relay-command
+  "The stdio MCP relay a CLI agent launches: `bin/dvergr-mcp` of this
+   checkout (DVERGR_MCP_RELAY overrides)."
+  []
+  (let [f (java.io.File. (or (System/getenv "DVERGR_MCP_RELAY")
+                             (str (System/getProperty "user.dir") "/bin/dvergr-mcp")))]
+    (when (.isFile f) (.getAbsolutePath f))))
+
+(defn- agent-mcp-config
+  "The --mcp-config of a CLI agent working in room `room-id` with exactly
+   `tool-names`: dvergr's MCP server through the stdio relay, the connection
+   pinned to that room. Nil when no relay or server is available."
+  [room-id tool-names]
+  (when-let [relay (relay-command)]
+    (let [port ((requiring-resolve 'dvergr.mcp.server/listening-port))]
+      (json/write-value-as-string
+       {:mcpServers {:dvergr {:type "stdio" :command relay
+                              :args ["--port" (str port) "--no-start"
+                                     "--room" room-id "--tools" (str/join "," tool-names)]}}}))))
+
+(defn- agent-invocation
+  "When `opts` name a work room (`:room-id`) and tools, the CLI runs as an
+   agent INTO that room: dvergr's tools over MCP, natively called, and the
+   CLI's own loop; the call returns its final answer. Else nil (the text
+   protocol)."
+  [opts]
+  (let [room-id (:room-id opts)
+        tool-names (vec (keep :name (:tools opts)))]
+    (when (and room-id (seq tool-names))
+      (when-let [config (agent-mcp-config room-id tool-names)]
+        {:mcp-config config
+         :allowed (mapv #(str "mcp__dvergr__" %) tool-names)}))))
+
 (defn- build-command
-  "Build the claude CLI command with arguments."
+  "Build the claude CLI command with arguments. With `:agent` (see
+   `agent-invocation`) the CLI calls dvergr's tools over MCP for up to
+   `agent-max-turns` turns; else it answers once and tools are text."
   [opts]
   (let [model (resolve-cli-model (:model opts))
         system (extract-system-prompt [] opts)
-        effort (resolve-effort opts)]
+        effort (resolve-effort opts)
+        agent (:agent opts)]
     (cond-> [(:cli @settings) "-p"
              "--output-format" "stream-json"
              "--verbose"
              "--include-partial-messages"
              "--model" model
-             "--max-turns" "0"
+             "--max-turns" (if agent (str agent-max-turns) "0")
              "--no-session-persistence"
              ;; Isolate the subprocess from the host's Claude Code environment,
              ;; or its leaked native tools shadow dvergr's text <tool_use>
@@ -412,7 +452,6 @@
              ;; `--safe-mode` drops user/project customizations while retaining
              ;; subscription auth; current Claude Code versions honor an empty
              ;; `--tools` list as the authoritative way to disable built-ins.
-             "--safe-mode"
              "--disable-slash-commands"
              "--tools" ""
              ;; Defense in depth for older CLI versions where an empty tools
@@ -420,9 +459,14 @@
              ;;  - MCP: --strict-mcp-config + an empty config drops the user's
              ;;    global MCP servers ("{}" alone is rejected — needs mcpServers).
              "--strict-mcp-config"
-             "--mcp-config" "{\"mcpServers\":{}}"
+             "--mcp-config" (if agent (:mcp-config agent) "{\"mcpServers\":{}}")
              "--disallowedTools"
              "Bash Read Edit Write Glob Grep Task WebFetch WebSearch ToolSearch Skill Workflow ListAgents ReportFindings ScheduleWakeup"]
+      ;; --safe-mode also drops --mcp-config, so only the text protocol uses
+      ;; it; an agent is isolated by --tools "", --strict-mcp-config, the
+      ;; disallowed built-ins and the empty config dir (no customizations)
+      (not agent) (conj "--safe-mode")
+      agent (into ["--allowedTools" (str/join " " (:allowed agent))])
       system (into ["--system-prompt" system])
       effort (into ["--effort" effort]))))
 
@@ -487,15 +531,17 @@
   [messages opts]
   (let [prompt (format-conversation messages)
         system-prompt (extract-system-prompt messages opts)
-        ;; Append tool definitions to system prompt if tools provided
-        tools (:tools opts)
+        ;; An agent into a work room calls the tools natively over MCP;
+        ;; otherwise the tool definitions go into the system prompt as text.
+        agent (agent-invocation opts)
+        tools (when-not agent (:tools opts))
         tools-prompt (build-tools-prompt tools)
         note (:system-note @settings)
         effective-system (some->> [system-prompt tools-prompt (when note (str "\n\n" note))]
                                   (remove nil?) seq (apply str) not-empty)
-        opts-with-system (if effective-system
-                           (assoc opts :system effective-system)
-                           opts)
+        opts-with-system (cond-> opts
+                           effective-system (assoc :system effective-system)
+                           agent (assoc :agent agent))
         cmd (build-command opts-with-system)
         process (start-process cmd)
         stdin (.getOutputStream process)

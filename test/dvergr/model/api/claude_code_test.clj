@@ -1,5 +1,7 @@
 (ns dvergr.model.api.claude-code-test
   (:require [clojure.string :as str]
+            [jsonista.core]
+            [dvergr.mcp.server]
             [clojure.test :refer [deftest is testing]]
             [dvergr.model.api.claude-code :as claude-code])
   (:import [java.util.concurrent CancellationException]))
@@ -214,3 +216,24 @@
       (is (= ["read_file"]
              (mapv :name (:tool-calls (parse (str "<tool_use>{\"name\":\"read_file\",\"input\":{\"path\":\"/x\"}}</tool_use>"
                                                   "<invoke name=\"shell\"><parameter name=\"command\">ls</parameter></invoke>")))))))))
+
+(deftest a-cli-agent-works-into-its-room-over-mcp
+  (let [invocation @#'claude-code/agent-invocation
+        build @#'claude-code/build-command
+        tools [{:name "read_file"} {:name "write_file"}]]
+    (is (nil? (invocation {:tools tools})) "no room: the text protocol")
+    (is (nil? (invocation {:room-id "w"})) "no tools: nothing to call")
+    (with-redefs [claude-code/relay-command (constantly "/x/bin/dvergr-mcp")
+                  dvergr.mcp.server/listening-port (constantly 4711)]
+      (let [agent (invocation {:room-id "world-1" :tools tools})
+            cmd (build {:model "claude-code-haiku" :agent agent})
+            after (fn [flag] (second (drop-while #(not= flag %) cmd)))
+            config (jsonista.core/read-value (after "--mcp-config"))]
+        (is (= ["mcp__dvergr__read_file" "mcp__dvergr__write_file"] (:allowed agent)))
+        (is (= ["--port" "4711" "--no-start" "--room" "world-1" "--tools" "read_file,write_file"]
+               (get-in config ["mcpServers" "dvergr" "args"])) "pinned to its room and tools")
+        (is (= "mcp__dvergr__read_file mcp__dvergr__write_file" (after "--allowedTools")))
+        (is (= "" (after "--tools")) "no built-in tools")
+        (is (not (some #{"--safe-mode"} cmd)) "safe mode would drop the MCP config")
+        (is (not= "0" (after "--max-turns")) "its own loop")))
+    (is (some #{"--safe-mode"} (build {:model "claude-code-haiku"})) "the text protocol keeps safe mode")))

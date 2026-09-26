@@ -12,6 +12,10 @@
 ;;
 ;; Usage (e.g. in a client's MCP config: command + args):
 ;;   bin/dvergr-mcp [--profile offload|readonly|admin] [--toolsets a,b]
+;;                  [--room ROOM] [--tools read_file,write_file]
+;;   --room pins the connection to one room (every call runs there; others are
+;;   refused); --tools lists exactly the tools it sees. A benchmark gives an
+;;   external agent (claude -p, codex exec) its Attempt's world this way.
 ;;                  [--port 17888] [--host 127.0.0.1] [--dir <dvergr checkout>]
 ;;                  [--no-start] [--wait-s 120]
 ;; Environment: DVERGR_MCP_PORT, DVERGR_MCP_PROFILE, DVERGR_MCP_TOOLSETS,
@@ -33,6 +37,8 @@
 (def port (parse-long (or (arg "--port") (env "DVERGR_MCP_PORT") "17888")))
 (def profile (or (arg "--profile") (env "DVERGR_MCP_PROFILE")))
 (def toolsets (or (arg "--toolsets") (env "DVERGR_MCP_TOOLSETS")))
+(def room (or (arg "--room") (env "DVERGR_MCP_ROOM")))
+(def only-tools (or (arg "--tools") (env "DVERGR_MCP_TOOLS")))
 (def dir (str (or (arg "--dir") (env "DVERGR_DIR")
                   (fs/parent (fs/parent (fs/canonicalize *file*))))))
 (def state-root
@@ -76,7 +82,9 @@
   [init]
   (cond-> init
     profile  (assoc-in [:params :_meta :dvergr/profile] profile)
-    toolsets (assoc-in [:params :_meta :dvergr/toolsets] toolsets)))
+    toolsets (assoc-in [:params :_meta :dvergr/toolsets] toolsets)
+    room     (assoc-in [:params :_meta :dvergr/room] room)
+    only-tools (assoc-in [:params :_meta :dvergr/tools] only-tools)))
 
 (defn- send! [{:keys [^BufferedWriter writer]} msg]
   (locking writer

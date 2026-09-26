@@ -107,7 +107,7 @@
   "The session's tool selection from a profile name and/or an explicit toolset
    list (strings or keywords; toolsets are added to the profile's). Unknown
    names throw, so a misconfigured client fails at connect, not later."
-  [{:keys [profile toolsets]}]
+  [{:keys [profile toolsets room tools]}]
   (let [pk (keyword (or (some-> profile name str/trim not-empty) (name default-profile)))
         base (or (get profiles pk)
                  (throw (ex-info (str "Unknown dvergr MCP profile: " (name pk)
@@ -121,7 +121,11 @@
     (cond-> (-> base
                 (update :toolsets into extra)
                 (assoc :profile pk))
-      (:repl-toolsets base) (update :repl-toolsets into extra))))
+      (:repl-toolsets base) (update :repl-toolsets into extra)
+      ;; a connection pinned to one room, seeing exactly the tools named
+      (not (str/blank? (str room))) (assoc :room (str room))
+      (seq tools) (assoc :tools (set (map (comp str/trim name)
+                                          (if (string? tools) (str/split tools #",") tools)))))))
 
 (defn repl-selection
   "The selection whose ops a REPL of `selection` may call: its
@@ -131,11 +135,36 @@
     (:repl-toolsets selection) (assoc :toolsets (:repl-toolsets selection))))
 
 (defn visible?
-  "Whether a tool definition (with `:dvergr/toolset`) is in `selection`."
+  "Whether a tool definition (with `:dvergr/toolset`) is in `selection`. A
+   selection with `:tools` (a set of names) sees exactly those."
   [selection tool-def]
-  (and (contains? (:toolsets selection) (:dvergr/toolset tool-def))
+  (and (if-let [only (:tools selection)]
+         (contains? only (:name tool-def))
+         (contains? (:toolsets selection) (:dvergr/toolset tool-def)))
        (or (not (:read-only? selection))
            (true? (get-in tool-def [:annotations :readOnlyHint])))))
+
+(defn pinned-view
+  "`tool-def` as a session pinned to one room (`:room` in `selection`) shows
+   it: without its `room` parameter, which the session supplies."
+  [selection tool-def]
+  (if (and (:room selection) (get-in tool-def [:inputSchema :properties :room]))
+    (-> tool-def
+        (update-in [:inputSchema :properties] dissoc :room)
+        (update-in [:inputSchema :required] #(vec (remove #{"room" :room} %))))
+    tool-def))
+
+(defn pinned-args
+  "`args` of a call in a session pinned to a room: its `room` is the pinned
+   one; naming another is refused. Unpinned sessions pass args through."
+  [selection args]
+  (if-let [pinned (:room selection)]
+    (let [given (some-> (:room args) str)]
+      (when (and given (not= given (str pinned)))
+        (throw (ex-info (str "This connection works in room " pinned " only")
+                        {:type ::room-pinned :room given :pinned pinned})))
+      (assoc args :room (str pinned)))
+    args))
 
 ;; ============================================================================
 ;; Annotations
