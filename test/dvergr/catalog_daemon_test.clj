@@ -175,10 +175,14 @@
         (is (= [1 1] (map #(get-in % [:candidates 0 :done]) mine)))
         (is (loop [n 0]
               (cond (and (nil? (ops/resolve-room *daemon* (:fixture-room started)))
-                         (nil? (sdb/room-by-slug (:fixture-room started)))) true
+                         (:room/archived-at (sdb/room-by-slug (:fixture-room started)))) true
                     (< 50 n) false
                     :else (do (Thread/sleep 100) (recur (inc n)))))
-            "the fixture room is removed once the job is over, and not hydrated again")))))
+            "the fixture room is archived once the job is over")
+        (let [row (sdb/room-by-slug (:fixture-room started))]
+          (is (some? row) "its registry row is kept")
+          (is (not-any? #(= (:room/id row) (:room/id %)) (sdb/all-rooms))
+              "and it is not hydrated again"))))))
 
 (deftest an-llm-experiment-can-fork-a-fork-of-the-room-keeping-its-records
   ;; The shape of a sub-experiment started inside a Run: the worlds fork the

@@ -69,6 +69,9 @@
    {:db/ident :room/telegram-chat-id :db/valueType :db.type/long    :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
    {:db/ident :room/agent-ids        :db/valueType :db.type/keyword :db/cardinality :db.cardinality/many}
    {:db/ident :room/parent-slug      :db/valueType :db.type/string  :db/cardinality :db.cardinality/one}
+   ;; An archived room is no longer hydrated, listed or started; its row, grants
+   ;; and stores are kept (history is kept, not deleted).
+   {:db/ident :room/archived-at      :db/valueType :db.type/instant :db/cardinality :db.cardinality/one}
 
    ;; --- Grants: room↔system attachment with permission ---
    {:db/ident :grant/id         :db/valueType :db.type/uuid    :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
@@ -407,11 +410,23 @@
   (d/transact (get-conn) [{:room/slug child-slug :room/parent-slug parent-slug}]))
 
 (defn all-rooms
-  "Every registered room, fully projected (`room-pull`) — the authoritative
-   registry the daemon hydrates from (RF5 S4) and recreates per-room ctxs for."
+  "Every registered room that is not archived, fully projected (`room-pull`) —
+   the authoritative registry the daemon hydrates from (RF5 S4) and recreates
+   per-room ctxs for."
   []
   (d/q '[:find [(pull ?e ?pull) ...] :in $ ?pull
-         :where [?e :room/id]] @(get-conn) room-pull))
+         :where [?e :room/id] (not [?e :room/archived-at _])] @(get-conn) room-pull))
+
+(defn archive-room!
+  "Mark the room `room-id` archived: from now on it is neither hydrated nor
+   listed. Nothing is retracted; its row, grants and stores stay. Idempotent."
+  [room-id]
+  (let [conn (get-conn)]
+    (when (and (d/q '[:find ?e . :in $ ?id :where [?e :room/id ?id]] @conn room-id)
+               (not (d/q '[:find ?t . :in $ ?id :where [?e :room/id ?id] [?e :room/archived-at ?t]]
+                         @conn room-id)))
+      (d/transact conn [{:room/id room-id :room/archived-at (java.util.Date.)}]))
+    true))
 
 ;; ---------------------------------------------------------------------------
 ;; Grants — attach / detach a system to a room with a permission
