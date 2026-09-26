@@ -656,6 +656,8 @@
              [:workflow [:string {:description "catalog workflow id, e.g. wiki/v2"}]]
              [:models [:vector {:description "model ids or aliases"} :string]]
              [:room {:optional true} [:string {:description "room id or slug that keeps the results (default: the new fixture room)"}]]
+             [:environments {:optional true} [:int {:min 1 :max 50 :description "generated worlds, for workflows that generate them (wiki/v3; default 6)"}]]
+             [:split {:optional true} [:enum {:description "dev (public, the default) or test (held out: the host's key)"} "dev" "test"]]
              [:repetitions {:optional true} [:int {:min 1 :max 10 :description "attempts per model (default 1)"}]]
              [:budget-dollars {:optional true} [:double {:description "budget per attempt in USD (default 0.50)"}]]
              [:timeout-ms {:optional true} [:int {:description "per attempt (default 10 minutes)"}]]]
@@ -666,7 +668,9 @@
                   control (when room
                             (or (resolve-room daemon room)
                                 (throw (ex-info (str "No room " room) {:type ::no-room :room room}))))
-                  plan (plan-fn (select-keys args [:models :budget-dollars :timeout-ms]))
+                  plan (plan-fn (cond-> (select-keys args [:models :budget-dollars :timeout-ms])
+                                  (:environments args) (assoc :n (:environments args))
+                                  (:split args) (assoc :split (keyword (:split args)))))
                   slug (str "bench-" (slugify (subs (str (:id wf)) 1)) "-" (subs (str (random-uuid)) 0 8))
                   r (in-ctx daemon
                             (rooms/create-room! {:title (str (:title wf) " (benchmark)") :slug slug})
