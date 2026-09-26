@@ -26,6 +26,7 @@
   {:id :deputy       :terms ["Rita Clifton"] :sources ["john-lewis-2025.md"]}
   {:id :ceo          :terms ["Nish Kankiwala" ["CEO" "chief executive"]] :sources ["john-lewis-2025.md"]}
   {:id :employees    :terms [["74,000" "74000"] "2024"] :sources ["john-lewis-2025.md"]}
+  {:id :operating-income :terms [["0.147 billion" "147 million"]] :sources ["john-lewis-2025.md"]}
   {:id :revenue      :terms [["12.426 billion" "12,426 million"] ["2023/24" "2023–24" "2023-24"]] :sources ["john-lewis-2025.md"]}
   {:id :businesses   :terms ["Waitrose" "John Lewis"] :sources ["john-lewis-2010.md" "john-lewis-2013.md" "john-lewis-2016.md"
                                                             "john-lewis-2019.md" "john-lewis-2022.md" "john-lewis-2025.md"]}

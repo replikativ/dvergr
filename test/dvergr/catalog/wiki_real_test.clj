@@ -75,12 +75,9 @@
          :uncited (uncited reference)
          :partial (select-keys reference ["/wiki/index.md" "/wiki/inigo-ucin.md"])}
         by (into {} (map (fn [[k pages]] [k (score pages)])) variants)]
-    (doseq [[k r] by :when (not= k :former-heads-as-current)]
+    ;; each stale value stated as current costs 0.03, however many the corpus has
+    (doseq [[k r] by]
       (is (<= (:reward r) (- ref 0.04)) (str k " scores clearly below the reference: " (:reward r))))
-    ;; Currency's weight is shared by the stale values (8 here, 5 in v2), so two
-    ;; former heads stated as current cost 0.15 × 2/8: below the reference, but
-    ;; by less than the other damages (doc/benchmarks.md, wiki v3).
-    (is (< (:reward (:former-heads-as-current by)) ref))
     (is (contains? (failing (:dump by)) :no-copied-pages?))
     (let [f (failing (:stale by))]
       (is (contains? f :current/employees-2008))
@@ -123,13 +120,10 @@
          :uncited (uncited reference)
          :partial (select-keys reference ["/wiki/index.md" "/wiki/waitrose.md"])}
         by (into {} (map (fn [[k pages]] [k (score pages)])) variants)]
-    (doseq [[k r] by :when (not (#{:stale :former-chair-as-current :planned-as-done} k))]
+    (doseq [[k r] by :when (not= k :planned-as-done)]
       (is (<= (:reward r) (- ref 0.04)) (str k " scores clearly below the reference: " (:reward r))))
-    ;; Twelve stale values share currency's weight, so two of them stated as
-    ;; current cost 0.15 × 2/12 = 0.025, and one missing fact of thirteen costs
-    ;; 0.25/13: below the reference, by less (doc/benchmarks.md, currency dilution).
-    (doseq [k [:stale :former-chair-as-current :planned-as-done]]
-      (is (< (:reward (by k)) ref) (str k ": " (:reward (by k)))))
+    ;; one missing fact of fourteen costs 0.25/14: below the reference, by less
+    (is (< (:reward (:planned-as-done by)) ref))
     (is (contains? (failing (:dump by)) :no-copied-pages?))
     (let [f (failing (:stale by))]
       (is (contains? f :current/employees-2008))

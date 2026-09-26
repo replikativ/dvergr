@@ -12,7 +12,7 @@ It runs the John Lewis department stores and the [Waitrose](waitrose.md) superma
 
 About 74,000 people worked for it in 2024 ([2025 snapshot](../docs/john-lewis-2025.md)). The headcount was 68,430 in 2008 ([2010 snapshot](../docs/john-lewis-2010.md)), 84,700 in 2013 ([2013 snapshot](../docs/john-lewis-2013.md)), a peak of 88,700 in 2015 ([2016 snapshot](../docs/john-lewis-2016.md)), 83,000 in the 2019 snapshot ([2019 snapshot](../docs/john-lewis-2019.md)) and, in the 2022 snapshot, 80,000 for 2022 or around 80,800 for 2020 ([2022 snapshot](../docs/john-lewis-2022.md)).
 
-Revenue in FY2023/24 was £12.426 billion ([2025 snapshot](../docs/john-lewis-2025.md)). Earlier figures: £7.42 billion in 2009-2010 ([2010 snapshot](../docs/john-lewis-2010.md)), £9.5 billion in 2013 ([2013 snapshot](../docs/john-lewis-2013.md)), £10.2 billion in 2018 ([2019 snapshot](../docs/john-lewis-2019.md)) and £10.15 billion in 2020 ([2022 snapshot](../docs/john-lewis-2022.md)).
+Revenue in FY2023/24 was £12.426 billion, and operating income £147 million ([2025 snapshot](../docs/john-lewis-2025.md)). Earlier figures: £7.42 billion in 2009-2010 ([2010 snapshot](../docs/john-lewis-2010.md)), £9.5 billion in 2013 ([2013 snapshot](../docs/john-lewis-2013.md)), £10.2 billion in 2018 ([2019 snapshot](../docs/john-lewis-2019.md)) and £10.15 billion in 2020 ([2022 snapshot](../docs/john-lewis-2022.md)).
 
 ## Ocado
 

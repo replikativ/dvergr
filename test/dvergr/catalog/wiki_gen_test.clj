@@ -113,6 +113,29 @@
       (is (contains? f :entity/designer) (str "seed " seed " partial"))
       (is (contains? f :fact/incident-dates) (str "seed " seed " partial")))))
 
+(deftest a-stale-value-costs-the-same-however-many-there-are
+  (doseq [seed (take 10 seeds)
+          :let [cost (fn [w] (let [by (into {} (map (fn [[k pages]] [k (:reward (score w pages))])) (variants w))]
+                               (- (:reward (score w (g/reference-wiki w))) (:stale by))))
+                small (g/world seed) big (g/world seed {:scale 5})]]
+    (is (< (count (:stale (g/gold small))) (count (:stale (g/gold big)))))
+    (is (< (Math/abs (- (cost small) (cost big))) 1e-9)
+        (str "seed " seed ": " (cost small) " at scale 1, " (cost big) " at scale 5"))))
+
+(deftest strict-grounding-finds-a-number-borrowed-from-a-table
+  (doseq [seed (take 10 seeds)
+          :let [w (g/world seed {:prose 3})
+                docs (g/documents w) n (g/document-names w)
+                borrowed (second (re-find #"\| Q1 \| (\d+) \|" (get docs (str "/docs/" (:report-1 n)))))
+                coop (str "/wiki/" (slug (:org w)) ".md")
+                clean (score w (g/reference-wiki w))
+                r (score w (update (g/reference-wiki w) coop str "\nIt runs " borrowed " pumping stations ([report](../docs/"
+                                   (:report-1 n) ")).\n"))]]
+    (is (<= 0.9 (get-in clean [:scores :grounding-strict])) (str "seed " seed))
+    (is (= 1.0 (get-in r [:scores :grounding])) "grounded: the number is in the cited report")
+    (is (some #(= borrowed (:number %)) (get-in r [:scores :loosely-grounded]))
+        (str "seed " seed ": but only loosely, from a table of other figures"))))
+
 (deftest scale-adds-documents-stale-values-and-distractors
   (let [base (g/world 4) scaled (g/world 4 {:scale 3})]
     (is (= (g/documents base) (g/documents (g/world 4 {:scale 1}))) "scale 1 is the base world")

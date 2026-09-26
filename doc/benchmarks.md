@@ -179,7 +179,14 @@ Scale 1 with prose 3: 12 documents, about 2,300 words; scale 3 with prose 4: 22
 documents, about 5,000 words, the size of a real dump. One consequence, measured by
 the calibration: grounding accepts a number found anywhere in a cited source, so
 routine figures make it more lenient, never stricter (an invented number that
-happens to appear in a cited table counts as supported).
+happens to appear in a cited table counts as supported). Strict grounding, reported
+next to it (`grounding-strict`, `loosely-grounded`) but not scored, catches that
+case: a number counts strictly when a cited source states it in a sentence (or its
+header: front matter and title) that shares a content word (stemmed to five
+letters) or another number with the page's paragraph, citations removed. Reference
+wikis read 0.97–1.0 on generated worlds and 0.98 on the real corpora; a number
+borrowed from a routine table is flagged. Whether it should count is to be decided
+on real runs.
 
 **Noise** (`:noise` n, 0–4, default 0; `catalog_benchmark {… noise: 3}`). Documents
 as they arrive, not as they were written; each level adds one kind, and the
@@ -228,18 +235,19 @@ revision, 74,000 in 2024); revenue is given for five different years; the oldest
 revision gives 1920 as the founding year and every later one 1929; the Ocado supply
 "will expire in September 2020" in 2019 and "expired" in 2022, a planned date later
 confirmed; the legal form goes from private to partnership to public limited
-company. Gold: 13 facts, 12 stale values. With twelve stale values the currency
-dilution is stronger still: two stale values stated as current cost 0.025. The
-operating income (£0.147 billion) is left out of the gold: grounding normalises
-0.147 to "0147", so a correct "£147 million" would count as unsupported, a limit of
-digit-level grounding for unit changes.
+company. Gold: 14 facts, 12 stale values. The operating income (£0.147 billion) is
+in the gold, and the reference writes it as "£147 million": grounding converts
+millions and billions ("0.147 billion" is 147 million, "750 million" is 0.75
+billion), which digit-level normalisation alone could not.
 
-A finding from `mondragon`: currency's weight (15%) is shared by a world's stale values, so
-the cost of one stale value shrinks as a world has more of them. Stating two former
-heads as current costs 0.04 here (8 stale values) and would cost 0.06 in v2 (5).
-For a reader "who runs it now" is not a small error; a fixed cost per stale value
-(or a gate on the current head) is a scorer change to decide, not done, since it
-would change v2's and v3's scores.
+A finding from `mondragon`, now fixed: currency's weight (15%) was shared by a
+world's stale values, so one stale value cost less as a world had more of them
+(two former heads stated as current cost 0.04 with 8 stale values, 0.025 with
+john-lewis's 12, 0.06 in v2's 5). Each stale value stated as current now costs a
+fifth of the weight, 0.03 of the reward, however many there are (up to the whole
+weight). v2 and scale-1 worlds have five stale values, so their scores are
+unchanged; larger worlds and the real corpora are stricter. The calibration pins
+that a damage costs the same at scale 1 and scale 5.
 
 **The anchor for article shape: FreshWiki** (the STORM paper's set, NAACL 2024;
 100 recent Wikipedia articles rated B-class or better, CC BY-SA 4.0; measured on its
