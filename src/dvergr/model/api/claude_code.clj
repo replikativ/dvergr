@@ -246,12 +246,56 @@
          :name (:name parsed)
          :input (or (:input parsed) {})}))))
 
+(def ^:private invoke-pattern
+  "An Anthropic-native call, `<invoke name=\"tool\">` with `<parameter>`s."
+  #"(?s)<invoke name=\"([^\"]+)\">(.*?)</invoke>")
+
+(def ^:private parameter-pattern
+  #"(?s)<parameter name=\"([^\"]+)\">(.*?)</parameter>")
+
+(def ^:private invoke-markup-pattern
+  "What an Anthropic-native call leaves in the text: its blocks and wrappers
+   (models mix in `</tool_use>` closers)."
+  #"(?s)<invoke name=\"[^\"]+\">.*?</invoke>|</?function_calls>|</?tool_use>")
+
+(defn- parameter-value
+  "A parameter's text, one surrounding newline dropped; a JSON object or
+   array is parsed (the native format passes structured values as JSON)."
+  [raw]
+  (let [v (-> raw (str/replace #"\A\n" "") (str/replace #"\n\z" ""))
+        t (str/trim v)]
+    (if (and (or (str/starts-with? t "{") (str/starts-with? t "["))
+             (or (str/ends-with? t "}") (str/ends-with? t "]")))
+      (try (json/read-value t json/keyword-keys-object-mapper) (catch Exception _ v))
+      v)))
+
+(defn- invoke-calls
+  "Calls in Anthropic's native format (`<function_calls><invoke name=…>
+   <parameter name=…>…</parameter></invoke>`), which Claude models emit
+   although the prompt asks for `<tool_use>` JSON (Haiku does, reliably).
+   Only calls of OFFERED tools; anything else is ignored, as for bare calls."
+  [text tool-names]
+  (vec (for [[_ tool-name body] (re-seq invoke-pattern text)
+             :when (contains? tool-names tool-name)]
+         {:id (str "tc_" (java.util.UUID/randomUUID))
+          :name tool-name
+          :input (into {} (for [[_ k v] (re-seq parameter-pattern body)]
+                            [(keyword k) (parameter-value v)]))})))
+
+(defn- dedupe-file-writes
+  "Calls with file writes deduplicated by path, last writer wins."
+  [calls]
+  (let [file-tools #{"write_file" "edit_file"}
+        {file-writes true others false} (group-by #(contains? file-tools (:name %)) calls)]
+    (vec (concat others (->> file-writes (group-by #(get-in % [:input :path])) vals (map last))))))
+
 (defn- parse-tool-calls
   "Parse <tool_use> blocks from response text.
    Strips hallucinated <tool_result> blocks first to avoid matching old content.
-   Deduplicates file-writing tools by path (last writer wins). When no block
-   is present, a response that is solely one well-formed call of an offered
-   tool is recovered (see `bare-tool-call`).
+   Deduplicates file-writing tools by path (last writer wins). Without such a
+   block, calls in Anthropic's native `<invoke>` format are taken
+   (`invoke-calls`); failing that, a response that is solely one well-formed
+   call of an offered tool is recovered (see `bare-tool-call`).
    Returns {:text stripped-text, :tool-calls [{:id :name :input}]}."
   ([text] (parse-tool-calls text #{}))
   ([text tool-names]
@@ -261,9 +305,18 @@
            cleaned (clean-response-text text)
            matches (re-seq tool-call-pattern cleaned)]
        (if (empty? matches)
-         (if-let [call (bare-tool-call cleaned tool-names)]
-           {:text "" :tool-calls [call]}
-           {:text (str/trim cleaned) :tool-calls nil})
+         (let [invoked (invoke-calls cleaned tool-names)]
+           (cond
+             (seq invoked)
+             (do (tel/log! {:level :info :id :claude-code/invoke-calls-parsed
+                            :data {:names (mapv :name invoked)}}
+                           "Parsed native-format tool calls")
+                 {:text (str/trim (str/replace cleaned invoke-markup-pattern ""))
+                  :tool-calls (dedupe-file-writes invoked)})
+             :else
+             (if-let [call (bare-tool-call cleaned tool-names)]
+               {:text "" :tool-calls [call]}
+               {:text (str/trim cleaned) :tool-calls nil})))
          (let [raw-calls
                (into []
                      (comp
@@ -280,16 +333,7 @@
                                             "Failed to parse tool call JSON")
                                   nil)))))
                      matches)
-              ;; Deduplicate file-writing tools: last write to same path wins
-               file-tools #{"write_file" "edit_file"}
-               tool-calls (let [{file-writes true others false}
-                                (group-by #(contains? file-tools (:name %)) raw-calls)
-                               ;; For file writes, group by path, keep last
-                                deduped-writes (->> file-writes
-                                                    (group-by #(get-in % [:input :path]))
-                                                    vals
-                                                    (map last))]
-                            (vec (concat others deduped-writes)))
+               tool-calls (dedupe-file-writes raw-calls)
                stripped (-> cleaned
                             (str/replace tool-call-pattern "")
                             str/trim)]
