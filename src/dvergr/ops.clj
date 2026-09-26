@@ -85,7 +85,7 @@
 (defn- room-data [r]
   (when r
     {:id           (id->str (:id r))
-     :title        (or (some-> r :meta deref :title) (id->str (:id r)))
+     :title        (or (:title r) (some-> r :meta deref :title) (id->str (:id r)))
      :parent       (id->str (some-> r :meta deref :conversation-id))
      :participants (try (mapv name (keys @(:participants r))) (catch Throwable _ []))}))
 

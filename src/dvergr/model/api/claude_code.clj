@@ -269,13 +269,27 @@
       (try (json/read-value t json/keyword-keys-object-mapper) (catch Exception _ v))
       v)))
 
+(def ^:private first-block-end
+  "Where the first native call block ends (models close with either tag)."
+  #"</function_calls>|</tool_use>")
+
+(defn- first-block
+  "`text` up to the end of its first native call block: calls after it were
+   written without seeing any result (Haiku goes on predicting its next steps,
+   repeating calls, instead of stopping), so they are guesses, not calls."
+  [text]
+  (if-let [m (re-find (re-matcher first-block-end text))]
+    (subs text 0 (+ (str/index-of text m) (count m)))
+    text))
+
 (defn- invoke-calls
   "Calls in Anthropic's native format (`<function_calls><invoke name=…>
    <parameter name=…>…</parameter></invoke>`), which Claude models emit
    although the prompt asks for `<tool_use>` JSON (Haiku does, reliably).
-   Only calls of OFFERED tools; anything else is ignored, as for bare calls."
+   Only the first block's calls (`first-block`), and only of OFFERED tools;
+   anything else is ignored, as for bare calls."
   [text tool-names]
-  (vec (for [[_ tool-name body] (re-seq invoke-pattern text)
+  (vec (for [[_ tool-name body] (re-seq invoke-pattern (first-block text))
              :when (contains? tool-names tool-name)]
          {:id (str "tc_" (java.util.UUID/randomUUID))
           :name tool-name
@@ -311,7 +325,7 @@
              (do (tel/log! {:level :info :id :claude-code/invoke-calls-parsed
                             :data {:names (mapv :name invoked)}}
                            "Parsed native-format tool calls")
-                 {:text (str/trim (str/replace cleaned invoke-markup-pattern ""))
+                 {:text (str/trim (str/replace (first-block cleaned) invoke-markup-pattern ""))
                   :tool-calls (dedupe-file-writes invoked)})
              :else
              (if-let [call (bare-tool-call cleaned tool-names)]

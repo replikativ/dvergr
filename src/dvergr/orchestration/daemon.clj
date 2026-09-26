@@ -35,6 +35,7 @@
             [dvergr.actors :as actors]
             [dvergr.agent.ops :as ops]
             [dvergr.model.registry :as registry]
+            [dvergr.model.api.claude-code :as cc]
             [dvergr.model.providers :as providers]
             [dvergr.discourse.commands :as commands]
             [dvergr.channels.telegram-send :as tg-send]
@@ -700,6 +701,27 @@
                     "MCP server bind failed; continuing without MCP")
           daemon)))))
 
+(defn- configure-claude-code!
+  "Run the Claude Code CLI (subscription models, `claude-code-*`) isolated, as
+   the experiment runner does: an empty config directory under the state root
+   and a long-lived `claude setup-token` token, so the account email the CLI
+   injects into every prompt with the interactive login never reaches a model,
+   a transcript or a record; plus the harness note. The token file is
+   `:claude-code {:token-file …}`, else DVERGR_CLAUDE_TOKEN_FILE, else
+   ~/.dvergr/secrets/claude-oauth-token; `:cli` pins the executable. Without a
+   token the CLI keeps the interactive login, and a warning says so."
+  [{:keys [token-file cli]}]
+  (let [f (io/file (or token-file (System/getenv "DVERGR_CLAUDE_TOKEN_FILE")
+                       (str (System/getProperty "user.home") "/.dvergr/secrets/claude-oauth-token")))]
+    (if (.isFile f)
+      (do (cc/configure! (cond-> {:env (cc/token-env (paths/path "claude-config") (slurp f))
+                                  :system-note @(requiring-resolve 'dvergr.agent.experiment.runner/host-context-note)}
+                           cli (assoc :cli cli)))
+          (tel/log! {:level :info :id :daemon/claude-code-isolated :data {:token-file (.getPath f)}}
+                    "Claude Code runs isolated on its setup token"))
+      (tel/log! {:level :warn :id :daemon/claude-code-not-isolated}
+                "No Claude Code setup token: claude-code-* models use the interactive login, whose account details the CLI adds to every prompt"))))
+
 (defn start!
   "Start the daemon with the given configuration.
 
@@ -711,6 +733,7 @@
                        :tags #{:secretary}
                        :description \"Default greeting agent\"}}
      :default-agent :var  ;; which agent handles new sessions
+     :claude-code {:token-file \"…\" :cli \"…\"}  ;; see `configure-claude-code!`
 
    Returns Daemon record."
   [config]
@@ -730,6 +753,7 @@
   ;; pricing/defaults). Without this the registry holds only the built-in
   ;; Anthropic defaults, so cost tracking and the model dropdowns are wrong.
   (registry/ensure-models-loaded!)
+  (configure-claude-code! (:claude-code config))
 
   ;; Create execution context, daemon-wide discourse room, and the
   ;; :_system receiver that drains all agent replies into the sink fan-out.

@@ -185,11 +185,18 @@
                    "</invoke>\n</function_calls>\n<function_calls>\n<invoke name=\"read_file\">\n"
                    "<parameter name=\"path\">/docs/blog-history.md</parameter>\n</invoke>\n</tool_use>\n\n"
                    "Let me check the rest.")]
-    (testing "every offered call, in order, and the prose around them as text"
+    (testing "the first block's calls only: later blocks were written without results"
       (let [{:keys [text tool-calls]} (parse haiku)]
-        (is (= [["shell" {:command "ls -la /docs/"}] ["read_file" {:path "/docs/blog-history.md"}]]
+        (is (= [["shell" {:command "ls -la /docs/"}]] (mapv (juxt :name :input) tool-calls)))
+        (is (= "" text))))
+    (testing "calls of one block, in order, and the prose before them as text"
+      (let [{:keys [text tool-calls]}
+            (parse (str "Reading the sources.\n<function_calls>\n<invoke name=\"shell\"><parameter name=\"command\">ls /docs</parameter></invoke>\n"
+                        "<invoke name=\"read_file\"><parameter name=\"path\">/docs/blog-history.md</parameter></invoke>\n</function_calls>\n"
+                        "<function_calls><invoke name=\"shell\"><parameter name=\"command\">ls /docs</parameter></invoke></function_calls>"))]
+        (is (= [["shell" {:command "ls /docs"}] ["read_file" {:path "/docs/blog-history.md"}]]
                (mapv (juxt :name :input) tool-calls)))
-        (is (= "Let me check the rest." text))))
+        (is (= "Reading the sources." text))))
     (testing "multi-line values keep their lines, JSON values are parsed, writes dedupe by path"
       (let [{:keys [tool-calls]}
             (parse (str "<function_calls><invoke name=\"write_file\"><parameter name=\"path\">/wiki/a.md</parameter>"
