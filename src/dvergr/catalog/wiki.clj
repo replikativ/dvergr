@@ -177,9 +177,19 @@
 ;;               it comes from, and that is not a copy of a source.
 ;;   currency    a superseded or wrong value (an old name, an old count, a
 ;;               blog's wrong year) only near a qualifier ("formerly", "in
-;;               2010", "the blog claims").
+;;               2010", "the blog claims"). Each value stated as current
+;;               costs a fifth of currency's weight (0.03 of the reward),
+;;               however many stale values a world has, so a wrong "who runs
+;;               it now" costs the same in a world of five stale values
+;;               and in one of twelve.
 ;;   grounding   every number of two or more digits on a page appears in a
-;;               source the page cites (or is a gold synthesis value).
+;;               source the page cites (or is a gold synthesis value); "0.147
+;;               billion" and "147 million" are the same number. Reported,
+;;               not scored: strict grounding, the share of numbers whose
+;;               sentence shares a word or another number with a sentence of
+;;               a cited source that states the number (a number that only
+;;               occurs somewhere in a cited source, e.g. in a routine table,
+;;               is grounded but not strictly).
 ;;   entities    a page per gold entity; relations as links between them.
 ;;   distractors nothing of the unrelated organisation in the corpus.
 ;;
@@ -235,13 +245,74 @@
            (into {} (for [[t n] tens [o i] (map vector (rest (take 10 ones)) (range 1 10))]
                       [(str t "-" o) (+ n i)])))))
 
-(defn- source-numbers
-  "The numbers a source states, in digits or in words (forty-two is 42): a
-   page may write either."
+(defn- scaled-numbers
+  "The numbers `text` states in millions or billions, also in the other unit
+   (\"0.147 billion\" → 147, \"750 million\" → 0.75), normalised as `numbers`
+   does: a page may convert."
   [text]
-  (into (numbers text)
-        (comp (keep number-words) (map str) (filter #(<= 2 (count %))))
-        (re-seq #"[a-z]+(?:-[a-z]+)?" (lower text))))
+  (into #{}
+        (comp (map (fn [[_ n unit]]
+                     (let [x (bigdec (str/replace n "," ""))]
+                       (if (= "billion" unit) (.movePointRight x 3) (.movePointLeft x 3)))))
+              (map #(-> ^java.math.BigDecimal % .stripTrailingZeros .toPlainString (str/replace #"[,.]" "")))
+              (filter #(<= 2 (count %))))
+        (re-seq #"(\d[\d,]*(?:\.\d+)?)\s*(billion|million)\b" (lower text))))
+
+(defn- source-numbers
+  "The numbers a source states, in digits or in words (forty-two is 42), and
+   in millions or billions converted: a page may write either."
+  [text]
+  (-> (numbers text)
+      (into (comp (keep number-words) (map str) (filter #(<= 2 (count %))))
+            (re-seq #"[a-z]+(?:-[a-z]+)?" (lower text)))
+      (into (scaled-numbers text))))
+
+(defn- sentences
+  "The sentences and lines of `text`, link targets stripped."
+  [text]
+  (->> (str/split (strip-link-targets text) #"(?<=[.!?])\s+|\n")
+       (map str/trim)
+       (remove str/blank?)))
+
+(def ^:private stop-words
+  #{"that" "with" "from" "this" "have" "were" "which" "their" "there" "about" "after"
+    "before" "also" "been" "into" "they" "than" "then" "when" "where" "while" "what"
+    "will" "would" "some" "such" "over" "more" "most" "only" "other" "each" "since"
+    "until" "under" "every" "both" "these" "those" "them" "its" "year" "years"})
+
+(defn- content-words
+  "The content words of `text`, stemmed crudely to five letters (\"founded\"
+   and \"foundation\" meet)."
+  [text]
+  (into #{} (comp (remove stop-words) (map #(subs % 0 (min 5 (count %)))))
+        (re-seq #"[a-z]{4,}" (lower text))))
+
+(defn- strict-paragraphs
+  "A page as paragraphs for strict grounding: citations of sources (label
+   and target) removed, as a label (\"2010 snapshot\") is not a claim."
+  [text source]
+  (->> (str/split (str/replace text (re-pattern (str "\\[[^\\]]*\\]\\((?:\\.\\.)?" source "/[^)]*\\)")) "")
+                  #"\n\s*\n")
+       (map str/trim)
+       (remove str/blank?)))
+
+(defn- strictly-grounded?
+  "Whether number `n` of the page paragraph `claim` is stated in a sentence
+   of one of `cited` (source texts) that shares a content word or another
+   number with `claim`."
+  [claim n cited]
+  (let [words (content-words claim)
+        others (disj (numbers claim) n)]
+    (boolean
+     (some (fn [text]
+             (some (fn [line]
+                     (and (contains? (source-numbers line) n)
+                          (or (some words (content-words line))
+                              (some others (source-numbers line)))))
+                   ;; the header (front matter and title) is one unit: a
+                   ;; press release states its year in its date
+                   (cons (first (str/split text #"\n\s*\n")) (sentences text))))
+           cited))))
 
 (defn- file-name [path] (last (str/split path #"/")))
 
@@ -335,6 +406,13 @@
                                :when (not (or (contains? allowed n)
                                               (some #(contains? (source-numbers (source-text %)) n) (cited p))))]
                            {:page p :number n}))
+        strict-claims (for [[p t] content
+                            line (strict-paragraphs t (subs source 1))
+                            n (numbers line)
+                            :when (and (not (contains? allowed n))
+                                       (some #(contains? (source-numbers (source-text %)) n) (cited p)))]
+                        {:page p :number n
+                         :strict? (strictly-grounded? line n (map source-text (cited p)))})
         entity-pages (into {} (for [[id aliases] entities] [id (entity-page content aliases)]))
         linked? (fn [a b] (let [pa (entity-pages a) pb (entity-pages b)]
                             (boolean (and pa pb (or (some #{pb} (get links pa))
@@ -350,6 +428,9 @@
                 :coverage (ratio* (count found) (count facts))
                 :currency (ratio* (- (count stale) (count stale-hits)) (count stale))
                 :grounding (ratio* (- (count number-claims) (count unsupported)) (count number-claims))
+                ;; reported, not scored (see the section comment)
+                :grounding-strict (ratio* (count (filter :strict? strict-claims)) (count strict-claims))
+                :loosely-grounded (vec (take 10 (map #(dissoc % :strict?) (remove :strict? strict-claims))))
                 :entities (ratio* (count (filter val entity-pages)) (count entities))
                 :relations (ratio* (count rels) (count relations))
                 :pages-cited (ratio* cited-pages (count content))
@@ -373,10 +454,12 @@
         ;; An invented number is the error a reader cannot see: each 1% of
         ;; unsupported numbers costs 5% of the grounding weight.
         grounding-credit (max 0.0 (- 1.0 (* 5.0 (- 1.0 (:grounding scores)))))
+        ;; a fifth of currency's weight per stale value stated as current
+        currency-credit (max 0.0 (- 1.0 (* 0.2 (count stale-hits))))
         reward (if (empty? content)
                  0.0
                  (+ (* 0.25 (:coverage scores))
-                    (* 0.15 (:currency scores))
+                    (* 0.15 currency-credit)
                     (* 0.20 grounding-credit)
                     (* 0.10 (:entities scores))
                     (* 0.05 (:relations scores))
