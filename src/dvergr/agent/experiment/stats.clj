@@ -6,7 +6,9 @@
    Pass rates use the Jeffreys interval: the central 95% of the Beta(passes +
    ½, fails + ½) posterior, well behaved at 0 and n passes. Mean rewards
    (bounded in [0, 1]) use a t interval, clipped to [0, 1], from two attempts
-   on. Pure functions, no dependencies.")
+   on. Two candidates compare by the probability that one pass rate beats
+   (or is no worse than) the other, and by their paired reward difference on
+   the worlds both ran. Pure functions, no dependencies.")
 
 ;; ============================================================================
 ;; The Beta distribution
@@ -87,13 +89,46 @@
    2.120 2.110 2.101 2.093 2.086 2.080 2.074 2.069 2.064 2.060 2.056 2.052 2.048 2.045 2.042])
 
 (defn mean-interval
-  "The 95% t interval of the mean of `xs` (rewards in [0, 1]), clipped to
-   [0, 1]: `[lo hi]`, nil for fewer than two values."
-  [xs]
-  (let [n (count xs)]
-    (when (<= 2 n)
-      (let [mean (/ (reduce + 0.0 xs) n)
-            var (/ (reduce + 0.0 (map #(let [d (- % mean)] (* d d)) xs)) (dec n))
-            t (get t-975 (dec (dec n)) 1.96)
-            half (* t (Math/sqrt (/ var n)))]
-        [(max 0.0 (- mean half)) (min 1.0 (+ mean half))]))))
+  "The 95% t interval of the mean of `xs`, clipped to `[lo hi]` (default
+   [0, 1], for rewards): `[lo hi]`, nil for fewer than two values."
+  ([xs] (mean-interval xs [0.0 1.0]))
+  ([xs [floor ceiling]]
+   (let [n (count xs)]
+     (when (<= 2 n)
+       (let [mean (/ (reduce + 0.0 xs) n)
+             var (/ (reduce + 0.0 (map #(let [d (- % mean)] (* d d)) xs)) (dec n))
+             t (get t-975 (dec (dec n)) 1.96)
+             half (* t (Math/sqrt (/ var n)))]
+         [(max floor (- mean half)) (min ceiling (+ mean half))])))))
+
+;; ============================================================================
+;; Comparing two candidates
+;; ============================================================================
+
+(defn prob-rate-above
+  "P(p₁ > p₂ − margin) for pass rates p₁ of `passes-1`/`n-1` and p₂ of
+   `passes-2`/`n-2`, under their independent Jeffreys posteriors: with margin
+   0, the probability that the first is better; with a margin, that it is no
+   worse by more than it. Integrated on a grid of 2,000 cells of the first
+   posterior's CDF."
+  [[passes-1 n-1] [passes-2 n-2] margin]
+  (let [a1 (+ passes-1 0.5) b1 (+ (- n-1 passes-1) 0.5)
+        a2 (+ passes-2 0.5) b2 (+ (- n-2 passes-2) 0.5)
+        cells 2000
+        xs (mapv #(/ (double %) cells) (range (inc cells)))
+        fx (mapv #(beta-cdf a1 b1 %) xs)]
+    (reduce + 0.0 (for [i (range cells)
+                        :let [mid (/ (+ (xs i) (xs (inc i))) 2.0)]]
+                    (* (- (fx (inc i)) (fx i))
+                       (beta-cdf a2 b2 (min 1.0 (+ mid margin))))))))
+
+(defn paired-difference
+  "The mean of the paired differences `(- x y)` over `pairs` of `[x y]` (the
+   same world scored for two candidates) and its 95% interval in [-1, 1]:
+   `{:mean :interval :n}`, nil without pairs."
+  [pairs]
+  (when (seq pairs)
+    (let [ds (mapv (fn [[x y]] (- (double x) (double y))) pairs)]
+      {:mean (/ (reduce + 0.0 ds) (count ds))
+       :interval (mean-interval ds [-1.0 1.0])
+       :n (count ds)})))

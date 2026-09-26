@@ -272,8 +272,14 @@ Next for the wiki benchmark:
   `scorecard_detail` adds each candidate's pass rate per check (which checks a model
   fails: currency, grounding, one fact). Computed when read
   (`dvergr.agent.experiment.stats`), so stored Scorecards and their content ids are
-  unchanged. Next: the comparison against a baseline model (the probability that a
-  cheaper model is no worse, and the saving per solved world).
+  unchanged. `scorecard_detail {…, baseline}` also compares every candidate with a
+  baseline (default: the top of the leaderboard): the probability that its pass
+  rate is higher, and that it is no worse by more than 5 points (under the two
+  Jeffreys posteriors); its reward minus the baseline's, paired by world, with a 95%
+  interval; and the cost per pass saved and the cost ratio. The question a pilot
+  asks: "is the model at a tenth of the price good enough here?" With 3 of 4 passes
+  against 4 of 4, the answer is "probably worse (P higher = 0.16, P no worse by 5
+  points = 0.24): run more worlds", not a ranking.
 
 Open: an LLM judge tier for prose faithfulness; attempts run one after another (a
 Datahike writer race on concurrent Runs in one durable room).
