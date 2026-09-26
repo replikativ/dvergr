@@ -678,15 +678,15 @@
                             (jobs/start! control {:kind :experiment :ctx (:ctx r)}
                                          #(runner/run-in control (assoc plan :experiment exp :parent-run %
                                                                         :world-parent r))
-                                         ;; The fixture room holds nothing once the job is
-                                         ;; over: every cell's world is settled and every
-                                         ;; record is in `control`.
+                                         ;; The fixture room's work is done once the job is
+                                         ;; over (every cell's world settled, every record in
+                                         ;; `control`): retire it, keeping its history.
                                          :settled (fn [_ _]
-                                                    (let [{:keys [ok? error]} (in-ctx daemon (rooms/remove-room! r))]
+                                                    (let [{:keys [ok? error]} (in-ctx daemon (rooms/archive-room! r))]
                                                       (when-not ok?
-                                                        (tel/log! {:level :warn :id ::fixture-room-not-removed
+                                                        (tel/log! {:level :warn :id ::fixture-room-not-archived
                                                                    :data {:room (id->str (:id r)) :error error}}
-                                                                  "A benchmark's fixture room could not be removed")))))
+                                                                  "A benchmark's fixture room could not be archived")))))
                             (jobs/start! r {:kind :experiment}
                                          #(runner/run-in r (assoc plan :experiment exp :parent-run %)))))
                   (->> (job-data daemon))
