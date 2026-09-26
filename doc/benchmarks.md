@@ -264,8 +264,16 @@ Next for the wiki benchmark:
 - **Incremental update.** New documents arrive; score the updated wiki and its cost.
 - **Claim-level receipts.** A citation counts only if the Run actually read the
   cited document (the file-read record), as `discovery-citations` does for the web.
-- **Reporting.** Credible intervals per model, per-check pass rates, cost per
-  solved world.
+- **Reporting.** Done: every leaderboard row (`scorecard_list`, `scorecard_detail`)
+  carries a 95% interval for its pass rate (Jeffreys: the central 95% of
+  Beta(passes + ½, fails + ½), sound at 0 and n passes; 3 of 4 passes is
+  [0.28, 0.97], not 0.75) and for its mean reward (a t interval clipped to [0, 1],
+  from two attempts on), and the cost per pass next to the cost per attempt;
+  `scorecard_detail` adds each candidate's pass rate per check (which checks a model
+  fails: currency, grounding, one fact). Computed when read
+  (`dvergr.agent.experiment.stats`), so stored Scorecards and their content ids are
+  unchanged. Next: the comparison against a baseline model (the probability that a
+  cheaper model is no worse, and the saving per solved world).
 
 Open: an LLM judge tier for prose faithfulness; attempts run one after another (a
 Datahike writer race on concurrent Runs in one durable room).

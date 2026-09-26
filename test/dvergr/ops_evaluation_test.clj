@@ -84,11 +84,16 @@
               (is (= [{:candidate "alpha" :attempts 2 :passed 2}]
                      (mapv #(select-keys % [:candidate :attempts :passed]) (:leaderboard sc))))
               (is (= 1.0 (:pass-rate (first (:leaderboard sc)))))
+              (let [[lo hi] (:pass-rate-interval (first (:leaderboard sc)))]
+                (is (< 0.3 lo 0.9) "two passes of two: a wide range")
+                (is (= 1.0 hi)))
+              (is (= [1.0 1.0] (:reward-interval (first (:leaderboard sc)))))
               (is (map? (:spend (first (:leaderboard sc)))))
               (is (not (contains? sc :entries)))
               (let [full (ops/invoke daemon :scorecard/detail {:room "ops-evaluation-test" :id (:id sc)})]
                 (is (= 2 (count (:entries full))))
-                (is (every? :passed? (:entries full))))))))
+                (is (every? :passed? (:entries full)))
+                (is (= {"alpha" {"exact?" 1.0}} (:check-rates full)) "each check's pass rate"))))))
       (finally
         (try (rreg/unregister! (:id room)) (catch Throwable _ nil))
         (d/close-room! room)))))

@@ -38,7 +38,7 @@
    :-list-attention       :internal
    ;; evaluation
    :-store-attempt!       {:written-by #{:workflow/attempt}}
-   :-load-attempt         {:read-by #{:attempt/detail}}
+   :-load-attempt         {:read-by #{:attempt/detail :scorecard/detail}}
    :-list-attempts        {:read-by #{:attempt/list}}
    :-store-scorecard!     :runtime
    :-load-scorecard       {:read-by #{:scorecard/detail}}

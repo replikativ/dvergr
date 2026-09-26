@@ -32,6 +32,7 @@
             [dvergr.agent.workflow :as workflow]
             [dvergr.catalog :as catalog]
             [dvergr.agent.experiment.runner :as runner]
+            [dvergr.agent.experiment.stats :as xstats]
             [dvergr.jobs :as jobs]
             [dvergr.resource :as resource]
             [dvergr.agent.fields :as fields]
@@ -162,12 +163,29 @@
         full? (assoc :evidence (:attempt/evidence a)
                      :result (:attempt/result receipt))))))
 
+(defn- check-rates
+  "Per candidate, the share of its Attempts that passed each check:
+   `{candidate {check rate}}`, from the certified Attempts of `entries`."
+  [entries load-attempt]
+  (into {}
+        (for [[candidate es] (group-by :candidate/id entries)
+              :let [checks (keep #(some-> (load-attempt (:attempt/id %)) :attempt/receipt :attempt/checks) es)]
+              :when (seq checks)]
+          [(kw->str candidate)
+           (into (sorted-map)
+                 (for [k (distinct (mapcat keys checks))]
+                   [(kw->str k) (/ (double (count (filter #(true? (get % k)) checks))) (count checks))]))])))
+
 (defn- scorecard-data
   "A Scorecard as a leaderboard: one row per candidate, ranked by reward mean
-   then by cost per pass. With `:full?`, also every cell."
-  [sc & [{:keys [full?]}]]
+   then by cost per pass, with 95% intervals for the pass rate (Jeffreys) and
+   the mean reward (`dvergr.agent.experiment.stats`). With `:full?`, also
+   every cell, and with `:load-attempt` (id → certified Attempt) the pass rate
+   of every check per candidate."
+  [sc & [{:keys [full? load-attempt]}]]
   (when sc
     (let [exp (:scorecard/experiment sc)
+          rewards (update-vals (group-by :candidate/id (:scorecard/entries sc)) #(mapv :reward %))
           rows (->> (:scorecard/summary sc)
                     (map (fn [s]
                            {:candidate       (kw->str (:candidate/id s))
@@ -175,7 +193,9 @@
                             :passed          (:passed-count s)
                             :pass-rate       (when (pos? (:attempt-count s 0))
                                                (/ (double (:passed-count s)) (:attempt-count s)))
+                            :pass-rate-interval (xstats/pass-rate-interval (:passed-count s 0) (:attempt-count s 0))
                             :reward-mean     (:reward-mean s)
+                            :reward-interval (xstats/mean-interval (get rewards (:candidate/id s)))
                             :spend           (spend-data (:spend s))
                             :microdollars-per-attempt (:microdollars-per-attempt s)
                             :microdollars-per-pass    (:microdollars-per-pass s)}))
@@ -191,6 +211,7 @@
                                 :repetitions (:experiment/repetitions exp)}
                :leaderboard    rows
                :cells          (count (:scorecard/entries sc))}
+        load-attempt (assoc :check-rates (check-rates (:scorecard/entries sc) load-attempt))
         full? (assoc :entries (mapv (fn [e]
                                       {:candidate (kw->str (:candidate/id e))
                                        :environment (some-> (get-in e [:environment :environment/content-id]) str)
@@ -479,12 +500,16 @@
                                                        experiment (assoc :experiment-id (keyword experiment))))))))}
 
    :scorecard/detail
-   {:doc "One Scorecard with every cell: candidate x environment x repetition, reward, pass, spend."
+   {:doc "One Scorecard with every cell (candidate x environment x repetition: reward, pass, spend) and each candidate's pass rate per check."
     :kind :read
     :schema [:map [:room Room] [:id [:string {:description "scorecard content id"}]]]
     :impl (fn [daemon {:keys [room id]}]
             (when-let [r (resolve-room daemon room)]
-              (in-ctx daemon (scorecard-data (experiment/scorecard r (uuid-arg id)) {:full? true}))))}
+              (in-ctx daemon
+                      (scorecard-data (experiment/scorecard r (uuid-arg id))
+                                      {:full? true
+                                       :load-attempt (when-let [st (:store r)]
+                                                       #(rstore/-load-attempt st (rstore/conversation-id r) %))}))))}
 
    :agent/list
    {:doc "List all agents (durable — includes offline), with model/provider/status."
