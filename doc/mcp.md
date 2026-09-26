@@ -121,6 +121,22 @@ around 40, and every definition costs context in every session.
   the Scorecard in `room`, where its dashboards (and `experiment_progress {room}`) show them.
 - **Money is in the result.** A workflow result has each attempt's spend, the per-model table
   (cost per completed attempt) and the room's wallet afterwards.
+- **The API is in the REPL too.** `clojure_eval`'s `dvergr.ops` namespace holds every op the
+  connection may call, as a function taking one map (`room-list`, `catalog-benchmark`,
+  `job-status`, `scorecard-detail`, … and `(call :room/list {})`), documented from the spec
+  (`(doc dvergr.ops/job-status)`, `(dir dvergr.ops)`, `apropos`) and validated against its
+  schema. So a client can write one program instead of a chain of tool calls:
+
+  ```clojure
+  (let [scs (dvergr.ops/scorecard-list {:room "r"})
+        d   (dvergr.ops/scorecard-detail {:room "r" :id (:id (first scs))})]
+    (select-keys (first (:leaderboard d)) [:candidate :pass-rate-interval]))
+  ```
+
+  The REPL has exactly the authority of the connection's tools: only the ops its selection
+  shows are installed, and each selection has a REPL session of its own (`:mcp/offload`, …),
+  so a connection never reaches a function another one installed. `room-delete` and
+  `room-purge` refuse the room the REPL runs in. An agent's own sandbox gets none of this.
 - REPL definitions live in the daemon's memory: they do not survive a daemon restart. Keep
   lasting code in the room's workspace.
 
@@ -132,8 +148,9 @@ answered with the latest. Tools, resources (derived from the read ops) with subs
 
 ## Next
 
-1. `repl_describe` (search the bound API) next to `clojure_eval`; evals metered to the wallet;
-   a `code-mode` profile.
+1. A `code` profile (`clojure_eval`, a read-only eval, `repl_describe`), evals metered to the
+   wallet; then native tools for Claude Code and Codex as benchmark candidates (their CLIs
+   reach a Run's tools over `--mcp-config`).
 2. MCP 2026-07-28 (stateless, `server/discover`, `_meta` per request) and Streamable HTTP for
    hosted use, then OAuth.
 3. A `data` toolset over pg-datahike (load a `pg_dump`, migrate on a fork, merge), and a client

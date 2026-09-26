@@ -22,6 +22,7 @@
      java -jar dvergr-mcp.jar --port 17888     # TCP mode"
   (:require [clojure.string :as str]
             [dvergr.mcp.json-rpc :as json-rpc]
+            [dvergr.mcp.repl :as repl]
             [dvergr.mcp.surface :as surface]
             [dvergr.ops :as ops]
             [dvergr.rooms.facts :as facts]
@@ -112,14 +113,20 @@
       (update :required #(vec (distinct (conj (vec %) "room"))))
       strict-schema))
 
-(defn- run-coding-tool [room tname input]
+(defn- run-coding-tool
+  "Run registry tool `tname` in `room`. `clojure_eval` runs in the REPL
+   session of the connection's `selection`, which gets the ops that selection
+   shows as the `dvergr.ops` namespace (`dvergr.mcp.repl`)."
+  [dmn selection room tname input]
   (let [execute      (requiring-resolve 'dvergr.tools/execute)
         make-context (requiring-resolve 'dvergr.tools/make-context)
-        ensure-ctx!  (requiring-resolve 'dvergr.agent.room-context/ensure-ctx!)]
+        ensure-ctx!  (requiring-resolve 'dvergr.agent.room-context/ensure-ctx!)
+        repl?        (and selection (= "clojure_eval" tname))]
     (binding [ec/*execution-context* (:ctx room)]
-      (let [cctx (ensure-ctx! room :mcp {})]
-        (execute tname input (make-context {:sci-ctx  (chat-context/sci-context-in
-                                                       cctx (:ctx room))
+      (let [cctx (ensure-ctx! room (if repl? (repl/session-actor selection) :mcp) {})
+            sci-ctx (cond-> (chat-context/sci-context-in cctx (:ctx room))
+                      repl? (repl/install! dmn selection room))]
+        (execute tname input (make-context {:sci-ctx  sci-ctx
                                             :db-conn  (:db-conn cctx)
                                             :chat-ctx cctx
                                             :execution-ctx (:ctx room)}))))))
@@ -128,12 +135,16 @@
   (let [annotations (surface/tool-annotations tname)]
     {:name tname
      :def  {:name tname :title (:title annotations)
-            :description (str (:description tdef) "\n\nRuns in the given room's sandbox and workspace.")
+            :description (str (:description tdef) "\n\nRuns in the given room's sandbox and workspace."
+                              (when (= "clojure_eval" tname)
+                                (str " The `dvergr.ops` namespace holds every op this connection may call, as"
+                                     " functions taking one map: (dvergr.ops/room-list {}),"
+                                     " (dvergr.ops/job-status {:job id}); (dir dvergr.ops) lists them.")))
             :inputSchema (with-room-param (:parameters tdef))
             :annotations annotations
             :dvergr/toolset (surface/tool-toolset tname nil true)}
      :handler
-     (fn [_context arguments]
+     (fn [context arguments]
        (if-let [dmn (current-daemon)]
          (let [args  (keywordize arguments)
                input (dissoc args :room)
@@ -145,7 +156,7 @@
                 (str tname " needs a room: pass `room` (id or slug; room_list lists them)")
                 (str "No room " (pr-str (:room args)) "; room_list lists them")))
              (try
-               (surface/tool-result (run-coding-tool room tname input))
+               (surface/tool-result (run-coding-tool dmn (some-> context :selection deref) room tname input))
                (catch Throwable e
                  (surface/error-result (str "Error: " (.getMessage e)))))))
          (surface/error-result no-daemon)))}))
