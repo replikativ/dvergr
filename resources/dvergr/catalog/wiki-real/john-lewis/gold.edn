@@ -1,0 +1,57 @@
+;; wiki/v3 real corpus "john-lewis": what a correct wiki of docs/ says. Six dated
+;; snapshots (infobox and lead) of the Wikipedia article "John Lewis
+;; Partnership", 2010–2025 (see LICENSE.md, CC BY-SA 4.0). The gold is curated
+;; from the documents, and a test checks that each fact is stated in the
+;; documents it names.
+;;
+;; What makes it hard is real: the chairman changes twice (Mayfield → White →
+;; Tarry); the headcount moves (68,430 in 2008, 84,700, 88,700, 83,000, 80,000 or
+;; 80,800, 74,000 in 2024) and one revision gives two figures; revenue is given
+;; for five different years; the founding year is 1920 in the oldest revision and
+;; 1929 in every later one; the Ocado supply "will expire in September 2020" in
+;; 2019 and "expired" in 2022; the legal form goes from private to partnership to
+;; public limited company. Same shape as wiki-v2/gold.edn.
+{:entities
+ {:jlp      ["John Lewis Partnership"]
+  :founder  ["John Spedan Lewis" "Spedan Lewis"]
+  :chairman ["Jason Tarry"]
+  :waitrose ["Waitrose"]}
+
+ :facts
+ [{:id :founded      :terms ["1929"] :sources ["john-lewis-2013.md" "john-lewis-2016.md" "john-lewis-2019.md"
+                                               "john-lewis-2022.md" "john-lewis-2025.md"]}
+  {:id :founder      :terms ["John Spedan Lewis"] :sources ["john-lewis-2010.md" "john-lewis-2013.md" "john-lewis-2016.md"
+                                                            "john-lewis-2019.md" "john-lewis-2022.md" "john-lewis-2025.md"]}
+  {:id :chairman     :terms ["Jason Tarry" "Chairman"] :sources ["john-lewis-2025.md"]}
+  {:id :deputy       :terms ["Rita Clifton"] :sources ["john-lewis-2025.md"]}
+  {:id :ceo          :terms ["Nish Kankiwala" ["CEO" "chief executive"]] :sources ["john-lewis-2025.md"]}
+  {:id :employees    :terms [["74,000" "74000"] "2024"] :sources ["john-lewis-2025.md"]}
+  {:id :revenue      :terms [["12.426 billion" "12,426 million"] ["2023/24" "2023–24" "2023-24"]] :sources ["john-lewis-2025.md"]}
+  {:id :businesses   :terms ["Waitrose" "John Lewis"] :sources ["john-lewis-2010.md" "john-lewis-2013.md" "john-lewis-2016.md"
+                                                            "john-lewis-2019.md" "john-lewis-2022.md" "john-lewis-2025.md"]}
+  {:id :trust        :terms ["trust" "Partners"] :sources ["john-lewis-2010.md" "john-lewis-2013.md" "john-lewis-2016.md"
+                                                          "john-lewis-2019.md" "john-lewis-2022.md" "john-lewis-2025.md"]}
+  {:id :plc          :terms [["public limited company" "plc"]] :sources ["john-lewis-2022.md" "john-lewis-2025.md"]}
+  {:id :former-name  :terms [["John Lewis Partnership, Limited" "John Lewis Partnership Limited"] "1982"] :sources ["john-lewis-2025.md"]}
+  {:id :headquarters :terms ["Pimlico"] :sources ["john-lewis-2025.md"]}
+  {:id :ocado-ended  :terms ["Ocado" "September 2020" ["Marks & Spencer" "M&S"]] :sources ["john-lewis-2022.md"]}]
+
+ ;; Values that are no longer current: each occurrence must sit near a qualifier
+ ;; (within 120 characters) or it counts as stated as current.
+ :stale
+ [{:id :founded-1920     :value ["1920"] :ok-near ["2010" "oldest" "earlier" "older" "incorrect" "revision" "contradict" "however" "instead"]}
+  {:id :chair-mayfield   :value ["Mayfield"] :ok-near ["former" "formerly" "previous" "previously" "was" "until" "earlier" "then" "2010" "2013" "2016" "2019" "chairman in"]}
+  {:id :chair-white      :value ["Sharon White"] :ok-near ["former" "formerly" "previous" "previously" "was" "until" "earlier" "then" "2022" "chairman in"]}
+  {:id :employees-2008   :value ["68,430" "68430"] :ok-near ["2008" "was" "had" "earlier" "previously" "from" "then"]}
+  {:id :employees-2013   :value ["84,700" "84700"] :ok-near ["2013" "was" "had" "earlier" "previously" "from" "then"]}
+  {:id :employees-2015   :value ["88,700" "88700"] :ok-near ["2015" "was" "had" "earlier" "previously" "from" "then" "peak"]}
+  {:id :employees-2019   :value ["83,000" "83000"] :ok-near ["2019" "was" "had" "earlier" "previously" "from" "then"]}
+  {:id :employees-2022   :value ["80,000" "80000" "80,800" "80800"] :ok-near ["2020" "2022" "was" "had" "earlier" "previously" "from" "then"]}
+  {:id :revenue-2009     :value ["7.42"] :ok-near ["2009" "2010" "was" "had" "earlier" "previously" "from" "then"]}
+  {:id :revenue-2013     :value ["9.5 billion"] :ok-near ["2013" "was" "had" "earlier" "previously" "from" "then"]}
+  {:id :revenue-2018     :value ["10.2 billion"] :ok-near ["2018" "was" "had" "earlier" "previously" "from" "then"]}
+  {:id :revenue-2020     :value ["10.15"] :ok-near ["2020" "was" "had" "earlier" "previously" "from" "then"]}]
+
+ :relations [[:founder :jlp] [:chairman :jlp] [:waitrose :jlp]]
+
+ :distractors []}
