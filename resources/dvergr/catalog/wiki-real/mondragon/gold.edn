@@ -1,0 +1,53 @@
+;; wiki/v3 real corpus "mondragon": what a correct wiki of docs/ says. Six dated
+;; snapshots (infobox and lead) of the Wikipedia article "Mondragon Corporation",
+;; 2010–2025 (see LICENSE.md, CC BY-SA 4.0). Unlike the generated worlds the
+;; documents were not written from a world: the gold is curated from them, and a
+;; test checks that each fact is stated in the documents it names.
+;;
+;; What makes it hard is real: the head of the federation changes four times, the
+;; employee count moves (92,773 → 80,321 or 83,321 → 74,335 → 81,507 → over
+;; 70,000), revenue and assets stop at 2015 and 2014 while the text goes on to
+;; 2025, and revisions contradict each other and themselves. Same shape as
+;; wiki-v2/gold.edn.
+{:entities
+ {:mondragon ["Mondragon Corporation" "MONDRAGON Corporation"]
+  :founder   ["José María Arizmendiarrieta" "Jose Maria Arizmendiarrieta" "Arizmendiarrieta"]
+  :president ["Iñigo Ucín" "Inigo Ucin"]}
+
+ :facts
+ [{:id :founded         :terms ["14 April 1956"] :sources ["mondragon-2022.md" "mondragon-2025.md"]}
+  {:id :founder         :terms ["Arizmendiarrieta"] :sources ["mondragon-2010.md" "mondragon-2013.md" "mondragon-2016.md"
+                                                         "mondragon-2019.md" "mondragon-2022.md" "mondragon-2025.md"]}
+  {:id :where           :terms ["Basque" ["Mondragón" "Mondragon"]] :sources ["mondragon-2010.md" "mondragon-2013.md" "mondragon-2016.md"
+                                                                        "mondragon-2019.md" "mondragon-2022.md" "mondragon-2025.md"]}
+  {:id :first-product   :terms ["paraffin heaters"] :sources ["mondragon-2010.md" "mondragon-2013.md" "mondragon-2016.md"
+                                                         "mondragon-2019.md" "mondragon-2022.md" "mondragon-2025.md"]}
+  {:id :president       :terms ["Iñigo Ucín" ["president" "General Council"]] :sources ["mondragon-2019.md" "mondragon-2022.md" "mondragon-2025.md"]}
+  {:id :employees       :terms [["70,000" "70000"] "2024"] :sources ["mondragon-2025.md"]}
+  {:id :employees-split :terms [["30,660" "30660"] ["29,340" "29340"]] :sources ["mondragon-2025.md"]}
+  {:id :employees-2019  :terms [["81,507" "81507"] "2019"] :sources ["mondragon-2022.md" "mondragon-2025.md"]}
+  {:id :companies       :terms ["257"] :sources ["mondragon-2016.md" "mondragon-2019.md" "mondragon-2022.md" "mondragon-2025.md"]}
+  {:id :areas           :terms ["finance" "industry" "retail" "knowledge"] :sources ["mondragon-2010.md" "mondragon-2013.md" "mondragon-2016.md"
+                                                                                "mondragon-2019.md" "mondragon-2022.md" "mondragon-2025.md"]}
+  {:id :revenue         :terms [["12,110 million" "12.110 billion" "12.11 billion" "12.1 billion"] "2015"]
+   :sources ["mondragon-2016.md" "mondragon-2019.md" "mondragon-2022.md" "mondragon-2025.md"]}
+  {:id :assets          :terms [["24,725 million" "24.725 billion" "24.7 billion"] "2014"]
+   :sources ["mondragon-2016.md" "mondragon-2019.md" "mondragon-2022.md" "mondragon-2025.md"]}
+  {:id :principles      :terms ["International Co-operative Alliance"] :sources ["mondragon-2013.md" "mondragon-2016.md" "mondragon-2019.md"
+                                                                             "mondragon-2022.md" "mondragon-2025.md"]}]
+
+ ;; Values that are no longer current: each occurrence must sit near a qualifier
+ ;; (within 120 characters) or it counts as stated as current.
+ :stale
+ [{:id :chairman-aldecoa  :value ["Aldecoa"]  :ok-near ["former" "formerly" "previous" "previously" "was" "until" "earlier" "then" "2010" "2008" "chairman in"]}
+  {:id :chairman-gisasola :value ["Gisasola"] :ok-near ["former" "formerly" "previous" "previously" "was" "until" "earlier" "then" "2013" "2012" "chairman in"]}
+  {:id :president-sotil   :value ["Sotil"]    :ok-near ["former" "formerly" "previous" "previously" "was" "until" "earlier" "then" "2016" "2015" "president in"]}
+  {:id :employees-2008    :value ["92,773" "92773"] :ok-near ["2008" "was" "had" "earlier" "previously" "from" "then" "peak"]}
+  {:id :employees-2012    :value ["80,321" "80321" "83,321" "83321"] :ok-near ["2012" "was" "had" "earlier" "previously" "from" "then"]}
+  {:id :employees-2015    :value ["74,335" "74335"] :ok-near ["2015" "was" "had" "earlier" "previously" "from" "then"]}
+  {:id :revenue-2008      :value ["16.8"] :ok-near ["2008" "was" "had" "earlier" "previously" "from" "then"]}
+  {:id :revenue-2011      :value ["14,832" "14832"] :ok-near ["2011" "was" "had" "earlier" "previously" "from" "then"]}]
+
+ :relations [[:founder :mondragon] [:president :mondragon]]
+
+ :distractors []}
