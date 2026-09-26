@@ -181,7 +181,7 @@ the calibration: grounding accepts a number found anywhere in a cited source, so
 routine figures make it more lenient, never stricter (an invented number that
 happens to appear in a cited table counts as supported).
 
-**Noise** (`:noise` n, 0–3, default 0; `catalog_benchmark {… noise: 3}`). Documents
+**Noise** (`:noise` n, 0–4, default 0; `catalog_benchmark {… noise: 3}`). Documents
 as they arrive, not as they were written; each level adds one kind, and the
 checker measures each. 1, scan artefacts: the paper genres (charter, annual
 reports, board minutes, incident reports) read like text extracted from a PDF,
@@ -194,11 +194,16 @@ gives the correct one; the misprint is one more stale value (qualified by
 "misprint", "erratum", "error", …) and the current count is supported only by the
 erratum. 3, short names: the board minutes name the general managers by initial and
 surname ("W. Novak"), so "head of operations" belongs to a person whose full name is
-stated in another document, and the gold names both. `unscan` undoes the scan, and
+stated in another document, and the gold names both. 4, retyped documents: the
+verbatim copy of the rename press release misspells the designer's surname (two
+neighbouring letters swapped, consistently, the plant's name included), a spelling
+a wiki may give only as a misspelling (one more stale value); a wiki that takes the
+copy's spelling loses the designer's entity and fact. The latest annual report
+gives its figures (members, capacities) in a table rather than in sentences. `unscan` undoes the scan, and
 the calibration checks the gold against the unscanned text; the copy check also
 compares against the sources with hyphenated words rejoined, so a dump of the
 cleaned-up documents is still a copy. Calibration covers every level on ten seeds,
-and noise 3 with scale 3 and prose 2.
+and noise 4 with scale 3 and prose 2.
 
 **Real corpora next to the generated worlds** (split `:real`). `mondragon`: six
 dated snapshots (infobox and lead, 2010–2025) of the Wikipedia article on the
@@ -254,8 +259,8 @@ Next for the wiki benchmark:
   `mondragon` and `john-lewis`), and SEC EDGAR filings (sec.gov: "may be copied or
   further distributed … without the SEC's permission") for documents of different
   genre and authority about one company.
-- **More noise.** Typos and misspelt names, facts stated in tables rather than
-  prose, and (from the real corpora) documents in more than one language.
+- **More noise.** Typos in running text, and (from the real corpora) documents in
+  more than one language.
 - **Incremental update.** New documents arrive; score the updated wiki and its cost.
 - **Claim-level receipts.** A citation counts only if the Run actually read the
   cited document (the file-read record), as `discovery-citations` does for the web.

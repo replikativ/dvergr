@@ -16,8 +16,8 @@
   (concat (map g/world seeds)
           (for [scale [3 5] seed (take 10 seeds)] (g/world seed {:scale scale}))
           (for [prose [2 4] seed (take 10 seeds)] (g/world seed {:scale 3 :prose prose}))
-          (for [noise [1 2 3] seed (take 10 seeds)] (g/world seed {:noise noise}))
-          (for [seed (take 10 seeds)] (g/world seed {:scale 3 :prose 2 :noise 3}))))
+          (for [noise [1 2 3 4] seed (take 10 seeds)] (g/world seed {:noise noise}))
+          (for [seed (take 10 seeds)] (g/world seed {:scale 3 :prose 2 :noise 4}))))
 
 (defn- label [w] (str "seed " (:seed w) " scale " (:scale w 1) " prose " (:prose w 0) " noise " (:noise w 0)))
 
@@ -171,6 +171,31 @@
                            (update "/wiki/index.md" str "- [" short-name "](" (slug short-name) ".md)\n")))]
         (is (contains? (failing r) :fact/gm3-before))
         (is (< (:reward r) ref-reward))))))
+
+(deftest retyped-documents-cost-what-they-damage
+  (doseq [seed (take 10 seeds)
+          :let [w (g/world seed {:noise 4})
+                docs (g/documents w)
+                n (g/document-names w)
+                ref (g/reference-wiki w)
+                ref-reward (:reward (score w ref))
+                surname (last (str/split (:designer w) #" "))
+                typo (:typo w)]]
+    (testing (str "seed " seed ": only the copy misspells the name, and consistently")
+      (is (not= surname typo))
+      (is (= [(str "/docs/" (:rename-copy n))]
+             (keep (fn [[p t]] (when (str/includes? (g/unscan t) typo) p)) docs)))
+      (is (not (str/includes? (get docs (str "/docs/" (:rename-copy n))) surname))))
+    (testing (str "seed " seed ": the latest report states its figures in a table")
+      (is (re-find #"\| Member households \| [\d,]+ \|" (get docs (str "/docs/" (:report-latest n))))))
+    (testing (str "seed " seed ": a wiki that takes the copy's spelling")
+      (let [r (score w (-> (update-vals ref #(str/replace % surname typo))
+                           (update-keys #(str/replace % (str/lower-case surname) (str/lower-case typo)))))
+            f (failing r)]
+        (is (contains? f :current/designer-misspelt))
+        (is (contains? f :entity/designer))
+        (is (contains? f :fact/plant-designer))
+        (is (< (:reward r) (- ref-reward 0.04)))))))
 
 (deftest the-held-out-split-needs-its-key
   (is (= [1 2 3] (g/seeds :dev 3)))

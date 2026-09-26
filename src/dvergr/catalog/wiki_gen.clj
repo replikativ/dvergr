@@ -258,7 +258,7 @@
 ;; Noise: documents as they arrive, not as they were written
 ;; ----------------------------------------------------------------------------
 ;;
-;; `:noise` n adds the first n of three kinds, each measured by the checker:
+;; `:noise` n adds the first n of four kinds, each measured by the checker:
 ;;
 ;; 1. Scan artefacts. Paper genres (charter, annual reports, board minutes,
 ;;    incident reports) read like text extracted from a PDF: lines wrapped hard,
@@ -272,6 +272,11 @@
 ;; 3. Short names. The board minutes name the general managers by initial and
 ;;    surname; the full names are stated in other documents, so the gold of what
 ;;    the minutes say names those documents too.
+;; 4. Retyped documents. The verbatim copy of the rename press release was
+;;    retyped and misspells the designer's surname (two letters swapped),
+;;    consistently, the plant's name included; the latest annual report gives
+;;    its figures in a table rather than in sentences. The misspelling is one
+;;    more stale value: a wiki may name it only as a misspelling.
 
 (defn- misprint
   "The latest member count with two digits swapped, a value no document states
@@ -284,6 +289,19 @@
                            (parse-long (apply str (assoc s i (s j) j (s i)))))))]
     (or (first (remove (some-fn nil? taken) [(swap 1 2) (swap 0 1) (swap 2 3)]))
         (first (remove taken (iterate #(+ % 900) (+ v 900)))))))
+
+(defn- typo
+  "The designer's surname with two neighbouring inner letters swapped, a
+   string `w` states nowhere else."
+  [w]
+  (let [surname (last (str/split (:designer w) #" "))
+        ;; (the routine bank states no names)
+        seen (str/lower-case (str (pr-str w) (pr-str kinds)))]
+    (first (for [i (range 1 (- (count surname) 2))
+                 :let [cs (vec surname)
+                       t (apply str (assoc cs i (cs (inc i)) (inc i) (cs i)))]
+                 :when (and (not= t surname) (not (str/includes? seen (str/lower-case t))))]
+             t))))
 
 (defn world
   "The world of `seed`: a map of everything its documents and its gold say.
@@ -299,7 +317,8 @@
              (pos? prose) (assoc :prose prose))]
      (cond-> w
        (pos? noise) (assoc :noise noise)
-       (<= 2 noise) (assoc :misprint (misprint w))))))
+       (<= 2 noise) (assoc :misprint (misprint w))
+       (<= 4 noise) (as-> w (assoc w :typo (typo w)))))))
 
 (defn- k [w key] (get-in kinds [(:kind w) key]))
 
@@ -486,7 +505,9 @@
                   (:project-cap w) " " unit "."))
 
         (:rename n) rename
-        (:rename-copy n) rename
+        (:rename-copy n) (if-let [t (:typo w)]
+                           (str/replace rename (last (str/split (:designer w) #" ")) t)
+                           rename)
 
         (:incident n)
         (doc "incident report" (format "%d-%02d-04" (:incident w) (min 12 (inc (.indexOf ^java.util.List months (:incident-month w)))))
@@ -505,9 +526,15 @@
 
         (:report-latest n)
         (doc "annual report" (format "%d-12-09" (:latest w)) (str "Annual report " (:latest w))
-             (str "The cooperative now serves " (thousands (or (:misprint w) (:members-2 w))) " member households. " (:plant-new w) " "
-                  (k w :plant-verb) " " (:cap-2 w) " " unit " after its " (:upgraded w) " upgrade, and the "
-                  (:project w) " supplies up to " (:project-cap w) " " unit " at peak.")
+             (if (<= 4 (:noise w 0))
+               (str "The year in figures (" (:plant-new w) " after its " (:upgraded w) " upgrade):\n\n"
+                    "| Figure | Value |\n| --- | --- |\n"
+                    "| Member households | " (thousands (or (:misprint w) (:members-2 w))) " |\n"
+                    "| " (:plant-new w) " | " (:cap-2 w) " " unit " |\n"
+                    "| " (:project w) ", at peak | " (:project-cap w) " " unit " |")
+               (str "The cooperative now serves " (thousands (or (:misprint w) (:members-2 w))) " member households. " (:plant-new w) " "
+                    (k w :plant-verb) " " (:cap-2 w) " " unit " after its " (:upgraded w) " upgrade, and the "
+                    (:project w) " supplies up to " (:project-cap w) " " unit " at peak."))
              (str "General manager " (:gm3 w) " signed a partnership with the " (:trust w) " " (k w :trust-work) " "
                   (:plant-new w) "."))
 
@@ -633,7 +660,10 @@
           :ok-near [(str year) "was" "had" "earlier" "previously" "grew" "from" "then"]})
        (when-let [m (:misprint w)]
          [{:id :members-misprint :value [(thousands m) (str m)]
-           :ok-near ["misprint" "erratum" "error" "incorrect" "wrongly" "mistaken" "corrected" "correction"]}])))
+           :ok-near ["misprint" "erratum" "error" "incorrect" "wrongly" "mistaken" "corrected" "correction"]}])
+       (when-let [t (:typo w)]
+         [{:id :designer-misspelt :value [t]
+           :ok-near ["misspel" "typo" "spelt" "spelled" "spelling" "sic" "error" "mistake"]}])))
 
      :relations
      [[:gm3 :plant] [:designer :plant] [:gm2 :project] [:cooperative :plant]

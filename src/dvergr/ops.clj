@@ -659,7 +659,7 @@
              [:environments {:optional true} [:int {:min 1 :max 50 :description "generated worlds, for workflows that generate them (wiki/v3; default 6)"}]]
              [:scale {:optional true} [:int {:min 1 :max 10 :description "documents per generated world, as a multiple (wiki/v3; default 1 = twelve documents)"}]]
              [:prose {:optional true} [:int {:min 0 :max 20 :description "paragraphs of routine text per generated document (wiki/v3; default 0)"}]]
-             [:noise {:optional true} [:int {:min 0 :max 3 :description "kinds of noise in generated documents: 1 scan artefacts, 2 and an erratum, 3 and short names (wiki/v3; default 0)"}]]
+             [:noise {:optional true} [:int {:min 0 :max 4 :description "kinds of noise in generated documents: 1 scan artefacts, 2 and an erratum, 3 and short names, 4 and retyped documents (wiki/v3; default 0)"}]]
              [:split {:optional true} [:enum {:description "dev (public, the default), test (held out: the host's key) or real (real corpora)"} "dev" "test" "real"]]
              [:repetitions {:optional true} [:int {:min 1 :max 10 :description "attempts per model (default 1)"}]]
              [:budget-dollars {:optional true} [:double {:description "budget per attempt in USD (default 0.50)"}]]
