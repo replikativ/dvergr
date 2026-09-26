@@ -54,3 +54,8 @@
   (is (not= (repl/session-actor (surface/selection {:profile "offload"}))
             (repl/session-actor (surface/selection {:profile "readonly"}))))
   (is (not= :mcp/offload (repl/session-actor (surface/selection {:profile "offload" :toolsets ["bench"]})))))
+
+(deftest the-code-profile-lists-the-repl-and-calls-the-api-through-it
+  (let [code (set (keys (ns-map "code")))]
+    (is (every? code '[room-list catalog-benchmark job-status scorecard-detail room-fork]))
+    (is (not-any? code '[room-purge room-unarchive agent-delete]) "admin ops stay admin")))

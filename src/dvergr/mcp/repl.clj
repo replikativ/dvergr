@@ -33,7 +33,7 @@
    with different authority never share definitions (`:mcp/offload`, or
    `:mcp/sel-<hash>` for a custom one)."
   [{:keys [profile] :as selection}]
-  (let [authority #(-> (select-keys % [:toolsets :read-only?]) (update :read-only? boolean))]
+  (let [authority #(-> (select-keys % [:toolsets :repl-toolsets :read-only?]) (update :read-only? boolean))]
     (if (= (authority (surface/selection {:profile profile})) (authority selection))
       (keyword "mcp" (name (or profile surface/default-profile)))
       (keyword "mcp" (str "sel-" (Integer/toHexString (hash (authority selection))))))))
@@ -41,12 +41,14 @@
 (defn- fn-name [op] (symbol (str/replace (ops/op->name op) "_" "-")))
 
 (defn visible-ops
-  "The ops `selection` shows, as `{op spec}`."
+  "The ops a REPL of `selection` may call, as `{op spec}`: those its tools
+   show, or its `:repl-toolsets` (the `code` profile lists only the REPL)."
   [selection]
   (into (sorted-map)
         (filter (fn [[op {:keys [kind]}]]
-                  (surface/visible? selection {:dvergr/toolset (surface/tool-toolset (ops/op->name op) op false)
-                                               :annotations (surface/op-annotations op kind)})))
+                  (surface/visible? (surface/repl-selection selection)
+                                    {:dvergr/toolset (surface/tool-toolset (ops/op->name op) op false)
+                                     :annotations (surface/op-annotations op kind)})))
         ops/specification))
 
 (def ^:private closes-room

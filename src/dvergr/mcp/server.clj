@@ -165,7 +165,74 @@
   (mapv (fn [[tname tdef]] (coding-tool tname tdef))
         (deref (deref (requiring-resolve 'dvergr.tools/registry)))))
 
-(def ^:private all-tools (into ops-tools coding-tools))
+;; ---- repl_describe: the REPL's API, for REPL-first clients (the `code` profile)
+
+(def ^:private describe-form
+  "Evaluated in the connection's REPL session: its dvergr namespaces and their
+   functions (name, arglists, first doc line), all or those matching `q`.
+   Docs sit on the var or, for injected fns, on the value."
+  "(fn [q]
+     (let [q (some-> q clojure.string/lower-case)
+           info (fn [sym v]
+                  (let [m (if (var? v) (merge (meta v) (meta (deref v))) (meta v))]
+                    {:name (str sym)
+                     :arglists (some-> (:arglists m) pr-str)
+                     :doc (some-> (:doc m) clojure.string/split-lines first)}))
+           hit? (fn [nsn f] (or (nil? q)
+                                (some #(clojure.string/includes? (clojure.string/lower-case (str %)) q)
+                                      [nsn (:name f) (:doc f)])))]
+       (->> (all-ns)
+            (map ns-name)
+            (filter #(clojure.string/starts-with? (str %) \"dvergr\"))
+            sort
+            (keep (fn [nsn]
+                    (let [fs (->> (ns-publics nsn) (sort-by key) (map (fn [[k v]] (info k v)))
+                                  (filter #(hit? nsn %)) vec)]
+                      (when (seq fs)
+                        {:ns (str nsn)
+                         :fns (if q fs (mapv :name fs))}))))
+            vec)))")
+
+(defn- repl-describe [dmn selection room query]
+  (let [ensure-ctx! (requiring-resolve 'dvergr.agent.room-context/ensure-ctx!)
+        eval-string* (requiring-resolve 'sci.core/eval-string*)]
+    (binding [ec/*execution-context* (:ctx room)]
+      (let [cctx (ensure-ctx! room (repl/session-actor selection) {})
+            sci-ctx (repl/install! (chat-context/sci-context-in cctx (:ctx room)) dmn selection room)]
+        ;; the call is evaluated in SCI too: all-ns needs its context
+        (eval-string* sci-ctx (str "(" describe-form " " (pr-str query) ")"))))))
+
+(def ^:private describe-tool
+  (let [tname "repl_describe"
+        annotations (surface/tool-annotations tname)]
+    {:name tname
+     :def {:name tname :title (:title annotations)
+           :description (str "The API of the given room's REPL (`clojure_eval`): its dvergr namespaces and "
+                             "functions, with signatures and the first line of their docs. Without `query`, the "
+                             "namespaces and their function names; with it, the functions whose namespace, name "
+                             "or doc matches. `dvergr.ops` holds every op this connection may call.")
+           :inputSchema (strict-schema {:type "object"
+                                        :properties {:room {:type "string" :description "Room id or slug"}
+                                                     :query {:type "string" :description "Filter: part of a namespace, function name or doc"}}
+                                        :required ["room"]})
+           :annotations annotations
+           :dvergr/toolset (surface/tool-toolset tname nil true)}
+     :handler
+     (fn [context arguments]
+       (if-let [dmn (current-daemon)]
+         (let [{:keys [room query]} (keywordize arguments)
+               r (when-not (str/blank? (str room)) (ops/resolve-room dmn room))]
+           (if-not r
+             (surface/error-result (str "No room " (pr-str room) "; room_list lists them"))
+             (try
+               (surface/data-result (repl-describe dmn (or (some-> context :selection deref)
+                                                           (surface/selection {}))
+                                                   r (when-not (str/blank? (str query)) query)))
+               (catch Throwable e
+                 (surface/error-result (str "Error: " (.getMessage e)))))))
+         (surface/error-result no-daemon)))}))
+
+(def ^:private all-tools (conj (into ops-tools coding-tools) describe-tool))
 
 (def tool-definitions
   "MCP tool defs: dvergr.ops (rooms/agents/forks) + the room-scoped coding tools
