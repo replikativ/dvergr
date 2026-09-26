@@ -639,12 +639,43 @@
                       (room-data (rreg/lookup (keyword sl))))))}
 
    :room/delete
-   {:doc "Delete a room."
+   {:doc (str "Delete a room: close it and archive it, so it is neither listed nor started again. "
+              "Its conversation, records and stores are kept (history is kept): room_unarchive brings "
+              "it back, room_purge removes it for good.")
     :kind :write
     :schema [:map [:room Room]]
     :impl (fn [daemon {:keys [room]}]
             (when-let [r (resolve-room daemon room)]
-              (in-ctx daemon (rooms/delete-room! r) {:deleted (id->str (:id r))})))}
+              (let [{:keys [ok? error]} (in-ctx daemon (rooms/archive-room! r))]
+                (when-not ok?
+                  (throw (ex-info (str "Could not archive " room ": " error) {:type ::archive-failed :room room})))
+                {:deleted (id->str (:id r)) :archived true})))}
+
+   :room/unarchive
+   {:doc "Bring an archived room back, with its conversation, records and stores as they were."
+    :kind :write
+    :schema [:map [:room [:string {:description "slug of the archived room"}]]]
+    :impl (fn [daemon {:keys [room]}]
+            (let [{:keys [ok? error]} (in-ctx daemon (rooms/unarchive-room! (:execution-ctx daemon) room))]
+              (when-not ok?
+                (throw (ex-info (str "Could not unarchive " room ": " error) {:type ::unarchive-failed :room room})))
+              (in-ctx daemon (room-data (rreg/lookup (rstore/slug->room-id room))))))}
+
+   :room/purge
+   {:doc (str "Remove an archived room for good: its registry entry and the stores it owns "
+              "(messages, knowledge base, repository). Irreversible. Only an archived room "
+              "(room_delete first), and `confirm` must repeat its slug.")
+    :kind :write
+    :schema [:map
+             [:room [:string {:description "slug of the archived room"}]]
+             [:confirm [:string {:description "the room's slug again, to confirm"}]]]
+    :impl (fn [daemon {:keys [room confirm]}]
+            (when-not (= room confirm)
+              (throw (ex-info "confirm must repeat the room's slug" {:type ::purge-unconfirmed :room room})))
+            (let [{:keys [ok? error owned-systems-removed]} (in-ctx daemon (rooms/purge-room! room))]
+              (when-not ok?
+                (throw (ex-info (str "Could not purge " room ": " error) {:type ::purge-failed :room room})))
+              {:purged room :owned-systems-removed owned-systems-removed}))}
 
    :workflow/attempt
    {:doc (str "Run a task several times per model, each attempt on its own copy-on-write "

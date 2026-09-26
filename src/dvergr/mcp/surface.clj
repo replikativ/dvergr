@@ -22,6 +22,8 @@
   {:room/list :rooms, :room/detail :rooms, :room/create :rooms,
    :room/delete :rooms, :room/messages :rooms, :room/post :rooms
 
+   :room/unarchive :admin, :room/purge :admin
+
    :room/fork :worlds, :room/diff :worlds, :room/review :worlds,
    :room/merge :worlds, :room/discard :worlds,
    :room/import :worlds, :room/export :worlds
@@ -62,6 +64,7 @@
    :repl     "The room's Clojure REPL (SCI sandbox) with dvergr's programming model"
    :agents   "Agent administration"
    :system   "Daemon and room statistics"
+   :admin    "Archived rooms: bring one back, or purge it for good"
    :code     "File, search, shell and task tools, for hosts without their own"
    :extra    "Tools registered at runtime (channels)"})
 
@@ -133,6 +136,8 @@
   {:room/post        {:destructiveHint false :idempotentHint false :openWorldHint true}
    :room/create      {:destructiveHint false :idempotentHint false :openWorldHint false}
    :room/delete      {:destructiveHint true  :idempotentHint true  :openWorldHint false}
+   :room/unarchive   {:destructiveHint false :idempotentHint true  :openWorldHint false}
+   :room/purge       {:destructiveHint true  :idempotentHint true  :openWorldHint false}
    :workflow/attempt {:destructiveHint false :idempotentHint false :openWorldHint true}
    :workflow/start   {:destructiveHint false :idempotentHint false :openWorldHint true}
    :job/cancel       {:destructiveHint true  :idempotentHint true  :openWorldHint false}

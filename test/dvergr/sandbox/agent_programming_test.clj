@@ -18,6 +18,8 @@
             [dvergr.sandbox.work :as sandbox-work]
             [dvergr.sandbox.ns.kb :as kb-ns]
             [dvergr.sandbox.ns.room :as room-ns]
+            [dvergr.system.db :as sdb]
+            [dvergr.system.rooms :as srooms]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.context :as context]
             [org.replikativ.spindel.engine.core :as ec]
@@ -30,30 +32,6 @@
         (pred) true
         (< (System/nanoTime) deadline) (do (Thread/sleep 5) (recur))
         :else false))))
-
-(defn- ordered-delete-store [delegate order]
-  (reify room-store/PRoomStore
-    (-store-room! [_ room-id metadata]
-      (room-store/-store-room! delegate room-id metadata))
-    (-load-room [_ id-or-slug]
-      (room-store/-load-room delegate id-or-slug))
-    (-delete-room! [_ room-id]
-      (swap! order conj :delete)
-      (room-store/-delete-room! delegate room-id))
-    (-list-rooms [_]
-      (room-store/-list-rooms delegate))
-    (-store-message! [_ room-id message]
-      (room-store/-store-message! delegate room-id message))
-    (-message-thread-root [_ room-id message-id]
-      (room-store/-message-thread-root delegate room-id message-id))
-    (-list-messages [_ room-id opts]
-      (room-store/-list-messages delegate room-id opts))
-    (-store-run! [_ room-id run]
-      (room-store/-store-run! delegate room-id run))
-    (-load-run [_ room-id run-id]
-      (room-store/-load-run delegate room-id run-id))
-    (-list-runs [_ room-id opts]
-      (room-store/-list-runs delegate room-id opts))))
 
 (deftest immutable-rosters-launch-composable-room-runs-from-sci
   (let [room    (d/make-room {:id :sci-agent-programming
@@ -413,7 +391,7 @@
                        (d/fork-room parent {:isolation :none}))
         deleted (atom nil)]
     (try
-      (with-redefs [rooms/delete-room!
+      (with-redefs [rooms/archive-room!
                     (fn [room]
                       (reset! deleted room)
                       {:ok? true})]
@@ -460,19 +438,24 @@
         (sandbox-work/close-room-work! room)
         (d/close-room! room)))))
 
-(deftest room-deletion-quiesces-sci-work-before-durable-delete
+(deftest room-purge-quiesces-sci-work-before-its-stores-go
   (let [order (atom [])
-        room (d/make-room {:id :sci-work-delete-order
-                           :store (ordered-delete-store (memory/make) order)})
+        room (d/make-room {:id :sci-work-purge-order
+                           :store (memory/make)})
         close-room! d/close-room!]
-    (with-redefs [d/close-room!
-                  (fn [target]
-                    (swap! order conj :quiesce)
-                    (close-room! target))]
-      (is (:ok? (rooms/delete-room! room))))
-    (is (= :delete (last @order)))
-    (is (some #{:quiesce} (butlast @order))
-        "durable deletion happens only after the runtime quiescence fence")))
+    ;; a purge of an archived room that something revived
+    (with-redefs [sdb/room-by-slug (fn [_] {:room/id :sci-work-purge-order :room/archived-at (java.util.Date.)})
+                  room-registry/lookup (fn [_] room)
+                  room-registry/unregister! (fn [_] nil)
+                  d/close-room! (fn [target]
+                                  (swap! order conj :quiesce)
+                                  (close-room! target))
+                  srooms/delete-room! (fn [_]
+                                        (swap! order conj :delete)
+                                        {:owned-systems-removed 0})]
+      (is (:ok? (rooms/purge-room! "sci-work-purge-order"))))
+    (is (= [:quiesce :delete] @order)
+        "the stores go only after the runtime quiescence fence")))
 
 (deftest room-sci-race-cancels-and-settles-its-owned-loser
   (let [room (d/make-room {:id :sci-agent-owned-race

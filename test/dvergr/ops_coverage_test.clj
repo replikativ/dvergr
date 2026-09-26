@@ -17,7 +17,8 @@
   {;; rooms and messages
    :-store-room!          {:written-by #{:room/create}}
    :-load-room            {:read-by #{:room/detail}}
-   :-delete-room!         {:written-by #{:room/delete}}
+   ;; purge drops the whole messages store the conversation lives in
+   :-delete-room!         {:written-by #{:room/purge}}
    :-list-rooms           {:read-by #{:room/list}}
    :-store-message!       {:written-by #{:room/post}}
    :-message-thread-root  :internal

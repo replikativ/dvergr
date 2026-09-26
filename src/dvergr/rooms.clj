@@ -142,31 +142,13 @@
                   (discourse-join! new-room aid))))))))
     (rstore/slug->room-id slug)))
 
-(defn delete-room!
-  "Delete a room: quiesce and unregister its live runtime, then retract its
-   persisted `:chat/*`/`:message/*` entity from the store. The CRUD counterpart of
-   `create-room!` — the single op both the TUI (`d`) and web (`/delete`) call.
-
-   (Distinct from `dvergr.rooms.forks/discard!`, which tears down a FORK's git +
-   datahike BRANCH; `delete-room!` removes a room's persisted conversation.)
-   Returns {:ok? true} or {:ok? false :error …}."
-  [room]
-  (try
-    (when room
-      ;; The durable store is the last boundary. Participant Runs and SCI work
-      ;; must acknowledge cancellation before conversation state disappears.
-      (d/close-room! room)
-      (when-let [store (:store room)]
-        (rstore/-delete-room! store (:id room))))
-    {:ok? true}
-    (catch Throwable t {:ok? false :error (.getMessage t)})))
-
 (defn archive-room!
   "Retire `room`: close its live runtime and mark it archived in the registry, so
    it is not hydrated again at the next boot. Its conversation, records, ledger
-   and stores are kept: history is kept, not deleted. For rooms that exist only
-   for their work, such as a benchmark's fixture room. Returns {:ok? true} or
-   {:ok? false :error …}."
+   and stores are kept: history is kept, not deleted. What deleting a room does
+   (the TUI's `d`, the web's delete, `room_delete`, the sandbox's `delete!`);
+   `unarchive-room!` brings it back and `purge-room!` removes it for good.
+   Returns {:ok? true} or {:ok? false :error …}."
   [room]
   (try
     (when room
@@ -359,3 +341,40 @@
   [child-ref parent-ref]
   (let [c (->slug child-ref) p (->slug parent-ref)]
     (when (and c p) (sdb/set-room-parent! c p))))
+
+(defn unarchive-room!
+  "Bring the archived room `slug` back: clear its archive mark and hydrate it
+   on `ctx` (the daemon's), with its conversation, records and stores as they
+   were. Returns {:ok? true} or {:ok? false :error …}."
+  [ctx slug]
+  (try
+    (if-let [row (sdb/room-by-slug slug)]
+      (do (sdb/unarchive-room! (:room/id row))
+          (hydrate-registry! ctx)
+          {:ok? true})
+      {:ok? false :error (str "No room " slug)})
+    (catch Throwable t {:ok? false :error (.getMessage t)})))
+
+(defn purge-room!
+  "Remove the archived room `slug` for good: its registry entry, its grants and
+   the systems it owns (messages, knowledge base, repository), stores
+   included; attached systems it does not own are only detached. Refuses a room
+   that is not archived: archiving first is what makes a purge deliberate.
+   Irreversible. Returns {:ok? true :owned-systems-removed n} or {:ok? false
+   :error …}."
+  [slug]
+  (let [row (sdb/room-by-slug slug)]
+    (cond
+      (nil? row) {:ok? false :error (str "No room " slug)}
+      (not (:room/archived-at row))
+      {:ok? false :error (str "Room " slug " is not archived: archive it first (room_delete)")}
+      :else
+      (try
+        ;; An archived room is closed; if something revived it, participant
+        ;; Runs and SCI work acknowledge cancellation before its stores go.
+        (when-let [live (rreg/lookup (rstore/slug->room-id slug))]
+          (d/close-room! live)
+          (rreg/unregister! (:id live)))
+        (let [{:keys [owned-systems-removed]} (srooms/delete-room! (:room/id row))]
+          {:ok? true :owned-systems-removed owned-systems-removed})
+        (catch Throwable t {:ok? false :error (.getMessage t)})))))

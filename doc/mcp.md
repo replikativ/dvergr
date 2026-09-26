@@ -58,7 +58,7 @@ neither listed nor callable.
 
 | Toolset | What |
 | --- | --- |
-| `rooms` | create, list, detail, delete, messages, post |
+| `rooms` | create, list, detail, delete (archives: history kept), messages, post |
 | `worlds` | fork, review, diff, merge, discard |
 | `attempts` | `workflow_start` and the job tools; Attempts, Scorecards |
 | `runs` | the blocking `workflow_attempt`; Runs |
@@ -67,6 +67,7 @@ neither listed nor callable.
 | `repl` | `clojure_eval` in the room's SCI sandbox |
 | `agents` | agent administration, `room_invite` |
 | `system` | statistics |
+| `admin` | archived rooms: `room_unarchive` brings one back, `room_purge` removes it and its stores for good (admin profile only) |
 | `code` | files, search, shell, tasks: for hosts without their own (off by default) |
 | `extra` | tools registered at runtime (channels) |
 
