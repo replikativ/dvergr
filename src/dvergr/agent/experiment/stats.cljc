@@ -8,7 +8,8 @@
    (bounded in [0, 1]) use a t interval, clipped to [0, 1], from two attempts
    on. Two candidates compare by the probability that one pass rate beats
    (or is no worse than) the other, and by their paired reward difference on
-   the worlds both ran. Pure functions, no dependencies.")
+   the worlds both ran. Pure functions, no dependencies, portable: the same
+   code runs on the JVM and in the browser (simmis's boards).")
 
 ;; ============================================================================
 ;; The Beta distribution
