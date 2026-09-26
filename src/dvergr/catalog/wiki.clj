@@ -467,7 +467,10 @@
    `resources/dvergr/catalog/wiki-real/<name>/` (each with its LICENSE.md)."
   {:mondragon {:dir "dvergr/catalog/wiki-real/mondragon"
                :docs ["mondragon-2010.md" "mondragon-2013.md" "mondragon-2016.md"
-                      "mondragon-2019.md" "mondragon-2022.md" "mondragon-2025.md"]}})
+                      "mondragon-2019.md" "mondragon-2022.md" "mondragon-2025.md"]}
+   :john-lewis {:dir "dvergr/catalog/wiki-real/john-lewis"
+                :docs ["john-lewis-2010.md" "john-lewis-2013.md" "john-lewis-2016.md"
+                       "john-lewis-2019.md" "john-lewis-2022.md" "john-lewis-2025.md"]}})
 
 (defn real-documents [corpus]
   (let [{:keys [dir docs]} (or (real-corpora corpus)

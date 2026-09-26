@@ -200,7 +200,7 @@ compares against the sources with hyphenated words rejoined, so a dump of the
 cleaned-up documents is still a copy. Calibration covers every level on ten seeds,
 and noise 3 with scale 3 and prose 2.
 
-**A real corpus next to the generated worlds** (split `:real`). `mondragon`: six
+**Real corpora next to the generated worlds** (split `:real`). `mondragon`: six
 dated snapshots (infobox and lead, 2010–2025) of the Wikipedia article on the
 Mondragon Corporation, in `resources/dvergr/catalog/wiki-real/mondragon/`
 (CC BY-SA 4.0; `LICENSE.md` links every revision and lists what was changed). What
@@ -215,7 +215,21 @@ and a hand-written reference wiki calibrates it like v2's
 `catalog_benchmark {workflow: "wiki/v3", split: "real", …}`: scores for real corpora
 are a separate Scorecard, not averaged into the generated worlds.
 
-A finding from it: currency's weight (15%) is shared by a world's stale values, so
+`john-lewis`: six snapshots (2010–2025) of the article on the John Lewis Partnership,
+in the same shape (`resources/dvergr/catalog/wiki-real/john-lewis/`). The chairman
+changes twice (Mayfield → White → Tarry); the headcount moves (68,430 in 2008,
+84,700, 88,700, 83,000, then 80,000 for 2022 or around 80,800 for 2020 in the same
+revision, 74,000 in 2024); revenue is given for five different years; the oldest
+revision gives 1920 as the founding year and every later one 1929; the Ocado supply
+"will expire in September 2020" in 2019 and "expired" in 2022, a planned date later
+confirmed; the legal form goes from private to partnership to public limited
+company. Gold: 13 facts, 12 stale values. With twelve stale values the currency
+dilution is stronger still: two stale values stated as current cost 0.025. The
+operating income (£0.147 billion) is left out of the gold: grounding normalises
+0.147 to "0147", so a correct "£147 million" would count as unsupported, a limit of
+digit-level grounding for unit changes.
+
+A finding from `mondragon`: currency's weight (15%) is shared by a world's stale values, so
 the cost of one stale value shrinks as a world has more of them. Stating two former
 heads as current costs 0.04 here (8 stale values) and would cost 0.06 in v2 (5).
 For a reader "who runs it now" is not a small error; a fixed cost per stale value
@@ -236,8 +250,8 @@ internal wiki, whose reader must be able to check every number).
 
 Next for the wiki benchmark:
 
-- **More real corpora.** Wikipedia revision histories of other organisations (the
-  same shape as `mondragon`), and SEC EDGAR filings (sec.gov: "may be copied or
+- **More real corpora.** More Wikipedia revision histories (the same shape as
+  `mondragon` and `john-lewis`), and SEC EDGAR filings (sec.gov: "may be copied or
   further distributed … without the SEC's permission") for documents of different
   genre and authority about one company.
 - **More noise.** Typos and misspelt names, facts stated in tables rather than
