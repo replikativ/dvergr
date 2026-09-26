@@ -10,6 +10,13 @@
 
 (def ^:private seeds (range 1 31))
 
+(def ^:private worlds
+  "Every seed at scale 1, and a third of them at scales 3 and 5."
+  (concat (map g/world seeds)
+          (for [scale [3 5] seed (take 10 seeds)] (g/world seed {:scale scale}))))
+
+(defn- label [w] (str "seed " (:seed w) " scale " (:scale w 1)))
+
 (defn- score [w pages]
   (wiki/score-wiki-v2 {:pages pages :sources (g/documents w) :gold (g/gold w)
                        :target "/wiki" :source "/docs"}))
@@ -31,8 +38,8 @@
            (finally (java.util.Locale/setDefault prev))))))
 
 (deftest the-gold-is-stated-in-the-documents-it-names
-  (doseq [seed seeds
-          :let [w (g/world seed) docs (g/documents w) gold (g/gold w)]]
+  (doseq [w worlds
+          :let [seed (label w) docs (g/documents w) gold (g/gold w)]]
     (doseq [{:keys [id terms synthesis] srcs :sources} (:facts gold)
             :when (not synthesis)
             :let [text (str/lower-case (str/join "\n" (map #(get docs (str "/docs/" %)) srcs)))]
@@ -46,8 +53,8 @@
         (is (str/includes? text (str/lower-case d)) (str "seed " seed ": " d))))))
 
 (deftest the-reference-wiki-scores-top-on-every-seed
-  (doseq [seed seeds
-          :let [w (g/world seed) r (score w (g/reference-wiki w))]]
+  (doseq [w worlds
+          :let [seed (label w) r (score w (g/reference-wiki w))]]
     (is (empty? (failing r)) (str "seed " seed ": " (failing r)))
     (is (= 1.0 (:reward r)) (str "seed " seed))))
 
@@ -75,8 +82,8 @@
      :partial (select-keys ref ["/wiki/index.md" coop plant])}))
 
 (deftest each-damage-costs-what-it-damaged-on-every-seed
-  (doseq [seed seeds
-          :let [w (g/world seed)
+  (doseq [w worlds
+          :let [seed (label w)
                 ref (:reward (score w (g/reference-wiki w)))
                 vs (variants w)
                 by (into {} (map (fn [[k pages]] [k (score w pages)])) vs)]]
@@ -102,6 +109,15 @@
       (is (contains? f :entity/designer) (str "seed " seed " partial"))
       (is (contains? f :fact/incident-dates) (str "seed " seed " partial")))))
 
+(deftest scale-adds-documents-stale-values-and-distractors
+  (let [base (g/world 4) scaled (g/world 4 {:scale 3})]
+    (is (= (g/documents base) (g/documents (g/world 4 {:scale 1}))) "scale 1 is the base world")
+    (is (every? (set (keys (g/documents scaled))) (keys (g/documents base))) "the base documents stay")
+    (is (< (count (g/documents base)) (count (g/documents scaled))))
+    (is (< (count (:stale (g/gold base))) (count (:stale (g/gold scaled)))))
+    (is (< (count (:distractors (g/gold base))) (count (:distractors (g/gold scaled)))))
+    (is (= (:facts (g/gold base)) (:facts (g/gold scaled))) "and the facts are the same")))
+
 (deftest the-held-out-split-needs-its-key
   (is (= [1 2 3] (g/seeds :dev 3)))
   (is (thrown? clojure.lang.ExceptionInfo (g/seeds :test 3)))
@@ -110,3 +126,12 @@
     (is (not= a b) "and different for another")
     (is (every? pos? a))
     (is (empty? (filter (set (g/seeds :dev 1000)) a)) "and not dev seeds")))
+
+(deftest a-scaled-plan-names-its-scale
+  (let [plan (wiki/experiment-plan {:version 3 :n 2 :scale 3 :models ["claude-haiku-4-5"]})]
+    (is (= [{:seed 1 :split :dev :generator g/version :scale 3}
+            {:seed 2 :split :dev :generator g/version :scale 3}]
+           (mapv :environment/metadata (:environments plan))))
+    (is (not-any? #(contains? (:environment/metadata %) :scale)
+                  (:environments (wiki/experiment-plan {:version 3 :n 2 :models ["claude-haiku-4-5"]})))
+        "scale 1 environments are unchanged")))

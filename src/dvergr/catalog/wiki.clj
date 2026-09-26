@@ -478,9 +478,9 @@
   "`{:docs :gold}` of a wiki/v3 environment: a generated world (`:seed`) or a
    real corpus (`:corpus`)."
   [environment]
-  (let [{:keys [seed corpus]} (:environment/metadata environment)]
+  (let [{:keys [seed corpus scale]} (:environment/metadata environment)]
     (cond corpus {:docs (real-documents corpus) :gold (real-gold corpus) :id corpus}
-          seed (let [w (gen/world seed)] {:docs (gen/documents w) :gold (gen/gold w) :id seed})
+          seed (let [w (gen/world seed {:scale (or scale 1)})] {:docs (gen/documents w) :gold (gen/gold w) :id seed})
           :else (throw (ex-info "A wiki/v3 environment names its seed or corpus" {:type ::no-world})))))
 
 (defn world-setup-v3
@@ -520,7 +520,7 @@
 (defn environments-v3
   "The EnvironmentDefs of `split`: one per seed of `:dev`, or of `:test` with
    `test-key`; one per real corpus of `:real` (`:corpora`, default all)."
-  [setup ev {:keys [timeout-ms split n seeds test-key corpora] :or {split :dev n 6}}]
+  [setup ev {:keys [timeout-ms split n seeds test-key corpora scale] :or {split :dev n 6 scale 1}}]
   (let [ref (evaluation/evaluator-ref ev)
         env (fn [metadata]
               (environment/make-environment
@@ -534,7 +534,8 @@
                 :metadata metadata}))]
     (if (= :real split)
       (mapv #(env {:corpus % :split :real}) (or corpora (sort (keys real-corpora))))
-      (mapv #(env {:seed % :split split :generator gen/version})
+      (mapv #(env (cond-> {:seed % :split split :generator gen/version}
+                    (< 1 scale) (assoc :scale scale)))
             (or seeds (gen/seeds split n test-key))))))
 
 (defn experiment-plan
@@ -542,7 +543,8 @@
    wherever it runs: capabilities, environments, the candidate team (one per
    model), the model specs, the dataset. v3 takes `:split` (`:dev`, the
    default, `:test`, or `:real` for the real corpora), `:n` worlds (default
-   6), explicit `:seeds` or `:corpora`, and the
+   6), their `:scale` (default 1: more documents, stale values and distractors
+   per world above it), explicit `:seeds` or `:corpora`, and the
    held-out split's key (`:test-key`, default the environment variable
    DVERGR_WIKI_TEST_KEY)."
   [{:keys [models budget-dollars timeout-ms prompt version] :or {version 1} :as opts}]
