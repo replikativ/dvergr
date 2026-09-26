@@ -288,6 +288,16 @@ Next for the wiki benchmark:
   asks: "is the model at a tenth of the price good enough here?" With 3 of 4 passes
   against 4 of 4, the answer is "probably worse (P higher = 0.16, P no worse by 5
   points = 0.24): run more worlds", not a ranking.
+- **Cost at list price.** A subscription model (Claude Code, Codex) costs nothing
+  per call, which says nothing about what the work is worth. Its registry entry
+  names the API model its tokens correspond to (`:list-price-of`: claude-code-haiku
+  → claude-haiku-4-5, codex-subscription-luna → gpt-5.6-luna, …), and its spend
+  carries `notional-microdollars`, the same tokens at that list price; for any
+  other model the notional cost is the cost. Spends show `notional-dollars` next to
+  `dollars` (what was paid), and leaderboard rows `notional-microdollars-per-pass`,
+  so cost per solved task compares across a subscription, a customer's own key and
+  a paid run. Spends recorded before fold exactly as they did (stored Scorecards
+  still validate).
 
 Open: an LLM judge tier for prose faithfulness; attempts run one after another (a
 Datahike writer race on concurrent Runs in one durable room).
