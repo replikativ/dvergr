@@ -428,6 +428,16 @@
       (d/transact conn [{:room/id room-id :room/archived-at (java.util.Date.)}]))
     true))
 
+(defn unarchive-room!
+  "Clear the archive mark of `room-id`: it is hydrated and listed again.
+   Idempotent."
+  [room-id]
+  (let [conn (get-conn)]
+    (when-let [[e t] (d/q '[:find [?e ?t] :in $ ?id :where [?e :room/id ?id] [?e :room/archived-at ?t]]
+                          @conn room-id)]
+      (d/transact conn [[:db/retract e :room/archived-at t]]))
+    true))
+
 ;; ---------------------------------------------------------------------------
 ;; Grants — attach / detach a system to a room with a permission
 ;; ---------------------------------------------------------------------------

@@ -85,7 +85,7 @@
         join-agent!*    @(ns-resolve 'dvergr.rooms 'join-agent!)
         leave-agent!*   @(ns-resolve 'dvergr.rooms 'leave-agent!)
         set-parent!*    @(ns-resolve 'dvergr.rooms 'set-parent!)
-        delete-room!*   @(ns-resolve 'dvergr.rooms 'delete-room!)
+        archive-room!*  @(ns-resolve 'dvergr.rooms 'archive-room!)
         get-by-slug*    @(ns-resolve 'dvergr.rooms 'get-room-by-slug)
         slug->id*       @(ns-resolve 'dvergr.room.store 'slug->room-id)
         rreg-lookup*    @(ns-resolve 'dvergr.room.registry 'lookup)
@@ -182,7 +182,7 @@
                                 (throw (ex-info "A Room cannot delete itself from its own SCI runtime"
                                                 {:type ::self-delete
                                                  :room-id (:id room)}))))
-                            (let [result (delete-room!* room)]
+                            (let [result (archive-room!* room)]
                               (if (:ok? result)
                                 {:deleted (:id room)}
                                 (throw (ex-info "Room deletion failed"
@@ -263,7 +263,7 @@
         set-parent!  [([child parent]) "Re-parent a room, building the room tree."]
         join!        [([ref who]) "Join a room so `who` (an agent id) receives its messages."]
         leave!       [([ref who]) "Stop `who` (an agent id) receiving a room's messages."]
-        delete!      [([ref]) "Delete a room. Destructive — prefer discard! on a fork, or archiving."]
+        delete!      [([ref]) "Delete a room: it is closed and archived, its history kept (an operator can unarchive or purge it). On a fork, prefer discard!."]
         fork!        [([ref] [ref opts]) "Branch a room into an ISOLATED copy — its own git repo AND database — so you can experiment freely. This is the safe way to attempt a substantial or risky change: fork, work, then merge! or discard!. Returns the fork Room. `opts` defaults to {:isolation :ctx}; pass {:isolation :none} only for a message-only probe that shares the parent's state."]
         merge!       [([parent fork]) "Collapse a fork's work (git + databases + messages) back into its parent — the other half of the fork→test→merge loop. `parent` and `fork` are each a slug, id or Room. Read `diff`/`review` first to judge it. Returns the PARENT Room, or {:error …} if either room is not found."]
         discard!     [([fork]) "Throw a fork away, keeping the parent untouched. `fork` is a slug, id or Room. Returns the fork Room, or {:error …} if it is not found."]

@@ -1204,13 +1204,13 @@
                     {:action :discard :room room
                      :label (str "Discard " (:slug room) " — deletes its branch.  y / n")})))
 
-        ;; `d` — delete the currently-selected room (shared op).
+        ;; `d` — delete (archive) the currently-selected room (shared op).
         (= key "d")
         (let [sel (tree-c/selected-node @(:tree signals))]
           (when (and sel (or (= :room (:kind sel)) (= :fork (:kind sel))))
             (let [room (or (:room sel) (:fork sel))]
               (binding [ec/*execution-context* (:execution-ctx daemon)]
-                ((requiring-resolve 'dvergr.rooms/delete-room!) room))
+                ((requiring-resolve 'dvergr.rooms/archive-room!) room))
               (reset! room-stats-cache {}))))
 
         :else
