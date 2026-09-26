@@ -157,6 +157,18 @@ plant name) are chosen so that no other document states them.
   uses world 1. End to end (`catalog_daemon_test`): a perfect wiki of each world
   scores 1.0 against that world's gold.
 
+**Scale** (`:scale` s, default 1; `catalog_benchmark {… scale: 3}`). A generated
+world at scale 1 has v2's twelve documents; above it, s − 1 times more are added from
+a random stream of their own, so scale 1 stays exactly the base world (and its
+environments keep their content ids): annual reports for years in between, each
+stating the member count of its year (one more stale value to qualify); routine
+newsletters with names and numbers but no gold fact; articles about other
+organisations (more distractors). New names, places and years collide with nothing
+the base world states, and no in-between report's year repeats a stale value (a
+title "Annual report 2011" must not repeat the planned opening). Scale 3: 22
+documents, about 1,000 words, 9 stale values; scale 5: 31–32 documents, about 1,400
+words, 12–13 stale values. Calibration runs on scales 1, 3 and 5.
+
 **A real corpus next to the generated worlds** (split `:real`). `mondragon`: six
 dated snapshots (infobox and lead, 2010–2025) of the Wikipedia article on the
 Mondragon Corporation, in `resources/dvergr/catalog/wiki-real/mondragon/`
@@ -197,8 +209,9 @@ Next for the wiki benchmark:
   same shape as `mondragon`), and SEC EDGAR filings (sec.gov: "may be copied or
   further distributed … without the SEC's permission") for documents of different
   genre and authority about one company.
-- **Scale knobs.** Documents per world and their length are far below a real dump
-  (12 documents, about 700 words); add more documents per genre and noise.
+- **Longer documents.** Scale adds documents, not length: a scale-5 world is about
+  1,400 words, still far below a real dump; add paragraphs of routine text per
+  document, and noise within documents (typos, tables, repeated boilerplate).
 - **Incremental update.** New documents arrive; score the updated wiki and its cost.
 - **Claim-level receipts.** A citation counts only if the Run actually read the
   cited document (the file-read record), as `discovery-citations` does for the web.
