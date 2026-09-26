@@ -7,6 +7,8 @@
             [dvergr.agent.run :as run]
             [dvergr.discourse :as d]
             [dvergr.mcp.server :as server]
+            [dvergr.mcp.repl]
+            [sci.core]
             [dvergr.mcp.json-rpc :as json-rpc]
             [dvergr.mcp.surface :as surface]
             [dvergr.ops :as ops]
@@ -240,3 +242,25 @@
         (try (binding [ec/*execution-context* (:ctx room)] (rreg/unregister! (:id room)))
              (catch Throwable _ nil))
         (d/close-room! room)))))
+
+(deftest the-code-profile-is-the-repl-and-its-description
+  (let [names (set (map :name (list-tools (session {:dvergr/profile "code"}))))]
+    (is (= #{"clojure_eval" "repl_describe"} names) "the whole API is in the REPL"))
+  (is (not (contains? (set (map :name (list-tools (session)))) "repl_describe"))
+      "the default profile keeps its size; its clojure_eval says how to discover the API"))
+
+(deftest repl-describe-lists-the-api-of-a-repl-session
+  (let [ctx (sci.core/init {})
+        describe #(sci.core/eval-string* ctx (str "(" @#'server/describe-form " " (pr-str %) ")"))]
+    (with-redefs [ops/invoke (fn [_ op _] {:op op})]
+      (dvergr.mcp.repl/install! ctx ::daemon (surface/selection {:profile "code"}) {:id :here}))
+    (let [all (describe nil)
+          ops-ns (first (filter #(= "dvergr.ops" (:ns %)) all))]
+      (is (some #{"job-status"} (:fns ops-ns)) "without a query: namespaces and function names")
+      (is (some #{"scorecard-detail"} (:fns ops-ns))))
+    (let [hits (describe "scorecard")
+          fns (mapcat :fns hits)]
+      (is (every? (set (map :name fns)) ["scorecard-detail" "scorecard-list"])
+          "names and docs match (catalog-benchmark's doc mentions its Scorecard)")
+      (is (every? (comp string? :doc) fns) "with a query: signatures and first doc lines")
+      (is (every? #(re-find #"args" (:arglists %)) fns)))))

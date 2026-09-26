@@ -50,7 +50,8 @@
   "Registry tools by toolset. `clojure_eval` is the room's REPL, the
    programming model; the rest duplicate what a host client already has
    (files, shell, search), so they are opt-in."
-  {"clojure_eval" :repl})
+  {"clojure_eval" :repl
+   "repl_describe" :describe})
 
 (def toolsets
   "Every toolset, with what it is for."
@@ -62,6 +63,7 @@
    :bench    "Benchmark models on a workflow's benchmark set; experiment progress"
    :wallets  "Budgets and model prices"
    :repl     "The room's Clojure REPL (SCI sandbox) with dvergr's programming model"
+   :describe "repl_describe: the REPL's API (dvergr namespaces, functions, docs), for REPL-first clients"
    :agents   "Agent administration"
    :system   "Daemon and room statistics"
    :admin    "Archived rooms: bring one back, or purge it for good"
@@ -69,9 +71,14 @@
    :extra    "Tools registered at runtime (channels)"})
 
 (def profiles
-  "Named selections. `:read-only?` keeps only tools annotated read-only."
+  "Named selections. `:read-only?` keeps only tools annotated read-only.
+   `:repl-toolsets` are the toolsets whose ops the REPL's `dvergr.ops` may
+   call when they differ from the listed ones (`dvergr.mcp.repl`)."
   {:offload  {:toolsets #{:rooms :worlds :attempts :catalog :wallets :repl}}
    :bench    {:toolsets #{:rooms :attempts :catalog :bench :wallets}}
+   ;; REPL-first: the whole API as `dvergr.ops` functions in `clojure_eval`
+   :code     {:toolsets #{:repl :describe}
+              :repl-toolsets #{:rooms :worlds :attempts :catalog :bench :wallets}}
    :readonly {:toolsets #{:rooms :worlds :attempts :catalog :bench :wallets :agents :system}
               :read-only? true}
    :admin    {:toolsets (set (keys toolsets))}})
@@ -111,9 +118,17 @@
     (when (seq unknown)
       (throw (ex-info (str "Unknown dvergr MCP toolset(s): " (str/join ", " (map name unknown)))
                       {:type ::unknown-toolset :toolsets (vec unknown)})))
-    (-> base
-        (update :toolsets into extra)
-        (assoc :profile pk))))
+    (cond-> (-> base
+                (update :toolsets into extra)
+                (assoc :profile pk))
+      (:repl-toolsets base) (update :repl-toolsets into extra))))
+
+(defn repl-selection
+  "The selection whose ops a REPL of `selection` may call: its
+   `:repl-toolsets` when it names them, else what it lists."
+  [selection]
+  (cond-> selection
+    (:repl-toolsets selection) (assoc :toolsets (:repl-toolsets selection))))
 
 (defn visible?
   "Whether a tool definition (with `:dvergr/toolset`) is in `selection`."
@@ -162,7 +177,7 @@
         w  (fn [destructive? open?] {:readOnlyHint false :destructiveHint destructive?
                                      :idempotentHint false :openWorldHint open?})]
     {"read_file" ro, "glob" ro, "grep" ro, "code_query" ro, "knowledge_search" ro,
-     "task_list" ro, "budget" ro, "clj_kondo" ro
+     "task_list" ro, "budget" ro, "clj_kondo" ro, "repl_describe" ro
      "clojure_eval" (w true true), "shell" (w true true),
      "write_file" (w true false), "edit_file" (w true false), "clojure_edit" (w true false),
      "run_tests" (w false false), "knowledge_add" (w false false),

@@ -53,6 +53,7 @@ neither listed nor callable.
 | Profile | Toolsets | Tools |
 | --- | --- | --- |
 | `offload` (default) | rooms, worlds, attempts, catalog, wallets, repl | 26 |
+| `code` | repl, describe (its REPL calls the ops of rooms, worlds, attempts, catalog, bench, wallets) | 2 |
 | `readonly` | every read op | read-only only |
 | `admin` | everything | all |
 
@@ -65,11 +66,16 @@ neither listed nor callable.
 | `catalog` | `catalog_list`, `catalog_start`: workflows with their own checker |
 | `wallets` | `room_wallet`, `models_list` |
 | `repl` | `clojure_eval` in the room's SCI sandbox |
+| `describe` | `repl_describe`: the REPL's API (dvergr namespaces, functions, signatures, docs), filtered by a query |
 | `agents` | agent administration, `room_invite` |
 | `system` | statistics |
 | `admin` | archived rooms: `room_unarchive` brings one back, `room_purge` removes it and its stores for good (admin profile only) |
 | `code` | files, search, shell, tasks: for hosts without their own (off by default) |
 | `extra` | tools registered at runtime (channels) |
+
+**REPL-first (`--profile code`).** Two tools: `clojure_eval`, whose `dvergr.ops` namespace
+calls every op of the listed toolsets (see below), and `repl_describe` to discover the API
+without writing code. A client writes one program where it would chain tool calls.
 
 The default is small on purpose: some clients cap the tools of all their servers together
 around 40, and every definition costs context in every session.
@@ -148,9 +154,9 @@ answered with the latest. Tools, resources (derived from the read ops) with subs
 
 ## Next
 
-1. A `code` profile (`clojure_eval`, a read-only eval, `repl_describe`), evals metered to the
-   wallet; then native tools for Claude Code and Codex as benchmark candidates (their CLIs
-   reach a Run's tools over `--mcp-config`).
+1. Native tools for Claude Code and Codex as benchmark candidates (their CLIs reach a Run's
+   tools over `--mcp-config`); a read-only eval (needs a restricted sandbox, not only fewer
+   ops) and evals metered to the wallet.
 2. MCP 2026-07-28 (stateless, `server/discover`, `_meta` per request) and Streamable HTTP for
    hosted use, then OAuth.
 3. A `data` toolset over pg-datahike (load a `pg_dump`, migrate on a fork, merge), and a client
