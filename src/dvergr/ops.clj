@@ -33,6 +33,7 @@
             [dvergr.catalog :as catalog]
             [dvergr.agent.experiment.runner :as runner]
             [dvergr.agent.experiment.stats :as xstats]
+            [dvergr.agent.spend :as spend]
             [dvergr.jobs :as jobs]
             [dvergr.resource :as resource]
             [dvergr.agent.fields :as fields]
@@ -107,10 +108,16 @@
 
 ;; ---- the evaluation read model: what the MCP tool and the web view share ----
 
-(defn- spend-data [spend]
+(defn- spend-data
+  "A spend as plain data: what was paid (`:dollars`) and, for subscription
+   models, what the same tokens are worth at list price (`:notional-dollars`;
+   equal to `:dollars` otherwise)."
+  [spend]
   (when spend
     {:microdollars (:microdollars spend 0)
      :dollars      (/ (double (:microdollars spend 0)) 1e6)
+     :notional-microdollars (spend/notional-microdollars spend)
+     :notional-dollars (/ (double (spend/notional-microdollars spend)) 1e6)
      :priced?      (:priced? spend true)
      :tokens       (:tokens spend {})
      :by-model     (into {} (map (fn [[m sp]] [(str m) {:microdollars (:microdollars sp 0)
@@ -234,7 +241,11 @@
                             :reward-interval (xstats/mean-interval (get rewards (:candidate/id s)))
                             :spend           (spend-data (:spend s))
                             :microdollars-per-attempt (:microdollars-per-attempt s)
-                            :microdollars-per-pass    (:microdollars-per-pass s)}))
+                            :microdollars-per-pass    (:microdollars-per-pass s)
+                            ;; at list price, so a subscription run compares with a paid one
+                            :notional-microdollars-per-pass
+                            (when (pos? (:passed-count s 0))
+                              (quot (spend/notional-microdollars (:spend s)) (:passed-count s)))}))
                     (sort-by (juxt #(- (or (:reward-mean %) 0))
                                    #(or (:microdollars-per-pass %) Long/MAX_VALUE)))
                     vec)]

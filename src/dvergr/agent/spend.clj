@@ -14,8 +14,17 @@
 
    so a Scorecard can put a bill next to a reward and a leaderboard can rank by
    cost per solved task. Prices are the registry's at the time of the Attempt;
-   the receipt keeps the tokens so a later price can be applied again."
-  (:require [dvergr.chat.accounting :as acct]))
+   the receipt keeps the tokens so a later price can be applied again.
+
+   A subscription model (Claude Code, Codex) costs nothing per call, which
+   says nothing about what the work is worth. Its registry entry names the API
+   model its tokens correspond to (`:list-price-of`), and its spend also
+   carries `:notional-microdollars`: the same tokens at that model's list
+   price. For any other model the notional cost is the cost. So cost per
+   solved task compares across a subscription, a customer's own key and a
+   paid run; the bill (`:microdollars`) stays what was paid."
+  (:require [dvergr.chat.accounting :as acct]
+            [dvergr.model.registry :as registry]))
 
 (def ^:private token-keys
   ;; provider usage key -> canonical token key -> accounting resource type
@@ -51,11 +60,36 @@
                0
                token-keys)))
 
+(defn- list-price-model
+  "The model whose list price `model`'s tokens are worth: its `:list-price-of`
+   (a subscription model), else itself."
+  [model]
+  (or (some-> model registry/get-model :list-price-of) model))
+
+(defn- notional
+  "Microdollars `usage` would cost at list price, or nil when `model` has no
+   list price model (then the notional cost is the cost)."
+  [model usage]
+  (let [reference (list-price-model model)]
+    (when (not= reference model)
+      (price reference usage))))
+
+(defn notional-microdollars
+  "What `spend` is worth at list price: `:notional-microdollars` when it
+   carries one (a subscription), else what it cost."
+  [spend]
+  (get spend :notional-microdollars (:microdollars spend 0)))
+
 (defn- merge-spend [a b]
-  {:microdollars (+ (:microdollars a 0) (:microdollars b 0))
-   :tokens (merge-with + (:tokens a {}) (:tokens b {}))
-   :by-model (merge-with merge-spend (:by-model a {}) (:by-model b {}))
-   :priced? (and (:priced? a true) (:priced? b true))})
+  (cond-> {:microdollars (+ (:microdollars a 0) (:microdollars b 0))
+           :tokens (merge-with + (:tokens a {}) (:tokens b {}))
+           :by-model (merge-with merge-spend (:by-model a {}) (:by-model b {}))
+           :priced? (and (:priced? a true) (:priced? b true))}
+    ;; Only when one of them carries it: spends recorded before notional
+    ;; costs existed fold to exactly what they folded to then (stored
+    ;; Scorecards recompute their summary from their entries).
+    (or (contains? a :notional-microdollars) (contains? b :notional-microdollars))
+    (assoc :notional-microdollars (+ (notional-microdollars a) (notional-microdollars b)))))
 
 (def zero {:microdollars 0 :tokens {} :by-model {} :priced? true})
 
@@ -64,7 +98,9 @@
   [model usage]
   (let [tokens (tokens-of usage)
         md (price model usage)
-        one {:microdollars (or md 0) :tokens tokens :priced? (some? md)}]
+        worth (notional model usage)
+        one (cond-> {:microdollars (or md 0) :tokens tokens :priced? (some? md)}
+              worth (assoc :notional-microdollars worth))]
     (assoc one :by-model (if model {model one} {}))))
 
 (defn of-budget
@@ -72,7 +108,9 @@
    natural units), attributed to `model`."
   [model {:keys [used by-type]}]
   (let [tokens (tokens-of by-type)
-        one {:microdollars (long (or used 0)) :tokens tokens :priced? true}]
+        worth (notional model by-type)
+        one (cond-> {:microdollars (long (or used 0)) :tokens tokens :priced? true}
+              worth (assoc :notional-microdollars worth))]
     (assoc one :by-model (if model {model one} {}))))
 
 (defn of-metrics

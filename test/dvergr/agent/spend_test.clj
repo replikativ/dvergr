@@ -49,3 +49,28 @@
     (is (= {:input 3} (:tokens t)))
     (is (= 30 (get-in t [:by-model priced-model :microdollars])))
     (is (= spend/zero (spend/total [])))))
+
+(deftest a-subscription-call-is-free-and-worth-its-list-price
+  (let [usage {:input-tokens 6511 :output-tokens 23298}
+        paid (spend/of-usage "claude-haiku-4-5" usage)
+        sub (spend/of-usage "claude-code-haiku" usage)]
+    (is (= 0 (:microdollars sub)) "the bill is what was paid")
+    (is (true? (:priced? sub)))
+    (is (pos? (:notional-microdollars sub)))
+    (is (= (:microdollars paid) (:notional-microdollars sub) (spend/notional-microdollars sub))
+        "worth what the API model would have cost")
+    (is (= (:microdollars paid) (spend/notional-microdollars paid)) "a paid call is worth its cost")
+    (is (not (contains? paid :notional-microdollars)))
+    (testing "a budget already accounted, too"
+      (let [b (spend/of-budget "codex-subscription-luna" {:used 0 :by-type usage})]
+        (is (= 0 (:microdollars b)))
+        (is (= (:microdollars (spend/of-usage "gpt-5.6-luna" usage)) (:notional-microdollars b)))))))
+
+(deftest folding-keeps-old-spends-as-they-were
+  (let [paid (spend/of-usage "claude-haiku-4-5" {:input-tokens 1000 :output-tokens 100})
+        sub (spend/of-usage "claude-code-haiku" {:input-tokens 1000 :output-tokens 100})]
+    (is (not (contains? (spend/total [paid paid]) :notional-microdollars))
+        "spends recorded before notional costs fold exactly as before")
+    (is (= (* 2 (:microdollars paid)) (:notional-microdollars (spend/total [paid sub])))
+        "a mixed fold is worth the paid cost plus the subscription's list price")
+    (is (= (:microdollars paid) (:microdollars (spend/total [paid sub]))))))

@@ -124,6 +124,7 @@
     :context 200000
     :max-output 32000
     :pricing {:input 0 :output 0}  ;; subscription-based
+    :list-price-of "claude-sonnet-4-6"  ;; the API model its tokens are worth (notional cost)
     :quirks {}}
 
    "claude-code-opus"
@@ -135,6 +136,7 @@
     :context 200000
     :max-output 32000
     :pricing {:input 0 :output 0}
+    :list-price-of "claude-opus-4-7"  ;; the API model its tokens are worth (notional cost)
     :quirks {}}
 
    "claude-code-haiku"
@@ -146,6 +148,7 @@
     :context 200000
     :max-output 32000
     :pricing {:input 0 :output 0}
+    :list-price-of "claude-haiku-4-5"  ;; the API model its tokens are worth (notional cost)
     :quirks {}}
 
    ;; ── OpenAI GPT-5.6 ───────────────────────────────────────────────
@@ -256,6 +259,7 @@
     :context 272000
     :max-output 128000
     :pricing {:input 0 :output 0}
+    :list-price-of "gpt-5.6-sol"  ;; the API model its tokens are worth (notional cost)
     :quirks {}}
 
    "codex-subscription-sol"
@@ -267,6 +271,7 @@
     :context 272000
     :max-output 128000
     :pricing {:input 0 :output 0}
+    :list-price-of "gpt-5.6-sol"  ;; the API model its tokens are worth (notional cost)
     :quirks {}}
 
    "codex-subscription-terra"
@@ -278,6 +283,7 @@
     :context 272000
     :max-output 128000
     :pricing {:input 0 :output 0}
+    :list-price-of "gpt-5.6-terra"  ;; the API model its tokens are worth (notional cost)
     :quirks {}}
 
    "codex-subscription-luna"
@@ -289,6 +295,7 @@
     :context 272000
     :max-output 128000
     :pricing {:input 0 :output 0}
+    :list-price-of "gpt-5.6-luna"  ;; the API model its tokens are worth (notional cost)
     :quirks {}}
 
    "codex-subscription-cli"
@@ -300,6 +307,7 @@
     :context 272000
     :max-output 128000
     :pricing {:input 0 :output 0}
+    :list-price-of "gpt-5.6-sol"  ;; the API model its tokens are worth (notional cost)
     :quirks {}}})
 
 ;; ============================================================================
