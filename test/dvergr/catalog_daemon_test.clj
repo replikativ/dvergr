@@ -10,6 +10,7 @@
             [clojure.test :refer [deftest is testing use-fixtures]]
             [dvergr.agent.experiment.runner :as runner]
             [dvergr.catalog :as catalog]
+            [dvergr.catalog.wiki-gen :as gen]
             [dvergr.chat.agent :as chat-agent]
             [dvergr.model.chat :as model-chat]
             [dvergr.model.providers :as providers]
@@ -46,7 +47,8 @@
                   "\n\n[source](../docs/company.md) [products](../docs/products.md)")]
     (fn [messages _opts]
       (let [n (swap! calls inc)]
-        (if (not-any? #(= :tool-result (:role %)) messages)
+        ;; Stored messages carry `:message/role`, API-shaped ones `:role`.
+        (if (not-any? #(= :tool-result (or (:role %) (:message/role %))) messages)
           {:content ""
            :tool-calls [{:id (str "index-" n) :name "write_file"
                          :input {:path "/wiki/index.md" :content "# Wiki\n\n- [Tessellate](tessellate.md)\n"}}
@@ -212,6 +214,58 @@
           (is (= 1 (:done cand) (:verdicts cand)) "the cell is certified in the room")
           (is (= 1.0 (:reward-mean cand)) "the wiki was written: the model ran past its first tool round")))
       (finally (forks/discard! world)))))
+
+(defn- reference-writer
+  "A scripted model that writes a perfect wiki of whichever generated world it
+   is in: it reads the blog, finds the seed whose world wrote it, and writes
+   that world's reference wiki. Decided per attempt, from the attempt's own
+   history."
+  [calls]
+  (fn [messages _opts]
+    (swap! calls inc)
+    ;; The stub sees stored messages (`:message/role`, …) or API-shaped ones.
+    (let [role #(or (:role %) (:message/role %))
+          content #(str (or (:content %) (:message/content %)))
+          use-id #(str (or (:tool-use-id %) (:message/tool-use-id %)))
+          results (filter #(= :tool-result (role %)) messages)
+          blog (some (fn [m] (let [c (content m)] (when (str/includes? c "A short history of") c))) results)]
+      (cond
+        (empty? results)
+        {:content "" :tool-calls [{:id "blog" :name "read_file" :input {:path "/docs/blog-history.md"}}]
+         :usage {:input-tokens 500 :output-tokens 20} :stop-reason :tool-use}
+
+        (and blog (not-any? #(str/starts-with? (use-id %) "page-") results))
+        (let [w (some #(let [w (gen/world %)]
+                         (when (str/includes? blog (str (:place w) " got its cooperative in " (:founded-wrong w))) w))
+                      (range 1 50))]
+          {:content ""
+           :tool-calls (vec (map-indexed (fn [i [path text]]
+                                           {:id (str "page-" i) :name "write_file" :input {:path path :content text}})
+                                         (sort (gen/reference-wiki w))))
+           :usage {:input-tokens 2000 :output-tokens 3000} :stop-reason :tool-use})
+
+        :else
+        {:content "Wrote the wiki." :tool-calls nil
+         :usage {:input-tokens 2500 :output-tokens 20} :stop-reason :end-turn}))))
+
+(deftest a-generated-world-benchmark-scores-a-perfect-wiki-top
+  ;; wiki/v3 end to end: each environment's world is generated from its seed
+  ;; into the attempt's world, and scored against the gold of that seed.
+  (let [calls (atom 0)]
+    (with-redefs [providers/ensure-initialized! (constantly nil)
+                  chat-agent/messages->api-format (fn [messages _ _] messages)
+                  model-chat/chat (reference-writer calls)]
+      (let [started (ops/invoke *daemon* :catalog/benchmark
+                                {:workflow "wiki/v3" :models ["claude-haiku-4-5"] :environments 2})
+            done (loop [n 0]
+                   (let [st (ops/invoke *daemon* :job/status {:job (:id started) :wait-ms 20000})]
+                     (if (or (not= "running" (:status st)) (< 8 n)) st (recur (inc n)))))
+            [cand] (get-in (ops/invoke *daemon* :experiment/progress {:room (:room started)})
+                           [:experiments 0 :candidates])]
+        (is (= "completed" (:status done)) (pr-str (dissoc done :result)))
+        (is (= 2 (:done cand) (:verdicts cand)) "one cell per generated world")
+        (is (= 1.0 (:reward-mean cand)) "a perfect wiki of each world scores top against that world's gold")
+        (is (= 1.0 (get-in done [:result :summary 0 :reward-mean])))))))
 
 (deftest a-checkout-becomes-a-room-and-its-changes-a-patch
   ;; A daemon room's repository starts as a clone of the sandbox stdlib; an

@@ -20,6 +20,7 @@
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.workflow :as workflow]
+            [dvergr.catalog.wiki-gen :as gen]
             [dvergr.catalog.workspace :as ws]
             [hasch.core :as hasch]))
 
@@ -444,10 +445,99 @@
       :world {:isolation :ctx :settlement :discard
               :setup (evaluation/world-setup-ref setup)}})))
 
+(declare experiment-plan-v1-v2)
+
+;; ============================================================================
+;; v3: generated worlds
+;; ============================================================================
+;;
+;; v2's checker on many worlds instead of one (`dvergr.catalog.wiki-gen`): an
+;; environment per seed, its documents written into the attempt's world by the
+;; setup and its gold derived from the same seed by the evaluator, so one
+;; setup and one evaluator serve any number of worlds. The seed is in the
+;; environment's metadata (and so in its content id); the dev split is public,
+;; the test split is derived from a key the host keeps.
+
+(defn- seed-of [environment]
+  (or (get-in environment [:environment/metadata :seed])
+      (throw (ex-info "A wiki/v3 environment names its seed" {:type ::no-seed}))))
+
+(defn world-setup-v3
+  "Writes the documents of the environment's world into /docs of each
+   attempt's world (a workspace of its own, committed)."
+  []
+  (evaluation/make-world-setup
+   {:id :catalog/wiki-generated :version 1 :basis {:generator gen/version}
+    :prepare (fn [{world :room environment :environment}]
+               (let [seed (seed-of environment)
+                     docs (gen/documents (gen/world seed))]
+                 (ws/ensure-workspace! world)
+                 (ws/seed! world docs)
+                 {:seed seed :files (count docs) :fixtures (str (hasch/uuid docs))}))}))
+
+(defn evaluator-v3
+  "v2's checker, against the gold of the environment's world."
+  [{:keys [source target]}]
+  (evaluation/make-evaluator
+   {:id :catalog/wiki :version 3
+    :capture (fn [{world :world/room}]
+               {:pages (ws/read-tree world target)
+                :sources (ws/read-tree world source)})
+    :observe (fn [{:keys [default result environment] captured :execution/evidence}]
+               (let [scored (score-wiki-v2 {:pages (:pages captured) :sources (:sources captured)
+                                            :gold (gen/gold (gen/world (seed-of environment)))
+                                            :target target :source source})]
+                 (assoc default
+                        :run-status (:run/status result)
+                        :pages (:pages captured)
+                        :scores (:scores scored)
+                        :checks (:checks scored)
+                        :reward (:reward scored))))
+    :verify (fn [_ {:keys [run-status checks reward]}]
+              {:checks (assoc checks :completed? (= :completed run-status))
+               :reward (if (= :completed run-status) reward 0.0)})}))
+
+(defn environments-v3
+  "One EnvironmentDef per seed of `split` (`:dev`, or `:test` with `test-key`)."
+  [setup ev {:keys [timeout-ms split n seeds test-key] :or {split :dev n 6}}]
+  (let [ref (evaluation/evaluator-ref ev)]
+    (mapv (fn [seed]
+            (environment/make-environment
+             {:id :catalog/wiki-v3
+              :task (task-v2 params)
+              :verifier {:id (:verifier/id ref) :version (:verifier/version ref)}
+              :limits {:timeout-ms (or timeout-ms (* 10 60 1000)) :cancel-timeout-ms 30000
+                       :on-timeout :verdict}
+              :world {:isolation :ctx :settlement :discard
+                      :setup (evaluation/world-setup-ref setup)}
+              :metadata {:seed seed :split split :generator gen/version}}))
+          (or seeds (gen/seeds split n test-key)))))
+
 (defn experiment-plan
-  "What running a benchmark set (`version` 1, the default, or 2) needs,
+  "What running a benchmark set (`version` 1, the default, 2 or 3) needs,
    wherever it runs: capabilities, environments, the candidate team (one per
-   model), the model specs, the dataset."
+   model), the model specs, the dataset. v3 takes `:split` (`:dev`, the
+   default, or `:test`), `:n` worlds (default 6), explicit `:seeds`, and the
+   held-out split's key (`:test-key`, default the environment variable
+   DVERGR_WIKI_TEST_KEY)."
+  [{:keys [models budget-dollars timeout-ms prompt version] :or {version 1} :as opts}]
+  (if (= 3 version)
+    (let [setup (world-setup-v3)
+          ev (evaluator-v3 params)
+          envs (environments-v3 setup ev (update opts :test-key #(or % (System/getenv "DVERGR_WIKI_TEST_KEY"))))
+          {:keys [team ids]} (workflow/candidates {:models models :profile "developer"
+                                                   :budget-dollars budget-dollars :prompt prompt})]
+      {:benchmark :catalog-wiki
+       :capabilities {:world-setup setup :evaluator ev}
+       :environments envs
+       :team team
+       :models (mapv #(:agent/model-policy (roster/agent team %)) ids)
+       :dataset {:id :catalog/wiki-v3
+                 :metadata {:generator gen/version :split (or (:split opts) :dev)
+                            :seeds (mapv #(get-in % [:environment/metadata :seed]) envs)}}})
+    (experiment-plan-v1-v2 opts)))
+
+(defn- experiment-plan-v1-v2
   [{:keys [models budget-dollars timeout-ms prompt version] :or {version 1}}]
   (let [v2? (= 2 version)
         files (if v2? (fixtures-v2) (fixtures))

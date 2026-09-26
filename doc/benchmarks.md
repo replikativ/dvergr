@@ -92,7 +92,7 @@ equivalent to; the checker is argued valid by **calibration** instead.
 | Grade | final state / emitted calls | the files left in the world |
 
 Two paths share task and checker: `experiment!` (discarded worlds, a Scorecard;
-`{:version 1|2}`) and `catalog_start` over MCP (worlds kept for review and
+`{:version 1|2|3}`) and `catalog_start` over MCP (worlds kept for review and
 adoption; without a room on the benchmark set, with one on the room's own `/docs`).
 
 **v1**: six documents, ten gold facts found by substring. Too easy (Luna 1.0 on
@@ -128,9 +128,52 @@ grounded; both lost a little for writing "42"); both missed the Tallow River
 Trust's own page and the derived duration; the weaker also the pipeline length,
 the drought and Achebe's tenure. Scores now separate attempts.
 
-Open: a private variant (the corpus is public in this repo); an LLM judge tier
-for prose faithfulness; attempts run one after another (a Datahike writer race
-on concurrent Runs in one durable room).
+**v3: generated worlds** (`dvergr.catalog.wiki-gen`). v2 measures one world, so
+n attempts of a model are n draws on the same twelve documents, and its corpus is
+public. v3 generates the world from a seed, in v2's shape: an organisation of one
+of three kinds (a water, energy or district-heating cooperative) with founders
+and a board, three general managers in turn, a plant that is renamed, a supply
+project that is delayed, a false-alarm incident, a crisis, a partnership, values
+that change (members, capacity) and an unrelated organisation nearby. The same
+twelve genres are written from it, the gold is derived from the world, and v2's
+checker scores it unchanged. The values a reader must qualify (the blog's
+founding year, the old member count and capacity, the planned opening, the old
+plant name) are chosen so that no other document states them.
+
+- Environments: one per seed (`:environment/metadata {:seed … :split … :generator …}`,
+  part of the content id); the world setup writes the seed's documents into the
+  attempt's world, the evaluator derives the seed's gold.
+- Splits: `:dev` is public (seeds 1…n); `:test` is held out, its seeds derived from
+  a key the host keeps (`DVERGR_WIKI_TEST_KEY`), so a prompt tuned on dev never saw
+  them.
+- Calibration (`test/dvergr/catalog/wiki_gen_test.clj`), on 30 seeds of all three
+  kinds: every gold fact is stated in the documents it names; the generated
+  reference wiki scores 1.0 with every check true; a dump, stale values, invented
+  numbers, a wiki without citations, the distractor's facts and missing pages each
+  lose exactly what they damaged. Worlds are pure functions of the seed and do not
+  depend on the JVM's locale.
+- Run: `catalog_benchmark {workflow: "wiki/v3", models, environments: 6, split: "dev"}`
+  (or `(wiki/experiment! {:version 3 :n 6 …})`); `catalog_start` on the benchmark set
+  uses world 1. End to end (`catalog_daemon_test`): a perfect wiki of each world
+  scores 1.0 against that world's gold.
+
+Next for the wiki benchmark:
+
+- **Anchor on real data.** FreshWiki (STORM, NAACL 2024; 100 B-class-or-better
+  Wikipedia articles, CC BY-SA, about 2,160 words and 90 references each) as the
+  reference for how a good article is shaped and sourced, and Wikipedia revision
+  histories or SEC filings for how values really go stale; then a small real-data
+  environment reported next to the generated ones. Licences to be verified first.
+- **Scale knobs.** Documents per world and their length are far below a real dump
+  (12 documents, about 700 words); add more documents per genre and noise.
+- **Incremental update.** New documents arrive; score the updated wiki and its cost.
+- **Claim-level receipts.** A citation counts only if the Run actually read the
+  cited document (the file-read record), as `discovery-citations` does for the web.
+- **Reporting.** Credible intervals per model, per-check pass rates, cost per
+  solved world.
+
+Open: an LLM judge tier for prose faithfulness; attempts run one after another (a
+Datahike writer race on concurrent Runs in one durable room).
 
 ## BFCL v4 (single-turn, Python)
 

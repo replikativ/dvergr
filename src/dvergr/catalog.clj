@@ -11,10 +11,13 @@
    from the workflow's own namespace, e.g. `dvergr.catalog.wiki/experiment!`.
 
    Workflows:
-     :wiki/v1 — a wiki from a folder of documents (`dvergr.catalog.wiki`)."
+     :wiki/v1 — a wiki from a folder of documents (`dvergr.catalog.wiki`);
+     :wiki/v2 — the same, on a harder hand-written world;
+     :wiki/v3 — v2's checker on generated worlds (`dvergr.catalog.wiki-gen`)."
   (:require [clojure.string :as str]
             [dvergr.agent.evaluators :as evaluators]
             [dvergr.catalog.wiki :as wiki]
+            [dvergr.catalog.wiki-gen :as gen]
             [dvergr.catalog.workspace :as ws]))
 
 (def seed! ws/seed!)
@@ -51,7 +54,25 @@
                    (wiki/evaluator-v2 (assoc params :gold gold))
                    (wiki/evaluator params)))
     :benchmark {:fixtures wiki/fixtures-v2 :gold wiki/gold-v2}
-    :experiment-plan #(wiki/experiment-plan (assoc % :version 2))}})
+    :experiment-plan #(wiki/experiment-plan (assoc % :version 2))}
+
+   :wiki/v3
+   {:id :wiki/v3
+    :title "Wiki from a folder of documents (v3, generated worlds)"
+    :doc (str "v2's checker on many generated worlds: each an organisation of one of several kinds, "
+              "its documents of different date and authority (stale values, a wrong blog, a "
+              "distractor) and its gold derived from the world. A public dev split and a held-out "
+              "test split; on your own room: v1's structural checks.")
+    :params wiki/params
+    :profile "developer"
+    :task wiki/task-v2
+    :evaluator (fn [params gold]
+                 (if gold
+                   (wiki/evaluator-v2 (assoc params :gold gold))
+                   (wiki/evaluator params)))
+    ;; One world, for catalog_start's benchmark mode; catalog_benchmark runs many.
+    :benchmark {:fixtures #(gen/documents (gen/world 1)) :gold #(gen/gold (gen/world 1))}
+    :experiment-plan #(wiki/experiment-plan (assoc % :version 3))}})
 
 (defn lookup
   "The catalog workflow `id` (keyword or \"ns/name\" string), or throws."
