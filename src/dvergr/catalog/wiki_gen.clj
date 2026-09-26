@@ -257,11 +257,14 @@
 (defn world
   "The world of `seed`: a map of everything its documents and its gold say.
    With `:scale` s > 1, also `:extra`: s-1 times more reports, newsletters and
-   other organisations (see above); scale 1 is the base world."
+   other organisations (see above); scale 1 is the base world. With `:prose` p
+   > 0, every document carries p paragraphs of routine text (`with-prose`)."
   ([seed] (world seed {}))
-  ([seed {:keys [scale] :or {scale 1}}]
+  ([seed {:keys [scale prose] :or {scale 1 prose 0}}]
    (let [base (base-world seed)]
-     (if (<= scale 1) base (assoc base :scale scale :extra (extra base scale))))))
+     (cond-> base
+       (< 1 scale) (assoc :scale scale :extra (extra base scale))
+       (pos? prose) (assoc :prose prose)))))
 
 (defn- k [w key] (get-in kinds [(:kind w) key]))
 
@@ -288,6 +291,51 @@
    :agenda (str "agenda-" (inc (:latest w)) ".md")
    :other (str (-> (:other-place w) str/lower-case (str/replace " " "-")) ".md")})
 
+;; ----------------------------------------------------------------------------
+;; Prose: routine text around the facts
+;; ----------------------------------------------------------------------------
+;;
+;; Real documents are mostly text a wiki does not need: maintenance, opening
+;; hours, thanks, boilerplate, tables of routine figures. `:prose` p appends p
+;; paragraphs of it to every document (and a routine table to annual reports),
+;; from a random stream of each document's own. The bank states no name, no
+;; year, no "million" and no number above sixty, so it can add no stale value,
+;; no distractor and nothing the checker would mistake for a fact.
+
+(def ^:private routine
+  ["Staff carried out the routine inspection of pumps, valves and meters, and replaced worn seals where needed."
+   "The office opening hours are unchanged: weekdays from nine to five, and Saturday mornings by appointment."
+   "Members are reminded to report leaks, faults or damage as soon as they notice them."
+   "The board thanks the volunteers who helped at the annual meeting and at the open day."
+   "Questions about bills can be raised with the member services team by letter, by telephone or at the office."
+   "Minor repairs were made to the depot roof and to the access road after the winter."
+   "A new filing system for member records was introduced and older paper files were archived."
+   "Training sessions on safe working practices were held for all field staff."
+   "The cooperative continues to present its accounts in full at the annual meeting."
+   "Several members asked about tariffs, and the board will set out its reasoning in a later issue."
+   "The website now has a simpler form for sending in meter readings."
+   "Vehicle maintenance and replacement followed the plan agreed by the board."
+   "Contractors are asked to register at reception before starting work on any site."
+   "The insurance policies were reviewed and renewed on similar terms."
+   "Local schools visited the site to learn how the service works."
+   "Complaints were answered within the agreed time in almost every case."
+   "The committee met four times and published its notes on the notice board."
+   "Members who move house are asked to tell the office so that their records stay correct."
+   "The depot was tidied and the old spare parts were sold for scrap."
+   "A survey of members found most satisfied with the service and asked for clearer bills."])
+
+(defn- with-prose
+  "`text` with `p` paragraphs of routine text before its end, and a routine table
+   when it is an annual report; `name` seeds the choice."
+  [w name text p]
+  (let [r (rng (bit-xor (long (:seed w)) (* 104729 (long p)) (long (hash name))))
+        paras (for [_ (range p)] (str/join " " (pick-distinct r 3 routine)))
+        table (when (str/starts-with? name "annual-report")
+                (str "| Quarter | Service calls | Planned jobs |\n| --- | --- | --- |\n"
+                     (str/join "\n" (for [q ["Q1" "Q2" "Q3" "Q4"]]
+                                      (str "| " q " | " (between r 10 60) " | " (between r 10 60) " |")))))]
+    (str (str/trimr text) "\n\n" (str/join "\n\n" (cond-> (vec paras) table (conj table))) "\n")))
+
 (declare extra-documents)
 
 (defn documents
@@ -300,80 +348,85 @@
         rename (doc "press release" (str (:renamed w) "-03-20") (str (:plant-old w) " plant renamed " (:plant-new w))
                     (str "The cooperative's " plant " on the " (:river w) " River, known since its construction as the "
                          (:plant-old w) " plant, is renamed " (:plant-new w) " in honour of " (:designer w)
-                         ", the engineer who designed it in " (:designed w) "."))]
-    (merge
-     (update-keys
-      {(:charter n)
-       (doc "charter" (format "%d-04-11" (:founded w)) (str "Charter of the " (:org w))
-            (str "The " (:org w) " is founded on " (:founded-day w) " " (:founded-month w) " " (:founded w) " by "
-                 (words (:founders w)) " " (k w :founders) " of " (:place w) ", " (k w :purpose) ".")
-            (str "The cooperative is owned by its members. Each member household has one vote at the annual "
-                 "meeting, which elects a board of " (words (:board w)) ". The board appoints a general manager."))
+                         ", the engineer who designed it in " (:designed w) "."))
+        prose (:prose w 0)]
+    (cond->
+     (merge
+      (update-keys
+       {(:charter n)
+        (doc "charter" (format "%d-04-11" (:founded w)) (str "Charter of the " (:org w))
+             (str "The " (:org w) " is founded on " (:founded-day w) " " (:founded-month w) " " (:founded w) " by "
+                  (words (:founders w)) " " (k w :founders) " of " (:place w) ", " (k w :purpose) ".")
+             (str "The cooperative is owned by its members. Each member household has one vote at the annual "
+                  "meeting, which elects a board of " (words (:board w)) ". The board appoints a general manager."))
 
-       (:blog n)
-       (doc "blog post (unofficial, community history blog)" "2021-06-02" (str "A short history of " (:place w))
-            (str (:place w) " got its cooperative in " (:founded-wrong w) ", when a group of neighbours pooled "
-                 "their savings. For decades the cooperative ran everything from the old " (:plant-old w) " plant.")
-            (str "Old-timers still call the plant \"" (:plant-old w) "\", whatever the signs say now."))
+        (:blog n)
+        (doc "blog post (unofficial, community history blog)" "2021-06-02" (str "A short history of " (:place w))
+             (str (:place w) " got its cooperative in " (:founded-wrong w) ", when a group of neighbours pooled "
+                  "their savings. For decades the cooperative ran everything from the old " (:plant-old w) " plant.")
+             (str "Old-timers still call the plant \"" (:plant-old w) "\", whatever the signs say now."))
 
-       (:report-1 n)
-       (doc "annual report" (format "%d-12-15" (:report-1 w)) (str "Annual report " (:report-1 w))
-            (str "The cooperative serves " (thousands (:members-1 w)) " member households. General manager "
-                 (:gm2 w) ", appointed in " (:gm2-from w) " after the retirement of " (:gm1 w)
-                 ", presented a plan for a second supply: the " (:project w) ", from the " (:project-source w) ".")
-            (str "The " (:plant-old w) " plant on the " (:river w) " River " (k w :plant-verb) " "
-                 (:cap-1 w) " " unit "."))
+        (:report-1 n)
+        (doc "annual report" (format "%d-12-15" (:report-1 w)) (str "Annual report " (:report-1 w))
+             (str "The cooperative serves " (thousands (:members-1 w)) " member households. General manager "
+                  (:gm2 w) ", appointed in " (:gm2-from w) " after the retirement of " (:gm1 w)
+                  ", presented a plan for a second supply: the " (:project w) ", from the " (:project-source w) ".")
+             (str "The " (:plant-old w) " plant on the " (:river w) " River " (k w :plant-verb) " "
+                  (:cap-1 w) " " unit "."))
 
-       (:newsletter n)
-       (doc "member newsletter" (format "%d-09-01" (:newsletter w)) (str "Newsletter, autumn " (:newsletter w))
-            (str "Construction of the " (:project w) " is under way. The line, " (:project-km w)
-                 " kilometres long, is expected to open in " (:expected w) ".")
-            (str "During the " (k w :crisis) " of " (:crisis w) " the cooperative " (k w :restriction) " for "
-                 (words (:crisis-weeks w)) " weeks."))
+        (:newsletter n)
+        (doc "member newsletter" (format "%d-09-01" (:newsletter w)) (str "Newsletter, autumn " (:newsletter w))
+             (str "Construction of the " (:project w) " is under way. The line, " (:project-km w)
+                  " kilometres long, is expected to open in " (:expected w) ".")
+             (str "During the " (k w :crisis) " of " (:crisis w) " the cooperative " (k w :restriction) " for "
+                  (words (:crisis-weeks w)) " weeks."))
 
-       (:report-opened n)
-       (doc "annual report" (format "%d-12-12" (:opened w)) (str "Annual report " (:opened w))
-            (str "After a delay caused by " (:delay w) " on the construction route, the " (:project w)
-                 " opened in " (:opened-month w) " " (:opened w) ", a year later than planned. It can deliver "
-                 (:project-cap w) " " unit "."))
+        (:report-opened n)
+        (doc "annual report" (format "%d-12-12" (:opened w)) (str "Annual report " (:opened w))
+             (str "After a delay caused by " (:delay w) " on the construction route, the " (:project w)
+                  " opened in " (:opened-month w) " " (:opened w) ", a year later than planned. It can deliver "
+                  (:project-cap w) " " unit "."))
 
-       (:rename n) rename
-       (:rename-copy n) rename
+        (:rename n) rename
+        (:rename-copy n) rename
 
-       (:incident n)
-       (doc "incident report" (format "%d-%02d-04" (:incident w) (min 12 (inc (.indexOf ^java.util.List months (:incident-month w)))))
-            (str (str/capitalize (k w :incident)) ", " (:incident-month w) " " (:incident w))
-            (str "On " (:incident-start w) " " (:incident-month w) " " (:incident w) " a sensor at " (:plant-new w) " "
-                 (k w :trigger) " and the cooperative issued a " (k w :incident) " for " (k w :area) ". "
-                 (k w :clear) "; the sensor was faulty. The " (k w :incident) " was lifted on "
-                 (:incident-end w) " " (:incident-month w) " " (:incident w) ".")
-            "The cooperative replaced the sensor array and added a second, independent sensor line.")
+        (:incident n)
+        (doc "incident report" (format "%d-%02d-04" (:incident w) (min 12 (inc (.indexOf ^java.util.List months (:incident-month w)))))
+             (str (str/capitalize (k w :incident)) ", " (:incident-month w) " " (:incident w))
+             (str "On " (:incident-start w) " " (:incident-month w) " " (:incident w) " a sensor at " (:plant-new w) " "
+                  (k w :trigger) " and the cooperative issued a " (k w :incident) " for " (k w :area) ". "
+                  (k w :clear) "; the sensor was faulty. The " (k w :incident) " was lifted on "
+                  (:incident-end w) " " (:incident-month w) " " (:incident w) ".")
+             "The cooperative replaced the sensor array and added a second, independent sensor line.")
 
-       (:minutes n)
-       (doc "board minutes" (format "%d-02-08" (:gm3-from w)) (str "Board minutes, 8 February " (:gm3-from w))
-            (str (:gm2 w) " announced a retirement as general manager after " (words (- (:gm3-from w) (:gm2-from w)))
-                 " years. The board appointed " (:gm3 w) ", head of operations at " (:plant-new w) " since "
-                 (:gm3-ops-from w) ", as general manager from 1 " (:gm3-month w) " " (:gm3-from w) "."))
+        (:minutes n)
+        (doc "board minutes" (format "%d-02-08" (:gm3-from w)) (str "Board minutes, 8 February " (:gm3-from w))
+             (str (:gm2 w) " announced a retirement as general manager after " (words (- (:gm3-from w) (:gm2-from w)))
+                  " years. The board appointed " (:gm3 w) ", head of operations at " (:plant-new w) " since "
+                  (:gm3-ops-from w) ", as general manager from 1 " (:gm3-month w) " " (:gm3-from w) "."))
 
-       (:report-latest n)
-       (doc "annual report" (format "%d-12-09" (:latest w)) (str "Annual report " (:latest w))
-            (str "The cooperative now serves " (thousands (:members-2 w)) " member households. " (:plant-new w) " "
-                 (k w :plant-verb) " " (:cap-2 w) " " unit " after its " (:upgraded w) " upgrade, and the "
-                 (:project w) " supplies up to " (:project-cap w) " " unit " at peak.")
-            (str "General manager " (:gm3 w) " signed a partnership with the " (:trust w) " " (k w :trust-work) " "
-                 (:plant-new w) "."))
+        (:report-latest n)
+        (doc "annual report" (format "%d-12-09" (:latest w)) (str "Annual report " (:latest w))
+             (str "The cooperative now serves " (thousands (:members-2 w)) " member households. " (:plant-new w) " "
+                  (k w :plant-verb) " " (:cap-2 w) " " unit " after its " (:upgraded w) " upgrade, and the "
+                  (:project w) " supplies up to " (:project-cap w) " " unit " at peak.")
+             (str "General manager " (:gm3 w) " signed a partnership with the " (:trust w) " " (k w :trust-work) " "
+                  (:plant-new w) "."))
 
-       (:agenda n)
-       (doc "meeting agenda" (format "%d-05-02" (inc (:latest w))) "Annual meeting agenda"
-            "1. Welcome\n2. Approval of last year's minutes\n3. Report of the general manager\n4. Election of board members\n5. Any other business")
+        (:agenda n)
+        (doc "meeting agenda" (format "%d-05-02" (inc (:latest w))) "Annual meeting agenda"
+             "1. Welcome\n2. Approval of last year's minutes\n3. Report of the general manager\n4. Election of board members\n5. Any other business")
 
-       (:other n)
-       (doc "news article (about a different organisation)" "2020-08-14" (str (:other-place w) " Irrigation District raises fees")
-            (str "The " (:other-place w) " Irrigation District, a separate body across the ridge, raised its fees by "
-                 (:other-pct w) " percent. Its director, " (:director w) ", said the district's " (:other-farms w)
-                 " farms need a new pumping station at " (:other-site w) "."))}
-      #(str "/docs/" %))
-     (update-keys (extra-documents w) #(str "/docs/" %)))))
+        (:other n)
+        (doc "news article (about a different organisation)" "2020-08-14" (str (:other-place w) " Irrigation District raises fees")
+             (str "The " (:other-place w) " Irrigation District, a separate body across the ridge, raised its fees by "
+                  (:other-pct w) " percent. Its director, " (:director w) ", said the district's " (:other-farms w)
+                  " farms need a new pumping station at " (:other-site w) "."))}
+       #(str "/docs/" %))
+      (update-keys (extra-documents w) #(str "/docs/" %)))
+      (pos? prose)
+      (as-> docs (into {} (for [[path text] docs]
+                            [path (with-prose w (last (str/split path #"/")) text prose)]))))))
 
 (defn- extra-documents
   "The documents scale adds (none at scale 1), by file name."
