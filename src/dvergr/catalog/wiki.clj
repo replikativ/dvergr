@@ -295,8 +295,11 @@
         cited (fn [page] (into #{} (filter #(contains? sources %)) (get links page)))
         cites (for [[p ls] links l ls :when (str/starts-with? l (str source "/"))] [p l])
         internal (for [[p ls] links l ls :when (str/starts-with? l (str target "/"))] [p l])
-        ;; copies: a page most of whose 8-word shingles are a source's
-        source-shingles (reduce into #{} (map #(shingles % 8) (vals sources)))
+        ;; copies: a page most of whose 8-word shingles are a source's (also
+        ;; with the words a scanned source hyphenates across lines rejoined)
+        source-shingles (reduce into #{} (mapcat (fn [t] [(shingles t 8)
+                                                          (shingles (str/replace t #"(\p{L})-\n(\p{L})" "$1$2") 8)])
+                                                 (vals sources)))
         copied (into #{}
                      (keep (fn [[p t]]
                              (let [sh (shingles (strip-link-targets t) 8)]
@@ -478,9 +481,9 @@
   "`{:docs :gold}` of a wiki/v3 environment: a generated world (`:seed`) or a
    real corpus (`:corpus`)."
   [environment]
-  (let [{:keys [seed corpus scale prose]} (:environment/metadata environment)]
+  (let [{:keys [seed corpus scale prose noise]} (:environment/metadata environment)]
     (cond corpus {:docs (real-documents corpus) :gold (real-gold corpus) :id corpus}
-          seed (let [w (gen/world seed {:scale (or scale 1) :prose (or prose 0)})] {:docs (gen/documents w) :gold (gen/gold w) :id seed})
+          seed (let [w (gen/world seed {:scale (or scale 1) :prose (or prose 0) :noise (or noise 0)})] {:docs (gen/documents w) :gold (gen/gold w) :id seed})
           :else (throw (ex-info "A wiki/v3 environment names its seed or corpus" {:type ::no-world})))))
 
 (defn world-setup-v3
@@ -520,7 +523,7 @@
 (defn environments-v3
   "The EnvironmentDefs of `split`: one per seed of `:dev`, or of `:test` with
    `test-key`; one per real corpus of `:real` (`:corpora`, default all)."
-  [setup ev {:keys [timeout-ms split n seeds test-key corpora scale prose] :or {split :dev n 6 scale 1 prose 0}}]
+  [setup ev {:keys [timeout-ms split n seeds test-key corpora scale prose noise] :or {split :dev n 6 scale 1 prose 0 noise 0}}]
   (let [ref (evaluation/evaluator-ref ev)
         env (fn [metadata]
               (environment/make-environment
@@ -536,7 +539,8 @@
       (mapv #(env {:corpus % :split :real}) (or corpora (sort (keys real-corpora))))
       (mapv #(env (cond-> {:seed % :split split :generator gen/version}
                     (< 1 scale) (assoc :scale scale)
-                    (pos? prose) (assoc :prose prose)))
+                    (pos? prose) (assoc :prose prose)
+                    (pos? noise) (assoc :noise noise)))
             (or seeds (gen/seeds split n test-key))))))
 
 (defn experiment-plan
@@ -546,7 +550,8 @@
    default, `:test`, or `:real` for the real corpora), `:n` worlds (default
    6), their `:scale` (default 1: more documents, stale values and distractors
    per world above it), `:prose` (paragraphs of routine text per document,
-   default 0), explicit `:seeds` or `:corpora`, and the
+   default 0), `:noise` (kinds of noise in the documents, 0–3, default 0; see
+   `dvergr.catalog.wiki-gen`), explicit `:seeds` or `:corpora`, and the
    held-out split's key (`:test-key`, default the environment variable
    DVERGR_WIKI_TEST_KEY)."
   [{:keys [models budget-dollars timeout-ms prompt version] :or {version 1} :as opts}]

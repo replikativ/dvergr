@@ -11,12 +11,15 @@
 (def ^:private seeds (range 1 31))
 
 (def ^:private worlds
-  "Every seed at scale 1, and a third of them at scales 3 and 5."
+  "Every seed at scale 1, and a third of them at scales 3 and 5, with prose,
+   and with each level of noise."
   (concat (map g/world seeds)
           (for [scale [3 5] seed (take 10 seeds)] (g/world seed {:scale scale}))
-          (for [prose [2 4] seed (take 10 seeds)] (g/world seed {:scale 3 :prose prose}))))
+          (for [prose [2 4] seed (take 10 seeds)] (g/world seed {:scale 3 :prose prose}))
+          (for [noise [1 2 3] seed (take 10 seeds)] (g/world seed {:noise noise}))
+          (for [seed (take 10 seeds)] (g/world seed {:scale 3 :prose 2 :noise 3}))))
 
-(defn- label [w] (str "seed " (:seed w) " scale " (:scale w 1) " prose " (:prose w 0)))
+(defn- label [w] (str "seed " (:seed w) " scale " (:scale w 1) " prose " (:prose w 0) " noise " (:noise w 0)))
 
 (defn- score [w pages]
   (wiki/score-wiki-v2 {:pages pages :sources (g/documents w) :gold (g/gold w)
@@ -40,7 +43,7 @@
 
 (deftest the-gold-is-stated-in-the-documents-it-names
   (doseq [w worlds
-          :let [seed (label w) docs (g/documents w) gold (g/gold w)]]
+          :let [seed (label w) docs (update-vals (g/documents w) g/unscan) gold (g/gold w)]]
     (doseq [{:keys [id terms synthesis] srcs :sources} (:facts gold)
             :when (not synthesis)
             :let [text (str/lower-case (str/join "\n" (map #(get docs (str "/docs/" %)) srcs)))]
@@ -130,6 +133,45 @@
                 (g/documents long))
         "prose follows the document's own text")))
 
+(deftest noise-costs-what-it-damages
+  (doseq [seed (take 10 seeds)
+          :let [w (g/world seed {:noise 3})
+                docs (g/documents w)
+                n (g/document-names w)
+                ref (g/reference-wiki w)
+                ref-reward (:reward (score w ref))
+                coop (str "/wiki/" (slug (:org w)) ".md")
+                gm3 (str "/wiki/" (slug (:gm3 w)) ".md")
+                short-name (let [[f l] (str/split (:gm3 w) #" ")] (str (subs f 0 1) ". " l))]]
+    (testing (str "seed " seed ": the scan hyphenates words across lines, and unscan undoes it")
+      (let [scanned (get docs (str "/docs/" (:report-1 n)))]
+        (is (re-find #"\p{L}-\n\p{L}" (str/join "\n" (vals docs))))
+        (is (str/includes? scanned " — page 1 of "))
+        (is (not (str/includes? (get docs (str "/docs/" (:blog n))) " — page ")) "only paper is scanned")
+        (is (str/includes? (g/unscan scanned) (str "General manager " (:gm2 w))))))
+    (testing (str "seed " seed ": a dump of the unscanned documents is still a copy")
+      (let [r (score w {"/wiki/index.md" "# Wiki\n\n- [All](all.md)\n"
+                        "/wiki/all.md" (str (str/join "\n\n" (map g/unscan (vals docs)))
+                                            "\n\n[source](../docs/" (:charter n) ")")})]
+        (is (contains? (failing r) :no-copied-pages?))))
+    (testing (str "seed " seed ": the misprinted count stated as current")
+      (let [r (score w (update ref coop str "\nIt serves " (String/format java.util.Locale/US "%,d" (object-array [(long (:misprint w))]))
+                               " member households ([report](../docs/" (:report-latest n) ")).\n"))]
+        (is (contains? (failing r) :current/members-misprint))
+        (is (< (:reward r) ref-reward))))
+    (testing (str "seed " seed ": the current count cited to the misprinted report only")
+      (let [r (score w (update-vals ref #(str/replace % (str "(../docs/" (:erratum n) ")") (str "(../docs/" (:report-latest n) ")"))))]
+        (is (contains? (failing r) :fact/members))))
+    (testing (str "seed " seed ": the minutes' short name kept as a person of its own")
+      (let [r (score w (-> (update-vals ref #(str/replace % " ran its operations" " worked there"))
+                           (update gm3 #(str/replace % #"(?s), and before that was head of operations.*?\)\. " ". "))
+                           (assoc (str "/wiki/" (slug short-name) ".md")
+                                  (str "# " short-name "\n\n" short-name " was head of operations at "
+                                       (:plant-new w) " ([minutes](../docs/" (:minutes n) ")).\n"))
+                           (update "/wiki/index.md" str "- [" short-name "](" (slug short-name) ".md)\n")))]
+        (is (contains? (failing r) :fact/gm3-before))
+        (is (< (:reward r) ref-reward))))))
+
 (deftest the-held-out-split-needs-its-key
   (is (= [1 2 3] (g/seeds :dev 3)))
   (is (thrown? clojure.lang.ExceptionInfo (g/seeds :test 3)))
@@ -147,6 +189,6 @@
     (is (not-any? #(contains? (:environment/metadata %) :scale)
                   (:environments (wiki/experiment-plan {:version 3 :n 2 :models ["claude-haiku-4-5"]})))
         "scale 1 environments are unchanged")
-    (is (= {:seed 1 :split :dev :generator g/version :scale 3 :prose 2}
-           (:environment/metadata (first (:environments (wiki/experiment-plan {:version 3 :n 1 :scale 3 :prose 2
+    (is (= {:seed 1 :split :dev :generator g/version :scale 3 :prose 2 :noise 3}
+           (:environment/metadata (first (:environments (wiki/experiment-plan {:version 3 :n 1 :scale 3 :prose 2 :noise 3
                                                                                :models ["claude-haiku-4-5"]}))))))))

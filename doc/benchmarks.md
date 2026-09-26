@@ -181,6 +181,25 @@ the calibration: grounding accepts a number found anywhere in a cited source, so
 routine figures make it more lenient, never stricter (an invented number that
 happens to appear in a cited table counts as supported).
 
+**Noise** (`:noise` n, 0–3, default 0; `catalog_benchmark {… noise: 3}`). Documents
+as they arrive, not as they were written; each level adds one kind, and the
+checker measures each. 1, scan artefacts: the paper genres (charter, annual
+reports, board minutes, incident reports) read like text extracted from a PDF,
+hard-wrapped at 64 characters, long words hyphenated across line ends ("volunt-" at the end of one line,
+"eers" on the next), a footer per page ("Annual report 2004 — page 1 of 2"); about one gold term
+per world (a name, "head of operations", "eleven years") is broken, so a wiki that
+copies fragments misses the fact or the entity. 2, an erratum: the latest annual
+report misprints the member count (two digits swapped) and a later erratum notice
+gives the correct one; the misprint is one more stale value (qualified by
+"misprint", "erratum", "error", …) and the current count is supported only by the
+erratum. 3, short names: the board minutes name the general managers by initial and
+surname ("W. Novak"), so "head of operations" belongs to a person whose full name is
+stated in another document, and the gold names both. `unscan` undoes the scan, and
+the calibration checks the gold against the unscanned text; the copy check also
+compares against the sources with hyphenated words rejoined, so a dump of the
+cleaned-up documents is still a copy. Calibration covers every level on ten seeds,
+and noise 3 with scale 3 and prose 2.
+
 **A real corpus next to the generated worlds** (split `:real`). `mondragon`: six
 dated snapshots (infobox and lead, 2010–2025) of the Wikipedia article on the
 Mondragon Corporation, in `resources/dvergr/catalog/wiki-real/mondragon/`
@@ -221,8 +240,8 @@ Next for the wiki benchmark:
   same shape as `mondragon`), and SEC EDGAR filings (sec.gov: "may be copied or
   further distributed … without the SEC's permission") for documents of different
   genre and authority about one company.
-- **Noise within documents.** Typos, inconsistent spellings of names, OCR-like
-  artefacts, and facts stated in tables rather than prose.
+- **More noise.** Typos and misspelt names, facts stated in tables rather than
+  prose, and (from the real corpora) documents in more than one language.
 - **Incremental update.** New documents arrive; score the updated wiki and its cost.
 - **Claim-level receipts.** A citation counts only if the Run actually read the
   cited document (the file-read record), as `discovery-citations` does for the web.
