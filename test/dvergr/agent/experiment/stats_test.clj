@@ -36,3 +36,21 @@
     (is (= 1.0 hi)))
   (let [[lo hi] (stats/mean-interval [0.6 0.7 0.8 0.7 0.6 0.8 0.7 0.7])]
     (is (< 0.6 lo 0.7 hi 0.8))))
+
+(deftest comparing-two-pass-rates
+  (testing "the same record: even odds"
+    (is (close? 0.5 (stats/prob-rate-above [3 5] [3 5] 0.0))))
+  (testing "the two directions add up to one"
+    (is (< (Math/abs (- 1.0 (+ (stats/prob-rate-above [7 10] [4 10] 0.0)
+                               (stats/prob-rate-above [4 10] [7 10] 0.0))))
+           1e-3)))
+  (testing "a clearly better record, and a margin makes \"no worse\" likelier"
+    (is (< 0.95 (stats/prob-rate-above [19 20] [5 20] 0.0)))
+    (is (< (stats/prob-rate-above [4 6] [5 6] 0.0) (stats/prob-rate-above [4 6] [5 6] 0.05)))))
+
+(deftest a-paired-difference
+  (is (nil? (stats/paired-difference [])))
+  (let [{:keys [mean interval n]} (stats/paired-difference [[0.9 1.0] [0.8 1.0] [1.0 1.0] [0.7 0.9]])]
+    (is (= 4 n))
+    (is (close? -0.125 mean))
+    (is (<= -1.0 (first interval) mean (second interval) 1.0))))

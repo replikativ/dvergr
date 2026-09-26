@@ -176,13 +176,49 @@
                  (for [k (distinct (mapcat keys checks))]
                    [(kw->str k) (/ (double (count (filter #(true? (get % k)) checks))) (count checks))]))])))
 
+(defn- comparison
+  "Every other candidate of a Scorecard against `baseline` (a candidate id;
+   default the leaderboard's top row): the probability that its pass rate is
+   higher, and that it is no worse by more than 5 points; its reward minus the
+   baseline's, paired by world (the same environments, repetitions averaged)
+   with a 95% interval; and what a pass costs next to the baseline's."
+  [entries rows baseline]
+  (let [by (into {} (map (juxt :candidate identity)) rows)
+        base (or baseline (:candidate (first rows)))
+        per-world (into {}
+                        (for [[c es] (group-by (comp kw->str :candidate/id) entries)]
+                          [c (update-vals (group-by #(get-in % [:environment :environment/content-id]) es)
+                                          #(/ (reduce + 0.0 (map :reward %)) (count %)))]))]
+    (when-let [b (by base)]
+      {:baseline base
+       :margin 0.05
+       :candidates
+       (vec (for [{:keys [candidate] :as r} rows
+                  :when (not= candidate base)
+                  :let [rate [(:passed r) (:attempts r)]
+                        base-rate [(:passed b) (:attempts b)]
+                        worlds (per-world candidate)
+                        base-worlds (per-world base)
+                        diff (xstats/paired-difference (for [[env x] worlds :let [y (get base-worlds env)] :when y] [x y]))
+                        cost (:microdollars-per-pass r)
+                        base-cost (:microdollars-per-pass b)]]
+              {:candidate candidate
+               :p-pass-rate-higher (xstats/prob-rate-above rate base-rate 0.0)
+               :p-pass-rate-no-worse (xstats/prob-rate-above rate base-rate 0.05)
+               :reward-difference (:mean diff)
+               :reward-difference-interval (:interval diff)
+               :paired-worlds (:n diff 0)
+               :microdollars-per-pass-saved (when (and cost base-cost) (- base-cost cost))
+               :cost-per-pass-ratio (when (and cost base-cost (pos? base-cost)) (/ (double cost) base-cost))}))})))
+
 (defn- scorecard-data
   "A Scorecard as a leaderboard: one row per candidate, ranked by reward mean
    then by cost per pass, with 95% intervals for the pass rate (Jeffreys) and
    the mean reward (`dvergr.agent.experiment.stats`). With `:full?`, also
    every cell, and with `:load-attempt` (id → certified Attempt) the pass rate
-   of every check per candidate."
-  [sc & [{:keys [full? load-attempt]}]]
+   of every check per candidate; with `:compare?`, every candidate against
+   `:baseline` (`comparison`)."
+  [sc & [{:keys [full? load-attempt compare? baseline]}]]
   (when sc
     (let [exp (:scorecard/experiment sc)
           rewards (update-vals (group-by :candidate/id (:scorecard/entries sc)) #(mapv :reward %))
@@ -212,6 +248,7 @@
                :leaderboard    rows
                :cells          (count (:scorecard/entries sc))}
         load-attempt (assoc :check-rates (check-rates (:scorecard/entries sc) load-attempt))
+        compare? (assoc :comparison (comparison (:scorecard/entries sc) rows baseline))
         full? (assoc :entries (mapv (fn [e]
                                       {:candidate (kw->str (:candidate/id e))
                                        :environment (some-> (get-in e [:environment :environment/content-id]) str)
@@ -500,14 +537,15 @@
                                                        experiment (assoc :experiment-id (keyword experiment))))))))}
 
    :scorecard/detail
-   {:doc "One Scorecard with every cell (candidate x environment x repetition: reward, pass, spend) and each candidate's pass rate per check."
+   {:doc "One Scorecard with every cell (candidate x environment x repetition: reward, pass, spend), each candidate's pass rate per check, and every candidate against a baseline: probability of a higher / no-worse pass rate, paired reward difference, cost per pass saved."
     :kind :read
-    :schema [:map [:room Room] [:id [:string {:description "scorecard content id"}]]]
-    :impl (fn [daemon {:keys [room id]}]
+    :schema [:map [:room Room] [:id [:string {:description "scorecard content id"}]]
+             [:baseline {:optional true} [:string {:description "candidate to compare the others against (default: the top of the leaderboard)"}]]]
+    :impl (fn [daemon {:keys [room id baseline]}]
             (when-let [r (resolve-room daemon room)]
               (in-ctx daemon
                       (scorecard-data (experiment/scorecard r (uuid-arg id))
-                                      {:full? true
+                                      {:full? true :compare? true :baseline baseline
                                        :load-attempt (when-let [st (:store r)]
                                                        #(rstore/-load-attempt st (rstore/conversation-id r) %))}))))}
 
