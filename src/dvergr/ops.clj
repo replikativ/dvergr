@@ -658,6 +658,7 @@
              [:room {:optional true} [:string {:description "room id or slug that keeps the results (default: the new fixture room)"}]]
              [:environments {:optional true} [:int {:min 1 :max 50 :description "generated worlds, for workflows that generate them (wiki/v3; default 6)"}]]
              [:scale {:optional true} [:int {:min 1 :max 10 :description "documents per generated world, as a multiple (wiki/v3; default 1 = twelve documents)"}]]
+             [:prose {:optional true} [:int {:min 0 :max 20 :description "paragraphs of routine text per generated document (wiki/v3; default 0)"}]]
              [:split {:optional true} [:enum {:description "dev (public, the default), test (held out: the host's key) or real (real corpora)"} "dev" "test" "real"]]
              [:repetitions {:optional true} [:int {:min 1 :max 10 :description "attempts per model (default 1)"}]]
              [:budget-dollars {:optional true} [:double {:description "budget per attempt in USD (default 0.50)"}]]
@@ -672,7 +673,8 @@
                   plan (plan-fn (cond-> (select-keys args [:models :budget-dollars :timeout-ms])
                                   (:environments args) (assoc :n (:environments args))
                                   (:split args) (assoc :split (keyword (:split args)))
-                                  (:scale args) (assoc :scale (:scale args))))
+                                  (:scale args) (assoc :scale (:scale args))
+                                  (:prose args) (assoc :prose (:prose args))))
                   slug (str "bench-" (slugify (subs (str (:id wf)) 1)) "-" (subs (str (random-uuid)) 0 8))
                   r (in-ctx daemon
                             (rooms/create-room! {:title (str (:title wf) " (benchmark)") :slug slug})

@@ -13,9 +13,10 @@
 (def ^:private worlds
   "Every seed at scale 1, and a third of them at scales 3 and 5."
   (concat (map g/world seeds)
-          (for [scale [3 5] seed (take 10 seeds)] (g/world seed {:scale scale}))))
+          (for [scale [3 5] seed (take 10 seeds)] (g/world seed {:scale scale}))
+          (for [prose [2 4] seed (take 10 seeds)] (g/world seed {:scale 3 :prose prose}))))
 
-(defn- label [w] (str "seed " (:seed w) " scale " (:scale w 1)))
+(defn- label [w] (str "seed " (:seed w) " scale " (:scale w 1) " prose " (:prose w 0)))
 
 (defn- score [w pages]
   (wiki/score-wiki-v2 {:pages pages :sources (g/documents w) :gold (g/gold w)
@@ -72,7 +73,7 @@
                                   (get-in (g/gold w) [:stale 2 :value 0]) " for the [" (:org w) "]("
                                   (slug (:org w)) ".md) ([report](../docs/"
                                   (:report-1 (g/document-names w)) ")).\n"))
-     :invented-numbers (update ref coop str "\nIt employs 312 people, runs 47 stations, laid 380 kilometres of"
+     :invented-numbers (update ref coop str "\nIt employs 312 people, runs 77 stations, laid 380 kilometres of"
                                " mains and opened its laboratory in 1987.\n")
      :uncited (into {} (map (fn [[p t]] [p (str/replace t #"\s*\(\[[^\]]*\]\(\.\./docs/[^)]*\)\)" "")])) ref)
      :distractor (assoc ref "/wiki/other.md"
@@ -99,7 +100,7 @@
       (is (contains? f :fact/plant-capacity) (str "seed " seed " stale: the current value is gone")))
     (let [r (:invented-numbers by)]
       (is (contains? (failing r) :grounded?) (str "seed " seed " invented"))
-      (is (= #{"312" "47" "380" "1987"} (set (map :number (get-in r [:scores :unsupported-numbers]))))
+      (is (= #{"312" "77" "380" "1987"} (set (map :number (get-in r [:scores :unsupported-numbers]))))
           (str "seed " seed " invented")))
     (let [f (failing (:uncited by))]
       (is (contains? f :every-page-cited?) (str "seed " seed " uncited"))
@@ -118,6 +119,17 @@
     (is (< (count (:distractors (g/gold base))) (count (:distractors (g/gold scaled)))))
     (is (= (:facts (g/gold base)) (:facts (g/gold scaled))) "and the facts are the same")))
 
+(deftest prose-lengthens-documents-without-adding-facts
+  (let [plain (g/world 6 {:scale 3}) long (g/world 6 {:scale 3 :prose 3})
+        words #(count (str/split (str/join " " (vals (g/documents %))) #"\s+"))]
+    (is (= (g/documents plain) (g/documents (g/world 6 {:scale 3 :prose 0}))) "prose 0 changes nothing")
+    (is (= (set (keys (g/documents plain))) (set (keys (g/documents long)))) "the same documents")
+    (is (< (* 2 (words plain)) (words long)) "much longer")
+    (is (= (g/gold plain) (g/gold long)) "and the same gold")
+    (is (every? (fn [[path text]] (str/starts-with? text (str/trimr (get (g/documents plain) path))))
+                (g/documents long))
+        "prose follows the document's own text")))
+
 (deftest the-held-out-split-needs-its-key
   (is (= [1 2 3] (g/seeds :dev 3)))
   (is (thrown? clojure.lang.ExceptionInfo (g/seeds :test 3)))
@@ -134,4 +146,7 @@
            (mapv :environment/metadata (:environments plan))))
     (is (not-any? #(contains? (:environment/metadata %) :scale)
                   (:environments (wiki/experiment-plan {:version 3 :n 2 :models ["claude-haiku-4-5"]})))
-        "scale 1 environments are unchanged")))
+        "scale 1 environments are unchanged")
+    (is (= {:seed 1 :split :dev :generator g/version :scale 3 :prose 2}
+           (:environment/metadata (first (:environments (wiki/experiment-plan {:version 3 :n 1 :scale 3 :prose 2
+                                                                               :models ["claude-haiku-4-5"]}))))))))

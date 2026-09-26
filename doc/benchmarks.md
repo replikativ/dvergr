@@ -169,6 +169,18 @@ title "Annual report 2011" must not repeat the planned opening). Scale 3: 22
 documents, about 1,000 words, 9 stale values; scale 5: 31–32 documents, about 1,400
 words, 12–13 stale values. Calibration runs on scales 1, 3 and 5.
 
+**Prose** (`:prose` p, default 0; `catalog_benchmark {… prose: 3}`). Real documents
+are mostly text a wiki does not need; p paragraphs of routine text (maintenance,
+opening hours, thanks, boilerplate) are appended to every document, and a table of
+routine figures to annual reports, from a random stream of each document's own. The
+bank states no name, no year, no "million" and no number above sixty, so it adds no
+stale value, no distractor and no fact; prose 0 is exactly the world without it.
+Scale 1 with prose 3: 12 documents, about 2,300 words; scale 3 with prose 4: 22
+documents, about 5,000 words, the size of a real dump. One consequence, measured by
+the calibration: grounding accepts a number found anywhere in a cited source, so
+routine figures make it more lenient, never stricter (an invented number that
+happens to appear in a cited table counts as supported).
+
 **A real corpus next to the generated worlds** (split `:real`). `mondragon`: six
 dated snapshots (infobox and lead, 2010–2025) of the Wikipedia article on the
 Mondragon Corporation, in `resources/dvergr/catalog/wiki-real/mondragon/`
@@ -209,9 +221,8 @@ Next for the wiki benchmark:
   same shape as `mondragon`), and SEC EDGAR filings (sec.gov: "may be copied or
   further distributed … without the SEC's permission") for documents of different
   genre and authority about one company.
-- **Longer documents.** Scale adds documents, not length: a scale-5 world is about
-  1,400 words, still far below a real dump; add paragraphs of routine text per
-  document, and noise within documents (typos, tables, repeated boilerplate).
+- **Noise within documents.** Typos, inconsistent spellings of names, OCR-like
+  artefacts, and facts stated in tables rather than prose.
 - **Incremental update.** New documents arrive; score the updated wiki and its cost.
 - **Claim-level receipts.** A citation counts only if the Run actually read the
   cited document (the file-read record), as `discovery-citations` does for the web.
