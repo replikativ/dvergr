@@ -553,7 +553,7 @@
    default, `:test`, or `:real` for the real corpora), `:n` worlds (default
    6), their `:scale` (default 1: more documents, stale values and distractors
    per world above it), `:prose` (paragraphs of routine text per document,
-   default 0), `:noise` (kinds of noise in the documents, 0–3, default 0; see
+   default 0), `:noise` (kinds of noise in the documents, 0–4, default 0; see
    `dvergr.catalog.wiki-gen`), explicit `:seeds` or `:corpora`, and the
    held-out split's key (`:test-key`, default the environment variable
    DVERGR_WIKI_TEST_KEY)."
