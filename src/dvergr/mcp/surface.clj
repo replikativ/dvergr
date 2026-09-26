@@ -259,7 +259,7 @@
     "- Catalog: `catalog_list` shows workflows with their own checker; `catalog_start` runs one on its"
     "  benchmark set (no room: compare models) or on your room's files, scored per attempt."
     "- Money: every model call is billed to the room's wallet (`room_wallet`); a spent wallet refuses work."
-    "- REPL: `clojure_eval` evaluates Clojure in the room's sandbox (SCI). State persists per room."
+    "- REPL: `clojure_eval` evaluates Clojure in the room's sandbox (SCI). State persists per room. Its `dvergr.ops` namespace holds every op this connection may call, as functions (`(dir dvergr.ops)`, `(doc dvergr.ops/job-status)`): one program instead of a chain of tool calls."
     "- Results are JSON. Large results are cut; ask for less (limits, detail ops) rather than more."
     ""
     "Tools are grouped into toolsets. This connection's profile decides which are visible."]))
