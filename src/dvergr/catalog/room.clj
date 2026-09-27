@@ -53,6 +53,9 @@
    ;; a model that answers the checker's `judge-requests` (e.g. is a new find
    ;; relevant?); part of what a score means, so part of the verifier's basis
    [:judge {:optional true} [:map [:model :string] [:max-requests {:optional true} [:int {:min 1 :max 50}]]]]
+   ;; hosts the task's answer is published on: requests to them (and their
+   ;; subdomains) are refused, and a frozen web leaves them out
+   [:blocked-sources {:optional true} [:vector :string]]
    ;; :frozen: the attempt's web is web.edn (`freeze`), not the internet
    [:web {:optional true} [:enum :live :frozen]]
    [:timeout-ms {:optional true} [:int {:min 1000}]]])
@@ -336,14 +339,16 @@
    (web.edn) and `:web :frozen`, so every attempt meets the same web. A new
    bundle: its own content id, calibrated and promoted on its own."
   [b files pages]
-  (when (empty? pages)
-    (throw (ex-info "Nothing to freeze: no fetched pages" {:type ::nothing-to-freeze})))
-  (let [definition (-> (:definition b)
-                       (assoc :web :frozen)
-                       (update :title str " (frozen web)"))]
-    (assoc files
-           "workflow.edn" (pr-str definition)
-           "web.edn" (pr-str pages))))
+  (let [blocked (set (get-in b [:definition :blocked-sources]))
+        pages (into (sorted-map) (remove (fn [[url _]] (effects/blocked-host? blocked (effects/host-of url)))) pages)]
+    (when (empty? pages)
+      (throw (ex-info "Nothing to freeze: no fetched pages" {:type ::nothing-to-freeze})))
+    (let [definition (-> (:definition b)
+                         (assoc :web :frozen)
+                         (update :title str " (frozen web)"))]
+      (assoc files
+             "workflow.edn" (pr-str definition)
+             "web.edn" (pr-str pages)))))
 
 (def ^:private max-page-chars
   "A fetched page is kept to this many characters as evidence."
@@ -384,7 +389,9 @@
      {:id (verifier-id b) :version 1 :tier (or tier (dvergr.catalog.room/tier b))
       :basis (cond-> {:bundle (str id)} judge-model (assoc :judge judge-model))
       :capture (fn [{world :world/room}]
-                 (cond-> {:files (into {} (map #(ws/read-tree world %)) dirs)}
+                 (cond-> {:files (into {} (map #(ws/read-tree world %)) dirs)
+                          ;; what the world refused the attempt, by who refused it
+                          :denials (effects/denials (some-> (effects/world-sink (:ctx world)) deref))}
                    (:fetched definition)
                    (assoc :fetched (bounded-pages (effects/fetched-pages (effects/world-recording (:ctx world)))))))
       :observe (fn [{:keys [default result] captured :execution/evidence}]
@@ -392,15 +399,18 @@
                               :params params :gold gold}
                        requests (when judge (judge-requests checker input max-requests))]
                    (cond-> (assoc default :run-status (:run/status result) :files (:files captured)
-                                  :fetched (:fetched captured {}))
+                                  :fetched (:fetched captured {}) :denials (:denials captured {}))
                      requests (assoc :judgements (into {} (map (fn [{:keys [id prompt]}] [id (judge prompt)]))
                                                        requests)
                                      :judge-requests requests))))
-      :verify (fn [_ {:keys [run-status files fetched judgements]}]
+      :verify (fn [_ {:keys [run-status files fetched judgements denials]}]
                 (let [{:keys [checks reward]} (run-checker checker {:files files :fetched fetched
                                                                     :judgements (or judgements {})
                                                                     :params params :gold gold})]
-                  {:checks (assoc checks :completed? (= :completed run-status))
+                  {:checks (cond-> (assoc checks :completed? (= :completed run-status))
+                             ;; tried to read the answer where it is published
+                             (seq (:blocked-sources definition))
+                             (assoc :no-blocked-fetch? (zero? (get denials :blocked 0))))
                    :reward (if (= :completed run-status) reward 0.0)}))})))
 
 (defn environment
@@ -413,10 +423,13 @@
       :verifier {:id (:verifier/id ref) :version (:verifier/version ref) :basis (:verifier/basis ref)}
       :limits {:timeout-ms (or timeout-ms (:timeout-ms definition) (* 10 60 1000))
                :cancel-timeout-ms 30000 :on-timeout :verdict}
-      :world (cond-> {:isolation :ctx :settlement :discard
-                      :setup (evaluation/world-setup-ref setup)}
-               ;; the checker is given what the attempt fetched: record it
-               (:fetched definition) (assoc :effects {:record true}))
+      :world (let [fx (cond-> {}
+                         ;; the checker is given what the attempt fetched: record it
+                        (:fetched definition) (assoc :record true)
+                        (seq (:blocked-sources definition)) (assoc :deny-hosts (set (:blocked-sources definition))))]
+               (cond-> {:isolation :ctx :settlement :discard
+                        :setup (evaluation/world-setup-ref setup)}
+                 (seq fx) (assoc :effects fx)))
       :metadata {:bundle (str (:id b))}})))
 
 (defn experiment-plan

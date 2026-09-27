@@ -113,13 +113,16 @@
   []
   (atom []))
 
-(defn- record! [sink receipt]
-  (when sink
-    (swap! sink (fn [rs]
-                  (let [rs (conj rs receipt)]
-                    (if (> (count rs) receipt-cap)
-                      (subvec rs (- (count rs) receipt-cap))
-                      rs)))))
+(defn- record!
+  "Append `receipt` to `sink`, or to each of several sinks (a sandbox's own and
+   its world's)."
+  [sink receipt]
+  (doseq [s (if (sequential? sink) sink [sink]) :when s]
+    (swap! s (fn [rs]
+               (let [rs (conj rs receipt)]
+                 (if (> (count rs) receipt-cap)
+                   (subvec rs (- (count rs) receipt-cap))
+                   rs)))))
   receipt)
 
 (defn digest
@@ -350,20 +353,47 @@
    :replay replay-handler
    :faults faults-handler})
 
+(defn host-of
+  "The host of `url`, lowercased, without `www.`; nil when it has none."
+  [url]
+  (some-> (re-find #"^[a-zA-Z][a-zA-Z0-9+.-]*://(?:[^@/]*@)?([^/:?#]+)" (str url)) second
+          str/lower-case (str/replace #"^www\." "")))
+
+(defn blocked-host?
+  "Is `host` one of `hosts` or beneath one (`docs.simm.is` under `simm.is`)?"
+  [hosts host]
+  (boolean (and host (some #(or (= host %) (str/ends-with? host (str "." %))) hosts))))
+
+(defn- deny-hosts-handler
+  "The filter refusing requests to `hosts` (and their subdomains): a task's
+   answer sources, which a candidate must not read the answer from."
+  [hosts]
+  (let [hosts (set (map str/lower-case hosts))]
+    (fn [effect next]
+      (if (and (= :http/request (:effect effect))
+               (blocked-host? hosts (host-of (get-in effect [:resource :url]))))
+        (deny! effect :blocked (str (host-of (get-in effect [:resource :url]))
+                                    " is a blocked source for this task"))
+        (next effect)))))
+
 (defn normalize
   "The canonical form of a handler configuration: one `[:admit S]` (the
    intersection of every class filter; omitted when it admits every class),
-   the predicate filters (each once, in a fixed order), then the answering
-   handlers in the order given."
+   one `[:deny-hosts H]` (the union of every host filter: denying A and
+   denying B is denying both), the predicate filters (each once, in a fixed
+   order), then the answering handlers in the order given."
   [specs]
   (let [class-filter? #(or (= :admit (first %)) (contains? sugar (first %)))
+        host-filter? #(= :deny-hosts (first %))
         predicate? #(contains? predicate-filters (first %))
         admit (reduce (fn [acc [k s]] (clojure.set/intersection acc (or (sugar k) (set s))))
-                      all-classes (filter class-filter? specs))]
+                      all-classes (filter class-filter? specs))
+        denied (reduce (fn [acc [_ hs]] (into acc (map str/lower-case) hs)) (sorted-set) (filter host-filter? specs))]
     (cond-> []
       (not= admit all-classes) (conj [:admit admit])
+      (seq denied) (conj [:deny-hosts denied])
       :always (into (sort-by pr-str (distinct (filter predicate? specs))))
-      :always (into (remove #(or (class-filter? %) (predicate? %)) specs)))))
+      :always (into (remove #(or (class-filter? %) (host-filter? %) (predicate? %)) specs)))))
 
 (defn compose
   "Compose configurations: `outer`'s handlers enclose `inner`'s (a fork's
@@ -380,6 +410,7 @@
    (mapv (fn [[k & args]]
            (cond
              (= :admit k) (admission (first args))
+             (= :deny-hosts k) (deny-hosts-handler (first args))
              (contains? predicate-filters k) ((predicate-filters k) ctx)
              :else (apply (or (get registry k)
                               (throw (ex-info (str "Unknown effect handler " k) {:handler k})))
@@ -447,6 +478,25 @@
   (binding [ec/*execution-context* ctx]
     (ec/swap-state! [:dvergr/effects :recording] (constantly id))))
 
+(defn set-world-sink!
+  "Give the world `ctx` a receipt sink every sandbox in it also writes to:
+   what host code reads of what happened there, denials included."
+  [ctx sink]
+  (binding [ec/*execution-context* ctx]
+    (ec/swap-state! [:dvergr/effects :sink] (constantly sink))))
+
+(defn world-sink
+  "The world `ctx`'s receipt sink, or nil."
+  [ctx]
+  (binding [ec/*execution-context* ctx]
+    (ec/get-state [:dvergr/effects :sink])))
+
+(defn denials
+  "How many effects in `receipts` were denied, by who denied them:
+   `{:blocked n :authority n …}`."
+  [receipts]
+  (frequencies (keep #(when (= :denied (:decision %)) (:by %)) receipts)))
+
 (defn world-recording
   "The entries recorded in the world `ctx` (`recorded`), or nil."
   [ctx]
@@ -470,12 +520,14 @@
      {:faults {:seed 7 :rate 0.1 :only #{:http/request} :kinds [:rate-limit]}
       :record true           ; record every effect (`:recording` id returned)
       :read-only true
-      :admit #{:read :network}}"
-  [{:keys [faults record read-only admit]}]
+      :admit #{:read :network}
+      :deny-hosts #{\"simm.is\"}}  ; a task's answer sources"
+  [{:keys [faults record read-only admit deny-hosts]}]
   (let [f (when faults (faults! faults))
         r (when record (recording!))]
     {:specs (cond-> []
               admit (conj [:admit (set admit)])
+              (seq deny-hosts) (conj [:deny-hosts (set deny-hosts)])
               read-only (conj [:read-only])
               r (conj [:record {:id r}])
               f (conj [:faults {:id f}]))
@@ -486,11 +538,12 @@
   "The boundary for a sandbox. `binding-resolver` reads the capability's world
    binding, where the runtime set the acting identity and `:effects {:handlers
    specs}`; `sink` holds the receipts. Options: `:world`, a function returning
-   the world's handler configuration (outside the binding's), and
+   the world's handler configuration (outside the binding's), `:world-sink`,
+   returning the world's receipt sink (receipts go there too), and
    `:relations`, returning the room relations for the authority filter the
    runtime adds for every agent. Any may be nil."
   ([binding-resolver sink] (boundary-resolver binding-resolver sink {}))
-  ([binding-resolver sink {:keys [relations world]}]
+  ([binding-resolver sink {:keys [relations world world-sink]}]
    (fn []
      (let [b (when binding-resolver (binding-resolver))
            agent-id (:agent-id b)
@@ -499,5 +552,5 @@
                    (not (full-reach? agent-id)) (conj [:authority]))]
        {:sink sink
         :subject subject
-        :handlers (into [(receipts sink subject)]
+        :handlers (into [(receipts [sink (when world-sink (world-sink))] subject)]
                         (handlers specs {:subject subject :relations relations}))}))))

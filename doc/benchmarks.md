@@ -342,6 +342,31 @@ Next for the wiki benchmark:
 Open: an LLM judge tier for prose faithfulness; attempts run one after another (a
 Datahike writer race on concurrent Runs in one durable room).
 
+## Competitor discovery (a room workflow)
+
+`examples/workflows/competitors/`, authored into a daemon room through the MCP REPL and run
+with `catalog_benchmark` (doc/room-workflows.md). Task: find products competing with Simmis,
+each with its site, a claim and a verbatim quote from a page the run fetched. Reward: 0.4
+recall of the reference set (the simm.is comparison: Wato, PromptQL, Dust, Buzz), 0.3
+grounding (the quote is on a page the run fetched), 0.3 relevance (a judge,
+`claude-code-haiku`, answers per entry whether it competes). simm.is is a blocked source:
+its comparison is the answer. At most 8 Brave searches per attempt.
+
+Results (2026-09-27, two attempts per candidate, 95% ranges wide at this size):
+
+| Run | Luna (Codex subscription) | Claude Code Haiku | List price per attempt |
+|---|---|---|---|
+| live web, judged | 0.51 [0.09, 0.92] | 0.28 [0.0, 1.0] | Luna $0.020, Haiku $0.39 |
+| frozen web (51 pages from 8 live Attempts), judged | 0.63 [0.0, 1.0] | 0.20 [0.0, 1.0] | Luna $0.076, Haiku $0.16 |
+
+Neither found the whole reference set (Luna found Dust in two of four attempts); both found
+relevant products the reference lacks (OpenAgents, Taskade, Symio, Onplana), which the judge
+credits. Haiku paraphrased quotes more often (grounding 30–50% of entries against Luna's
+80–100%) and one frozen attempt did not complete. What the runs fixed: the first live run
+scored every quote ungrounded because fetched pages were cut as raw HTML before the quoted
+words (now captured as text), and recall alone gave relevant new finds nothing (now the
+judge). Next: more repetitions on the frozen variant, which costs no search queries.
+
 ## BFCL v4 (single-turn, Python)
 
 The Berkeley Function Calling Leaderboard, pinned at gorilla `6ea5797`

@@ -91,6 +91,7 @@
   (let [gen-classes (gen/fmap set (gen/vector (gen/elements (vec effects/all-classes))))]
     (gen/vector (gen/one-of [(gen/return [:read-only])
                              (gen/return [:authority])
+                             (gen/fmap (fn [hs] [:deny-hosts hs]) (gen/set (gen/elements ["a.com" "b.com" "c.com"])))
                              (gen/fmap (fn [s] [:admit s]) gen-classes)
                              (gen/fmap (fn [n] [:answer n]) gen/small-integer)])
                 0 5)))
@@ -457,3 +458,42 @@
       (is (uuid? recording))
       (release)
       (is (thrown? Exception (effects/recorded recording)) "released"))))
+
+(deftest a-task-s-answer-sources-are-blocked
+  (let [sink (effects/make-sink)
+        get! (fn [specs url]
+               (try (effects/perform! (constantly {:handlers (into [(effects/receipts sink nil)]
+                                                                   (effects/handlers specs))})
+                                      {:effect :http/request :resource {:method :get :url url}}
+                                      (constantly {:status 200 :headers {} :body "ok"}))
+                    (catch clojure.lang.ExceptionInfo e (:by (ex-data e)))))]
+    (testing "the host and its subdomains are refused, receipted as blocked; others pass"
+      (is (= :blocked (get! [[:deny-hosts #{"simm.is"}]] "https://simm.is/blog/x")))
+      (is (= :blocked (get! [[:deny-hosts #{"simm.is"}]] "https://www.simm.is/")))
+      (is (= :blocked (get! [[:deny-hosts #{"simm.is"}]] "https://docs.simm.is/a")))
+      (is (= {:status 200 :headers {} :body "ok"} (get! [[:deny-hosts #{"simm.is"}]] "https://notsimm.is/")))
+      (is (= [:denied :blocked] ((juxt :decision :by) (first (filter #(= :denied (:decision %)) @sink))))))
+    (testing "host filters compose by union, and sit outside answering handlers"
+      (is (= [[:deny-hosts #{"a.com" "b.com"}]] (effects/normalize [[:deny-hosts #{"a.com"}] [:deny-hosts #{"B.com"}]])))
+      (is (= [[:deny-hosts #{"simm.is"}] [:faults {:id 1}]]
+             (effects/normalize [[:faults {:id 1}] [:deny-hosts #{"simm.is"}]]))))
+    (testing "a replay cannot answer a blocked request either"
+      (let [p (effects/replay! [{:key [:http/request {:method :get :url "https://simm.is/"}] :value {:status 200 :headers {} :body "the answer"}}])]
+        (is (= :blocked (get! [[:replay {:id p}] [:deny-hosts #{"simm.is"}]] "https://simm.is/")))
+        (effects/release! p)))))
+
+(deftest a-world-sees-what-was-refused-in-it
+  (let [ec (ctx/create-execution-context)
+        own (effects/make-sink)
+        world (effects/make-sink)]
+    (try
+      (effects/install-world! ec [[:deny-hosts #{"simm.is"}]])
+      (effects/set-world-sink! ec world)
+      (let [b (effects/boundary-resolver nil own {:world #(effects/world-handlers ec)
+                                                  :world-sink #(effects/world-sink ec)})]
+        (is (thrown? Exception (effects/perform! b {:effect :http/request :resource {:method :get :url "https://simm.is/"}}
+                                                 (constantly nil))))
+        (effects/perform! b {:effect :fs/read :resource {:path "a"}} (constantly "x"))
+        (is (= 2 (count @own) (count @world)) "both sinks have every receipt")
+        (is (= {:blocked 1} (effects/denials @world))))
+      (finally (ctx/stop-context! ec)))))
