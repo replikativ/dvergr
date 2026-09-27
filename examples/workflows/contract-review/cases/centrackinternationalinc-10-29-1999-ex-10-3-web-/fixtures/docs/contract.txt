@@ -1,0 +1,139 @@
+1                                                                     Exhibit 10.3
+
+I-on. (LOGO) www.i-on.com 561.394.9484 o 561.394-9773 fax 1733 avenida del sol, boca raton, florida, 33432
+
+WEB SITE HOSTING AGREEMENT
+
+This WEB SITE HOSTING AGREEMENT ("this Agreement") is entered into this 6th day of April, 1999 by and between Centrack International, a Florida corporation ("the Customer"), and i-on interactive, a Florida corporation ("i-on").
+
+DEFINITIONS
+
+As used in this Agreement, the term "Web site" shall mean a computer system intended to be accessed through the World Wide Web segment of the Internet, including software and content intended to be viewed and/or operated upon by persons accessing the computer system via the Internet. A Web site may exist on a single computer system with other Web sites.
+
+The term "Hosted Site" shall mean the Web site of the Customer that is hosted by i-on under the terms and conditions of this Agreement.
+
+The term "Hosting Computer" shall mean the computer system and related equipment on which the Hosted Site exists.
+
+SERVICES PROVIDED TO THE CUSTOMER
+
+i-on will maintain the operation of the Hosted Site continuously, twenty-four (24) hours per day, seven (7) days per week, including holidays, with the exception of reasonable hardware and software maintenance that must be performed on the Hosting Computer and/or the Hosted Site. i-on will use best efforts to schedule and perform such maintenance between the hours of 8pm and 8am Eastern Standard Time on weekdays, or during weekends.
+
+Under this Agreement, i-on will provide the following limited services for the Hosted Site:
+
+      1. connectivity to the Internet via a T1 (that may be shared by other             Web sites) to a leading Internet backbone access provider such as             UUNET, and reasonable efforts to maintain such connectivity with the             phone company and the Internet backbone access provider;
+
+      2. use of the Hosting Computer (that may be shared by other Web sites)             as described in this Agreement and maintenance required to keep such             Hosting Computer in good working order;
+
+      3. physical space for the Hosting Computer at a facility that maintains             proper environmental conditions in the area(s) where the Hosting             Computer is located and maintains reasonable efforts to prevent             unauthorized access to the physical location of the Hosting             Computer;
+
+      4. an emergency electrical power backup system for the Hosting             Computer;
+
+      5. up to 150 MB of mirrored computer storage on the Hosting Computer;
+
+      6. archival backups of such mirrored computer storage on a weekly             basis;    2          7.  off-site storage of such backups at separate facility than the              location of the Hosting Computer;
+
+      8.  use of the Microsoft Windows NT Server 4.0 or higher operating              system software for the Hosting Computer and the Hosted Site;
+
+      9.  use of the Microsoft Internet Information Service (IIS) 3.0 or              higher Web server software for the Hosted Site (providing support              for the HTTP Web protocol);
+
+      10. use of the Microsoft SQL Server 6.5 or higher database server              software for the Hosted Site, within the boundaries of allocated              computer storage, per #5 above;
+
+      11. access to the Hosted Site via the ftp protocol to an administrative              account designated by the Customer for the Customer to maintain the              Hosted Site's static content (such as HTML Web pages and computer              graphics);
+
+      12. up to 10 mailboxes accessible via the POP3 mail protocol that are              mapped to the Hosted Site's Internet address;
+
+      13. up to 1 hour per month of Web site administration services at no              additional charge, limited to:
+
+               requests for changes to ftp/e-mail users and passwords;                   requests for e-mail configuration changes;                   modification of mail aliases;                   changes to server MIME types;                   files restored from backup;
+
+
+
+
+
+               answering questions about server-side scripts;                   ftp configuration changes;                   log file configuration changes;                   importing or exporting of database records;                   and consultation on site operation and administration.
+
+          Additional Web site administration services will be billed at $200              per hour.
+
+      14. a monthly report of user activity on the Hosted Site.
+
+RESPONSIBILITIES OF THE CUSTOMER
+
+The Customer is responsible for paying i-on the recurring monthly fee in the amount of $450. The Customer is responsible for paying the recurring monthly fees by the 5th day of each month beginning in April 1, 1999. The Customer acknowledges that failure to pay such fees in a timely manner will result in the interruption or discontinuation of services for the Hosted Site.
+
+The Customer is solely responsible for all content on the Hosted Site, including but not limited to, HTML pages, graphics, sounds, animations, video clips, Java applets, client-site scripts such as JavaScript and VBScript features, ActiveX controls, and other files and/or executable components for use or download by the users of the Hosted Site, as well as the accuracy and validity of any information or data contained within, as well as the overall look-and-feel of the Hosted Site from a user's perspective. The Customer is solely responsible for the ongoing maintenance of such content. The Customer acknowledges that this Agreement is explicitly not an agreement for i-on to provide content creation or maintenance services for the Hosted Site.
+
+The Customer is solely responsible for all customer support required by users of Hosted Site. In the case of a problem with the Hosted Site that is the responsibility of i-on according to this Agreement, the Customer shall directly notify i-on, which shall report the resolution of such problem directly to the Customer. If the problem of which i-on is notified is not a problem that is the responsibility of i-on according to this Agreement, the time spent by i-on relating to the incident will count towards the Customer's monthly allocation of Web administration services, and any additional time
+
+3 exceeding such allocation will be billed to the Customer at the rate set forth for such services. At no time will i-on take responsibility for directly interacting with the Customer's users. The Customer acknowledges that this Agreement is explicitly not an agreement for i-on to provide "help desk" services to the users of the Hosted Site.
+
+The Customer is solely responsible for all marketing and promotion of the Hosted Site and is solely responsible for generating traffic to the Hosted Site.
+
+The Customer is solely responsible for the security of its administrator account(s) and respective password(s) for the Hosted Site, and is solely responsible for any loss of data or damage to the Hosted Site that arises out of any breach of such security.
+
+The Customer is solely responsible for any and all advertising on the Hosted Site.
+
+The Customer is responsible for any and all software programs, server-side scripts, and/or executable components that are installed on the Hosting Computer for the purpose of providing interactive applications or dynamic content on the Hosted Site. Any such programs, scripts, or components that might affect the stability of the Hosting Computer or interfere with other Web sites on the Hosting Computer must be approved by i-on before being installed on the Hosted Site, i-on reserves the right to deny the Customer permission to install any such programs, scripts, or components, to require additional fees for the installation and/or ongoing operation of any such programs, scripts, or components, or to remove any such programs, scripts, or components, if in i-on's sole discretion they will interfere with the operation of the Hosting Computer or exceed the Customer's monthly allocation of Web administration services.
+
+CONDITIONS OF SERVICE
+
+The Customer acknowledges that the Internet is an unreliable, unsecured, and error-prone network and agrees to hold i-on harmless for any interruptions in service to the Hosted Site or inability for users to reach or effectively use the Hosted Site that arises outside the scope of i-on's responsibilities as explicitly described in this Agreement.
+
+The Customer acknowledges that data loss is a possibility, even with mirrored computer storage and archival backup of such storage as provided by i-on per this Agreement, and agrees to hold i-on harmless for any such data loss for the Hosted Site, provided that i-on maintains reasonable steps as described in this Agreement to protect against such data loss.
+
+The Customer shall use i-on's resources in a manner that is clearly consistent with the purposes of the products and services offered. The Customer shall comply with applicable laws, standards, policies, and procedures. The Customer incurs the responsibility to determine what restrictions apply and to review the policies and procedures that will be updated continually. The customer is responsible to use the resources with sensitivity to the rights of others. Any conduct by the Customer that in i-on's sole discretion restricts or inhibits any other user, whether a customer of i-on or a user of any other system, from using and enjoying any of i-on's services is strictly prohibited. This includes, but is not limited to, the posting or transmitting on or through any of i-on's
+
+
+
+
+
+services, any information that is, in i-on's sole discretion, unlawful, obscene, threatening, abusive, libelous, or harmful, or encourages conduct that would constitute a criminal offense, give rise to civil liability, or otherwise violate any local, state, national, or International law.
+
+The Customer expressly agrees to use all of i-on's services only for lawful purposes. Transmission or storage of any information, data, or material in violation of United States or state regulation or law is prohibited, including but not limited to, material protected by copyright, trademark, trade secret, or any other statute.
+
+TERM AND TERMINATION
+
+The term of this Agreement for the Hosted Site shall commence upon April 1, 1999 and shall continue for a period of six (6) months, unless earlier terminated in accordance with provisions hereof. This Agreement shall automatically be renewed for one (1) or more one (1) month periods unless either the Customer or i-on gives notice to the other party of its intention not to renew the
+
+4 Agreement, which notice must be given not less than fifteen (15) days before the end of the respective initial or renewal term.
+
+Either party may terminate this Agreement without cause at any time effective upon thirty (30) days' written notice. Notwithstanding anything to the contrary contained in this Agreement, no termination of this Agreement for any reason whatsoever shall relieve the Customer of the obligation to pay all amounts due to i-on and to make such payments on a timely basis.
+
+LIMITATION OF LIABILITY
+
+i-on will not be liable under any circumstances for any lost profits or other consequential damages, even if i-on has been advised as to the possibility of such damages. i-on's liability for damages to the Customer for any cause whatsoever, regardless of the form of action, and whether in contract or in tort, including negligence, shall be limited to one (1) month's fees and the remaining portion of any prepaid fees.
+
+INDEMNIFICATION
+
+The Customer agrees to indemnify and hold harmless i-on, against any lawsuits, claims, damages, or liabilities (or actions or proceedings in respect thereof) to which i-on may become subject related to or arising out of Customer's use of i-on's services, and will reimburse i-on for all legal and other expenses, including attorney's fees, incurred in connection with investigating, defending, or settling any such loss, claim, damage, liability, action, or proceeding whether or not in connection with pending or threatened litigation in which i-on is a party. The provisions of this Agreement relating to indemnification shall survive termination of the Customer's Hosted Site.
+
+THIRD-PARTY SOFTWARE
+
+i-on expressly assumes no responsibility of the proper operation or maintenance of any of the Centrack site software that we authored by Imaginet and/or other third parties.
+
+MISCELLANEOUS
+
+This Agreement constitutes the entire understanding and agreement between the parties hereto and supersedes any and all prior or contemporaneous representations, understandings, and agreements between the Customer and i-on with respect to the subject matter hereof, all of which are merged herein. The parties understand that work i-on does in the development and maintenance of Web content and applications for Centrack International is governed by separate agreement(s).
+
+Nothing contained herein shall be deemed or construed to create a joint venture or partnership between the Customer and i-on. Neither party is, by virtue of this Agreement or otherwise, authorized as an agent or legal representative of the other party. Neither party is granted any such right or authority to assume or to create any obligation or responsibility, express or implied, on behalf of or in the name of the other party or to bind such other party in any manner.
+
+No waiver of any provision of this Agreement or any rights or obligations of either party hereunder shall be effective, except pursuant to a written instrument signed by the party or parties waiving compliance, and any such waiver shall be effective only in the specific instance and for the specific purpose stated in such writing.
+
+In the event that any provision hereof is found invalid or unenforceable pursuant to judicial decree or decision, the remainder of this Agreement shall remain valid and enforceable according to its terms.
+
+This Agreement was entered into in the State of Florida, and its validity, construction, interpretation, and legal effect shall be governed by the laws and judicial decisions of the State of Florida applicable to contracts entered into and performed entirely within the State of Florida.
+
+Neither the Customer nor i-on shall be deemed in default if its performance or obligations hereunder are delayed or become impossible or impractical by reason of any act of God, war,
+
+5 fire, earthquake, labor dispute, sickness, accident, civil commotion, epidemic, act of government or government agency or offices, or any other cause beyond
+
+
+
+
+
+such party's control.
+
+IN WITNESS WHEREOF, the parties have executed this Agreement as of the date first set forth above.
+
+CENTRACK INTERNATIONAL, INC.            I-ON INTERACTIVE, INC.
+
+By: /s/ JOHN J. LOFQUIST                By: /s/ ANNA TALERICO    -------------------------               ----------------------------- Name: John J. Lofquist                  Name:   Anna Talerico Title: President & CEO                  Title:  Vice President

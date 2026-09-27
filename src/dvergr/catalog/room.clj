@@ -90,8 +90,8 @@
       (and (map? definition) (not (::error definition)) (not (m/validate Definition definition)))
       (conj (str "workflow.edn: " (pr-str (me/humanize (m/explain Definition definition)))))
       (not (contains? files "checker.clj")) (conj "checker.clj is missing")
-      (not (some #(str/starts-with? % "fixtures/") (keys files)))
-      (conj "fixtures/ is empty: every attempt's world would start with nothing")
+      (not (some #(or (str/starts-with? % "fixtures/") (str/starts-with? % "cases/")) (keys files)))
+      (conj "fixtures/ is empty and there are no cases/: every attempt's world would start with nothing")
 
       (and (map? definition) (= :frozen (:web definition)) (not (contains? files "web.edn")))
       (conj "workflow.edn says :web :frozen but web.edn is missing"))))
@@ -116,7 +116,30 @@
                              (when (str/starts-with? path "fixtures/")
                                [(subs path (count "fixtures")) text])))
                      files)
+     ;; a dataset: cases/<id>/fixtures/… and cases/<id>/gold.edn, one
+     ;; environment per case (its fixtures over the shared ones, its gold)
+     :cases (reduce (fn [cases [path text]]
+                      (if-let [[_ id rest] (re-find #"^cases/([^/]+)/(.+)$" path)]
+                        (cond
+                          (= rest "gold.edn") (assoc-in cases [id :gold] (read-edn files path))
+                          (str/starts-with? rest "fixtures/")
+                          (assoc-in cases [id :fixtures (subs rest (count "fixtures"))] text)
+                          :else cases)
+                        cases))
+                    (sorted-map) files)
      :id (hasch/uuid [:dvergr/room-workflow files])}))
+
+(defn case-of
+  "The case an environment of bundle `b` runs, from its metadata; nil for a
+   bundle without cases."
+  [b environment]
+  (when-let [id (get-in environment [:environment/metadata :case])]
+    (get (:cases b) id)))
+
+(defn gold-of
+  "The gold an environment is scored against: its case's, else the bundle's."
+  [b environment]
+  (or (:gold (case-of b environment)) (:gold b)))
 
 (defn bundle-files
   "The files of `workflows/<name>/` in `room`'s workspace, by path relative to
@@ -209,8 +232,10 @@
    the checks it says it damages and score below the reference. Returns
    `{:ok? :reference verdict :damaged {name {:verdict :ok? :kept [check …]}}
    :problems [...]}`."
-  [{:keys [checker gold calibration definition id]}]
+  [{:keys [checker calibration definition id] :as b}]
   (let [params (:params definition)
+        ;; a dataset bundle calibrates against one of its cases' gold
+        gold (if-let [c (:case calibration)] (get-in b [:cases c :gold]) (:gold b))
         ;; judgements, like fetched pages, come from calibration.edn: no model
         run (fn [files fetched judgements]
               (run-checker checker {:files files :fetched (or fetched (:fetched calibration) {})
@@ -288,16 +313,16 @@
    own, committed) and, for a frozen web, its pages as the world's web: every
    HTTP request in the world is answered from them. Its evidence is their
    digest."
-  [{:keys [fixtures id web]}]
-  (let [digest (str (hasch/uuid fixtures))
+  [{:keys [fixtures id web] :as b}]
+  (let [digest (str (hasch/uuid [fixtures (update-vals (:cases b) :fixtures)]))
         transport (when web (frozen-web/transport web))
         web-id (when web (hasch/uuid [:room-workflow/web web]))]
     (evaluation/make-world-setup
      {:id :room-workflow/fixtures :version 1
       :basis (cond-> {:bundle (str id) :fixtures digest} web (assoc :web (str web-id)))
-      :prepare (fn [{world :room}]
+      :prepare (fn [{world :room environment :environment}]
                  (ws/ensure-workspace! world)
-                 (ws/seed! world fixtures)
+                 (ws/seed! world (merge fixtures (:fixtures (case-of b environment))))
                  (when web
                    (binding [ec/*execution-context* (:ctx world)]
                      (sandbox-io/install-http-fixture!
@@ -382,7 +407,7 @@
    the checker's `judge-requests` are answered by that model once, when the
    Attempt is observed, and kept as evidence (`:judgements {id answer}`, given
    to `check`); `judge-fn` replaces the model (tests)."
-  [{:keys [definition checker gold id] :as b} {:keys [params tier judge-fn]}]
+  [{:keys [definition checker id] :as b} {:keys [params tier judge-fn]}]
   (let [dirs (or (:capture definition) ["/out"])
         params (merge (:params definition) params)
         {judge-model :model max-requests :max-requests :or {max-requests 20}} (:judge definition)
@@ -396,19 +421,19 @@
                           :denials (effects/denials (some-> (effects/world-sink (:ctx world)) deref))}
                    (:fetched definition)
                    (assoc :fetched (bounded-pages (effects/fetched-pages (effects/world-recording (:ctx world)))))))
-      :observe (fn [{:keys [default result] captured :execution/evidence}]
+      :observe (fn [{:keys [default result environment] captured :execution/evidence}]
                  (let [input {:files (:files captured) :fetched (:fetched captured {})
-                              :params params :gold gold}
+                              :params params :gold (gold-of b environment)}
                        requests (when judge (judge-requests checker input max-requests))]
                    (cond-> (assoc default :run-status (:run/status result) :files (:files captured)
                                   :fetched (:fetched captured {}) :denials (:denials captured {}))
                      requests (assoc :judgements (into {} (map (fn [{:keys [id prompt]}] [id (judge prompt)]))
                                                        requests)
                                      :judge-requests requests))))
-      :verify (fn [_ {:keys [run-status files fetched judgements denials]}]
+      :verify (fn [environment {:keys [run-status files fetched judgements denials]}]
                 (let [{:keys [checks reward]} (run-checker checker {:files files :fetched fetched
                                                                     :judgements (or judgements {})
-                                                                    :params params :gold gold})]
+                                                                    :params params :gold (gold-of b environment)})]
                   {:checks (cond-> (assoc checks :completed? (= :completed run-status))
                              ;; tried to read the answer where it is published
                              (seq (:blocked-sources definition))
@@ -416,7 +441,9 @@
                    :reward (if (= :completed run-status) reward 0.0)}))})))
 
 (defn environment
-  [{:keys [definition name] :as b} setup ev {:keys [timeout-ms params]}]
+  "The EnvironmentDef of `b` (of one of its cases, `case-id`, when it has
+   cases)."
+  [{:keys [definition name] :as b} setup ev {:keys [timeout-ms params]} & [case-id]]
   (let [ref (evaluation/evaluator-ref ev)]
     (environment/make-environment
      {:id (keyword "room-workflow" name)
@@ -433,7 +460,7 @@
                (cond-> {:isolation :ctx :settlement :discard
                         :setup (evaluation/world-setup-ref setup)}
                  (seq fx) (assoc :effects fx)))
-      :metadata {:bundle (str (:id b))}})))
+      :metadata (cond-> {:bundle (str (:id b))} case-id (assoc :case case-id))})))
 
 (defn experiment-plan
   "What `dvergr.agent.experiment.runner` needs to benchmark `b` on `models`."
@@ -445,11 +472,15 @@
                                                  :budget-dollars budget-dollars :prompt prompt})]
     {:benchmark :room-workflow
      :capabilities {:world-setup setup :evaluator ev}
-     :environments [(environment b setup ev opts)]
+     ;; a dataset bundle: one environment per case
+     :environments (if (seq (:cases b))
+                     (mapv #(environment b setup ev opts %) (keys (:cases b)))
+                     [(environment b setup ev opts)])
      :team team
      :models (mapv #(:agent/model-policy (roster/agent team %)) ids)
      :dataset {:id (keyword "room-workflow" (:name b))
-               :metadata {:bundle (str (:id b))}}}))
+               :metadata (cond-> {:bundle (str (:id b))}
+                           (seq (:cases b)) (assoc :cases (vec (keys (:cases b)))))}}))
 
 (defn experiment!
   "Benchmark bundle `b` in its own process (see `dvergr.catalog.wiki/experiment!`)."

@@ -367,6 +367,34 @@ scored every quote ungrounded because fetched pages were cut as raw HTML before 
 words (now captured as text), and recall alone gave relevant new finds nothing (now the
 judge). Next: more repetitions on the frozen variant, which costs no search queries.
 
+## Contract review (CUAD, a room workflow dataset)
+
+`examples/workflows/contract-review/`: eight contracts from the CUAD test split, one case
+each (`cases/<id>/fixtures` + `gold.edn`), authored into a daemon room through the MCP REPL
+and run with `catalog_benchmark`. Task: for eight clause types (Governing Law,
+Anti-Assignment, Cap On Liability, Termination For Convenience, Exclusivity, Change Of
+Control, Non-Compete, Audit Rights), say whether the contract has one and quote it verbatim.
+Reward per clause type: 0 for the wrong presence, 1 for a correct absence, 1 for a present
+clause whose quote matches a lawyer-annotated span, else 0.5; the mean over the eight. No
+judge, no network.
+
+Results (2026-09-27, one attempt per contract, both on subscriptions; list prices are
+notional):
+
+| Candidate | Mean reward | Contracts fully right | List price per attempt |
+|---|---|---|---|
+| Luna (Codex subscription) | 0.92 | 4 / 8 | $0.009 |
+| Claude Code Haiku | 0.89 | 4 / 8 | $0.062 |
+
+Every remaining loss is a presence call, mostly a clause claimed that CUAD does not annotate
+(Exclusivity, Audit Rights, Termination For Convenience), a few of which a reader may
+dispute (a six-month notice "for any reason other than breach" is not labelled Termination
+For Convenience). What the first run fixed: the checker scored quotes by token F1 against a
+single annotated sentence, so a model quoting the whole numbered section, or one item of a
+long annotated list, lost half the clause; 7 of 16 answers did. A quote now matches when it
+overlaps, contains or lies inside an annotated span (the README has the bounds). Under the
+first checker both scored 0.875.
+
 ## BFCL v4 (single-turn, Python)
 
 The Berkeley Function Calling Leaderboard, pinned at gorilla `6ea5797`

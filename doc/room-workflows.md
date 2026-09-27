@@ -122,6 +122,12 @@ every sandbox in it writes to, and the capture counts its denials by who decided
 so its scores are comparable over time. It is a bundle of its own, calibrated and promoted
 on its own.
 
+**Datasets.** A bundle with `cases/<id>/fixtures/…` and `cases/<id>/gold.edn` is a dataset:
+one environment per case (its fixtures over the shared ones, its gold), the case in the
+environment's metadata; `calibration.edn` names the case whose gold it scores against
+(`:case`). `examples/workflows/contract-review/` is one: eight CUAD contracts
+(`dev/cuad_bundle.py` builds more).
+
 `catalog_deploy {room name agent every on? at? params?}` schedules the bundle's task for an
 agent of the room (the Scorecard's pick); the room's REPL lists and cancels it
 (`dvergr.scheduler/list`, `cancel`).

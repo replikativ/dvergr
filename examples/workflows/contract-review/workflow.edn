@@ -1,0 +1,6 @@
+{:title "Contract review (CUAD)"
+ :doc "Review a commercial contract for eight clause types a lawyer checks first: for each, whether the contract has it and a verbatim quote. Scored against the lawyers' annotations of CUAD (CC BY 4.0): presence, and the overlap of the quote with the annotated text."
+ :task "Review the contract in /docs/contract.txt. For each of these clause types: Governing Law, Anti-Assignment, Cap On Liability, Termination For Convenience, Exclusivity, Change Of Control, Non-Compete, Audit Rights, decide whether the contract contains such a clause. Write /out/review.edn: a map from the clause type (the exact name above, as a string) to {:present true :quote \"<the clause, copied verbatim from the contract>\"} or {:present false}. Quote only text that is in the contract."
+ :profile "developer"
+ :capture ["/out"]
+ :timeout-ms 600000}
