@@ -31,7 +31,7 @@
 
         ;; Dvergr uses the async sequence/CPS namespaces directly; keep this a
         ;; direct dependency instead of relying on Spindel's implementation deps.
-        is.simm/partial-cps        {:mvn/version "0.1.63"}
+        is.simm/partial-cps        {:mvn/version "0.1.66"}
 
         ;; Spindel — Reactive runtime with CoW forking.
         ;; 0.1.35 (#27 lost-wakeup redesign + follow-ups): continuation
@@ -64,7 +64,7 @@
         ;; buffer-only taps); needs partial-cps 0.1.63 (lost-continuation fixes).
         ;; 0.1.54 signals an access to a runtime atom, deferred or mailbox from
         ;; a world with no state for it (`spindel.missing-state`; the tests throw).
-        org.replikativ/spindel     {:mvn/version "0.1.54"}
+        org.replikativ/spindel     {:mvn/version "0.1.70"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context
