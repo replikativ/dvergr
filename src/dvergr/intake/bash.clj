@@ -138,6 +138,25 @@
    {:tool :bash :pattern {:kind :argv-vec :vec ["git" git-local-subcommands]}
     :action :allow :origin :default}])
 
+(def network-builtins
+  "muschel builtins that reach the network. Not given to the room shell's
+   host, so no path to them exists (`sh -c`, `xargs` and `find -exec` do not
+   pass the permit rules; a missing builtin is missing everywhere)."
+  ["curl" "wget"])
+
+(def network-rules
+  "Refuse the shell's network commands. muschel's JVM `curl` builtin reaches
+   the internet from inside the process, past every guard the sandbox's HTTP
+   has: the domain policy, the SSRF guard, secret substitution, receipts,
+   recording, faults and a task's blocked sources (verified: `curl
+   https://example.com` returned the page). The network is one door:
+   `babashka.http-client` in clojure_eval, through the effect boundary."
+  (vec (for [cmd ["curl" "wget"]]
+         {:tool :bash :pattern {:kind :cmd-name :name cmd} :action :deny
+          :reason (str cmd " is not available in the room shell: use babashka.http-client in "
+                       "clojure_eval, where the domain policy, secrets and receipts apply")
+          :origin :default})))
+
 (def workspace-delete-rules
   "Re-allow recursive `rm` inside the workspace; keep it denied on system paths.
 
@@ -346,7 +365,8 @@
    Options:
      :workspace          (default: `default-workspace`)
      :fallback-allowlist (default: default-fallback-allowlist)
-     :builtins           (default: muschel.builtins.posix/standard)
+     :builtins           (default: muschel.builtins.posix/standard without
+                         its network builtins, `network-builtins`)
      :mounts             map of absolute sandbox path → muschel FS,
                          union-mounted over the workspace via
                          muschel.fs.mount. Embedders mount e.g. a drive
@@ -355,7 +375,7 @@
   [{:keys [workspace fallback-allowlist builtins mounts]
     :or {workspace          (default-workspace)
          fallback-allowlist default-fallback-allowlist
-         builtins           posix/standard}}]
+         builtins           (apply dissoc posix/standard network-builtins)}}]
   (let [filesystem (if (map? workspace)
                      (geschichte/filesystem workspace)
                      (fs.disk/make workspace {:mount-at "/"}))
@@ -605,7 +625,7 @@
                     ;; Agents don't write stdin; never inherit System/in
                     ;; (would block under nREPL / when daemonised).
                     :in          (java.io.ByteArrayInputStream. (.getBytes ""))
-                    :permit      {:rulesets [m/default-rules git-sandbox-rules workspace-delete-rules]
+                    :permit      {:rulesets [m/default-rules git-sandbox-rules workspace-delete-rules network-rules]
                                   :prompter prompter}
                     :timeout-ms  timeout-ms
                     :trace       (trace-bridge)}
