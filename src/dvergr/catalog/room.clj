@@ -10,6 +10,9 @@
      gold.edn       optional: the reference facts the checker scores against
      fixtures/…     the files each attempt's world starts with (at the root:
                     fixtures/docs/a.md → /docs/a.md)
+     calibration.edn optional: {:reference {path text} :damaged {name {:files
+                    {path text} :loses [check …]}}}, how the checker earns
+                    trust (`calibrate`, `promote!`)
 
    The checker runs in SCI with no effects: it is given the files the attempt
    left under the captured directories and returns a verdict. It cannot read
@@ -83,6 +86,7 @@
      :definition definition
      :checker (get files "checker.clj")
      :gold (read-edn files "gold.edn")
+     :calibration (read-edn files "calibration.edn")
      :fixtures (into (sorted-map)
                      (keep (fn [[path text]]
                              (when (str/starts-with? path "fixtures/")
@@ -150,6 +154,73 @@
       verdict)))
 
 ;; ---------------------------------------------------------------------------
+;; Calibration and promotion: how a checker earns trust
+;; ---------------------------------------------------------------------------
+
+(defn calibrate
+  "Run the checker on the bundle's reference answer and damaged variants. The
+   reference must pass every check and score highest; each variant must fail
+   the checks it says it damages and score below the reference. Returns
+   `{:ok? :reference verdict :damaged {name {:verdict :ok? :kept [check …]}}
+   :problems [...]}`."
+  [{:keys [checker gold calibration definition id]}]
+  (let [params (:params definition)
+        run #(run-checker checker {:files % :gold gold :params params})]
+    (if-not (:reference calibration)
+      {:ok? false :bundle (str id) :problems ["calibration.edn has no :reference answer"]}
+      (let [reference (run (:reference calibration))
+            damaged (into (sorted-map)
+                          (for [[k {:keys [files loses]}] (:damaged calibration)
+                                :let [v (run files)
+                                      kept (vec (filter #(get-in v [:checks %]) loses))]]
+                            [k {:verdict v :kept kept
+                                :ok? (boolean (and (empty? kept) (seq loses)
+                                                   (< (:reward v) (:reward reference))))}]))
+            problems (cond-> []
+                       (not-every? true? (vals (:checks reference)))
+                       (conj (str "the reference fails " (vec (keep (fn [[k v]] (when-not v k)) (:checks reference)))))
+                       (empty? damaged) (conj "calibration.edn has no :damaged variants: nothing shows the checker notices damage")
+                       :always (into (for [[k {:keys [ok? kept]}] damaged :when (not ok?)]
+                                       (if (seq kept)
+                                         (str (name k) " still passes " kept)
+                                         (str (name k) " does not score below the reference")))))]
+        {:ok? (empty? problems) :bundle (str id) :reference reference :damaged damaged :problems problems}))))
+
+(defn- promotions-file []
+  (java.io.File. (str ((requiring-resolve 'dvergr.substrate.paths/home))) "workflow-promotions.edn"))
+
+(defn- promotions []
+  (let [f (promotions-file)]
+    (if (.exists f) (edn/read-string (slurp f)) {})))
+
+(defn promoted?
+  "Was bundle `id` promoted on this host?"
+  [id]
+  (contains? (promotions) (str id)))
+
+(def ^:private promotion-lock (Object.))
+
+(defn promote!
+  "Promote bundle `b` of `room-slug` on this host: calibrate it now and record
+   its content id when calibration holds. Host state under the state root,
+   outside every workspace: sandbox code cannot write it. A changed bundle is a
+   new id, promoted afresh."
+  [b room-slug]
+  (let [{:keys [ok?] :as result} (calibrate b)]
+    (when ok?
+      (locking promotion-lock
+        (let [f (promotions-file)]
+          (.mkdirs (.getParentFile f))
+          (spit f (pr-str (assoc (promotions) (str (:id b))
+                                 {:room (str room-slug) :name (:name b) :at (java.util.Date.)}))))))
+    (assoc result :promoted? (boolean ok?))))
+
+(defn tier
+  "The trust tier of `b`'s verifier: `:room` once promoted, else `:ad-hoc`."
+  [b]
+  (if (promoted? (:id b)) :room :ad-hoc))
+
+;; ---------------------------------------------------------------------------
 ;; As a catalog workflow: task, world setup, evaluator, environment, plan
 ;; ---------------------------------------------------------------------------
 
@@ -182,7 +253,7 @@
   (let [dirs (or (:capture definition) ["/out"])
         params (merge (:params definition) params)]
     (evaluation/make-evaluator
-     {:id (verifier-id b) :version 1 :tier (or tier :ad-hoc)
+     {:id (verifier-id b) :version 1 :tier (or tier (dvergr.catalog.room/tier b))
       :basis {:bundle (str id)}
       :capture (fn [{world :world/room}]
                  {:files (into {} (map #(ws/read-tree world %)) dirs)})

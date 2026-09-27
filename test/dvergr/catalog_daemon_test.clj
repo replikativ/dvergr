@@ -309,6 +309,9 @@
                          n (count (filter #(str/includes? t %) (:names gold)))]
                      {:checks {:all? (= n (count (:names gold)))} :reward (double (/ n (count (:names gold))))}))"
                 "/workflows/competitors/gold.edn" (pr-str {:names ["Wato" "Dust"]})
+                "/workflows/competitors/calibration.edn"
+                (pr-str {:reference {"/out/list.md" "Wato, Dust"}
+                         :damaged {:half {:files {"/out/list.md" "Wato"} :loses [:all?]}}})
                 "/workflows/competitors/fixtures/docs/brief.md" "Simmis vs Wato and Dust."}]
     (catalog/seed! r bundle)
     (testing "catalog_check reports the bundle and runs its checker on an answer"
@@ -320,9 +323,14 @@
     (testing "a broken bundle says why"
       (catalog/seed! r {"/workflows/broken/workflow.edn" "{:title \"x\"}"})
       (is (false? (:ok (ops/invoke *daemon* :catalog/check {:room "marketing" :name "broken"})))))
-    (testing "catalog_list with the room lists it"
-      (is (some #(= "marketing/competitors" (:id %))
-                (ops/invoke *daemon* :catalog/list {:room "marketing"}))))
+    (testing "catalog_list with the room lists it, ad hoc until promoted"
+      (is (= "ad-hoc" (:verifier (first (filter #(= "marketing/competitors" (:id %))
+                                                (ops/invoke *daemon* :catalog/list {:room "marketing"})))))))
+    (testing "calibrated, then promoted by the owner's connection"
+      (is (:ok? (ops/invoke *daemon* :catalog/calibrate {:room "marketing" :name "competitors"})))
+      (is (:promoted? (ops/invoke *daemon* :catalog/promote {:room "marketing" :name "competitors"})))
+      (is (= "room" (:verifier (first (filter #(= "marketing/competitors" (:id %))
+                                              (ops/invoke *daemon* :catalog/list {:room "marketing"})))))))
     (testing "catalog_benchmark runs it as \"<room>/<name>\""
       (let [calls (atom 0)]
         (with-redefs [providers/ensure-initialized! (constantly nil)
@@ -341,4 +349,8 @@
                        (let [st (ops/invoke *daemon* :job/status {:job (:id started) :wait-ms 20000})]
                          (if (or (not= "running" (:status st)) (< 8 n)) st (recur (inc n)))))]
             (is (= "completed" (:status done)) (pr-str (dissoc done :result)))
-            (is (= 1.0 (get-in done [:result :summary 0 :reward-mean])))))))))
+            (is (= 1.0 (get-in done [:result :summary 0 :reward-mean])))
+            (testing "and its Scorecard says who vouches for the rewards"
+              (let [[sc] (ops/invoke *daemon* :scorecard/list {:room (:room started)})]
+                (is (= ["room"] (:verifier-trust (ops/invoke *daemon* :scorecard/detail
+                                                             {:room (:room started) :id (:id sc)}))))))))))))

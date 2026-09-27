@@ -29,10 +29,9 @@ It is ordinary room content: versioned, forked and merged with the room, reviewa
 
 1. **Author**: `workflows/author!` in the sandbox (or files written through MCP) creates the
    bundle; `workflows/check` validates its shape.
-2. **Calibrate**: a checker earns trust the way the wiki benchmark did. `workflows/calibrate`
+2. **Calibrate**: a checker earns trust the way the wiki benchmark did. `catalog_calibrate`
    scores the reference answer (must score top) and each damaged variant (must lose what it
-   damaged); the result is recorded with the bundle's content id. An uncalibrated checker
-   can run, but its Scorecards say so.
+   damaged). An uncalibrated checker can run, but its Scorecards say so.
 3. **Benchmark**: `catalog_benchmark {workflow: "<room>/<name>", models: […]}`; worlds are
    seeded from the fixtures or the generator; Scorecards, ranges, the baseline comparison and
    cost at list price as for any workflow. Candidates include external agents (a CLI or any
@@ -68,7 +67,17 @@ verdict validated. Ops: `catalog_check {room name answer?}` (problems, or the bu
 with an answer, the checker's verdict on it), `catalog_list {room}` lists a room's bundles,
 `catalog_benchmark {workflow: "<room>/<name>"}` benchmarks one like a catalog workflow.
 
-Next: calibrate and promote (the tier on Scorecards), export and import, deploy by schedule.
+Part 2: `calibration.edn` holds a reference answer and damaged variants, each naming the
+checks it damages. `catalog_calibrate` runs the checker on them: the reference must pass
+every check and score highest, each variant must fail what it damaged and score lower.
+`catalog_promote` (admin toolset: the owner's connection) calibrates the bundle now and, when
+that holds, records its content id on the host, under the state root and outside every
+workspace, so sandbox code cannot forge a promotion. From then on its verifier is `:room`;
+a changed bundle is a new id, `:ad-hoc` again. `catalog_list {room}` shows each bundle's
+tier and `scorecard_detail` lists the tiers among a Scorecard's Attempts
+(`:verifier-trust`).
+
+Next: export and import, deploy by schedule.
 
 ## The first one: competitor discovery
 

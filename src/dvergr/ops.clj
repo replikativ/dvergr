@@ -276,7 +276,12 @@
                                 :repetitions (:experiment/repetitions exp)}
                :leaderboard    rows
                :cells          (count (:scorecard/entries sc))}
-        load-attempt (assoc :check-rates (check-rates (:scorecard/entries sc) load-attempt))
+        load-attempt (assoc :check-rates (check-rates (:scorecard/entries sc) load-attempt)
+                            ;; who vouches for the rewards: every tier among its Attempts
+                            :verifier-trust (vec (distinct (keep #(some-> (load-attempt (:attempt/id %))
+                                                                          :attempt/receipt :attempt/metrics
+                                                                          :verifier-trust name)
+                                                                 (:scorecard/entries sc)))))
         compare? (assoc :comparison (comparison (:scorecard/entries sc) rows baseline))
         full? (assoc :entries (mapv (fn [e]
                                       {:candidate (kw->str (:candidate/id e))
@@ -512,8 +517,29 @@
                           :let [b (try (in-ctx daemon (room-wf/read-bundle r n)) (catch Exception _ nil))]]
                       (cond-> {:id (str (:slug r) "/" n) :room (:slug r)}
                         b (merge (select-keys (:definition b) [:title :doc :params :profile])
-                                 {:bundle (str (:id b)) :verifier "ad-hoc"})
+                                 {:bundle (str (:id b)) :verifier (name (room-wf/tier b))})
                         (nil? b) (assoc :problems ["not well formed; see catalog_check"]))))))}
+
+   :catalog/calibrate
+   {:doc (str "Calibrate a workflow bundle's checker (calibration.edn: a reference answer and "
+              "damaged variants, each naming the checks it damages): the reference must pass every "
+              "check and score highest, each variant must lose what it damaged. What catalog_promote "
+              "requires.")
+    :kind :read
+    :schema [:map [:room Room] [:name :string]]
+    :impl (fn [daemon {:keys [room name]}]
+            (when-let [r (resolve-room daemon room)]
+              (room-wf/calibrate (in-ctx daemon (room-wf/read-bundle r name)))))}
+
+   :catalog/promote
+   {:doc (str "Promote a room's workflow bundle on this host: it is calibrated now and, when "
+              "calibration holds, its verifier is trusted as :room (not :ad-hoc) on every Attempt "
+              "and Scorecard from then on. A changed bundle is new and must be promoted again.")
+    :kind :write
+    :schema [:map [:room Room] [:name :string]]
+    :impl (fn [daemon {:keys [room name]}]
+            (when-let [r (resolve-room daemon room)]
+              (room-wf/promote! (in-ctx daemon (room-wf/read-bundle r name)) (:slug r))))}
 
    :catalog/check
    {:doc (str "Check a workflow bundle in a room (workflows/<name>/: workflow.edn, checker.clj, "

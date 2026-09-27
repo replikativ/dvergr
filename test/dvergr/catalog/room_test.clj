@@ -107,3 +107,41 @@
                       (get-in (room-wf/experiment-plan (room-wf/bundle "competitors" files)
                                                        {:models ["claude-haiku-4-5"]})
                               [:capabilities :evaluator])))))))
+
+(def calibration
+  {:reference {"/out/competitors.md" "Wato\nPromptQL\nDust\nBuzz"}
+   :damaged {:one-missing {:files {"/out/competitors.md" "Wato\nPromptQL\nDust"} :loses [:found-all?]}
+             :empty {:files {} :loses [:wrote-list? :found-all?]}}})
+
+(deftest a-checker-earns-trust-by-calibration
+  (let [b (room-wf/bundle "competitors" (assoc files "calibration.edn" (pr-str calibration)))]
+    (testing "the reference passes and scores highest; every damage is noticed"
+      (let [c (room-wf/calibrate b)]
+        (is (:ok? c) (pr-str (:problems c)))
+        (is (= 1.0 (get-in c [:reference :reward])))
+        (is (every? :ok? (vals (:damaged c))))))
+    (testing "a checker that misses a damage does not calibrate"
+      (let [lenient (room-wf/bundle "competitors"
+                                    (assoc files
+                                           "calibration.edn" (pr-str calibration)
+                                           "checker.clj" "(ns c) (defn check [_] {:checks {:wrote-list? true :found-all? true} :reward 1.0})"))
+            c (room-wf/calibrate lenient)]
+        (is (not (:ok? c)))
+        (is (some #(re-find #"one-missing still passes" %) (:problems c)))))
+    (testing "without a calibration there is nothing to earn trust with"
+      (is (not (:ok? (room-wf/calibrate (room-wf/bundle "competitors" files))))))
+    (testing "promotion: calibrated now, recorded on the host, the verifier trusted as :room"
+      (let [prev (paths/home)]
+        (try
+          (paths/set-home! (str (System/getProperty "java.io.tmpdir") "/dvergr-promote-" (random-uuid)))
+          (is (= :ad-hoc (room-wf/tier b)))
+          (is (:promoted? (room-wf/promote! b "marketing")))
+          (is (= :room (room-wf/tier b)))
+          (is (= :room (evaluation/evaluator-tier (room-wf/evaluator b {}))))
+          (testing "a changed bundle is new and not promoted"
+            (is (= :ad-hoc (room-wf/tier (room-wf/bundle "competitors"
+                                                         (assoc files "calibration.edn" (pr-str calibration)
+                                                                "gold.edn" (pr-str {:competitors ["Wato"]})))))))
+          (testing "one that fails calibration is not promoted"
+            (is (false? (:promoted? (room-wf/promote! (room-wf/bundle "competitors" files) "marketing")))))
+          (finally (paths/set-home! prev)))))))
