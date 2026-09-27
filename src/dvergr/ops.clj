@@ -31,6 +31,7 @@
             [dvergr.agent.run :as run]
             [dvergr.agent.workflow :as workflow]
             [dvergr.catalog :as catalog]
+            [dvergr.catalog.room :as room-wf]
             [dvergr.agent.experiment.runner :as runner]
             [dvergr.agent.experiment.stats :as xstats]
             [dvergr.agent.spend :as spend]
@@ -275,7 +276,12 @@
                                 :repetitions (:experiment/repetitions exp)}
                :leaderboard    rows
                :cells          (count (:scorecard/entries sc))}
-        load-attempt (assoc :check-rates (check-rates (:scorecard/entries sc) load-attempt))
+        load-attempt (assoc :check-rates (check-rates (:scorecard/entries sc) load-attempt)
+                            ;; who vouches for the rewards: every tier among its Attempts
+                            :verifier-trust (vec (distinct (keep #(some-> (load-attempt (:attempt/id %))
+                                                                          :attempt/receipt :attempt/metrics
+                                                                          :verifier-trust name)
+                                                                 (:scorecard/entries sc)))))
         compare? (assoc :comparison (comparison (:scorecard/entries sc) rows baseline))
         full? (assoc :entries (mapv (fn [e]
                                       {:candidate (kw->str (:candidate/id e))
@@ -499,10 +505,143 @@
               (in-ctx daemon (experiment/progress r))))}
 
    :catalog/list
-   {:doc "Workflows that come with their own checker and benchmark set; run one with catalog_start."
+   {:doc (str "Workflows that come with their own checker and benchmark set; run one with catalog_start. "
+              "With `room`, also the workflows defined in that room (workflows/<name>/ in its "
+              "repository; benchmark one as \"<room>/<name>\").")
     :kind :read
-    :schema [:map]
-    :impl (fn [_daemon _] (mapv catalog/describe (vals catalog/workflows)))}
+    :schema [:map [:room {:optional true} Room]]
+    :impl (fn [daemon {:keys [room]}]
+            (into (mapv catalog/describe (vals catalog/workflows))
+                  (when-let [r (some->> room (resolve-room daemon))]
+                    (for [n (in-ctx daemon (room-wf/list-bundles r))
+                          :let [b (try (in-ctx daemon (room-wf/read-bundle r n)) (catch Exception _ nil))]]
+                      (cond-> {:id (str (:slug r) "/" n) :room (:slug r)}
+                        b (merge (select-keys (:definition b) [:title :doc :params :profile])
+                                 {:bundle (str (:id b)) :verifier (name (room-wf/tier b))})
+                        (nil? b) (assoc :problems ["not well formed; see catalog_check"]))))))}
+
+   :catalog/calibrate
+   {:doc (str "Calibrate a workflow bundle's checker (calibration.edn: a reference answer and "
+              "damaged variants, each naming the checks it damages): the reference must pass every "
+              "check and score highest, each variant must lose what it damaged. What catalog_promote "
+              "requires.")
+    :kind :read
+    :schema [:map [:room Room] [:name :string]]
+    :impl (fn [daemon {:keys [room name]}]
+            (when-let [r (resolve-room daemon room)]
+              (room-wf/calibrate (in-ctx daemon (room-wf/read-bundle r name)))))}
+
+   :catalog/promote
+   {:doc (str "Promote a room's workflow bundle on this host: it is calibrated now and, when "
+              "calibration holds, its verifier is trusted as :room (not :ad-hoc) on every Attempt "
+              "and Scorecard from then on. A changed bundle is new and must be promoted again.")
+    :kind :write
+    :schema [:map [:room Room] [:name :string]]
+    :impl (fn [daemon {:keys [room name]}]
+            (when-let [r (resolve-room daemon room)]
+              (room-wf/promote! (in-ctx daemon (room-wf/read-bundle r name)) (:slug r))))}
+
+   :catalog/export
+   {:doc (str "A room's workflow bundle to take elsewhere: {manifest, files}, the files by path "
+              "and a manifest with the bundle's content id, the dvergr version and its calibration "
+              "here. Install it with catalog_import on another dvergr, or run it from a directory "
+              "with `clojure -M -m dvergr.catalog.room-run <dir> --models …`. Trust does not "
+              "travel: the receiving host promotes it itself.")
+    :kind :read
+    :schema [:map [:room Room] [:name :string]]
+    :impl (fn [daemon {:keys [room name]}]
+            (when-let [r (resolve-room daemon room)]
+              (in-ctx daemon (room-wf/export r name))))}
+
+   :catalog/import
+   {:doc (str "Install a workflow export ({manifest, files}, from catalog_export) in a room as "
+              "workflows/<as or its name>/, committed; refused when the files are not the bundle the "
+              "manifest names. Its verifier is ad hoc here until promoted.")
+    :kind :write
+    :schema [:map [:room Room]
+             [:export [:map [:manifest :map] [:files [:map-of :string :string]]]]
+             [:as {:optional true} :string]]
+    :impl (fn [daemon {:keys [room export as]}]
+            (when-let [r (resolve-room daemon room)]
+              (let [export (update export :manifest #(update-keys % keyword))
+                    b (in-ctx daemon (room-wf/import! r export as))]
+                {:imported (str (:slug r) "/" (:name b)) :bundle (str (:id b))
+                 :verifier (name (room-wf/tier b))})))}
+
+   :catalog/deploy
+   {:doc (str "Deploy a room's workflow: a schedule in the room gives the bundle's task (its "
+              "params filled from `params`) to `agent`, a participant, on each fire, e.g. {every: "
+              "\"week\", on: \"monday\", at: \"09:00\"}. Pick the agent from the workflow's "
+              "Scorecard. The room's REPL lists and cancels it (dvergr.scheduler/list, cancel).")
+    :kind :write
+    :schema [:map [:room Room] [:name :string]
+             [:agent [:string {:description "the agent (a participant of the room) that runs it"}]]
+             [:every [:enum {:description "cadence"} "hour" "day" "week"]]
+             [:at {:optional true} [:string {:description "wall-clock time, HH:MM"}]]
+             [:on {:optional true} [:string {:description "day of the week, with every: week"}]]
+             [:params {:optional true} [:map-of :keyword :any]]]
+    :impl (fn [daemon {:keys [room name agent every at on params]}]
+            (when-let [r (resolve-room daemon room)]
+              (let [b (in-ctx daemon (room-wf/read-bundle r name))
+                    create! (requiring-resolve 'dvergr.scheduler.core/create-schedule!)
+                    id (in-ctx daemon
+                               (create! r {:agent-id (keyword agent)
+                                           :task (room-wf/task b params)
+                                           :schedule (cond-> {:every (keyword every)}
+                                                       at (assoc :at at)
+                                                       on (assoc :on (keyword on)))
+                                           :description (str "workflow " name " (" (subs (str (:id b)) 0 8) ")")}))]
+                {:schedule (str id) :workflow (str (:slug r) "/" name) :bundle (str (:id b))
+                 :agent agent})))}
+
+   :catalog/freeze
+   {:doc (str "Freeze a room's workflow into a stable benchmark: a new bundle (default "
+              "<name>-frozen) whose web is the pages its live Attempts in this room fetched "
+              "(web.edn), so every later attempt meets the same web and scores are comparable "
+              "over time. Search is lexical over those pages. Calibrate and promote it like any "
+              "bundle.")
+    :kind :write
+    :schema [:map [:room Room] [:name :string]
+             [:as {:optional true} [:string {:description "the frozen bundle's name (default <name>-frozen)"}]]]
+    :impl (fn [daemon {:keys [room name as]}]
+            (when-let [r (resolve-room daemon room)]
+              (in-ctx daemon
+                      (let [files (room-wf/bundle-files r name)
+                            b (room-wf/bundle name files)
+                            as (or as (str name "-frozen"))
+                            atts (attempts/attempts r {:environment-id (keyword "room-workflow" name) :limit 200})
+                            fetched (keep #(get-in % [:attempt/evidence :fetched]) atts)
+                            pages (room-wf/frozen-pages fetched)
+                            frozen (room-wf/freeze b files pages)]
+                        (catalog/seed! r (into {} (map (fn [[p t]] [(str "/workflows/" as "/" p) t])) frozen))
+                        (let [fb (room-wf/bundle as frozen)]
+                          {:frozen (str (:slug r) "/" as) :bundle (str (:id fb))
+                           :pages (count pages) :from-attempts (count fetched)})))))}
+
+   :catalog/check
+   {:doc (str "Check a workflow bundle in a room (workflows/<name>/: workflow.edn, checker.clj, "
+              "gold.edn, fixtures/): its problems, or its content id, task and fixtures when it is "
+              "well formed. With `answer` ({path text}, as an attempt would leave them under its "
+              "captured directories), also the checker's verdict on it: how to test a checker "
+              "before benchmarking with it.")
+    :kind :read
+    :schema [:map [:room Room] [:name :string]
+             [:answer {:optional true} [:map-of :string :string]]]
+    :impl (fn [daemon {:keys [room name answer]}]
+            (when-let [r (resolve-room daemon room)]
+              (let [files (in-ctx daemon (room-wf/bundle-files r name))
+                    problems (room-wf/check-files files)]
+                (if (seq problems)
+                  {:ok false :problems problems}
+                  (let [b (room-wf/bundle name files)]
+                    (cond-> {:ok true :bundle (str (:id b)) :title (get-in b [:definition :title])
+                             :task (room-wf/task b {}) :fixtures (vec (keys (:fixtures b)))
+                             :capture (get-in b [:definition :capture] ["/out"])}
+                      answer (assoc :verdict
+                                    (try (room-wf/run-checker (:checker b)
+                                                              {:files answer :gold (:gold b)
+                                                               :params (get-in b [:definition :params])})
+                                         (catch Exception e {:error (ex-message e)})))))))))}
 
    :job/status
    {:doc (str "A job's status, and its result once completed. `wait-ms` (at most 25000) "
@@ -787,7 +926,15 @@
              [:budget-dollars {:optional true} [:double {:description "budget per attempt in USD (default 0.50)"}]]
              [:timeout-ms {:optional true} [:int {:description "per attempt (default 10 minutes)"}]]]
     :impl (fn [daemon {:keys [workflow models repetitions room] :as args}]
-            (let [wf (catalog/lookup workflow)
+            (let [wf (or (get catalog/workflows (keyword workflow))
+                         ;; a workflow defined in a room: "<room>/<name>"
+                         (let [[_ rref n] (re-find #"^([^/]+)/([^/]+)$" workflow)
+                               r (or (some->> rref (resolve-room daemon))
+                                     (catalog/lookup workflow))
+                               b (in-ctx daemon (room-wf/read-bundle r n))]
+                           {:id (keyword (:slug r) n)
+                            :title (get-in b [:definition :title])
+                            :experiment-plan #(room-wf/experiment-plan b %)}))
                   plan-fn (or (:experiment-plan wf)
                               (throw (ex-info (str workflow " has no benchmark set") {:type ::no-benchmark})))
                   control (when room

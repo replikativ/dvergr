@@ -295,3 +295,76 @@
           (git! "apply" "room.patch")
           (is (= "(ns core)\n\n(defn answer [] 42)\n" (slurp (io/file src "src" "core.clj"))))))
       (finally (sh/sh "rm" "-rf" (.getPath src))))))
+
+(deftest a-workflow-defined-in-a-room-is-checked-listed-and-benchmarked
+  (let [room (:id (ops/invoke *daemon* :room/create {:title "Marketing" :slug "marketing"}))
+        r (ops/resolve-room *daemon* room)
+        bundle {"/workflows/competitors/workflow.edn"
+                (pr-str {:title "Competitors" :task "Write the competitors of {product} to /out/list.md."
+                         :params {:product "Simmis"} :capture ["/out"]})
+                "/workflows/competitors/checker.clj"
+                "(ns c (:require [clojure.string :as str]))
+                 (defn check [{:keys [files gold]}]
+                   (let [t (get files \"/out/list.md\" \"\")
+                         n (count (filter #(str/includes? t %) (:names gold)))]
+                     {:checks {:all? (= n (count (:names gold)))} :reward (double (/ n (count (:names gold))))}))"
+                "/workflows/competitors/gold.edn" (pr-str {:names ["Wato" "Dust"]})
+                "/workflows/competitors/calibration.edn"
+                (pr-str {:reference {"/out/list.md" "Wato, Dust"}
+                         :damaged {:half {:files {"/out/list.md" "Wato"} :loses [:all?]}}})
+                "/workflows/competitors/fixtures/docs/brief.md" "Simmis vs Wato and Dust."}]
+    (catalog/seed! r bundle)
+    (testing "catalog_check reports the bundle and runs its checker on an answer"
+      (let [c (ops/invoke *daemon* :catalog/check {:room "marketing" :name "competitors"
+                                                   :answer {"/out/list.md" "Wato"}})]
+        (is (:ok c) (pr-str c))
+        (is (= ["/docs/brief.md"] (:fixtures c)))
+        (is (= 0.5 (get-in c [:verdict :reward])))))
+    (testing "a broken bundle says why"
+      (catalog/seed! r {"/workflows/broken/workflow.edn" "{:title \"x\"}"})
+      (is (false? (:ok (ops/invoke *daemon* :catalog/check {:room "marketing" :name "broken"})))))
+    (testing "catalog_list with the room lists it, ad hoc until promoted"
+      (is (= "ad-hoc" (:verifier (first (filter #(= "marketing/competitors" (:id %))
+                                                (ops/invoke *daemon* :catalog/list {:room "marketing"})))))))
+    (testing "calibrated, then promoted by the owner's connection"
+      (is (:ok? (ops/invoke *daemon* :catalog/calibrate {:room "marketing" :name "competitors"})))
+      (is (:promoted? (ops/invoke *daemon* :catalog/promote {:room "marketing" :name "competitors"})))
+      (is (= "room" (:verifier (first (filter #(= "marketing/competitors" (:id %))
+                                              (ops/invoke *daemon* :catalog/list {:room "marketing"})))))))
+    (testing "catalog_benchmark runs it as \"<room>/<name>\""
+      (let [calls (atom 0)]
+        (with-redefs [providers/ensure-initialized! (constantly nil)
+                      chat-agent/messages->api-format (fn [messages _ _] messages)
+                      model-chat/chat (fn [messages _]
+                                        (swap! calls inc)
+                                        (if (not-any? #(= :tool-result (or (:role %) (:message/role %))) messages)
+                                          {:content "" :tool-calls [{:id (str "w" @calls) :name "write_file"
+                                                                     :input {:path "/out/list.md" :content "Wato, Dust"}}]
+                                           :usage {:input-tokens 500 :output-tokens 20} :stop-reason :tool-use}
+                                          {:content "Done." :tool-calls nil
+                                           :usage {:input-tokens 600 :output-tokens 5} :stop-reason :end-turn}))]
+          (let [started (ops/invoke *daemon* :catalog/benchmark
+                                    {:workflow "marketing/competitors" :models ["claude-haiku-4-5"]})
+                done (loop [n 0]
+                       (let [st (ops/invoke *daemon* :job/status {:job (:id started) :wait-ms 20000})]
+                         (if (or (not= "running" (:status st)) (< 8 n)) st (recur (inc n)))))]
+            (is (= "completed" (:status done)) (pr-str (dissoc done :result)))
+            (is (= 1.0 (get-in done [:result :summary 0 :reward-mean])))
+            (testing "exported, imported into another room, deployed there on a schedule"
+              (ops/invoke *daemon* :room/create {:title "Sales" :slug "sales"})
+              (let [export (ops/invoke *daemon* :catalog/export {:room "marketing" :name "competitors"})
+                    imported (ops/invoke *daemon* :catalog/import {:room "sales" :export export :as "rivals"})]
+                (is (= "sales/rivals" (:imported imported)))
+                (is (= (get-in export [:manifest :bundle]) (:bundle imported)))
+                (is (= "room" (:verifier imported)) "same content, same host: already promoted")
+                (let [d (ops/invoke *daemon* :catalog/deploy {:room "sales" :name "rivals" :agent "var"
+                                                              :every "week" :on "monday" :at "09:00"})
+                      rows ((requiring-resolve 'dvergr.scheduler.core/list-schedules)
+                            (ops/resolve-room *daemon* "sales"))]
+                  (is (:schedule d))
+                  (is (some #(clojure.string/includes? (str (:task %) (:schedule/task %)) "Simmis") rows)
+                      (pr-str rows)))))
+            (testing "and its Scorecard says who vouches for the rewards"
+              (let [[sc] (ops/invoke *daemon* :scorecard/list {:room (:room started)})]
+                (is (= ["room"] (:verifier-trust (ops/invoke *daemon* :scorecard/detail
+                                                             {:room (:room started) :id (:id sc)}))))))))))))

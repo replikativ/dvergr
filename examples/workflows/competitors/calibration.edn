@@ -1,0 +1,32 @@
+{:reference
+ {"/out/competitors.edn"
+  "[{:name \"Wato\" :url \"https://www.watolabs.com/\" :claim \"AI coworkers for teams\" :quote \"Wato is where your team and AI agents work together\" :source-url \"https://www.watolabs.com/\"}
+    {:name \"PromptQL\" :url \"https://promptql.io/\" :claim \"AI for business data\" :quote \"PromptQL builds a shared context wiki for your team\" :source-url \"https://promptql.io/\"}
+    {:name \"Dust\" :url \"https://dust.tt/\" :claim \"Agents for the enterprise\" :quote \"Build custom AI agents for your whole team\" :source-url \"https://dust.tt/\"}
+    {:name \"Buzz\" :url \"https://github.com/block/buzz\" :claim \"A relay for humans and agents\" :quote \"Buzz is a signed event log for teams of humans and agents\" :source-url \"https://github.com/block/buzz\"}]"}
+ :fetched {"https://www.watolabs.com/" "<p>Wato is where your team and AI agents work together.</p>"
+           "https://promptql.io/" "<h1>PromptQL builds a shared context wiki for your team</h1>"
+           "https://dust.tt/" "Build custom AI agents for your whole team."
+           "https://github.com/block/buzz" "Buzz is a signed event log for teams of humans and agents."}
+ :judgements {"wato" "Yes, it is." "promptql" "Yes." "dust" "Yes." "buzz" "Yes."}
+ :damaged
+ {:irrelevant {:files {"/out/competitors.edn" "[{:name \"Wato\" :url \"https://www.watolabs.com/\" :claim \"x\" :quote \"Wato is where your team and AI agents work together\" :source-url \"https://www.watolabs.com/\"}
+                                                {:name \"PromptQL\" :url \"https://promptql.io/\" :claim \"x\" :quote \"PromptQL builds a shared context wiki for your team\" :source-url \"https://promptql.io/\"}
+                                                {:name \"Dust\" :url \"https://dust.tt/\" :claim \"x\" :quote \"Build custom AI agents for your whole team\" :source-url \"https://dust.tt/\"}
+                                                {:name \"Buzz\" :url \"https://github.com/block/buzz\" :claim \"x\" :quote \"Buzz is a signed event log for teams of humans and agents\" :source-url \"https://github.com/block/buzz\"}
+                                                {:name \"Pizza Hut\" :url \"https://www.pizzahut.com/\" :claim \"x\" :quote \"Order pizza online for delivery or carryout\" :source-url \"https://www.pizzahut.com/\"}]"}
+               :fetched {"https://www.watolabs.com/" "Wato is where your team and AI agents work together."
+                         "https://promptql.io/" "PromptQL builds a shared context wiki for your team"
+                         "https://dust.tt/" "Build custom AI agents for your whole team."
+                         "https://github.com/block/buzz" "Buzz is a signed event log for teams of humans and agents."
+                         "https://www.pizzahut.com/" "Order pizza online for delivery or carryout."}
+               :judgements {"wato" "yes" "promptql" "yes" "dust" "yes" "buzz" "yes" "pizza hut" "No, it sells pizza."}
+               :loses [:all-relevant?]}
+  :missing-one {:files {"/out/competitors.edn" "[{:name \"Wato\" :url \"https://www.watolabs.com/\" :claim \"x\" :quote \"Wato is where your team and AI agents work together\" :source-url \"https://www.watolabs.com/\"}]"}
+                :loses [:found-reference?]}
+  :invented-quote {:files {"/out/competitors.edn" "[{:name \"Wato\" :url \"https://www.watolabs.com/\" :claim \"x\" :quote \"Wato replaces every tool your company has ever bought\" :source-url \"https://www.watolabs.com/\"}
+                                                    {:name \"PromptQL\" :url \"https://promptql.io/\" :claim \"x\" :quote \"PromptQL builds a shared context wiki for your team\" :source-url \"https://promptql.io/\"}
+                                                    {:name \"Dust\" :url \"https://dust.tt/\" :claim \"x\" :quote \"Build custom AI agents for your whole team\" :source-url \"https://dust.tt/\"}
+                                                    {:name \"Buzz\" :url \"https://github.com/block/buzz\" :claim \"x\" :quote \"Buzz is a signed event log for teams of humans and agents\" :source-url \"https://github.com/block/buzz\"}]"}
+                   :loses [:every-quote-fetched?]}
+  :nothing {:files {} :loses [:wrote-list? :found-reference?]}}}

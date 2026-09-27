@@ -22,7 +22,7 @@
   {:room/list :rooms, :room/detail :rooms, :room/create :rooms,
    :room/delete :rooms, :room/messages :rooms, :room/post :rooms
 
-   :room/unarchive :admin, :room/purge :admin
+   :room/unarchive :admin, :room/purge :admin, :catalog/promote :admin
 
    :room/fork :worlds, :room/diff :worlds, :room/review :worlds,
    :room/merge :worlds, :room/discard :worlds,
@@ -36,7 +36,8 @@
 
    :catalog/list :catalog, :catalog/start :catalog
 
-   :catalog/benchmark :bench, :experiment/progress :bench
+   :catalog/benchmark :bench, :catalog/check :bench, :catalog/calibrate :bench,
+   :catalog/export :bench, :catalog/import :bench, :catalog/deploy :bench, :catalog/freeze :bench, :experiment/progress :bench
 
    :room/wallet :wallets, :models/list :wallets
 
@@ -187,6 +188,10 @@
    :job/cancel       {:destructiveHint true  :idempotentHint true  :openWorldHint false}
    :catalog/start    {:destructiveHint false :idempotentHint false :openWorldHint true}
    :catalog/benchmark {:destructiveHint false :idempotentHint false :openWorldHint true}
+   :catalog/promote  {:destructiveHint false :idempotentHint true  :openWorldHint false}
+   :catalog/import   {:destructiveHint true  :idempotentHint true  :openWorldHint false}
+   :catalog/deploy   {:destructiveHint false :idempotentHint false :openWorldHint true}
+   :catalog/freeze   {:destructiveHint false :idempotentHint true  :openWorldHint false}
    :room/fork        {:destructiveHint false :idempotentHint false :openWorldHint false}
    :room/merge       {:destructiveHint true  :idempotentHint false :openWorldHint false}
    :room/discard     {:destructiveHint true  :idempotentHint true  :openWorldHint false}
