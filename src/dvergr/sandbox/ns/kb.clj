@@ -5,6 +5,7 @@
    datahike + spindel directly."
   (:require [dvergr.substrate.load :as load]
             [sci.core :as sci]
+            [clojure.string :as str]
             [datahike.api :as dh]
             [dvergr.runtime.ctx :as runtime-ctx]
             [org.replikativ.spindel.engine.core :as rtc]
@@ -64,13 +65,18 @@
 ;; (RF5: the calendar folded into the per-room scheduler — see `scheduler/*` +
 ;; `dvergr.room/schedules`. The standalone calendar subsystem is gone.)
 
+(def ^:private authorship-keys
+  "Message fields that name an author. The runtime sets them; `post!` refuses
+   them from the caller."
+  [:from :source-user :source-username :source-user-id])
+
 (defn room-ops-map
   "The unified Room-ops map — `create!`/`list`/`get`/`post!`/`messages`/`children`/
    `set-parent!`/`join!`/`leave!`/`delete!`/`fork!`/`merge!`/`discard!`/`diff`/
    `review`/`classify`/`forks`/`participants`/`root` — for the `dvergr.room` SCI
    namespace (mounted, merged with the DB surface, by `dvergr.sandbox.ns.room`).
    Persistent rooms + forks are behind one surface — same for agents, TUI, web."
-  [spindel-ctx & [agent-program-ceiling source-room]]
+  [spindel-ctx & [agent-program-ceiling source-room acting-agent]]
   (load/require! 'dvergr.discourse)
   (load/require! 'dvergr.rooms)
   (load/require! 'dvergr.room.registry)
@@ -142,14 +148,19 @@
                       (binding [rtc/*execution-context* (selected-ctx)]
                         (if where (rreg-list* :where where) (rreg-list*))))
         get-fn      resolve-room
-        post-fn     (fn [ref {:keys [content from source-user source-username source-user-id]}]
+        ;; The author is the acting identity from the runtime, never the
+        ;; caller's: code cannot post as a human or another agent
+        ;; (doc/effects.md, hardening 7). Without one (a bare sandbox) the
+        ;; message is the sandbox's own.
+        post-fn     (fn [ref {:keys [content] :as opts}]
+                      (when-let [claimed (seq (filter (set (keys opts)) authorship-keys))]
+                        (throw (ex-info (str "post! takes its author from the runtime; drop "
+                                             (str/join ", " claimed))
+                                        {:refused (vec claimed)})))
                       (if-let [room (resolve-room ref)]
                         (binding [rtc/*execution-context* (:ctx room)]
-                          (post* room (msg* (or from :user) nil content nil
-                                            (cond-> {}
-                                              source-user      (assoc :source-user source-user)
-                                              source-username  (assoc :source-username source-username)
-                                              source-user-id   (assoc :source-user-id source-user-id))))
+                          (post* room (msg* (or (when acting-agent (acting-agent)) :sandbox)
+                                            nil content nil {}))
                           {:posted-to (:id room) :content content})
                         {:error (str "Room not found: " ref)}))
         messages-fn (fn [ref & {:keys [limit since]}]
@@ -264,7 +275,7 @@
       '{create!      [([opts]) "Create a persistent room. `opts` takes :slug :title :agents. Rooms are the unit of work: each has its own git repo, knowledge base and schedules."]
         list         [([]) "Every room you can see, as maps."]
         get          [([ref]) "One room by slug or id, or nil."]
-        post!        [([ref {:keys [content]}]) "Post a message into a room — how you talk to the people and agents in it. `ref` is a slug or id; the message is a map, e.g. (dvergr.room/post! \"ops\" {:content \"deploy done\"})."]
+        post!        [([ref {:keys [content]}]) "Post a message into a room — how you talk to the people and agents in it. `ref` is a slug or id; the message is a map, e.g. (dvergr.room/post! \"ops\" {:content \"deploy done\"}). You are its author: `:from` and `:source-user…` are refused."]
         messages     [([ref] [ref opts]) "Recent messages in a room, OLDEST first (chronological; the last element is the newest). `opts` takes :limit (default 100 — the most recent n) and :since (a java.util.Date)."]
         children     [([ref]) "Rooms whose parent is this one."]
         set-parent!  [([child parent]) "Re-parent a room, building the room tree."]

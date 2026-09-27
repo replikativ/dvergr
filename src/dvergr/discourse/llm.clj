@@ -321,6 +321,7 @@
               chat-ctx
               (let [c (turn/new-working-ctx
                        {:execution-ctx  ctx
+                        :agent-id       id
                         :title          (str "agent " (name id))
                         :budget-dollars (:dollars budget 1.0)
                         :db-conn        db-conn})]

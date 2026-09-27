@@ -1348,8 +1348,8 @@
 
 (register!
  {:name "update_agent_profile"
-  :description "Rewrite an agent's system-prompt profile file (resources/agents/<name>.md).
-Use this to improve an agent's instructions based on observed performance.
+  :description "Rewrite your own system prompt (agent-name is your own id).
+Use this to improve your instructions based on observed performance.
 
 Only permitted for agents in resources/agents/. Pass the complete updated
 markdown content — the file will be overwritten in full.
@@ -1365,10 +1365,19 @@ Note: changes take effect on the next agent restart or reload."
                             :content    {:type "string"
                                          :description "Full markdown content to write to the profile file"}}
                :required ["agent-name" "content"]}
-  :execute (fn [{:keys [agent-name content]} _ctx]
+  :execute (fn [{:keys [agent-name content]} ctx]
              (cond
                (str/blank? agent-name)
                {:type :error :error "agent-name is required"}
+
+               ;; an agent rewrites its own prompt only (doc/effects.md,
+               ;; hardening 8); the host (no chat) and MCP connections keep reach
+               (let [me (some-> ctx :chat-ctx :agent-id)]
+                 (and (:chat-ctx ctx)
+                      (not= "mcp" (some-> me namespace))
+                      (not= agent-name (some-> me name))))
+               {:type :error :error (str "update_agent_profile changes the acting agent's own prompt only, not '"
+                                         agent-name "'")}
 
                (str/blank? content)
                {:type :error :error "content is required — pass the full profile markdown"}

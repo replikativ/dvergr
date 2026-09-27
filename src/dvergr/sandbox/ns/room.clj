@@ -97,12 +97,7 @@
                              [:* [:cat [:= :where] 'ifn?]]]]
                   [:vector Room]]
    'get          [:=> [:cat RoomRef] [:maybe Room]]
-   'post!        [:=> [:cat RoomRef [:map
-                                     [:content :string]
-                                     [:from {:optional true} :keyword]
-                                     [:source-user {:optional true} :string]
-                                     [:source-username {:optional true} :string]
-                                     [:source-user-id {:optional true} :int]]]
+   'post!        [:=> [:cat RoomRef [:map [:content :string]]]
                   [:or [:map [:posted-to :keyword] [:content :string]] ErrorResult]]
    'messages     [:=> [:cat RoomRef [:alt [:cat [:map [:limit {:optional true} :int]
                                                  [:since {:optional true} 'inst?]]]
@@ -193,6 +188,7 @@
                                  {:id (:room-runtime-id binding)
                                   :incarnation (:room-incarnation binding)})
                                source-room)
+        acting-agent   #(some-> binding-resolver (apply []) :agent-id)
         room-view      (when (or room-id room-conn)
                          (ns-datahike/world-connection
                           #(if-let [room-id (current-room-id)]
@@ -307,7 +303,7 @@
                         (binding [ec/*execution-context* (selected-ctx)]
                           (srooms/room-kb-conn (current-room-id) slug))))))
         room-map (merge (ns-kb/room-ops-map ctx agent-program-ceiling
-                                            current-source-room) ; create!/fork!/merge!/post!/messages/…
+                                            current-source-room acting-agent) ; create!/fork!/merge!/post!/messages/…
                         ;; Docs live HERE rather than only in these trailing
                         ;; comments: the comments never reached the sandbox, so
                         ;; `(clojure.repl/doc dvergr.room/kb-search)` answered

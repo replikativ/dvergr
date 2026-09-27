@@ -907,6 +907,22 @@
                              'lift!     [:=> [:cat SkillName :any :any] :string]
                              'promote!  [:=> [:cat SkillName :any :any] [:= true]]})))))
 
+(defn- acting-agent-fn
+  "The acting agent's id from the world binding, or nil for a sandbox with no
+   agent (the host, tests). MCP connections act as `:mcp/<profile>`."
+  [binding-resolver]
+  #(some-> binding-resolver (apply []) :agent-id))
+
+(defn- full-reach?
+  "An MCP connection (the owner's, within its selection) and host code keep
+   their reach; an agent's global writes are scoped to itself (doc/effects.md,
+   hardening 8)."
+  [acting]
+  (or (nil? acting) (= "mcp" (namespace acting))))
+
+(defn- refuse! [msg data]
+  (throw (ex-info msg (assoc data :refused true))))
+
 (defn add-actors-ns!
   "Expose the durable actor table as 'actors namespace in SCI.
 
@@ -932,9 +948,10 @@
      (actors/update! :scribe {:skills #{:prose :writing}})
      (actors/add-skill! :scribe :prose)
      (actors/remove-skill! :scribe :writing)"
-  [sci-ctx conn]
+  [sci-ctx conn & [binding-resolver]]
   (load/require! 'dvergr.actors)
-  (let [list-fn         @(ns-resolve 'dvergr.actors 'list-actors)
+  (let [acting          (acting-agent-fn binding-resolver)
+        list-fn         @(ns-resolve 'dvergr.actors 'list-actors)
         lookup-fn       @(ns-resolve 'dvergr.actors 'lookup)
         online?-fn      @(ns-resolve 'dvergr.actors 'online?)
         spawn-agent-fn  @(ns-resolve 'dvergr.actors 'spawn-agent!)
@@ -942,18 +959,44 @@
         dismiss-fn      @(ns-resolve 'dvergr.actors 'dismiss!)
         update-fn       @(ns-resolve 'dvergr.actors 'update-actor!)
         add-skill-fn    @(ns-resolve 'dvergr.actors 'add-skill!)
-        remove-skill-fn @(ns-resolve 'dvergr.actors 'remove-skill!)]
+        remove-skill-fn @(ns-resolve 'dvergr.actors 'remove-skill!)
+        ;; An agent writes its own row and the rows of agents it spawned
+        ;; (recorded as `:spawned-by` in their config), nothing else.
+        own!  (fn [id]
+                (let [me (acting)]
+                  (when-not (or (full-reach? me)
+                                (= id me)
+                                (= me (get-in (lookup-fn conn id) [:config :spawned-by])))
+                    (refuse! (str (name me) " may change only its own actor row and agents it spawned, not " id)
+                             {:actor id :acting me}))))
+        spawn! (fn [opts]
+                 (let [me (acting)]
+                   (if (full-reach? me)
+                     (spawn-agent-fn conn opts)
+                     (do
+                       ;; spawn-agent! upserts: an existing id is not a new agent
+                       (when (lookup-fn conn (:id opts))
+                         (refuse! (str (:id opts) " exists; spawn-agent! creates a new agent")
+                                  {:actor (:id opts) :acting me}))
+                       (spawn-agent-fn conn (assoc-in opts [:config :spawned-by] me))))))]
     (sci/add-namespace! sci-ctx 'dvergr.actors
                         (doc/with-docs
                           {'list          (fn [& kvs] (apply list-fn conn kvs))
                            'lookup        (fn [id]      (lookup-fn conn id))
                            'online?       (fn [id]      (online?-fn id))
-                           'spawn-agent!  (fn [opts]    (spawn-agent-fn conn opts))
-                           'spawn-human!  (fn [opts]    (spawn-human-fn conn opts))
-                           'dismiss!      (fn [id]      (dismiss-fn conn id))
-                           'update!       (fn [id patch] (update-fn conn id patch))
-                           'add-skill!    (fn [id skill] (add-skill-fn conn id skill))
-                           'remove-skill! (fn [id skill] (remove-skill-fn conn id skill))}
+                           'spawn-agent!  spawn!
+                           ;; a human actor maps channel identities (e.g. a
+                           ;; Telegram id) onto a person: the owner's to do
+                           'spawn-human!  (fn [opts]
+                                            (let [me (acting)]
+                                              (when-not (full-reach? me)
+                                                (refuse! "spawn-human! is for the room's owner, not an agent"
+                                                         {:acting me}))
+                                              (spawn-human-fn conn opts)))
+                           'dismiss!      (fn [id]      (own! id) (dismiss-fn conn id))
+                           'update!       (fn [id patch] (own! id) (update-fn conn id patch))
+                           'add-skill!    (fn [id skill] (own! id) (add-skill-fn conn id skill))
+                           'remove-skill! (fn [id skill] (own! id) (remove-skill-fn conn id skill))}
                           (with-schemas
                             '{list          [([] [& {:keys [kind status]}]) "Every DURABLE actor the system knows — including offline and retired ones (contrast dvergr.agents/list, which is who is alive now). Filter with :kind (:agent/:human) and :status (e.g. :online, :retired)."]
                               lookup        [([id]) "The durable row for one actor id, or nil. Persisted state, not runtime state."]
@@ -996,20 +1039,32 @@
      (tasks/accept!   task-uuid)
      (tasks/complete! task-uuid \"done — here's what I found\")
      (tasks/ignore!   task-uuid)"
-  [sci-ctx conn]
+  [sci-ctx conn & [binding-resolver]]
   (load/require! 'dvergr.orchestration.tasks)
-  (let [list-fn     @(ns-resolve 'dvergr.orchestration.tasks 'list-tasks)
+  (let [acting      (acting-agent-fn binding-resolver)
+        list-fn     @(ns-resolve 'dvergr.orchestration.tasks 'list-tasks)
         lookup-fn   @(ns-resolve 'dvergr.orchestration.tasks 'lookup)
         accept-fn   @(ns-resolve 'dvergr.orchestration.tasks 'accept!)
         complete-fn @(ns-resolve 'dvergr.orchestration.tasks 'complete!)
-        ignore-fn   @(ns-resolve 'dvergr.orchestration.tasks 'ignore!)]
+        ignore-fn   @(ns-resolve 'dvergr.orchestration.tasks 'ignore!)
+        ;; An agent settles tasks assigned to it, dispatched by it, or posted
+        ;; in the room it works in; another room's (or a person's) are not its.
+        ours! (fn [id]
+                (let [me (acting)]
+                  (when-not (full-reach? me)
+                    (let [{:keys [actor-id from-actor room-id]} (lookup-fn conn id)
+                          here (some-> binding-resolver (apply []) :room-runtime-id)]
+                      (when-not (or (= me actor-id) (= me from-actor)
+                                    (and here (= here room-id)))
+                        (refuse! (str (name me) " may settle only its own tasks and its room's")
+                                 {:task id :acting me}))))))]
     (sci/add-namespace! sci-ctx 'dvergr.tasks
                         (doc/with-docs
                           {'list      (fn [& kvs] (apply list-fn conn kvs))
                            'lookup    (fn [id]    (lookup-fn conn id))
-                           'accept!   (fn [id]    (accept-fn conn id))
-                           'complete! (fn [id r]  (complete-fn conn id r))
-                           'ignore!   (fn [id]    (ignore-fn conn id))}
+                           'accept!   (fn [id]    (ours! id) (accept-fn conn id))
+                           'complete! (fn [id r]  (ours! id) (complete-fn conn id r))
+                           'ignore!   (fn [id]    (ours! id) (ignore-fn conn id))}
                           (with-schemas
                             '{list      [([] [& {:keys [actor-id status]}]) "The shared task ledger — persistent rows for work dispatched to non-agent actors (humans). Filter with :actor-id and :status (e.g. :pending). Agents themselves just react to inbox messages and need no task row."]
                               lookup    [([id]) "One task by its uuid, or nil."]

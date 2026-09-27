@@ -278,6 +278,7 @@
                     {:execution-ctx  (:ctx room)
                      :chat-id        (stable-chat-id room-id agent-id)
                      :title          (str (name agent-id) "-" (name room-id))
+                     :agent-id       agent-id
                      :budget-dollars budget-dollars
                         ;; RF5 S4: the cost ledger (account-usage!) writes to THIS
                         ;; room's own msgs store — per-room, fork-aware — not the
