@@ -418,7 +418,8 @@
     :attempt/interpreter-version :attempt/prompt-id
     :attempt/model-resolution :attempt/model-steps
     :attempt/evidence-content-id :attempt/settlement-intent
-    :attempt/microdollars :attempt/experiment-content-id :attempt/experiment-candidate
+    :attempt/microdollars :attempt/notional-microdollars
+    :attempt/experiment-content-id :attempt/experiment-candidate
     {:attempt/run [:run/id]}
     {:attempt/evidence-runs [:run/id]}
     {:attempt/evidence-messages [:message/id]}
@@ -527,6 +528,8 @@
       (:model-steps metrics) (assoc :attempt/model-steps (long (:model-steps metrics)))
       (get-in metrics [:spend :microdollars])
       (assoc :attempt/microdollars (long (get-in metrics [:spend :microdollars])))
+      (get-in metrics [:spend :notional-microdollars])
+      (assoc :attempt/notional-microdollars (long (get-in metrics [:spend :notional-microdollars])))
       (:experiment-content-id metrics)
       (assoc :attempt/experiment-content-id (:experiment-content-id metrics))
       (:experiment-candidate metrics)
@@ -602,6 +605,7 @@
                                     ;; checked where an Attempt has them.
                                     (select-keys
                                      {:attempt/microdollars (get-in metrics [:spend :microdollars])
+                                      :attempt/notional-microdollars (get-in metrics [:spend :notional-microdollars])
                                       :attempt/experiment-content-id (:experiment-content-id metrics)
                                       :attempt/experiment-candidate (:experiment-candidate metrics)}
                                      (keys entity)))]

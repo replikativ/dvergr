@@ -866,6 +866,11 @@
     :db/cardinality :db.cardinality/one
     :db/doc "What the Attempt's model calls cost, in microdollars (0 when unpriced)"}
 
+   {:db/ident :attempt/notional-microdollars
+    :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one
+    :db/doc "What the Attempt's tokens are worth at list price, in microdollars, when a subscription model made them (dvergr.agent.spend)"}
+
    {:db/ident :attempt/experiment-content-id
     :db/valueType :db.type/uuid
     :db/cardinality :db.cardinality/one
