@@ -440,6 +440,28 @@
   (binding [ec/*execution-context* ctx]
     (ec/get-state world-path)))
 
+(defn set-world-recording!
+  "Name `id` as the recording of the world `ctx`, for host code that reads
+   what the world did (an evaluator's capture)."
+  [ctx id]
+  (binding [ec/*execution-context* ctx]
+    (ec/swap-state! [:dvergr/effects :recording] (constantly id))))
+
+(defn world-recording
+  "The entries recorded in the world `ctx` (`recorded`), or nil."
+  [ctx]
+  (when-let [id (binding [ec/*execution-context* ctx] (ec/get-state [:dvergr/effects :recording]))]
+    (try (recorded id) (catch clojure.lang.ExceptionInfo _ nil))))
+
+(defn fetched-pages
+  "The pages a recording shows fetched: `{url body}` of its successful GET
+   requests with a text body."
+  [entries]
+  (into {} (for [{[kind resource] :key value :value} entries
+                 :when (and (= :http/request kind) (= :get (:method resource))
+                            (string? (:body value)) (< (or (:status value) 500) 400))]
+             [(:url resource) (:body value)])))
+
 (defn environment-handlers!
   "Host-side: the handler configuration an environment's `:world :effects`
    asks for, with the state it needs created. Portable data in, `{:specs

@@ -88,6 +88,12 @@ clojure -M -m dvergr.catalog.room-run path/to/competitors --check
 clojure -M -m dvergr.catalog.room-run path/to/competitors --models claude-haiku-4-5,codex-subscription-luna --repetitions 2
 ```
 
+A bundle with `:fetched true` in `workflow.edn` records its Attempts' effects (`:world
+:effects {:record true}`), and its checker is given `:fetched {url body}`: the successful GET
+responses of the Attempt (at most 40 pages, 200,000 characters each). A citation counts only
+if the Attempt fetched the page. `calibration.edn` may give `:fetched` for its reference and
+variants.
+
 `catalog_deploy {room name agent every on? at? params?}` schedules the bundle's task for an
 agent of the room (the Scorecard's pick); the room's REPL lists and cancels it
 (`dvergr.scheduler/list`, `cancel`).

@@ -605,10 +605,14 @@
                 ;; world, the candidate's sandbox and an external agent's MCP
                 ;; eval alike. The same seed for every Attempt: candidates meet
                 ;; the same faults, so comparisons stay paired.
+                ;; Registered before the capture below, so released after it
+                ;; (cleanup is LIFO): a capture may read the world's recording.
                 (when world-effects
-                  (let [{:keys [specs release]} (effects/environment-handlers! world-effects)]
+                  (let [{:keys [specs release recording]} (effects/environment-handlers! world-effects)
+                        world (:ctx (:room context))]
                     ((:register-cleanup! context) (fn [] (release) nil))
-                    (effects/install-world! (:ctx (:room context)) specs)))
+                    (effects/install-world! world specs)
+                    (when recording (effects/set-world-recording! world recording))))
                 (when-let [capture (:capture evaluator)]
                   ;; Register first: supervisor cleanup is LIFO, so capture
                   ;; sees the final substrate after other resource cleanup.

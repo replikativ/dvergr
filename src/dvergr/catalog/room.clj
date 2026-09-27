@@ -5,13 +5,14 @@
 
      workflow.edn   {:title :doc :task \"… {param} …\" :params {…} :profile
                      :capture [\"/out\"] :timeout-ms}
-     checker.clj    a namespace defining (check {:files :params :gold})
+     checker.clj    a namespace defining (check {:files :fetched :params :gold})
                     → {:checks {k bool} :reward 0..1}
      gold.edn       optional: the reference facts the checker scores against
      fixtures/…     the files each attempt's world starts with (at the root:
                     fixtures/docs/a.md → /docs/a.md)
-     calibration.edn optional: {:reference {path text} :damaged {name {:files
-                    {path text} :loses [check …]}}}, how the checker earns
+     calibration.edn optional: {:reference {path text} :fetched {url body}
+                    :damaged {name {:files {path text} :fetched {…} :loses
+                    [check …]}}}, how the checker earns
                     trust (`calibrate`, `promote!`)
 
    The checker runs in SCI with no effects: it is given the files the attempt
@@ -26,6 +27,7 @@
             [dvergr.agent.roster :as roster]
             [dvergr.agent.workflow :as workflow]
             [dvergr.catalog.workspace :as ws]
+            [dvergr.effects :as effects]
             [dvergr.sandbox :as sandbox]
             [hasch.core :as hasch]
             [malli.core :as m]
@@ -41,6 +43,8 @@
    [:params {:optional true} [:map-of :keyword :any]]
    [:profile {:optional true} :string]
    [:capture {:optional true} [:vector [:re #"^/[^.]*$"]]]
+   ;; give the checker the pages the attempt fetched (`:fetched {url body}`)
+   [:fetched {:optional true} :boolean]
    [:timeout-ms {:optional true} [:int {:min 1000}]]])
 
 (def Verdict
@@ -166,13 +170,15 @@
    :problems [...]}`."
   [{:keys [checker gold calibration definition id]}]
   (let [params (:params definition)
-        run #(run-checker checker {:files % :gold gold :params params})]
+        run (fn [files fetched]
+              (run-checker checker {:files files :fetched (or fetched (:fetched calibration) {})
+                                    :gold gold :params params}))]
     (if-not (:reference calibration)
       {:ok? false :bundle (str id) :problems ["calibration.edn has no :reference answer"]}
-      (let [reference (run (:reference calibration))
+      (let [reference (run (:reference calibration) nil)
             damaged (into (sorted-map)
-                          (for [[k {:keys [files loses]}] (:damaged calibration)
-                                :let [v (run files)
+                          (for [[k {:keys [files fetched loses]}] (:damaged calibration)
+                                :let [v (run files fetched)
                                       kept (vec (filter #(get-in v [:checks %]) loses))]]
                             [k {:verdict v :kept kept
                                 :ok? (boolean (and (empty? kept) (seq loses)
@@ -246,6 +252,16 @@
                  (ws/seed! world fixtures)
                  {:fixtures digest :files (count fixtures)})})))
 
+(def ^:private max-page-chars
+  "A fetched page is kept to this many characters as evidence."
+  200000)
+
+(defn- bounded-pages
+  "At most 40 pages, each cut to `max-page-chars`: the evidence is stored with
+   the Attempt."
+  [pages]
+  (into {} (map (fn [[u b]] [u (subs b 0 (min (count b) max-page-chars))])) (take 40 pages)))
+
 (defn evaluator
   "The bundle's checker as an Evaluator: it captures the files under the
    bundle's `:capture` directories and runs the checker on them. `tier` is
@@ -257,11 +273,15 @@
      {:id (verifier-id b) :version 1 :tier (or tier (dvergr.catalog.room/tier b))
       :basis {:bundle (str id)}
       :capture (fn [{world :world/room}]
-                 {:files (into {} (map #(ws/read-tree world %)) dirs)})
+                 (cond-> {:files (into {} (map #(ws/read-tree world %)) dirs)}
+                   (:fetched definition)
+                   (assoc :fetched (bounded-pages (effects/fetched-pages (effects/world-recording (:ctx world)))))))
       :observe (fn [{:keys [default result] captured :execution/evidence}]
-                 (assoc default :run-status (:run/status result) :files (:files captured)))
-      :verify (fn [_ {:keys [run-status files]}]
-                (let [{:keys [checks reward]} (run-checker checker {:files files :params params :gold gold})]
+                 (assoc default :run-status (:run/status result) :files (:files captured)
+                        :fetched (:fetched captured {})))
+      :verify (fn [_ {:keys [run-status files fetched]}]
+                (let [{:keys [checks reward]} (run-checker checker {:files files :fetched fetched
+                                                                    :params params :gold gold})]
                   {:checks (assoc checks :completed? (= :completed run-status))
                    :reward (if (= :completed run-status) reward 0.0)}))})))
 
@@ -275,8 +295,10 @@
       :verifier {:id (:verifier/id ref) :version (:verifier/version ref) :basis (:verifier/basis ref)}
       :limits {:timeout-ms (or timeout-ms (:timeout-ms definition) (* 10 60 1000))
                :cancel-timeout-ms 30000 :on-timeout :verdict}
-      :world {:isolation :ctx :settlement :discard
-              :setup (evaluation/world-setup-ref setup)}
+      :world (cond-> {:isolation :ctx :settlement :discard
+                      :setup (evaluation/world-setup-ref setup)}
+               ;; the checker is given what the attempt fetched: record it
+               (:fetched definition) (assoc :effects {:record true}))
       :metadata {:bundle (str (:id b))}})))
 
 (defn experiment-plan

@@ -9,6 +9,7 @@
             [dvergr.catalog.room :as room-wf]
             [dvergr.catalog.workspace :as ws]
             [dvergr.discourse :as d]
+            [dvergr.effects :as effects]
             [dvergr.room.store.memory :as memory]
             [dvergr.chat.agent :as chat-agent]
             [dvergr.model.chat :as model-chat]
@@ -176,3 +177,35 @@
             (spit (io/file dir p) t))
           (is (= (:bundle manifest) (str (:id (room-wf/read-dir dir)))))
           (doseq [f (reverse (file-seq (.getParentFile dir)))] (.delete f)))))))
+
+(deftest a-checker-can-be-given-the-pages-the-attempt-fetched
+  (let [fs {"workflow.edn" (pr-str {:title "Quotes" :task "Quote a page." :capture ["/out"] :fetched true})
+            "checker.clj" "(ns q (:require [clojure.string :as str]))
+                           (defn check [{:keys [files fetched]}]
+                             (let [quote (get files \"/out/quote.md\" \"\")
+                                   ok (boolean (some #(str/includes? % quote) (vals fetched)))]
+                               {:checks {:quote-fetched? ok} :reward (if ok 1.0 0.0)}))"
+            "fixtures/README.md" "Quote a page."}
+        b (room-wf/bundle "quotes" fs)
+        room (d/make-room {:id :room-workflow-fetched :store (memory/make)})]
+    (testing "the environment records the attempt's effects"
+      (let [plan (room-wf/experiment-plan b {:models ["claude-haiku-4-5"]})]
+        (is (= {:record true} (get-in plan [:environments 0 :environment/world :effects])))))
+    (ws/ensure-workspace! room)
+    (ws/seed! room {"/out/quote.md" "the page says hello"})
+    (let [r (effects/recording!)
+          boundary (constantly {:handlers (effects/handlers [[:record {:id r}]])})
+          get! #(effects/perform! boundary {:effect :http/request :resource {:method :get :url %1}}
+                                  (constantly {:status %2 :headers {} :body %3}))]
+      (get! "https://example.test/a" 200 "<p>the page says hello</p>")
+      (get! "https://example.test/missing" 404 "not found")
+      (effects/set-world-recording! (:ctx room) r)
+      (let [ev (room-wf/evaluator b {})
+            captured ((:capture ev) {:world/room room})]
+        (is (= {"https://example.test/a" "<p>the page says hello</p>"} (:fetched captured))
+            "successful GETs only")
+        (is (= 1.0 (:reward ((:verify ev) nil {:run-status :completed :files (:files captured)
+                                               :fetched (:fetched captured)}))))
+        (is (= 0.0 (:reward ((:verify ev) nil {:run-status :completed :files (:files captured) :fetched {}})))
+            "a quote from a page not fetched does not count"))
+      (effects/release! r))))
