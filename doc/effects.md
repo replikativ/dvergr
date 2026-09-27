@@ -160,8 +160,25 @@ reports thread CPU and wall time (`:meter`), and `clojure_eval` records it as an
 receipt (recorded, not charged).
 
 Not routed, and why: database queries (a query reads an immutable value of a database the
-world already holds); the mailbox is a connection handle (reads). **Next**: `can?` and the
-cross-room policy (step 3), then replay and faults as answering handlers.
+world already holds); the mailbox is a connection handle (reads).
+
+**Authority** (step 3, `dvergr.authority`): `can? relations subject action resource`, shaped
+like simmis's `is.simm.model.access/can?` and pure over a relations value (the room registry's
+fork/nesting parents and participants), so eacl can answer behind the same signature later.
+Actions as in simmis, weakest first: `:read`, `:write` (including writing a fork), `:merge`,
+`:admin` (discard, delete). An agent may read, write and merge on its own room and everything
+beneath it (forks and nested rooms, transitively), discard or delete what is beneath its room
+(never the room itself), and read and write rooms it takes part in; anything else is denied
+until grants exist. Re-parenting needs `:admin` on the room moved, so it cannot be used to gain
+authority. The authority filter is a **predicate filter**: it composes by conjunction (once is
+enough) and sits after the class filter; the runtime adds it for every agent subject, so no
+configuration removes it; MCP connections and the host keep their reach. Laws (the action
+ladder, monotonicity in relations, authority carrying down the tree) are test.check
+properties (`test/dvergr/authority_test.clj`).
+
+An agent that creates a room keeps it by taking part in it (`:agents`) or nesting it
+(`:parent-id`) under its own. **Next**: grants (eacl), replay and faults as answering
+handlers.
 
 ### How modes answer the goals
 
@@ -201,7 +218,7 @@ for tool calls. The effect vocabulary and `can?` resource shapes are shared.
    through it namespace by namespace, starting with network and files. Eval metering as a
    recorded resource.
 3. **Authority and read-only**: the `can?` seam over existing relations, cross-room effects
-   decided by it; `:read-only`.
+   decided by it; `:read-only`. (Done; grants pending.)
 4. **Replay** (and trajectory export from receipts).
 5. **Faults** as a benchmark knob.
 6. **Preflight**, then beichte for static purity.

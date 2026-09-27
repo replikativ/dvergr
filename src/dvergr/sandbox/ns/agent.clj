@@ -914,13 +914,6 @@
   [binding-resolver]
   #(some-> binding-resolver (apply []) :agent-id))
 
-(defn- full-reach?
-  "An MCP connection (the owner's, within its selection) and host code keep
-   their reach; an agent's global writes are scoped to itself (doc/effects.md,
-   hardening 8)."
-  [acting]
-  (or (nil? acting) (= "mcp" (namespace acting))))
-
 (defn- refuse! [msg data]
   (throw (ex-info msg (assoc data :refused true))))
 
@@ -965,14 +958,14 @@
         ;; (recorded as `:spawned-by` in their config), nothing else.
         own!  (fn [id]
                 (let [me (acting)]
-                  (when-not (or (full-reach? me)
+                  (when-not (or (effects/full-reach? me)
                                 (= id me)
                                 (= me (get-in (lookup-fn conn id) [:config :spawned-by])))
                     (refuse! (str (name me) " may change only its own actor row and agents it spawned, not " id)
                              {:actor id :acting me}))))
         spawn! (fn [opts]
                  (let [me (acting)]
-                   (if (full-reach? me)
+                   (if (effects/full-reach? me)
                      (spawn-agent-fn conn opts)
                      (do
                        ;; spawn-agent! upserts: an existing id is not a new agent
@@ -990,7 +983,7 @@
                            ;; Telegram id) onto a person: the owner's to do
                            'spawn-human!  (fn [opts]
                                             (let [me (acting)]
-                                              (when-not (full-reach? me)
+                                              (when-not (effects/full-reach? me)
                                                 (refuse! "spawn-human! is for the room's owner, not an agent"
                                                          {:acting me}))
                                               (spawn-human-fn conn opts)))
@@ -1052,7 +1045,7 @@
         ;; in the room it works in; another room's (or a person's) are not its.
         ours! (fn [id]
                 (let [me (acting)]
-                  (when-not (full-reach? me)
+                  (when-not (effects/full-reach? me)
                     (let [{:keys [actor-id from-actor room-id]} (lookup-fn conn id)
                           here (some-> binding-resolver (apply []) :room-runtime-id)]
                       (when-not (or (= me actor-id) (= me from-actor)
