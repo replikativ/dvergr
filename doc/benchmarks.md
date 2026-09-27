@@ -395,6 +395,59 @@ long annotated list, lost half the clause; 7 of 16 answers did. A quote now matc
 overlaps, contains or lies inside an annotated span (the README has the bounds). Under the
 first checker both scored 0.875.
 
+## AutomationBench (an adapter)
+
+Zapier's AutomationBench (https://github.com/zapier/AutomationBench, pinned at `4a8e106`):
+600 scored business workflows (100 each in sales, marketing, operations, support, finance,
+hr; `simple`, 200 more, is a tool-use baseline outside the score) over 47 simulated SaaS
+apps. A task is a prompt, an initial world and assertions on the final world; there is no
+simulated user and no judge.
+
+It is the first benchmark here that is **not transcribed**: the simulated apps are ~85k lines
+of Python and the rubric ~350 assertion types, too much to port and to keep in step with
+upstream. Instead upstream's own code runs behind a stateless service
+(`benchmarks/resources/benchmarks/automationbench/sidecar.py`, JSON lines over a pipe) and
+dvergr owns the episode (`dvergr.benchmarks.automationbench.{sidecar,provider,experiment}`):
+
+| | |
+| --- | --- |
+| World | upstream's `WorldState` as JSON, kept in the Run's forked world; every call sends it and gets the new one back |
+| Protocol | upstream's loop: the task's system and user prompt, the toolset's tools (`api`, upstream's default: `api_search`, `api_fetch`, `base64_encode`), model steps until a reply without tool calls or 50 steps |
+| Tools | upstream's functions, schemas as its runner shows them (the injected `world` hidden), `{}` arguments dropped, a failed call's text `f"{e}"` |
+| Grade | upstream's `partial_credit` (the reward) and `task_completed_correctly` (the check `:passed`), plus a check per failed assertion type |
+| Certification | the verifier replays the recorded calls in one process on one world, as upstream's runner would, and checks that world is the one the Run kept (`:world-replays`) |
+
+What makes the replay exact: upstream's worlds take wall-clock defaults
+(`default_factory=datetime.now`) and random ids (`uuid4`), so two builds of one task differ.
+The service makes each world at a recorded instant with the clock frozen (`time-machine`)
+and randomness seeded by task and call index; the Attempt records the instants. Verified:
+all 800 initial worlds survive the JSON round trip unchanged and grade identically through
+it; a stateless episode that mutates (a Gmail send) ends in the world a one-process replay
+makes; scripted candidates through `evaluate` (do the task: 1.0, `:world-replays`; do
+nothing or the wrong thing: 0.0, with the failed assertion named)
+(`benchmarks/test/dvergr/benchmarks/automationbench_test.clj`, skipped without the checkout).
+
+First live run (2026-09-28, Luna on the Codex subscription, one task per domain, `api`
+toolset): 1 of 6 passed (sales), mean partial credit 0.56, 2.05M input tokens (1.79M cached)
+for $0.075 per task at list prices. Every Attempt's world replayed. Where it lost: Gmail
+messages to the wrong recipient or without the required content (hr, finance, marketing),
+a sheet row not written (hr, finance), a Slack post into a channel it should have left
+alone (support), and 50 model steps without the Drive and Notion actions (operations).
+For scale, upstream's public-set leaderboard has GPT-5.6 Terra at 37% and Sol at 46%, at
+maximum reasoning effort.
+
+Not done: a Dvergr-harness candidate (the REPL action space, where `api_fetch` becomes a
+sandbox function over the same world); the `zapier` meta-tool toolset; the private held-out
+set, which upstream does not release.
+
+Setup: `benchmarks/resources/benchmarks/automationbench/README.md`. Run:
+
+```clojure
+(require '[dvergr.benchmarks.automationbench.experiment :as abx])
+(abx/run! {:dir ".dvergr/benchmarks/ab-smoke" :domains abx/public-domains :sample 1
+           :candidates [{:id :luna :model "codex-subscription-luna"}]})
+```
+
 ## BFCL v4 (single-turn, Python)
 
 The Berkeley Function Calling Leaderboard, pinned at gorilla `6ea5797`
