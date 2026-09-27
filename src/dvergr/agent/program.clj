@@ -19,6 +19,7 @@
             [dvergr.room.store :as room-store]
             [dvergr.system.rooms :as system-rooms]
             [dvergr.tools :as tools]
+            [datahike.api :as dh]
             [hasch.core :as hasch]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
@@ -690,6 +691,15 @@
         budget-dollars (min (double budget-dollars)
                             (double (or (:budget-dollars limits)
                                         budget-dollars)))
+        ;; the one ledger (doc/unified-worlds.md, step 4): a Run allocated
+        ;; microdollars spends its wallet, and a resumed Run what the stopped one
+        ;; left, not a fresh budget
+        spend-wallet (resource/spend-wallet control-room run-id)
+        budget-dollars (cond-> budget-dollars
+                         spend-wallet
+                         (min (/ (double (resource/wallet-microdollars control-room run-id)) 1e6))
+                         (::resume agent)
+                         (-> (- (/ (double (or (get-in agent [::resume :spent]) 0)) 1e6)) (max 0.0)))
         effective-limits {:max-model-steps max-model-steps
                           :budget-dollars budget-dollars}]
     (sp/spin
@@ -762,6 +772,7 @@
                   supervisor
                   (fn []
                     (binding [chat-agent/*turn-failure* failure
+                              resource/*spend-wallet* spend-wallet
                               resource/*model-scope*
                               (some-> (resource/model-scope control-room run-id)
                                       (assoc :cancel? #(run/cancel-requested? run-id)))]
@@ -1632,6 +1643,13 @@
                                    :settlement-reason reason}))
         (throw t)))))
 
+(defn- chat-spent
+  "Microdollars the chat `chat-id` recorded as used, in `room`'s store."
+  [room chat-id]
+  (or (when-let [conn (some-> room :store :conn)]
+        (dh/q '[:find ?u . :in $ ?c :where [?e :chat/id ?c] [?e :chat/budget-used ?u]] @conn chat-id))
+      0))
+
 (defn resume!
   "Continue Run `run-id` of `control-room` from its latest turn savepoint
    (doc/run-resume.md): a new Run, caused by it, whose world is a fork of
@@ -1671,7 +1689,10 @@
                     (seq remaining) (assoc :resources remaining))
                   nil nil
                   {:id new-id :snapshots (not-empty (:world/systems data))
-                   :resume {:from run-id :chat (:run/chat-id old) :step step}})]
+                   :resume {:from run-id :chat (:run/chat-id old) :step step
+                            ;; what the stopped Run's chat spent (microdollars):
+                            ;; its budget is not spent again
+                            :spent (chat-spent control-room (:run/chat-id old))}})]
       (run/record-cause! new-id run-id)
       handle)))
 

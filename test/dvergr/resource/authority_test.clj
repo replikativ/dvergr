@@ -132,3 +132,33 @@
       (finally
         (kontor-governance/ungovern! conn)
         (d/close-room! room)))))
+
+(deftest model-spend-is-paid-from-the-run-s-wallet
+  (let [[room conn] (ledger-room)
+        team (roster/make-agent (roster/make-roster {:id :spend-team})
+                                {:id :worker :tools #{}
+                                 :model-policy {:provider :codex-subscription :model "codex-subscription-sol"}
+                                 :program {:kind :llm :max-model-steps 4 :auto-compact? false :budget-dollars 5.0}})
+        costs (atom [400000 700000])
+        wallets (atom [])]
+    (try
+      (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 10000000M}})
+      (with-redefs [providers/ensure-initialized! (constantly nil)
+                    ;; a model call costs what it is accounted as, here in microdollars
+                    dvergr.chat.accounting/calculate-cost (fn [_type amount & _] amount)
+                    chat-agent/run-agent-turn!
+                    (fn [chat-ctx opts]
+                      (chat-context/account-usage! chat-ctx :output-tokens (first @costs))
+                      (swap! costs rest)
+                      (swap! wallets conj (resource/wallet-microdollars room (:run-id opts)))
+                      (chat-context/add-message! chat-ctx {:role :assistant :content "working"})
+                      :continue)]
+        (let [handle (binding [ec/*execution-context* (:ctx room)]
+                       (program/hire! room team :worker {:task "work" :resources {resource/microdollars 1000000M}}))
+              result (binding [ec/*execution-context* (:ctx room)] @handle)]
+          (is (= [600000M 0M] @wallets) "each model call is paid from the wallet; the overrun takes the rest")
+          (is (= :waiting (:run/status result)) "an empty wallet is an exhausted budget")
+          (is (= {resource/microdollars 9000000M} (resource/balance room)) "$1 spent on models, nothing created or lost")))
+      (finally
+        (kontor-governance/ungovern! conn)
+        (d/close-room! room)))))

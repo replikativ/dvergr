@@ -134,7 +134,13 @@
                       :by-type (update by-type resource-type (fnil + 0) amount)
                       :crossed-thresholds new-crossed
                       ::just-crossed threshold}))))
-        threshold-info (::just-crossed new-state)]
+        threshold-info (::just-crossed new-state)
+        ;; model spend on the one ledger: a Run with a microdollar wallet pays
+        ;; from it, and has no more budget when it is empty
+        {:keys [exhausted?]} ((requiring-resolve 'dvergr.resource/charge-spend!) cost)
+        _ (when exhausted?
+            (binding [rtc/*execution-context* (selected-execution-context chat-ctx)]
+              (swap! (:budget-signal chat-ctx) (fn [b] (assoc b :used (max (:used b) (:total b)))))))]
 
     ;; Persist via THE ledger writer (acct/record-usage!): the ledger row +
     ;; the :chat/budget-used rollup land in one atomic transact there. This
