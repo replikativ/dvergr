@@ -261,42 +261,28 @@ encyclopedic writing cites fewer than half its sentences, so our per-page citati
 and grounding checks are stricter than Wikipedia practice (defensible for an
 internal wiki, whose reader must be able to check every number).
 
-**Caveat (found 2026-09-27, after these runs):** the `claude-code-haiku` rows below ran the
-CLI in a checkout of dvergr, where it loaded that project's `CLAUDE.md` and settings into the
-candidate's context; they are contaminated and are rerun with the CLI in an empty directory
-of its own. The Luna rows (no CLI) are unaffected.
+**Validation, 2026-09-27** (wiki/v3 through `catalog_benchmark` over MCP; both candidates on
+subscriptions; the Claude Code CLI in an empty directory of its own, see below):
 
-**First validation, 2026-09-27** (dev split, 3 generated worlds at scale 1, one repetition,
-both candidates on subscriptions, run through `catalog_benchmark` over MCP):
-
-| Candidate | Mean reward (95% range) | All checks passed | Cost at list price | Tokens in / out |
+| Set | `codex-subscription-luna` | `claude-code-haiku` | Difference, 95% range | List price per attempt |
 | --- | --- | --- | --- | --- |
-| `codex-subscription-luna` | 0.861 (0.79–0.93) | 0 of 3 | $0.08 | 348k / 8.7k |
-| `claude-code-haiku` (CLI into the world over MCP) | 0.739 (0.50–0.97) | 0 of 3 | $0.77 | 671k / 20k |
+| dev, 3 generated worlds | 0.919 (0.77–1.0) | 0.909 (0.81–1.0) | −0.009 paired (−0.07 to +0.05) | Luna $0.026, Haiku $0.244 |
+| real, 2 corpora × 3 runs | 0.845 (0.75–0.94) | 0.882 (0.85–0.91) | −0.036 unpaired (−0.13 to +0.06) | Luna $0.022, Haiku $0.147 |
 
-Haiku against Luna, paired by world: −0.122 (−0.41 to +0.16), so three worlds do not
-separate them; Haiku costs about 10× at list price (twice the tokens, a pricier model).
-Neither wrote a wiki that passes every check. Luna misses the trust's entity page and the
-incident duration (which must be computed); Haiku fails grounding (invented numbers) and more
-facts. Both leave out the crisis (four of six wikis never mention it): a real weakness on a
-minor event, not a scorer strictness (the one sentence that states it cites another
-document). With no passes, cost per pass is undefined, so the comparison now also reports
-list-price cost per attempt (`notional-cost-ratio`).
+Not separated on either set, and Luna costs a seventh to a ninth at list price: the answer to
+"is the cheaper model good enough here?", with its uncertainty stated. No wiki passes every
+check. Luna misses the trust's page, the crisis, a manager's tenure and a computed duration,
+and on the real corpora states former heads as current; Haiku misses the incident page and a
+former chairman. Runs of one model on one corpus spread widely (a single run per world
+misleads), and with two corpora a paired interval has one degree of freedom, so the
+comparison also reports the unpaired difference over every Attempt
+(`reward-difference-unpaired`). With no passes, cost per pass is undefined; the comparison
+reports list-price cost per attempt (`notional-cost-ratio`).
 
-**Real corpora, 2026-09-27** (mondragon and john-lewis, three runs each):
-
-| Candidate | Mean reward (95% range) | List price per attempt |
-| --- | --- | --- |
-| `claude-code-haiku` | 0.879 (0.78–0.98) | $0.238 |
-| `codex-subscription-luna` | 0.833 (0.75–0.92) | $0.023 |
-
-A single run per corpus had Haiku far ahead (0.882 vs 0.751); three runs shrink it to
-+0.046, with an unpaired (Welch) interval of −0.07 to +0.16: not separated, at a tenth of the
-list price for Luna. Runs of one model on one corpus spread widely (Haiku 0.70–0.97 on
-mondragon), so one run per world misleads. Both state former chairmen as current (currency)
-and miss assets, the former name and the end of the Ocado supply. Pairing by world with only
-two corpora leaves a t with one degree of freedom (−0.47 to +0.38), so the comparison now also
-reports the unpaired difference over every Attempt (`reward-difference-unpaired`).
+An earlier round (same day) ran the Claude Code CLI inside a checkout of dvergr, where it
+loaded that project's `CLAUDE.md` and settings into the candidate's context: Haiku scored
+0.739 on the same three dev worlds (0.909 clean). The CLI now runs in an empty directory
+outside any repository (dvergr #176); a benchmark's candidates must see only the task.
 
 Next for the wiki benchmark:
 
