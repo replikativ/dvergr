@@ -328,3 +328,28 @@
           evidence ((:observe ev) {:default {} :result {:run/status :completed} :execution/evidence captured})]
       (is (= {:blocked 1} (:denials captured)))
       (is (false? (get-in ((:verify ev) nil evidence) [:checks :no-blocked-fetch?]))))))
+
+(deftest a-bundle-with-cases-is-a-dataset
+  (let [fs {"workflow.edn" (pr-str {:title "Cases" :task "Answer /docs/q.txt in /out/a.txt." :capture ["/out"]})
+            "checker.clj" "(ns c) (defn check [{:keys [files gold]}]
+                             (let [ok (= (:answer gold) (get files \"/out/a.txt\"))]
+                               {:checks {:right? ok} :reward (if ok 1.0 0.0)}))"
+            "cases/one/fixtures/docs/q.txt" "1+1"
+            "cases/one/gold.edn" (pr-str {:answer "2"})
+            "cases/two/fixtures/docs/q.txt" "2+2"
+            "cases/two/gold.edn" (pr-str {:answer "4"})}
+        b (room-wf/bundle "cases" fs)
+        plan (room-wf/experiment-plan b {:models ["claude-haiku-4-5"]})
+        envs (:environments plan)
+        ev (room-wf/evaluator b {})]
+    (testing "one environment per case, named in its metadata"
+      (is (= ["one" "two"] (mapv #(get-in % [:environment/metadata :case]) envs)))
+      (is (= 2 (count (distinct (map :environment/content-id envs))))))
+    (testing "each world starts with its case's fixtures"
+      (let [room (d/make-room {:id :room-workflow-cases :store (memory/make)})
+            setup (get-in plan [:capabilities :world-setup])]
+        ((:prepare setup) {:room room :environment (second envs)})
+        (is (= "2+2" (get (ws/read-tree room "/docs") "/docs/q.txt")))))
+    (testing "and is scored against its case's gold"
+      (is (= 1.0 (:reward ((:verify ev) (second envs) {:run-status :completed :files {"/out/a.txt" "4"}}))))
+      (is (= 0.0 (:reward ((:verify ev) (first envs) {:run-status :completed :files {"/out/a.txt" "4"}})))))))
