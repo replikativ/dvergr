@@ -4,6 +4,8 @@
  :params {:product "Simmis" :max-searches 8 :max-entries 10
           :description "an organizational control system for work shared by people and AI agents: a durable shared state, separate attempts, controlled adoption"}
  :judge {:model "claude-code-haiku" :max-requests 12}
+ ;; the reference set is simm.is's own comparison: not to be read off it
+ :blocked-sources ["simm.is"]
  :profile "developer"
  :capture ["/out"]
  :fetched true

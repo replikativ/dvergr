@@ -295,3 +295,17 @@
       (is (empty? @asked)))
     (testing "the judge model is part of the verifier's basis"
       (is (= "claude-code-haiku" (get-in (evaluation/evaluator-ref ev) [:verifier/basis :judge]))))))
+
+(deftest a-task-s-answer-sources-stay-out-of-reach
+  (let [b (room-wf/bundle "blocked" (assoc files "workflow.edn"
+                                           (pr-str {:title "C" :task "t" :capture ["/out"] :fetched true
+                                                    :blocked-sources ["simm.is"]})))]
+    (testing "the environment refuses them"
+      (is (= {:record true :deny-hosts #{"simm.is"}}
+             (get-in (room-wf/experiment-plan b {:models ["claude-haiku-4-5"]})
+                     [:environments 0 :environment/world :effects]))))
+    (testing "a frozen web leaves them out"
+      (let [web (-> (room-wf/freeze b files {"https://simm.is/blog" {:title "answer" :body "Wato PromptQL"}
+                                             "https://dust.tt/" {:title "Dust" :body "agents"}})
+                    (get "web.edn") clojure.edn/read-string)]
+        (is (= ["https://dust.tt/"] (keys web)))))))

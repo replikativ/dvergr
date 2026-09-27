@@ -350,20 +350,47 @@
    :replay replay-handler
    :faults faults-handler})
 
+(defn host-of
+  "The host of `url`, lowercased, without `www.`; nil when it has none."
+  [url]
+  (some-> (re-find #"^[a-zA-Z][a-zA-Z0-9+.-]*://(?:[^@/]*@)?([^/:?#]+)" (str url)) second
+          str/lower-case (str/replace #"^www\." "")))
+
+(defn blocked-host?
+  "Is `host` one of `hosts` or beneath one (`docs.simm.is` under `simm.is`)?"
+  [hosts host]
+  (boolean (and host (some #(or (= host %) (str/ends-with? host (str "." %))) hosts))))
+
+(defn- deny-hosts-handler
+  "The filter refusing requests to `hosts` (and their subdomains): a task's
+   answer sources, which a candidate must not read the answer from."
+  [hosts]
+  (let [hosts (set (map str/lower-case hosts))]
+    (fn [effect next]
+      (if (and (= :http/request (:effect effect))
+               (blocked-host? hosts (host-of (get-in effect [:resource :url]))))
+        (deny! effect :blocked (str (host-of (get-in effect [:resource :url]))
+                                    " is a blocked source for this task"))
+        (next effect)))))
+
 (defn normalize
   "The canonical form of a handler configuration: one `[:admit S]` (the
    intersection of every class filter; omitted when it admits every class),
-   the predicate filters (each once, in a fixed order), then the answering
-   handlers in the order given."
+   one `[:deny-hosts H]` (the union of every host filter: denying A and
+   denying B is denying both), the predicate filters (each once, in a fixed
+   order), then the answering handlers in the order given."
   [specs]
   (let [class-filter? #(or (= :admit (first %)) (contains? sugar (first %)))
+        host-filter? #(= :deny-hosts (first %))
         predicate? #(contains? predicate-filters (first %))
         admit (reduce (fn [acc [k s]] (clojure.set/intersection acc (or (sugar k) (set s))))
-                      all-classes (filter class-filter? specs))]
+                      all-classes (filter class-filter? specs))
+        denied (reduce (fn [acc [_ hs]] (into acc (map str/lower-case) hs)) (sorted-set) (filter host-filter? specs))]
     (cond-> []
       (not= admit all-classes) (conj [:admit admit])
+      (seq denied) (conj [:deny-hosts denied])
       :always (into (sort-by pr-str (distinct (filter predicate? specs))))
-      :always (into (remove #(or (class-filter? %) (predicate? %)) specs)))))
+      :always (into (remove #(or (class-filter? %) (host-filter? %) (predicate? %)) specs)))))
 
 (defn compose
   "Compose configurations: `outer`'s handlers enclose `inner`'s (a fork's
@@ -380,6 +407,7 @@
    (mapv (fn [[k & args]]
            (cond
              (= :admit k) (admission (first args))
+             (= :deny-hosts k) (deny-hosts-handler (first args))
              (contains? predicate-filters k) ((predicate-filters k) ctx)
              :else (apply (or (get registry k)
                               (throw (ex-info (str "Unknown effect handler " k) {:handler k})))
@@ -470,12 +498,14 @@
      {:faults {:seed 7 :rate 0.1 :only #{:http/request} :kinds [:rate-limit]}
       :record true           ; record every effect (`:recording` id returned)
       :read-only true
-      :admit #{:read :network}}"
-  [{:keys [faults record read-only admit]}]
+      :admit #{:read :network}
+      :deny-hosts #{\"simm.is\"}}  ; a task's answer sources"
+  [{:keys [faults record read-only admit deny-hosts]}]
   (let [f (when faults (faults! faults))
         r (when record (recording!))]
     {:specs (cond-> []
               admit (conj [:admit (set admit)])
+              (seq deny-hosts) (conj [:deny-hosts (set deny-hosts)])
               read-only (conj [:read-only])
               r (conj [:record {:id r}])
               f (conj [:faults {:id f}]))

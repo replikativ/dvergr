@@ -102,6 +102,11 @@ and `check` receives them as `:judgements {id answer}`. The checker stays pure; 
 in the verifier's basis; re-verifying asks no one; `calibration.edn` gives `:judgements` for
 its cases.
 
+`:blocked-sources ["simm.is"]` names the hosts a task's answer is published on: the
+environment refuses requests to them and their subdomains (`[:deny-hosts …]`, a filter in the
+effect algebra that composes by union and sits outside answering handlers, so a frozen web or
+a replay cannot answer them either), and freezing leaves them out.
+
 `catalog_freeze {room name as?}` makes a stable benchmark of a live one: a new bundle
 (`<name>-frozen`) whose `web.edn` is the pages its live Attempts fetched (as text) and whose
 `workflow.edn` says `:web :frozen`. Every attempt in it meets the same web
