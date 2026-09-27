@@ -1,6 +1,6 @@
 # Resuming Runs from savepoints
 
-Status: **design, for decision** (2026-09-27). Builds on spindel savepoints (spindel#56:
+Status: **design, agreed** (2026-09-27; the four recommendations below). Builds on spindel savepoints (spindel#56:
 `effects.savepoint`, `savepoint.portable`, shipped in 0.1.53; dvergr pins 0.1.54) and on the
 effect logs with idempotency classes (doc/effects.md).
 
@@ -42,7 +42,7 @@ room, and its effects are receipted, but nothing continues it.
    instead of continuing. That needs the receipts of a running Run to be durable per step,
    not only at the Attempt's end (a change to `effect-log`).
 
-## Decisions needed
+## Decisions (agreed 2026-09-27: each recommendation)
 
 1. **World.** The loop runs in the control room's context; the Run's files live in its work
    world (a fork). The savepoint must be published in the work world so `persist` records
