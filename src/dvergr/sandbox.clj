@@ -277,9 +277,12 @@
 
    Options:
      :resource-limits - result of (make-resource-limits ...) or nil to disable.
-                        Defaults to (make-resource-limits) with standard bounds."
-  [& {:keys [resource-limits]
-      :or   {resource-limits (make-resource-limits)}}]
+                        Defaults to (make-resource-limits) with standard bounds.
+     :load-fn         - how `require` finds source (default: the workspace's;
+                        `(constantly nil)` for an interpreter with no load path)."
+  [& {:keys [resource-limits load-fn]
+      :or   {resource-limits (make-resource-limits)
+             load-fn workspace/load-fn}}]
   ;; SCI includes most of clojure.core and standard namespaces by default.
   ;; clojure.string, clojure.set, clojure.walk, clojure.edn are built-in.
   ;; Agents must use standard (require ...) forms - no magic aliases.
@@ -301,7 +304,7 @@
 
            ;; Resolve `(require '[ns] :reload)` against the agent's workspace repo,
            ;; path-clamped (dvergr.sandbox.workspace). nil → not found → SCI throws.
-          :load-fn workspace/load-fn
+          :load-fn load-fn
 
            ;; Clojure 1.11 core additions SCI's clojure.core lacks — agents reach for
            ;; `(random-uuid)`/`(parse-long …)` constantly, so provide equivalents

@@ -36,7 +36,7 @@
 
    :catalog/list :catalog, :catalog/start :catalog
 
-   :catalog/benchmark :bench, :experiment/progress :bench
+   :catalog/benchmark :bench, :catalog/check :bench, :experiment/progress :bench
 
    :room/wallet :wallets, :models/list :wallets
 

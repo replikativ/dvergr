@@ -31,6 +31,7 @@
             [dvergr.agent.run :as run]
             [dvergr.agent.workflow :as workflow]
             [dvergr.catalog :as catalog]
+            [dvergr.catalog.room :as room-wf]
             [dvergr.agent.experiment.runner :as runner]
             [dvergr.agent.experiment.stats :as xstats]
             [dvergr.agent.spend :as spend]
@@ -499,10 +500,45 @@
               (in-ctx daemon (experiment/progress r))))}
 
    :catalog/list
-   {:doc "Workflows that come with their own checker and benchmark set; run one with catalog_start."
+   {:doc (str "Workflows that come with their own checker and benchmark set; run one with catalog_start. "
+              "With `room`, also the workflows defined in that room (workflows/<name>/ in its "
+              "repository; benchmark one as \"<room>/<name>\").")
     :kind :read
-    :schema [:map]
-    :impl (fn [_daemon _] (mapv catalog/describe (vals catalog/workflows)))}
+    :schema [:map [:room {:optional true} Room]]
+    :impl (fn [daemon {:keys [room]}]
+            (into (mapv catalog/describe (vals catalog/workflows))
+                  (when-let [r (some->> room (resolve-room daemon))]
+                    (for [n (in-ctx daemon (room-wf/list-bundles r))
+                          :let [b (try (in-ctx daemon (room-wf/read-bundle r n)) (catch Exception _ nil))]]
+                      (cond-> {:id (str (:slug r) "/" n) :room (:slug r)}
+                        b (merge (select-keys (:definition b) [:title :doc :params :profile])
+                                 {:bundle (str (:id b)) :verifier "ad-hoc"})
+                        (nil? b) (assoc :problems ["not well formed; see catalog_check"]))))))}
+
+   :catalog/check
+   {:doc (str "Check a workflow bundle in a room (workflows/<name>/: workflow.edn, checker.clj, "
+              "gold.edn, fixtures/): its problems, or its content id, task and fixtures when it is "
+              "well formed. With `answer` ({path text}, as an attempt would leave them under its "
+              "captured directories), also the checker's verdict on it: how to test a checker "
+              "before benchmarking with it.")
+    :kind :read
+    :schema [:map [:room Room] [:name :string]
+             [:answer {:optional true} [:map-of :string :string]]]
+    :impl (fn [daemon {:keys [room name answer]}]
+            (when-let [r (resolve-room daemon room)]
+              (let [files (in-ctx daemon (room-wf/bundle-files r name))
+                    problems (room-wf/check-files files)]
+                (if (seq problems)
+                  {:ok false :problems problems}
+                  (let [b (room-wf/bundle name files)]
+                    (cond-> {:ok true :bundle (str (:id b)) :title (get-in b [:definition :title])
+                             :task (room-wf/task b {}) :fixtures (vec (keys (:fixtures b)))
+                             :capture (get-in b [:definition :capture] ["/out"])}
+                      answer (assoc :verdict
+                                    (try (room-wf/run-checker (:checker b)
+                                                              {:files answer :gold (:gold b)
+                                                               :params (get-in b [:definition :params])})
+                                         (catch Exception e {:error (ex-message e)})))))))))}
 
    :job/status
    {:doc (str "A job's status, and its result once completed. `wait-ms` (at most 25000) "
@@ -787,7 +823,15 @@
              [:budget-dollars {:optional true} [:double {:description "budget per attempt in USD (default 0.50)"}]]
              [:timeout-ms {:optional true} [:int {:description "per attempt (default 10 minutes)"}]]]
     :impl (fn [daemon {:keys [workflow models repetitions room] :as args}]
-            (let [wf (catalog/lookup workflow)
+            (let [wf (or (get catalog/workflows (keyword workflow))
+                         ;; a workflow defined in a room: "<room>/<name>"
+                         (let [[_ rref n] (re-find #"^([^/]+)/([^/]+)$" workflow)
+                               r (or (some->> rref (resolve-room daemon))
+                                     (catalog/lookup workflow))
+                               b (in-ctx daemon (room-wf/read-bundle r n))]
+                           {:id (keyword (:slug r) n)
+                            :title (get-in b [:definition :title])
+                            :experiment-plan #(room-wf/experiment-plan b %)}))
                   plan-fn (or (:experiment-plan wf)
                               (throw (ex-info (str workflow " has no benchmark set") {:type ::no-benchmark})))
                   control (when room

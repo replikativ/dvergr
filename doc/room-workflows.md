@@ -17,8 +17,8 @@ A directory in the room's repository, `workflows/<name>/`:
 
 | File | What |
 |---|---|
-| `workflow.edn` | `{:title :doc :params {…defaults} :task "template with {param}" :tools [...] :profile}` |
-| `checker.clj` | a namespace with `(check {:world … :params … :gold …}) → {:checks {k bool} :reward 0..1}`, over what the Attempt left in its world (files, receipts) |
+| `workflow.edn` | `{:title :doc :params {…defaults} :task "template with {param}" :profile :capture ["/out"] :timeout-ms}` |
+| `checker.clj` | a namespace with `(check {:files … :params … :gold …}) → {:checks {k bool} :reward 0..1}`, over the files the Attempt left under the captured directories (receipts later) |
 | `gold.edn`, `fixtures/` | the reference facts and the documents a benchmark world starts from, or |
 | `generator.clj` | `(world seed opts) → {:docs … :gold …}`, for generated benchmark sets with splits |
 | `calibration/` | a reference answer and damaged variants (see below) |
@@ -38,7 +38,8 @@ It is ordinary room content: versioned, forked and merged with the room, reviewa
    cost at list price as for any workflow. Candidates include external agents (a CLI or any
    MCP client working in the Attempt's world).
 4. **Promote**: the room's owner promotes a calibrated bundle (like skills' `promote!`); its
-   verifier trust moves from `:room-authored` to `:trusted`, which Scorecards show.
+   verifier trust moves from `:ad-hoc` to `:room` (`dvergr.agent.evaluation/trust-tiers`),
+   which Scorecards show. Only host code is `:trusted`.
 5. **Deploy**: a schedule in a room (`dvergr.scheduler`) runs the workflow on the room's own
    data, e.g. "competitor watch, weekly", with the winning candidate.
 6. **Export / import**: `workflow_export` returns the bundle (an archive of its directory with
@@ -52,7 +53,22 @@ It is ordinary room content: versioned, forked and merged with the room, reviewa
 The checker runs in a sandbox with no effects except reading the Attempt's captured evidence
 (the effect boundary's `:read-only` mode, doc/effects.md; until then, a sandbox without the
 network and write namespaces). Its trust tier is part of every Scorecard; a room-authored
-checker never certifies as `:trusted` until promoted.
+checker is `:ad-hoc` until promoted, then `:room`; never `:trusted`.
+
+## Landed
+
+Part 1 (`dvergr.catalog.room`): a bundle is read from `workflows/<name>/` (`bundle-files`,
+`read-bundle`, `list-bundles`), checked for shape (`check-files`: a malli schema for
+`workflow.edn`, a checker, fixtures), content-addressed (its id is the verifier's `:basis`,
+so a changed checker is a different verifier), and turned into a world setup (fixtures
+seeded at the world root), an Evaluator (captures `:capture`, runs the checker) and an
+experiment plan. The checker runs in a fresh SCI interpreter with the base sandbox's core
+and no load path: no files, network, host classes or other code; bounded in time; its
+verdict validated. Ops: `catalog_check {room name answer?}` (problems, or the bundle and,
+with an answer, the checker's verdict on it), `catalog_list {room}` lists a room's bundles,
+`catalog_benchmark {workflow: "<room>/<name>"}` benchmarks one like a catalog workflow.
+
+Next: calibrate and promote (the tier on Scorecards), export and import, deploy by schedule.
 
 ## The first one: competitor discovery
 
