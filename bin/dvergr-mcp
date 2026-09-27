@@ -299,6 +299,14 @@
     "ping"
     (when (contains? msg :id) (to-client! {:jsonrpc "2.0" :id (:id msg) :result {}}))
 
+    ;; The 2026-07-28 revision's probe, sent before any handshake (Claude Code
+    ;; 2.1.28x). Answered here, at once: forwarding it would wait for a
+    ;; connection that only `initialize` opens, and the loop reading stdin with
+    ;; it. "Method not found" tells the client to fall back to `initialize`.
+    "server/discover"
+    (when (contains? msg :id)
+      (to-client! (error-response (:id msg) -32601 "Method not found: this server speaks the initialize handshake")))
+
     "tools/list"
     (if-let [cached (and (nil? (:conn @state)) (nil? (get-in msg [:params :cursor]))
                          (read-tools-cache))]
