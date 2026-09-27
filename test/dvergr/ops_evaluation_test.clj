@@ -103,8 +103,10 @@
         env (fn [i] {:environment/content-id (keyword (str "env" i))})
         entries (vec (concat (for [i (range 4)] {:candidate/id :big :environment (env i) :reward 1.0})
                              (for [i (range 4)] {:candidate/id :small :environment (env i) :reward (if (= i 3) 0.5 1.0)})))
-        rows [{:candidate "big" :attempts 4 :passed 4 :microdollars-per-pass 400000}
-              {:candidate "small" :attempts 4 :passed 3 :microdollars-per-pass 40000}]
+        rows [{:candidate "big" :attempts 4 :passed 4 :microdollars-per-pass 400000
+               :notional-microdollars-per-attempt 400000}
+              {:candidate "small" :attempts 4 :passed 3 :microdollars-per-pass 40000
+               :notional-microdollars-per-attempt 30000}]
         {:keys [baseline candidates]} (comparison entries rows nil)
         [small] candidates]
     (is (= "big" baseline) "the top of the leaderboard by default")
@@ -115,5 +117,6 @@
     (is (= -0.125 (:reward-difference small)))
     (is (= 360000 (:microdollars-per-pass-saved small)) "a pass costs a tenth")
     (is (= 0.1 (:cost-per-pass-ratio small)))
+    (is (= 0.075 (:notional-cost-ratio small)) "at list price per attempt: defined even when nothing passes")
     (is (= ["big"] (mapv :candidate (:candidates (comparison entries rows "small")))) "any baseline")
     (is (nil? (comparison entries rows "nobody")))))
