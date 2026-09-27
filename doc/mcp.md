@@ -44,6 +44,15 @@ To run the daemon yourself: `clojure -M:cli --no-tui --mcp [--mcp-port 17888]`, 
 `:mcp {:port 17888 :profile "offload"}` in the config file. The daemon inherits its
 environment: a `TELEGRAM_BOT_TOKEN` there connects that bot.
 
+**A connection pinned to one room.** `--room ROOM --tools read_file,write_file` gives a
+connection exactly those tools, in that room only: their `room` parameter disappears (the
+connection supplies it) and a call naming another room is refused. This is how an external
+agent works in a benchmark Attempt: a `claude-code-*` candidate runs `claude -p` INTO its
+Attempt's world, with this relay in `--mcp-config` (its own built-in tools disabled, only
+`mcp__dvergr__<tool>` allowed, its own loop of up to 60 turns); the CLI calls the same tools
+every other candidate gets, natively, and the evaluator scores the world when it answers. The
+daemon (or any process running an Attempt) serves MCP on a loopback port for it.
+
 ## Profiles and toolsets
 
 A connection sees one selection of tools, chosen by `--profile` / `--toolsets` (the relay puts

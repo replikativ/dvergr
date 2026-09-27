@@ -85,10 +85,12 @@
 
 (defn- session-tool-defs
   "The tool definitions this session may see and call: all of them, or those
-   `(:tool-visible? context)` admits."
+   `(:tool-visible? context)` admits, as `(:tool-view context)` presents them
+   (a room-pinned session drops the `room` parameter)."
   [context]
-  (let [visible? (or (:tool-visible? context) (constantly true))]
-    (filterv visible? @(:tool-defs context))))
+  (let [visible? (or (:tool-visible? context) (constantly true))
+        view (or (:tool-view context) identity)]
+    (mapv view (filterv visible? @(:tool-defs context)))))
 
 (defn- tools-list-handler
   "Return the session's tool definitions from the dynamic registry."

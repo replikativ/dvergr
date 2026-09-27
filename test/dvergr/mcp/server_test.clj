@@ -264,3 +264,17 @@
           "names and docs match (catalog-benchmark's doc mentions its Scorecard)")
       (is (every? (comp string? :doc) fns) "with a query: signatures and first doc lines")
       (is (every? #(re-find #"args" (:arglists %)) fns)))))
+
+(deftest a-connection-pinned-to-a-room-sees-exactly-its-tools-without-a-room-param
+  (let [tools (list-tools (session {:dvergr/room "world-1" :dvergr/tools "read_file,write_file"}))]
+    (is (= #{"read_file" "write_file"} (set (map :name tools))) "exactly the tools named")
+    (is (every? #(not (contains? (get-in % [:inputSchema :properties]) :room)) tools)
+        "the session supplies the room")
+    (is (every? #(not (some #{"room"} (get-in % [:inputSchema :required]))) tools)))
+  (testing "calls are pinned: the room is supplied, another is refused"
+    (let [sel (surface/selection {:room "world-1" :tools "read_file"})]
+      (is (= {:path "/x" :room "world-1"} (surface/pinned-args sel {:path "/x"})))
+      (is (= {:path "/x" :room "world-1"} (surface/pinned-args sel {:path "/x" :room "world-1"})))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"works in room world-1 only"
+                            (surface/pinned-args sel {:path "/x" :room "other"})))
+      (is (= {:path "/x"} (surface/pinned-args (surface/selection {}) {:path "/x"})) "unpinned: unchanged"))))
