@@ -343,6 +343,32 @@
                 (throw (ex-info (str "Injected fault: " (name kind) " failed")
                                 {:type :effect/fault :fault :error})))))))))
 
+(defn quota!
+  "Start a write quota of `bytes`: `[:quota {:id id}]` counts the `:bytes` of
+   every write effect (files, database transactions) and refuses the one that
+   would exceed it. Returns the id."
+  [{:keys [bytes]}]
+  (let [id (random-uuid)]
+    (swap! states assoc id {:limit bytes :used (atom 0)})
+    id))
+
+(defn quota-used
+  "Bytes written under quota `id` so far."
+  [id]
+  @(:used (state id)))
+
+(defn- quota-handler [_ctx {:keys [id]}]
+  (fn [effect next]
+    (let [{:keys [limit used]} (state id)
+          n (:bytes effect)]
+      (if (and n (contains? (effect-classes effect) :write))
+        (let [[before after] (swap-vals! used #(if (<= (+ % n) limit) (+ % n) %))]
+          (if (= before after)
+            (deny! effect :quota (str "the write quota of " limit " bytes is used up ("
+                                      before " written, this write is " n ")"))
+            (next effect)))
+        (next effect)))))
+
 (def registry
   "Answering handlers by spec key, each `(fn [ctx & args])`. Filters are not
    here: `normalize` folds class filters into one `:admit` and keeps each
@@ -351,7 +377,8 @@
    what reached the world."
   {:record record-handler
    :replay replay-handler
-   :faults faults-handler})
+   :faults faults-handler
+   :quota quota-handler})
 
 (defn host-of
   "The host of `url`, lowercased, without `www.`; nil when it has none."
@@ -521,18 +548,21 @@
       :record true           ; record every effect (`:recording` id returned)
       :read-only true
       :admit #{:read :network}
-      :deny-hosts #{\"simm.is\"}}  ; a task's answer sources"
-  [{:keys [faults record read-only admit deny-hosts]}]
+      :deny-hosts #{\"simm.is\"}  ; a task's answer sources
+      :quota-bytes 50000000}      ; what the attempt may write"
+  [{:keys [faults record read-only admit deny-hosts quota-bytes]}]
   (let [f (when faults (faults! faults))
-        r (when record (recording!))]
+        r (when record (recording!))
+        q (when quota-bytes (quota! {:bytes quota-bytes}))]
     {:specs (cond-> []
               admit (conj [:admit (set admit)])
               (seq deny-hosts) (conj [:deny-hosts (set deny-hosts)])
               read-only (conj [:read-only])
               r (conj [:record {:id r}])
+              q (conj [:quota {:id q}])
               f (conj [:faults {:id f}]))
      :recording r
-     :release #(do (some-> f release!) (some-> r release!))}))
+     :release #(do (some-> f release!) (some-> r release!) (some-> q release!))}))
 
 (defn boundary-resolver
   "The boundary for a sandbox. `binding-resolver` reads the capability's world

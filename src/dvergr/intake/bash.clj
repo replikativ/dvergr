@@ -525,6 +525,28 @@
   []
   default-fallback-allowlist)
 
+(defn- bounded-sink
+  "An OutputStream keeping the first `limit` bytes written to it and counting
+   the rest, which it discards: a command's output is bounded where it is
+   produced, not after it was all held in memory (`yes` for a minute is
+   gigabytes). `[stream kept-bytes-fn total-fn]`."
+  [limit]
+  (let [kept (java.io.ByteArrayOutputStream.)
+        total (java.util.concurrent.atomic.AtomicLong.)
+        room #(max 0 (- limit (.size kept)))
+        out (proxy [java.io.OutputStream] []
+              (write
+                ([b]
+                 (if (bytes? b)
+                   (let [^bytes b b] (.write ^java.io.OutputStream this b 0 (alength b)))
+                   (do (.incrementAndGet total)
+                       (when (pos? (room)) (.write kept (int b))))))
+                ([b off len]
+                 (.addAndGet total len)
+                 (let [n (min len (room))]
+                   (when (pos? n) (.write kept ^bytes b (int off) (int n)))))))]
+    [out #(.toByteArray kept) #(.get total)]))
+
 (defn run
   "Execute a bash source string against the chat-ctx's session.
 
@@ -532,7 +554,9 @@
      :host         override the muschel host (default: BuiltinHost
                    rooted at the workspace via get-or-create-host!)
      :max-out      cap stdout / stderr returned (default 8000 chars
-                   each — protects the agent context window)
+                   each — protects the agent context window). Output past
+                   four times that many bytes is never held: it is counted
+                   and dropped as the command writes it.
      :prompter     muschel prompter for `:ask` permit decisions
                    (default `m/allow-all-prompter`; pass
                    `m/deny-all-prompter` for safer policy)
@@ -569,11 +593,15 @@
                            'dvergr.chat.context/selected-execution-context) chat-ctx)]
                  (msession/-env sess))
           interrupt-fn (mbudget/combine (process-abort-interrupt-fn process))
-          {:keys [stdout stderr exit env permit trace]}
-          (m/run-and-capture
+          [out-sink out-bytes out-total] (bounded-sink (* 4 max-out))
+          [err-sink err-bytes err-total] (bounded-sink (* 4 max-out))
+          {:keys [exit env permit trace]}
+          (m/run
            env0 cmd
            (cond-> {:session     sess
                     :host        host
+                    :out         out-sink
+                    :err         err-sink
                     ;; Agents don't write stdin; never inherit System/in
                     ;; (would block under nREPL / when daemonised).
                     :in          (java.io.ByteArrayInputStream. (.getBytes ""))
@@ -589,10 +617,13 @@
                           (some->> permit :per-call
                                    (filter #(= :deny (:decision %)))
                                    first :reason))
-          clip (fn [s]
-                 (if (and s (> (count s) max-out))
-                   (str (subs s 0 max-out) "\n[...truncated]")
-                   (or s "")))]
+          stdout (String. ^bytes (out-bytes) "UTF-8")
+          stderr (String. ^bytes (err-bytes) "UTF-8")
+          cut? (fn [s bs total] (or (> (count s) max-out) (> total (alength ^bytes bs))))
+          clip (fn [s bs total]
+                 (if (cut? s bs total)
+                   (str (subs s 0 (min max-out (count s))) "\n[...truncated]")
+                   s))]
       (if denied-reason
         (do (tel/log! {:level :warn :id ::denied
                        :data {:cmd cmd :reason denied-reason}}
@@ -601,12 +632,13 @@
                      :exit   126
                      :permit permit}
               trace-full? (assoc :trace-full trace)))
-        (cond-> {:stdout     (clip stdout)
-                 :stderr     (clip stderr)
+        (cond-> {:stdout     (clip stdout (out-bytes) (out-total))
+                 :stderr     (clip stderr (err-bytes) (err-total))
                  :exit       exit
                  :cwd        (some-> env :cwd)
-                 :truncated? (or (and stdout (> (count stdout) max-out))
-                                 (and stderr (> (count stderr) max-out)))
+                 :truncated? (boolean (or (cut? stdout (out-bytes) (out-total))
+                                          (cut? stderr (err-bytes) (err-total))))
+                 :output-bytes {:stdout (out-total) :stderr (err-total)}
                  :trace      (trace-summary trace)}
           ;; Full permit result is huge (AST per call). Only include
           ;; when explicitly requested.

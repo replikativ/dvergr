@@ -275,9 +275,12 @@
                                   (srooms/delete-room-db! room-id nm))))))))}
         ;; writes and lifecycle are effects (dvergr.effects); queries read an
         ;; immutable value of a database and are not
+        ;; a transaction's size, what a quota counts: its printed form
+        tx-bytes (fn [[_ tx-data]] (count (pr-str tx-data)))
         fx (fn [kind resource-of f]
              (fn [& args]
-               (effects/perform! effects {:effect kind :resource (resource-of args)}
+               (effects/perform! effects (cond-> {:effect kind :resource (resource-of args)}
+                                           (= :db/transact kind) (assoc :bytes (tx-bytes args)))
                                  #(apply f args))))
         tx-resource (fn [[_ tx-data]] {:datoms (count tx-data)})
         db-resource (fn [[cfg]] {:name (str (cfg-name cfg))})

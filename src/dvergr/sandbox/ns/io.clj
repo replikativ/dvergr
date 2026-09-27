@@ -36,6 +36,14 @@
   ([boundary kind resource result-of f]
    (effects/perform! boundary {:effect kind :resource resource :result-of result-of} f)))
 
+(defn- sized-write-fx
+  "Perform a write of `content`: its size in bytes is part of the effect, what a
+   quota counts."
+  [boundary resource content f]
+  (effects/perform! boundary {:effect :fs/write :resource resource :result-of (constantly (str content))
+                              :bytes (alength (.getBytes (str content) "UTF-8"))}
+                    f))
+
 (defn sensitive-path-policy
   "Throw if path matches known-sensitive OS path patterns.
    Call this synchronously before opening a file.
@@ -328,10 +336,10 @@
                       {'slurp (fn [p & opts] (fx effects :fs/read {:path (str p)}
                                                  #(apply clojure.core/slurp (sr p) opts)))
                        'spit  (fn [p content & opts]
-                                (fx effects :fs/write {:path (str p)} (constantly (str content))
-                                    #(let [f (sr p)]
-                                       (when-let [par (bb-parent f)] (bb-create-dirs par))
-                                       (apply clojure.core/spit f content opts) (str f))))}}})))
+                                (sized-write-fx effects {:path (str p)} content
+                                                #(let [f (sr p)]
+                                                   (when-let [par (bb-parent f)] (bb-create-dirs par))
+                                                   (apply clojure.core/spit f content opts) (str f))))}}})))
 
 (defn- virtual-path [filesystem path]
   (let [path (str path)]
@@ -501,12 +509,12 @@
                           (or (mfs/read-file filesystem path)
                               (throw (ex-info "No such virtual file" {:path path}))))))
           'spit (fn [path content & options]
-                  (fx effects :fs/write {:path (str path)} (constantly (str content))
-                      #(let [path (resolve! path)
-                             append? (boolean (:append (first options)))]
-                         (virtual-mkdirs! filesystem (virtual-parent path))
-                         (mfs/write-string! filesystem path (str content) append?)
-                         (relative path))))}}}))))
+                  (sized-write-fx effects {:path (str path)} content
+                                  #(let [path (resolve! path)
+                                         append? (boolean (:append (first options)))]
+                                     (virtual-mkdirs! filesystem (virtual-parent path))
+                                     (mfs/write-string! filesystem path (str content) append?)
+                                     (relative path))))}}}))))
 
 (defn add-fs-ns!
   "Expose a filesystem namespace backed by Muschel when `:filesystem` is

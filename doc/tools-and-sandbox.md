@@ -104,7 +104,7 @@ cancellable.
   response — so the agent uses keys it never sees (see
   [boundary-secret-injection.md](boundary-secret-injection.md)).
 - **Resource limits**: an `interrupt-fn` fires at every fn-body entry to honour
-  `Thread.interrupt()` (Esc / watchdog) and cap thread-allocated memory (default 256 MiB).
+  `Thread.interrupt()` (Esc / watchdog) and cap cumulative thread-allocated memory (default 4 GiB: allocation, garbage included, not retained memory; a runaway backstop, since 256 MiB killed real feed scans). A shell command's output is bounded as it is written (four times `:max-out` bytes kept, the rest counted and dropped), and an environment can bound what an attempt writes (`:world :effects {:quota-bytes n}`, doc/effects.md).
   Timeout is enforced by a watchdog thread plus a `future`/deref outer fence, so even a
   non-interruptible blocking syscall unblocks the caller.
 - **Gated deps**: `clojure.repl.deps/add-libs` is available (`dvergr.sandbox.deps`) but

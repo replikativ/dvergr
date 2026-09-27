@@ -196,7 +196,15 @@ in it runs under, outside each capability's own (`install-world!`, `world-handle
 inherit them and may add their own without touching the parent. An EnvironmentDef's
 `:world :effects` installs them in each Attempt's isolated world (doc/benchmarks.md).
 
-**Next**: grants (eacl), preflight, and trajectory export from receipts and recordings.
+**Quotas**: `[:quota {:id …}]` (host state from `quota!`) counts the `:bytes` of every write
+effect (file writes carry their size, database transactions their printed size) and refuses
+the write that would exceed the budget, receipted `:by :quota`; reads are free. An
+EnvironmentDef asks for one with `:world :effects {:quota-bytes n}`. A shell command's output
+is bounded where it is written (`dvergr.intake.bash`), not after it was held in memory.
+
+**Next**: durable recordings and receipts with an idempotency class per operation (the input
+for trajectory export and for resuming Runs from savepoints, not by replay), grants (eacl),
+preflight.
 
 ### How modes answer the goals
 

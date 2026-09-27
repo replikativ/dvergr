@@ -497,3 +497,24 @@
         (is (= 2 (count @own) (count @world)) "both sinks have every receipt")
         (is (= {:blocked 1} (effects/denials @world))))
       (finally (ctx/stop-context! ec)))))
+
+(deftest writes-are-bounded-by-a-quota
+  (let [q (effects/quota! {:bytes 10})
+        b (constantly {:handlers (effects/handlers [[:quota {:id q}]])})
+        write (fn [n] (try (effects/perform! b {:effect :fs/write :resource {:path "a"} :bytes n} (constantly :ok))
+                           (catch clojure.lang.ExceptionInfo e (:by (ex-data e)))))]
+    (is (= :ok (write 6)))
+    (is (= :quota (write 5)) "6 + 5 > 10: refused, and not counted")
+    (is (= :ok (write 4)))
+    (is (= 10 (effects/quota-used q)))
+    (is (= :ok (effects/perform! b {:effect :fs/read :resource {:path "a"}} (constantly :ok))) "reads are free")
+    (effects/release! q))
+  (testing "a sandbox's spit counts against it, and is refused past it"
+    (let [q (effects/quota! {:bytes 100})]
+      (with-world-sandbox {:effects {:handlers [[:quota {:id q}]]}}
+        (fn [{:keys [root eval]}]
+          (is (:ok (eval "(spit \"a.txt\" (apply str (repeat 60 \"x\")))")))
+          (is (re-find #"quota" (str (:err (eval "(spit \"b.txt\" (apply str (repeat 60 \"y\")))")))))
+          (is (not (.exists (io/file root "b.txt"))) "the refused write never happened")
+          (is (= 60 (effects/quota-used q)))))
+      (effects/release! q))))
