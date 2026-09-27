@@ -819,3 +819,19 @@
       (is (= "second"
              (-> (store/-list-messages st room-id {}) first
                  :metadata :activities first :activity/tool-name))))))
+
+(deftest a-room-from-an-older-dvergr-gains-new-attributes
+  ;; A room created before :attempt/notional-microdollars existed: pulling an
+  ;; Attempt names it, and failed with "not defined in current schema"
+  ;; (a simmis room hydrated by dvergr 0.1.152).
+  (let [cfg {:store {:backend :memory :id (random-uuid)} :keep-history? false :schema-flexibility :write}
+        _ (dh/create-database cfg)
+        conn (dh/connect cfg)
+        older (remove #(= :attempt/notional-microdollars (:db/ident %)) schema/full-schema)]
+    (dh/transact conn (vec older))
+    (is (nil? (dh/q '[:find ?e . :where [?e :db/ident :attempt/notional-microdollars]] @conn)))
+    (let [st (dhs/make conn (artifact/memory-store))]
+      (is (some? (dh/q '[:find ?e . :where [?e :db/ident :attempt/notional-microdollars]] @conn))
+          "making the store upgrades its schema")
+      (store/-store-room! st :older-room {:slug "older-room"})
+      (is (nil? (store/-load-attempt st :older-room (random-uuid))) "and Attempts read again"))))

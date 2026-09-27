@@ -1524,12 +1524,16 @@
     nil))
 
 (defn make
-  "Create a DatahikeStore. `conn` must be an existing Datahike
-   connection whose db includes the dvergr.chat.schema attributes. An optional
+  "Create a DatahikeStore over an existing Datahike connection. An optional
    artifact store can be injected for tests; by default payloads live in this
-   database's Konserve store and participate in its store-ref GC lifecycle."
+   database's Konserve store and participate in its store-ref GC lifecycle.
+
+   The dvergr chat schema is ensured here (once per connection per process):
+   a room created by an older dvergr lacks attributes added since, and a pull
+   naming one (e.g. :attempt/notional-microdollars) fails on it."
   ([conn]
    (make conn (artifact/datahike-store conn)))
   ([conn artifacts]
+   (schema/ensure-full-schema! conn)
    (attempt-governance/govern! conn)
    (->DatahikeStore conn artifacts)))
