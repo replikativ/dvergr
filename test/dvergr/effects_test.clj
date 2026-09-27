@@ -10,8 +10,10 @@
             [clojure.test.check.properties :as prop]
             [dvergr.agent.turn :as turn]
             [dvergr.chat.context :as chat-context]
+            [dvergr.authority :as authority]
             [dvergr.discourse :as d]
             [dvergr.effects :as effects]
+            [dvergr.room.registry :as rreg]
             [dvergr.room.store.memory :as memory]
             [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.sandbox :as sandbox]
@@ -58,7 +60,7 @@
                                               {:effect :http/request :class #{:egress}}
                                               (constantly :ok)))))
     (testing "a handler that answers is named in the receipt; the world never runs"
-      (with-redefs [effects/registry {:canned (fn [v] (fn [_ _] (effects/answer :canned v)))}]
+      (with-redefs [effects/registry {:canned (fn [_ctx v] (fn [_ _] (effects/answer :canned v)))}]
         (is (= "recorded" (effects/perform! (boundary sink [[:canned "recorded"]])
                                             {:effect :fs/read :resource {:path "a"}}
                                             #(throw (ex-info "the world ran" {})))))
@@ -88,6 +90,7 @@
 (def ^:private gen-config
   (let [gen-classes (gen/fmap set (gen/vector (gen/elements (vec effects/all-classes))))]
     (gen/vector (gen/one-of [(gen/return [:read-only])
+                             (gen/return [:authority])
                              (gen/fmap (fn [s] [:admit s]) gen-classes)
                              (gen/fmap (fn [n] [:answer n]) gen/small-integer)])
                 0 5)))
@@ -140,6 +143,9 @@
     (is (= (effects/normalize [[:read-only]]) (effects/normalize [[:admit #{:read}]]))))
   (testing "admitting every class is no filter"
     (is (= [] (effects/normalize [[:admit effects/all-classes]]))))
+  (testing "a predicate filter composes with itself to one"
+    (is (= [[:admit #{:read}] [:authority]]
+           (effects/normalize [[:authority] [:read-only] [:authority]]))))
   (testing "answering handlers keep their order, after the filter"
     (is (= [[:admit #{:read}] [:answer 1] [:answer 2]]
            (effects/normalize [[:answer 1] [:read-only] [:answer 2]])))))
@@ -293,3 +299,39 @@
   (with-world-sandbox {:effects {:handlers [[:read-only]]}}
     (fn [{:keys [eval]}]
       (is (re-find #"read-only" (str (:err (eval "(datahike.api/create-database {:store {:backend :mem :id \"x\"}})"))))))))
+
+(deftest an-agent-acts-on-its-own-rooms-and-those-it-takes-part-in
+  (let [ec (ctx/create-execution-context)
+        sink (effects/make-sink)]
+    (try
+      (binding [rtc/*execution-context* ec]
+        (let [home (d/make-room {:id :authority-home :ctx ec :store (memory/make)})
+              other (d/make-room {:id :authority-other :ctx ec :store (memory/make)})
+              fx (effects/boundary-resolver (constantly {:agent-id :var :room-runtime-id (:id home)})
+                                            sink
+                                            #(authority/relations (rreg/list-rooms)))
+              ops (ns-kb/room-ops-map ec nil (select-keys home [:id :incarnation])
+                                      {:acting-agent (constantly :var) :effects fx})
+              post! ('post! ops)]
+          (testing "its own room"
+            (is (:posted-to (post! (:id home) {:content "here"}))))
+          (testing "another room it takes no part in: refused, and receipted as authority's"
+            (is (thrown-with-msg? Exception #"may not write" (post! (:id other) {:content "there"})))
+            (is (empty? (d/messages other {})))
+            (is (= [:denied :authority] ((juxt :decision :by) (last @sink)))))
+          (testing "a fork of its room"
+            (let [fork (('fork! ops) (:id home))]
+              (is (:posted-to (post! (:id fork) {:content "in the fork"})))
+              (is (some? (('discard! ops) (:id fork))) "and it may discard it")))
+          (testing "a room it joins"
+            (d/join other (d/participant {:id :var :on-message (constantly nil)}))
+            (is (:posted-to (post! (:id other) {:content "now a participant"})))
+            (is (thrown-with-msg? Exception #"may not admin" (('delete! ops) (:id other)))
+                "but it does not own it"))
+          (testing "an MCP connection keeps its reach"
+            (let [mcp (ns-kb/room-ops-map ec nil (select-keys home [:id :incarnation])
+                                          {:effects (effects/boundary-resolver
+                                                     (constantly {:agent-id :mcp/code}) sink
+                                                     #(authority/relations (rreg/list-rooms)))})]
+              (is (some? (('get mcp) (:id other))))))))
+      (finally (ctx/stop-context! ec)))))

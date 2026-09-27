@@ -28,6 +28,8 @@
    configurations concatenates and normalizes; a fork composes its own onto
    its parent's, so it can narrow authority and never widen it."
   (:require [clojure.set]
+            [clojure.string :as str]
+            [dvergr.authority :as authority]
             [malli.core :as m])
   (:import [java.security MessageDigest]))
 
@@ -197,22 +199,44 @@
   "Specs that are names for a filter."
   {:read-only #{:read}})
 
+(defn- authority-handler
+  "The filter asking `dvergr.authority/decide` for room effects: `ctx` holds
+   the subject and a function returning the current relations."
+  [{:keys [subject relations]}]
+  (fn [effect next]
+    (let [failed (authority/decide (if relations (relations) {}) subject effect)]
+      (if (seq failed)
+        (deny! effect :authority
+               (str (some-> (:agent subject) name) " may not "
+                    (str/join ", " (map (fn [[action ref]] (str (name action) " " ref)) failed))
+                    " (its own room, rooms beneath it and rooms it takes part in; else a grant)"))
+        (next effect)))))
+
+(def ^:private predicate-filters
+  "Filters that are predicates over the subject and resource rather than
+   class sets. Several of the same compose to one (idempotent)."
+  {:authority authority-handler})
+
 (def registry
-  "Answering handlers by spec key (replay, faults). Filters are not here:
-   `normalize` folds them into one `:admit`."
+  "Answering handlers by spec key (replay, faults), each `(fn [ctx & args])`.
+   Filters are not here: `normalize` folds class filters into one `:admit` and
+   keeps each predicate filter once."
   {})
 
 (defn normalize
   "The canonical form of a handler configuration: one `[:admit S]` (the
-   intersection of every filter; omitted when it admits every class), then the
-   answering handlers in the order given."
+   intersection of every class filter; omitted when it admits every class),
+   the predicate filters (each once, in a fixed order), then the answering
+   handlers in the order given."
   [specs]
-  (let [filter? #(or (= :admit (first %)) (contains? sugar (first %)))
+  (let [class-filter? #(or (= :admit (first %)) (contains? sugar (first %)))
+        predicate? #(contains? predicate-filters (first %))
         admit (reduce (fn [acc [k s]] (clojure.set/intersection acc (or (sugar k) (set s))))
-                      all-classes (filter filter? specs))]
+                      all-classes (filter class-filter? specs))]
     (cond-> []
       (not= admit all-classes) (conj [:admit admit])
-      :always (into (remove filter? specs)))))
+      :always (into (sort-by pr-str (distinct (filter predicate? specs))))
+      :always (into (remove #(or (class-filter? %) (predicate? %)) specs)))))
 
 (defn compose
   "Compose configurations: `outer`'s handlers enclose `inner`'s (a fork's
@@ -222,15 +246,18 @@
   (normalize (concat outer inner)))
 
 (defn handlers
-  "Build the handler stack from a configuration, outermost first."
-  [specs]
-  (mapv (fn [[k & args]]
-          (if (= :admit k)
-            (admission (first args))
-            (apply (or (get registry k)
-                       (throw (ex-info (str "Unknown effect handler " k) {:handler k})))
-                   args)))
-        (normalize specs)))
+  "Build the handler stack from a configuration, outermost first. `ctx` is
+   what the runtime knows at the call (the subject, the relations)."
+  ([specs] (handlers specs {}))
+  ([specs ctx]
+   (mapv (fn [[k & args]]
+           (cond
+             (= :admit k) (admission (first args))
+             (contains? predicate-filters k) ((predicate-filters k) ctx)
+             :else (apply (or (get registry k)
+                              (throw (ex-info (str "Unknown effect handler " k) {:handler k})))
+                          ctx args)))
+         (normalize specs))))
 
 ;; ---------------------------------------------------------------------------
 ;; perform
@@ -257,16 +284,26 @@
                            :at (java.util.Date.) :decision :noted}
                     subject (assoc :subject subject)))))
 
+(defn full-reach?
+  "An MCP connection (the owner's, within its selection) and host code keep
+   their reach; an agent's cross-room effects are decided by `can?`."
+  [agent-id]
+  (or (nil? agent-id) (= "mcp" (namespace agent-id))))
+
 (defn boundary-resolver
   "The boundary for a sandbox. `binding-resolver` reads the world binding,
    where the runtime set the acting identity and `:effects {:handlers specs}`;
-   `sink` holds the receipts. Either may be nil."
-  [binding-resolver sink]
-  (fn []
-    (let [b (when binding-resolver (binding-resolver))
-          subject (when (:agent-id b)
-                    {:agent (:agent-id b) :room (:room-runtime-id b)})]
-      {:sink sink
-       :subject subject
-       :handlers (into [(receipts sink subject)]
-                       (handlers (get-in b [:effects :handlers])))})))
+   `sink` holds the receipts; `relations` returns the room relations for the
+   authority filter, which the runtime adds for every agent. Any may be nil."
+  ([binding-resolver sink] (boundary-resolver binding-resolver sink nil))
+  ([binding-resolver sink relations]
+   (fn []
+     (let [b (when binding-resolver (binding-resolver))
+           agent-id (:agent-id b)
+           subject (when agent-id {:agent agent-id :room (:room-runtime-id b)})
+           specs (cond-> (vec (get-in b [:effects :handlers]))
+                   (not (full-reach? agent-id)) (conj [:authority]))]
+       {:sink sink
+        :subject subject
+        :handlers (into [(receipts sink subject)]
+                        (handlers specs {:subject subject :relations relations}))}))))
