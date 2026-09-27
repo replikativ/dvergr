@@ -281,6 +281,12 @@ has most of the first half.
   real but cannot be requested by a client. `claude -p` gives no logprobs,
   token ids or seeds, ever. So now: export successful trajectories and
   same-prefix preference pairs as data. RL needs a policy we serve.
+  Trajectory export exists: `attempt_export {room min-reward? file?}`
+  (`dvergr.agent.trajectory`) gives one JSON object per certified Attempt with
+  the task, the candidate and model, every model turn with its tool calls and
+  results, the effects on its world (receipts with idempotency and result
+  digests, from the Attempt's effect log) and the verdict (reward, checks,
+  verifier trust, spend). Preference pairs are not built yet.
 - **Providers are nondeterministic.** Branches are samples, not replays.
 
 ## Order of work

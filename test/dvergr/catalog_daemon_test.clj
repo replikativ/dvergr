@@ -364,6 +364,15 @@
                   (is (:schedule d))
                   (is (some #(clojure.string/includes? (str (:task %) (:schedule/task %)) "Simmis") rows)
                       (pr-str rows)))))
+            (testing "its Attempts export as trajectories: turns, tool calls, effects, verdict"
+              (let [[t] (ops/invoke *daemon* :attempt/export {:room (:room started) :limit 1})]
+                (is (= 1.0 (:reward t)))
+                (is (= "room" (:verifier-trust t)))
+                (is (some #(= "tool-result" (:role %)) (:messages t)) (pr-str (:messages t)))
+                (is (some #(= "fs/write" (:effect %)) (:effects t)) (pr-str (:effects t))))
+              (let [{:keys [file count]} (ops/invoke *daemon* :attempt/export {:room (:room started) :file "competitors.jsonl"})]
+                (is (pos? count))
+                (is (= count (clojure.core/count (clojure.string/split-lines (slurp file)))))))
             (testing "and its Scorecard says who vouches for the rewards"
               (let [[sc] (ops/invoke *daemon* :scorecard/list {:room (:room started)})]
                 (is (= ["room"] (:verifier-trust (ops/invoke *daemon* :scorecard/detail

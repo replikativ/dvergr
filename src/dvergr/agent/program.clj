@@ -83,7 +83,9 @@
   ([status value] {::status status ::value value})
   ([status value reason] {::status status ::value value ::reason reason}))
 
-(defn- run-chat-id [run-id]
+(defn run-chat-id
+  "The chat a Run's model turns are kept under, in its control room."
+  [run-id]
   (UUID/nameUUIDFromBytes
    (.getBytes (str "dvergr-agent-run|" run-id) StandardCharsets/UTF_8)))
 

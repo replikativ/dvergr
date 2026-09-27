@@ -30,6 +30,7 @@
 
    :workflow/start :attempts, :job/status :attempts, :job/list :attempts,
    :job/cancel :attempts, :attempt/list :attempts, :attempt/detail :attempts,
+   :attempt/export :bench,
    :scorecard/list :attempts, :scorecard/detail :attempts
 
    :workflow/attempt :runs, :run/list :runs, :run/detail :runs

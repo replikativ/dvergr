@@ -216,7 +216,9 @@ dropped replay-based recovery; arXiv:2609.22978).
 `grep`, `shell`) pass the same boundary as the sandbox: the chat's receipts and binding, the
 world's handlers and sink, so read-only, quotas and denials cover them.
 
-**Next**: trajectory export from the effect logs, resume from savepoints, grants (eacl),
+Trajectory export reads the effect logs: `attempt_export` (`dvergr.agent.trajectory`).
+
+**Next**: resume from savepoints, grants (eacl),
 preflight.
 
 ### How modes answer the goals
