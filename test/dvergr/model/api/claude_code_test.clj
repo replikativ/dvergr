@@ -237,3 +237,13 @@
         (is (not (some #{"--safe-mode"} cmd)) "safe mode would drop the MCP config")
         (is (not= "0" (after "--max-turns")) "its own loop")))
     (is (some #{"--safe-mode"} (build {:model "claude-code-haiku"})) "the text protocol keeps safe mode")))
+
+(deftest the-cli-runs-outside-any-project
+  ;; the CLI reads project settings, skills and CLAUDE.md from its working
+  ;; directory and the git root above it: a candidate launched from a
+  ;; checkout saw that project's configuration
+  (let [dir (@#'claude-code/cli-work-dir)]
+    (is (.isDirectory dir))
+    (is (not-any? #(.exists (java.io.File. ^java.io.File % ".git"))
+                  (take-while some? (iterate #(.getParentFile ^java.io.File %) (.getCanonicalFile dir))))
+        "no repository above it")))

@@ -477,9 +477,21 @@
 (def ^:private cancel-poll-ms 10)
 (def ^:private process-exit-grace-ms 100)
 
+(defn- cli-work-dir
+  "An empty directory outside any repository, for the CLI to run in: it reads
+   project settings, skills and CLAUDE.md from its working directory and the
+   git root above it, which must never reach a model (a candidate launched
+   from simmis's or dvergr's checkout saw that project's configuration)."
+  ^java.io.File []
+  (let [base (if (.isDirectory (java.io.File. "/tmp")) "/tmp" (System/getProperty "java.io.tmpdir"))
+        d (java.io.File. (str base) "dvergr-claude-cli")]
+    (.mkdirs d)
+    d))
+
 (defn- start-process [cmd]
   (let [pb (doto (ProcessBuilder. ^java.util.List cmd)
-             (.redirectErrorStream false))]
+             (.redirectErrorStream false)
+             (.directory (cli-work-dir)))]
     (when-let [env (:env @settings)]
       (.putAll (.environment pb) ^java.util.Map env))
     (.start pb)))

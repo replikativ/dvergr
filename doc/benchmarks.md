@@ -261,6 +261,11 @@ encyclopedic writing cites fewer than half its sentences, so our per-page citati
 and grounding checks are stricter than Wikipedia practice (defensible for an
 internal wiki, whose reader must be able to check every number).
 
+**Caveat (found 2026-09-27, after these runs):** the `claude-code-haiku` rows below ran the
+CLI in a checkout of dvergr, where it loaded that project's `CLAUDE.md` and settings into the
+candidate's context; they are contaminated and are rerun with the CLI in an empty directory
+of its own. The Luna rows (no CLI) are unaffected.
+
 **First validation, 2026-09-27** (dev split, 3 generated worlds at scale 1, one repetition,
 both candidates on subscriptions, run through `catalog_benchmark` over MCP):
 
