@@ -155,6 +155,44 @@
       (when (contains? (:resources allocation) model-dispatches)
         {:room room :run-id run-id}))))
 
+(def ^:dynamic *spend-wallet*
+  "The Run whose conserved microUSD wallet pays for model calls made here:
+   `{:room :run-id}`, bound by the LLM program around its model steps when the
+   Run was allocated microdollars (doc/unified-worlds.md, step 4). Unlike
+   `*model-scope*` it restricts no provider: it only moves spend onto the
+   ledger."
+  nil)
+
+(defn spend-wallet
+  "The spend wallet of `run-id` in control Room `room`: when its allocation
+   carries microdollars."
+  [room run-id]
+  (when (satisfies? store/PResourceStore (:store room))
+    (let [allocation (store/-resource-receipt (:store room) (allocation-id run-id))]
+      (when (contains? (:resources allocation) microdollars)
+        {:room room :run-id run-id}))))
+
+(defn wallet-microdollars
+  "What is left in `run-id`'s wallet, in microdollars."
+  [room run-id]
+  (get (run-balance room run-id) microdollars 0M))
+
+(defn charge-spend!
+  "Consume `cost` microdollars of model spend from the bound spend wallet.
+   The provider was already paid, so the ledger cannot refuse it: a cost
+   beyond what is left takes the rest. Returns `{:charged n :exhausted?
+   bool}`, or nil when no wallet is bound or there is nothing to charge."
+  [cost]
+  (when-let [{:keys [room run-id]} *spend-wallet*]
+    (when (pos? cost)
+      (let [left (wallet-microdollars room run-id)
+            amount (min (bigdec cost) left)]
+        (when (pos? amount)
+          (consume! room run-id {:id (UUID/randomUUID)
+                                 :resources {microdollars amount}
+                                 :effective-date (java.util.Date.)}))
+        {:charged amount :exhausted? (<= left (bigdec cost))}))))
+
 (defn admit-model-dispatch!
   "Spend one admission immediately before native model egress. No read/check/
    write race: Kontor validates the debit atomically. Rejected admission never

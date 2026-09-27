@@ -47,10 +47,12 @@
         ;; that stopped would leave it: failed, with the gap after step 0 kept)
         (let [first-run
               (with-redefs [providers/ensure-initialized! (constantly nil)
+                            dvergr.chat.accounting/calculate-cost (fn [_type amount & _] amount)
                             chat-agent/run-agent-turn!
                             (fn [chat-ctx opts]
                               (if (zero? (:turn-number opts))
-                                (tool-step! chat-ctx 0)
+                                (do (chat-context/account-usage! chat-ctx :output-tokens 250000)
+                                    (tool-step! chat-ctx 0))
                                 (throw (ex-info "the process stopped" {}))))]
                 (let [h (program/hire! room team :worker {:task "calculate"})]
                   @h
@@ -69,6 +71,7 @@
                                 chat-agent/run-agent-turn!
                                 (fn [chat-ctx opts]
                                   (swap! seen conj {:step (:turn-number opts)
+                                                    :budget (:total (chat-context/get-budget chat-ctx))
                                                     :messages (mapv :message/role (chat-context/get-messages chat-ctx))})
                                   (chat-context/add-message! chat-ctx {:role :assistant :content "The result is 2."})
                                   :complete)]
@@ -78,6 +81,8 @@
                       (is (= "The result is 2." (:run/value result)))
                       (program/run-id h)))]
               (is (= [1] (mapv :step @seen)) "the steps count on from the savepoint")
+              (is (= 750000 (:budget (first @seen)))
+                  "its budget is what the stopped Run left, not a fresh one")
               (is (= [:system :user :assistant :tool-result] (:messages (first @seen)))
                   "the conversation is the old Run's, up to the savepoint")
               (is (contains? (:run/caused-by (run/run room second-run)) first-run))
