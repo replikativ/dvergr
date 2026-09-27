@@ -120,3 +120,12 @@
     (is (= 0.075 (:notional-cost-ratio small)) "at list price per attempt: defined even when nothing passes")
     (is (= ["big"] (mapv :candidate (:candidates (comparison entries rows "small")))) "any baseline")
     (is (nil? (comparison entries rows "nobody")))))
+
+(deftest a-check-rate-counts-the-attempts-that-have-the-check
+  ;; two real corpora: each Attempt has its own corpus's checks
+  (let [check-rates @#'ops/check-rates
+        attempts {1 {:attempt/receipt {:attempt/checks {:fact/a true :fact/b false}}}
+                  2 {:attempt/receipt {:attempt/checks {:fact/c true :fact/b true}}}}
+        entries [{:candidate/id :m :attempt/id 1} {:candidate/id :m :attempt/id 2}]]
+    (is (= {"m" {"fact/a" 1.0 "fact/b" 0.5 "fact/c" 1.0}}
+           (check-rates entries attempts)))))

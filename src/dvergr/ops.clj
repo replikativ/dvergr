@@ -180,8 +180,11 @@
               :when (seq checks)]
           [(kw->str candidate)
            (into (sorted-map)
-                 (for [k (distinct (mapcat keys checks))]
-                   [(kw->str k) (/ (double (count (filter #(true? (get % k)) checks))) (count checks))]))])))
+                 (for [k (distinct (mapcat keys checks))
+                       ;; only Attempts that have the check: environments differ
+                       ;; in their checks (one real corpus's facts are not another's)
+                       :let [with-k (filter #(contains? % k) checks)]]
+                   [(kw->str k) (/ (double (count (filter #(true? (get % k)) with-k))) (count with-k))]))])))
 
 (defn- comparison
   "Every other candidate of a Scorecard against `baseline` (a candidate id;
