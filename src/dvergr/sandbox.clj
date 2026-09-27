@@ -32,6 +32,7 @@
             [dvergr.sandbox.workspace :as workspace]
             [dvergr.sandbox.ns.agent :as ns-agent]
             [dvergr.sandbox.ns.io :as ns-io]
+            [dvergr.effects :as effects]
             [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.system.db :as sdb])
   (:import [java.io StringWriter]
@@ -258,13 +259,10 @@
 ;; ---------------------------------------------------------------------------
 
 (defn make-audit-log
-  "Return a fresh audit log: an atom containing a vector of IO events.
-
-   Each event is {:op keyword :t epoch-ms :data map}.
-   Attach to a SCI context via the :audit-log option on add-*-ns! calls.
-   The log is returned alongside the SCI ctx so callers can inspect it."
+  "Return a fresh receipt sink (`dvergr.effects/make-sink`): the effects a
+   sandbox performed, newest last."
   []
-  (atom []))
+  (effects/make-sink))
 
 (defn create-base-ctx
   "Create base SCI context with safe Clojure core and exposed tool functions.
@@ -1094,15 +1092,17 @@
 
    allowed-http-domains is a set of URL prefixes; non-empty restricts outbound HTTP.
 
-   Returns the audit-log atom — a vector of IO events ({:op :t :data}) accumulated
-   during the agent's execution.  Attach to the agent result for post-hoc analysis."
+   Every file, git and HTTP operation is an effect (`dvergr.effects`): decided by
+   the boundary the world binding carries (mode, admission, acting identity) and
+   receipted into `receipts` (a sink; a fresh one when absent), which is returned."
   [sci-ctx spindel-ctx & {:keys [base-path proc-allow allowed-http-domains room-conn kb-conn room-id
                                  room-runtime-id room-incarnation capability-id
-                                 agent-program-ceiling]
+                                 agent-program-ceiling receipts]
                           :or   {proc-allow #{}}}]
-  (let [audit-log  (make-audit-log)
+  (let [audit-log  (or receipts (make-audit-log))
         binding-resolver (when capability-id
                            (runtime-ctx/sandbox-binding-resolver spindel-ctx capability-id))
+        boundary   (effects/boundary-resolver binding-resolver audit-log)
         binding-swap! (when capability-id
                         (fn [f & args]
                           (apply runtime-ctx/update-sandbox-binding!
@@ -1179,11 +1179,11 @@
                              ((requiring-resolve
                                'dvergr.substrate.geschichte/filesystem)
                               workspace)))
-                        :audit-log audit-log)
+                        :effects boundary)
     ;; (proc folded into the muschel-backed babashka.process — add-bash-ns! in turn.clj)
     (ns-io/add-git-ns!  sci-ctx :base-path cwd :workspace workspace
                         :workspace-resolver (when workspace workspace-resolver)
-                        :audit-log audit-log)
+                        :effects boundary)
     (ns-kb/add-llm-ns!  sci-ctx agent-program-ceiling)
     ;; Boundary secret injection (doc/boundary-secret-injection.md): build the
     ;; host-side secret registry from config `:secrets` (resolved against the host
@@ -1217,7 +1217,7 @@
                                                      (fn [m]
                                                        (apply f (or m {}) args))))))
                          :secrets secrets)
-      (ns-io/add-http-ns! sci-ctx :audit-log audit-log :allowed-domains allowed-http-domains
+      (ns-io/add-http-ns! sci-ctx :effects boundary :allowed-domains allowed-http-domains
                           :secrets secrets :fixture-transport (:transport fixture)))
     (ns-agent/add-scheduler-ns! sci-ctx)
     ;; Default coder kit: discovery, dep-add, HTML, tests — these are

@@ -164,7 +164,8 @@
                        metosin/reitit-ring {:mvn/version "0.7.2"} metosin/reitit-malli {:mvn/version "0.7.2"} metosin/reitit-middleware {:mvn/version "0.7.2"} metosin/reitit-swagger {:mvn/version "0.7.2"} io.github.nextjournal/markdown {:mvn/version "0.7.222"} ; web (reitit, sans swagger-ui — add reitit-swagger-ui for the /docs page)
                        io.forward/clojure-mail {:mvn/version "1.0.8"} ; mail intake
                        org.replikativ/briefkasten {:mvn/version "0.1.2"} ; briefkasten (mail)
-                       org.replikativ/spindel-tui {:mvn/version "0.1.14"}}
+                       org.replikativ/spindel-tui {:mvn/version "0.1.14"}
+                       org.clojure/test.check {:mvn/version "1.1.1"}} ; laws (effects algebra)
          ;; State touched from another world (e.g. a control room's context)
          ;; fails the test instead of warning; see spindel's missing-state-mode.
          ;; Tests' temporary files go to target/test-tmp, emptied after the run
