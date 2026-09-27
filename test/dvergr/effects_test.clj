@@ -481,3 +481,19 @@
       (let [p (effects/replay! [{:key [:http/request {:method :get :url "https://simm.is/"}] :value {:status 200 :headers {} :body "the answer"}}])]
         (is (= :blocked (get! [[:replay {:id p}] [:deny-hosts #{"simm.is"}]] "https://simm.is/")))
         (effects/release! p)))))
+
+(deftest a-world-sees-what-was-refused-in-it
+  (let [ec (ctx/create-execution-context)
+        own (effects/make-sink)
+        world (effects/make-sink)]
+    (try
+      (effects/install-world! ec [[:deny-hosts #{"simm.is"}]])
+      (effects/set-world-sink! ec world)
+      (let [b (effects/boundary-resolver nil own {:world #(effects/world-handlers ec)
+                                                  :world-sink #(effects/world-sink ec)})]
+        (is (thrown? Exception (effects/perform! b {:effect :http/request :resource {:method :get :url "https://simm.is/"}}
+                                                 (constantly nil))))
+        (effects/perform! b {:effect :fs/read :resource {:path "a"}} (constantly "x"))
+        (is (= 2 (count @own) (count @world)) "both sinks have every receipt")
+        (is (= {:blocked 1} (effects/denials @world))))
+      (finally (ctx/stop-context! ec)))))

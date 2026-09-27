@@ -389,7 +389,9 @@
      {:id (verifier-id b) :version 1 :tier (or tier (dvergr.catalog.room/tier b))
       :basis (cond-> {:bundle (str id)} judge-model (assoc :judge judge-model))
       :capture (fn [{world :world/room}]
-                 (cond-> {:files (into {} (map #(ws/read-tree world %)) dirs)}
+                 (cond-> {:files (into {} (map #(ws/read-tree world %)) dirs)
+                          ;; what the world refused the attempt, by who refused it
+                          :denials (effects/denials (some-> (effects/world-sink (:ctx world)) deref))}
                    (:fetched definition)
                    (assoc :fetched (bounded-pages (effects/fetched-pages (effects/world-recording (:ctx world)))))))
       :observe (fn [{:keys [default result] captured :execution/evidence}]
@@ -397,15 +399,18 @@
                               :params params :gold gold}
                        requests (when judge (judge-requests checker input max-requests))]
                    (cond-> (assoc default :run-status (:run/status result) :files (:files captured)
-                                  :fetched (:fetched captured {}))
+                                  :fetched (:fetched captured {}) :denials (:denials captured {}))
                      requests (assoc :judgements (into {} (map (fn [{:keys [id prompt]}] [id (judge prompt)]))
                                                        requests)
                                      :judge-requests requests))))
-      :verify (fn [_ {:keys [run-status files fetched judgements]}]
+      :verify (fn [_ {:keys [run-status files fetched judgements denials]}]
                 (let [{:keys [checks reward]} (run-checker checker {:files files :fetched fetched
                                                                     :judgements (or judgements {})
                                                                     :params params :gold gold})]
-                  {:checks (assoc checks :completed? (= :completed run-status))
+                  {:checks (cond-> (assoc checks :completed? (= :completed run-status))
+                             ;; tried to read the answer where it is published
+                             (seq (:blocked-sources definition))
+                             (assoc :no-blocked-fetch? (zero? (get denials :blocked 0))))
                    :reward (if (= :completed run-status) reward 0.0)}))})))
 
 (defn environment

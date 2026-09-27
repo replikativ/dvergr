@@ -1130,7 +1130,8 @@
         boundary   (effects/boundary-resolver
                     binding-resolver audit-log
                     {:relations relations
-                     :world #(effects/world-handlers (runtime-ctx/selected-context spindel-ctx))})
+                     :world #(effects/world-handlers (runtime-ctx/selected-context spindel-ctx))
+                     :world-sink #(effects/world-sink (runtime-ctx/selected-context spindel-ctx))})
         binding-swap! (when capability-id
                         (fn [f & args]
                           (apply runtime-ctx/update-sandbox-binding!

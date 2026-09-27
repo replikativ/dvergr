@@ -84,7 +84,8 @@
         (let [boundary (effects/boundary-resolver
                         (runtime-ctx/sandbox-binding-resolver execution-ctx capability-id)
                         (:receipts cctx)
-                        {:world #(effects/world-handlers (runtime-ctx/selected-context execution-ctx))})]
+                        {:world #(effects/world-handlers (runtime-ctx/selected-context execution-ctx))
+                         :world-sink #(effects/world-sink (runtime-ctx/selected-context execution-ctx))})]
           (ns-io/add-bash-ns!    sci cctx boundary)
           (ns-io/add-media-ns!   sci cctx boundary)
           ;; model calls from code are the agent's spend, charged to this chat

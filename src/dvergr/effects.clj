@@ -113,13 +113,16 @@
   []
   (atom []))
 
-(defn- record! [sink receipt]
-  (when sink
-    (swap! sink (fn [rs]
-                  (let [rs (conj rs receipt)]
-                    (if (> (count rs) receipt-cap)
-                      (subvec rs (- (count rs) receipt-cap))
-                      rs)))))
+(defn- record!
+  "Append `receipt` to `sink`, or to each of several sinks (a sandbox's own and
+   its world's)."
+  [sink receipt]
+  (doseq [s (if (sequential? sink) sink [sink]) :when s]
+    (swap! s (fn [rs]
+               (let [rs (conj rs receipt)]
+                 (if (> (count rs) receipt-cap)
+                   (subvec rs (- (count rs) receipt-cap))
+                   rs)))))
   receipt)
 
 (defn digest
@@ -475,6 +478,25 @@
   (binding [ec/*execution-context* ctx]
     (ec/swap-state! [:dvergr/effects :recording] (constantly id))))
 
+(defn set-world-sink!
+  "Give the world `ctx` a receipt sink every sandbox in it also writes to:
+   what host code reads of what happened there, denials included."
+  [ctx sink]
+  (binding [ec/*execution-context* ctx]
+    (ec/swap-state! [:dvergr/effects :sink] (constantly sink))))
+
+(defn world-sink
+  "The world `ctx`'s receipt sink, or nil."
+  [ctx]
+  (binding [ec/*execution-context* ctx]
+    (ec/get-state [:dvergr/effects :sink])))
+
+(defn denials
+  "How many effects in `receipts` were denied, by who denied them:
+   `{:blocked n :authority n …}`."
+  [receipts]
+  (frequencies (keep #(when (= :denied (:decision %)) (:by %)) receipts)))
+
 (defn world-recording
   "The entries recorded in the world `ctx` (`recorded`), or nil."
   [ctx]
@@ -516,11 +538,12 @@
   "The boundary for a sandbox. `binding-resolver` reads the capability's world
    binding, where the runtime set the acting identity and `:effects {:handlers
    specs}`; `sink` holds the receipts. Options: `:world`, a function returning
-   the world's handler configuration (outside the binding's), and
+   the world's handler configuration (outside the binding's), `:world-sink`,
+   returning the world's receipt sink (receipts go there too), and
    `:relations`, returning the room relations for the authority filter the
    runtime adds for every agent. Any may be nil."
   ([binding-resolver sink] (boundary-resolver binding-resolver sink {}))
-  ([binding-resolver sink {:keys [relations world]}]
+  ([binding-resolver sink {:keys [relations world world-sink]}]
    (fn []
      (let [b (when binding-resolver (binding-resolver))
            agent-id (:agent-id b)
@@ -529,5 +552,5 @@
                    (not (full-reach? agent-id)) (conj [:authority]))]
        {:sink sink
         :subject subject
-        :handlers (into [(receipts sink subject)]
+        :handlers (into [(receipts [sink (when world-sink (world-sink))] subject)]
                         (handlers specs {:subject subject :relations relations}))}))))

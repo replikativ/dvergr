@@ -105,7 +105,10 @@ its cases.
 `:blocked-sources ["simm.is"]` names the hosts a task's answer is published on: the
 environment refuses requests to them and their subdomains (`[:deny-hosts …]`, a filter in the
 effect algebra that composes by union and sits outside answering handlers, so a frozen web or
-a replay cannot answer them either), and freezing leaves them out.
+a replay cannot answer them either), and freezing leaves them out. An attempt that
+reached for one fails the check `:no-blocked-fetch?`: each Attempt's world has a receipt sink
+every sandbox in it writes to, and the capture counts its denials by who decided them
+(`:denials {:blocked n :authority n …}`, kept as evidence).
 
 `catalog_freeze {room name as?}` makes a stable benchmark of a live one: a new bundle
 (`<name>-frozen`) whose `web.edn` is the pages its live Attempts fetched (as text) and whose

@@ -309,3 +309,22 @@
                                              "https://dust.tt/" {:title "Dust" :body "agents"}})
                     (get "web.edn") clojure.edn/read-string)]
         (is (= ["https://dust.tt/"] (keys web)))))))
+
+(deftest an-attempt-that-reached-for-the-answer-is-marked
+  (let [b (room-wf/bundle "blocked2" (assoc files "workflow.edn"
+                                            (pr-str {:title "C" :task "t" :capture ["/out"] :blocked-sources ["simm.is"]})))
+        room (d/make-room {:id :room-workflow-denials :store (memory/make)})
+        sink (effects/make-sink)]
+    (ws/ensure-workspace! room)
+    (ws/seed! room {"/out/competitors.md" "Wato"})
+    (effects/set-world-sink! (:ctx room) sink)
+    (let [boundary (effects/boundary-resolver nil nil {:world (constantly [[:deny-hosts #{"simm.is"}]])
+                                                       :world-sink #(effects/world-sink (:ctx room))})]
+      (try (effects/perform! boundary {:effect :http/request :resource {:method :get :url "https://simm.is/blog"}}
+                             (constantly nil))
+           (catch Exception _)))
+    (let [ev (room-wf/evaluator b {})
+          captured ((:capture ev) {:world/room room})
+          evidence ((:observe ev) {:default {} :result {:run/status :completed} :execution/evidence captured})]
+      (is (= {:blocked 1} (:denials captured)))
+      (is (false? (get-in ((:verify ev) nil evidence) [:checks :no-blocked-fetch?]))))))

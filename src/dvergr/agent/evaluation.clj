@@ -613,6 +613,9 @@
                         world (:ctx (:room context))]
                     ((:register-cleanup! context) (fn [] (release) nil))
                     (effects/install-world! world specs)
+                    ;; the world's receipts, for what the capture counts
+                    ;; (denials: blocked sources, authority)
+                    (effects/set-world-sink! world (effects/make-sink))
                     (when recording (effects/set-world-recording! world recording))))
                 (when-let [capture (:capture evaluator)]
                   ;; Register first: supervisor cleanup is LIFO, so capture
