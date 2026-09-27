@@ -216,7 +216,12 @@
                :reward-difference-interval (:interval diff)
                :paired-worlds (:n diff 0)
                :microdollars-per-pass-saved (when (and cost base-cost) (- base-cost cost))
-               :cost-per-pass-ratio (when (and cost base-cost (pos? base-cost)) (/ (double cost) base-cost))}))})))
+               :cost-per-pass-ratio (when (and cost base-cost (pos? base-cost)) (/ (double cost) base-cost))
+               ;; at list price and per attempt: defined when nothing passed,
+               ;; and comparable across a subscription, a customer's key and a paid run
+               :notional-cost-ratio (let [c (:notional-microdollars-per-attempt r)
+                                          bc (:notional-microdollars-per-attempt b)]
+                                      (when (and c bc (pos? bc)) (/ (double c) bc)))}))})))
 
 (defn- scorecard-data
   "A Scorecard as a leaderboard: one row per candidate, ranked by reward mean
@@ -243,6 +248,9 @@
                             :microdollars-per-attempt (:microdollars-per-attempt s)
                             :microdollars-per-pass    (:microdollars-per-pass s)
                             ;; at list price, so a subscription run compares with a paid one
+                            :notional-microdollars-per-attempt
+                            (when (pos? (:attempt-count s 0))
+                              (quot (spend/notional-microdollars (:spend s)) (:attempt-count s)))
                             :notional-microdollars-per-pass
                             (when (pos? (:passed-count s 0))
                               (quot (spend/notional-microdollars (:spend s)) (:passed-count s)))}))

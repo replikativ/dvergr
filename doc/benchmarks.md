@@ -261,6 +261,23 @@ encyclopedic writing cites fewer than half its sentences, so our per-page citati
 and grounding checks are stricter than Wikipedia practice (defensible for an
 internal wiki, whose reader must be able to check every number).
 
+**First validation, 2026-09-27** (dev split, 3 generated worlds at scale 1, one repetition,
+both candidates on subscriptions, run through `catalog_benchmark` over MCP):
+
+| Candidate | Mean reward (95% range) | All checks passed | Cost at list price | Tokens in / out |
+| --- | --- | --- | --- | --- |
+| `codex-subscription-luna` | 0.861 (0.79–0.93) | 0 of 3 | $0.08 | 348k / 8.7k |
+| `claude-code-haiku` (CLI into the world over MCP) | 0.739 (0.50–0.97) | 0 of 3 | $0.77 | 671k / 20k |
+
+Haiku against Luna, paired by world: −0.122 (−0.41 to +0.16), so three worlds do not
+separate them; Haiku costs about 10× at list price (twice the tokens, a pricier model).
+Neither wrote a wiki that passes every check. Luna misses the trust's entity page and the
+incident duration (which must be computed); Haiku fails grounding (invented numbers) and more
+facts. Both leave out the crisis (four of six wikis never mention it): a real weakness on a
+minor event, not a scorer strictness (the one sentence that states it cites another
+document). With no passes, cost per pass is undefined, so the comparison now also reports
+list-price cost per attempt (`notional-cost-ratio`).
+
 Next for the wiki benchmark:
 
 - **More real corpora.** More Wikipedia revision histories (the same shape as
