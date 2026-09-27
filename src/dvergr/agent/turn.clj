@@ -15,6 +15,7 @@
             [org.replikativ.spindel.engine.core :as rtc]
             [dvergr.discourse :as d]
             [dvergr.chat.context :as chat-ctx]
+            [dvergr.effects :as effects]
             [dvergr.agent.run :as run]
             [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.sandbox :as sandbox]
@@ -45,7 +46,7 @@
    refresh keeps newly added APIs visible; it is not the isolation boundary."
   [cctx {:keys [execution-ctx db-conn kb-conn room-id room-runtime-id
                 room-incarnation capability-id fork-projection?
-                agent-program-ceiling allowed-domains agent-id]}]
+                agent-program-ceiling allowed-domains agent-id effects]}]
   (let [capability-id (or capability-id (:capability-id cctx)
                           (throw (ex-info "Working context has no capability identity" {})))
         agent-id (or agent-id (:agent-id cctx))]
@@ -58,6 +59,14 @@
               :room-runtime-id room-runtime-id
               :room-incarnation room-incarnation}
        agent-id (assoc :agent-id agent-id)
+       ;; effect handlers ([[:read-only]], [[:admit #{:read :write}]]), set by
+       ;; the runtime (doc/effects.md). They compose onto what the world
+       ;; already has, so a rebind or a fork narrows and never widens.
+       effects (assoc-in [:effects :handlers]
+                         (effects/compose
+                          (get-in (runtime-ctx/sandbox-binding execution-ctx capability-id)
+                                  [:effects :handlers])
+                          effects))
        fork-projection? (assoc :ephemeral-databases {})))
     (binding [rtc/*execution-context* execution-ctx]
       (when-let [sci (chat-ctx/sci-context-in cctx execution-ctx)]
@@ -67,7 +76,8 @@
                                          :room-incarnation room-incarnation
                                          :capability-id capability-id
                                          :agent-program-ceiling agent-program-ceiling
-                                         :allowed-http-domains allowed-domains)
+                                         :allowed-http-domains allowed-domains
+                                         :receipts (:receipts cctx))
       ;; These capabilities close over the ChatContext itself, so a projected
       ;; child facade must replace them as well.
         (ns-io/add-bash-ns!    sci cctx)
@@ -86,7 +96,7 @@
    writer). Returns the ChatContext."
   [{:keys [execution-ctx chat-id title budget-dollars db-conn kb-conn room-id
            room-runtime-id room-incarnation capability-id agent-program-ceiling
-           durable? allowed-domains agent-id]}]
+           durable? allowed-domains agent-id effects]}]
   (binding [rtc/*execution-context* execution-ctx]
     (let [capability-id (or capability-id (random-uuid))
           cctx (assoc (cond-> (chat-ctx/create-chat-context
@@ -100,7 +110,9 @@
                  ;; mount provider) resolve room-scoped resources from it
                         room-id (assoc :room-id room-id)
                         agent-id (assoc :agent-id agent-id))
-                      :capability-id capability-id)]
+                      :capability-id capability-id
+                      ;; every effect the sandbox performs, newest last
+                      :receipts (effects/make-sink))]
       ;; create-chat-context forks a sci-ctx but does NOT inject the ctx-bound
       ;; namespaces — do it here so clojure_eval has the room/kb/intake nses
       ;; everywhere. `db-conn` is the room's OWN messages store (= `*room*`);
@@ -113,7 +125,8 @@
                                    :capability-id capability-id
                                    :agent-program-ceiling agent-program-ceiling
                                    :allowed-domains allowed-domains
-                                   :agent-id agent-id})
+                                   :agent-id agent-id
+                                   :effects effects})
         cctx
         (catch Throwable error
           ;; Namespace/resource installation is part of construction. A caller

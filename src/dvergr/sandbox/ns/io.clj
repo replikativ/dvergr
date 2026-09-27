@@ -9,6 +9,7 @@
             [jsonista.core :as j]
             [babashka.fs :as fs]
             [muschel.fs :as mfs]
+            [dvergr.effects :as effects]
             [dvergr.io.acquisition :as acquisition]
             [org.replikativ.spindel.engine.core :as ec]
             [dvergr.sandbox.ns.doc :as doc])
@@ -29,11 +30,11 @@
   (ec/swap-state! [::http-fixture] (constantly fixture))
   id)
 
-(defn- audit!
-  "Append an IO event to the audit log (no-op when log is nil)."
-  [log op data]
-  (when log
-    (swap! log conj {:op op :t (System/currentTimeMillis) :data data})))
+(defn- fx
+  "Perform one effect through the sandbox's boundary (`dvergr.effects`)."
+  ([boundary kind resource f] (effects/perform! boundary {:effect kind :resource resource} f))
+  ([boundary kind resource result-of f]
+   (effects/perform! boundary {:effect kind :resource resource :result-of result-of} f)))
 
 (defn sensitive-path-policy
   "Throw if path matches known-sensitive OS path patterns.
@@ -132,7 +133,7 @@
   "Replace `spec`'s placeholder with its real value in `opts` (headers/query/body),
    enforcing the secret's domain + slot policy. Throws on ANY violation (never
    strip-and-send). Audits placeholder slots (never values). Returns rewritten opts."
-  [audit-log url opts {:keys [placeholder value allowed-domains allowed-locations header-names]}]
+  [effects url opts {:keys [placeholder value allowed-domains allowed-locations header-names]}]
   (let [hit-header (some (fn [[_ v]] (contains-ph? placeholder v)) (:headers opts))
         hit-query  (some (fn [[_ v]] (contains-ph? placeholder v)) (:query-params opts))
         hit-body   (contains-ph? placeholder (:body opts))]
@@ -140,7 +141,7 @@
       opts
       (do
         (when (and (seq allowed-domains) (not (domain-allows? allowed-domains url)))
-          (audit! audit-log :http/secret-denied {:reason :domain :url url})
+          (effects/note! effects :http/secret-denied {:reason :domain :url url})
           (throw (ex-info "secret not permitted for this destination"
                           {:muschel/denied true :url url :allowed allowed-domains})))
         (cond-> opts
@@ -154,7 +155,7 @@
                                             (or (empty? header-names) (contains? header-names k)))
                                (throw (ex-info "secret not permitted in this header"
                                                {:muschel/denied true :header k})))
-                             (audit! audit-log :http/secret-injected {:slot [:header k]})
+                             (effects/note! effects :http/secret-injected {:slot [:header k]})
                              (assoc m k (str/replace v placeholder value)))
                          (assoc m k v)))
                      {} hs)))
@@ -163,7 +164,7 @@
                   (fn [qs]
                     (when-not (contains? allowed-locations :query)
                       (throw (ex-info "secret not permitted in query" {:muschel/denied true})))
-                    (audit! audit-log :http/secret-injected {:slot :query})
+                    (effects/note! effects :http/secret-injected {:slot :query})
                     (reduce-kv (fn [m k v]
                                  (assoc m k (if (contains-ph? placeholder v)
                                               (str/replace v placeholder value) v)))
@@ -172,13 +173,13 @@
           (as-> o
                 (do (when-not (contains? allowed-locations :body)
                       (throw (ex-info "secret not permitted in body" {:muschel/denied true})))
-                    (audit! audit-log :http/secret-injected {:slot :body})
+                    (effects/note! effects :http/secret-injected {:slot :body})
                     (update o :body str/replace placeholder value))))))))
 
 (defn- substitute-secrets!
   "Apply every registry secret's substitution to `opts`. Throws on policy violation."
-  [secrets audit-log url opts]
-  (reduce (fn [o [_ spec]] (substitute-one audit-log url o spec)) opts (or secrets {})))
+  [secrets effects url opts]
+  (reduce (fn [o [_ spec]] (substitute-one effects url o spec)) opts (or secrets {})))
 
 (defn- scrub-response
   "Re-mask any real secret value reflected in the response body/headers back to its
@@ -231,7 +232,7 @@
    Sensitive OS path patterns (/etc/passwd, .ssh/, .env, etc.) are also blocked.
 
    :base-path  - absolute root for all relative path resolution (default: user.dir)
-   :audit-log  - atom from (make-audit-log); records every FS op with timestamp
+   :effects    - boundary fn (`dvergr.effects/boundary-resolver`); every op is an effect
 
    Usage in SCI:
      (require '[fs])
@@ -246,7 +247,7 @@
      (fs/copy \"src.clj\" \"dst.clj\")
      (fs/read \"src/core.clj\")
      (fs/write \"src/out.clj\" content)"
-  [sci-ctx & {:keys [base-path audit-log]
+  [sci-ctx & {:keys [base-path effects]
               :or   {base-path ((requiring-resolve 'dvergr.substrate.git/safe-workspace-root))}}]
   (load/require! 'babashka.fs)
   (let [fs-ns          (find-ns 'babashka.fs)
@@ -272,18 +273,23 @@
                                    :else nil)))
         bb-parent      (r 'parent)
         bb-create-dirs (r 'create-dirs)
-        mkdir          (fn [p] (let [f (sr p)] (audit! audit-log :fs/mkdir {:path (str f)}) (bb-create-dirs f) (rel f)))
-        del            (fn [bb] (fn [p] (let [f (sr p)] (audit! audit-log :fs/delete {:path (str f)}) (bb f))))
-        cpmv           (fn [op bb] (fn [a b & m] (let [fa (sr a) fb (sr b)]
-                                                   (audit! audit-log op {:src (str fa) :dst (str fb)})
-                                                   (apply bb fa fb m) (rel fb))))
-        pred           (fn [bb] (fn [p] (bb (sr p))))]
+        ;; Receipts name the path as the code gave it, never the host path;
+        ;; resolution and containment run inside the effect, so a refused
+        ;; path is receipted too.
+        mkdir          (fn [p] (fx effects :fs/mkdir {:path (str p)}
+                                   #(let [f (sr p)] (bb-create-dirs f) (rel f))))
+        del            (fn [bb] (fn [p] (fx effects :fs/delete {:path (str p)} #(bb (sr p)))))
+        cpmv           (fn [op bb] (fn [a b & m] (fx effects op {:src (str a) :dst (str b)}
+                                                     #(let [fa (sr a) fb (sr b)]
+                                                        (apply bb fa fb m) (rel fb)))))
+        pred           (fn [bb] (fn [p] (fx effects :fs/stat {:path (str p)} #(bb (sr p)))))]
     ;; The real babashka.fs SUBSET, every path clamped to base-path. Returns strings
     ;; (not Path objects) so SCI agents get serialisable values. Content read/write
     ;; is `slurp`/`spit` (below), as in real Clojure — NOT an fs fn.
     (sci/add-namespace! sci-ctx 'babashka.fs
-                        {'list-dir           (fn [d & more] (audit! audit-log :fs/ls {:path (str (sr d))})
-                                               (into [] (keep rel) (apply (r 'list-dir) (sr d) more)))
+                        {'list-dir           (fn [d & more]
+                                               (fx effects :fs/list {:path (str d)}
+                                                   #(into [] (keep rel) (apply (r 'list-dir) (sr d) more))))
                          ;; 1-arg is pattern-only (root = workspace root) — the
                          ;; form an LLM reaches for, `(fs/glob "**/*.clj")`.
                          ;; babashka.fs/glob is root-first, so the raw 1-arg call
@@ -292,14 +298,17 @@
                          ;; out rather than rely on that leniency. (The virtual
                          ;; adapter below already carries the same 1-arg form.)
                          'glob               (fn
-                                               ([pat] (into [] (keep rel) ((r 'glob) (sr ".") pat)))
-                                               ([d pat & more] (into [] (keep rel) (apply (r 'glob) (sr d) pat more))))
+                                               ([pat] (fx effects :fs/list {:path "." :glob (str pat)}
+                                                          #(into [] (keep rel) ((r 'glob) (sr ".") pat))))
+                                               ([d pat & more] (fx effects :fs/list {:path (str d) :glob (str pat)}
+                                                                   #(into [] (keep rel) (apply (r 'glob) (sr d) pat more)))))
                          'exists?            (pred (r 'exists?))
                          'directory?         (pred (r 'directory?))
                          'regular-file?      (pred (r 'regular-file?))
                          'sym-link?          (pred (r 'sym-link?))
                          'size               (pred (r 'size))
-                         'last-modified-time (fn [p] (str ((r 'last-modified-time) (sr p))))
+                         'last-modified-time (fn [p] (fx effects :fs/stat {:path (str p)}
+                                                         #(str ((r 'last-modified-time) (sr p)))))
                          'create-dir         mkdir
                          'create-dirs        mkdir
                          'delete             (del (r 'delete))
@@ -316,12 +325,13 @@
     (sci/merge-opts sci-ctx
                     {:namespaces
                      {'clojure.core
-                      {'slurp (fn [p & opts] (let [f (sr p)] (audit! audit-log :fs/read {:path (str f)})
-                                                  (apply clojure.core/slurp f opts)))
+                      {'slurp (fn [p & opts] (fx effects :fs/read {:path (str p)}
+                                                 #(apply clojure.core/slurp (sr p) opts)))
                        'spit  (fn [p content & opts]
-                                (let [f (sr p)] (audit! audit-log :fs/write {:path (str f)})
-                                     (when-let [par (bb-parent f)] (bb-create-dirs par))
-                                     (apply clojure.core/spit f content opts) (str f)))}}})))
+                                (fx effects :fs/write {:path (str p)} (constantly (str content))
+                                    #(let [f (sr p)]
+                                       (when-let [par (bb-parent f)] (bb-create-dirs par))
+                                       (apply clojure.core/spit f content opts) (str f))))}}})))
 
 (defn- virtual-path [filesystem path]
   (let [path (str path)]
@@ -402,7 +412,7 @@
       (str/replace "\u0003" "[^/]*")
       (str/replace "\u0004" "[^/]")))
 
-(defn- add-virtual-fs-ns! [sci-ctx filesystem audit-log]
+(defn- add-virtual-fs-ns! [sci-ctx filesystem effects]
   (let [resolve! #(virtual-path filesystem %)
         relative #(str/replace % #"^/+" "")
         stat-map (fn [path]
@@ -426,7 +436,9 @@
                                     (mfs/read-bytes filesystem source)))
                          nil)
                        target))]
-    (letfn [(glob-paths [directory pattern]
+    (letfn [(stat-fx [f] (fn [p] (fx effects :fs/stat {:path (str p)} #(f p))))
+            (write-fx [kind f] (fn [p] (fx effects kind {:path (str p)} #(f p))))
+            (glob-paths [directory pattern]
               (let [root (resolve! directory)
                     matcher (re-pattern (str "^" (glob-regex (str pattern)) "$"))
                     prefix (str (str/replace root #"/$" "") "/")]
@@ -439,58 +451,62 @@
       (sci/add-namespace!
        sci-ctx 'babashka.fs
        {'list-dir (fn [directory & _]
-                    (let [path (resolve! directory)]
-                      (audit! audit-log :fs/ls {:path path})
-                      (mapv #(relative (str (str/replace path #"/$" "")
-                                            "/" (:name %)))
-                            (or (mfs/list-dir filesystem path) []))))
+                    (fx effects :fs/list {:path (str directory)}
+                        #(let [path (resolve! directory)]
+                           (mapv (fn [e] (relative (str (str/replace path #"/$" "")
+                                                        "/" (:name e))))
+                                 (or (mfs/list-dir filesystem path) [])))))
         'glob (fn
-                ([pattern] (glob-paths "." pattern))
-                ([directory pattern & _] (glob-paths directory pattern)))
-        'exists? #(mfs/exists? filesystem (resolve! %))
-        'directory? #(= :dir (:type (mfs/stat filesystem (resolve! %))))
-        'regular-file? #(= :file (:type (mfs/stat filesystem (resolve! %))))
-        'sym-link? #(= :symlink (:type (mfs/stat filesystem (resolve! %))))
-        'size #(some-> (mfs/stat filesystem (resolve! %)) :size)
-        'last-modified-time #(str (or (:mtime-ms (mfs/stat filesystem (resolve! %))) 0))
-        'create-dir (fn [path] (let [path (resolve! path)] (mfs/mkdir filesystem path) (relative path)))
-        'create-dirs (fn [path] (relative (virtual-mkdirs! filesystem (resolve! path))))
-        'delete (fn [path] (mfs/delete filesystem (resolve! path)))
-        'delete-if-exists (fn [path] (let [path (resolve! path)]
-                                       (if (mfs/exists? filesystem path)
-                                         (mfs/delete filesystem path) false)))
-        'delete-tree (fn [path] (delete-tree! (resolve! path)))
+                ([pattern] (fx effects :fs/list {:path "." :glob (str pattern)}
+                               #(glob-paths "." pattern)))
+                ([directory pattern & _] (fx effects :fs/list {:path (str directory) :glob (str pattern)}
+                                             #(glob-paths directory pattern))))
+        'exists? (stat-fx #(mfs/exists? filesystem (resolve! %)))
+        'directory? (stat-fx #(= :dir (:type (mfs/stat filesystem (resolve! %)))))
+        'regular-file? (stat-fx #(= :file (:type (mfs/stat filesystem (resolve! %)))))
+        'sym-link? (stat-fx #(= :symlink (:type (mfs/stat filesystem (resolve! %)))))
+        'size (stat-fx #(some-> (mfs/stat filesystem (resolve! %)) :size))
+        'last-modified-time (stat-fx #(str (or (:mtime-ms (mfs/stat filesystem (resolve! %))) 0)))
+        'create-dir (write-fx :fs/mkdir #(let [path (resolve! %)] (mfs/mkdir filesystem path) (relative path)))
+        'create-dirs (write-fx :fs/mkdir #(relative (virtual-mkdirs! filesystem (resolve! %))))
+        'delete (write-fx :fs/delete #(mfs/delete filesystem (resolve! %)))
+        'delete-if-exists (write-fx :fs/delete #(let [path (resolve! %)]
+                                                  (if (mfs/exists? filesystem path)
+                                                    (mfs/delete filesystem path) false)))
+        'delete-tree (write-fx :fs/delete #(delete-tree! (resolve! %)))
         'move (fn [source target & _]
-                (let [source (resolve! source) target (resolve! target)]
-                  (audit! audit-log :fs/move {:src source :dst target})
-                  (mfs/rename filesystem source target)
-                  (relative target)))
+                (fx effects :fs/move {:src (str source) :dst (str target)}
+                    #(let [source (resolve! source) target (resolve! target)]
+                       (mfs/rename filesystem source target)
+                       (relative target))))
         'copy (fn [source target & _]
-                (relative (copy-tree! (resolve! source) (resolve! target))))
+                (fx effects :fs/copy {:src (str source) :dst (str target)}
+                    #(relative (copy-tree! (resolve! source) (resolve! target)))))
         'copy-tree (fn [source target & _]
-                     (relative (copy-tree! (resolve! source) (resolve! target))))
+                     (fx effects :fs/copy {:src (str source) :dst (str target)}
+                         #(relative (copy-tree! (resolve! source) (resolve! target)))))
         'parent (fn [path] (let [path (resolve! path)]
                              (when-not (= path "/") (relative (virtual-parent path)))))
         'file-name #(last (str/split (str %) #"/"))
         'absolutize #(relative (resolve! %))
         'canonicalize #(relative (resolve! %))
-        'stat #(stat-map (resolve! %))})
+        'stat (stat-fx #(stat-map (resolve! %)))})
       (sci/merge-opts
        sci-ctx
        {:namespaces
         {'clojure.core
          {'slurp (fn [path & _]
-                   (let [path (resolve! path)]
-                     (audit! audit-log :fs/read {:path path})
-                     (or (mfs/read-file filesystem path)
-                         (throw (ex-info "No such virtual file" {:path path})))))
+                   (fx effects :fs/read {:path (str path)}
+                       #(let [path (resolve! path)]
+                          (or (mfs/read-file filesystem path)
+                              (throw (ex-info "No such virtual file" {:path path}))))))
           'spit (fn [path content & options]
-                  (let [path (resolve! path)
-                        append? (boolean (:append (first options)))]
-                    (audit! audit-log :fs/write {:path path})
-                    (virtual-mkdirs! filesystem (virtual-parent path))
-                    (mfs/write-string! filesystem path (str content) append?)
-                    (relative path)))}}}))))
+                  (fx effects :fs/write {:path (str path)} (constantly (str content))
+                      #(let [path (resolve! path)
+                             append? (boolean (:append (first options)))]
+                         (virtual-mkdirs! filesystem (virtual-parent path))
+                         (mfs/write-string! filesystem path (str content) append?)
+                         (relative path))))}}}))))
 
 (defn add-fs-ns!
   "Expose a filesystem namespace backed by Muschel when `:filesystem` is
@@ -501,7 +517,7 @@
                         (if filesystem-resolver
                           (world-filesystem filesystem-resolver)
                           filesystem)
-                        (:audit-log options))
+                        (:effects options))
     (apply add-physical-fs-ns! sci-ctx (mapcat identity options))))
 
 (defn add-git-ns!
@@ -512,7 +528,7 @@
    structured Clojure data rather than raw strings.
 
    :base-path - git working directory (default: user.dir)
-   :audit-log - atom from (make-audit-log); records write ops (add, commit)
+   :effects   - boundary fn (`dvergr.effects/boundary-resolver`); add/commit are effects
 
    Usage in SCI:
      (require '[git])
@@ -531,7 +547,7 @@
 
      (git/commit \"Add feature\")
      ;; => \"[main abc1234] Add feature\""
-  [sci-ctx & {:keys [base-path audit-log workspace workspace-resolver]
+  [sci-ctx & {:keys [base-path effects workspace workspace-resolver]
               :or   {base-path ((requiring-resolve 'dvergr.substrate.git/safe-workspace-root))}}]
   (let [run!      (if (or workspace workspace-resolver)
                     (fn [& args]
@@ -547,29 +563,32 @@
                     (fn [& args] (apply git-run* base-path args)))
 
         status-fn (fn []
-                    (parse-porcelain-status
-                     (run! "status" "--porcelain=v1" "--branch")))
+                    (fx effects :git/read {:op :status}
+                        #(parse-porcelain-status
+                          (run! "status" "--porcelain=v1" "--branch"))))
 
         log-fn    (fn [& [opts]]
-                    (let [n (str "-" (or (:n opts) 10))]
-                      (parse-git-log
-                       (run! "log" git-log-format n))))
+                    (fx effects :git/read {:op :log}
+                        #(let [n (str "-" (or (:n opts) 10))]
+                           (parse-git-log
+                            (run! "log" git-log-format n)))))
 
         diff-fn   (fn [& args]
-                    (if (seq args)
-                      (apply run! "diff" args)
-                      (run! "diff")))
+                    (fx effects :git/read {:op :diff :args (vec args)}
+                        #(if (seq args)
+                           (apply run! "diff" args)
+                           (run! "diff"))))
 
         add-fn    (fn [& paths]
-                    (audit! audit-log :git/add {:paths (vec paths)})
-                    (apply run! "add" paths)
-                    :ok)
+                    (fx effects :git/add {:paths (vec paths)}
+                        #(do (apply run! "add" paths)
+                             :ok)))
 
         commit-fn (fn [message & [opts]]
-                    (audit! audit-log :git/commit {:message message})
-                    (let [args (cond-> ["commit" "-m" message]
-                                 (:author opts) (into ["--author" (:author opts)]))]
-                      (str/trim (apply run! args))))]
+                    (fx effects :git/commit {:message message}
+                        #(let [args (cond-> ["commit" "-m" message]
+                                      (:author opts) (into ["--author" (:author opts)]))]
+                           (str/trim (apply run! args)))))]
 
     (sci/add-namespace! sci-ctx 'git
                         (doc/with-docs
@@ -656,7 +675,8 @@
    Responses are returned as maps with :status, :headers, :body.
    JSON bodies are auto-parsed.
 
-   :audit-log      - atom from (make-audit-log); records every request (method + url, no body)
+   :effects        - boundary fn (`dvergr.effects/boundary-resolver`); every request is
+                     an effect (method + URL; the response body by digest only)
    :fixture-transport - trusted host-only offline request function, local to this
                         SCI namespace. Preserves domain checks and acquisition
                         recording; replaces DNS/network and secret injection.
@@ -672,14 +692,13 @@
        {:headers {\"Authorization\" (str \"Bearer \" (env/get \"MY_SERVICE_TOKEN\"))}
         :json {:channel \"#general\" :text \"Hello from dvergr\"}})
      (http/request {:url \"...\" :method :put :headers {...} :body \"...\"})"
-  [sci-ctx & {:keys [audit-log allowed-domains secrets fixture-transport]}]
+  [sci-ctx & {:keys [effects allowed-domains secrets fixture-transport]}]
   (let [domain-check (make-domain-policy allowed-domains)
         perform-request
         (fn [{:keys [url method headers body json query-params timeout]
               :or {method :get timeout 30000}}]
-          ;; Audit first (even blocked requests should appear in the log)
-          ;; then enforce domain policy — order matters for forensics
-          (audit! audit-log :http/request {:method method :url url})
+          ;; The request is already receipted (do-request); a refused
+          ;; domain is receipted with its error.
           (when domain-check (domain-check url))
           (ssrf-guard! url)
           (load/require! 'hato.client)
@@ -698,7 +717,7 @@
                 ;; Boundary secret injection: substitute placeholders → real values
                 ;; AFTER domain/ssrf guards, just before the bytes leave; the agent
                 ;; never holds plaintext. (No-op when no secrets configured.)
-                opts (substitute-secrets! secrets audit-log url opts)
+                opts (substitute-secrets! secrets effects url opts)
                 resp (hato-request opts)
                 ;; Scrub any reflected secret value back to its placeholder — the
                 ;; only path the plaintext could re-enter the sandbox.
@@ -712,14 +731,20 @@
         ;; transport Var: concurrent live and simulated interpreters coexist.
         ;; A fixture does no DNS, secret substitution or network fallback.
         do-request (fn [opts]
-                     (acquisition/record-request!
-                      opts #(if fixture-transport
-                              (do
-                                (audit! audit-log :http/request
-                                        {:method (or (:method opts) :get) :url (:url opts)})
-                                (when domain-check (domain-check (:url opts)))
-                                (fixture-transport opts))
-                              (perform-request opts))))]
+                     (let [method (or (:method opts) :get)]
+                       (effects/perform!
+                        effects
+                        {:effect :http/request
+                         :resource {:method method :url (:url opts)}
+                         ;; a request that sends data is egress, not only network
+                         :class (when-not (#{:get :head} method) #{:egress})
+                         :result-of :body}
+                        #(acquisition/record-request!
+                          opts (fn []
+                                 (if fixture-transport
+                                   (do (when domain-check (domain-check (:url opts)))
+                                       (fixture-transport opts))
+                                   (perform-request opts)))))))]
     (sci/add-namespace! sci-ctx 'babashka.http-client
                         {'request do-request
                          'get     (fn [url & [opts]] (do-request (merge {:url url :method :get} opts)))

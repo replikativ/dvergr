@@ -45,7 +45,7 @@ registry tools pass `dvergr.tools/execute`, which already has an allowlist and a
 
 The inventory found holes that are bugs today. They are fixed before the boundary, in their
 own PR, each with a test that fails first. **Fixed** (`test/dvergr/sandbox/hardening_test.clj`):
-1, 2, 3, 4, 6, 7, 8. **Open**: 5 becomes the receipt stream of the boundary.
+1, 2, 3, 4, 6, 7, 8; 5 is the boundary's receipt stream (below).
 
 For 7 and 8 the working context carries the acting identity (`:agent-id`, from the agent the
 context was built for; MCP connections act as `:mcp/<profile>`) into the sandbox's world
@@ -120,6 +120,41 @@ evaluation (per Run, per MCP connection), not per capability:
 
 The receipt belongs to the runtime, not the capability: an SCI function cannot fabricate the
 authority it ran under (as simmis's `doc/tool-authorization.md` requires).
+
+### Effects and handlers (as built, `dvergr.effects`)
+
+The chain above is a stack of **handlers** in the algebraic-effects sense. An effect is data
+(an operation from the closed vocabulary, with a malli signature for its resource and result);
+a capability performs it with `perform!` and the function that does the real work, which is
+the innermost handler (the world). A handler is `(fn [effect next] value)` and does one of three
+things: **answers** with a value (replay, a fault, a preflight stand-in), **refuses** by
+throwing, or **forwards** with `next`, doing something around it (receipts, metering,
+containment). The receipts handler is outermost and records every effect with who decided or
+answered it.
+
+Handlers resume once and at once (tail resumption), so no continuation is captured; SCI code
+is not CPS-transformed. Resuming later (an approval) parks the calling thread on a deferred.
+Resuming several ways (a counterfactual: "what if this search had returned that") re-executes
+against the receipt log: the log is the trace, replay reproduces it, a fault is an
+intervention on it. Code running inside spindel spins could later get the same handlers with
+real continuations, without changing capabilities.
+
+**Configuration is data and composes algebraically.** A world's handlers live in its binding
+(`:effects {:handlers [[:admit #{:read :network}] [:read-only]]}`), set by the runtime and
+unreachable from code; they fork with the world. A refusing handler is a filter `admit S`
+(`read-only` is `admit #{:read}`); filters compose by intersection, so they commute, are
+idempotent, and admitting every class is the identity. `normalize` gives the canonical stack:
+receipts, one filter, then answering handlers in the order given, then the world. `compose`
+concatenates and normalizes; it is associative with `[]` as identity. A rebind or fork
+composes its handlers onto the world's, so authority narrows and never widens (attenuation,
+as in simmis's delegation). These laws are test.check properties
+(`test/dvergr/effects_test.clj`).
+
+**Landed** (step 2, first part): the vocabulary, `perform!`, receipts (reads by digest;
+subject = the acting identity), the filter (admission and `read-only`), sandbox files
+(physical and virtual), git and HTTP routed through it, receipts kept on the working context
+(hardening 5). **Next**: the remaining capabilities (rooms, databases, processes, mail,
+schedules, model calls), eval metering, then `can?`, replay and faults as answering handlers.
 
 ### How modes answer the goals
 
