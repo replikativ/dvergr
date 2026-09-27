@@ -10,6 +10,7 @@
   (:require [clojure.string :as str]
             [dvergr.substrate.load :as load]
             [sci.core :as sci]
+            [dvergr.effects :as effects]
             [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.sandbox.ns.doc :as doc]
             [org.replikativ.spindel.core :as sp]
@@ -1091,13 +1092,21 @@
      (scheduler/at \"2026-04-01T09:00\" :var \"April Fools reminder\")
      (scheduler/cancel schedule-id)
      (scheduler/list)"
-  [sci-ctx]
+  [sci-ctx & [effects]]
   (load/require! 'dvergr.scheduler.core)
   ;; A raw `(fn …)` carries no metadata, so the closures below are documented
   ;; through `doc/with-docs` — otherwise an agent's only way to learn a
   ;; signature was to call it and read the error.
-  (let [sched-create  @(ns-resolve 'dvergr.scheduler.core 'create-schedule!)
-        sched-cancel  @(ns-resolve 'dvergr.scheduler.core 'cancel-schedule!)
+  (let [create*       @(ns-resolve 'dvergr.scheduler.core 'create-schedule!)
+        cancel*       @(ns-resolve 'dvergr.scheduler.core 'cancel-schedule!)
+        ;; every schedule change is an effect (dvergr.effects)
+        sched-create  (fn [room cfg]
+                        (effects/perform! effects {:effect :schedule/create
+                                                   :resource {:agent (str (:agent-id cfg))}}
+                                          #(create* (room) cfg)))
+        sched-cancel  (fn [room id]
+                        (effects/perform! effects {:effect :schedule/cancel :resource {:id (str id)}}
+                                          #(cancel* (room) id)))
         sched-list    @(ns-resolve 'dvergr.scheduler.core 'list-schedules)
         current-room  @(ns-resolve 'dvergr.scheduler.core 'current-room)
         room!         (fn []
@@ -1142,7 +1151,7 @@
                                     (or (not (:at opts)) (string? (:at opts)))
                                     (or (not (:on opts)) (keyword? (:on opts))))
                        (wrong))
-                     (sched-create (room!)
+                     (sched-create room!
                                    {:agent-id agent-id
                                     :task task
                                     :schedule opts
@@ -1151,13 +1160,13 @@
                                                       (when (:on opts) (str " on " (name (:on opts)))))})))
 
         at-fn (fn [datetime agent-id task]
-                (sched-create (room!)
+                (sched-create room!
                               {:agent-id agent-id :task task
                                :schedule {:at datetime :once true}
                                :description (str "One-shot at " datetime)}))
 
         interval-fn (fn [ms agent-id task]
-                      (sched-create (room!)
+                      (sched-create room!
                                     {:agent-id agent-id :task task
                                      :interval-ms ms
                                      :description (str "Every " (/ ms 60000.0) " minutes")}))]
@@ -1190,8 +1199,8 @@
                                            " — allowed: "
                                            (str/join " " (map pr-str (sort create-keys))))
                                       {:unknown (vec unknown) :allowed create-keys})))
-                    (sched-create (room!) cfg))
-        'cancel   (fn [id] (sched-cancel (room!) id))
+                    (sched-create room! cfg))
+        'cancel   (fn [id] (sched-cancel room! id))
         'list     (fn [] (sched-list (room!)))}
        (with-schemas
          '{every    [([period agent-id task]

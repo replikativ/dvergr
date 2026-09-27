@@ -79,12 +79,16 @@
                                          :allowed-http-domains allowed-domains
                                          :receipts (:receipts cctx))
       ;; These capabilities close over the ChatContext itself, so a projected
-      ;; child facade must replace them as well.
-        (ns-io/add-bash-ns!    sci cctx)
-        (ns-io/add-media-ns!   sci cctx)
-        ;; model calls from code are the agent's spend, charged to this chat
-        ((requiring-resolve 'dvergr.sandbox.ns.kb/add-llm-ns!) sci agent-program-ceiling cctx)
-        (ns-io/add-process-ns! sci cctx)))
+      ;; child facade must replace them as well. They perform their effects
+      ;; through the same boundary as the rest of the sandbox.
+        (let [boundary (effects/boundary-resolver
+                        (runtime-ctx/sandbox-binding-resolver execution-ctx capability-id)
+                        (:receipts cctx))]
+          (ns-io/add-bash-ns!    sci cctx boundary)
+          (ns-io/add-media-ns!   sci cctx boundary)
+          ;; model calls from code are the agent's spend, charged to this chat
+          ((requiring-resolve 'dvergr.sandbox.ns.kb/add-llm-ns!) sci agent-program-ceiling cctx boundary)
+          (ns-io/add-process-ns! sci cctx boundary))))
     cctx))
 
 (defn new-working-ctx

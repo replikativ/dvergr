@@ -23,6 +23,7 @@
    (Discovery + by-name access to the room's MANAGED databases — KB, messages,
    created data DBs — is dvergr-specific and lives in `dvergr.room`, not here.)"
   (:require [datahike.api :as d]
+            [dvergr.effects :as effects]
             [dvergr.system.rooms :as srooms]
             [dvergr.runtime.ctx :as runtime-ctx]
             [clojure.string :as str]
@@ -156,7 +157,7 @@
 (defn add-datahike-ns!
   "Mount the faithful datahike API under `datahike.api` and `d`, with lifecycle fns
    guarded to room `room-id` (resolved fork-aware under `ctx`)."
-  [sci-ctx room-id ctx & [binding-resolver binding-swap!]]
+  [sci-ctx room-id ctx & [binding-resolver binding-swap! effects]]
   (let [data      (into {} (keep (fn [sym]
                                    (when-let [v (ns-resolve 'datahike.api sym)]
                                      (let [f @v]
@@ -272,6 +273,18 @@
                          true)
                        (boolean (when-let [room-id (current-room-id)]
                                   (srooms/delete-room-db! room-id nm))))))))}
-        m (merge data guard)]
+        ;; writes and lifecycle are effects (dvergr.effects); queries read an
+        ;; immutable value of a database and are not
+        fx (fn [kind resource-of f]
+             (fn [& args]
+               (effects/perform! effects {:effect kind :resource (resource-of args)}
+                                 #(apply f args))))
+        tx-resource (fn [[_ tx-data]] {:datoms (count tx-data)})
+        db-resource (fn [[cfg]] {:name (str (cfg-name cfg))})
+        m (-> (merge data guard)
+              (update 'transact #(fx :db/transact tx-resource %))
+              (update 'transact! #(fx :db/transact tx-resource %))
+              (update 'create-database #(fx :db/create db-resource %))
+              (update 'delete-database #(fx :db/delete db-resource %)))]
     ;; The real datahike.api name (the model aliases it `:as d` itself, as everyone does).
     (sci/add-namespace! sci-ctx 'datahike.api m)))

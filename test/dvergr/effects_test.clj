@@ -9,9 +9,18 @@
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
             [dvergr.agent.turn :as turn]
+            [dvergr.chat.context :as chat-context]
+            [dvergr.discourse :as d]
             [dvergr.effects :as effects]
+            [dvergr.room.store.memory :as memory]
             [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.sandbox :as sandbox]
+            [dvergr.sandbox.ns.agent :as agent-ns]
+            [dvergr.sandbox.ns.io :as ns-io]
+            [dvergr.sandbox.ns.kb :as ns-kb]
+            [dvergr.tools :as tools]
+            [dvergr.tools.llm-call :as llm-call]
+            [sci.core :as sci]
             [org.replikativ.spindel.engine.context :as ctx]
             [org.replikativ.spindel.engine.core :as rtc]))
 
@@ -206,3 +215,81 @@
         (is (= [[:admit #{:read}]] (handlers)) "admitting everything later does not widen")
         (is (some? (:receipts cctx)) "the working context owns its receipts"))
       (finally (ctx/stop-context! ec)))))
+
+(deftest every-routed-capability-is-decided-before-it-runs
+  (let [sink (effects/make-sink)
+        ro (boundary sink [[:read-only]])
+        touched (atom [])]
+    (testing "rooms: posting, forking, creating are refused; reading is not"
+      (let [room (d/make-room {:id :effects-rooms :store (memory/make)})
+            ops (ns-kb/room-ops-map (:ctx room) nil (select-keys room [:id :incarnation])
+                                    {:effects ro})]
+        (is (thrown-with-msg? Exception #"read-only" (('post! ops) (:id room) {:content "x"})))
+        (is (empty? (d/messages room {})) "nothing was posted")
+        (is (thrown-with-msg? Exception #"read-only" (('fork! ops) (:id room))))
+        (is (thrown-with-msg? Exception #"read-only" (('create! ops) {:slug "new-room"})))
+        (is (= (:id room) (:id (('get ops) (:id room)))) "a read runs")
+        (is (= [:room/post :denied] ((juxt :effect :decision) (first (filter #(= :room/post (:effect %)) @sink)))))))
+    (testing "schedules"
+      (let [sci-ctx (sci/init {})]
+        (agent-ns/add-scheduler-ns! sci-ctx ro)
+        (is (thrown-with-msg? Exception #"read-only"
+                              (sci/eval-string* sci-ctx "(dvergr.scheduler/every :day \"09:00\" :var \"sweep\")")))
+        (is (thrown-with-msg? Exception #"read-only"
+                              (sci/eval-string* sci-ctx "(dvergr.scheduler/cancel \"s1\")")))))
+    (testing "model calls, the shell and process directives"
+      (with-redefs [llm-call/cheap-llm-call (fn [& _] (swap! touched conj :model) {:text "x"})]
+        (let [sci-ctx (sci/init {})]
+          (ns-kb/add-llm-ns! sci-ctx nil nil ro)
+          (is (thrown-with-msg? Exception #"read-only" (sci/eval-string* sci-ctx "(llm/call \"s\" \"c\")")))))
+      (let [sci-ctx (sci/init {})]
+        (ns-io/add-bash-ns! sci-ctx ::chat ro)
+        (ns-io/add-process-ns! sci-ctx ::chat ro)
+        (is (thrown-with-msg? Exception #"read-only" (sci/eval-string* sci-ctx "(dvergr.shell/run \"ls\")")))
+        (is (thrown-with-msg? Exception #"read-only"
+                              (sci/eval-string* sci-ctx "(processes/directive! 1 {:type :abort})"))))
+      (is (empty? @touched) "no refused capability ran"))
+    (testing "and each refusal is receipted"
+      (is (every? #(= :denied (:decision %)) (remove #(= :room/read (:effect %)) @sink)))
+      (is (= #{:room/post :room/fork :room/create :room/read :schedule/create :schedule/cancel
+               :model/call :process/run :process/directive}
+             (set (map :effect @sink)))))))
+
+(deftest evals-are-metered
+  (testing "an eval reports its CPU and wall time"
+    (let [ec (ctx/create-execution-context)
+          sci-ctx (sandbox/fork-for-session ec)]
+      (try
+        (doseq [opts [{} {:timeout-ms 5000}]]
+          (let [r (apply sandbox/eval-code sci-ctx "(reduce + (range 2000000))" (mapcat identity opts))]
+            (is (:success r))
+            (is (nat-int? (get-in r [:meter :cpu-ms])) (str opts))
+            (is (<= (get-in r [:meter :cpu-ms]) (+ 50 (get-in r [:meter :wall-ms]))))))
+        (finally (ctx/stop-context! ec)))))
+  (testing "clojure_eval records it on the working context's receipts"
+    (let [ec (ctx/create-execution-context)]
+      (try
+        (let [cctx (turn/new-working-ctx {:execution-ctx ec :title "meter" :durable? false})
+              r (binding [rtc/*execution-context* ec]
+                  (tools/execute "clojure_eval" {:code "(+ 1 2)"}
+                                 (tools/make-context {:sci-ctx (chat-context/sci-context-in cctx ec)
+                                                      :chat-ctx cctx :execution-ctx ec
+                                                      :isolation :sci
+                                                      :cwd (System/getProperty "java.io.tmpdir")})))]
+          (is (= :success (:type r)))
+          (is (= :eval/run (:effect (last @(:receipts cctx)))))
+          (is (nat-int? (get-in (last @(:receipts cctx)) [:resource :wall-ms]))))
+        (finally (ctx/stop-context! ec))))))
+
+(deftest database-writes-pass-the-boundary
+  (with-world-sandbox {:agent-id :var}
+    (fn [{:keys [sink eval]}]
+      (is (:ok (eval "(let [cfg {:store {:backend :mem :id \"scratch\"} :schema-flexibility :read}]
+                        (datahike.api/create-database cfg)
+                        (datahike.api/transact (datahike.api/connect cfg) [{:note \"a\"} {:note \"b\"}])
+                        true)")))
+      (is (= [[:db/create {:name "scratch"}] [:db/transact {:datoms 2}]]
+             (mapv (juxt :effect :resource) (filter #(#{"db"} (namespace (:effect %))) @sink))))))
+  (with-world-sandbox {:effects {:handlers [[:read-only]]}}
+    (fn [{:keys [eval]}]
+      (is (re-find #"read-only" (str (:err (eval "(datahike.api/create-database {:store {:backend :mem :id \"x\"}})"))))))))

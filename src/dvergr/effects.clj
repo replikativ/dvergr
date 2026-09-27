@@ -58,6 +58,25 @@
      :git/read  {:class #{:read}  :resource [:map [:op :keyword]] :result :any}
      :git/add   {:class #{:write} :resource [:map [:paths [:vector :any]]] :result [:= :ok]}
      :git/commit {:class #{:write} :resource [:map [:message :string]] :result :string}
+     ;; rooms: the op's room (its id or slug as given)
+     :room/read    {:class #{:read} :resource :map :result :any}
+     :room/post    {:class #{:write} :resource [:map [:room :string]] :result :any}
+     :room/write   {:class #{:write} :resource :map :result :any}
+     :room/join    {:class #{:write} :resource [:map [:room :string] [:who :string]] :result :any}
+     :room/create  {:class #{:lifecycle} :resource [:map [:slug :string]] :result :any}
+     :room/fork    {:class #{:lifecycle} :resource [:map [:room :string]] :result :any}
+     :room/merge   {:class #{:write :lifecycle} :resource [:map [:room :string] [:fork :string]] :result :any}
+     :room/discard {:class #{:lifecycle} :resource [:map [:room :string]] :result :any}
+     :room/delete  {:class #{:lifecycle} :resource [:map [:room :string]] :result :any}
+     :model/call        {:class #{:spend :network} :resource [:map [:model :string]] :result :any}
+     :process/run       {:class #{:process} :resource [:map [:cmd :string]] :result :any}
+     :process/directive {:class #{:process} :resource :map :result :any}
+     :schedule/create   {:class #{:schedule} :resource :map :result :any}
+     :schedule/cancel   {:class #{:schedule} :resource :map :result :any}
+     :db/transact       {:class #{:write} :resource [:map [:datoms :int]] :result :any}
+     :db/create         {:class #{:lifecycle} :resource [:map [:name :string]] :result :any}
+     :db/delete         {:class #{:lifecycle} :resource [:map [:name :string]] :result :any}
+     :eval/run          {:class #{} :resource [:map [:cpu-ms :int] [:wall-ms :int]]}
      :http/secret-injected {:class #{} :resource :map}
      :http/secret-denied   {:class #{} :resource :map}}))
 
