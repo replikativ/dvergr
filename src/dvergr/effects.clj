@@ -83,6 +83,32 @@
      :http/secret-injected {:class #{} :resource :map}
      :http/secret-denied   {:class #{} :resource :map}}))
 
+(def idempotency
+  "Whether an operation may be performed again, e.g. when resuming a Run:
+   `:idempotent` (again leaves the world as once: reads, writes of given
+   content, a model call, which changes nothing), `:compensable` (a known
+   inverse undoes it) or `:once` (never again without confirmation: a
+   message posted, a commit, a shell command). HTTP by method, as HTTP
+   defines it (`effect-idempotency`)."
+  {:fs/read :idempotent :fs/list :idempotent :fs/stat :idempotent
+   :fs/write :idempotent :fs/mkdir :idempotent :fs/delete :idempotent
+   :fs/copy :idempotent :fs/move :compensable
+   :git/read :idempotent :git/add :idempotent :git/commit :once
+   :room/read :idempotent :room/join :idempotent :room/write :idempotent
+   :room/post :once :room/create :once :room/fork :once :room/merge :once
+   :room/discard :once :room/delete :once
+   :db/transact :once :db/create :once :db/delete :once
+   :model/call :idempotent
+   :process/run :once :process/directive :once
+   :schedule/create :once :schedule/cancel :idempotent})
+
+(defn effect-idempotency
+  "The idempotency class of `effect` (see `idempotency`); nil for events."
+  [{kind :effect :as effect}]
+  (if (= :http/request kind)
+    (if (#{:post :patch} (get-in effect [:resource :method] :get)) :once :idempotent)
+    (get idempotency kind)))
+
 (defn operation [kind]
   (or (get vocabulary kind)
       (throw (ex-info (str "Unknown effect kind " kind) {:effect kind}))))
@@ -159,6 +185,7 @@
   (fn [effect next]
     (let [base (cond-> (assoc (select-keys effect [:effect :resource])
                               :class (effect-classes effect)
+                              :idempotency (effect-idempotency effect)
                               :at (java.util.Date.))
                  subject (assoc :subject subject))
           t0 (System/nanoTime)
