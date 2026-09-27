@@ -418,7 +418,8 @@
                :unknown (set unknown)})))
     ;; the world's effect handlers (dvergr.effects/environment-handlers!)
     (when-let [fx (:effects world)]
-      (let [bad (or (seq (remove #{:faults :record :read-only :admit :deny-hosts :quota-bytes} (keys fx)))
+      (let [bad (or (seq (remove #{:faults :record :read-only :admit :deny-hosts :allow-hosts :quota-bytes} (keys fx)))
+                    (when-let [hs (:allow-hosts fx)] (when-not (and (coll? hs) (every? string? hs)) [:allow-hosts]))
                     (when-let [q (:quota-bytes fx)] (when-not (pos-int? q) [:quota-bytes]))
                     (when-let [hs (:deny-hosts fx)] (when-not (and (coll? hs) (every? string? hs)) [:deny-hosts]))
                     (seq (remove #{:seed :rate :only :kinds} (keys (:faults fx))))

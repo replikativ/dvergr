@@ -56,6 +56,8 @@
    ;; hosts the task's answer is published on: requests to them (and their
    ;; subdomains) are refused, and a frozen web leaves them out
    [:blocked-sources {:optional true} [:vector :string]]
+   ;; the only hosts the task may read (and their subdomains); nil: any
+   [:allowed-sources {:optional true} [:vector :string]]
    ;; :frozen: the attempt's web is web.edn (`freeze`), not the internet
    [:web {:optional true} [:enum :live :frozen]]
    [:timeout-ms {:optional true} [:int {:min 1000}]]])
@@ -426,7 +428,8 @@
       :world (let [fx (cond-> {}
                          ;; the checker is given what the attempt fetched: record it
                         (:fetched definition) (assoc :record true)
-                        (seq (:blocked-sources definition)) (assoc :deny-hosts (set (:blocked-sources definition))))]
+                        (seq (:blocked-sources definition)) (assoc :deny-hosts (set (:blocked-sources definition)))
+                        (:allowed-sources definition) (assoc :allow-hosts (set (:allowed-sources definition))))]
                (cond-> {:isolation :ctx :settlement :discard
                         :setup (evaluation/world-setup-ref setup)}
                  (seq fx) (assoc :effects fx)))

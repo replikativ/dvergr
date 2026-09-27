@@ -430,6 +430,28 @@
                                     " is a blocked source for this task"))
         (next effect)))))
 
+(defn- allow-hosts-handler
+  "The filter admitting requests only to `hosts` (and their subdomains): the
+   sources a task may read."
+  [hosts]
+  (let [hosts (set (map str/lower-case hosts))]
+    (fn [effect next]
+      (let [host (host-of (get-in effect [:resource :url]))]
+        (if (and (= :http/request (:effect effect)) (not (blocked-host? hosts host)))
+          (deny! effect :not-allowed (str host " is not among the sources this task may read"))
+          (next effect))))))
+
+(defn meet-hosts
+  "Two allowlists composed: the hosts either names that the other covers, so
+   a host is allowed by the result exactly when both allow it (`{x.com}` and
+   `{docs.x.com}` meet in `{docs.x.com}`)."
+  [a b]
+  (let [both (into #{} (concat (filter #(blocked-host? b %) a)
+                               (filter #(blocked-host? a %) b)))]
+    ;; minimal: a host another one already covers says nothing more, and the
+    ;; canonical form is what makes composition associative as an equality
+    (into (sorted-set) (remove (fn [h] (some #(and (not= h %) (blocked-host? #{%} h)) both)) both))))
+
 (defn normalize
   "The canonical form of a handler configuration: one `[:admit S]` (the
    intersection of every class filter; omitted when it admits every class),
@@ -439,6 +461,8 @@
   [specs]
   (let [class-filter? #(or (= :admit (first %)) (contains? sugar (first %)))
         host-filter? #(= :deny-hosts (first %))
+        allow-filter? #(= :allow-hosts (first %))
+        allows (seq (map #(set (map str/lower-case (second %))) (filter allow-filter? specs)))
         predicate? #(contains? predicate-filters (first %))
         admit (reduce (fn [acc [k s]] (clojure.set/intersection acc (or (sugar k) (set s))))
                       all-classes (filter class-filter? specs))
@@ -446,8 +470,9 @@
     (cond-> []
       (not= admit all-classes) (conj [:admit admit])
       (seq denied) (conj [:deny-hosts denied])
+      allows (conj [:allow-hosts (reduce meet-hosts (meet-hosts (first allows) (first allows)) (rest allows))])
       :always (into (sort-by pr-str (distinct (filter predicate? specs))))
-      :always (into (remove #(or (class-filter? %) (host-filter? %) (predicate? %)) specs)))))
+      :always (into (remove #(or (class-filter? %) (host-filter? %) (allow-filter? %) (predicate? %)) specs)))))
 
 (defn compose
   "Compose configurations: `outer`'s handlers enclose `inner`'s (a fork's
@@ -465,6 +490,7 @@
            (cond
              (= :admit k) (admission (first args))
              (= :deny-hosts k) (deny-hosts-handler (first args))
+             (= :allow-hosts k) (allow-hosts-handler (first args))
              (contains? predicate-filters k) ((predicate-filters k) ctx)
              :else (apply (or (get registry k)
                               (throw (ex-info (str "Unknown effect handler " k) {:handler k})))
@@ -577,13 +603,14 @@
       :admit #{:read :network}
       :deny-hosts #{\"simm.is\"}  ; a task's answer sources
       :quota-bytes 50000000}      ; what the attempt may write"
-  [{:keys [faults record read-only admit deny-hosts quota-bytes]}]
+  [{:keys [faults record read-only admit deny-hosts allow-hosts quota-bytes]}]
   (let [f (when faults (faults! faults))
         r (when record (recording!))
         q (when quota-bytes (quota! {:bytes quota-bytes}))]
     {:specs (cond-> []
               admit (conj [:admit (set admit)])
               (seq deny-hosts) (conj [:deny-hosts (set deny-hosts)])
+              allow-hosts (conj [:allow-hosts (set allow-hosts)])
               read-only (conj [:read-only])
               r (conj [:record {:id r}])
               q (conj [:quota {:id q}])
