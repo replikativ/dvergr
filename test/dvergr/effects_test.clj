@@ -91,6 +91,7 @@
   (let [gen-classes (gen/fmap set (gen/vector (gen/elements (vec effects/all-classes))))]
     (gen/vector (gen/one-of [(gen/return [:read-only])
                              (gen/return [:authority])
+                             (gen/fmap (fn [hs] [:allow-hosts hs]) (gen/set (gen/elements ["a.com" "docs.a.com" "b.com"]) {:min-elements 1}))
                              (gen/fmap (fn [hs] [:deny-hosts hs]) (gen/set (gen/elements ["a.com" "b.com" "c.com"])))
                              (gen/fmap (fn [s] [:admit s]) gen-classes)
                              (gen/fmap (fn [n] [:answer n]) gen/small-integer)])
@@ -538,3 +539,28 @@
       (finally
         (ctx/stop-context! ec)
         (doseq [f (reverse (file-seq root))] (.delete f))))))
+
+(def ^:private gen-host
+  (gen/elements ["a.com" "docs.a.com" "x.docs.a.com" "b.com" "c.org" "docs.c.org"]))
+
+(defspec allowlists-meet-by-what-both-allow 300
+  (prop/for-all [a (gen/set gen-host) b (gen/set gen-host) h gen-host]
+                (= (effects/blocked-host? (effects/meet-hosts a b) h)
+                   (and (effects/blocked-host? a h) (effects/blocked-host? b h)))))
+
+(deftest a-task-reads-only-its-allowed-sources
+  (let [get! (fn [specs url]
+               (try (effects/perform! (constantly {:handlers (effects/handlers specs)})
+                                      {:effect :http/request :resource {:method :get :url url}}
+                                      (constantly :ok))
+                    (catch clojure.lang.ExceptionInfo e (:by (ex-data e)))))]
+    (is (= :ok (get! [[:allow-hosts #{"dust.tt"}]] "https://docs.dust.tt/x")))
+    (is (= :not-allowed (get! [[:allow-hosts #{"dust.tt"}]] "https://evil.com/")))
+    (testing "an allowlist and a blocklist together: allowed and not blocked"
+      (is (= :blocked (get! [[:allow-hosts #{"simm.is" "dust.tt"}] [:deny-hosts #{"simm.is"}]] "https://simm.is/"))))
+    (testing "two allowlists meet"
+      (is (= [[:allow-hosts #{"docs.a.com"}]]
+             (effects/normalize [[:allow-hosts #{"a.com"}] [:allow-hosts #{"docs.a.com" "b.com"}]]))))
+    (testing "other effects pass"
+      (is (= :ok (effects/perform! (constantly {:handlers (effects/handlers [[:allow-hosts #{"a.com"}]])})
+                                   {:effect :fs/read :resource {:path "x"}} (constantly :ok)))))))

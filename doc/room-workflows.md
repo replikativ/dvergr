@@ -102,6 +102,11 @@ and `check` receives them as `:judgements {id answer}`. The checker stays pure; 
 in the verifier's basis; re-verifying asks no one; `calibration.edn` gives `:judgements` for
 its cases.
 
+`:allowed-sources ["dust.tt" "github.com"]` names the only hosts a task may read (and their
+subdomains): `[:allow-hosts …]`, refusing others with `:not-allowed`. Two allowlists meet in
+what both allow (`{x.com}` and `{docs.x.com}` meet in `{docs.x.com}`, kept minimal so
+composition stays associative); with a blocklist, a host must be allowed and not blocked.
+
 `:blocked-sources ["simm.is"]` names the hosts a task's answer is published on: the
 environment refuses requests to them and their subdomains (`[:deny-hosts …]`, a filter in the
 effect algebra that composes by union and sits outside answering handlers, so a frozen web or
