@@ -46,6 +46,7 @@
             [muschel.budget :as mbudget]
             [muschel.builtins.posix :as posix]
             [muschel.core :as m]
+            [clojure.java.shell]
             [muschel.env :as menv]
             [muschel.fs.disk :as fs.disk]
             [muschel.fs.mount :as fs.mount]
@@ -372,7 +373,7 @@
                          muschel.fs.mount. Embedders mount e.g. a drive
                          at /drive so agents reach it with plain
                          ls/cat/redirects."
-  [{:keys [workspace fallback-allowlist builtins mounts]
+  [{:keys [workspace fallback-allowlist builtins mounts jail]
     :or {workspace          (default-workspace)
          fallback-allowlist default-fallback-allowlist
          builtins           (apply dissoc posix/standard network-builtins)}}]
@@ -388,9 +389,14 @@
                        (fs.mount/make filesystem mounts))
                      filesystem)]
     (hb/make {:fs filesystem
-              :fallback-host (host.jvm/make)
+              ;; `:jail {:mirror dir :commands [...] …}`: real programs, under
+              ;; bubblewrap over a mirror of the worktree (dvergr.intake.jail)
+              :fallback-host (if jail
+                               ((requiring-resolve 'dvergr.intake.jail/host)
+                                (host.jvm/make) filesystem (:mirror jail) jail)
+                               (host.jvm/make))
               :builtins builtins
-              :fallback-allowlist fallback-allowlist
+              :fallback-allowlist (into (set fallback-allowlist) (:commands jail))
               :geschichte (when (map? workspace) true)})))
 
 (defonce ^{:doc "Embedder hook: (fn [chat-ctx] {\"/drive\" <muschel FS>, …})
@@ -439,6 +445,17 @@
               (ec/swap-state! path (fn [existing] (or existing s)))
               (ec/get-state path)))))))
 
+(defn- jail-config
+  "The daemon's `:shell {:jail {...}}`, when set and bubblewrap is present,
+   with the workspace's mirror under the state root."
+  [workspace-key]
+  (when-let [cfg (try (get-in ((requiring-resolve 'dvergr.substrate.config/config)) [:shell :jail])
+                      (catch Throwable _ nil))]
+    (when (and (seq (:commands cfg))
+               (try (zero? (:exit (clojure.java.shell/sh "bwrap" "--version"))) (catch Throwable _ false)))
+      (assoc cfg :mirror (java.io.File. (str ((requiring-resolve 'dvergr.substrate.paths/path) "jail")
+                                             "/" (hash workspace-key)))))))
+
 (defn get-or-create-host!
   "Return the chat-ctx's BuiltinHost for the current workspace,
    creating it on first use. See `get-or-create-session!` for why
@@ -451,8 +468,10 @@
             key (if (map? ws) (:id ws) ws)
             path (host-path key)]
         (or (ec/get-state path)
-            (let [h (make-host {:workspace ws
-                                :mounts (resolve-mounts chat-ctx)})]
+            (let [jail (jail-config key)
+                  h (make-host (cond-> {:workspace ws
+                                        :mounts (resolve-mounts chat-ctx)}
+                                 jail (assoc :jail jail)))]
               (ec/swap-state! path (fn [existing] (or existing h)))
               (ec/get-state path)))))))
 

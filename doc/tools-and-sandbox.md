@@ -110,6 +110,26 @@ cancellable.
 - **Gated deps**: `clojure.repl.deps/add-libs` is available (`dvergr.sandbox.deps`) but
   passes through a policy gate with a denylist before adding/mirroring libraries.
 
+### Real programs in the shell: the jail (bubblewrap)
+
+The room shell runs muschel builtins over the virtual worktree; it has no network (`curl` and
+`wget` are not its builtins) and no external binaries by default. A daemon may give it real
+programs, jailed:
+
+```clojure
+:shell {:jail {:commands ["python3" "pytest"] :mem-max "2G" :tasks-max 256 :cpu-quota "200%"}}
+```
+
+A listed command runs under bubblewrap (muschel's `SandboxedHost`): network unshared, PID
+namespace unshared, only `/usr` and `/etc` read-only, the worktree at `/home/agent`, cgroup
+limits through `systemd-run --user`. The worktree stays virtual (Geschichte, forked with the
+room); each spawn syncs it into a disk mirror under the state root (`jail/`, one per
+workspace, changed files only), runs, and syncs back what the program wrote, created or
+deleted (`dvergr.intake.jail`). A fork's shell has its own mirror. Without bubblewrap on the
+host, the setting is ignored and the commands stay unavailable. The program runs inside the
+shell's `:process/run` effect, and with no network cannot reach past the sandbox's HTTP
+boundary. One jailed program runs at a time per workspace.
+
 ## Room-scoping & fork isolation
 
 Tool I/O is anchored to the surrounding room's workspace, not the daemon root. Tool
