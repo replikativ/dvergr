@@ -21,8 +21,10 @@
 
    Returns {:text :usage :model} or {:error}. Top-level sandboxes retain the
    historical unbounded surface. A nested authority with
-   `:provider-effects? false` removes this provider-spend bypass."
-  [sci-ctx & [agent-program-ceiling]]
+   `:provider-effects? false` removes this provider-spend bypass. With
+   `chat-ctx`, calls are the agent's spend: refused over budget and charged,
+   as the `llm_call` tool is (`dvergr.agent.turn/rebind-working-ctx!` binds it)."
+  [sci-ctx & [agent-program-ceiling chat-ctx]]
   (load/require! 'dvergr.tools.llm-call)
   (let [raw-call-fn  @(ns-resolve 'dvergr.tools.llm-call 'cheap-llm-call)
         call-fn      (fn [& args]
@@ -30,8 +32,13 @@
                          (throw (ex-info
                                  "LLM provider effects exceed this sandbox's delegation ceiling"
                                  {:type ::provider-effects-disallowed})))
+                       (when (and chat-ctx ((requiring-resolve 'dvergr.chat.context/budget-exceeded?) chat-ctx))
+                         (throw (ex-info "Budget exceeded — llm call refused" {:type :budget-exceeded})))
                        ;; The documented 2-arity: default opts.
-                       (apply raw-call-fn (cond-> (vec args) (= 2 (count args)) (conj {}))))
+                       (let [result (apply raw-call-fn (cond-> (vec args) (= 2 (count args)) (conj {})))]
+                         (when chat-ctx
+                           ((requiring-resolve 'dvergr.tools.llm-call/account-response!) chat-ctx result))
+                         result))
         summarize-fn (fn [content & [opts]]
                        (call-fn "Summarize the key points concisely:"
                                 content (or opts {})))]

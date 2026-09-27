@@ -140,8 +140,8 @@
    'partitionv     (sci/copy-var partitionv clojure-core-ns)
    'partitionv-all (sci/copy-var partitionv-all clojure-core-ns)
    'tap>           (sci/copy-var tap> clojure-core-ns)
-   'add-tap        (sci/copy-var add-tap clojure-core-ns)
-   'remove-tap     (sci/copy-var remove-tap clojure-core-ns)
+   ;; add-tap/remove-tap are withheld: the tap set is JVM-global, so a sandbox
+   ;; fn registered there would see every other sandbox's (and the host's) taps.
    'Throwable->map (sci/copy-var Throwable->map clojure-core-ns)})
 
 ;; ---------------------------------------------------------------------------

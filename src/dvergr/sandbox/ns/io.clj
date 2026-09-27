@@ -760,15 +760,24 @@
                          (re-find #"(?i)\.webp$" p) "image/webp"
                          (re-find #"(?i)\.(md|txt|csv|json|xml|edn|clj|cljs|cljc)$" p) "text/plain"
                          :else "application/octet-stream")))
+        ;; Model calls here are the agent's spend: refused over budget, and
+        ;; every response charged to the chat, like the llm_call tool.
+        charged (fn [f]
+                  (when (and chat-ctx ((requiring-resolve 'dvergr.chat.context/budget-exceeded?) chat-ctx))
+                    (throw (ex-info "Budget exceeded — vision/doc call refused" {:type :budget-exceeded})))
+                  (with-bindings {(requiring-resolve 'dvergr.media.vision/*on-response*)
+                                  (fn [r] (when chat-ctx
+                                            ((requiring-resolve 'dvergr.tools.llm-call/account-response!) chat-ctx r)))}
+                    (f)))
         extract (fn [path]
-                  ((requiring-resolve 'dvergr.media.doc/extract-text)
-                   (read-bytes path) (guess-mime path)))
+                  (charged #((requiring-resolve 'dvergr.media.doc/extract-text)
+                             (read-bytes path) (guess-mime path))))
         describe (fn [path & [opts]]
-                   ((requiring-resolve 'dvergr.media.vision/describe)
-                    (read-bytes path) (guess-mime path) opts))
+                   (charged #((requiring-resolve 'dvergr.media.vision/describe)
+                              (read-bytes path) (guess-mime path) opts)))
         extract-data (fn [path opts]
-                       ((requiring-resolve 'dvergr.media.vision/extract)
-                        (read-bytes path) (guess-mime path) opts))]
+                       (charged #((requiring-resolve 'dvergr.media.vision/extract)
+                                  (read-bytes path) (guess-mime path) opts)))]
     (sci/add-namespace! sci-ctx 'doc {'extract-text extract})
     (sci/add-namespace! sci-ctx 'vision {'describe describe
                                          'extract extract-data})))
@@ -826,7 +835,6 @@
      (processes/list)                       ; → vector of snapshots
      (processes/snapshot some-pid)          ; → single snapshot
      (processes/directive! pid {:type :abort :reason \"…\"})
-     (processes/directive! pid {:type :extend-budget :dollars 0.10})
      (processes/directive! pid {:type :refocus :hint \"…\"})"
   [sci-ctx chat-ctx]
   (let [proc-ns   (find-ns 'dvergr.agent.process)
@@ -838,7 +846,14 @@
                         {'list       (fn [] (list-fn chat-ctx))
                          'snapshot   (fn [pid] (when-let [p (get-fn chat-ctx pid)]
                                                  (snap-fn p)))
-                         'directive! (fn [pid d] (dir-fn chat-ctx pid d))})))
+                         ;; An agent steers its own work, but a budget is set by
+                         ;; whoever gave it: no extending it from inside.
+                         'directive! (fn [pid d]
+                                       (when (or (= :extend-budget (:type d))
+                                                 (some #(= :extend-budget (:op %)) (:effects d)))
+                                         (throw (ex-info "A budget is extended by its supervisor or the room's owner, not from the sandbox"
+                                                         {:type ::budget-self-extension})))
+                                       (dir-fn chat-ctx pid d))})))
 
 (defn- fs-safe-resolve
   "Resolve user-supplied path against base-dir, canonicalising symlinks and `..`

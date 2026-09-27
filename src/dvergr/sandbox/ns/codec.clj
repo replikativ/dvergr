@@ -137,7 +137,17 @@
   ;; clojure.data.xml NAME, our hardened parser (string or reader)
   (sci/add-namespace! sci-ctx 'clojure.data.xml
                       {'parse-str xml-parse
-                       'parse     (fn [in] (xml-parse (if (string? in) in (slurp in))))
+                       ;; A string or a Reader only: the host `slurp` of anything else
+                       ;; (a java.net.URI, a File) would read the network or the disk
+                       ;; past every sandbox guard.
+                       'parse     (fn [in]
+                                    (cond
+                                      (string? in) (xml-parse in)
+                                      (instance? java.io.Reader in) (xml-parse (slurp in))
+                                      :else (throw (ex-info (str "clojure.data.xml/parse takes a string or a reader, not "
+                                                                 (some-> in class .getName)
+                                                                 "; fetch a URL with babashka.http-client and parse its :body")
+                                                            {:type ::xml-input :class (some-> in class .getName)}))))
                        'text      xml-text})
   ;; dvergr.codec — base64 / url / html (no babashka equivalent)
   (sci/add-namespace! sci-ctx 'dvergr.codec
