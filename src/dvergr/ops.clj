@@ -32,6 +32,8 @@
             [dvergr.agent.workflow :as workflow]
             [dvergr.catalog :as catalog]
             [dvergr.catalog.room :as room-wf]
+            [dvergr.agent.trajectory :as trajectory]
+            [dvergr.substrate.paths :as paths]
             [dvergr.agent.experiment.runner :as runner]
             [dvergr.agent.experiment.stats :as xstats]
             [dvergr.agent.spend :as spend]
@@ -678,6 +680,32 @@
                                                    environment (assoc :environment-id (keyword environment))
                                                    model (assoc :model model)
                                                    status (assoc :status (keyword status))))))))}
+
+   :attempt/export
+   {:doc (str "A room's certified Attempts as trajectories, training and analysis data: the task, "
+              "the candidate and model, every model turn with its tool calls and results, the "
+              "effects on the Attempt's world (receipts: kind, resource, decision, idempotency, "
+              "digest) and the verdict (reward, checks, verifier trust, spend). Inline (at most "
+              "`limit`, default 20), or with `file` written as JSON lines under the state root's "
+              "exports/ directory. `min-reward` keeps only Attempts scoring at least that.")
+    :kind :read
+    :schema [:map [:room Room]
+             [:limit {:optional true} [:int {:min 1 :max 1000 :description "max attempts (default 20)"}]]
+             [:environment {:optional true} [:string {:description "environment id"}]]
+             [:min-reward {:optional true} [:double {:description "keep Attempts scoring at least this"}]]
+             [:file {:optional true} [:re {:description "a file name under exports/, e.g. competitors.jsonl"}
+                                      #"^[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl$"]]]
+    :impl (fn [daemon {:keys [room limit environment min-reward file]}]
+            (when-let [r (resolve-room daemon room)]
+              (let [ts (in-ctx daemon
+                               (trajectory/trajectories
+                                r (cond-> {:limit (or limit (if file 1000 20))}
+                                    environment (assoc :environment-id (keyword environment))
+                                    min-reward (assoc :min-reward min-reward))))]
+                (if file
+                  (let [path (paths/path (str "exports/" file))]
+                    {:file path :count (trajectory/write-jsonl! path ts)})
+                  ts))))}
 
    :attempt/detail
    {:doc "One certified Attempt with its evidence: transcript, calls, traces, result."
