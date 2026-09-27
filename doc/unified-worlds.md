@@ -1,6 +1,6 @@
 # One algebra for worlds, savepoints and budgets
 
-Status: **design** (2026-09-27, agreed in direction: "unify our stack and FRP algebra").
+Status: **in progress** (2026-09-27; agreed in direction: "unify our stack and FRP algebra"). Done: steps 1 (spindel#74, released in 0.1.67), 2 (#195), 3 (resume through `hydrate-into!`), 4 (#196). Next: 5, 6.
 
 dvergr grew its own versions of things spindel now provides: Run worlds beside spindel's
 savepoint worlds, a resource ledger beside spindel's resource authority, a resume path beside
@@ -36,11 +36,13 @@ states (and tests) hold for dvergr too.
    the remainder into an escrow account named by the savepoint id, `claim!` = move it into
    the claiming Run's wallet, once. Run worlds' savepoint sessions carry it; turn savepoints
    persist with `{:escrow? true}`.
-3. **Resume through the law:** `resume!` = fork a Run world at the savepoint's snapshots
-   (dvergr owns the handle) + `hydrate-into!`, running `continue-llm-run` for real: it
-   re-enters the LLM loop at the recorded step in that world, as the Run its payload names
-   (a new Run caused by the old one). The escrow carries the budget; `claim-resume!`'s once
-   becomes the escrow's once.
+3. **Resume through the law (done, spindel 0.1.70):** `resume!` opens a Run world forked at
+   the savepoint's snapshots (dvergr owns the handle and settles it), and
+   `portable/hydrate-into!` makes that world the savepoint's continuation: seed and sequence,
+   bookkeeping cleared, pinned components repinned, and `continue-llm-run` started as the
+   session's computation, before the Run's first step. The Run's supervisor drives the loop
+   from the recorded step; the continuation resolves with the resumed Run's result, so the
+   session's end is the Run's end. The budget moves as step 2 says.
 4. **Model budget in the ledger (done):** a Run allocated microdollars pays its model spend
    from its wallet: `account-usage!` charges each cost through `resource/*spend-wallet*`
    (bound by the LLM loop; unlike `*model-scope*` it restricts no provider), a cost beyond

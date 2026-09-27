@@ -1710,7 +1710,9 @@
             (is (wait-until #(= :cancelled
                                 (:run/status (program/observe room handle)))
                             1000))))
-        (is (empty? (run/active-runs (:id room)))))
+        ;; a cancelled Run's durable status is written before its live
+        ;; lease is released: no Run stays active, eventually
+        (is (wait-until #(empty? (run/active-runs (:id room))) 2000)))
       (finally
         (d/close-room! room)))))
 

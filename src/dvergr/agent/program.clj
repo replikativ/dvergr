@@ -616,14 +616,27 @@
 ;; Turn savepoints (doc/run-resume.md)
 ;; ---------------------------------------------------------------------------
 
+(defonce ^:private resuming
+  ;; stopped Run id -> {:deferred :world}: the continuation `hydrate-into!`
+  ;; started for it, until `resume!` delivers the resumed Run's result
+  (atom {}))
+
 (defn continue-llm-run
-  "The portable name a turn savepoint gives for continuing its Run. A Run is
-   continued by `resume!`, which hires a new Run from the savepoint in a world
-   forked at the recorded snapshots; this function is that operation's name in
-   the portable form, not an entry point of its own."
-  [run-id step value]
-  (throw (ex-info "Continue a Run with dvergr.agent.program/resume!"
-                  {:type ::resume-with-resume! :run/id run-id :step step :value value})))
+  "The continuation a turn savepoint names (its portable `:resume`). Hydrating
+   the savepoint (`resume!`, through `savepoint.portable/hydrate-into!`) runs it
+   in the new Run's world, prepared as the savepoint recorded it; the new Run
+   continues the stopped one's loop from step `step`, and this spin resolves
+   with that Run's result, so the session's end is the resumed Run's end."
+  [run-id _step _value]
+  (let [done (sync/deferred)]
+    (swap! resuming assoc run-id {:deferred done :world ec/*execution-context*})
+    (sp/spin (sp/await done))))
+
+(defn- resumed! [run-id result]
+  (when-let [{:keys [deferred world]} (get @resuming run-id)]
+    (swap! resuming dissoc run-id)
+    (binding [ec/*execution-context* world]
+      (deferred result))))
 
 (defn- turn-savepoint-handler
   "Persist every turn savepoint on the Run its payload names, then continue at
@@ -1457,7 +1470,8 @@
    {:keys [task from parent-run settlement resources limits]
     :or {from :repl settlement :automatic}
     :as raw-opts}
-   prepare-world! & [protocol {resume-from :resume snapshots :snapshots preset-id :id}]]
+   prepare-world! & [protocol {resume-from :resume snapshots :snapshots preset-id :id
+                               on-world :on-world}]]
   (when-not (or (nil? prepare-world!) (fn? prepare-world!))
     (throw (ex-info "Run world preparer must be a function"
                     {:type ::invalid-world-preparer})))
@@ -1475,6 +1489,7 @@
         supervisor (make-supervisor (:ctx world-parent) (:ctx work-room))
         _ (when (and (= :llm (get-in agent [:agent/program :kind])) (:store control-room))
             (when-let [session (install-turn-savepoints! control-room work-room)]
+              (when on-world (on-world work-room session))
               (register-cleanup! supervisor
                                  #(let [done (promise)]
                                     ((savepoint/close! session) (fn [_] (deliver done :closed))
@@ -1689,11 +1704,26 @@
                     (seq remaining) (assoc :resources remaining))
                   nil nil
                   {:id new-id :snapshots (not-empty (:world/systems data))
+                   ;; spindel's own resume: the new world becomes the
+                   ;; savepoint's continuation (seed, sequence, bookkeeping,
+                   ;; pinned components as recorded; `continue-llm-run` its
+                   ;; computation) before the Run's first step
+                   :on-world (fn [_work-room session]
+                               (let [done (promise)]
+                                 ((portable/hydrate-into! session (:root session) data
+                                                          (:savepoint/payload data))
+                                  (fn [_] (deliver done :ok)) (fn [e] (deliver done e)))
+                                 (let [r (deref done 10000 (ex-info "hydrate-into! timed out" {}))]
+                                   (when (instance? Throwable r) (throw r)))))
                    :resume {:from run-id :chat (:run/chat-id old) :step step
                             ;; what the stopped Run's chat spent (microdollars):
                             ;; its budget is not spent again
                             :spent (chat-spent control-room (:run/chat-id old))}})]
       (run/record-cause! new-id run-id)
+      ;; the hydrated continuation resolves with the resumed Run's result
+      (sync/spawn! (result-spin handle)
+                   {:on-success #(resumed! run-id %)
+                    :on-error #(resumed! run-id {:run/status :failed :run/error (ex-message %)})})
       handle)))
 
 (defn hire-in!

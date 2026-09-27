@@ -40,7 +40,9 @@
 
 (deftest a-stopped-run-continues-from-its-last-turn
   (let [room (durable-room :resume-room)
-        seen (atom [])]
+        seen (atom [])
+        continued (atom [])
+        continue-llm-run program/continue-llm-run]
     (try
       (binding [ec/*execution-context* (:ctx room)]
         ;; the first Run: a tool step, then its model call fails (as a process
@@ -68,6 +70,11 @@
           (testing "resuming: a new Run, caused by the old, continuing at step 1 with its conversation"
             (let [second-run
                   (with-redefs [providers/ensure-initialized! (constantly nil)
+                                ;; spindel's hydrate-into! starts the named continuation
+                                program/continue-llm-run
+                                (fn [run-id step value]
+                                  (swap! continued conj [run-id step])
+                                  (continue-llm-run run-id step value))
                                 chat-agent/run-agent-turn!
                                 (fn [chat-ctx opts]
                                   (swap! seen conj {:step (:turn-number opts)
@@ -83,6 +90,8 @@
               (is (= [1] (mapv :step @seen)) "the steps count on from the savepoint")
               (is (= 750000 (:budget (first @seen)))
                   "its budget is what the stopped Run left, not a fresh one")
+              (is (= [[first-run 0]] @continued)
+                  "the new world was hydrated from the savepoint: its continuation ran there")
               (is (= [:system :user :assistant :tool-result] (:messages (first @seen)))
                   "the conversation is the old Run's, up to the savepoint")
               (is (contains? (:run/caused-by (run/run room second-run)) first-run))

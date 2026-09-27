@@ -81,16 +81,15 @@ stays what it is for: reproducing an Attempt and freezing a benchmark.
   `:snapshots`), its chat seeded with the old Run's persisted messages, its step count on from
   the savepoint, the old Run as its cause (`:run/caused-by`). `run_detail` shows
   `resumable-from-step` and `resumed-by`.
-- **Differences from the proposal.** The world is a Run world of the room forked at the
-  recorded snapshots, not `hydrate!`'s fork of a session root: that keeps registry,
-  settlement and review as for any Run (`continue-llm-run` is the portable name, and
-  `resume!` the operation). The budget moves with dvergr's own resource wallets (the old
-  Run's remainder returned to its parent and granted to the new Run), which is where a Run's
-  budget lives, rather than spindel's escrow authority.
+- **Through spindel.** The world is a Run world of the room forked at the recorded
+  snapshots (so registry, settlement and review are as for any Run), and
+  `savepoint.portable/hydrate-into!` (spindel 0.1.67+) makes it the savepoint's continuation
+  before the first step: `continue-llm-run` runs there and resolves with the resumed Run's
+  result (doc/unified-worlds.md, step 3). The budget moves with dvergr's resource wallets (the
+  old Run's remainder returned to its parent and granted to the new Run); spindel's escrow is
+  for a planned handoff (doc/unified-worlds.md, step 2).
 - **Open.** Receipts of a running Run are not yet durable per step, so the step a Run stopped
   in is redone without checking its `:once` effects; `run_resume`'s doc says so. Automatic
   resume on start comes after on-request resume has been exercised. Protocol Runs (tau2) are
   not resumable yet.
-- **spindel:** `persist` (0.1.54) dereferences the session's scope even without escrow, so it
-  throws on a world without a savepoint session (`@(:scope (sp/session world))`); a
-  `some->` there would let session-less worlds persist.
+- **spindel:** `persist` without a session was fixed in spindel#74 (0.1.67).
