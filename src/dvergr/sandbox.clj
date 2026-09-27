@@ -1155,9 +1155,9 @@
         ;; dvergr.mail/*inbox* — the room's attached mailbox conn (fork-aware),
         ;; nil when no mailbox attached. Read helpers are seed source (dvergr/mail/).
         (ns-mail/add-mail-ns! sci-ctx)
-        (ns-agent/add-actors-ns! sci-ctx sys-conn)
+        (ns-agent/add-actors-ns! sci-ctx sys-conn binding-resolver)
         (ns-agent/add-skills-ns! sci-ctx sys-conn)
-        (ns-agent/add-tasks-ns! sci-ctx sys-conn)))
+        (ns-agent/add-tasks-ns! sci-ctx sys-conn binding-resolver)))
     (ns-agent/add-agents-ns! sci-ctx)
     ;; Pure AgentDef/Roster construction plus the explicit, Run-backed `hire!`
     ;; effect. No roster is kept in a host atom: callers thread the immutable

@@ -45,15 +45,19 @@
    refresh keeps newly added APIs visible; it is not the isolation boundary."
   [cctx {:keys [execution-ctx db-conn kb-conn room-id room-runtime-id
                 room-incarnation capability-id fork-projection?
-                agent-program-ceiling allowed-domains]}]
+                agent-program-ceiling allowed-domains agent-id]}]
   (let [capability-id (or capability-id (:capability-id cctx)
-                          (throw (ex-info "Working context has no capability identity" {})))]
+                          (throw (ex-info "Working context has no capability identity" {})))
+        agent-id (or agent-id (:agent-id cctx))]
+    ;; `:agent-id` is the acting identity: code in the sandbox cannot name
+    ;; another author (doc/effects.md, hardening 7).
     (runtime-ctx/install-sandbox-binding!
      execution-ctx capability-id
      (cond-> {:capability-id capability-id
               :room-id room-id
               :room-runtime-id room-runtime-id
               :room-incarnation room-incarnation}
+       agent-id (assoc :agent-id agent-id)
        fork-projection? (assoc :ephemeral-databases {})))
     (binding [rtc/*execution-context* execution-ctx]
       (when-let [sci (chat-ctx/sci-context-in cctx execution-ctx)]
@@ -82,7 +86,7 @@
    writer). Returns the ChatContext."
   [{:keys [execution-ctx chat-id title budget-dollars db-conn kb-conn room-id
            room-runtime-id room-incarnation capability-id agent-program-ceiling
-           durable? allowed-domains]}]
+           durable? allowed-domains agent-id]}]
   (binding [rtc/*execution-context* execution-ctx]
     (let [capability-id (or capability-id (random-uuid))
           cctx (assoc (cond-> (chat-ctx/create-chat-context
@@ -94,7 +98,8 @@
                         (some? durable?) (assoc :durable? durable?)
                  ;; the ctx knows its room: embedder hooks (e.g. the bash
                  ;; mount provider) resolve room-scoped resources from it
-                        room-id (assoc :room-id room-id))
+                        room-id (assoc :room-id room-id)
+                        agent-id (assoc :agent-id agent-id))
                       :capability-id capability-id)]
       ;; create-chat-context forks a sci-ctx but does NOT inject the ctx-bound
       ;; namespaces — do it here so clojure_eval has the room/kb/intake nses
@@ -107,7 +112,8 @@
                                    :room-incarnation room-incarnation
                                    :capability-id capability-id
                                    :agent-program-ceiling agent-program-ceiling
-                                   :allowed-domains allowed-domains})
+                                   :allowed-domains allowed-domains
+                                   :agent-id agent-id})
         cctx
         (catch Throwable error
           ;; Namespace/resource installation is part of construction. A caller

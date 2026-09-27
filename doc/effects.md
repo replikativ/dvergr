@@ -1,7 +1,7 @@
 # Effects: one boundary between sandbox code and the world
 
-Status: **design, for review** (2026-09-27). Nothing here is built yet except where a
-section says so.
+Status: **design, agreed** (2026-09-27; decisions at the end). Built in steps, each noted
+where it lands.
 
 ## Why
 
@@ -45,8 +45,15 @@ registry tools pass `dvergr.tools/execute`, which already has an allowlist and a
 
 The inventory found holes that are bugs today. They are fixed before the boundary, in their
 own PR, each with a test that fails first. **Fixed** (`test/dvergr/sandbox/hardening_test.clj`):
-1, 2, 3, 4, 6. **Open**: 5 becomes the receipt stream of the boundary; 7 and 8 wait for the
-decisions below.
+1, 2, 3, 4, 6, 7, 8. **Open**: 5 becomes the receipt stream of the boundary.
+
+For 7 and 8 the working context carries the acting identity (`:agent-id`, from the agent the
+context was built for; MCP connections act as `:mcp/<profile>`) into the sandbox's world
+binding, where code cannot change it. `post!` authors as that identity (`:sandbox` when there
+is none) and refuses `:from`/`:source-user…`. An agent changes its own actor row and those of
+agents it spawned (`:spawned-by` in their config), cannot re-spawn an existing id or register
+a human, settles tasks assigned to or dispatched by it or posted in its room, and rewrites
+only its own prompt. The host and MCP connections keep their reach.
 
 1. `clojure.data.xml/parse` of a non-string (a `java.net.URI` is an allowed class) runs the
    host's `slurp`: a network and file read past every guard. Accept strings and readers the
@@ -158,11 +165,19 @@ for tool calls. The effect vocabulary and `can?` resource shapes are shared.
 6. **Preflight**, then beichte for static purity.
 7. Later: the chain as spindel effect handlers; eacl behind `can?`.
 
-## Decisions for review
+## Decisions (agreed 2026-09-27)
 
-- The effect vocabulary and classes above (closed, namespaced).
-- Cross-room effects: deny by default for agents, allow for the room's owner and for MCP
-  connections by their selection? (The inventory shows most room ops reach any room today.)
-- Receipts for reads: every read (complete, larger), or reads only where a mode needs them
-  (replay, citations)?
-- Whether hardening item 8 (global writes) waits for the authority handler or is scoped now.
+1. **Vocabulary**: closed and namespaced, defined by dvergr only (`:http/request`,
+   `:fs/read`, `:fs/write`, `:db/transact`, `:room/fork`, `:room/merge`, `:room/post`,
+   `:model/call`, `:process/run`, `:schedule/create`, `:mail/send`, …), each with classes
+   from `:read :write :network :egress :spend :process :lifecycle :schedule :global`.
+2. **Cross-room effects**: an agent acts on its own room, forks of it, and rooms it
+   participates in; anything else needs a grant (`can?`). The room's owner, and MCP
+   connections within their selection, keep their reach.
+3. **Receipts for reads**: every effect is recorded; reads compactly (kind, resource, a hash
+   of the result, no body); full bodies for network reads and for Runs marked for replay
+   (benchmark worlds).
+4. **Now, before `can?`**: `post!` takes its author from the acting identity and refuses
+   caller-supplied `:from`/`:source-user…`; `update_agent_profile` changes the acting
+   agent's own prompt only; `dvergr.actors`/`dvergr.tasks` writes are limited to the acting
+   agent and its rooms.
