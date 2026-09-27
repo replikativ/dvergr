@@ -5,7 +5,8 @@
    isolated Room/context to the interpreter. Settlement is deliberately a
    second axis from execution: a completed program may be merged, retained for
    review, or discarded without rewriting its execution outcome."
-  (:require [dvergr.discourse :as d]))
+  (:require [dvergr.discourse :as d]
+            [org.replikativ.spindel.engine.core :as ec]))
 
 (def settlement-policies #{:automatic :review :discard :deferred})
 
@@ -44,6 +45,9 @@
                                   ;; a child conversation. Nested agents enter
                                   ;; only through explicit hire/tool effects.
                                    :clone-participants? false})]
+     ;; the world knows its Run: a resource authority spends from its wallet
+     (binding [ec/*execution-context* (:ctx work)]
+       (ec/swap-state! [:dvergr/run-id] (constantly run-id)))
      (swap! (:meta work) assoc
             :run-world? true
             :run-id run-id
