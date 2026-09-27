@@ -68,6 +68,8 @@
       ;; child facade must replace them as well.
         (ns-io/add-bash-ns!    sci cctx)
         (ns-io/add-media-ns!   sci cctx)
+        ;; model calls from code are the agent's spend, charged to this chat
+        ((requiring-resolve 'dvergr.sandbox.ns.kb/add-llm-ns!) sci agent-program-ceiling cctx)
         (ns-io/add-process-ns! sci cctx)))
     cctx))
 

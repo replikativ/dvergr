@@ -294,9 +294,9 @@ off something heavy and want to check in:
 ;; Get a fresh snapshot of one without disturbing it
 (processes/snapshot some-pid)
 
-;; Issue a directive — abort, keep going, raise budget, drop a hint
+;; Issue a directive — abort, keep going, drop a hint (a budget is raised by
+;; whoever set it, not from here: ask the user)
 (processes/directive! some-pid {:type :abort :reason "scope changed"})
-(processes/directive! some-pid {:type :extend-budget :dollars 0.10})
 (processes/directive! some-pid {:type :refocus :hint "look at the cache table"})
 ```
 

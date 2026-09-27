@@ -56,6 +56,12 @@
       (when (pos? out)
         (chat-ctx/account-tokens! chat-ctx :output-tokens out {:model m})))))
 
+(defn account-response!
+  "Charge a model response (its :usage, as model.chat returns it) to
+   `chat-ctx`: the accounting every sandbox model call shares."
+  [chat-ctx response]
+  (account-llm-call! chat-ctx {:usage (:usage response) :model (:model response)}))
+
 (tools/register!
  {:name        "llm_call"
   :description "Make a cheap one-shot LLM call for summarization, extraction, or classification. Does NOT start a new agent turn — just returns text. Use to condense long content (transcripts, web pages, search results) before it enters your context window. Deducts from the calling agent's budget."

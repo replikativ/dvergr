@@ -44,6 +44,16 @@
 (def ^:private default-prompt
   "Describe this image in detail. Transcribe any visible text verbatim.")
 
+(def ^:dynamic *on-response*
+  "Called with every model response (its :usage included) when bound: the
+   sandbox's vision/doc wrappers charge the calling agent's budget with it."
+  nil)
+
+(defn- call-model [messages opts]
+  (let [r (chat/chat messages opts)]
+    (when *on-response* (*on-response* r))
+    r))
+
 (defn describe
   "Describe image bytes → text, or nil on failure. Routes through
    dvergr.model.chat/chat (provider/key resolution + 429/5xx retry), sending
@@ -52,9 +62,9 @@
   [^bytes bytes mime & [{:keys [prompt model max-tokens]}]]
   (let [messages [(image-message (->data-url bytes mime) (or prompt default-prompt))]]
     (try
-      (:content (chat/chat messages
-                           {:model (model-id model)
-                            :max-tokens (or max-tokens 1024)}))
+      (:content (call-model messages
+                            {:model (model-id model)
+                             :max-tokens (or max-tokens 1024)}))
       (catch Throwable t
         (tel/log! {:level :warn :id ::vision-failed :data {:error (.getMessage t)}})
         nil))))
@@ -110,7 +120,7 @@
    itself failed (treated as unverified, not as mismatch)."
   [data-url model field claimed]
   (let [reread (try
-                 (:content (chat/chat
+                 (:content (call-model
                             [(image-message
                               data-url
                               (str "Look at this document and report ONLY the exact "
@@ -165,8 +175,8 @@
                       "NOT guess or infer a plausible value.\n\nFields:\n" schema-s
                       (when instructions (str "\n\n" instructions)))
         reply    (try
-                   (:content (chat/chat [(image-message data-url prompt)]
-                                        {:model mid :max-tokens (or max-tokens 4096)}))
+                   (:content (call-model [(image-message data-url prompt)]
+                                         {:model mid :max-tokens (or max-tokens 4096)}))
                    (catch Throwable t
                      (tel/log! {:level :warn :id ::extract-failed
                                 :data {:error (.getMessage t)}})

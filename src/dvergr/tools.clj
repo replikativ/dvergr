@@ -211,6 +211,18 @@
             :execution-ctx execution-ctx
             :abort (or (:abort options) (atom false))})))
 
+(defn- physical-path
+  "`path` on the host disk, clamped to `cwd` like the sandbox's own file
+   access: canonical (symlinks and `..` resolved), under `cwd`, and not a
+   sensitive path. An absolute path is kept when it lies under `cwd`."
+  [cwd path]
+  (let [base (.getCanonicalFile (java.io.File. (str (or cwd "."))))
+        file (.getCanonicalFile (if (fs/absolute? path) (java.io.File. (str path)) (java.io.File. base (str path))))]
+    (when-not (.startsWith (.toPath file) (.toPath base))
+      (throw (ex-info (str "Path outside the workspace: " path) {:path (str path) :workspace (str base)})))
+    ((requiring-resolve 'dvergr.sandbox.ns.io/sensitive-path-policy) (str file))
+    (str file)))
+
 (defn- tool-path [{:keys [filesystem cwd]} path]
   (if filesystem
     (or (mfs/resolve filesystem
@@ -218,7 +230,7 @@
                        path
                        (str (str/replace (or cwd "/") #"/$" "") "/" path)))
         (throw (ex-info "Path escapes the virtual workspace" {:path path})))
-    (str (if (fs/absolute? path) (fs/file path) (fs/file cwd path)))))
+    (physical-path cwd path)))
 
 (defn- workspace-read [ctx path]
   (let [path (tool-path ctx path)]
@@ -1421,12 +1433,8 @@ Note: changes take effect on the next agent restart or reload."
              (try
                (let [kondo-ns (clj-kondo-ns)
                      run! (ns-resolve kondo-ns 'run!)
-                      ;; Resolve paths relative to cwd
-                     paths (mapv (fn [p]
-                                   (if (fs/absolute? p)
-                                     p
-                                     (str cwd "/" p)))
-                                 lint)
+                      ;; Paths under cwd only, like the file tools
+                     paths (mapv #(physical-path cwd %) lint)
                      opts (cond-> {:lint paths}
                             config (assoc :config config))
                      result (run! opts)
