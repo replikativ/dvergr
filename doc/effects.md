@@ -177,8 +177,26 @@ ladder, monotonicity in relations, authority carrying down the tree) are test.ch
 properties (`test/dvergr/authority_test.clj`).
 
 An agent that creates a room keeps it by taking part in it (`:agents`) or nesting it
-(`:parent-id`) under its own. **Next**: grants (eacl), replay and faults as answering
-handlers.
+(`:parent-id`) under its own.
+
+**Record, replay, faults** (steps 4 and 5): answering handlers. Their configuration is data
+(`[:replay {:id …}]`); the state they need (a recording, a replay cursor, fault counters) is
+host-side, created before the run (`recording!`, `replay!`, `faults!`) and unreachable from
+code. `[:record]` appends each effect's key (operation, resource, optional finer `:key`) and
+its result or error; `[:replay]` answers each effect with the next recorded entry for its key
+and never reaches the world, reporting divergence when asked for something unrecorded;
+`[:faults]` fails a `rate` of the effects in scope with a fault drawn from `kinds` (`:error`,
+`:timeout`, and for HTTP a 429 or 503 answer of the operation's shape), as a function of
+`(seed, key, occurrence)`. Answering handlers do not commute (a recording outside faults
+records them; inside, only what reached the world). Laws as properties: replay reproduces a
+recording without the world; rate 0 is the identity; the same seed gives the same faults.
+
+**World configuration**: a world (a Room's execution context) holds handlers every sandbox
+in it runs under, outside each capability's own (`install-world!`, `world-handlers`); forks
+inherit them and may add their own without touching the parent. An EnvironmentDef's
+`:world :effects` installs them in each Attempt's isolated world (doc/benchmarks.md).
+
+**Next**: grants (eacl), preflight, and trajectory export from receipts and recordings.
 
 ### How modes answer the goals
 
@@ -219,8 +237,8 @@ for tool calls. The effect vocabulary and `can?` resource shapes are shared.
    recorded resource.
 3. **Authority and read-only**: the `can?` seam over existing relations, cross-room effects
    decided by it; `:read-only`. (Done; grants pending.)
-4. **Replay** (and trajectory export from receipts).
-5. **Faults** as a benchmark knob.
+4. **Replay** (and trajectory export from receipts). (Replay done; export pending.)
+5. **Faults** as a benchmark knob. (Done: `:world :effects :faults`.)
 6. **Preflight**, then beichte for static purity.
 7. Later: the chain as spindel effect handlers; eacl behind `can?`.
 

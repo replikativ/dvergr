@@ -30,7 +30,8 @@
   (:require [clojure.set]
             [clojure.string :as str]
             [dvergr.authority :as authority]
-            [malli.core :as m])
+            [malli.core :as m]
+            [org.replikativ.spindel.engine.core :as ec])
   (:import [java.security MessageDigest]))
 
 ;; ---------------------------------------------------------------------------
@@ -217,11 +218,137 @@
    class sets. Several of the same compose to one (idempotent)."
   {:authority authority-handler})
 
+;; ---------------------------------------------------------------------------
+;; Answering handlers: record, replay, faults
+;;
+;; Their configuration is data (`[:replay {:id …}]`); the state a run needs (a
+;; recording, a replay cursor, fault counters) is host-side, keyed by that id,
+;; and created by the host before the run (`recording!`, `replay!`, `faults!`).
+;; Sandbox code can reach none of it.
+;; ---------------------------------------------------------------------------
+
+(defonce ^:private states (atom {}))
+
+(defn- state [id]
+  (or (get @states id)
+      (throw (ex-info (str "No effect handler state " id) {:id id}))))
+
+(defn release!
+  "Drop the host-side state of a recording, replay or fault injection."
+  [id]
+  (swap! states dissoc id)
+  nil)
+
+(defn effect-key
+  "What identifies an effect for replay and faults: its operation and
+   resource, plus `:key` when the capability gives a finer one."
+  [{kind :effect :keys [resource key]}]
+  (cond-> [kind resource] key (conj key)))
+
+(defn recording!
+  "Start a recording; `[:record {:id id}]` appends every effect it sees (its
+   key and result, or the error it raised). Returns the id."
+  []
+  (let [id (random-uuid)]
+    (swap! states assoc id (atom []))
+    id))
+
+(defn recorded
+  "The entries of a recording, in order: `{:key :value}` or `{:key :error}`."
+  [id]
+  @(state id))
+
+(defn replay!
+  "Start replaying `entries` (from `recorded`); `[:replay {:id id}]` answers
+   each effect with the next entry for its key, in order, and never reaches
+   the world. Returns the id."
+  [entries]
+  (let [id (random-uuid)]
+    (swap! states assoc id (atom (reduce (fn [qs e] (update qs (:key e) (fnil conj []) e))
+                                         {} entries)))
+    id))
+
+(defn faults!
+  "Start a seeded fault injection: `rate` (0..1) of the effects whose kind is in
+   `only` (all when nil) fail, each with a fault drawn from `kinds` (`:error`,
+   `:timeout`, and for HTTP `:rate-limit`, `:server-error`). The n-th occurrence
+   of an effect key faults as a function of `(seed, key, n)` alone, so a faulty
+   run is reproducible. `[:faults {:id id}]`. Returns the id."
+  [{:keys [seed rate only kinds] :or {seed 0 rate 0.1 kinds [:error :timeout]}}]
+  (let [id (random-uuid)]
+    (swap! states assoc id {:seed seed :rate rate :only (some-> only set) :kinds (vec kinds)
+                            :counts (atom {})})
+    id))
+
+(defn- record-handler [_ctx {:keys [id]}]
+  (fn [effect next]
+    (let [log (state id)
+          k (effect-key effect)]
+      (try
+        (let [v (next effect)]
+          (swap! log conj {:key k :value v})
+          v)
+        (catch clojure.lang.ExceptionInfo e
+          ;; a refusal is the stack's own decision, not the world's answer
+          (when-not (= :effect/denied (:type (ex-data e)))
+            (swap! log conj {:key k :error (.getMessage e)}))
+          (throw e))
+        (catch Throwable t
+          (swap! log conj {:key k :error (str (.getName (class t)) ": " (.getMessage t))})
+          (throw t))))))
+
+(defn- replay-handler [_ctx {:keys [id]}]
+  (fn [effect _next]
+    (let [queues (state id)
+          k (effect-key effect)
+          [entry] (get @queues k)]
+      (when-not entry
+        (throw (ex-info (str "Replay diverged: nothing recorded for " (pr-str k))
+                        {:type :effect/replay-divergence :key k})))
+      (swap! queues update k subvec 1)
+      (if (contains? entry :error)
+        (do (answer :replay nil)
+            (throw (ex-info (str "Replayed error: " (:error entry))
+                            {:type :effect/replayed-error :key k})))
+        (answer :replay (:value entry))))))
+
+(defn- fault-for
+  "The fault the n-th occurrence of `k` gets under `cfg`, or nil."
+  [{:keys [seed rate kinds]} k n]
+  (let [rng (java.util.Random. (hash [seed k n]))]
+    (when (< (.nextDouble rng) rate)
+      (nth kinds (.nextInt rng (count kinds))))))
+
+(defn- faults-handler [_ctx {:keys [id]}]
+  (fn [effect next]
+    (let [{:keys [only counts] :as cfg} (state id)
+          kind (:effect effect)
+          k (effect-key effect)]
+      (if (and only (not (contains? only kind)))
+        (next effect)
+        (let [n (get (swap! counts update k (fnil inc -1)) k)
+              fault (fault-for cfg k n)
+              http? (= :http/request kind)]
+          (case (if (and (#{:rate-limit :server-error} fault) (not http?)) :error fault)
+            nil (next effect)
+            :rate-limit (answer :faults {:status 429 :headers {"retry-after" "1"} :body "rate limited"})
+            :server-error (answer :faults {:status 503 :headers {} :body "service unavailable"})
+            :timeout (do (answer :faults nil)
+                         (throw (ex-info (str "Injected fault: " (name kind) " timed out")
+                                         {:type :effect/fault :fault :timeout})))
+            (do (answer :faults nil)
+                (throw (ex-info (str "Injected fault: " (name kind) " failed")
+                                {:type :effect/fault :fault :error})))))))))
+
 (def registry
-  "Answering handlers by spec key (replay, faults), each `(fn [ctx & args])`.
-   Filters are not here: `normalize` folds class filters into one `:admit` and
-   keeps each predicate filter once."
-  {})
+  "Answering handlers by spec key, each `(fn [ctx & args])`. Filters are not
+   here: `normalize` folds class filters into one `:admit` and keeps each
+   predicate filter once. Answering handlers do not commute: `[[:record r]
+   [:faults f]]` records the injected faults, `[[:faults f] [:record r]]` only
+   what reached the world."
+  {:record record-handler
+   :replay replay-handler
+   :faults faults-handler})
 
 (defn normalize
   "The canonical form of a handler configuration: one `[:admit S]` (the
@@ -290,18 +417,63 @@
   [agent-id]
   (or (nil? agent-id) (= "mcp" (namespace agent-id))))
 
+;; ---------------------------------------------------------------------------
+;; World configuration: handlers every sandbox in a world runs under
+;; ---------------------------------------------------------------------------
+
+(def ^:private world-path
+  "Where a world (a Room's execution context) keeps its handler configuration.
+   It is context state, so a fork inherits its parent's and may narrow it or
+   add answering handlers of its own."
+  [:dvergr/effects :handlers])
+
+(defn install-world!
+  "Compose `specs` onto the handlers of the world `ctx`: every sandbox that
+   runs there, an agent's or an MCP connection's, performs under them."
+  [ctx specs]
+  (binding [ec/*execution-context* ctx]
+    (ec/swap-state! world-path #(compose % specs))))
+
+(defn world-handlers
+  "The handler configuration of the world `ctx`."
+  [ctx]
+  (binding [ec/*execution-context* ctx]
+    (ec/get-state world-path)))
+
+(defn environment-handlers!
+  "Host-side: the handler configuration an environment's `:world :effects`
+   asks for, with the state it needs created. Portable data in, `{:specs
+   [...] :release (fn [])}` out:
+
+     {:faults {:seed 7 :rate 0.1 :only #{:http/request} :kinds [:rate-limit]}
+      :record true           ; record every effect (`:recording` id returned)
+      :read-only true
+      :admit #{:read :network}}"
+  [{:keys [faults record read-only admit]}]
+  (let [f (when faults (faults! faults))
+        r (when record (recording!))]
+    {:specs (cond-> []
+              admit (conj [:admit (set admit)])
+              read-only (conj [:read-only])
+              r (conj [:record {:id r}])
+              f (conj [:faults {:id f}]))
+     :recording r
+     :release #(do (some-> f release!) (some-> r release!))}))
+
 (defn boundary-resolver
-  "The boundary for a sandbox. `binding-resolver` reads the world binding,
-   where the runtime set the acting identity and `:effects {:handlers specs}`;
-   `sink` holds the receipts; `relations` returns the room relations for the
-   authority filter, which the runtime adds for every agent. Any may be nil."
-  ([binding-resolver sink] (boundary-resolver binding-resolver sink nil))
-  ([binding-resolver sink relations]
+  "The boundary for a sandbox. `binding-resolver` reads the capability's world
+   binding, where the runtime set the acting identity and `:effects {:handlers
+   specs}`; `sink` holds the receipts. Options: `:world`, a function returning
+   the world's handler configuration (outside the binding's), and
+   `:relations`, returning the room relations for the authority filter the
+   runtime adds for every agent. Any may be nil."
+  ([binding-resolver sink] (boundary-resolver binding-resolver sink {}))
+  ([binding-resolver sink {:keys [relations world]}]
    (fn []
      (let [b (when binding-resolver (binding-resolver))
            agent-id (:agent-id b)
            subject (when agent-id {:agent agent-id :room (:room-runtime-id b)})
-           specs (cond-> (vec (get-in b [:effects :handlers]))
+           specs (cond-> (compose (when world (world)) (get-in b [:effects :handlers]))
                    (not (full-reach? agent-id)) (conj [:authority]))]
        {:sink sink
         :subject subject

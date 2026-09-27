@@ -1124,7 +1124,10 @@
         ;; the world the call runs in
         relations  #(binding [rtc/*execution-context* (runtime-ctx/selected-context spindel-ctx)]
                       (authority/relations ((requiring-resolve 'dvergr.room.registry/list-rooms))))
-        boundary   (effects/boundary-resolver binding-resolver audit-log relations)
+        boundary   (effects/boundary-resolver
+                    binding-resolver audit-log
+                    {:relations relations
+                     :world #(effects/world-handlers (runtime-ctx/selected-context spindel-ctx))})
         binding-swap! (when capability-id
                         (fn [f & args]
                           (apply runtime-ctx/update-sandbox-binding!

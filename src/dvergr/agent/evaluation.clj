@@ -7,6 +7,7 @@
    receipt. Parallelism, races, quorums, and later inference policies compose
    these Spins with the existing Spindel combinators."
   (:require [dvergr.agent.environment :as environment]
+            [dvergr.effects :as effects]
             [dvergr.agent.attempt :as attempt]
             [dvergr.agent.program :as program]
             [dvergr.agent.roster :as roster]
@@ -407,12 +408,23 @@
       (throw (ex-info "Environment :on-timeout must be :fault or :verdict"
                       {:type ::invalid-on-timeout :on-timeout (:on-timeout limits)})))
     (when-let [unknown (seq (remove #{:isolation :settlement :resources :setup
-                                      :protocol}
+                                      :protocol :effects}
                                     (keys world)))]
       (throw (ex-info
               "Evaluation environment contains unsupported world policy; setup requires a trusted resolver"
               {:type ::unsupported-evaluation-world
                :unknown (set unknown)})))
+    ;; the world's effect handlers (dvergr.effects/environment-handlers!)
+    (when-let [fx (:effects world)]
+      (let [bad (or (seq (remove #{:faults :record :read-only :admit} (keys fx)))
+                    (seq (remove #{:seed :rate :only :kinds} (keys (:faults fx))))
+                    (when-let [r (get-in fx [:faults :rate])]
+                      (when-not (and (number? r) (<= 0 r 1)) [:rate]))
+                    (seq (remove #{:error :timeout :rate-limit :server-error}
+                                 (get-in fx [:faults :kinds]))))]
+        (when bad
+          (throw (ex-info "Environment :world :effects is not a supported handler configuration"
+                          {:type ::unsupported-world-effects :effects fx :invalid (vec bad)})))))
     (when (and (seq model-limits)
                (not= :llm (get-in agent [:agent/program :kind])))
       (throw (ex-info "Environment model limits require an LLM AgentDef"
@@ -584,9 +596,19 @@
             ;; Per-invocation host handoff, not another world-state store.
             ;; Portable captured evidence enters the durable Attempt.
             captured (atom ::pending)
+            world-effects (get-in definition [:environment/world :effects])
             prepare-world!
-            (when (or world-setup (:capture evaluator))
+            (when (or world-setup (:capture evaluator) world-effects)
               (fn [context]
+                ;; The environment's effect handlers (faults, recording,
+                ;; read-only) apply to everything that runs in the isolated
+                ;; world, the candidate's sandbox and an external agent's MCP
+                ;; eval alike. The same seed for every Attempt: candidates meet
+                ;; the same faults, so comparisons stay paired.
+                (when world-effects
+                  (let [{:keys [specs release]} (effects/environment-handlers! world-effects)]
+                    ((:register-cleanup! context) (fn [] (release) nil))
+                    (effects/install-world! (:ctx (:room context)) specs)))
                 (when-let [capture (:capture evaluator)]
                   ;; Register first: supervisor cleanup is LIFO, so capture
                   ;; sees the final substrate after other resource cleanup.
