@@ -267,3 +267,31 @@
                 (is (zero? failed-cells) (pr-str (:incomplete scorecard)))
                 (is (= 1.0 (:reward-mean (first (:scorecard/summary scorecard)))))))
             (finally (paths/set-home! prev) (sdb/reset-conn!))))))))
+
+(deftest a-judge-answers-what-the-checker-asks
+  (let [fs {"workflow.edn" (pr-str {:title "Finds" :task "List finds." :capture ["/out"]
+                                    :judge {:model "claude-code-haiku" :max-requests 2}})
+            "checker.clj" "(ns j (:require [clojure.string :as str]))
+                           (defn- finds [files] (remove str/blank? (str/split-lines (get files \"/out/finds.md\" \"\"))))
+                           (defn judge-requests [{:keys [files]}]
+                             (vec (for [f (finds files)] {:id f :prompt (str \"Is \" f \" relevant? yes or no\")})))
+                           (defn check [{:keys [files judgements]}]
+                             (let [fs (finds files)
+                                   yes (filter #(str/starts-with? (str/lower-case (get judgements % \"\")) \"yes\") fs)]
+                               {:checks {:all-relevant? (= (count yes) (count fs))}
+                                :reward (double (/ (count yes) (max 1 (count fs))))}))"
+            "fixtures/README.md" "x"}
+        b (room-wf/bundle "finds" fs)
+        asked (atom [])
+        ev (room-wf/evaluator b {:judge-fn (fn [p] (swap! asked conj p) (if (re-find #"Dock" p) "Yes." "No."))})
+        evidence ((:observe ev) {:default {} :result {:run/status :completed}
+                                 :execution/evidence {:files {"/out/finds.md" "Dock\nPizza\nThird"}}})]
+    (testing "the judge is asked once, when observed, within max-requests, and its answers kept"
+      (is (= 2 (count @asked)))
+      (is (= {"Dock" "Yes." "Pizza" "No."} (:judgements evidence))))
+    (testing "the checker scores with the answers; re-verifying asks no one"
+      (reset! asked [])
+      (is (= 0.3333333333333333 (:reward ((:verify ev) nil evidence))))
+      (is (empty? @asked)))
+    (testing "the judge model is part of the verifier's basis"
+      (is (= "claude-code-haiku" (get-in (evaluation/evaluator-ref ev) [:verifier/basis :judge]))))))

@@ -5,7 +5,9 @@
 
      workflow.edn   {:title :doc :task \"… {param} …\" :params {…} :profile
                      :capture [\"/out\"] :timeout-ms}
-     checker.clj    a namespace defining (check {:files :fetched :params :gold})
+     checker.clj    a namespace defining (check {:files :fetched :judgements
+                    :params :gold}), and optionally (judge-requests {…}) →
+                    [{:id :prompt}] for the `:judge` model
                     → {:checks {k bool} :reward 0..1}
      gold.edn       optional: the reference facts the checker scores against
      fixtures/…     the files each attempt's world starts with (at the root:
@@ -48,6 +50,9 @@
    [:capture {:optional true} [:vector [:re #"^/[^.]*$"]]]
    ;; give the checker the pages the attempt fetched (`:fetched {url body}`)
    [:fetched {:optional true} :boolean]
+   ;; a model that answers the checker's `judge-requests` (e.g. is a new find
+   ;; relevant?); part of what a score means, so part of the verifier's basis
+   [:judge {:optional true} [:map [:model :string] [:max-requests {:optional true} [:int {:min 1 :max 50}]]]]
    ;; :frozen: the attempt's web is web.edn (`freeze`), not the internet
    [:web {:optional true} [:enum :live :frozen]]
    [:timeout-ms {:optional true} [:int {:min 1000}]]])
@@ -146,21 +151,43 @@
   []
   (sandbox/create-base-ctx :load-fn (constantly nil)))
 
-(defn run-checker
-  "Run `source`'s `check` on `input`, bounded in time; the verdict, validated."
-  [source input]
+(defn- call-checker
+  "Call `fname` of checker `source` on `input` in a fresh interpreter, bounded
+   in time; `::absent` when the checker does not define it."
+  [source fname input]
   (let [ctx (checker-ctx)
         run (future
               (let [{:keys [ns]} (sci/eval-string+ ctx source)
-                    check (sci/eval-string* ctx (str "(ns-resolve '" ns " 'check)"))]
-                (when-not check
-                  (throw (ex-info "checker.clj defines no `check`" {:type ::no-check})))
-                (@check input)))
-        verdict (deref run checker-timeout-ms ::timeout)]
-    (when (= ::timeout verdict)
+                    f (sci/eval-string* ctx (str "(ns-resolve '" ns " '" fname ")"))]
+                (if f (@f input) ::absent)))
+        result (deref run checker-timeout-ms ::timeout)]
+    (when (= ::timeout result)
       (future-cancel run)
       (throw (ex-info (str "The checker did not finish within " checker-timeout-ms "ms")
                       {:type ::checker-timeout})))
+    result))
+
+(def JudgeRequests
+  "What a checker's `judge-requests` returns: questions for the judge model."
+  [:vector [:map [:id :string] [:prompt :string]]])
+
+(defn judge-requests
+  "The questions `source`'s `judge-requests` asks about `input` (nil when it
+   defines none), validated and bounded by `max-requests`."
+  [source input max-requests]
+  (let [rs (call-checker source "judge-requests" input)]
+    (when-not (= ::absent rs)
+      (when-not (m/validate JudgeRequests (vec rs))
+        (throw (ex-info (str "judge-requests returned no requests: " (pr-str (me/humanize (m/explain JudgeRequests (vec rs)))))
+                        {:type ::invalid-judge-requests})))
+      (vec (take max-requests rs)))))
+
+(defn run-checker
+  "Run `source`'s `check` on `input`, bounded in time; the verdict, validated."
+  [source input]
+  (let [verdict (call-checker source "check" input)]
+    (when (= ::absent verdict)
+      (throw (ex-info "checker.clj defines no `check`" {:type ::no-check})))
     (let [verdict (update verdict :reward #(some-> % double))]
       (when-not (m/validate Verdict verdict)
         (throw (ex-info (str "The checker returned no verdict: " (pr-str (me/humanize (m/explain Verdict verdict))))
@@ -179,15 +206,17 @@
    :problems [...]}`."
   [{:keys [checker gold calibration definition id]}]
   (let [params (:params definition)
-        run (fn [files fetched]
+        ;; judgements, like fetched pages, come from calibration.edn: no model
+        run (fn [files fetched judgements]
               (run-checker checker {:files files :fetched (or fetched (:fetched calibration) {})
+                                    :judgements (or judgements (:judgements calibration) {})
                                     :gold gold :params params}))]
     (if-not (:reference calibration)
       {:ok? false :bundle (str id) :problems ["calibration.edn has no :reference answer"]}
-      (let [reference (run (:reference calibration) nil)
+      (let [reference (run (:reference calibration) nil nil)
             damaged (into (sorted-map)
-                          (for [[k {:keys [files fetched loses]}] (:damaged calibration)
-                                :let [v (run files fetched)
+                          (for [[k {:keys [files fetched judgements loses]}] (:damaged calibration)
+                                :let [v (run files fetched judgements)
                                       kept (vec (filter #(get-in v [:checks %]) loses))]]
                             [k {:verdict v :kept kept
                                 :ok? (boolean (and (empty? kept) (seq loses)
@@ -328,25 +357,48 @@
   (into {} (map (fn [[u b]] (let [t (page-text b)] [u (subs t 0 (min (count t) max-page-chars))])))
         (take 40 pages)))
 
+(defn- model-judge
+  "Ask `model` one judge question: its answer as text (at most 500 characters)."
+  [model]
+  (fn [prompt]
+    (let [{:keys [text error]} ((requiring-resolve 'dvergr.tools.llm-call/cheap-llm-call)
+                                "Answer the question exactly as it asks, briefly." prompt
+                                {:model model :max-tokens 200})]
+      (if error
+        (throw (ex-info (str "The judge failed: " error) {:type ::judge-failed}))
+        (let [t (str/trim (str text))] (subs t 0 (min (count t) 500)))))))
+
 (defn evaluator
   "The bundle's checker as an Evaluator: it captures the files under the
    bundle's `:capture` directories and runs the checker on them. `tier` is
-   `:ad-hoc` unless the bundle was promoted."
-  [{:keys [definition checker gold id] :as b} {:keys [params tier]}]
+   `:ad-hoc` unless the bundle was promoted. With a `:judge` in workflow.edn,
+   the checker's `judge-requests` are answered by that model once, when the
+   Attempt is observed, and kept as evidence (`:judgements {id answer}`, given
+   to `check`); `judge-fn` replaces the model (tests)."
+  [{:keys [definition checker gold id] :as b} {:keys [params tier judge-fn]}]
   (let [dirs (or (:capture definition) ["/out"])
-        params (merge (:params definition) params)]
+        params (merge (:params definition) params)
+        {judge-model :model max-requests :max-requests :or {max-requests 20}} (:judge definition)
+        judge (or judge-fn (when judge-model (model-judge judge-model)))]
     (evaluation/make-evaluator
      {:id (verifier-id b) :version 1 :tier (or tier (dvergr.catalog.room/tier b))
-      :basis {:bundle (str id)}
+      :basis (cond-> {:bundle (str id)} judge-model (assoc :judge judge-model))
       :capture (fn [{world :world/room}]
                  (cond-> {:files (into {} (map #(ws/read-tree world %)) dirs)}
                    (:fetched definition)
                    (assoc :fetched (bounded-pages (effects/fetched-pages (effects/world-recording (:ctx world)))))))
       :observe (fn [{:keys [default result] captured :execution/evidence}]
-                 (assoc default :run-status (:run/status result) :files (:files captured)
-                        :fetched (:fetched captured {})))
-      :verify (fn [_ {:keys [run-status files fetched]}]
+                 (let [input {:files (:files captured) :fetched (:fetched captured {})
+                              :params params :gold gold}
+                       requests (when judge (judge-requests checker input max-requests))]
+                   (cond-> (assoc default :run-status (:run/status result) :files (:files captured)
+                                  :fetched (:fetched captured {}))
+                     requests (assoc :judgements (into {} (map (fn [{:keys [id prompt]}] [id (judge prompt)]))
+                                                       requests)
+                                     :judge-requests requests))))
+      :verify (fn [_ {:keys [run-status files fetched judgements]}]
                 (let [{:keys [checks reward]} (run-checker checker {:files files :fetched fetched
+                                                                    :judgements (or judgements {})
                                                                     :params params :gold gold})]
                   {:checks (assoc checks :completed? (= :completed run-status))
                    :reward (if (= :completed run-status) reward 0.0)}))})))
@@ -369,9 +421,9 @@
 
 (defn experiment-plan
   "What `dvergr.agent.experiment.runner` needs to benchmark `b` on `models`."
-  [b {:keys [models budget-dollars timeout-ms prompt params tier] :as opts}]
+  [b {:keys [models budget-dollars timeout-ms prompt params tier judge-fn] :as opts}]
   (let [setup (world-setup b)
-        ev (evaluator b {:params params :tier tier})
+        ev (evaluator b {:params params :tier tier :judge-fn judge-fn})
         {:keys [team ids]} (workflow/candidates {:models models
                                                  :profile (or (get-in b [:definition :profile]) "developer")
                                                  :budget-dollars budget-dollars :prompt prompt})]

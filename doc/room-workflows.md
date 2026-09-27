@@ -95,6 +95,13 @@ most of a page, and the words a citation quotes may lie past any cut of the raw 
 if the Attempt fetched the page. `calibration.edn` may give `:fetched` for its reference and
 variants.
 
+A `:judge {:model … :max-requests n}` in `workflow.edn` answers what a checker cannot decide
+by itself (is this new find relevant?): its `judge-requests` returns `[{:id :prompt}]`, the
+host asks the model once when the Attempt is observed and keeps the answers as evidence,
+and `check` receives them as `:judgements {id answer}`. The checker stays pure; the model is
+in the verifier's basis; re-verifying asks no one; `calibration.edn` gives `:judgements` for
+its cases.
+
 `catalog_freeze {room name as?}` makes a stable benchmark of a live one: a new bundle
 (`<name>-frozen`) whose `web.edn` is the pages its live Attempts fetched (as text) and whose
 `workflow.edn` says `:web :frozen`. Every attempt in it meets the same web
