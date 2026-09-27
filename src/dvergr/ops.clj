@@ -217,6 +217,12 @@
                :p-pass-rate-no-worse (xstats/prob-rate-above rate base-rate 0.05)
                :reward-difference (:mean diff)
                :reward-difference-interval (:interval diff)
+               ;; every Attempt, unpaired: informative when worlds are few but
+               ;; repetitions many (two corpora x three runs)
+               :reward-difference-unpaired (let [w (xstats/welch-difference
+                                                    (map :reward (filter #(= candidate (kw->str (:candidate/id %))) entries))
+                                                    (map :reward (filter #(= base (kw->str (:candidate/id %))) entries)))]
+                                             (select-keys w [:mean :interval :n]))
                :paired-worlds (:n diff 0)
                :microdollars-per-pass-saved (when (and cost base-cost) (- base-cost cost))
                :cost-per-pass-ratio (when (and cost base-cost (pos? base-cost)) (/ (double cost) base-cost))

@@ -278,6 +278,21 @@ minor event, not a scorer strictness (the one sentence that states it cites anot
 document). With no passes, cost per pass is undefined, so the comparison now also reports
 list-price cost per attempt (`notional-cost-ratio`).
 
+**Real corpora, 2026-09-27** (mondragon and john-lewis, three runs each):
+
+| Candidate | Mean reward (95% range) | List price per attempt |
+| --- | --- | --- |
+| `claude-code-haiku` | 0.879 (0.78–0.98) | $0.238 |
+| `codex-subscription-luna` | 0.833 (0.75–0.92) | $0.023 |
+
+A single run per corpus had Haiku far ahead (0.882 vs 0.751); three runs shrink it to
++0.046, with an unpaired (Welch) interval of −0.07 to +0.16: not separated, at a tenth of the
+list price for Luna. Runs of one model on one corpus spread widely (Haiku 0.70–0.97 on
+mondragon), so one run per world misleads. Both state former chairmen as current (currency)
+and miss assets, the former name and the end of the Ocado supply. Pairing by world with only
+two corpora leaves a t with one degree of freedom (−0.47 to +0.38), so the comparison now also
+reports the unpaired difference over every Attempt (`reward-difference-unpaired`).
+
 Next for the wiki benchmark:
 
 - **More real corpora.** More Wikipedia revision histories (the same shape as

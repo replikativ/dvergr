@@ -54,3 +54,17 @@
     (is (= 4 n))
     (is (close? -0.125 mean))
     (is (<= -1.0 (first interval) mean (second interval) 1.0))))
+
+(deftest an-unpaired-difference-uses-every-attempt
+  ;; Haiku vs Luna on two real corpora x three runs (2026-09-27); scipy's
+  ;; Welch interval: 0.046167 [-0.065972, 0.158305] (df 9.72; ours floors the
+  ;; df to 9, a little wider, never narrower)
+  (let [{:keys [mean interval n]} (stats/welch-difference [0.965 0.704 0.862 0.942 0.877 0.922]
+                                                          [0.94 0.745 0.808 0.747 0.871 0.884])
+        [lo hi] interval]
+    (is (close? 0.046167 mean))
+    (is (= [6 6] n))
+    (is (< (Math/abs (- lo -0.065972)) 0.01))
+    (is (< (Math/abs (- hi 0.158305)) 0.01))
+    (is (<= lo -0.065972) "conservative")
+    (is (nil? (stats/welch-difference [0.5] [0.4 0.6])))))
