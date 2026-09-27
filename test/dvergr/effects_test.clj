@@ -309,7 +309,7 @@
               other (d/make-room {:id :authority-other :ctx ec :store (memory/make)})
               fx (effects/boundary-resolver (constantly {:agent-id :var :room-runtime-id (:id home)})
                                             sink
-                                            #(authority/relations (rreg/list-rooms)))
+                                            {:relations #(authority/relations (rreg/list-rooms))})
               ops (ns-kb/room-ops-map ec nil (select-keys home [:id :incarnation])
                                       {:acting-agent (constantly :var) :effects fx})
               post! ('post! ops)]
@@ -332,6 +332,128 @@
             (let [mcp (ns-kb/room-ops-map ec nil (select-keys home [:id :incarnation])
                                           {:effects (effects/boundary-resolver
                                                      (constantly {:agent-id :mcp/code}) sink
-                                                     #(authority/relations (rreg/list-rooms)))})]
+                                                     {:relations #(authority/relations (rreg/list-rooms))})})]
               (is (some? (('get mcp) (:id other))))))))
       (finally (ctx/stop-context! ec)))))
+
+;; ---------------------------------------------------------------------------
+;; Answering handlers: record, replay, faults
+;; ---------------------------------------------------------------------------
+
+(def ^:private gen-program
+  "A run as the effects it performs."
+  (gen/vector (gen/let [kind (gen/elements [:fs/read :fs/write :http/request :git/read])
+                        path (gen/elements ["a" "b" "c"])]
+                {:effect kind :resource {:path path}})
+              0 12))
+
+(defn- run-program
+  "Perform `program` under `specs`; `world` answers what reaches it. Returns
+   each effect's outcome."
+  [specs program world]
+  (let [b (constantly {:handlers (effects/handlers specs)})]
+    (mapv (fn [e]
+            (try [:ok (effects/perform! b e #(world e))]
+                 (catch clojure.lang.ExceptionInfo x [:err (:type (ex-data x))])))
+          program)))
+
+(defn- counting-world
+  "A world whose answer depends on how often it was asked: replay must give
+   back exactly what it answered, not recompute it."
+  []
+  (let [n (atom 0)] (fn [e] [(:effect e) (:resource e) (swap! n inc)])))
+
+(defspec replay-reproduces-a-recording-without-the-world 200
+  (prop/for-all [program gen-program]
+                (let [r (effects/recording!)
+                      live (run-program [[:record {:id r}]] program (counting-world))
+                      p (effects/replay! (effects/recorded r))
+                      replayed (run-program [[:replay {:id p}]] program
+                                            (fn [_] (throw (ex-info "the world was asked" {}))))]
+                  (effects/release! r) (effects/release! p)
+                  (= live replayed))))
+
+(defspec a-fault-rate-of-zero-is-the-identity 200
+  (prop/for-all [program gen-program seed gen/small-integer]
+                (let [f (effects/faults! {:seed seed :rate 0.0})
+                      w (fn [e] [(:effect e) (:resource e)])
+                      r (= (run-program [] program w) (run-program [[:faults {:id f}]] program w))]
+                  (effects/release! f)
+                  r)))
+
+(defspec the-same-seed-gives-the-same-faults 200
+  (prop/for-all [program gen-program seed gen/small-integer]
+                (let [run #(let [f (effects/faults! {:seed seed :rate 0.5 :kinds [:error :timeout :rate-limit]})
+                                 out (run-program [[:faults {:id f}]] program (fn [e] (:resource e)))]
+                             (effects/release! f)
+                             out)]
+                  (= (run) (run)))))
+
+(deftest answering-handlers
+  (testing "a replay that is asked for something unrecorded says so"
+    (let [p (effects/replay! [])]
+      (is (= [[:err :effect/replay-divergence]]
+             (run-program [[:replay {:id p}]] [{:effect :fs/read :resource {:path "x"}}] identity)))))
+  (testing "a recorded error is replayed as an error"
+    (let [r (effects/recording!)
+          e {:effect :fs/read :resource {:path "gone"}}]
+      (run-program [[:record {:id r}]] [e] (fn [_] (throw (ex-info "No such file" {}))))
+      (let [p (effects/replay! (effects/recorded r))]
+        (is (= [[:err :effect/replayed-error]] (run-program [[:replay {:id p}]] [e] identity))))))
+  (testing "rate 1: every effect in scope faults, others reach the world"
+    (let [f (effects/faults! {:seed 1 :rate 1.0 :only #{:http/request} :kinds [:rate-limit]})
+          out (run-program [[:faults {:id f}]]
+                           [{:effect :http/request :resource {:method :get :url "u"}}
+                            {:effect :fs/read :resource {:path "a"}}]
+                           (constantly {:status 200 :headers {} :body "ok"}))]
+      (is (= [[:ok {:status 429 :headers {"retry-after" "1"} :body "rate limited"}]
+              [:ok {:status 200 :headers {} :body "ok"}]]
+             out))
+      (is (effects/valid-result? :http/request (second (first out))) "an injected answer has the operation's shape")))
+  (testing "answering handlers do not commute: recording outside faults records them"
+    (let [program [{:effect :fs/read :resource {:path "a"}}]
+          outside (effects/recording!) inside (effects/recording!)
+          f1 (effects/faults! {:seed 1 :rate 1.0}) f2 (effects/faults! {:seed 1 :rate 1.0})]
+      (run-program [[:record {:id outside}] [:faults {:id f1}]] program identity)
+      (run-program [[:faults {:id f2}] [:record {:id inside}]] program identity)
+      (is (= 1 (count (effects/recorded outside))))
+      (is (empty? (effects/recorded inside)) "the fault answered before anything reached the recording")))
+  (testing "a receipt names who answered"
+    (let [sink (effects/make-sink)
+          f (effects/faults! {:seed 1 :rate 1.0 :kinds [:timeout]})
+          b (constantly {:handlers (into [(effects/receipts sink nil)] (effects/handlers [[:faults {:id f}]]))})]
+      (is (thrown? Exception (effects/perform! b {:effect :fs/read :resource {:path "a"}} (constantly "x"))))
+      (is (= :faults (:by (last @sink)))))))
+
+(deftest a-world-configures-every-sandbox-in-it
+  (testing "handlers installed on the world apply to a sandbox whose binding has none"
+    (let [ec (ctx/create-execution-context)
+          sci-ctx (sandbox/fork-for-session ec)
+          root (.getAbsoluteFile (doto (io/file (System/getProperty "java.io.tmpdir") (str "world-" (random-uuid))) .mkdirs))]
+      (try
+        (effects/install-world! ec [[:read-only]])
+        (binding [rtc/*execution-context* ec]
+          (sandbox/setup-agent-namespaces! sci-ctx ec :base-path (str root))
+          (is (re-find #"read-only" (str (get-in (sandbox/eval-code sci-ctx "(spit \"x\" \"y\")") [:error :message])))))
+        (finally (ctx/stop-context! ec) (doseq [f (reverse (file-seq root))] (.delete f))))))
+  (testing "a fork inherits its world's handlers and adds its own without touching the parent"
+    (let [ec (ctx/create-execution-context)]
+      (try
+        (binding [rtc/*execution-context* ec]
+          (let [home (d/make-room {:id :world-effects-home :ctx ec :store (memory/make)})
+                _ (effects/install-world! (:ctx home) [[:admit #{:read :write}]])
+                ops (ns-kb/room-ops-map ec nil (select-keys home [:id :incarnation]))
+                fork (('fork! ops) (:id home))]
+            (is (= [[:admit #{:read :write}]] (effects/world-handlers (:ctx fork))))
+            (effects/install-world! (:ctx fork) [[:read-only]])
+            (is (= [[:admit #{:read}]] (effects/world-handlers (:ctx fork))))
+            (is (= [[:admit #{:read :write}]] (effects/world-handlers (:ctx home))) "the parent is unchanged")
+            (('discard! ops) (:id fork))))
+        (finally (ctx/stop-context! ec)))))
+  (testing "an environment's :effects become specs and host state"
+    (let [{:keys [specs recording release]} (effects/environment-handlers!
+                                             {:faults {:seed 3 :rate 0.2} :record true :read-only true})]
+      (is (= [:read-only :record :faults] (mapv first specs)))
+      (is (uuid? recording))
+      (release)
+      (is (thrown? Exception (effects/recorded recording)) "released"))))

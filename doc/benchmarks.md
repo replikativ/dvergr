@@ -69,6 +69,23 @@ A provider is a namespace (`dvergr.benchmarks.<name>.provider`) with:
    a scripted candidate that replays gold answers, so the whole path is tested
    end to end without a model.
 
+**Effects of the world** (`:world :effects` in an EnvironmentDef, doc/effects.md): the
+handlers everything in the Attempt's isolated world performs under, the candidate's sandbox
+and an external agent's MCP eval alike. Being in the EnvironmentDef, they are in its content
+id, so a faulty environment is a different environment on a Scorecard.
+
+```clojure
+:world {:isolation :ctx :settlement :discard
+        :effects {:faults {:seed 7 :rate 0.1 :only #{:http/request}
+                           :kinds [:rate-limit :server-error :timeout]}
+                  :record true      ; record every effect (for replay)
+                  :read-only true}} ; or :admit #{:read :network}
+```
+
+Faults are seeded by `(seed, effect, occurrence)`: every Attempt meets the same faults, so
+candidates are compared on the same draws (paired). Robustness is then the difference
+between a candidate's Scorecard on the environment with and without `:faults`.
+
 `dvergr.agent.experiment.runner/run!` is everything else: the experiment directory
 and Room, Claude Code settings for the run, waiting out subscription usage
 windows, resume, the Scorecard. A provider's `experiment/run!` is a call to it.
