@@ -43,10 +43,13 @@ states (and tests) hold for dvergr too.
    session's computation, before the Run's first step. The Run's supervisor drives the loop
    from the recorded step; the continuation resolves with the resumed Run's result, so the
    session's end is the Run's end. The budget moves as step 2 says.
-4. **Model budget in the ledger:** a Run's `budget-dollars` becomes its wallet's microUSD
-   allocation, charged as model calls account (`resource/consume!`), so it is conserved,
-   escrowed and resumed with everything else. Closes the gap that a resumed Run starts with a
-   fresh chat budget.
+4. **Model budget in the ledger (done):** a Run allocated microdollars pays its model spend
+   from its wallet: `account-usage!` charges each cost through `resource/*spend-wallet*`
+   (bound by the LLM loop; unlike `*model-scope*` it restricts no provider), a cost beyond
+   what is left takes the rest and exhausts the budget, and the Run's budget is at most its
+   wallet. Model spend is thereby conserved, escrowed and resumed with everything else. A
+   resumed Run without a wallet starts with its budget minus what the stopped Run's chat
+   spent, not a fresh one.
 5. **One handler table:** dvergr's effect configuration and spindel's savepoint handlers are
    both "handlers in world state, inherited by forks". Keep dvergr's algebra (normalize,
    compose, narrowing) and store both under spindel's world-state conventions; a later spindel
