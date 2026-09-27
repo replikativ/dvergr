@@ -1,0 +1,8 @@
+{:title "Competitor discovery"
+ :doc "Find products that compete with a given product, each with its site, a one-line claim and a quote from a page the run fetched. Scored on recall of a reference set and on grounding: a quote counts only if it is on a page the run fetched."
+ :task "Read /docs/product.md: it describes {product}. Find products that compete with {product}: shared workspaces or systems where people and AI agents work together on an organization's state. Search the web with the Brave Search API: (babashka.http-client/get \"https://api.search.brave.com/res/v1/web/search\" {:query-params {:q query :count 10} :headers {\"X-Subscription-Token\" (env/get \"BRAVE_API_KEY\")}}) (the token is a placeholder the sandbox fills in); results are under [:web :results] of the JSON body. Use at most {max-searches} searches. Fetch each candidate's own page before you list it. Write /out/competitors.edn: a vector of maps {:name :url :claim :quote :source-url}, where :url is the product's site, :claim one line on what it does, and :quote a sentence copied verbatim from the page at :source-url, which you fetched. List only products you checked; at most {max-entries}."
+ :params {:product "Simmis" :max-searches 8 :max-entries 10}
+ :profile "developer"
+ :capture ["/out"]
+ :fetched true
+ :timeout-ms 900000}

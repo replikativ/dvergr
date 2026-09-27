@@ -1,0 +1,4 @@
+{:reference [{:name "Wato" :hosts #{"watolabs.com"}}
+             {:name "PromptQL" :hosts #{"promptql.io"}}
+             {:name "Dust" :hosts #{"dust.tt" "docs.dust.tt"}}
+             {:name "Buzz" :hosts #{"github.com/block/buzz"}}]}
