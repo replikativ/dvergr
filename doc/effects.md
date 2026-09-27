@@ -202,8 +202,21 @@ the write that would exceed the budget, receipted `:by :quota`; reads are free. 
 EnvironmentDef asks for one with `:world :effects {:quota-bytes n}`. A shell command's output
 is bounded where it is written (`dvergr.intake.bash`), not after it was held in memory.
 
-**Next**: durable recordings and receipts with an idempotency class per operation (the input
-for trajectory export and for resuming Runs from savepoints, not by replay), grants (eacl),
+**Idempotency and durable effect logs**: every operation has a class (`effects/idempotency`):
+`:idempotent` (performing it again leaves the world as once: reads, writes of given content,
+model calls), `:compensable` (a known inverse undoes it: a move) or `:once` (never again
+without confirmation: a post, a commit, a shell command, a transaction); HTTP by method.
+Receipts carry it. Every Attempt's world has a receipt sink; the Attempt's metrics keep
+`:effects {:count :denials :once :log}`, `:log` the receipts as a content-addressed artifact
+of the control room. This is the input for trajectory export and for resuming a Run: from a
+spindel savepoint, redoing only `:idempotent` effects, not by replaying a log (DeepSeek's DSec
+dropped replay-based recovery; arXiv:2609.22978).
+
+**Registry tools** that touch the workspace (`read_file`, `write_file`, `edit_file`, `glob`,
+`grep`, `shell`) pass the same boundary as the sandbox: the chat's receipts and binding, the
+world's handlers and sink, so read-only, quotas and denials cover them.
+
+**Next**: trajectory export from the effect logs, resume from savepoints, grants (eacl),
 preflight.
 
 ### How modes answer the goals

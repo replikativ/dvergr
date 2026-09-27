@@ -7,6 +7,7 @@
             [datahike.api :as d]
             [dvergr.sandbox :as sandbox]
             [dvergr.effects :as effects]
+            [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.io.acquisition :as acquisition]
             [dvergr.agent.process :as proc]
             [dvergr.code.index :as idx]
@@ -274,6 +275,36 @@
            vec))
     (fs/glob cwd pattern)))
 
+(def ^:private tool-effects
+  "The effect a registry tool performs, from its input: tools that touch the
+   workspace pass the same boundary as the sandbox (`dvergr.effects`), so a
+   world's read-only mode, quota, receipts and denials cover them too.
+   `clojure_eval` is not here: the effects inside it are its own."
+  {"read_file"  (fn [{:keys [path]}] {:effect :fs/read :resource {:path (str path)}})
+   "write_file" (fn [{:keys [path content]}] {:effect :fs/write :resource {:path (str path)}
+                                              :bytes (alength (.getBytes (str content) "UTF-8"))})
+   "edit_file"  (fn [{:keys [path new_string new-string]}]
+                  {:effect :fs/write :resource {:path (str path)}
+                   :bytes (alength (.getBytes (str (or new_string new-string)) "UTF-8"))})
+   "glob"       (fn [{:keys [pattern path]}] {:effect :fs/list :resource {:path (str (or path ".")) :glob (str pattern)}})
+   "grep"       (fn [{:keys [path]}] {:effect :fs/list :resource {:path (str (or path "."))}})
+   "shell"      (fn [{:keys [command]}] {:effect :process/run :resource {:cmd (str command)}})})
+
+(defn- tool-boundary
+  "The boundary a tool call passes: its chat's (receipts, world binding) and
+   its world's (handlers, sink). nil without a chat: host calls run as before."
+  [ctx]
+  (when-let [cctx (:chat-ctx ctx)]
+    (let [ec (or (:execution-ctx ctx) (:spindel-ctx cctx))
+          cap (:capability-id cctx)
+          world #(runtime-ctx/selected-context ec)
+          binding (when (and ec cap)
+                    (let [resolve (runtime-ctx/sandbox-binding-resolver ec cap)]
+                      #(try (resolve) (catch clojure.lang.ExceptionInfo _ nil))))]
+      (effects/boundary-resolver binding (:receipts cctx)
+                                 (when ec {:world #(effects/world-handlers (world))
+                                           :world-sink #(effects/world-sink (world))})))))
+
 (defn execute
   "Execute a tool by name with given input and context.
 
@@ -317,12 +348,21 @@
             ;; untrusted/custom tool cannot claim broader authority by putting
             ;; a fabricated receipt in its result.
             (binding [acquisition/*scope* (acquisition/tool-scope ctx)]
-              (assoc (-> (if-let [exec-fn (:execute tool)]
+              (let [run #(if-let [exec-fn (:execute tool)]
                            (exec-fn input ctx)
                            (when-let [handler-fn (:handler tool)]
                              (handler-fn input)))
-                         (compaction/truncate-tool-result))
-                     :authorization decision))
+                    effect-of (get tool-effects tool-name)
+                    result (try
+                             (if effect-of
+                               (effects/perform! (tool-boundary ctx) (effect-of input) run)
+                               (run))
+                             (catch clojure.lang.ExceptionInfo e
+                               (if (= :effect/denied (:type (ex-data e)))
+                                 {:type :error :error (ex-message e)}
+                                 (throw e))))]
+                (assoc (compaction/truncate-tool-result result)
+                       :authorization decision)))
             (catch Exception e
               {:type :error
                :error (.getMessage e)

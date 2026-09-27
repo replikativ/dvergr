@@ -518,3 +518,23 @@
           (is (not (.exists (io/file root "b.txt"))) "the refused write never happened")
           (is (= 60 (effects/quota-used q)))))
       (effects/release! q))))
+(deftest registry-tools-pass-the-same-boundary
+  (let [ec (ctx/create-execution-context)
+        root (.getAbsoluteFile (doto (io/file (System/getProperty "java.io.tmpdir") (str "tools-fx-" (random-uuid))) .mkdirs))]
+    (try
+      (spit (io/file root "notes.md") "inside")
+      (let [cctx (turn/new-working-ctx {:execution-ctx ec :title "tools" :durable? false :agent-id :mcp/code
+                                        :effects [[:read-only]]})
+            tctx (tools/make-context {:cwd (str root) :chat-ctx cctx :execution-ctx ec})
+            run #(binding [rtc/*execution-context* ec] (tools/execute %1 %2 tctx))]
+        (testing "a read runs; a write is refused by the world's read-only mode and never happens"
+          (is (re-find #"inside" (str (:content (run "read_file" {:path "notes.md"})))))
+          (let [w (run "write_file" {:path "out.md" :content "x"})]
+            (is (= :error (:type w)))
+            (is (re-find #"read-only" (str (:error w)))))
+          (is (not (.exists (io/file root "out.md")))))
+        (testing "both are receipted on the chat"
+          (is (= [:fs/read :fs/write] (mapv :effect (filter #(#{:fs/read :fs/write} (:effect %)) @(:receipts cctx)))))))
+      (finally
+        (ctx/stop-context! ec)
+        (doseq [f (reverse (file-seq root))] (.delete f))))))

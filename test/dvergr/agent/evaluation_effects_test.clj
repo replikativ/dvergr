@@ -51,7 +51,8 @@
           (let [world (:ctx (second args))
                 specs (effects/world-handlers world)
                 ;; what a sandbox in this world would perform under
-                boundary (effects/boundary-resolver nil nil {:world #(effects/world-handlers world)})]
+                boundary (effects/boundary-resolver nil nil {:world #(effects/world-handlers world)
+                                                             :world-sink #(effects/world-sink world)})]
             (reset! seen {:specs specs
                           :write (try (effects/perform! boundary {:effect :fs/write :resource {:path "a"}}
                                                         (constantly "a"))
@@ -71,7 +72,11 @@
                                     (effects/perform! (constantly {:handlers (effects/handlers [[:faults {:id id}]])})
                                                       {:effect :fs/write :resource {:path "a"}}
                                                       (constantly nil))))))
-          (is (= :completed (get-in result [:attempt-receipt :attempt/status])))))))
+          (is (= :completed (get-in result [:attempt-receipt :attempt/status])))
+          (testing "the world's effects are kept with the Attempt"
+            (let [fx (get-in result [:attempt-receipt :attempt/metrics :effects])]
+              (is (= 2 (:count fx)) (pr-str fx))
+              (is (= 0 (:once fx)) "a write and a read may both be redone")))))))
   (testing "an unsupported configuration is refused up front"
     (let [room (d/make-room {:id :evaluation-effects-bad :store (memory/make)})]
       (is (thrown-with-msg? Exception #"not a supported handler configuration"

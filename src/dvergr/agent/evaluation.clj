@@ -8,6 +8,7 @@
    these Spins with the existing Spindel combinators."
   (:require [dvergr.agent.environment :as environment]
             [dvergr.effects :as effects]
+            [dvergr.artifact :as artifact]
             [dvergr.agent.attempt :as attempt]
             [dvergr.agent.program :as program]
             [dvergr.agent.roster :as roster]
@@ -20,7 +21,8 @@
             [org.replikativ.spindel.engine.impl.simple :as simple]
             [org.replikativ.spindel.spin.combinators :as comb]
             [org.replikativ.spindel.spin.core :as spin-core]
-            [org.replikativ.spindel.spin.sync :as sync]))
+            [org.replikativ.spindel.spin.sync :as sync]
+            [taoensso.telemere :as tel]))
 
 (defrecord Evaluator [ref observe verify capture tier])
 
@@ -464,9 +466,29 @@
           (= "Spin cancelled" (ex-message error))
           (recur (ex-cause error))))))
 
+(defn- effect-log
+  "What an Attempt's world did, for its metrics: how many effects, the
+   denials by who decided them, how many may not be redone (`:once`), and the
+   receipts themselves as a content-addressed artifact of the control room
+   (`:log`), when it has a store."
+  [room receipts]
+  (let [receipts (vec receipts)
+        store (or (some-> room :store :artifacts)
+                  (some-> room :store :conn artifact/datahike-store))
+        log (when store
+              (try (artifact/publish-value! store {:dvergr/effect-log receipts} identity)
+                   (catch Throwable e
+                     (tel/log! {:level :warn :id ::effect-log-not-stored :data {:error (ex-message e)}}
+                               "An Attempt's effect log could not be stored")
+                     nil)))]
+    (cond-> {:count (count receipts)
+             :denials (effects/denials receipts)
+             :once (count (filter #(= :once (:idempotency %)) receipts))}
+      log (assoc :log (str log)))))
+
 (defn- certification-candidate
   [{:keys [room world-room setup-evidence execution-evidence definition evaluator agent run-id
-           result durable started-at started-nanos timeout? extra-metrics]}]
+           result durable started-at started-nanos timeout? extra-metrics effect-receipts]}]
   (let [evidence ((:observe evaluator)
                   {:room room
                    :agent agent
@@ -505,6 +527,8 @@
                                           :timed-out? timeout?
                                           :verifier-trust (:tier evaluator)
                                           :spend attempt-spend)
+                             (seq effect-receipts)
+                             (assoc :effects (effect-log room effect-receipts))
                              ;; An environment may count a timeout against the
                              ;; candidate (a verdict: it did not finish in time)
                              ;; rather than as a fault to re-run.
@@ -599,9 +623,12 @@
             ;; Portable captured evidence enters the durable Attempt.
             captured (atom ::pending)
             world-effects (get-in definition [:environment/world :effects])
+            ;; every Attempt world keeps its receipts: what the candidate's
+            ;; effects were, kept with the Attempt (durable, content-addressed)
+            world-sink (effects/make-sink)
             prepare-world!
-            (when (or world-setup (:capture evaluator) world-effects)
-              (fn [context]
+            (fn [context]
+              (effects/set-world-sink! (:ctx (:room context)) world-sink)
                 ;; The environment's effect handlers (faults, recording,
                 ;; read-only) apply to everything that runs in the isolated
                 ;; world, the candidate's sandbox and an external agent's MCP
@@ -609,41 +636,38 @@
                 ;; the same faults, so comparisons stay paired.
                 ;; Registered before the capture below, so released after it
                 ;; (cleanup is LIFO): a capture may read the world's recording.
-                (when world-effects
-                  (let [{:keys [specs release recording]} (effects/environment-handlers! world-effects)
-                        world (:ctx (:room context))]
-                    ((:register-cleanup! context) (fn [] (release) nil))
-                    (effects/install-world! world specs)
-                    ;; the world's receipts, for what the capture counts
-                    ;; (denials: blocked sources, authority)
-                    (effects/set-world-sink! world (effects/make-sink))
-                    (when recording (effects/set-world-recording! world recording))))
-                (when-let [capture (:capture evaluator)]
+              (when world-effects
+                (let [{:keys [specs release recording]} (effects/environment-handlers! world-effects)
+                      world (:ctx (:room context))]
+                  ((:register-cleanup! context) (fn [] (release) nil))
+                  (effects/install-world! world specs)
+                  (when recording (effects/set-world-recording! world recording))))
+              (when-let [capture (:capture evaluator)]
                   ;; Register first: supervisor cleanup is LIFO, so capture
                   ;; sees the final substrate after other resource cleanup.
-                  ((:register-cleanup! context)
-                   (fn []
-                     (reset! captured
-                             (try
-                               (let [evidence
-                                     (capture {:room room
-                                               :world/room (:room context)
-                                               :run-id (:run/id context)
-                                               :environment definition})]
-                                 (when-not (roster/data-value? evidence)
-                                   (throw (ex-info "Captured evidence must be portable"
-                                                   {:type ::invalid-captured-evidence})))
-                                 {:ok evidence})
-                               (catch Throwable error {:error error})))
-                     nil)))
-                (when world-setup
-                  (let [evidence ((:prepare world-setup)
-                                  (assoc context :environment definition))]
-                    (when-not (roster/data-value? evidence)
-                      (throw (ex-info "World setup evidence must be portable"
-                                      {:type ::non-portable-setup-evidence
-                                       :setup (:ref world-setup)})))
-                    (reset! setup-evidence evidence)))))
+                ((:register-cleanup! context)
+                 (fn []
+                   (reset! captured
+                           (try
+                             (let [evidence
+                                   (capture {:room room
+                                             :world/room (:room context)
+                                             :run-id (:run/id context)
+                                             :environment definition})]
+                               (when-not (roster/data-value? evidence)
+                                 (throw (ex-info "Captured evidence must be portable"
+                                                 {:type ::invalid-captured-evidence})))
+                               {:ok evidence})
+                             (catch Throwable error {:error error})))
+                   nil)))
+              (when world-setup
+                (let [evidence ((:prepare world-setup)
+                                (assoc context :environment definition))]
+                  (when-not (roster/data-value? evidence)
+                    (throw (ex-info "World setup evidence must be portable"
+                                    {:type ::non-portable-setup-evidence
+                                     :setup (:ref world-setup)})))
+                  (reset! setup-evidence evidence))))
             ;; Like the world setup, the protocol is told which exact
             ;; environment it is hosting.
             hosted-protocol
@@ -767,6 +791,7 @@
                              :world-room fork
                              :setup-evidence @setup-evidence
                              :execution-evidence (:ok @captured)
+                             :effect-receipts @world-sink
                              :result result :durable durable
                              :started-at started-at :started-nanos started-nanos
                              :timeout? timeout? :extra-metrics metrics})
