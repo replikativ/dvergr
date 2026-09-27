@@ -4,7 +4,8 @@
    A Run is durable identity and correlation data. Live execution and
   cancellation handles remain private in this namespace and are never returned
    by snapshots, lifecycle events, or the Room store."
-  (:require [dvergr.chat.context :as chat-ctx]
+  (:require [clojure.edn]
+            [dvergr.chat.context :as chat-ctx]
             [dvergr.room.store :as store]
             [org.replikativ.spindel.engine.core :as ec]
             [taoensso.telemere :as tel]))
@@ -378,6 +379,57 @@
                             {:type ::settlement-not-durable
                              :run/id run-id
                              :run/settlement-status status})))))))
+
+(defn record-savepoint!
+  "Keep `data` (a portable savepoint, `savepoint.portable/persist`) as the live
+   Run's latest point to resume from (doc/run-resume.md). Durable and in the
+   live entry, so the Run's later updates carry it. nil when the Run is not
+   live in this process."
+  [run-id data]
+  (locking lifecycle-lock
+    (when-let [entry (get @active run-id)]
+      (let [run (assoc (:run entry)
+                       :run/savepoint (pr-str data)
+                       :run/updated-at (java.util.Date.))]
+        (when-let [room-store (:store entry)]
+          (when-not (store/-store-run! room-store (:store-room-id entry) run)
+            (throw (ex-info "Run savepoint was not durable"
+                            {:type ::savepoint-not-durable :run/id run-id}))))
+        (swap! active assoc-in [run-id :run] run)
+        run))))
+
+(defn savepoint
+  "The latest portable savepoint of durable `run`, as data, or nil."
+  [run]
+  (some-> (:run/savepoint run) clojure.edn/read-string))
+
+(defn claim-resume!
+  "Mark the stored Run `run-id` of `room` as continued by `resumed-by`, once:
+   a Run is resumed at most one time. Returns the updated Run; throws when it
+   has no savepoint, is live, or was resumed before."
+  [room run-id resumed-by]
+  (locking lifecycle-lock
+    (let [room-store (:store room)
+          room-id (store/conversation-id room)
+          existing (some-> room-store (store/-load-run room-id run-id))]
+      (cond
+        (nil? existing)
+        (throw (ex-info "No such Run" {:type ::run-not-found :run/id run-id}))
+        (contains? @active run-id)
+        (throw (ex-info "The Run is live in this process: nothing to resume"
+                        {:type ::run-live :run/id run-id}))
+        (nil? (:run/savepoint existing))
+        (throw (ex-info "The Run has no savepoint to resume from"
+                        {:type ::no-savepoint :run/id run-id}))
+        (:run/resumed-by existing)
+        (throw (ex-info "The Run was resumed before"
+                        {:type ::already-resumed :run/id run-id
+                         :run/resumed-by (:run/resumed-by existing)}))
+        :else
+        (let [updated (assoc existing :run/resumed-by resumed-by
+                             :run/updated-at (java.util.Date.))]
+          (or (store/-store-run! room-store room-id updated)
+              (throw (ex-info "Resume claim was not durable" {:type ::claim-not-durable :run/id run-id}))))))))
 
 (defn cancel-requested?
   "True when targeted cancellation has been requested for this live Run. The

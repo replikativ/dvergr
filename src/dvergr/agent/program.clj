@@ -27,6 +27,8 @@
             [org.replikativ.spindel.spin.combinators :as comb]
             [org.replikativ.spindel.spin.core :as spin-core]
             [org.replikativ.spindel.spin.sync :as sync]
+            [org.replikativ.spindel.effects.savepoint :as savepoint :refer [savepoint]]
+            [org.replikativ.spindel.savepoint.portable :as portable]
             [taoensso.telemere :as tel])
   (:import [java.nio.charset StandardCharsets]
            [java.util UUID]
@@ -608,6 +610,68 @@
                 (when system-id (system-rooms/room-kb-conn system-id)))
          (assoc :room room))}))
 
+;; ---------------------------------------------------------------------------
+;; Turn savepoints (doc/run-resume.md)
+;; ---------------------------------------------------------------------------
+
+(defn continue-llm-run
+  "The portable name a turn savepoint gives for continuing its Run. A Run is
+   continued by `resume!`, which hires a new Run from the savepoint in a world
+   forked at the recorded snapshots; this function is that operation's name in
+   the portable form, not an entry point of its own."
+  [run-id step value]
+  (throw (ex-info "Continue a Run with dvergr.agent.program/resume!"
+                  {:type ::resume-with-resume! :run/id run-id :step step :value value})))
+
+(defn- turn-savepoint-handler
+  "Persist every turn savepoint on the Run its payload names, then continue at
+   once. A savepoint that cannot be persisted costs the Run its resumability,
+   never its progress."
+  [sp]
+  (let [payload (:savepoint/payload sp)
+        continue! #(savepoint/resume sp payload)]
+    ((portable/persist sp)
+     (fn [data]
+       (try (run/record-savepoint! (:run payload) data)
+            (catch Throwable t
+              (tel/log! {:level :warn :id ::savepoint-not-recorded
+                         :data {:run/id (:run payload) :error (ex-message t)}}
+                        "A turn savepoint could not be recorded")))
+       (continue!))
+     (fn [error]
+       (tel/log! {:level :warn :id ::savepoint-not-persisted
+                  :data {:run/id (:run payload) :error (ex-message error)}}
+                 "A turn savepoint could not be persisted")
+       (continue!)))))
+
+(defn- install-turn-savepoints!
+  "Make LLM Runs in `work-room` resumable: its world (and every fork of it)
+   persists their turn savepoints, under a savepoint session of the world
+   (persisting needs one). A nested Run's world inherits its parent's session;
+   only a world without one opens its own. Returns the session opened, to close
+   with the Run, or nil."
+  [work-room]
+  (let [world (:ctx work-room)
+        table {:conversation/turn turn-savepoint-handler}]
+    (if (savepoint/session world)
+      (do (savepoint/install-handlers! world table) nil)
+      (savepoint/open! world {:handlers table :purpose :run}))))
+
+(defn- turn-savepoint!
+  "Publish the gap after model step `step` of Run `run-id` as a savepoint in
+   the work world (where its systems are, so the portable form records their
+   snapshots). A Spin in the calling (control) context that completes once
+   the handler continued it; with no handler it completes at once."
+  [work-room run-id step payload]
+  (let [done (sync/deferred)
+        caller ec/*execution-context*]
+    (binding [ec/*execution-context* (:ctx work-room)]
+      (sync/spawn! (sp/spin (savepoint :conversation/turn payload
+                                       {:resume `continue-llm-run :args [run-id step]}))
+                   {:on-success (fn [_] (binding [ec/*execution-context* caller] (done :ok)))
+                    :on-error (fn [e] (binding [ec/*execution-context* caller] (done {::savepoint-error e})))}))
+    (sp/spin (sp/await done))))
+
 (defn- execute-llm-program
   "Run a bounded Dvergr-native model/tool loop. Each blocking model round-trip
    runs under a supervised worker; this Spin retains orchestration, activity
@@ -662,10 +726,14 @@
                     :model-steps 0
                     :usage {}}
                     (seq limits) (assoc :limits effective-limits))))
-                (chat-context/add-message!
-                 chat-ctx {:role :system :content instructions})
-                (chat-context/add-message!
-                 chat-ctx {:role :user :content (result-content task)})
+                (if-let [{from-chat :chat} (::resume agent)]
+                  ;; resuming: the conversation so far is the resumed Run's
+                  (chat-context/replace-messages!
+                   chat-ctx (chat-context/load-messages (some-> control-room :store :conn) from-chat))
+                  (do (chat-context/add-message!
+                       chat-ctx {:role :system :content instructions})
+                      (chat-context/add-message!
+                       chat-ctx {:role :user :content (result-content task)})))
                 {:chat-ctx chat-ctx
                  :tool-map tool-map
                  :tool-ctx tool-ctx
@@ -681,7 +749,7 @@
                          (::worker-error initialized))))
        (let [{:keys [chat-ctx tool-map tool-ctx model-spec]} initialized
              posted (ratom/create-atom 0)]
-         (loop [model-step 0]
+         (loop [model-step (if-let [{:keys [step]} (::resume agent)] (inc step) 0)]
            (when (run/cancel-requested? run-id)
              (cancelled! run-id))
            (let [failure (volatile! nil)
@@ -793,7 +861,14 @@
                                     :max-model-steps max-model-steps})))
 
                :else
-               (recur (inc model-step))))))))))
+               (do
+                 ;; the gap after this step: a point to resume the Run from
+                 (sp/await (turn-savepoint!
+                            work-room run-id model-step
+                            {:run run-id :step model-step :task task
+                             :agent (dissoc agent ::protocol ::resume)
+                             :control-room (:id control-room)}))
+                 (recur (inc model-step)))))))))))
 
 (declare execute-agent-program)
 
@@ -1367,7 +1442,7 @@
    {:keys [task from parent-run settlement resources limits]
     :or {from :repl settlement :automatic}
     :as raw-opts}
-   prepare-world! & [protocol]]
+   prepare-world! & [protocol {resume-from :resume snapshots :snapshots preset-id :id}]]
   (when-not (or (nil? prepare-world!) (fn? prepare-world!))
     (throw (ex-info "Run world preparer must be a function"
                     {:type ::invalid-world-preparer})))
@@ -1377,11 +1452,19 @@
   (let [opts      (assoc raw-opts :from from)
         agent     (validate-hire! roster agent-ref opts)
         actor     (:agent/id agent)
-        id        (random-uuid)
+        id        (or preset-id (random-uuid))
         chat-id   (run-chat-id id)
-        run-world (world/open! world-parent id settlement control-room)
+        run-world (world/open! world-parent id settlement control-room
+                               (when snapshots {:snapshots snapshots}))
         work-room (:work run-world)
         supervisor (make-supervisor (:ctx world-parent) (:ctx work-room))
+        _ (when (and (= :llm (get-in agent [:agent/program :kind])) (:store control-room))
+            (when-let [session (install-turn-savepoints! work-room)]
+              (register-cleanup! supervisor
+                                 #(let [done (promise)]
+                                    ((savepoint/close! session) (fn [_] (deliver done :closed))
+                                                                (fn [e] (deliver done e)))
+                                    (deref done 10000 :timeout)))))
         allocation-state
         (atom (if (seq resources) :not-started :not-requested))
         ;; Private Run facts are still Room messages, but never addressed to an
@@ -1458,7 +1541,9 @@
             worker-execution
             ;; The protocol rides on the agent value like `::limits`; it
             ;; is attached after the provenance hash above was taken.
-            (let [agent (cond-> agent protocol (assoc ::protocol protocol))]
+            (let [agent (cond-> agent
+                          protocol (assoc ::protocol protocol)
+                          resume-from (assoc ::resume resume-from))]
               (if prepare-world!
                 (prepared-execution-spin control-room work-room agent task trigger
                                          id chat-id parent-run resources supervisor
@@ -1542,6 +1627,49 @@
                                    :settlement-status status
                                    :settlement-reason reason}))
         (throw t)))))
+
+(defn resume!
+  "Continue Run `run-id` of `control-room` from its latest turn savepoint
+   (doc/run-resume.md): a new Run, caused by it, whose world is a fork of
+   `world-parent` at the systems' recorded snapshots, whose conversation
+   starts as the old Run's did at the savepoint and whose steps count on from
+   it. The old Run must be terminal (a Run whose process stopped is failed on
+   start) and is resumed once; what was left in its wallet moves to the new
+   Run. Returns the new Run's handle.
+
+   The step the old Run was in when it stopped is redone from the savepoint;
+   `:once` effects it had already performed (its receipts) are the caller's to
+   reconcile."
+  [control-room world-parent run-id]
+  (let [old (run/run control-room run-id)
+        data (some-> old run/savepoint)]
+    (when-not old
+      (throw (ex-info "No such Run" {:type ::run-not-found :run/id run-id})))
+    (when-not (contains? room-store/terminal-run-statuses (:run/status old))
+      (throw (ex-info "Only a stopped Run is resumed" {:type ::run-not-terminal
+                                                       :run/id run-id :run/status (:run/status old)})))
+    (when-not data
+      (throw (ex-info "The Run has no savepoint to resume from" {:type ::no-savepoint :run/id run-id})))
+    (let [{:keys [agent task step]} (:savepoint/payload data)
+          new-id (random-uuid)
+          _ (run/claim-resume! control-room run-id new-id)
+          parent (:run/parent old)
+          ;; conserved: the old Run's remainder, returned to its parent and
+          ;; granted to the new one
+          remaining (try (resource/run-balance control-room run-id) (catch Throwable _ nil))
+          _ (when (seq remaining) (resource/return! control-room run-id parent remaining))
+          roster (assoc-in (roster/make-roster) [:roster/agents (:agent/id agent)] agent)
+          handle (hire-prepared-in!
+                  control-room world-parent roster (:agent/id agent)
+                  (cond-> {:task task :from :resume
+                           :settlement (or (:run/settlement-policy old) :automatic)}
+                    parent (assoc :parent-run parent)
+                    (seq remaining) (assoc :resources remaining))
+                  nil nil
+                  {:id new-id :snapshots (not-empty (:world/systems data))
+                   :resume {:from run-id :chat (:run/chat-id old) :step step}})]
+      (run/record-cause! new-id run-id)
+      handle)))
 
 (defn hire-in!
   "Start one AgentDef execution with separate control and work parents.
