@@ -8,6 +8,7 @@
             [dvergr.benchmarks.automationbench.provider :as provider]
             [dvergr.benchmarks.automationbench.sidecar :as sc]
             [dvergr.discourse :as d]
+            [dvergr.model.chat :as model-chat]
             [dvergr.room.store.memory :as memory]
             [dvergr.test-support :as support]
             [org.replikativ.spindel.engine.core :as ec]))
@@ -32,15 +33,21 @@
                                         {:id (str "call_" i) :name tool-name :arguments args})
                                       step)}))))))
 
-(defn- evaluate! [room steps seen]
-  (let [caps (provider/capabilities {:agent-generate (scripted steps seen)})
-        task (some #(when (= ["simple" "3011"] [(get % "domain") (get % "id")]) %)
+(defn- evaluate-with!
+  "Evaluate simple/3011 (mark opportunity 006001 Closed Won) with `caps` and
+   the candidate `spec`."
+  [room caps spec]
+  (let [task (some #(when (= ["simple" "3011"] [(get % "domain") (get % "id")]) %)
                    (sc/tasks (sc/shared!) ["simple"]))
         env (provider/environment-def task caps {:timeout-ms 60000})
-        team (provider/candidate-roster [{:id :scripted :model "claude-code-sonnet"}])]
+        team (provider/candidate-roster [spec])]
     (binding [ec/*execution-context* (:ctx room)]
-      @(evaluation/evaluate room team :scripted env (:evaluator caps)
+      @(evaluation/evaluate room team (:id spec) env (:evaluator caps)
                             {:world-setup (:world-setup caps) :protocol (:protocol caps)}))))
+
+(defn- evaluate! [room steps seen]
+  (evaluate-with! room (provider/capabilities {:agent-generate (scripted steps seen)})
+                  {:id :scripted :model "claude-code-sonnet"}))
 
 (deftest the-stateless-service-makes-upstream-s-world
   (if-not (sc/available?)
@@ -108,3 +115,47 @@
             (is (= 0.0 (:attempt/reward receipt)))
             (is (true? (get-in receipt [:attempt/checks :world-replays])))))
         (finally (d/close-room! room))))))
+
+(def ^:private usage {:input-tokens 10 :output-tokens 5})
+
+(deftest dvergr-s-loop-as-a-candidate
+  (if-not (sc/available?)
+    (support/skip! "dvergr-s-loop-as-a-candidate: no AutomationBench checkout")
+    (let [;; the model's responses per action space: the write, then a reply
+          responses {:tools [{:content "" :usage usage
+                              :tool-calls [{:id "c1" :name "api_fetch"
+                                            :input {:method "PATCH" :url opportunity
+                                                    :body "{\"StageName\": \"Closed Won\"}"}}]}
+                             {:content "Marked it Closed Won." :usage usage :tool-calls []}]
+                     :repl [{:content "" :usage usage
+                             :tool-calls [{:id "e1" :name "clojure_eval"
+                                           :input {:code (str "(let [found (ab/parse (ab/search {\"query\" \"salesforce opportunity update\"}))]"
+                                                              "  (ab/fetch {\"method\" \"PATCH\" \"url\" \"" opportunity "\""
+                                                              "             \"body\" {\"StageName\" \"Closed Won\"}})"
+                                                              "  (count (get found \"results\")))")}}]}
+                            {:content "Marked it Closed Won." :usage usage :tool-calls []}]}]
+      (doseq [action-space [:tools :repl]]
+        (testing (str action-space)
+          (let [room (d/make-room {:id (keyword "automationbench" (str "dv-" (name action-space)))
+                                   :store (memory/make)})
+                left (atom (get responses action-space))
+                requests (atom [])]
+            (try
+              (with-redefs [model-chat/chat (fn [messages opts]
+                                              (swap! requests conj {:messages messages :opts opts})
+                                              (let [r (first @left)] (swap! left rest) r))]
+                (let [receipt (:attempt-receipt
+                               (evaluate-with! room (provider/capabilities {})
+                                               {:id :dv :harness :dvergr :action-space action-space
+                                                :model "claude-code-sonnet"}))]
+                  (is (= 1.0 (:attempt/reward receipt)) (pr-str receipt))
+                  (is (= {:completed true :stopped-by-itself true :world-replays true :passed true}
+                         (:attempt/checks receipt)))
+                  (is (= 2 (count @requests)) "a write, then the reply")
+                  (case action-space
+                    :tools (is (= #{"api_search" "api_fetch" "base64_encode"}
+                                  (set (map :name (:tools (:opts (first @requests)))))))
+                    :repl (do (is (= ["clojure_eval"] (mapv :name (:tools (:opts (first @requests))))))
+                              (is (re-find #"ab/fetch" (pr-str (:messages (first @requests))))
+                                  "the REPL guidance is in the system prompt")))))
+              (finally (d/close-room! room)))))))))

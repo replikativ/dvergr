@@ -436,9 +436,15 @@ alone (support), and 50 model steps without the Drive and Notion actions (operat
 For scale, upstream's public-set leaderboard has GPT-5.6 Terra at 37% and Sol at 46%, at
 maximum reasoning effort.
 
-Not done: a Dvergr-harness candidate (the REPL action space, where `api_fetch` becomes a
-sandbox function over the same world); the `zapier` meta-tool toolset; the private held-out
-set, which upstream does not release.
+**Dvergr's loop as a candidate** (`automationbench.harness`, `:harness :dvergr`): Dvergr's
+agent loop (`run-agent-turn!`) in a working chat of the Run's world instead of upstream's,
+with `:action-space :tools` (upstream's three tools as Dvergr tools) or `:repl` (one
+`clojure_eval`; the APIs are `ab/search`, `ab/fetch`, `ab/base64`, returning upstream's text,
+and `ab/parse` reads JSON, so matching and summing over records happens in code). Every call
+still goes through `episode/call-tool!`, so its world replays like the reference's.
+
+Not done: the `zapier` meta-tool toolset; the private held-out set, which upstream does not
+release.
 
 Setup: `benchmarks/resources/benchmarks/automationbench/README.md`. Run:
 
