@@ -123,6 +123,30 @@
                     (* (- (fx (inc i)) (fx i))
                        (beta-cdf a2 b2 (min 1.0 (+ mid margin))))))))
 
+(defn welch-difference
+  "The difference of the means of `xs` and `ys` (all Attempts, unpaired) and
+   its 95% Welch interval in [-1, 1]: `{:mean :interval :n [nx ny]}`, nil
+   with fewer than two values on a side. With few worlds but several
+   repetitions, pairing by world leaves too few pairs for a useful interval;
+   this uses every Attempt."
+  [xs ys]
+  (let [nx (count xs) ny (count ys)]
+    (when (and (<= 2 nx) (<= 2 ny))
+      (let [mean (fn [v] (/ (reduce + 0.0 v) (count v)))
+            variance (fn [v m] (/ (reduce + 0.0 (map #(let [d (- % m)] (* d d)) v)) (dec (count v))))
+            mx (mean xs) my (mean ys)
+            a (/ (variance xs mx) nx) b (/ (variance ys my) ny)
+            se (Math/sqrt (+ a b))
+            df (if (zero? (+ a b))
+                 (+ nx ny -2)
+                 (/ (* (+ a b) (+ a b))
+                    (+ (/ (* a a) (dec nx)) (/ (* b b) (dec ny)))))
+            t (get t-975 (dec (max 1 (int (Math/floor df)))) 1.96)
+            d (- mx my)]
+        {:mean d
+         :interval [(max -1.0 (- d (* t se))) (min 1.0 (+ d (* t se)))]
+         :n [nx ny]}))))
+
 (defn paired-difference
   "The mean of the paired differences `(- x y)` over `pairs` of `[x y]` (the
    same world scored for two candidates) and its 95% interval in [-1, 1]:
