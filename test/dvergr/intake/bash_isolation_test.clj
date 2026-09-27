@@ -5,6 +5,7 @@
             [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as dh]
             [dvergr.intake.bash :as b]
+            [dvergr.test-support :as ts]
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.substrate.geschichte :as g]
             [muschel.fs :as mfs]
@@ -131,7 +132,7 @@
 
 (deftest jailed-programs-work-on-the-virtual-worktree
   (if-not (zero? (:exit (clojure.java.shell/sh "sh" "-c" "command -v bwrap && test -x /usr/bin/python3")))
-    (println "SKIP jailed-programs: no bwrap or /usr/bin/python3")
+    (ts/skip! "jailed-programs: no bwrap or /usr/bin/python3")
     (let [chat (chat-on *base-ctx*)
           mirror (.toFile (java.nio.file.Files/createTempDirectory "dvergr-jail-" (make-array java.nio.file.attribute.FileAttribute 0)))
           ws (binding [ec/*execution-context* *base-ctx*] (g/current-workspace))
