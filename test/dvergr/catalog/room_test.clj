@@ -2,10 +2,14 @@
   "A workflow defined as files (doc/room-workflows.md): checked for shape, its
    checker run in SCI with no effects, and benchmarked like a catalog
    workflow, the checker's verdict on every Attempt with its `:ad-hoc` tier."
-  (:require [clojure.string :as str]
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.catalog.room :as room-wf]
+            [dvergr.catalog.workspace :as ws]
+            [dvergr.discourse :as d]
+            [dvergr.room.store.memory :as memory]
             [dvergr.chat.agent :as chat-agent]
             [dvergr.model.chat :as model-chat]
             [dvergr.model.providers :as providers]
@@ -145,3 +149,30 @@
           (testing "one that fails calibration is not promoted"
             (is (false? (:promoted? (room-wf/promote! (room-wf/bundle "competitors" files) "marketing")))))
           (finally (paths/set-home! prev)))))))
+
+(deftest a-bundle-travels-as-files-and-a-manifest
+  (let [room (d/make-room {:id :room-workflow-export :store (memory/make)})
+        other (d/make-room {:id :room-workflow-import :store (memory/make)})
+        fs (assoc files "calibration.edn" (pr-str calibration))]
+    (ws/ensure-workspace! room)
+    (ws/seed! room (into {} (map (fn [[p t]] [(str "/workflows/competitors/" p) t])) fs))
+    (let [{:keys [manifest] :as export} (room-wf/export room "competitors")]
+      (testing "the manifest names the bundle and its calibration"
+        (is (= "dvergr-workflow/1" (:format manifest)))
+        (is (= (str (:id (room-wf/bundle "competitors" fs))) (:bundle manifest)))
+        (is (true? (get-in manifest [:calibration :ok?]))))
+      (testing "imported elsewhere, it is the same bundle"
+        (let [b (room-wf/import! other export "rivals")]
+          (is (= (:bundle manifest) (str (:id b))))
+          (is (= ["rivals"] (room-wf/list-bundles other)))
+          (is (= (:id b) (:id (room-wf/read-bundle other "rivals"))))))
+      (testing "files changed after export are refused"
+        (is (thrown-with-msg? Exception #"changed after export"
+                              (room-wf/import! other (assoc-in export [:files "gold.edn"] "{:competitors []}")))))
+      (testing "and it runs from a directory"
+        (let [dir (io/file (System/getProperty "java.io.tmpdir") (str "bundle-" (random-uuid)) "competitors")]
+          (doseq [[p t] (:files export)]
+            (io/make-parents (io/file dir p))
+            (spit (io/file dir p) t))
+          (is (= (:bundle manifest) (str (:id (room-wf/read-dir dir)))))
+          (doseq [f (reverse (file-seq (.getParentFile dir)))] (.delete f)))))))

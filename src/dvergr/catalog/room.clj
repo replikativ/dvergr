@@ -19,6 +19,7 @@
    the room, the network or its own workspace. An unpromoted bundle's
    verifier is `:ad-hoc` on every receipt."
   (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [dvergr.agent.environment :as environment]
             [dvergr.agent.evaluation :as evaluation]
@@ -300,3 +301,69 @@
   ((requiring-resolve 'dvergr.agent.experiment.runner/run!)
    (assoc (experiment-plan b opts) :dir dir :repetitions repetitions
           :parallelism (or parallelism 1))))
+
+;; ---------------------------------------------------------------------------
+;; Export and import: a bundle travels as its files and a manifest
+;; ---------------------------------------------------------------------------
+
+(def manifest-format "dvergr-workflow/1")
+
+(defn- dvergr-version []
+  (or (some-> (io/resource "META-INF/maven/org.replikativ/dvergr/pom.properties")
+              slurp
+              (->> (re-find #"(?m)^version=(.+)$"))
+              second)
+      "dev"))
+
+(defn export
+  "Bundle `name` of `room` as `{:manifest :files}`: the files by path relative
+   to the bundle, and a manifest naming its content id, the dvergr version it
+   was exported from and its calibration there. Trust does not travel: a
+   receiving host promotes the bundle itself."
+  [room name]
+  (let [files (bundle-files room name)
+        b (bundle name files)
+        c (when (:calibration b) (calibrate b))]
+    {:manifest {:format manifest-format
+                :name name
+                :bundle (str (:id b))
+                :title (get-in b [:definition :title])
+                :dvergr-version (dvergr-version)
+                :exported-at (java.util.Date.)
+                :calibration (if c (select-keys c [:ok? :problems]) {:ok? false :problems ["no calibration.edn"]})}
+     :files (into (sorted-map) files)}))
+
+(defn verify-export
+  "The bundle an export describes, or throws: the files must be well formed and
+   be exactly the bundle its manifest names."
+  [{:keys [manifest files]}]
+  (when-not (= manifest-format (:format manifest))
+    (throw (ex-info (str "Not a workflow export (format " (pr-str (:format manifest)) ")")
+                    {:type ::invalid-export})))
+  (let [b (bundle (:name manifest) files)]
+    (when-not (= (:bundle manifest) (str (:id b)))
+      (throw (ex-info "The files are not the bundle the manifest names: changed after export"
+                      {:type ::export-mismatch :manifest (:bundle manifest) :files (str (:id b))})))
+    b))
+
+(defn import!
+  "Install an export in `room` as `workflows/<as>/` (default its own name),
+   committed. Returns the bundle."
+  [room {:keys [manifest files] :as export} & [as]]
+  (let [b (verify-export export)
+        name (or as (:name manifest))]
+    (when-not (re-matches #"[a-z0-9][a-z0-9-]*" (str name))
+      (throw (ex-info (str "A workflow name is lowercase letters, digits and dashes: " name)
+                      {:type ::invalid-name :name name})))
+    (ws/ensure-workspace! room)
+    (ws/seed! room (into {} (map (fn [[p t]] [(str "/workflows/" name "/" p) t])) files))
+    (assoc b :name name)))
+
+(defn read-dir
+  "A bundle from a local directory (an unpacked export, or one being written)."
+  [dir]
+  (let [root (.getCanonicalFile (io/file dir))
+        base (str (.getPath root) "/")
+        files (into {} (for [f (file-seq root) :when (.isFile f)]
+                         [(subs (.getPath (.getCanonicalFile f)) (count base)) (slurp f)]))]
+    (bundle (.getName root) files)))

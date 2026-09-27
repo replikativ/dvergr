@@ -350,6 +350,20 @@
                          (if (or (not= "running" (:status st)) (< 8 n)) st (recur (inc n)))))]
             (is (= "completed" (:status done)) (pr-str (dissoc done :result)))
             (is (= 1.0 (get-in done [:result :summary 0 :reward-mean])))
+            (testing "exported, imported into another room, deployed there on a schedule"
+              (ops/invoke *daemon* :room/create {:title "Sales" :slug "sales"})
+              (let [export (ops/invoke *daemon* :catalog/export {:room "marketing" :name "competitors"})
+                    imported (ops/invoke *daemon* :catalog/import {:room "sales" :export export :as "rivals"})]
+                (is (= "sales/rivals" (:imported imported)))
+                (is (= (get-in export [:manifest :bundle]) (:bundle imported)))
+                (is (= "room" (:verifier imported)) "same content, same host: already promoted")
+                (let [d (ops/invoke *daemon* :catalog/deploy {:room "sales" :name "rivals" :agent "var"
+                                                              :every "week" :on "monday" :at "09:00"})
+                      rows ((requiring-resolve 'dvergr.scheduler.core/list-schedules)
+                            (ops/resolve-room *daemon* "sales"))]
+                  (is (:schedule d))
+                  (is (some #(clojure.string/includes? (str (:task %) (:schedule/task %)) "Simmis") rows)
+                      (pr-str rows)))))
             (testing "and its Scorecard says who vouches for the rewards"
               (let [[sc] (ops/invoke *daemon* :scorecard/list {:room (:room started)})]
                 (is (= ["room"] (:verifier-trust (ops/invoke *daemon* :scorecard/detail

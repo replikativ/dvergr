@@ -77,7 +77,20 @@ a changed bundle is a new id, `:ad-hoc` again. `catalog_list {room}` shows each 
 tier and `scorecard_detail` lists the tiers among a Scorecard's Attempts
 (`:verifier-trust`).
 
-Next: export and import, deploy by schedule.
+Part 3: `catalog_export {room name}` returns `{manifest files}` (format `dvergr-workflow/1`,
+the bundle's content id, the dvergr version, its calibration there); `catalog_import {room
+export as?}` installs it as `workflows/<as>/`, committed, refused when the files are not the
+bundle the manifest names. Trust does not travel: a host promotes a bundle itself (the same
+content on the same host is already promoted). Run one without a daemon from a directory:
+
+```
+clojure -M -m dvergr.catalog.room-run path/to/competitors --check
+clojure -M -m dvergr.catalog.room-run path/to/competitors --models claude-haiku-4-5,codex-subscription-luna --repetitions 2
+```
+
+`catalog_deploy {room name agent every on? at? params?}` schedules the bundle's task for an
+agent of the room (the Scorecard's pick); the room's REPL lists and cancels it
+(`dvergr.scheduler/list`, `cancel`).
 
 ## The first one: competitor discovery
 

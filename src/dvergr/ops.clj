@@ -541,6 +541,59 @@
             (when-let [r (resolve-room daemon room)]
               (room-wf/promote! (in-ctx daemon (room-wf/read-bundle r name)) (:slug r))))}
 
+   :catalog/export
+   {:doc (str "A room's workflow bundle to take elsewhere: {manifest, files}, the files by path "
+              "and a manifest with the bundle's content id, the dvergr version and its calibration "
+              "here. Install it with catalog_import on another dvergr, or run it from a directory "
+              "with `clojure -M -m dvergr.catalog.room-run <dir> --models …`. Trust does not "
+              "travel: the receiving host promotes it itself.")
+    :kind :read
+    :schema [:map [:room Room] [:name :string]]
+    :impl (fn [daemon {:keys [room name]}]
+            (when-let [r (resolve-room daemon room)]
+              (in-ctx daemon (room-wf/export r name))))}
+
+   :catalog/import
+   {:doc (str "Install a workflow export ({manifest, files}, from catalog_export) in a room as "
+              "workflows/<as or its name>/, committed; refused when the files are not the bundle the "
+              "manifest names. Its verifier is ad hoc here until promoted.")
+    :kind :write
+    :schema [:map [:room Room]
+             [:export [:map [:manifest :map] [:files [:map-of :string :string]]]]
+             [:as {:optional true} :string]]
+    :impl (fn [daemon {:keys [room export as]}]
+            (when-let [r (resolve-room daemon room)]
+              (let [export (update export :manifest #(update-keys % keyword))
+                    b (in-ctx daemon (room-wf/import! r export as))]
+                {:imported (str (:slug r) "/" (:name b)) :bundle (str (:id b))
+                 :verifier (name (room-wf/tier b))})))}
+
+   :catalog/deploy
+   {:doc (str "Deploy a room's workflow: a schedule in the room gives the bundle's task (its "
+              "params filled from `params`) to `agent`, a participant, on each fire, e.g. {every: "
+              "\"week\", on: \"monday\", at: \"09:00\"}. Pick the agent from the workflow's "
+              "Scorecard. The room's REPL lists and cancels it (dvergr.scheduler/list, cancel).")
+    :kind :write
+    :schema [:map [:room Room] [:name :string]
+             [:agent [:string {:description "the agent (a participant of the room) that runs it"}]]
+             [:every [:enum {:description "cadence"} "hour" "day" "week"]]
+             [:at {:optional true} [:string {:description "wall-clock time, HH:MM"}]]
+             [:on {:optional true} [:string {:description "day of the week, with every: week"}]]
+             [:params {:optional true} [:map-of :keyword :any]]]
+    :impl (fn [daemon {:keys [room name agent every at on params]}]
+            (when-let [r (resolve-room daemon room)]
+              (let [b (in-ctx daemon (room-wf/read-bundle r name))
+                    create! (requiring-resolve 'dvergr.scheduler.core/create-schedule!)
+                    id (in-ctx daemon
+                               (create! r {:agent-id (keyword agent)
+                                           :task (room-wf/task b params)
+                                           :schedule (cond-> {:every (keyword every)}
+                                                       at (assoc :at at)
+                                                       on (assoc :on (keyword on)))
+                                           :description (str "workflow " name " (" (subs (str (:id b)) 0 8) ")")}))]
+                {:schedule (str id) :workflow (str (:slug r) "/" name) :bundle (str (:id b))
+                 :agent agent})))}
+
    :catalog/check
    {:doc (str "Check a workflow bundle in a room (workflows/<name>/: workflow.edn, checker.clj, "
               "gold.edn, fixtures/): its problems, or its content id, task and fixtures when it is "
