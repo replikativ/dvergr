@@ -128,3 +128,26 @@
       (let [r (b/run chat cmd)]
         (is (not (re-find #"(?i)example domain" (str (:stdout r)))) cmd)
         (is (not (zero? (:exit r))) cmd)))))
+
+(deftest jailed-programs-work-on-the-virtual-worktree
+  (if-not (zero? (:exit (clojure.java.shell/sh "sh" "-c" "command -v bwrap && test -x /usr/bin/python3")))
+    (println "SKIP jailed-programs: no bwrap or /usr/bin/python3")
+    (let [chat (chat-on *base-ctx*)
+          mirror (.toFile (java.nio.file.Files/createTempDirectory "dvergr-jail-" (make-array java.nio.file.attribute.FileAttribute 0)))
+          ws (binding [ec/*execution-context* *base-ctx*] (g/current-workspace))
+          h (b/make-host {:workspace ws :jail {:mirror mirror :commands ["python3"] :tasks-max 64}})
+          run #(b/run chat % :host h)]
+      (run "echo 'print(open(\"in.txt\").read().upper())' > up.py; echo hello > in.txt; echo gone > old.txt")
+      (testing "a jailed program reads the worktree and its writes and deletes come back"
+        (let [r (run "python3 -c \"import os; open('out.txt','w').write(open('in.txt').read()*2); os.remove('old.txt')\"")]
+          (is (zero? (:exit r)) (pr-str r)))
+        (is (= "hello\nhello\n" (:stdout (run "cat out.txt"))))
+        (is (not (zero? (:exit (run "cat old.txt")))) "deleted in the jail, deleted in the worktree")
+        (is (= "HELLO\n\n" (:stdout (run "python3 up.py")))))
+      (testing "the jail has no network and no home"
+        (let [r (run "python3 -c \"import urllib.request; urllib.request.urlopen('https://example.com', timeout=5)\"")]
+          (is (not (zero? (:exit r)))))
+        (let [r (run (str "python3 -c \"import os; print(os.path.exists('" (System/getProperty "user.home") "'))\""))]
+          (is (= "False\n" (:stdout r)) (pr-str r))))
+      (testing "a command not on the jail's list is still refused"
+        (is (not (zero? (:exit (run "node -e 1")))))))))
