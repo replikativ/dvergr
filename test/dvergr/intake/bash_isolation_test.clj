@@ -106,3 +106,18 @@
   (let [result (bash (chat-on *base-ctx*) "cat /etc/passwd")]
     (is (not= 0 (:exit result)))
     (is (re-find #"No such file" (:stderr result)))))
+
+(deftest output-is-bounded-as-it-is-produced
+  (let [chat (chat-on *base-ctx*)
+        r (b/run chat "for i in $(seq 1 20000); do echo line-$i-of-some-output; done" :max-out 1000)]
+    (testing "the agent sees the start, marked as cut"
+      (is (str/starts-with? (:stdout r) "line-1-of-some-output"))
+      (is (str/ends-with? (:stdout r) "[...truncated]"))
+      (is (< (count (:stdout r)) 1100))
+      (is (true? (:truncated? r))))
+    (testing "the rest was counted, not kept"
+      (is (< 400000 (get-in r [:output-bytes :stdout]))))
+    (testing "small output is whole"
+      (let [s (b/run chat "echo hi")]
+        (is (= "hi\n" (:stdout s)))
+        (is (false? (:truncated? s)))))))
