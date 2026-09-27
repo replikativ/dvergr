@@ -7,6 +7,7 @@
             [sci.core :as sci]
             [clojure.string :as str]
             [datahike.api :as dh]
+            [dvergr.effects :as effects]
             [dvergr.runtime.ctx :as runtime-ctx]
             [org.replikativ.spindel.engine.core :as rtc]
             [dvergr.sandbox.ns.doc :as doc]))
@@ -25,7 +26,7 @@
    `:provider-effects? false` removes this provider-spend bypass. With
    `chat-ctx`, calls are the agent's spend: refused over budget and charged,
    as the `llm_call` tool is (`dvergr.agent.turn/rebind-working-ctx!` binds it)."
-  [sci-ctx & [agent-program-ceiling chat-ctx]]
+  [sci-ctx & [agent-program-ceiling chat-ctx effects]]
   (load/require! 'dvergr.tools.llm-call)
   (let [raw-call-fn  @(ns-resolve 'dvergr.tools.llm-call 'cheap-llm-call)
         call-fn      (fn [& args]
@@ -36,10 +37,14 @@
                        (when (and chat-ctx ((requiring-resolve 'dvergr.chat.context/budget-exceeded?) chat-ctx))
                          (throw (ex-info "Budget exceeded — llm call refused" {:type :budget-exceeded})))
                        ;; The documented 2-arity: default opts.
-                       (let [result (apply raw-call-fn (cond-> (vec args) (= 2 (count args)) (conj {})))]
-                         (when chat-ctx
-                           ((requiring-resolve 'dvergr.tools.llm-call/account-response!) chat-ctx result))
-                         result))
+                       (effects/perform!
+                        effects {:effect :model/call
+                                 :resource {:model (str (or (:model (nth args 2 nil)) "cheap"))}
+                                 :result-of :text}
+                        #(let [result (apply raw-call-fn (cond-> (vec args) (= 2 (count args)) (conj {})))]
+                           (when chat-ctx
+                             ((requiring-resolve 'dvergr.tools.llm-call/account-response!) chat-ctx result))
+                           result)))
         summarize-fn (fn [content & [opts]]
                        (call-fn "Summarize the key points concisely:"
                                 content (or opts {})))]
@@ -70,13 +75,53 @@
    them from the caller."
   [:from :source-user :source-username :source-user-id])
 
+(defn- room-ref
+  "A room reference as a receipt names it: its id for a Room, else as given."
+  [ref]
+  (str (if (map? ref) (:id ref) ref)))
+
+(def ^:private room-effects
+  "Each room op's effect: its kind and the resource, from its arguments."
+  (let [room (fn [[ref]] {:room (room-ref ref)})
+        read (fn [op] [:room/read (fn [[ref]] (cond-> {:op op} ref (assoc :room (room-ref ref))))])]
+    {'create!      [:room/create (fn [[opts]] {:slug (str (:slug opts))})]
+     'post!        [:room/post room]
+     'set-parent!  [:room/write (fn [[child parent]] {:room (room-ref child) :parent (room-ref parent)})]
+     'join!        [:room/join (fn [[ref who]] {:room (room-ref ref) :who (str who)})]
+     'leave!       [:room/join (fn [[ref who]] {:room (room-ref ref) :who (str who) :leave true})]
+     'delete!      [:room/delete room]
+     'fork!        [:room/fork room]
+     'merge!       [:room/merge (fn [[parent fork]] {:room (room-ref parent) :fork (room-ref fork)})]
+     'discard!     [:room/discard room]
+     'list         (read :list)
+     'get          (read :get)
+     'messages     (read :messages)
+     'children     (read :children)
+     'diff         (read :diff)
+     'review       (read :review)
+     'forks        (read :forks)
+     'participants (read :participants)
+     'root         (read :root)}))
+
+(defn- through-boundary
+  "Route every room op through the effect boundary (`dvergr.effects`)."
+  [effects ops]
+  (reduce-kv (fn [m sym f]
+               (if-let [[kind resource] (get room-effects sym)]
+                 (assoc m sym (with-meta (fn [& args]
+                                           (effects/perform! effects {:effect kind :resource (resource args)}
+                                                             #(apply f args)))
+                                (meta f)))
+                 m))
+             ops ops))
+
 (defn room-ops-map
   "The unified Room-ops map — `create!`/`list`/`get`/`post!`/`messages`/`children`/
    `set-parent!`/`join!`/`leave!`/`delete!`/`fork!`/`merge!`/`discard!`/`diff`/
    `review`/`classify`/`forks`/`participants`/`root` — for the `dvergr.room` SCI
    namespace (mounted, merged with the DB surface, by `dvergr.sandbox.ns.room`).
    Persistent rooms + forks are behind one surface — same for agents, TUI, web."
-  [spindel-ctx & [agent-program-ceiling source-room acting-agent]]
+  [spindel-ctx & [agent-program-ceiling source-room {:keys [acting-agent effects]}]]
   (load/require! 'dvergr.discourse)
   (load/require! 'dvergr.rooms)
   (load/require! 'dvergr.room.registry)
@@ -253,25 +298,27 @@
                         (or (rreg-lookup* :daemon)
                             (rtc/get-state [:dvergr/discourse-root]))))]
     (doc/with-docs
-      {'create!      create-fn
-       'list         list-fn
-       'get          get-fn
-       'post!        post-fn
-       'messages     messages-fn
-       'children     children-fn
-       'set-parent!  set-parent-fn
-       'join!        join-fn
-       'leave!       leave-fn
-       'delete!      delete-fn
-       'fork!        fork-fn
-       'merge!       merge-fn
-       'discard!     discard-fn
-       'diff         diff-fn
-       'review       review-fn
-       'classify     fork-classify*
-       'forks        forks-fn
-       'participants participants-fn
-       'root         root-fn}
+      (through-boundary
+       effects
+       {'create!      create-fn
+        'list         list-fn
+        'get          get-fn
+        'post!        post-fn
+        'messages     messages-fn
+        'children     children-fn
+        'set-parent!  set-parent-fn
+        'join!        join-fn
+        'leave!       leave-fn
+        'delete!      delete-fn
+        'fork!        fork-fn
+        'merge!       merge-fn
+        'discard!     discard-fn
+        'diff         diff-fn
+        'review       review-fn
+        'classify     fork-classify*
+        'forks        forks-fn
+        'participants participants-fn
+        'root         root-fn})
       '{create!      [([opts]) "Create a persistent room. `opts` takes :slug :title :agents. Rooms are the unit of work: each has its own git repo, knowledge base and schedules."]
         list         [([]) "Every room you can see, as maps."]
         get          [([ref]) "One room by slug or id, or nil."]

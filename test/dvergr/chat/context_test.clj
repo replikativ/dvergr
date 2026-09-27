@@ -37,9 +37,11 @@
       (try
         (let [ref (:sci-component chat)
               parent-sci (ctx/sci-context-in chat parent)
+              ;; the eval's meter (CPU and wall time) is not part of what it returned
               eval-in (fn [world interpreter source]
-                        (sandbox/eval-code interpreter source
-                                           :execution-context world))]
+                        (dissoc (sandbox/eval-code interpreter source
+                                                   :execution-context world)
+                                :meter))]
           (is (some? ref))
           ;; Exercise the interpreter agents actually receive, not only the
           ;; bare Spindel macro context. Every injected capability must either

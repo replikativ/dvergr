@@ -178,7 +178,7 @@
    `agent-program-ceiling` is forwarded to the room-bound SCI setup; bounded
    delegation itself lives only in the `dvergr.agent` namespace."
   [sci-ctx room-conn kb-conn room-id ctx
-   & [agent-program-ceiling {:keys [binding-resolver source-room]}]]
+   & [agent-program-ceiling {:keys [binding-resolver source-room effects]}]]
   (let [selected-ctx   #(runtime-ctx/selected-context ctx)
         current-room-id #(or (when binding-resolver
                                (:room-id (binding-resolver)))
@@ -303,7 +303,8 @@
                         (binding [ec/*execution-context* (selected-ctx)]
                           (srooms/room-kb-conn (current-room-id) slug))))))
         room-map (merge (ns-kb/room-ops-map ctx agent-program-ceiling
-                                            current-source-room acting-agent) ; create!/fork!/merge!/post!/messages/…
+                                            current-source-room
+                                            {:acting-agent acting-agent :effects effects}) ; create!/fork!/merge!/post!/messages/…
                         ;; Docs live HERE rather than only in these trailing
                         ;; comments: the comments never reached the sandbox, so
                         ;; `(clojure.repl/doc dvergr.room/kb-search)` answered

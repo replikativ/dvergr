@@ -433,6 +433,19 @@
 ;; Evaluation
 ;; ---------------------------------------------------------------------------
 
+(defn- metered
+  "Run `f` (an eval, on the thread that evaluates) and add `:meter {:cpu-ms
+   :wall-ms}` to its result: eval time as a recorded resource (doc/effects.md),
+   not charged."
+  [f]
+  (let [mx (java.lang.management.ManagementFactory/getThreadMXBean)
+        cpu0 (.getCurrentThreadCpuTime mx)
+        t0 (System/nanoTime)
+        r (f)]
+    (cond-> r
+      (map? r) (assoc :meter {:cpu-ms (quot (- (.getCurrentThreadCpuTime mx) cpu0) 1000000)
+                              :wall-ms (quot (- (System/nanoTime) t0) 1000000)}))))
+
 (defn- eval-code*
   "Evaluate Clojure code in the session's SCI context.
 
@@ -489,34 +502,36 @@
           cancel-poll-stop (atom false)
           cancel-fired (atom false)
           eval-future (future
+                        (metered
+                         (fn []
                         ;; Watchdog starts here on the eval thread
-                        (let [{:keys [cancel! fired?]} (make-timeout timeout-ms)
-                              eval-thread (Thread/currentThread)
-                              _ (when cancel?
-                                  (let [t (Thread.
-                                           #(loop []
-                                              (when-not @cancel-poll-stop
-                                                (if (try (cancel?) (catch Throwable _ false))
+                           (let [{:keys [cancel! fired?]} (make-timeout timeout-ms)
+                                 eval-thread (Thread/currentThread)
+                                 _ (when cancel?
+                                     (let [t (Thread.
+                                              #(loop []
+                                                 (when-not @cancel-poll-stop
+                                                   (if (try (cancel?) (catch Throwable _ false))
                                                    ;; Mirror watchdog semantics:
                                                    ;; mark fired and interrupt the
                                                    ;; eval thread so SCI's
                                                    ;; interrupt-fn / responsive IO
                                                    ;; sees it and unwinds the
                                                    ;; computation cleanly.
-                                                  (do (reset! cancel-fired true)
-                                                      (.interrupt eval-thread))
-                                                  (do (Thread/sleep 100) (recur))))))]
-                                    (.setDaemon t true)
-                                    (.setName t "dvergr-eval-cancel-poll")
-                                    (.start t)))]
-                          (try
-                            (sci-ctx-store/with-ctx sci-ctx
-                              (sci/binding [sci/out stdout sci/err stderr]
-                                (let [result (sci/eval-string* sci-ctx code)
-                                      result (if realize? (pr-str result) result)]
-                                  {:value result :stdout (str stdout) :stderr (str stderr)
-                                   :success true})))
-                            (catch Throwable e
+                                                     (do (reset! cancel-fired true)
+                                                         (.interrupt eval-thread))
+                                                     (do (Thread/sleep 100) (recur))))))]
+                                       (.setDaemon t true)
+                                       (.setName t "dvergr-eval-cancel-poll")
+                                       (.start t)))]
+                             (try
+                               (sci-ctx-store/with-ctx sci-ctx
+                                 (sci/binding [sci/out stdout sci/err stderr]
+                                   (let [result (sci/eval-string* sci-ctx code)
+                                         result (if realize? (pr-str result) result)]
+                                     {:value result :stdout (str stdout) :stderr (str stderr)
+                                      :success true})))
+                               (catch Throwable e
                               ;; Catch Throwable so JVM Errors (StackOverflowError,
                               ;; OutOfMemoryError) also produce a structured result
                               ;; rather than crashing the future unhandled.
@@ -532,44 +547,44 @@
                               ;; would surface to the agent as e.g. "sleep
                               ;; interrupted / InterruptedException" and the
                               ;; agent has to GUESS it was a timeout.
-                              (cond
-                                @cancel-fired
-                                {:error   {:message "Evaluation cancelled by user"
-                                           :type    "CancellationException"
-                                           :data    {:cause :user-cancel}}
-                                 :stdout  (str stdout)
-                                 :stderr  (str stderr)
-                                 :success false}
+                                 (cond
+                                   @cancel-fired
+                                   {:error   {:message "Evaluation cancelled by user"
+                                              :type    "CancellationException"
+                                              :data    {:cause :user-cancel}}
+                                    :stdout  (str stdout)
+                                    :stderr  (str stderr)
+                                    :success false}
 
-                                (fired?)
-                                {:error   {:message (str "Timed out after " timeout-ms "ms"
-                                                         " — your code likely got stuck"
-                                                         " (a (spin …) that never resolved,"
-                                                         " an infinite loop, or oversized"
-                                                         " inference). Try fewer particles,"
-                                                         " bound your loops, or check for"
-                                                         " hung @spin / await.")
-                                           :type    "TimeoutException"
-                                           :data    {:timeout-ms timeout-ms
-                                                     :cause :watchdog-interrupt}}
-                                 :stdout  (str stdout)
-                                 :stderr  (str stderr)
-                                 :success false}
+                                   (fired?)
+                                   {:error   {:message (str "Timed out after " timeout-ms "ms"
+                                                            " — your code likely got stuck"
+                                                            " (a (spin …) that never resolved,"
+                                                            " an infinite loop, or oversized"
+                                                            " inference). Try fewer particles,"
+                                                            " bound your loops, or check for"
+                                                            " hung @spin / await.")
+                                              :type    "TimeoutException"
+                                              :data    {:timeout-ms timeout-ms
+                                                        :cause :watchdog-interrupt}}
+                                    :stdout  (str stdout)
+                                    :stderr  (str stderr)
+                                    :success false}
 
-                                :else
-                                {:error {:message (.getMessage e)
-                                         :type     (str (class e))
-                                         :data     (when (instance? clojure.lang.ExceptionInfo e)
-                                                     (ex-data e))
-                                         :stacktrace (when (instance? Exception e)
-                                                       (sci/stacktrace e))}
-                                 :stdout (str stdout)
-                                 :stderr (str stderr)
-                                 :success false}))
-                            (finally
+                                   :else
+                                   {:error {:message (.getMessage e)
+                                            :type     (str (class e))
+                                            :data     (when (instance? clojure.lang.ExceptionInfo e)
+                                                        (ex-data e))
+                                            :stacktrace (when (instance? Exception e)
+                                                          (sci/stacktrace e))}
+                                    :stdout (str stdout)
+                                    :stderr (str stderr)
+                                    :success false}))
+                               (finally
                               ;; Always cancel the watchdog when eval finishes
-                              (cancel!)
-                              (reset! cancel-poll-stop true)))))]
+                                 (cancel!)
+                                 (reset! cancel-poll-stop true)))))))]
       ;; Outer fence: poll the eval-future short-interval, so we ALSO
       ;; honour user cancel even when the inner SCI interrupt-fn isn't
       ;; reachable (spindel-backed SCI doesn't expose it for every
@@ -614,20 +629,22 @@
     ;; No timeout — direct eval on caller's thread
     (let [stdout (StringWriter.)
           stderr (StringWriter.)]
-      (try
-        (sci-ctx-store/with-ctx sci-ctx
-          (sci/binding [sci/out stdout sci/err stderr]
-            (let [result (sci/eval-string* sci-ctx code)
-                  result (if realize? (pr-str result) result)]
-              {:value result :stdout (str stdout) :stderr (str stderr) :success true})))
-        (catch Exception e
-          {:error {:message (.getMessage e)
-                   :type    (str (class e))
-                   :data    (ex-data e)
-                   :stacktrace (sci/stacktrace e)}
-           :stdout (str stdout)
-           :stderr (str stderr)
-           :success false})))))
+      (metered
+       (fn []
+         (try
+           (sci-ctx-store/with-ctx sci-ctx
+             (sci/binding [sci/out stdout sci/err stderr]
+               (let [result (sci/eval-string* sci-ctx code)
+                     result (if realize? (pr-str result) result)]
+                 {:value result :stdout (str stdout) :stderr (str stderr) :success true})))
+           (catch Exception e
+             {:error {:message (.getMessage e)
+                      :type    (str (class e))
+                      :data    (ex-data e)
+                      :stacktrace (sci/stacktrace e)}
+              :stdout (str stdout)
+              :stderr (str stderr)
+              :success false})))))))
 
 (defn eval-code
   "Evaluate code in an SCI interpreter, selecting `:execution-context` for
@@ -1142,7 +1159,7 @@
                             %
                             (assoc % :ephemeral-databases {}))))
         (ns-datahike/add-datahike-ns! sci-ctx room-id spindel-ctx
-                                      binding-resolver binding-swap!) ; the ONE datahike surface: faithful `d`/`datahike.api`
+                                      binding-resolver binding-swap! boundary) ; the ONE datahike surface: faithful `d`/`datahike.api`
         ;; ONE `dvergr.room` (+ legacy `room` alias): the Room ops MERGED with the
         ;; room's DB surface (*room*/*kb*/databases/db + queries). The KB is reached
         ;; via `dvergr.room/*kb*` + `kb-find`/`kb-search` + `d` — no separate `entity`
@@ -1150,6 +1167,7 @@
         (ns-room/add-room-ns! sci-ctx room-conn kb-conn room-id spindel-ctx
                               agent-program-ceiling
                               {:binding-resolver binding-resolver
+                               :effects boundary
                                :source-room {:id (or room-runtime-id room-id)
                                              :incarnation room-incarnation}})
         ;; dvergr.mail/*inbox* — the room's attached mailbox conn (fork-aware),
@@ -1219,7 +1237,7 @@
                          :secrets secrets)
       (ns-io/add-http-ns! sci-ctx :effects boundary :allowed-domains allowed-http-domains
                           :secrets secrets :fixture-transport (:transport fixture)))
-    (ns-agent/add-scheduler-ns! sci-ctx)
+    (ns-agent/add-scheduler-ns! sci-ctx boundary)
     ;; Default coder kit: discovery, dep-add, HTML, tests — these are
     ;; safe and useful for any coding agent regardless of role. Each
     ;; is still individually callable if a caller wants just one.

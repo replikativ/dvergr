@@ -112,7 +112,7 @@
         acting (atom :var)
         post! ('post! (ns-kb/room-ops-map (:ctx room) nil
                                           (select-keys room [:id :incarnation])
-                                          #(deref acting)))
+                                          {:acting-agent #(deref acting)}))
         last-from #(:from (last (d/messages room {})))]
     (testing "the acting agent is the author"
       (post! (:id room) {:content "hello"})

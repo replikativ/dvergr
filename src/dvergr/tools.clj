@@ -6,6 +6,7 @@
             [clojure.edn :as edn]
             [datahike.api :as d]
             [dvergr.sandbox :as sandbox]
+            [dvergr.effects :as effects]
             [dvergr.io.acquisition :as acquisition]
             [dvergr.agent.process :as proc]
             [dvergr.code.index :as idx]
@@ -671,6 +672,9 @@
                                                         :execution-context execution-ctx))))
                   ;; Block on process completion / abort.
                  (let [{:keys [ok aborted]} @result-p]
+                   ;; the eval's CPU and wall time: a recorded resource
+                   (when-let [meter (:meter ok)]
+                     (effects/note! (constantly {:sink (:receipts chat-ctx)}) :eval/run meter))
                    (cond
                      aborted
                      {:type :error :error "cancelled"

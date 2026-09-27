@@ -150,11 +150,18 @@ composes its handlers onto the world's, so authority narrows and never widens (a
 as in simmis's delegation). These laws are test.check properties
 (`test/dvergr/effects_test.clj`).
 
-**Landed** (step 2, first part): the vocabulary, `perform!`, receipts (reads by digest;
-subject = the acting identity), the filter (admission and `read-only`), sandbox files
-(physical and virtual), git and HTTP routed through it, receipts kept on the working context
-(hardening 5). **Next**: the remaining capabilities (rooms, databases, processes, mail,
-schedules, model calls), eval metering, then `can?`, replay and faults as answering handlers.
+**Landed** (step 2): the vocabulary, `perform!`, receipts (reads by digest; subject = the
+acting identity), the filter (admission and `read-only`), receipts kept on the working
+context (hardening 5). Routed: sandbox files (physical and virtual), git, HTTP, room ops
+(reads, post, join, create, fork, merge, discard, delete), schedules, the shell, process
+directives, model calls from code (`llm/*`, `vision/*`, `doc/*`), database transacts and
+database creation/deletion. Eval metering: every eval
+reports thread CPU and wall time (`:meter`), and `clojure_eval` records it as an `:eval/run`
+receipt (recorded, not charged).
+
+Not routed, and why: database queries (a query reads an immutable value of a database the
+world already holds); the mailbox is a connection handle (reads). **Next**: `can?` and the
+cross-room policy (step 3), then replay and faults as answering handlers.
 
 ### How modes answer the goals
 

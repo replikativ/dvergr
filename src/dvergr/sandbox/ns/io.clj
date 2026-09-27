@@ -769,7 +769,7 @@
    filesystem the shell sees, so worktree files AND mounted drives
    (e.g. /drive) both work. Bytes never enter the SCI sandbox; only
    extracted text / parsed data comes back."
-  [sci-ctx chat-ctx]
+  [sci-ctx chat-ctx & [effects]]
   (let [read-bytes (fn [path]
                      (let [host ((requiring-resolve 'dvergr.intake.bash/get-or-create-host!)
                                  chat-ctx)
@@ -788,12 +788,15 @@
         ;; Model calls here are the agent's spend: refused over budget, and
         ;; every response charged to the chat, like the llm_call tool.
         charged (fn [f]
-                  (when (and chat-ctx ((requiring-resolve 'dvergr.chat.context/budget-exceeded?) chat-ctx))
-                    (throw (ex-info "Budget exceeded — vision/doc call refused" {:type :budget-exceeded})))
-                  (with-bindings {(requiring-resolve 'dvergr.media.vision/*on-response*)
-                                  (fn [r] (when chat-ctx
-                                            ((requiring-resolve 'dvergr.tools.llm-call/account-response!) chat-ctx r)))}
-                    (f)))
+                  (effects/perform!
+                   effects {:effect :model/call :resource {:model "vision"}}
+                   (fn []
+                     (when (and chat-ctx ((requiring-resolve 'dvergr.chat.context/budget-exceeded?) chat-ctx))
+                       (throw (ex-info "Budget exceeded — vision/doc call refused" {:type :budget-exceeded})))
+                     (with-bindings {(requiring-resolve 'dvergr.media.vision/*on-response*)
+                                     (fn [r] (when chat-ctx
+                                               ((requiring-resolve 'dvergr.tools.llm-call/account-response!) chat-ctx r)))}
+                       (f)))))
         extract (fn [path]
                   (charged #((requiring-resolve 'dvergr.media.doc/extract-text)
                              (read-bytes path) (guess-mime path))))
@@ -822,13 +825,16 @@
    The `shell` JSON-schema tool wraps the same `run`, so a worker
    picks whichever door fits the call site — direct tool for typical
    ops, SCI fn for pipelines that mix bash and Clojure transforms."
-  [sci-ctx chat-ctx]
+  [sci-ctx chat-ctx & [effects]]
   (load/require! 'dvergr.intake.bash)
   (let [run-fn       (var-get (ns-resolve 'dvergr.intake.bash 'run))
         check-fn     (var-get (ns-resolve 'dvergr.intake.bash 'check))
         builtins-fn  (var-get (ns-resolve 'dvergr.intake.bash 'builtins))
         allowlist-fn (var-get (ns-resolve 'dvergr.intake.bash 'allowlist))
-        run          (fn [cmd & opts] (apply run-fn chat-ctx cmd opts)) ; → {:stdout :stderr :exit …}
+        run          (fn [cmd & opts] ; → {:stdout :stderr :exit …}
+                       (effects/perform! effects {:effect :process/run :resource {:cmd (str cmd)}
+                                                  :result-of :stdout}
+                                         #(apply run-fn chat-ctx cmd opts)))
         ->result     (fn [m] (if (:error m)
                                {:exit (or (:exit m) 1) :out "" :err (:error m)}
                                {:exit (:exit m) :out (or (:stdout m) "") :err (or (:stderr m) "")}))
@@ -861,7 +867,7 @@
      (processes/snapshot some-pid)          ; → single snapshot
      (processes/directive! pid {:type :abort :reason \"…\"})
      (processes/directive! pid {:type :refocus :hint \"…\"})"
-  [sci-ctx chat-ctx]
+  [sci-ctx chat-ctx & [effects]]
   (let [proc-ns   (find-ns 'dvergr.agent.process)
         list-fn   (var-get (ns-resolve proc-ns 'list-processes))
         snap-fn   (var-get (ns-resolve proc-ns 'snapshot))
@@ -878,7 +884,9 @@
                                                  (some #(= :extend-budget (:op %)) (:effects d)))
                                          (throw (ex-info "A budget is extended by its supervisor or the room's owner, not from the sandbox"
                                                          {:type ::budget-self-extension})))
-                                       (dir-fn chat-ctx pid d))})))
+                                       (effects/perform! effects {:effect :process/directive
+                                                                  :resource {:pid (str pid) :type (:type d)}}
+                                                         #(dir-fn chat-ctx pid d)))})))
 
 (defn- fs-safe-resolve
   "Resolve user-supplied path against base-dir, canonicalising symlinks and `..`
