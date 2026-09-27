@@ -29,6 +29,7 @@
             [org.replikativ.spindel.spin.sync :as sync]
             [org.replikativ.spindel.effects.savepoint :as savepoint :refer [savepoint]]
             [org.replikativ.spindel.savepoint.portable :as portable]
+            [dvergr.resource.authority :as authority]
             [taoensso.telemere :as tel])
   (:import [java.nio.charset StandardCharsets]
            [java.util UUID]
@@ -650,12 +651,15 @@
    (persisting needs one). A nested Run's world inherits its parent's session;
    only a world without one opens its own. Returns the session opened, to close
    with the Run, or nil."
-  [work-room]
+  [control-room work-room]
   (let [world (:ctx work-room)
         table {:conversation/turn turn-savepoint-handler}]
     (if (savepoint/session world)
       (do (savepoint/install-handlers! world table) nil)
-      (savepoint/open! world {:handlers table :purpose :run}))))
+      ;; the session's forks spend the Run's budget, on the one ledger
+      (savepoint/open! world (cond-> {:handlers table :purpose :run}
+                               (satisfies? room-store/PResourceStore (:store control-room))
+                               (assoc :authority (authority/authority control-room)))))))
 
 (defn- turn-savepoint!
   "Publish the gap after model step `step` of Run `run-id` as a savepoint in
@@ -1459,7 +1463,7 @@
         work-room (:work run-world)
         supervisor (make-supervisor (:ctx world-parent) (:ctx work-room))
         _ (when (and (= :llm (get-in agent [:agent/program :kind])) (:store control-room))
-            (when-let [session (install-turn-savepoints! work-room)]
+            (when-let [session (install-turn-savepoints! control-room work-room)]
               (register-cleanup! supervisor
                                  #(let [done (promise)]
                                     ((savepoint/close! session) (fn [_] (deliver done :closed))
