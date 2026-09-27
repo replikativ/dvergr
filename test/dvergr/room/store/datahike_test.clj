@@ -297,7 +297,7 @@
         :run/agent-version 1 :run/program-kind :echo
         :run/interpreter-version 5 :run/agent-def-hash (hasch/uuid agent)}))
     (let [value (certified-attempt cell agent
-                                   {:spend {:microdollars 1234 :priced? true}
+                                   {:spend {:microdollars 1234 :priced? true :notional-microdollars 5678}
                                     :experiment-content-id experiment-id
                                     :experiment-candidate :candidate
                                     :experiment-repetition 0})]
@@ -305,6 +305,10 @@
       (is (= value (store/-load-attempt st room-id cell))))
     (store/-store-attempt! st room-id (certified-attempt plain agent))
     (is (some? (store/-load-attempt st room-id plain)) "an Attempt without them still reads")
+    (is (= #{[cell 5678]}
+           (dh/q '[:find ?run-id ?n :where [?a :attempt/notional-microdollars ?n]
+                   [?a :attempt/run ?r] [?r :run/id ?run-id]] @conn))
+        "a subscription's list-price cost is typed next to what it cost")
     (is (= #{[cell 1234 experiment-id :candidate]}
            (dh/q '[:find ?run-id ?md ?exp ?candidate
                    :where
