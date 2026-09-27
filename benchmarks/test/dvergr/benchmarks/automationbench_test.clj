@@ -75,6 +75,23 @@
           (is (= (get (sc/grade s "sales" "501" world) "partial_credit")
                  (get (sc/grade s "sales" "501" (get replayed "world")) "partial_credit"))))))))
 
+(deftest key-order-survives-the-boundary
+  (if-not (sc/available?)
+    (support/skip! "key-order-survives-the-boundary: no AutomationBench checkout")
+    ;; a sheet write fills columns in the order of a row's cells: a world
+    ;; parsed into a Clojure map (more than eight keys) would reorder them
+    (let [s (sc/shared!)
+          start (sc/start s "hr" "5119" {:at 1790000000000})
+          call {:n 0 :name "api_fetch"
+                :arguments {"method" "PUT" "params" "{\"valueInputOption\":\"RAW\"}"
+                            "url" "https://sheets.googleapis.com/v4/spreadsheets/ss_expenses_5119/values/ws_pending_5119!E2:E9"
+                            "body" "{\"range\":\"ws_pending_5119!E2:E9\",\"majorDimension\":\"COLUMNS\",\"values\":[[\"a\",\"b\",\"c\",\"d\",\"e\",\"f\",\"g\",\"h\"]]}"}}
+          r (sc/call s "hr" "5119" (assoc call :world (get start "world")))]
+      (is (string? (get start "world")) "the world is text on this side")
+      (is (= (get r "digest")
+             (get (sc/replay s "hr" "5119" {:start-at 1790000000000 :calls [(assoc call :at (get r "at"))]})
+                  "digest"))))))
+
 (deftest a-task-through-evaluate
   (if-not (sc/available?)
     (support/skip! "a-task-through-evaluate: no AutomationBench checkout")

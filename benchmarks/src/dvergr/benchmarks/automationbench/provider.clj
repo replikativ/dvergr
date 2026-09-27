@@ -34,7 +34,10 @@
             [dvergr.benchmarks.pyjson :as pj]
             [dvergr.model.registry :as registry]))
 
-(def version 1)
+(def version
+  "2: worlds cross the service boundary as JSON text (version 1 parsed them into
+   Clojure maps, which reorder keys; a sheet write then filled other columns)."
+  2)
 
 (defn- task-of [definition]
   (let [{:keys [domain task-id toolset]} (:environment/task definition)]
