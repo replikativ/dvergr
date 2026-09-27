@@ -1,9 +1,14 @@
 (ns contract-review.checker
   "Contract review against CUAD's lawyers' annotations. Per clause type: 0 for
    the wrong presence; 1 for a clause correctly absent; for a clause present,
-   1 when the quote overlaps an annotated span (token F1 at least 0.5), 0.5
-   when it names the clause but quotes too little or too much of it. The
-   reward is the mean over the clause types."
+   1 when the quote matches an annotated span, 0.5 when it names the clause
+   but quotes something else. The reward is the mean over the clause types.
+
+   A quote matches a span when their tokens overlap (F1 at least 0.5), when
+   it contains the span (80% of the span's tokens, in at most 200 tokens: a
+   whole numbered section, not the contract), or when it lies inside the span
+   (90% of its at least 8 tokens: one item of a long annotated list). CUAD
+   annotates sentences; a reviewer quotes the clause, whose bounds differ."
   (:require [clojure.edn :as edn]
             [clojure.string :as str]))
 
@@ -19,6 +24,19 @@
       (let [p (/ common na) r (/ common nb)]
         (double (/ (* 2 p r) (+ p r)))))))
 
+(defn- overlap
+  "`[common quote-tokens span-tokens]` of `quote` and `span`."
+  [quote span]
+  (let [fq (frequencies (tokens quote)) fs (frequencies (tokens span))]
+    [(reduce + (map (fn [[t n]] (min n (get fq t 0))) fs))
+     (reduce + (vals fq)) (reduce + (vals fs))]))
+
+(defn- matches? [quote span]
+  (let [[common nq ns] (overlap quote span)]
+    (or (<= 0.5 (f1 quote span))
+        (and (pos? ns) (<= 0.8 (/ common ns)) (<= nq 200))
+        (and (<= 8 nq) (<= 0.9 (/ common nq))))))
+
 (defn- review [files]
   (try (let [v (edn/read-string (get files "/out/review.edn" ""))]
          (when (map? v) v))
@@ -29,7 +47,7 @@
     (cond
       (not= present said) 0.0
       (not present) 1.0
-      (<= 0.5 (reduce max 0.0 (map #(f1 (:quote answer) %) spans))) 1.0
+      (some #(matches? (:quote answer) %) spans) 1.0
       :else 0.5)))
 
 (defn check [{:keys [files gold]}]
