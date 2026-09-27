@@ -32,6 +32,7 @@
             [dvergr.sandbox.workspace :as workspace]
             [dvergr.sandbox.ns.agent :as ns-agent]
             [dvergr.sandbox.ns.io :as ns-io]
+            [dvergr.authority :as authority]
             [dvergr.effects :as effects]
             [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.system.db :as sdb])
@@ -1119,7 +1120,11 @@
   (let [audit-log  (or receipts (make-audit-log))
         binding-resolver (when capability-id
                            (runtime-ctx/sandbox-binding-resolver spindel-ctx capability-id))
-        boundary   (effects/boundary-resolver binding-resolver audit-log)
+        ;; the room relations the authority filter decides over, read in
+        ;; the world the call runs in
+        relations  #(binding [rtc/*execution-context* (runtime-ctx/selected-context spindel-ctx)]
+                      (authority/relations ((requiring-resolve 'dvergr.room.registry/list-rooms))))
+        boundary   (effects/boundary-resolver binding-resolver audit-log relations)
         binding-swap! (when capability-id
                         (fn [f & args]
                           (apply runtime-ctx/update-sandbox-binding!
