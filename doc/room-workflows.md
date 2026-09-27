@@ -90,9 +90,17 @@ clojure -M -m dvergr.catalog.room-run path/to/competitors --models claude-haiku-
 
 A bundle with `:fetched true` in `workflow.edn` records its Attempts' effects (`:world
 :effects {:record true}`), and its checker is given `:fetched {url body}`: the successful GET
-responses of the Attempt (at most 40 pages, 200,000 characters each). A citation counts only
+responses of the Attempt, as text (at most 40 pages, 200,000 characters each: markup can be
+most of a page, and the words a citation quotes may lie past any cut of the raw HTML). A citation counts only
 if the Attempt fetched the page. `calibration.edn` may give `:fetched` for its reference and
 variants.
+
+`catalog_freeze {room name as?}` makes a stable benchmark of a live one: a new bundle
+(`<name>-frozen`) whose `web.edn` is the pages its live Attempts fetched (as text) and whose
+`workflow.edn` says `:web :frozen`. Every attempt in it meets the same web
+(`dvergr.io.frozen-web`: pages by URL, search lexical over them, 404 otherwise, no network),
+so its scores are comparable over time. It is a bundle of its own, calibrated and promoted
+on its own.
 
 `catalog_deploy {room name agent every on? at? params?}` schedules the bundle's task for an
 agent of the room (the Scorecard's pick); the room's REPL lists and cancels it

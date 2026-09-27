@@ -594,6 +594,30 @@
                 {:schedule (str id) :workflow (str (:slug r) "/" name) :bundle (str (:id b))
                  :agent agent})))}
 
+   :catalog/freeze
+   {:doc (str "Freeze a room's workflow into a stable benchmark: a new bundle (default "
+              "<name>-frozen) whose web is the pages its live Attempts in this room fetched "
+              "(web.edn), so every later attempt meets the same web and scores are comparable "
+              "over time. Search is lexical over those pages. Calibrate and promote it like any "
+              "bundle.")
+    :kind :write
+    :schema [:map [:room Room] [:name :string]
+             [:as {:optional true} [:string {:description "the frozen bundle's name (default <name>-frozen)"}]]]
+    :impl (fn [daemon {:keys [room name as]}]
+            (when-let [r (resolve-room daemon room)]
+              (in-ctx daemon
+                      (let [files (room-wf/bundle-files r name)
+                            b (room-wf/bundle name files)
+                            as (or as (str name "-frozen"))
+                            atts (attempts/attempts r {:environment-id (keyword "room-workflow" name) :limit 200})
+                            fetched (keep #(get-in % [:attempt/evidence :fetched]) atts)
+                            pages (room-wf/frozen-pages fetched)
+                            frozen (room-wf/freeze b files pages)]
+                        (catalog/seed! r (into {} (map (fn [[p t]] [(str "/workflows/" as "/" p) t])) frozen))
+                        (let [fb (room-wf/bundle as frozen)]
+                          {:frozen (str (:slug r) "/" as) :bundle (str (:id fb))
+                           :pages (count pages) :from-attempts (count fetched)})))))}
+
    :catalog/check
    {:doc (str "Check a workflow bundle in a room (workflows/<name>/: workflow.edn, checker.clj, "
               "gold.edn, fixtures/): its problems, or its content id, task and fixtures when it is "

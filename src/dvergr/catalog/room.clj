@@ -28,6 +28,9 @@
             [dvergr.agent.workflow :as workflow]
             [dvergr.catalog.workspace :as ws]
             [dvergr.effects :as effects]
+            [dvergr.io.frozen-web :as frozen-web]
+            [dvergr.sandbox.ns.io :as sandbox-io]
+            [org.replikativ.spindel.engine.core :as ec]
             [dvergr.sandbox :as sandbox]
             [hasch.core :as hasch]
             [malli.core :as m]
@@ -45,6 +48,8 @@
    [:capture {:optional true} [:vector [:re #"^/[^.]*$"]]]
    ;; give the checker the pages the attempt fetched (`:fetched {url body}`)
    [:fetched {:optional true} :boolean]
+   ;; :frozen: the attempt's web is web.edn (`freeze`), not the internet
+   [:web {:optional true} [:enum :live :frozen]]
    [:timeout-ms {:optional true} [:int {:min 1000}]]])
 
 (def Verdict
@@ -76,7 +81,10 @@
       (conj (str "workflow.edn: " (pr-str (me/humanize (m/explain Definition definition)))))
       (not (contains? files "checker.clj")) (conj "checker.clj is missing")
       (not (some #(str/starts-with? % "fixtures/") (keys files)))
-      (conj "fixtures/ is empty: every attempt's world would start with nothing"))))
+      (conj "fixtures/ is empty: every attempt's world would start with nothing")
+
+      (and (map? definition) (= :frozen (:web definition)) (not (contains? files "web.edn")))
+      (conj "workflow.edn says :web :frozen but web.edn is missing"))))
 
 (defn bundle
   "A bundle from its files (`{relative-path text}`), or throws with its
@@ -92,6 +100,7 @@
      :checker (get files "checker.clj")
      :gold (read-edn files "gold.edn")
      :calibration (read-edn files "calibration.edn")
+     :web (when (= :frozen (:web definition)) (read-edn files "web.edn"))
      :fixtures (into (sorted-map)
                      (keep (fn [[path text]]
                              (when (str/starts-with? path "fixtures/")
@@ -242,25 +251,82 @@
 
 (defn world-setup
   "Installs the bundle's fixtures in each attempt's world (a workspace of its
-   own, committed). Its evidence is their digest."
-  [{:keys [fixtures id]}]
-  (let [digest (str (hasch/uuid fixtures))]
+   own, committed) and, for a frozen web, its pages as the world's web: every
+   HTTP request in the world is answered from them. Its evidence is their
+   digest."
+  [{:keys [fixtures id web]}]
+  (let [digest (str (hasch/uuid fixtures))
+        transport (when web (frozen-web/transport web))
+        web-id (when web (hasch/uuid [:room-workflow/web web]))]
     (evaluation/make-world-setup
-     {:id :room-workflow/fixtures :version 1 :basis {:bundle (str id) :fixtures digest}
+     {:id :room-workflow/fixtures :version 1
+      :basis (cond-> {:bundle (str id) :fixtures digest} web (assoc :web (str web-id)))
       :prepare (fn [{world :room}]
                  (ws/ensure-workspace! world)
                  (ws/seed! world fixtures)
-                 {:fixtures digest :files (count fixtures)})})))
+                 (when web
+                   (binding [ec/*execution-context* (:ctx world)]
+                     (sandbox-io/install-http-fixture!
+                      {:id web-id :transport transport :env {"BRAVE_API_KEY" "frozen-web"}})))
+                 (cond-> {:fixtures digest :files (count fixtures)}
+                   web (assoc :web (str web-id) :pages (count web))))})))
+
+;; ---------------------------------------------------------------------------
+;; Freezing: the web a live run saw, as a stable benchmark
+;; ---------------------------------------------------------------------------
+
+(defn- page-text
+  "A fetched page as text: scripts, styles and tags removed, whitespace folded."
+  [body]
+  (-> (str body)
+      (str/replace #"(?is)<(script|style|noscript)[^>]*>.*?</\1>" " ")
+      (str/replace #"(?s)<[^>]+>" " ")
+      (str/replace #"&nbsp;|&#160;" " ") (str/replace "&amp;" "&")
+      (str/replace #"\s+" " ") str/trim))
+
+(defn- page-title [body url]
+  (or (some-> (re-find #"(?is)<title[^>]*>(.*?)</title>" (str body)) second page-text not-empty)
+      url))
+
+(defn frozen-pages
+  "The web `fetched` maps (`{url body}`, e.g. from Attempts' evidence) show,
+   as frozen pages `{url {:title :body}}`: https pages only, not search
+   responses (frozen search runs over the pages), each at most 50,000
+   characters of text."
+  [fetched]
+  (into (sorted-map)
+        (for [m fetched [url body] m
+              :when (and (re-matches #"https://[^\s?#]+" url)
+                         (not (str/starts-with? url frozen-web/search-url)))
+              :let [text (page-text body)]
+              :when (seq text)]
+          [url {:title (page-title body url) :body (subs text 0 (min (count text) 50000))}])))
+
+(defn freeze
+  "The files of `b`'s frozen variant: the same bundle with `pages` as its web
+   (web.edn) and `:web :frozen`, so every attempt meets the same web. A new
+   bundle: its own content id, calibrated and promoted on its own."
+  [b files pages]
+  (when (empty? pages)
+    (throw (ex-info "Nothing to freeze: no fetched pages" {:type ::nothing-to-freeze})))
+  (let [definition (-> (:definition b)
+                       (assoc :web :frozen)
+                       (update :title str " (frozen web)"))]
+    (assoc files
+           "workflow.edn" (pr-str definition)
+           "web.edn" (pr-str pages))))
 
 (def ^:private max-page-chars
   "A fetched page is kept to this many characters as evidence."
   200000)
 
 (defn- bounded-pages
-  "At most 40 pages, each cut to `max-page-chars`: the evidence is stored with
-   the Attempt."
+  "At most 40 pages, each as text (a page's markup can be most of it: the
+   words a citation quotes may lie past any cut of the raw HTML), cut to
+   `max-page-chars`: the evidence is stored with the Attempt."
   [pages]
-  (into {} (map (fn [[u b]] [u (subs b 0 (min (count b) max-page-chars))])) (take 40 pages)))
+  (into {} (map (fn [[u b]] (let [t (page-text b)] [u (subs t 0 (min (count t) max-page-chars))])))
+        (take 40 pages)))
 
 (defn evaluator
   "The bundle's checker as an Evaluator: it captures the files under the

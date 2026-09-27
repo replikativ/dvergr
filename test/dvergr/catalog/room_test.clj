@@ -202,10 +202,68 @@
       (effects/set-world-recording! (:ctx room) r)
       (let [ev (room-wf/evaluator b {})
             captured ((:capture ev) {:world/room room})]
-        (is (= {"https://example.test/a" "<p>the page says hello</p>"} (:fetched captured))
-            "successful GETs only")
+        (is (= {"https://example.test/a" "the page says hello"} (:fetched captured))
+            "successful GETs only, as text")
         (is (= 1.0 (:reward ((:verify ev) nil {:run-status :completed :files (:files captured)
                                                :fetched (:fetched captured)}))))
         (is (= 0.0 (:reward ((:verify ev) nil {:run-status :completed :files (:files captured) :fetched {}})))
             "a quote from a page not fetched does not count"))
       (effects/release! r))))
+
+(def ^:private quote-checker
+  "(ns q (:require [clojure.edn :as edn] [clojure.string :as str]))
+   (defn check [{:keys [files fetched]}]
+     (let [{:keys [quote source-url]} (edn/read-string (get files \"/out/answer.edn\" \"{}\"))
+           page (get fetched source-url \"\")
+           ok (boolean (and quote (str/includes? page quote)))]
+       {:checks {:quote-fetched? ok} :reward (if ok 1.0 0.0)}))")
+
+(def ^:private quote-files
+  {"workflow.edn" (pr-str {:title "Quote" :task "Find a product page and quote it in /out/answer.edn."
+                           :capture ["/out"] :fetched true})
+   "checker.clj" quote-checker
+   "fixtures/README.md" "Quote a page."})
+
+(defn- fetching-model
+  "First call: search the (frozen) web, fetch a page, write the quote; second: end."
+  [calls]
+  (fn [messages _opts]
+    (swap! calls inc)
+    (if (not-any? #(= :tool-result (or (:role %) (:message/role %))) messages)
+      {:content ""
+       :tool-calls [{:id (str "e" @calls) :name "clojure_eval"
+                     :input {:code (str "(let [s (babashka.http-client/get \"https://api.search.brave.com/res/v1/web/search\" "
+                                        "{:query-params {:q \"agents team\" :count 5}}) "
+                                        "p (babashka.http-client/get \"https://www.watolabs.com/\")] "
+                                        "(spit \"/out/answer.edn\" (pr-str {:quote \"your team and AI agents\" "
+                                        ":source-url \"https://www.watolabs.com/\"})) "
+                                        "[(:status s) (:status p)])")}}]
+       :usage {:input-tokens 800 :output-tokens 80} :stop-reason :tool-use}
+      {:content "Done." :tool-calls nil :usage {:input-tokens 900 :output-tokens 5} :stop-reason :end-turn})))
+
+(deftest a-frozen-web-is-the-web-a-live-run-saw
+  (let [fetched [{"https://www.watolabs.com/" "<html><title>Wato</title><script>x()</script><p>Wato is where your team and AI agents work together.</p></html>"
+                  "https://api.search.brave.com/res/v1/web/search?q=x" "{\"web\":{}}"}
+                 {"http://insecure.test/" "skipped"}]
+        pages (room-wf/frozen-pages fetched)]
+    (testing "fetched pages become frozen text pages; search responses and plain http do not"
+      (is (= {"https://www.watolabs.com/" {:title "Wato" :body "Wato Wato is where your team and AI agents work together."}}
+             pages)))
+    (let [b (room-wf/bundle "quote" quote-files)
+          frozen (room-wf/bundle "quote-frozen" (room-wf/freeze b quote-files pages))]
+      (testing "the frozen variant is a bundle of its own"
+        (is (= :frozen (get-in frozen [:definition :web])))
+        (is (not= (:id b) (:id frozen))))
+      (testing "an attempt meets the frozen web, and the checker sees what it fetched there"
+        (let [prev (paths/home)
+              calls (atom 0)]
+          (try
+            (with-redefs [providers/ensure-initialized! (constantly nil)
+                          chat-agent/messages->api-format (fn [messages _ _] messages)
+                          model-chat/chat (fetching-model calls)]
+              (let [{:keys [scorecard failed-cells]}
+                    (room-wf/experiment! frozen {:dir (str (System/getProperty "java.io.tmpdir") "/dvergr-frozen-" (random-uuid))
+                                                 :models ["claude-haiku-4-5"] :timeout-ms 60000})]
+                (is (zero? failed-cells) (pr-str (:incomplete scorecard)))
+                (is (= 1.0 (:reward-mean (first (:scorecard/summary scorecard)))))))
+            (finally (paths/set-home! prev) (sdb/reset-conn!))))))))
