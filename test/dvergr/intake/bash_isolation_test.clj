@@ -121,3 +121,10 @@
       (let [s (b/run chat "echo hi")]
         (is (= "hi\n" (:stdout s)))
         (is (false? (:truncated? s)))))))
+(deftest the-shell-has-no-network
+  (let [chat (chat-on *base-ctx*)]
+    (doseq [cmd ["curl -s https://example.com" "sh -c 'curl -s https://example.com'"
+                 "echo https://example.com | xargs curl -s" "wget -q -O - https://example.com"]]
+      (let [r (b/run chat cmd)]
+        (is (not (re-find #"(?i)example domain" (str (:stdout r)))) cmd)
+        (is (not (zero? (:exit r))) cmd)))))
