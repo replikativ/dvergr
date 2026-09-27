@@ -355,7 +355,10 @@
     :run/world :run/isolation :run/settlement-policy
     :run/settlement-status :run/settlement-reason
     :run/roster :run/agent-version :run/program-kind
-    :run/interpreter-version :run/agent-def-hash :run/chat-id})
+    :run/interpreter-version :run/agent-def-hash :run/chat-id
+    ;; resuming (doc/run-resume.md): the latest portable savepoint, as EDN,
+    ;; and the Run that continued from it
+    :run/savepoint :run/resumed-by})
 
 (def immutable-run-keys
   [:run/id :run/kind :run/room :run/actor :run/trigger :run/parent

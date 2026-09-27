@@ -17,7 +17,8 @@
    world remains inspectable after its executor has quiesced. `record-room`
    (default `parent`) is the Room that keeps the Run."
   ([parent run-id policy] (open! parent run-id policy parent))
-  ([parent run-id policy record-room]
+  ([parent run-id policy record-room] (open! parent run-id policy record-room nil))
+  ([parent run-id policy record-room {:keys [snapshots]}]
    (when-not (contains? settlement-policies policy)
      (throw (ex-info "Unknown Run settlement policy"
                      {:type ::invalid-settlement-policy
@@ -26,6 +27,9 @@
    (let [work (d/fork-room parent {:isolation :ctx
                                    :fork-opts {:purpose :run
                                                :owner run-id
+                                               ;; resuming: the systems as the
+                                               ;; savepoint recorded them
+                                               :snapshots snapshots
                                               ;; A hired agent receives the
                                               ;; durable substrate of its
                                               ;; parent world, but constructs

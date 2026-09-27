@@ -29,6 +29,7 @@
             [dvergr.agent.experiment :as experiment]
             [dvergr.agent.ops :as aops]
             [dvergr.agent.run :as run]
+            [dvergr.agent.program :as program]
             [dvergr.agent.workflow :as workflow]
             [dvergr.catalog :as catalog]
             [dvergr.catalog.room :as room-wf]
@@ -141,7 +142,11 @@
      :program-kind   (some-> (:run/program-kind r) name)
      :created-at     (:run/created-at r)
      :started-at     (:run/started-at r)
-     :ended-at       (:run/ended-at r)}))
+     :ended-at       (:run/ended-at r)
+     ;; resuming (doc/run-resume.md): the step its latest savepoint follows,
+     ;; and the Run that continued it
+     :resumable-from-step (some-> (run/savepoint r) :savepoint/payload :step)
+     :resumed-by     (some-> (:run/resumed-by r) str)}))
 
 (defn- attempt-data
   "One certified Attempt as a leaderboard row: who, on what, reward, checks,
@@ -486,6 +491,21 @@
     :impl (fn [daemon {:keys [room id]}]
             (when-let [r (resolve-room daemon room)]
               (in-ctx daemon (run-data (run/run r (uuid-arg id))))))}
+
+   :run/resume
+   {:doc (str "Continue a stopped Run (failed when its process stopped, cancelled, or failed) from "
+              "its latest turn savepoint (run_detail's resumable-from-step): a new Run, caused by it, "
+              "whose world is forked at the snapshots the savepoint recorded and whose conversation "
+              "starts where the old one was; the old Run's remaining budget moves to it. A Run is "
+              "resumed once. The step it stopped in is redone: if that step had posted, committed or "
+              "run a shell command, check its effects first.")
+    :kind :write
+    :schema [:map [:room Room] [:run [:string {:description "the stopped Run's id"}]]]
+    :impl (fn [daemon {:keys [room run]}]
+            (when-let [r (resolve-room daemon room)]
+              (let [old (uuid-arg run)
+                    handle (in-ctx daemon (program/resume! r r old))]
+                {:run (str (program/run-id handle)) :resumes (str old)})))}
 
    :room/wallet
    {:doc "Conserved resources of a room's wallet, or of one Run's wallet: what is left to spend."

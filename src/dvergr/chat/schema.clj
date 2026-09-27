@@ -678,6 +678,16 @@
     :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/one}
 
+   {:db/ident :run/savepoint
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/doc "The Run's latest portable savepoint (spindel savepoint.portable/persist), EDN: what resuming it continues from (doc/run-resume.md)"}
+
+   {:db/ident :run/resumed-by
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/doc "The Run that continues this one from its savepoint; a Run is resumed once"}
+
    {:db/ident :run/status
     :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/one

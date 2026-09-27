@@ -22,7 +22,7 @@
   {:room/list :rooms, :room/detail :rooms, :room/create :rooms,
    :room/delete :rooms, :room/messages :rooms, :room/post :rooms
 
-   :room/unarchive :admin, :room/purge :admin, :catalog/promote :admin
+   :room/unarchive :admin, :room/purge :admin, :catalog/promote :admin, :run/resume :admin
 
    :room/fork :worlds, :room/diff :worlds, :room/review :worlds,
    :room/merge :worlds, :room/discard :worlds,
@@ -190,6 +190,7 @@
    :catalog/start    {:destructiveHint false :idempotentHint false :openWorldHint true}
    :catalog/benchmark {:destructiveHint false :idempotentHint false :openWorldHint true}
    :catalog/promote  {:destructiveHint false :idempotentHint true  :openWorldHint false}
+   :run/resume       {:destructiveHint false :idempotentHint false :openWorldHint true}
    :catalog/import   {:destructiveHint true  :idempotentHint true  :openWorldHint false}
    :catalog/deploy   {:destructiveHint false :idempotentHint false :openWorldHint true}
    :catalog/freeze   {:destructiveHint false :idempotentHint true  :openWorldHint false}
