@@ -16,6 +16,8 @@
     (is (= #{[:a 1] [:a 3] [:b 1] [:b 3]} pilot)
         "the first environment of each stratum, first repetition, per candidate")
     (is (nil? ((preflight/pilot-admit pilot) (cell :a :bench.sales/t1 1 0))))
+    (is (some? ((preflight/pilot-admit pilot) (cell :a :bench.sales/t1 1 1)))
+        "a pilot environment's later repetitions are not the pilot")
     (is (= :preflight-pilot (:reason ((preflight/pilot-admit pilot) (cell :a :bench.sales/t2 2 0)))))))
 
 (defn- receipt [candidate usd tokens ms]

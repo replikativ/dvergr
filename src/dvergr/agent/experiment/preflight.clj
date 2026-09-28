@@ -50,7 +50,8 @@
   "An admission function that admits only `pilot` cells (see `pilot-cells`)."
   [pilot]
   (fn [job]
-    (when-not (contains? pilot [(:candidate/id job) (get-in job [:environment :environment/content-id])])
+    (when-not (and (zero? (:repetition job))
+                   (contains? pilot [(:candidate/id job) (get-in job [:environment :environment/content-id])]))
       {:reason :preflight-pilot})))
 
 (defn- mean [xs] (/ (reduce + 0.0 xs) (count xs)))
