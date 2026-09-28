@@ -278,3 +278,36 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"works in room world-1 only"
                             (surface/pinned-args sel {:path "/x" :room "other"})))
       (is (= {:path "/x"} (surface/pinned-args (surface/selection {}) {:path "/x"})) "unpinned: unchanged"))))
+
+(deftest a-waiting-request-does-not-block-the-connection
+  (let [release (promise)
+        sent (atom [])
+        c {:session (atom (json-rpc/create-session {}))
+           :tool-defs (atom [{:name "slow" :inputSchema {:type "object"}}])
+           :tool-handlers (atom {"slow" (fn [_ _] @release {:content [{:type "text" :text "done"}]})})}
+        send! #(swap! sent conj %)
+        responded? (fn [id] (some #(= id (:id %)) @sent))
+        wait-for (fn [pred] (loop [i 0] (when (and (< i 200) (not (pred))) (Thread/sleep 10) (recur (inc i)))))]
+    (init! c)
+    (server/dispatch! c send! {:jsonrpc "2.0" :id 2 :method "tools/call" :params {:name "slow"}})
+    (server/dispatch! c send! {:jsonrpc "2.0" :id 3 :method "ping"})
+    (testing "a ping is answered while the tool call waits"
+      (is (responded? 3))
+      (is (not (responded? 2))))
+    (testing "a call cancelled before it finishes gets no response"
+      (server/dispatch! c send! {:jsonrpc "2.0" :id 4 :method "tools/call" :params {:name "slow"}})
+      (server/dispatch! c send! {:jsonrpc "2.0" :method "notifications/cancelled" :params {:requestId 4}})
+      (deliver release true)
+      (wait-for #(responded? 2))
+      (Thread/sleep 100)
+      (is (responded? 2) "the uncancelled call answers once released")
+      (is (not (responded? 4)))
+      (is (empty? (:cancelled-requests @(:session c))) "and its id is forgotten"))))
+
+(deftest an-unknown-resource-is-a-protocol-error
+  (with-redefs-fn {#'dvergr.mcp.server/current-daemon (constantly :a-daemon)}
+    (fn []
+      (let [r (json-rpc/handle-message (init! (ctx)) {:jsonrpc "2.0" :id 9 :method "resources/read"
+                                                      :params {:uri "dvergr://nope/nothing"}})]
+        (is (= -32002 (get-in r [:error :code])))
+        (is (nil? (:result r)))))))

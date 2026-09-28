@@ -298,7 +298,9 @@
     (if-let [{:keys [op args]} (uri->op+args uri)]
       {:contents [{:uri uri :mimeType "application/json"
                    :text (-> (surface/data-result (ops/invoke dmn op args)) :content first :text)}]}
-      {:contents [] :isError true})
+      ;; the protocol's error for a resource that does not exist
+      (throw (ex-info (str "Resource not found: " uri)
+                      {:json-rpc/code -32002 :json-rpc/data {:uri uri}})))
     {:contents []}))
 
 (defonce ^:private resource-subs (atom {}))  ; uri -> #{send-fn}
@@ -440,6 +442,36 @@
 ;; Connection handling (shared by TCP and stdio)
 ;; ============================================================================
 
+(def ^:private concurrent-methods
+  "Requests that may take long (a tool, a resource read: a job wait, an
+   evaluation). Each runs on its own virtual thread, so a connection keeps
+   answering while one waits; everything else (the handshake, lists,
+   notifications) runs in order on the read loop."
+  #{"tools/call" "resources/read"})
+
+(defn dispatch!
+  "Handle one parsed `message` on a connection: answer it through `send-fn`,
+   concurrently for `concurrent-methods`. A request cancelled
+   (`notifications/cancelled`) before it finishes gets no response, as the
+   protocol asks; its work is not interrupted."
+  [context send-fn message]
+  (let [id (:id message)
+        cancelled? #(contains? (:cancelled-requests @(:session context)) id)
+        forget! #(swap! (:session context) update :cancelled-requests disj id)
+        answer! (fn []
+                  (let [response (json-rpc/handle-message context message)]
+                    (if (and response id (cancelled?))
+                      (forget!)
+                      (when response (send-fn response)))))]
+    (if (and id (concurrent-methods (:method message)))
+      (Thread/startVirtualThread
+       (fn []
+         (try (answer!)
+              (catch Throwable t
+                (binding [*err* *err*]
+                  (.println *err* (str "dvergr-mcp: request " id " failed: " (.getMessage t))))))))
+      (answer!))))
+
 (defn- handle-connection
   "Handle a single MCP connection. Reads JSON lines from reader,
    dispatches via json-rpc/handle-message, writes responses via writer.
@@ -464,8 +496,7 @@
                             (send-fn json-rpc/parse-error-response)
                             nil))]
             (when message
-              (when-some [response (json-rpc/handle-message context message)]
-                (send-fn response)))
+              (dispatch! context send-fn message))
             (recur))))
       (finally
         (swap! connected-send-fns disj send-fn)
