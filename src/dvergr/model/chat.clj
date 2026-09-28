@@ -148,6 +148,28 @@
 ;; Core Chat Implementation
 ;; ============================================================================
 
+(def ^:dynamic *stream-idle-ms*
+  "How long a response stream may send nothing before it counts as stalled:
+   the stream is closed and the call retried. A provider that holds a stream
+   open without data otherwise blocks its caller until something above gives
+   up (an evaluation's timeout)."
+  180000)
+
+(defonce ^:private watchdog
+  (delay (java.util.concurrent.Executors/newSingleThreadScheduledExecutor
+          (reify java.util.concurrent.ThreadFactory
+            (newThread [_ r] (doto (Thread. ^Runnable r "dvergr-stream-watchdog") (.setDaemon true)))))))
+
+(defn- watched-stream
+  "`in` whose reads record activity in `last-read` (epoch ms)."
+  ^java.io.InputStream [^java.io.InputStream in ^java.util.concurrent.atomic.AtomicLong last-read]
+  (proxy [java.io.FilterInputStream] [in]
+    (read
+      ([] (let [b (.read in)] (.set last-read (System/currentTimeMillis)) b))
+      ([bs] (let [n (.read in ^bytes bs)] (.set last-read (System/currentTimeMillis)) n))
+      ([bs off len] (let [n (.read in ^bytes bs (int off) (int len))]
+                      (.set last-read (System/currentTimeMillis)) n)))))
+
 (defn- stream-chat-impl
   "Internal implementation of streaming chat with a provider."
   [provider model-def messages opts]
@@ -156,11 +178,28 @@
 
         ;; Make HTTP request
         response (make-request (p/provider-id provider) url headers body credentials)
-        reader (BufferedReader. (io/reader (:body response)))]
-
+        last-read (java.util.concurrent.atomic.AtomicLong. (System/currentTimeMillis))
+        stalled (atom false)
+        ^java.io.InputStream raw (:body response)
+        reader (BufferedReader. (io/reader (watched-stream raw last-read)))
+        idle-ms (long *stream-idle-ms*)
+        check (.scheduleWithFixedDelay
+               ^java.util.concurrent.ScheduledExecutorService @watchdog
+               ^Runnable (fn []
+                           (when (> (- (System/currentTimeMillis) (.get last-read)) idle-ms)
+                             (reset! stalled true)
+                             ;; the stream, not the reader: a blocked readLine
+                             ;; holds the reader's lock, so closing the reader
+                             ;; would wait for it; closing the response body
+                             ;; aborts the blocked read
+                             (try (.close raw) (catch Exception _ nil))))
+               (min idle-ms 5000) (min idle-ms 5000) java.util.concurrent.TimeUnit/MILLISECONDS)]
     {:events (sse-seq reader)
      :reader reader
-     :close! (fn [] (.close reader))}))
+     :stalled? (fn [] @stalled)
+     :close! (fn []
+               (.cancel ^java.util.concurrent.ScheduledFuture check false)
+               (.close reader))}))
 
 (defn- determine-event-type
   "Determine event type for accumulator.
@@ -219,6 +258,8 @@
                           "Retrying model chat after retryable error"))
               (Thread/sleep (long delay-ms))
               (recur (inc attempt) (:error result)))))))))
+
+(declare consume-stream)
 
 (defn chat
   "Send a chat completion request and accumulate the full response.
@@ -295,60 +336,82 @@
                          :provider provider-key}))
         (p/direct-chat provider messages opts))
 
-      ;; Standard HTTP+SSE streaming path
-      (let [{:keys [events close!]} (stream-chat provider model-def messages opts)
-            on-text (:on-text opts)
-            on-event (:on-event opts)
+      ;; Standard HTTP+SSE streaming path. A model call has no side effect,
+      ;; so a stream that stalls or breaks while it is read is asked again,
+      ;; as a request that fails to open is (`stream-chat`).
+      (loop [attempt 0]
+        (let [r (try {:response (consume-stream provider model-def messages opts)}
+                     (catch IOException e
+                       (if (< attempt 2) {:retry e} (throw e))))]
+          (if-let [e (:retry r)]
+            (do (log/log! {:level :warn :id :model/stream-retry
+                           :data {:attempt (inc attempt) :provider provider-key :model model-id
+                                  :error (.getMessage ^Exception e)}}
+                          "The response stream stalled or broke; asking again")
+                (Thread/sleep (long (calculate-backoff attempt nil)))
+                (recur (inc attempt)))
+            (:response r)))))))
+
+(defn- consume-stream
+  "Stream one response and accumulate it (see `chat`)."
+  [provider model-def messages opts]
+  (let [{:keys [events close! stalled?]} (stream-chat provider model-def messages opts)
+        on-text (:on-text opts)
+        on-event (:on-event opts)
             ;; :cancel? - optional 0-arity predicate. Polled before each
             ;; SSE event; once true we close! the reader (kills the
             ;; underlying socket — Anthropic/Fireworks stop generating
             ;; billed tokens) and throw an explicit
             ;; CancellationException so the turn-loop catcher can bail
             ;; out instead of returning a half-baked response.
-            cancel? (:cancel? opts)
-            api-type (p/api-type provider)]
-        (try
-          (let [final-state
-                (reduce
-                 (fn [state event]
-                   (when (and cancel? (cancel?))
-                     (close!)
-                     (throw (java.util.concurrent.CancellationException.
-                             "LLM call cancelled")))
+        cancel? (:cancel? opts)
+        api-type (p/api-type provider)]
+    (try
+      (let [final-state
+            (reduce
+             (fn [state event]
+               (when (and cancel? (cancel?))
+                 (close!)
+                 (throw (java.util.concurrent.CancellationException.
+                         "LLM call cancelled")))
 
                     ;; Call event callback
-                   (when on-event (on-event event))
+               (when on-event (on-event event))
 
                     ;; Stream text callback - handle both API types
-                   (when on-text
-                     (case api-type
-                       :anthropic-messages
-                       (when (and (= "content_block_delta" (:type event))
-                                  (= "text_delta" (get-in event [:delta :type])))
-                         (on-text (get-in event [:delta :text])))
+               (when on-text
+                 (case api-type
+                   :anthropic-messages
+                   (when (and (= "content_block_delta" (:type event))
+                              (= "text_delta" (get-in event [:delta :type])))
+                     (on-text (get-in event [:delta :text])))
 
-                       :openai-chat
-                       (doseq [choice (:choices event)]
-                         (when-let [text (get-in choice [:delta :content])]
-                           (on-text text)))
+                   :openai-chat
+                   (doseq [choice (:choices event)]
+                     (when-let [text (get-in choice [:delta :content])]
+                       (on-text text)))
 
-                       :openai-responses
-                       (when (= "response.output_text.delta" (:type event))
-                         (when-let [text (:delta event)]
-                           (on-text text)))
+                   :openai-responses
+                   (when (= "response.output_text.delta" (:type event))
+                     (when-let [text (:delta event)]
+                       (on-text text)))
 
-                       nil))
+                   nil))
 
                     ;; Accumulate
-                   (let [event-type (determine-event-type provider event)]
-                     (p/accumulate-event provider state event-type event model-def)))
-                 (p/create-accumulator provider model-def)
-                 events)]
+               (let [event-type (determine-event-type provider event)]
+                 (p/accumulate-event provider state event-type event model-def)))
+             (p/create-accumulator provider model-def)
+             events)]
 
             ;; Extract final response
-            (p/extract-response provider final-state))
-          (finally
-            (close!)))))))
+        (p/extract-response provider final-state))
+      (catch IOException e
+        (throw (if (stalled?)
+                 (IOException. (str "no data for " *stream-idle-ms* " ms") e)
+                 e)))
+      (finally
+        (close!)))))
 
 ;; ============================================================================
 ;; Convenience Functions

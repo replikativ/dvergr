@@ -13,6 +13,7 @@
             [dvergr.room.store :as store]
             [hasch.core :as hasch]
             [org.replikativ.spindel.core :as sp]
+            [org.replikativ.spindel.spin.core :as spin-core]
             [org.replikativ.spindel.spin.combinators :as comb]))
 
 (defn- invalid! [message type data]
@@ -362,6 +363,41 @@
              tail (sp/await (run-batches rest-spins parallelism))]
          (into head tail))))
     (sp/spin [])))
+
+(defn run-windowed
+  "A Spin yielding the values of `spins` in order, running at most
+   `parallelism` of them at a time: a new one starts as soon as one ends,
+   where `run-batches` waits for a whole batch, so one slow cell idles the
+   rest of its batch. For spins that contain their failures (the first
+   rejection rejects the whole). The window is process-local: a Spindel
+   semaphore lives in world state, and each cell runs in its own fork, so
+   its permits would be released into a copy."
+  [spins parallelism]
+  (let [spins (vec spins)
+        n (count spins)]
+    (if (zero? n)
+      (sp/spin [])
+      (spin-core/make-spin
+       (fn [resolve reject]
+         (let [results (object-array n)
+               started (atom 0)
+               finished (atom 0)
+               failed (atom false)]
+           (letfn [(start-next! []
+                     (let [i (dec (swap! started inc))]
+                       (when (and (< i n) (not @failed))
+                         ((nth spins i)
+                          (fn [v]
+                            (aset results i v)
+                            (if (= n (swap! finished inc))
+                              (spin-core/resume resolve (vec results))
+                              (start-next!)))
+                          (fn [e]
+                            (when (compare-and-set! failed false true)
+                              (spin-core/resume reject e)))))))]
+             (dotimes [_ (min (max 1 parallelism) n)] (start-next!)))
+           spin-core/incomplete))
+       :experiment/run-windowed))))
 
 (defn- passed? [receipt]
   (every? true? (vals (:attempt/checks receipt))))
@@ -744,7 +780,12 @@
                     (remove #(contains? done (cell-key %)) all-jobs))]
      (sp/spin
       (let [results (into (vec resumed)
-                          (sp/await (run-batches spins parallelism)))
+                          ;; complete-only cells contain their failures, so
+                          ;; every cell runs and a window keeps the slots
+                          ;; busy; a fail-fast experiment stops at the batch
+                          ;; that failed
+                          (sp/await ((if complete-only? run-windowed run-batches)
+                                     spins parallelism)))
             errors (filterv :error results)
             refused (filterv :refused results)]
         (when (and (seq errors) (not complete-only?))

@@ -51,3 +51,17 @@
       (is (nil? (preflight/gate est {:dollars 1.0})) "billed dollars: a subscription bills none")
       (is (contains? (preflight/gate est {:subscription 0.05}) :subscription))
       (is (nil? (preflight/gate est {:subscription 100.0}))))))
+
+(deftest recorded-runs-calibrate-the-window-estimate
+  (let [pilot [(receipt :c 0.01 1000000 1000) (receipt :c 0.01 1000000 1000)]
+        from-pilot (preflight/estimate {:pilot-receipts pilot :remaining {:c 100} :window-points 0.0})
+        calibrated (preflight/estimate {:pilot-receipts pilot :remaining {:c 100} :window-points 0.0
+                                        :calibration {:points-per-token 1e-9 :tokens 50000000}})]
+    (is (= :pilot (get-in from-pilot [:window-rate :from])))
+    (is (= :recorded-runs (get-in calibrated [:window-rate :from])))
+    (is (< (get-in calibrated [:window-points :expected]) (get-in from-pilot [:window-points :expected]))
+        "a pilot that moved no whole point can only bound the rate coarsely")
+    (testing "fewer recorded tokens than the pilot's: the pilot decides"
+      (is (= :pilot (get-in (preflight/estimate {:pilot-receipts pilot :remaining {:c 1} :window-points 0.0
+                                                 :calibration {:points-per-token 1e-9 :tokens 10}})
+                            [:window-rate :from]))))))

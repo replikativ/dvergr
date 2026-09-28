@@ -704,3 +704,22 @@
       (finally
         (evaluation/await-cleanups! room 5000)
         (d/close-room! room)))))
+
+(deftest a-slow-cell-does-not-idle-the-others
+  ;; the window (complete-only experiments) starts a new spin as soon as one
+  ;; ends: with 2 slots, one slow spin and four quick ones, the quick ones all
+  ;; finish while the slow one runs
+  (let [room (d/make-room {:id :experiment-window :store (memory/make)})
+        order (atom [])
+        slow (fn [k ms] (org.replikativ.spindel.spin.core/make-spin
+                         (fn [resolve _]
+                           (future (Thread/sleep (long ms)) (swap! order conj k) (resolve k))
+                           org.replikativ.spindel.spin.core/incomplete)
+                         (keyword (str "spin-" (name k)))))]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [spins [(slow :slow 1500) (slow :q1 100) (slow :q2 100) (slow :q3 100) (slow :q4 100)]
+              result @(experiment/run-windowed spins 2)]
+          (is (= [:slow :q1 :q2 :q3 :q4] result) "results in the spins' order")
+          (is (= :slow (peek @order)) "the quick ones did not wait for the slow one's batch")))
+      (finally (d/close-room! room)))))

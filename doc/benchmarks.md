@@ -528,12 +528,27 @@ loop; 120 cells, the weekly Codex window did not move a point):
 Shortlist: `:lean`, `:batch`. The guidance the REPL runs under decides its cost: the
 default advice cost a third more than saying nothing.
 
-The held-out confirmation (30 eval tasks × 2 repetitions, reference vs `:lean` vs `:batch`)
-did not run: its preflight stopped it after the pilot, estimating 9 points of the weekly
-window (14.8 conservative) against a budget of 10. The estimate is high because the meter
-shows whole points and the pilot moved one; the day's runs measured about 130 cells per
-point, which puts the run at one or two. Next: estimate from that cross-run calibration
-(tokens → points over all recorded readings) instead of the pilot's single coarse step.
+**Held-out confirmation** (2026-09-28, 30 eval tasks, five per domain, never used in tuning,
+× 2 repetitions, Luna; 180 cells; the weekly Codex window did not move a point):
+
+| Candidate | Mean partial credit | Pass rate | List price per task |
+| --- | --- | --- | --- |
+| upstream's loop (reference) | 0.546 | 13% | $0.062 |
+| REPL, `:batch` | 0.536 | 18% | $0.049 |
+| REPL, `:lean` | 0.576 | 18% | $0.044 |
+
+Paired by task against the reference (95%):
+
+| Variant | Reward difference | Cost ratio | Cost difference |
+| --- | --- | --- | --- |
+| `:lean` | +0.030 [−0.056, +0.116] | 0.71 | −$0.018 [−$0.026, −$0.010] |
+| `:batch` | −0.010 [−0.078, +0.059] | 0.80 | −$0.012 [−$0.022, −$0.002] |
+
+On held-out tasks the REPL with lean guidance costs 29% less, with an interval that excludes
+no saving, at a reward no worse on the estimate. It falls short of the strict non-inferiority
+rule at a 0.05 margin by 0.006 (lower bound −0.056). The claim that holds: about 30% cheaper at
+equal task success, on held-out AutomationBench tasks, with Luna. Open: a second model and a
+second benchmark. The earlier default guidance (`:compute`) is not among these: tuning dropped it.
 
 Not done: the `zapier` meta-tool toolset; the private held-out set, which upstream does not
 release.
@@ -545,6 +560,49 @@ Setup: `benchmarks/resources/benchmarks/automationbench/README.md`. Run:
 (abx/run! {:dir ".dvergr/benchmarks/ab-smoke" :domains abx/public-domains :sample 1
            :candidates [{:id :luna :model "codex-subscription-luna"}]})
 ```
+
+## BIRD on Datahike (text-to-SQL, and Datalog)
+
+BIRD (https://bird-bench.github.io, CC BY-SA 4.0; dev set: 11 SQLite databases, 1,534 questions
+with gold SQL; `dvergr.benchmarks.bird.*`). A question is answered by a query; upstream's
+execution accuracy runs it and compares its SET of result rows with the gold SQL's on SQLite
+(Python equality: 1 = 1.0). The question here is whether Datahike, the store dvergr is built
+on, is competitive as the database under such work, with SQL (through pg-datahike) and with
+Datalog.
+
+- **Data:** every SQLite table is loaded into Datahike as attributes `:table/column` with
+  pg-datahike's row marker (`bird.load`), so the same data answers SQL and `d/q`.
+  Identifiers are lower-cased (SQLite's are case-insensitive), and value types are inferred
+  from the values (SQLite does not enforce declared types).
+- **Candidates:** one loop for every engine (`bird.provider`). The candidate sees the
+  question, BIRD's evidence and the schema, with a `query` tool (run a query, see up to 50
+  rows) and `submit`. The engine is the candidate's:
+  - `:sqlite`: SQL on SQLite, as upstream;
+  - `:pg-datahike`: SQL on Datahike;
+  - `:datalog`: a Clojure expression over `(q query & inputs)`, evaluated in the sandbox.
+    Ranking is `sort-by`/`take`, since Datalog has no ORDER BY or LIMIT.
+- **Grading:** the evaluator re-runs the submitted query on the candidate's engine and
+  compares rows with the gold.
+
+**Substrate check (zero tokens, `bird.compat`).** Every gold query on SQLite and through
+pg-datahike on the same data, raw and through a SQLite→PostgreSQL rewrite (`bird.dialect`:
+backticks and case-folding, `IIF`, `STRFTIME` on ISO text, `INSTR`, `DATE('now')`,
+`LIMIT a, b`, SQLite's NULL ordering). On 6 of the 11 databases (858 questions; the five
+large ones pending):
+
+| | exact match with SQLite |
+| --- | --- |
+| raw BIRD SQL through pg-datahike | 624 / 858 (73%) |
+| with the dialect rewrite | 748 / 858 (87%): simple 437/479, moderate 227/277, challenging 84/102 |
+
+The remaining 110 split into:
+- pg-datahike defects, 11 of them, each reproduced in isolation and handed over
+  (2026-09-28). The worst: every window function returns NULL after the 8th row (a
+  transient written in place). Others include a derived table's `ORDER BY … LIMIT` and
+  `HAVING` being ignored, and `DISTINCT … ORDER BY … LIMIT` over a join dropping rows.
+- SQLite semantics PostgreSQL rightly rejects (type affinity, lenient CAST, bare GROUP BY
+  columns), for a proposed SQLite compatibility mode.
+- Ties at `LIMIT` and float summation order, which are not defects.
 
 ## BFCL v4 (single-turn, Python)
 
