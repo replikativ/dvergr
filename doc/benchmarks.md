@@ -528,6 +528,13 @@ loop; 120 cells, the weekly Codex window did not move a point):
 Shortlist: `:lean`, `:batch`. The guidance the REPL runs under decides its cost: the
 default advice cost a third more than saying nothing.
 
+The held-out confirmation (30 eval tasks × 2 repetitions, reference vs `:lean` vs `:batch`)
+did not run: its preflight stopped it after the pilot, estimating 9 points of the weekly
+window (14.8 conservative) against a budget of 10. The estimate is high because the meter
+shows whole points and the pilot moved one; the day's runs measured about 130 cells per
+point, which puts the run at one or two. Next: estimate from that cross-run calibration
+(tokens → points over all recorded readings) instead of the pilot's single coarse step.
+
 Not done: the `zapier` meta-tool toolset; the private held-out set, which upstream does not
 release.
 
