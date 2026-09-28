@@ -157,9 +157,22 @@ around 40, and every definition costs context in every session.
 
 ## Protocol
 
-Handshake versions 2024-11-05, 2025-03-26, 2025-06-18 and 2025-11-25; an unknown version is
-answered with the latest. Tools, resources (derived from the read ops) with subscriptions, and
-`listChanged`. Unknown tools are `-32602`, unknown resources `-32002`.
+Both eras of the protocol, decided per request, so one connection may carry both:
+
+- **Handshake versions** 2024-11-05, 2025-03-26, 2025-06-18 and 2025-11-25: `initialize`, then
+  requests; an unknown version is answered with the latest. Tools, resources (derived from the
+  read ops) with subscriptions, `listChanged` and `ping`. Unknown tools are `-32602`, unknown
+  resources `-32002`.
+- **Stateless 2026-07-28**: no `initialize`; each request names its version, client info and
+  capabilities in `_meta` (`io.modelcontextprotocol/protocolVersion`, `…/clientInfo`,
+  `…/clientCapabilities`), and its tool selection too (`dvergr/profile`, `dvergr/toolsets`,
+  `dvergr/room`, `dvergr/tools`), which holds for that request only. `server/discover` names
+  every supported version, the capabilities and the instructions. Every result has
+  `resultType: "complete"` and the server's info in `_meta` (`io.modelcontextprotocol/serverInfo`);
+  lists and reads carry `ttlMs` and `cacheScope` (`private`: what a client sees depends on its
+  selection; a read is live, `ttlMs` 0). A version the server does not speak is refused with
+  `-32022` and `data {supported, requested}`; an unknown resource is `-32602`; `ping` is gone.
+  Subscriptions (`subscriptions/listen`) and progress come next, then the HTTP transport.
 
 A connection answers requests concurrently: every `tools/call` and `resources/read` runs on
 its own virtual thread, so a `job_status` wait or a long evaluation does not hold up the
