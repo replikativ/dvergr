@@ -1,8 +1,14 @@
 (ns dvergr.mcp.json-rpc
-  "Clean-room JSON-RPC 2.0 dispatch and MCP protocol handlers.
-   Implements the MCP handshake protocols 2024-11-05 through 2025-11-25.
-   `handle-message` answers one message; the transport
-   (`dvergr.mcp.server/dispatch!`) decides what runs concurrently.
+  "Clean-room JSON-RPC 2.0 dispatch and MCP protocol handlers, for both eras
+   of the protocol:
+   - the handshake versions 2024-11-05 through 2025-11-25: `initialize`, then
+     requests on that connection's session;
+   - the stateless 2026-07-28: each request names its version, client info
+     and capabilities in `_meta` (`io.modelcontextprotocol/*`), no
+     `initialize`; `server/discover` tells a client what the server speaks.
+   The era is decided per request (a stateless version in `_meta`), so one
+   connection may carry both. `handle-message` answers one message; the
+   transport (`dvergr.mcp.server/dispatch!`) decides what runs concurrently.
 
    All handlers are plain fns: (fn [context message] -> result-map | nil).
    handle-message returns a response map directly (no promises).")
@@ -44,6 +50,11 @@
 (def supported-versions
   "Handshake protocol versions, oldest first."
   ["2024-11-05" "2025-03-26" "2025-06-18" "2025-11-25"])
+
+(def stateless-versions
+  "Stateless protocol versions (no handshake; the version is in each
+   request's `_meta`), oldest first."
+  ["2026-07-28"])
 
 (defn negotiate-version
   "The version to answer `requested` with: the same when supported, else the
@@ -167,7 +178,9 @@
   {"ping" ping-handler
    "initialize" initialize-handler
    "notifications/initialized" (fn [ctx msg]
-                                 (initialized-notification-handler ctx msg))})
+                                 (initialized-notification-handler ctx msg))
+   ;; a stateless client never initializes and may still cancel
+   "notifications/cancelled" cancelled-notification-handler})
 
 (defn- post-init-handlers
   "Handler map after initialization is complete."
@@ -181,6 +194,117 @@
    "resources/subscribe" resources-subscribe-handler
    "resources/unsubscribe" resources-unsubscribe-handler
    "notifications/cancelled" cancelled-notification-handler})
+
+;; ============================================================================
+;; The stateless era (2026-07-28)
+;; ============================================================================
+
+(def ^:private mcp-meta
+  "The `_meta` keys the stateless protocol reserves."
+  {:protocol-version :io.modelcontextprotocol/protocolVersion
+   :client-info :io.modelcontextprotocol/clientInfo
+   :client-capabilities :io.modelcontextprotocol/clientCapabilities
+   :server-info :io.modelcontextprotocol/serverInfo})
+
+(defn request-version
+  "The protocol version a request names in its `_meta`, or nil (a handshake-era
+   request)."
+  [message]
+  (get-in message [:params :_meta (:protocol-version mcp-meta)]))
+
+(defn stateless?
+  "Whether `message` is answered in the stateless era: `server/discover`, or a
+   request whose `_meta` names a version that is not a handshake version (an
+   unsupported one is answered with that era's error)."
+  [message]
+  (let [v (request-version message)]
+    (or (= "server/discover" (:method message))
+        (and (some? v) (not (some #{v} supported-versions))))))
+
+(def ^:private cache-hints
+  "`ttlMs`/`cacheScope` of each cacheable result. `private`: what a connection
+   sees depends on its selection (profile, toolsets, pinned room), so no
+   shared cache may reuse it; a read is live, so it is not reused at all."
+  {"server/discover" {:ttlMs 300000 :cacheScope "private"}
+   "tools/list" {:ttlMs 60000 :cacheScope "private"}
+   "resources/list" {:ttlMs 60000 :cacheScope "private"}
+   "resources/templates/list" {:ttlMs 60000 :cacheScope "private"}
+   "resources/read" {:ttlMs 0 :cacheScope "private"}})
+
+(def ^:private stateless-capabilities
+  ;; list changes and resource subscriptions arrive with subscriptions/listen
+  {:tools {} :resources {}})
+
+(defn- discover-handler [context _message]
+  (let [session @(:session context)]
+    (cond-> {:supportedVersions (into (vec stateless-versions) (rseq supported-versions))
+             :capabilities stateless-capabilities}
+      (:instructions session) (assoc :instructions (:instructions session)))))
+
+(def ^:private stateless-handlers
+  {"server/discover" discover-handler
+   "tools/list" tools-list-handler
+   "tools/call" tools-call-handler
+   "resources/list" resources-list-handler
+   "resources/templates/list" resources-templates-list-handler
+   "resources/read" resources-read-handler
+   "notifications/cancelled" cancelled-notification-handler})
+
+(defn- unsupported-version-response [id requested]
+  {:jsonrpc "2.0" :id id
+   :error {:code -32022
+           :message (str "Unsupported protocol version: " requested)
+           :data {:supported (into (vec stateless-versions) (rseq supported-versions))
+                  :requested requested}}})
+
+(defn- error-response
+  "The response for exception `e` from a handler: the protocol error it names
+   (`:json-rpc/code`), else an internal error."
+  [id ^Exception e]
+  (let [{code :json-rpc/code data :json-rpc/data} (ex-data e)]
+    (cond
+      (= -32602 code) (invalid-params-response id (.getMessage e))
+      ;; any other protocol error a handler names (e.g. -32002, resource
+      ;; not found)
+      (integer? code) {:jsonrpc "2.0" :id id
+                       :error (cond-> {:code code :message (.getMessage e)}
+                                data (assoc :data data))}
+      :else (internal-error-response id (.getMessage e)))))
+
+(defn- handle-stateless
+  "Answer a stateless-era message. The request carries everything: its
+   selection comes from its own `_meta` (`(:request-context context)`), the
+   connection's session is not consulted except for cancellations. Every
+   result says it is complete and which server answered."
+  [context message]
+  (let [{:keys [id method params]} message
+        version (request-version message)
+        handler (get stateless-handlers method)]
+    (cond
+      (and version (not (some #{version} stateless-versions)))
+      (when id (unsupported-version-response id version))
+
+      (nil? handler)
+      (when id (method-not-found-response id))
+
+      (nil? id)
+      (try (handler context message) nil
+           (catch Exception _ nil))
+
+      :else
+      (try
+        (let [ctx (if-let [f (:request-context context)] (f params) context)
+              result (handler ctx message)]
+          {:jsonrpc "2.0" :id id
+           :result (-> result
+                       (merge (get cache-hints method))
+                       (assoc :resultType "complete")
+                       (assoc-in [:_meta (:server-info mcp-meta)] (:server-info @(:session context))))})
+        (catch Exception e
+          (let [resp (error-response id e)]
+            ;; a missing resource is invalid params in this era (-32002 before)
+            (cond-> resp
+              (= -32002 (get-in resp [:error :code])) (assoc-in [:error :code] -32602))))))))
 
 ;; ============================================================================
 ;; Session factory
@@ -227,6 +351,9 @@
       (nil? method)
       nil
 
+      (stateless? message)
+      (handle-stateless context message)
+
       ;; Unknown method
       (nil? handler)
       (when id
@@ -251,12 +378,4 @@
            :id id
            :result result})
         (catch Exception e
-          (let [{code :json-rpc/code data :json-rpc/data} (ex-data e)]
-            (cond
-              (= -32602 code) (invalid-params-response id (.getMessage e))
-              ;; any other protocol error a handler names (e.g. -32002,
-              ;; resource not found)
-              (integer? code) {:jsonrpc "2.0" :id id
-                               :error (cond-> {:code code :message (.getMessage e)}
-                                        data (assoc :data data))}
-              :else (internal-error-response id (.getMessage e)))))))))
+          (error-response id e))))))

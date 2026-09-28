@@ -38,7 +38,9 @@
 ;; ============================================================================
 
 (def ^:private json-write-mapper
-  (json/object-mapper {:encode-key-fn name}))
+  ;; keys keep their namespace: the protocol's `_meta` keys are
+  ;; `io.modelcontextprotocol/…`
+  (json/object-mapper {:encode-key-fn (fn [k] (if (keyword? k) (subs (str k) 1) (str k)))}))
 
 (def ^:private json-read-mapper
   (json/object-mapper {:decode-key-fn keyword}))
@@ -294,14 +296,15 @@
       :else nil)))
 
 (defn- read-resource [uri]
-  (if-let [dmn (current-daemon)]
-    (if-let [{:keys [op args]} (uri->op+args uri)]
+  (if-let [{:keys [op args]} (uri->op+args uri)]
+    (if-let [dmn (current-daemon)]
       {:contents [{:uri uri :mimeType "application/json"
                    :text (-> (surface/data-result (ops/invoke dmn op args)) :content first :text)}]}
-      ;; the protocol's error for a resource that does not exist
-      (throw (ex-info (str "Resource not found: " uri)
-                      {:json-rpc/code -32002 :json-rpc/data {:uri uri}})))
-    {:contents []}))
+      {:contents []})
+    ;; the protocol's error for a resource that does not exist (the
+    ;; stateless era answers it as -32602, `json-rpc/handle-stateless`)
+    (throw (ex-info (str "Resource not found: " uri)
+                    {:json-rpc/code -32002 :json-rpc/data {:uri uri}}))))
 
 (defonce ^:private resource-subs (atom {}))  ; uri -> #{send-fn}
 (defonce ^:private room-uris (atom {}))      ; room-id -> #{uri} with a live facts watcher
@@ -406,8 +409,9 @@
           :instructions surface/instructions})))
 
 (defn- meta-selection
-  "The tool selection a client asks for in `initialize` `_meta`
-   (`dvergr/profile`, `dvergr/toolsets`), over the connection's default."
+  "The tool selection a client asks for in `_meta` (`dvergr/profile`,
+   `dvergr/toolsets`, `dvergr/room`, `dvergr/tools`) of `initialize` or of a
+   stateless request, over the connection's default."
   [default params]
   (let [m (:_meta params)
         profile (or (get m :dvergr/profile) (get m (keyword "dvergr/profile")))
@@ -422,21 +426,28 @@
 (defn session-context
   "The per-connection dispatch context: `send-fn` writes to the client;
    `selection` (from `surface/selection`) is the default tool selection, which
-   the client may replace in `initialize` `_meta`."
+   the client may replace in `initialize` `_meta` (handshake era) or name in
+   each request's `_meta` (stateless era, `:request-context`)."
   [send-fn selection]
-  (let [sel (atom selection)]
-    {:session (make-session)
-     :send-fn send-fn
-     :tool-defs tool-definitions
-     :tool-handlers tool-handlers
-     :tool-visible? (fn [td] (surface/visible? @sel td))
-     :tool-view (fn [td] (surface/pinned-view @sel td))
-     :on-initialize (fn [params] (reset! sel (meta-selection selection params)))
-     :selection sel
-     :resource-defs resource-definitions
-     :read-resource read-resource
-     :subscribe-resource subscribe-resource!
-     :unsubscribe-resource unsubscribe-resource!}))
+  (let [scoped (fn [sel]
+                 {:tool-visible? (fn [td] (surface/visible? @sel td))
+                  :tool-view (fn [td] (surface/pinned-view @sel td))
+                  :selection sel})
+        sel (atom selection)
+        context (merge {:session (make-session)
+                        :send-fn send-fn
+                        :tool-defs tool-definitions
+                        :tool-handlers tool-handlers
+                        :on-initialize (fn [params] (reset! sel (meta-selection selection params)))
+                        :resource-defs resource-definitions
+                        :read-resource read-resource
+                        :subscribe-resource subscribe-resource!
+                        :unsubscribe-resource unsubscribe-resource!}
+                       (scoped sel))]
+    ;; a stateless request brings its own selection in `_meta`, over the
+    ;; connection's default; it does not change the connection's
+    (assoc context :request-context
+           (fn [params] (merge context (scoped (atom (meta-selection selection params))))))))
 
 ;; ============================================================================
 ;; Connection handling (shared by TCP and stdio)
