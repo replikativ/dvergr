@@ -505,6 +505,36 @@ candidate's write landed in other columns than upstream's would have. Worlds now
 boundary as JSON text, never parsed on the dvergr side (provider version 2; a regression
 test replays that write).
 
+**Tuning on pilots, proving on held-out tasks.** Upstream has no split, so `:split :dev` is
+a fixed third of each domain's tasks (by the digest of `domain/id`) and `:split :eval` the
+rest; nothing tuned on dev is reported from it. `abx/tune!` runs a baseline and variants on
+dev tasks and `experiment.select/choose` shortlists the cheaper variants whose mean reward is
+within 0.05 of the baseline's. A pilot chooses on point estimates: at 12 worlds a paired
+reward interval is about ±0.15 wide, so demanding proof there keeps the baseline every
+time (the first version of the rule did exactly that). The shortlist then runs against the
+baseline on eval tasks, frozen, where the claim is tested with intervals
+(`:rule :non-inferior`).
+
+Development tuning (2026-09-28, 12 dev tasks × 2 repetitions, Luna, against the reference
+loop; 120 cells, the weekly Codex window did not move a point):
+
+| Variant | Reward difference [95%] | Cost ratio |
+| --- | --- | --- |
+| Dvergr's loop, upstream's tools | +0.09 [−0.06, +0.23] | 0.97 |
+| REPL, `:compute` guidance (the default so far) | −0.04 [−0.20, +0.12] | 0.83 |
+| REPL, `:batch` (fetch everything a decision needs in one evaluation, return only the deciding fields) | +0.06 [−0.06, +0.18] | 0.69 |
+| REPL, `:lean` (the APIs' docs, no advice) | +0.01 [−0.13, +0.15] | 0.61 |
+
+Shortlist: `:lean`, `:batch`. The guidance the REPL runs under decides its cost: the
+default advice cost a third more than saying nothing.
+
+The held-out confirmation (30 eval tasks × 2 repetitions, reference vs `:lean` vs `:batch`)
+did not run: its preflight stopped it after the pilot, estimating 9 points of the weekly
+window (14.8 conservative) against a budget of 10. The estimate is high because the meter
+shows whole points and the pilot moved one; the day's runs measured about 130 cells per
+point, which puts the run at one or two. Next: estimate from that cross-run calibration
+(tokens → points over all recorded readings) instead of the pilot's single coarse step.
+
 Not done: the `zapier` meta-tool toolset; the private held-out set, which upstream does not
 release.
 

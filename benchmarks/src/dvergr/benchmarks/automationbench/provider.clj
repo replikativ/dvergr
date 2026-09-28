@@ -83,13 +83,14 @@
        :run (fn [{:keys [room agent environment cancelled? model-scope]}]
               (let [task (task-of environment)
                     max-turns (get-in environment [:environment/limits :max-turns] 50)
-                    {:automationbench/keys [harness action-space]} (:agent/metadata agent)
+                    {:automationbench/keys [harness action-space repl-guidance]} (:agent/metadata agent)
                     episode {:room room :sidecar sidecar :task task :max-turns max-turns
                              :cancelled? cancelled? :model-scope model-scope}
                     outcome (if (and (= :dvergr harness) (not agent-generate))
                               (harness/run-episode!
                                episode (assoc (:agent/model-policy agent)
                                               :action-space action-space
+                                              :guidance (or repl-guidance :compute)
                                               :budget-dollars (get-in agent [:agent/program :budget-dollars])))
                               (ep/run-episode!
                                (assoc episode :generate
@@ -177,13 +178,19 @@
 
 (defn candidate-roster
   "AgentDefs for candidate specs `{:id :model :provider :budget-dollars
-   :harness :action-space}`. `:harness :reference` (default) is the model
-   behind upstream's loop; `:dvergr` is Dvergr's agent loop with `:action-space
-   :tools` (upstream's tools) or `:repl` (`harness`). The prompt is the task's."
+   :harness :action-space :repl-guidance}`. `:harness :reference` (default) is
+   the model behind upstream's loop; `:dvergr` is Dvergr's agent loop with
+   `:action-space :tools` (upstream's tools) or `:repl` (`harness`, guided by
+   `:repl-guidance`, one of `harness/repl-guidance`). The prompt is the task's."
   [specs]
-  (reduce (fn [team {:keys [id model provider budget-dollars harness action-space]
-                     :or {budget-dollars 2.0 harness :reference action-space :tools}}]
-            (let [model-id (registry/resolve-alias model)]
+  (reduce (fn [team {:keys [id model provider budget-dollars harness action-space repl-guidance]
+                     :or {budget-dollars 2.0 harness :reference action-space :tools repl-guidance :compute}}]
+            (let [model-id (registry/resolve-alias model)
+                  repl? (and (= :dvergr harness) (= :repl action-space))]
+              (when (and repl? (not (contains? harness/repl-guidance repl-guidance)))
+                (throw (ex-info "Unknown :repl-guidance"
+                                {:type ::unknown-repl-guidance :repl-guidance repl-guidance
+                                 :known (set (keys harness/repl-guidance))})))
               (roster/make-agent
                team
                {:id id
@@ -195,7 +202,9 @@
                 :metadata (cond-> {:automationbench/harness harness}
                             (= :dvergr harness)
                             (assoc :automationbench/action-space action-space)
-                            (harness/guidance-sha256 (when (= :dvergr harness) action-space))
-                            (assoc :automationbench/guidance-sha256 (harness/guidance-sha256 action-space)))})))
+                            repl?
+                            (assoc :automationbench/repl-guidance repl-guidance
+                                   :automationbench/guidance-sha256
+                                   (harness/guidance-sha256 action-space repl-guidance)))})))
           (roster/make-roster {:id :automationbench/candidates})
           specs))

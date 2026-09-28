@@ -2,9 +2,12 @@
   "AutomationBench on the generic evaluation path, with scripted candidates
    (no model), over upstream's code in the sidecar. Skipped without the
    checkout (see `dvergr.benchmarks.automationbench.sidecar`)."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.set]
+            [clojure.test :refer [deftest is testing]]
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.run :as run]
+            [dvergr.benchmarks.automationbench.experiment :as abx]
+            [dvergr.benchmarks.automationbench.harness :as harness]
             [dvergr.benchmarks.automationbench.provider :as provider]
             [dvergr.benchmarks.automationbench.sidecar :as sc]
             [dvergr.discourse :as d]
@@ -176,3 +179,21 @@
                               (is (re-find #"ab/fetch" (pr-str (:messages (first @requests))))
                                   "the REPL guidance is in the system prompt")))))
               (finally (d/close-room! room)))))))))
+
+(deftest tuning-and-reporting-never-share-a-task
+  (if-not (sc/available?)
+    (support/skip! "tuning-and-reporting-never-share-a-task: no AutomationBench checkout")
+    (let [all (sc/tasks (sc/shared!) abx/public-domains)
+          dev (abx/select-tasks (sc/shared!) {:split :dev})
+          ev (abx/select-tasks (sc/shared!) {:split :eval})]
+      (is (= (count all) (+ (count dev) (count ev))))
+      (is (empty? (clojure.set/intersection (set (map (juxt #(get % "domain") #(get % "id")) dev))
+                                            (set (map (juxt #(get % "domain") #(get % "id")) ev)))))
+      (is (< 0.25 (/ (count dev) (count all)) 0.42) "about a third is for tuning")
+      (testing "a split is fixed by the task, not by the sample"
+        (is (every? #(= :dev (abx/split-of %)) (abx/select-tasks (sc/shared!) {:split :dev :sample 2}))))
+      (testing "guidance variants are distinct candidates"
+        (is (apply distinct? (map #(harness/guidance-sha256 :repl %) (keys harness/repl-guidance))))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (provider/candidate-roster [{:id :x :model "claude-code-sonnet" :harness :dvergr
+                                                  :action-space :repl :repl-guidance :nope}])))))))
