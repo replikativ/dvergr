@@ -18,6 +18,11 @@
             [dvergr.benchmarks.bird.core :as bird])
   (:import [java.sql Connection]))
 
+(def version-tag
+  "Part of every BIRD verifier's basis: a change to how data is loaded is a
+   change to what a score means."
+  "bird.load/1: lower-cased identifiers, value-inferred types, pg-datahike row markers")
+
 (defn- ident [s] (str/lower-case (str s)))
 
 (defn tables

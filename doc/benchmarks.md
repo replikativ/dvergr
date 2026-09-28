@@ -549,6 +549,49 @@ Setup: `benchmarks/resources/benchmarks/automationbench/README.md`. Run:
            :candidates [{:id :luna :model "codex-subscription-luna"}]})
 ```
 
+## BIRD on Datahike (text-to-SQL, and Datalog)
+
+BIRD (https://bird-bench.github.io, CC BY-SA 4.0; dev set: 11 SQLite databases, 1,534 questions
+with gold SQL; `dvergr.benchmarks.bird.*`). A question is answered by a query; upstream's
+execution accuracy runs it and compares its SET of result rows with the gold SQL's on SQLite
+(Python equality: 1 = 1.0). The question here is whether Datahike, the store dvergr is built
+on, is competitive as the database under such work, with SQL (through pg-datahike) and with
+Datalog.
+
+- **Data:** every SQLite table is loaded into Datahike as attributes `:table/column` with
+  pg-datahike's row marker (`bird.load`), so the same data answers SQL and `d/q`.
+  Identifiers are lower-cased (SQLite's are case-insensitive), and value types are inferred
+  from the values (SQLite does not enforce declared types).
+- **Candidates:** one loop for every engine (`bird.provider`). The candidate sees the
+  question, BIRD's evidence and the schema, with a `query` tool (run a query, see up to 50
+  rows) and `submit`. The engine is the candidate's:
+  - `:sqlite`: SQL on SQLite, as upstream;
+  - `:pg-datahike`: SQL on Datahike;
+  - `:datalog`: a Clojure expression over `(q query & inputs)`, evaluated in the sandbox.
+    Ranking is `sort-by`/`take`, since Datalog has no ORDER BY or LIMIT.
+- **Grading:** the evaluator re-runs the submitted query on the candidate's engine and
+  compares rows with the gold.
+
+**Substrate check (zero tokens, `bird.compat`).** Every gold query on SQLite and through
+pg-datahike on the same data, raw and through a SQLite→PostgreSQL rewrite (`bird.dialect`:
+backticks and case-folding, `IIF`, `STRFTIME` on ISO text, `INSTR`, `DATE('now')`,
+`LIMIT a, b`, SQLite's NULL ordering). On 6 of the 11 databases (858 questions; the five
+large ones pending):
+
+| | exact match with SQLite |
+| --- | --- |
+| raw BIRD SQL through pg-datahike | 624 / 858 (73%) |
+| with the dialect rewrite | 748 / 858 (87%): simple 437/479, moderate 227/277, challenging 84/102 |
+
+The remaining 110 split into:
+- pg-datahike defects, 11 of them, each reproduced in isolation and handed over
+  (2026-09-28). The worst: every window function returns NULL after the 8th row (a
+  transient written in place). Others include a derived table's `ORDER BY … LIMIT` and
+  `HAVING` being ignored, and `DISTINCT … ORDER BY … LIMIT` over a join dropping rows.
+- SQLite semantics PostgreSQL rightly rejects (type affinity, lenient CAST, bare GROUP BY
+  columns), for a proposed SQLite compatibility mode.
+- Ties at `LIMIT` and float summation order, which are not defects.
+
 ## BFCL v4 (single-turn, Python)
 
 The Berkeley Function Calling Leaderboard, pinned at gorilla `6ea5797`
