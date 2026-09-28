@@ -5,15 +5,14 @@
    picks the cheapest variant that is not worse than the baseline, so the full
    run, on tasks the tuning never saw, runs the efficient one.
 
-   The rule, per variant against the baseline, paired by world:
-
-     non-inferior  the 95% lower bound of the reward difference is above
-                   `-margin` (default 0.05): it loses at most that much
-     cheaper       its mean cost per world is below the baseline's
-
-   Among non-inferior variants the cheapest wins; when none is non-inferior,
-   or none is cheaper, the baseline stays. Every variant's comparison is in
-   the result, so the choice says why. Pure and portable (simmis can show it)."
+   Per variant against the baseline, paired by world: is its reward good
+   enough (within `margin`, by the mean on a pilot, by the 95% lower bound
+   when confirming), and is it cheaper? The cheapest good-enough variants form
+   the shortlist; with none the baseline stays. Tuning chooses on point
+   estimates, because a pilot is too small to prove anything (at 12 worlds a
+   reward interval is ±0.15 wide); the held-out run is where the claim is
+   proven. Every variant's comparison is in the result, so the choice says
+   why. Pure and portable (simmis can show it)."
   (:require [dvergr.agent.experiment.stats :as stats]))
 
 (defn- cost [entry]
@@ -48,19 +47,35 @@
 
 (defn choose
   "The variant to run, from pilot Scorecard `entries`: `{:choice id :reason
-   kw :comparisons [...]}`. `variants` excludes `baseline`."
+   kw :shortlist [ids] :comparisons [...]}`. `variants` excludes `baseline`.
+
+   `:rule` is what the evidence must show:
+     :expected      (default; tuning) the mean reward difference is above
+                    `-margin`: a pilot is too small to prove anything, so it
+                    chooses on point estimates, and the held-out run proves
+     :non-inferior  (confirmation) the 95% lower bound is above `-margin`
+   Either way only cheaper variants qualify; `:shortlist` is every qualifying
+   variant, cheapest first (at most `:keep`, default 2): what a held-out run
+   then confirms."
   ([entries baseline variants] (choose entries baseline variants {}))
-  ([entries baseline variants {:keys [margin] :or {margin 0.05}}]
+  ([entries baseline variants {:keys [margin rule keep] :or {margin 0.05 rule :expected keep 2}}]
    (let [comparisons (mapv #(compare-to entries baseline %) variants)
-         non-inferior? (fn [{:keys [reward]}]
-                         (when-let [[lo _] (:interval reward)] (> lo (- margin))))
+         good-enough? (fn [{:keys [reward]}]
+                        (case rule
+                          :expected (some-> (:mean reward) (> (- margin)))
+                          :non-inferior (when-let [[lo _] (:interval reward)] (> lo (- margin)))))
          cheaper? (fn [{:keys [cost]}] (some-> (:ratio cost) (< 1.0)))
-         eligible (filter #(and (non-inferior? %) (cheaper? %)) comparisons)
-         best (first (sort-by #(get-in % [:cost :ratio]) eligible))]
-     {:choice (if best (:variant best) baseline)
-      :reason (cond best :cheaper-and-non-inferior
-                    (some non-inferior? comparisons) :none-cheaper
-                    :else :none-non-inferior)
+         shortlist (->> comparisons
+                        (filter #(and (good-enough? %) (cheaper? %)))
+                        (sort-by #(get-in % [:cost :ratio]))
+                        (take keep)
+                        (mapv :variant))]
+     {:choice (or (first shortlist) baseline)
+      :shortlist shortlist
+      :reason (cond (seq shortlist) :cheaper-and-good-enough
+                    (some good-enough? comparisons) :none-cheaper
+                    :else :none-good-enough)
+      :rule rule
       :baseline baseline
       :margin margin
       :comparisons comparisons})))

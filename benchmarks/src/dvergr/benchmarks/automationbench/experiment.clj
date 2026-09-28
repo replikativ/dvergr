@@ -90,10 +90,10 @@
   "Choose among `variants` (candidate specs) of `baseline` (a candidate spec)
    on the development split: run all of them on `:sample` dev tasks per
    domain (default 2) with `:repetitions` (default 2), then
-   `experiment.select/choose`: the cheapest variant whose reward is not worse
-   than the baseline's by more than `:margin`. Returns `{:choice :spec
-   :selection :run}`; `:spec` is the chosen candidate spec, to run on
-   `:split :eval`."
+   `experiment.select/choose`: the cheapest variants whose mean reward is
+   within `:margin` of the baseline's. Returns `{:choice :shortlist :specs
+   :selection :run}`; `:specs` are the shortlisted candidate specs, to confirm
+   against the baseline on `:split :eval`."
   [{:keys [baseline variants sample repetitions margin] :or {sample 2 repetitions 2 margin 0.05}
     :as opts}]
   (let [specs (into [baseline] variants)
@@ -102,6 +102,7 @@
         selection (when-let [entries (seq (get-in r [:scorecard :scorecard/entries]))]
                     (select/choose entries (:id baseline) (mapv :id variants) {:margin margin}))]
     {:choice (:choice selection)
-     :spec (some #(when (= (:choice selection) (:id %)) %) specs)
+     :shortlist (:shortlist selection)
+     :specs (filterv #(contains? (set (:shortlist selection)) (:id %)) specs)
      :selection selection
      :run (dissoc r :scorecard)}))

@@ -19,7 +19,8 @@
         chosen (select/choose (concat base same-cheaper better-dearer worse-cheapest)
                               :base [:lean :rich :cheap])]
     (is (= :lean (:choice chosen)))
-    (is (= :cheaper-and-non-inferior (:reason chosen)))
+    (is (= [:lean] (:shortlist chosen)) "the dearer and the worse variants are not on it")
+    (is (= :cheaper-and-good-enough (:reason chosen)))
     (testing "every comparison says why"
       (let [by (into {} (map (juxt :variant identity)) (:comparisons chosen))]
         (is (< (Math/abs (- 0.7 (get-in by [:lean :cost :ratio]))) 1e-9))
@@ -32,5 +33,14 @@
         worse (entries :cheap 8 (constantly 0.1) (constantly 10))]
     (is (= {:choice :base :reason :none-cheaper}
            (select-keys (select/choose (concat base dearer) :base [:rich]) [:choice :reason])))
-    (is (= {:choice :base :reason :none-non-inferior}
+    (is (= {:choice :base :reason :none-good-enough}
            (select-keys (select/choose (concat base worse) :base [:cheap]) [:choice :reason])))))
+
+(deftest a-pilot-chooses-on-estimates-a-held-out-run-proves
+  ;; noisy but equal on average, 30% cheaper: good enough to try, not proven
+  (let [base (entries :base 12 #(if (even? %) 1.0 0.0) (constantly 100))
+        noisy (entries :lean 12 #(if (zero? (mod % 3)) 1.0 0.4) (constantly 70))
+        all (concat base noisy)]
+    (is (= :lean (:choice (select/choose all :base [:lean]))) "on the estimate")
+    (is (= :base (:choice (select/choose all :base [:lean] {:rule :non-inferior})))
+        "not proven non-inferior at twelve worlds")))
