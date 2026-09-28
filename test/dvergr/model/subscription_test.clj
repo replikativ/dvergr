@@ -42,3 +42,19 @@
     (testing "an unmetered provider is never refused"
       (is (nil? ((subscription/governor {:share 0.0 :pause-at 0.0} #{::no-meter})))))
     (subscription/forget! p)))
+
+(deftest runs-calibrate-what-a-token-costs
+  (let [f (java.io.File/createTempFile "calibration" ".edn")]
+    (.delete f)
+    (binding [subscription/*calibration-file* (str f)]
+      (is (nil? (subscription/points-per-token ::p)) "nothing recorded")
+      (subscription/record-run! ::p {:tokens 10000000 :points 0.0 :cells 100})
+      (subscription/record-run! ::p {:tokens 30000000 :points 0.02 :cells 300})
+      (subscription/record-run! ::p {:tokens 0 :points 0.01})
+      (subscription/record-run! ::other {:tokens 5 :points 0.5})
+      (let [{:keys [points-per-token tokens points runs]} (subscription/points-per-token ::p)]
+        (is (= [40000000 2] [tokens runs]) "an empty run records nothing; providers apart")
+        (is (< (Math/abs (- 0.02 points)) 1e-12))
+        (is (< (Math/abs (- (/ 0.03 40000000) points-per-token)) 1e-18)
+            "the unseen part of a point is counted once: it errs high")))
+    (.delete f)))

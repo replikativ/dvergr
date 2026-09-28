@@ -532,8 +532,11 @@ The held-out confirmation (30 eval tasks × 2 repetitions, reference vs `:lean` 
 did not run: its preflight stopped it after the pilot, estimating 9 points of the weekly
 window (14.8 conservative) against a budget of 10. The estimate is high because the meter
 shows whole points and the pilot moved one; the day's runs measured about 130 cells per
-point, which puts the run at one or two. Next: estimate from that cross-run calibration
-(tokens → points over all recorded readings) instead of the pilot's single coarse step.
+point, which puts the run at one or two. Since then every run records what it spent and how
+far the window moved (`~/.config/dvergr/subscription-calibration.edn`, per user: the quota
+is theirs), and the preflight estimates window points from all recorded runs once they hold
+more tokens than the pilot; seeded with the day's runs (52.7M tokens, three points), about
+one weekly point per 13M tokens, counting the hidden part of a point once, so it errs high.
 
 Not done: the `zapier` meta-tool toolset; the private held-out set, which upstream does not
 release.

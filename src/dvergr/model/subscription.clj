@@ -17,7 +17,9 @@
    An allowance bounds one experiment: `{:share 0.10 :pause-at 0.80}` admits
    no new cell once the experiment has used ten points of any window since it
    started, or once a window is 80% used, whoever used it."
-  (:require [clojure.string :as str]
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.string :as str]
             [taoensso.telemere :as tel]))
 
 (defonce ^:private readings (atom {}))
@@ -76,6 +78,51 @@
                         (when-let [u0 (get-in first-r [:windows k :used])]
                           (when u (- u u0))))
                       (:windows last-r)))))))
+
+;; ---------------------------------------------------------------------------
+;; Calibration: what a token costs in window points, across runs
+
+(def ^:dynamic *calibration-file*
+  "Where runs record what they spent and moved. A subscription's quota is the
+   user's, not a project's, so this is per user (`DVERGR_CALIBRATION` moves
+   it)."
+  (or (System/getenv "DVERGR_CALIBRATION")
+      (str (System/getProperty "user.home") "/.config/dvergr/subscription-calibration.edn")))
+
+(defn calibration-records
+  "Every recorded run: `[{:provider :tokens :points :at-ms :cells}]`."
+  []
+  (let [f (io/file *calibration-file*)]
+    (if (.exists f)
+      (try (vec (edn/read-string (slurp f))) (catch Exception _ []))
+      [])))
+
+(defn record-run!
+  "Record that a run spent `tokens` on `provider` and moved its most used
+   window `points` (a fraction; whole points only, so often 0)."
+  [provider {:keys [tokens points cells]}]
+  (when (and (pos? (or tokens 0)) (some? points))
+    (let [f (io/file *calibration-file*)]
+      (io/make-parents f)
+      (locking #'record-run!
+        (spit f (pr-str (conj (calibration-records)
+                              {:provider provider :tokens (long tokens) :points (double points)
+                               :cells cells :at-ms (System/currentTimeMillis)})))))))
+
+(defn points-per-token
+  "`provider`'s window points per token over every recorded run: total points
+   over total tokens, with the unseen part of a point counted once more (each
+   reading hides up to one point), so it errs high; nil without records. The
+   records are only as clean as the window: the user's own use during a run
+   counts too, which errs high again."
+  ([provider] (points-per-token provider (calibration-records)))
+  ([provider records]
+   (let [rs (filter #(= provider (:provider %)) records)
+         tokens (reduce + 0 (map :tokens rs))
+         points (reduce + 0.0 (map :points rs))]
+     (when (pos? tokens)
+       {:points-per-token (/ (+ points resolution) tokens)
+        :tokens tokens :points points :runs (count rs)}))))
 
 ;; ---------------------------------------------------------------------------
 ;; What providers report

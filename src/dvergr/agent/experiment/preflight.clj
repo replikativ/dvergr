@@ -16,8 +16,10 @@
                     per-Run budget, which its wallet enforces
 
    for list-price dollars (what a BYOK key would be billed), billed dollars,
-   tokens and wall time at the run's parallelism; and, for subscriptions, the
-   window points the pilot moved per token, applied to the tokens left.
+   tokens and wall time at the run's parallelism; and, for subscriptions,
+   window points per token applied to the tokens left: from every recorded
+   run (`subscription/points-per-token`) when they hold more tokens than the
+   pilot, else from the pilot (which, moving whole points, bounds it coarsely).
 
    `gate` compares an estimate with a budget: `{:dollars d :subscription
    share}` (a share of a window, e.g. 0.10). This is the experiment predicting
@@ -96,7 +98,7 @@
    `window-points` the fraction of a subscription window the pilot moved (nil
    when unmetered); a reading shows whole points, so a pilot that moved none
    is counted as having moved one (`resolution`), an upper bound."
-  [{:keys [pilot-receipts remaining parallelism window-points resolution cell-caps]
+  [{:keys [pilot-receipts remaining parallelism window-points resolution cell-caps calibration]
     :or {resolution 0.01}}]
   (let [by-candidate (group-by #(get-in % [:attempt/metrics :experiment-candidate]) pilot-receipts)
         per-candidate (into {}
@@ -107,8 +109,13 @@
                                         :cells-left (get remaining c 0))]))
         total (fn [k band] (reduce + 0.0 (map #(get-in % [k band]) (vals per-candidate))))
         pilot-tokens (reduce + 0 (map (comp :tokens cell-costs) pilot-receipts))
-        points-per-token (when (and window-points (pos? pilot-tokens))
-                           (/ (max (double window-points) resolution) pilot-tokens))]
+        pilot-rate (when (and window-points (pos? pilot-tokens))
+                     (/ (max (double window-points) resolution) pilot-tokens))
+        ;; recorded runs, when they hold more tokens than the pilot: a pilot
+        ;; rarely moves a whole point, so its own rate is a coarse upper bound
+        calibrated (when (and calibration (> (:tokens calibration 0) pilot-tokens))
+                     (:points-per-token calibration))
+        points-per-token (or calibrated pilot-rate)]
     {:candidates per-candidate
      ;; a hard bound, not an estimate: every Run's model spend is paid from a
      ;; wallet of its candidate's budget (`cell-caps`, {candidate microdollars})
@@ -123,6 +130,11 @@
      :window-points (when points-per-token
                       (into {} (for [band [:expected :conservative :worst-seen]]
                                  [band (* points-per-token (total :tokens band))])))
+     :window-rate (when points-per-token
+                    {:points-per-token points-per-token
+                     :from (if calibrated :recorded-runs :pilot)
+                     :pilot pilot-rate
+                     :recorded (select-keys calibration [:points-per-token :tokens :points :runs])})
      :pilot {:cells (count pilot-receipts) :tokens pilot-tokens :window-points window-points}}))
 
 (defn gate
