@@ -3,11 +3,11 @@
    speaks. Only what SQLite has and PostgreSQL does not is rewritten, and each
    rewrite keeps SQLite's meaning:
 
-     `ident`                 → \"ident\" (lower-cased: SQLite identifiers
-                               are case-insensitive, `bird.load` stores them
-                               lower-cased, and unquoted PostgreSQL names fold
-                               to lower case)
-     \"ident\"                → lower-cased likewise
+     `Some Ident`            → \"some_ident\" (the canonical form `bird.load`
+                               stores: lower case, since SQLite identifiers are
+                               case-insensitive and unquoted PostgreSQL names
+                               fold to lower case; [^a-z0-9_] as _)
+     \"Some Ident\"           → likewise
      IIF(c, a, b)            → CASE WHEN c THEN a ELSE b END
      STRFTIME('%Y', x)       → SUBSTR(x, 1, 4)   (BIRD's dates are ISO text;
                                likewise %m %d %H %M and %Y-%m, %Y-%m-%d),
@@ -164,8 +164,9 @@
     (if-let [t (first ts)]
       (let [nxt (->> (rest ts) (drop-while #(= :ws (:t %))))]
         (cond
-          ;; SQLite identifiers are case-insensitive: canonical lower case
-          (= :qid (:t t)) (recur (subvec ts 1) (conj out (update t :s str/lower-case)))
+          ;; SQLite identifiers are case-insensitive: the canonical form
+          ;; bird.load stores them in (lower case, [^a-z0-9_] as _)
+          (= :qid (:t t)) (recur (subvec ts 1) (conj out (update t :s #(str/replace (str/lower-case %) #"[^a-z0-9_]" "_"))))
 
           (and (#{"IIF" "STRFTIME" "INSTR" "DATE"} (str/upper-case (str (:s t)))) (= :word (:t t))
                (some-> (first nxt) (punct? "(")))

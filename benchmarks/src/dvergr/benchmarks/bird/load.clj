@@ -3,9 +3,10 @@
    `:table/column` with pg-datahike's row marker (`:table/db-row-exists`), so
    the same data answers SQL (pg-datahike) and Datalog (`d/q`).
 
-   Identifiers are lower-cased: SQLite's are case-insensitive (`CDSCode` and
-   `cdscode` are one column), PostgreSQL folds unquoted names to lower case,
-   and one canonical spelling serves both. A column's value type comes from
+   Identifiers are canonical (`ident`): lower case, since SQLite's are
+   case-insensitive (`CDSCode` and `cdscode` are one column) and PostgreSQL
+   folds unquoted names to lower case; and a keyword a Datalog query can write
+   (no spaces or parentheses), which `bird.dialect` maps quoted SQL names to. A column's value type comes from
    the values it holds, not its declared type, which SQLite does not enforce:
    all integers → long, all numbers → double, anything else → string (a
    number in such a column is kept as SQLite's text of it).
@@ -21,9 +22,15 @@
 (def version-tag
   "Part of every BIRD verifier's basis: a change to how data is loaded is a
    change to what a score means."
-  "bird.load/1: lower-cased identifiers, value-inferred types, pg-datahike row markers")
+  "bird.load/2: identifiers lower-cased with other than [a-z0-9_] as _, value-inferred types, pg-datahike row markers")
 
-(defn- ident [s] (str/lower-case (str s)))
+(defn ident
+  "An identifier as Datahike stores it: lower case (SQLite's are
+   case-insensitive), and every character other than a-z, 0-9 and _ as _, so
+   each column is a keyword a Datalog query can write literally
+   (`Free Meal Count (K-12)` → `free_meal_count__k_12_`)."
+  [s]
+  (str/replace (str/lower-case (str s)) #"[^a-z0-9_]" "_"))
 
 (defn tables
   "`{table [{:name :declared :pk?}]}` of the SQLite database (identifiers as
@@ -57,8 +64,8 @@
 
 (defn store-config [db-id]
   {:store {:backend :file
-           :path (str (System/getProperty "user.home") "/.cache/dvergr-bench/bird/datahike/" db-id)
-           :id (java.util.UUID/nameUUIDFromBytes (.getBytes (str "bird/" db-id)))}
+           :path (str (System/getProperty "user.home") "/.cache/dvergr-bench/bird/datahike/v2/" db-id)
+           :id (java.util.UUID/nameUUIDFromBytes (.getBytes (str "bird/v2/" db-id)))}
    :keep-history? false
    :schema-flexibility :write
    :index :datahike.index/persistent-set})

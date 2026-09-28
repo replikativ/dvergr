@@ -604,6 +604,45 @@ The remaining 110 split into:
   columns), for a proposed SQLite compatibility mode.
 - Ties at `LIMIT` and float summation order, which are not defects.
 
+
+**Model runs, Luna, SQL on SQLite vs Datalog on Datahike** (2026-09-28). Harness iterations on
+the dev split (`:split :dev`, a third of each database's questions by digest). There's no
+held-out result yet: 4 databases × 8 questions × 2, 128 cells each, a few minutes each, the
+weekly window unmoved.
+
+| Harness | SQL on SQLite | Datalog | Datalog − SQL [95%] | Datalog query errors | Datalog cost vs SQL |
+| --- | --- | --- | --- | --- | --- |
+| v1 (first run, not the dev split) | 0.625 | 0.578 | −0.05 [−0.16, +0.06] | 75 / 223 | 5.5× |
+| v2: plain EDN queries, equal example rows | 0.69 | 0.31 | −0.38 [−0.55, −0.20] | 57 / 188 | 2.5× |
+| v3: canonical identifiers, a query-only reply counts | 0.70 | 0.53 | −0.17 [−0.34, −0.00] | 8 / 105 | 1.5× |
+| v4: `:find`'s set semantics and `:with` named | 0.73 | 0.55 | −0.19 [−0.36, −0.02] | 14 / 122 | 1.7× |
+
+What each step fixed:
+- **v1:** the model closed Clojure quotes like SQL strings, `(q '[...]')`. The prompts were
+  also unequal, with example rows for Datalog only.
+- **v2:** Datalog got plain EDN queries, and every engine got the same example rows. The
+  model then often answered with the query as text instead of calling submit, and columns
+  with spaces (`:frpm/county name`) cannot be written as keywords.
+- **v3:** identifiers became safe keywords for both Datahike engines (`bird.load/2`, with the
+  dialect mapping quoted SQL names the same way; the compatibility report is unchanged at
+  748/858), and a final reply that is only a query counts as submitted, for every engine.
+  Query errors fell from 30% to 8%.
+- **v4:** the prompt names the remaining Datalog-specific error: `:find` is a set, so
+  `(avg ?h)` without `:with ?e` averages distinct heights. That didn't move the score
+  measurably.
+
+What holds:
+- With Luna, Datalog answers about 0.17–0.19 fewer questions than SQL at 1.5–1.7× the tokens.
+- Its failures are now mostly wrong but running answers, which is model skill in a language
+  it has seen far less of, not the substrate.
+- Some losses are float last-digit differences from the order of operations, graded wrong by
+  upstream's exact comparison for any engine.
+
+The stronger Datahike story for BIRD is SQL on Datahike: 87% of the gold queries already
+return SQLite's exact rows, most of the rest are pg-datahike defects handed over, and the
+model writes the SQL it is best at. That candidate runs once the fixes land. Open: a
+stronger model for Datalog, and the eval split.
+
 ## BFCL v4 (single-turn, Python)
 
 The Berkeley Function Calling Leaderboard, pinned at gorilla `6ea5797`

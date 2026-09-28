@@ -12,13 +12,24 @@
   (:require [dvergr.agent.experiment.runner :as runner]
             [dvergr.benchmarks.bird.core :as bird]
             [dvergr.benchmarks.bird.provider :as provider]
+            [dvergr.benchmarks.pyjson :as pj]
             [hasch.core :as hasch])
   (:import [java.util ArrayList Collections Random]))
 
+(defn split-of
+  "`:dev` or `:eval` for a question: a third are `:dev`, fixed by the digest
+   of `db-id/question-id`. Tune on `:dev`, report on `:eval`."
+  [{:keys [db-id question-id]}]
+  (if (< (Long/parseLong (subs (pj/sha256-hex (str db-id "/" question-id)) 0 8) 16) (quot 0x100000000 3))
+    :dev
+    :eval))
+
 (defn select-questions
-  [{:keys [db-ids sample seed question-ids] :or {seed 20260928}}]
+  [{:keys [db-ids sample seed question-ids split] :or {seed 20260928}}]
   (let [qs (bird/questions)
-        qs (cond->> qs (seq db-ids) (filter #((set db-ids) (:db-id %))))]
+        qs (cond->> qs
+             (seq db-ids) (filter #((set db-ids) (:db-id %)))
+             split (filter #(= split (split-of %))))]
     (if question-ids
       (filterv #((set question-ids) (:question-id %)) qs)
       (into [] (mapcat (fn [[_ qs]]
