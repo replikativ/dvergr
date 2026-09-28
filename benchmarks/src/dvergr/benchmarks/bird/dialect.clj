@@ -10,7 +10,12 @@
      \"ident\"                → lower-cased likewise
      IIF(c, a, b)            → CASE WHEN c THEN a ELSE b END
      STRFTIME('%Y', x)       → SUBSTR(x, 1, 4)   (BIRD's dates are ISO text;
-                               likewise %m %d %H %M and %Y-%m, %Y-%m-%d)
+                               likewise %m %d %H %M and %Y-%m, %Y-%m-%d),
+                               cast to INTEGER where it is an operand of
+                               arithmetic (SQLite converts text there; 47 of
+                               BIRD's uses subtract years, 97 compare text)
+     INSTR(s, t)             → STRPOS(s, t)
+     DATE('now')             → CURRENT_DATE
      LIMIT a, b              → LIMIT b OFFSET a
      CAST(x AS REAL)         → CAST(x AS DOUBLE PRECISION)
      ORDER BY k [ASC|DESC]   → ... NULLS FIRST | NULLS LAST (SQLite orders
@@ -103,6 +108,13 @@
   [name-tok args]
   (let [args (mapv (comp rewrite trim-ws) args)]
     (cond
+      (and (word? name-tok "INSTR") (= 2 (count args)))
+      (concat [(w "STRPOS") (p "(")] (first args) [(p ",") sp] (second args) [(p ")")])
+
+      (and (word? name-tok "DATE") (= 1 (count args)) (= 1 (count (first args)))
+           (= "'now'" (str/lower-case (:s (ffirst args)))))
+      [(w "CURRENT_DATE")]
+
       (and (word? name-tok "IIF") (= 3 (count args)))
       (let [[c a b] args]
         (concat [(w "CASE") sp (w "WHEN") sp] c [sp (w "THEN") sp] a [sp (w "ELSE") sp] b [sp (w "END")]))
@@ -155,11 +167,17 @@
           ;; SQLite identifiers are case-insensitive: canonical lower case
           (= :qid (:t t)) (recur (subvec ts 1) (conj out (update t :s str/lower-case)))
 
-          (and (#{"IIF" "STRFTIME"} (str/upper-case (str (:s t)))) (= :word (:t t))
+          (and (#{"IIF" "STRFTIME" "INSTR" "DATE"} (str/upper-case (str (:s t)))) (= :word (:t t))
                (some-> (first nxt) (punct? "(")))
           (if-let [[args after] (call-args (rest nxt))]
             (if-let [r (rewrite-call t args)]
-              (recur (vec after) (into out r))
+              (let [arith? (fn [tok] (and tok (= :punct (:t tok)) (#{"-" "+" "*" "/"} (:s tok))))
+                    before (last (remove #(= :ws (:t %)) out))
+                    following (first (remove #(= :ws (:t %)) after))
+                    r (if (and (word? t "STRFTIME") (or (arith? before) (arith? following)))
+                        (concat [(w "CAST") (p "(")] r [sp (w "AS") sp (w "INTEGER") (p ")")])
+                        r)]
+                (recur (vec after) (into out r)))
               (recur (subvec ts 1) (conj out t)))
             (recur (subvec ts 1) (conj out t)))
 

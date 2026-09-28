@@ -18,6 +18,13 @@
            (dialect/to-postgres "SELECT STRFTIME('%Y', birthday) FROM p")))
     (is (= "SELECT strftime('%W', d) FROM p" (dialect/to-postgres "SELECT strftime('%W', d) FROM p"))
         "a format it cannot keep the meaning of passes through, for the report to show"))
+  (testing "STRFTIME as an operand of arithmetic is a number, compared it stays text"
+    (is (= "SELECT CAST(SUBSTR(CURRENT_TIMESTAMP, 1, 4) AS INTEGER) - CAST(SUBSTR(dob, 1, 4) AS INTEGER) FROM d"
+           (dialect/to-postgres "SELECT STRFTIME('%Y', CURRENT_TIMESTAMP) - STRFTIME('%Y', dob) FROM d")))
+    (is (= "SELECT x FROM d WHERE SUBSTR(dob, 1, 4) = '1990'"
+           (dialect/to-postgres "SELECT x FROM d WHERE STRFTIME('%Y', dob) = '1990'"))))
+  (testing "INSTR and DATE('now')"
+    (is (= "SELECT STRPOS(t, ':'), CURRENT_DATE FROM d" (dialect/to-postgres "SELECT INSTR(t, ':'), DATE('now') FROM d"))))
   (testing "LIMIT offset, count"
     (is (= "SELECT x FROM t LIMIT 5 OFFSET 10" (dialect/to-postgres "SELECT x FROM t LIMIT 10, 5"))))
   (testing "ORDER BY keeps SQLite's NULL placement"
