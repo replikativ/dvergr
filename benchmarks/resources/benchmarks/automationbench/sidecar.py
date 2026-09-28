@@ -22,8 +22,11 @@ Requests (`op`):
                                          the calls in one process on one world,
                                          as upstream runs an episode: {world digest}
 
-Every world a response carries comes with its `digest`, the sha256 of its
-canonical JSON, so both sides compare worlds without shipping them twice.
+A world travels as JSON TEXT (a string field), never as a JSON object the
+other side parses: upstream's behaviour depends on key order (a sheet's
+columns are the order of a row's cells), which a map on the other side need
+not keep. Every world comes with its `digest`, the sha256 of its canonical
+JSON, so both sides compare worlds without reading them.
 """
 
 import contextlib
@@ -91,8 +94,12 @@ def _initial(task):
     return world, initial, assertions
 
 
-def _world(data):
-    return WorldState(**data)
+def _world(text):
+    return WorldState(**json.loads(text))
+
+
+def _text(data):
+    return json.dumps(data, ensure_ascii=False)
 
 
 def _dump(world):
@@ -197,7 +204,7 @@ def _call(domain, task_id, world_data, name, arguments, at, seed, toolset="api")
     world = _world(world_data)
     content, error = _apply(world, name, arguments, at, seed, toolset)
     data = _dump(world)
-    return {"world": data, "digest": _digest(data), "content": content, "error": error,
+    return {"world": _text(data), "digest": _digest(data), "content": content, "error": error,
             "at": at}
 
 
@@ -211,7 +218,7 @@ def _replay(domain, task_id, start, calls, toolset="api"):
                        toolset)[0]
                 for c in calls]
     data = _dump(world)
-    return {"world": data, "digest": _digest(data), "contents": contents}
+    return {"world": _text(data), "digest": _digest(data), "contents": contents}
 
 
 def _grade(domain, task_id, world_data):
@@ -256,7 +263,8 @@ def handle(req):
         prompt = [{"role": m["role"], "content": m["content"]} for m in task["prompt"]]
         data = _dump(world)
         return {"prompt": prompt, "tools": _schemas(req.get("toolset", "api"), task),
-                "world": data, "digest": _digest(data), "contract": _contract(task), "at": at}
+                "world": _text(data), "digest": _digest(data), "contract": _contract(task),
+                "at": at}
     if op == "call":
         return _call(req["domain"], req["id"], req["world"], req["name"],
                      req.get("arguments") or {}, req.get("at"), req.get("seed", 0),

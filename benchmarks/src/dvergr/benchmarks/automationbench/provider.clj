@@ -27,23 +27,17 @@
             [dvergr.agent.roster :as roster]
             [dvergr.agent.spend :as spend]
             [dvergr.agent.verifiers :as verifiers]
+            [dvergr.benchmarks.automationbench.episode :as ep]
+            [dvergr.benchmarks.automationbench.harness :as harness]
             [dvergr.benchmarks.automationbench.sidecar :as sc]
             [dvergr.benchmarks.live :as live]
             [dvergr.benchmarks.pyjson :as pj]
-            [dvergr.model.registry :as registry]
-            [org.replikativ.spindel.engine.core :as ec]))
+            [dvergr.model.registry :as registry]))
 
-(def version 1)
-
-(def ^:private episode-path [::episode])
-
-(defn- episode-state [room]
-  (binding [ec/*execution-context* (:ctx room)]
-    (ec/get-state episode-path)))
-
-(defn- swap-episode! [room f & args]
-  (binding [ec/*execution-context* (:ctx room)]
-    (ec/swap-state! episode-path #(apply f % args))))
+(def version
+  "2: worlds cross the service boundary as JSON text (version 1 parsed them into
+   Clojure maps, which reorder keys; a sheet write then filled other columns)."
+  2)
 
 (defn- task-of [definition]
   (let [{:keys [domain task-id toolset]} (:environment/task definition)]
@@ -54,56 +48,6 @@
 
 (defn- basis [revision]
   {:upstream (:repo sc/upstream) :revision revision})
-
-(defn- add-usage [acc usage]
-  (if (map? usage)
-    (merge-with (fn [a b] (if (and (number? a) (number? b)) (+ a b) b))
-                acc (select-keys usage [:input-tokens :output-tokens
-                                        :cache-read-tokens :cache-creation-tokens]))
-    acc))
-
-(defn- ->message [{:strs [role content]}]
-  {:role (keyword role) :content content})
-
-(defn run-episode!
-  "Upstream's rollout in `room`'s world: model steps (`generate`, taking
-   `{:system :messages :tools}`) until a reply without tool calls or
-   `max-turns` model steps. Returns `{:termination :calls :transcript
-   :usage}`; every call's world is in the Run's world as it happens."
-  [{:keys [room sidecar task generate max-turns cancelled?]}]
-  (let [{:keys [domain id toolset]} task
-        {:keys [prompt tools]} (episode-state room)
-        system (some #(when (= "system" (get % "role")) (get % "content")) prompt)
-        opening (into [] (comp (remove #(= "system" (get % "role"))) (map ->message)) prompt)]
-    (loop [turn 0 history opening calls [] usage {}]
-      (let [done (fn [termination]
-                   {:termination termination :calls calls :usage usage
-                    :model-steps turn :transcript (subvec history (count opening))})]
-        (cond
-          (and cancelled? (cancelled?)) (done :cancelled)
-          (>= turn max-turns) (done :max-turns)
-          :else
-          (let [{:keys [content tool-calls] :as response}
-                (generate {:system system :messages history :tools tools})
-                usage (add-usage usage (:usage response))
-                history (conj history (cond-> {:role :assistant :content content}
-                                        (seq tool-calls) (assoc :tool-calls (vec tool-calls))))]
-            (if (empty? tool-calls)
-              (assoc (done :agent-stop) :usage usage :model-steps (inc turn)
-                     :transcript (subvec history (count opening)))
-              (let [[history calls]
-                    (reduce (fn [[history calls] {call-id :id :keys [name arguments]}]
-                              (let [n (count calls)
-                                    args (pj/stringify-keys (or arguments {}))
-                                    r (sc/call sidecar domain id
-                                               {:toolset toolset :n n :name name :arguments args
-                                                :world (:world (episode-state room))})]
-                                (swap-episode! room assoc :world (get r "world") :digest (get r "digest"))
-                                [(conj history {:role :tool :id call-id :content (get r "content")})
-                                 (conj calls {:n n :name name :arguments args :at (get r "at")
-                                              :error (boolean (get r "error"))})]))
-                            [history calls] tool-calls)]
-                (recur (inc turn) history calls usage)))))))))
 
 (defn capabilities
   "The trusted capabilities: `{:world-setup :protocol :evaluator}`.
@@ -122,11 +66,11 @@
        :prepare (fn [{:keys [room environment]}]
                   (let [{:keys [domain id toolset]} (task-of environment)
                         r (sc/start sidecar domain id {:toolset toolset})]
-                    (swap-episode! room (constantly {:at (get r "at")
-                                                     :prompt (get r "prompt")
-                                                     :tools (get r "tools")
-                                                     :world (get r "world")
-                                                     :digest (get r "digest")}))
+                    (ep/swap-episode! room (constantly {:at (get r "at")
+                                                        :prompt (get r "prompt")
+                                                        :tools (get r "tools")
+                                                        :world (get r "world")
+                                                        :digest (get r "digest")}))
                     {:world/initial-digest (get r "digest")
                      :world/started-at (get r "at")
                      :task/contract (get r "contract")
@@ -139,14 +83,23 @@
        :run (fn [{:keys [room agent environment cancelled? model-scope]}]
               (let [task (task-of environment)
                     max-turns (get-in environment [:environment/limits :max-turns] 50)
-                    generate (live/scoped (if agent-generate
-                                            (agent-generate task)
-                                            (live/model-generate (:agent/model-policy agent)))
-                                          model-scope)]
-                (assoc (run-episode! {:room room :sidecar sidecar :task task :generate generate
-                                      :max-turns max-turns :cancelled? cancelled?})
-                       :started-at (:at (episode-state room))
-                       :world-digest (:digest (episode-state room)))))})
+                    {:automationbench/keys [harness action-space]} (:agent/metadata agent)
+                    episode {:room room :sidecar sidecar :task task :max-turns max-turns
+                             :cancelled? cancelled? :model-scope model-scope}
+                    outcome (if (and (= :dvergr harness) (not agent-generate))
+                              (harness/run-episode!
+                               episode (assoc (:agent/model-policy agent)
+                                              :action-space action-space
+                                              :budget-dollars (get-in agent [:agent/program :budget-dollars])))
+                              (ep/run-episode!
+                               (assoc episode :generate
+                                      (live/scoped (if agent-generate
+                                                     (agent-generate task)
+                                                     (live/model-generate (:agent/model-policy agent)))
+                                                   model-scope))))]
+                (assoc outcome
+                       :started-at (:at (ep/episode-state room))
+                       :world-digest (:digest (ep/episode-state room)))))})
 
      :evaluator
      (evaluation/make-evaluator
@@ -163,13 +116,18 @@
                      :world-digest (:world-digest outcome)
                      :episode (select-keys outcome [:model-steps :usage])
                      :transcript (:transcript outcome)
-                     :spend (if (map? (:usage outcome))
-                              (spend/of-usage (get-in agent [:agent/model-policy :model]) (:usage outcome))
-                              spend/zero)}))
+                     ;; the Dvergr loop reports its chat budget, the
+                     ;; reference loop the provider's raw counts
+                     :spend (let [model (get-in agent [:agent/model-policy :model])
+                                  usage (:usage outcome)]
+                              (cond
+                                (and (map? usage) (contains? usage :used)) (spend/of-budget model usage)
+                                (map? usage) (spend/of-usage model usage)
+                                :else spend/zero))}))
        :verify (fn [definition {:keys [calls started-at world-digest] :as evidence}]
                  (let [{:keys [domain id toolset]} (task-of definition)
                        termination (get-in evidence [:result :termination])
-                       ran? (contains? #{:agent-stop :max-turns} termination)]
+                       ran? (contains? #{:agent-stop :max-turns :agent-error} termination)]
                    (if-not (and ran? started-at)
                      {:reward 0.0 :checks {:completed false}}
                      (let [replayed (sc/replay sidecar domain id {:toolset toolset :start-at started-at
@@ -218,10 +176,13 @@
       :metadata {:benchmark :automationbench :scored? (not= "simple" domain)}})))
 
 (defn candidate-roster
-  "AgentDefs for candidate specs `{:id :model :provider :budget-dollars}`:
-   the model behind upstream's loop (the prompt and tools are the task's)."
+  "AgentDefs for candidate specs `{:id :model :provider :budget-dollars
+   :harness :action-space}`. `:harness :reference` (default) is the model
+   behind upstream's loop; `:dvergr` is Dvergr's agent loop with `:action-space
+   :tools` (upstream's tools) or `:repl` (`harness`). The prompt is the task's."
   [specs]
-  (reduce (fn [team {:keys [id model provider budget-dollars] :or {budget-dollars 2.0}}]
+  (reduce (fn [team {:keys [id model provider budget-dollars harness action-space]
+                     :or {budget-dollars 2.0 harness :reference action-space :tools}}]
             (let [model-id (registry/resolve-alias model)]
               (roster/make-agent
                team
@@ -231,6 +192,10 @@
                 :model-policy {:provider (or provider (:provider (registry/get-model! model-id)))
                                :model model-id}
                 :program {:kind :llm :max-model-steps 50 :budget-dollars budget-dollars}
-                :metadata {:automationbench/harness :reference}})))
+                :metadata (cond-> {:automationbench/harness harness}
+                            (= :dvergr harness)
+                            (assoc :automationbench/action-space action-space)
+                            (harness/guidance-sha256 (when (= :dvergr harness) action-space))
+                            (assoc :automationbench/guidance-sha256 (harness/guidance-sha256 action-space)))})))
           (roster/make-roster {:id :automationbench/candidates})
           specs))

@@ -4,8 +4,11 @@
    (`resources/benchmarks/automationbench/sidecar.py`).
 
    It is stateless: a world goes in and comes out with every call, so the
-   episode's world lives in the Run's forked world on the dvergr side. One
-   process serves every Attempt; requests are serialized.
+   episode's world lives in the Run's forked world on the dvergr side. A world
+   is JSON TEXT here, never parsed: upstream's behaviour depends on key order
+   (a sheet's columns are the order of a row's cells), which a Clojure map does
+   not keep past eight keys. One process serves every Attempt; requests are
+   serialized.
 
    The checkout is `AUTOMATIONBENCH_ROOT`, else
    `~/.cache/dvergr-bench/automationbench`, set up with
@@ -130,7 +133,8 @@
                       at (assoc :at at))))
 
 (defn call
-  "Call `n` (0-based) of an episode: `{\"world\" \"digest\" \"content\" \"error\" \"at\"}`."
+  "Call `n` (0-based) of an episode on `world` (JSON text): `{\"world\"
+   \"digest\" \"content\" \"error\" \"at\"}`, the new world as JSON text."
   [sidecar domain id {:keys [toolset world n name arguments at]}]
   (request! sidecar (cond-> {:op "call" :domain domain :id id :toolset (or toolset "api")
                              :world world :name name :arguments (or arguments {})
@@ -149,6 +153,7 @@
                                   calls)}))
 
 (defn grade
-  "Upstream's rubric on `world`: `{\"partial_credit\" \"passed\" \"assertions\"}`."
+  "Upstream's rubric on `world` (JSON text): `{\"partial_credit\" \"passed\"
+   \"assertions\"}`."
   [sidecar domain id world]
   (request! sidecar {:op "grade" :domain domain :id id :world world}))

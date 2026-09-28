@@ -436,9 +436,36 @@ alone (support), and 50 model steps without the Drive and Notion actions (operat
 For scale, upstream's public-set leaderboard has GPT-5.6 Terra at 37% and Sol at 46%, at
 maximum reasoning effort.
 
-Not done: a Dvergr-harness candidate (the REPL action space, where `api_fetch` becomes a
-sandbox function over the same world); the `zapier` meta-tool toolset; the private held-out
-set, which upstream does not release.
+**Dvergr's loop as a candidate** (`automationbench.harness`, `:harness :dvergr`): Dvergr's
+agent loop (`run-agent-turn!`) in a working chat of the Run's world instead of upstream's,
+with `:action-space :tools` (upstream's three tools as Dvergr tools) or `:repl` (one
+`clojure_eval`; the APIs are `ab/search`, `ab/fetch`, `ab/base64`, returning upstream's text,
+and `ab/parse` reads JSON, so matching and summing over records happens in code). Every call
+still goes through `episode/call-tool!`, so its world replays like the reference's.
+
+Three loops on the same 12 tasks (two per domain, Luna, one attempt each, 2026-09-28):
+
+| Candidate | Mean partial credit | Passed | Model steps | Tool calls | List price per task |
+| --- | --- | --- | --- | --- | --- |
+| upstream's loop (reference) | 0.68 | 2 | 25 | 24 | $0.055 |
+| Dvergr's loop, upstream's tools | 0.72 | 2 | 28 | 27 | $0.059 |
+| Dvergr's loop, REPL | 0.61 | 3 | 21 | 31 | $0.040 |
+
+At this size the means are noise: an earlier run of the same cells (before the fix below)
+gave 0.63 / 0.68 / 0.61, and single tasks swing from 1.0 to 0.5 between runs of one
+candidate. What holds across both runs: the REPL candidate makes more calls in fewer model
+steps and costs a quarter to a third less. Separating the loops needs repetitions and more
+tasks, which cost nothing on the subscription.
+
+What the replay check caught: the first comparison had one Attempt (of 36) whose world did
+not replay. The adapter parsed worlds into Clojure maps, which do not keep key order past
+eight keys, and upstream's sheet writes fill columns in the order of a row's cells: the
+candidate's write landed in other columns than upstream's would have. Worlds now cross the
+boundary as JSON text, never parsed on the dvergr side (provider version 2; a regression
+test replays that write).
+
+Not done: the `zapier` meta-tool toolset; the private held-out set, which upstream does not
+release.
 
 Setup: `benchmarks/resources/benchmarks/automationbench/README.md`. Run:
 
