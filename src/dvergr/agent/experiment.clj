@@ -13,6 +13,7 @@
             [dvergr.room.store :as store]
             [hasch.core :as hasch]
             [org.replikativ.spindel.core :as sp]
+            [org.replikativ.spindel.semaphore :as sem]
             [org.replikativ.spindel.spin.combinators :as comb]))
 
 (defn- invalid! [message type data]
@@ -362,6 +363,20 @@
              tail (sp/await (run-batches rest-spins parallelism))]
          (into head tail))))
     (sp/spin [])))
+
+(defn run-windowed
+  "A Spin yielding the values of `spins` in order, running at most
+   `parallelism` of them at a time: a new one starts as soon as one ends (one
+   semaphore), where `run-batches` waits for a whole batch, so one slow cell
+   idles the rest of its batch. For spins that contain their failures: every
+   spin runs whatever the others do."
+  [spins parallelism]
+  (let [spins (vec spins)]
+    (if (empty? spins)
+      (sp/spin [])
+      (sp/spin
+       (let [permits (sem/semaphore parallelism)]
+         (vec (sp/await (apply comb/parallel (mapv #(sem/holding permits %) spins)))))))))
 
 (defn- passed? [receipt]
   (every? true? (vals (:attempt/checks receipt))))
@@ -744,7 +759,12 @@
                     (remove #(contains? done (cell-key %)) all-jobs))]
      (sp/spin
       (let [results (into (vec resumed)
-                          (sp/await (run-batches spins parallelism)))
+                          ;; complete-only cells contain their failures, so
+                          ;; every cell runs and a window keeps the slots
+                          ;; busy; a fail-fast experiment stops at the batch
+                          ;; that failed
+                          (sp/await ((if complete-only? run-windowed run-batches)
+                                     spins parallelism)))
             errors (filterv :error results)
             refused (filterv :refused results)]
         (when (and (seq errors) (not complete-only?))
