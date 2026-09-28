@@ -50,7 +50,8 @@
     (runner/run!
      (merge
       (select-keys opts [:dir :repetitions :parallelism :experiment-id :claude-cli :claude-env
-                         :host-context-note :usage-pause-threshold :usage-retries])
+                         :host-context-note :usage-pause-threshold :usage-retries
+                         :preflight :allowance])
       {:benchmark :bfcl
        :capabilities caps
        :environments (mapv #(provider/environment-def % caps {:timeout-ms timeout-ms}) selected)

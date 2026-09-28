@@ -679,3 +679,28 @@
       (finally
         (evaluation/await-cleanups! room 5000)
         (d/close-room! room)))))
+
+(deftest a-governor-stops-new-cells-and-a-resume-runs-them
+  (let [{:keys [team definition]} (fixture)
+        room (d/make-room {:id :experiment-governed :store (memory/make)})
+        admitted (atom 0)
+        ;; admits three cells, then refuses (as a subscription allowance would)
+        admit (fn [_cell] (when (> (swap! admitted inc) 3) {:reason :allowance-used}))
+        evaluators {(:ref exact-evaluator) exact-evaluator}]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [first-pass @(experiment/run room team definition evaluators
+                                          {:resume? true :complete-only? true :admit admit})]
+          (is (= {:reason :allowance-used} (:refused first-pass)))
+          (is (= 3 (count (remove nil? (:attempts first-pass)))) "refused cells do not run")
+          (is (= {:cells 5 :refused 5} (select-keys (:incomplete (:scorecard first-pass)) [:cells :refused]))
+              "and no Scorecard is persisted"))
+        (let [second-pass @(experiment/run room team definition evaluators
+                                           {:resume? true :complete-only? true})]
+          (is (nil? (:refused second-pass)))
+          (is (= 8 (count (:attempts second-pass))))
+          (is (= 8 (count (:scorecard/entries (:scorecard second-pass)))))
+          (is (= 8 (count (run/runs room {:limit 20}))) "the resume ran only the five refused cells")))
+      (finally
+        (evaluation/await-cleanups! room 5000)
+        (d/close-room! room)))))

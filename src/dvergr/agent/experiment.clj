@@ -300,27 +300,33 @@
   "One cell. With `contain?` (complete-only experiments) a cell whose
    evaluation fails to certify becomes an `:error` result, so the other cells
    run and the experiment reports it; otherwise the failure propagates and the
-   experiment fails fast."
-  [room team evaluators capabilities opts experiment job on-result contain?]
+   experiment fails fast. `admit` (optional, `(fn [cell])` → nil or a
+   refusal, `cell` as `experiment-job` describes it) is asked when the cell is
+   about to start: a refused cell does not run and
+   becomes a `:refused` result (a governor's decision, e.g. a subscription
+   allowance; resuming runs it later)."
+  [room team evaluators capabilities opts experiment job on-result contain? admit]
   (let [definition (:environment job)
-        candidate (:candidate job)
-        evaluation-spin
-        (evaluation/evaluate room team (:candidate/agent candidate)
-                             definition (evaluator! evaluators definition)
-                             (assoc (cell-evaluation-opts capabilities opts definition)
-                                    :metrics (cell-metrics experiment job)))]
+        candidate (:candidate job)]
     (sp/spin
-     ;; One cell's failure to certify is that cell's, not the experiment's.
-     (let [result (try
-                    (assoc (sp/await evaluation-spin) :experiment/job (experiment-job job))
-                    (catch Throwable t
-                      (if contain?
-                        {:experiment/job (experiment-job job)
-                         :error (or (ex-message t) (str t))}
-                        (throw t))))]
-       (when on-result
-         (try (on-result result) (catch Throwable _ nil)))
-       result))))
+     (if-let [refusal (when admit (admit (experiment-job job)))]
+       {:experiment/job (experiment-job job) :refused refusal}
+       ;; One cell's failure to certify is that cell's, not the experiment's.
+       (let [evaluation-spin
+             (evaluation/evaluate room team (:candidate/agent candidate)
+                                  definition (evaluator! evaluators definition)
+                                  (assoc (cell-evaluation-opts capabilities opts definition)
+                                         :metrics (cell-metrics experiment job)))
+             result (try
+                      (assoc (sp/await evaluation-spin) :experiment/job (experiment-job job))
+                      (catch Throwable t
+                        (if contain?
+                          {:experiment/job (experiment-job job)
+                           :error (or (ex-message t) (str t))}
+                          (throw t))))]
+         (when on-result
+           (try (on-result result) (catch Throwable _ nil)))
+         result)))))
 
 (defn- completed-cells
   "`{[candidate-id environment-content-id repetition] Attempt}` for the
@@ -648,12 +654,17 @@
    With `:complete-only? true` no Scorecard is persisted while any cell's
    Attempt is not `:completed` (an infrastructure fault is not a verdict);
    the result carries `:incomplete {:cells n}` instead, and a resumed run
-   re-runs exactly those cells."
+   re-runs exactly those cells.
+
+   `:admit` (`(fn [cell])` → nil or a refusal) is asked before each cell starts;
+   refused cells do not run, the result carries the first refusal as
+   `:refused`, and no Scorecard is persisted until a resumed run completes
+   them (e.g. a subscription allowance, `dvergr.model.subscription/governor`)."
   ([room team experiment evaluators]
    (run room team experiment evaluators {}))
   ([room team experiment evaluators
     {:keys [parallelism max-parallelism max-attempts world-setups protocols
-            cleanup-group resume? complete-only? on-result]
+            cleanup-group resume? complete-only? on-result admit]
      :or {parallelism 1 max-parallelism 16 max-attempts 256 world-setups {}
           protocols {}}
      :as opts}]
@@ -681,7 +692,7 @@
    (when-let [unknown (seq (remove #{:from :parent-run :world-parent :parallelism
                                      :max-parallelism :max-attempts
                                      :world-setups :protocols :cleanup-group
-                                     :resume? :complete-only? :on-result}
+                                     :resume? :complete-only? :on-result :admit}
                                    (keys opts)))]
      (invalid! "Experiment contains unknown run options"
                ::unknown-run-options {:unknown (set unknown)}))
@@ -729,18 +740,20 @@
                        all-jobs)
          spins (map #(result-spin room team evaluators capabilities
                                   base-evaluation-opts experiment % on-result
-                                  (boolean complete-only?))
+                                  (boolean complete-only?) admit)
                     (remove #(contains? done (cell-key %)) all-jobs))]
      (sp/spin
       (let [results (into (vec resumed)
                           (sp/await (run-batches spins parallelism)))
-            errors (filterv :error results)]
+            errors (filterv :error results)
+            refused (filterv :refused results)]
         (when (and (seq errors) (not complete-only?))
           (throw (ex-info (str "Experiment cell failed: " (:error (first errors)))
                           {:type ::cell-failed :errors (mapv #(select-keys % [:experiment/job :error]) errors)})))
         (let [unfinished (count (remove #(and (:attempt %) (verdict? (:attempt %))) results))
-              scorecard (if (and complete-only? (pos? unfinished))
+              scorecard (if (and (or complete-only? (seq refused)) (pos? unfinished))
                           {:incomplete {:cells unfinished
+                                        :refused (count refused)
                                         :errors (mapv (fn [{:keys [error] job :experiment/job}]
                                                         {:candidate (get-in job [:candidate/id])
                                                          :repetition (:repetition job)
@@ -756,6 +769,7 @@
                        :attempt-count attempt-count
                        :cleanup-group cleanup-group}
            :results results
+           :refused (first (map :refused refused))
            :attempts (mapv :attempt results)
            :scorecard scorecard}))))))
 

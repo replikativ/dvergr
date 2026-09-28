@@ -7,6 +7,7 @@
             [dvergr.model.gateway :as gateway]
             [dvergr.model.providers :as providers]
             [dvergr.model.registry :as registry]
+            [dvergr.model.subscription :as subscription]
             [dvergr.resource :as resource]
             [hato.client :as hc]
             [jsonista.core :as json]
@@ -125,8 +126,10 @@
 ;; ============================================================================
 
 (defn- make-request
-  "Make HTTP request with error handling. Returns response or throws."
-  [url headers body credentials]
+  "Make HTTP request with error handling. Returns response or throws. The
+   usage a subscription provider reports in the headers is recorded, also
+   on a refusal."
+  [provider-id url headers body credentials]
   (let [response (gateway/request! {:method :post
                                     :url url
                                     :headers headers
@@ -135,6 +138,8 @@
                                     :as :stream
                                     :http-client (get-http-client)
                                     :throw-exceptions false})]
+    (try (subscription/observe-headers! provider-id (:headers response))
+         (catch Exception _ nil))
     (if (>= (:status response) 400)
       (throw (wrap-api-error response))
       response)))
@@ -150,7 +155,7 @@
         {:keys [url headers body credentials]} (p/build-request provider messages opts)
 
         ;; Make HTTP request
-        response (make-request url headers body credentials)
+        response (make-request (p/provider-id provider) url headers body credentials)
         reader (BufferedReader. (io/reader (:body response)))]
 
     {:events (sse-seq reader)

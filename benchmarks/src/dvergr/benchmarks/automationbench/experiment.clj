@@ -51,7 +51,8 @@
     (runner/run!
      (merge
       (select-keys opts [:dir :repetitions :parallelism :experiment-id :claude-cli :claude-env
-                         :host-context-note :usage-pause-threshold :usage-retries])
+                         :host-context-note :usage-pause-threshold :usage-retries
+                         :preflight :allowance])
       {:benchmark :automationbench
        :capabilities caps
        :environments (mapv #(provider/environment-def % caps {:toolset toolset :max-turns max-turns

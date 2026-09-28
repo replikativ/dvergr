@@ -998,7 +998,10 @@
                   r (in-ctx daemon
                             (rooms/create-room! {:title (str (:title wf) " (benchmark)") :slug slug})
                             (rreg/lookup (keyword slug)))
-                  exp (runner/experiment-def (assoc plan :id (keyword slug) :repetitions (or repetitions 1)))]
+                  exp (runner/experiment-def (assoc plan :id (keyword slug) :repetitions (or repetitions 1)))
+                  ;; no new cell once the run has taken its share of a
+                  ;; subscription window (the user's own quota)
+                  plan (assoc plan :admit (runner/admit-for models))]
               (-> (in-ctx daemon
                           (if control
                             ;; The records in `control`, the worlds forked from `r`.

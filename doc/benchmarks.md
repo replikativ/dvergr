@@ -90,6 +90,31 @@ between a candidate's Scorecard on the environment with and without `:faults`.
 and Room, Claude Code settings for the run, waiting out subscription usage
 windows, resume, the Scorecard. A provider's `experiment/run!` is a call to it.
 
+**Subscription allowance.** A subscription (Codex, Claude Code) has no bill, but it is the
+user's own quota. `dvergr.model.subscription` meters it from what the provider reports with
+every call (Codex: `x-codex-primary-used-percent` and friends, whole percent of a weekly
+window; Claude Code: utilization per window), and an experiment runs under an allowance,
+by default `{:share 0.10 :pause-at 0.80}`: no new cell starts once the experiment has used
+ten points of any window since it started, or once a window is 80% used by anyone. Refused
+cells do not run, the result says why (`:refused`), no Scorecard is persisted, and running
+the same directory again resumes them. `catalog_benchmark` runs under the same default. The
+result's `:subscription` holds the readings before and after, which with the Scorecard's
+tokens measure what a unit of work costs in window points.
+
+**Preflight.** `run!` with `:preflight {:budget {:dollars d :subscription share}}` first runs a
+pilot: one cell per candidate per stratum (default: the environment id's namespace, e.g. an
+AutomationBench domain), first repetition (`dvergr.agent.experiment.preflight`). The
+pilot's cells are cells of the experiment, so nothing is spent twice. From their bills it
+extrapolates the rest per candidate, as `:expected` (the mean), `:conservative` (a one-sided
+95% upper bound on the mean) and `:worst-seen` (every cell at the dearest pilot cell, since
+agent costs are heavy-tailed), for list-price and billed dollars, tokens, wall time at the
+run's parallelism and subscription window points (the points the pilot moved per token; a
+pilot that moved no whole point counts as one, an upper bound). When the conservative
+estimate exceeds the budget the run stops with the estimate (`:stopped :over-budget`);
+running again with a larger budget resumes from the pilot. This is the experiment predicting
+its own resource use before committing to it; the measurements it keeps are what later
+predictions, and tuning on pilots before a full run, build on.
+
 Still shared by accident, not by design: the Python-semantics layer and the
 JSON reader live under `dvergr.benchmarks.tau2` (`python`, `pyjson`) and BFCL
 requires them from there.
