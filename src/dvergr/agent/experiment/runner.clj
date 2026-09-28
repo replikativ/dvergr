@@ -239,7 +239,8 @@
     :or {repetitions 1 parallelism 1 usage-pause-threshold 0.97 usage-retries 3}
     :as opts}]
   (conv/isolate-home! dir)
-  (let [allowance (get opts :allowance default-allowance)
+  (let [started-ms (System/currentTimeMillis)
+        allowance (get opts :allowance default-allowance)
         metered (metered-providers models)
         before (select-keys (subscription/all-readings) metered)
         admit (admit-for models allowance)
@@ -301,7 +302,11 @@
          :results (count (:results result)) :failed-cells failed-cells
          :refused (:refused result)
          :preflight estimate
-         :subscription (into {} (map (fn [p] [p {:before (get before p)
+         ;; a fresh process has no reading before its first call: then
+         ;; the first one taken during the run
+         :subscription (into {} (map (fn [p] [p {:before (or (get before p)
+                                                           (first (filter #(>= (:at-ms %) started-ms)
+                                                                          (subscription/samples p))))
                                                  :after (subscription/reading p)}]))
                              metered)
          :scorecard (:scorecard result)})))

@@ -21,7 +21,8 @@
     (is (= :preflight-pilot (:reason ((preflight/pilot-admit pilot) (cell :a :bench.sales/t2 2 0)))))))
 
 (defn- receipt [candidate usd tokens ms]
-  {:attempt/metrics {:experiment-candidate candidate :elapsed-ms ms
+  {:attempt/elapsed-ms ms
+   :attempt/metrics {:experiment-candidate candidate
                      :spend {:microdollars 0 :notional-microdollars (* usd 1e6)
                              :tokens {:input tokens :output 0}}}})
 

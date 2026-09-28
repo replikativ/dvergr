@@ -478,9 +478,25 @@ Three loops on the same 12 tasks (two per domain, Luna, one attempt each, 2026-0
 
 At this size the means are noise: an earlier run of the same cells (before the fix below)
 gave 0.63 / 0.68 / 0.61, and single tasks swing from 1.0 to 0.5 between runs of one
-candidate. What holds across both runs: the REPL candidate makes more calls in fewer model
-steps and costs a quarter to a third less. Separating the loops needs repetitions and more
-tasks, which cost nothing on the subscription.
+candidate.
+
+A larger run (2026-09-28, 18 tasks, three per domain, two repetitions, 108 Attempts, all
+replayed; under a preflight, which estimated 1.9–2.5 points of the weekly Codex window for
+the cells after its pilot, and the whole run moved it about one):
+
+| Candidate | Mean partial credit | Pass rate | Tokens per task | Model steps | List price per task |
+| --- | --- | --- | --- | --- | --- |
+| upstream's loop (reference) | 0.56 | 19% | 243k | 25.7 | $0.052 |
+| Dvergr's loop, upstream's tools | 0.57 | 19% | 223k | 23.4 | $0.048 |
+| Dvergr's loop, REPL | 0.60 | 17% | 216k | 22.1 | $0.047 |
+
+Paired by task against the reference (bootstrap over tasks, 95%): the REPL's partial credit
++0.04 [−0.06, +0.13] and its cost −11%, a difference of −$0.006 [−$0.013, +$0.002]; Dvergr's
+loop with upstream's tools +0.01 [−0.11, +0.10] and −7%. Neither is distinguishable from
+the reference here. The quarter-to-a-third saving of the 12-task runs did not hold at 18
+tasks with repetitions; on AutomationBench with Luna, the REPL is not yet a systematic
+saving. What it would take: tasks whose decisions are over many records (where computing
+beats reading), guidance tuned on a development split, and a second model.
 
 What the replay check caught: the first comparison had one Attempt (of 36) whose world did
 not replay. The adapter parsed worlds into Clojure maps, which do not keep key order past

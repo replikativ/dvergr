@@ -77,7 +77,7 @@
     {:list-microdollars (or (:notional-microdollars spend) (:microdollars spend) 0)
      :billed-microdollars (or (:microdollars spend) 0)
      :tokens tokens
-     :elapsed-ms (or (get-in receipt [:attempt/metrics :elapsed-ms]) 0)}))
+     :elapsed-ms (or (:attempt/elapsed-ms receipt) (get-in receipt [:attempt/metrics :elapsed-ms]) 0)}))
 
 (defn- extrapolate [samples left]
   (into {}
