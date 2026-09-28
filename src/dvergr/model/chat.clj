@@ -356,62 +356,62 @@
   "Stream one response and accumulate it (see `chat`)."
   [provider model-def messages opts]
   (let [{:keys [events close! stalled?]} (stream-chat provider model-def messages opts)
-            on-text (:on-text opts)
-            on-event (:on-event opts)
+        on-text (:on-text opts)
+        on-event (:on-event opts)
             ;; :cancel? - optional 0-arity predicate. Polled before each
             ;; SSE event; once true we close! the reader (kills the
             ;; underlying socket — Anthropic/Fireworks stop generating
             ;; billed tokens) and throw an explicit
             ;; CancellationException so the turn-loop catcher can bail
             ;; out instead of returning a half-baked response.
-            cancel? (:cancel? opts)
-            api-type (p/api-type provider)]
-        (try
-          (let [final-state
-                (reduce
-                 (fn [state event]
-                   (when (and cancel? (cancel?))
-                     (close!)
-                     (throw (java.util.concurrent.CancellationException.
-                             "LLM call cancelled")))
+        cancel? (:cancel? opts)
+        api-type (p/api-type provider)]
+    (try
+      (let [final-state
+            (reduce
+             (fn [state event]
+               (when (and cancel? (cancel?))
+                 (close!)
+                 (throw (java.util.concurrent.CancellationException.
+                         "LLM call cancelled")))
 
                     ;; Call event callback
-                   (when on-event (on-event event))
+               (when on-event (on-event event))
 
                     ;; Stream text callback - handle both API types
-                   (when on-text
-                     (case api-type
-                       :anthropic-messages
-                       (when (and (= "content_block_delta" (:type event))
-                                  (= "text_delta" (get-in event [:delta :type])))
-                         (on-text (get-in event [:delta :text])))
+               (when on-text
+                 (case api-type
+                   :anthropic-messages
+                   (when (and (= "content_block_delta" (:type event))
+                              (= "text_delta" (get-in event [:delta :type])))
+                     (on-text (get-in event [:delta :text])))
 
-                       :openai-chat
-                       (doseq [choice (:choices event)]
-                         (when-let [text (get-in choice [:delta :content])]
-                           (on-text text)))
+                   :openai-chat
+                   (doseq [choice (:choices event)]
+                     (when-let [text (get-in choice [:delta :content])]
+                       (on-text text)))
 
-                       :openai-responses
-                       (when (= "response.output_text.delta" (:type event))
-                         (when-let [text (:delta event)]
-                           (on-text text)))
+                   :openai-responses
+                   (when (= "response.output_text.delta" (:type event))
+                     (when-let [text (:delta event)]
+                       (on-text text)))
 
-                       nil))
+                   nil))
 
                     ;; Accumulate
-                   (let [event-type (determine-event-type provider event)]
-                     (p/accumulate-event provider state event-type event model-def)))
-                 (p/create-accumulator provider model-def)
-                 events)]
+               (let [event-type (determine-event-type provider event)]
+                 (p/accumulate-event provider state event-type event model-def)))
+             (p/create-accumulator provider model-def)
+             events)]
 
             ;; Extract final response
-            (p/extract-response provider final-state))
-          (catch IOException e
-            (throw (if (stalled?)
-                     (IOException. (str "no data for " *stream-idle-ms* " ms") e)
-                     e)))
-          (finally
-            (close!)))))
+        (p/extract-response provider final-state))
+      (catch IOException e
+        (throw (if (stalled?)
+                 (IOException. (str "no data for " *stream-idle-ms* " ms") e)
+                 e)))
+      (finally
+        (close!)))))
 
 ;; ============================================================================
 ;; Convenience Functions

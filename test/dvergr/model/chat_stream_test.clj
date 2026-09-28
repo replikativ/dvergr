@@ -44,10 +44,10 @@
                           :body (if (= 1 (swap! calls inc))
                                   (silent)
                                   (ByteArrayInputStream. (.getBytes events "UTF-8")))})}
-       (fn []
-        (let [started (System/currentTimeMillis)
-              r (chat/chat [{:role "user" :content "hi"}] {:model "m" :provider :test-stream})]
-          (testing "the second attempt's answer"
-            (is (= "ok" (:content r))))
-          (is (= 2 @calls) "the stalled stream was closed and the call made again")
-          (is (< (- (System/currentTimeMillis) started) 10000) "within the idle limit, not forever")))))))
+        (fn []
+          (let [started (System/currentTimeMillis)
+                r (chat/chat [{:role "user" :content "hi"}] {:model "m" :provider :test-stream})]
+            (testing "the second attempt's answer"
+              (is (= "ok" (:content r))))
+            (is (= 2 @calls) "the stalled stream was closed and the call made again")
+            (is (< (- (System/currentTimeMillis) started) 10000) "within the idle limit, not forever")))))))

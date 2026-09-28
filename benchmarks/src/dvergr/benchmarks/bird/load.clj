@@ -81,7 +81,7 @@
            (with-open [sq (bird/connect root db-id)]
              (doseq [[t cols] (tables sq)]
                (let [{:keys [rows]} (bird/execute sq (str "SELECT * FROM \"" t "\"") {:max-rows Long/MAX_VALUE
-                                                                                          :timeout-s 600})
+                                                                                      :timeout-s 600})
                      types (mapv (fn [i] (value-type (map #(nth % i) rows))) (range (count cols)))]
                  (d/transact conn {:tx-data (into [{:db/ident (keyword (ident t) "db-row-exists")
                                                     :db/valueType :db.type/boolean

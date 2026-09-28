@@ -78,7 +78,7 @@
                                            (error-kind (get-in % [:shimmed :error])))
                                         graded))
      :shimmed-by-difficulty (into {} (map (fn [[d rs]] [d (format "%d/%d" (count (filter #(= :match (get-in % [:shimmed :status])) rs))
-                                                                (count rs))]))
+                                                                  (count rs))]))
                                   (group-by :difficulty graded))}))
 
 (defn report
