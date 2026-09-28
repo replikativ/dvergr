@@ -5,8 +5,8 @@
             [dvergr.benchmarks.bird.dialect :as dialect]))
 
 (deftest sqlite-idioms-in-postgres
-  (testing "identifiers: back-quoted and double-quoted, lower-cased"
-    (is (= "SELECT \"free meal count (k-12)\" FROM frpm"
+  (testing "identifiers: back-quoted and double-quoted, in bird.load's canonical form"
+    (is (= "SELECT \"free_meal_count__k_12_\" FROM frpm"
            (dialect/to-postgres "SELECT `Free Meal Count (K-12)` FROM frpm"))))
   (testing "string literals are never touched"
     (is (= "SELECT 'It''s `x`' FROM t" (dialect/to-postgres "SELECT 'It''s `x`' FROM t"))))

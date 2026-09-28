@@ -18,7 +18,8 @@
 
    The gold SQL, the gold rows and upstream's difficulty stay here; an
    EnvironmentDef names a question by database and id."
-  (:require [clojure.string :as str]
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]
             [datahike.api :as d]
             [datahike.pg :as pg]
             [dvergr.agent.environment :as environment]
@@ -28,12 +29,18 @@
             [dvergr.agent.verifiers :as verifiers]
             [dvergr.benchmarks.bird.compat :as compat]
             [dvergr.benchmarks.bird.core :as bird]
+            [dvergr.benchmarks.bird.dialect :as dialect]
             [dvergr.benchmarks.bird.load :as load]
             [dvergr.benchmarks.live :as live]
             [dvergr.model.registry :as registry]
             [dvergr.sandbox :as sandbox]))
 
-(def version 1)
+(def version
+  "4: the Datalog description names :find's set semantics and :with. 3:
+   identifiers canonical (bird.load/2); a final reply that is only a query
+   counts as submitted. 2: a plain Datalog query (an EDN vector) runs as is;
+   every engine's schema shows example rows."
+  4)
 
 (def engines #{:sqlite :pg-datahike :datalog})
 
@@ -72,10 +79,13 @@
       :sqlite (with-open [c (bird/connect root db-id)]
                 (select-keys (bird/execute c query {:timeout-s 60}) [:rows]))
       :pg-datahike (select-keys (compat/pg-execute (handler db-id) query) [:rows :error])
-      :datalog (let [r (sandbox/eval-code (datalog-ctx db-id) query :timeout-ms 60000)]
-                 (if (:success r)
-                   {:rows (rows-of (:value r))}
-                   {:error (str (get-in r [:error :message]))})))
+      :datalog (if (str/starts-with? (str/triml query) "[")
+                 ;; a plain Datalog query, as SQL is plain SQL
+                 {:rows (rows-of (d/q (edn/read-string query) (d/db (load/load! db-id))))}
+                 (let [r (sandbox/eval-code (datalog-ctx db-id) query :timeout-ms 60000)]
+                   (if (:success r)
+                     {:rows (rows-of (:value r))}
+                     {:error (str (get-in r [:error :message]))}))))
     (catch Throwable t {:error (or (ex-message t) (str (class t)))})))
 
 ;; ---------------------------------------------------------------------------
@@ -95,26 +105,31 @@
             [t (let [{:keys [columns rows]} (bird/execute c (str "SELECT * FROM \"" t "\" LIMIT 3"))]
                  (mapv #(zipmap columns %) rows))]))))
 
+(defn- example-rows [root db-id]
+  (str "\n\nExample rows:\n"
+       (str/join "\n" (for [[t rows] (samples root db-id)] (str (str/lower-case t) ": " (pr-str rows))))))
+
 (defn schema-text
-  "The schema as the candidate on `engine` sees it."
+  "The schema as the candidate on `engine` sees it; every engine gets the
+   same example rows."
   [engine db-id {:keys [root] :or {root (bird/root)}}]
   (case engine
-    :sqlite (sqlite-schema root db-id)
-    :pg-datahike (str "PostgreSQL dialect. Identifiers are lower case: write them unquoted, or "
-                      "double-quoted and lower-case when they contain spaces or symbols.\n\n"
-                      (str/lower-case (str/replace (sqlite-schema root db-id) "`" "\"")))
+    :sqlite (str (sqlite-schema root db-id) (example-rows root db-id))
+    :pg-datahike (str "PostgreSQL dialect. Identifiers are lower case, with every character other "
+                      "than a-z, 0-9 and _ written as _ (as below).\n\n"
+                      (dialect/to-postgres (str/lower-case (sqlite-schema root db-id)))
+                      (example-rows root db-id))
     :datalog (let [ex (samples root db-id)]
                (with-open [c (bird/connect root db-id)]
                  (str "Datahike (Datalog). Every table row is an entity with the marker attribute "
-                      ":<table>/db-row-exists true; every column is an attribute :<table>/<column> "
-                      "(lower case; a column name with spaces or symbols is a keyword like "
-                      "(keyword \"frpm\" \"free meal count (k-12)\")). A NULL is a missing attribute. "
+                      ":<table>/db-row-exists true; every column is an attribute :<table>/<column>, "
+                      "listed below (lower case, other characters as _). A NULL is a missing attribute. "
                       "Foreign keys are plain values: join by equal values, not refs.\n\n"
                       (str/join "\n\n"
                                 (for [[t cols] (load/tables c)]
-                                  (str "table " (str/lower-case t) ":\n"
-                                       (str/join "\n" (map #(str "  :" (str/lower-case t) "/"
-                                                                 (str/lower-case (:name %))
+                                  (str "table " (load/ident t) ":\n"
+                                       (str/join "\n" (map #(str "  :" (load/ident t) "/"
+                                                                 (load/ident (:name %))
                                                                  "  (declared " (:declared %) ")")
                                                            cols))
                                        "\n  example rows: " (pr-str (get ex t))))))))))
@@ -122,7 +137,16 @@
 (def ^:private language
   {:sqlite "SQL (SQLite dialect)"
    :pg-datahike "SQL (PostgreSQL dialect)"
-   :datalog "a Clojure expression over (q query & inputs), Datahike's Datalog (e.g. (->> (q '[:find ?n ?h :where [?e :t/name ?n] [?e :t/height ?h]]) (sort-by second >) (take 1))); its value must be a collection of result rows"})
+   :datalog (str "Datahike's Datalog: either a plain query, an EDN vector such as "
+                 "[:find ?n :where [?e :t/name ?n] [?e :t/height ?h] [(> ?h 200)]], "
+                 "or, to sort or limit (Datalog has no ORDER BY or LIMIT), a Clojure expression "
+                 "over (q query & inputs) such as "
+                 "(->> (q '[:find ?n ?h :where [?e :t/name ?n] [?e :t/height ?h]]) (sort-by second >) (take 1)) "
+                 "-- in Clojure ' quotes the one form after it and is not closed; the value must be a "
+                 "collection of result rows. :find returns a SET: identical rows collapse, and so do "
+                 "the values an aggregate sees, so aggregate per entity with :with, e.g. "
+                 "[:find (avg ?h) :with ?e :where [?e :t/height ?h]] (without :with ?e, heights "
+                 "that occur twice count once)")})
 
 (defn system-prompt [engine]
   (str "You answer a question about a database by writing a query in " (language engine) ". "
@@ -156,6 +180,17 @@
     (str (count rows) " row(s)" (when (> (count rows) 50) ", first 50") ":\n"
          (str/join "\n" (map pr-str (take 50 rows))))))
 
+(defn reply-query
+  "The query a final reply consists of, or nil: the reply without code
+   fences, when it reads as one query in `engine`'s language."
+  [engine content]
+  (let [t (-> (str content) str/trim
+              (str/replace #"(?s)^```[a-zA-Z]*\s*(.*?)\s*```$" "$1") str/trim)]
+    (when (case engine
+            (:sqlite :pg-datahike) (re-find #"(?i)^(select|with)\s" t)
+            :datalog (re-find #"^[\[(]" t))
+      t)))
+
 (defn- episode!
   "The query/submit loop. Returns `{:termination :submitted :queries :usage
    :transcript :model-steps}`."
@@ -184,7 +219,12 @@
             (cond
               submit (done :submitted (get-in submit [:arguments :query] (get-in submit [:arguments "query"]))
                            (inc turn) history usage)
-              (empty? tool-calls) (done :no-submission nil (inc turn) history usage)
+              (empty? tool-calls)
+              ;; a final reply that is only a query is its submission (for
+              ;; every engine alike): models answer so as often as they call
+              (if-let [q (reply-query engine content)]
+                (done :submitted q (inc turn) history usage)
+                (done :no-submission nil (inc turn) history usage))
               :else
               (let [results (mapv (fn [{:keys [id arguments]}]
                                     (let [q (or (:query arguments) (get arguments "query"))]
