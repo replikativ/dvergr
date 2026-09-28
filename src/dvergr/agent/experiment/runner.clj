@@ -92,7 +92,7 @@
   "Run the pilot cells of `experiment` (under the governor `admit` too), then
    estimate the rest and gate it against the budget. Returns the estimate,
    with `:over` when the conservative estimate exceeds the budget."
-  [{:keys [preflight experiment metered parallelism admit run-once]}]
+  [{:keys [preflight experiment team metered parallelism admit run-once]}]
   (let [{:keys [budget stratum-fn]} preflight
         pilot (preflight/pilot-cells (cells experiment) (or stratum-fn preflight/stratum))
         pilot-admit (preflight/pilot-admit pilot)
@@ -108,8 +108,12 @@
         remaining (into {} (map (fn [c] [(:candidate/id c) (- per-candidate (get done (:candidate/id c) 0))]))
                         (:experiment/candidates experiment))
         points (some->> (seq (keep #(subscription/moved % started) metered)) (reduce max))
+        caps (into {} (keep (fn [c] (when-let [d (get-in (roster/agent team (:candidate/agent c))
+                                                         [:agent/program :budget-dollars])]
+                                      [(:candidate/id c) (* 1e6 (double d))])))
+                   (:experiment/candidates experiment))
         est (preflight/estimate {:pilot-receipts (mapv :attempt/receipt (filter pilot? attempts))
-                                 :remaining remaining :parallelism parallelism
+                                 :remaining remaining :parallelism parallelism :cell-caps caps
                                  :window-points (when (seq metered) (or points 0.0))
                                  :resolution subscription/resolution})
         over (preflight/gate est budget)]
@@ -282,7 +286,7 @@
                       (binding [ec/*execution-context* (:ctx room)] @spin))))]
     (try
       (let [estimate (when-let [pf (:preflight opts)]
-                       (run-preflight! {:preflight pf :experiment experiment-def :metered metered
+                       (run-preflight! {:preflight pf :experiment experiment-def :team team :metered metered
                                         :parallelism parallelism :admit admit :run-once run-once}))]
         (if (:over estimate)
         ;; the pilot's cells are kept: running again with a larger budget

@@ -62,16 +62,32 @@
                    repl-fns)]
     (sandbox/add-namespace! sci-ctx 'ab (ns-doc/with-docs fns docs))))
 
-(def repl-guidance
+(def ^:private guidance-head
   (str "\n\n<tools>\nYou act through the `clojure_eval` tool, a Clojure (SCI) REPL; definitions "
        "persist across evaluations. The APIs are functions in namespace `ab`, each taking one map "
        "with string keys and returning the API's text exactly: `(ab/search {\"query\" \"...\"})` "
        "finds endpoints, `(ab/fetch {\"method\" \"GET\" \"url\" \"...\" \"params\" {...}})` calls "
        "one (params and body may be maps), `(ab/base64 {\"text\" \"...\"})` encodes Gmail bodies. "
-       "`(ab/parse s)` turns a JSON result into data. Several calls can run in one evaluation. "
-       "Whenever a decision depends on filtering, matching, comparing or summing records, do it "
-       "in code over parsed data rather than by eye. Writes (POST/PUT/PATCH/DELETE) take effect "
-       "immediately: make each exactly once.\n</tools>"))
+       "`(ab/parse s)` turns a JSON result into data. "))
+
+(def ^:private guidance-tail
+  (str "Writes (POST/PUT/PATCH/DELETE) take effect immediately: make each exactly once.\n</tools>"))
+
+(def repl-guidance
+  "What the REPL candidate is told about its action space, by variant (the
+   candidate's `:repl-guidance`, default `:compute`); variants are what a
+   pilot tunes over."
+  {:compute (str guidance-head
+                 "Several calls can run in one evaluation. Whenever a decision depends on "
+                 "filtering, matching, comparing or summing records, do it in code over parsed data "
+                 "rather than by eye. " guidance-tail)
+   ;; fewer model steps: read everything a decision needs in one evaluation,
+   ;; and return only what the decision needs
+   :batch (str guidance-head
+               "Batch: in ONE evaluation, fetch every record a decision needs (several `ab/fetch` "
+               "calls, parsed), then return only the fields that decide it (a small map or vector), "
+               "not whole API responses. Match, filter, compare and sum in code. " guidance-tail)
+   :lean (str guidance-head guidance-tail)})
 
 (defn- repl-tools [sci-ctx execution-ctx]
   {"clojure_eval"
@@ -91,17 +107,22 @@
 
 (defn system-prompt
   "The candidate's system prompt: the task's, plus the REPL guidance for `:repl`."
-  [system action-space]
-  (case action-space
-    :tools system
-    :repl (str system repl-guidance)))
+  ([system action-space] (system-prompt system action-space :compute))
+  ([system action-space guidance]
+   (case action-space
+     :tools system
+     :repl (str system (or (repl-guidance guidance)
+                           (throw (ex-info "Unknown REPL guidance"
+                                           {:type ::unknown-guidance :guidance guidance
+                                            :known (set (keys repl-guidance))})))))))
 
 (defn run-episode!
   "Dvergr's agent loop on the task in `room`'s world. `spec` is `{:provider
    :model :action-space :budget-dollars}`. Returns what
    `episode/run-episode!` returns, `:usage` being the chat budget."
   [{:keys [room max-turns cancelled? model-scope] :as episode}
-   {:keys [provider model action-space budget-dollars] :or {action-space :tools budget-dollars 2.0}}]
+   {:keys [provider model action-space budget-dollars guidance]
+    :or {action-space :tools budget-dollars 2.0 guidance :compute}}]
   (let [{:keys [system messages tools]} (ep/task-prompt room)
         calls (atom [])
         call! (fn [name args] (ep/call-tool! (assoc episode :calls calls) name args))
@@ -125,7 +146,7 @@
                                                  (:message/tool-uses m))))))))]
     (try
       (providers/ensure-initialized!)
-      (chat-context/add-message! chat-ctx {:role :system :content (system-prompt system action-space)})
+      (chat-context/add-message! chat-ctx {:role :system :content (system-prompt system action-space guidance)})
       (doseq [{:keys [role content]} messages]
         (chat-context/add-message! chat-ctx {:role role :content content}))
       (let [[termination steps]
@@ -156,5 +177,6 @@
 
 (defn guidance-sha256
   "Digest of what a REPL candidate is told beyond the task (in its AgentDef)."
-  [action-space]
-  (when (= :repl action-space) (pj/sha256-hex repl-guidance)))
+  ([action-space] (guidance-sha256 action-space :compute))
+  ([action-space guidance]
+   (when (= :repl action-space) (pj/sha256-hex (system-prompt "" :repl guidance)))))

@@ -1,6 +1,6 @@
 # One algebra for worlds, savepoints and budgets
 
-Status: **in progress** (2026-09-27; agreed in direction: "unify our stack and FRP algebra"). Done: steps 1 (spindel#74, released in 0.1.67), 2 (#195), 3 (resume through `hydrate-into!`), 4 (#196). Next: 5, 6.
+Status: **in progress** (2026-09-27; agreed in direction: "unify our stack and FRP algebra"). Done: steps 1 (spindel#74, released in 0.1.67), 2 (#195), 3 (resume through `hydrate-into!`), 4 (#196). Step 5 is a renaming without a new guarantee and step 6 is deferred until inference runs over Attempts (below).
 
 dvergr grew its own versions of things spindel now provides: Run worlds beside spindel's
 savepoint worlds, a resource ledger beside spindel's resource authority, a resume path beside
@@ -50,12 +50,22 @@ states (and tests) hold for dvergr too.
    wallet. Model spend is thereby conserved, escrowed and resumed with everything else. A
    resumed Run without a wallet starts with its budget minus what the stopped Run's chat
    spent, not a fresh one.
-5. **One handler table:** dvergr's effect configuration and spindel's savepoint handlers are
-   both "handlers in world state, inherited by forks". Keep dvergr's algebra (normalize,
-   compose, narrowing) and store both under spindel's world-state conventions; a later spindel
-   step may give handler tables the composition dvergr has.
-6. **Experiments as scopes:** an experiment's Attempt worlds as one `world-scope` (quiescence,
-   discard, descriptors for audit, the authority for their budgets).
+5. **One handler table (assessed, not done):** dvergr's effect configuration and spindel's
+   savepoint handlers are both "handlers in world state, inherited by forks", but one holds
+   portable effect specs with a composition algebra and the other maps savepoint sites to
+   functions; storing both under one convention renames keys and adds no guarantee. It
+   becomes worth doing if spindel's handler tables gain dvergr's composition.
+6. **Experiments as scopes (assessed 2026-09-28, deferred):** an experiment's Attempt worlds as
+   one `world-scope`. Each thing a scope gives, the experiment path already guarantees:
+   *budgets*: every cell's Run pays its model spend from a wallet of its candidate's budget
+   (step 4), so an experiment is bounded by cells × per-Run budget (the preflight reports
+   this cap); *discard and quiescence*: cells settle `:discard` after certification and
+   cleanup groups join the teardown; *audit*: certified Attempts. What a scope adds is the
+   algebra spindel's inference uses (SMC, MCTS), which pays when an algorithm runs over
+   Attempts (resampling agent runs, branching at savepoints), not for a fixed grid of cells.
+   The enabling change then: a scope whose fork and discard the embedder supplies (a Run
+   world is a Room fork: store, registry and context, not a bare context fork), with its
+   affine ownership, quiescence and authority unchanged.
 
 Steps 1 and 2 are independent; 3 needs both; 4 needs 2; 5 and 6 are refactors without new
 behaviour and come last.

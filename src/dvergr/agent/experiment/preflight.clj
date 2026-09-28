@@ -12,6 +12,8 @@
      :worst-seen    the dearest pilot cell × the cells left (agent costs are
                     heavy-tailed: an episode at its step bound costs several
                     ordinary ones)
+     :cap           not an estimate: the cells left × each candidate's
+                    per-Run budget, which its wallet enforces
 
    for list-price dollars (what a BYOK key would be billed), billed dollars,
    tokens and wall time at the run's parallelism; and, for subscriptions, the
@@ -94,7 +96,7 @@
    `window-points` the fraction of a subscription window the pilot moved (nil
    when unmetered); a reading shows whole points, so a pilot that moved none
    is counted as having moved one (`resolution`), an upper bound."
-  [{:keys [pilot-receipts remaining parallelism window-points resolution]
+  [{:keys [pilot-receipts remaining parallelism window-points resolution cell-caps]
     :or {resolution 0.01}}]
   (let [by-candidate (group-by #(get-in % [:attempt/metrics :experiment-candidate]) pilot-receipts)
         per-candidate (into {}
@@ -108,6 +110,10 @@
         points-per-token (when (and window-points (pos? pilot-tokens))
                            (/ (max (double window-points) resolution) pilot-tokens))]
     {:candidates per-candidate
+     ;; a hard bound, not an estimate: every Run's model spend is paid from a
+     ;; wallet of its candidate's budget (`cell-caps`, {candidate microdollars})
+     :cap-microdollars (when (seq cell-caps)
+                         (reduce + 0.0 (map (fn [[c left]] (* left (get cell-caps c 0))) remaining)))
      :total (into {}
                   (for [k [:list-microdollars :billed-microdollars :tokens]]
                     [k (into {} (for [band [:expected :conservative :worst-seen]]

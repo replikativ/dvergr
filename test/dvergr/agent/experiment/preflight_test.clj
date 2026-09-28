@@ -31,7 +31,10 @@
              {:pilot-receipts [(receipt :cheap 0.01 1000 1000) (receipt :cheap 0.03 3000 3000)
                                (receipt :dear 1.0 50000 10000)]
               :remaining {:cheap 10 :dear 4} :parallelism 2
-              :window-points 0.0})]
+              :window-points 0.0
+              :cell-caps {:cheap 50000.0 :dear 2000000.0}})]
+    (testing "the cap is the cells left at each candidate's per-Run budget"
+      (is (= (+ (* 10 50000.0) (* 4 2000000.0)) (:cap-microdollars est))))
     (testing "expected is the pilot mean, per candidate, times the cells left"
       (is (< (Math/abs (- 200000.0 (get-in est [:candidates :cheap :list-microdollars :expected]))) 1e-6))
       (is (= 4000000.0 (get-in est [:candidates :dear :list-microdollars :expected]))))
