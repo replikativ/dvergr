@@ -275,41 +275,41 @@
                    ([admit]
                    ;; Wait outside the Runs: inside one, the wait would count
                    ;; against the evaluation's own timeout.
-                   (when uses-cc? (cc/await-usage-window! {:threshold usage-pause-threshold}))
-                   (let [spin (run-in room {:capabilities capabilities :team team :admit admit
-                                            :experiment experiment-def :parallelism parallelism
-                                            :cleanup-group cleanup-group :benchmark benchmark})]
-                     (binding [ec/*execution-context* (:ctx room)] @spin))))]
+                    (when uses-cc? (cc/await-usage-window! {:threshold usage-pause-threshold}))
+                    (let [spin (run-in room {:capabilities capabilities :team team :admit admit
+                                             :experiment experiment-def :parallelism parallelism
+                                             :cleanup-group cleanup-group :benchmark benchmark})]
+                      (binding [ec/*execution-context* (:ctx room)] @spin))))]
     (try
       (let [estimate (when-let [pf (:preflight opts)]
                        (run-preflight! {:preflight pf :experiment experiment-def :metered metered
                                         :parallelism parallelism :admit admit :run-once run-once}))]
-      (if (:over estimate)
+        (if (:over estimate)
         ;; the pilot's cells are kept: running again with a larger budget
         ;; (or none) resumes from them
-        {:dir dir :experiment-room room-id :experiment experiment-def
-         :preflight estimate :stopped :over-budget}
-      (let [result (loop [n 0]
-                     (let [r (run-once)]
+          {:dir dir :experiment-room room-id :experiment experiment-def
+           :preflight estimate :stopped :over-budget}
+          (let [result (loop [n 0]
+                         (let [r (run-once)]
                        ;; Cells a rejected subscription call failed are re-run
                        ;; (resume skips the completed ones) after the reset.
-                       (if (and uses-cc? (< n usage-retries) (not (:refused r))
-                                (:incomplete (:scorecard r)) (cc/usage-limited?))
-                         (recur (inc n))
-                         r)))
-            failed-cells (get-in result [:scorecard :incomplete :cells] 0)]
-        {:dir dir :experiment-room room-id :experiment experiment-def
-         :results (count (:results result)) :failed-cells failed-cells
-         :refused (:refused result)
-         :preflight estimate
+                           (if (and uses-cc? (< n usage-retries) (not (:refused r))
+                                    (:incomplete (:scorecard r)) (cc/usage-limited?))
+                             (recur (inc n))
+                             r)))
+                failed-cells (get-in result [:scorecard :incomplete :cells] 0)]
+            {:dir dir :experiment-room room-id :experiment experiment-def
+             :results (count (:results result)) :failed-cells failed-cells
+             :refused (:refused result)
+             :preflight estimate
          ;; a fresh process has no reading before its first call: then
          ;; the first one taken during the run
-         :subscription (into {} (map (fn [p] [p {:before (or (get before p)
-                                                           (first (filter #(>= (:at-ms %) started-ms)
-                                                                          (subscription/samples p))))
-                                                 :after (subscription/reading p)}]))
-                             metered)
-         :scorecard (:scorecard result)})))
+             :subscription (into {} (map (fn [p] [p {:before (or (get before p)
+                                                                 (first (filter #(>= (:at-ms %) started-ms)
+                                                                                (subscription/samples p))))
+                                                     :after (subscription/reading p)}]))
+                                 metered)
+             :scorecard (:scorecard result)})))
       (finally
         (try (evaluation/await-cleanups-for! room cleanup-group) (catch Throwable _ nil))
         (try (evaluation/await-cleanups! room) (catch Throwable _ nil))
