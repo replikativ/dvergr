@@ -114,6 +114,9 @@
                    (:experiment/candidates experiment))
         est (preflight/estimate {:pilot-receipts (mapv :attempt/receipt (filter pilot? attempts))
                                  :remaining remaining :parallelism parallelism :cell-caps caps
+                                 ;; the most drained window decides: rate of its provider
+                                 :calibration (some->> (seq (keep subscription/points-per-token metered))
+                                                       (apply max-key :points-per-token))
                                  :window-points (when (seq metered) (or points 0.0))
                                  :resolution subscription/resolution})
         over (preflight/gate est budget)]
@@ -121,8 +124,34 @@
                :data {:experiment (:experiment/id experiment) :budget budget :over over
                       :total (:total est) :window-points (:window-points est)}}
               (if over "Preflight: the estimate exceeds the budget" "Preflight: within budget"))
-    (cond-> (assoc est :budget budget)
-      over (assoc :over over))))
+    ;; the pilot's Attempts ride along as metadata (not portable data): the
+    ;; run records what they spent
+    (with-meta (cond-> (assoc est :budget budget)
+                 over (assoc :over over))
+      {:attempts attempts})))
+
+(defn- tokens-by-meter
+  "Tokens the `attempts` spent, per subscription meter."
+  [attempts]
+  (reduce (fn [acc a]
+            (reduce-kv (fn [acc model {:keys [tokens]}]
+                         (let [p (some-> (model-provider {:model model}) meter-provider)]
+                           (if (subscription-providers p)
+                             (update acc p (fnil + 0) (+ (:input tokens 0) (:output tokens 0)))
+                             acc)))
+                       acc (get-in a [:attempt/receipt :attempt/metrics :spend :by-model])))
+          {} attempts))
+
+(defn- record-calibration!
+  "Record what this invocation spent per meter and how far its window moved."
+  [metered started-ms attempts]
+  (doseq [[p tokens] (tokens-by-meter attempts)
+          :when (contains? metered p)]
+    (try (subscription/record-run! p {:tokens tokens :cells (count attempts)
+                                      :points (or (subscription/moved p started-ms) 0.0)})
+         (catch Exception e
+           (tel/log! {:level :warn :id ::calibration-not-recorded :error e}
+                     "Could not record the subscription calibration")))))
 
 (defn experiment-def
   "The ExperimentDef of a provider's pieces: `benchmark` (namespaces the ids),
@@ -291,8 +320,9 @@
         (if (:over estimate)
         ;; the pilot's cells are kept: running again with a larger budget
         ;; (or none) resumes from them
-          {:dir dir :experiment-room room-id :experiment experiment-def
-           :preflight estimate :stopped :over-budget}
+          (do (record-calibration! metered started-ms (:attempts (meta estimate)))
+              {:dir dir :experiment-room room-id :experiment experiment-def
+               :preflight estimate :stopped :over-budget})
           (let [result (loop [n 0]
                          (let [r (run-once)]
                        ;; Cells a rejected subscription call failed are re-run
@@ -301,7 +331,11 @@
                                     (:incomplete (:scorecard r)) (cc/usage-limited?))
                              (recur (inc n))
                              r)))
-                failed-cells (get-in result [:scorecard :incomplete :cells] 0)]
+                failed-cells (get-in result [:scorecard :incomplete :cells] 0)
+                ;; every Attempt this invocation ran, the pilot's included
+                ran (filter #(>= (or (get-in % [:attempt/receipt :attempt/started-at]) 0) started-ms)
+                            (keep :attempt (:results result)))
+                _ (record-calibration! metered started-ms ran)]
             {:dir dir :experiment-room room-id :experiment experiment-def
              :results (count (:results result)) :failed-cells failed-cells
              :refused (:refused result)
