@@ -159,7 +159,15 @@ around 40, and every definition costs context in every session.
 
 Handshake versions 2024-11-05, 2025-03-26, 2025-06-18 and 2025-11-25; an unknown version is
 answered with the latest. Tools, resources (derived from the read ops) with subscriptions, and
-`listChanged`. Unknown tools are `-32602`.
+`listChanged`. Unknown tools are `-32602`, unknown resources `-32002`.
+
+A connection answers requests concurrently: every `tools/call` and `resources/read` runs on
+its own virtual thread, so a `job_status` wait or a long evaluation does not hold up the
+connection's other requests (a `ping`, a list, another tool). The handshake, lists and
+notifications stay in order. Responses to concurrent requests may therefore arrive out of
+order, as JSON-RPC allows. A request cancelled with `notifications/cancelled` before it
+finishes gets no response. Its work is not interrupted: a job keeps running until
+`job_cancel`.
 
 ## Next
 
@@ -167,6 +175,6 @@ answered with the latest. Tools, resources (derived from the read ops) with subs
    tools over `--mcp-config`); a read-only eval (needs a restricted sandbox, not only fewer
    ops) and evals metered to the wallet.
 2. MCP 2026-07-28 (stateless, `server/discover`, `_meta` per request) and Streamable HTTP for
-   hosted use, then OAuth.
+   hosted use, then OAuth. Concurrent dispatch and cancellation (above) are the first step.
 3. A `data` toolset over pg-datahike (load a `pg_dump`, migrate on a fork, merge), and a client
    test pass over Cursor, VS Code, Gemini CLI, n8n and ChatGPT.

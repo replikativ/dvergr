@@ -1,7 +1,8 @@
 (ns dvergr.mcp.json-rpc
   "Clean-room JSON-RPC 2.0 dispatch and MCP protocol handlers.
-   Implements the MCP handshake protocols 2024-11-05 through 2025-11-25 with
-   synchronous dispatch.
+   Implements the MCP handshake protocols 2024-11-05 through 2025-11-25.
+   `handle-message` answers one message; the transport
+   (`dvergr.mcp.server/dispatch!`) decides what runs concurrently.
 
    All handlers are plain fns: (fn [context message] -> result-map | nil).
    handle-message returns a response map directly (no promises).")
@@ -250,6 +251,12 @@
            :id id
            :result result})
         (catch Exception e
-          (if (= -32602 (:json-rpc/code (ex-data e)))
-            (invalid-params-response id (.getMessage e))
-            (internal-error-response id (.getMessage e))))))))
+          (let [{code :json-rpc/code data :json-rpc/data} (ex-data e)]
+            (cond
+              (= -32602 code) (invalid-params-response id (.getMessage e))
+              ;; any other protocol error a handler names (e.g. -32002,
+              ;; resource not found)
+              (integer? code) {:jsonrpc "2.0" :id id
+                               :error (cond-> {:code code :message (.getMessage e)}
+                                        data (assoc :data data))}
+              :else (internal-error-response id (.getMessage e)))))))))
