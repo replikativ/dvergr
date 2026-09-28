@@ -528,15 +528,27 @@ loop; 120 cells, the weekly Codex window did not move a point):
 Shortlist: `:lean`, `:batch`. The guidance the REPL runs under decides its cost: the
 default advice cost a third more than saying nothing.
 
-The held-out confirmation (30 eval tasks × 2 repetitions, reference vs `:lean` vs `:batch`)
-did not run: its preflight stopped it after the pilot, estimating 9 points of the weekly
-window (14.8 conservative) against a budget of 10. The estimate is high because the meter
-shows whole points and the pilot moved one; the day's runs measured about 130 cells per
-point, which puts the run at one or two. Since then every run records what it spent and how
-far the window moved (`~/.config/dvergr/subscription-calibration.edn`, per user: the quota
-is theirs), and the preflight estimates window points from all recorded runs once they hold
-more tokens than the pilot; seeded with the day's runs (52.7M tokens, three points), about
-one weekly point per 13M tokens, counting the hidden part of a point once, so it errs high.
+**Held-out confirmation** (2026-09-28, 30 eval tasks, five per domain, never used in tuning,
+× 2 repetitions, Luna; 180 cells; the weekly Codex window did not move a point):
+
+| Candidate | Mean partial credit | Pass rate | List price per task |
+| --- | --- | --- | --- |
+| upstream's loop (reference) | 0.546 | 13% | $0.062 |
+| REPL, `:batch` | 0.536 | 18% | $0.049 |
+| REPL, `:lean` | 0.576 | 18% | $0.044 |
+
+Paired by task against the reference (95%):
+
+| Variant | Reward difference | Cost ratio | Cost difference |
+| --- | --- | --- | --- |
+| `:lean` | +0.030 [−0.056, +0.116] | 0.71 | −$0.018 [−$0.026, −$0.010] |
+| `:batch` | −0.010 [−0.078, +0.059] | 0.80 | −$0.012 [−$0.022, −$0.002] |
+
+On held-out tasks the REPL with lean guidance costs 29% less, with an interval that excludes
+no saving, at a reward no worse on the estimate. It falls short of the strict non-inferiority
+rule at a 0.05 margin by 0.006 (lower bound −0.056). The claim that holds: about 30% cheaper at
+equal task success, on held-out AutomationBench tasks, with Luna. Open: a second model and a
+second benchmark. The earlier default guidance (`:compute`) is not among these: tuning dropped it.
 
 Not done: the `zapier` meta-tool toolset; the private held-out set, which upstream does not
 release.
