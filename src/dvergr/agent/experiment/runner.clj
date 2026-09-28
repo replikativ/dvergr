@@ -23,11 +23,14 @@
   (:require [clojure.java.io :as io]
             [dvergr.agent.conversation :as conv]
             [dvergr.agent.evaluation :as evaluation]
+            [dvergr.agent.environment :as environment]
             [dvergr.agent.experiment :as experiment]
+            [dvergr.agent.experiment.preflight :as preflight]
             [dvergr.agent.roster :as roster]
             [dvergr.discourse :as d]
             [dvergr.model.api.claude-code :as cc]
             [dvergr.model.registry :as registry]
+            [dvergr.model.subscription :as subscription]
             [dvergr.room.store :as store]
             [hasch.core :as hasch]
             [taoensso.telemere :as tel]
@@ -43,6 +46,79 @@
 
 (defn- model-provider [{:keys [model provider]}]
   (or provider (when model (:provider (registry/get-model! (registry/resolve-alias model))))))
+
+(def subscription-providers
+  "Providers that spend the user's own subscription windows, not a bill."
+  #{:codex-subscription :codex-subscription-cli :claude-code})
+
+(def default-allowance
+  "What an experiment may take of a subscription: ten points of any window
+   since it started, and nothing once a window is 80% used."
+  {:share 0.10 :pause-at 0.80})
+
+(defn- meter-provider
+  "The provider whose meter covers `provider` (the Codex CLI spends the same
+   subscription as its HTTP path)."
+  [provider]
+  (if (= :codex-subscription-cli provider) :codex-subscription provider))
+
+(defn metered-providers
+  "The subscription meters `models` (specs `{:model :provider}` or model ids)
+   spend from."
+  [models]
+  (into #{} (comp (map #(model-provider (if (map? %) % {:model %})))
+                  (filter subscription-providers) (map meter-provider))
+        models))
+
+(defn admit-for
+  "The admission function an experiment of `models` runs under `allowance`
+   (default `default-allowance`), or nil when none of them is a subscription
+   (or the allowance is nil)."
+  ([models] (admit-for models default-allowance))
+  ([models allowance]
+   (let [metered (metered-providers models)]
+     (when (and allowance (seq metered))
+       (subscription/governor allowance metered)))))
+
+(defn- cells
+  "Every cell of `experiment` as admission sees it."
+  [experiment]
+  (for [c (:experiment/candidates experiment)
+        e (get-in experiment [:experiment/dataset :dataset/environments])
+        r (range (:experiment/repetitions experiment))]
+    {:candidate/id (:candidate/id c) :environment (environment/environment-ref e) :repetition r}))
+
+(defn- run-preflight!
+  "Run the pilot cells of `experiment` (under the governor `admit` too), then
+   estimate the rest and gate it against the budget. Returns the estimate,
+   with `:over` when the conservative estimate exceeds the budget."
+  [{:keys [preflight experiment metered parallelism admit run-once]}]
+  (let [{:keys [budget stratum-fn]} preflight
+        pilot (preflight/pilot-cells (cells experiment) (or stratum-fn preflight/stratum))
+        pilot-admit (preflight/pilot-admit pilot)
+        started (System/currentTimeMillis)
+        r (run-once (fn [cell] (or (pilot-admit cell) (when admit (admit cell)))))
+        attempts (keep :attempt (:results r))
+        pilot? (fn [a] (contains? pilot [(get-in a [:attempt/receipt :attempt/metrics :experiment-candidate])
+                                         (get-in a [:attempt/receipt :attempt/environment :environment/content-id])]))
+        done (frequencies (map #(get-in % [:attempt/receipt :attempt/metrics :experiment-candidate])
+                               (filter experiment/verdict? attempts)))
+        per-candidate (* (count (get-in experiment [:experiment/dataset :dataset/environments]))
+                         (:experiment/repetitions experiment))
+        remaining (into {} (map (fn [c] [(:candidate/id c) (- per-candidate (get done (:candidate/id c) 0))]))
+                        (:experiment/candidates experiment))
+        points (some->> (seq (keep #(subscription/moved % started) metered)) (reduce max))
+        est (preflight/estimate {:pilot-receipts (mapv :attempt/receipt (filter pilot? attempts))
+                                 :remaining remaining :parallelism parallelism
+                                 :window-points (when (seq metered) (or points 0.0))
+                                 :resolution subscription/resolution})
+        over (preflight/gate est budget)]
+    (tel/log! {:level (if over :warn :info) :id :experiment/preflight
+               :data {:experiment (:experiment/id experiment) :budget budget :over over
+                      :total (:total est) :window-points (:window-points est)}}
+              (if over "Preflight: the estimate exceeds the budget" "Preflight: within budget"))
+    (cond-> (assoc est :budget budget)
+      over (assoc :over over))))
 
 (defn experiment-def
   "The ExperimentDef of a provider's pieces: `benchmark` (namespaces the ids),
@@ -84,7 +160,7 @@
    latter loses its Run's wakeups. `capabilities` is
    `{:world-setup :protocol :evaluator}` (setup and protocol when named)."
   [room {:keys [capabilities team experiment parallelism cleanup-group benchmark parent-run
-                world-parent]
+                world-parent admit]
          :or {parallelism 1}}]
   (let [{:keys [world-setup protocol evaluator]} capabilities
         cells (* (count (:experiment/candidates experiment))
@@ -106,7 +182,8 @@
         :complete-only? true
         :on-result #(log-cell benchmark %)
         :parent-run parent-run
-        :world-parent world-parent}))))
+        :world-parent world-parent
+        :admit admit}))))
 
 (defn progress
   "The progress of the experiment stored in `dir` (a `run!` directory),
@@ -137,6 +214,20 @@
      :repetitions :parallelism :experiment-id
      :claude-cli :claude-env :host-context-note (`:auto`, a string, or nil)
      :usage-pause-threshold :usage-retries
+     :preflight     `{:budget {:dollars d :subscription share} :stratum-fn f}`:
+                    run a pilot first (one cell per candidate per stratum,
+                    `experiment.preflight`), estimate the rest, and stop with
+                    the estimate (`:stopped :over-budget`) when its
+                    conservative bound exceeds the budget; the result's
+                    `:preflight` is the estimate
+     :allowance     what the experiment may take of the subscriptions its
+                    models use (`default-allowance`; nil: no bound): once
+                    reached no new cell starts, the result carries
+                    `:refused`, and running again resumes the rest
+
+   The result's `:subscription` is `{provider {:before :after}}`, the meter
+   readings around the run: with the tokens on the Scorecard, what a unit of
+   work costs in window points.
 
    Calls `conv/isolate-home!`: Dvergr's state root becomes `<dir>/home` for
    the whole process. This is the separate-process host (a dedicated JVM or
@@ -148,7 +239,12 @@
     :or {repetitions 1 parallelism 1 usage-pause-threshold 0.97 usage-retries 3}
     :as opts}]
   (conv/isolate-home! dir)
-  (let [cc-before (cc/settings-snapshot)
+  (let [started-ms (System/currentTimeMillis)
+        allowance (get opts :allowance default-allowance)
+        metered (metered-providers models)
+        before (select-keys (subscription/all-readings) metered)
+        admit (admit-for models allowance)
+        cc-before (cc/settings-snapshot)
         uses-cc? (boolean (some #{:claude-code} (map model-provider models)))
         note (let [n (get opts :host-context-note :auto)]
                (cond (= :auto n) (when uses-cc? host-context-note)
@@ -174,27 +270,46 @@
         ;; Detached evaluation cleanup of this operation is joined before the
         ;; Room and its store are closed.
         cleanup-group (evaluation/cleanup-group)
-        run-once (fn []
+        run-once (fn run-once
+                   ([] (run-once admit))
+                   ([admit]
                    ;; Wait outside the Runs: inside one, the wait would count
                    ;; against the evaluation's own timeout.
-                   (when uses-cc? (cc/await-usage-window! {:threshold usage-pause-threshold}))
-                   (let [spin (run-in room {:capabilities capabilities :team team
-                                            :experiment experiment-def :parallelism parallelism
-                                            :cleanup-group cleanup-group :benchmark benchmark})]
-                     (binding [ec/*execution-context* (:ctx room)] @spin)))]
+                    (when uses-cc? (cc/await-usage-window! {:threshold usage-pause-threshold}))
+                    (let [spin (run-in room {:capabilities capabilities :team team :admit admit
+                                             :experiment experiment-def :parallelism parallelism
+                                             :cleanup-group cleanup-group :benchmark benchmark})]
+                      (binding [ec/*execution-context* (:ctx room)] @spin))))]
     (try
-      (let [result (loop [n 0]
-                     (let [r (run-once)]
+      (let [estimate (when-let [pf (:preflight opts)]
+                       (run-preflight! {:preflight pf :experiment experiment-def :metered metered
+                                        :parallelism parallelism :admit admit :run-once run-once}))]
+        (if (:over estimate)
+        ;; the pilot's cells are kept: running again with a larger budget
+        ;; (or none) resumes from them
+          {:dir dir :experiment-room room-id :experiment experiment-def
+           :preflight estimate :stopped :over-budget}
+          (let [result (loop [n 0]
+                         (let [r (run-once)]
                        ;; Cells a rejected subscription call failed are re-run
                        ;; (resume skips the completed ones) after the reset.
-                       (if (and uses-cc? (< n usage-retries)
-                                (:incomplete (:scorecard r)) (cc/usage-limited?))
-                         (recur (inc n))
-                         r)))
-            failed-cells (get-in result [:scorecard :incomplete :cells] 0)]
-        {:dir dir :experiment-room room-id :experiment experiment-def
-         :results (count (:results result)) :failed-cells failed-cells
-         :scorecard (:scorecard result)})
+                           (if (and uses-cc? (< n usage-retries) (not (:refused r))
+                                    (:incomplete (:scorecard r)) (cc/usage-limited?))
+                             (recur (inc n))
+                             r)))
+                failed-cells (get-in result [:scorecard :incomplete :cells] 0)]
+            {:dir dir :experiment-room room-id :experiment experiment-def
+             :results (count (:results result)) :failed-cells failed-cells
+             :refused (:refused result)
+             :preflight estimate
+         ;; a fresh process has no reading before its first call: then
+         ;; the first one taken during the run
+             :subscription (into {} (map (fn [p] [p {:before (or (get before p)
+                                                                 (first (filter #(>= (:at-ms %) started-ms)
+                                                                                (subscription/samples p))))
+                                                     :after (subscription/reading p)}]))
+                                 metered)
+             :scorecard (:scorecard result)})))
       (finally
         (try (evaluation/await-cleanups-for! room cleanup-group) (catch Throwable _ nil))
         (try (evaluation/await-cleanups! room) (catch Throwable _ nil))

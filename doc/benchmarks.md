@@ -90,6 +90,31 @@ between a candidate's Scorecard on the environment with and without `:faults`.
 and Room, Claude Code settings for the run, waiting out subscription usage
 windows, resume, the Scorecard. A provider's `experiment/run!` is a call to it.
 
+**Subscription allowance.** A subscription (Codex, Claude Code) has no bill, but it is the
+user's own quota. `dvergr.model.subscription` meters it from what the provider reports with
+every call (Codex: `x-codex-primary-used-percent` and friends, whole percent of a weekly
+window; Claude Code: utilization per window), and an experiment runs under an allowance,
+by default `{:share 0.10 :pause-at 0.80}`: no new cell starts once the experiment has used
+ten points of any window since it started, or once a window is 80% used by anyone. Refused
+cells do not run, the result says why (`:refused`), no Scorecard is persisted, and running
+the same directory again resumes them. `catalog_benchmark` runs under the same default. The
+result's `:subscription` holds the readings before and after, which with the Scorecard's
+tokens measure what a unit of work costs in window points.
+
+**Preflight.** `run!` with `:preflight {:budget {:dollars d :subscription share}}` first runs a
+pilot: one cell per candidate per stratum (default: the environment id's namespace, e.g. an
+AutomationBench domain), first repetition (`dvergr.agent.experiment.preflight`). The
+pilot's cells are cells of the experiment, so nothing is spent twice. From their bills it
+extrapolates the rest per candidate, as `:expected` (the mean), `:conservative` (a one-sided
+95% upper bound on the mean) and `:worst-seen` (every cell at the dearest pilot cell, since
+agent costs are heavy-tailed), for list-price and billed dollars, tokens, wall time at the
+run's parallelism and subscription window points (the points the pilot moved per token; a
+pilot that moved no whole point counts as one, an upper bound). When the conservative
+estimate exceeds the budget the run stops with the estimate (`:stopped :over-budget`);
+running again with a larger budget resumes from the pilot. This is the experiment predicting
+its own resource use before committing to it; the measurements it keeps are what later
+predictions, and tuning on pilots before a full run, build on.
+
 Still shared by accident, not by design: the Python-semantics layer and the
 JSON reader live under `dvergr.benchmarks.tau2` (`python`, `pyjson`) and BFCL
 requires them from there.
@@ -453,9 +478,25 @@ Three loops on the same 12 tasks (two per domain, Luna, one attempt each, 2026-0
 
 At this size the means are noise: an earlier run of the same cells (before the fix below)
 gave 0.63 / 0.68 / 0.61, and single tasks swing from 1.0 to 0.5 between runs of one
-candidate. What holds across both runs: the REPL candidate makes more calls in fewer model
-steps and costs a quarter to a third less. Separating the loops needs repetitions and more
-tasks, which cost nothing on the subscription.
+candidate.
+
+A larger run (2026-09-28, 18 tasks, three per domain, two repetitions, 108 Attempts, all
+replayed; under a preflight, which estimated 1.9–2.5 points of the weekly Codex window for
+the cells after its pilot, and the whole run moved it about one):
+
+| Candidate | Mean partial credit | Pass rate | Tokens per task | Model steps | List price per task |
+| --- | --- | --- | --- | --- | --- |
+| upstream's loop (reference) | 0.56 | 19% | 243k | 25.7 | $0.052 |
+| Dvergr's loop, upstream's tools | 0.57 | 19% | 223k | 23.4 | $0.048 |
+| Dvergr's loop, REPL | 0.60 | 17% | 216k | 22.1 | $0.047 |
+
+Paired by task against the reference (bootstrap over tasks, 95%): the REPL's partial credit
++0.04 [−0.06, +0.13] and its cost −11%, a difference of −$0.006 [−$0.013, +$0.002]; Dvergr's
+loop with upstream's tools +0.01 [−0.11, +0.10] and −7%. Neither is distinguishable from
+the reference here. The quarter-to-a-third saving of the 12-task runs did not hold at 18
+tasks with repetitions; on AutomationBench with Luna, the REPL is not yet a systematic
+saving. What it would take: tasks whose decisions are over many records (where computing
+beats reading), guidance tuned on a development split, and a second model.
 
 What the replay check caught: the first comparison had one Attempt (of 36) whose world did
 not replay. The adapter parsed worlds into Clojure maps, which do not keep key order past

@@ -3,7 +3,8 @@
             [jsonista.core]
             [dvergr.mcp.server]
             [clojure.test :refer [deftest is testing]]
-            [dvergr.model.api.claude-code :as claude-code])
+            [dvergr.model.api.claude-code :as claude-code]
+            [dvergr.model.subscription :as subscription])
   (:import [java.util.concurrent CancellationException]))
 
 (def ^:private result-json
@@ -177,7 +178,10 @@
                      (catch Exception e e))]
           (is (some? e))
           (is (not (claude-code/usage-limit-error? e)))))
-      (finally (reset! rate-limits nil)))))
+      (finally
+        (reset! rate-limits nil)
+        ;; the faked report reached the shared subscription meter too
+        (subscription/forget! :claude-code)))))
 
 (deftest native-invoke-calls-are-parsed
   ;; What claude-code-haiku emitted on a wiki task, instead of <tool_use> JSON

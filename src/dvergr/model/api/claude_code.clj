@@ -17,6 +17,7 @@
    current date -- that cannot be switched off)."
   (:require [dvergr.model.provider :as p]
             [dvergr.model.quirks :as quirks]
+            [dvergr.model.subscription :as subscription]
             [dvergr.chat.tool-schema :as tool-schema]
             [jsonista.core :as json]
             [clojure.string :as str]
@@ -76,6 +77,12 @@
 (defn- epoch-ms [seconds] (when seconds (* 1000 (long seconds))))
 
 (defn- record-rate-limit! [{:keys [status resetsAt rateLimitType utilization unifiedWindows]}]
+  (subscription/observe! :claude-code
+                         {:windows (into {} (keep (fn [[k {:keys [utilization resetsAt]}]]
+                                                    (when utilization
+                                                      [(keyword k) {:used (double utilization)
+                                                                    :resets-at-ms (epoch-ms resetsAt)}])))
+                                         unifiedWindows)})
   (reset! rate-limits
           {:status (keyword status)
            :type (some-> rateLimitType keyword)
