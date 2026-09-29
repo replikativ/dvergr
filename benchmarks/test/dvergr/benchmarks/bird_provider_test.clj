@@ -100,3 +100,16 @@
                 [:find (count-distinct ?x) :where [?e :t/a ?x]]]]
       (is (= q (provider/with-rows q))))))
 
+(deftest top-k-by-a-column-the-answer-does-not-show
+  (if-not (bird/available?)
+    (support/skip! "top-k-by-a-column-the-answer-does-not-show: no BIRD dev set")
+    (let [tallest (fn [q] (:rows (provider/run-query :datalog "superhero" q {})))]
+      (is (= [["Surtur"]] (tallest "{:find [?n] :where [[?e :superhero/superhero_name ?n] [?e :superhero/height_cm ?h]] :order-by [?h :desc ?n :asc] :limit 1}"))
+          "ordered by a variable :find does not return; a map query is a plain query")
+      (is (= [["Surtur"]] (tallest "[:find ?n :where [?e :superhero/superhero_name ?n] [?e :superhero/height_cm ?h] :order-by ?h :desc ?n :asc :limit 1]"))
+          "the vector form with :order-by")
+      (is (= [["Surtur"]] (tallest "(q '{:find [?n] :where [[?e :superhero/superhero_name ?n] [?e :superhero/height_cm ?h]] :order-by [?h :desc ?n :asc] :limit 1})"))
+          "through q in an expression")
+      (is (= 1 (count (tallest "{:find [?a (count ?e)] :where [[?e :superhero/alignment_id ?a]] :order-by [1 :desc] :limit 1}")))
+          "ordered by an aggregate's column"))))
+
