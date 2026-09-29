@@ -61,13 +61,27 @@
                     (recur (conj! acc (row-values rs n)) (inc i))
                     (persistent! acc)))})))))
 
+(defn ratio->double
+  "The double nearest to the exact ratio `r`. Clojure's `(double r)` rounds
+   to 16 significant digits (BigDecimal, DECIMAL64), which is not always the
+   nearest double: `(double 519/203)` is 2.556650246305419, SQL's REAL
+   division 2.5566502463054186. Dividing two integers that are exact doubles
+   is correctly rounded (IEEE); beyond 2^53, 40 digits."
+  [r]
+  (let [n (numerator r) d (denominator r) exact 9007199254740992]
+    (if (and (<= (abs n) exact) (<= (abs d) exact))
+      (/ (double n) (double d))
+      (.doubleValue (.divide (bigdec n) (bigdec d) (java.math.MathContext. 40))))))
+
 (defn canonical
   "A result value as upstream's comparison sees it: numbers compare by value
-   (1 = 1.0), so every number becomes a double; text stays text."
+   (1 = 1.0), so every number becomes a double (an exact ratio the nearest
+   one); text stays text."
   [v]
   (cond
     (nil? v) nil
     (instance? Boolean v) (if v 1.0 0.0)
+    (ratio? v) (ratio->double v)
     (number? v) (double v)
     (bytes? v) (vec v)
     :else (str v)))

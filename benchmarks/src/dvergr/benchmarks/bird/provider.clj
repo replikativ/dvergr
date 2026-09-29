@@ -36,11 +36,17 @@
             [dvergr.sandbox :as sandbox]))
 
 (def version
-  "4: the Datalog description names :find's set semantics and :with. 3:
+  "5: the sorting example drops its sort key from the answer; aggregates
+   count every row of the join, as in SQL (`with-rows`); an
+   exact ratio grades as its nearest double; in the Datalog sandbox
+   `double` converts a ratio to its nearest double; a vector that is not a
+   query (its first element is not a keyword) is evaluated as an expression;
+   the Datalog description says aggregates see every row, to stay exact, and
+   to keep aggregates out of :where and of expressions. 4: the Datalog description names :find's set semantics and :with. 3:
    identifiers canonical (bird.load/2); a final reply that is only a query
    counts as submitted. 2: a plain Datalog query (an EDN vector) runs as is;
    every engine's schema shows example rows."
-  4)
+  5)
 
 (def engines #{:sqlite :pg-datahike :datalog})
 
@@ -63,12 +69,64 @@
     (mapv #(if (and (coll? %) (not (map? %))) (vec %) [%]) v)
     :else [[v]]))
 
+(def ^:private bag-aggregates
+  "The aggregates duplicates change: those `:find`'s set semantics would
+   mislead."
+  '#{count sum avg median variance stddev})
+
+(defn- lvar? [x] (and (symbol? x) (str/starts-with? (name x) "?")))
+
+(defn- clause-parts
+  "A vector-form query as `[[keyword forms] ...]`, in order."
+  [v]
+  (reduce (fn [acc x] (if (keyword? x) (conj acc [x []]) (update-in acc [(dec (count acc)) 1] conj x)))
+          [] v))
+
+(defn with-rows
+  "`query` with SQL's row semantics for its aggregates: when `:find` has an
+   aggregate duplicates change and there is no `:with`, every entity
+   variable `:where` binds (the first place of a data pattern) that `:find`
+   does not use becomes `:with`, so an aggregate sees one value per row of
+   the join, as in SQL, instead of the set of distinct values.
+   `count-distinct` still counts distinct values. Other queries are
+   returned as they are."
+  [query]
+  (let [m (cond (map? query) query
+                (vector? query) (into {} (clause-parts query))
+                :else nil)
+        find (:find m)
+        find-vars (set (filter lvar? (flatten (map #(if (seq? %) (seq %) [%]) find))))
+        agg? (some #(and (seq? %) (bag-aggregates (first %))) find)
+        entity-vars (->> (:where m)
+                         (filter #(and (vector? %) (lvar? (first %)) (keyword? (second %))))
+                         (map first) distinct
+                         (remove (into find-vars (filter lvar? (flatten (seq (:in m)))))))]
+    (if (or (nil? m) (not agg?) (contains? m :with) (empty? entity-vars))
+      query
+      (if (map? query)
+        (assoc query :with (vec entity-vars))
+        (let [parts (clause-parts query)
+              at (or (first (keep-indexed (fn [i [k]] (when (#{:in :where} k) i)) parts)) (count parts))
+              parts (vec (concat (take at parts) [[:with (vec entity-vars)]] (drop at parts)))]
+          (into [] (mapcat (fn [[k forms]] (cons k forms))) parts))))))
+
 (defn- datalog-ctx [db-id]
   (let [ctx (sandbox/create-base-ctx :load-fn (constantly nil))
         db (d/db (load/load! db-id))]
-    (sandbox/add-namespace! ctx 'user {'q (fn [query & inputs] (apply d/q query db inputs))
-                                       'pull (fn [pattern eid] (d/pull db pattern eid))})
+    (sandbox/add-namespace! ctx 'user {'q (fn [query & inputs] (apply d/q (with-rows query) db inputs))
+                                       'pull (fn [pattern eid] (d/pull db pattern eid))
+                                       ;; Clojure's (double ratio) is not the nearest double
+                                       'double (fn [x] (if (ratio? x) (bird/ratio->double x) (clojure.core/double x)))})
     ctx))
+
+(defn- plain-query?
+  "Whether `query` is a Datalog query as data (a vector opening with a
+   keyword such as :find), not a Clojure expression; `[(let ...)]` is an
+   expression."
+  [query]
+  (and (str/starts-with? (str/triml query) "[")
+       (try (let [v (edn/read-string query)] (and (vector? v) (keyword? (first v))))
+            (catch Exception _ false))))
 
 (defn run-query
   "Rows of `query` (text) on `engine` over database `db-id`: `{:rows}` or
@@ -79,9 +137,9 @@
       :sqlite (with-open [c (bird/connect root db-id)]
                 (select-keys (bird/execute c query {:timeout-s 60}) [:rows]))
       :pg-datahike (select-keys (compat/pg-execute (handler db-id) query) [:rows :error])
-      :datalog (if (str/starts-with? (str/triml query) "[")
+      :datalog (if (plain-query? query)
                  ;; a plain Datalog query, as SQL is plain SQL
-                 {:rows (rows-of (d/q (edn/read-string query) (d/db (load/load! db-id))))}
+                 {:rows (rows-of (d/q (with-rows (edn/read-string query)) (d/db (load/load! db-id))))}
                  (let [r (sandbox/eval-code (datalog-ctx db-id) query :timeout-ms 60000)]
                    (if (:success r)
                      {:rows (rows-of (:value r))}
@@ -141,12 +199,18 @@
                  "[:find ?n :where [?e :t/name ?n] [?e :t/height ?h] [(> ?h 200)]], "
                  "or, to sort or limit (Datalog has no ORDER BY or LIMIT), a Clojure expression "
                  "over (q query & inputs) such as "
-                 "(->> (q '[:find ?n ?h :where [?e :t/name ?n] [?e :t/height ?h]]) (sort-by second >) (take 1)) "
+                 "(->> (q '[:find ?n ?h :where [?e :t/name ?n] [?e :t/height ?h]]) (sort-by second >) (take 1) "
+                 "(map (fn [[n _]] [n]))) -- the last step keeps only the asked column: a sort key you "
+                 "sorted by is not part of the answer unless the question asks for it "
                  "-- in Clojure ' quotes the one form after it and is not closed; the value must be a "
-                 "collection of result rows. :find returns a SET: identical rows collapse, and so do "
-                 "the values an aggregate sees, so aggregate per entity with :with, e.g. "
-                 "[:find (avg ?h) :with ?e :where [?e :t/height ?h]] (without :with ?e, heights "
-                 "that occur twice count once)")})
+                 "collection of result rows. :find returns a SET: identical result rows collapse. "
+                 "Aggregates (count, sum, avg, …) see every row of the join, as in SQL: equal values "
+                 "each count; (count-distinct ?x) counts distinct values. "
+                 "Aggregates stand alone in :find: never in :where and never inside an expression, so "
+                 "compute a ratio, percentage or difference of aggregates in Clojure over the rows of q. "
+                 "Integer arithmetic is exact: (/ 3 14) is the ratio 3/14, and a result ratio is graded "
+                 "as its nearest double, as SQL's REAL division; stay exact, e.g. (* 100 (/ a b)), since "
+                 "mixing in a double such as 100.0 rounds the ratio to 16 digits first")})
 
 (defn system-prompt [engine]
   (str "You answer a question about a database by writing a query in " (language engine) ". "
