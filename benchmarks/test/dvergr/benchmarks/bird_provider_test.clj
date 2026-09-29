@@ -163,3 +163,16 @@
         (is (false? (get-in (run ["42" "still 42"]) [:attempt/checks :submitted])) "one reminder only")
         (finally (d/close-room! room))))))
 
+(deftest a-query-cannot-reach-the-host
+  (if-not (bird/available?)
+    (support/skip! "a-query-cannot-reach-the-host: no BIRD dev set")
+    (doseq [q ["[:find ?x :where [(slurp \"/etc/hostname\") ?x]]"
+               "(q '[:find ?x :where [(slurp \"/etc/hostname\") ?x]])"
+               "[:find ?x :where [(clojure.java.shell/sh \"true\") ?x]]"]]
+      (is (re-find #"Unknown function" (str (:error (provider/run-query :datalog "superhero" q {})))) q))))
+
+(deftest a-plain-query-may-hold-a-regex
+  (if-not (bird/available?)
+    (support/skip! "a-plain-query-may-hold-a-regex: no BIRD dev set")
+    (is (= [[66]] (:rows (provider/run-query :datalog "superhero" "[:find (count ?e) :where [?e :superhero/superhero_name ?n] [(re-find #\"(?i)man\" ?n)]]" {}))))))
+
