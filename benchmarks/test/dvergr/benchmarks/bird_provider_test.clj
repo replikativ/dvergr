@@ -137,3 +137,29 @@
     (support/skip! "ordering-in-the-vector-form: no BIRD dev set")
     (is (= 1 (count (:rows (provider/run-query :datalog "superhero" "[:find ?a (count ?e) :where [?e :superhero/alignment_id ?a] :order-by 1 :desc :limit 1]" {})))))))
 
+(deftest an-answer-instead-of-a-submission-gets-one-reminder
+  (if-not (bird/available?)
+    (support/skip! "an-answer-instead-of-a-submission-gets-one-reminder: no BIRD dev set")
+    (let [room (d/make-room {:id :bird/provider-test-3 :store (memory/make)})
+          replies (fn [contents]
+                    (fn [_question]
+                      (let [left (atom contents)]
+                        (fn [_request]
+                          (let [c (first @left)] (swap! left rest)
+                               (if (vector? c)
+                                 {:content "" :tool-calls [{:id "s" :name "submit" :arguments {:query (second c)}}]}
+                                 {:content (str c) :tool-calls []}))))))
+          run (fn [contents]
+                (let [q (some #(when (= 747 (:question-id %)) %) (bird/questions))
+                      caps (provider/capabilities [q] {:agent-generate (replies contents)})
+                      env (provider/environment-def q caps {:timeout-ms 120000})
+                      team (provider/candidate-roster [{:id :sqlite :model "claude-code-sonnet" :engine :sqlite}])]
+                  (binding [ec/*execution-context* (:ctx room)]
+                    (:attempt-receipt @(evaluation/evaluate room team :sqlite env (:evaluator caps) {:protocol (:protocol caps)})))))]
+      (try
+        (is (= {:submitted true :runs true :correct true}
+               (:attempt/checks (run ["42" ["submit" (answers :sqlite)]])))
+            "the value, then the query after the reminder")
+        (is (false? (get-in (run ["42" "still 42"]) [:attempt/checks :submitted])) "one reminder only")
+        (finally (d/close-room! room))))))
+

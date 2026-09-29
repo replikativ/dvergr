@@ -36,7 +36,8 @@
             [dvergr.sandbox :as sandbox]))
 
 (def version
-  "8: a submitted query that fails comes back with its error (every engine);
+  "8: a final reply that is not a query that runs (the answer's value, a
+   fragment) gets one reminder to submit; a submitted query that fails comes back with its error (every engine);
    a Datalog query has a 60 s deadline; a map written as vector clauses
    reads as that vector; the Datalog description is shorter and orders in
    the vector form. 7: the arithmetic example takes each aggregate with ffirst from its own
@@ -315,7 +316,7 @@
                   (when-not (str/blank? (:evidence question)) (str "\nEvidence: " (:evidence question)))
                   "\n\nSchema:\n" (schema-text engine db-id {}))
         opening [{:role :user :content user}]]
-    (loop [turn 0 history opening queries [] usage {}]
+    (loop [turn 0 history opening queries [] usage {} reminded? false]
       (let [done (fn [termination submitted turns history usage]
                    {:termination termination :submitted submitted :queries queries :usage usage
                     :model-steps turns :transcript (subvec history 1)})]
@@ -348,13 +349,23 @@
                                                           "Not run: a submit in the same turn failed.")}))
                                tool-calls)
                          (conj queries {:query q :error (:error r) :submit? true})
-                         usage)))
+                         usage reminded?)))
               (empty? tool-calls)
-              ;; a final reply that is only a query is its submission (for
-              ;; every engine alike): models answer so as often as they call
-              (if-let [q (reply-query engine content)]
-                (done :submitted q (inc turn) history usage)
-                (done :no-submission nil (inc turn) history usage))
+              ;; a final reply that is only a query that runs is its
+              ;; submission (for every engine alike): models answer so as
+              ;; often as they call. Anything else (the answer's value, a
+              ;; fragment) gets one reminder to submit the query.
+              (let [q (reply-query engine content)
+                    runs? (and q (not (:error (run-query engine db-id q {}))))]
+                (cond
+                  runs? (done :submitted q (inc turn) history usage)
+                  reminded? (done :no-submission nil (inc turn) history usage)
+                  :else (recur (inc turn)
+                               (conj history {:role :user
+                                              :content (str "That is not a submission: the answer is graded by "
+                                                            "running a query. Call `submit` with the one query "
+                                                            "whose result answers the question.")})
+                               queries usage true)))
               :else
               (let [results (mapv (fn [{:keys [id arguments]}]
                                     (let [q (or (:query arguments) (get arguments "query"))]
@@ -363,7 +374,7 @@
                 (recur (inc turn)
                        (into history (map (fn [[id _ r]] {:role :tool :id id :content (shown r)})) results)
                        (into queries (map (fn [[_ q r]] {:query q :error (:error r)})) results)
-                       usage)))))))))
+                       usage reminded?)))))))))
 
 (defonce ^:private gold-cache (atom {}))
 
