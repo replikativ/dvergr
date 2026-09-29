@@ -22,7 +22,7 @@
    Inference (orthogonal — Open Q #11): use spindel's inference primitives
    (`choose`, `observe`, `sample`) inside any participant or room-evolution
    spin; select an inference kernel via `kernel-infer` from
-   `org.replikativ.spindel.inference.inference`. No discourse-specific
+   `org.replikativ.foerster.core`. No discourse-specific
    inference primitive is needed."
   (:require [clojure.set :as set]
             [clojure.string :as str]
