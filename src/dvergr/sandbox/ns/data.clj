@@ -18,7 +18,7 @@
   "Project a native Spindel measure before it crosses into SCI. Execution
    contexts and their process-local executors deliberately do not survive."
   [measure]
-  (let [measure-ns  (find-ns 'org.replikativ.spindel.inference.measure)
+  (let [measure-ns  (find-ns 'org.replikativ.foerster.measure)
         contexts    (@(ns-resolve measure-ns 'get-contexts) measure)
         value-of    @(ns-resolve measure-ns 'get-value)
         log-weights (vec (@(ns-resolve measure-ns 'get-log-weights) measure))
@@ -68,7 +68,7 @@
        :type :empirical})))
 
 (defn- posterior-predict [posterior pred-fn samples]
-  (let [measure-ns (find-ns 'org.replikativ.spindel.inference.measure)
+  (let [measure-ns (find-ns 'org.replikativ.foerster.measure)
         indices    (@(ns-resolve measure-ns 'systematic-resample)
                     (:posterior/weights posterior) samples)
         values     (:posterior/values posterior)]
@@ -300,18 +300,20 @@
    may explicitly request `:fresh` for a proven-pure model.
 
    Namespaces added:
-   - dist/   — Anglican distributions: normal, beta, gamma, uniform, flip, …
+   - dist/   — foerster distributions: normal, uniform, exponential, gamma
+               (shape, SCALE), beta, poisson, bernoulli, flip, discrete,
+               categorical, dirichlet, mvn, student-t, chi-squared
    - infer/  — smc-infer, importance-sampling, query, predict
-   - org.replikativ.spindel.inference.effects/ — sample, observe, choose (as CPS breakpoints)
+   - org.replikativ.foerster.effects/ — sample, observe, choose (as CPS breakpoints)
 
    NOTE: must be called AFTER fork-for-session (needs the SCI spin/await context)."
   [sci-ctx]
   ;; Load JVM-side namespaces (auto-registers effects on load)
-  (require '[org.replikativ.spindel.inference.effects])
-  (require '[org.replikativ.spindel.inference.inference :as infer*])
-  (require '[org.replikativ.spindel.inference.measure   :as measure*])
+  (require '[org.replikativ.foerster.effects])
+  (require '[org.replikativ.foerster.core :as infer*])
+  (require '[org.replikativ.foerster.measure   :as measure*])
   (require '[org.replikativ.spindel.engine.effects      :as eff*])
-  (require '[anglican.runtime :as ar*])
+  (require '[org.replikativ.foerster.dist :as dist*])
 
   ;; Inject dispatch-symbol-call as a native function accessible from SCI code.
   ;; Also add it to the org.replikativ.spindel.engine.effects namespace for
@@ -325,7 +327,7 @@
   ;; for breakpoint lookup — plain functions added via sci/add-namespace! lack
   ;; this metadata and are invisible to the CPS transformer.
   (sci/eval-string* sci-ctx
-                    "(ns org.replikativ.spindel.inference.effects)
+                    "(ns org.replikativ.foerster.effects)
      (defn choose [& _] (throw (ex-info \"choose called outside spin context\" {})))
      (defn sample [& _] (throw (ex-info \"sample called outside spin context\" {})))
      (defn observe [& _] (throw (ex-info \"observe called outside spin context\" {})))")
@@ -347,7 +349,7 @@
                 spin-id# org.replikativ.spindel.engine.core/*spin-id*]
             (org.replikativ.spindel.engine.effects/dispatch-symbol-call
               org.replikativ.spindel.engine.core/*execution-context*
-              'org.replikativ.spindel.inference.effects/choose
+              'org.replikativ.foerster.effects/choose
               [~@args]
               spin-id#
               \"infer\"
@@ -361,7 +363,7 @@
                 spin-id# org.replikativ.spindel.engine.core/*spin-id*]
             (org.replikativ.spindel.engine.effects/dispatch-symbol-call
               org.replikativ.spindel.engine.core/*execution-context*
-              'org.replikativ.spindel.inference.effects/sample
+              'org.replikativ.foerster.effects/sample
               [~@args]
               spin-id#
               \"infer\"
@@ -375,7 +377,7 @@
                 spin-id# org.replikativ.spindel.engine.core/*spin-id*]
             (org.replikativ.spindel.engine.effects/dispatch-symbol-call
               org.replikativ.spindel.engine.core/*execution-context*
-              'org.replikativ.spindel.inference.effects/observe
+              'org.replikativ.foerster.effects/observe
               [~@args]
               spin-id#
               \"infer\"
@@ -384,35 +386,27 @@
 
      (def breakpoints
        (assoc breakpoints
-         'org.replikativ.spindel.inference.effects/choose  'is.simm.partial-cps.async/choose-bp
-         'org.replikativ.spindel.inference.effects/sample  'is.simm.partial-cps.async/sample-bp
-         'org.replikativ.spindel.inference.effects/observe 'is.simm.partial-cps.async/observe-bp))")
+         'org.replikativ.foerster.effects/choose  'is.simm.partial-cps.async/choose-bp
+         'org.replikativ.foerster.effects/sample  'is.simm.partial-cps.async/sample-bp
+         'org.replikativ.foerster.effects/observe 'is.simm.partial-cps.async/observe-bp))")
 
-  ;; Anglican distribution constructors
+  ;; Distribution constructors (foerster.dist: raster's names and
+  ;; parameterizations; gamma's second parameter is the scale)
   (sci/add-namespace! sci-ctx 'dist
-                      (let [ar (find-ns 'anglican.runtime)]
-                        {'normal             @(ns-resolve ar 'normal)
-                         'beta               @(ns-resolve ar 'beta)
-                         'gamma              @(ns-resolve ar 'gamma)
-                         'uniform-continuous @(ns-resolve ar 'uniform-continuous)
-                         'exponential        @(ns-resolve ar 'exponential)
-                         'flip               @(ns-resolve ar 'flip)
-                         'bernoulli          @(ns-resolve ar 'bernoulli)
-                         'poisson            @(ns-resolve ar 'poisson)
-                         'dirichlet          @(ns-resolve ar 'dirichlet)
-                         'categorical        @(ns-resolve ar 'categorical)
-                         'mvn                @(ns-resolve ar 'mvn)
-                         'chi-squared        @(ns-resolve ar 'chi-squared)
-                         'student-t          (fn [nu] (@(ns-resolve ar 'student-t) nu))}))
+                      (let [d (find-ns 'org.replikativ.foerster.dist)]
+                        (into {} (map (fn [sym] [sym @(ns-resolve d sym)]))
+                              '[normal uniform exponential gamma beta poisson
+                                bernoulli flip discrete categorical dirichlet
+                                mvn student-t chi-squared])))
 
   ;; Inference runners — these take/return Spins and compose with await in Spin
   ;; bodies. Room-capable sandboxes default to canonical particle worlds: a
   ;; model that happens to touch a registered Yggdrasil system must not alias
   ;; the ambient room merely because its author omitted an expert-only option.
   ;; `:fresh` remains an explicit fast path for known-pure models.
-  (let [smc*        @(resolve 'org.replikativ.spindel.inference.inference/smc-infer)
-        importance* @(resolve 'org.replikativ.spindel.inference.inference/importance-sampling)
-        kernel*     @(resolve 'org.replikativ.spindel.inference.inference/kernel-infer)
+  (let [smc*        @(resolve 'org.replikativ.foerster.core/smc-infer)
+        importance* @(resolve 'org.replikativ.foerster.core/importance-sampling)
+        kernel*     @(resolve 'org.replikativ.foerster.core/kernel-infer)
         world-opts  (fn [opts]
                       (merge {:world-policy :fork} (or opts {})))]
     (sci/add-namespace!

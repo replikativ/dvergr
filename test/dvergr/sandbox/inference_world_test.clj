@@ -46,7 +46,7 @@
                  (str
                   "(require '[org.replikativ.spindel.spin.cps :refer [spin]] "
                   "         '[org.replikativ.spindel.effects.await :refer [await]] "
-                  "         '[org.replikativ.spindel.inference.effects :refer [observe]] "
+                  "         '[org.replikativ.foerster.effects :refer [observe]] "
                   "         '[dist] '[infer] '[particle]) "
                   "(let [model (spin "
                   "              (let [id (particle/id)] "

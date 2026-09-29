@@ -74,7 +74,12 @@
         ;; particle runs the whole model in a fork of the caller's world; a
         ;; particle's slot is [:inference :slot]. world.scope/copy! splits a
         ;; world's budget between copies.
-        org.replikativ/spindel     {:mvn/version "0.1.88"}
+        ;; 0.1.89: canonical particles are copies of worlds; 0.1.90: effect
+        ;; adapters as functions (foerster's effects in ClojureScript).
+        org.replikativ/spindel     {:mvn/version "0.1.90"}
+        ;; probabilistic inference in forkable worlds, split out of spindel:
+        ;; the sandbox's infer/ and dist/ namespaces (foerster.core, .dist)
+        org.replikativ/foerster    {:mvn/version "0.1.35"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context
