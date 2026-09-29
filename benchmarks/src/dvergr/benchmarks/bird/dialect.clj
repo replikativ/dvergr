@@ -15,6 +15,9 @@
                                arithmetic (SQLite converts text there; 47 of
                                BIRD's uses subtract years, 97 compare text)
      INSTR(s, t)             → STRPOS(s, t)
+     SUBSTR(s, -n)           → RIGHT(s, n)   (SQLite counts a negative start
+     SUBSTR(s, -n, k)        → SUBSTR(s, LENGTH(s) - n + 1, k)   from the end)
+     a LIKE b                → a ILIKE b     (SQLite's LIKE ignores case)
      DATE('now')             → CURRENT_DATE
      LIMIT a, b              → LIMIT b OFFSET a
      CAST(x AS REAL)         → CAST(x AS DOUBLE PRECISION)
@@ -119,6 +122,14 @@
       (let [[c a b] args]
         (concat [(w "CASE") sp (w "WHEN") sp] c [sp (w "THEN") sp] a [sp (w "ELSE") sp] b [sp (w "END")]))
 
+      (and (word? name-tok "SUBSTR") (#{2 3} (count args))
+           (let [[m n] (second args)] (and (punct? m "-") (= :num (:t n)) (= 2 (count (second args))))))
+      (let [[s [_ n] k] args]
+        (if-not k
+          (concat [(w "RIGHT") (p "(")] s [(p ",") sp n (p ")")])
+          (concat [(w "SUBSTR") (p "(")] s [(p ",") sp (w "LENGTH") (p "(")] s
+                  [(p ")") sp (p "-") sp n sp (p "+") sp {:t :num :s "1"} (p ",") sp] k [(p ")")])))
+
       (and (word? name-tok "STRFTIME") (= 2 (count args))
            (= 1 (count (first args))) (strftime-parts (:s (ffirst args))))
       (let [[from len] (strftime-parts (:s (ffirst args)))]
@@ -168,7 +179,7 @@
           ;; bird.load stores them in (lower case, [^a-z0-9_] as _)
           (= :qid (:t t)) (recur (subvec ts 1) (conj out (update t :s #(str/replace (str/lower-case %) #"[^a-z0-9_]" "_"))))
 
-          (and (#{"IIF" "STRFTIME" "INSTR" "DATE"} (str/upper-case (str (:s t)))) (= :word (:t t))
+          (and (#{"IIF" "STRFTIME" "INSTR" "DATE" "SUBSTR"} (str/upper-case (str (:s t)))) (= :word (:t t))
                (some-> (first nxt) (punct? "(")))
           (if-let [[args after] (call-args (rest nxt))]
             (if-let [r (rewrite-call t args)]
@@ -181,6 +192,9 @@
                 (recur (vec after) (into out r)))
               (recur (subvec ts 1) (conj out t)))
             (recur (subvec ts 1) (conj out t)))
+
+          ;; SQLite's LIKE ignores case (ASCII); PostgreSQL's does not
+          (word? t "LIKE") (recur (subvec ts 1) (conj out (w "ILIKE")))
 
           ;; CAST(x AS REAL): SQLite's REAL is PostgreSQL's single-precision
           ;; float, which would lose digits

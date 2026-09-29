@@ -42,13 +42,36 @@
             [t (mapv (fn [[_ name declared _ _ pk]] {:name name :declared declared :pk? (pos? (long pk))})
                      (:rows (bird/execute conn (str "PRAGMA table_info(\"" t "\")"))))]))))
 
-(defn- value-type [values]
-  (let [vs (remove nil? values)]
+(defn- column-type
+  "The value type of column `col` of `table`, from the storage classes its
+   values have (SQLite's `typeof`): all integers → long, all numbers →
+   double, anything else → string. Asked of SQLite, so a table is never held
+   in memory to find it."
+  [^Connection conn table col]
+  (let [classes (set (map first (:rows (bird/execute conn (str "SELECT DISTINCT typeof(\"" col "\") FROM \"" table "\"")
+                                                     {:timeout-s 600}))))
+        classes (disj classes "null")]
     (cond
-      (empty? vs) :db.type/string
-      (every? integer? vs) :db.type/long
-      (every? number? vs) :db.type/double
+      (empty? classes) :db.type/string
+      (= #{"integer"} classes) :db.type/long
+      (every? #{"integer" "real"} classes) :db.type/double
       :else :db.type/string)))
+
+(defn- each-row-batch
+  "Call `f` with each batch of up to `n` rows of `sql` on `conn`, streamed."
+  [^Connection conn sql n f]
+  (with-open [st (.createStatement conn)]
+    (.setFetchSize st (int n))
+    (with-open [rs (.executeQuery st sql)]
+      (let [k (.getColumnCount (.getMetaData rs))
+            row #(mapv (fn [i] (.getObject rs (int i))) (range 1 (inc k)))]
+        (loop [acc (transient [])]
+          (cond
+            (.next rs) (let [acc (conj! acc (row))]
+                         (if (= n (count acc))
+                           (do (f (persistent! acc)) (recur (transient [])))
+                           (recur acc)))
+            (pos? (count acc)) (f (persistent! acc))))))))
 
 (defn- coerce [type v]
   (when (some? v)
@@ -87,9 +110,7 @@
          (let [conn (d/connect cfg)]
            (with-open [sq (bird/connect root db-id)]
              (doseq [[t cols] (tables sq)]
-               (let [{:keys [rows]} (bird/execute sq (str "SELECT * FROM \"" t "\"") {:max-rows Long/MAX_VALUE
-                                                                                      :timeout-s 600})
-                     types (mapv (fn [i] (value-type (map #(nth % i) rows))) (range (count cols)))]
+               (let [types (mapv #(column-type sq t (:name %)) cols)]
                  (d/transact conn {:tx-data (into [{:db/ident (keyword (ident t) "db-row-exists")
                                                     :db/valueType :db.type/boolean
                                                     :db/cardinality :db.cardinality/one}]
@@ -98,13 +119,15 @@
                                                           :db/valueType type
                                                           :db/cardinality :db.cardinality/one})
                                                        cols types))})
-                 (doseq [chunk (partition-all batch rows)]
-                   (d/transact conn {:tx-data
-                                     (mapv (fn [row]
-                                             (into {(keyword (ident t) "db-row-exists") true}
-                                                   (keep (fn [[{:keys [name]} type v]]
-                                                           (when-let [c (coerce type v)] [(attr t name) c])))
-                                                   (map vector cols types row)))
-                                           chunk)})))))
+                 (each-row-batch
+                  sq (str "SELECT * FROM \"" t "\"") batch
+                  (fn [chunk]
+                    (d/transact conn {:tx-data
+                                      (mapv (fn [row]
+                                              (into {(keyword (ident t) "db-row-exists") true}
+                                                    (keep (fn [[{:keys [name]} type v]]
+                                                            (when-let [c (coerce type v)] [(attr t name) c])))
+                                                    (map vector cols types row)))
+                                            chunk)}))))))
            (spit done (pr-str {:loaded-at (java.util.Date.)}))
            conn))))))

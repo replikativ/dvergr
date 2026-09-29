@@ -36,3 +36,10 @@
   (testing "REAL is double precision"
     (is (= "SELECT CAST(x AS DOUBLE PRECISION) / y FROM t"
            (dialect/to-postgres "SELECT CAST(x AS REAL) / y FROM t")))))
+
+(deftest a-negative-substr-start-counts-from-the-end-and-like-ignores-case
+  (is (= "SELECT RIGHT(atom_id, 2) FROM atom" (dialect/to-postgres "SELECT SUBSTR(atom_id, -2) FROM atom")))
+  (is (= "SELECT SUBSTR(a, LENGTH(a) - 3 + 1, 2) FROM t" (dialect/to-postgres "SELECT SUBSTR(a, -3, 2) FROM t")))
+  (is (= "SELECT SUBSTR(a, 1, 4) FROM t" (dialect/to-postgres "SELECT SUBSTR(a, 1, 4) FROM t")) "a positive start is PostgreSQL's too")
+  (is (= "SELECT x FROM m WHERE p ILIKE 'vice president' AND q NOT ILIKE '%a%'"
+         (dialect/to-postgres "SELECT x FROM m WHERE p LIKE 'vice president' AND q NOT LIKE '%a%'"))))
