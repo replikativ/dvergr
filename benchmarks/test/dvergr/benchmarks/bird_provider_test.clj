@@ -68,3 +68,35 @@
   (is (= "[:find ?x :where [?e :t/a ?x]]" (provider/reply-query :datalog "[:find ?x :where [?e :t/a ?x]]")))
   (is (nil? (provider/reply-query :sqlite "The answer is 5.")) "prose is not a submission")
   (is (nil? (provider/reply-query :datalog "SELECT 1")) "another engine's language is not either"))
+
+(deftest an-exact-ratio-grades-as-its-nearest-double
+  ;; Clojure's (double 519/203) is 2.556650246305419; SQLite's 519.0 / 203
+  (is (= 2.5566502463054186 (bird/ratio->double 519/203)))
+  (is (= 164.82142857142858 (bird/ratio->double (/ 4615 28))))
+  (is (bird/same-result? [[519/203]] [[2.5566502463054186]]))
+  (is (= 3.3333333333333335E21 (bird/ratio->double (/ (bigint 10000000000000000000001) 3)))
+      "beyond 2^53"))
+
+(deftest a-vector-that-is-not-a-query-is-an-expression
+  (if-not (bird/available?)
+    (support/skip! "a-vector-that-is-not-a-query-is-an-expression: no BIRD dev set")
+    (do
+      (is (= [[1]] (:rows (provider/run-query :datalog "superhero" "[(let [x 1] [x])]" {}))))
+      (is (= [[2.5566502463054186]]
+             (:rows (provider/run-query :datalog "superhero" "[[(double 519/203)]]" {})))
+          "the sandbox's double is the nearest one"))))
+
+(deftest aggregates-count-every-row-of-the-join
+  (is (= '[:find (sum ?s) :with ?e :where [?e :budget/category "Food"] [?e :budget/spent ?s]]
+         (provider/with-rows '[:find (sum ?s) :where [?e :budget/category "Food"] [?e :budget/spent ?s]]))
+      "equal amounts are not one value")
+  (is (= '[:find ?el (count ?a) :with ?m :where [?a :atom/molecule_id ?mid] [?a :atom/element ?el] [?m :molecule/molecule_id ?mid]]
+         (provider/with-rows '[:find ?el (count ?a) :where [?a :atom/molecule_id ?mid] [?a :atom/element ?el] [?m :molecule/molecule_id ?mid]])))
+  (is (= '{:find [(avg ?h)] :where [[?s :t/h ?h]] :with [?s]} (provider/with-rows '{:find [(avg ?h)] :where [[?s :t/h ?h]]})))
+  (testing "left as they are"
+    (doseq [q '[[:find (count ?e) :where [?e :t/a ?x]]
+                [:find ?x :where [?e :t/a ?x]]
+                [:find (sum ?s) :with ?e :where [?e :t/s ?s]]
+                [:find (count-distinct ?x) :where [?e :t/a ?x]]]]
+      (is (= q (provider/with-rows q))))))
+
