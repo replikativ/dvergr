@@ -176,3 +176,43 @@
     (support/skip! "a-plain-query-may-hold-a-regex: no BIRD dev set")
     (is (= [[66]] (:rows (provider/run-query :datalog "superhero" "[:find (count ?e) :where [?e :superhero/superhero_name ?n] [(re-find #\"(?i)man\" ?n)]]" {}))))))
 
+(deftest nested-calls-desugar-into-fresh-variables
+  (is (= '[:find (count ?e) :where [?e :t/h ?h] [?e :t/w ?w] [(/ ?w ?h) ?__1] [(> ?__1 0.5)]]
+         (provider/desugar-nested '[:find (count ?e) :where [?e :t/h ?h] [?e :t/w ?w] [(> (/ ?w ?h) 0.5)]])))
+  (is (= '[:find ?r :where [?e :t/a ?a] [(+ ?a 1) ?__1] [(* 100 ?__1) ?r]]
+         (provider/desugar-nested '[:find ?r :where [?e :t/a ?a] [(* 100 (+ ?a 1)) ?r]]))
+      "a binding clause; innermost first")
+  (testing "fresh variables stay in their scope"
+    (is (= '[:find ?e :where [?e :t/d ?d] (or-join [?d] (and [(subs ?d 0 4) ?__1] [(= ?__1 "1991")]) [(= ?d "x")])]
+           (provider/desugar-nested '[:find ?e :where [?e :t/d ?d] (or [(= (subs ?d 0 4) "1991")] [(= ?d "x")])])))
+    (is (= '[:find ?e :where [?e :t/d ?d] (not-join [?d] [(subs ?d 0 4) ?__1] [(= ?__1 "1991")])]
+           (provider/desugar-nested '[:find ?e :where [?e :t/d ?d] (not [(= (subs ?d 0 4) "1991")])]))))
+  (testing "data stays data; a subquery literal is a query of its own"
+    (is (= '[:find ?x :where [?e :t/a ?a] [(contains? (quote #{1 2}) ?a)]]
+           (provider/desugar-nested '[:find ?x :where [?e :t/a ?a] [(contains? (quote #{1 2}) ?a)]])))
+    (is (= '[:find ?n :where [(q [:find (max ?h) :where [_ :t/h ?h] [(* ?h 2) ?__1] [(> ?__1 3)]] $) [[?n]]]]
+           (provider/desugar-nested '[:find ?n :where [(q [:find (max ?h) :where [_ :t/h ?h] [(> (* ?h 2) 3)]] $) [[?n]]]]))))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"cannot be nested"
+                        (provider/desugar-nested '[:find ?x :where [?e :t/a ?a] [(= (and (pos? ?a) true) true)]]))
+      "and/or/if would lose their laziness"))
+
+(deftest a-nested-candidate-answers-as-the-flat-query-does
+  (if-not (bird/available?)
+    (support/skip! "a-nested-candidate-answers-as-the-flat-query-does: no BIRD dev set")
+    (let [nested "[:find (count ?e) :where [?e :superhero/height_cm ?h] [?e :superhero/weight_kg ?w] [(pos? ?h)] [(> (/ ?w ?h) 0.5)]]"
+          flat "[:find (count ?e) :where [?e :superhero/height_cm ?h] [?e :superhero/weight_kg ?w] [(pos? ?h)] [(/ ?w ?h) ?r] [(> ?r 0.5)]]"]
+      (is (= (:rows (provider/run-query :datalog "superhero" flat {}))
+             (:rows (provider/run-query :datalog "superhero" nested {:nested? true}))))
+      (is (:error (provider/run-query :datalog "superhero" nested {})) "without the flag, Datahike's rule stands"))))
+
+(deftest a-constant-binding-is-an-equality
+  (is (= '[:find ?e :where [?e :t/id ?id] [(subs ?id 6 7) ?__c1] [(= ?__c1 "4")]]
+         (provider/bind-constants '[:find ?e :where [?e :t/id ?id] [(subs ?id 6 7) "4"]])))
+  (is (= '[:find ?e :where [?e :t/id ?id] [(subs ?id 6 7) ?x]]
+         (provider/bind-constants '[:find ?e :where [?e :t/id ?id] [(subs ?id 6 7) ?x]]))))
+
+(deftest q-in-an-expression-may-name-the-db
+  (if-not (bird/available?)
+    (support/skip! "q-in-an-expression-may-name-the-db: no BIRD dev set")
+    (is (= [[69]] (:rows (provider/run-query :datalog "superhero" "(q '[:find (count ?e) :where [?e :superhero/height_cm ?h] [(> ?h 200)]] $)" {}))))))
+
