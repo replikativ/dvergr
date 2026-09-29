@@ -29,8 +29,9 @@
           (sci/add-namespace!
            sci-ctx 'particle
            {'id (fn []
-                  (rtp/get-state ec/*execution-context*
-                                 [:inference :particle-id]))
+                  (keyword (str "particle-"
+                                (rtp/get-state ec/*execution-context*
+                                               [:inference :slot]))))
             'write! (fn [value]
                       (let [signal (ygg/system-signal "dvergr-inference-kb")]
                         (reset! signal
