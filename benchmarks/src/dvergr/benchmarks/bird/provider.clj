@@ -36,7 +36,9 @@
             [dvergr.sandbox :as sandbox]))
 
 (def version
-  "6: the map form's :order-by/:limit/:offset (Datahike has them) is the
+  "7: the arithmetic example takes each aggregate with ffirst from its own
+   query (6's nested destructuring was copied with broken brackets). 6: the
+   map form's :order-by/:limit/:offset (Datahike has them) is the
    way to sort and limit; ordering by a variable :find does not return is
    allowed; a map query is a plain query. 5: the sorting example drops its sort key from the answer; aggregates
    count every row of the join, as in SQL (`with-rows`); an
@@ -48,7 +50,7 @@
    identifiers canonical (bird.load/2); a final reply that is only a query
    counts as submitted. 2: a plain Datalog query (an EDN vector) runs as is;
    every engine's schema shows example rows."
-  6)
+  7)
 
 (def engines #{:sqlite :pg-datahike :datalog})
 
@@ -235,7 +237,9 @@
                  "its column index, {:find [?c (count ?e)] ... :order-by [1 :desc] :limit 1}; :offset n "
                  "skips n rows after ordering. For anything else (ratios, percentages, rounding) write "
                  "a Clojure expression over (q query & inputs), e.g. "
-                 "(let [[[n]] (q '[:find (count ?e) :where [?e :t/h ?h]])] [[(* 100 (/ n 7))]]) "
+                 "(let [n (ffirst (q '[:find (count ?e) :where [?e :t/h ?h] [(> ?h 200)]])) "
+                 "total (ffirst (q '[:find (count ?e) :where [?e :t/h ?h]]))] [[(* 100 (/ n total))]]) "
+                 "-- one aggregate per query: two in one :find multiply over the join "
                  "-- in Clojure ' quotes the one form after it and is not closed; the value must be a "
                  "collection of result rows, with exactly the columns the question asks for. "
                  ":find returns a SET: identical result rows collapse. "
