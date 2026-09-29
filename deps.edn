@@ -64,7 +64,12 @@
         ;; buffer-only taps); needs partial-cps 0.1.63 (lost-continuation fixes).
         ;; 0.1.54 signals an access to a runtime atom, deferred or mailbox from
         ;; a world with no state for it (`spindel.missing-state`; the tests throw).
-        org.replikativ/spindel     {:mvn/version "0.1.70"}
+        ;; 0.1.85: settlement by intent (`register!` :intents/:stamp/
+        ;; :parent-footprint; merge-fork!, copy families and checkpoint!
+        ;; replay a room's :book instead of merging datoms), and review sees
+        ;; intents and the parent's claims; inference measures of pure
+        ;; particles hold Samples (read worlds via `measure/world-descriptors`).
+        org.replikativ/spindel     {:mvn/version "0.1.85"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context
@@ -91,7 +96,9 @@
         org.replikativ/datahike    {:mvn/version "0.8.1899"}
         ;; 0.1.37 provides conserved resource vectors, durable receipts, and
         ;; mandatory Datahike invariants for Run resource delegation.
-        org.replikativ/kontor      {:mvn/version "0.1.37"}
+        ;; 0.1.38 settles a world's book by replay (ADR-172, `kontor.settlement`):
+        ;; the room's :book system (dvergr.substrate.kontor-book).
+        org.replikativ/kontor      {:mvn/version "0.1.38"}
 
         ;; Yggdrasil — CoW branching for git and Datahike
         ;; 0.3.46 merges a diverged Geschichte overlay three-way (#24): a fork
