@@ -37,7 +37,9 @@
             [dvergr.sandbox :as sandbox]))
 
 (def version
-  "10: the Datalog description names the pure functions a clause may call,
+  "11: (q query $) in an expression (the subquery clause's spelling) works; a
+   function clause bound to a constant is that equality (bind-constants).
+   10: the Datalog description names the pure functions a clause may call,
    subqueries, the 0-based :order-by index, CASE/round/date idioms and the
    flat-call rule; a :nested candidate may nest calls (desugar-nested). 9:
    agent-written queries resolve functions as the Datahike server does
@@ -60,7 +62,7 @@
    identifiers canonical (bird.load/2); a final reply that is only a query
    counts as submitted. 2: a plain Datalog query (an EDN vector) runs as is;
    every engine's schema shows example rows."
-  10)
+  11)
 
 (def engines #{:sqlite :pg-datahike :datalog})
 
@@ -228,6 +230,32 @@
           (assoc query :where where)
           (into [] (mapcat (fn [[k forms]] (cons k (if (= :where k) where forms)))) (clause-parts query)))))))
 
+(defn- literal? [x] (or (string? x) (number? x) (keyword? x) (boolean? x)))
+
+(defn bind-constants
+  "A function clause whose binding is a constant, [(subs ?id 6 7) \"4\"] (SQL's
+   SUBSTR(id, 7, 1) = '4'; Datalog binds only variables), as that equality:
+   [(subs ?id 6 7) ?__c1] [(= ?__c1 \"4\")]. Inside or/not bodies too."
+  [query]
+  (let [n (atom 0)
+        walk (fn walk [clauses]
+               (vec (mapcat (fn [c]
+                              (cond
+                                (and (vector? c) (call-form? (first c)) (= 2 (count c)) (literal? (second c)))
+                                (let [v (symbol (str "?__c" (swap! n inc)))]
+                                  [[(first c) v] [(list '= v (second c))]])
+                                (and (seq? c) ('#{or and not} (first c)))
+                                [(apply list (first c) (map #(if (vector? %) (let [w (walk [%])] (if (= 1 (count w)) (first w) (apply list 'and w))) %) (rest c)))]
+                                :else [c]))
+                            clauses)))
+        m (cond (map? query) query (vector? query) (into {} (clause-parts query)) :else nil)]
+    (if-not (seq (:where m))
+      query
+      (let [where (walk (:where m))]
+        (if (map? query)
+          (assoc query :where where)
+          (into [] (mapcat (fn [[k forms]] (cons k (if (= :where k) where forms)))) (clause-parts query)))))))
+
 (defn- as-map-query
   "A vector-form query that uses the map form's `:order-by`, `:limit` or
    `:offset` as the map form; other queries as they are."
@@ -260,7 +288,7 @@
    rows (not with aggregates, whose grouping another variable would change)."
   ([db query inputs] (run-q db query inputs {}))
   ([db query inputs {:keys [nested?]}]
-   (let [q (with-rows (as-map-query (cond-> query nested? desugar-nested)))
+   (let [q (with-rows (as-map-query (bind-constants (cond-> query nested? desugar-nested))))
          find (when (map? q) (:find q))
          find-vars (set (filter lvar? find))
          hidden (when (and (map? q) (not-any? seq? find))
@@ -272,7 +300,11 @@
 (defn- datalog-ctx [db-id nested?]
   (let [ctx (sandbox/create-base-ctx :load-fn (constantly nil))
         db (d/db (load/load! db-id))]
-    (sandbox/add-namespace! ctx 'user {'q (fn [query & inputs] (run-q db query inputs {:nested? nested?}))
+    (sandbox/add-namespace! ctx 'user {'q (fn [query & inputs]
+                                            ;; the db is bound already: (q query $) as in
+                                            ;; a subquery clause names it again
+                                            (run-q db query (remove #(identical? db %) inputs) {:nested? nested?}))
+                                       '$ db
                                        'pull (fn [pattern eid] (d/pull db pattern eid))
                                        ;; Clojure's (double ratio) is not the nearest double
                                        'double (fn [x] (if (ratio? x) (bird/ratio->double x) (clojure.core/double x)))})

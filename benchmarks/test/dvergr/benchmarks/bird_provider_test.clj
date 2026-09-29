@@ -205,3 +205,14 @@
              (:rows (provider/run-query :datalog "superhero" nested {:nested? true}))))
       (is (:error (provider/run-query :datalog "superhero" nested {})) "without the flag, Datahike's rule stands"))))
 
+(deftest a-constant-binding-is-an-equality
+  (is (= '[:find ?e :where [?e :t/id ?id] [(subs ?id 6 7) ?__c1] [(= ?__c1 "4")]]
+         (provider/bind-constants '[:find ?e :where [?e :t/id ?id] [(subs ?id 6 7) "4"]])))
+  (is (= '[:find ?e :where [?e :t/id ?id] [(subs ?id 6 7) ?x]]
+         (provider/bind-constants '[:find ?e :where [?e :t/id ?id] [(subs ?id 6 7) ?x]]))))
+
+(deftest q-in-an-expression-may-name-the-db
+  (if-not (bird/available?)
+    (support/skip! "q-in-an-expression-may-name-the-db: no BIRD dev set")
+    (is (= [[69]] (:rows (provider/run-query :datalog "superhero" "(q '[:find (count ?e) :where [?e :superhero/height_cm ?h] [(> ?h 200)]] $)" {}))))))
+
