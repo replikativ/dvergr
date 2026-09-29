@@ -69,7 +69,12 @@
         ;; replay a room's :book instead of merging datoms), and review sees
         ;; intents and the parent's claims; inference measures of pure
         ;; particles hold Samples (read worlds via `measure/world-descriptors`).
-        org.replikativ/spindel     {:mvn/version "0.1.85"}
+        ;; 0.1.88: every inference method runs on savepoints, :world-policy
+        ;; :fork included (the coordinator is retired): each canonical
+        ;; particle runs the whole model in a fork of the caller's world; a
+        ;; particle's slot is [:inference :slot]. world.scope/copy! splits a
+        ;; world's budget between copies.
+        org.replikativ/spindel     {:mvn/version "0.1.88"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context
