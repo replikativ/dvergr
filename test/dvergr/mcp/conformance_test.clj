@@ -151,3 +151,73 @@
                                      :params {:_meta (modern-meta)}})
                               [:result :resultType])))
     (is (= {} (:result (send {:jsonrpc "2.0" :id 4 :method "ping"}))) "the handshake session still stands")))
+
+;; ---- subscriptions/listen and progress (a connection that records what it is sent)
+
+(defn- recording-connection [& [profile]]
+  (let [seen (atom [])
+        send-fn #(swap! seen conj %)
+        c (server/session-context send-fn (surface/selection {:profile (or profile "admin")}))]
+    {:seen seen :send! #(server/dispatch! c send-fn %)}))
+
+(defn- listen-meta [] {:_meta (modern-meta)})
+
+(deftest a-subscription-is-acknowledged-first-and-its-notifications-are-tagged
+  (let [{:keys [seen send!]} (recording-connection)
+        quiet (recording-connection)]
+    (send! {:jsonrpc "2.0" :id 7 :method "subscriptions/listen"
+            :params (merge (listen-meta)
+                           {:notifications {:toolsListChanged true :promptsListChanged true
+                                            :resourceSubscriptions ["room://list" "nope://x"]}})})
+    (testing "acknowledged first, with the filter this server honours; the request stays open"
+      (is (= 1 (count @seen)))
+      (let [ack (first @seen)]
+        (is (= "notifications/subscriptions/acknowledged" (:method ack)))
+        (is (= 7 (get-in ack [:params :_meta :io.modelcontextprotocol/subscriptionId])))
+        (is (= {:toolsListChanged true :resourceSubscriptions ["room://list"]} (get-in ack [:params :notifications]))
+            "no prompts; an unknown resource is left out")))
+    (try
+      (server/register-tool! {:name "listen_probe" :description "probe" :inputSchema {:type "object"}}
+                             (fn [_ _] {:content [] :isError false}))
+      (testing "a list change reaches the subscription, tagged"
+        (let [n (last @seen)]
+          (is (= "notifications/tools/list_changed" (:method n)))
+          (is (= 7 (get-in n [:params :_meta :io.modelcontextprotocol/subscriptionId])))))
+      (is (empty? @(:seen quiet)) "a stateless client that did not subscribe gets nothing")
+      (testing "a cancelled subscription ends, without a response"
+        (send! {:jsonrpc "2.0" :method "notifications/cancelled" :params (merge (listen-meta) {:requestId 7})})
+        (let [before (count @seen)]
+          (server/unregister-tool! "listen_probe")
+          (is (= before (count @seen)))
+          (is (not-any? #(= 7 (:id %)) @seen))))
+      (finally (server/unregister-tool! "listen_probe")))))
+
+(deftest the-server-ends-a-subscription-gracefully
+  (let [{:keys [seen send!]} (recording-connection)]
+    (send! {:jsonrpc "2.0" :id "s1" :method "subscriptions/listen"
+            :params (merge (listen-meta) {:notifications {:toolsListChanged true}})})
+    (server/close-subscriptions!)
+    (let [r (last @seen)]
+      (is (= "s1" (:id r)))
+      (is (= "complete" (get-in r [:result :resultType])))
+      (is (= "s1" (get-in r [:result :_meta :io.modelcontextprotocol/subscriptionId]))))))
+
+(deftest a-long-request-with-a-progress-token-reports-progress-until-its-response
+  (let [{:keys [seen send!]} (recording-connection)]
+    (try
+      (server/register-tool! {:name "slow_probe" :description "sleeps" :inputSchema {:type "object"}}
+                             (fn [_ _] (Thread/sleep 450) {:content [{:type "text" :text "done"}] :isError false}))
+      (binding [server/*progress-interval-ms* 100]
+        (send! {:jsonrpc "2.0" :id 9 :method "tools/call"
+                :params {:name "slow_probe" :arguments {} :_meta (assoc (modern-meta) :progressToken "p1")}}))
+      (loop [n 0] (when (and (< n 100) (not-any? #(= 9 (:id %)) @seen)) (Thread/sleep 20) (recur (inc n))))
+      (Thread/sleep 300)
+      (let [msgs @seen
+            response-at (first (keep-indexed (fn [i m] (when (= 9 (:id m)) i)) msgs))
+            progress (filter #(= "notifications/progress" (:method %)) msgs)]
+        (is (some? response-at) "answered")
+        (is (<= 2 (count progress)) "reported while it ran")
+        (is (every? #(= "p1" (get-in % [:params :progressToken])) progress))
+        (is (apply < (map #(get-in % [:params :progress]) progress)) "progress only increases")
+        (is (every? #(< (.indexOf ^java.util.List msgs %) response-at) progress) "none after the response"))
+      (finally (server/unregister-tool! "slow_probe")))))

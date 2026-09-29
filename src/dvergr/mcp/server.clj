@@ -360,20 +360,73 @@
 ;; Connected clients (for server-initiated notifications)
 ;; ============================================================================
 
-;; Atom of #{send-fn}. Each connected client registers its send-fn here.
-(defonce ^:private connected-send-fns (atom #{}))
+;; send-fn -> session atom of every open connection
+(defonce ^:private connected-send-fns (atom {}))
+
+;; [send-fn subscription-id] -> {:tag fn :accepted filter} — the open
+;; subscriptions/listen requests (stateless era)
+(defonce ^:private subscriptions (atom {}))
+
+(def ^:private subscription-id-key :io.modelcontextprotocol/subscriptionId)
+
+(defn- tagged
+  "`send-fn` putting subscription `id` on every message's `_meta`."
+  [send-fn id]
+  (fn [message] (send-fn (assoc-in message [:params :_meta subscription-id-key] id))))
+
+(defn- safe-send! [send-fn message]
+  (try (send-fn message)
+       (catch Exception e
+         (binding [*err* *err*]
+           (.println *err* (str "dvergr-mcp: notification error: " (.getMessage e)))
+           (.flush *err*)))))
 
 (defn- broadcast-notification!
-  "Send a JSON-RPC notification to all connected clients."
-  [method params]
+  "Send a list-changed notification: untagged to every connection that did
+   the handshake (it opted in with `initialize`), tagged to every
+   subscription that asked for `filter-key`. A stateless client that did
+   not subscribe gets nothing, as the protocol asks."
+  [method params filter-key]
   (let [notification {:jsonrpc "2.0" :method method :params params}]
-    (doseq [send-fn @connected-send-fns]
-      (try
-        (send-fn notification)
-        (catch Exception e
-          (binding [*err* *err*]
-            (.println *err* (str "dvergr-mcp: broadcast error: " (.getMessage e)))
-            (.flush *err*)))))))
+    (doseq [[send-fn session] @connected-send-fns
+            :when (:initialized @session)]
+      (safe-send! send-fn notification))
+    (doseq [[_ {:keys [tag accepted]}] @subscriptions
+            :when (get accepted filter-key)]
+      (safe-send! tag notification))))
+
+(defn- listen!
+  "Open subscription `id` for the connection writing through `send-fn`:
+   acknowledge (first, with the filter this server honours: tools list
+   changes and existing resource URIs; it has no prompts and does not
+   announce resource list changes), then deliver."
+  [send-fn {:keys [id params]}]
+  (let [{:keys [toolsListChanged resourceSubscriptions]} (:notifications params)
+        uris (vec (filter uri->op+args resourceSubscriptions))
+        accepted (cond-> {}
+                   (true? toolsListChanged) (assoc :toolsListChanged true)
+                   (seq uris) (assoc :resourceSubscriptions uris))
+        tag (tagged send-fn id)]
+    (tag {:jsonrpc "2.0" :method "notifications/subscriptions/acknowledged"
+          :params {:notifications accepted}})
+    (swap! subscriptions assoc [send-fn id] {:tag tag :accepted accepted})
+    (doseq [u uris] (subscribe-resource! u tag))))
+
+(defn- end-subscription!
+  "Close subscription `id` of `send-fn`; with `respond?`, send the graceful
+   closing response first (the server ends it, not the client)."
+  [send-fn id respond?]
+  (when-let [{:keys [tag accepted]} (get @subscriptions [send-fn id])]
+    (swap! subscriptions dissoc [send-fn id])
+    (doseq [u (:resourceSubscriptions accepted)] (unsubscribe-resource! u tag))
+    (when respond?
+      (safe-send! send-fn {:jsonrpc "2.0" :id id
+                           :result {:resultType "complete" :_meta {subscription-id-key id}}}))))
+
+(defn close-subscriptions!
+  "End every open subscription gracefully (server shutdown)."
+  []
+  (doseq [[send-fn id] (keys @subscriptions)] (end-subscription! send-fn id true)))
 
 ;; ============================================================================
 ;; Dynamic tool registration
@@ -388,14 +441,14 @@
                                        :annotations (surface/tool-annotations (:name tool-def))}
                                       tool-def))
   (swap! tool-handlers assoc (:name tool-def) handler-fn)
-  (broadcast-notification! "notifications/tools/list_changed" {}))
+  (broadcast-notification! "notifications/tools/list_changed" {} :toolsListChanged))
 
 (defn unregister-tool!
   "Remove a tool by name. Broadcasts tools/list_changed to all clients."
   [tool-name]
   (swap! tool-definitions (fn [defs] (vec (remove #(= (:name %) tool-name) defs))))
   (swap! tool-handlers dissoc tool-name)
-  (broadcast-notification! "notifications/tools/list_changed" {}))
+  (broadcast-notification! "notifications/tools/list_changed" {} :toolsListChanged))
 
 ;; ============================================================================
 ;; Session factory
@@ -442,7 +495,9 @@
                         :resource-defs resource-definitions
                         :read-resource read-resource
                         :subscribe-resource subscribe-resource!
-                        :unsubscribe-resource unsubscribe-resource!}
+                        :unsubscribe-resource unsubscribe-resource!
+                        :listen (fn [message] (listen! send-fn message))
+                        :on-cancel (fn [id] (end-subscription! send-fn id false))}
                        (scoped sel))]
     ;; a stateless request brings its own selection in `_meta`, over the
     ;; connection's default; it does not change the connection's
@@ -460,21 +515,64 @@
    notifications) runs in order on the read loop."
   #{"tools/call" "resources/read"})
 
+(def ^:dynamic *progress-interval-ms*
+  "How often a long request with a `progressToken` reports that it is still
+   running."
+  10000)
+
+(defn- progress-reporter
+  "For a request carrying `token`: `{:progress! (fn [progress & [total
+   message]]) :done! (fn [])}`. Progress only increases and stops at
+   `done!` (called before the response is sent), as the protocol asks; a
+   heartbeat reports the elapsed seconds every `interval-ms` until then."
+  [send-fn token interval-ms cancelled?]
+  (let [state (atom {:done false :last 0})
+        lock (Object.)
+        progress! (fn [progress & [total message]]
+                    (locking lock
+                      (let [{:keys [done last]} @state]
+                        (when (and (not done) (not (cancelled?)) (> progress last))
+                          (swap! state assoc :last progress)
+                          (safe-send! send-fn {:jsonrpc "2.0" :method "notifications/progress"
+                                               :params (cond-> {:progressToken token :progress progress}
+                                                         total (assoc :total total)
+                                                         message (assoc :message message))})))))
+        started (System/currentTimeMillis)]
+    (Thread/startVirtualThread
+     (fn []
+       (loop []
+         (Thread/sleep (long interval-ms))
+         (when-not (:done @state)
+           (let [secs (quot (- (System/currentTimeMillis) started) 1000)]
+             ;; whole seconds; a heartbeat faster than a second counts ticks
+             (progress! (max (inc (:last @state)) secs) nil (str "running for " secs " s")))
+           (recur)))))
+    {:progress! progress!
+     :done! #(locking lock (swap! state assoc :done true))}))
+
 (defn dispatch!
   "Handle one parsed `message` on a connection: answer it through `send-fn`,
    concurrently for `concurrent-methods`. A request cancelled
    (`notifications/cancelled`) before it finishes gets no response, as the
-   protocol asks; its work is not interrupted."
+   protocol asks; its work is not interrupted. A concurrent request with a
+   `progressToken` in `_meta` reports progress while it runs (a heartbeat,
+   and whatever its handler reports through `:progress!`)."
   [context send-fn message]
   (let [id (:id message)
         cancelled? #(contains? (:cancelled-requests @(:session context)) id)
         forget! #(swap! (:session context) update :cancelled-requests disj id)
+        concurrent? (and id (concurrent-methods (:method message)))
+        token (when concurrent? (get-in message [:params :_meta :progressToken]))
+        reporter (when (some? token)
+                   (progress-reporter send-fn token *progress-interval-ms* cancelled?))
+        context (cond-> context reporter (assoc :progress! (:progress! reporter)))
         answer! (fn []
-                  (let [response (json-rpc/handle-message context message)]
+                  (let [response (try (json-rpc/handle-message context message)
+                                      (finally (some-> reporter :done! (apply []))))]
                     (if (and response id (cancelled?))
                       (forget!)
                       (when response (send-fn response)))))]
-    (if (and id (concurrent-methods (:method message)))
+    (if concurrent?
       (Thread/startVirtualThread
        (fn []
          (try (answer!)
@@ -494,7 +592,7 @@
                     (.write writer "\n")
                     (.flush writer)))
         context (session-context send-fn selection)]
-    (swap! connected-send-fns conj send-fn)
+    (swap! connected-send-fns assoc send-fn (:session context))
     (binding [*err* *err*]
       (.println *err* (str "dvergr-mcp: connection opened (" label ")"))
       (.flush *err*))
@@ -510,7 +608,9 @@
               (dispatch! context send-fn message))
             (recur))))
       (finally
-        (swap! connected-send-fns disj send-fn)
+        (swap! connected-send-fns dissoc send-fn)
+        ;; the transport closed: its subscriptions end without a response
+        (doseq [[sf id] (keys @subscriptions) :when (= sf send-fn)] (end-subscription! sf id false))
         (drop-subscriber! send-fn)
         (binding [*err* *err*]
           (.println *err* (str "dvergr-mcp: connection closed (" label ")"))
@@ -586,6 +686,8 @@
   "Stop the TCP MCP server."
   []
   (when-let [{:keys [^ServerSocket server-socket]} @server-state]
+    ;; subscriptions end gracefully: a response before the stream closes
+    (close-subscriptions!)
     (.close server-socket)
     (doseq [^Socket conn @connections]
       (try (.close conn) (catch Exception _)))
