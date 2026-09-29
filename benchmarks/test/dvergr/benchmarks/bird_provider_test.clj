@@ -113,3 +113,53 @@
       (is (= 1 (count (tallest "{:find [?a (count ?e)] :where [[?e :superhero/alignment_id ?a]] :order-by [1 :desc] :limit 1}")))
           "ordered by an aggregate's column"))))
 
+(deftest a-map-written-as-vector-clauses-is-that-vector
+  (is (= '[:find ?n :where [?e :t/n ?n] :order-by ?n :desc :limit 1]
+         (provider/read-query "{:find ?n :where [?e :t/n ?n] :order-by ?n :desc :limit 1}")))
+  (is (= '{:find [?n] :where [[?e :t/n ?n]]} (provider/read-query "{:find [?n] :where [[?e :t/n ?n]]}")))
+  (is (nil? (provider/read-query "[(let [x 1] [x])]")) "an expression")
+  (is (nil? (provider/read-query "{:a 1 :b}")) "not a query"))
+
+(deftest a-submitted-query-that-fails-comes-back
+  (if-not (bird/available?)
+    (support/skip! "a-submitted-query-that-fails-comes-back: no BIRD dev set")
+    (let [room (d/make-room {:id :bird/provider-test-2 :store (memory/make)})]
+      (try
+        (let [seen (atom [])
+              receipt (evaluate! room :sqlite [["submit" "SELECT nope FROM superhero"]
+                                               ["submit" (answers :sqlite)]] seen)]
+          (is (= {:submitted true :runs true :correct true} (:attempt/checks receipt)))
+          (is (re-find #"Not submitted: the query fails" (:content (last (:messages (second @seen)))))))
+        (finally (d/close-room! room))))))
+
+(deftest ordering-in-the-vector-form
+  (if-not (bird/available?)
+    (support/skip! "ordering-in-the-vector-form: no BIRD dev set")
+    (is (= 1 (count (:rows (provider/run-query :datalog "superhero" "[:find ?a (count ?e) :where [?e :superhero/alignment_id ?a] :order-by 1 :desc :limit 1]" {})))))))
+
+(deftest an-answer-instead-of-a-submission-gets-one-reminder
+  (if-not (bird/available?)
+    (support/skip! "an-answer-instead-of-a-submission-gets-one-reminder: no BIRD dev set")
+    (let [room (d/make-room {:id :bird/provider-test-3 :store (memory/make)})
+          replies (fn [contents]
+                    (fn [_question]
+                      (let [left (atom contents)]
+                        (fn [_request]
+                          (let [c (first @left)] (swap! left rest)
+                               (if (vector? c)
+                                 {:content "" :tool-calls [{:id "s" :name "submit" :arguments {:query (second c)}}]}
+                                 {:content (str c) :tool-calls []}))))))
+          run (fn [contents]
+                (let [q (some #(when (= 747 (:question-id %)) %) (bird/questions))
+                      caps (provider/capabilities [q] {:agent-generate (replies contents)})
+                      env (provider/environment-def q caps {:timeout-ms 120000})
+                      team (provider/candidate-roster [{:id :sqlite :model "claude-code-sonnet" :engine :sqlite}])]
+                  (binding [ec/*execution-context* (:ctx room)]
+                    (:attempt-receipt @(evaluation/evaluate room team :sqlite env (:evaluator caps) {:protocol (:protocol caps)})))))]
+      (try
+        (is (= {:submitted true :runs true :correct true}
+               (:attempt/checks (run ["42" ["submit" (answers :sqlite)]])))
+            "the value, then the query after the reminder")
+        (is (false? (get-in (run ["42" "still 42"]) [:attempt/checks :submitted])) "one reminder only")
+        (finally (d/close-room! room))))))
+

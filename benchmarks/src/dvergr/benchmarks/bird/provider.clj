@@ -36,7 +36,11 @@
             [dvergr.sandbox :as sandbox]))
 
 (def version
-  "7: the arithmetic example takes each aggregate with ffirst from its own
+  "8: a final reply that is not a query that runs (the answer's value, a
+   fragment) gets one reminder to submit; a submitted query that fails comes back with its error (every engine);
+   a Datalog query has a 60 s deadline; a map written as vector clauses
+   reads as that vector; the Datalog description is shorter and orders in
+   the vector form. 7: the arithmetic example takes each aggregate with ffirst from its own
    query (6's nested destructuring was copied with broken brackets). 6: the
    map form's :order-by/:limit/:offset (Datahike has them) is the
    way to sort and limit; ordering by a variable :find does not return is
@@ -50,7 +54,7 @@
    identifiers canonical (bird.load/2); a final reply that is only a query
    counts as submitted. 2: a plain Datalog query (an EDN vector) runs as is;
    every engine's schema shows example rows."
-  7)
+  8)
 
 (def engines #{:sqlite :pg-datahike :datalog})
 
@@ -127,6 +131,14 @@
           (clause-parts query))
     query))
 
+(def query-timeout-ms
+  "A Datalog query's deadline, as a SQLite query's (`bird/execute`); Datahike
+   stops the query there and frees what it built (datahike#1098)."
+  60000)
+
+(defn- q-bounded [query db inputs]
+  (d/q {:query query :args (into [db] inputs) :timeout query-timeout-ms}))
+
 (defn run-q
   "`query` on `db`, as the candidate means it: aggregates with SQL's row
    semantics (`with-rows`), and ordering by a variable `:find` does not
@@ -139,8 +151,8 @@
         hidden (when (and (map? q) (not-any? seq? find))
                  (->> (:order-by q) (filter lvar?) distinct (remove find-vars) vec))]
     (if (seq hidden)
-      (mapv #(vec (take (count find) %)) (apply d/q (update q :find into hidden) db inputs))
-      (apply d/q q db inputs))))
+      (mapv #(vec (take (count find) %)) (q-bounded (update q :find into hidden) db inputs))
+      (q-bounded q db inputs))))
 
 (defn- datalog-ctx [db-id]
   (let [ctx (sandbox/create-base-ctx :load-fn (constantly nil))
@@ -151,15 +163,25 @@
                                        'double (fn [x] (if (ratio? x) (bird/ratio->double x) (clojure.core/double x)))})
     ctx))
 
-(defn- plain-query?
-  "Whether `query` is a Datalog query as data (a vector opening with a
-   keyword such as :find, or a map with :find), not a Clojure expression;
-   `[(let ...)]` is an expression."
-  [query]
-  (and (#{\[ \{} (first (str/triml query)))
-       (try (let [v (edn/read-string query)]
-              (or (and (vector? v) (keyword? (first v))) (and (map? v) (contains? v :find))))
-            (catch Exception _ false))))
+(defn read-query
+  "`text` as a Datalog query (data), or nil when it is not one: a vector
+   opening with a keyword such as :find, or a map with :find. A map written
+   as a vector's clauses (`{:find ?n :where [...]}`, which is not a map: its
+   forms do not pair) is read as that vector."
+  [text]
+  (let [t (str/trim (str text))
+        query? #(or (and (vector? %) (keyword? (first %))) (and (map? %) (contains? % :find)))
+        read #(try (edn/read-string %) (catch Exception _ ::unreadable))]
+    (when (#{\[ \{} (first t))
+      (let [v (read t)]
+        (cond
+          (query? v) v
+          (and (= ::unreadable v) (str/starts-with? t "{") (str/ends-with? t "}"))
+          (let [w (read (str "[" (subs t 1 (dec (count t))) "]"))]
+            (when (and (vector? w) (= :find (first w))) w))
+          :else nil)))))
+
+(defn- plain-query? [query] (some? (read-query query)))
 
 (defn run-query
   "Rows of `query` (text) on `engine` over database `db-id`: `{:rows}` or
@@ -172,7 +194,7 @@
       :pg-datahike (select-keys (compat/pg-execute (handler db-id) query) [:rows :error])
       :datalog (if (plain-query? query)
                  ;; a plain Datalog query, as SQL is plain SQL
-                 {:rows (rows-of (run-q (d/db (load/load! db-id)) (edn/read-string query) []))}
+                 {:rows (rows-of (run-q (d/db (load/load! db-id)) (read-query query) []))}
                  (let [r (sandbox/eval-code (datalog-ctx db-id) query :timeout-ms 60000)]
                    (if (:success r)
                      {:rows (rows-of (:value r))}
@@ -228,28 +250,19 @@
 (def ^:private language
   {:sqlite "SQL (SQLite dialect)"
    :pg-datahike "SQL (PostgreSQL dialect)"
-   :datalog (str "Datahike's Datalog. A plain query is an EDN vector such as "
-                 "[:find ?n :where [?e :t/name ?n] [?e :t/height ?h] [(> ?h 200)]], or a map, which "
-                 "also orders and limits (use it for \"top k\", \"the n-th\", \"highest\"): "
-                 "{:find [?n] :where [[?e :t/name ?n] [?e :t/height ?h]] :order-by [?h :desc] :limit 1} "
-                 "-- :order-by is flat, [?h :desc] or [?a :asc ?b :desc] (not nested), ascending by "
-                 "default; a variable you order by need not be in :find; to order by an aggregate give "
-                 "its column index, {:find [?c (count ?e)] ... :order-by [1 :desc] :limit 1}; :offset n "
-                 "skips n rows after ordering. For anything else (ratios, percentages, rounding) write "
-                 "a Clojure expression over (q query & inputs), e.g. "
+   :datalog (str "Datahike's Datalog. A query is an EDN vector: "
+                 "[:find ?n :where [?e :t/name ?n] [?e :t/height ?h] [(> ?h 200)]]. To sort and limit, end "
+                 "it with :order-by and :limit: "
+                 "[:find ?n :where [?e :t/name ?n] [?e :t/height ?h] :order-by ?h :desc :limit 1] "
+                 "(:offset n skips n rows; several keys: :order-by ?a :asc ?b :desc; by an aggregate, its "
+                 "column index: [:find ?c (count ?e) :where [?e :t/c ?c] :order-by 1 :desc :limit 1]). "
+                 "Aggregates (count, sum, avg, min, max, count-distinct) go in :find only and see every row "
+                 "of the join, as in SQL. For arithmetic on results (ratios, percentages, rounding) write a "
+                 "Clojure expression over (q query), one aggregate per q: "
                  "(let [n (ffirst (q '[:find (count ?e) :where [?e :t/h ?h] [(> ?h 200)]])) "
-                 "total (ffirst (q '[:find (count ?e) :where [?e :t/h ?h]]))] [[(* 100 (/ n total))]]) "
-                 "-- one aggregate per query: two in one :find multiply over the join "
-                 "-- in Clojure ' quotes the one form after it and is not closed; the value must be a "
-                 "collection of result rows, with exactly the columns the question asks for. "
-                 ":find returns a SET: identical result rows collapse. "
-                 "Aggregates (count, sum, avg, …) see every row of the join, as in SQL: equal values "
-                 "each count; (count-distinct ?x) counts distinct values. "
-                 "Aggregates stand alone in :find: never in :where and never inside an expression, so "
-                 "compute a ratio, percentage or difference of aggregates in Clojure over the rows of q. "
-                 "Integer arithmetic is exact: (/ 3 14) is the ratio 3/14, and a result ratio is graded "
-                 "as its nearest double, as SQL's REAL division; stay exact, e.g. (* 100 (/ a b)), since "
-                 "mixing in a double such as 100.0 rounds the ratio to 16 digits first")})
+                 "total (ffirst (q '[:find (count ?e) :where [?e :t/h ?h]]))] [[(* 100 (/ n total))]]). "
+                 "Integers divide exactly; keep it so (100, not 100.0): the result is graded as its nearest "
+                 "double. A query's value is its rows, with exactly the columns the question asks for")})
 
 (defn system-prompt [engine]
   (str "You answer a question about a database by writing a query in " (language engine) ". "
@@ -263,7 +276,7 @@
     "function" {"name" "query" "description" "Run a query; see its result rows (up to 50) or its error."
                 "parameters" {"type" "object" "properties" {"query" {"type" "string"}} "required" ["query"]}}}
    {"type" "function"
-    "function" {"name" "submit" "description" "Submit the query whose result answers the question. Ends the task."
+    "function" {"name" "submit" "description" "Submit the query whose result answers the question. Ends the task, unless the query fails: then its error comes back and nothing is submitted."
                 "parameters" {"type" "object" "properties" {"query" {"type" "string"}} "required" ["query"]}}}])
 
 ;; ---------------------------------------------------------------------------
@@ -303,7 +316,7 @@
                   (when-not (str/blank? (:evidence question)) (str "\nEvidence: " (:evidence question)))
                   "\n\nSchema:\n" (schema-text engine db-id {}))
         opening [{:role :user :content user}]]
-    (loop [turn 0 history opening queries [] usage {}]
+    (loop [turn 0 history opening queries [] usage {} reminded? false]
       (let [done (fn [termination submitted turns history usage]
                    {:termination termination :submitted submitted :queries queries :usage usage
                     :model-steps turns :transcript (subvec history 1)})]
@@ -320,14 +333,39 @@
                                         (seq tool-calls) (assoc :tool-calls (vec tool-calls))))
                 submit (some #(when (= "submit" (:name %)) %) tool-calls)]
             (cond
-              submit (done :submitted (get-in submit [:arguments :query] (get-in submit [:arguments "query"]))
-                           (inc turn) history usage)
+              submit
+              (let [q (str (get-in submit [:arguments :query] (get-in submit [:arguments "query"])))
+                    r (run-query engine db-id q {})]
+                (if-not (:error r)
+                  (done :submitted q (inc turn) history usage)
+                  ;; a query that fails cannot be the answer: say so, and
+                  ;; let the agent fix it (every engine alike)
+                  (recur (inc turn)
+                         (into history (map (fn [{:keys [id name]}]
+                                              {:role :tool :id id
+                                               :content (if (= "submit" name)
+                                                          (str "Not submitted: the query fails: " (:error r)
+                                                               "\nFix it and submit again.")
+                                                          "Not run: a submit in the same turn failed.")}))
+                               tool-calls)
+                         (conj queries {:query q :error (:error r) :submit? true})
+                         usage reminded?)))
               (empty? tool-calls)
-              ;; a final reply that is only a query is its submission (for
-              ;; every engine alike): models answer so as often as they call
-              (if-let [q (reply-query engine content)]
-                (done :submitted q (inc turn) history usage)
-                (done :no-submission nil (inc turn) history usage))
+              ;; a final reply that is only a query that runs is its
+              ;; submission (for every engine alike): models answer so as
+              ;; often as they call. Anything else (the answer's value, a
+              ;; fragment) gets one reminder to submit the query.
+              (let [q (reply-query engine content)
+                    runs? (and q (not (:error (run-query engine db-id q {}))))]
+                (cond
+                  runs? (done :submitted q (inc turn) history usage)
+                  reminded? (done :no-submission nil (inc turn) history usage)
+                  :else (recur (inc turn)
+                               (conj history {:role :user
+                                              :content (str "That is not a submission: the answer is graded by "
+                                                            "running a query. Call `submit` with the one query "
+                                                            "whose result answers the question.")})
+                               queries usage true)))
               :else
               (let [results (mapv (fn [{:keys [id arguments]}]
                                     (let [q (or (:query arguments) (get arguments "query"))]
@@ -336,7 +374,7 @@
                 (recur (inc turn)
                        (into history (map (fn [[id _ r]] {:role :tool :id id :content (shown r)})) results)
                        (into queries (map (fn [[_ q r]] {:query q :error (:error r)})) results)
-                       usage)))))))))
+                       usage reminded?)))))))))
 
 (defonce ^:private gold-cache (atom {}))
 
