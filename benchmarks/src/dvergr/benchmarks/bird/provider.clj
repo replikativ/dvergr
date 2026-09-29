@@ -36,7 +36,11 @@
             [dvergr.sandbox :as sandbox]))
 
 (def version
-  "5: the sorting example drops its sort key from the answer; aggregates
+  "7: the arithmetic example takes each aggregate with ffirst from its own
+   query (6's nested destructuring was copied with broken brackets). 6: the
+   map form's :order-by/:limit/:offset (Datahike has them) is the
+   way to sort and limit; ordering by a variable :find does not return is
+   allowed; a map query is a plain query. 5: the sorting example drops its sort key from the answer; aggregates
    count every row of the join, as in SQL (`with-rows`); an
    exact ratio grades as its nearest double; in the Datalog sandbox
    `double` converts a ratio to its nearest double; a vector that is not a
@@ -46,7 +50,7 @@
    identifiers canonical (bird.load/2); a final reply that is only a query
    counts as submitted. 2: a plain Datalog query (an EDN vector) runs as is;
    every engine's schema shows example rows."
-  5)
+  7)
 
 (def engines #{:sqlite :pg-datahike :datalog})
 
@@ -76,10 +80,14 @@
 
 (defn- lvar? [x] (and (symbol? x) (str/starts-with? (name x) "?")))
 
+(def ^:private clause-keys
+  #{:find :keys :strs :syms :with :in :where :order-by :limit :offset :timeout})
+
 (defn- clause-parts
-  "A vector-form query as `[[keyword forms] ...]`, in order."
+  "A vector-form query as `[[keyword forms] ...]`, in order; only clause
+   keywords start a clause (`:desc` in `:order-by` does not)."
   [v]
-  (reduce (fn [acc x] (if (keyword? x) (conj acc [x []]) (update-in acc [(dec (count acc)) 1] conj x)))
+  (reduce (fn [acc x] (if (clause-keys x) (conj acc [x []]) (update-in acc [(dec (count acc)) 1] conj x)))
           [] v))
 
 (defn with-rows
@@ -110,10 +118,34 @@
               parts (vec (concat (take at parts) [[:with (vec entity-vars)]] (drop at parts)))]
           (into [] (mapcat (fn [[k forms]] (cons k forms))) parts))))))
 
+(defn- as-map-query
+  "A vector-form query that uses the map form's `:order-by`, `:limit` or
+   `:offset` as the map form; other queries as they are."
+  [query]
+  (if (and (vector? query) (some #{:order-by :limit :offset} query))
+    (into {} (map (fn [[k forms]] [k (if (#{:limit :offset} k) (first forms) (vec forms))]))
+          (clause-parts query))
+    query))
+
+(defn run-q
+  "`query` on `db`, as the candidate means it: aggregates with SQL's row
+   semantics (`with-rows`), and ordering by a variable `:find` does not
+   return, as SQL allows: the variable is found too and dropped from the
+   rows (not with aggregates, whose grouping another variable would change)."
+  [db query inputs]
+  (let [q (with-rows (as-map-query query))
+        find (when (map? q) (:find q))
+        find-vars (set (filter lvar? find))
+        hidden (when (and (map? q) (not-any? seq? find))
+                 (->> (:order-by q) (filter lvar?) distinct (remove find-vars) vec))]
+    (if (seq hidden)
+      (mapv #(vec (take (count find) %)) (apply d/q (update q :find into hidden) db inputs))
+      (apply d/q q db inputs))))
+
 (defn- datalog-ctx [db-id]
   (let [ctx (sandbox/create-base-ctx :load-fn (constantly nil))
         db (d/db (load/load! db-id))]
-    (sandbox/add-namespace! ctx 'user {'q (fn [query & inputs] (apply d/q (with-rows query) db inputs))
+    (sandbox/add-namespace! ctx 'user {'q (fn [query & inputs] (run-q db query inputs))
                                        'pull (fn [pattern eid] (d/pull db pattern eid))
                                        ;; Clojure's (double ratio) is not the nearest double
                                        'double (fn [x] (if (ratio? x) (bird/ratio->double x) (clojure.core/double x)))})
@@ -121,11 +153,12 @@
 
 (defn- plain-query?
   "Whether `query` is a Datalog query as data (a vector opening with a
-   keyword such as :find), not a Clojure expression; `[(let ...)]` is an
-   expression."
+   keyword such as :find, or a map with :find), not a Clojure expression;
+   `[(let ...)]` is an expression."
   [query]
-  (and (str/starts-with? (str/triml query) "[")
-       (try (let [v (edn/read-string query)] (and (vector? v) (keyword? (first v))))
+  (and (#{\[ \{} (first (str/triml query)))
+       (try (let [v (edn/read-string query)]
+              (or (and (vector? v) (keyword? (first v))) (and (map? v) (contains? v :find))))
             (catch Exception _ false))))
 
 (defn run-query
@@ -139,7 +172,7 @@
       :pg-datahike (select-keys (compat/pg-execute (handler db-id) query) [:rows :error])
       :datalog (if (plain-query? query)
                  ;; a plain Datalog query, as SQL is plain SQL
-                 {:rows (rows-of (d/q (with-rows (edn/read-string query)) (d/db (load/load! db-id))))}
+                 {:rows (rows-of (run-q (d/db (load/load! db-id)) (edn/read-string query) []))}
                  (let [r (sandbox/eval-code (datalog-ctx db-id) query :timeout-ms 60000)]
                    (if (:success r)
                      {:rows (rows-of (:value r))}
@@ -195,15 +228,21 @@
 (def ^:private language
   {:sqlite "SQL (SQLite dialect)"
    :pg-datahike "SQL (PostgreSQL dialect)"
-   :datalog (str "Datahike's Datalog: either a plain query, an EDN vector such as "
-                 "[:find ?n :where [?e :t/name ?n] [?e :t/height ?h] [(> ?h 200)]], "
-                 "or, to sort or limit (Datalog has no ORDER BY or LIMIT), a Clojure expression "
-                 "over (q query & inputs) such as "
-                 "(->> (q '[:find ?n ?h :where [?e :t/name ?n] [?e :t/height ?h]]) (sort-by second >) (take 1) "
-                 "(map (fn [[n _]] [n]))) -- the last step keeps only the asked column: a sort key you "
-                 "sorted by is not part of the answer unless the question asks for it "
+   :datalog (str "Datahike's Datalog. A plain query is an EDN vector such as "
+                 "[:find ?n :where [?e :t/name ?n] [?e :t/height ?h] [(> ?h 200)]], or a map, which "
+                 "also orders and limits (use it for \"top k\", \"the n-th\", \"highest\"): "
+                 "{:find [?n] :where [[?e :t/name ?n] [?e :t/height ?h]] :order-by [?h :desc] :limit 1} "
+                 "-- :order-by is flat, [?h :desc] or [?a :asc ?b :desc] (not nested), ascending by "
+                 "default; a variable you order by need not be in :find; to order by an aggregate give "
+                 "its column index, {:find [?c (count ?e)] ... :order-by [1 :desc] :limit 1}; :offset n "
+                 "skips n rows after ordering. For anything else (ratios, percentages, rounding) write "
+                 "a Clojure expression over (q query & inputs), e.g. "
+                 "(let [n (ffirst (q '[:find (count ?e) :where [?e :t/h ?h] [(> ?h 200)]])) "
+                 "total (ffirst (q '[:find (count ?e) :where [?e :t/h ?h]]))] [[(* 100 (/ n total))]]) "
+                 "-- one aggregate per query: two in one :find multiply over the join "
                  "-- in Clojure ' quotes the one form after it and is not closed; the value must be a "
-                 "collection of result rows. :find returns a SET: identical result rows collapse. "
+                 "collection of result rows, with exactly the columns the question asks for. "
+                 ":find returns a SET: identical result rows collapse. "
                  "Aggregates (count, sum, avg, …) see every row of the join, as in SQL: equal values "
                  "each count; (count-distinct ?x) counts distinct values. "
                  "Aggregates stand alone in :find: never in :where and never inside an expression, so "
