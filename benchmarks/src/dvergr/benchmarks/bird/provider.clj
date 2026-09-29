@@ -37,7 +37,10 @@
             [dvergr.sandbox :as sandbox]))
 
 (def version
-  "9: agent-written queries resolve functions as the Datahike server does
+  "10: the Datalog description names the pure functions a clause may call,
+   subqueries, the 0-based :order-by index, CASE/round/date idioms and the
+   flat-call rule; a :nested candidate may nest calls (desugar-nested). 9:
+   agent-written queries resolve functions as the Datahike server does
    (safe-symbol-resolver), not the embedded default that reaches the host; a
    plain query may hold a regex literal. 8: a final reply that is not a query that runs (the answer's value, a
    fragment) gets one reminder to submit; a submitted query that fails comes back with its error (every engine);
@@ -57,7 +60,7 @@
    identifiers canonical (bird.load/2); a final reply that is only a query
    counts as submitted. 2: a plain Datalog query (an EDN vector) runs as is;
    every engine's schema shows example rows."
-  9)
+  10)
 
 (def engines #{:sqlite :pg-datahike :datalog})
 
@@ -125,6 +128,106 @@
               parts (vec (concat (take at parts) [[:with (vec entity-vars)]] (drop at parts)))]
           (into [] (mapcat (fn [[k forms]] (cons k forms))) parts))))))
 
+(def ^:private lazy-forms
+  "Macros and special forms: desugaring evaluates every argument first, which
+   is not their meaning (and `(and (pos? ?n) (/ ?a ?n))` would divide by
+   zero), so they cannot appear inside an expression."
+  '#{and or if when when-not cond case let fn if-let when-let})
+
+(defn- call-form? [x]
+  (and (seq? x) (symbol? (first x)) (not= 'quote (first x))))
+
+(defn- query-literal? [x]
+  (or (and (vector? x) (= :find (first x))) (and (map? x) (contains? x :find))))
+
+(declare desugar-nested)
+
+(defn- flatten-call
+  "`form` (a call) as `[clauses value]`: each nested call argument bound to a
+   fresh variable in its own clause, in evaluation order, and the call with
+   those variables in their place. A query literal passed to `q` is
+   desugared as a query of its own; other data (vectors, maps, sets, quote)
+   stays as it is."
+  [form fresh!]
+  (let [[head & args] form]
+    (when (lazy-forms head)
+      (throw (ex-info (str "(" head " …) cannot be nested inside an expression: its arguments would all "
+                           "be evaluated first. Write separate clauses (several predicates are an "
+                           "and; an (or …) clause is an or), or for a CASE use (get {k v} ?x default).")
+                      {:form form})))
+    (let [[clauses args] (reduce (fn [[cs as] a]
+                                   (cond
+                                     (call-form? a) (let [[inner v] (flatten-call a fresh!)
+                                                          ?v (fresh!)]
+                                                      [(into cs (conj (vec inner) [(apply list (first v) (rest v)) ?v]))
+                                                       (conj as ?v)])
+                                     (and (query-literal? a) ('#{q datahike.api/q} head))
+                                     [cs (conj as (desugar-nested a))]
+                                     :else [cs (conj as a)]))
+                                 [[] []] args)]
+      [clauses (apply list head args)])))
+
+(defn- clause-vars [c] (set (filter lvar? (flatten (map #(if (seq? %) (seq %) %) (if (seq? c) (rest c) c))))))
+
+(defn- desugar-clauses
+  "A :where clause list with nested calls flattened (`flatten-call`); fresh
+   variables stay local to the scope they are made in: an `or`/`not` whose
+   branches gain some becomes `or-join`/`not-join` over the variables it
+   had."
+  [clauses fresh!]
+  (vec
+   (mapcat
+    (fn [c]
+      (cond
+        ;; [(f args) binding?]
+        (and (vector? c) (call-form? (first c)))
+        (let [[call & binding] c
+              [pre call] (flatten-call call fresh!)]
+          (conj (vec pre) (into [call] binding)))
+
+        (and (seq? c) ('#{or and not} (first c)))
+        (let [before (clause-vars c)
+              body (if (= 'or (first c))
+                     ;; each branch one clause: several become an (and …)
+                     (mapv (fn [b] (if (and (seq? b) (= 'and (first b)))
+                                     (apply list 'and (desugar-clauses (rest b) fresh!))
+                                     (let [d (desugar-clauses [b] fresh!)]
+                                       (if (= 1 (count d)) (first d) (apply list 'and d)))))
+                           (rest c))
+                     ;; not/and: their clauses are already a conjunction
+                     (desugar-clauses (rest c) fresh!))
+              after (clause-vars (apply list (first c) body))
+              join (vec (sort-by str (filter before after)))]
+          [(if (= before after)
+             (apply list (first c) body)
+             (case (first c)
+               or (apply list 'or-join join body)
+               not (apply list 'not-join join body)
+               and (apply list 'and body)))])
+
+        (and (seq? c) ('#{or-join not-join} (first c)))
+        (let [[k vars & body] c]
+          [(apply list k vars (desugar-clauses body fresh!))])
+
+        :else [c]))
+    clauses)))
+
+(defn desugar-nested
+  "`query` (vector or map form) with nested calls in its :where clauses
+   flattened into fresh variables, as a SQL user writes them:
+   [(> (/ ?w ?h) 0.5)] -> [(/ ?w ?h) ?__1] [(> ?__1 0.5)]. Other queries as
+   they are."
+  [query]
+  (let [n (atom 0)
+        fresh! #(symbol (str "?__" (swap! n inc)))
+        m (cond (map? query) query (vector? query) (into {} (clause-parts query)) :else nil)]
+    (if-not (seq (:where m))
+      query
+      (let [where (desugar-clauses (:where m) fresh!)]
+        (if (map? query)
+          (assoc query :where where)
+          (into [] (mapcat (fn [[k forms]] (cons k (if (= :where k) where forms)))) (clause-parts query)))))))
+
 (defn- as-map-query
   "A vector-form query that uses the map form's `:order-by`, `:limit` or
    `:offset` as the map form; other queries as they are."
@@ -150,24 +253,26 @@
     (d/q {:query query :args (into [db] inputs) :timeout query-timeout-ms})))
 
 (defn run-q
-  "`query` on `db`, as the candidate means it: aggregates with SQL's row
+  "`query` on `db`, as the candidate means it (`:nested?`: nested calls
+   flattened, `desugar-nested`): aggregates with SQL's row
    semantics (`with-rows`), and ordering by a variable `:find` does not
    return, as SQL allows: the variable is found too and dropped from the
    rows (not with aggregates, whose grouping another variable would change)."
-  [db query inputs]
-  (let [q (with-rows (as-map-query query))
-        find (when (map? q) (:find q))
-        find-vars (set (filter lvar? find))
-        hidden (when (and (map? q) (not-any? seq? find))
-                 (->> (:order-by q) (filter lvar?) distinct (remove find-vars) vec))]
-    (if (seq hidden)
-      (mapv #(vec (take (count find) %)) (q-bounded (update q :find into hidden) db inputs))
-      (q-bounded q db inputs))))
+  ([db query inputs] (run-q db query inputs {}))
+  ([db query inputs {:keys [nested?]}]
+   (let [q (with-rows (as-map-query (cond-> query nested? desugar-nested)))
+         find (when (map? q) (:find q))
+         find-vars (set (filter lvar? find))
+         hidden (when (and (map? q) (not-any? seq? find))
+                  (->> (:order-by q) (filter lvar?) distinct (remove find-vars) vec))]
+     (if (seq hidden)
+       (mapv #(vec (take (count find) %)) (q-bounded (update q :find into hidden) db inputs))
+       (q-bounded q db inputs)))))
 
-(defn- datalog-ctx [db-id]
+(defn- datalog-ctx [db-id nested?]
   (let [ctx (sandbox/create-base-ctx :load-fn (constantly nil))
         db (d/db (load/load! db-id))]
-    (sandbox/add-namespace! ctx 'user {'q (fn [query & inputs] (run-q db query inputs))
+    (sandbox/add-namespace! ctx 'user {'q (fn [query & inputs] (run-q db query inputs {:nested? nested?}))
                                        'pull (fn [pattern eid] (d/pull db pattern eid))
                                        ;; Clojure's (double ratio) is not the nearest double
                                        'double (fn [x] (if (ratio? x) (bird/ratio->double x) (clojure.core/double x)))})
@@ -197,8 +302,8 @@
 
 (defn run-query
   "Rows of `query` (text) on `engine` over database `db-id`: `{:rows}` or
-   `{:error}`."
-  [engine db-id query {:keys [root] :or {root (bird/root)}}]
+   `{:error}`. `:nested?`: Datalog calls may nest (`desugar-nested`)."
+  [engine db-id query {:keys [root nested?] :or {root (bird/root)}}]
   (try
     (case engine
       :sqlite (with-open [c (bird/connect root db-id)]
@@ -206,8 +311,8 @@
       :pg-datahike (select-keys (compat/pg-execute (handler db-id) query) [:rows :error])
       :datalog (if (plain-query? query)
                  ;; a plain Datalog query, as SQL is plain SQL
-                 {:rows (rows-of (run-q (d/db (load/load! db-id)) (read-query query) []))}
-                 (let [r (sandbox/eval-code (datalog-ctx db-id) query :timeout-ms 60000)]
+                 {:rows (rows-of (run-q (d/db (load/load! db-id)) (read-query query) [] {:nested? nested?}))}
+                 (let [r (sandbox/eval-code (datalog-ctx db-id nested?) query :timeout-ms 60000)]
                    (if (:success r)
                      {:rows (rows-of (:value r))}
                      {:error (str (get-in r [:error :message]))}))))
@@ -267,21 +372,40 @@
                  "it with :order-by and :limit: "
                  "[:find ?n :where [?e :t/name ?n] [?e :t/height ?h] :order-by ?h :desc :limit 1] "
                  "(:offset n skips n rows; several keys: :order-by ?a :asc ?b :desc; by an aggregate, its "
-                 "column index: [:find ?c (count ?e) :where [?e :t/c ?c] :order-by 1 :desc :limit 1]). "
+                 "column index counted from 0: [:find ?c (count ?e) :where [?e :t/c ?c] :order-by 1 :desc :limit 1]). "
                  "Aggregates (count, sum, avg, min, max, count-distinct) go in :find only and see every row "
-                 "of the join, as in SQL. For arithmetic on results (ratios, percentages, rounding) write a "
+                 "of the join, as in SQL. A subquery binds one value inside :where, e.g. the maximum: "
+                 "[(q [:find (max ?h) :where [_ :t/height ?h]] $) [[?mx]]] [?e :t/height ?mx]. "
+                 "Clauses may call any pure clojure.core or clojure.string function (subs, str, count, "
+                 "parse-long, parse-double, re-find, clojure.string/lower-case, …), no Java or Math methods. "
+                 "NESTING "
+                 "There is no if: a CASE is (get {1 \"a\" 2 \"b\"} ?x \"other\"); round with "
+                 "[(format \"%.2f\" ?x) ?s] [(parse-double ?s) ?r]; dates are ISO text: [(subs ?d 0 4) ?year]. "
+                 "For arithmetic on aggregates (ratios, percentages) write a "
                  "Clojure expression over (q query), one aggregate per q: "
                  "(let [n (ffirst (q '[:find (count ?e) :where [?e :t/h ?h] [(> ?h 200)]])) "
                  "total (ffirst (q '[:find (count ?e) :where [?e :t/h ?h]]))] [[(* 100 (/ n total))]]). "
                  "Integers divide exactly; keep it so (100, not 100.0): the result is graded as its nearest "
                  "double. A query's value is its rows, with exactly the columns the question asks for")})
 
-(defn system-prompt [engine]
-  (str "You answer a question about a database by writing a query in " (language engine) ". "
-       "Use the `query` tool to run queries and look at the data (it shows up to 50 rows), then "
-       "call `submit` with the one query whose result answers the question. The answer is graded "
-       "by running your submitted query and comparing its result rows (as a set) with the "
-       "correct ones, so return exactly the columns the question asks for, no extra columns."))
+(def ^:private nesting
+  {false (str "Each call is its own clause: bind a sub-expression to a variable first, "
+              "[(subs ?d 0 4) ?y] [(= ?y \"1991\")], not [(= (subs ?d 0 4) \"1991\")] (an error). ")
+   true (str "Calls may nest, [(= (subs ?d 0 4) \"1991\")], [(> (/ ?a ?b) 0.5)], but not and/or/if "
+             "inside an expression: write separate clauses, or an (or ...) clause. ")})
+
+(defn- language-of [engine nested?]
+  (cond-> (language engine)
+    (= :datalog engine) (str/replace "NESTING " (nesting (boolean nested?)))))
+
+(defn system-prompt
+  ([engine] (system-prompt engine false))
+  ([engine nested?]
+   (str "You answer a question about a database by writing a query in " (language-of engine nested?) ". "
+        "Use the `query` tool to run queries and look at the data (it shows up to 50 rows), then "
+        "call `submit` with the one query whose result answers the question. The answer is graded "
+        "by running your submitted query and comparing its result rows (as a set) with the "
+        "correct ones, so return exactly the columns the question asks for, no extra columns.")))
 
 (def ^:private tools
   [{"type" "function"
@@ -301,6 +425,7 @@
                         {:type ::unknown-question :db-id db-id :question-id question-id})))))
 
 (defn- engine-of [agent] (get-in agent [:agent/metadata :bird/engine] :sqlite))
+(defn- nested-of [agent] (boolean (get-in agent [:agent/metadata :bird/nested])))
 
 (defn- shown [{:keys [rows error]}]
   (if error
@@ -322,7 +447,7 @@
 (defn- episode!
   "The query/submit loop. Returns `{:termination :submitted :queries :usage
    :transcript :model-steps}`."
-  [{:keys [question engine generate max-turns cancelled?]}]
+  [{:keys [question engine nested? generate max-turns cancelled?]}]
   (let [{:keys [db-id]} question
         user (str "Question: " (:question question)
                   (when-not (str/blank? (:evidence question)) (str "\nEvidence: " (:evidence question)))
@@ -337,7 +462,7 @@
           (>= turn max-turns) (done :max-turns nil turn history usage)
           :else
           (let [{:keys [content tool-calls] :as response}
-                (generate {:system (system-prompt engine) :messages history :tools tools})
+                (generate {:system (system-prompt engine nested?) :messages history :tools tools})
                 usage (merge-with #(if (and (number? %1) (number? %2)) (+ %1 %2) %2)
                                   usage (select-keys (:usage response) [:input-tokens :output-tokens
                                                                         :cache-read-tokens]))
@@ -347,7 +472,7 @@
             (cond
               submit
               (let [q (str (get-in submit [:arguments :query] (get-in submit [:arguments "query"])))
-                    r (run-query engine db-id q {})]
+                    r (run-query engine db-id q {:nested? nested?})]
                 (if-not (:error r)
                   (done :submitted q (inc turn) history usage)
                   ;; a query that fails cannot be the answer: say so, and
@@ -368,7 +493,7 @@
               ;; often as they call. Anything else (the answer's value, a
               ;; fragment) gets one reminder to submit the query.
               (let [q (reply-query engine content)
-                    runs? (and q (not (:error (run-query engine db-id q {}))))]
+                    runs? (and q (not (:error (run-query engine db-id q {:nested? nested?}))))]
                 (cond
                   runs? (done :submitted q (inc turn) history usage)
                   reminded? (done :no-submission nil (inc turn) history usage)
@@ -381,7 +506,7 @@
               :else
               (let [results (mapv (fn [{:keys [id arguments]}]
                                     (let [q (or (:query arguments) (get arguments "query"))]
-                                      [id q (run-query engine db-id (str q) {})]))
+                                      [id q (run-query engine db-id (str q) {:nested? nested?})]))
                                   tool-calls)]
                 (recur (inc turn)
                        (into history (map (fn [[id _ r]] {:role :tool :id id :content (shown r)})) results)
@@ -407,7 +532,7 @@
       {:id :bird/query-submit :version version :basis basis :limit-keys #{:max-turns}
        :run (fn [{:keys [agent environment cancelled? model-scope]}]
               (let [question (question-of by-id environment)]
-                (episode! {:question question :engine (engine-of agent)
+                (episode! {:question question :engine (engine-of agent) :nested? (nested-of agent)
                            :max-turns (get-in environment [:environment/limits :max-turns] 20)
                            :cancelled? cancelled?
                            :generate (live/scoped (if agent-generate
@@ -424,6 +549,7 @@
                                 {:status (:run/status result) :reason (:run/reason durable)
                                  :message (:run/error durable)})
                      :engine (engine-of agent)
+                     :nested? (nested-of agent)
                      :submitted (:submitted outcome)
                      :queries (:queries outcome)
                      :episode (select-keys outcome [:model-steps :usage])
@@ -431,11 +557,11 @@
                      :spend (if (map? (:usage outcome))
                               (spend/of-usage (get-in agent [:agent/model-policy :model]) (:usage outcome))
                               spend/zero)}))
-       :verify (fn [definition {:keys [engine submitted] :as evidence}]
+       :verify (fn [definition {:keys [engine nested? submitted] :as evidence}]
                  (let [question (question-of by-id definition)
                        submitted? (and (= :submitted (get-in evidence [:result :termination]))
                                        (not (str/blank? (str submitted))))
-                       r (when submitted? (run-query engine (:db-id question) submitted {}))
+                       r (when submitted? (run-query engine (:db-id question) submitted {:nested? nested?}))
                        correct? (boolean (and r (not (:error r))
                                               (bird/same-result? (:rows r) (gold-rows question))))]
                    {:reward (if correct? 1.0 0.0)
@@ -464,9 +590,10 @@
       :metadata {:benchmark :bird :difficulty difficulty}})))
 
 (defn candidate-roster
-  "AgentDefs for `{:id :model :provider :engine :budget-dollars}`."
+  "AgentDefs for `{:id :model :provider :engine :nested :budget-dollars}`;
+   `:nested` (Datalog): calls may nest in clauses (`desugar-nested`)."
   [specs]
-  (reduce (fn [team {:keys [id model provider engine budget-dollars] :or {engine :sqlite budget-dollars 1.0}}]
+  (reduce (fn [team {:keys [id model provider engine nested budget-dollars] :or {engine :sqlite budget-dollars 1.0}}]
             (when-not (engines engine)
               (throw (ex-info "Unknown BIRD engine" {:type ::unknown-engine :engine engine :known engines})))
             (let [model-id (registry/resolve-alias model)]
@@ -477,6 +604,6 @@
                 :tools #{}
                 :model-policy {:provider (or provider (:provider (registry/get-model! model-id))) :model model-id}
                 :program {:kind :llm :max-model-steps 20 :budget-dollars budget-dollars}
-                :metadata {:bird/engine engine}})))
+                :metadata (cond-> {:bird/engine engine} nested (assoc :bird/nested true))})))
           (roster/make-roster {:id :bird/candidates})
           specs))
