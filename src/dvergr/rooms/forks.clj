@@ -231,6 +231,7 @@
   [delta]
   (cond
     (nil? delta)               true
+    (contains? delta :intents) (empty? (:intents delta))    ; a book settling by replay
     (:error delta)             false                       ; DiffError
     (contains? delta :files)   (empty? (:files delta))     ; GitDiff
     (contains? delta :summary) (zero? (long (or (:added-datoms (:summary delta)) 0)))
@@ -449,9 +450,23 @@
    the chosen fields in the parent. Returns
    {:ok? true :reconciled N :resolutions [...] :rationale …} or {:ok? false :error}."
   [fork]
-  (let [conflicts (vec (fork-conflicts fork))]
-    (if (empty? conflicts)
+  (let [conflicts (vec (fork-conflicts fork))
+        ;; a book settling by replay conflicts on CLAIMS (a bank line, an
+        ;; invoice both sides booked): no field to pick a side of, and forcing
+        ;; would book it twice. A decision about which intents to drop.
+        claims (filterv #(= :parent (:with %)) conflicts)]
+    (cond
+      (seq claims)
+      {:ok? false
+       :error (str "The fork's book claims what the room claimed meanwhile ("
+                   (count claims) " conflict(s)); decide which of the fork's entries to drop — "
+                   "they cannot be reconciled field by field")
+       :book-conflicts claims}
+
+      (empty? conflicts)
       (merge! fork)
+
+      :else
       (if-let [parent (rreg/lookup (:parent-id fork))]
         (try
           (prepare-workspaces! parent fork)

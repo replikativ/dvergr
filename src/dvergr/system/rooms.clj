@@ -30,6 +30,7 @@
             [geschichte.workspace :as gworkspace]
             [dvergr.substrate.paths :as paths]
             [dvergr.substrate.datahike :as sdh]
+            [dvergr.substrate.kontor-book :as kontor-book]
             [org.replikativ.spindel.yggdrasil :as ygg]
             [org.replikativ.spindel.engine.core :as ec]))
 
@@ -131,6 +132,10 @@
              (d/connect (assoc cfg :schema-flexibility :read))
              (throw e))))))
 
+(defn- book-system-name
+  "Yggdrasil system id for a room's kontor book at `path`."
+  [path] (str "room-book-" (.getName (io/file path))))
+
 (defn- kb-system-name   "Yggdrasil system id for a KB store path."  [path]
   (str "room-kb-" (.getName (io/file path))))
 (defn- repo-system-name "Yggdrasil system id for a repo path."      [path]
@@ -224,6 +229,11 @@
       ;; agent-created data DBs (see create-room-db!) — re-register so they survive
       ;; restart, same as the room's own KB/msgs. Custom connect (schema-flexibility
       ;; fallback), so pass the conn; never impose dvergr schema on agent stores.
+      ;; the room's business book settles by replay (kontor ADR-172), so it is
+      ;; registered with its settlement hooks, never as a plain datom store
+      :book (kontor-book/register-book!
+             (sdh/provision! {:cfg (store-cfg scope) :schema? false :register? false})
+             (book-system-name scope))
       :data (sdh/provision! {:conn (connect-data-store scope) :schema? false
                              :system-name (str "room-data-" (.getName (io/file scope)))})
       nil)
@@ -452,6 +462,32 @@
            (filter #(= (name db-name) (:slug %)))
            first :path data-system-name ygg/system :conn))
 
+(defn room-book-conn
+  "Fork-aware conn to the room's kontor book, or nil when it has none."
+  [room-id]
+  (some->> (resolve-type room-id :book) first :path book-system-name ygg/system :conn))
+
+(defn create-room-book!
+  "Create the room's kontor business book, register it into the CURRENT ctx's
+   composite as a book that settles by replay (`dvergr.substrate.kontor-book`)
+   and record its system-db grant. Returns the fork-aware conn. Idempotent per
+   room. Requires a bound ctx (the room's)."
+  [room-id & {:keys [owner-id]}]
+  (or (room-book-conn room-id)
+      (let [path (scope-path (str (random-uuid)))
+            conn (sdh/provision! {:cfg (store-cfg path) :schema? false :register? false})]
+        (kontor-book/register-book! conn (book-system-name path))
+        (if (ec/get-state [:dvergr/transient-fork?])
+          (ec/swap-state! [:dvergr/pending-grants]
+                          (fn [v] (conj (or v [])
+                                        {:room-id room-id :name "book" :type :book
+                                         :scope path :owner-id owner-id})))
+          (sdb/attach! room-id
+                       (sdb/register-system! {:type :book :name "book"
+                                              :scope path :owner-id owner-id})
+                       :owner))
+        (room-book-conn room-id))))
+
 (defn create-room-db!
   "Create a room-OWNED datahike DB `db-name`, register it into the CURRENT ctx's
    composite (forks/merges/discards with the room) + record its system-db grant
@@ -545,10 +581,10 @@
    the fork's pending-grant list — so a fork's agent-created DBs become durable room
    systems only once the fork is accepted (P2). Idempotent per (room, scope)."
   [pending-grants]
-  (doseq [{:keys [room-id name scope owner-id]} pending-grants]
+  (doseq [{:keys [room-id name scope owner-id type]} pending-grants]
     (try
       (sdb/attach! room-id
-                   (sdb/register-system! {:type :data :name name :scope scope :owner-id owner-id})
+                   (sdb/register-system! {:type (or type :data) :name name :scope scope :owner-id owner-id})
                    :owner)
       (catch Throwable e
         ((requiring-resolve 'taoensso.telemere/log!)

@@ -10,7 +10,6 @@
             [dvergr.sandbox.ns.doc :as doc]
             [dvergr.sandbox.work :as sandbox-work]
             [org.replikativ.spindel.engine.core :as rtc]
-            [org.replikativ.spindel.engine.protocols :as rtp]
             [org.replikativ.spindel.effects.await :as sp-await]
             [org.replikativ.spindel.spin.cps :as sp]
             [org.replikativ.spindel.core :as sync]))
@@ -24,9 +23,7 @@
         value-of    @(ns-resolve measure-ns 'get-value)
         log-weights (vec (@(ns-resolve measure-ns 'get-log-weights) measure))
         values      (mapv value-of contexts)
-        worlds      (->> contexts
-                         (keep #(rtp/get-state % [:inference :world-descriptor]))
-                         vec)
+        worlds      (@(ns-resolve measure-ns 'world-descriptors) measure)
         posterior   {:posterior/values values
                      :posterior/log-weights log-weights
                      :posterior/weights
