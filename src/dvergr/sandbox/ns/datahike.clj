@@ -23,6 +23,7 @@
    (Discovery + by-name access to the room's MANAGED databases — KB, messages,
    created data DBs — is dvergr-specific and lives in `dvergr.room`, not here.)"
   (:require [datahike.api :as d]
+            [datahike.query.resolve :as resolve]
             [dvergr.effects :as effects]
             [dvergr.system.rooms :as srooms]
             [dvergr.runtime.ctx :as runtime-ctx]
@@ -154,6 +155,16 @@
       (binding-swap! assoc :ephemeral-databases {})
       errors)))
 
+(defn untrusted
+  "Run `f` resolving query/predicate function symbols as Datahike's server
+   does (`safe-symbol-resolver`: pure clojure.core, clojure.string,
+   read-only Datahike fns, registered fns). Embedded Datahike resolves them
+   permissively (any var, reflection), so a sandboxed query clause such as
+   [(slurp ?p) ?x] or [(clojure.java.shell/sh ...) ?x] would run on the host
+   past SCI."
+  [f]
+  (binding [resolve/*symbol-resolver* resolve/safe-symbol-resolver] (f)))
+
 (defn add-datahike-ns!
   "Mount the faithful datahike API under `datahike.api` and `d`, with lifecycle fns
    guarded to room `room-id` (resolved fork-aware under `ctx`)."
@@ -164,11 +175,13 @@
                                        [sym (fn [& args]
                                               (let [resolved (mapv resolve-connection args)]
                                                 (try
-                                                  (apply f resolved)
+                                                  (untrusted #(apply f resolved))
                                                   (catch Throwable error
                                                     (throw
                                                      (ex-info
-                                                      "Sandbox Datahike operation failed"
+                                                      ;; the cause is what the agent can act on
+                                                      (str "Sandbox Datahike operation " sym " failed: "
+                                                           (ex-message error))
                                                       {:operation sym
                                                        :argument-types
                                                        (mapv #(some-> % class str) resolved)}
@@ -178,15 +191,15 @@
                          'transact
                          (fn [conn tx-data]
                            (let [conn (resolve-connection conn)]
-                             (d/transact conn
-                                         (assert-no-certified-evaluation-write!
-                                          conn tx-data))))
+                             (untrusted #(d/transact conn
+                                                     (assert-no-certified-evaluation-write!
+                                                      conn tx-data)))))
                          'transact!
                          (fn [conn tx-data]
                            (let [conn (resolve-connection conn)]
-                             (d/transact! conn
-                                          (assert-no-certified-evaluation-write!
-                                           conn tx-data)))))
+                             (untrusted #(d/transact! conn
+                                                      (assert-no-certified-evaluation-write!
+                                                       conn tx-data))))))
         ;; per-sandbox ephemeral (:mem) databases, keyed by logical name
         ephemeral (atom {})
         ephemeral-map #(if binding-resolver

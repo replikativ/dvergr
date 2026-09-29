@@ -21,6 +21,7 @@
   (:require [clojure.edn :as edn]
             [clojure.string :as str]
             [datahike.api :as d]
+            [datahike.query.resolve :as resolve]
             [datahike.pg :as pg]
             [dvergr.agent.environment :as environment]
             [dvergr.agent.evaluation :as evaluation]
@@ -36,7 +37,9 @@
             [dvergr.sandbox :as sandbox]))
 
 (def version
-  "8: a final reply that is not a query that runs (the answer's value, a
+  "9: agent-written queries resolve functions as the Datahike server does
+   (safe-symbol-resolver), not the embedded default that reaches the host; a
+   plain query may hold a regex literal. 8: a final reply that is not a query that runs (the answer's value, a
    fragment) gets one reminder to submit; a submitted query that fails comes back with its error (every engine);
    a Datalog query has a 60 s deadline; a map written as vector clauses
    reads as that vector; the Datalog description is shorter and orders in
@@ -54,7 +57,7 @@
    identifiers canonical (bird.load/2); a final reply that is only a query
    counts as submitted. 2: a plain Datalog query (an EDN vector) runs as is;
    every engine's schema shows example rows."
-  8)
+  9)
 
 (def engines #{:sqlite :pg-datahike :datalog})
 
@@ -136,8 +139,15 @@
    stops the query there and frees what it built (datahike#1098)."
   60000)
 
-(defn- q-bounded [query db inputs]
-  (d/q {:query query :args (into [db] inputs) :timeout query-timeout-ms}))
+(defn- q-bounded
+  "`query` as the candidate wrote it, so as untrusted input: with a deadline,
+   and resolving function symbols as the Datahike server does
+   (`safe-symbol-resolver`: pure clojure.core, clojure.string, subqueries),
+   not as embedded Datahike does (any var, reflection), which would let a
+   query clause reach the host (slurp, shell) past the sandbox."
+  [query db inputs]
+  (binding [resolve/*symbol-resolver* resolve/safe-symbol-resolver]
+    (d/q {:query query :args (into [db] inputs) :timeout query-timeout-ms})))
 
 (defn run-q
   "`query` on `db`, as the candidate means it: aggregates with SQL's row
@@ -171,7 +181,9 @@
   [text]
   (let [t (str/trim (str text))
         query? #(or (and (vector? %) (keyword? (first %))) (and (map? %) (contains? % :find)))
-        read #(try (edn/read-string %) (catch Exception _ ::unreadable))]
+        ;; Clojure's reader, not EDN's: a query may hold a regex literal
+        ;; (#"(?i)man"); *read-eval* off, so #= cannot evaluate
+        read #(try (binding [*read-eval* false] (read-string %)) (catch Exception _ ::unreadable))]
     (when (#{\[ \{} (first t))
       (let [v (read t)]
         (cond
