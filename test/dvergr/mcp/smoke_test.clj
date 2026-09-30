@@ -21,7 +21,7 @@
     (let [prev-home (paths/home)]
       (paths/set-home! (str (System/getProperty "java.io.tmpdir") "/dvergr-mcp-smoke-" (random-uuid)))
       (sdb/reset-conn!)
-      (let [d (daemon/start! {:agents {} :mcp {:port 0}})]
+      (let [d (daemon/start! {:agents {} :mcp {:port 0 :http {:port 0}}})]
         (try
           (binding [*daemon* d] (f))
           (finally
@@ -116,4 +116,22 @@
           (let [ack (await #(= "notifications/subscriptions/acknowledged" (:method %)))]
             (is (= 3 (get-in ack [:params :_meta :io.modelcontextprotocol/subscriptionId]))))
           (finally (.destroy p)))))))
+
+(deftest the-daemon-serves-mcp-over-http
+  (let [{:keys [port token]} (:mcp-http *daemon*)
+        body {:jsonrpc "2.0" :id 1 :method "tools/list"
+              :params {:_meta {:io.modelcontextprotocol/protocolVersion "2026-07-28"
+                               :io.modelcontextprotocol/clientInfo {:name "smoke" :version "0"}
+                               :io.modelcontextprotocol/clientCapabilities {}}}}
+        req (-> (java.net.http.HttpRequest/newBuilder (java.net.URI. (str "http://127.0.0.1:" port "/mcp")))
+                (.header "Authorization" (str "Bearer " token))
+                (.header "Content-Type" "application/json")
+                (.header "MCP-Protocol-Version" "2026-07-28")
+                (.header "Mcp-Method" "tools/list")
+                (.POST (java.net.http.HttpRequest$BodyPublishers/ofString (j/write-value-as-string body)))
+                (.build))
+        r (.send (java.net.http.HttpClient/newHttpClient) req (java.net.http.HttpResponse$BodyHandlers/ofString))
+        tools (get-in (j/read-value (.body r) j/keyword-keys-object-mapper) [:result :tools])]
+    (is (= 200 (.statusCode r)))
+    (is (some #(= "room_list" (:name %)) tools) "the daemon's tools")))
 

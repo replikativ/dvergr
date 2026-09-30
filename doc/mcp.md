@@ -180,6 +180,17 @@ Both eras of the protocol, decided per request, so one connection may carry both
   listen request (`resultType: "complete"`) before closing. A stateless client that did not
   subscribe gets no notifications; a handshake connection gets list changes as before.
 
+**Streamable HTTP** (`dvergr.mcp.http`, `:mcp {:http {:port 17889}}` in the daemon config): one
+`POST /mcp` endpoint on its own loopback listener. Every request needs `Authorization: Bearer
+<token>` (the token is in `<state>/mcp/http-token`, mode 0600, created on first start); an
+`Origin` that is not loopback is refused (403). Stateless requests must carry
+`MCP-Protocol-Version`, `Mcp-Method` and (for `tools/call`, `resources/read`) `Mcp-Name`
+matching the body (else 400, -32020); an unsupported version is 400 (-32022), an unknown method
+404. The response is JSON, or SSE for `subscriptions/listen` (an open stream with keep-alive
+comments) and for a long request with a `progressToken`; closing a stream cancels its request.
+Handshake clients get an `Mcp-Session-Id` from `initialize` (DELETE ends it); there is no GET
+stream (405).
+
 **The relay** (`bin/dvergr-mcp`) speaks both eras too: it forwards `server/discover` to the
 daemon (answering it itself, with the same versions, while the daemon starts), puts its
 `--profile`/`--toolsets`/`--room`/`--tools` pins into each stateless request's `_meta` (there is
