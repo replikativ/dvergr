@@ -269,10 +269,13 @@ has most of the first half.
 
 - **Terminal-only rewards make SMC equal to best-of-N.** tau2 and the
   current `Evaluator` score at the end. Particle filtering needs partial
-  verifiers. Spindel also lacks a `factor` effect (weights can only come
-  from densities at `observe` sites) and resamples at a global lockstep
-  barrier that throws when particles end at different turn counts. MCTS
-  (`spindel.search.mcts`, in 0.1.49) fits terminal rewards better.
+  verifiers, or a value estimate of the reward to come. foerster (0.1.45)
+  has the machinery: `(factor w :barrier true)` weighs and resamples at a
+  scored step, particles that end early are carried along, and
+  `infer/steer` builds the twisted step loop — a value estimate ψ at each
+  step, the reward at the end, target p(trajectory)·exp(reward). With no
+  value estimate it is exactly best-of-N weighted by the reward. MCTS
+  (`spindel.search.mcts`, in 0.1.49) fits terminal rewards too.
 - **A model step cannot be forked.** A step is blocking host work. Snapshots
   are taken between steps.
 - **Training starts at SFT.** `finetune-rstr` has real SFT with
@@ -319,8 +322,8 @@ Refactor first. Each step keeps the suite green.
    Room from the world parent, so a branch is an evaluation whose world
    parent is a retained snapshot world. Then the step log with prefix ids.
 4. **Policies.** Best-of-N and retries from a snapshot; per-turn value
-   curves; partial verifiers; then search, which needs `factor` and a
-   barrier that tolerates uneven episode lengths in spindel.
+   curves; partial verifiers; then search: SMC over steps with
+   `infer/steer` (partial verifiers or value estimates as twists), and MCTS.
 
 ## Decided
 
