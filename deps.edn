@@ -171,7 +171,9 @@
                        org.replikativ/briefkasten {:mvn/version "0.1.2"} ; briefkasten (mail)
                        org.replikativ/spindel-tui {:mvn/version "0.1.14"}
                        org.replikativ/pg-datahike {:mvn/version "0.1.264"}
-                       org.xerial/sqlite-jdbc {:mvn/version "3.50.3.0"}}}
+                       org.xerial/sqlite-jdbc {:mvn/version "3.50.3.0"}
+                       org.replikativ/rechentafel {:mvn/version "0.1.9"} ; SpreadsheetBench
+                       org.apache.poi/poi-ooxml {:mvn/version "5.5.1"} org.apache.poi/poi-ooxml-full {:mvn/version "5.5.1"}}}
 
   ;; src-clients/ on the test path so dvergr.web.server-test still
   ;; loads the namespaces it tests.
@@ -186,6 +188,8 @@
                        org.replikativ/spindel-tui {:mvn/version "0.1.14"}
                        org.replikativ/pg-datahike {:mvn/version "0.1.264"}
                        org.xerial/sqlite-jdbc {:mvn/version "3.50.3.0"}
+                       org.replikativ/rechentafel {:mvn/version "0.1.9"} ; SpreadsheetBench
+                       org.apache.poi/poi-ooxml {:mvn/version "5.5.1"} org.apache.poi/poi-ooxml-full {:mvn/version "5.5.1"}
                        org.clojure/test.check {:mvn/version "1.1.1"}} ; laws (effects algebra)
          ;; State touched from another world (e.g. a control room's context)
          ;; fails the test instead of warning; see spindel's missing-state-mode.
@@ -202,7 +206,9 @@
   :benchmarks {:extra-paths ["benchmarks/src" "benchmarks/resources"]
                ;; BIRD: SQLite (the gold) and SQL over Datahike
                :extra-deps {org.replikativ/pg-datahike {:mvn/version "0.1.264"}
-                            org.xerial/sqlite-jdbc {:mvn/version "3.50.3.0"}}}
+                            org.xerial/sqlite-jdbc {:mvn/version "3.50.3.0"}
+                       org.replikativ/rechentafel {:mvn/version "0.1.9"} ; SpreadsheetBench
+                       org.apache.poi/poi-ooxml {:mvn/version "5.5.1"} org.apache.poi/poi-ooxml-full {:mvn/version "5.5.1"}}}
 
   :repl {:main-opts ["-m" "nrepl.cmdline"
                      "--middleware" "[cider.nrepl/cider-middleware]"

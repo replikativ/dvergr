@@ -4,4 +4,6 @@
 {:paths ["src" "resources"]
  :deps {org.replikativ/dvergr {:local/root ".."}
         org.replikativ/pg-datahike {:mvn/version "0.1.264"}
-        org.xerial/sqlite-jdbc {:mvn/version "3.50.3.0"}}}
+        org.xerial/sqlite-jdbc {:mvn/version "3.50.3.0"}
+        org.replikativ/rechentafel {:mvn/version "0.1.9"} ; SpreadsheetBench
+        org.apache.poi/poi-ooxml {:mvn/version "5.5.1"} org.apache.poi/poi-ooxml-full {:mvn/version "5.5.1"}}}
