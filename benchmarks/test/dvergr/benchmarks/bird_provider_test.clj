@@ -205,11 +205,16 @@
              (:rows (provider/run-query :datalog "superhero" nested {:nested? true}))))
       (is (:error (provider/run-query :datalog "superhero" nested {})) "without the flag, Datahike's rule stands"))))
 
-(deftest a-constant-binding-is-an-equality
-  (is (= '[:find ?e :where [?e :t/id ?id] [(subs ?id 6 7) ?__c1] [(= ?__c1 "4")]]
-         (provider/bind-constants '[:find ?e :where [?e :t/id ?id] [(subs ?id 6 7) "4"]])))
-  (is (= '[:find ?e :where [?e :t/id ?id] [(subs ?id 6 7) ?x]]
-         (provider/bind-constants '[:find ?e :where [?e :t/id ?id] [(subs ?id 6 7) ?x]]))))
+(deftest constants-and-if-in-clauses
+  (if-not (bird/available?)
+    (support/skip! "constants-and-if-in-clauses: no BIRD dev set")
+    (let [run #(:rows (provider/run-query :datalog "superhero" % {}))]
+      (is (= (run "[:find (count ?e) :where [?e :superhero/superhero_name ?n] [(subs ?n 0 1) ?x] [(= ?x \"A\")]]")
+             (run "[:find (count ?e) :where [?e :superhero/superhero_name ?n] [(subs ?n 0 1) \"A\"]]"))
+          "a constant in the binding is that equality (Datahike 0.8.1902)")
+      (is (= (run "[:find (count ?e) :where [?e :superhero/height_cm ?h] [(> ?h 200)]]")
+             (run "[:find (count ?e) :where [?e :superhero/height_cm ?h] [(> ?h 200) ?t] [(if ?t \"tall\" \"short\") \"tall\"]]"))
+          "if on a bound condition"))))
 
 (deftest q-in-an-expression-may-name-the-db
   (if-not (bird/available?)
