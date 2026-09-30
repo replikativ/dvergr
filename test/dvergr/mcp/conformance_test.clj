@@ -221,3 +221,11 @@
         (is (apply < (map #(get-in % [:params :progress]) progress)) "progress only increases")
         (is (every? #(< (.indexOf ^java.util.List msgs %) response-at) progress) "none after the response"))
       (finally (server/unregister-tool! "slow_probe")))))
+
+(deftest the-relay-speaks-the-servers-versions
+  ;; bin/dvergr-mcp answers initialize and server/discover itself while the
+  ;; daemon starts; its version lists must be the server's
+  (let [src (slurp "bin/dvergr-mcp")
+        vec-of (fn [nm] (some->> (re-find (re-pattern (str "\\(def " nm " (\\[[^\\]]*\\])\\)")) src) second read-string))]
+    (is (= json-rpc/supported-versions (vec-of "versions")))
+    (is (= json-rpc/stateless-versions (vec-of "stateless-versions")))))
