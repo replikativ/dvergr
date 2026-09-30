@@ -156,6 +156,10 @@
 
         ;; Structured logging
         com.taoensso/telemere      {:mvn/version "1.2.1"}
+        ;; dvergr.substrate.log configures timbre (routed to telemere). It
+        ;; arrived transitively through spindel → anglican until inference
+        ;; moved to foerster; the version it resolved to then.
+        com.taoensso/timbre        {:mvn/version "4.10.0"}
 
         ;; katzen (Catlab/GATlab port) — the shared categorical schema
         ;; substrate: the KB + Clojure-code ACSet schemas live in
