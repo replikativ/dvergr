@@ -180,6 +180,13 @@ Both eras of the protocol, decided per request, so one connection may carry both
   listen request (`resultType: "complete"`) before closing. A stateless client that did not
   subscribe gets no notifications; a handshake connection gets list changes as before.
 
+**The relay** (`bin/dvergr-mcp`) speaks both eras too: it forwards `server/discover` to the
+daemon (answering it itself, with the same versions, while the daemon starts), puts its
+`--profile`/`--toolsets`/`--room`/`--tools` pins into each stateless request's `_meta` (there is
+no `initialize` to carry them), opens a connection for a stateless request, and re-opens the
+client's subscriptions after a daemon restart (dropping the repeated acknowledgement). A test
+keeps its version lists equal to the server's.
+
 **Progress** (both eras): a `tools/call` or `resources/read` with `_meta.progressToken` gets
 `notifications/progress` while it runs — a heartbeat every 10 s (`progress` = elapsed seconds,
 only increasing) plus whatever the tool reports through `:progress!` — and none after its

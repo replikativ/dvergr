@@ -51,6 +51,12 @@
                         " -p 0 --nrepl-port-file .dvergr/mcp-daemon.nrepl-port")))
 
 (def versions ["2024-11-05" "2025-03-26" "2025-06-18" "2025-11-25"])
+(def stateless-versions ["2026-07-28"])
+
+(defn- stateless?
+  "A request in the stateless era: its _meta names a stateless version."
+  [msg]
+  (some #{(get-in msg [:params :_meta :io.modelcontextprotocol/protocolVersion])} stateless-versions))
 
 (defn- log [& xs]
   (binding [*out* *err*] (apply println "dvergr-mcp:" xs) (flush)))
@@ -75,7 +81,9 @@
          :pending {}        ; id → request, forwarded and not yet answered
          :starting? false
          :daemon nil        ; the daemon process this relay started
-         :start-failed? false}))
+         :start-failed? false
+         :listens {}        ; id → subscriptions/listen request, open
+         :replaying #{}}))  ; listen ids re-sent after a reconnect (their ack is dropped)
 
 (defn- with-meta-selection
   "The client's initialize with the connection's profile/toolsets in `_meta`."
@@ -84,6 +92,19 @@
     profile  (assoc-in [:params :_meta :dvergr/profile] profile)
     toolsets (assoc-in [:params :_meta :dvergr/toolsets] toolsets)
     room     (assoc-in [:params :_meta :dvergr/room] room)
+    only-tools (assoc-in [:params :_meta :dvergr/tools] only-tools)))
+
+(defn- with-request-selection
+  "A stateless request with this relay's pins (profile, toolsets, room,
+   tools) in its _meta, where the client did not choose its own: there is
+   no initialize to carry them."
+  [msg]
+  (cond-> msg
+    (and profile (nil? (get-in msg [:params :_meta :dvergr/profile])))
+    (assoc-in [:params :_meta :dvergr/profile] profile)
+    (and toolsets (nil? (get-in msg [:params :_meta :dvergr/toolsets])))
+    (assoc-in [:params :_meta :dvergr/toolsets] toolsets)
+    room (assoc-in [:params :_meta :dvergr/room] room)
     only-tools (assoc-in [:params :_meta :dvergr/tools] only-tools)))
 
 (defn- send! [{:keys [^BufferedWriter writer]} msg]
@@ -97,8 +118,9 @@
 (defn- fail-pending!
   "Answer every forwarded, unanswered request: the daemon went away."
   []
-  (let [[old _] (swap-vals! state assoc :pending {})]
-    (doseq [[id req] (:pending old)]
+  (let [[old _] (swap-vals! state (fn [st] (assoc st :pending (select-keys (:pending st) (keys (:listens st))))))]
+    ;; open subscriptions are re-established on the next connection, not failed
+    (doseq [[id req] (apply dissoc (:pending old) (keys (:listens old)))]
       (to-client!
        (if (= "tools/call" (:method req))
          {:jsonrpc "2.0" :id id
@@ -131,8 +153,13 @@
         (when-let [msg (try (json/parse-string line true) (catch Exception _ nil))]
           (cond
             (shim-id? (:id msg)) nil
+            ;; the acknowledgement of a subscription this relay re-opened:
+            ;; the client saw the first one
+            (and (= "notifications/subscriptions/acknowledged" (:method msg))
+                 (contains? (:replaying @state) (get-in msg [:params :_meta :io.modelcontextprotocol/subscriptionId])))
+            (swap! state update :replaying disj (get-in msg [:params :_meta :io.modelcontextprotocol/subscriptionId]))
             (contains? msg :id)
-            (let [[old _] (swap-vals! state update :pending dissoc (:id msg))]
+            (let [[old _] (swap-vals! state #(-> % (update :pending dissoc (:id msg)) (update :listens dissoc (:id msg))))]
               (when (and (= "tools/list" (get-in old [:pending (:id msg) :method]))
                          (:result msg) (nil? (get-in old [:pending (:id msg) :params :cursor])))
                 (write-tools-cache! (:result msg)))
@@ -203,7 +230,12 @@
   (when-let [init (:init @state)]
     (send! conn (assoc (with-meta-selection init) :id (str "dvergr-shim-init-" (random-uuid))))
     (when (:initialized? @state)
-      (send! conn {:jsonrpc "2.0" :method "notifications/initialized"}))))
+      (send! conn {:jsonrpc "2.0" :method "notifications/initialized"})))
+  ;; stateless subscriptions: the server holds none across connections, and
+  ;; the client does not know this one changed, so re-open them here
+  (let [listens (:listens @state)]
+    (swap! state update :replaying into (keys listens))
+    (doseq [[_ msg] listens] (send! conn msg))))
 
 (defn connect!
   "Connect (starting the daemon when none listens) and replay the handshake.
@@ -218,7 +250,9 @@
         (swap! state assoc :conn conn :starting? false :daemon nil)
         (future (read-loop conn reader))
         (log "connected to daemon" (str host ":" port))
-        (when changed?
+        ;; a handshake client asked for list changes in initialize; a
+        ;; stateless one only gets what it subscribed to
+        (when (and changed? (:init @state))
           (to-client! {:jsonrpc "2.0" :method "notifications/tools/list_changed"})
           (to-client! {:jsonrpc "2.0" :method "notifications/resources/list_changed"}))
         conn)
@@ -261,6 +295,24 @@
                              :resources {:subscribe true :listChanged true}}
               :instructions "dvergr is starting; its tools appear when the daemon is up (tools/list_changed follows)."}}))
 
+(defn- local-discover
+  "Answer `server/discover` without the daemon (it is starting): the
+   versions the daemon speaks, so the client may go stateless."
+  [{:keys [id]}]
+  {:jsonrpc "2.0" :id id
+   :result {:resultType "complete"
+            :supportedVersions (into stateless-versions (rseq versions))
+            :capabilities {:tools {:listChanged true} :resources {:subscribe true}}
+            :instructions "dvergr is starting; its tools appear when the daemon is up."
+            :ttlMs 0 :cacheScope "private"
+            :_meta {:io.modelcontextprotocol/serverInfo {:name "dvergr" :title "dvergr" :version "0.1.0"}}}})
+
+(defn- ensure-conn!
+  "The live connection, opening one when a daemon listens; nil without one."
+  []
+  (or (:conn @state)
+      (when-let [s (try-connect)] (.close ^Socket s) (connect! false))))
+
 (defn- forward! [msg]
   (when (:start-failed? @state)             ; try again on the next request
     (swap! state assoc :start-failed? false)
@@ -278,6 +330,13 @@
                               :isError true}}
                     (error-response (:id msg) -32000
                                     (str "dvergr daemon not reachable on " host ":" port)))))))
+
+(defn- forward-stateless!
+  "Forward a stateless request with the relay's pins, opening a connection
+   (starting the daemon when none listens) since no initialize opens one."
+  [msg]
+  (or (ensure-conn!) (reconnect!))
+  (forward! (with-request-selection msg)))
 
 (defn- handle-client! [msg]
   (case (:method msg)
@@ -299,21 +358,38 @@
     "ping"
     (when (contains? msg :id) (to-client! {:jsonrpc "2.0" :id (:id msg) :result {}}))
 
-    ;; The 2026-07-28 revision's probe, sent before any handshake (Claude Code
-    ;; 2.1.28x). Answered here, at once: forwarding it would wait for a
-    ;; connection that only `initialize` opens, and the loop reading stdin with
-    ;; it. "Method not found" tells the client to fall back to `initialize`.
+    ;; The 2026-07-28 revision's probe, sent before any handshake. Forwarded
+    ;; when a daemon listens; while one starts, answered here at once with
+    ;; the versions it speaks (waiting would block the loop reading stdin).
     "server/discover"
     (when (contains? msg :id)
-      (to-client! (error-response (:id msg) -32601 "Method not found: this server speaks the initialize handshake")))
+      (if (ensure-conn!)
+        (forward! (with-request-selection msg))
+        (do (to-client! (local-discover msg))
+            (reconnect!))))
+
+    "subscriptions/listen"
+    (let [msg (with-request-selection msg)]
+      (when (contains? msg :id) (swap! state update :listens assoc (:id msg) msg))
+      (forward-stateless! msg))
+
+    "notifications/cancelled"
+    (do (swap! state update :listens dissoc (get-in msg [:params :requestId]))
+        (forward! msg))
 
     "tools/list"
-    (if-let [cached (and (nil? (:conn @state)) (nil? (get-in msg [:params :cursor]))
-                         (read-tools-cache))]
-      (to-client! {:jsonrpc "2.0" :id (:id msg) :result cached})
-      (forward! msg))
+    (if (stateless? msg)
+      (forward-stateless! msg)
+      (if-let [cached (and (nil? (:conn @state)) (nil? (get-in msg [:params :cursor]))
+                           (read-tools-cache))]
+        (to-client! {:jsonrpc "2.0" :id (:id msg) :result cached})
+        (forward! msg)))
 
-    (forward! msg)))
+    ;; a stateless request carries the relay's pins itself; one that opens
+    ;; no connection yet gets one (there is no initialize to open it)
+    (if (stateless? msg)
+      (forward-stateless! msg)
+      (forward! msg))))
 
 (let [in (BufferedReader. (InputStreamReader. System/in "UTF-8"))]
   (loop []

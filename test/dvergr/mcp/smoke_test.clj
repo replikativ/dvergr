@@ -9,6 +9,7 @@
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.substrate.paths :as paths]
             [dvergr.system.db :as sdb]
+            [dvergr.test-support :as support]
             [jsonista.core :as j])
   (:import (java.io BufferedReader BufferedWriter InputStreamReader OutputStreamWriter)
            (java.net Socket)))
@@ -80,3 +81,39 @@
       (is (re-find #"room pinned only"
                    (text (rpc "tools/call" {:name "read_file" :arguments {:path "/x" :room "smoke"}}))))
       (finally (close)))))
+
+(deftest the-relay-serves-a-stateless-client-with-its-pins
+  ;; bin/dvergr-mcp between a 2026-07-28 client (no initialize) and the
+  ;; daemon: discover is the daemon's, the relay's --room/--tools pins reach
+  ;; each request, a subscription is acknowledged. Needs babashka.
+  (if-not (some #(.canExecute (java.io.File. (str % "/bb")))
+                (clojure.string/split (System/getenv "PATH") #":"))
+    (support/skip! "the-relay-serves-a-stateless-client-with-its-pins: no bb on PATH")
+    (do
+      (ops/invoke *daemon* :room/create {:slug "relayed" :title "Relayed room"})
+      (let [p (.start (ProcessBuilder. ["bb" "bin/dvergr-mcp" "--no-start"
+                                        "--port" (str (get-in *daemon* [:mcp-server :port]))
+                                        "--room" "relayed" "--tools" "read_file,write_file"]))
+            out (BufferedWriter. (OutputStreamWriter. (.getOutputStream p)))
+            in (BufferedReader. (InputStreamReader. (.getInputStream p)))
+            meta {:io.modelcontextprotocol/protocolVersion "2026-07-28"
+                  :io.modelcontextprotocol/clientInfo {:name "relay-test" :version "0"}
+                  :io.modelcontextprotocol/clientCapabilities {}}
+            send! (fn [m] (.write out (j/write-value-as-string m)) (.write out "\n") (.flush out))
+            read! (fn [] (j/read-value (.readLine in) j/keyword-keys-object-mapper))
+            await (fn [pred] (loop [n 0] (let [m (read!)] (if (or (pred m) (> n 50)) m (recur (inc n))))))]
+        (try
+          (send! {:jsonrpc "2.0" :id 1 :method "server/discover" :params {:_meta meta}})
+          (let [r (await #(= 1 (:id %)))]
+            (is (some #{"2026-07-28"} (get-in r [:result :supportedVersions])))
+            (is (not (re-find #"starting" (str (get-in r [:result :instructions])))) "the daemon's answer, not the relay's"))
+          (send! {:jsonrpc "2.0" :id 2 :method "tools/list" :params {:_meta meta}})
+          (is (= #{"read_file" "write_file"}
+                 (set (map :name (get-in (await #(= 2 (:id %))) [:result :tools]))))
+              "the relay's pins reach a request without initialize")
+          (send! {:jsonrpc "2.0" :id 3 :method "subscriptions/listen"
+                  :params {:_meta meta :notifications {:toolsListChanged true}}})
+          (let [ack (await #(= "notifications/subscriptions/acknowledged" (:method %)))]
+            (is (= 3 (get-in ack [:params :_meta :io.modelcontextprotocol/subscriptionId]))))
+          (finally (.destroy p)))))))
+
