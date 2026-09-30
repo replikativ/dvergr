@@ -10,6 +10,10 @@
             [dvergr.discourse :as d]
             [dvergr.room.store.memory :as memory]
             [dvergr.test-support :as support]
+            [rechentafel.cell]
+            [rechentafel.eval]
+            [rechentafel.rc]
+            [rechentafel.unparse]
             [org.replikativ.spindel.engine.core :as ec])
   (:import (org.apache.poi.ss.util CellReference)))
 
@@ -55,6 +59,18 @@
     (binding [ec/*execution-context* (:ctx room)]
       (:attempt-receipt @(evaluation/evaluate room team :scripted env (:evaluator caps) {:protocol (:protocol caps)})))))
 
+(deftest a-range-write-fills-it
+  (let [wb (:wb (provider/apply-writes (rechentafel.eval/empty-workbook ["S"])
+                                       [{:cell "'S'!A1:A3" :value 2}
+                                        {:cell "'S'!B1:B3" :formula "=A1*10"}
+                                        {:cell "'S'!C1:C2" :value "x"}
+                                        {:cell "'S'!C1:C2" :value nil}]))
+        v #(:v (rechentafel.eval/get-cell wb (rechentafel.cell/pack 0 %1 %2)))]
+    (is (= [2.0 2.0 2.0] [(v 0 0) (v 1 0) (v 2 0)]) "a value in every cell")
+    (is (= [20.0 20.0 20.0] [(v 0 1) (v 1 1) (v 2 1)]) "a formula relative to the top-left cell")
+    (is (= "=A3*10" (str "=" (rechentafel.unparse/unparse (rechentafel.rc/resolve-at (get-in wb [:formulas (rechentafel.cell/pack 0 2 1)]) 2 1)))))
+    (is (nil? (v 0 2)) "null clears")))
+
 (deftest writing-the-gold-answer-is-graded-correct
   (if-not (sb/available?)
     (support/skip! "writing-the-gold-answer-is-graded-correct: no SpreadsheetBench data")
@@ -64,5 +80,8 @@
         (let [r (evaluate! room task [["write" {"cells" (gold-writes task)}] ["submit" {}]])]
           (is (= 1.0 (:attempt/reward r)) (pr-str (:attempt/checks r))))
         (testing "the input as it is fails"
-          (is (= 0.0 (:attempt/reward (evaluate! room task [["submit" {}]])))))
+          (let [r (evaluate! room task [["submit" {}]])]
+            (is (= 0.0 (:attempt/reward r)))
+            (is (pos? (get-in r [:attempt/metrics :verification :mismatched])) "the receipt says what mismatched")
+            (is (seq (get-in r [:attempt/metrics :verification :mismatches])))))
         (finally (d/close-room! room))))))
