@@ -1,0 +1,61 @@
+(ns dvergr.benchmarks.spreadsheetbench.experiment
+  "SpreadsheetBench experiments (`dvergr.agent.experiment.runner`), over the
+   tasks the oracle certifies (`oracle-file`, written by
+   `spreadsheetbench.oracle/report`):
+
+     (run! {:dir \"~/.cache/dvergr-bench/sb-dev\" :split :dev :sample 20 :repetitions 2
+            :candidates [{:id :luna :model \"codex-subscription-luna\"}]})"
+  (:refer-clojure :exclude [run!])
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [dvergr.agent.experiment.runner :as runner]
+            [dvergr.benchmarks.pyjson :as pj]
+            [dvergr.benchmarks.spreadsheetbench.core :as sb]
+            [dvergr.benchmarks.spreadsheetbench.provider :as provider]
+            [hasch.core :as hasch])
+  (:import [java.util ArrayList Collections Random]))
+
+(defn oracle-file []
+  (str (System/getProperty "user.home") "/.cache/dvergr-bench/spreadsheetbench/oracle-verified-400.edn"))
+
+(defn certified-ids
+  "The ids the oracle certified, or nil without an oracle run."
+  []
+  (let [f (io/file (oracle-file))]
+    (when (.exists f)
+      (set (keep #(when (#{:certified :certified-gold} (:status %)) (:id %))
+                 (:results (edn/read-string {:default tagged-literal} (slurp f))))))))
+
+(defn split-of
+  "`:dev` (a third) or `:eval`, fixed by the digest of the task id."
+  [{:keys [id]}]
+  (if (< (Long/parseLong (subs (pj/sha256-hex (str "spreadsheetbench/" id)) 0 8) 16) (quot 0x100000000 3)) :dev :eval))
+
+(defn select-tasks
+  [{:keys [split sample seed ids] :or {seed 20260930}}]
+  (let [certified (or (certified-ids) (throw (ex-info "Run the oracle first (spreadsheetbench.oracle/report)" {})))
+        ts (cond->> (filter #(certified (:id %)) (sb/tasks))
+             split (filter #(= split (split-of %)))
+             ids (filter #((set ids) (:id %))))]
+    (if (or (nil? sample) (>= sample (count ts)))
+      (vec ts)
+      (let [l (ArrayList. ^java.util.Collection (vec ts))]
+        (Collections/shuffle l (Random. (long seed)))
+        (vec (sort-by :id (take sample l)))))))
+
+(defn run!
+  [{:keys [candidates agent-generate max-turns] :or {max-turns 30} :as opts}]
+  (let [selected (select-tasks opts)
+        caps (provider/capabilities selected {:agent-generate agent-generate})]
+    (runner/run!
+     (merge
+      (select-keys opts [:dir :repetitions :parallelism :experiment-id :preflight :allowance
+                         :usage-pause-threshold :usage-retries])
+      {:benchmark :spreadsheetbench
+       :capabilities caps
+       :environments (mapv #(provider/environment-def % caps {:max-turns max-turns}) selected)
+       :team (provider/candidate-roster candidates)
+       :models candidates
+       :dataset {:id (keyword "spreadsheetbench" (str "tasks-" (hasch/uuid (mapv :id selected))))
+                 :metadata {:upstream "SpreadsheetBench verified_400" :tasks (count selected)}}
+       :metadata {:sample (:sample opts) :seed (:seed opts) :split (:split opts)}}))))
