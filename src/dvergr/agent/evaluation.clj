@@ -175,7 +175,9 @@
    and the setup and execution evidence) and returns portable evidence; a
    `:spend` it returns (`dvergr.agent.spend`) is the Attempt's bill on the
    receipt, else the Run's own metrics are. `verify` receives the EnvironmentDef
-   plus that evidence and returns `{:checks {keyword boolean} :reward number}`.
+   plus that evidence and returns `{:checks {keyword boolean} :reward number}`,
+   and optionally `:metrics`, a portable map of what it measured (the receipt
+   records it under `:metrics :verification`).
    Optional `capture` receives `{:room control-room :world/room work-room
    :run-id uuid :environment EnvironmentDef}` after candidate work and owned
    resource cleanup quiesce, before world settlement (including failure and
@@ -505,7 +507,10 @@
         _ (when-not (and (map? evidence) (roster/data-value? evidence))
             (throw (ex-info "Evaluator evidence must be a portable map"
                             {:type ::invalid-evidence :evidence evidence})))
-        {:keys [checks reward]} ((:verify evaluator) definition evidence)
+        {:keys [checks reward] verification :metrics} ((:verify evaluator) definition evidence)
+        _ (when (and (some? verification) (not (and (map? verification) (roster/data-value? verification))))
+            (throw (ex-info "Evaluator :verify :metrics must be a portable map"
+                            {:type ::invalid-verification :metrics verification})))
         {:keys [provider model metrics]} (execution-identity agent result durable)
         ;; What the Attempt cost, on every receipt: an LLM program's Run
         ;; carries its chat budget in :run/metrics; a protocol Run's observer
@@ -528,6 +533,9 @@
                                           :timed-out? timeout?
                                           :verifier-trust (:tier evaluator)
                                           :spend attempt-spend)
+                             ;; what the verifier measured beside its checks
+                             ;; (which cells mismatched, how many compared)
+                             (seq verification) (assoc :verification verification)
                              (seq effect-receipts)
                              (assoc :effects (effect-log room effect-receipts))
                              ;; An environment may count a timeout against the

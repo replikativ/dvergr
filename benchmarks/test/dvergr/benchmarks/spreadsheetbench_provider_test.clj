@@ -80,5 +80,8 @@
         (let [r (evaluate! room task [["write" {"cells" (gold-writes task)}] ["submit" {}]])]
           (is (= 1.0 (:attempt/reward r)) (pr-str (:attempt/checks r))))
         (testing "the input as it is fails"
-          (is (= 0.0 (:attempt/reward (evaluate! room task [["submit" {}]])))))
+          (let [r (evaluate! room task [["submit" {}]])]
+            (is (= 0.0 (:attempt/reward r)))
+            (is (pos? (get-in r [:attempt/metrics :verification :mismatched])) "the receipt says what mismatched")
+            (is (seq (get-in r [:attempt/metrics :verification :mismatches])))))
         (finally (d/close-room! room))))))
