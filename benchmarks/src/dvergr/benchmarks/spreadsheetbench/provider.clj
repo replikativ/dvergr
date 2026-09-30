@@ -22,14 +22,17 @@
             [rechentafel.eval :as e]
             [rechentafel.functions.all]
             [rechentafel.poi :as poi]
+            [rechentafel.parser :as parser]
             [rechentafel.rc :as rc]
             [rechentafel.unparse :as unparse])
   (:import (org.apache.poi.ss.util CellReference)))
 
 (def version
   "1: read/write/submit over rechentafel; graded by upstream's compare rules
-   against the gold's saved values."
-  1)
+   against the gold's saved values. 2: `write` to a range fills it (a value
+   in every cell, blank to clear; a formula relative to its top-left cell,
+   as Excel fills); the grade names the first mismatched cells."
+  2)
 
 ;; ---------------------------------------------------------------------------
 ;; The workbook as the candidate sees and edits it
@@ -96,6 +99,19 @@
         si (when rng (resolve-sheet wb rng))]
     (when (and rng si) [(cell/pack si (:r0 rng) (:c0 rng)) (:r1 rng) (:c1 rng)])))
 
+(defn- fill-range
+  "`wb` with `input` (a value, or a formula string) in every cell from
+   `anchor` to row `r1`, column `c1`: a value as it is, a formula relative to
+   the anchor (=A1*2 filled down B1:B3 is =A2*2 in B2), as Excel fills."
+  [wb anchor r1 c1 input]
+  (let [s (cell/sheet anchor) r0 (cell/row anchor) c0 (cell/col anchor)
+        cells (for [r (range r0 (inc (long r1))) c (range c0 (inc (long c1)))] [r c])]
+    (if (and (string? input) (str/starts-with? input "="))
+      (let [rc (rc/normalize (parser/parse (subs input 1)) r0 c0)]
+        (reduce (fn [wb [r c]] (e/set-cell wb (cell/pack s r c) (if (and (= r r0) (= c c0)) input (rc/resolve-at rc r c))))
+                wb cells))
+      (reduce (fn [wb [r c]] (e/set-cell wb (cell/pack s r c) input)) wb cells))))
+
 (defn apply-writes
   "`wb` with `writes` `[{:cell \"'S'!B2\" :value v | :formula \"=…\" :array bool}]`
    applied and recalculated: `{:wb :errors}`."
@@ -109,15 +125,15 @@
                         (try [(e/set-array-formula wb anchor (let [f (str/trim (str formula))] (if (str/starts-with? f "=") f (str "=" f))) r1 c1) errs]
                              (catch Throwable t [wb (conj errs (str cell ": " (ex-message t)))]))
                         [wb (conj errs (str "not a range: " (pr-str cell)))])
-                      (if-let [id (parse-target wb cell)]
+                      (if-let [[anchor r1 c1] (parse-range-target wb cell)]
                         (try
-                          [(e/set-cell wb id (cond
-                                               (some? formula) (let [f (str/trim (str formula))] (if (str/starts-with? f "=") f (str "=" f)))
-                                               (string? value) {:t :str :v value}
-                                               :else value))
+                          [(fill-range wb anchor r1 c1
+                                       (if (some? formula)
+                                         (let [f (str/trim (str formula))] (if (str/starts-with? f "=") f (str "=" f)))
+                                         (if (string? value) {:t :str :v value} value)))
                            errs]
                           (catch Throwable t [wb (conj errs (str cell ": " (ex-message t)))]))
-                        [wb (conj errs (str "not a single cell: " (pr-str cell)))]))))
+                        [wb (conj errs (str "not a cell or range: " (pr-str cell)))]))))
                 [wb []] writes)]
     {:wb (e/recalc wb) :errors errors}))
 
@@ -158,7 +174,7 @@
                 "parameters" {"type" "object"
                               "properties" {"cells" {"type" "array"
                                                      "items" {"type" "object"
-                                                              "properties" {"cell" {"type" "string" "description" "one cell, e.g. 'Sheet1'!B2"}
+                                                              "properties" {"cell" {"type" "string" "description" "a cell, e.g. 'Sheet1'!B2, or a range to fill: every cell gets `value` (null clears), or `formula` relative to the range's top-left cell as Excel fills it"}
                                                                             "value" {"description" "a number, text or boolean"}
                                                                             "formula" {"type" "string" "description" "e.g. =SUM(A1:A3)"}
                                                                             "array" {"type" "boolean" "description" "true: `cell` is a range and `formula` a legacy array (Ctrl+Shift+Enter) formula filling it"}}
@@ -222,7 +238,9 @@
             names (mapv #(.getSheetName pg (int %)) (range (.getNumberOfSheets pg)))
             {:keys [wb]} (apply-writes (init-workbook task) writes)
             {:keys [compared mismatches]} (oracle/compare-cells wb names gold)]
-        {:correct (empty? mismatches) :cells compared :mismatched (count mismatches)}))))
+        {:correct (empty? mismatches) :cells compared :mismatched (count mismatches)
+         ;; the first ones, to tell a model's miss from a harness gap
+         :mismatches (vec (take 5 mismatches))}))))
 
 (defn- task-of [by-id definition] (get by-id (get-in definition [:environment/task :id])))
 
@@ -265,7 +283,7 @@
                        g (when submitted? (grade task (or writes [])))]
                    {:reward (if (:correct g) 1.0 0.0)
                     :checks {:submitted submitted? :correct (boolean (:correct g))}
-                    :metrics (select-keys g [:cells :mismatched])}))})}))
+                    :metrics (select-keys g [:cells :mismatched :mismatches])}))})}))
 
 (defn environment-def
   [{:keys [id type]} {:keys [protocol evaluator]}

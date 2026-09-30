@@ -10,6 +10,10 @@
             [dvergr.discourse :as d]
             [dvergr.room.store.memory :as memory]
             [dvergr.test-support :as support]
+            [rechentafel.cell]
+            [rechentafel.eval]
+            [rechentafel.rc]
+            [rechentafel.unparse]
             [org.replikativ.spindel.engine.core :as ec])
   (:import (org.apache.poi.ss.util CellReference)))
 
@@ -54,6 +58,18 @@
         team (provider/candidate-roster [{:id :scripted :model "claude-code-sonnet"}])]
     (binding [ec/*execution-context* (:ctx room)]
       (:attempt-receipt @(evaluation/evaluate room team :scripted env (:evaluator caps) {:protocol (:protocol caps)})))))
+
+(deftest a-range-write-fills-it
+  (let [wb (:wb (provider/apply-writes (rechentafel.eval/empty-workbook ["S"])
+                                       [{:cell "'S'!A1:A3" :value 2}
+                                        {:cell "'S'!B1:B3" :formula "=A1*10"}
+                                        {:cell "'S'!C1:C2" :value "x"}
+                                        {:cell "'S'!C1:C2" :value nil}]))
+        v #(:v (rechentafel.eval/get-cell wb (rechentafel.cell/pack 0 %1 %2)))]
+    (is (= [2.0 2.0 2.0] [(v 0 0) (v 1 0) (v 2 0)]) "a value in every cell")
+    (is (= [20.0 20.0 20.0] [(v 0 1) (v 1 1) (v 2 1)]) "a formula relative to the top-left cell")
+    (is (= "=A3*10" (str "=" (rechentafel.unparse/unparse (rechentafel.rc/resolve-at (get-in wb [:formulas (rechentafel.cell/pack 0 2 1)]) 2 1)))))
+    (is (nil? (v 0 2)) "null clears")))
 
 (deftest writing-the-gold-answer-is-graded-correct
   (if-not (sb/available?)
