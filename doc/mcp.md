@@ -172,7 +172,18 @@ Both eras of the protocol, decided per request, so one connection may carry both
   lists and reads carry `ttlMs` and `cacheScope` (`private`: what a client sees depends on its
   selection; a read is live, `ttlMs` 0). A version the server does not speak is refused with
   `-32022` and `data {supported, requested}`; an unknown resource is `-32602`; `ping` is gone.
-  Subscriptions (`subscriptions/listen`) and progress come next, then the HTTP transport.
+  `subscriptions/listen` opens a subscription: the request stays open, the server first sends
+  `notifications/subscriptions/acknowledged` with the part of the filter it honours
+  (`toolsListChanged`, `resourceSubscriptions` for existing resources; no prompts, no resource
+  list changes), then tagged notifications (`io.modelcontextprotocol/subscriptionId`, the
+  listen request's id). `notifications/cancelled` ends it; at shutdown the server answers the
+  listen request (`resultType: "complete"`) before closing. A stateless client that did not
+  subscribe gets no notifications; a handshake connection gets list changes as before.
+
+**Progress** (both eras): a `tools/call` or `resources/read` with `_meta.progressToken` gets
+`notifications/progress` while it runs — a heartbeat every 10 s (`progress` = elapsed seconds,
+only increasing) plus whatever the tool reports through `:progress!` — and none after its
+response. The HTTP transport comes next.
 
 A connection answers requests concurrently: every `tools/call` and `resources/read` runs on
 its own virtual thread, so a `job_status` wait or a long evaluation does not hold up the

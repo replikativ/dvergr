@@ -145,7 +145,9 @@
   (let [session-atom (:session context)
         request-id (get-in message [:params :requestId])]
     (when request-id
-      (swap! session-atom update :cancelled-requests (fnil conj #{}) request-id))
+      (swap! session-atom update :cancelled-requests (fnil conj #{}) request-id)
+      ;; a cancelled subscriptions/listen ends its subscription
+      (when-let [f (:on-cancel context)] (f request-id)))
     nil))
 
 ;; ---- Resources (derived from dvergr.ops reads; see dvergr.mcp.server) ----
@@ -232,8 +234,20 @@
    "resources/read" {:ttlMs 0 :cacheScope "private"}})
 
 (def ^:private stateless-capabilities
-  ;; list changes and resource subscriptions arrive with subscriptions/listen
-  {:tools {} :resources {}})
+  ;; list changes and resource updates arrive on subscriptions/listen
+  {:tools {:listChanged true} :resources {:subscribe true}})
+
+(def no-response
+  "What a handler returns for a request it answers later, or never
+   (`subscriptions/listen`: the response ends the subscription)."
+  ::no-response)
+
+(defn- listen-handler
+  "Open a subscription (`(:listen context)` acknowledges it and registers
+   it); the request stays open."
+  [context message]
+  ((:listen context) message)
+  no-response)
 
 (defn- discover-handler [context _message]
   (let [session @(:session context)]
@@ -248,6 +262,7 @@
    "resources/list" resources-list-handler
    "resources/templates/list" resources-templates-list-handler
    "resources/read" resources-read-handler
+   "subscriptions/listen" listen-handler
    "notifications/cancelled" cancelled-notification-handler})
 
 (defn- unsupported-version-response [id requested]
@@ -293,13 +308,18 @@
 
       :else
       (try
-        (let [ctx (if-let [f (:request-context context)] (f params) context)
+        (let [ctx (if-let [f (:request-context context)]
+                    ;; request-scoped: its selection, plus what dispatch
+                    ;; gave this request (progress, listen, cancel hooks)
+                    (merge (f params) (select-keys context [:progress! :listen :on-cancel]))
+                    context)
               result (handler ctx message)]
-          {:jsonrpc "2.0" :id id
-           :result (-> result
-                       (merge (get cache-hints method))
-                       (assoc :resultType "complete")
-                       (assoc-in [:_meta (:server-info mcp-meta)] (:server-info @(:session context))))})
+          (when-not (= no-response result)
+            {:jsonrpc "2.0" :id id
+             :result (-> result
+                         (merge (get cache-hints method))
+                         (assoc :resultType "complete")
+                         (assoc-in [:_meta (:server-info mcp-meta)] (:server-info @(:session context))))}))
         (catch Exception e
           (let [resp (error-response id e)]
             ;; a missing resource is invalid params in this era (-32002 before)
