@@ -53,6 +53,31 @@ Attempt's world, with this relay in `--mcp-config` (its own built-in tools disab
 every other candidate gets, natively, and the evaluator scores the world when it answers. The
 daemon (or any process running an Attempt) serves MCP on a loopback port for it.
 
+**Over HTTP, without the relay.** Give the daemon `:mcp {:port 17888 :http {:port 17889}}` and
+it also serves Streamable HTTP at `http://127.0.0.1:17889/mcp` (loopback only). Requests need
+the bearer token the daemon writes to `.dvergr/mcp/http-token` (mode 0600) on its first start.
+Claude Code:
+
+```sh
+claude mcp add --transport http dvergr http://127.0.0.1:17889/mcp \
+  --header "Authorization: Bearer $(cat .dvergr/mcp/http-token)"
+```
+
+or in `.mcp.json`:
+
+```json
+{"mcpServers": {"dvergr": {"type": "http", "url": "http://127.0.0.1:17889/mcp",
+                           "headers": {"Authorization": "Bearer <token>"}}}}
+```
+
+Other clients that speak Streamable HTTP take the same URL and header. The selection
+(`dvergr/profile`, `dvergr/toolsets`, `dvergr/room`, `dvergr/tools`) goes in each request's
+`_meta`, or in `initialize`'s for a handshake client.
+
+Which to use: the **stdio relay** starts the daemon when none runs and hides its restarts, so a
+client never sees its server die; **HTTP** needs a running daemon, has no relay process, and
+is the way to a hosted dvergr (behind a TLS proxy; the listener itself stays on loopback).
+
 ## Profiles and toolsets
 
 A connection sees one selection of tools, chosen by `--profile` / `--toolsets` (the relay puts
@@ -136,6 +161,10 @@ around 40, and every definition costs context in every session.
   the Scorecard in `room`, where its dashboards (and `experiment_progress {room}`) show them.
 - **Money is in the result.** A workflow result has each attempt's spend, the per-model table
   (cost per completed attempt) and the room's wallet afterwards.
+- **A query cannot reach the host.** Datahike queries and transactions from the sandbox
+  (`clojure_eval`, `d/q` on a room's databases) resolve functions as Datahike's server does:
+  pure `clojure.core`, `clojure.string`, subqueries and registered functions, never `slurp`, a
+  shell or reflection.
 - **The API is in the REPL too.** `clojure_eval`'s `dvergr.ops` namespace holds every op the
   connection may call, as a function taking one map (`room-list`, `catalog-benchmark`,
   `job-status`, `scorecard-detail`, … and `(call :room/list {})`), documented from the spec
@@ -156,6 +185,17 @@ around 40, and every definition costs context in every session.
   lasting code in the room's workspace.
 
 ## Protocol
+
+| | stdio (relay) | TCP (loopback) | Streamable HTTP |
+|---|---|---|---|
+| Handshake 2024-11-05 … 2025-11-25 | ✓ | ✓ | ✓ (`Mcp-Session-Id`; no GET stream) |
+| Stateless 2026-07-28 | ✓ | ✓ | ✓ (headers validated; SSE for listen/progress) |
+| `subscriptions/listen` | ✓ (tagged on the shared channel) | ✓ | ✓ (its own SSE stream) |
+| Progress | ✓ | ✓ | ✓ (SSE) |
+| Cancellation | `notifications/cancelled` | `notifications/cancelled` | closing the stream |
+
+`test/dvergr/mcp/conformance_test.clj` checks the versions in process and over TCP,
+`http_test.clj` the HTTP transport, `smoke_test.clj` a daemon through the relay and over HTTP.
 
 Both eras of the protocol, decided per request, so one connection may carry both:
 
@@ -216,7 +256,7 @@ finishes gets no response. Its work is not interrupted: a job keeps running unti
 1. Native tools for Claude Code and Codex as benchmark candidates (their CLIs reach a Run's
    tools over `--mcp-config`); a read-only eval (needs a restricted sandbox, not only fewer
    ops) and evals metered to the wallet.
-2. MCP 2026-07-28 (stateless, `server/discover`, `_meta` per request) and Streamable HTTP for
-   hosted use, then OAuth. Concurrent dispatch and cancellation (above) are the first step.
+2. Hosted use: OAuth on the HTTP transport (instead of the local bearer token), and
+   multi-round-trip requests (sampling, elicitation) if a tool needs input from the client.
 3. A `data` toolset over pg-datahike (load a `pg_dump`, migrate on a fork, merge), and a client
    test pass over Cursor, VS Code, Gemini CLI, n8n and ChatGPT.
