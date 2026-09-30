@@ -684,7 +684,8 @@
 
 (defn- start-mcp!
   "Start the MCP server on the daemon's loopback TCP port when `mcp-config` is
-   given (`{:port 17888 :bind \"127.0.0.1\" :profile \"offload\" :toolsets …}`).
+   given (`{:port 17888 :bind \"127.0.0.1\" :profile \"offload\" :toolsets …}`),
+   and over Streamable HTTP when it has `:http` (`dvergr.mcp.http`).
    Clients reach it through the stdio relay `bin/dvergr-mcp`. A port already
    in use is logged, not fatal."
   [daemon mcp-config]
@@ -692,14 +693,33 @@
     daemon
     (let [start-fn (requiring-resolve 'dvergr.mcp.server/start!)
           {:keys [port bind profile toolsets] :or {port 17888 bind "127.0.0.1"}} mcp-config]
-      (try
-        (assoc daemon :mcp-server (start-fn :port port :bind bind
-                                            :profile profile :toolsets toolsets))
-        (catch java.net.BindException e
-          (tel/log! {:level :warn :id :daemon/mcp-bind-failed
-                     :data {:port port :error (.getMessage e)}}
-                    "MCP server bind failed; continuing without MCP")
-          daemon)))))
+      (cond-> (try
+                (assoc daemon :mcp-server (start-fn :port port :bind bind
+                                                    :profile profile :toolsets toolsets))
+                (catch java.net.BindException e
+                  (tel/log! {:level :warn :id :daemon/mcp-bind-failed
+                             :data {:port port :error (.getMessage e)}}
+                            "MCP server bind failed; continuing without MCP")
+                  daemon))
+        ;; `:http {:port 17889 :bind "127.0.0.1" :allowed-origins #{…}}`: MCP over
+        ;; Streamable HTTP too, with a bearer token in <state>/mcp/http-token
+        (:http mcp-config)
+        (as-> d
+              (let [{hport :port hbind :bind origins :allowed-origins
+                     :or {hport 17889 hbind "127.0.0.1"}} (:http mcp-config)]
+                (try
+                  (let [h ((requiring-resolve 'dvergr.mcp.http/start!)
+                           {:port hport :bind hbind :allowed-origins origins
+                            :token-file (paths/path "mcp" "http-token")
+                            :profile profile :toolsets toolsets})]
+                    (tel/log! {:level :info :id :daemon/mcp-http :data {:port (:port h) :bind hbind}}
+                              "MCP over HTTP")
+                    (assoc d :mcp-http h))
+                  (catch java.net.BindException e
+                    (tel/log! {:level :warn :id :daemon/mcp-http-bind-failed
+                               :data {:port hport :error (.getMessage e)}}
+                              "MCP HTTP bind failed; continuing without it")
+                    d))))))))
 
 (defn- configure-claude-code!
   "Run the Claude Code CLI (subscription models, `claude-code-*`) isolated, as
@@ -1088,6 +1108,8 @@
                             (catch Throwable _ nil))]
       (stop-fn)))
 
+  (when-let [stop (get-in daemon [:mcp-http :stop])]
+    (try (stop) (catch Throwable _ nil)))
   (when (:mcp-server daemon)
     (try ((requiring-resolve 'dvergr.mcp.server/stop!)) (catch Throwable _ nil)))
 
