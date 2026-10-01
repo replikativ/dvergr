@@ -10,7 +10,17 @@
    `require!` takes the same global lock as `requiring-resolve`.")
 
 (defn require!
-  "`require` under Clojure's global require lock."
+  "`require` under Clojure's global require lock, which only a load needs:
+   when every lib is already loaded (and nothing asks to reload), `require`
+   loads nothing and runs without it. Contexts call this on every creation;
+   under the lock, parallel benchmark cells queued on it (28 s of 64 cells'
+   lock waits)."
   [& args]
-  (locking clojure.lang.RT/REQUIRE_LOCK
-    (apply require args)))
+  (let [libs (keep #(cond (symbol? %) % (vector? %) (first %)) args)
+        loaded (loaded-libs)]
+    (if (and (seq libs)
+             (not-any? #{:reload :reload-all} args)
+             (every? #(contains? loaded %) libs))
+      (apply require args)
+      (locking clojure.lang.RT/REQUIRE_LOCK
+        (apply require args)))))
