@@ -4,7 +4,10 @@
    `spreadsheetbench.oracle/report`):
 
      (run! {:dir \"~/.cache/dvergr-bench/sb-dev\" :split :dev :sample 20 :repetitions 2
-            :candidates [{:id :luna :model \"codex-subscription-luna\"}]})"
+            :candidates [{:id :luna :model \"codex-subscription-luna\"}]})
+
+   `:search` runs every episode as an SMC search over episodes instead
+   (`spreadsheetbench.smc/run` options, e.g. {:particles 4 :twist :oracle})."
   (:refer-clojure :exclude [run!])
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
@@ -12,6 +15,7 @@
             [dvergr.benchmarks.pyjson :as pj]
             [dvergr.benchmarks.spreadsheetbench.core :as sb]
             [dvergr.benchmarks.spreadsheetbench.provider :as provider]
+            [dvergr.benchmarks.spreadsheetbench.smc :as smc]
             [hasch.core :as hasch])
   (:import [java.util ArrayList Collections Random]))
 
@@ -44,9 +48,15 @@
         (vec (sort-by :id (take sample l)))))))
 
 (defn run!
-  [{:keys [candidates agent-generate max-turns] :or {max-turns 30} :as opts}]
+  [{:keys [candidates agent-generate max-turns search] :or {max-turns 30} :as opts}]
   (let [selected (select-tasks opts)
-        caps (provider/capabilities selected {:agent-generate agent-generate})]
+        caps (provider/capabilities selected
+                                    (cond-> {:agent-generate agent-generate}
+                                      search (assoc :run-episode
+                                                    (fn [task {:keys [generate max-turns cancelled?]}]
+                                                      (smc/run task (assoc search :generate generate
+                                                                           :max-turns max-turns
+                                                                           :cancelled? cancelled?))))))]
     (runner/run!
      (merge
       (select-keys opts [:dir :repetitions :parallelism :experiment-id :preflight :allowance
@@ -58,4 +68,5 @@
        :models candidates
        :dataset {:id (keyword "spreadsheetbench" (str "tasks-" (hasch/uuid (mapv :id selected))))
                  :metadata {:upstream "SpreadsheetBench verified_400" :tasks (count selected)}}
-       :metadata {:sample (:sample opts) :seed (:seed opts) :split (:split opts)}}))))
+       :metadata {:sample (:sample opts) :seed (:seed opts) :split (:split opts)
+                  :search (dissoc search :generate)}}))))

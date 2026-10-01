@@ -184,47 +184,72 @@
     "function" {"name" "submit" "description" "Finish: the answer position is graded as it is now."
                 "parameters" {"type" "object" "properties" {}}}}])
 
-(defn- episode!
-  [{:keys [task generate max-turns cancelled?]}]
+(defn initial-state
+  "The episode before its first turn: the prompt, the input workbook, no
+  writes. Episodes are plain values, so a branch is a copy."
+  [task]
   (let [user (str "Task (" (:type task) "):\n" (:instruction task)
                   "\n\nAnswer position: " (:answer-position task)
                   (when (and (:answer-sheet task) (not (str/includes? (str (:answer-position task)) "!")))
                     (str " (sheet " (pr-str (:answer-sheet task)) ")"))
                   "\n\nSheets:\n" (sheets-overview task))]
-    (loop [turn 0 history [{:role :user :content user}] wb (init-workbook task) writes [] usage {}]
-      (let [done (fn [termination turns history usage]
-                   {:termination termination :writes writes :usage usage :model-steps turns
-                    :transcript (subvec history 1)})]
+    {:turn 0 :history [{:role :user :content user}] :wb (init-workbook task) :writes [] :usage {}
+     :errors 0}))
+
+(defn done? [state] (some? (:termination state)))
+
+(defn step
+  "The episode after one more turn: `generate` proposes, its tool calls are
+  applied. Ends it (`:termination`) on submit, on a turn without tool calls,
+  or at `max-turns`."
+  [state generate max-turns]
+  (let [{:keys [turn history wb writes usage]} state]
+    (if (>= turn max-turns)
+      (assoc state :termination :max-turns)
+      (let [{:keys [content tool-calls] :as response}
+            (generate {:system system-prompt :messages history :tools tools})
+            usage (merge-with #(if (and (number? %1) (number? %2)) (+ %1 %2) %2)
+                              usage (select-keys (:usage response) [:input-tokens :output-tokens :cache-read-tokens]))
+            history (conj history (cond-> {:role :assistant :content content}
+                                    (seq tool-calls) (assoc :tool-calls (vec tool-calls))))]
         (cond
-          (and cancelled? (cancelled?)) (done :cancelled turn history usage)
-          (>= turn max-turns) (done :max-turns turn history usage)
+          (or (some #(= "submit" (:name %)) tool-calls) (empty? tool-calls))
+          (assoc state :turn (inc turn) :history history :usage usage :termination :submitted)
+
           :else
-          (let [{:keys [content tool-calls] :as response}
-                (generate {:system system-prompt :messages history :tools tools})
-                usage (merge-with #(if (and (number? %1) (number? %2)) (+ %1 %2) %2)
-                                  usage (select-keys (:usage response) [:input-tokens :output-tokens :cache-read-tokens]))
-                history (conj history (cond-> {:role :assistant :content content}
-                                        (seq tool-calls) (assoc :tool-calls (vec tool-calls))))]
-            (cond
-              (some #(= "submit" (:name %)) tool-calls) (done :submitted (inc turn) history usage)
-              (empty? tool-calls) (done :submitted (inc turn) history usage)
-              :else
-              (let [[wb writes results]
-                    (reduce (fn [[wb writes results] {:keys [id name arguments]}]
-                              (case name
-                                "read" [wb writes (conj results [id (read-range wb (str (or (:range arguments) (get arguments "range"))))])]
-                                "write" (let [ws (normalize-writes (or (:cells arguments) (get arguments "cells")))
-                                              {wb' :wb errors :errors} (apply-writes wb ws)]
-                                          [wb' (into writes ws)
-                                           (conj results [id (str "Wrote " (- (count ws) (count errors)) " cell(s)."
-                                                                  (when (seq errors) (str " Errors: " (str/join "; " errors)))
-                                                                  "\n" (str/join "\n" (for [w ws :let [cid (parse-target wb' (:cell w))] :when cid]
-                                                                                        (str (:cell w) " = " (show-value (sb/rechentafel-value (e/get-cell wb' cid) (sb/formula-result? wb' cid)))))))])])
-                                [wb writes (conj results [id (str "Unknown tool " name)])]))
-                            [wb writes []] tool-calls)]
-                (recur (inc turn)
-                       (into history (map (fn [[id text]] {:role :tool :id id :content text})) results)
-                       wb writes usage)))))))))
+          (let [[wb writes results errors]
+                (reduce (fn [[wb writes results errs] {:keys [id name arguments]}]
+                          (case name
+                            "read" [wb writes (conj results [id (read-range wb (str (or (:range arguments) (get arguments "range"))))]) errs]
+                            "write" (let [ws (normalize-writes (or (:cells arguments) (get arguments "cells")))
+                                          {wb' :wb errors :errors} (apply-writes wb ws)]
+                                      [wb' (into writes ws)
+                                       (conj results [id (str "Wrote " (- (count ws) (count errors)) " cell(s)."
+                                                              (when (seq errors) (str " Errors: " (str/join "; " errors)))
+                                                              "\n" (str/join "\n" (for [w ws :let [cid (parse-target wb' (:cell w))] :when cid]
+                                                                                    (str (:cell w) " = " (show-value (sb/rechentafel-value (e/get-cell wb' cid) (sb/formula-result? wb' cid)))))))])
+                                       (+ errs (count errors))])
+                            [wb writes (conj results [id (str "Unknown tool " name)]) errs]))
+                        [wb writes [] 0] tool-calls)]
+            (assoc state
+                   :turn (inc turn)
+                   :history (into history (map (fn [[id text]] {:role :tool :id id :content text})) results)
+                   :wb wb :writes writes :usage usage
+                   :errors (+ (:errors state) errors))))))))
+
+(defn outcome
+  "What a protocol returns of a finished episode."
+  [{:keys [termination writes usage turn history]}]
+  {:termination termination :writes writes :usage usage :model-steps turn
+   :transcript (subvec history 1)})
+
+(defn- episode!
+  [{:keys [task generate max-turns cancelled?]}]
+  (loop [state (initial-state task)]
+    (cond
+      (done? state) (outcome state)
+      (and cancelled? (cancelled?)) (outcome (assoc state :termination :cancelled))
+      :else (recur (step state generate max-turns)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Grading
@@ -246,22 +271,26 @@
 
 (defn capabilities
   "The trusted capabilities over `tasks`. `:agent-generate` `(fn [task]) ->
-   generate fn` replaces the model."
-  [tasks {:keys [agent-generate]}]
+   generate fn` replaces the model; `:run-episode` `(fn [task {:keys
+   [generate max-turns cancelled?]}]) -> outcome` replaces the single episode
+   (a search over episodes, `spreadsheetbench.smc`)."
+  [tasks {:keys [agent-generate run-episode]}]
   (let [by-id (into {} (map (juxt :id identity)) tasks)
         basis {:upstream "SpreadsheetBench verified_400" :grading "compare_workbooks (evaluation.py), gold saved values"}]
     {:protocol
      (evaluation/make-protocol
       {:id :spreadsheetbench/read-write-submit :version version :basis basis :limit-keys #{:max-turns}
        :run (fn [{:keys [agent environment cancelled? model-scope]}]
-              (let [task (task-of by-id environment)]
-                (episode! {:task task
-                           :max-turns (get-in environment [:environment/limits :max-turns] 30)
-                           :cancelled? cancelled?
-                           :generate (live/scoped (if agent-generate
-                                                    (agent-generate task)
-                                                    (live/model-generate (:agent/model-policy agent)))
-                                                  model-scope)})))})
+              (let [task (task-of by-id environment)
+                    opts {:max-turns (get-in environment [:environment/limits :max-turns] 30)
+                          :cancelled? cancelled?
+                          :generate (live/scoped (if agent-generate
+                                                   (agent-generate task)
+                                                   (live/model-generate (:agent/model-policy agent)))
+                                                 model-scope)}]
+                (if run-episode
+                  (run-episode task opts)
+                  (episode! (assoc opts :task task)))))})
      :evaluator
      (evaluation/make-evaluator
       {:id :spreadsheetbench/answer-range :version version :basis basis :tier :trusted
@@ -272,7 +301,7 @@
                                 {:status (:run/status result) :reason (:run/reason durable)
                                  :message (:run/error durable)})
                      :writes (:writes outcome)
-                     :episode (select-keys outcome [:model-steps :usage])
+                     :episode (select-keys outcome [:model-steps :usage :search])
                      :transcript (:transcript outcome)
                      :spend (if (map? (:usage outcome))
                               (spend/of-usage (get-in agent [:agent/model-policy :model]) (:usage outcome))
