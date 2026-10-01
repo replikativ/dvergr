@@ -251,3 +251,20 @@
     (is (not-any? #(.exists (java.io.File. ^java.io.File % ".git"))
                   (take-while some? (iterate #(.getParentFile ^java.io.File %) (.getCanonicalFile dir))))
         "no repository above it")))
+
+(deftest haiku-tool-use-calls-parse-flat-arguments-and-stop-at-the-first-run
+  ;; SpreadsheetBench, verbatim shape: flat arguments, the same calls again
+  ;; with `input`, then calls written from imagined results and a submit
+  (let [parse #(@#'claude-code/parse-tool-calls % #{"read" "write" "submit"})
+        text (str "Let me look at both sheets.\n"
+                  "<tool_use>\n{\"name\": \"read\", \"range\": \"Result!A1:L13\"}\n</tool_use>\n"
+                  "<tool_use>\n{\"name\": \"read\", \"range\": \"Master-RM!A1:K22\"}\n</tool_use>"
+                  "<tool_use>\n{\"name\":\"read\",\"input\":{\"range\":\"Result!A1:L13\"}}\n</tool_use>\n"
+                  "Looking at the data, I'll use INDEX/MATCH:\n"
+                  "<tool_use>\n{\"name\":\"write\",\"input\":{\"cells\":[{\"cell\":\"Result!G10\",\"formula\":\"=1\"}]}}\n</tool_use>\n"
+                  "Perfect! G10 = 202.\n<tool_use>\n{\"name\":\"submit\",\"input\":{}}\n</tool_use>")
+        {:keys [text tool-calls]} (parse text)]
+    (is (= [["read" {:range "Result!A1:L13"}] ["read" {:range "Master-RM!A1:K22"}]]
+           (mapv (juxt :name :input) tool-calls))
+        "flat arguments parse; the repeat is one call; nothing after the first run runs")
+    (is (= "Let me look at both sheets." text) "the guesses after the calls are not the turn's text")))
