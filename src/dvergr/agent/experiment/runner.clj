@@ -295,6 +295,9 @@
         room-id (or experiment-id (keyword (name benchmark) (.getName (io/file dir))))
         room (d/make-room {:id room-id :store (:store xs)
                            :title (str (name benchmark) " experiment " (name room-id))})
+        ;; an embedder that serves the experiment's rooms (a headless daemon
+        ;; for CLI candidates' MCP tools) learns the room they fork from
+        _ (when-let [f (:on-room opts)] (f room))
         experiment-def (experiment-def {:benchmark benchmark :id room-id
                                         :environments environments :team team
                                         :dataset dataset :repetitions repetitions

@@ -354,12 +354,15 @@
       (is (= 1.0 (:reward ((:verify ev) (second envs) {:run-status :completed :files {"/out/a.txt" "4"}}))))
       (is (= 0.0 (:reward ((:verify ev) (first envs) {:run-status :completed :files {"/out/a.txt" "4"}})))))))
 
-(deftest a-cli-candidate-without-a-daemon-is-refused
-  ;; its MCP tools are the daemon's ops: without one every read and write of
-  ;; the attempt's world would fail and the bundle score a silent zero
+(deftest a-cli-candidate-gets-a-headless-daemon-for-the-experiment
+  ;; its MCP tools are the daemon's: without one every read and write of the
+  ;; attempt's world failed and the bundle scored a silent zero
   (dvergr.model.registry/ensure-models-loaded!)
-  (let [e (try (room-wf/experiment! (room-wf/bundle "competitors" files)
-                                    {:dir "/tmp/unused" :models ["claude-code-haiku"]})
-               nil
-               (catch clojure.lang.ExceptionInfo e e))]
-    (is (= ::room-wf/cli-needs-daemon (:type (ex-data e))))))
+  (let [current @(requiring-resolve 'dvergr.orchestration.daemon/current-daemon)
+        seen (atom nil)]
+    (with-redefs [dvergr.agent.experiment.runner/run!
+                  (fn [opts] ((:on-room opts) {:ctx ::the-room-ctx}) (reset! seen @current) :ran)]
+      (is (= :ran (room-wf/experiment! (room-wf/bundle "competitors" files)
+                                       {:dir "/tmp/unused" :models ["claude-code-haiku"]}))))
+    (is (= {:headless? true :execution-ctx ::the-room-ctx} @seen) "the experiment room's context finds its rooms")
+    (is (nil? @current) "gone after the experiment")))
