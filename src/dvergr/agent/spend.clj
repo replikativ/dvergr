@@ -50,15 +50,25 @@
 
 (defn- price
   "Microdollars for `usage` under `model`, or nil when the model has no
-   registry price. Never invents a price: an unpriced Attempt says so."
+   registry price. Never invents a price: an unpriced Attempt says so.
+
+   `:input-tokens` counts every input token, cached ones included (as Codex
+   and Claude Code report it): the cached part is billed at the cache rates
+   (`:cache-read`; `:cache-write`, else the input rate), the rest at the
+   input rate. Billing cached input at the full rate overstated a Luna
+   attempt by about a fifth."
   [model usage]
-  (when (and model (acct/get-model-pricing model))
-    (reduce-kv (fn [sum k [_ resource-type]]
-                 (if-let [n (get usage k)]
-                   (+ sum (acct/calculate-cost resource-type (long n) {:model model}))
-                   sum))
-               0
-               token-keys)))
+  (when-let [pricing (and model (acct/get-model-pricing model))]
+    (let [n #(long (or (get usage %) 0))
+          cache-read (n :cache-read-tokens)
+          cache-write (+ (n :cache-creation-tokens) (n :cache-write-tokens))
+          fresh (max 0 (- (n :input-tokens) cache-read cache-write))
+          at (fn [tokens rate] (Math/round (double (* tokens (double rate)))))]
+      (+ (at fresh (:input pricing 1))
+         (at cache-read (:cache-read pricing (:input pricing 1)))
+         (at cache-write (:cache-write pricing (:input pricing 1)))
+         (at (n :output-tokens) (:output pricing 1))
+         (at (n :reasoning-output-tokens) (:output pricing 1))))))
 
 (defn- list-price-model
   "The model whose list price `model`'s tokens are worth: its `:list-price-of`
@@ -107,7 +117,11 @@
   "The spend a chat budget already accounted (`:used` microdollars, `:by-type`
    natural units), attributed to `model`."
   [model {:keys [used by-type]}]
-  (let [tokens (tokens-of by-type)
+  ;; a chat budget accounts uncached input under :input-tokens and cached
+  ;; input apart (`dvergr.chat.agent`); a spend's input counts both
+  (let [cached (+ (get by-type :cache-read-tokens 0) (get by-type :cache-creation-tokens 0))
+        by-type (cond-> by-type (pos? cached) (update :input-tokens (fnil + 0) cached))
+        tokens (tokens-of by-type)
         worth (notional model by-type)
         one (cond-> {:microdollars (long (or used 0)) :tokens tokens :priced? true}
               worth (assoc :notional-microdollars worth))]
