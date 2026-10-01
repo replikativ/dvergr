@@ -14,7 +14,8 @@
    `dev_databases.zip` unpacked in it)."
   (:require [clojure.java.io :as io]
             [jsonista.core :as json])
-  (:import [java.sql Connection DriverManager ResultSet ResultSetMetaData]))
+  (:import [java.sql Connection ResultSet ResultSetMetaData]
+           [org.sqlite SQLiteConfig SQLiteConnection SQLiteLimits]))
 
 (defn root []
   (or (System/getenv "BIRD_ROOT")
@@ -37,10 +38,15 @@
   (io/file root "dev_databases" db-id (str db-id ".sqlite")))
 
 (defn connect
-  "A read-only JDBC connection to database `db-id`."
+  "A read-only JDBC connection to database `db-id` that cannot attach other
+   database files (`mode=ro` alone still lets `ATTACH` open or create any
+   file the process can reach)."
   ^Connection [root db-id]
-  (DriverManager/getConnection (str "jdbc:sqlite:file:" (.getCanonicalPath (sqlite-file root db-id))
-                                    "?mode=ro")))
+  (let [cfg (doto (SQLiteConfig.) (.setReadOnly true))
+        conn (.createConnection cfg (str "jdbc:sqlite:file:" (.getCanonicalPath (sqlite-file root db-id))
+                                         "?mode=ro"))]
+    (.setLimit ^SQLiteConnection conn SQLiteLimits/SQLITE_LIMIT_ATTACHED 0)
+    conn))
 
 (defn- row-values [^ResultSet rs n]
   (mapv #(.getObject rs (int %)) (range 1 (inc n))))

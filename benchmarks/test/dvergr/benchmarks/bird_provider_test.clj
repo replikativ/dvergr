@@ -221,3 +221,26 @@
     (support/skip! "q-in-an-expression-may-name-the-db: no BIRD dev set")
     (is (= [[69]] (:rows (provider/run-query :datalog "superhero" "(q '[:find (count ?e) :where [?e :superhero/height_cm ?h] [(> ?h 200)]] $)" {}))))))
 
+(deftest a-candidate-query-may-only-read
+  ;; the databases are shared by every cell (and SQLite's read-only mode
+  ;; still let ATTACH open or create any file the process can reach)
+  (is (nil? (provider/read-only-sql "SELECT name FROM t WHERE note = 'insert; drop' -- why")))
+  (is (nil? (provider/read-only-sql "WITH a AS (SELECT 1) SELECT * FROM a;")))
+  (doseq [q ["ATTACH '/tmp/x.db' AS x" "SELECT 1; ATTACH '/tmp/x.db' AS x"
+             "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d" "PRAGMA table_info(t)"
+             "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE" "INSERT INTO t VALUES (1)" ""]]
+    (is (string? (provider/read-only-sql q)) q))
+  (testing "every gold query reads"
+    (if-not (bird/available?)
+      (support/skip! "a-candidate-query-may-only-read: no BIRD data")
+      (is (empty? (keep #(provider/read-only-sql (:sql %)) (bird/questions)))))))
+
+(deftest a-sqlite-connection-cannot-attach
+  (if-not (bird/available?)
+    (support/skip! "a-sqlite-connection-cannot-attach: no BIRD data")
+    (let [f (java.io.File/createTempFile "dvergr-attach" ".db")]
+      (.delete f)
+      (with-open [c (bird/connect (bird/root) "superhero")]
+        (is (thrown? java.sql.SQLException
+                     (bird/execute c (str "ATTACH DATABASE '" f "' AS x")))))
+      (is (not (.exists f)) "no file was created"))))
