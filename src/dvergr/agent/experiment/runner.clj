@@ -279,8 +279,8 @@
    with `run-in` (e.g. the `catalog/benchmark` op)."
   [{:keys [dir benchmark capabilities environments team models dataset metadata
            repetitions parallelism experiment-id claude-cli claude-env
-           usage-pause-threshold usage-retries]
-    :or {repetitions 1 parallelism 1 usage-pause-threshold 0.97 usage-retries 3}
+           usage-pause-threshold usage-retries fault-retries]
+    :or {repetitions 1 parallelism 1 usage-pause-threshold 0.97 usage-retries 3 fault-retries 1}
     :as opts}]
   (conv/isolate-home! dir)
   (let [started-ms (System/currentTimeMillis)
@@ -341,8 +341,13 @@
                          (let [r (run-once)]
                        ;; Cells a rejected subscription call failed are re-run
                        ;; (resume skips the completed ones) after the reset.
-                           (if (and uses-cc? (< n usage-retries) (not (:refused r))
-                                    (:incomplete (:scorecard r)) (cc/usage-limited?))
+                           ;; So are cells that faulted or failed (a lost
+                           ;; connection): a fresh run with one such cell had
+                           ;; no Scorecard, its report nothing to show.
+                           (if (let [inc (:incomplete (:scorecard r))]
+                                 (and inc (not (:refused r))
+                                      (or (and (< n fault-retries) (or (pos? (:faults inc 0)) (seq (:errors inc))))
+                                          (and uses-cc? (< n usage-retries) (cc/usage-limited?)))))
                              (recur (inc n))
                              r)))
                 failed-cells (get-in result [:scorecard :incomplete :cells] 0)

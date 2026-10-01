@@ -34,3 +34,9 @@
     (is (str/includes? md "| luna | 900 | 100 | 0% | 20 s | 20 s | 1.3 min | $0.0080 |"))
     (is (str/includes? md "| bu | 3 / 4 | 1 / 4 |") "haiku, then luna")
     (is (str/includes? md "259 of 264 cases could grade an answer; the others were excluded: 2 duplicate id, 1 unlabelled"))))
+
+(deftest an-unfinished-experiment-says-so
+  ;; a cell that never reached a verdict leaves no Scorecard: the report said
+  ;; nothing at all, its tables empty
+  (let [md (report/markdown {:title "t" :result {:scorecard {:incomplete {:cells 1 :faults 1}}}})]
+    (is (str/includes? md "**Incomplete:** 1 cell did not finish"))))

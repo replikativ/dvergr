@@ -683,7 +683,8 @@
    op instead, which runs the same plan in one of its rooms."
   [{:keys [dir repetitions parallelism] :or {repetitions 1} :as opts}]
   ((requiring-resolve 'dvergr.agent.experiment.runner/run!)
-   (assoc (experiment-plan opts)
-          :dir dir
-          :repetitions repetitions
-          :parallelism (or parallelism 1))))
+   (merge (assoc (experiment-plan opts)
+                 :dir dir
+                 :repetitions repetitions
+                 :parallelism (or parallelism 1))
+          (select-keys opts [:fault-retries]))))

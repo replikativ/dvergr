@@ -64,6 +64,9 @@
     (str
      "# " (or title "Benchmark report") "\n\n"
      (when note (str note "\n\n"))
+     (when-let [{:keys [cells]} (:incomplete (:scorecard result))]
+       (str "**Incomplete:** " cells " cell" (when (not= 1 cells) "s") " did not finish, so there is no "
+            "Scorecard yet; running the experiment again resumes them.\n\n"))
      "## Frontier\n\n"
      "| Candidate | Attempts | Passed | 95% interval | Mean reward | Cost / attempt | Cost / pass | Tokens / attempt | Median time |\n"
      "|---|---:|---:|---|---:|---:|---:|---:|---:|\n"
