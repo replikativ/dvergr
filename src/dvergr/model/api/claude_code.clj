@@ -310,6 +310,18 @@
         {file-writes true others false} (group-by #(contains? file-tools (:name %)) calls)]
     (vec (concat others (->> file-writes (group-by #(get-in % [:input :path])) vals (map last))))))
 
+(def ^:private first-run-pattern
+  "The first run of `<tool_use>` blocks: the calls a response opens with,
+   separated only by whitespace."
+  #"(?s)<tool_use>\s*\{.*?\}\s*</tool_use>(?:\s*<tool_use>\s*\{.*?\}\s*</tool_use>)*")
+
+(defn- tool-use-input
+  "A `<tool_use>` call's arguments: its `input`, or, when a model writes them
+   flat beside `name` (Haiku does: `{\"name\": \"read\", \"range\": …}`),
+   every other key."
+  [parsed]
+  (or (:input parsed) (not-empty (dissoc parsed :name :id)) {}))
+
 (defn- parse-tool-calls
   "Parse <tool_use> blocks from response text.
    Strips hallucinated <tool_result> blocks first to avoid matching old content.
@@ -324,7 +336,12 @@
      {:text "" :tool-calls nil}
      (let [;; Strip hallucinated tool_results FIRST — they may contain old tool_use blocks
            cleaned (clean-response-text text)
-           matches (re-seq tool-call-pattern cleaned)]
+           ;; only the run of calls the response opens with: whatever follows
+           ;; it was written without seeing a result (Haiku goes on, repeating
+           ;; calls, writing from imagined values, submitting), as for
+           ;; `first-block` of native calls
+           first-run (re-find first-run-pattern cleaned)
+           matches (when first-run (re-seq tool-call-pattern first-run))]
        (if (empty? matches)
          (let [invoked (invoke-calls cleaned tool-names)]
            (cond
@@ -347,15 +364,16 @@
                                 (let [parsed (json/read-value json-str json/keyword-keys-object-mapper)]
                                   {:id (or (:id parsed) (str "tc_" (java.util.UUID/randomUUID)))
                                    :name (:name parsed)
-                                   :input (or (:input parsed) {})})
+                                   :input (tool-use-input parsed)})
                                 (catch Exception e
                                   (tel/log! {:level :warn :id :claude-code/tool-call-parse-error
                                              :data {:json json-str :error (.getMessage e)}}
                                             "Failed to parse tool call JSON")
                                   nil)))))
                      matches)
-               tool-calls (dedupe-file-writes raw-calls)
-               stripped (-> cleaned
+               tool-calls (dedupe-file-writes (->> raw-calls (group-by (juxt :name :input)) vals (map first)
+                                                   (sort-by #(.indexOf ^java.util.List raw-calls %))))
+               stripped (-> (subs cleaned 0 (+ (str/index-of cleaned first-run) (count first-run)))
                             (str/replace tool-call-pattern "")
                             str/trim)]
            {:text stripped
