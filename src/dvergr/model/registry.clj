@@ -298,6 +298,17 @@
     :list-price-of "gpt-5.6-luna"  ;; the API model its tokens are worth (notional cost)
     :quirks {}}
 
+   "codex-subscription-sol-6.1"
+   {:id "codex-subscription-sol-6.1"
+    :name "Codex GPT-6.1 Sol (subscription)"
+    :provider :codex-subscription
+    :api-type :openai-responses
+    :capabilities #{:tools :system-prompt :thinking :streaming}
+    :context 272000
+    :max-output 128000
+    :pricing {:input 0 :output 0}
+    :quirks {}}
+
    "codex-subscription-cli"
    {:id "codex-subscription-cli"
     :name "Codex subscription (CLI fallback)"
@@ -625,7 +636,8 @@
                  "codex" "codex-subscription"
                  "codex-sol" "codex-subscription-sol"
                  "codex-terra" "codex-subscription-terra"
-                 "codex-luna" "codex-subscription-luna"}))
+                 "codex-luna" "codex-subscription-luna"
+                 "codex-sol-6.1" "codex-subscription-sol-6.1"}))
 
 (defn register-alias!
   "Register an alias for a model ID."

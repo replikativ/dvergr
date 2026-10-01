@@ -7,11 +7,16 @@
             :candidates [{:id :luna :model \"codex-subscription-luna\"}]})
 
    `:search` runs every episode as an SMC search over episodes instead
-   (`spreadsheetbench.smc/run` options, e.g. {:particles 4 :twist :oracle})."
+   (`spreadsheetbench.smc/run` options, e.g. {:particles 4 :twist :oracle};
+   `:judge-model` a model spec for the `:judge` potential, e.g.
+   {:model \"codex-subscription-sol-6.1\" :effort :medium}. `:export` a file
+   that collects the searches' trajectories as finetune-rstr training records
+   (`smc/training-records`), one EDN record per line."
   (:refer-clojure :exclude [run!])
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [dvergr.agent.experiment.runner :as runner]
+            [dvergr.benchmarks.live :as live]
             [dvergr.benchmarks.pyjson :as pj]
             [dvergr.benchmarks.spreadsheetbench.core :as sb]
             [dvergr.benchmarks.spreadsheetbench.provider :as provider]
@@ -47,16 +52,30 @@
         (Collections/shuffle l (Random. (long seed)))
         (vec (sort-by :id (take sample l)))))))
 
+(defn- export-records!
+  "Append `records` to the EDN-lines file `path`, one per line."
+  [path records]
+  (locking export-records!
+    (with-open [w (io/writer (io/file path) :append true)]
+      (doseq [r records] (.write w (pr-str r)) (.write w "\n")))))
+
+(defn- search-episode
+  "The protocol's episode as an SMC search (`smc/run`) with `search`'s
+  options."
+  [search export]
+  (let [judge (some-> (:judge-model search) live/model-generate)]
+    (fn [task {:keys [generate max-turns cancelled?]}]
+      (smc/run task (cond-> (assoc search :generate generate :max-turns max-turns :cancelled? cancelled?)
+                      judge (assoc :judge judge)
+                      export (assoc :on-trajectories
+                                    #(export-records! export (smc/training-records task %))))))))
+
 (defn run!
-  [{:keys [candidates agent-generate max-turns search] :or {max-turns 30} :as opts}]
+  [{:keys [candidates agent-generate max-turns search export] :or {max-turns 30} :as opts}]
   (let [selected (select-tasks opts)
         caps (provider/capabilities selected
                                     (cond-> {:agent-generate agent-generate}
-                                      search (assoc :run-episode
-                                                    (fn [task {:keys [generate max-turns cancelled?]}]
-                                                      (smc/run task (assoc search :generate generate
-                                                                           :max-turns max-turns
-                                                                           :cancelled? cancelled?))))))]
+                                      search (assoc :run-episode (search-episode search export))))]
     (runner/run!
      (merge
       (select-keys opts [:dir :repetitions :parallelism :experiment-id :preflight :allowance

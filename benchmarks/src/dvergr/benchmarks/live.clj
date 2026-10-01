@@ -42,8 +42,9 @@
 (defn model-generate
   "Return a generate fn backed by `dvergr.model.chat/chat`.
    `spec` is `{:model id-or-alias :provider kw? :temperature n? :max-tokens n?
-   :parallel-tool-calls bool?}`."
-  [{:keys [model provider temperature max-tokens parallel-tool-calls]}]
+   :parallel-tool-calls bool? :effort kw?}` (`:effort`: the reasoning effort,
+   where the provider takes one)."
+  [{:keys [model provider temperature max-tokens parallel-tool-calls effort]}]
   (providers/ensure-initialized!)
   (let [model-id (registry/resolve-alias model)
         provider (or provider (:provider (registry/get-model! model-id)))
@@ -58,7 +59,8 @@
                                   (some? parallel-tool-calls)
                                   (assoc :parallel-tool-calls parallel-tool-calls)
                                   temperature (assoc :temperature temperature)
-                                  max-tokens (assoc :max-tokens max-tokens)))]
+                                  max-tokens (assoc :max-tokens max-tokens)
+                                  effort (assoc :effort effort)))]
         {:content (:content response)
          :tool-calls (mapv (fn [{:keys [id name input]}]
                              {:id (or id (str "call_" (swap! counter inc)))
