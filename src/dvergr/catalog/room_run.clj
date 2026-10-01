@@ -6,7 +6,9 @@
 
    The directory is a bundle (workflow.edn, checker.clj, gold.edn, fixtures/),
    e.g. an export from `catalog_export` unpacked. The experiment's state (its
-   rooms, Attempts, Scorecard) lives under `--out`; the Scorecard is printed."
+   rooms, Attempts, Scorecard) lives in `--out`/<bundle name>: running again resumes it. The
+   Scorecard is printed (billed and list-price cost), report.md written; the exit code is 1 when
+   cells did not finish."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.tools.cli :as cli]
@@ -36,7 +38,9 @@
         (println "Bundle" (:name b) (str (:id b)))
         (if (:check options)
           (prn (select-keys (room-wf/calibrate b) [:ok? :problems]))
-          (let [out-dir (str (:out options) "/" (:name b) "-" (subs (str (random-uuid)) 0 8))
+          ;; one directory per bundle: running again resumes (cells with a
+          ;; verdict are kept), as the report says
+          (let [out-dir (str (:out options) "/" (:name b))
                 {:keys [scorecard failed-cells] :as result}
                 (room-wf/experiment! b (cond-> {:dir out-dir
                                                 :models (:models options)
@@ -45,16 +49,21 @@
                                          (:timeout-ms options) (assoc :timeout-ms (:timeout-ms options))
                                          (:cases options) (assoc :cases (:cases options))))]
             (doseq [s (:scorecard/summary scorecard)]
-              (println (format "%-40s reward %.3f  passed %d/%d  $%.4f"
+              (println (format "%-40s reward %.3f  passed %d/%d  billed $%.4f  list price $%.4f"
                                (name (:candidate/id s)) (double (or (:reward-mean s) 0))
                                (:passed-count s 0) (:attempt-count s 0)
-                               (/ (double (get-in s [:spend :microdollars] 0)) 1e6))))
+                               (/ (double (get-in s [:spend :microdollars] 0)) 1e6)
+                               (/ (double (get-in s [:spend :notional-microdollars]
+                                                  (get-in s [:spend :microdollars] 0))) 1e6))))
             (when (pos? (or failed-cells 0)) (println failed-cells "cells failed"))
             ;; the report a pilot hands over
             (let [f (io/file out-dir "report.md")]
               (io/make-parents f)
               (spit f (report/markdown {:title (get-in b [:definition :title]) :result result
                                         :certification (:certification b)}))
-              (println "Report:" (str f)))))
+              (println "Report:" (str f))
+              (shutdown-agents)
+              ;; unfinished cells are a failed run: run again to resume them
+              (System/exit (if (or (pos? (or failed-cells 0)) (:incomplete scorecard) (:stopped result)) 1 0)))))
         (shutdown-agents)
         (System/exit 0)))))
