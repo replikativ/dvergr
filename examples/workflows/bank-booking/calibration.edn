@@ -1,0 +1,1 @@
+{:case "B0001", :reference {"/out/answer.edn" "{\"gegenkonto\" \"6815\", \"bu\" \"9\"}"}, :damaged {:gegenkonto {:files {"/out/answer.edn" "{\"gegenkonto\" \"not 6815\", \"bu\" \"9\"}"}, :loses [:gegenkonto]}, :bu {:files {"/out/answer.edn" "{\"gegenkonto\" \"6815\", \"bu\" \"not 9\"}"}, :loses [:bu]}}}

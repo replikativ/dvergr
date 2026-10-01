@@ -464,8 +464,17 @@
 
 (defn experiment-plan
   "What `dvergr.agent.experiment.runner` needs to benchmark `b` on `models`."
-  [b {:keys [models budget-dollars timeout-ms prompt params tier judge-fn] :as opts}]
+  [b {:keys [models budget-dollars timeout-ms prompt params tier judge-fn cases] :as opts}]
   (let [setup (world-setup b)
+        ;; `:cases`: a number, that many of a dataset's cases (the same
+        ;; ones every time), or the case ids
+        case-ids (let [all (vec (keys (:cases b)))]
+                   (cond
+                     (nil? cases) all
+                     (number? cases) (let [l (java.util.ArrayList. ^java.util.Collection all)]
+                                       (java.util.Collections/shuffle l (java.util.Random. 20261001))
+                                       (vec (sort (take cases l))))
+                     :else (vec (filter (set cases) all))))
         ev (evaluator b {:params params :tier tier :judge-fn judge-fn})
         {:keys [team ids]} (workflow/candidates {:models models
                                                  :profile (or (get-in b [:definition :profile]) "developer")
@@ -474,13 +483,13 @@
      :capabilities {:world-setup setup :evaluator ev}
      ;; a dataset bundle: one environment per case
      :environments (if (seq (:cases b))
-                     (mapv #(environment b setup ev opts %) (keys (:cases b)))
+                     (mapv #(environment b setup ev opts %) case-ids)
                      [(environment b setup ev opts)])
      :team team
      :models (mapv #(:agent/model-policy (roster/agent team %)) ids)
      :dataset {:id (keyword "room-workflow" (:name b))
                :metadata (cond-> {:bundle (str (:id b))}
-                           (seq (:cases b)) (assoc :cases (vec (keys (:cases b)))))}}))
+                           (seq (:cases b)) (assoc :cases case-ids))}}))
 
 (defn experiment!
   "Benchmark bundle `b` in its own process (see `dvergr.catalog.wiki/experiment!`)."

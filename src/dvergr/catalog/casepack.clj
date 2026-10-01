@@ -15,7 +15,8 @@
                  \"tags\"    {:rule :set}
                  \"vendor_name\" {:rule :ci}
                  \"due\"     {:rule :date}}
-      :task     \"…\"}                         ; optional; else one is written
+      :task     \"…\"                          ; optional; else one is written
+      :shared   {\"/docs/accounts.txt\" \"…\"}}  ; files every case's world has
 
    Every case becomes `cases/<id>/`: its inputs as `/docs/case.edn` (and its
    attachments), its outcome as `gold.edn`. The checker reads the attempt's
@@ -219,7 +220,7 @@
   "The bundle files (`{relative-path text}`) and certification for `spec`
    over `rows`; `read-attachment` is a fn of an attachment's path (as the
    table names it) to its text, or nil when there is none."
-  [{:keys [title doc id inputs attachments expected task] :as spec} rows read-attachment]
+  [{:keys [title doc id inputs attachments expected task shared] :as spec} rows read-attachment]
   (let [read-attachment (or read-attachment (constantly nil))
         verdicts (certify spec rows read-attachment)
         certified (into [] (keep (fn [[r v]] (when (= :certified (:status v)) [r (:id v)]))) (map vector rows verdicts))
@@ -256,6 +257,7 @@
          "certification.edn" (with-out-str (pprint/pprint {:cases (count rows) :certified (count certified)
                                                            :by-reason (into (sorted-map) summary)
                                                            :excluded (filterv #(= :excluded (:status %)) verdicts)}))}
+        (into {} (for [[path text] shared] [(str "fixtures" (if (str/starts-with? path "/") path (str "/" path))) text]))
         (into {} (mapcat (fn [[r cid]] (case-files r cid)) certified))))}))
 
 (defn from-table
