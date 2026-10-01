@@ -1,7 +1,6 @@
 (ns dvergr.catalog.report
   "The report a benchmark pilot hands over, from an experiment's result
-   (`dvergr.agent.experiment.runner/run!`: its Scorecard and its Attempt
-   receipts) and, for a case pack, the bundle's certification:
+   (`dvergr.agent.experiment.runner/run!`: its Scorecard and `:receipts`) and, for a case pack, the bundle's certification:
 
    - the frontier: per candidate, how often it passed (95% interval), its
      mean reward, what an attempt and a pass cost at list price, tokens and
@@ -26,8 +25,8 @@
   "Per candidate: `{:candidate :n :passes :pass-rate :pass-interval :reward
    :reward-interval :notional-per-attempt :notional-per-pass :tokens-per-attempt
    :median-seconds :failed-checks {check n}}` from a run result."
-  [{:keys [scorecard results]}]
-  (let [receipt-by-id (into {} (map (juxt :attempt/id identity)) results)]
+  [{:keys [scorecard receipts]}]
+  (let [receipt-by-id (into {} (map (juxt :attempt/id identity)) receipts)]
     (vec
      (for [[cid entries] (sort-by key (group-by :candidate/id (:scorecard/entries scorecard)))
            :let [n (count entries)

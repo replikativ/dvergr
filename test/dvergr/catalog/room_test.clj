@@ -353,3 +353,13 @@
     (testing "and is scored against its case's gold"
       (is (= 1.0 (:reward ((:verify ev) (second envs) {:run-status :completed :files {"/out/a.txt" "4"}}))))
       (is (= 0.0 (:reward ((:verify ev) (first envs) {:run-status :completed :files {"/out/a.txt" "4"}})))))))
+
+(deftest a-cli-candidate-without-a-daemon-is-refused
+  ;; its MCP tools are the daemon's ops: without one every read and write of
+  ;; the attempt's world would fail and the bundle score a silent zero
+  (dvergr.model.registry/ensure-models-loaded!)
+  (let [e (try (room-wf/experiment! (room-wf/bundle "competitors" files)
+                                    {:dir "/tmp/unused" :models ["claude-code-haiku"]})
+               nil
+               (catch clojure.lang.ExceptionInfo e e))]
+    (is (= ::room-wf/cli-needs-daemon (:type (ex-data e))))))

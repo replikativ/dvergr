@@ -494,8 +494,19 @@
                            (seq (:cases b)) (assoc :cases case-ids))}}))
 
 (defn experiment!
-  "Benchmark bundle `b` in its own process (see `dvergr.catalog.wiki/experiment!`)."
-  [b {:keys [dir repetitions parallelism] :or {repetitions 1} :as opts}]
+  "Benchmark bundle `b` in its own process (see `dvergr.catalog.wiki/experiment!`).
+   A Claude Code CLI candidate works in the attempt's world through the
+   daemon's MCP tools, so it needs a daemon in this process; without one it
+   is refused here rather than scored on files it could not write."
+  [b {:keys [dir repetitions parallelism models] :or {repetitions 1} :as opts}]
+  (let [cli (filterv #(= :claude-code (some-> (requiring-resolve 'dvergr.model.registry/provider-of)
+                                              (apply [(or ((requiring-resolve 'dvergr.model.registry/resolve-alias) %) %)])))
+                     models)]
+    (when (and (seq cli) (nil? (some-> (requiring-resolve 'dvergr.orchestration.daemon/current-daemon) deref deref)))
+      (throw (ex-info (str "Claude Code CLI candidates " cli " reach the attempt's world through a daemon's MCP tools, "
+                           "and no daemon runs in this process: benchmark them with catalog_benchmark in a daemon, "
+                           "or use API models here")
+                      {:type ::cli-needs-daemon :models cli}))))
   ((requiring-resolve 'dvergr.agent.experiment.runner/run!)
    (assoc (experiment-plan b opts) :dir dir :repetitions repetitions
           :parallelism (or parallelism 1))))
