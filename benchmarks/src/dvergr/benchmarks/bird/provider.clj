@@ -23,6 +23,7 @@
             [datahike.api :as d]
             [datahike.query.resolve :as resolve]
             [datahike.pg :as pg]
+            [datahike.pg.sql.classify :as pg-classify]
             [dvergr.agent.environment :as environment]
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.roster :as roster]
@@ -37,7 +38,9 @@
             [dvergr.sandbox :as sandbox]))
 
 (def version
-  "13: the Datalog description says rows are already distinct (`(distinct ?x)`
+  "14: a candidate's SQL may only read (one SELECT/WITH statement, nothing
+   that writes data, schema, files or session state); pg-datahike runs each
+   query in a fresh session; SQLite connections cannot ATTACH files. 13: the Datalog description says rows are already distinct (`(distinct ?x)`
    is an aggregate: one cell holding a set) and how to return the row with
    the largest value without its value (bind the max by subquery, match it):
    the two Datalog-only failures of the held-out tier-1 run. 12: Datahike 0.8.1903 binds a function clause to a constant itself, so
@@ -68,19 +71,41 @@
    identifiers canonical (bird.load/2); a final reply that is only a query
    counts as submitted. 2: a plain Datalog query (an EDN vector) runs as is;
    every engine's schema shows example rows."
-  13)
+  14)
 
 (def engines #{:sqlite :pg-datahike :datalog})
 
 ;; ---------------------------------------------------------------------------
 ;; Engines: run a query, get rows
 
-(defonce ^:private handlers (atom {}))
+(defn- handler
+  "A fresh pg-datahike session over database `db-id`: no session state
+   (SET, an open transaction) carries from one query to the next."
+  [db-id]
+  (pg/make-query-handler (load/load! db-id) {:max-result-rows 100000}))
 
-(defn- handler [db-id]
-  (or (get @handlers db-id)
-      (get (swap! handlers assoc db-id (pg/make-query-handler (load/load! db-id) {:max-result-rows 100000}))
-           db-id)))
+(def ^:private writing-words
+  "Keywords of statements that change data, schema, files or the session."
+  #{"insert" "update" "delete" "merge" "upsert" "create" "drop" "alter" "truncate" "attach" "detach"
+    "pragma" "vacuum" "reindex" "analyze" "copy" "grant" "revoke" "set" "reset" "begin" "commit"
+    "rollback" "savepoint" "release" "lock" "call" "do" "execute" "prepare" "deallocate" "listen"
+    "notify" "load" "import"})
+
+(defn read-only-sql
+  "nil when `sql` is one read statement (SELECT or WITH, nothing that writes
+   data, schema, files or session state, outside string literals), else why
+   not. A candidate's query runs on shared data: it may only read."
+  [sql]
+  (let [toks (->> (pg-classify/tokenize-all (str sql))
+                  (remove #(= :comment (:type %)))
+                  reverse (drop-while #(= ";" (:text %))) reverse)
+        words (keep #(when (= :ident (:type %)) (str/lower-case (:text %))) toks)]
+    (cond
+      (empty? toks) "an empty query"
+      (some #(= ";" (:text %)) toks) "one statement at a time"
+      (not (#{"select" "with"} (first words))) "only SELECT (or WITH … SELECT) queries"
+      :else (when-let [w (some writing-words words)]
+              (str "a query may only read (" (str/upper-case w) ")")))))
 
 (defn- rows-of
   "A Datalog expression's value as result rows."
@@ -319,6 +344,9 @@
    `{:error}`. `:nested?`: Datalog calls may nest (`desugar-nested`)."
   [engine db-id query {:keys [root nested?] :or {root (bird/root)}}]
   (try
+    (case engine
+      (:sqlite :pg-datahike) (when-let [why (read-only-sql query)] (throw (ex-info why {})))
+      nil)
     (case engine
       :sqlite (with-open [c (bird/connect root db-id)]
                 (select-keys (bird/execute c query {:timeout-s 60}) [:rows]))
