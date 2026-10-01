@@ -21,4 +21,8 @@ Regenerate with `(dvergr.benchmarks.bankbooking/write-example! "examples/workflo
 (benchmarks alias). Benchmark a sample:
 
     clojure -M -m dvergr.catalog.room-run examples/workflows/bank-booking \
-      --models codex-subscription-luna,claude-code-haiku --cases 30
+      --models codex-subscription-luna --cases 30
+
+(Claude Code CLI models work in the attempt's world through a daemon's MCP tools: benchmark
+them with `catalog_benchmark` in a daemon.) `report.md` beside the experiment is the pilot
+report: the frontier, which checks fail, and the certification.

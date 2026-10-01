@@ -338,6 +338,10 @@
                 _ (record-calibration! metered started-ms ran)]
             {:dir dir :experiment-room room-id :experiment experiment-def
              :results (count (:results result)) :failed-cells failed-cells
+             ;; the receipts of the Attempts this invocation has (a report's
+             ;; checks and times), by Attempt id
+             :receipts (mapv (fn [a] (assoc (:attempt/receipt a) :attempt/id (:attempt/id a)))
+                             (keep :attempt (:results result)))
              :refused (:refused result)
              :preflight estimate
          ;; a fresh process has no reading before its first call: then

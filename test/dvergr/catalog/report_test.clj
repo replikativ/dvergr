@@ -12,11 +12,11 @@
                      (for [i (range 4)]
                        {:attempt/id (keyword (str "b" i)) :candidate/id :haiku :passed? (< i 1) :reward (if (< i 1) 1.0 0.0)
                         :spend {:notional-microdollars 6000 :tokens {:input 1800 :output 200}}})))}
-   :results (vec (concat
-                  (for [i (range 4)] {:attempt/id (keyword (str "a" i)) :attempt/elapsed-ms 20000
-                                      :attempt/checks {:answer-present true :bu (< i 3) :gegenkonto true}})
-                  (for [i (range 4)] {:attempt/id (keyword (str "b" i)) :attempt/elapsed-ms 40000
-                                      :attempt/checks {:answer-present true :bu (< i 1) :gegenkonto (< i 2)}})))})
+   :receipts (vec (concat
+                   (for [i (range 4)] {:attempt/id (keyword (str "a" i)) :attempt/elapsed-ms 20000
+                                       :attempt/checks {:answer-present true :bu (< i 3) :gegenkonto true}})
+                   (for [i (range 4)] {:attempt/id (keyword (str "b" i)) :attempt/elapsed-ms 40000
+                                       :attempt/checks {:answer-present true :bu (< i 1) :gegenkonto (< i 2)}})))})
 
 (deftest the-frontier-and-where-answers-fail
   (let [rs (into {} (map (juxt :candidate identity)) (report/rows result))]
