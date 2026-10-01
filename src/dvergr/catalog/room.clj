@@ -110,6 +110,8 @@
      :checker (get files "checker.clj")
      :gold (read-edn files "gold.edn")
      :calibration (read-edn files "calibration.edn")
+     ;; a case pack's: which rows became cases, which could not and why
+     :certification (read-edn files "certification.edn")
      :web (when (= :frozen (:web definition)) (read-edn files "web.edn"))
      :fixtures (into (sorted-map)
                      (keep (fn [[path text]]

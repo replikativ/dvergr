@@ -7,8 +7,10 @@
    The directory is a bundle (workflow.edn, checker.clj, gold.edn, fixtures/),
    e.g. an export from `catalog_export` unpacked. The experiment's state (its
    rooms, Attempts, Scorecard) lives under `--out`; the Scorecard is printed."
-  (:require [clojure.string :as str]
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.tools.cli :as cli]
+            [dvergr.catalog.report :as report]
             [dvergr.catalog.room :as room-wf]))
 
 (def ^:private options
@@ -34,8 +36,9 @@
         (println "Bundle" (:name b) (str (:id b)))
         (if (:check options)
           (prn (select-keys (room-wf/calibrate b) [:ok? :problems]))
-          (let [{:keys [scorecard failed-cells]}
-                (room-wf/experiment! b (cond-> {:dir (str (:out options) "/" (:name b) "-" (subs (str (random-uuid)) 0 8))
+          (let [out-dir (str (:out options) "/" (:name b) "-" (subs (str (random-uuid)) 0 8))
+                {:keys [scorecard failed-cells] :as result}
+                (room-wf/experiment! b (cond-> {:dir out-dir
                                                 :models (:models options)
                                                 :repetitions (:repetitions options)}
                                          (:budget-dollars options) (assoc :budget-dollars (:budget-dollars options))
@@ -46,6 +49,12 @@
                                (name (:candidate/id s)) (double (or (:reward-mean s) 0))
                                (:passed-count s 0) (:attempt-count s 0)
                                (/ (double (get-in s [:spend :microdollars] 0)) 1e6))))
-            (when (pos? (or failed-cells 0)) (println failed-cells "cells failed"))))
+            (when (pos? (or failed-cells 0)) (println failed-cells "cells failed"))
+            ;; the report a pilot hands over
+            (let [f (io/file out-dir "report.md")]
+              (io/make-parents f)
+              (spit f (report/markdown {:title (get-in b [:definition :title]) :result result
+                                        :certification (:certification b)}))
+              (println "Report:" (str f)))))
         (shutdown-agents)
         (System/exit 0)))))
