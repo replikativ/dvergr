@@ -303,8 +303,10 @@
    - dist/   — foerster distributions: normal, uniform, exponential, gamma
                (shape, SCALE), beta, poisson, bernoulli, flip, discrete,
                categorical, dirichlet, mvn, student-t, chi-squared
-   - infer/  — smc-infer, importance-sampling, query, predict
-   - org.replikativ.foerster.effects/ — sample, observe, choose (as CPS breakpoints)
+   - infer/  — smc-infer, importance-sampling, kernel-infer, steer, query, predict
+   - org.replikativ.foerster.effects/ — sample, observe, choose, factor
+     (`(factor w :barrier true)` resamples there), deterministic (as CPS
+     breakpoints)
 
    NOTE: must be called AFTER fork-for-session (needs the SCI spin/await context)."
   [sci-ctx]
@@ -314,6 +316,7 @@
   (require '[org.replikativ.foerster.measure   :as measure*])
   (require '[org.replikativ.spindel.engine.effects      :as eff*])
   (require '[org.replikativ.foerster.dist :as dist*])
+  (require '[org.replikativ.foerster.steer :as steer*])
 
   ;; Inject dispatch-symbol-call as a native function accessible from SCI code.
   ;; Also add it to the org.replikativ.spindel.engine.effects namespace for
@@ -330,7 +333,9 @@
                     "(ns org.replikativ.foerster.effects)
      (defn choose [& _] (throw (ex-info \"choose called outside spin context\" {})))
      (defn sample [& _] (throw (ex-info \"sample called outside spin context\" {})))
-     (defn observe [& _] (throw (ex-info \"observe called outside spin context\" {})))")
+     (defn observe [& _] (throw (ex-info \"observe called outside spin context\" {})))
+     (defn factor [& _] (throw (ex-info \"factor called outside spin context\" {})))
+     (defn deterministic [& _] (throw (ex-info \"deterministic called outside spin context\" {})))")
 
   ;; Extend pcps-async/breakpoints inside SCI so the spin macro CPS-transforms
   ;; calls to sample/observe/choose (mirrors how spindel's await was wired in macro.clj).
@@ -384,11 +389,41 @@
               resolve#
               reject#))))
 
+     (defn factor-bp [_ r e]
+       (fn [args]
+         `(let [resolve# (fn [v#] (is.simm.partial-cps.async/invoke-continuation ~r v#))
+                reject#  (fn [err#] (is.simm.partial-cps.async/invoke-continuation ~e err#))
+                spin-id# org.replikativ.spindel.engine.core/*spin-id*]
+            (org.replikativ.spindel.engine.effects/dispatch-symbol-call
+              org.replikativ.spindel.engine.core/*execution-context*
+              'org.replikativ.foerster.effects/factor
+              [~@args]
+              spin-id#
+              \"infer\"
+              resolve#
+              reject#))))
+
+     (defn deterministic-bp [_ r e]
+       (fn [args]
+         `(let [resolve# (fn [v#] (is.simm.partial-cps.async/invoke-continuation ~r v#))
+                reject#  (fn [err#] (is.simm.partial-cps.async/invoke-continuation ~e err#))
+                spin-id# org.replikativ.spindel.engine.core/*spin-id*]
+            (org.replikativ.spindel.engine.effects/dispatch-symbol-call
+              org.replikativ.spindel.engine.core/*execution-context*
+              'org.replikativ.foerster.effects/deterministic
+              [~@args]
+              spin-id#
+              \"infer\"
+              resolve#
+              reject#))))
+
      (def breakpoints
        (assoc breakpoints
          'org.replikativ.foerster.effects/choose  'is.simm.partial-cps.async/choose-bp
          'org.replikativ.foerster.effects/sample  'is.simm.partial-cps.async/sample-bp
-         'org.replikativ.foerster.effects/observe 'is.simm.partial-cps.async/observe-bp))")
+         'org.replikativ.foerster.effects/observe 'is.simm.partial-cps.async/observe-bp
+         'org.replikativ.foerster.effects/factor  'is.simm.partial-cps.async/factor-bp
+         'org.replikativ.foerster.effects/deterministic 'is.simm.partial-cps.async/deterministic-bp))")
 
   ;; Distribution constructors (foerster.dist: raster's names and
   ;; parameterizations; gamma's second parameter is the scale)
@@ -407,6 +442,7 @@
   (let [smc*        @(resolve 'org.replikativ.foerster.core/smc-infer)
         importance* @(resolve 'org.replikativ.foerster.core/importance-sampling)
         kernel*     @(resolve 'org.replikativ.foerster.core/kernel-infer)
+        steer*      @(resolve 'org.replikativ.foerster.steer/model)
         world-opts  (fn [opts]
                       (merge {:world-policy :fork} (or opts {})))]
     (sci/add-namespace!
@@ -435,6 +471,7 @@
           ([model kernel particles opts]
            (posterior-spin
             (kernel* model kernel particles (world-opts opts)))))
+        'steer       (fn [opts] (steer* opts))
         'query       posterior-query
         'predict     posterior-predict
         'values      :posterior/values
@@ -444,6 +481,7 @@
        '{smc-infer [([model particles] [model particles opts]) "Run SMC. Dvergr defaults opts :world-policy to :fork; pass :fresh only for a proven-pure model."]
          importance-sampling [([model particles] [model particles opts]) "Run importance sampling with canonical particle worlds by default."]
          kernel-infer [([model kernel particles] [model kernel particles opts]) "Run a Spindel inference kernel with canonical particle worlds by default."]
+         steer [([{:keys [init step value reward done? max-steps]}]) "A model that steers a process by SMC: `step` (state → next state, a spin or value; its randomness — a model call, a tool — is the proposal), `value` (state → log ψ, the reward to come: a verifier, judge or process reward), `reward` (final state → log potential), `done?`. Targets p(trajectory)·exp(reward); resamples at every step on the twist log ψ_t − log ψ_{t−1}. Run it with smc-infer, e.g. (infer/smc-infer (infer/steer {...}) 8 {:resampling :stratified})."]
          query [([posterior query-fn]) "Compute numeric posterior statistics from portable program results."]
          predict [([posterior pred-fn samples]) "Resample portable posterior values and apply pred-fn; execution contexts never enter SCI."]
          values [([posterior]) "Return each particle's portable program result in posterior order."]

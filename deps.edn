@@ -76,10 +76,14 @@
         ;; world's budget between copies.
         ;; 0.1.89: canonical particles are copies of worlds; 0.1.90: effect
         ;; adapters as functions (foerster's effects in ClojureScript).
-        org.replikativ/spindel     {:mvn/version "0.1.90"}
+        ;; 0.1.96: trace :until and replay :seed, O(log n) world release,
+        ;; runs release what they held (resample-move SMC).
+        org.replikativ/spindel     {:mvn/version "0.1.96"}
         ;; probabilistic inference in forkable worlds, split out of spindel:
-        ;; the sandbox's infer/ and dist/ namespaces (foerster.core, .dist)
-        org.replikativ/foerster    {:mvn/version "0.1.35"}
+        ;; the sandbox's infer/ and dist/ namespaces (foerster.core, .dist).
+        ;; 0.1.45: savepoint inference throughout, resample-move, tempering,
+        ;; SMCP3, barrier factors and foerster.steer (infer/steer).
+        org.replikativ/foerster    {:mvn/version "0.1.45"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context
@@ -152,6 +156,10 @@
 
         ;; Structured logging
         com.taoensso/telemere      {:mvn/version "1.2.1"}
+        ;; dvergr.substrate.log configures timbre (routed to telemere). It
+        ;; arrived transitively through spindel → anglican until inference
+        ;; moved to foerster; the version it resolved to then.
+        com.taoensso/timbre        {:mvn/version "4.10.0"}
 
         ;; katzen (Catlab/GATlab port) — the shared categorical schema
         ;; substrate: the KB + Clojure-code ACSet schemas live in
