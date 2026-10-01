@@ -335,7 +335,10 @@
    (if (str/blank? text)
      {:text "" :tool-calls nil}
      (let [;; Strip hallucinated tool_results FIRST — they may contain old tool_use blocks
-           cleaned (clean-response-text text)
+           ;; a predicted <tool_result> ends the response: what follows it
+           ;; was written from an imagined result (stripping it instead made
+           ;; "call, predicted result, submit" one run that submitted)
+           cleaned (clean-response-text (if-let [i (str/index-of text "<tool_result")] (subs text 0 i) text))
            ;; only the run of calls the response opens with: whatever follows
            ;; it was written without seeing a result (Haiku goes on, repeating
            ;; calls, writing from imagined values, submitting), as for
