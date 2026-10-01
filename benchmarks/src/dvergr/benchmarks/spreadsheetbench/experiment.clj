@@ -53,9 +53,10 @@
         caps (provider/capabilities selected
                                     (cond-> {:agent-generate agent-generate}
                                       search (assoc :run-episode
-                                                    (fn [task {:keys [generate max-turns]}]
+                                                    (fn [task {:keys [generate max-turns cancelled?]}]
                                                       (smc/run task (assoc search :generate generate
-                                                                           :max-turns max-turns))))))]
+                                                                           :max-turns max-turns
+                                                                           :cancelled? cancelled?))))))]
     (runner/run!
      (merge
       (select-keys opts [:dir :repetitions :parallelism :experiment-id :preflight :allowance

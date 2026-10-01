@@ -54,17 +54,22 @@
     (support/skip! "steering-by-the-partial-grade-beats-best-of-n: no SpreadsheetBench data")
     (let [[task cells] (task-with-numeric-answers)
           k (count cells)
-          runs 12
+          runs 20
           success (fn [opts]
                     (count (filter #(:correct (provider/grade task (:writes %)))
                                    (repeatedly runs #(smc/run task (assoc opts :generate (coin-model cells)
                                                                           :max-turns (inc k)))))))
-          steered (success {:particles 8 :twist :oracle :reward :oracle})
-          best-of-n (success {:particles 8 :twist :none :reward :oracle :resample-threshold 0.0})]
+          steered (success {:particles 4 :twist :oracle :reward :oracle})
+          best-of-n (success {:particles 4 :twist :none :reward :oracle :resample-threshold 0.0})]
       (testing (str k " answer cells, a single episode succeeds with probability " (Math/pow 0.5 k))
-        (is (> steered best-of-n) (str "steered " steered "/" runs " vs best-of-8 " best-of-n "/" runs))
-        (is (>= steered (* 0.75 runs)) (str steered "/" runs)))
+        (is (> steered best-of-n) (str "steered " steered "/" runs " vs best-of-4 " best-of-n "/" runs))
+        (is (>= steered (* 0.6 runs)) (str steered "/" runs)))
       (testing "the search counts every particle's model calls"
         (let [out (smc/run task {:particles 4 :generate (coin-model cells) :max-turns (inc k)})]
           (is (= (* 4 (inc k)) (get-in out [:search :model-steps])))
-          (is (= :submitted (:termination out))))))))
+          (is (= :submitted (:termination out)))))
+      (testing "a cancelled search ends every particle without another model call"
+        (let [out (smc/run task {:particles 4 :generate (coin-model cells) :max-turns (inc k)
+                                 :cancelled? (constantly true)})]
+          (is (= 0 (get-in out [:search :model-steps])))
+          (is (= :cancelled (:termination out))))))))

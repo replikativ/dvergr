@@ -79,11 +79,13 @@
                          equal, so :max-weight alone picks arbitrarily.
     :generate            (fn [request]) -> response, the model
     :max-turns           (default 30)
+    :cancelled?          (fn []) -> true once the runner gives up: every
+                         particle ends at its next turn
 
   Returns the provider's outcome of the selected episode, with its usage the
   usage of every particle, and `:search` {:particles :model-steps
   :log-evidence :resamplings :weights}."
-  [task {:keys [particles twist reward resample-threshold select generate max-turns]
+  [task {:keys [particles twist reward resample-threshold select generate max-turns cancelled?]
          :or {particles 4 twist :oracle reward :oracle resample-threshold 1.0
               select :max-reward max-turns 30}
          :as opts}]
@@ -99,7 +101,10 @@
         final (potential reward task opts)
         model (fn []
                 (steer/model (cond-> {:init (provider/initial-state task)
-                                      :step (fn [state] (off-thread #(provider/step state counted max-turns)))
+                                      :step (fn [state]
+                                              (if (and cancelled? (cancelled?))
+                                                (assoc state :termination :cancelled)
+                                                (off-thread #(provider/step state counted max-turns))))
                                       :done? provider/done?
                                       :max-steps (inc max-turns)}
                                value (assoc :value value)
