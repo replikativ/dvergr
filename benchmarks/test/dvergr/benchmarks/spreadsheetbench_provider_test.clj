@@ -42,14 +42,19 @@
                array (assoc "array" true)
                (not formula) (assoc "value" (:v saved))))))))
 
-(defn- scripted [steps]
+(defn- scripted
+  "A model that answers with `steps`, one per response: `[tool args]`, or a
+   vector of those for calls sent together."
+  [steps]
   (fn [_task]
     (let [left (atom steps)]
       (fn [_request]
-        (let [[tool args] (first @left)]
+        (let [step (first @left)
+              calls (if (vector? (first step)) step (when step [step]))]
           (swap! left rest)
-          (if tool
-            {:content "" :tool-calls [{:id (str "c" (count @left)) :name tool :arguments args}]}
+          (if (seq calls)
+            {:content "" :tool-calls (vec (map-indexed (fn [i [tool args]] {:id (str "c" (count @left) "-" i) :name tool :arguments args})
+                                                       calls))}
             {:content "done" :tool-calls []}))))))
 
 (defn- evaluate! [room task steps]
@@ -79,6 +84,11 @@
       (try
         (let [r (evaluate! room task [["write" {"cells" (gold-writes task)}] ["submit" {}]])]
           (is (= 1.0 (:attempt/reward r)) (pr-str (:attempt/checks r))))
+        (testing "a write sent with the submit is part of the answer"
+          ;; Haiku sent its last write with its submit in 20 of 79 attempts;
+          ;; the write was dropped and each was graded 0
+          (let [r (evaluate! room task [[["write" {"cells" (gold-writes task)}] ["submit" {}]]])]
+            (is (= 1.0 (:attempt/reward r)) (pr-str (:attempt/checks r)))))
         (testing "the input as it is fails"
           (let [r (evaluate! room task [["submit" {}]])]
             (is (= 0.0 (:attempt/reward r)))

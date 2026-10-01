@@ -31,8 +31,10 @@
   "1: read/write/submit over rechentafel; graded by upstream's compare rules
    against the gold's saved values. 2: `write` to a range fills it (a value
    in every cell, blank to clear; a formula relative to its top-left cell,
-   as Excel fills); the grade names the first mismatched cells."
-  2)
+   as Excel fills); the grade names the first mismatched cells. 3: writes in
+   the response that submits are applied (they were dropped: Haiku sent its
+   last write with its submit in 20 of 79 attempts, each graded 0)."
+  3)
 
 ;; ---------------------------------------------------------------------------
 ;; The workbook as the candidate sees and edits it
@@ -211,31 +213,33 @@
             usage (merge-with #(if (and (number? %1) (number? %2)) (+ %1 %2) %2)
                               usage (select-keys (:usage response) [:input-tokens :output-tokens :cache-read-tokens]))
             history (conj history (cond-> {:role :assistant :content content}
-                                    (seq tool-calls) (assoc :tool-calls (vec tool-calls))))]
-        (cond
-          (or (some #(= "submit" (:name %)) tool-calls) (empty? tool-calls))
-          (assoc state :turn (inc turn) :history history :usage usage :termination :submitted)
-
-          :else
-          (let [[wb writes results errors]
-                (reduce (fn [[wb writes results errs] {:keys [id name arguments]}]
-                          (case name
-                            "read" [wb writes (conj results [id (read-range wb (str (or (:range arguments) (get arguments "range"))))]) errs]
-                            "write" (let [ws (normalize-writes (or (:cells arguments) (get arguments "cells")))
-                                          {wb' :wb errors :errors} (apply-writes wb ws)]
-                                      [wb' (into writes ws)
-                                       (conj results [id (str "Wrote " (- (count ws) (count errors)) " cell(s)."
-                                                              (when (seq errors) (str " Errors: " (str/join "; " errors)))
-                                                              "\n" (str/join "\n" (for [w ws :let [cid (parse-target wb' (:cell w))] :when cid]
-                                                                                    (str (:cell w) " = " (show-value (sb/rechentafel-value (e/get-cell wb' cid) (sb/formula-result? wb' cid)))))))])
-                                       (+ errs (count errors))])
-                            [wb writes (conj results [id (str "Unknown tool " name)]) errs]))
-                        [wb writes [] 0] tool-calls)]
-            (assoc state
-                   :turn (inc turn)
-                   :history (into history (map (fn [[id text]] {:role :tool :id id :content text})) results)
-                   :wb wb :writes writes :usage usage
-                   :errors (+ (:errors state) errors))))))))
+                                    (seq tool-calls) (assoc :tool-calls (vec tool-calls))))
+            ;; the calls of a response that submits are applied first: a
+            ;; final write sent with the submit is part of the answer
+            [wb writes results errors]
+            (reduce (fn [[wb writes results errs] {:keys [id name arguments]}]
+                      (case name
+                        "read" [wb writes (conj results [id (read-range wb (str (or (:range arguments) (get arguments "range"))))]) errs]
+                        "write" (let [ws (normalize-writes (or (:cells arguments) (get arguments "cells")))
+                                      {wb' :wb errors :errors} (apply-writes wb ws)]
+                                  [wb' (into writes ws)
+                                   (conj results [id (str "Wrote " (- (count ws) (count errors)) " cell(s)."
+                                                          (when (seq errors) (str " Errors: " (str/join "; " errors)))
+                                                          "\n" (str/join "\n" (for [w ws :let [cid (parse-target wb' (:cell w))] :when cid]
+                                                                                (str (:cell w) " = " (show-value (sb/rechentafel-value (e/get-cell wb' cid) (sb/formula-result? wb' cid)))))))])
+                                   (+ errs (count errors))])
+                        "submit" [wb writes results errs]
+                        [wb writes (conj results [id (str "Unknown tool " name)]) errs]))
+                    [wb writes [] 0] tool-calls)
+            submitted? (or (some #(= "submit" (:name %)) tool-calls) (empty? tool-calls))]
+        (cond-> (assoc state
+                       :turn (inc turn)
+                       :history (if submitted?
+                                  history
+                                  (into history (map (fn [[id text]] {:role :tool :id id :content text})) results))
+                       :wb wb :writes writes :usage usage
+                       :errors (+ (:errors state) errors))
+          submitted? (assoc :termination :submitted))))))
 
 (defn outcome
   "What a protocol returns of a finished episode."
