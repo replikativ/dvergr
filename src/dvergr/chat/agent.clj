@@ -307,10 +307,18 @@
           reply-notes (:notes reply-hook)
 
           ;; Account for token usage and capture threshold warnings
+          ;; cached input (inside :input-tokens, as Codex and Claude Code
+          ;; report it) is billed at its own rate, apart
+          cache-read (long (or (:cache-read-tokens usage) 0))
+          cache-write (long (or (:cache-creation-tokens usage) (:cache-write-tokens usage) 0))
+          _ (when (pos? cache-read)
+              (chat-ctx/account-tokens! chat-ctx :cache-read-tokens cache-read {:model model}))
+          _ (when (pos? cache-write)
+              (chat-ctx/account-tokens! chat-ctx :cache-creation-tokens cache-write {:model model}))
           input-result (when (:input-tokens usage)
                          (chat-ctx/account-tokens! chat-ctx
                                                    :input-tokens
-                                                   (:input-tokens usage)
+                                                   (max 0 (- (long (:input-tokens usage)) cache-read cache-write))
                                                    {:model model}))
           output-result (when (:output-tokens usage)
                           (chat-ctx/account-tokens! chat-ctx

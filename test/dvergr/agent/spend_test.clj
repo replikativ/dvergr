@@ -14,11 +14,33 @@
         s (spend/of-usage priced-model usage)]
     (is (= {:input 1000 :output 100 :cache-read 10} (:tokens s)))
     (is (true? (:priced? s)))
-    (is (= (+ (acct/calculate-cost :input-tokens 1000 {:model priced-model})
+    (is (= (+ (acct/calculate-cost :input-tokens 990 {:model priced-model})
               (acct/calculate-cost :output-tokens 100 {:model priced-model})
               (acct/calculate-cost :cache-read-tokens 10 {:model priced-model}))
-           (:microdollars s)))
+           (:microdollars s))
+        "the 10 cached of the 1000 input tokens at the cache rate, once")
     (is (= (:microdollars s) (get-in s [:by-model priced-model :microdollars])))))
+
+(deftest cached-input-is-billed-at-the-cache-rate
+  ;; a BIRD attempt of Luna: 12012 input tokens, 7424 of them cached; billed
+  ;; at the full input rate it cost 2949 μ$ at list price
+  (let [{:keys [input cache-read output]} (acct/get-model-pricing "gpt-5.6-luna")
+        usage {:input-tokens 12012 :cache-read-tokens 7424 :output-tokens 456}
+        s (spend/of-usage "codex-subscription-luna" usage)]
+    (is (< cache-read input) "the registry discounts cached input")
+    (is (= (Math/round (+ (* 4588 input) (* 7424 cache-read) (* 456 output)))
+           (:notional-microdollars s)))
+    (is (= {:input 12012 :cache-read 7424 :output 456} (:tokens s)) "input counts every input token"))
+  (testing "a chat budget accounts the cached part apart; its spend is the same"
+    (let [b (spend/of-budget "codex-subscription-luna"
+                             {:used 0 :by-type {:input-tokens 4588 :cache-read-tokens 7424 :output-tokens 456}})]
+      (is (= (:notional-microdollars (spend/of-usage "codex-subscription-luna"
+                                                     {:input-tokens 12012 :cache-read-tokens 7424 :output-tokens 456}))
+             (:notional-microdollars b)))
+      (is (= {:input 12012 :cache-read 7424 :output 456} (:tokens b)))))
+  (testing "writing the cache is billed at its own rate"
+    (is (= (acct/calculate-cost :cache-creation-tokens 100 {:model priced-model})
+           (:microdollars (spend/of-usage priced-model {:input-tokens 100 :cache-creation-tokens 100}))))))
 
 (deftest an-unknown-model-is-counted-but-not-priced
   (let [s (spend/of-usage "no-such-model" {:input-tokens 5 :output-tokens 5})]

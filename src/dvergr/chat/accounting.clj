@@ -109,14 +109,14 @@
         (cost (:output pricing 1))
         amount)
 
-      :token-cache-read
+      (:token-cache-read :cache-read-tokens)
       (if-let [pricing (get-model-pricing model)]
-        (cost (:cache-read pricing 0))
+        (cost (:cache-read pricing (:input pricing 0)))
         0)
 
-      :token-cache-write
+      (:token-cache-write :cache-write-tokens :cache-creation-tokens)
       (if-let [pricing (get-model-pricing model)]
-        (cost (:cache-write pricing 0))
+        (cost (:cache-write pricing (:input pricing 0)))
         0)
 
       ;; Static pricing for everything else
