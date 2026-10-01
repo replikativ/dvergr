@@ -268,3 +268,12 @@
            (mapv (juxt :name :input) tool-calls))
         "flat arguments parse; the repeat is one call; nothing after the first run runs")
     (is (= "Let me look at both sheets." text) "the guesses after the calls are not the turn's text")))
+
+(deftest a-predicted-result-ends-the-response
+  ;; BIRD, Haiku: a query, the result it imagined, then the submit; the
+  ;; submit ran without the query's result ever being seen
+  (let [parse #(@#'claude-code/parse-tool-calls % #{"query" "submit"})
+        {:keys [tool-calls]} (parse (str "<tool_use>\n{\"name\": \"query\", \"input\": {\"sql\": \"SELECT 1\"}}\n</tool_use>\n"
+                                         "<tool_result name=\"query\">1</tool_result>\n"
+                                         "<tool_use>\n{\"name\": \"submit\", \"input\": {\"sql\": \"SELECT 1\"}}\n</tool_use>"))]
+    (is (= ["query"] (mapv :name tool-calls)))))
