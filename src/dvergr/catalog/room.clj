@@ -495,21 +495,26 @@
 
 (defn experiment!
   "Benchmark bundle `b` in its own process (see `dvergr.catalog.wiki/experiment!`).
-   A Claude Code CLI candidate works in the attempt's world through the
-   daemon's MCP tools, so it needs a daemon in this process; without one it
-   is refused here rather than scored on files it could not write."
+   A Claude Code CLI candidate works in the attempt's world through dvergr's
+   MCP tools, which resolve the attempt's room by id and run in its own
+   context: in a process with no daemon, a headless one (only that) serves
+   them for the experiment's length."
   [b {:keys [dir repetitions parallelism models] :or {repetitions 1} :as opts}]
-  (let [cli (filterv #(= :claude-code (some-> (requiring-resolve 'dvergr.model.registry/provider-of)
-                                              (apply [(or ((requiring-resolve 'dvergr.model.registry/resolve-alias) %) %)])))
-                     models)]
-    (when (and (seq cli) (nil? (some-> (requiring-resolve 'dvergr.orchestration.daemon/current-daemon) deref deref)))
-      (throw (ex-info (str "Claude Code CLI candidates " cli " reach the attempt's world through a daemon's MCP tools, "
-                           "and no daemon runs in this process: benchmark them with catalog_benchmark in a daemon, "
-                           "or use API models here")
-                      {:type ::cli-needs-daemon :models cli}))))
-  ((requiring-resolve 'dvergr.agent.experiment.runner/run!)
-   (assoc (experiment-plan b opts) :dir dir :repetitions repetitions
-          :parallelism (or parallelism 1))))
+  (let [provider-of (requiring-resolve 'dvergr.model.registry/provider-of)
+        resolve-alias (requiring-resolve 'dvergr.model.registry/resolve-alias)
+        cli? (some #(= :claude-code (provider-of (or (resolve-alias %) %))) models)
+        current @(requiring-resolve 'dvergr.orchestration.daemon/current-daemon)
+        headless? (and cli? (nil? @current))]
+    (when headless? (reset! current {:headless? true}))
+    (try
+      ((requiring-resolve 'dvergr.agent.experiment.runner/run!)
+       (cond-> (assoc (experiment-plan b opts) :dir dir :repetitions repetitions
+                      :parallelism (or parallelism 1))
+         ;; the attempts' rooms fork from the experiment's room: its context
+         ;; finds them in the registry
+         headless? (assoc :on-room #(swap! current assoc :execution-ctx (:ctx %)))))
+      (finally
+        (when headless? (reset! current nil))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Export and import: a bundle travels as its files and a manifest
