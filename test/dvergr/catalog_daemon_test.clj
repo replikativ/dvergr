@@ -377,3 +377,23 @@
               (let [[sc] (ops/invoke *daemon* :scorecard/list {:room (:room started)})]
                 (is (= ["room"] (:verifier-trust (ops/invoke *daemon* :scorecard/detail
                                                              {:room (:room started) :id (:id sc)}))))))))))))
+
+(deftest a-table-of-cases-becomes-a-certified-workflow
+  (let [room (:id (ops/invoke *daemon* :room/create {:title "Books" :slug "books"}))
+        r (ops/resolve-room *daemon* room)]
+    (catalog/seed! r {"/data/cases.csv" (str "no;vendor;text;doc;account;amount\n"
+                                             "1;Acme;toner;inv1.txt;4930;119,00\n"
+                                             "2;Beta;rent;inv2.txt;4210;1.500,00\n"
+                                             "3;Gamma;fuel;inv3.txt;;50\n")
+                      "/data/inv1.txt" "Invoice 1: toner 119,00 EUR"
+                      "/data/inv2.txt" "Invoice 2: rent 1.500,00 EUR"
+                      "/data/inv3.txt" "Invoice 3: fuel"})
+    (let [res (ops/invoke *daemon* :catalog/cases
+                          {:room "books" :name "invoice-coding" :table "/data/cases.csv"
+                           :spec {:id "no" :inputs ["vendor" "text"] :attachments ["doc"]
+                                  :expected {"account" {"rule" "exact"} "amount" {:rule "number" :tolerance 0.01}}}})]
+      (is (= "books/invoice-coding" (:workflow res)))
+      (is (= [3 2] [(:cases res) (:certified res)]))
+      (is (= {:certified 2 :unlabelled 1} (:by-reason res)) "case 3 has no account")
+      (is (:ok (ops/invoke *daemon* :catalog/check {:room "books" :name "invoice-coding"})))
+      (is (:ok? (ops/invoke *daemon* :catalog/calibrate {:room "books" :name "invoice-coding"}))))))

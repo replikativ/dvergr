@@ -152,3 +152,32 @@ variant. Search through the configured `BRAVE_API_KEY` (approved; queries counte
   calibrated on, the calibration result); history stays in the room.
 - **Search**: the configured `BRAVE_API_KEY` may be used, sparingly; queries are counted in
   the benchmark's records.
+
+## Case packs: a benchmark from your own history
+
+`catalog_cases {room name table spec}` (`dvergr.catalog.casepack`) turns a table of
+historical cases in a room's workspace into a dataset bundle: the same workflow,
+benchmarked against the outcomes those cases actually had. Most organisations have this
+already: invoices with the account they were booked to, tickets with the team that solved
+them, applications with the decision.
+
+- **The table** is CSV (`,` or `;`, quotes, a byte-order mark, as Excel and DATEV write it),
+  JSON lines or EDN. `spec` names its columns: `id`, `inputs` (written to the case's
+  `/docs/case.edn`), `attachments` (text files beside the table, copied to `/docs/`),
+  `expected {column {:rule …}}`, and optionally `title`, `task` (else one is written from the
+  fields) and `doc`.
+- **Rules** per expected field: `exact` (numbers as numbers), `ci` (ignoring case and
+  spacing), `number` (within `tolerance`; `1.234,56` and `1,234.56` both read), `set` (a
+  vector, or text split on `, ; |`) and `date` (`yyyy-mm-dd` or `dd.mm.yyyy`). The generated
+  checker scores the attempt's `/out/answer.edn` field by field; the reward is the share right.
+- **Certification** keeps only cases that can grade an answer and says why the others
+  cannot: no id or a duplicate one, an outcome left empty, a missing attachment, the same
+  inputs with different outcomes (the history disagrees with itself), or an outcome the
+  checker does not accept as right (an amount that is not a number). `certification.edn` in
+  the bundle lists every excluded case with its reasons; the op returns the counts. On real
+  data this report is a first result in itself: which of your cases are usable.
+- **Calibration** is generated: the reference is a certified case's outcome, and each field
+  has a damaged variant that must lose that field's check. Then `catalog_calibrate`,
+  `catalog_benchmark` and the rest apply as to any bundle.
+
+Attachments are text for now (a PDF needs its text extracted first).

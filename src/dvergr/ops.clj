@@ -32,7 +32,9 @@
             [dvergr.agent.program :as program]
             [dvergr.agent.workflow :as workflow]
             [dvergr.catalog :as catalog]
+            [dvergr.catalog.casepack :as casepack]
             [dvergr.catalog.room :as room-wf]
+            [dvergr.catalog.workspace :as catalog-ws]
             [dvergr.agent.trajectory :as trajectory]
             [dvergr.substrate.paths :as paths]
             [dvergr.agent.experiment.runner :as runner]
@@ -589,6 +591,58 @@
                     b (in-ctx daemon (room-wf/import! r export as))]
                 {:imported (str (:slug r) "/" (:name b)) :bundle (str (:id b))
                  :verifier (name (room-wf/tier b))})))}
+
+   :catalog/cases
+   {:doc (str "Turn a table of historical cases in a room's workspace (CSV with , or ;, JSON lines, "
+              "or EDN; e.g. /data/cases.csv) into a workflow bundle that benchmarks agents against "
+              "the outcomes those cases had: workflows/<name>/, one case per certified row. `spec` "
+              "names the columns: id (the case's), inputs (into the case's /docs/case.edn), "
+              "attachments (text files beside the table), expected {column {rule exact|ci|number|set|"
+              "date, tolerance, doc}} (what the answer must get right), and optionally title and "
+              "task. Certification keeps only the cases that can grade an answer and says why the "
+              "others cannot (no or duplicate id, an outcome left empty, the same inputs with "
+              "different outcomes, an outcome its rule cannot read); the result counts them. "
+              "Then catalog_calibrate and catalog_benchmark the bundle as any other.")
+    :kind :write
+    :schema [:map [:room Room] [:name :string]
+             [:table [:string {:description "path of the table in the room's workspace"}]]
+             [:spec [:map
+                     [:id :string]
+                     [:inputs [:vector :string]]
+                     [:expected [:map-of :any :map]]
+                     [:attachments {:optional true} [:vector :string]]
+                     [:title {:optional true} :string]
+                     [:task {:optional true} :string]
+                     [:doc {:optional true} :string]]]
+             [:delimiter {:optional true} :string]]
+    :impl (fn [daemon {:keys [room name table spec delimiter]}]
+            (when-not (re-matches #"[a-z0-9][a-z0-9-]*" (str name))
+              (throw (ex-info (str "A workflow name is lowercase letters, digits and dashes: " name) {:name name})))
+            (when-let [r (resolve-room daemon room)]
+              (in-ctx daemon
+                      (let [table (if (str/starts-with? table "/") table (str "/" table))
+                            dir (subs table 0 (str/last-index-of table "/"))
+                            tree (catalog-ws/read-tree r (if (str/blank? dir) "/" dir))
+                            text (or (get tree table)
+                                     (throw (ex-info (str "No table " table " in the room's workspace") {:table table})))
+                            spec (-> spec
+                                     (assoc :name name)
+                                     (update :expected
+                                             (fn [m] (into {} (for [[f rule] m]
+                                                                [(clojure.core/name f)
+                                                                 (cond-> (update-keys rule keyword)
+                                                                   (:rule rule) (update :rule keyword)
+                                                                   (get rule "rule") (assoc :rule (keyword (get rule "rule"))))])))))
+                            rows (casepack/table-rows text table {:delimiter (some-> delimiter first)})
+                            {:keys [files certification]} (casepack/case-pack spec rows #(get tree (str dir "/" %)))]
+                        (when files
+                          (catalog-ws/ensure-workspace! r)
+                          (catalog-ws/seed! r (into {} (map (fn [[p t]] [(str "/workflows/" name "/" p) t])) files)))
+                        {:workflow (when files (str (:slug r) "/" name))
+                         :cases (:cases certification)
+                         :certified (:certified certification)
+                         :by-reason (:by-reason certification)
+                         :excluded (vec (take 25 (filter #(= :excluded (:status %)) (:verdicts certification))))}))))}
 
    :catalog/deploy
    {:doc (str "Deploy a room's workflow: a schedule in the room gives the bundle's task (its "
