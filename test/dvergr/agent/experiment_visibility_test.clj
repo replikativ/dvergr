@@ -14,7 +14,8 @@
             [dvergr.system.db :as sdb]
             [org.replikativ.spindel.core :as sp]))
 
-(defn- run-with [model-fn & {:keys [repetitions dir timeout-ms] :or {repetitions 2 timeout-ms 60000}}]
+(defn- run-with [model-fn & {:keys [repetitions dir timeout-ms fault-retries]
+                             :or {repetitions 2 timeout-ms 60000 fault-retries 0}}]
   (let [prev (paths/home)
         dir (or dir (str (System/getProperty "java.io.tmpdir") "/dvergr-visibility-" (random-uuid)))]
     (try
@@ -22,7 +23,8 @@
                     chat-agent/messages->api-format (fn [messages _ _] messages)
                     model-chat/chat model-fn]
         (assoc (wiki/experiment! {:dir dir :version 2 :models ["claude-haiku-4-5"]
-                                  :repetitions repetitions :timeout-ms timeout-ms})
+                                  :repetitions repetitions :timeout-ms timeout-ms
+                                  :fault-retries fault-retries})
                :dir dir))
       (finally
         (paths/set-home! prev)
@@ -83,6 +85,20 @@
         (is (= 1 (count (get-in scorecard [:incomplete :errors]))))
         (is (re-find #"certification failed" (get-in scorecard [:incomplete :errors 0 :error])))
         (is (= 1 (:verdicts (cand dir))) "the other cell ran to its verdict")))))
+
+(deftest a-cell-that-errors-once-is-run-again
+  ;; a lost connection fails one cell; without a retry the experiment had no
+  ;; Scorecard and its report nothing to show
+  (let [real @#'evaluation/evaluate
+        calls (atom 0)]
+    (with-redefs [evaluation/evaluate
+                  (fn [& args]
+                    (if (= 3 (swap! calls inc))
+                      (sp/spin (throw (ex-info "Connection reset" {})))
+                      (apply real args)))]
+      (let [{:keys [scorecard]} (run-with silent-model :repetitions 2 :fault-retries 1)]
+        (is (nil? (:incomplete scorecard)) "the errored cell ran again and completed")
+        (is (= 2 (count (:scorecard/entries scorecard))))))))
 
 (defn- expensive-model
   "Keeps working, and each step costs more than an attempt's budget."
