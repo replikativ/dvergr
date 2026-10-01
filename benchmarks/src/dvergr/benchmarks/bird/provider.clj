@@ -37,7 +37,10 @@
             [dvergr.sandbox :as sandbox]))
 
 (def version
-  "12: Datahike 0.8.1903 binds a function clause to a constant itself, so
+  "13: the Datalog description says rows are already distinct (`(distinct ?x)`
+   is an aggregate: one cell holding a set) and how to return the row with
+   the largest value without its value (bind the max by subquery, match it):
+   the two Datalog-only failures of the held-out tier-1 run. 12: Datahike 0.8.1903 binds a function clause to a constant itself, so
    bind-constants is gone; the Datalog description offers if (on a bound
    condition), clojure.math and constant bindings instead of the get/format
    workarounds. 11: (q query $) in an expression (the subquery clause's spelling) works; a
@@ -65,7 +68,7 @@
    identifiers canonical (bird.load/2); a final reply that is only a query
    counts as submitted. 2: a plain Datalog query (an EDN vector) runs as is;
    every engine's schema shows example rows."
-  12)
+  13)
 
 (def engines #{:sqlite :pg-datahike :datalog})
 
@@ -385,8 +388,11 @@
                  "(:offset n skips n rows; several keys: :order-by ?a :asc ?b :desc; by an aggregate, its "
                  "column index counted from 0: [:find ?c (count ?e) :where [?e :t/c ?c] :order-by 1 :desc :limit 1]). "
                  "Aggregates (count, sum, avg, min, max, count-distinct) go in :find only and see every row "
-                 "of the join, as in SQL. A subquery binds one value inside :where, e.g. the maximum: "
-                 "[(q [:find (max ?h) :where [_ :t/height ?h]] $) [[?mx]]] [?e :t/height ?mx]. "
+                 "of the join, as in SQL. Rows are already distinct: to list values, :find ?x; (distinct ?x) "
+                 "is an aggregate that returns ONE cell holding a set. A subquery binds one value inside "
+                 ":where, e.g. the maximum: [(q [:find (max ?h) :where [_ :t/height ?h]] $) [[?mx]]] "
+                 "[?e :t/height ?mx]; that is also how to return the row with the largest value WITHOUT the "
+                 "value as a column (:order-by needs its column in :find). "
                  "Clauses may call any pure clojure.core, clojure.string or clojure.math function (subs, str, "
                  "count, parse-long, parse-double, re-find, clojure.string/lower-case, clojure.math/round, "
                  "clojure.math/floor, clojure.math/pow, …), no Java methods. A constant in the binding tests "
