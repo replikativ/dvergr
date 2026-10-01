@@ -1,0 +1,35 @@
+SKR04 accounts of Musterfirma GmbH
+0670  Geringwertige Wirtschaftsgüter
+1200  Forderungen aus Lieferungen und Leistungen
+1800  Bank
+3300  Verbindlichkeiten aus Lieferungen und Leistungen
+3720  Verbindlichkeiten aus Lohn und Gehalt
+3730  Verbindlichkeiten aus Lohn- und Kirchensteuer
+3740  Verbindlichkeiten im Rahmen der sozialen Sicherheit
+3820  Umsatzsteuer-Vorauszahlungen
+4300  Erlöse 7 % USt (Automatikkonto)
+4400  Erlöse 19 % USt (Automatikkonto)
+6310  Miete (unbewegliche Wirtschaftsgüter)
+6325  Gas, Strom, Wasser
+6400  Versicherungen
+6420  Beiträge
+6520  Kfz-Versicherungen
+6530  Laufende Kfz-Betriebskosten
+6600  Werbekosten
+6640  Bewirtungskosten
+6650  Reisekosten Arbeitnehmer
+6800  Porto
+6805  Telefon
+6815  Bürobedarf
+6820  Zeitschriften, Bücher
+6827  Abschluss- und Prüfungskosten
+6830  Buchführungskosten
+6837  Aufwendungen für Lizenzen, Konzessionen
+6855  Nebenkosten des Geldverkehrs
+
+DATEV BU-Schlüssel
+9  19 % Vorsteuer
+8  7 % Vorsteuer
+3  19 % Umsatzsteuer
+2  7 % Umsatzsteuer
+-  kein Schlüssel (steuerfrei, nicht steuerbar, Automatikkonto oder Verrechnung)

@@ -1,0 +1,19 @@
+{:cases 264,
+ :certified 259,
+ :by-reason
+ {:certified 259,
+  :conflicting-outcomes 2,
+  :duplicate-id 2,
+  :unlabelled 1},
+ :excluded
+ [{:id "B0006",
+   :status :excluded,
+   :reasons [{:reason :conflicting-outcomes}]}
+  {:id "B0011",
+   :status :excluded,
+   :reasons [{:reason :unlabelled, :fields ["gegenkonto"]}]}
+  {:id "B0262", :status :excluded, :reasons [{:reason :duplicate-id}]}
+  {:id "B0262", :status :excluded, :reasons [{:reason :duplicate-id}]}
+  {:id "B0264",
+   :status :excluded,
+   :reasons [{:reason :conflicting-outcomes}]}]}

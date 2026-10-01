@@ -16,6 +16,7 @@
    [nil "--repetitions N" "Attempts per model" :default 1 :parse-fn #(Integer/parseInt %)]
    [nil "--budget-dollars USD" "Budget per attempt" :parse-fn #(Double/parseDouble %)]
    [nil "--timeout-ms MS" "Per attempt" :parse-fn #(Integer/parseInt %)]
+   [nil "--cases N" "A dataset's first N cases of a fixed shuffle (default all)" :parse-fn #(Integer/parseInt %)]
    [nil "--out DIR" "Where the experiment's state is kept" :default "workflow-runs"]
    [nil "--check" "Only check and calibrate the bundle"]
    ["-h" "--help"]])
@@ -38,7 +39,8 @@
                                                 :models (:models options)
                                                 :repetitions (:repetitions options)}
                                          (:budget-dollars options) (assoc :budget-dollars (:budget-dollars options))
-                                         (:timeout-ms options) (assoc :timeout-ms (:timeout-ms options))))]
+                                         (:timeout-ms options) (assoc :timeout-ms (:timeout-ms options))
+                                         (:cases options) (assoc :cases (:cases options))))]
             (doseq [s (:scorecard/summary scorecard)]
               (println (format "%-40s reward %.3f  passed %d/%d  $%.4f"
                                (name (:candidate/id s)) (double (or (:reward-mean s) 0))

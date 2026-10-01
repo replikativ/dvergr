@@ -58,6 +58,9 @@
     (is (< 0.6 (:reward (score {"account" "4210" "amount" 1500 "tags" ["rent" "extra"]})) 0.7))
     (is (= 0.0 (:reward (room/run-checker (:checker b) {:files {} :gold (get-in b [:cases "2" :gold])
                                                         :params (get-in b [:definition :params])}))))
+    (testing "shared files are every case's"
+      (is (= "SKR04" (get (:files (cp/case-pack (assoc spec :shared {"/docs/accounts.txt" "SKR04"}) clean nil))
+                          "fixtures/docs/accounts.txt"))))
     (testing "its calibration holds: the reference scores top, each damaged field is noticed"
       (is (:ok? (room/calibrate b)) (pr-str (:problems (room/calibrate b)))))))
 
