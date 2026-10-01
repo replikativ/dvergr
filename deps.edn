@@ -83,7 +83,7 @@
         ;; the sandbox's infer/ and dist/ namespaces (foerster.core, .dist).
         ;; 0.1.45: savepoint inference throughout, resample-move, tempering,
         ;; SMCP3, barrier factors and foerster.steer (infer/steer).
-        org.replikativ/foerster    {:mvn/version "0.1.45"}
+        org.replikativ/foerster    {:mvn/version "0.1.51"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context

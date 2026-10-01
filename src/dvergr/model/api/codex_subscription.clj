@@ -42,7 +42,8 @@
 (def ^:private model-aliases
   {"codex-subscription-sol" "gpt-5.6-sol"
    "codex-subscription-terra" "gpt-5.6-terra"
-   "codex-subscription-luna" "gpt-5.6-luna"})
+   "codex-subscription-luna" "gpt-5.6-luna"
+   "codex-subscription-sol-6.1" "gpt-6.1-sol"})
 
 (def ^:private passive-item-types
   ;; Fail closed for every other current or future Codex item type. Dvergr only

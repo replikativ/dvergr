@@ -9,6 +9,7 @@
             [dvergr.benchmarks.spreadsheetbench.experiment :as experiment]
             [dvergr.benchmarks.spreadsheetbench.provider :as provider]
             [dvergr.benchmarks.spreadsheetbench.smc :as smc]
+            [clojure.string :as str]
             [dvergr.test-support :as support])
   (:import (org.apache.poi.ss.util CellReference)))
 
@@ -73,3 +74,42 @@
                                  :cancelled? (constantly true)})]
           (is (= 0 (get-in out [:search :model-steps])))
           (is (= :cancelled (:termination out))))))))
+
+(deftest a-judge-reply-is-a-probability
+  (is (= 0.7 (smc/parse-probability "{\"p\": 0.7}")))
+  (is (= 1.0 (smc/parse-probability "{\"p\": 3}")))
+  (is (= 0.01 (smc/parse-probability "no idea"))))
+
+(deftest the-judge-scores-each-state-once
+  (if-not (and (sb/available?) (experiment/certified-ids))
+    (support/skip! "the-judge-scores-each-state-once: no SpreadsheetBench data")
+    (let [[task cells] (task-with-numeric-answers)
+          k (count cells)
+          prompts (atom [])
+          judge (fn [{:keys [messages]}]
+                  (swap! prompts conj (:content (first messages)))
+                  {:content "{\"p\": 0.5}" :usage {:input-tokens 10 :output-tokens 2}})
+          out (smc/run task {:particles 4 :twist :judge :reward :judge :judge judge
+                             :generate (coin-model cells) :max-turns (inc k)})]
+      (is (= :submitted (:termination out)))
+      ;; every state a particle reaches is judged at most once, copies included
+      (is (<= 1 (get-in out [:search :judge-calls]) (get-in out [:search :model-steps])))
+      (is (= (get-in out [:search :judge-calls]) (count @prompts)))
+      (is (every? #(str/includes? % "ANSWER POSITION NOW") @prompts)))))
+
+(deftest searches-export-training-records
+  (if-not (and (sb/available?) (experiment/certified-ids))
+    (support/skip! "searches-export-training-records: no SpreadsheetBench data")
+    (let [[task cells] (task-with-numeric-answers)
+          k (count cells)
+          seen (atom nil)
+          out (smc/run task {:particles 4 :twist :oracle :reward :oracle
+                             :generate (coin-model cells) :max-turns (inc k)
+                             :on-trajectories #(reset! seen %)})
+          records (smc/training-records task @seen)]
+      (is (= 4 (count @seen)))
+      (is (= (reduce + (map (comp count :states) @seen)) (count records)) "one record per state")
+      (is (every? #(and (string? (:state %)) (boolean? (get-in % [:gold :success :label]))) records))
+      (is (some #(get-in % [:gold :success :label]) records) "the steered search ends correct somewhere")
+      (is (< (Math/abs (- 1.0 (reduce + (map :weight @seen)))) 1e-9))
+      (is (= :submitted (:termination out))))))
