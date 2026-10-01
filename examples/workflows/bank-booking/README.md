@@ -11,9 +11,13 @@ is the demo of a **case pack built from a firm's own history**:
    real export takes;
 3. `dvergr.catalog.casepack` certifies the cases and writes this bundle.
 
-Certification found what real histories have: a voucher number used twice, the same
-transaction booked to two accounts, and a line left unbooked (`certification.edn`);
-259 cases remain. Each case is the bank's date, amount and text (`/docs/case.edn`), with
+The generator plants the defects real histories have (a voucher number used twice, the
+same transaction booked to two accounts, a line left unbooked), and certification finds
+and excludes them (`certification.edn`); 259 cases remain. The gold labels are one
+synthetic bookkeeper's conventions, some of which a tax adviser could book differently
+(card-terminal payouts straight to revenue 4400, office rent without a tax key, foreign
+ad invoices without a reverse-charge key): a pilot on a firm's own export grades against
+that firm's conventions. Each case is the bank's date, amount and text (`/docs/case.edn`), with
 the chart and tax keys the firm uses (`/docs/kontenrahmen.txt`); the answer is
 `{"gegenkonto" "6805" "bu" "9"}`, graded per field.
 
@@ -21,8 +25,9 @@ Regenerate with `(dvergr.benchmarks.bankbooking/write-example! "examples/workflo
 (benchmarks alias). Benchmark a sample:
 
     clojure -M -m dvergr.catalog.room-run examples/workflows/bank-booking \
-      --models codex-subscription-luna --cases 30
+      --models codex-subscription-luna,claude-code-haiku --cases 30 --out runs
 
-(Claude Code CLI models work in the attempt's world through a daemon's MCP tools: benchmark
-them with `catalog_benchmark` in a daemon.) `report.md` beside the experiment is the pilot
-report: the frontier, which checks fail, and the certification.
+Claude Code CLI models call the attempt's tools over MCP; `room-run` serves them from a
+headless daemon of its own. The state lives in `runs/bank-booking`: running the same
+command again resumes it. `report.md` there is the pilot report: the frontier, which
+checks fail, tokens, time and list-price cost, and the certification.
