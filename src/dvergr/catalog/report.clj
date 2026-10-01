@@ -33,8 +33,10 @@
                  passes (count (filter :passed? entries))
                  rewards (mapv #(double (or (:reward %) 0)) entries)
                  notional (reduce + 0 (map #(get-in % [:spend :notional-microdollars] 0) entries))
-                 tokens (reduce + 0 (map #(let [t (get-in % [:spend :tokens])] (+ (:input t 0) (:output t 0))) entries))
+                 tok (fn [k] (reduce + 0 (map #(get-in % [:spend :tokens k] 0) entries)))
+                 tokens (+ (tok :input) (tok :output))
                  receipts (keep #(receipt-by-id (:attempt/id %)) entries)
+                 secs (sort (keep #(some-> (:attempt/elapsed-ms %) (/ 1000.0)) receipts))
                  failed (frequencies (mapcat (fn [r] (keep (fn [[k v]] (when (false? v) k)) (:attempt/checks r))) receipts))]]
        {:candidate cid :n n :passes passes
         :pass-rate (when (pos? n) (/ passes (double n)))
@@ -44,7 +46,13 @@
         :notional-per-attempt (when (pos? n) (/ notional n))
         :notional-per-pass (when (pos? passes) (/ notional passes))
         :tokens-per-attempt (when (pos? n) (quot tokens n))
-        :median-seconds (some-> (median (keep :attempt/elapsed-ms receipts)) (/ 1000.0))
+        :input-per-attempt (when (pos? n) (quot (tok :input) n))
+        :output-per-attempt (when (pos? n) (quot (tok :output) n))
+        :cache-share (when (pos? (tok :input)) (/ (tok :cache-read) (double (tok :input))))
+        :notional-total notional
+        :median-seconds (median secs)
+        :p90-seconds (when (seq secs) (nth (vec secs) (int (* 0.9 (dec (count secs))))))
+        :total-seconds (when (seq secs) (reduce + secs))
         :failed-checks (into (sorted-map) failed)}))))
 
 (defn markdown
@@ -70,6 +78,18 @@
                 (if notional-per-pass (money notional-per-pass) "–")
                 (or tokens-per-attempt "–")
                 (if median-seconds (format "%.0f s" median-seconds) "–"))))
+     "\n## Resources\n\n"
+     "| Candidate | Input tokens / attempt | Output tokens / attempt | Cached input | Median time | p90 time | Total time | Total cost |\n"
+     "|---|---:|---:|---:|---:|---:|---:|---:|\n"
+     (str/join
+      (for [{:keys [candidate input-per-attempt output-per-attempt cache-share median-seconds p90-seconds total-seconds
+                    notional-total]} rs]
+        (format "| %s | %s | %s | %s | %s | %s | %s | %s |\n" (name candidate)
+                (or input-per-attempt "–") (or output-per-attempt "–") (pct cache-share)
+                (if median-seconds (format "%.0f s" median-seconds) "–")
+                (if p90-seconds (format "%.0f s" p90-seconds) "–")
+                (if total-seconds (format "%.1f min" (/ total-seconds 60.0)) "–")
+                (money (or notional-total 0)))))
      "\nCosts are at the models' list prices (what the same tokens cost through the API), whether or not "
      "a subscription paid for them.\n"
      (when (seq checks)
