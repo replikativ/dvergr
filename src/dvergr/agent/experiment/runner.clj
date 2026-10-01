@@ -228,6 +228,17 @@
         (experiment/progress {:id room-id :store (:store xs)}))
       (finally (conv/close-store! xs)))))
 
+(defn- write-report!
+  "`result` with its report written beside the experiment (`report.md`: the
+   frontier, where answers fail, tokens, time and cost). A report that cannot
+   be written is logged, never the experiment's failure."
+  [dir title result]
+  (try (spit (io/file dir "report.md")
+             ((requiring-resolve 'dvergr.catalog.report/markdown) {:title title :result result}))
+       (catch Throwable e
+         (tel/log! {:level :warn :id :experiment/report-failed :data {:dir (str dir) :error (ex-message e)}})))
+  result)
+
 (defn run!
   "Run (or resume) an experiment. Returns `{:dir :experiment-room :experiment
    :results :failed-cells :scorecard}`.
@@ -339,22 +350,24 @@
                 ran (filter #(>= (or (get-in % [:attempt/receipt :attempt/started-at]) 0) started-ms)
                             (keep :attempt (:results result)))
                 _ (record-calibration! metered started-ms ran)]
-            {:dir dir :experiment-room room-id :experiment experiment-def
-             :results (count (:results result)) :failed-cells failed-cells
+            (write-report!
+             dir (str (name benchmark) " — " (name room-id))
+             {:dir dir :experiment-room room-id :experiment experiment-def
+              :results (count (:results result)) :failed-cells failed-cells
              ;; the receipts of the Attempts this invocation has (a report's
              ;; checks and times), by Attempt id
-             :receipts (mapv (fn [a] (assoc (:attempt/receipt a) :attempt/id (:attempt/id a)))
-                             (keep :attempt (:results result)))
-             :refused (:refused result)
-             :preflight estimate
+              :receipts (mapv (fn [a] (assoc (:attempt/receipt a) :attempt/id (:attempt/id a)))
+                              (keep :attempt (:results result)))
+              :refused (:refused result)
+              :preflight estimate
          ;; a fresh process has no reading before its first call: then
          ;; the first one taken during the run
-             :subscription (into {} (map (fn [p] [p {:before (or (get before p)
-                                                                 (first (filter #(>= (:at-ms %) started-ms)
-                                                                                (subscription/samples p))))
-                                                     :after (subscription/reading p)}]))
-                                 metered)
-             :scorecard (:scorecard result)})))
+              :subscription (into {} (map (fn [p] [p {:before (or (get before p)
+                                                                  (first (filter #(>= (:at-ms %) started-ms)
+                                                                                 (subscription/samples p))))
+                                                      :after (subscription/reading p)}]))
+                                  metered)
+              :scorecard (:scorecard result)}))))
       (finally
         (try (evaluation/await-cleanups-for! room cleanup-group) (catch Throwable _ nil))
         (try (evaluation/await-cleanups! room) (catch Throwable _ nil))
