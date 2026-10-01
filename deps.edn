@@ -107,7 +107,7 @@
         ;; Datahike — persistent Datalog storage
         ;; Keep the direct dependency current: Dvergr uses Datahike's API and
         ;; transaction predicates itself, not merely through Geschichte.
-        org.replikativ/datahike    {:mvn/version "0.8.1901"}
+        org.replikativ/datahike    {:mvn/version "0.8.1903"}
         ;; 0.1.37 provides conserved resource vectors, durable receipts, and
         ;; mandatory Datahike invariants for Run resource delegation.
         ;; 0.1.38 settles a world's book by replay (ADR-172, `kontor.settlement`):
