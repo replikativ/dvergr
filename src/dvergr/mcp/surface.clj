@@ -38,7 +38,7 @@
    :catalog/list :catalog, :catalog/start :catalog
 
    :catalog/benchmark :bench, :catalog/check :bench, :catalog/calibrate :bench,
-   :catalog/export :bench, :catalog/import :bench, :catalog/deploy :bench, :catalog/freeze :bench, :experiment/progress :bench
+   :catalog/export :bench, :catalog/import :bench, :catalog/cases :bench, :catalog/deploy :bench, :catalog/freeze :bench, :experiment/progress :bench
 
    :room/wallet :wallets, :models/list :wallets
 
@@ -192,6 +192,7 @@
    :catalog/promote  {:destructiveHint false :idempotentHint true  :openWorldHint false}
    :run/resume       {:destructiveHint false :idempotentHint false :openWorldHint true}
    :catalog/import   {:destructiveHint true  :idempotentHint true  :openWorldHint false}
+   :catalog/cases    {:destructiveHint true  :idempotentHint true  :openWorldHint false}
    :catalog/deploy   {:destructiveHint false :idempotentHint false :openWorldHint true}
    :catalog/freeze   {:destructiveHint false :idempotentHint true  :openWorldHint false}
    :room/fork        {:destructiveHint false :idempotentHint false :openWorldHint false}
