@@ -239,6 +239,21 @@
          (tel/log! {:level :warn :id :experiment/report-failed :data {:dir (str dir) :error (ex-message e)}})))
   result)
 
+(defn ^:no-doc serve-headless!
+  "Install a headless daemon serving `room`'s forks when the process has no
+   daemon; returns it (for `release-headless!`), or nil when one is there."
+  [room]
+  (let [current @(requiring-resolve 'dvergr.orchestration.daemon/current-daemon)
+        headless {:headless? true :execution-ctx (:ctx room)}]
+    (when (compare-and-set! current nil headless)
+      headless)))
+
+(defn ^:no-doc release-headless!
+  "Remove the headless daemon `serve-headless!` installed, if it still is."
+  [headless]
+  (when headless
+    (compare-and-set! @(requiring-resolve 'dvergr.orchestration.daemon/current-daemon) headless nil)))
+
 (defn run!
   "Run (or resume) an experiment. Returns `{:dir :experiment-room :experiment
    :results :failed-cells :scorecard}`.
@@ -306,8 +321,15 @@
         room-id (or experiment-id (keyword (name benchmark) (.getName (io/file dir))))
         room (d/make-room {:id room-id :store (:store xs)
                            :title (str (name benchmark) " experiment " (name room-id))})
-        ;; an embedder that serves the experiment's rooms (a headless daemon
-        ;; for CLI candidates' MCP tools) learns the room they fork from
+        ;; A Claude Code CLI candidate calls the attempt's tools over MCP,
+        ;; which resolve its room by id through the daemon: in a process with
+        ;; no daemon, a headless one (only that) serves them for the
+        ;; experiment's length; its context finds the attempts' rooms, forks
+        ;; of this one. Without it every tool call failed and a candidate's
+        ;; certified score was a silent 0 (wiki benchmarks, room workflows).
+        headless (when uses-cc? (serve-headless! room))
+        ;; an embedder that serves the experiment's rooms learns the room
+        ;; they fork from
         _ (when-let [f (:on-room opts)] (f room))
         experiment-def (experiment-def {:benchmark benchmark :id room-id
                                         :environments environments :team team
@@ -378,4 +400,5 @@
         (try (evaluation/await-cleanups! room) (catch Throwable _ nil))
         (try (d/close-room! room) (catch Throwable _ nil))
         (conv/close-store! xs)
+        (release-headless! headless)
         (cc/configure! cc-before)))))

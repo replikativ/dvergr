@@ -2,7 +2,8 @@
   "A workflow defined as files (doc/room-workflows.md): checked for shape, its
    checker run in SCI with no effects, and benchmarked like a catalog
    workflow, the checker's verdict on every Attempt with its `:ad-hoc` tier."
-  (:require [clojure.java.io :as io]
+  (:require [dvergr.agent.experiment.runner]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [dvergr.agent.evaluation :as evaluation]
@@ -356,13 +357,12 @@
 
 (deftest a-cli-candidate-gets-a-headless-daemon-for-the-experiment
   ;; its MCP tools are the daemon's: without one every read and write of the
-  ;; attempt's world failed and the bundle scored a silent zero
-  (dvergr.model.registry/ensure-models-loaded!)
+  ;; attempt's world failed and the candidate scored a silent zero (room
+  ;; workflows and wiki benchmarks alike: the runner installs it)
   (let [current @(requiring-resolve 'dvergr.orchestration.daemon/current-daemon)
-        seen (atom nil)]
-    (with-redefs [dvergr.agent.experiment.runner/run!
-                  (fn [opts] ((:on-room opts) {:ctx ::the-room-ctx}) (reset! seen @current) :ran)]
-      (is (= :ran (room-wf/experiment! (room-wf/bundle "competitors" files)
-                                       {:dir "/tmp/unused" :models ["claude-code-haiku"]}))))
-    (is (= {:headless? true :execution-ctx ::the-room-ctx} @seen) "the experiment room's context finds its rooms")
+        h (dvergr.agent.experiment.runner/serve-headless! {:ctx ::the-room-ctx})]
+    (try
+      (is (= {:headless? true :execution-ctx ::the-room-ctx} @current) "the experiment room's context finds its rooms")
+      (is (nil? (dvergr.agent.experiment.runner/serve-headless! {:ctx ::another})) "a daemon is there: none installed")
+      (finally (dvergr.agent.experiment.runner/release-headless! h)))
     (is (nil? @current) "gone after the experiment")))
