@@ -5,6 +5,9 @@ environment state is an immutable value. A fork is a structural share and a
 replay is a reduction, so resetting and branching an environment costs nothing.
 A transcription counts as the benchmark only after it has been shown
 equivalent to the upstream implementation (see *Equivalence method* below).
+How to run one, what its report means, and what an experiment guarantees
+(resume, faults, cost at list price, held-out discipline):
+[running-benchmarks.md](running-benchmarks.md).
 
 The providers are not part of the `dvergr` jar. They live in
 [`benchmarks/`](../benchmarks/README.md) and ship as
