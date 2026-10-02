@@ -209,6 +209,8 @@
           dir (temp-dir)
           r (tx/run! {:dir dir :domain dom :task-ids ["0"]
                       :candidates [{:id :gold :harness :reference :model "claude-code-sonnet"}]
+                      ;; one attempt: the fault is the subject, not its re-run
+                      :fault-retries 0
                       :user-fn (fn [_] (throw (ex-info "provider 529" {:status 529})))
                       :agent-generate gold-agent})
           xs (conv/open-store! dir)]
