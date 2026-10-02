@@ -86,6 +86,12 @@
            (catch Throwable _ nil))
       (default-sandbox-repo)))
 
+(defonce ^:private seed-locks (java.util.concurrent.ConcurrentHashMap.))
+
+(defn- seed-lock [root]
+  (.computeIfAbsent ^java.util.concurrent.ConcurrentHashMap seed-locks (.getCanonicalPath (io/file root))
+                    (reify java.util.function.Function (apply [_ _] (Object.)))))
+
 (defn ensure-repo!
   "Ensure `root` is a git repo seeded with the dvergr sandbox stdlib by CLONING it
    from `(sandbox-repo)` — a local path in dev, the github URL in production (git
@@ -96,20 +102,24 @@
    default workspace and each room's own code repo."
   [root]
   (.mkdirs (io/file root))
-  (when-not (.exists (io/file root ".git"))
-    (let [src (sandbox-repo)
-          res (clojure.java.shell/sh "git" "clone" "--quiet" (str src) (str root))]
-      (if (zero? (:exit res))
-        (clojure.java.shell/sh "git" "-C" (str root) "remote" "rename" "origin" "upstream")
-        (let [sh (fn [& args] (apply clojure.java.shell/sh "git" "-C" (str root) args))]
-          (tel/log! {:level :warn :id :workspace/seed-clone-failed
-                     :data {:source src :err (:err res)}}
-                    "Sandbox stdlib clone failed — creating an empty workspace repo")
-          (sh "init" "-q" "-b" "main")
-          (spit (io/file root "user.clj") "(ns user)\n")
-          (sh "add" "-A")
-          (sh "-c" "user.email=agent@dvergr" "-c" "user.name=dvergr"
-              "commit" "-q" "-m" "workspace: empty (stdlib source unreachable)")))))
+  ;; One seeding per directory: parallel cells' first contexts seed the same
+  ;; default workspace at once, and concurrent clones into one path fail
+  ;; (each loser fell back to an empty repo, its cell faulted).
+  (locking (seed-lock root)
+    (when-not (.exists (io/file root ".git"))
+      (let [src (sandbox-repo)
+            res (clojure.java.shell/sh "git" "clone" "--quiet" (str src) (str root))]
+        (if (zero? (:exit res))
+          (clojure.java.shell/sh "git" "-C" (str root) "remote" "rename" "origin" "upstream")
+          (let [sh (fn [& args] (apply clojure.java.shell/sh "git" "-C" (str root) args))]
+            (tel/log! {:level :warn :id :workspace/seed-clone-failed
+                       :data {:source src :err (:err res)}}
+                      "Sandbox stdlib clone failed — creating an empty workspace repo")
+            (sh "init" "-q" "-b" "main")
+            (spit (io/file root "user.clj") "(ns user)\n")
+            (sh "add" "-A")
+            (sh "-c" "user.email=agent@dvergr" "-c" "user.name=dvergr"
+                "commit" "-q" "-m" "workspace: empty (stdlib source unreachable)"))))))
   root)
 
 (defn ensure-workspace-repo!

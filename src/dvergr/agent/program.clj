@@ -21,6 +21,7 @@
             [dvergr.tools :as tools]
             [datahike.api :as dh]
             [hasch.core :as hasch]
+            [org.replikativ.spindel.blocking :as blocking]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.impl.simple :as simple]
@@ -817,8 +818,10 @@
              (update-llm-metrics!
               supervisor merge {:model-steps (inc model-step)
                                 :usage (select-keys budget [:used :by-type])})
-             (turn/post-turn-activity! control-room (:agent/id agent) chat-ctx posted
-                                       run-id trigger)
+             ;; posting the turn's rows is a durable write: off the drain
+             (sp/await (blocking/blocking
+                        #(turn/post-turn-activity! control-room (:agent/id agent) chat-ctx posted
+                                                   run-id trigger)))
              (cond
                (or (= ::worker-cancelled outcome)
                    (run/cancel-requested? run-id))

@@ -78,7 +78,7 @@
         ;; adapters as functions (foerster's effects in ClojureScript).
         ;; 0.1.96: trace :until and replay :seed, O(log n) world release,
         ;; runs release what they held (resample-move SMC).
-        org.replikativ/spindel     {:mvn/version "0.1.96"}
+        org.replikativ/spindel     {:mvn/version "0.1.97"}
         ;; probabilistic inference in forkable worlds, split out of spindel:
         ;; the sandbox's infer/ and dist/ namespaces (foerster.core, .dist).
         ;; 0.1.45: savepoint inference throughout, resample-move, tempering,

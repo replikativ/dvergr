@@ -16,6 +16,7 @@
             [dvergr.room.registry :as registry]
             [dvergr.rooms.forks :as forks]
             [hasch.core :as hasch]
+            [org.replikativ.spindel.blocking :as blocking]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.impl.simple :as simple]
@@ -684,6 +685,9 @@
               (update protocol :run
                       (fn [run] (fn [context]
                                   (run (assoc context :environment definition))))))
+            ;; Admission (fork the world, the Run's durable start) still runs
+            ;; on the drain: off it (spindel `blocking`), the Run's execution
+            ;; never completed at :parallelism 8 (doc: frp-recovery-plan).
             handle (program/hire-prepared-in! room (or world-parent room) team agent-ref
                                               hire-opts prepare-world! hosted-protocol)
             timed-out ::timed-out
@@ -703,7 +707,7 @@
                            :run/id (program/run-id handle)
                            :cancel-timeout-ms cancel-timeout-ms})))
         (let [run-id (program/run-id handle)
-              durable (program/observe room handle)
+              durable (sp/await (blocking/blocking #(program/observe room handle)))
               fork (some-> (:run/world result) registry/lookup)
               _ (when (contains? #{:world-setup-failed
                                    :world-setup-cancelled}

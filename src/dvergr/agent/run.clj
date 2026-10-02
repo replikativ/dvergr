@@ -13,7 +13,29 @@
 (def ^:private finish-statuses #{:waiting :completed :failed :cancelled})
 (defonce ^:private active (atom {}))
 (defonce ^:private subscribers (atom {}))
-(def ^:private lifecycle-lock (Object.))
+(def ^:private lifecycle-lock
+  "Orders the in-memory lifecycle: `active` and the events subscribers see
+   (`watch-runs!`'s snapshot is a frontier of that order). Held briefly, never
+   across a store write."
+  (Object.))
+
+(defonce ^:private room-locks (java.util.concurrent.ConcurrentHashMap.))
+
+(defn- room-lock
+  "The lock of one Room's Run lifecycle: admission and teardown fences and the
+   durable writes of its Runs serialize per Room, so a store write of one
+   Room's Run does not stall every other Room's (one process-wide lock did:
+   parallel benchmark cells queued on it). Order: Room lock, then
+   `lifecycle-lock`, then Room metadata."
+  [room-id]
+  (.computeIfAbsent ^java.util.concurrent.ConcurrentHashMap room-locks (or room-id ::none)
+                    (reify java.util.function.Function (apply [_ _] (Object.)))))
+
+(defn- run-lock
+  "The Room lock of live Run `run-id` (any lock when it is not live: the
+   operation then finds no entry and does nothing)."
+  [run-id]
+  (room-lock (get-in @active [run-id :run :run/room])))
 
 (def provenance-keys
   "Run fields an interpreter may add without changing core causal identity."
@@ -77,7 +99,7 @@
 (defn open-room-admission!
   "Open Run admission for a newly constructed Room in its Spindel context."
   [room-id execution-ctx]
-  (locking lifecycle-lock
+  (locking (room-lock room-id)
     (binding [ec/*execution-context* execution-ctx]
       (ec/swap-state! (admission-path room-id) (constantly :open))))
   nil)
@@ -102,7 +124,7 @@
    admitted before the fence. Teardown drains exactly this set."
   [room]
   (let [room-id (:id room)]
-    (locking lifecycle-lock
+    (locking (room-lock room-id)
       (binding [ec/*execution-context* (:ctx room)]
         (ec/swap-state! (admission-path room-id) (constantly :closed)))
       (->> (vals @active)
@@ -120,7 +142,7 @@
    Run events or invoke lifecycle subscribers."
   [room install-fence!]
   (let [room-id (:id room)]
-    (locking lifecycle-lock
+    (locking (room-lock room-id)
       (binding [ec/*execution-context* (:ctx room)]
         (ec/swap-state! (admission-path room-id) (constantly :closed)))
       (let [entries (->> (vals @active)
@@ -138,7 +160,7 @@
    preserving the sole nested order Run lifecycle -> Room metadata. It must
    return truthy only when it removed the expected fence generation."
   [room recover-fence!]
-  (locking lifecycle-lock
+  (locking (room-lock (:id room))
     (when (recover-fence!)
       (binding [ec/*execution-context* (:ctx room)]
         (ec/swap-state! (admission-path (:id room)) (constantly :open)))
@@ -187,7 +209,7 @@
                      :cancel-hooks {}
                      :store (:store room)
                      :store-room-id (store/conversation-id room)}]
-     (locking lifecycle-lock
+     (locking (room-lock (:run/room run))
        (when (and (:ctx room)
                   (= :closed
                      (binding [ec/*execution-context* (:ctx room)]
@@ -205,8 +227,9 @@
                            {:type ::start-not-durable
                             :run/id (:run/id run)
                             :run/room (:id room)}))))
-       (swap! active assoc (:run/id run) entry)
-       (notify! {:type :run/started :run run}))
+       (locking lifecycle-lock
+         (swap! active assoc (:run/id run) entry)
+         (notify! {:type :run/started :run run})))
      run)))
 
 (defn record-cause!
@@ -224,7 +247,7 @@
                     {:type ::invalid-cause
                      :run/id run-id
                      :cause-run/id cause-run-id})))
-  (locking lifecycle-lock
+  (locking (run-lock run-id)
     (let [entry (or (get @active run-id)
                     (throw (ex-info "Causal consumer Run is not live"
                                     {:type ::run-not-active :run/id run-id})))
@@ -243,7 +266,7 @@
                             {:type ::cause-not-durable
                              :run/id run-id
                              :cause-run/id cause-run-id}))))
-        (swap! active assoc-in [run-id :run] updated)
+        (locking lifecycle-lock (swap! active assoc-in [run-id :run] updated))
         updated))))
 
 (defn finish!
@@ -254,7 +277,7 @@
    (when-not (contains? finish-statuses status)
      (throw (ex-info "Invalid run finish status"
                      {:type ::invalid-finish-status :status status :run-id run-id})))
-   (locking lifecycle-lock
+   (locking (run-lock run-id)
      (when-let [entry (get @active run-id)]
        (let [now (or now (java.util.Date.))
              run (cond-> (assoc (:run entry)
@@ -274,8 +297,9 @@
                              {:type ::finish-not-durable
                               :run/id run-id
                               :run/status status}))))
-         (swap! active dissoc run-id)
-         (notify! {:type :run/finished :run run})
+         (locking lifecycle-lock
+           (swap! active dissoc run-id)
+           (notify! {:type :run/finished :run run}))
          run)))))
 
 (defn retain-finished!
@@ -290,7 +314,7 @@
    (when-not (contains? finish-statuses status)
      (throw (ex-info "Invalid run finish status"
                      {:type ::invalid-finish-status :status status :run-id run-id})))
-   (locking lifecycle-lock
+   (locking (run-lock run-id)
      (when-let [entry (get @active run-id)]
        ;; Exactly one settlement path owns result publication. A graph callback
        ;; racing the normal Spin sees this retained terminal state and yields.
@@ -311,14 +335,14 @@
                                {:type ::finish-not-durable
                                 :run/id run-id
                                 :run/status status}))))
-           (swap! active assoc-in [run-id :run] run)
+           (locking lifecycle-lock (swap! active assoc-in [run-id :run] run))
            run))))))
 
 (defn release-finished!
   "Release a Run whose terminal projection was written by `retain-finished!`.
    Emits the lifecycle finish event only as the execution lease disappears."
   [run-id]
-  (locking lifecycle-lock
+  (locking (run-lock run-id)
     (when-let [entry (get @active run-id)]
       (let [run (:run entry)]
         (when-not (contains? finish-statuses (:run/status run))
@@ -326,8 +350,9 @@
                           {:type ::run-not-finished
                            :run/id run-id
                            :run/status (:run/status run)})))
-        (swap! active dissoc run-id)
-        (notify! {:type :run/finished :run run})
+        (locking lifecycle-lock
+          (swap! active dissoc run-id)
+          (notify! {:type :run/finished :run run}))
         run))))
 
 (defn publish-finished!
@@ -335,7 +360,7 @@
    fence. Room teardown cannot observe the lease disappear and close the
    execution context before `publish!` has written the fork-aware result."
   [run-id publish! result]
-  (locking lifecycle-lock
+  (locking (run-lock run-id)
     (when-let [entry (get @active run-id)]
       (let [run (:run entry)]
         (when-not (contains? finish-statuses (:run/status run))
@@ -343,15 +368,16 @@
                           {:type ::run-not-finished
                            :run/id run-id
                            :run/status (:run/status run)})))
-        (swap! active dissoc run-id)
-        (try
-          (publish! result)
-          (catch Throwable t
-            ;; Keep the durable terminal lease recoverable if publication into
-            ;; the execution context itself fails.
-            (swap! active assoc run-id entry)
-            (throw t)))
-        (notify! {:type :run/finished :run run})
+        (locking lifecycle-lock
+          (swap! active dissoc run-id)
+          (try
+            (publish! result)
+            (catch Throwable t
+              ;; Keep the durable terminal lease recoverable if publication
+              ;; into the execution context itself fails.
+              (swap! active assoc run-id entry)
+              (throw t)))
+          (notify! {:type :run/finished :run run}))
         run))))
 
 (defn update-durable-settlement!
@@ -386,7 +412,7 @@
    live entry, so the Run's later updates carry it. nil when the Run is not
    live in this process."
   [run-id data]
-  (locking lifecycle-lock
+  (locking (run-lock run-id)
     (when-let [entry (get @active run-id)]
       (let [run (assoc (:run entry)
                        :run/savepoint (pr-str data)
@@ -395,7 +421,7 @@
           (when-not (store/-store-run! room-store (:store-room-id entry) run)
             (throw (ex-info "Run savepoint was not durable"
                             {:type ::savepoint-not-durable :run/id run-id}))))
-        (swap! active assoc-in [run-id :run] run)
+        (locking lifecycle-lock (swap! active assoc-in [run-id :run] run))
         run))))
 
 (defn savepoint
