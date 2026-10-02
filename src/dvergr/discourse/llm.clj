@@ -495,7 +495,11 @@
                            (if room
                              (room-context/append-inbound! room id (:id m)
                                                            :user (:content m)
-                                                           (room-context/display-name room (:from m))
+                                                           ;; a plain message (an evaluation world's
+                                                           ;; simulated user) reads as sent: no
+                                                           ;; `[author · HH:mm]`, no wall clock
+                                                           (when-not (get-in m [:metadata :plain?])
+                                                             (room-context/display-name room (:from m)))
                                                            (:ts m))
                              (cc/add-message! chat-ctx {:role :user :content (:content m)})))
                          drain-inclusions!
