@@ -496,25 +496,12 @@
 (defn experiment!
   "Benchmark bundle `b` in its own process (see `dvergr.catalog.wiki/experiment!`).
    A Claude Code CLI candidate works in the attempt's world through dvergr's
-   MCP tools, which resolve the attempt's room by id and run in its own
-   context: in a process with no daemon, a headless one (only that) serves
-   them for the experiment's length."
-  [b {:keys [dir repetitions parallelism models] :or {repetitions 1} :as opts}]
-  (let [provider-of (requiring-resolve 'dvergr.model.registry/provider-of)
-        resolve-alias (requiring-resolve 'dvergr.model.registry/resolve-alias)
-        cli? (some #(= :claude-code (provider-of (or (resolve-alias %) %))) models)
-        current @(requiring-resolve 'dvergr.orchestration.daemon/current-daemon)
-        headless? (and cli? (nil? @current))]
-    (when headless? (reset! current {:headless? true}))
-    (try
-      ((requiring-resolve 'dvergr.agent.experiment.runner/run!)
-       (cond-> (assoc (experiment-plan b opts) :dir dir :repetitions repetitions
-                      :parallelism (or parallelism 1))
-         ;; the attempts' rooms fork from the experiment's room: its context
-         ;; finds them in the registry
-         headless? (assoc :on-room #(swap! current assoc :execution-ctx (:ctx %)))))
-      (finally
-        (when headless? (reset! current nil))))))
+   MCP tools; without a daemon in the process, the runner serves them from a
+   headless one."
+  [b {:keys [dir repetitions parallelism] :or {repetitions 1} :as opts}]
+  ((requiring-resolve 'dvergr.agent.experiment.runner/run!)
+   (assoc (experiment-plan b opts) :dir dir :repetitions repetitions
+          :parallelism (or parallelism 1))))
 
 ;; ---------------------------------------------------------------------------
 ;; Export and import: a bundle travels as its files and a manifest
