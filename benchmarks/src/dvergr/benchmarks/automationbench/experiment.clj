@@ -67,7 +67,7 @@
         caps (provider/capabilities {:sidecar sidecar :agent-generate agent-generate})]
     (runner/run!
      (merge
-      (select-keys opts [:dir :repetitions :parallelism :experiment-id :claude-cli :claude-env
+      (select-keys opts [:dir :repetitions :parallelism :experiment-id :fault-retries :claude-cli :claude-env
                          :host-context-note :usage-pause-threshold :usage-retries
                          :preflight :allowance])
       {:benchmark :automationbench
