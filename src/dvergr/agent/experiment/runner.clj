@@ -153,6 +153,26 @@
            (tel/log! {:level :warn :id ::calibration-not-recorded :error e}
                      "Could not record the subscription calibration")))))
 
+(def ^:private identity-libraries
+  "The libraries an experiment's execution and grading run on: their versions
+   are part of its identity, so a resume never folds Attempts of one version
+   into a Scorecard with another's (provider prompt and grader versions are
+   already in it)."
+  [["org.replikativ" "spindel"] ["org.replikativ" "datahike"] ["org.replikativ" "pg-datahike"]
+   ["org.replikativ" "rechentafel"] ["org.replikativ" "kontor"] ["is.simm" "partial-cps"]
+   ["org.babashka" "sci"]])
+
+(defn library-versions
+  "`{\"group/artifact\" version}` of `identity-libraries` found as jars on the
+   classpath (their pom.properties); a library from a local checkout is absent."
+  []
+  (into (sorted-map)
+        (for [[g a] identity-libraries
+              :let [r (io/resource (str "META-INF/maven/" g "/" a "/pom.properties"))]
+              :when r]
+          [(str g "/" a) (with-open [in (io/input-stream r)]
+                           (.getProperty (doto (java.util.Properties.) (.load in)) "version"))])))
+
 (defn experiment-def
   "The ExperimentDef of a provider's pieces: `benchmark` (namespaces the ids),
    `id`, `environments`, the candidate `team`, `dataset` `{:id :metadata}`,
@@ -334,7 +354,7 @@
         experiment-def (experiment-def {:benchmark benchmark :id room-id
                                         :environments environments :team team
                                         :dataset dataset :repetitions repetitions
-                                        :metadata (cond-> (or metadata {})
+                                        :metadata (cond-> (assoc (or metadata {}) :libraries (library-versions))
                                                     host (assoc :host host))})
         ;; Detached evaluation cleanup of this operation is joined before the
         ;; Room and its store are closed.
