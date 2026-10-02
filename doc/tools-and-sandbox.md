@@ -28,20 +28,22 @@ returns `{:type :success/:error :content "..." :metadata {...}}`.
 - **Code eval / shell** — `clojure_eval` (the main one — see below) and `shell` (a
   muschel-jailed bash via `dvergr.intake.bash/run`; read-only commands auto-allowed,
   destructive ones like `sudo`/`rm -rf` auto-denied, output capped at 8000 chars/stream).
-- **Knowledge graph** — `knowledge_search`, `knowledge_add` (the `[[Entity]]` graph),
-  `entity_sync` (refetch an entity's stored sync sources + LLM-extract). (A general
-  fulltext search over a native Datahike `:scriptum` secondary index is planned; for
-  now agents query Datahike directly in the sandbox.)
+- **Knowledge graph** — `knowledge_search` (fulltext over the room's native Datahike
+  `:scriptum` secondary index) and `knowledge_add` (the `[[Entity]]` graph).
 - **Tasks** — `task_create`, `task_list`, `task_update` (Datahike-backed `:task/*`).
 - **Agent / orchestration** — `spawn_agent` (Run-backed delegation with automatic
   settlement), `propose_change` (the same interpreter with its world retained for
   review), `update_agent_profile` (rewrites an agent's system prompt → actor row),
   `budget` (remaining μ$ / cost estimate).
-- **Data sources (intake)** — the `dvergr.intake.*` modules: HN, Reddit, Lobsters,
-  Bluesky, Mastodon, dev.to, web fetch/search, YouTube transcripts, Twitter, GitHub,
-  RSS, mail, Slack, Zulip, plus company/market intel (SEC EDGAR, Companies House,
-  Finnhub, GLEIF, Wikidata, crt.sh, Wayback, LinkedIn, Adzuna jobs, arXiv). Most are
-  surfaced **inside the sandbox** as `intake.*` namespaces rather than as discrete tools.
+- **Registered beside `dvergr.tools`** — `llm_call` (a cheap one-shot LLM call,
+  `dvergr.tools.llm-call`), `request_dependency` and `request_plan_review` (ask a human
+  to approve a library or a plan, `dvergr.tools.approval`).
+- **Data sources (intake)** — the `dvergr.intake.*` modules: HN, Lobsters, Bluesky,
+  Mastodon, dev.to, web fetch/search, YouTube transcripts, Twitter, GitHub, RSS, Zulip,
+  plus company/market intel (SEC EDGAR, Companies House, Finnhub, GLEIF, Wikidata,
+  crt.sh, Wayback, LinkedIn, Adzuna jobs, arXiv), and mail (`dvergr.mail`,
+  `intake.mail`). They are surfaced **inside the sandbox** as namespaces rather than as
+  discrete tools.
 
 ### Role-scoping = the `:tools` allowlist
 
@@ -68,39 +70,51 @@ cancellable.
   `java.time.*`, `UUID`, `Date`). **`System` is deliberately not exposed** (no
   `System/exit`, no `System/getenv` secret leaks).
 - **Injected integrated namespaces** (via `setup-agent-namespaces!`), called
-  fully-qualified, no `require` needed:
-  - `dh` — datahike `q`/`pull`/`transact!` against the shared chat DB.
+  fully-qualified or required and aliased as in babashka. The borrowed surfaces carry
+  their real names, so the model's training transfers:
+  - `babashka.fs` (path-clamped to the workspace; content I/O is `slurp`/`spit`),
+    `babashka.http-client` (domain-gated), `babashka.process` (`shell`/`sh`, muschel-backed
+    and jailed), `cheshire.core`, `clojure.data.xml` (XXE-safe), `datahike.api` (the real
+    API on any conn), `dvergr.codec` (base64, url, html helpers).
+  - `dh` — datahike `q`/`pull`/`pull-many`/`entity`/`datoms`/`schema`/`db` against the
+    room's DB, and `dh/search` (fulltext over the scriptum secondary index).
   - `dvergr.intake.*` — read-only external SOURCE files in the room repo (cloned from
     the [dvergr-sandbox](https://github.com/replikativ/dvergr-sandbox) stdlib);
     `require` + extend them. e.g. `dvergr.intake.hn`,
     `dvergr.intake.web-fetch` (`fetch-page`), `dvergr.intake.web-search` (`search`),
     `dvergr.intake.github`, `dvergr.intake.youtube` (`get-transcript`), … —
     `(sandbox/overview)` lists the live set.
-  - `search`, `entity`, `knowledge` — knowledge base + graph.
-  - `room` (post to / read other rooms), `tasks`, `agents` (read-only directory),
-    `actors` (spawn sub-agents / assign skills), `calendar`, `skills`.
+  - `dvergr.room` — your room: its `*kb*`/`*room*` conns, databases, `fork!`/`merge!`,
+    posting to other rooms, `kb-search`.
+  - `dvergr.agent` — rosters, environments and `hire!` (a durable Run with a result
+    Spin; on the host `dvergr.agent.program/hire!`), `dvergr.tasks` (the task ledger),
+    `dvergr.agents` (read-only directory), `dvergr.actors` (register/retire participants,
+    assign skills), `dvergr.skills` (find, author, lift, promote), `dvergr.mail` (the room's
+    mailbox, when attached).
   - `llm` — cheap one-shot LLM calls (`summarize`/`call`).
   - `doc`, `vision` — media extraction: `doc/extract-text` (PDF/text → string),
     `vision/describe` (image → OCR + description), `vision/extract` (image →
     schema-constrained JSON with per-field verification). Read through the
     chat-ctx's muschel FS, so `/drive` files work; see [media.md](media.md).
-  - `scheduler` — per-room recurring / one-shot tasks, incl. `:code` schedules
-    (see [scheduling.md](scheduling.md)).
-  - `fs`, `git`, `bash`, `proc`, `http`, `env` — path-safe, audited I/O (see boundaries).
-  - `spindel.comb` / `spindel.sig` / `sync` — reactive primitives; `spin`/`await`/`track`
-    when the session is backed by a spindel execution context.
+  - `dvergr.scheduler` — per-room recurring / one-shot tasks, incl. `:code` schedules
+    (see [scheduling.md](scheduling.md)); there is no separate calendar namespace.
+  - `git` (structured git for the workspace), `dvergr.shell` (the shell's
+    `check`/`builtins`/`allowlist`), `env` (env vars, secrets as placeholders),
+    `processes` (list and steer your own long-running work).
+  - `spindel.comb` / `spindel.sig` / `spindel.work` / `sync` — reactive primitives;
+    `spin`/`await`/`track` when the session is backed by a spindel execution context.
+  - `infer` / `dist` — probabilistic inference (foerster).
   - `sandbox` — runtime self-reflection: `(sandbox/overview)` lists every injected
     namespace with purpose + example + fns; `(sandbox/doc 'dh)` zooms into one.
 
 ### Safety boundaries
 
 - **Denied**: `eval`, `load-file`, `load-string` (and their `clojure.core/*` forms).
-- **No raw file/shell/network.** I/O only goes through the gated namespaces: `fs`/`git`
-  are path-safe and **audited** (every op logged to an audit-log atom); `bash` is the
+- **No raw file/shell/network.** I/O only goes through the gated namespaces:
+  `babashka.fs`/`git` are path-safe (clamped to the workspace); `babashka.process` is the
   muschel jail (workspace rooted at `/`, relative paths only, destructive ops blocked);
-  `proc` is capability-gated by an explicit command allow-list (default `#{}` — nothing);
-  `http` is domain-gated; `env` returns a *placeholder* for any configured API key,
-  which `http` substitutes only at the key's bound domain + slot and scrubs from the
+  `babashka.http-client` is domain-gated; `env` returns a *placeholder* for any configured
+  API key, which the HTTP client substitutes only at the key's bound domain + slot and scrubs from the
   response — so the agent uses keys it never sees (see
   [boundary-secret-injection.md](boundary-secret-injection.md)).
 - **Resource limits**: an `interrupt-fn` fires at every fn-body entry to honour
@@ -150,8 +164,11 @@ artifacts, a content-addressed blob store): agents reach them with the same
 `ls`/`cat`/`grep`/redirect idioms as any other path, and the media fns
 (`doc/extract-text`, `vision/*`) read through the same FS.
 
-Mounts are supplied by the embedder through the `:mounts` option on
-`dvergr.intake.bash/make-host` (or the `set-mounts-fn!` hook, resolved per
-workspace). The standalone daemon ships no drive yet; simmis provides a
-datahike + CAS-backed one, and a built-in drive is on the roadmap — see
+Mounts are supplied through the `:mounts` option on `dvergr.intake.bash/make-host`
+(or the `set-mounts-fn!` hook, resolved per workspace). The daemon installs the
+built-in drive (`dvergr.drive.*`, `dvergr.drive.integration/install!`): every room's
+shell sees its own drive at `/drive`, provisioned on first use. File contents are
+content-addressed blobs in a konserve store, a filestore under `.dvergr/blobs` unless
+`:blob-store` in the config names another (e.g. `{:backend :s3 :bucket … :region …}`).
+Other hosts (simmis) call the same `install!` — see
 [media.md](media.md#files-in--the-drive-mount).

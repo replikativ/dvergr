@@ -134,7 +134,7 @@
             :default-top-k       40}}
 
   ;; MiniMax M2.5 removed 2026-07-02 — Fireworks now 404s it (deprecated).
-  ;; Use minimax-m2p7 (above). Re-probe the registry when models rotate.
+  ;; Use minimax-m3 (above). Re-probe the registry when models rotate.
 
   ;; ─── Qwen ──────────────────────────────────────────────────────────────────
 

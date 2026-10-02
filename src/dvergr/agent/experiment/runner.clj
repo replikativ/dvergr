@@ -2,8 +2,9 @@
   "Run an experiment durably: what every benchmark provider shares.
 
    A provider brings its capabilities, EnvironmentDefs and candidates (the
-   `org.replikativ/dvergr-benchmarks` artefact has two, tau2 and BFCL; a
-   user's own benchmark is a third: doc/benchmarks.md). This namespace brings the
+   `org.replikativ/dvergr-benchmarks` artefact has tau2, BFCL, BIRD,
+   AutomationBench and SpreadsheetBench; a user's own benchmark is one more:
+   doc/benchmarks.md). This namespace brings the
    rest: the durable experiment directory, the experiment Room, Claude Code
    settings for the run, waiting out subscription usage windows, resume, and
    the Scorecard. Every cell (candidate x environment x repetition) is one
@@ -276,7 +277,11 @@
 
 (defn run!
   "Run (or resume) an experiment. Returns `{:dir :experiment-room :experiment
-   :results :failed-cells :scorecard}`.
+   :results :failed-cells :scorecard :receipts :refused :preflight
+   :subscription}` (`:results` is the number of cell results, `:receipts` the
+   Attempts' receipts) and writes `<dir>/report.md`. A preflight stop returns
+   `{:dir :experiment-room :experiment :preflight :stopped :over-budget}` and
+   writes no report.
 
      :dir           the experiment directory
      :benchmark     keyword; namespaces the experiment and dataset ids
@@ -293,6 +298,9 @@
      :repetitions :parallelism :experiment-id
      :claude-cli :claude-env :host-context-note (`:auto`, a string, or nil)
      :usage-pause-threshold :usage-retries
+     :fault-retries how often cells that faulted or errored are re-run within
+                    this call (default 1; not when cells were `:refused`)
+     :on-room       `(fn [room])`, called with the experiment Room
      :preflight     `{:budget {:dollars d :subscription share} :stratum-fn f}`:
                     run a pilot first (one cell per candidate per stratum,
                     `experiment.preflight`), estimate the rest, and stop with

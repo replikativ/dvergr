@@ -228,7 +228,8 @@ A lead Run works in world `A`. Hiring a researcher creates `B = fork(A)`; that
 researcher may create `C = fork(B)`. Accepted `C` work merges into `B`, and
 accepted `B` work merges into `A`. Trunk is never an implicit target.
 
-The canonical nested ownership path now exists: SCI `dvergr.agent/hire!` and the
+The canonical nested ownership path now exists: SCI `dvergr.agent/hire!` (host:
+`dvergr.agent.program/hire!`) and the
 `spawn_agent` / `propose_change` tool adapters all use Run worlds. Recursive
 `hire-in!` keeps durable facts in the root control Room while forking and settling
 against the immediate work-world parent. Paid recursive LLM delegation remains

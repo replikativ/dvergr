@@ -44,7 +44,7 @@ Priority: `(paths/set-home! …)` → `$DVERGR_HOME` → `./.dvergr`. Layout:
 ```clojure
 {;; LLM agents — SEED for the Datahike actor rows (see "Agents" below).
  :agents {:var {:provider :fireworks
-                :model    "accounts/fireworks/models/minimax-m2p5"
+                :model    "accounts/fireworks/models/minimax-m3"
                 :tags     #{:secretary}
                 :description "Primary interface — chat and task routing"
                 :profile  "var"}}   ; optional; defaults to the agent id → resources/agents/<id>.md
@@ -55,7 +55,6 @@ Priority: `(paths/set-home! …)` → `$DVERGR_HOME` → `./.dvergr`. Layout:
                  :tool-commands? false}       ; allow /clojure_eval etc. from Telegram (default off)
  :allowed-users [{:id 12345 :username "…"}]   ; Telegram access control
  :notify-chat-ids [12345]                     ; route intake output to these chats
- :slack         {:token "xoxp-…"}             ; or env SLACK_USER_TOKEN
  :zulip         {:email "…" :api-key "…" :site "…"}
  :github        {:token "…"}                  ; or env GITHUB_DVERGR_TOKEN
  :mail          {:account-id {:email "…" :imap {…} :smtp {…} :data-path "…"}}
@@ -68,13 +67,22 @@ Priority: `(paths/set-home! …)` → `$DVERGR_HOME` → `./.dvergr`. Layout:
  :sandbox-env   {"ZULIP_SITE" "https://your-org.zulipchat.com"}
 
  ;; Sandbox stdlib source — every room workspace is cloned from here.
- :sandbox-repo  "https://github.com/replikativ/dvergr-sandbox"}
+ :sandbox-repo  "https://github.com/replikativ/dvergr-sandbox"
+
+ ;; Daemon services.
+ :http          {:port 17880 :ip "127.0.0.1"}   ; web dashboard + JSON API (needs the web deps)
+ :mcp           {:port 17888 :bind "127.0.0.1" :profile "offload"
+                 :http {:port 17889}}           ; MCP over loopback TCP, optionally Streamable HTTP; doc/mcp.md
+ :gc            {:interval-ms 21600000          ; storage GC every 6 h (default)
+                 :retention-days 30}            ; default nil: keep all history, reclaim only fork garbage
+ :blob-store    {:backend :s3 :bucket "…" :region "…"}  ; /drive blobs; default a filestore under .dvergr/blobs
+ :shell         {:jail {:commands ["python3"]}}}  ; real programs in the room shell; doc/tools-and-sandbox.md
 ```
 
 ### Environment variables
 
 **Core** — `DVERGR_CONFIG` (config path) · `DVERGR_HOME` (state root) ·
-`TELEGRAM_BOT_TOKEN` · `GITHUB_DVERGR_TOKEN` · `SLACK_USER_TOKEN`.
+`TELEGRAM_BOT_TOKEN` · `GITHUB_DVERGR_TOKEN`.
 
 **Models** — `ANTHROPIC_API_KEY` · `OPENAI_API_KEY` / `OPENAI_BASE_URL` ·
 `FIREWORKS_API_KEY` / `FIREWORKS_BASE_URL` · `CODEX_HOME` (providers) ·
@@ -92,15 +100,16 @@ Two independent pieces, both project-overridable:
 
 1. **Config** (model / provider / tags / description): the **Datahike actor row
    is authoritative**. `config.local.edn :agents` is materialised into actor rows
-   **once** at startup (`dvergr.actors/bootstrap-from-config!`, idempotent — it
-   only writes agents that don't exist yet). Thereafter the runtime / UI edits the
+   at daemon start (`dvergr.orchestration.daemon/start-from-config!` creates each
+   configured agent; `dvergr.actors/ensure-agent!` is idempotent — it only writes
+   agents that don't exist yet). Thereafter the runtime / UI edits the
    actor row; the file is not rewritten. To re-seed a changed file, add the new
    agent (bootstrap skips existing) or edit the actor row directly.
 
 2. **Persona** (the system prompt): **managed state, not a file** — stored on the
    actor row (`:actor/system-prompt`) and resolved **DB-first** by
    `dvergr.agent.persona`, falling back to the built-in `resources/agents/<id>.md`.
-   `update_agent_profile`, the agent-config UI, and `ops/update-agent!` all write the
+   `update_agent_profile`, the agent-config UI, and `dvergr.agent.ops/update-agent!` all write the
    row; dvergr's own resources are never mutated. `(persona/source id)` reports
    `:db` / `:builtin` / `:none`. Because the prompt lives in Datahike it is
    value-semantic (forks with the actor row) and versioned with the rest of the DB —
@@ -116,6 +125,8 @@ DB) — without forking dvergr.
 ```clojure
 ;; deps.edn → add dvergr as a dependency, then:
 ;; 1. ./config.local.edn  — your agents + tokens (gitignored)
-;; 2. ./.dvergr/agents/*.md — optional persona overrides
+;; 2. ./.dvergr/agents/*.md — optional agent definitions (frontmatter + prompt;
+;;    the daemon starts those with `autostart: true` and `vetted: true`;
+;;    scope chain of dvergr.discourse.definitions: builtin → ~/.dvergr → ./.dvergr → room)
 ;; 3. start the daemon from your project root; state lands in ./.dvergr/
 ```

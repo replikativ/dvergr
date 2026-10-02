@@ -24,16 +24,20 @@ clojure -M:cli --no-tui --web
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `-p`, `--port PORT` | `7888` | nREPL port (written to `.nrepl-port` for editor/`clj-nrepl-eval` auto-discovery) |
+| `--nrepl-port-file PATH` | `.nrepl-port` | where to write the nREPL port |
 | `--no-tui` | — | run without the TUI (daemon + nREPL only) |
 | `--web` | — | also start the web dashboard |
 | `--web-port PORT` | `17880` | web dashboard port (with `--web`) |
 | `--web-bind IP` | `127.0.0.1` | web bind address — the UI/API are unauthenticated, so default is loopback |
+| `--mcp` | — | also serve MCP on loopback TCP (clients connect through `bin/dvergr-mcp`; [mcp.md](mcp.md)) |
+| `--mcp-port PORT` | `17888` | MCP port (with `--mcp`) |
 | `-h`, `--help` | — | show usage |
 
 **Provider, model, and agents are not CLI flags** — they come from
 `config.local.edn` (with an env fallback). The shipped default leaves the provider
-unpinned and auto-selects the best one you have a key for (Anthropic → Fireworks →
-OpenAI → the local `claude` CLI). See [provider-setup.md](provider-setup.md) and
+unpinned and auto-selects the best one you have a key or login for (Anthropic →
+Fireworks → OpenAI → native Codex subscription → isolated Codex CLI → the local
+`claude` CLI). See [provider-setup.md](provider-setup.md) and
 [configuration.md](configuration.md).
 
 ## Layout

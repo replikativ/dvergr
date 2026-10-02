@@ -38,14 +38,15 @@ new namespace belongs at the lowest layer that satisfies its dependencies.
 
 ## REPL & tests
 
-Tests run under kaocha, with the `:local` alias active so sibling repos
-(`../spindel`, `../datahike`, `../yggdrasil`, …) override the published deps for
-co-development:
+Tests run under kaocha against the published deps, as CI does:
 
 ```bash
-clj -M:local:test                 # full suite
-clj -M:local:test --focus my.ns   # one namespace
+clj -M:test                       # full suite
+clj -M:test --focus my.ns         # one namespace
 ```
+
+For co-development, add the `:local` alias so sibling checkouts (`../spindel`,
+`../datahike`, `../yggdrasil`, …) override the published deps: `clj -M:local:test`.
 
 Start a REPL (drop `:local` if you don't have the siblings checked out):
 
@@ -69,8 +70,6 @@ The published artifact ships `src` + `resources` only (the `src-clients/` TUI + 
 are standalone apps, not the library). To keep the core footprint small, some deps
 are **not** in `:deps` — add them in your project if you use that feature:
 
-- **SCI** — pinned to the `whilo/sci` fork (a git dep, so it isn't written into the
-  published pom). Clojars consumers must add it until the fork lands on Maven.
 - **Web dashboard + JSON API** (`dvergr.web.*`) — ships in the library; add the four
   reitit modules to run it: `metosin/reitit-ring`, `reitit-malli`, `reitit-middleware`,
   `reitit-swagger` (~2.5 MB; **not** the `metosin/reitit` uber-bundle, which is 7.8 MB
@@ -81,7 +80,7 @@ are **not** in `:deps` — add them in your project if you use that feature:
 - **Mail intake** (`dvergr.intake.mail`) — add `io.forward/clojure-mail` +
   `org.replikativ/briefkasten`. Without them the sandbox just has no `intake.mail`.
 
-Heavier transitive weight (ClojureScript/shadow, Anglican, Lucene) comes from the
+Heavier transitive weight (ClojureScript/shadow, Lucene) comes from the
 sibling libs (spindel, scriptum, briefkasten), not dvergr's direct deps — trimming
 those is an upstream task tracked separately.
 

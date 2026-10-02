@@ -23,6 +23,11 @@ in your own repo: `dvergr.agent.evaluation`, `environment`, `experiment`,
 | 1 | Frozen/recorded IO, no containers | planned |
 | 2 | Container-bound public leaderboards (Terminal-Bench, SWE-bench) | calibration only, via an external adapter |
 
+Other providers, each with its own section below: AutomationBench (upstream's Python behind
+a sidecar), BIRD (text-to-SQL on SQLite and Datahike), SpreadsheetBench (graded on
+rechentafel), and the room workflows (competitor discovery, contract review, the bank-booking
+case pack; doc/room-workflows.md). Data setup per benchmark: [benchmarks/README.md](../benchmarks/README.md).
+
 ## What a benchmark brings
 
 Every benchmark is a *provider* on one evaluation path
@@ -118,10 +123,6 @@ running again with a larger budget resumes from the pilot. This is the experimen
 its own resource use before committing to it; the measurements it keeps are what later
 predictions, and tuning on pilots before a full run, build on.
 
-Still shared by accident, not by design: the Python-semantics layer and the
-JSON reader live under `dvergr.benchmarks.tau2` (`python`, `pyjson`) and BFCL
-requires them from there.
-
 ## Wiki (a catalog workflow, not a transcription)
 
 `dvergr.catalog.wiki`: turn a folder of documents (`/docs`) into a linked wiki
@@ -198,7 +199,7 @@ plant name) are chosen so that no other document states them.
   lose exactly what they damaged. Worlds are pure functions of the seed and do not
   depend on the JVM's locale.
 - Run: `catalog_benchmark {workflow: "wiki/v3", models, environments: 6, split: "dev"}`
-  (or `(wiki/experiment! {:version 3 :n 6 …})`); `catalog_start` on the benchmark set
+  (an MCP connection with `--profile bench`, doc/mcp.md; or `(wiki/experiment! {:version 3 :n 6 …})`); `catalog_start` on the benchmark set
   uses world 1. End to end (`catalog_daemon_test`): a perfect wiki of each world
   scores 1.0 against that world's gold.
 
@@ -583,22 +584,30 @@ Datalog.
   - `:sqlite`: SQL on SQLite, as upstream;
   - `:pg-datahike`: SQL on Datahike;
   - `:datalog`: a Clojure expression over `(q query & inputs)`, evaluated in the sandbox.
-    Ranking is `sort-by`/`take`, since Datalog has no ORDER BY or LIMIT.
+    Ranking uses the map query form's `:order-by`, `:limit` and `:offset` (since #210; a
+    vector query with `:order-by` reads as the map form).
+- **Read-only SQL** (provider version 14): a candidate's SQL must be one read statement
+  (SELECT or WITH); pg-datahike runs each query in a fresh session, and SQLite connections
+  cannot ATTACH files.
 - **Grading:** the evaluator re-runs the submitted query on the candidate's engine and
   compares rows with the gold.
 
 **Substrate check (zero tokens, `bird.compat`).** Every gold query on SQLite and through
 pg-datahike on the same data, raw and through a SQLite→PostgreSQL rewrite (`bird.dialect`:
 backticks and case-folding, `IIF`, `STRFTIME` on ISO text, `INSTR`, `DATE('now')`,
-`LIMIT a, b`, SQLite's NULL ordering). On 6 of the 11 databases (858 questions; the five
-large ones pending):
+`LIMIT a, b`, SQLite's NULL ordering, negative `SUBSTR` starts, case-insensitive `LIKE`).
+
+All 11 dev databases, 1,534 questions (#207, measured on 2026-09-29): with the dialect
+rewrite, **1372 / 1534 (89.4%)** return SQLite's exact rows on pg-datahike 0.1.264.
+
+The first check (2026-09-28) covered 6 of the 11 databases (858 questions):
 
 | | exact match with SQLite |
 | --- | --- |
 | raw BIRD SQL through pg-datahike | 624 / 858 (73%) |
-| with the dialect rewrite | 748 / 858 (87%): simple 437/479, moderate 227/277, challenging 84/102 |
+| with the dialect rewrite | 748 / 858 (87%): simple 437/479, moderate 227/277, challenging 84/102; 774 / 858 with #207 |
 
-The remaining 110 split into:
+The remaining 110 of that first check split into:
 - pg-datahike defects, 11 of them, each reproduced in isolation and handed over
   (2026-09-28). The worst: every window function returns NULL after the 8th row (a
   transient written in place). Others include a derived table's `ORDER BY … LIMIT` and
@@ -609,9 +618,9 @@ The remaining 110 split into:
 
 
 **Model runs, Luna, SQL on SQLite vs Datalog on Datahike** (2026-09-28). Harness iterations on
-the dev split (`:split :dev`, a third of each database's questions by digest). There's no
-held-out result yet: 4 databases × 8 questions × 2, 128 cells each, a few minutes each, the
-weekly window unmoved.
+the dev split (`:split :dev`, a third of each database's questions by digest): 4 databases ×
+8 questions × 2, 128 cells each, a few minutes each, the weekly window unmoved. Later
+versions and the held-out results follow below.
 
 | Harness | SQL on SQLite | Datalog | Datalog − SQL [95%] | Datalog query errors | Datalog cost vs SQL |
 | --- | --- | --- | --- | --- | --- |
@@ -641,10 +650,97 @@ What holds:
 - Some losses are float last-digit differences from the order of operations, graded wrong by
   upstream's exact comparison for any engine.
 
-The stronger Datahike story for BIRD is SQL on Datahike: 87% of the gold queries already
-return SQLite's exact rows, most of the rest are pg-datahike defects handed over, and the
-model writes the SQL it is best at. That candidate runs once the fixes land. Open: a
-stronger model for Datalog, and the eval split.
+**Provider versions 5–14** (2026-09-29 to 2026-10-02; each version is in the verifier's
+basis, so a change never resumes into old cells):
+- **5** (#209): aggregates see every row of the join, as in SQL (`:with` over the entity
+  variables); exact ratios are graded as their nearest double.
+- **6–7** (#210): sort and limit with the map form's `:order-by`/`:limit`/`:offset`; the
+  arithmetic example takes each aggregate from its own query.
+- **8** (#214): a submitted query that fails comes back with its error (every engine);
+  Datalog queries have a 60 s deadline; a shorter Datalog description; a final reply that is
+  not a working query gets one reminder to submit.
+- **9** (#215): agent-written queries resolve functions as the Datahike server does, not
+  through the host.
+- **10–11** (#216): the description names the functions a clause may call, subqueries and the
+  0-based `:order-by` index; an experimental `:nested` candidate (nested calls made it worse:
+  0.625 vs flat 0.688).
+- **12** (#224): Datahike binds a function clause to a constant itself; `if` and
+  `clojure.math` in clauses.
+- **13** (#232): the description says rows are already distinct and how to return the row
+  with the largest value without that value, the two Datalog-only failures of the held-out
+  tier-1 run.
+- **14** (#242): a candidate's SQL may only read (see Candidates).
+
+**Held-out results** (`:split :eval`, Luna = `codex-subscription-luna`, paired: both engines
+answer the same questions):
+
+| Measured | Questions | SQL on SQLite | Datalog | Notes |
+| --- | --- | --- | --- | --- |
+| 2026-09-30 | 84 | 0.732 | 0.708 | Datalog − SQL −0.024 [95%: −0.08, +0.03] |
+| 2026-10-01, tier 1 | 100 | 0.67 | 0.64 | within variance (McNemar p = 0.51) |
+| 2026-10-01, A3 (100 fresh questions) | 100 | 0.59 | v13: 0.63, v12: 0.58 | v13 − v12 +0.05 [−0.01, +0.11], p = 0.23; Datalog vs SQLite not significant (p = 0.29) |
+
+On held-out questions Datalog on Datahike is within noise of SQL on SQLite with Luna, at about
+1.6× SQLite's tokens per question. Open: the cost gap.
+
+SQL on Datahike remains the other Datahike candidate: 89.4% of the gold queries already return
+SQLite's exact rows, and the model writes the SQL it is best at.
+
+## SpreadsheetBench (spreadsheet tasks, on rechentafel)
+
+SpreadsheetBench (https://github.com/RUCKBReasoning/SpreadsheetBench, CC BY-SA 4.0; the
+Verified set `verified_400`: 400 tasks from Excel forums, one test case each;
+`dvergr.benchmarks.spreadsheetbench.*`). A task is an instruction, an input workbook and an
+answer position; upstream grades the cells of the answer range against a gold workbook.
+
+- **Grading** (`spreadsheetbench.core`): upstream's `compare_workbooks` (evaluation.py),
+  ported: answer ranges column-major, numbers and booleans rounded to 2 places as Python's
+  `round` does, dates to a day serial, times to `HH:MM`, nil and `""` equal; the truth is the
+  value Excel saved in the gold workbook. One deliberate difference: rechentafel keeps no
+  number formats, so a produced cell is typed by the gold cell's format.
+- **Oracle** (`spreadsheetbench.oracle`, zero tokens): for each task, whether the input
+  workbook with the gold's answer cells written into it recalculates in rechentafel to the
+  answer Excel saved (`:certified`: a correct answer would be graded correct), or, for a
+  solution that also edits other cells, whether recalculating the gold workbook reproduces
+  its saved answer (`:certified-gold`). The rest are reported with the reason (unsolvable,
+  malformed, missing sheet, error, timeout), never charged to a candidate. **390 of 400** tasks are
+  certified. Experiments run only certified tasks.
+- **Candidates** (`spreadsheetbench.provider`, version 3): the workbook is a rechentafel value
+  in memory; the tools are `read` (a range's values and formulas), `write` (values or
+  formulas; the workbook recalculates and the candidate sees the computed values) and
+  `submit`. The evidence is the list of writes; the evaluator replays them onto a fresh copy
+  of the input, recalculates and grades the answer range (`:checks {:submitted :correct}`),
+  so a verdict is reproducible without the model.
+- **Splits** (`spreadsheetbench.experiment`): `:dev` (a third) and `:eval`, fixed by the
+  digest of the task id. `:sample n` takes n tasks of a split, the same ones for a given
+  `:seed`. Tune on `:dev`, report on `:eval`.
+- **Search** (`spreadsheetbench.smc`): `:search {:particles 4 :twist :oracle}` runs each
+  episode as SMC over agent steps (foerster's `steer`): N particles, each an episode advanced
+  one model turn at a time and resampled on a value estimate after every turn. Value
+  estimates: `:oracle` (the answer cells still wrong; privileged, an upper bound),
+  `:structural` (write errors), `:judge` (a judge model's estimate that the answer will be
+  correct) or `:none` (best-of-N). Every particle's model calls are counted, so a search is
+  compared with single episodes at equal model calls. `:export` writes the searches'
+  trajectories as training records.
+
+Data: `SPREADSHEETBENCH_ROOT` (default
+`~/.cache/dvergr-bench/spreadsheetbench/data/spreadsheetbench_verified_400`). Experiments
+read the oracle's certification from `~/.cache/dvergr-bench/spreadsheetbench/oracle-verified-400.edn`
+and throw "Run the oracle first" without it; write it once with
+`(spit (experiment/oracle-file) (pr-str (oracle/report)))`.
+
+```clojure
+(require '[dvergr.benchmarks.spreadsheetbench.experiment :as sbx])
+(sbx/run! {:dir "runs/sb-eval" :split :eval :sample 100
+           :candidates [{:id :luna :model "codex-subscription-luna"}]})
+```
+
+**Held-out result** (measured on 2026-10-01; provider version 3): a sample of 100 certified
+`:eval` tasks, Luna (`codex-subscription-luna`): **85 / 100** (95% interval 77–91%), $0.0045
+per pass at list price, median 29 s per task. This is not comparable to the public
+leaderboard: it is a subset (certified, held-out), the tool interface differs (read, write and
+submit over rechentafel, where the agent sees computed values) and each task has one test
+case.
 
 ## BFCL v4 (single-turn, Python)
 
@@ -855,7 +951,9 @@ temperature 0 as both the user simulator and the NL-assertion judge. A
 number produced with a different user or judge model is a Dvergr-internal
 measurement, not a leaderboard entry. Use the upstream `train` split (74
 tasks) for tuning and self-optimization. Report on `test` (40 tasks), which
-tuning must never see.
+tuning must never see. Nothing enforces this: `tx/run!` defaults to `:split "base"`
+(train and test together), so pass `:split "test"` for a reported number. BFCL has no
+split.
 
 ### Protocol notes
 
@@ -1120,8 +1218,10 @@ records its verifier's trust tier (`:verifier-trust`) and its experiment cell.
 
 Each experiment directory holds one durable store with the experiment Room,
 a certified Attempt per cell, and a Scorecard once every cell completed (an
-infrastructure fault is not a verdict; re-running resumes and re-runs exactly
-those cells). Records made before 2026-09-20 used episode Rooms instead;
+infrastructure fault is not a verdict: `runner/run!` re-runs faulted or errored cells
+within the same call, `:fault-retries` times, default 1, and re-running the same
+directory resumes and re-runs exactly the cells still without a verdict). `run!` writes
+`<dir>/report.md`, except when a preflight stops it (`:stopped :over-budget`). Records made before 2026-09-20 used episode Rooms instead;
 `inspect` reads both shapes.
 
 Run it in a dedicated JVM, because it isolates Dvergr's home to the
@@ -1149,8 +1249,9 @@ experiment directory:
 (insp/verify-episode e)                          ; Room-path records only
 ```
 
-The host runner (`dvergr.benchmarks.tau2.runner`) remains available for
-quick, unrecorded batches.
+The host runner (`dvergr.benchmarks.tau2.runner/run!`) remains available for
+quick batches outside the experiment path (no certified Attempts or Scorecard);
+`tx/run!` is the recorded path.
 
 ## tau2-bench (banking_knowledge, `bm25` retrieval)
 
@@ -1465,14 +1566,14 @@ environment execution only; model latency dominates live episodes.
 
 ## Next steps
 
-1. Fork-at-turn rollouts. These need a frozen context fork and a store that
-   follows the fork (`doc/conversation-evaluation.md`, revision 10).
-2. Measure the candidates properly: full `base` split, 4 trials, and a
-   user simulator that differs from the agent model. Then tune the REPL
-   candidate's prompt and affordances on `train` only.
-3. Use forks for branching. Branch at a user turn for counterfactual rollouts
-   and cheap pass^k/GRPO-style groups from one shared prefix.
-4. Port the telecom domain the same way: oracle, fuzz,
-   equivalence, then live. Banking's other retrieval configurations
-   (`grep_only`, `full_kb`, `golden_retrieval`) need no embeddings and reuse
-   the same tools.
+Done since this list was first written: the telecom domain is ported and
+verified (above), and fork-at-turn exists (`:checkpoint-at` and `branch!` in
+`dvergr.benchmarks.tau2.episode`, see *Checkpoints and branches*).
+
+1. Measure the candidates properly: 4 trials on `test`, and a user simulator
+   that differs from the agent model. Then tune the REPL candidate's prompt and
+   affordances on `train` only.
+2. Use branches for counterfactual rollouts and cheap pass^k/GRPO-style groups
+   from one shared prefix; checkpoints and branches still use the Room path.
+3. Banking's other retrieval configurations (`grep_only`, `full_kb`,
+   `golden_retrieval`) need no embeddings and reuse the same tools.

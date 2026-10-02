@@ -27,8 +27,8 @@ workspace + Datahike message/knowledge stores); a thin global **system-db**
 - **L2 — per-chat / per-room state**: `chat.context` (signals + Datahike + SCI),
   `chat.schema` (the unified Datahike schema), `chat.accounting` (microdollar budgets),
   `participant.context`, the per-[room,agent] folded ChatContext (`agent/room-context`),
-  Room store impls (`room/store/*`), the `system.db` registry, the in-memory code index,
-  and analysis queries.
+  Room store impls (`room/store/*`), the `system.db` registry and the in-memory code
+  index.
 - **L3 — discourse + rooms**: `discourse` core (Room/Participant/Message, fork/merge,
   algebra: ask/fan-out/race/quorum/pipeline), the `room.registry`, `rooms` (CRUD +
   Datahike unification), rooms-as-projects provisioning (`system.rooms`, `system.mail`),
@@ -50,7 +50,7 @@ workspace + Datahike message/knowledge stores); a thin global **system-db**
   checkpoint/resume (`agent/process`).
 - **L6 — orchestration**: the `daemon` (still a large monolith — turn loop + session
   handling + Telegram adapter + evaluator inlined), the `scheduler`, actors + transport,
-  skills + the unified `definitions` loader, tasks, stats, personas, workflows, the
+  skills + the unified `definitions` loader, tasks, stats, personas, the
   central `ops` spec, and the Telegram channel.
 - **L7 — clients**: the `core` facade, MCP server/json-rpc, the nREPL `client`, the CLI
   entry point, the TUI app, and the web dashboard/API.
@@ -218,24 +218,29 @@ graph TD
 | `system/{db,rooms,mail}` | L2/L3 | the global system-db registry (identity backbone); rooms-as-projects provisioning/resolvers; attach a briefkasten mailbox as a ygg system |
 | `room/{registry,store,store/datahike,store/memory}` | L2/L3 | slug↔Room registry; PRoomStore protocol + Datahike/in-memory impls |
 | `discourse` (core) | L3 | Room/Participant/Message, fork/merge, algebra combinators |
-| `discourse/{background,enrichment,human,commands,personas,workflows,definitions}` | L3/L6 | background spawner; on-message decorators; human participant; slash-command registry; pre-built personas; workflow patterns; the unified skill+agent-identity loader |
+| `discourse/{background,enrichment,human,commands,personas,definitions,attention}` | L3/L6 | background spawner; on-message decorators; human participant; slash-command registry; pre-built personas; the unified skill+agent-identity loader; pure attention decisions |
 | `discourse/{llm,generation}` | L4/L5 | LLM participant factory; GenerationHandle bridge |
 | `rooms` + `rooms/{forks,messages,tree,stats,theme,scheduler}` | L3 | room CRUD + Datahike unification; fork describe/review/merge/discard; signal-backed transcript/tree/stats views; per-speaker theme; per-room reactive scheduler |
 | `adapters/core` | L3 | transport-agnostic medium adapter: inbound posting + egress Participant |
-| `tools` + `tools/{structural,code_analyzer,dependency_search,llm_call,approval}` | L4 | tool registry/executor (role-scoped); structural/analyzer edits; dependency search; one-shot LLM tool; approval workflow |
+| `tools` + `tools/{structural,llm_call,approval}` | L4 | tool registry/executor (role-scoped); structural edits; one-shot LLM tool; approval workflow |
+| `effects`, `authority`, `resource` + `resource/authority` | L4 | the effect boundary between sandbox code and the world (doc/effects.md); the `can?` authorization seam; conserved budgets and spindel's resource authority over the ledger (doc/unified-worlds.md) |
+| `drive/{core,fs,blobs,integration}` | L4 | the built-in room drive mounted at `/drive`: file nodes, the muschel FS, content-addressed blobs, host wiring |
+| `io/{frozen_web,acquisition}`, `search/secondary`, `media/{doc,vision}`, `audio/{stt,record}` | L4 | frozen web for discovery experiments; HTTP acquisition records; fulltext over Datahike's scriptum secondary index; document text and vision; speech-to-text |
 | `sandbox` + `sandbox/{deps,workspace}` + `sandbox/ns/*` | L4 | SCI runtime (ctx/eval/limits); gated add-libs; the workspace load-root; the injected namespaces (`io`/`data`/`datahike`/`agent`/`kb`/`room`/`mail`/`codec`/`dev`/`intake`) |
 | `intake/{bash,mail}` | L4 | the only in-tree intakes — muschel-jailed shell + briefkasten mail (all other data sources live in the dvergr-sandbox stdlib repo) |
 | `channels/{core,telegram,telegram_commands,telegram_send}` | L4/L6 | channel framework; Telegram Bot API (polling/old dispatch); `dvergr.ops` slash-command binding; outbound Markdown→HTML rendering + chunking |
 | `model/{provider,providers,registry,chat,quirks,gateway}` + `model/api/{anthropic,openai,claude_code,codex_subscription,codex_auth}` | L5 | provider protocol + registry + metadata; origin-confined credential injection; HTTP/SSE, native Codex subscription, and CLI compatibility transports; provider quirks |
 | `agent/{turn,prompt,process,tool_commands,persona,ops,fields}` | L5/L6 | shared turn mechanics; system-prompt assembler; checkpoint/resume process; tool commands; persona resolution; agent-management ops + field spec |
+| `agent/{program,run,world,roster,workflow}` | L5/L6 | `hire!` and agent programs; durable Runs; a Run's forked work world; immutable rosters; one task run N times on forks |
+| `agent/{evaluation,environment,experiment,experiment/*,verifiers,evaluators,attempt,spend,trajectory,conversation,episode}` | L5/L6 | the evaluation path (doc/evaluation-model.md): Attempts, EnvironmentDefs, experiments and their runner, preflight and statistics, verifier trust tiers, spend, trajectory export, certified conversations |
+| `catalog` + `catalog/{wiki,wiki_gen,room,room_run,casepack,report,workspace}` | L6 | catalog workflows (the wiki family) and room workflows (doc/room-workflows.md): bundles, case packs, `room-run`, report.md |
+| `jobs`, `artifact`, `activity` | L6 | long operations as durable Runs; content-addressed portable values; durable observations on room messages |
 | `orchestration/{daemon,skills,tasks,stats}` | L6 | the runtime daemon (lifecycle/registry/turn loop/sessions/Telegram); skill registry; task ledger; stats cache |
 | `actors` + `actors/transport` | L6 | durable actor identity table; PActorTransport impls |
 | `ops` | L6 | central operations spec — one data map; web/MCP/Telegram surfaces derived (datahike-spec pattern) |
 | `security/allowlist` | L6 | Telegram user allowlist access control |
-| `analysis/{queries,coverage}` | L2/L6 | Datalog extraction helpers; heuristic test-coverage analysis |
 | `core` | L7 | public API facade (re-exports discourse/llm/personas/bus) |
-| `mcp/{server,json_rpc}` | L7 | TCP/stdio MCP server + JSON-RPC/MCP dispatch |
+| `mcp/{server,json_rpc,http,surface,repl}` | L7 | TCP/stdio MCP server + JSON-RPC/MCP dispatch; Streamable HTTP; profiles, toolsets and result encoding; the REPL's `dvergr.ops` (doc/mcp.md) |
 | `clients/client` | L7 | nREPL client — inspect/interact + fork-task workflow over a daemon |
 | `cli/main` + `tui/app` (src-clients) | L7 | CLI entry point; the TUI app (a rich medium adapter onto rooms) |
 | `web/{server,dashboard,api,ops,agents}` | L7 | http-kit server; dashboard (hiccup+HTMX); spec-derived JSON API; web `ops` binding; agent config UI |
-| `experimental/distributed` | cross | EXPERIMENTAL Kabel remote-peer bridge (not release-wired) |

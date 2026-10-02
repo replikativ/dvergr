@@ -304,7 +304,8 @@ the canonical recoverable settlement boundary.
     (d/discard fork)))
 ```
 
-Bounded agent programs normally use `dvergr.agent/hire!`: it opens the canonical
+Bounded agent programs normally use the sandbox's `dvergr.agent/hire!` (on the
+host: `dvergr.agent.program/hire!`): it opens the canonical
 world, admits a durable Run, and returns a native result Spin for composition.
 `spawn_agent` and `propose_change` are model-tool adapters over that exact
 interpreter, selecting `:automatic` and `:review` settlement respectively. They

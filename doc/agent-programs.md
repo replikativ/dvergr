@@ -710,7 +710,7 @@ facts; it introduces no lifecycle, clock, mutable cell, or settlement authority.
 
 Probabilistic programs use the same placement rule. In SCI, Dvergr defaults
 `infer/smc-infer`, `infer/importance-sampling`, and `infer/kernel-infer` to
-Spindel's `:world-policy :fork`. Each particle and resampling descendant owns a
+`:world-policy :fork` (the inference is foerster's, run on Spindel worlds). Each particle and resampling descendant owns a
 canonical Yggdrasil fork. Before a result crosses into SCI, Dvergr removes the
 execution contexts and exposes only portable results, weights, statistics, and
 world descriptors. `infer/predict` likewise receives values rather than native

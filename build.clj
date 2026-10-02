@@ -14,13 +14,9 @@
      clj -T:build benchmarks-deploy   # ... to Clojars
      clj -T:build clean      # Remove target/
 
-   NOTE: dvergr depends on a fork of SCI via a git dep (whilo/sci, see
-   deps.edn). tools.build's write-pom only emits Maven coordinates, so the
-   SCI git dep does NOT appear in the published pom. Consequences:
-     - git-dep consumers (`org.replikativ/dvergr {:git/url …}`) resolve SCI fine.
-     - the uberjar bundles SCI fine.
-     - a Clojars consumer must add the SCI git dep themselves until the fork
-       lands on Maven (upstream PR) or we publish it under our own group."
+   NOTE: dvergr depends on SCI as `org.replikativ/sci` (a Maven release of
+   the fork with forkable interpreter worlds, see deps.edn), so the published
+   pom names it and Maven and git consumers resolve the same implementation."
   (:require [clojure.edn :as edn]
             [clojure.tools.build.api :as b]))
 
@@ -90,7 +86,7 @@
   "Build the standalone harness uberjar: one runnable jar that boots the daemon +
    nREPL + TUI + web dashboard + Telegram (main = dvergr.cli.main, the :cli entry).
    Bundles src-clients/ and the :cli extra-deps (spindel-tui, reitit web,
-   clojure-mail, nREPL). The SCI git dep is bundled into the uber too."
+   clojure-mail, nREPL)."
   [_]
   (clean nil)
   (b/copy-dir {:src-dirs ["src" "src-clients" "resources"] :target-dir class-dir})

@@ -304,8 +304,8 @@ Refactor first. Each step keeps the suite green.
    - `experiment/run`: protocols, each Attempt's cell identity, `:resume?`,
      `:complete-only?`.
    - `dvergr.benchmarks.tau2.provider`: world setup, conversation protocol,
-     grader as Evaluator. `tx/run!` is `experiment/run`; its own runner is
-     gone. All four domains and all three candidates verified on it.
+     grader as Evaluator. `tx/run!` is `experiment/run`; the host runner
+     (`tau2.runner/run!`) remains for unrecorded batches only. All four domains and all three candidates verified on it.
    - OPEN: checkpoints and branches (`episode/run!`, `branch!`) still use the
      Room path, which keeps `dvergr.agent.conversation`'s certification
      alive. They move with step 3. The tau2 episode namespace is not renamed

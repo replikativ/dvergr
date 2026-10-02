@@ -71,6 +71,14 @@
                                     #(export-records! export (smc/training-records task %))))))))
 
 (defn run!
+  "Run (or resume) a SpreadsheetBench experiment over the certified tasks
+   `select-tasks` picks (`:split`, `:sample`, `:seed`, `:ids`); see
+   `dvergr.agent.experiment.runner/run!` for the directory, resume, fault
+   re-runs and report. It forwards `:dir :repetitions :parallelism
+   :experiment-id :fault-retries :preflight :allowance
+   :usage-pause-threshold :usage-retries`, not the Claude Code options
+   (`:claude-cli`, `:claude-env`, `:host-context-note`: the runner's defaults
+   apply)."
   [{:keys [candidates agent-generate max-turns search export] :or {max-turns 30} :as opts}]
   (let [selected (select-tasks opts)
         caps (provider/capabilities selected

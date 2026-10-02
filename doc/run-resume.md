@@ -1,15 +1,16 @@
 # Resuming Runs from savepoints
 
 Status: **implemented** (2026-09-27), as below; see *As built* for where it differs from the proposal. Builds on spindel savepoints (spindel#56:
-`effects.savepoint`, `savepoint.portable`, shipped in 0.1.53; dvergr pins 0.1.54) and on the
+`effects.savepoint`, `savepoint.portable`, shipped in 0.1.53; dvergr pins spindel in deps.edn, 0.1.97 at the time of writing) and on the
 effect logs with idempotency classes (doc/effects.md).
 
-## Today
+## Before this work
 
-A Run that was running when its process stopped is failed on the next start
-(`run/reconcile-orphaned-runs!`, reason `:orphaned`). Its conversation is persisted (the
-Run's chat in the control room store, `program/run-chat-id`), its world is a fork of the
-room, and its effects are receipted, but nothing continues it.
+A Run that was running when its process stopped was failed on the next start
+(`run/reconcile-orphaned-runs!`, reason `:orphaned`). Its conversation was persisted (the
+Run's chat in the control room store, `program/run-chat-id`), its world was a fork of the
+room, and its effects were receipted, but nothing continued it. Now `program/resume!` (and
+the `run_resume` op) continues it; see *As built*.
 
 ## Proposal
 

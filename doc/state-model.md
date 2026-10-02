@@ -27,8 +27,8 @@ resolves `paths/set-home!` → `DVERGR_HOME` env → `./.dvergr` (project-relati
 
 - Datahike **store bytes** (`.dvergr/db/`), per-sim DBs, intake transcripts, the log.
   The DB's *content* is Tier 1 (branchable); its *store directory* is just where bytes
-  land. (Fulltext search is moving to a native Datahike `:scriptum` secondary index
-  maintained inside the DB store — no separate Lucene directory.)
+  land. (Fulltext search is a native Datahike `:scriptum` secondary index maintained
+  inside the DB store — no separate Lucene directory.)
   (Agent **prompts** used to live here as `.dvergr/agents/<id>.md`; they now live in
   the actor row — Tier 1. See "Personas" below.)
 

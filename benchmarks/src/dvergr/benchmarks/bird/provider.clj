@@ -13,8 +13,8 @@
      :sqlite       SQL on SQLite, as upstream
      :pg-datahike  SQL on the same data in Datahike, through pg-datahike
      :datalog      a Clojure expression over `(q query & inputs)`, Datahike's
-                   Datalog on that data, evaluated in the sandbox: Datalog has
-                   no ORDER BY or LIMIT, so ranking is `sort-by` and `take`
+                   Datalog on that data, evaluated in the sandbox; ranking
+                   uses the map form's `:order-by`/`:limit`/`:offset`
 
    The gold SQL, the gold rows and upstream's difficulty stay here; an
    EnvironmentDef names a question by database and id."

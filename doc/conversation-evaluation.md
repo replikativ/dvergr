@@ -49,20 +49,17 @@ experiment Room  (durable DatahikeStore, one per experiment directory)
 
 ### Namespaces
 
-- **`dvergr.agent.conversation`** (new, generic, agent layer). It certifies
-  conversational episodes:
-  - `(episode-spin experiment-room store env-def evaluator candidate opts)`
-    returns a Spin that yields a certified, persisted Attempt;
-  - `ConversationEnv` is a host capability (never exposed to SCI) providing
-    `:initial-world`, `:agent-tools`, `:counterpart`, `:respond` (the effect
-    interpreter), `:limits`, and the terminal predicate.
+The design named `episode-spin`, a `ConversationEnv` capability and a
+`dvergr.benchmarks.tau2.env` namespace; none was built under those names. As built
+(see *Implementation* below):
 
-  It reuses `environment/make-attempt-receipt`, `attempt/make-attempt`,
-  `attempt/persist!`, and `experiment/make-scorecard` /
+- **`dvergr.agent.conversation`** (generic, agent layer): the experiment store, home
+  isolation, episode Run admission and finish (`open-episode!`, `finish-episode!`),
+  effect rows and certification. It reuses `environment/make-attempt-receipt`,
+  `attempt/make-attempt`, `attempt/persist!`, and `experiment/make-scorecard` /
   `persist-scorecard!`. It adds no new durable types.
-- **`dvergr.benchmarks.tau2.env`**. This is the tau2 `ConversationEnv`: the
-  world, tools, customer, grader, and evaluator, built from the existing
-  domain map (`t2/load-domain`).
+- **`dvergr.benchmarks.tau2.episode`**: one tau2 episode: the world, tools, customer,
+  grader and candidates, built from the domain map (`t2/load-domain`).
 - **`dvergr.benchmarks.tau2.inspect`**. Read-only queries over an experiment
   store. It lists Scorecards and Attempts, shows an episode transcript
   (messages + activities + effects), replays the world, diffs against gold,
@@ -72,7 +69,7 @@ experiment Room  (durable DatahikeStore, one per experiment directory)
 
 The tau2 world value (retail db, or the banking
 `{:db :agent-unlocked :user-given :allowlist}`) is stored in the episode
-Room's Spindel context state at `[:dvergr.conversation/world]`. Tool
+Room's Spindel context state at `[:dvergr.benchmarks.tau2.episode/world]`. Tool
 execution reads and swaps it with the episode Room's context bound. As a
 result:
 

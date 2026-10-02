@@ -210,7 +210,7 @@
         (or (:on spec) (:on-day spec))
         (throw (ex-info (str ":n and :on/:on-day don't combine — :n expands to a "
                              "fixed interval, which cannot honour a calendar "
-                             "anchor. Use {:every :week :on :mon} for calendar "
+                             "anchor. Use {:every :week :on :monday} for calendar "
                              "cadence, or :n alone for fixed intervals.")
                         {:spec spec}))))
     ;; Raw interval forms get the same positivity guard: 0 / negative ms
@@ -231,7 +231,7 @@
      {:interval-ms N} | {:every-ms N}        → :interval
      {:every :hour :n 4}                     → :interval (N × unit)
      {:at \"ISO\" :once true}                  → :once
-     {:every :day :at \"HH:MM\" :on :mon …}    → :recurring
+     {:every :day :at \"HH:MM\" :on :monday …}    → :recurring
    Rejects unknown keys (see `normalize-spec`)."
   [spec ^java.util.Date from]
   (let [spec (normalize-spec spec)
