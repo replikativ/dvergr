@@ -277,3 +277,15 @@
                                          "<tool_result name=\"query\">1</tool_result>\n"
                                          "<tool_use>\n{\"name\": \"submit\", \"input\": {\"sql\": \"SELECT 1\"}}\n</tool_use>"))]
     (is (= ["query"] (mapv :name tool-calls)))))
+
+(deftest native-invoke-arguments-are-typed-by-the-tool-schema
+  ;; BFCL: `<parameter name="n">5</parameter>` arrived as "5" and failed the
+  ;; call's type check
+  (let [coerce @#'claude-code/coerce-arguments
+        tools [{:name "f" :parameters {:type "object"
+                                       :properties {:n {:type "integer"} :x {:type "number"}
+                                                    :ok {:type "boolean"} :s {:type "string"}}}}]]
+    (is (= {:n 5 :x 2.5 :ok true :s "5"}
+           (:input (first (coerce tools [{:name "f" :input {:n "5" :x "2.5" :ok "true" :s "5"}}])))))
+    (is (= {:n "five"} (:input (first (coerce tools [{:name "f" :input {:n "five"}}]))))
+        "a value that does not read as its type stays as it is")))
