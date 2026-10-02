@@ -125,7 +125,15 @@
     :or {action-space :tools budget-dollars 2.0 guidance :compute}}]
   (let [{:keys [system messages tools]} (ep/task-prompt room)
         calls (atom [])
-        call! (fn [name args] (ep/call-tool! (assoc episode :calls calls) name args))
+        ;; the sidecar failing (not the tool answering with an error) is the
+        ;; harness's failure: the tool layer would hand it to the model as
+        ;; the tool's result, so it is kept and the cell faults below
+        sidecar-failure (atom nil)
+        call! (fn [name args]
+                (try (ep/call-tool! (assoc episode :calls calls) name args)
+                     (catch Throwable t
+                       (reset! sidecar-failure t)
+                       (throw t))))
         chat-ctx (turn/new-working-ctx {:execution-ctx (:ctx room)
                                         :title "automationbench candidate"
                                         :budget-dollars budget-dollars})
@@ -155,15 +163,25 @@
                 (and cancelled? (cancelled?)) [:cancelled turn]
                 (>= turn max-turns) [:max-turns turn]
                 :else
-                (let [outcome (binding [ec/*execution-context* (:ctx room)
-                                        resource/*model-scope* model-scope]
+                (let [failure (volatile! nil)
+                      outcome (binding [ec/*execution-context* (:ctx room)
+                                        resource/*model-scope* model-scope
+                                        chat-agent/*turn-failure* failure]
                                 (chat-agent/run-agent-turn!
                                  chat-ctx {:provider provider :model model :tools tool-map
                                            :tool-ctx {:chat-ctx chat-ctx :tools tool-map :sci-ctx sci-ctx}
                                            :auto-compact? false :turn-number turn}))]
-                  ;; a failed turn (a provider error, a model that keeps
-                  ;; answering nothing) ends the episode with the world as
-                  ;; it is, as upstream's rollout ends on an error
+                  ;; a failure of the path to the model (transport, provider
+                  ;; limits) is not the model's: the cell faults and is run
+                  ;; again, as for the reference candidates. A model that
+                  ;; keeps answering nothing ends the episode with the world
+                  ;; as it is, as upstream's rollout ends on an error.
+                  (when-let [t @sidecar-failure]
+                    (throw (ex-info (str "AutomationBench sidecar failed: " (ex-message t))
+                                    {:type ::sidecar-failed} t)))
+                  (when (and (= :error outcome) (= :infrastructure (:kind @failure)))
+                    (throw (ex-info (str "Model provider failed: " (:cause @failure))
+                                    {:type ::provider-failed :failure @failure})))
                   (case outcome
                     :continue (recur (inc turn))
                     :complete [:agent-stop (inc turn)]

@@ -197,3 +197,18 @@
         (is (thrown? clojure.lang.ExceptionInfo
                      (provider/candidate-roster [{:id :x :model "claude-code-sonnet" :harness :dvergr
                                                   :action-space :repl :repl-guidance :nope}])))))))
+
+(deftest a-provider-failure-is-a-fault-not-the-model-s
+  ;; the Dvergr loop graded a provider outage as the model's :agent-error;
+  ;; the reference candidates' cells fault and are run again
+  (if-not (sc/available?)
+    (support/skip! "a-provider-failure-is-a-fault-not-the-model-s: no AutomationBench checkout")
+    (let [room (d/make-room {:id :automationbench/dv-provider-down :store (memory/make)})]
+      (try
+        (with-redefs [model-chat/chat (fn [_ _] (throw (ex-info "Max retries exceeded" {:status 503})))]
+          (let [receipt (:attempt-receipt
+                         (evaluate-with! room (provider/capabilities {})
+                                         {:id :dv :harness :dvergr :action-space :tools
+                                          :model "claude-code-sonnet"}))]
+            (is (not= :completed (:attempt/status receipt)) (pr-str (select-keys receipt [:attempt/status :attempt/checks])))))
+        (finally (d/close-room! room))))))
