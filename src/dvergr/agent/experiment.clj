@@ -12,6 +12,7 @@
             [dvergr.agent.spend :as spend]
             [dvergr.room.store :as store]
             [hasch.core :as hasch]
+            [org.replikativ.spindel.blocking :as blocking]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.spin.core :as spin-core]
             [org.replikativ.spindel.spin.combinators :as comb]))
@@ -802,9 +803,11 @@
                                                       errors)
                                         :faults (count (filter #(and (:attempt %) (not (verdict? (:attempt %))))
                                                                results))}}
-                          (->> results
-                               (make-scorecard experiment)
-                               (persist-scorecard! room)))]
+                          ;; a durable write: off the drain
+                          (sp/await (blocking/blocking
+                                     #(->> results
+                                           (make-scorecard experiment)
+                                           (persist-scorecard! room)))))]
           {:experiment experiment
            :execution {:parallelism parallelism
                        :attempt-count attempt-count
