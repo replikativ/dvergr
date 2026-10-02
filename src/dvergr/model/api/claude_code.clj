@@ -322,6 +322,30 @@
   [parsed]
   (or (:input parsed) (not-empty (dissoc parsed :name :id)) {}))
 
+(defn- coerce-argument
+  "`v` as the JSON-schema `type` asks, when it is a string that reads as one:
+   native `<invoke>` parameters arrive as text (`5`, `true`)."
+  [schema v]
+  (let [t (some-> (or (get schema :type) (get schema "type")) name)]
+    (if-not (string? v)
+      v
+      (case t
+        "integer" (or (some-> (re-matches #"\s*-?\d+\s*" v) str/trim parse-long) v)
+        "number" (or (when (re-matches #"\s*-?\d+(\.\d+)?([eE][-+]?\d+)?\s*" v) (parse-double (str/trim v))) v)
+        "boolean" (case (str/trim v) "true" true "false" false v)
+        v))))
+
+(defn- coerce-arguments
+  "Tool calls with each argument typed by its tool's parameter schema."
+  [tools calls]
+  (let [props (into {} (for [{:keys [name parameters]} tools]
+                         [name (or (get parameters :properties) (get parameters "properties"))]))]
+    (mapv (fn [{:keys [name input] :as call}]
+            (let [ps (get props name)]
+              (assoc call :input (into {} (for [[k v] input]
+                                            [k (coerce-argument (or (get ps k) (get ps (clojure.core/name k))) v)])))))
+          calls)))
+
 (defn- parse-tool-calls
   "Parse <tool_use> blocks from response text.
    Strips hallucinated <tool_result> blocks first to avoid matching old content.
@@ -663,8 +687,9 @@
                 raw-content (or (:result result-event) "")
                 ;; Parse tool calls from response text
                 {:keys [text tool-calls]} (if (seq tools)
-                                            (parse-tool-calls raw-content
-                                                              (set (keep :name tools)))
+                                            (update (parse-tool-calls raw-content
+                                                                      (set (keep :name tools)))
+                                                    :tool-calls #(some->> % (coerce-arguments tools) not-empty))
                                             {:text raw-content :tool-calls nil})]
             {:content text
              :tool-calls tool-calls
