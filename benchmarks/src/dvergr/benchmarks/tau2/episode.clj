@@ -576,7 +576,10 @@
                              nil)
 
                          :else
-                         {:to :agent :content reply :metadata {:role :user}})))))))))})))
+                         ;; plain, as the reference harnesses deliver it: no
+                         ;; `[customer · HH:mm]` (the wall clock leaked into a
+                         ;; frozen-clock world)
+                         {:to :agent :content reply :metadata {:role :user :plain? true}})))))))))})))
 
 ;; ---------------------------------------------------------------------------
 ;; Orchestration (host thread)
@@ -911,7 +914,7 @@
            ;; point at the checkpoint's world) before the message arrives.
            ((:after-greeting candidate))
            (binding [ec/*execution-context* (:ctx room)]
-             (d/post! room (d/message :customer :agent (:content pending) nil {:role :user})))
+             (d/post! room (d/message :customer :agent (:content pending) nil {:role :user :plain? true})))
            (when (= ::timeout (deref (:ended episode) timeout-ms ::timeout))
              (end! episode :timeout))
            (catch Throwable t (fault! episode :setup t)))

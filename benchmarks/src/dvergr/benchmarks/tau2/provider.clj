@@ -27,7 +27,11 @@
             [dvergr.benchmarks.live :as live]
             [dvergr.benchmarks.pyjson :as pj]))
 
-(def version 1)
+(def version
+  "2: the customer's messages reach a Dvergr-harness candidate as sent, without
+   the room's `[customer · HH:mm]` prefix (the wall clock leaked into a
+   frozen-clock world; reference candidates got the raw text)."
+  2)
 
 (defn- task-of [domain definition]
   (let [task-id (get-in definition [:environment/task :task-id])]
