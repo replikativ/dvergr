@@ -42,7 +42,7 @@ Two kinds of scheduled task:
 | Form | Meaning |
 |---|---|
 | `{:every :day :at "07:00"}` | daily at a wall-clock time |
-| `{:every :week :on :mon}` | calendar cadence (day-of-week) |
+| `{:every :week :on :monday}` | calendar cadence (day-of-week) |
 | `{:every :hour :n 4}` | every 4 hours — `:n` multiplies a fixed unit |
 | `{:interval-ms N}` / `{:every-ms N}` | raw fixed interval |
 | `{:at "2026-08-01T09:00" :once true}` | one-shot at an instant |

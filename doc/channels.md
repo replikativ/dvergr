@@ -38,12 +38,11 @@ for a private bot).
 |---|---|
 | **Text** | posted into the chat's Room as your user-actor; the room's agent replies |
 | **Voice note** | transcribed via [ASR](media.md#speech-to-text-asr) → posted as a `🎤 <transcript>` message, then handled like text; the transcript is echoed back so you see what was heard |
-| **Document / photo** | persisted via the embedder's `:store-file-fn` (into the room drive at `/drive/telegram/…`) and announced with a `📎` note; agents read it at `/drive` |
+| **Document / photo** | stored in the room's drive at `/drive/telegram/…` and announced with a `📎` note; agents read it at `/drive` |
 
 Voice transcription is wired by the daemon (`telegram-caps :transcribe-fn` →
-`dvergr.audio.stt/transcribe`). Document/photo storage requires an embedder that
-supplies `:store-file-fn` + a drive — the standalone daemon does not persist
-files yet (see [media.md](media.md#files-in--the-drive-mount)).
+`dvergr.audio.stt/transcribe`). Documents and photos go to the built-in drive
+(`dvergr.drive.integration/store-upload!`; see [media.md](media.md#files-in--the-drive-mount)).
 
 ## Rooms & addressing
 

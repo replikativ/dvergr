@@ -9,8 +9,10 @@
                  recalculates to the saved answer: a correct answer would be
                  graded correct.
 
-   A task is certified when it is solvable; the rest are reported with why,
-   never charged to a candidate."
+   A task is certified when it is solvable (`:certified`), or when the gold
+   recalculates as saved and its solution edits more than the answer cells
+   (`:certified-gold`); the rest are reported with why, never charged to a
+   candidate."
   (:require [dvergr.benchmarks.spreadsheetbench.core :as sb]
             [rechentafel.cell :as cell]
             [rechentafel.eval :as e]

@@ -30,7 +30,7 @@ states (and tests) hold for dvergr too.
      the declared state and seed, repin components, claim the escrow, `start-in!` the named
      function. `hydrate!` becomes `fork` + `hydrate-into!`. The embedder keeps its handle, and
      the law is unchanged.
-2. **dvergr authority:** `dvergr.resource/authority`, a `PResourceAuthority` over the ledger,
+2. **dvergr authority:** `dvergr.resource.authority/authority`, a `PResourceAuthority` over the ledger,
    mapping a world to the Run that owns it (`:run-id` in the Room's meta): `grant!` =
    allocate from the parent Run's wallet, `return!` = return the remainder, `escrow!` = move
    the remainder into an escrow account named by the savepoint id, `claim!` = move it into

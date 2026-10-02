@@ -125,8 +125,9 @@ as vision, so mounted drives work.
 
 Channels that receive files (Telegram documents/photos) persist them so agents
 can read them at `/drive` in their shell (`ls`, `cat`, `grep`) and via the media
-fns above. The drive is provided by the embedder through the `:store-file-fn`
-cap and the shell `:mounts` hook (`muschel.fs.mount`, mounted at `/drive`) — see
-[tools-and-sandbox.md](tools-and-sandbox.md#the-drive-mount). A built-in
-content-addressed drive for the standalone daemon is on the roadmap; until then
-document storage is an embedder capability.
+fns above. The daemon installs a built-in content-addressed drive
+(`dvergr.drive.*`): each room's drive is mounted at `/drive` in its shell
+(`muschel.fs.mount`), and uploads land there through
+`dvergr.drive.integration/store-upload!` (Telegram files under `/drive/telegram/`). Blobs
+go to a filestore under `.dvergr/blobs` unless `:blob-store` names another konserve store;
+see [tools-and-sandbox.md](tools-and-sandbox.md#the-drive-mount).

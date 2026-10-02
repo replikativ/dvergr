@@ -1,6 +1,7 @@
 # Process model — deliberable long-running work
 
-A `dvergr.agent.process.Process` wraps a spin so long-running work (a sandbox
+A process (the record `dvergr.agent.process.Proc`, named so it does not collide with
+`java.lang.Process`) wraps a spin so long-running work (a sandbox
 eval, an LLM turn, a delegated /task) can be **paused at checkpoints,
 inspected, redirected, and resumed** by a manager — the user pressing a
 TUI key, or the agent itself looking at its own running processes.

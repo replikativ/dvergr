@@ -106,6 +106,9 @@
    boundary. Re-running with the same directory resumes; a Scorecard is
    persisted only when every cell completed.
 
+   `:split` defaults to \"base\" (upstream's train and test together); tune
+   on \"train\" and report on \"test\" (nothing enforces it).
+
    Calls `conv/isolate-home!`: Dvergr's state root becomes `<dir>/home` for
    the whole process. Run experiments in a dedicated JVM or REPL, never in a
    daemon process."

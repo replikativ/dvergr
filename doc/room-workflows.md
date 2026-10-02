@@ -1,6 +1,12 @@
 # Workflows defined in a room
 
-Status: **design, agreed** (2026-09-27; decisions at the end).
+Status: **implemented** (see Landed); the Lifecycle below is the original design
+(agreed 2026-09-27; decisions at the end).
+
+Over MCP, the ops on this page (`catalog_check`, `catalog_calibrate`, `catalog_benchmark`,
+`catalog_cases`, `catalog_freeze`, `catalog_deploy`, `catalog_export`, `catalog_import`) are in
+the `bench` toolset: connect with `--profile bench` (the default `offload` profile does not
+list them; doc/mcp.md). `catalog_promote` is in the `admin` toolset.
 
 ## Why
 
@@ -21,31 +27,30 @@ A directory in the room's repository, `workflows/<name>/`:
 | `checker.clj` | a namespace with `(check {:files … :params … :gold …}) → {:checks {k bool} :reward 0..1}`, over the files the Attempt left under the captured directories (receipts later) |
 | `gold.edn`, `fixtures/` | the reference facts and the documents a benchmark world starts from, or |
 | `generator.clj` | `(world seed opts) → {:docs … :gold …}`, for generated benchmark sets with splits |
-| `calibration/` | a reference answer and damaged variants (see below) |
+| `calibration.edn` | a reference answer and damaged variants (see below) |
 
 It is ordinary room content: versioned, forked and merged with the room, reviewable as a diff.
 
 ## Lifecycle
 
-1. **Author**: `workflows/author!` in the sandbox (or files written through MCP) creates the
-   bundle; `workflows/check` validates its shape.
+1. **Author**: write the bundle's files into `workflows/<name>/` of the room (from the
+   sandbox or through MCP); `catalog_check` validates its shape.
 2. **Calibrate**: a checker earns trust the way the wiki benchmark did. `catalog_calibrate`
    scores the reference answer (must score top) and each damaged variant (must lose what it
    damaged). An uncalibrated checker can run, but its Scorecards say so.
 3. **Benchmark**: `catalog_benchmark {workflow: "<room>/<name>", models: […]}`; worlds are
    seeded from the fixtures or the generator; Scorecards, ranges, the baseline comparison and
-   cost at list price as for any workflow. Candidates include external agents (a CLI or any
+   cost as for any workflow (billed and list price, see below). Candidates include external agents (a CLI or any
    MCP client working in the Attempt's world).
 4. **Promote**: the room's owner promotes a calibrated bundle (like skills' `promote!`); its
    verifier trust moves from `:ad-hoc` to `:room` (`dvergr.agent.evaluation/trust-tiers`),
    which Scorecards show. Only host code is `:trusted`.
 5. **Deploy**: a schedule in a room (`dvergr.scheduler`) runs the workflow on the room's own
    data, e.g. "competitor watch, weekly", with the winning candidate.
-6. **Export / import**: `workflow_export` returns the bundle (an archive of its directory with
-   a manifest: content ids, the dvergr version it was calibrated on, the calibration result);
-   `workflow_import` installs it in another room
-   or on another machine, where `dvergr workflow run <bundle>` (CLI) or the local MCP server
-   runs and benchmarks it.
+6. **Export / import**: `catalog_export` returns the bundle (its files and a manifest:
+   content id, the dvergr version it was exported from, the calibration result);
+   `catalog_import` installs it in another room or on another machine, where
+   `dvergr.catalog.room-run` or the local MCP server runs and benchmarks it (Part 3).
 
 ## Trust
 
@@ -81,12 +86,36 @@ Part 3: `catalog_export {room name}` returns `{manifest files}` (format `dvergr-
 the bundle's content id, the dvergr version, its calibration there); `catalog_import {room
 export as?}` installs it as `workflows/<as>/`, committed, refused when the files are not the
 bundle the manifest names. Trust does not travel: a host promotes a bundle itself (the same
-content on the same host is already promoted). Run one without a daemon from a directory:
+content on the same host is already promoted).
+
+An export is an EDN map, not an archive. To run it from a directory, write its `:files`
+under a directory named like the bundle: `(dvergr.catalog.casepack/write-dir!
+"competitors" export)` writes every path of `:files` under `competitors/`. Then run it
+without a daemon:
 
 ```
 clojure -M -m dvergr.catalog.room-run path/to/competitors --check
 clojure -M -m dvergr.catalog.room-run path/to/competitors --models claude-haiku-4-5,codex-subscription-luna --repetitions 2
 ```
+
+`room-run` keeps the experiment in `<--out>/<bundle name>` (default `workflow-runs/`):
+running it again resumes, keeping cells that have a verdict. `--cases N` takes the first N
+cases of a dataset in a fixed shuffle (seed 20261001), so the same N gives the same cases
+every time. It prints each candidate's reward and two costs, writes `report.md` beside the
+experiment, and exits 1 when cells did not finish. A `claude-code-*` candidate works through
+dvergr's MCP tools; in a process without a daemon, the runner serves them from a headless
+one on an ephemeral loopback port.
+
+**Billed and list price.** `billed` is what the run was charged: about $0 for subscription
+candidates (`codex-subscription-*`, `claude-code-*`). `list price` is the same tokens at the
+list price of the API model a subscription model corresponds to (its registry entry's
+`:list-price-of`; for any other model it equals the bill), which is what compares models
+(`dvergr.agent.spend`); report.md uses it.
+
+**In a daemon**, `catalog_benchmark` runs the experiment in a room (`runner/run-in`): it
+writes no report.md, does not re-run faulted cells, and has no `cases` parameter, so a
+dataset runs every case per model (budget per attempt: $0.50 unless given). Only `room-run`
+and `runner/run!` write report.md.
 
 A bundle with `:fetched true` in `workflow.edn` records its Attempts' effects (`:world
 :effects {:record true}`), and its checker is given `:fetched {url body}`: the successful GET
@@ -145,11 +174,11 @@ variant. Search through the configured `BRAVE_API_KEY` (approved; queries counte
 ## Decisions (agreed 2026-09-27)
 
 - **Layout**: `workflows/<name>/` with `workflow.edn`, `checker.clj`, `gold.edn`, `fixtures/`,
-  optional `generator.clj`, `calibration/`.
+  optional `generator.clj`, `calibration.edn`.
 - **Checkers run in SCI**: sandboxed and portable (the same checker in dvergr, simmis and on
   a user's machine after export); a host fast path later if checkers get slow.
-- **Export**: a plain archive plus a manifest (content ids, the dvergr version it was
-  calibrated on, the calibration result); history stays in the room.
+- **Export**: the bundle's files plus a manifest (content id, the dvergr version it was
+  exported from, the calibration result), as one EDN map; history stays in the room.
 - **Search**: the configured `BRAVE_API_KEY` may be used, sparingly; queries are counted in
   the benchmark's records.
 
@@ -181,3 +210,16 @@ them, applications with the decision.
   `catalog_benchmark` and the rest apply as to any bundle.
 
 Attachments are text for now (a PDF needs its text extracted first).
+
+**Without a daemon.** The table need not be in a room: `dvergr.catalog.casepack/from-table`
+reads it (attachments beside it) and `write-dir!` writes the bundle, which `room-run` then
+benchmarks:
+
+```clojure
+(require '[dvergr.catalog.casepack :as casepack])
+(casepack/write-dir! "bookings" (casepack/from-table spec "export/bookings.csv"))
+;; clojure -M -m dvergr.catalog.room-run bookings --check
+```
+
+In a daemon, `catalog_cases` reads `table` from the room's workspace: write the file there
+first (e.g. with the room's file tools).

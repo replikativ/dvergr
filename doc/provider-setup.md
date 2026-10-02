@@ -152,7 +152,7 @@ model `:codex-subscription-cli` / `"codex-subscription-cli"`.
 | Claude Code subscription | Logged-in `claude` on `PATH` | `:claude-code` / `"claude-code-sonnet"` |
 | ChatGPT Codex subscription | `codex login` with ChatGPT | `:codex-subscription` / `"codex-subscription"` |
 | Keyring-only Codex login | Logged-in `codex` on `PATH` | `:codex-subscription-cli` / `"codex-subscription-cli"` |
-| Fireworks account | `FIREWORKS_API_KEY` | `:fireworks` / `"accounts/fireworks/models/minimax-m2p7"` |
+| Fireworks account | `FIREWORKS_API_KEY` | `:fireworks` / `"accounts/fireworks/models/minimax-m3"` |
 | OpenAI API account | `OPENAI_API_KEY`, plus an OpenAI registry entry | `:openai` / the registered model id |
 
 The built-in registry carries Anthropic, Claude Code, Codex subscription, five
@@ -202,21 +202,21 @@ startup and is also re-loadable via `(registry/load-models-resource!)`. Shape:
 
 ```clojure
 {:models
- {"accounts/fireworks/models/minimax-m2p7"     ; map key = the model :id
-  {:name "MiniMax M2.7"
+ {"accounts/fireworks/models/minimax-m3"       ; map key = the model :id
+  {:name "MiniMax M3"
    :provider :fireworks                         ; must match a provider key
    :api-type :openai-chat
    :capabilities #{:tools :streaming}           ; :tools :vision :thinking :streaming
                                                 ; :system-prompt :cache-control :json-mode
-   :context 196608                              ; context window (tokens)
-   :max-output 8192
-   :pricing {:input 0.30 :cache-read 0.03 :output 1.20}  ; $/MTok
+   :context 512000                              ; context window (tokens)
+   :max-output 16384
+   :pricing {:input 0.30 :cache-read 0.06 :output 1.20}  ; $/MTok
    :quirks {}}}                                 ; e.g. :default-top-p, :tool-id-in-every-chunk?
 
- :aliases  {"minimax" "accounts/fireworks/models/minimax-m2p7"}  ; short names
+ :aliases  {"minimax" "accounts/fireworks/models/minimax-m3"}  ; short names
 
- :defaults {:primary-model    "accounts/fireworks/models/minimax-m2p7"
-            :compaction-model "accounts/fireworks/models/minimax-m2p7"
+ :defaults {:primary-model    "accounts/fireworks/models/minimax-m3"
+            :compaction-model "accounts/fireworks/models/minimax-m3"
             :summary-model    "accounts/fireworks/models/gpt-oss-20b"}}
 ```
 
@@ -264,6 +264,6 @@ materialised into Datahike actor rows). The registry's `:defaults`
 
 ```clojure
 :agents {:var {:provider :fireworks
-               :model    "accounts/fireworks/models/minimax-m2p7"
+               :model    "accounts/fireworks/models/minimax-m3"
                :tags     #{:secretary}}}
 ```

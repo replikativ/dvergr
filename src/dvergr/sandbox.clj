@@ -1088,28 +1088,27 @@
    Call after fork-for-session, passing the spindel execution context
    (which for worker agents is the forked context with isolated systems).
 
-   Sets up:
-   - d/q d/pull d/entity ...         - datahike read (the real datahike.api)
-   - dh/transact! dh/retract!        - datahike write (same forked conn)
-   - sync/deferred sync/mailbox      - spindel sync primitives
-   - intake.hn, intake.web, etc.     - intake library functions
-   - fs/read, fs/write, fs/ls, ...   - rich filesystem (path-safe, audited)
-   - file/read, file/write, etc.     - legacy file I/O (kept for compat)
-   - proc/run, proc/run!, proc/lines - capability-gated process execution
-   - git/status, git/log, git/diff, git/add, git/commit - structured git (audited)
+   Sets up (the live list: `(sandbox/overview)`):
+   - datahike.api, dh/q dh/pull dh/search ... - datahike (the real API; fork-local conns)
+   - sync, spindel.comb, spindel.sig, spindel.work - spindel primitives
+   - dvergr.intake.*                 - intake SOURCE in the workspace (require + extend)
+   - babashka.fs                     - filesystem (path-clamped to base-path)
+   - babashka.process, dvergr.shell  - the muschel-jailed shell
+   - babashka.http-client            - outbound HTTP (domain-gated)
+   - git/status, git/log, git/diff, git/add, git/commit - structured git
    - llm/call, llm/summarize         - cheap one-shot LLM calls
-   - dvergr.room/kb-find, kb-search, *kb* - the room's knowledge base (datalog via `d`)
+   - dvergr.room/kb-find, kb-search, *kb* - the room's knowledge base
 
    Because writes go to the fork-local datahike conn, transact! in a worker
    agent context writes to the isolated fork — nothing lands in the parent
    until merge! is called.
 
-   base-path controls where fs/* and git/* resolve relative paths.
+   base-path controls where babashka.fs and git/* resolve relative paths.
    Pass the worktree directory for task contexts.
 
-   proc-allow is the capability set for proc/run (set of command name strings).
-   Defaults to #{} (nothing). Add e.g. #{\"clj\" \"npm\" \"cargo\"} for build agents.
-   git/* is always available and uses git directly (already scoped to worktree).
+   proc-allow is accepted for compatibility and unused (there is no proc
+   namespace; commands run through the jailed shell). git/* is always
+   available and uses git directly (already scoped to worktree).
 
    allowed-http-domains is a set of URL prefixes; non-empty restricts outbound HTTP.
 

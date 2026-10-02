@@ -52,6 +52,11 @@ Attempt's world, with this relay in `--mcp-config` (its own built-in tools disab
 `mcp__dvergr__<tool>` allowed, its own loop of up to 60 turns); the CLI calls the same tools
 every other candidate gets, natively, and the evaluator scores the world when it answers. The
 daemon (or any process running an Attempt) serves MCP on a loopback port for it.
+This path needs the relay at `bin/dvergr-mcp` under the process's working directory (a
+checkout; `DVERGR_MCP_RELAY` names another path) and babashka (`bb`) to run it. Without the
+relay, or without a work room and tools, `claude -p` answers once and calls tools through the
+text `<tool_use>` protocol instead (`dvergr.model.api.claude-code`), so scores from the two
+paths are not the same measurement.
 
 **Over HTTP, without the relay.** Give the daemon `:mcp {:port 17888 :http {:port 17889}}` and
 it also serves Streamable HTTP at `http://127.0.0.1:17889/mcp` (loopback only). Requests need
@@ -87,6 +92,7 @@ neither listed nor callable.
 | Profile | Toolsets | Tools |
 | --- | --- | --- |
 | `offload` (default) | rooms, worlds, attempts, catalog, wallets, repl | 26 |
+| `bench` | rooms, attempts, catalog, bench, wallets | 28 |
 | `code` | repl, describe (its REPL calls the ops of rooms, worlds, attempts, catalog, bench, wallets) | 2 |
 | `readonly` | every read op | read-only only |
 | `admin` | everything | all |
@@ -98,6 +104,7 @@ neither listed nor callable.
 | `attempts` | `workflow_start` and the job tools; Attempts, Scorecards |
 | `runs` | the blocking `workflow_attempt`; Runs |
 | `catalog` | `catalog_list`, `catalog_start`: workflows with their own checker |
+| `bench` | `catalog_benchmark`, `catalog_check`, `catalog_calibrate`, `catalog_cases`, `catalog_freeze`, `catalog_deploy`, `catalog_export`, `catalog_import`, `experiment_progress`, `attempt_export` |
 | `wallets` | `room_wallet`, `models_list` |
 | `repl` | `clojure_eval` in the room's SCI sandbox |
 | `describe` | `repl_describe`: the REPL's API (dvergr namespaces, functions, signatures, docs), filtered by a query |
@@ -156,7 +163,8 @@ around 40, and every definition costs context in every session.
   without a room runs on the benchmark set (fixtures seeded into a new room, ten known facts);
   with a room, on its own `/docs`, scored by citations, links and structure. Each attempt's
   `checks` say what it got right (one per fact), `reward` weighs them.
-- **A benchmark can report into your room.** `catalog_benchmark {workflow, models, room}` still
+- **A benchmark can report into your room.** `catalog_benchmark {workflow, models, room}` (the
+  `bench` profile) still
   runs every cell in a world forked from a new fixture room, but keeps the job, its Attempts and
   the Scorecard in `room`, where its dashboards (and `experiment_progress {room}`) show them.
 - **Money is in the result.** A workflow result has each attempt's spend, the per-model table
@@ -241,7 +249,7 @@ keeps its version lists equal to the server's.
 **Progress** (both eras): a `tools/call` or `resources/read` with `_meta.progressToken` gets
 `notifications/progress` while it runs — a heartbeat every 10 s (`progress` = elapsed seconds,
 only increasing) plus whatever the tool reports through `:progress!` — and none after its
-response. The HTTP transport comes next.
+response.
 
 A connection answers requests concurrently: every `tools/call` and `resources/read` runs on
 its own virtual thread, so a `job_status` wait or a long evaluation does not hold up the
@@ -253,8 +261,8 @@ finishes gets no response. Its work is not interrupted: a job keeps running unti
 
 ## Next
 
-1. Native tools for Claude Code and Codex as benchmark candidates (their CLIs reach a Run's
-   tools over `--mcp-config`); a read-only eval (needs a restricted sandbox, not only fewer
+1. Native tools for Codex as a benchmark candidate (Claude Code's CLI already reaches a Run's
+   tools over `--mcp-config`, above); a read-only eval (needs a restricted sandbox, not only fewer
    ops) and evals metered to the wallet.
 2. Hosted use: OAuth on the HTTP transport (instead of the local bearer token), and
    multi-round-trip requests (sampling, elicitation) if a tool needs input from the client.

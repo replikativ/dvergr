@@ -10,6 +10,7 @@ New to dvergr? Start with **[Getting Started](getting-started.md)**.
 - **[Configuration](configuration.md)** — config + state layers, the `.dvergr/` layout
 - **[Provider & model setup](provider-setup.md)** — API keys, providers, the `models.edn` registry
 - **[CLI reference](cli.md)** — `dvergr-cli`: flags, persistence, telemetry
+- **[MCP](mcp.md)** — dvergr as an MCP server: the relay, HTTP, profiles and toolsets, what each tool promises
 
 ## 📚 Concepts
 
@@ -22,6 +23,9 @@ New to dvergr? Start with **[Getting Started](getting-started.md)**.
 - **[Discourse Theory](discourse-theory.md)** — why "discourse": speech acts, theory of mind, and the Rational-Speech-Acts/FRP lineage (short, optional)
 - **[Architecture](architecture.md)** — the L0–L7 layer map, subsystem graph, inbound message flow, per-file table
 - **[State Model](state-model.md)** — the three-tier copy-on-write state + workspace model
+- **[Effects](effects.md)** — one boundary between sandbox code and the world: handlers, faults, recording, replay
+- **[Unified worlds](unified-worlds.md)** — one algebra for worlds, savepoints and budgets
+- **[Resuming Runs](run-resume.md)** — resuming Runs from savepoints
 
 ## 🔧 Reference
 
@@ -31,8 +35,16 @@ New to dvergr? Start with **[Getting Started](getting-started.md)**.
 - **[Scheduling](scheduling.md)** — per-room recurring / one-shot tasks, incl. deterministic `:code` schedules
 - **[Boundary secret injection](boundary-secret-injection.md)** — how an agent uses an API key it never sees (credential handling + the `:secrets` config)
 - **[Process model](process-model.md)** — the pausable/resumable Process abstraction
-- **[Benchmarks](benchmarks.md)** — the benchmarks Dvergr runs (tau2-bench, BFCL, BIRD, SpreadsheetBench, AutomationBench, room workflows), their equivalence to upstream
+
+## 📏 Evaluation and benchmarks
+
+- **[Workflows defined in a room](room-workflows.md)** — a room's own benchmark: bundles, checkers, calibration, case packs from your own history, `room-run`
+- **[Benchmarks](benchmarks.md)** — the providers (tau2-bench's four domains, BFCL, AutomationBench, BIRD, SpreadsheetBench, the wiki and room workflows), equivalence, results
 - **[Running benchmarks](running-benchmarks.md)** — how to run one, what its report means, resume, faults, cost at list price, held-out discipline
+- **[Evaluation model](evaluation-model.md)** — Attempts, Evaluators, Experiments, Scorecards
+- **[Practical agent evaluation](practical-agent-evaluation.md)** — frozen-web discovery, citation verification, market evidence
+- **[Coding benchmarks](coding-benchmarks.md)** — coding repair in the SCI workspace
+- **[Conversation evaluation](conversation-evaluation.md)** — certified conversational episodes
 
 ## 🤝 Contributing
 
@@ -44,7 +56,7 @@ New to dvergr? Start with **[Getting Started](getting-started.md)**.
 live-running, browsable at [replikativ.github.io/dvergr](https://replikativ.github.io/dvergr/);
 build with `clj -M:clay -m notebooks.render`. Start with
 [`getting_started.clj`](../notebooks/notebooks/getting_started.clj), then
-`humans_and_agents`, `auditor`, `escalation`, `streaming`, and `llm_agent`.
+`programming_model`, `humans_and_agents` and `agents_and_tools`.
 
 **Runnable scenario scripts** ([`examples/`](../examples/)) — what the notebooks
 import; run with `clj -M:examples -m <ns>` (or `-X:examples humans-and-agents/run`):

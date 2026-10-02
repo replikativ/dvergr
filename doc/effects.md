@@ -1,7 +1,7 @@
 # Effects: one boundary between sandbox code and the world
 
-Status: **design, agreed** (2026-09-27; decisions at the end). Built in steps, each noted
-where it lands.
+Status: **implemented** (`dvergr.effects`; the design was agreed 2026-09-27, decisions at
+the end). Built in steps, each noted where it lands; grants (eacl) are still open.
 
 ## Why
 
@@ -218,7 +218,7 @@ world's handlers and sink, so read-only, quotas and denials cover them.
 
 Trajectory export reads the effect logs: `attempt_export` (`dvergr.agent.trajectory`).
 
-**Next**: resume from savepoints, grants (eacl),
+Resume from savepoints is built (doc/run-resume.md). **Next**: grants (eacl),
 preflight.
 
 ### How modes answer the goals
@@ -260,7 +260,7 @@ for tool calls. The effect vocabulary and `can?` resource shapes are shared.
    recorded resource.
 3. **Authority and read-only**: the `can?` seam over existing relations, cross-room effects
    decided by it; `:read-only`. (Done; grants pending.)
-4. **Replay** (and trajectory export from receipts). (Replay done; export pending.)
+4. **Replay** (and trajectory export from receipts). (Done: replay, and export with `attempt_export`.)
 5. **Faults** as a benchmark knob. (Done: `:world :effects :faults`.)
 6. **Preflight**, then beichte for static purity.
 7. Later: the chain as spindel effect handlers; eacl behind `can?`.

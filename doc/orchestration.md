@@ -198,6 +198,13 @@ Workspace policy must be explicit:
 
 ## Provider-neutral task protocol
 
+> **Superseded design.** None of `delegate!`, `message!`, `follow-up!`, `interrupt!`
+> or `await!` exists. Delegation is `hire!` (the sandbox's `dvergr.agent/hire!`, on the
+> host `dvergr.agent.program/hire!`): it starts a durable Run in a forked world and returns
+> a result Spin; `spawn_agent` and `propose_change` are tool adapters over it
+> ([agent-programs.md](agent-programs.md), [runs.md](runs.md)). The behavioral
+> distinctions below still hold.
+
 The first orchestration surface should be small and message-oriented:
 
 ```clojure
@@ -337,12 +344,12 @@ Its operations map as follows:
 |---|---|
 | Root agent thread | Lead execution in a workroom |
 | Agent path `/root/reviewer` | Task/delegation lineage, not global actor identity |
-| `spawn_agent` | `delegate!` plus child execution/workroom |
+| `spawn_agent` | `hire!` plus child execution/workroom (the `spawn_agent` tool adapter) |
 | `fork_turns` | Explicit context policy and frontier |
 | Shared working directory | Selected workspace policy |
-| `send_message` | `message!` without wake |
-| `followup_task` | `follow-up!` with wake |
-| `wait_agent` | Internal `await!` |
+| `send_message` | a message without wake (the superseded `message!` design) |
+| `followup_task` | a message with wake (the superseded `follow-up!` design) |
+| `wait_agent` | awaiting the hired Run's result Spin |
 | `interrupt_agent` | Interrupt the live execution, retain task history |
 | Child final response | `:work/result-produced`, delivered to parent |
 | Collaboration activity item | Normalized work/activity event |

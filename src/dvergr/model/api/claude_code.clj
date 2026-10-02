@@ -6,8 +6,12 @@
 
    Supports streaming via --output-format stream-json --verbose --include-partial-messages.
 
-   Tool calling is implemented by embedding tool definitions in the system prompt
-   and parsing structured <tool_call> blocks from the response text.
+   Tool calling has two paths. With a work room (`:room-id`) and tools, and
+   the stdio relay `bin/dvergr-mcp` under the working directory (or
+   DVERGR_MCP_RELAY; it needs babashka), the CLI runs as an agent over MCP for
+   up to 60 turns. Otherwise it answers once (`--max-turns 0`) and tools are
+   text: definitions in the system prompt, `<tool_use>` blocks parsed from the
+   response, of which only the opening run of calls executes.
 
    Subscription usage limits are tracked from the CLI's `rate_limit_event`s:
    `rate-limit-status`, `usage-limited?` and `await-usage-window!` let long

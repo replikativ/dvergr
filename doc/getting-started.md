@@ -179,8 +179,10 @@ inspect the result, then **merge** or **discard** through its affine handle.
 ;; held in isolation until you decide.
 (def fork (d/fork-room room {:isolation :ctx}))
 
-;; Portable identity/ownership/status, without the live settlement capability:
-(d/fork-descriptor fork)
+;; Portable identity/ownership/status, without the live settlement capability
+;; (dvergr.core does not re-export it; it lives in dvergr.discourse):
+(require '[dvergr.discourse :as discourse])
+(discourse/fork-descriptor fork)
 
 (binding [ec/*execution-context* (:ctx fork)]
   (d/join fork (d/coder {:id :coder}))
@@ -197,7 +199,8 @@ inspect the result, then **merge** or **discard** through its affine handle.
 ```
 
 Agents reach the same lifecycle through two equivalent surfaces. SCI programs
-construct immutable Rosters and compose `dvergr.agent/hire!` result Spins;
+construct immutable Rosters and compose the sandbox's `dvergr.agent/hire!`
+(on the host: `dvergr.agent.program/hire!`) result Spins;
 models may use the thinner `spawn_agent` (automatic settlement) and
 `propose_change` (retain for review) tool adapters. Both adapters create the same
 durable Run and isolated Spindel world—there is no separate sub-agent runtime.
@@ -222,12 +225,13 @@ accept, the registered systems settle through the canonical fork handle.
 
 **"Could not locate dvergr.core__init.class..."** — make sure dvergr
 is on the classpath. From a checkout: `clojure -M:cli` (uses the
-`:cli` alias) or `clojure -M:repl`.
+`:cli` alias) or `clojure -M:dev:repl`. The `:repl` alias only sets the nREPL
+main; nREPL and cider-nrepl come from `:dev` or `:cli`.
 
 **No web dashboard / "running headless"** — the web layer's deps are
-opt-in. `:cli` bundles them; a bare `:repl`/`:local` boot is headless.
-Add the `:web` alias for the dashboard, e.g. `clojure -M:repl:web` or
-`clojure -M:local:web`. The dashboard then serves on
+opt-in. `:cli` and `:dev` bundle them; a bare `:local` boot is headless.
+Add the `:web` alias for the dashboard there, e.g. `clojure -M:local:web`.
+The dashboard then serves on
 `http://127.0.0.1:17880` (when `:http` is set in config).
 
 **Agent doesn't reply** — make sure the provider is configured.
