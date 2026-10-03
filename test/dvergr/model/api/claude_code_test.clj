@@ -289,3 +289,24 @@
            (:input (first (coerce tools [{:name "f" :input {:n "5" :x "2.5" :ok "true" :s "5"}}])))))
     (is (= {:n "five"} (:input (first (coerce tools [{:name "f" :input {:n "five"}}]))))
         "a value that does not read as its type stays as it is")))
+
+(deftest a-stalled-cli-call-is-abandoned
+  ;; a dropped connection left `claude -p` waiting 74 minutes, holding a
+  ;; benchmark slot: a call that sends nothing for the stall timeout is
+  ;; abandoned as a retryable timeout
+  (let [script (doto (java.io.File/createTempFile "fake-claude" ".sh")
+                 (spit "#!/bin/sh\nsleep 60\n")
+                 (.setExecutable true))
+        before (claude-code/settings-snapshot)]
+    (try
+      (claude-code/configure! {:cli (.getAbsolutePath script) :stall-timeout-ms 1000})
+      (let [t0 (System/currentTimeMillis)
+            e (try (@#'claude-code/run-claude-streaming [{:role :user :content "hi"}] {:model "claude-code-haiku"})
+                   nil
+                   (catch clojure.lang.ExceptionInfo e e))]
+        (is (= ::claude-code/stalled (:type (ex-data e))) (pr-str e))
+        (is (= 504 (:status (ex-data e))) "retried like an upstream timeout")
+        (is (< (- (System/currentTimeMillis) t0) 10000) "abandoned after the timeout, not after the sleep"))
+      (finally
+        (reset! @#'claude-code/settings before)
+        (.delete script)))))
