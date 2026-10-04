@@ -41,9 +41,11 @@
      :cli          executable to run (a versioned binary pins the CLI)
      :system-note  text appended to every system prompt, or nil
      :env          environment entries added to the CLI process, e.g.
-                   {\"CLAUDE_CONFIG_DIR\" dir \"CLAUDE_CODE_OAUTH_TOKEN\" token}"
+                   {\"CLAUDE_CONFIG_DIR\" dir \"CLAUDE_CODE_OAUTH_TOKEN\" token}
+     :stall-timeout-ms  how long the CLI may send nothing before a call is
+                   abandoned (default 180000)"
   [m]
-  (swap! settings merge (select-keys m [:cli :system-note :env])))
+  (swap! settings merge (select-keys m [:cli :system-note :env :stall-timeout-ms])))
 
 (defn settings-snapshot [] @settings)
 
@@ -531,6 +533,12 @@
 ;; ============================================================================
 
 (def ^:private cancel-poll-ms 10)
+
+(def ^:private default-stall-timeout-ms
+  "How long the CLI may send nothing before its call is abandoned as stalled
+   (the API providers' stream timeout): a dropped connection left `claude -p`
+   waiting for 74 minutes, holding a benchmark slot."
+  180000)
 (def ^:private process-exit-grace-ms 100)
 
 (defn- cli-work-dir
@@ -559,15 +567,20 @@
       (catch Exception _))))
 
 (defn- terminate-process!
-  "Terminate process, escalating promptly when a graceful destroy is ignored."
+  "Terminate process and its descendants (the CLI is a process tree: a child
+   left alive keeps stdout open and the read waiting), escalating promptly
+   when a graceful destroy is ignored."
   [^Process process]
   (when process
     (locking process
       (when (.isAlive process)
-        (.destroy process)
-        (when-not (.waitFor process process-exit-grace-ms TimeUnit/MILLISECONDS)
-          (.destroyForcibly process)
-          (.waitFor process process-exit-grace-ms TimeUnit/MILLISECONDS))))))
+        (let [children (vec (iterator-seq (.iterator ^java.util.stream.Stream (.descendants (.toHandle process)))))]
+          (doseq [^java.lang.ProcessHandle c children] (.destroy c))
+          (.destroy process)
+          (when-not (.waitFor process process-exit-grace-ms TimeUnit/MILLISECONDS)
+            (.destroyForcibly process)
+            (.waitFor process process-exit-grace-ms TimeUnit/MILLISECONDS))
+          (doseq [^java.lang.ProcessHandle c children] (when (.isAlive c) (.destroyForcibly c))))))))
 
 (defn- parse-json-line [line]
   (when (and (string? line) (not (str/blank? line)))
@@ -622,6 +635,24 @@
         cancelled? (atom false)
         monitor-done? (atom false)
         cancel? (:cancel? opts)
+        stall-ms (or (:stall-timeout-ms opts) (:stall-timeout-ms @settings) default-stall-timeout-ms)
+        last-activity (atom (System/currentTimeMillis))
+        stalled? (atom false)
+        stall-monitor
+        (future
+          (try
+            (loop []
+              (when (and (not @monitor-done?) (.isAlive process))
+                (if (> (- (System/currentTimeMillis) @last-activity) stall-ms)
+                  (do (reset! stalled? true)
+                      (terminate-process! process))
+                  (do (Thread/sleep 500)
+                      (recur)))))
+            (catch InterruptedException _)
+            (catch Exception e
+              (tel/log! {:level :warn :id :claude-code/stall-monitor-error
+                         :data {:error (.getMessage e)}}
+                        "Claude Code stall monitor failed"))))
         cancel-monitor
         (when cancel?
           (future
@@ -661,7 +692,8 @@
                                 result nil]
                            (if (nil? line)
                              result
-                             (let [event (parse-json-line line)]
+                             (let [_ (reset! last-activity (System/currentTimeMillis))
+                                   event (parse-json-line line)]
                                (when (= "rate_limit_event" (:type event))
                                  (record-rate-limit! (:rate_limit_info event)))
                                (when event
@@ -676,6 +708,11 @@
             stderr @stderr-future]
         (when @cancelled?
           (throw (CancellationException. "LLM call cancelled")))
+        ;; "timed out" marks it as the path to the model failing (a transient
+        ;; error the chat retries, and a fault in an experiment)
+        (when @stalled?
+          (throw (ex-info (str "claude CLI timed out: no data for " stall-ms " ms")
+                          {:type ::stalled :status 504 :stall-timeout-ms stall-ms :exit-code exit-code})))
         ;; An error result carries an error message, never a model reply.
         (when (:is_error result-event)
           (let [text (str (:result result-event))
