@@ -1,5 +1,6 @@
 (ns dvergr.agent.experiment-test
-  (:require [clojure.edn :as edn]
+  (:require [org.replikativ.spindel.blocking]
+            [clojure.edn :as edn]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [dvergr.activity :as activity]
@@ -718,8 +719,42 @@
                          (keyword (str "spin-" (name k)))))]
     (try
       (binding [ec/*execution-context* (:ctx room)]
-        (let [spins [(slow :slow 1500) (slow :q1 100) (slow :q2 100) (slow :q3 100) (slow :q4 100)]
-              result @(experiment/run-windowed spins 2)]
+        (let [cells [#(slow :slow 1500) #(slow :q1 100) #(slow :q2 100) #(slow :q3 100) #(slow :q4 100)]
+              result @(experiment/run-admitted cells 2)]
           (is (= [:slow :q1 :q2 :q3 :q4] result) "results in the spins' order")
           (is (= :slow (peek @order)) "the quick ones did not wait for the slow one's batch")))
+      (finally (d/close-room! room)))))
+
+(deftest at-most-parallelism-cells-run-at-once
+  (let [room (d/make-room {:id :experiment-admission-limit :store (memory/make)})
+        running (atom 0) peak (atom 0)
+        cell (fn [] (org.replikativ.spindel.blocking/blocking
+                     (fn [] (swap! peak max (swap! running inc))
+                       (Thread/sleep 100) (swap! running dec) :done)))]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (is (= (vec (repeat 12 :done)) @(experiment/run-admitted (repeat 12 cell) 3)))
+        (is (= 3 @peak) "three slots, all used, never more"))
+      (finally (d/close-room! room)))))
+
+(deftest cancelling-the-experiment-cancels-its-cells
+  ;; the admission controller owns the cells it started: cancelling the
+  ;; experiment interrupts the running ones and the queued ones never start
+  ;; (the hand-written window did not own its cells)
+  (let [room (d/make-room {:id :experiment-admission-cancel :store (memory/make)})
+        started (atom 0) interrupted (atom 0)
+        cell (fn [] (org.replikativ.spindel.blocking/blocking
+                     (fn [] (swap! started inc)
+                       (try (Thread/sleep 30000) :slept
+                            (catch InterruptedException _ (swap! interrupted inc) :interrupted)))))]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [run (experiment/run-admitted (repeat 6 cell) 2)]
+          (future (try @run (catch Throwable _ nil)))
+          (is (loop [n 0] (or (= 2 @started) (when (< n 500) (Thread/sleep 10) (recur (inc n))))))
+          (org.replikativ.spindel.spin.core/cancel-spin! run)
+          (is (loop [n 0] (or (= 2 @interrupted) (when (< n 500) (Thread/sleep 10) (recur (inc n)))))
+              "the running cells were interrupted")
+          (Thread/sleep 300)
+          (is (= 2 @started) "the queued cells never started")))
       (finally (d/close-room! room)))))

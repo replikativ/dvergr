@@ -15,7 +15,9 @@
             [org.replikativ.spindel.blocking :as blocking]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.spin.core :as spin-core]
-            [org.replikativ.spindel.spin.combinators :as comb]))
+            [org.replikativ.spindel.spin.combinators :as comb]
+            [org.replikativ.spindel.spin.sync :as sync]
+            [org.replikativ.spindel.work :as work]))
 
 (defn- invalid! [message type data]
   (throw (ex-info message (assoc data :type type))))
@@ -365,40 +367,63 @@
          (into head tail))))
     (sp/spin [])))
 
-(defn run-windowed
-  "A Spin yielding the values of `spins` in order, running at most
-   `parallelism` of them at a time: a new one starts as soon as one ends,
-   where `run-batches` waits for a whole batch, so one slow cell idles the
-   rest of its batch. For spins that contain their failures (the first
-   rejection rejects the whole). The window is process-local: a Spindel
-   semaphore lives in world state, and each cell runs in its own fork, so
-   its permits would be released into a copy."
-  [spins parallelism]
-  (let [spins (vec spins)
-        n (count spins)]
+(defn run-admitted
+  "A Spin yielding, in order, the values of the cells `cell-fns` start (each a
+   zero-arg fn returning a Spin, called when its cell is admitted), at most
+   `parallelism` running at a time: a new cell starts as soon as one ends.
+
+   A `spindel.work` parallel admission controller runs them and owns every
+   cell it started, so cancelling this Spin cancels the queued and running
+   cells (structured cancellation). The first cell that rejects rejects the
+   whole and cancels the rest; cells that contain their failures (complete-only
+   experiments) never reject. Each cell's outcome is delivered to its own
+   deferred and read back in cell order."
+  [cell-fns parallelism]
+  (let [cell-fns (vec cell-fns)
+        n (count cell-fns)]
     (if (zero? n)
       (sp/spin [])
-      (spin-core/make-spin
-       (fn [resolve reject]
-         (let [results (object-array n)
-               started (atom 0)
-               finished (atom 0)
-               failed (atom false)]
-           (letfn [(start-next! []
-                     (let [i (dec (swap! started inc))]
-                       (when (and (< i n) (not @failed))
-                         ((nth spins i)
-                          (fn [v]
-                            (aset results i v)
-                            (if (= n (swap! finished inc))
-                              (spin-core/resume resolve (vec results))
-                              (start-next!)))
-                          (fn [e]
-                            (when (compare-and-set! failed false true)
-                              (spin-core/resume reject e)))))))]
-             (dotimes [_ (min (max 1 parallelism) n)] (start-next!)))
-           spin-core/incomplete))
-       :experiment/run-windowed))))
+      (sp/spin
+       (let [outcomes (vec (repeatedly n sync/deferred))
+             ;; the first cell to fail, whichever finishes first: a fail-fast
+             ;; experiment stops there, not at the failure's turn in order
+             first-failure (sync/deferred)
+             failed? (atom false)
+             admission (work/parallel {:concurrency (max 1 parallelism)
+                                       :capacity n :ingress-capacity n}
+                                      (fn [i]
+                                        (work/task
+                                         (let [outcome (try {:ok (sp/await ((nth cell-fns i)))}
+                                                            (catch Throwable e {:error e}))]
+                                           (when (and (:error outcome) (compare-and-set! failed? false true))
+                                             (sync/deliver! first-failure (:error outcome)))
+                                           (sync/deliver! (nth outcomes i) outcome)
+                                           outcome))))]
+         (try
+           (doseq [i (range n)]
+             (when-not (work/submit! admission i)
+               (throw (ex-info "Experiment cell not admitted" {:type ::cell-not-admitted :cell i}))))
+           (work/close! admission)
+           (let [values (sp/await
+                         (comb/race
+                          (sp/spin
+                           (loop [i 0 acc (transient [])]
+                             (if (= i n)
+                               (persistent! acc)
+                               (let [{:keys [ok error]} (sp/await (nth outcomes i))]
+                                 (if error
+                                   (throw error)
+                                   (recur (inc i) (conj! acc ok)))))))
+                          (sp/spin (throw (sp/await first-failure)))))]
+             (sp/await (work/completion admission))
+             values)
+           (catch Throwable e
+             (work/cancel! admission)
+             (throw e))
+           (finally
+             ;; cancelled while awaiting: the cells go with it (a no-op once
+             ;; the controller has drained)
+             (work/cancel! admission))))))))
 
 (defn- passed? [receipt]
   (every? true? (vals (:attempt/checks receipt))))
@@ -775,18 +800,19 @@
                            {:attempt a :experiment/job (experiment-job job)
                             :resumed? true}))
                        all-jobs)
-         spins (map #(result-spin room team evaluators capabilities
-                                  base-evaluation-opts experiment % on-result
-                                  (boolean complete-only?) admit)
-                    (remove #(contains? done (cell-key %)) all-jobs))]
+         ;; constructors: a cell's Spin (and its Run) exists only once the
+         ;; admission controller starts it
+         cell-fns (map (fn [job]
+                         #(result-spin room team evaluators capabilities
+                                       base-evaluation-opts experiment job on-result
+                                       (boolean complete-only?) admit))
+                       (remove #(contains? done (cell-key %)) all-jobs))]
      (sp/spin
       (let [results (into (vec resumed)
                           ;; complete-only cells contain their failures, so
-                          ;; every cell runs and a window keeps the slots
-                          ;; busy; a fail-fast experiment stops at the batch
-                          ;; that failed
-                          (sp/await ((if complete-only? run-windowed run-batches)
-                                     spins parallelism)))
+                          ;; every cell runs; a fail-fast experiment stops at
+                          ;; the first cell that fails, cancelling the rest
+                          (sp/await (run-admitted cell-fns parallelism)))
             errors (filterv :error results)
             refused (filterv :refused results)]
         (when (and (seq errors) (not complete-only?))
