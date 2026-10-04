@@ -33,8 +33,10 @@
    in every cell, blank to clear; a formula relative to its top-left cell,
    as Excel fills); the grade names the first mismatched cells. 3: writes in
    the response that submits are applied (they were dropped: Haiku sent its
-   last write with its submit in 20 of 79 attempts, each graded 0)."
-  3)
+   last write with its submit in 20 of 79 attempts, each graded 0). 4: a
+   range write shows the cells it wrote, with their values (it showed none,
+   so every model filling a range with a formula wrote it blind)."
+  4)
 
 ;; ---------------------------------------------------------------------------
 ;; The workbook as the candidate sees and edits it
@@ -95,6 +97,31 @@
         si (when rng (resolve-sheet wb rng))]
     (when (and rng si (= (:r0 rng) (:r1 rng)) (= (:c0 rng) (:c1 rng)))
       (cell/pack si (:r0 rng) (:c0 rng)))))
+
+(def ^:private range-echo-cap 20)
+
+(defn- write-feedback
+  "What a write shows the candidate: each single cell with its value; a
+   range's cells as `read` shows them, at most `range-echo-cap` of them (a
+   range write showed nothing, so a filled formula's result was never seen)."
+  [wb ws]
+  (str/join "\n"
+            (for [w ws]
+              (if-let [cid (parse-target wb (:cell w))]
+                (str (:cell w) " = " (show-value (sb/rechentafel-value (e/get-cell wb cid) (sb/formula-result? wb cid))))
+                (let [lines (str/split-lines (str (read-range wb (str (:cell w)))))
+                      shown (take range-echo-cap lines)]
+                  (str (:cell w) ":\n" (str/join "\n" shown)
+                       (when (> (count lines) range-echo-cap)
+                         (str "\n… " (- (count lines) range-echo-cap) " more (read the range to see them)"))))))))
+
+(defn- cells-written
+  "How many cells writes `ws` cover (a range counts its cells)."
+  [wb ws]
+  (reduce + (for [w ws]
+              (if-let [rng (sb/parse-range (str (:cell w)))]
+                (* (inc (- (:r1 rng) (:r0 rng))) (inc (- (:c1 rng) (:c0 rng))))
+                1))))
 
 (defn- parse-range-target [wb target]
   (let [rng (sb/parse-range (str target))
@@ -223,10 +250,9 @@
                         "write" (let [ws (normalize-writes (or (:cells arguments) (get arguments "cells")))
                                       {wb' :wb errors :errors} (apply-writes wb ws)]
                                   [wb' (into writes ws)
-                                   (conj results [id (str "Wrote " (- (count ws) (count errors)) " cell(s)."
+                                   (conj results [id (str "Wrote " (cells-written wb' ws) " cell(s)."
                                                           (when (seq errors) (str " Errors: " (str/join "; " errors)))
-                                                          "\n" (str/join "\n" (for [w ws :let [cid (parse-target wb' (:cell w))] :when cid]
-                                                                                (str (:cell w) " = " (show-value (sb/rechentafel-value (e/get-cell wb' cid) (sb/formula-result? wb' cid)))))))])
+                                                          "\n" (write-feedback wb' ws))])
                                    (+ errs (count errors))])
                         "submit" [wb writes results errs]
                         [wb writes (conj results [id (str "Unknown tool " name)]) errs]))

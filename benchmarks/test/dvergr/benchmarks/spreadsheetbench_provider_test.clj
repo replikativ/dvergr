@@ -95,3 +95,14 @@
             (is (pos? (get-in r [:attempt/metrics :verification :mismatched])) "the receipt says what mismatched")
             (is (seq (get-in r [:attempt/metrics :verification :mismatches])))))
         (finally (d/close-room! room))))))
+
+(deftest a-range-write-shows-what-it-wrote
+  ;; every model of SpreadsheetBench 51262 filled 'Sheet1'!F6:H6 with one
+  ;; formula and was told only "Wrote 1 cell(s)."
+  (let [{:keys [wb]} (provider/apply-writes (rechentafel.eval/empty-workbook ["S"])
+                                            [{:cell "'S'!A1:A3" :value 2}
+                                             {:cell "'S'!B1:B3" :formula "=A1*10"}])
+        text (@#'provider/write-feedback wb [{:cell "'S'!B1:B3" :formula "=A1*10"}])]
+    (is (re-find #"B1 = 20" text) text)
+    (is (re-find #"B3 = 20" text) text)
+    (is (= 3 (@#'provider/cells-written wb [{:cell "'S'!B1:B3"}])))))
