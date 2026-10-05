@@ -598,6 +598,19 @@
               :schedule-id schedule-id}
              (:metadata (first (store/-list-messages st room-id {}))))))))
 
+(deftest plain-metadata-round-trip
+  (testing "a message read as sent (an evaluation world's simulated user) stays plain"
+    (let [[conn st] (mem-store)
+          room-id :plain-message
+          message-id (random-uuid)]
+      (store/-store-room! st room-id {:slug (name room-id) :title "T"})
+      (store/-store-message!
+       st room-id
+       {:id message-id :from :customer :to :agent :content "I need help with an exchange."
+        :metadata {:role :user :plain? true}})
+      (is (true? (:message/plain? (dh/pull @conn [:message/plain?] [:message/id message-id]))))
+      (is (true? (:plain? (:metadata (first (store/-list-messages st room-id {})))))))))
+
 (deftest tool-uses-round-trip
   (testing "the room store persists and returns structured :tool-uses"
     (let [[_conn st] (mem-store)

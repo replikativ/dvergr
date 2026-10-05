@@ -505,7 +505,7 @@
   #{:role :source-user :source-username :source-user-id
     :audience :mentions :attachment :provenance
     :object
-    :tool-uses :activities :reasoning :kind :from :source :schedule-id
+    :tool-uses :activities :reasoning :kind :from :source :schedule-id :plain?
     :notification/type :notification/agent :notification/task
     :notification/elapsed :run-id})
 

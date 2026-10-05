@@ -193,6 +193,11 @@
     :db/cardinality :db.cardinality/one
     :db/doc "Schedule whose firing produced this message"}
 
+   {:db/ident :message/plain?
+    :db/valueType :db.type/boolean
+    :db/cardinality :db.cardinality/one
+    :db/doc "Read as sent, without the room's [author · HH:mm] prefix (an evaluation world's simulated user)"}
+
    ;; Attachments may name an object through Datahike's GC-aware store-ref, or
    ;; carry a foreign CAS id (the current dvergr drive uses SHA-256 strings in a
    ;; separately configured blob store). A message uses at most one form.

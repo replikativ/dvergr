@@ -127,6 +127,7 @@
       (:from metadata) (assoc :message/context-from (:from metadata))
       (:source metadata) (assoc :message/source (:source metadata))
       (:schedule-id metadata) (assoc :message/schedule-id (:schedule-id metadata))
+      (true? (:plain? metadata)) (assoc :message/plain? true)
       (uuid? blob-id) (assoc :message/attachment-store-ref blob-id)
       (and blob-id (not (uuid? blob-id)))
       (assoc :message/attachment-blob-id (str blob-id))
@@ -376,7 +377,7 @@
     :message/reasoning
     :message/audience :message/mention-handles
     :message/metadata-kind :message/context-from
-    :message/source :message/schedule-id
+    :message/source :message/schedule-id :message/plain?
     :message/attachment-store-ref
     :message/attachment-blob-id
     :message/attachment-node-id
@@ -1025,6 +1026,8 @@
                                    (assoc :source (:message/source m))
                                    (:message/schedule-id m)
                                    (assoc :schedule-id (:message/schedule-id m))
+                                   (:message/plain? m)
+                                   (assoc :plain? true)
                                    (:message/notification-type m)
                                    (assoc :notification/type
                                           (:message/notification-type m))
