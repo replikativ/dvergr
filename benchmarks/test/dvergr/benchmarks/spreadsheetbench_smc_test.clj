@@ -103,11 +103,13 @@
     (let [[task cells] (task-with-numeric-answers)
           k (count cells)
           seen (atom nil)
-          out (smc/run task {:particles 4 :twist :oracle :reward :oracle
+          ;; 16 particles: the steered search fails only when every particle
+          ;; writes a step wrong (1/16 a step with 4, a quarter of all runs)
+          out (smc/run task {:particles 16 :twist :oracle :reward :oracle
                              :generate (coin-model cells) :max-turns (inc k)
                              :on-trajectories #(reset! seen %)})
           records (smc/training-records task @seen)]
-      (is (= 4 (count @seen)))
+      (is (= 16 (count @seen)))
       (is (= (reduce + (map (comp count :states) @seen)) (count records)) "one record per state")
       (is (every? #(and (string? (:state %)) (boolean? (get-in % [:gold :success :label]))) records))
       (is (some #(get-in % [:gold :success :label]) records) "the steered search ends correct somewhere")
