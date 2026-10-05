@@ -30,8 +30,10 @@
 (def version
   "2: the customer's messages reach a Dvergr-harness candidate as sent, without
    the room's `[customer · HH:mm]` prefix (the wall clock leaked into a
-   frozen-clock world; reference candidates got the raw text)."
-  2)
+   frozen-clock world; reference candidates got the raw text). 3: a durable
+   room store keeps that metadata (`:plain?`); under 2 it refused every
+   customer message, so episodes in a durable room lost the customer's turns."
+  3)
 
 (defn- task-of [domain definition]
   (let [task-id (get-in definition [:environment/task :task-id])]
