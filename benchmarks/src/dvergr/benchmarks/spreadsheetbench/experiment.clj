@@ -27,12 +27,22 @@
 (defn oracle-file []
   (str (System/getProperty "user.home") "/.cache/dvergr-bench/spreadsheetbench/oracle-verified-400.edn"))
 
+(def upstream-faults
+  "Tasks whose gold answer is wrong upstream, with the evidence: never
+   graded (as BFCL's upstream-unsatisfiable tasks are not)."
+  {"118-50" (str "The gold lists 11 pairs; the rule the prompt states finds 12 in the input: "
+                 "ABORTING/TABORING are both in column A and the gold omits them, shifting every later "
+                 "row (an independent recomputation; Opus and Sonnet both answered the 12).")})
+
 (defn certified-ids
-  "The ids the oracle certified, or nil without an oracle run."
+  "The ids the oracle certified, or nil without an oracle run, less the
+   `upstream-faults`."
   []
   (let [f (io/file (oracle-file))]
     (when (.exists f)
-      (set (keep #(when (#{:certified :certified-gold} (:status %)) (:id %))
+      (set (keep #(when (and (#{:certified :certified-gold} (:status %))
+                             (not (contains? upstream-faults (str (:id %)))))
+                    (:id %))
                  (:results (edn/read-string {:default tagged-literal} (slurp f))))))))
 
 (defn split-of
