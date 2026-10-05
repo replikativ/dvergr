@@ -822,3 +822,59 @@
           (is (empty? (run/active-runs (:id room))))))
       (finally
         (d/close-room! room)))))
+
+(defrecord BlockingStartStore [delegate entered release]
+  store/PRoomStore
+  (-store-room! [_ room-id metadata] (store/-store-room! delegate room-id metadata))
+  (-load-room [_ id] (store/-load-room delegate id))
+  (-delete-room! [_ room-id] (store/-delete-room! delegate room-id))
+  (-list-rooms [_] (store/-list-rooms delegate))
+  (-store-message! [_ room-id message] (store/-store-message! delegate room-id message))
+  (-message-thread-root [_ room-id message-id] (store/-message-thread-root delegate room-id message-id))
+  (-list-messages [_ room-id opts] (store/-list-messages delegate room-id opts))
+  (-store-run! [_ room-id value]
+    ;; the Run's durable start waits until the test has cancelled the cell
+    (when (and (= :running (:run/status value)) (not (realized? release)))
+      (deliver entered (:run/id value))
+      @release)
+    (store/-store-run! delegate room-id value))
+  (-load-run [_ room-id run-id] (store/-load-run delegate room-id run-id))
+  (-list-runs [_ room-id opts] (store/-list-runs delegate room-id opts))
+  store/PAttemptStore
+  (-store-attempt! [_ room-id value] (store/-store-attempt! delegate room-id value))
+  (-load-attempt [_ room-id attempt-id] (store/-load-attempt delegate room-id attempt-id))
+  (-list-attempts [_ room-id opts] (store/-list-attempts delegate room-id opts)))
+
+(deftest cancellation-during-admission-leaves-no-live-run
+  ;; admission runs off the drain and is not interrupted half way: a cell
+  ;; cancelled while its Run is being admitted cancels the admitted Run
+  (let [entered (promise)
+        release (promise)
+        room (d/make-room {:id :evaluation-cancel-admission
+                           :store (->BlockingStartStore (memory/make) entered release)})
+        team (roster/make-agent (roster/make-roster)
+                                ;; runs until cancelled: only the abandon step ends it
+                                {:id :candidate :program {:kind :scripted :delay-ms 20000 :reply "late"}})
+        env (definition :test/cancel-admission {})
+        evaluator (evaluation/make-evaluator
+                   {:id :test/exact :version 1 :basis "test:v1"
+                    :observe (fn [{:keys [default]}] default)
+                    :verify (fn [_ _] {:checks {:verified? true} :reward 1.0})})]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [attempt (evaluation/evaluate room team :candidate env evaluator)
+              settled (future (try @attempt (catch Throwable _ ::cancelled)))]
+          (let [run-id (deref entered 5000 ::timeout)]
+            (is (uuid? run-id) "admission reached the Run's durable start")
+            (spin-core/cancel-spin! attempt)
+            (is (= ::cancelled (deref settled 5000 ::timeout)) "the cell is cancelled while admission is blocked")
+            (deliver release true)
+            (is (wait-until #(let [r (run/run room run-id)]
+                               (and r (not= :running (:run/status r))
+                                    (not (contains? (set (map :run/id (run/active-runs))) run-id))))
+                            5000)
+                "the Run admitted for the cancelled cell does not stay live")
+            (is (nil? (store/-load-attempt (:store room) (:id room) run-id))
+                "a cancelled cell certifies no Attempt"))))
+      (finally
+        (d/close-room! room)))))

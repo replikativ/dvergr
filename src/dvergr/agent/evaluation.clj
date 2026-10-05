@@ -40,6 +40,28 @@
 
 (declare positive-timeout!)
 
+(defn- admit-uninterruptibly
+  "`admit` as the body of a `blocking` call that a cancelled cell does not
+   interrupt half way: admission runs to the end on its own thread, and a
+   Run admitted for a cell cancelled meanwhile is cancelled (`abandon`)
+   instead of left without an owner."
+  [admit abandon]
+  (fn []
+    (let [outcome (promise)
+          admit (bound-fn* admit)
+          abandon (bound-fn* abandon)]
+      (doto (Thread. ^Runnable (fn [] (deliver outcome (try {:ok (admit)} (catch Throwable t {:error t}))))
+                     "dvergr-admission")
+        (.setDaemon true)
+        (.start))
+      (try
+        (let [{:keys [ok error]} @outcome]
+          (if error (throw error) ok))
+        (catch InterruptedException e
+          (future (when-let [handle (:ok @outcome)]
+                    (try (abandon handle) (catch Throwable _ nil))))
+          (throw e))))))
+
 (defn- cleanup-scope [room]
   [(:id room) (:incarnation room)])
 
@@ -685,11 +707,16 @@
               (update protocol :run
                       (fn [run] (fn [context]
                                   (run (assoc context :environment definition))))))
-            ;; Admission (fork the world, the Run's durable start) still runs
-            ;; on the drain: off it (spindel `blocking`), the Run's execution
-            ;; never completed at :parallelism 8 (doc: frp-recovery-plan).
-            handle (program/hire-prepared-in! room (or world-parent room) team agent-ref
-                                              hire-opts prepare-world! hosted-protocol)
+            ;; Admission (fork the world, the Run's durable start) blocks on
+            ;; the store, so it runs off the drain. (It once hung there at
+            ;; :parallelism 8: spins built on several threads at once shared
+            ;; ids, spindel#110.)
+            handle (sp/await
+                    (blocking/blocking
+                     (admit-uninterruptibly
+                      #(program/hire-prepared-in! room (or world-parent room) team agent-ref
+                                                  hire-opts prepare-world! hosted-protocol)
+                      #(program/cancel! room %))))
             timed-out ::timed-out
             initial (sp/await
                      (comb/timeout (program/owned-result-spin handle)
