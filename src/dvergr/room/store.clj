@@ -104,7 +104,10 @@
   [store room-id msgs]
   (if (satisfies? PMessageBatchStore store)
     (vec (-store-messages! store room-id msgs))
-    (mapv #(-store-message! store room-id %) msgs)))
+    ;; a message that throws is answered with its error; the ones written
+    ;; before it keep their status (retrying them would read them back as
+    ;; duplicates and never publish them)
+    (mapv #(try (-store-message! store room-id %) (catch Throwable t t)) msgs)))
 
 (defprotocol PResourceStore
   "Conserved resource authority cohabiting with durable Room control state.
