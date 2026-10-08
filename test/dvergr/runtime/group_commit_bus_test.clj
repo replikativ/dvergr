@@ -6,7 +6,10 @@
             [dvergr.room.store.datahike :as dhs]
             [dvergr.runtime.bus :as bus]
             [datahike.api :as dh]
-            [dvergr.chat.schema :as schema])
+            [dvergr.chat.schema :as schema]
+            [dvergr.discourse :as d]
+            [dvergr.room.store.memory :as memory]
+            [dvergr.agent.run :as run])
   (:import [java.util.concurrent CountDownLatch]))
 
 (defn- post-at-once!
@@ -86,3 +89,73 @@
       (is (= #{(str a) (str b) (str c)}
              (set (map :content (rstore/-list-messages st room-id {})))))
       (finally (dh/release conn)))))
+
+(defn- held-store
+  "A durable hook like a store's (a second write of an id is :duplicate)
+   whose first write waits for `release`, so the posts after it queue into
+   one batch; `fail?` marks the ids it refuses."
+  [entered release fail?]
+  (let [written (atom #{}) first? (atom true)
+        one (fn [m] (cond (fail? (:id m)) :failed
+                          (contains? @written (:id m)) :duplicate
+                          :else (do (swap! written conj (:id m)) :inserted)))]
+    {:durable-append! (fn [m] (when (compare-and-set! first? true false) (deliver entered true) @release) (one m))
+     :durable-append-batch! (fn [msgs] (mapv one msgs))}))
+
+(defn- post-behind-a-held-commit!
+  "Post `msgs` while a first post holds the commit, so they share a batch."
+  [b entered release msgs]
+  (let [first-post (future (bus/post! b {:id (random-uuid) :to :x :content "first"}))]
+    (deref entered 2000 nil)
+    (let [latch (CountDownLatch. 1)
+          fs (mapv (fn [m] (future (.await latch) (try (bus/post! b m) nil (catch Throwable t t)))) msgs)]
+      (.countDown latch)
+      (Thread/sleep 100)
+      (deliver release true)
+      @first-post
+      (mapv #(deref % 5000 ::hung) fs))))
+
+(deftest a-partly-failed-batch-publishes-what-it-wrote
+  ;; the written message must not be written again: a store reads it back as
+  ;; a duplicate, and it would never be published
+  (let [bad (random-uuid) entered (promise) release (promise)
+        b (bus/create-bus (held-store entered release #{bad}))
+        good {:id (random-uuid) :to :x :content "good"}
+        errors (post-behind-a-held-commit! b entered release [good {:id bad :to :x :content "bad"}])]
+    (is (= 1 (count (remove nil? errors))) "only the bad post fails")
+    (is (some #(= (:id good) (:id %)) (bus/log b)) "the good message is published")))
+
+(deftest a-failed-publication-answers-every-poster
+  (let [entered (promise) release (promise)
+        b (bus/create-bus (held-store entered release #{}))
+        boom (random-uuid)
+        publish @#'bus/publish!]
+    (with-redefs [bus/publish! (fn [bus msg] (if (= boom (:id msg)) (throw (ex-info "mailbox down" {})) (publish bus msg)))]
+      (let [msgs (into [{:id boom :to :x :content "boom"}] (map #(hash-map :id (random-uuid) :to :x :content %) (range 5)))
+            done (future (post-behind-a-held-commit! b entered release msgs))
+            errors (deref done 10000 ::hung)]
+        (is (not= ::hung errors) "no poster waits forever")
+        (is (not-any? #{::hung} (if (vector? errors) errors [])))
+        (is (= 1 (count (remove nil? errors))))
+        (is (= 6 (count (bus/log b))) "the first post and the five others are published")))))
+
+(deftest a-repeated-id-in-a-batch-is-published-once
+  (let [room (d/make-room {:id (keyword (str "batch-dup-" (random-uuid))) :store (memory/make)})
+        m (d/message :customer :agent "twice" nil {:role :user})]
+    (try
+      (d/post-batch! room [m m])
+      (is (= 1 (count (filter #(= (:id m) (:id %)) (d/log room))))
+          "the first occurrence is published, the repeat is not")
+      (finally (d/close-room! room)))))
+
+(deftest nested-operations-of-two-runs-refuse-even-on-one-stripe
+  (let [call @#'run/call-with-run-lock
+        stripe (Object.)
+        [x y] (repeatedly 2 random-uuid)]
+    (with-redefs-fn {#'run/run-stripe (fn [_] stripe)}
+      (fn []
+        (is (= :inner (call :room-a x (fn [] (call :room-a x (fn [] :inner)))))
+            "the same Run again is reentrant")
+        (is (thrown-with-msg? Exception #"nested inside another Run"
+                              (call :room-a x (fn [] (call :room-b y (fn [] :inner)))))
+            "another Run inside, sharing the stripe, is refused")))))
