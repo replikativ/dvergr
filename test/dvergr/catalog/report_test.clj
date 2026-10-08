@@ -41,3 +41,12 @@
   ;; nothing at all, its tables empty
   (let [md (report/markdown {:title "t" :result {:scorecard {:incomplete {:cells 1 :faults 1}}}})]
     (is (str/includes? md "**Incomplete:** 1 cell did not finish"))))
+
+(deftest a-paid-candidate-costs-what-it-was-billed
+  ;; a Fireworks candidate's spend has no notional figure, only the bill; the
+  ;; report showed it as $0
+  (let [entry (fn [id md] {:candidate/id :fireworks :attempt/id id :passed? true :reward 1.0
+                           :spend {:microdollars md :tokens {:input 900 :output 100}}})
+        rs (into {} (map (juxt :candidate identity))
+                 (report/rows {:scorecard {:scorecard/entries [(entry 1 2862) (entry 2 1138)]} :receipts []}))]
+    (is (= 2000 (:notional-per-attempt (rs :fireworks))))))

@@ -10,7 +10,8 @@
 
    As Markdown, to read or to publish."
   (:require [clojure.string :as str]
-            [dvergr.agent.experiment.stats :as xstats]))
+            [dvergr.agent.experiment.stats :as xstats]
+            [dvergr.agent.spend :as spend]))
 
 (defn- money [microdollars] (format "$%.4f" (/ (double microdollars) 1e6)))
 
@@ -32,7 +33,8 @@
            :let [n (count entries)
                  passes (count (filter :passed? entries))
                  rewards (mapv #(double (or (:reward %) 0)) entries)
-                 notional (reduce + 0 (map #(get-in % [:spend :notional-microdollars] 0) entries))
+                 ;; a paid call's bill is its list price; a subscription's is notional
+                 notional (reduce + 0 (map #(spend/notional-microdollars (:spend % {})) entries))
                  tok (fn [k] (reduce + 0 (map #(get-in % [:spend :tokens k] 0) entries)))
                  tokens (+ (tok :input) (tok :output))
                  receipts (keep #(receipt-by-id (:attempt/id %)) entries)
