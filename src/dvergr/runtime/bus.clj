@@ -140,7 +140,10 @@
    ;; group commit: posts admitted but not yet durable and on the log, in
    ;; post order, and the lock one committer at a time holds
             pending
-            ^java.util.concurrent.locks.ReentrantLock commit-lock])
+            ^java.util.concurrent.locks.ReentrantLock commit-lock
+   ;; the batch being committed (taken from `pending`, not yet published):
+   ;; with `pending`, every post admitted but not yet on the log
+            committing])
 
 (def ^:private history-key
   "Metadata key marking log entries absorbed as HISTORY (fork seeding /
@@ -268,7 +271,8 @@
            (->Bus ctx source m to-pub-v type-pub-v
                   log-state hint-mbx durable-append! pump
                   durable-append-batch! (atom [])
-                  (java.util.concurrent.locks.ReentrantLock.))))))))
+                  (java.util.concurrent.locks.ReentrantLock.)
+                  (atom []))))))))
 
 ;; ============================================================================
 ;; Posting
@@ -315,6 +319,7 @@
     (try
       (let [[batch _] (swap-vals! (:pending bus) (constantly []))]
         (when (seq batch)
+          (reset! (:committing bus) batch)
           (try
             (let [msgs (mapv first batch)
                   statuses (durable-statuses bus msgs)]
@@ -331,6 +336,7 @@
                   :else (deliver done (try (publish! bus msg) :published
                                            (catch Throwable t t))))))
             (finally
+              (reset! (:committing bus) [])
               ;; every poster of the batch is answered, whatever failed above
               (doseq [[msg done] batch]
                 (deliver done (ex-info "Bus commit failed"
@@ -345,6 +351,21 @@
   (let [done (promise)]
     (swap! (:pending bus) conj [(stamp msg) done])
     done))
+
+(defn enqueue-all!
+  "Admit `msgs` for the next group commit as one step (no committer can take
+   part of them before the rest are admitted); their promises, in order."
+  [bus msgs]
+  (let [entries (mapv (fn [m] [(stamp m) (promise)]) msgs)]
+    (swap! (:pending bus) into entries)
+    (mapv second entries)))
+
+(defn admitted
+  "The message with `id` among the posts admitted but not yet on the log
+   (queued or being committed), or nil."
+  [bus id]
+  (some (fn [[m _]] (when (= id (:id m)) m))
+        (concat @(:committing bus) @(:pending bus))))
 
 (defn await-post!
   "Wait until the post behind `done` is durable and on the log (committing

@@ -180,8 +180,10 @@
         ;; the parent arrives.
         msg (if (instance? Message msg)
               (if-let [parent-id (:in-reply-to msg)]
-                (let [live-parent (some #(when (= parent-id (:id %)) %)
-                                        (rseq (vec (bus/log (:bus room)))))
+                (let [live-parent (or (some #(when (= parent-id (:id %)) %)
+                                            (rseq (vec (bus/log (:bus room)))))
+                                      ;; a parent admitted but not yet on the log
+                                      (bus/admitted (:bus room) parent-id))
                       root (or (some-> live-parent thread-root-id)
                                (when-let [store (:store room)]
                                  (rstore/-message-thread-root
@@ -251,8 +253,11 @@
   [room msgs]
   (let [dones (locking (:meta room)
                 (ensure-room-work-admitted! room :post-batch)
-                (mapv #(bus/enqueue! (:bus room) %) msgs))]
-    (doseq [done dones] (bus/await-post! (:bus room) done))
+                (bus/enqueue-all! (:bus room) msgs))
+        ;; every message is seen through before the first error is thrown,
+        ;; so none is left admitted with no one to commit it
+        errors (vec (keep #(try (bus/await-post! (:bus room) %) nil (catch Throwable t t)) dones))]
+    (when-let [e (first errors)] (throw e))
     msgs))
 
 (defn log
