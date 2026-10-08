@@ -171,3 +171,51 @@
       (is (= [(:id good)] (mapv :id (filter #(#{(:id good) (:id bad)} (:id %)) (d/log room))))
           "the written message is published, the refused one is not")
       (finally (d/close-room! room)))))
+
+(defrecord HoldingMessageStore [delegate hold? entered release]
+  rstore/PRoomStore
+  (-store-room! [_ room-id metadata] (rstore/-store-room! delegate room-id metadata))
+  (-load-room [_ id] (rstore/-load-room delegate id))
+  (-delete-room! [_ room-id] (rstore/-delete-room! delegate room-id))
+  (-list-rooms [_] (rstore/-list-rooms delegate))
+  (-store-message! [_ room-id msg]
+    ;; the message `hold?` picks waits for `release` before it is written
+    (when (hold? msg) (deliver entered true) @release)
+    (rstore/-store-message! delegate room-id msg))
+  (-message-thread-root [_ room-id message-id] (rstore/-message-thread-root delegate room-id message-id))
+  (-list-messages [_ room-id opts] (rstore/-list-messages delegate room-id opts))
+  (-store-run! [_ room-id value] (rstore/-store-run! delegate room-id value))
+  (-load-run [_ room-id run-id] (rstore/-load-run delegate room-id run-id))
+  (-list-runs [_ room-id opts] (rstore/-list-runs delegate room-id opts)))
+
+(deftest a-reply-to-a-parent-still-being-written-finds-its-root
+  (let [root (d/message :customer :agent "root" nil {:role :user})
+        parent (d/reply :agent :customer "parent" root)
+        entered (promise) release (promise)
+        room (d/make-room {:id (keyword (str "pending-parent-" (random-uuid)))
+                           :store (->HoldingMessageStore (memory/make) #(= (:id parent) (:id %)) entered release)})]
+    (try
+      (d/post! room root)
+      (let [posted (future (d/post! room parent))
+            _ (is (true? (deref entered 2000 false)) "the parent's write is held")
+            ;; names only its immediate parent (the legacy arity takes it for
+            ;; the root): the Room derives the real one
+            child (d/message :customer :agent "child" (:id parent))
+            child-post (future (d/post! room child))]
+        (Thread/sleep 100)
+        (deliver release true)
+        @posted @child-post
+        (is (= (:id root)
+               (:thread-root-id (some #(when (= (:id child) (:id %)) %) (d/log room))))
+            "the child's root is the parent's root, not the parent"))
+      (finally (d/close-room! room)))))
+
+(deftest a-failing-batch-leaves-nothing-admitted
+  (let [room (d/make-room {:id (keyword (str "batch-fail-" (random-uuid))) :store (memory/make)})
+        bad (d/message :customer :agent "bad" nil {:role :user :not-a-modelled-key true})
+        goods (repeatedly 3 #(d/message :customer :agent "good" nil {:role :user}))]
+    (try
+      (is (thrown? Exception (d/post-batch! room (into [bad] goods))))
+      (is (empty? @(:pending (:bus room))) "no admitted message is left without a committer")
+      (is (= (set (map :id goods)) (set (keep #(when ((set (map :id goods)) (:id %)) (:id %)) (d/log room)))))
+      (finally (d/close-room! room)))))
