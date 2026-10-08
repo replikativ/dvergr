@@ -62,6 +62,24 @@
 (defn- entity-map [db eid]
   (d/pull db entity-pattern eid))
 
+(def ^:private marker-pattern
+  "What decides an entity's kind: enough for every check but a new or
+   deleted Attempt or Scorecard, which read the full `entity-map`."
+  [:db/id :attempt/id :attempt.check/id :scorecard/id :scorecard.summary/id])
+
+(defn- entity-views
+  "Per touched entity: its kind markers before and after (one small pull
+   each) and its full maps, pulled only when a check reads them. Every
+   transaction on a governed store runs this inside the writer, and an
+   Attempt touches its checks too: six full nested pulls per entity (the
+   Run included) cost about 140 ms per Attempt commit."
+  [db-before db-after eids]
+  (into {} (for [eid eids]
+             [eid {:before (d/pull db-before marker-pattern eid)
+                   :after (d/pull db-after marker-pattern eid)
+                   :before* (delay (entity-map db-before eid))
+                   :after* (delay (entity-map db-after eid))}])))
+
 (defn- attempt? [entity] (uuid? (:attempt/id entity)))
 (defn- check? [entity] (uuid? (:attempt.check/id entity)))
 (defn- scorecard? [entity] (uuid? (:scorecard/id entity)))
@@ -213,10 +231,10 @@
   (let [changed (vec (touched report))
         eids (into #{} (map #(nth % 0)) changed)
         authorized-id (authorized-attempt-id report)
-        authorized-scorecard-id (authorized-scorecard-id report)]
+        authorized-scorecard-id (authorized-scorecard-id report)
+        views (entity-views db-before db-after eids)]
     (doseq [eid eids]
-      (let [before (entity-map db-before eid)
-            after (entity-map db-after eid)
+      (let [{:keys [before after before* after*]} (views eid)
             before-attempt? (attempt? before)
             after-attempt? (attempt? after)
             before-check? (check? before)
@@ -233,7 +251,7 @@
               (throw (ex-info "Certified Attempts require the trusted writer"
                               {:type ::unauthorized-attempt-create
                                :attempt/id (:attempt/id after)})))
-            (validate-new-attempt! db-after after))
+            (validate-new-attempt! db-after @after*))
 
           (and before-attempt? after-attempt?)
           (when (seq entity-datoms)
@@ -244,7 +262,7 @@
           (and before-attempt? (not after-attempt?))
           (when (:chat/id
                  (d/pull db-after [:chat/id]
-                         (get-in before [:attempt/chat :db/id])))
+                         (get-in @before* [:attempt/chat :db/id])))
             (throw (ex-info "Certified Attempt deletion requires Room deletion"
                             {:type ::attempt-deletion
                              :attempt/id (:attempt/id before)})))
@@ -276,7 +294,7 @@
               (throw (ex-info "Certified Scorecards require the trusted writer"
                               {:type ::unauthorized-scorecard-create
                                :scorecard/id (:scorecard/id after)})))
-            (validate-new-scorecard! db-after after))
+            (validate-new-scorecard! db-after @after*))
 
           (and before-scorecard? after-scorecard?)
           (when (seq entity-datoms)
@@ -287,7 +305,7 @@
           (and before-scorecard? (not after-scorecard?))
           (when (:chat/id
                  (d/pull db-after [:chat/id]
-                         (get-in before [:scorecard/chat :db/id])))
+                         (get-in @before* [:scorecard/chat :db/id])))
             (throw (ex-info "Certified Scorecard deletion requires Room deletion"
                             {:type ::scorecard-deletion
                              :scorecard/id (:scorecard/id before)})))
@@ -314,18 +332,22 @@
                         {:type ::scorecard-summary-deletion
                          :summary/id (:scorecard.summary/id before)})))))))
     ;; A newly-created check must be owned by an Attempt component edge.
-    (doseq [eid eids
-            :let [before (entity-map db-before eid)
-                  after (entity-map db-after eid)]
-            :when (and (not (check? before)) (check? after))]
-      (when-not (d/q '[:find ?a . :in $ ?check
-                       :where [?a :attempt/checks ?check]] db-after eid)
+    ;; one query for every new check (an Attempt adds all of its checks at once)
+    (let [new-checks (filterv #(let [{:keys [before after]} (views %)]
+                                 (and (not (check? before)) (check? after)))
+                              eids)
+          owned (when (seq new-checks)
+                  (set (d/q '[:find [?check ...] :in $ [?check ...]
+                              :where [_ :attempt/checks ?check]]
+                            db-after new-checks)))]
+      (doseq [eid new-checks
+              :when (not (contains? owned eid))]
         (throw (ex-info "Attempt check is not owned by a certified Attempt"
-                        {:type ::orphan-check :check/id (:attempt.check/id after)}))))
+                        {:type ::orphan-check
+                         :check/id (:attempt.check/id (:after (views eid)))}))))
     ;; A newly-created summary must be a component of the authorized Scorecard.
     (doseq [eid eids
-            :let [before (entity-map db-before eid)
-                  after (entity-map db-after eid)]
+            :let [{:keys [before after]} (views eid)]
             :when (and (not (summary? before)) (summary? after))]
       (let [owner (d/q '[:find ?s . :in $ ?summary
                          :where [?s :scorecard/summaries ?summary]]

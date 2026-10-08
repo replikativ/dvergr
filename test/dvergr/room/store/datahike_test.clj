@@ -232,6 +232,18 @@
            Throwable #"immutable"
            (dh/transact conn [[:db/add [:attempt/id run-id]
                                :attempt/reward 0.0]]))))
+    (testing "the writer predicate guards an Attempt's checks"
+      (let [check (dh/q '[:find ?c . :where [_ :attempt/checks ?c]] @conn)
+            passed? (:attempt.check/passed? (dh/pull @conn [:attempt.check/passed?] check))]
+        (is (thrown-with-msg?
+             Throwable #"Attempt checks are immutable"
+             (dh/transact conn [[:db/add check :attempt.check/passed? (not passed?)]])))
+        (is (thrown-with-msg?
+             Throwable #"Attempt checks require the trusted writer"
+             (dh/transact conn [{:attempt.check/id (random-uuid)}])))
+        (is (thrown-with-msg?
+             Throwable #"immutable|deletion requires Attempt deletion"
+             (dh/transact conn [[:db/retractEntity check]])))))
     (testing "an arbitrary transaction function is not a trusted writer"
       (let [rogue-run-id (random-uuid)
             rogue (certified-attempt rogue-run-id agent)
