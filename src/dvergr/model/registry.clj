@@ -472,10 +472,14 @@
   [model-id]
   (get @registry model-id))
 
+(declare ensure-models-loaded!)
+
 (defn get-model!
-  "Get model definition by ID. Throws if not found."
+  "Get model definition by ID, loading models.edn (the Fireworks models)
+   before giving up on one. Throws if not found."
   [model-id]
   (or (get-model model-id)
+      (do (ensure-models-loaded!) (get-model model-id))
       (throw (ex-info "Model not found in registry"
                       {:model-id model-id
                        :available (keys @registry)}))))
