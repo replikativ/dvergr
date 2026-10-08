@@ -284,13 +284,18 @@
    failed batch is retried message by message, so one bad message fails
    only itself."
   [bus msgs]
-  (let [one (fn [m] (when-let [append! (:durable-append! bus)] (append! m)))]
+  (let [one (fn [m] (try (when-let [append! (:durable-append! bus)] (append! m))
+                         (catch Throwable t t)))
+        failed? (fn [s] (or (= :failed s) (false? s) (instance? Throwable s)))]
     (if-let [batch! (and (next msgs) (:durable-append-batch! bus))]
       (let [statuses (try (vec (batch! msgs)) (catch Throwable _ nil))]
-        (if (and statuses (= (count statuses) (count msgs)) (not-any? #{:failed} statuses))
-          statuses
-          (mapv #(try (one %) (catch Throwable t t)) msgs)))
-      (mapv #(try (one %) (catch Throwable t t)) msgs))))
+        (if (and statuses (= (count statuses) (count msgs)))
+          ;; keep what the batch wrote: retrying a written message would read
+          ;; it back as a duplicate and never publish it
+          (mapv (fn [m s] (if (failed? s) (one m) s)) msgs statuses)
+          ;; the batch threw: nothing of it is known written
+          (mapv one msgs)))
+      (mapv one msgs))))
 
 (defn- publish!
   "Make one durable message visible: the log (the fan-out source of truth,
@@ -310,19 +315,26 @@
     (try
       (let [[batch _] (swap-vals! (:pending bus) (constantly []))]
         (when (seq batch)
-          (let [msgs (mapv first batch)
-                statuses (durable-statuses bus msgs)]
-            (doseq [[[msg done] status] (map vector batch statuses)]
-              (cond
-                (instance? Throwable status) (deliver done status)
-                (or (= :failed status) (false? status))
-                (deliver done (ex-info "Durable bus append failed"
-                                       {:type :bus/durable-append-failed
-                                        :message-id (:id msg)}))
-                ;; A duplicate immutable envelope was already made visible by
-                ;; the post that won persistence: no repeated live effect.
-                (= :duplicate status) (deliver done :duplicate)
-                :else (do (publish! bus msg) (deliver done :published)))))))
+          (try
+            (let [msgs (mapv first batch)
+                  statuses (durable-statuses bus msgs)]
+              (doseq [[[msg done] status] (map vector batch statuses)]
+                (cond
+                  (instance? Throwable status) (deliver done status)
+                  (or (= :failed status) (false? status))
+                  (deliver done (ex-info "Durable bus append failed"
+                                         {:type :bus/durable-append-failed
+                                          :message-id (:id msg)}))
+                  ;; A duplicate immutable envelope was already made visible by
+                  ;; the post that won persistence: no repeated live effect.
+                  (= :duplicate status) (deliver done :duplicate)
+                  :else (deliver done (try (publish! bus msg) :published
+                                           (catch Throwable t t))))))
+            (finally
+              ;; every poster of the batch is answered, whatever failed above
+              (doseq [[msg done] batch]
+                (deliver done (ex-info "Bus commit failed"
+                                       {:type :bus/commit-failed :message-id (:id msg)})))))))
       (finally (.unlock lock)))))
 
 (defn enqueue!

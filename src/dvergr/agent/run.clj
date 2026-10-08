@@ -38,7 +38,7 @@
   "Run locks, striped by Run id: a fixed set, nothing to reclaim."
   (vec (repeatedly 256 #(Object.))))
 
-(def ^:private ^ThreadLocal held-run-stripe (ThreadLocal.))
+(def ^:private ^ThreadLocal held-run (ThreadLocal.))
 
 (defn- run-stripe [run-id]
   (nth run-stripes (mod (hash run-id) (count run-stripes))))
@@ -55,17 +55,19 @@
 (defn- call-with-run-lock [room-id run-id f]
   (let [lock (room-lock room-id)
         stripe (run-stripe run-id)
-        held (.get held-run-stripe)]
-    (when (and held (not (identical? held stripe)))
+        held (.get held-run)]
+    (when (and (some? held) (not= held run-id))
       ;; two Run locks nested on one thread could deadlock against the
-      ;; reverse nesting on another: refuse instead of waiting
+      ;; reverse nesting on another (also when the two Runs share a stripe:
+      ;; the nested Room lock can queue behind a writer): refuse instead
+      ;; of waiting. The same Run again is reentrant.
       (throw (ex-info "A Run operation nested inside another Run's"
-                      {:type ::nested-run-locks :run/id run-id})))
+                      {:type ::nested-run-locks :run/id run-id :held held})))
     (.lock (.readLock lock))
     (try
       (locking stripe
-        (.set held-run-stripe stripe)
-        (try (f) (finally (.set held-run-stripe held))))
+        (.set held-run run-id)
+        (try (f) (finally (.set held-run held))))
       (finally (.unlock (.readLock lock))))))
 
 (defmacro ^:private with-room-exclusive [room-id & body]

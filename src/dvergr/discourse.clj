@@ -319,10 +319,15 @@
         ;; take no durable write, as above
         durable-append-batch! (when store
                                 (fn [msgs]
+                                  ;; statuses by position: a repeated id is :inserted
+                                  ;; once and :duplicate after
                                   (let [shaped (filterv rstore/message-shape? msgs)
-                                        statuses (zipmap (map :id shaped)
-                                                         (rstore/store-messages! store conv-id shaped))]
-                                    (mapv #(when (rstore/message-shape? %) (get statuses (:id %))) msgs))))
+                                        statuses (rstore/store-messages! store conv-id shaped)]
+                                    (first (reduce (fn [[out [s & more :as ss]] m]
+                                                     (if (rstore/message-shape? m)
+                                                       [(conj out s) more]
+                                                       [(conj out nil) ss]))
+                                                   [[] statuses] msgs)))))
         b     (bus-with-peer-relay ctx id :room
                                    (when durable-append!
                                      {:durable-append! durable-append!
@@ -425,13 +430,17 @@
           emitted
           (try
             (let [[emitted done]
-                  (route-and-log!
-                   room
-                   (if parent-message
-                     (reply (:id p) (:to reply-spec) (:content reply-spec)
-                            parent-message (:metadata reply-spec))
-                     (message (:id p) (:to reply-spec) (:content reply-spec)
-                              nil (:metadata reply-spec))))]
+                  ;; admitted under the Room's lock, so a holder that waited
+                  ;; for the posts in flight sees none appear (replies are not
+                  ;; fence-checked, as before)
+                  (locking (:meta room)
+                    (route-and-log!
+                     room
+                     (if parent-message
+                       (reply (:id p) (:to reply-spec) (:content reply-spec)
+                              parent-message (:metadata reply-spec))
+                       (message (:id p) (:to reply-spec) (:content reply-spec)
+                                nil (:metadata reply-spec)))))]
               (bus/await-post! (:bus room) done)
               emitted)
             (catch Throwable t
