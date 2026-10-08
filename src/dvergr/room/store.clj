@@ -92,6 +92,23 @@
      with :status or :actor; callers should project the bounded subtree and
      filter it explicitly."))
 
+(defprotocol PMessageBatchStore
+  "Several messages of one Room in one durable write, in order."
+  (-store-messages! [store room-id msgs]
+    "Persist `msgs` (in order) as one write. Returns one status per message,
+     as `-store-message!` would: :inserted, :duplicate or :failed."))
+
+(defn store-messages!
+  "Persist `msgs` of `room-id` in order: one write where the store can, else
+   one per message. One status per message."
+  [store room-id msgs]
+  (if (satisfies? PMessageBatchStore store)
+    (vec (-store-messages! store room-id msgs))
+    ;; a message that throws is answered with its error; the ones written
+    ;; before it keep their status (retrying them would read them back as
+    ;; duplicates and never publish them)
+    (mapv #(try (-store-message! store room-id %) (catch Throwable t t)) msgs)))
+
 (defprotocol PResourceStore
   "Conserved resource authority cohabiting with durable Room control state.
 

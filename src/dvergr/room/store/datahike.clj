@@ -44,6 +44,13 @@
           :where [?e :room/slug ?slug]]
         @conn slug))
 
+(def ^:private run-write-locks
+  "Locks of Run and Attempt writes, striped by id."
+  (vec (repeatedly 256 #(Object.))))
+
+(defn- run-write-lock [id]
+  (nth run-write-locks (mod (hash id) (count run-write-locks))))
+
 (defn- room->metadata
   "Convert a Datahike room entity to the PRoomStore metadata shape."
   [ent]
@@ -1074,10 +1081,14 @@
   (-store-run! [this room-id run]
     (let [slug (store/room-id->slug room-id)]
       (when-let [ent (room-by-slug conn slug)]
-        ;; Serialize validation and assertion on the connection. Terminal cause
-        ;; Runs cannot be retracted through this store, and append-only checking
-        ;; prevents concurrent/stale writers from losing an accepted edge.
-        (locking conn
+        ;; Serialize validation and assertion per Run: the update is checked
+        ;; against that Run's stored version, and append-only checking keeps
+        ;; concurrent/stale writers of it from losing an accepted edge. Terminal
+        ;; cause Runs cannot be retracted through this store, so another Run's
+        ;; concurrent write cannot invalidate the check, and writes of different
+        ;; Runs reach the writer together (one lock on the connection
+        ;; serialized every Run's commit).
+        (locking (run-write-lock (:run/id (store/validate-run! run)))
           (let [run (store/validate-run! run)
                 existing (store/-load-run this room-id (:run/id run))
                 run (->> run
@@ -1163,6 +1174,50 @@
              vec)
         [])))
 
+  store/PMessageBatchStore
+  (-store-messages! [_ room-id msgs]
+    (let [slug (store/room-id->slug room-id)]
+      (if-let [ent (room-by-slug conn slug)]
+        ;; As -store-message!, for several messages in ONE transaction: each
+        ;; first-write-wins in the writer, in order. Concurrent posts to a Room
+        ;; share a commit instead of queueing one commit apiece.
+        (let [db @conn
+              chat-id (:chat/id ent)
+              ;; a repeated id in one batch is written once (its first)
+              fresh (->> msgs (remove #(dh/entity db [:message/id (:id %)]))
+                         (reduce (fn [[seen out] m] (if (seen (:id m)) [seen out] [(conj seen (:id m)) (conj out m)]))
+                                 [#{} []])
+                         second)]
+          (if (empty? fresh)
+            (mapv (constantly :duplicate) msgs)
+            (do
+              (doseq [m fresh]
+                (schema/ensure-tool-use-schemas! conn (get-in m [:metadata :tool-uses])))
+              (let [touch {:db/id [:chat/id chat-id] :chat/updated-at (java.util.Date.)}
+                    report (persist/persist-tx-result!
+                            conn
+                            (vec (for [m fresh]
+                                   [:db.fn/call store-message-if-absent (message->entity chat-id m) touch]))
+                            {:op :store-messages :room-id room-id :msg-id (mapv :id fresh)})]
+                (if (false? report)
+                  (mapv (constantly :failed) msgs)
+                  (let [before (:db-before report)
+                        inserted (into #{} (comp (map :id)
+                                                 (filter #(and (nil? (dh/entity before [:message/id %]))
+                                                               (dh/entity (:db-after report) [:message/id %]))))
+                                       fresh)]
+                    ;; the first occurrence of an inserted id is :inserted
+                    (first (reduce (fn [[out claimed] m]
+                                     (if (and (inserted (:id m)) (not (claimed (:id m))))
+                                       [(conj out :inserted) (conj claimed (:id m))]
+                                       [(conj out :duplicate) claimed]))
+                                   [[] #{}] msgs))))))))
+        (do
+          (tel/log! {:level :error :id :room-store/datahike-missing-room
+                     :data {:room-id room-id :msg-ids (mapv :id msgs)}}
+                    "messages for unknown room — not persisted (dropped)")
+          (mapv (constantly :failed) msgs)))))
+
   store/PAttemptStore
 
   (-store-attempt! [this room-id value]
@@ -1175,7 +1230,8 @@
          artifacts value
          (fn [payload-ref]
            (let [entity (attempt->entity (:chat/id ent) value payload-ref)]
-             (locking conn
+             ;; the identity check is per Attempt: different Attempts commit together
+             (locking (run-write-lock (:attempt/id value))
                (if-let [existing (store/-load-attempt this room-id
                                                       (:attempt/id value))]
                  (if (= existing value)

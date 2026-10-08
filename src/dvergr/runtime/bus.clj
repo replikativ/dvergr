@@ -133,7 +133,17 @@
    ;; A throw here fails the post loudly; nothing is half-delivered.
             durable-append!
    ;; the supervised fan-out pump (spin) — kept for introspection
-            pump])
+            pump
+   ;; optional (fn [msgs]) → one status per message: several posts in one
+   ;; durable write (group commit, see `post!`)
+            durable-append-batch!
+   ;; group commit: posts admitted but not yet durable and on the log, in
+   ;; post order, and the lock one committer at a time holds
+            pending
+            ^java.util.concurrent.locks.ReentrantLock commit-lock
+   ;; the batch being committed (taken from `pending`, not yet published):
+   ;; with `pending`, every post admitted but not yet on the log
+            committing])
 
 (def ^:private history-key
   "Metadata key marking log entries absorbed as HISTORY (fork seeding /
@@ -243,7 +253,7 @@
      :log?            — accepted for compatibility; the log is now the
                         fan-out source of truth and always kept."
   ([] (create-bus {}))
-  ([{:keys [ctx durable-append! relay-to relay-tag log?] :as _opts}]
+  ([{:keys [ctx durable-append! durable-append-batch! relay-to relay-tag log?] :as _opts}]
    (let [_ log? ;; vestigial — see docstring
          ctx (or ctx (ectx/create-execution-context))]
      (binding [ec/*execution-context* ctx]
@@ -259,14 +269,135 @@
            (spawn-relay-drain! ctx m relay-to (or relay-tag {})))
          (let [pump (spawn-fanout-pump! ctx log-state hint-mbx source)]
            (->Bus ctx source m to-pub-v type-pub-v
-                  log-state hint-mbx durable-append! pump)))))))
+                  log-state hint-mbx durable-append! pump
+                  durable-append-batch! (atom [])
+                  (java.util.concurrent.locks.ReentrantLock.)
+                  (atom []))))))))
 
 ;; ============================================================================
 ;; Posting
 ;; ============================================================================
 
+(defn- stamp [msg]
+  (cond-> msg
+    (and (map? msg) (nil? (:id msg))) (assoc :id (random-uuid))))
+
+(defn- durable-statuses
+  "Persist `msgs` in order: one write through `durable-append-batch!` when the
+   bus has it; one status per message (nil without a durability hook). A
+   failed batch is retried message by message, so one bad message fails
+   only itself."
+  [bus msgs]
+  (let [one (fn [m] (try (when-let [append! (:durable-append! bus)] (append! m))
+                         (catch Throwable t t)))
+        failed? (fn [s] (or (= :failed s) (false? s) (instance? Throwable s)))]
+    (if-let [batch! (and (next msgs) (:durable-append-batch! bus))]
+      (let [statuses (try (vec (batch! msgs)) (catch Throwable _ nil))]
+        (if (and statuses (= (count statuses) (count msgs)))
+          ;; keep what the batch wrote: retrying a written message would read
+          ;; it back as a duplicate and never publish it
+          (mapv (fn [m s] (if (failed? s) (one m) s)) msgs statuses)
+          ;; the batch threw: nothing of it is known written
+          (mapv one msgs)))
+      (mapv one msgs))))
+
+(defn- publish!
+  "Make one durable message visible: the log (the fan-out source of truth,
+   so log order == post order) and the pump's doorbell."
+  [bus msg]
+  (swap! (:log bus) update :entries conj msg)
+  (binding [ec/*execution-context* (:ctx bus)]
+    (sync/post! (:hint-mbx bus) ::hint)))
+
+(defn- commit-pending!
+  "Commit and publish every admitted post, in order, as one durable write;
+   one committer at a time (a later batch waits for the earlier one, so
+   batches publish in post order)."
+  [bus]
+  (let [^java.util.concurrent.locks.ReentrantLock lock (:commit-lock bus)]
+    (.lock lock)
+    (try
+      ;; Recorded as being committed BEFORE it leaves `pending`, and cleared
+      ;; only after it is published: an admitted message is always in
+      ;; `pending`, `committing` or the log (`admitted`, then the log, finds it).
+      ;; Only the committer, under this lock, removes from `pending`.
+      (let [batch @(:pending bus)]
+        (when (seq batch)
+          (reset! (:committing bus) batch)
+          (swap! (:pending bus) #(subvec % (count batch)))
+          (try
+            (let [msgs (mapv first batch)
+                  statuses (durable-statuses bus msgs)]
+              (doseq [[[msg done] status] (map vector batch statuses)]
+                (cond
+                  (instance? Throwable status) (deliver done status)
+                  (or (= :failed status) (false? status))
+                  (deliver done (ex-info "Durable bus append failed"
+                                         {:type :bus/durable-append-failed
+                                          :message-id (:id msg)}))
+                  ;; A duplicate immutable envelope was already made visible by
+                  ;; the post that won persistence: no repeated live effect.
+                  (= :duplicate status) (deliver done :duplicate)
+                  :else (deliver done (try (publish! bus msg) :published
+                                           (catch Throwable t t))))))
+            (finally
+              (reset! (:committing bus) [])
+              ;; every poster of the batch is answered, whatever failed above
+              (doseq [[msg done] batch]
+                (deliver done (ex-info "Bus commit failed"
+                                       {:type :bus/commit-failed :message-id (:id msg)})))))))
+      (finally (.unlock lock)))))
+
+(defn enqueue!
+  "Admit `msg` (stamped with an :id) for the next group commit and return the
+   promise its outcome is delivered to. Admission order is post order. The
+   caller completes it with `await-post!`."
+  [bus msg]
+  (let [done (promise)]
+    (swap! (:pending bus) conj [(stamp msg) done])
+    done))
+
+(defn enqueue-all!
+  "Admit `msgs` for the next group commit as one step (no committer can take
+   part of them before the rest are admitted); their promises, in order."
+  [bus msgs]
+  (let [entries (mapv (fn [m] [(stamp m) (promise)]) msgs)]
+    (swap! (:pending bus) into entries)
+    (mapv second entries)))
+
+(defn admitted
+  "The message with `id` among the posts admitted but not yet on the log
+   (queued or being committed), or nil. Read this BEFORE the log: a message
+   leaves these only after it is on the log."
+  [bus id]
+  (some (fn [[m _]] (when (= id (:id m)) m))
+        (concat @(:committing bus) @(:pending bus))))
+
+(defn await-post!
+  "Wait until the post behind `done` is durable and on the log (committing
+   the pending posts when no other poster is): throws when its durable
+   append failed."
+  [bus done]
+  (loop []
+    (when-not (realized? done)
+      (commit-pending! bus)
+      (recur)))
+  (let [outcome @done]
+    (when (instance? Throwable outcome) (throw outcome))
+    nil))
+
+(defn quiesce!
+  "Return once every post admitted so far is durable and on the log (or
+   failed): what a caller holding the Room's admission lock needs to see a
+   Room with no post in flight."
+  [bus]
+  (when (or (seq @(:pending bus)) (.isLocked ^java.util.concurrent.locks.ReentrantLock (:commit-lock bus)))
+    (commit-pending! bus))
+  nil)
+
 (defn post!
-  "Enqueue `msg` onto the bus. Safe from any thread. Returns nil.
+  "Enqueue `msg` onto the bus. Safe from any thread. Returns nil once `msg`
+   is durable (for a bus with a durability hook) and on the log.
 
    A well-formed message has at least `:to` (direct routing) or
    `:type` (capability routing) — typically both. The bus does not
@@ -277,34 +408,15 @@
    several matching subscriptions carries the SAME id on each copy. That is what
    lets `dvergr.discourse/participant-spin` dedup and deliver each message once
    (a broadcast that also carries a subscribed `:type` matches both `[:to nil]`
-   and `[:type …]`)."
+   and `[:type …]`).
+
+   Durability FIRST: for a room with a store the message is persisted before
+   it is visible anywhere — a store failure fails the post loudly and nothing
+   is half-delivered. Concurrent posts share one durable write (group
+   commit): each is admitted in post order, one committer persists everything
+   admitted in one write and publishes it in that order."
   [bus msg]
-  (let [msg' (cond-> msg
-               (and (map? msg) (nil? (:id msg))) (assoc :id (random-uuid)))]
-    ;; 1. Durability FIRST. For a room with a store this persists the
-    ;;    message before it is visible anywhere — a store failure fails
-    ;;    the post loudly and nothing is half-delivered (this inverts
-    ;;    the old persistence-listener model, where a store failure
-    ;;    silently lost durability while the live message flowed).
-    (let [durability (when-let [append! (:durable-append! bus)]
-                       (append! msg'))]
-      (when (or (= :failed durability) (false? durability))
-        (throw (ex-info "Durable bus append failed"
-                        {:type :bus/durable-append-failed
-                         :message-id (:id msg')})))
-      ;; A duplicate immutable envelope was already made visible by the call
-      ;; that won persistence. Suppress every repeated live effect as well as
-      ;; the durable duplicate. Nil preserves compatibility with custom append
-      ;; hooks that predate insertion-status returns.
-      (when-not (= :duplicate durability)
-        ;; 2. The log is the fan-out source of truth. Appending here (not
-        ;;    in a delivery tap) means log order == post order, and a
-        ;;    message is on record before any consumer runs.
-        (swap! (:log bus) update :entries conj msg')
-        ;; 3. Doorbell for the pump.
-        (binding [ec/*execution-context* (:ctx bus)]
-          (sync/post! (:hint-mbx bus) ::hint)))))
-  nil)
+  (await-post! bus (enqueue! bus msg)))
 
 (defn post-many!
   "Post a sequence of messages in order."

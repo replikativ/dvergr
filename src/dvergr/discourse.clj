@@ -180,8 +180,11 @@
         ;; the parent arrives.
         msg (if (instance? Message msg)
               (if-let [parent-id (:in-reply-to msg)]
-                (let [live-parent (some #(when (= parent-id (:id %)) %)
-                                        (rseq (vec (bus/log (:bus room)))))
+                (let [live-parent (or ;; admitted first, then the log: a message
+                                      ;; leaves the admitted ones only once on the log
+                                   (bus/admitted (:bus room) parent-id)
+                                   (some #(when (= parent-id (:id %)) %)
+                                         (rseq (vec (bus/log (:bus room))))))
                       root (or (some-> live-parent thread-root-id)
                                (when-let [store (:store room)]
                                  (rstore/-message-thread-root
@@ -194,17 +197,40 @@
         msg' (if (and (instance? Message msg) (nil? (:type msg)))
                (assoc msg :type :user/message)
                msg)]
-    (bus/post! (:bus room) msg')
-    msg'))
+    ;; admitted here, in post order; durable and published by the caller's
+    ;; `bus/await-post!` outside the Room's lock (group commit)
+    [msg' (bus/enqueue! (:bus room) msg')]))
 
 (declare ensure-room-work-admitted!)
 
+(defmacro with-room-lock
+  "Hold `room`'s lock with no post in flight: the posts admitted before are
+   first durable and published (or failed). Posts are admitted under this
+   lock but written outside it (group commit, `post!`); every other holder
+   waits for them, so it sees the Room as when a post's write was inside
+   the lock. The committer never takes this lock, so the wait cannot
+   deadlock."
+  [room & body]
+  `(let [room# ~room]
+     (locking (:meta room#)
+       (some-> (:bus room#) bus/quiesce!)
+       ~@body)))
+
 (defn post!
-  "Route a Message into the room. Safe to call from any thread."
+  "Route a Message into the room. Safe to call from any thread. Returns once
+   the message is durable (for a Room with a store) and published.
+
+   The Room's lock covers only admission (the fence check and the place in
+   the Room's order); the durable write happens outside it, so concurrent
+   posts share one commit (group commit, `bus/post!`). Every other holder of
+   the Room's lock first waits for the admitted posts (`with-room-lock`), so
+   it still sees no post in flight."
   [room msg]
-  (locking (:meta room)
-    (ensure-room-work-admitted! room :post msg)
-    (route-and-log! room msg)))
+  (let [[msg' done] (locking (:meta room)
+                      (ensure-room-work-admitted! room :post msg)
+                      (route-and-log! room msg))]
+    (bus/await-post! (:bus room) done)
+    msg'))
 
 (defn room-target
   "The canonical addressing target for user input into `room`, derived from
@@ -226,9 +252,13 @@
 (defn post-batch!
   "Route msgs into the room in order."
   [room msgs]
-  (locking (:meta room)
-    (ensure-room-work-admitted! room :post-batch)
-    (bus/post-many! (:bus room) msgs)
+  (let [dones (locking (:meta room)
+                (ensure-room-work-admitted! room :post-batch)
+                (bus/enqueue-all! (:bus room) msgs))
+        ;; every message is seen through before the first error is thrown,
+        ;; so none is left admitted with no one to commit it
+        errors (vec (keep #(try (bus/await-post! (:bus room) %) nil (catch Throwable t t)) dones))]
+    (when-let [e (first errors)] (throw e))
     msgs))
 
 (defn log
@@ -245,11 +275,12 @@
    (when one is registered in the current ctx). Falls back to a plain
    bus if not — keeps tests / library use happy without daemon
    bootstrap."
-  [ctx room-id scope & [{:keys [durable-append!]}]]
+  [ctx room-id scope & [{:keys [durable-append! durable-append-batch!]}]]
   (let [peer (binding [ec/*execution-context* ctx] (peer-bus/current))]
     (bus/create-bus
      (cond-> {:ctx ctx}
        durable-append! (assoc :durable-append! durable-append!)
+       durable-append-batch! (assoc :durable-append-batch! durable-append-batch!)
        peer (assoc :relay-to  peer
                    :relay-tag {:dvergr/origin room-id
                                :dvergr/scope  scope})))))
@@ -290,9 +321,23 @@
                           (fn [msg]
                             (when (rstore/message-shape? msg)
                               (rstore/-store-message! store conv-id msg))))
+        ;; several posts in one write; messages that are not message-shaped
+        ;; take no durable write, as above
+        durable-append-batch! (when store
+                                (fn [msgs]
+                                  ;; statuses by position: a repeated id is :inserted
+                                  ;; once and :duplicate after
+                                  (let [shaped (filterv rstore/message-shape? msgs)
+                                        statuses (rstore/store-messages! store conv-id shaped)]
+                                    (first (reduce (fn [[out [s & more :as ss]] m]
+                                                     (if (rstore/message-shape? m)
+                                                       [(conj out s) more]
+                                                       [(conj out nil) ss]))
+                                                   [[] statuses] msgs)))))
         b     (bus-with-peer-relay ctx id :room
                                    (when durable-append!
-                                     {:durable-append! durable-append!}))
+                                     {:durable-append! durable-append!
+                                      :durable-append-batch! durable-append-batch!}))
         room  (->Room id slug title parent-id (atom {}) b ctx 0 store
                       (atom (or meta {})) nil (random-uuid))]
     (agent-run/open-room-admission! id ctx)
@@ -390,13 +435,20 @@
           on-failed  (get reply-spec reply-emit-failed-key)
           emitted
           (try
-            (route-and-log!
-             room
-             (if parent-message
-               (reply (:id p) (:to reply-spec) (:content reply-spec)
-                      parent-message (:metadata reply-spec))
-               (message (:id p) (:to reply-spec) (:content reply-spec)
-                        nil (:metadata reply-spec))))
+            (let [[emitted done]
+                  ;; admitted under the Room's lock, so a holder that waited
+                  ;; for the posts in flight sees none appear (replies are not
+                  ;; fence-checked, as before)
+                  (locking (:meta room)
+                    (route-and-log!
+                     room
+                     (if parent-message
+                       (reply (:id p) (:to reply-spec) (:content reply-spec)
+                              parent-message (:metadata reply-spec))
+                       (message (:id p) (:to reply-spec) (:content reply-spec)
+                                nil (:metadata reply-spec)))))]
+              (bus/await-post! (:bus room) done)
+              emitted)
             (catch Throwable t
               (when on-failed
                 (try (on-failed t)
@@ -611,7 +663,7 @@
    reflect the entire room (a channel egress that shows what a rich UI shows).
    Errors in `f` are logged, never swallowed, and don't stop the listener."
   [room f]
-  (locking (:meta room)
+  (with-room-lock room
     (ensure-room-work-admitted! room :on-each-message)
     (install-room-listener! room f)))
 
@@ -623,7 +675,7 @@
     (agent-run/fence-room-admission!
      room
      (fn [admitted active]
-       (locking (:meta room)
+       (with-room-lock room
          (if-let [state (get @(:meta room) fork-transfer-state-key)]
            (throw (ex-info "Room is already fenced for lifecycle work"
                            {:type ::room-lifecycle-in-progress
@@ -671,7 +723,7 @@
   "Retire the causal-post handoff after every admitted Run has acknowledged
    cancellation. No Room write may cross this boundary into settlement."
   [room operation]
-  (locking (:meta room)
+  (with-room-lock room
     (let [state (get @(:meta room) fork-transfer-state-key)]
       (when (= :tearing-down (:state state))
         (swap! (:meta room) update fork-transfer-state-key
@@ -680,7 +732,7 @@
 
 (defn- restore-room-listeners!
   [room callbacks]
-  (locking (:meta room)
+  (with-room-lock room
     (doseq [f callbacks]
       (install-room-listener! room f))))
 
@@ -708,7 +760,7 @@
                 (agent-run/recover-room-admission!
                  room
                  (fn []
-                   (locking (:meta room)
+                   (with-room-lock room
                      (when (and (= token (get-in @(:meta room)
                                                  [fork-transfer-state-key :token]))
                                 (or (nil? work-fence)
@@ -733,7 +785,7 @@
    fence. A nil or stale token owns no lifecycle state."
   [room token operation error]
   (when token
-    (locking (:meta room)
+    (with-room-lock room
       (when (= token (get-in @(:meta room)
                              [fork-transfer-state-key :token]))
         (swap! (:meta room) update fork-transfer-state-key
@@ -813,7 +865,7 @@
    participant sees every broadcast post; targeted posts only the
    addressed one\" — falls out naturally."
   [room p]
-  (locking (:meta room)
+  (with-room-lock room
     (ensure-room-work-admitted! room :join)
     (binding [ec/*execution-context* (:ctx room)]
       (let [inbox-sub     (bus/subscribe! (:bus room) [:to (:id p)])
@@ -867,7 +919,7 @@
   ([room p topic]
    (subscribe! room p topic nil))
   ([room p topic buffer]
-   (locking (:meta room)
+   (with-room-lock room
      (ensure-room-work-admitted! room :subscribe)
      (or (get @(:subs p) topic)
          (let [sub (binding [ec/*execution-context* (:ctx room)]
@@ -1053,7 +1105,7 @@
   [room target-id msg-spec]
   (sp/spin
    (let [asker-id (keyword (str "ask-" (random-uuid)))
-         asker-sub (locking (:meta room)
+         asker-sub (with-room-lock room
                      (ensure-room-work-admitted! room :ask)
                      (let [sub (binding [ec/*execution-context* (:ctx room)]
                                  (bus/subscribe! (:bus room) [:to asker-id]))]
@@ -1158,7 +1210,7 @@
   ([room] (fork-room room {}))
   ([room {:keys [isolation clone-participants? fork-opts]
           :or {isolation :none clone-participants? true}}]
-   (locking (:meta room)
+   (with-room-lock room
      (ensure-room-work-admitted! room :fork-room)
      (let [short-uuid (subs (str (random-uuid)) 0 8)
            new-slug   (str (:slug room) "/fork-" short-uuid)
@@ -1256,7 +1308,7 @@
            ;; Publication and its control event share the child's lifecycle
            ;; monitor. A reader may discover the complete Room+topology pair,
            ;; but cannot begin settlement until the creation event is posted.
-           (locking (:meta new-room)
+           (with-room-lock new-room
              (binding [ec/*execution-context* (:ctx room)]
                (if (= :ctx isolation)
                  (rreg/register-fork! new-room (:id room) (:fork-id fork-handle))
@@ -1336,7 +1388,7 @@
 (def ^:dynamic ^:private *deferred-settlement-authority* nil)
 
 (defn- assert-settlement-released! [fork operation]
-  (locking (:meta fork)
+  (with-room-lock fork
     (let [meta @(:meta fork)
           live (binding [ec/*execution-context* (fork-home-ctx fork)]
                  (rreg/lookup (:id fork)))]
@@ -1530,7 +1582,7 @@
                                 (agent-run/recover-room-admission!
                                  fork
                                  (fn []
-                                   (locking (:meta fork)
+                                   (with-room-lock fork
                                      (when (and (= @fence-token*
                                                    (get-in @(:meta fork)
                                                            [fork-transfer-state-key :token]))
@@ -1985,7 +2037,7 @@
   ([fork claim!]
    (discard-deferred fork claim! (constantly nil)))
   ([fork claim! abort!]
-   (locking (:meta fork)
+   (with-room-lock fork
      (let [meta @(:meta fork)
            live (binding [ec/*execution-context* (fork-home-ctx fork)]
                   (rreg/lookup (:id fork)))]

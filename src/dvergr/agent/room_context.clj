@@ -260,7 +260,7 @@
         k       [room-id agent-id]]
     ;; Room forking and unregister hold the same monitor. Cache reads belong
     ;; inside it too: a returned handle must remain live through this boundary.
-    (locking (:meta room)
+    (d/with-room-lock room
       (binding [ec/*execution-context* (:ctx room)]
         (let [_ (when-not (rreg/admitted-incarnation? room)
                   (throw (ex-info "Working context requested for a closed Room incarnation"
@@ -425,7 +425,7 @@
    shared monitor makes the closed marker and complete component teardown one
    lifecycle transition, so a stale caller cannot publish after cleanup."
   [room]
-  (locking (:meta room)
+  (d/with-room-lock room
     (doseq [[rid aid] (keys @room-agent-ctxs)
             :when (= rid (:id room))]
       (drop-entry! rid aid)))
