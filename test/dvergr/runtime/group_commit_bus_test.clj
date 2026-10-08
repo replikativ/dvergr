@@ -159,3 +159,15 @@
         (is (thrown-with-msg? Exception #"nested inside another Run"
                               (call :room-a x (fn [] (call :room-b y (fn [] :inner)))))
             "another Run inside, sharing the stripe, is refused")))))
+
+(deftest a-store-without-batches-keeps-what-it-wrote-before-a-throw
+  ;; the per-message fallback: a later message that throws must not cost
+  ;; the earlier, written ones their publication
+  (let [room (d/make-room {:id (keyword (str "fallback-" (random-uuid))) :store (memory/make)})
+        good (d/message :customer :agent "good" nil {:role :user})
+        bad (d/message :customer :agent "bad" nil {:role :user :not-a-modelled-key true})]
+    (try
+      (is (thrown? Exception (d/post-batch! room [good bad])))
+      (is (= [(:id good)] (mapv :id (filter #(#{(:id good) (:id bad)} (:id %)) (d/log room))))
+          "the written message is published, the refused one is not")
+      (finally (d/close-room! room)))))
