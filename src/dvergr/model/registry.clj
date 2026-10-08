@@ -114,41 +114,77 @@
     :pricing {:input 1.0 :output 5.0 :cache-read 0.10 :cache-write 1.25 :cache-write-1h 2.0}
     :quirks {}}
 
+   ;; ── Claude 5.5 (list prices from platform.claude.com/docs/en/about-claude/pricing, 2026-10-08)
+   "claude-haiku-5-5"
+   {:id "claude-haiku-5-5"
+    :name "Claude Haiku 5.5"
+    :provider :anthropic
+    :api-type :anthropic-messages
+    :capabilities #{:tools :vision :streaming :system-prompt :cache-control}
+    :context 200000
+    :max-output 64000
+    ;; prompts up to 100,000 tokens; over that $0.50 / $2.50 (not modelled,
+    ;; as the other long-context rates are not)
+    :pricing {:input 0.10 :output 0.50 :cache-read 0.01 :cache-write 0.125 :cache-write-1h 0.20}
+    :quirks {}}
+
+   "claude-sonnet-5-5"
+   {:id "claude-sonnet-5-5"
+    :name "Claude Sonnet 5.5"
+    :provider :anthropic
+    :api-type :anthropic-messages
+    :capabilities #{:tools :vision :thinking :streaming :system-prompt :cache-control}
+    :context 1000000
+    :max-output 128000
+    :pricing {:input 2.0 :output 10.0 :cache-read 0.10 :cache-write 2.50 :cache-write-1h 4.0}
+    :quirks {}}
+
+   "claude-opus-5-5"
+   {:id "claude-opus-5-5"
+    :name "Claude Opus 5.5"
+    :provider :anthropic
+    :api-type :anthropic-messages
+    :capabilities #{:tools :vision :thinking :streaming :system-prompt :cache-control}
+    :context 1000000
+    :max-output 128000
+    :pricing {:input 4.0 :output 20.0 :cache-read 0.20 :cache-write 5.0 :cache-write-1h 8.0}
+    :quirks {}}
+
 ;; Claude Code CLI models (via subscription)
    "claude-code-sonnet"
    {:id "claude-code-sonnet"
-    :name "Claude Sonnet (Code CLI)"
+    :name "Claude Sonnet 5.5 (Code CLI)"
     :provider :claude-code
     :api-type :claude-code-cli
     :capabilities #{:tools :system-prompt :thinking :streaming}
     :context 200000
     :max-output 32000
     :pricing {:input 0 :output 0}  ;; subscription-based
-    :list-price-of "claude-sonnet-4-6"  ;; the API model its tokens are worth (notional cost)
+    :list-price-of "claude-sonnet-5-5"  ;; the API model its tokens are worth (notional cost)
     :quirks {}}
 
    "claude-code-opus"
    {:id "claude-code-opus"
-    :name "Claude Opus (Code CLI)"
+    :name "Claude Opus 5.5 (Code CLI)"
     :provider :claude-code
     :api-type :claude-code-cli
     :capabilities #{:tools :system-prompt :thinking :streaming}
     :context 200000
     :max-output 32000
     :pricing {:input 0 :output 0}
-    :list-price-of "claude-opus-4-7"  ;; the API model its tokens are worth (notional cost)
+    :list-price-of "claude-opus-5-5"  ;; the API model its tokens are worth (notional cost)
     :quirks {}}
 
    "claude-code-haiku"
    {:id "claude-code-haiku"
-    :name "Claude Haiku (Code CLI)"
+    :name "Claude Haiku 5.5 (Code CLI)"
     :provider :claude-code
     :api-type :claude-code-cli
     :capabilities #{:tools :system-prompt :streaming}
     :context 200000
     :max-output 32000
     :pricing {:input 0 :output 0}
-    :list-price-of "claude-haiku-4-5"  ;; the API model its tokens are worth (notional cost)
+    :list-price-of "claude-haiku-5-5"  ;; the API model its tokens are worth (notional cost)
     :quirks {}}
 
    ;; ── OpenAI GPT-5.6 ───────────────────────────────────────────────

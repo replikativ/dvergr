@@ -4,6 +4,7 @@
             [dvergr.mcp.server]
             [clojure.test :refer [deftest is testing]]
             [dvergr.model.api.claude-code :as claude-code]
+            [dvergr.model.provider]
             [dvergr.model.subscription :as subscription])
   (:import [java.util.concurrent CancellationException]))
 
@@ -310,3 +311,25 @@
       (finally
         (reset! @#'claude-code/settings before)
         (.delete script)))))
+
+(deftest cli-candidates-ask-for-an-exact-model
+  ;; a family alias moves to the CLI's latest model and mixes versions
+  (doseq [[candidate exact] {"claude-code-haiku" "claude-haiku-5-5"
+                             "claude-code-sonnet" "claude-sonnet-5-5"
+                             "claude-code-opus" "claude-opus-5-5"}]
+    (let [command (#'claude-code/build-command {:model candidate})]
+      (is (= exact (second (drop-while #(not= "--model" %) command))) candidate))))
+
+(deftest another-model-served-is-a-fault
+  (let [provider (claude-code/create {})
+        served (fn [model] (constantly {:content "ok" :tool-calls nil :usage {} :stop-reason :end-turn
+                                        :model model :served #{model}}))]
+    (with-redefs-fn {#'claude-code/run-claude-streaming (served "claude-haiku-5-5")}
+      #(is (= "ok" (:content (dvergr.model.provider/direct-chat provider [{:role :user :content "hi"}]
+                                                                {:model "claude-code-haiku"})))))
+    (with-redefs-fn {#'claude-code/run-claude-streaming (served "claude-haiku-4-5")}
+      #(let [e (try (dvergr.model.provider/direct-chat provider [{:role :user :content "hi"}]
+                                                       {:model "claude-code-haiku"})
+                    nil (catch clojure.lang.ExceptionInfo e e))]
+         (is (some? e) "the call fails instead of answering under the wrong model")
+         (is (= 502 (:status (ex-data e))) "as a fault: retried, the cell runs again")))))

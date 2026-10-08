@@ -417,7 +417,13 @@
 ;; ============================================================================
 
 (def ^:private model-aliases
-  {"claude-sonnet-4-6"        "sonnet"
+  ;; The CLI candidates name an exact model: a family alias ("haiku") moves
+  ;; to whatever the CLI serves as the family's latest, so results and list
+  ;; prices would silently mix versions.
+  {"claude-code-haiku"        "claude-haiku-5-5"
+   "claude-code-sonnet"       "claude-sonnet-5-5"
+   "claude-code-opus"         "claude-opus-5-5"
+   "claude-sonnet-4-6"        "sonnet"
    "claude-opus-4-6"          "opus"
    "claude-haiku-4-5"         "haiku"
    "claude-sonnet-4-5"        "sonnet"
@@ -737,6 +743,7 @@
              :usage (parse-result-usage result-event)
              :stop-reason (if (seq tool-calls) :tool-use :end-turn)
              :model (when model-key (name model-key))
+             :served (into #{} (map name) (keys model-usage))
              :id (:session_id result-event)
              :cost-usd (:total_cost_usd result-event)})
           (throw (ex-info (str "claude CLI failed (exit " exit-code ")")
@@ -795,7 +802,16 @@
     ;; Don't spend a subprocess on a call the subscription will reject.
     (when (usage-limited?)
       (throw (usage-limit-error "Claude subscription usage limit active" {})))
-    (let [parsed (run-claude-streaming messages opts)]
+    (let [parsed (run-claude-streaming messages opts)
+          wanted (resolve-cli-model (:model opts))]
+      ;; An exact model asked for and another served: a fault (the cell runs
+      ;; again), never a result recorded under the wrong model.
+      (when (and (str/starts-with? wanted "claude-") (seq (:served parsed))
+                 (not (contains? (:served parsed) wanted)))
+        (throw (ex-info (str "Claude Code CLI served " (str/join ", " (sort (:served parsed)))
+                             " for " wanted)
+                        {:status 502 ::model-mismatch true
+                         :wanted wanted :served (:served parsed)})))
       (tel/log! {:id :claude-code/chat-complete
                  :data {:model (:model parsed)
                         :usage (:usage parsed)
