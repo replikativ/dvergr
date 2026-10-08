@@ -317,9 +317,14 @@
   (let [^java.util.concurrent.locks.ReentrantLock lock (:commit-lock bus)]
     (.lock lock)
     (try
-      (let [[batch _] (swap-vals! (:pending bus) (constantly []))]
+      ;; Recorded as being committed BEFORE it leaves `pending`, and cleared
+      ;; only after it is published: an admitted message is always in
+      ;; `pending`, `committing` or the log (`admitted`, then the log, finds it).
+      ;; Only the committer, under this lock, removes from `pending`.
+      (let [batch @(:pending bus)]
         (when (seq batch)
           (reset! (:committing bus) batch)
+          (swap! (:pending bus) #(subvec % (count batch)))
           (try
             (let [msgs (mapv first batch)
                   statuses (durable-statuses bus msgs)]
@@ -362,7 +367,8 @@
 
 (defn admitted
   "The message with `id` among the posts admitted but not yet on the log
-   (queued or being committed), or nil."
+   (queued or being committed), or nil. Read this BEFORE the log: a message
+   leaves these only after it is on the log."
   [bus id]
   (some (fn [[m _]] (when (= id (:id m)) m))
         (concat @(:committing bus) @(:pending bus))))
