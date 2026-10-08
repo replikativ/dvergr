@@ -22,20 +22,62 @@
 (defonce ^:private room-locks (java.util.concurrent.ConcurrentHashMap.))
 
 (defn- room-lock
-  "The lock of one Room's Run lifecycle: admission and teardown fences and the
-   durable writes of its Runs serialize per Room, so a store write of one
-   Room's Run does not stall every other Room's (one process-wide lock did:
-   parallel benchmark cells queued on it). Order: Room lock, then
-   `lifecycle-lock`, then Room metadata."
-  [room-id]
+  "The read-write lock of one Room's Run lifecycle. Admission fences (open,
+   close, fence, recover) hold it exclusively and see a fixed admitted set;
+   a Run's admission and its durable writes hold it shared, together with
+   their Run's own lock, so the writes of different Runs of one Room proceed
+   together (an experiment's cells are Runs of one Room: one exclusive lock
+   queued every cell's Run start behind the others' commits).
+   Order: Room lock, then Run lock, then `lifecycle-lock`, then Room metadata."
+  ^java.util.concurrent.locks.ReentrantReadWriteLock [room-id]
   (.computeIfAbsent ^java.util.concurrent.ConcurrentHashMap room-locks (or room-id ::none)
-                    (reify java.util.function.Function (apply [_ _] (Object.)))))
+                    (reify java.util.function.Function
+                      (apply [_ _] (java.util.concurrent.locks.ReentrantReadWriteLock.)))))
 
-(defn- run-lock
-  "The Room lock of live Run `run-id` (any lock when it is not live: the
-   operation then finds no entry and does nothing)."
-  [run-id]
-  (room-lock (get-in @active [run-id :run :run/room])))
+(def ^:private run-stripes
+  "Run locks, striped by Run id: a fixed set, nothing to reclaim."
+  (vec (repeatedly 256 #(Object.))))
+
+(def ^:private ^ThreadLocal held-run-stripe (ThreadLocal.))
+
+(defn- run-stripe [run-id]
+  (nth run-stripes (mod (hash run-id) (count run-stripes))))
+
+(defn- call-exclusive [room-id f]
+  (let [lock (room-lock room-id)]
+    (when (pos? (.getReadHoldCount lock))
+      ;; a read hold cannot be upgraded: this would wait for itself
+      (throw (ex-info "Room admission fence taken inside one of the Room's Run operations"
+                      {:type ::lock-upgrade :room-id room-id})))
+    (.lock (.writeLock lock))
+    (try (f) (finally (.unlock (.writeLock lock))))))
+
+(defn- call-with-run-lock [room-id run-id f]
+  (let [lock (room-lock room-id)
+        stripe (run-stripe run-id)
+        held (.get held-run-stripe)]
+    (when (and held (not (identical? held stripe)))
+      ;; two Run locks nested on one thread could deadlock against the
+      ;; reverse nesting on another: refuse instead of waiting
+      (throw (ex-info "A Run operation nested inside another Run's"
+                      {:type ::nested-run-locks :run/id run-id})))
+    (.lock (.readLock lock))
+    (try
+      (locking stripe
+        (.set held-run-stripe stripe)
+        (try (f) (finally (.set held-run-stripe held))))
+      (finally (.unlock (.readLock lock))))))
+
+(defmacro ^:private with-room-exclusive [room-id & body]
+  `(call-exclusive ~room-id (fn [] ~@body)))
+
+(defmacro ^:private with-run-lock
+  "Hold the shared lock of live Run `run-id`'s Room and the Run's own lock
+   (any Room's when it is not live: the operation then finds no entry and
+   does nothing)."
+  [run-id & body]
+  `(let [run-id# ~run-id]
+     (call-with-run-lock (get-in @active [run-id# :run :run/room]) run-id# (fn [] ~@body))))
 
 (def provenance-keys
   "Run fields an interpreter may add without changing core causal identity."
@@ -99,7 +141,7 @@
 (defn open-room-admission!
   "Open Run admission for a newly constructed Room in its Spindel context."
   [room-id execution-ctx]
-  (locking (room-lock room-id)
+  (with-room-exclusive room-id
     (binding [ec/*execution-context* execution-ctx]
       (ec/swap-state! (admission-path room-id) (constantly :open))))
   nil)
@@ -124,7 +166,7 @@
    admitted before the fence. Teardown drains exactly this set."
   [room]
   (let [room-id (:id room)]
-    (locking (room-lock room-id)
+    (with-room-exclusive room-id
       (binding [ec/*execution-context* (:ctx room)]
         (ec/swap-state! (admission-path room-id) (constantly :closed)))
       (->> (vals @active)
@@ -142,7 +184,7 @@
    Run events or invoke lifecycle subscribers."
   [room install-fence!]
   (let [room-id (:id room)]
-    (locking (room-lock room-id)
+    (with-room-exclusive room-id
       (binding [ec/*execution-context* (:ctx room)]
         (ec/swap-state! (admission-path room-id) (constantly :closed)))
       (let [entries (->> (vals @active)
@@ -160,7 +202,7 @@
    preserving the sole nested order Run lifecycle -> Room metadata. It must
    return truthy only when it removed the expected fence generation."
   [room recover-fence!]
-  (locking (room-lock (:id room))
+  (with-room-exclusive (:id room)
     (when (recover-fence!)
       (binding [ec/*execution-context* (:ctx room)]
         (ec/swap-state! (admission-path (:id room)) (constantly :open)))
@@ -209,27 +251,27 @@
                      :cancel-hooks {}
                      :store (:store room)
                      :store-room-id (store/conversation-id room)}]
-     (locking (room-lock (:run/room run))
-       (when (and (:ctx room)
-                  (= :closed
-                     (binding [ec/*execution-context* (:ctx room)]
-                       (ec/get-state (admission-path (:id room))))))
-         (throw (ex-info "Run admission is closed for Room teardown"
-                         {:type ::room-admission-closed
-                          :run/id (:run/id run)
-                          :run/room (:id room)})))
+     (call-with-run-lock (:run/room run) (:run/id run) (fn []
+                                                         (when (and (:ctx room)
+                                                                    (= :closed
+                                                                       (binding [ec/*execution-context* (:ctx room)]
+                                                                         (ec/get-state (admission-path (:id room))))))
+                                                           (throw (ex-info "Run admission is closed for Room teardown"
+                                                                           {:type ::room-admission-closed
+                                                                            :run/id (:run/id run)
+                                                                            :run/room (:id room)})))
        ;; Persistence is inside the same admission critical section as the
        ;; fence check: teardown can see either no Run or the fully admitted Run,
        ;; never a durable-but-unowned half-admission.
-       (when-let [room-store (:store entry)]
-         (when-not (store/-store-run! room-store (:store-room-id entry) run)
-           (throw (ex-info "Run admission failed: start was not durable"
-                           {:type ::start-not-durable
-                            :run/id (:run/id run)
-                            :run/room (:id room)}))))
-       (locking lifecycle-lock
-         (swap! active assoc (:run/id run) entry)
-         (notify! {:type :run/started :run run})))
+                                                         (when-let [room-store (:store entry)]
+                                                           (when-not (store/-store-run! room-store (:store-room-id entry) run)
+                                                             (throw (ex-info "Run admission failed: start was not durable"
+                                                                             {:type ::start-not-durable
+                                                                              :run/id (:run/id run)
+                                                                              :run/room (:id room)}))))
+                                                         (locking lifecycle-lock
+                                                           (swap! active assoc (:run/id run) entry)
+                                                           (notify! {:type :run/started :run run}))))
      run)))
 
 (defn record-cause!
@@ -247,7 +289,7 @@
                     {:type ::invalid-cause
                      :run/id run-id
                      :cause-run/id cause-run-id})))
-  (locking (run-lock run-id)
+  (with-run-lock run-id
     (let [entry (or (get @active run-id)
                     (throw (ex-info "Causal consumer Run is not live"
                                     {:type ::run-not-active :run/id run-id})))
@@ -277,7 +319,7 @@
    (when-not (contains? finish-statuses status)
      (throw (ex-info "Invalid run finish status"
                      {:type ::invalid-finish-status :status status :run-id run-id})))
-   (locking (run-lock run-id)
+   (with-run-lock run-id
      (when-let [entry (get @active run-id)]
        (let [now (or now (java.util.Date.))
              run (cond-> (assoc (:run entry)
@@ -314,7 +356,7 @@
    (when-not (contains? finish-statuses status)
      (throw (ex-info "Invalid run finish status"
                      {:type ::invalid-finish-status :status status :run-id run-id})))
-   (locking (run-lock run-id)
+   (with-run-lock run-id
      (when-let [entry (get @active run-id)]
        ;; Exactly one settlement path owns result publication. A graph callback
        ;; racing the normal Spin sees this retained terminal state and yields.
@@ -342,7 +384,7 @@
   "Release a Run whose terminal projection was written by `retain-finished!`.
    Emits the lifecycle finish event only as the execution lease disappears."
   [run-id]
-  (locking (run-lock run-id)
+  (with-run-lock run-id
     (when-let [entry (get @active run-id)]
       (let [run (:run entry)]
         (when-not (contains? finish-statuses (:run/status run))
@@ -360,7 +402,7 @@
    fence. Room teardown cannot observe the lease disappear and close the
    execution context before `publish!` has written the fork-aware result."
   [run-id publish! result]
-  (locking (run-lock run-id)
+  (with-run-lock run-id
     (when-let [entry (get @active run-id)]
       (let [run (:run entry)]
         (when-not (contains? finish-statuses (:run/status run))
@@ -412,7 +454,7 @@
    live entry, so the Run's later updates carry it. nil when the Run is not
    live in this process."
   [run-id data]
-  (locking (run-lock run-id)
+  (with-run-lock run-id
     (when-let [entry (get @active run-id)]
       (let [run (assoc (:run entry)
                        :run/savepoint (pr-str data)
