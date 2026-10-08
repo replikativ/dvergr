@@ -180,10 +180,11 @@
         ;; the parent arrives.
         msg (if (instance? Message msg)
               (if-let [parent-id (:in-reply-to msg)]
-                (let [live-parent (or (some #(when (= parent-id (:id %)) %)
-                                            (rseq (vec (bus/log (:bus room)))))
-                                      ;; a parent admitted but not yet on the log
-                                      (bus/admitted (:bus room) parent-id))
+                (let [live-parent (or ;; admitted first, then the log: a message
+                                      ;; leaves the admitted ones only once on the log
+                                   (bus/admitted (:bus room) parent-id)
+                                   (some #(when (= parent-id (:id %)) %)
+                                         (rseq (vec (bus/log (:bus room))))))
                       root (or (some-> live-parent thread-root-id)
                                (when-let [store (:store room)]
                                  (rstore/-message-thread-root
