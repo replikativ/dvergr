@@ -74,7 +74,8 @@
 
 (deftest a-subscription-call-is-free-and-worth-its-list-price
   (let [usage {:input-tokens 6511 :output-tokens 23298}
-        paid (spend/of-usage "claude-haiku-4-5" usage)
+        ;; the CLI candidate is worth the API model it pins
+        paid (spend/of-usage "claude-haiku-5-5" usage)
         sub (spend/of-usage "claude-code-haiku" usage)]
     (is (= 0 (:microdollars sub)) "the bill is what was paid")
     (is (true? (:priced? sub)))
@@ -89,7 +90,7 @@
         (is (= (:microdollars (spend/of-usage "gpt-5.6-luna" usage)) (:notional-microdollars b)))))))
 
 (deftest folding-keeps-old-spends-as-they-were
-  (let [paid (spend/of-usage "claude-haiku-4-5" {:input-tokens 1000 :output-tokens 100})
+  (let [paid (spend/of-usage "claude-haiku-5-5" {:input-tokens 1000 :output-tokens 100})
         sub (spend/of-usage "claude-code-haiku" {:input-tokens 1000 :output-tokens 100})]
     (is (not (contains? (spend/total [paid paid]) :notional-microdollars))
         "spends recorded before notional costs fold exactly as before")
