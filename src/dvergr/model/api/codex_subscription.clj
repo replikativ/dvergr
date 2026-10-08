@@ -43,7 +43,9 @@
   {"codex-subscription-sol" "gpt-5.6-sol"
    "codex-subscription-terra" "gpt-5.6-terra"
    "codex-subscription-luna" "gpt-5.6-luna"
-   "codex-subscription-sol-6.1" "gpt-6.1-sol"})
+   "codex-subscription-sol-6.1" "gpt-6.1-sol"
+   "codex-subscription-luna-6" "gpt-6-luna"
+   "codex-subscription-astra-6" "gpt-6-astra"})
 
 (def ^:private passive-item-types
   ;; Fail closed for every other current or future Codex item type. Dvergr only
@@ -444,7 +446,7 @@
         sid (session-id cache-key)
         effort (or (resolve-effort opts)
                    (:default-effort config)
-                   (if (= model "gpt-5.6-sol") "low" "medium"))
+                   (if (#{"gpt-5.6-sol" "gpt-6.1-sol"} model) "low" "medium"))
         input (formatted-input messages)
         body-base {:model model
                    :input (if responses-lite?
@@ -501,8 +503,9 @@
   (build-request [_ messages opts]
     (native-request config credentials messages opts))
 
-  (create-accumulator [_ _]
-    {:content ""
+  (create-accumulator [_ model-def]
+    {:wanted (resolve-native-model (:id model-def))
+     :content ""
      :reasoning ""
      :tool-calls []
      :usage {:input-tokens 0 :output-tokens 0}
@@ -565,6 +568,14 @@
       state))
 
   (extract-response [_ state]
+    ;; An exact model asked for and another served: a fault (the cell runs
+    ;; again), never a result recorded under the wrong model. A served name
+    ;; may carry a date suffix.
+    (let [{:keys [wanted model]} state]
+      (when (and wanted model (not (str/starts-with? model wanted)))
+        (throw (ex-info (str "Codex served " model " for " wanted)
+                        {:status 502 ::model-mismatch true
+                         :wanted wanted :served model}))))
     {:content (:content state)
      :reasoning (not-empty (:reasoning state))
      :tool-calls (not-empty (:tool-calls state))

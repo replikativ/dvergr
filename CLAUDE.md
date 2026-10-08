@@ -55,7 +55,8 @@ quirks; `resources/models.edn` adds Fireworks models, and `(registry/refresh-fro
 #{:fireworks})` overlays current prices.
 
 - Subscriptions (no per-token bill; reports price them at list price via `:list-price-of`):
-  `codex-subscription-luna`, `codex-subscription-sol` (Codex), `claude-code-haiku`,
+  `codex-subscription-luna`, `codex-subscription-sol` (Codex, GPT-5.6), `codex-subscription-luna-6`,
+  `codex-subscription-sol-6.1`, `codex-subscription-astra-6` (Codex, GPT-6/6.1), `claude-code-haiku`,
   `claude-code-sonnet`, `claude-code-opus` (Claude Code CLI).
 - Fireworks: `accounts/fireworks/models/minimax-m3` (default), `glm-5p3-flash`,
   `deepseek-v4p1-flash`, `glm-5p3`, `kimi-k3`. Key: `OPENAI_API_KEY` +

@@ -237,6 +237,67 @@
     :pricing {:input 0.20 :output 1.20 :cache-read 0.02 :cache-write 0.25}
     :quirks {:chat-tools-need-effort-none? true}}
 
+   ;; ── OpenAI GPT-6 / 6.1 ──────────────────────────────────────────
+   ;; List prices (developers.openai.com/api/docs/pricing, 2026-10-08,
+   ;; standard tier up to 272K input); the Codex subscription candidates
+   ;; below are priced at them. Context and default effort as Codex's model
+   ;; list gives them. Not yet exercised through the API provider.
+   "gpt-6.1-sol"
+   {:id "gpt-6.1-sol"
+    :name "GPT-6.1 Sol"
+    :provider :openai
+    :api-type :openai-chat
+    :capabilities #{:tools :vision :thinking :streaming :system-prompt :cache-control}
+    :context 272000
+    :max-output 128000
+    :reasoning-efforts ["low" "medium" "high" "xhigh" "max"]
+    :default-reasoning-effort "low"
+    :instruction-role :developer
+    :pricing {:input 2.0 :output 10.0 :cache-read 0.10 :cache-write 2.50}
+    :quirks {}}
+
+   "gpt-6-sol"
+   {:id "gpt-6-sol"
+    :name "GPT-6 Sol"
+    :provider :openai
+    :api-type :openai-chat
+    :capabilities #{:tools :vision :thinking :streaming :system-prompt :cache-control}
+    :context 272000
+    :max-output 128000
+    :reasoning-efforts ["low" "medium" "high" "xhigh" "max"]
+    :default-reasoning-effort "medium"
+    :instruction-role :developer
+    :pricing {:input 2.0 :output 10.0 :cache-read 0.20 :cache-write 2.50}
+    :quirks {}}
+
+   "gpt-6-luna"
+   {:id "gpt-6-luna"
+    :name "GPT-6 Luna"
+    :provider :openai
+    :api-type :openai-chat
+    :capabilities #{:tools :vision :thinking :streaming :system-prompt :cache-control}
+    :context 272000
+    :max-output 128000
+    :reasoning-efforts ["low" "medium" "high" "xhigh" "max"]
+    :default-reasoning-effort "medium"
+    :instruction-role :developer
+    :pricing {:input 0.10 :output 0.50 :cache-read 0.01 :cache-write 0.125}
+    :quirks {}}
+
+   "gpt-6-astra"
+   {:id "gpt-6-astra"
+    :name "GPT-6 Astra"
+    :provider :openai
+    :api-type :openai-chat
+    :capabilities #{:tools :vision :thinking :streaming :system-prompt :cache-control}
+    :context 272000
+    :max-output 128000
+    :reasoning-efforts ["low" "medium" "high" "xhigh" "max"]
+    :default-reasoning-effort "medium"
+    :instruction-role :developer
+    :pricing {:input 10.0 :output 50.0 :cache-read 1.0 :cache-write 12.50}
+    :quirks {}}
+
    ;; ── OpenAI GPT-5.5 / 5.4 ─────────────────────────────────────────
    ;; GPT-5.5 has its own documented reasoning contract: medium is the default
    ;; and max is not supported. It does not inherit the GPT-5.6 Chat tool quirk.
@@ -343,6 +404,31 @@
     :context 272000
     :max-output 128000
     :pricing {:input 0 :output 0}
+    :list-price-of "gpt-6.1-sol"  ;; the API model its tokens are worth (notional cost)
+    :quirks {}}
+
+   "codex-subscription-luna-6"
+   {:id "codex-subscription-luna-6"
+    :name "Codex GPT-6 Luna (subscription)"
+    :provider :codex-subscription
+    :api-type :openai-responses
+    :capabilities #{:tools :system-prompt :thinking :streaming}
+    :context 272000
+    :max-output 128000
+    :pricing {:input 0 :output 0}
+    :list-price-of "gpt-6-luna"  ;; the API model its tokens are worth (notional cost)
+    :quirks {}}
+
+   "codex-subscription-astra-6"
+   {:id "codex-subscription-astra-6"
+    :name "Codex GPT-6 Astra (subscription)"
+    :provider :codex-subscription
+    :api-type :openai-responses
+    :capabilities #{:tools :system-prompt :thinking :streaming}
+    :context 272000
+    :max-output 128000
+    :pricing {:input 0 :output 0}
+    :list-price-of "gpt-6-astra"  ;; the API model its tokens are worth (notional cost)
     :quirks {}}
 
    "codex-subscription-cli"
@@ -673,7 +759,9 @@
                  "codex-sol" "codex-subscription-sol"
                  "codex-terra" "codex-subscription-terra"
                  "codex-luna" "codex-subscription-luna"
-                 "codex-sol-6.1" "codex-subscription-sol-6.1"}))
+                 "codex-sol-6.1" "codex-subscription-sol-6.1"
+                 "codex-luna-6" "codex-subscription-luna-6"
+                 "codex-astra-6" "codex-subscription-astra-6"}))
 
 (defn register-alias!
   "Register an alias for a model ID."

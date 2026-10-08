@@ -239,3 +239,34 @@
             :cache-read-tokens 31
             :reasoning-output-tokens 4}
            (:usage response)))))
+
+(defn- completed-by [model-id served]
+  (let [codex-provider (codex/create {:credentials ::fake})
+        model-def {:id model-id}
+        state (provider/accumulate-event
+               codex-provider (provider/create-accumulator codex-provider model-def)
+               "response.completed"
+               {:type "response.completed"
+                :response {:id "resp-1" :model served
+                           :usage {:input_tokens 3 :output_tokens 1}}}
+               model-def)]
+    (provider/extract-response codex-provider state)))
+
+(deftest the-6-generation-candidates-ask-for-their-exact-model
+  (let [codex-provider (codex/create {:credentials ::fake})
+        model-of (fn [id] (get-in (provider/build-request codex-provider [{:role :user :content "Hi"}] {:model id})
+                                  [:body :model]))]
+    (is (= "gpt-6-luna" (model-of "codex-subscription-luna-6")))
+    (is (= "gpt-6.1-sol" (model-of "codex-subscription-sol-6.1")))
+    (is (= "gpt-6-astra" (model-of "codex-subscription-astra-6")))
+    (is (= "gpt-5.6-luna" (model-of "codex-subscription-luna")) "the 5.6 id keeps its model")))
+
+(deftest another-model-served-is-a-fault
+  (is (= "gpt-6-luna" (:model (completed-by "codex-subscription-luna-6" "gpt-6-luna"))))
+  (is (= "gpt-6-luna-2026-09-22" (:model (completed-by "codex-subscription-luna-6" "gpt-6-luna-2026-09-22")))
+      "a dated name of the model asked for is that model")
+  (let [e (try (completed-by "codex-subscription-luna-6" "gpt-5.6-luna") nil
+               (catch clojure.lang.ExceptionInfo e e))]
+    (is (some? e))
+    (is (= {:status 502 :wanted "gpt-6-luna" :served "gpt-5.6-luna"}
+           (select-keys (ex-data e) [:status :wanted :served])))))
