@@ -43,6 +43,15 @@
     (is (= 1.0 (:overlap r)))
     (is (= #{"https://live/page"} (:changed r)))))
 
+(deftest a-search-is-its-endpoint-and-query
+  (let [search (fn [q] {:effect :http/request
+                        :resource {:method :get :url "https://api.search/s" :query {"q" q "count" "10"}}
+                        :decision :allowed :digest q})
+        r (grounds/independence (grounds/grounds [(search "agent teams")])
+                                (grounds/grounds [(search "agent teams") (search "memory")]))]
+    (is (= #{"https://api.search/s?count=10&q=agent teams"} (:shared r)))
+    (is (= 0.5 (:overlap r)))))
+
 (deftest no-external-reads-is-no-evidence-not-independence
   (is (nil? (:overlap (grounds/independence (grounds/grounds [(read-file "a" "x")])
                                             (grounds/grounds []))))))

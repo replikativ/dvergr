@@ -14,6 +14,7 @@
    so a fact an Attempt took from its prompt or a model's memory has no
    ground here."
   (:require [clojure.set :as set]
+            [clojure.string :as str]
             [dvergr.artifact :as artifact]))
 
 (defn effect-log
@@ -39,7 +40,10 @@
   [{:keys [effect resource decision error]}]
   (when (and (= :allowed decision) (nil? error))
     (case effect
-      :http/request (when-let [url (:url resource)] [:external url])
+      :http/request (when-let [url (:url resource)]
+                      [:external (if-let [q (seq (:query resource))]
+                                   (str url "?" (str/join "&" (map (fn [[k v]] (str k "=" v)) (sort q))))
+                                   url)])
       :fs/read [:local (str "file:" (if (map? resource) (:path resource) resource))]
       :room/read [:local (str "room:" (or (:room resource) (pr-str resource)))]
       nil)))

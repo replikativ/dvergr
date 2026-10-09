@@ -743,7 +743,13 @@
                        (effects/perform!
                         effects
                         {:effect :http/request
-                         :resource {:method method :url (:url opts)}
+                         ;; the query names what was asked: two searches of one
+                         ;; endpoint are different sources
+                         :resource (cond-> {:method method :url (:url opts)}
+                                     (seq (:query-params opts))
+                                     (assoc :query (into (sorted-map)
+                                                         (map (fn [[k v]] [(name k) (str v)]))
+                                                         (:query-params opts))))
                          ;; a request that sends data is egress, not only network
                          :class (when-not (#{:get :head} method) #{:egress})
                          :result-of :body}
