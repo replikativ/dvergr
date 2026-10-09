@@ -18,8 +18,10 @@
    happens on the room's yggdrasil composite (spindel `register!` / `detach!`).
    Generalises simmis's `is.simm.model.system-db` from `:kb/*` to any `:system/*`."
   (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [datahike.api :as d]
             [dvergr.chat.schema :as cschema]
+            [dvergr.substrate.datahike :as sdh]
             [dvergr.substrate.paths :as paths])
   (:import [java.nio.charset StandardCharsets]
            [java.util UUID]))
@@ -118,7 +120,7 @@
 (defn- cfg []
   (let [path (paths/system-db-dir)]
     {:store {:backend :file :path path
-             :id (java.util.UUID/nameUUIDFromBytes (.getBytes ^String path))}
+             :id (sdh/file-store-id path)}
      :schema-flexibility :write}))
 
 (defonce ^:private conn-atom (atom nil))
@@ -138,8 +140,14 @@
   "Drop the cached system-DB connection so the next `get-conn` reconnects at the
    *current* `paths/system-db-dir`. For tests that re-root
    `dvergr.substrate.paths` to an isolated temp dir (call after
-   `paths/set-home!`), so they neither read nor pollute the real `.dvergr`."
+   `paths/set-home!`), so they neither read nor pollute the real `.dvergr`.
+
+   Releases the connection: Datahike caches connections by store id, and a
+   home copied to another directory keeps its stores' ids, so an unreleased
+   connection to the original would be handed out for the copy."
   []
+  (when-let [conn @conn-atom]
+    (try (d/release conn) (catch Throwable _ nil)))
   (reset! conn-atom nil))
 
 (defn- now [] (java.util.Date.))
@@ -174,6 +182,38 @@
   []
   (d/q '[:find [(pull ?e [:system/id :system/type :system/scope :system/name]) ...]
          :where [?e :system/id]] @(get-conn)))
+
+(defn- rehomed-scope
+  "Where `scope` lives under the current home, when it is a store of another
+   home's `systems/` directory that exists here (the home was moved or
+   copied); else nil."
+  [scope systems-dir]
+  (when (string? scope)
+    (let [f (io/file scope)
+          parent (.getParentFile f)
+          here (io/file systems-dir (.getName f))]
+      (when (and (.isAbsolute f) parent (= "systems" (.getName parent))
+                 (not= (.getCanonicalFile parent) (.getCanonicalFile (io/file systems-dir)))
+                 (.exists here))
+        (str here)))))
+
+(defn rehome-scopes!
+  "Point every registered system whose scope is a store of another home's
+   `systems/` directory at the same store under this home, when it exists here.
+   A home that was moved or copied otherwise opens its rooms' stores where they
+   used to be: their ids match, so nothing fails, and a copy writes into the
+   original. Scopes outside a `systems/` directory (a drive's filesystem path)
+   are left alone. Idempotent; returns the number of scopes rewritten. Run
+   before any room store is opened."
+  []
+  (let [conn (get-conn)
+        dir (paths/systems-dir)
+        tx (vec (for [{:system/keys [id scope]} (all-systems)
+                      :let [here (rehomed-scope scope dir)]
+                      :when here]
+                  [:db/add [:system/id id] :system/scope here]))]
+    (when (seq tx) (d/transact conn tx))
+    (count tx)))
 
 ;; ---------------------------------------------------------------------------
 ;; Rooms (projects)

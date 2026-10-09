@@ -11,6 +11,10 @@
    it too — the helper IS the documented provisioning idiom, not a wrapper
    beside it."
   (:require [datahike.api :as d]
+            [datahike.config :as dc]
+            [datahike.store :as ds]
+            [konserve.core :as k]
+            [konserve.store :as ks]
             [yggdrasil.adapters.datahike :as dh-adapter]
             [org.replikativ.spindel.yggdrasil :as ygg]
             [dvergr.chat.schema :as cschema]))
@@ -34,6 +38,51 @@
      128         57 MB   12697     10.9 ms  17.1 ms   <- knee
      256         78 MB   12436     13.4 ms  31.7 ms"
   128)
+
+(defn stored-store-id
+  "The `:store :id` the Datahike database in `store-config` was created with,
+   or nil when there is no database there. Reads the stored db record the way
+   `datahike.writing/-database-exists?*` does; konserve does not check the id
+   on connect, so a probe id opens any store."
+  [store-config]
+  (let [probe (cond-> store-config (nil? (:id store-config)) (assoc :id (random-uuid)))]
+    (when (ks/store-exists? probe {:sync? true})
+      (let [raw (ks/connect-store probe {:sync? true})
+            store (ds/add-cache-and-handlers raw (dc/load-config {:store probe}))]
+        (try (get-in (k/get store :db nil {:sync? true}) [:config :store :id])
+             (finally (ks/release-store probe store {:sync? true})))))))
+
+(defonce ^:private file-store-ids (atom {}))
+
+(defn file-store-id
+  "The konserve store id for the file store at `path`: the id its database was
+   created with when there is one, else a fresh one that the store keeps once
+   created. Never derived from the path, so a home moved or copied to another
+   directory opens its stores (a path-derived id changes with the path and
+   Datahike refuses the store). Stores created by older versions keep their
+   path-derived ids: they are read, not recomputed.
+
+   Cached per path, so every config built for one store names one id, also
+   before the store exists. `forget-file-store-id!` after deleting a store."
+  [path]
+  (let [path (str path)]
+    (or (get @file-store-ids path)
+        (let [id (or (stored-store-id {:backend :file :path path}) (random-uuid))]
+          (get (swap! file-store-ids #(if (contains? % path) % (assoc % path id))) path)))))
+
+(defn forget-file-store-id!
+  "Drop the cached id of the store at `path` (after deleting it)."
+  [path]
+  (swap! file-store-ids dissoc (str path))
+  nil)
+
+(defn delete-database!
+  "Delete the database `cfg` names and forget its cached store id, so a store
+   created again at the same path gets its own."
+  [cfg]
+  (try (d/delete-database cfg)
+       (finally (when-let [path (get-in cfg [:store :path])]
+                  (forget-file-store-id! path)))))
 
 (defn connect!
   "Connect to `cfg`, creating the database first when it doesn't exist.

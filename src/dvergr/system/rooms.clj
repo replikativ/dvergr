@@ -53,6 +53,28 @@
                     error))
     (get @room-ctxs room-id)))
 
+(defn release-room-stores!
+  "Release the Datahike connection of every store registered in a room's
+   context, all of its leases: the daemon owns them and is stopping. Datahike
+   caches connections by store id and a home copied to another directory keeps
+   its stores' ids, so a connection left open would be handed out again for
+   the copy (or to a same-process restart). Best-effort per store. `ctxs`:
+   the room contexts by room id, `room-ctxs-snapshot` taken before
+   `clear-room-ctxs!`; release after everything that writes has stopped."
+  [ctxs]
+  (doseq [[_ ctx] ctxs]
+    (binding [ec/*execution-context* ctx]
+      (doseq [[_ system] (try (ygg/registered-systems) (catch Throwable _ {}))
+              :let [conn (:conn system)]
+              :when conn]
+        (try (d/release conn true) (catch Throwable _ nil))))))
+
+(defn room-ctxs-snapshot
+  "The room contexts by room id, for `release-room-stores!` after
+   `clear-room-ctxs!`."
+  []
+  @room-ctxs)
+
 (defn clear-room-ctxs!
   "Drop all per-room execution contexts. Call on daemon stop! so a same-process
    restart doesn't reuse stale forked ctxs pointing at the previous daemon root."
@@ -63,15 +85,17 @@
 (defn- scope-path [scope] (str (io/file (paths/systems-dir) scope)))
 
 (defn store-id
-  "Konserve store id for a room store `path`. Deterministic in the path, so the
-   id is stable across restarts and derivable without touching the store.
+  "Konserve store id for a room store `path`: the id the store was created
+   with (`substrate.datahike/file-store-id`), so it is stable across restarts
+   and survives moving the home. Not derivable from the path: a store created
+   by an older version has a path-derived id, a new one a random id.
 
    Public because it is the konserve-sync SCOPE: a consumer that collapses its
    own per-room database onto the room store (simmis binds
    `:room/content-db-scope` to it) must name the same store the writer uses, and
    must not re-derive the formula on its own."
   [path]
-  (java.util.UUID/nameUUIDFromBytes (.getBytes ^String path)))
+  (sdh/file-store-id path))
 
 (defn- store-cfg
   "ONE config for every datom store a room owns — messages, KB, agent `:data`.
@@ -265,6 +289,8 @@
    system DB is up. Requires a bound ctx (its `current-root` is the fork parent).
    Best-effort per room."
   []
+  ;; a moved or copied home: its registry still names the old home's stores
+  (sdb/rehome-scopes!)
   (doseq [{:room/keys [id]} (sdb/all-rooms)]
     (let [room-ctx (fork-room-ctx)]
       (try
@@ -599,7 +625,7 @@
    scratch DBs don't linger / resurrect."
   [pending-grants]
   (doseq [{:keys [scope]} pending-grants]
-    (try (d/delete-database (data-cfg scope)) (catch Throwable _))))
+    (try (sdh/delete-database! (data-cfg scope)) (catch Throwable _))))
 
 (defn delete-room-db!
   "Remove an agent-created data DB `db-name` from the room: detach + retract the
@@ -609,7 +635,7 @@
   (when-let [{:keys [path]} (first (filter #(= (name db-name) (:slug %)) (room-data-dbs room-id)))]
     (try (ygg/unregister! (data-system-name path)) (catch Throwable _))
     (sdb/delete-system-by-scope! room-id path)
-    (try (d/delete-database (data-cfg path)) (catch Throwable _))
+    (try (sdh/delete-database! (data-cfg path)) (catch Throwable _))
     true))
 
 (defn room-databases
@@ -701,12 +727,12 @@
                     (delete-tree! scope))
           :kb   (do (ygg/unregister! (kb-system-name scope))
                     (try (when (d/database-exists? (kb-cfg scope))
-                           (d/delete-database (kb-cfg scope)))
+                           (sdh/delete-database! (kb-cfg scope)))
                          (catch Throwable _ nil))
                     (delete-tree! scope))
           :msgs (do (ygg/unregister! (msgs-system-name scope))
                     (try (when (d/database-exists? (msgs-cfg scope))
-                           (d/delete-database (msgs-cfg scope)))
+                           (sdh/delete-database! (msgs-cfg scope)))
                          (catch Throwable _ nil))
                     (delete-tree! scope))
           nil)))

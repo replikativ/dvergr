@@ -75,7 +75,8 @@
 (defn- store-config [dir]
   (let [path (.getAbsolutePath (io/file dir "store"))]
     {:store {:backend :file :path path
-             :id (java.util.UUID/nameUUIDFromBytes (.getBytes (str "dvergr-experiment:" path) "UTF-8"))}
+             ;; the id the store was created with: an experiment directory can move
+             :id (sdh/file-store-id path)}
      :keep-history? true
      :schema-flexibility :write}))
 

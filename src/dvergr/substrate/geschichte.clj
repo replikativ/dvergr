@@ -38,15 +38,15 @@
 (defn repository-config
   "Portable Datahike configuration for one persistent Geschichte repository."
   [scope]
-  (let [scope-path (.getCanonicalPath (io/file scope))
-        ;; Keep the store below the repository scope. Besides leaving room for
+  (let [;; Keep the store below the repository scope. Besides leaving room for
         ;; future repository metadata, this lets callers hand us an existing
         ;; empty scope directory (the old native-worktree API commonly did).
         path (.getCanonicalPath (io/file scope "datahike"))]
     {:store {:backend :file
              :path path
-             :id (java.util.UUID/nameUUIDFromBytes
-                  (.getBytes (str "dvergr-geschichte:" scope-path) "UTF-8"))}
+             ;; the id the store was created with, not one derived from the
+             ;; path: a moved home keeps its repositories
+             :id (sdh/file-store-id path)}
      ;; 128, not 256 — measured knee on a room-shaped store; see
      ;; `dvergr.substrate.datahike/diff-buf-size` for the table.
      :index-config {:diff-buf-size sdh/diff-buf-size}
@@ -116,7 +116,7 @@
                  (if fallback?
                    (fallback-workspace! conn source error)
                    (do (d/release conn)
-                       (d/delete-database cfg)
+                       (sdh/delete-database! cfg)
                        (throw (ex-info (str "Could not import " source ": " (ex-message error))
                                        {:type ::import-failed :source source}
                                        error)))))))
@@ -133,7 +133,7 @@
 (defn delete-repository! [scope]
   (let [cfg (repository-config scope)]
     (when (d/database-exists? cfg)
-      (d/delete-database cfg))))
+      (sdh/delete-database! cfg))))
 
 (defn current-system
   "The room-owned Geschichte system in the bound Spindel context."
