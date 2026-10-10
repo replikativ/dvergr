@@ -33,14 +33,27 @@
   [room attempt]
   (effect-log room (get-in attempt [:attempt/receipt :attempt/metrics :effects :log])))
 
+(defn- decode [s] (java.net.URLDecoder/decode ^String s "UTF-8"))
+(defn- encode [s] (java.net.URLEncoder/encode ^String s "UTF-8"))
+
+(defn- query-pairs
+  "The decoded name/value pairs of an encoded query string."
+  [s]
+  (for [kv (str/split (or s "") #"&") :when (seq kv)
+        :let [[k v] (str/split kv #"=" 2)]]
+    [(decode k) (decode (or v ""))]))
+
 (defn- request-source
-  "A request's source: its URL with the query it asked (appended to any query
-   the URL already carries) and, for a request with a body, the body's digest."
+  "A request's source: its URL without fragment, with every query parameter it
+   sent (those in the URL and its `:query`) decoded, sorted and encoded again,
+   so one request written two ways is one source; and, for a request with a
+   body, the body's digest after a space (no URL contains one)."
   [url {:keys [query body-digest]}]
-  (cond-> url
-    (seq query) (str (if (str/includes? url "?") "&" "?")
-                     (str/join "&" (map (fn [[k v]] (str k "=" v)) (sort query))))
-    body-digest (str "#body=" body-digest)))
+  (let [[base url-query] (str/split (first (str/split url #"#" 2)) #"\?" 2)
+        pairs (sort (concat (query-pairs url-query) (query-pairs query)))]
+    (cond-> base
+      (seq pairs) (str "?" (str/join "&" (map (fn [[k v]] (str (encode k) "=" (encode v))) pairs)))
+      body-digest (str " body=" body-digest))))
 
 (defn source
   "The source receipt `r` read, as `[:external id]` or `[:local id]`, or nil

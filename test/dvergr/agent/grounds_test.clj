@@ -2,7 +2,9 @@
   "An Attempt's grounds from its receipts, and the overlap that makes two
    agreeing Attempts one source counted twice."
   (:require [clojure.test :refer [deftest is testing]]
+            [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.grounds :as grounds]
+            [dvergr.artifact :as artifact]
             [dvergr.effects :as effects]
             [dvergr.sandbox.ns.io :as io]
             [sci.core :as sci]))
@@ -48,17 +50,17 @@
 
 (deftest a-search-is-its-endpoint-and-query
   (let [search (fn [q] {:effect :http/request
-                        :resource {:method :get :url "https://api.search/s" :query {"q" q "count" "10"}}
+                        :resource {:method :get :url "https://api.search/s" :query (str "q=" q "&count=10")}
                         :decision :allowed :digest q})
-        r (grounds/independence (grounds/grounds [(search "agent teams")])
-                                (grounds/grounds [(search "agent teams") (search "memory")]))]
-    (is (= #{"https://api.search/s?count=10&q=agent teams"} (:shared r)))
+        r (grounds/independence (grounds/grounds [(search "agent+teams")])
+                                (grounds/grounds [(search "agent+teams") (search "memory")]))]
+    (is (= #{"https://api.search/s?count=10&q=agent+teams"} (:shared r)))
     (is (= 0.5 (:overlap r)))))
 
 (deftest a-query-joins-the-one-in-the-url
   (is (= {"https://api.search/s?lang=en&q=x" #{"d"}}
          (:external (grounds/grounds [{:effect :http/request
-                                       :resource {:method :get :url "https://api.search/s?lang=en" :query {"q" "x"}}
+                                       :resource {:method :get :url "https://api.search/s?lang=en#top" :query "q=x"}
                                        :decision :allowed :digest "d"}])))))
 
 (deftest a-posted-search-is-its-endpoint-and-body
@@ -67,7 +69,7 @@
                                 :decision :allowed :digest body-digest})
         r (grounds/independence (grounds/grounds [(post "b1")])
                                 (grounds/grounds [(post "b1") (post "b2")]))]
-    (is (= #{"https://api.search/graphql#body=b1"} (:shared r)))
+    (is (= #{"https://api.search/graphql body=b1"} (:shared r)))
     (is (= 0.5 (:overlap r)))))
 
 (deftest no-external-reads-is-no-evidence-not-independence
@@ -84,6 +86,59 @@
             {:attempts [0 2] :overlap 0.33 :shared ["https://p/2"]}
             {:attempts [1 2] :overlap 0.33 :shared ["https://p/2"]}]
            (grounds/shared-sources gs)))))
+
+(defn- sandbox-receipts
+  "The receipts of evaluating `code` (http calls) in a sandbox whose requests
+   reach an offline transport."
+  [code]
+  (let [sink (effects/make-sink)
+        ctx (sci/init {})]
+    (io/add-http-ns! ctx :effects (constantly {:handlers [(effects/receipts sink nil)]})
+                     :fixture-transport (fn [_] {:status 200 :headers {} :body "ok"}))
+    (sci/eval-string* ctx code)
+    @sink))
+
+(defn- sources [receipts]
+  (mapv #(second (grounds/source %)) receipts))
+
+(deftest one-request-written-two-ways-is-one-source
+  (let [[a b] (sources (sandbox-receipts
+                        (str "(babashka.http-client/get \"https://api/s?q=a%20b&lang=en#frag\")"
+                             "(babashka.http-client/get \"https://api/s\" {:query-params {:lang \"en\" :q \"a b\"}})")))]
+    (is (= a b))))
+
+(deftest reserved-characters-and-repeated-parameters-stay-distinct
+  (let [rs (sandbox-receipts
+            (str "(babashka.http-client/get \"https://api/s\" {:query-params {:q \"x&r=y\"}})"
+                 "(babashka.http-client/get \"https://api/s\" {:query-params {:q \"x\" :r \"y\"}})"
+                 "(babashka.http-client/get \"https://api/s\" {:query-params {:t [\"a\" \"b\"]}})"
+                 "(babashka.http-client/get \"https://api/s\" {:query-params {:t \"[\\\"a\\\" \\\"b\\\"]\"}})"))
+        [amp two vec lit] (sources rs)]
+    (is (not= amp two) "an encoded & is not a second parameter")
+    (is (= "https://api/s?t=a&t=b" vec) "a vector is one parameter per element, as sent")
+    (is (not= vec lit))
+    (testing "and replay tells them apart"
+      (is (= 4 (count (distinct (map effects/effect-key rs))))))))
+
+(deftest the-digest-is-of-the-body-the-transport-sends
+  (let [[same-body-a same-body-b form-only] (map :resource
+                                                 (sandbox-receipts
+                                                  (str "(babashka.http-client/post \"https://api/g\" {:body \"x\" :json {:q 1}})"
+                                                       "(babashka.http-client/post \"https://api/g\" {:body \"x\" :json {:q 2}})"
+                                                       "(babashka.http-client/post \"https://api/g\" {:form-params {:q 1}})")))]
+    (is (not= (:body-digest same-body-a) (:body-digest same-body-b)) ":json is what is sent")
+    (is (nil? (:body-digest form-only)) "the transport sends no form body")))
+
+(deftest an-attempts-receipts-are-read-back-from-its-room
+  ;; the path evaluation stores the log on and workflow results read it from
+  (let [room {:store {:artifacts (artifact/memory-store)}}
+        receipts [(fetch "https://p/1" "a") (read-file "task.md" "t")]
+        {:keys [log]} (#'evaluation/effect-log room receipts)
+        attempt {:attempt/receipt {:attempt/metrics {:effects {:log log}}}}]
+    (is (some? log))
+    (is (= receipts (grounds/attempt-receipts room attempt)))
+    (is (= {:external 1 :local 1}
+           (grounds/summary (grounds/grounds (grounds/attempt-receipts room attempt)))))))
 
 (deftest sandbox-requests-receipt-what-they-asked
   (let [sink (effects/make-sink)
