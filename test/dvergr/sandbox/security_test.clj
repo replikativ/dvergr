@@ -100,6 +100,46 @@
       (is (refused? #(sci/eval-string* ctx %) "(git/add \"*\")"))
       (finally (close!)))))
 
+(deftest virtual-staging-and-tree-ops-are-confined
+  (let [{:keys [conn close!] :as repository} (gfs/memory-repository! {:name "virtual-confined"})
+        workspace {:conn conn :id [(get-in @conn [:config :store :id]) :db]
+                   :repository repository}
+        filesystem (gfs/make-root repository)
+        ctx (sci/init {})
+        staged #(:staged (sci/eval-string* ctx "(git/status)"))]
+    (try
+      (io/add-fs-ns! ctx :filesystem filesystem)
+      (io/add-git-ns! ctx :workspace workspace)
+      (sci/eval-string* ctx "(spit \"src/x.clj\" \"(ns x)\")")
+      (testing "a normalised operand stages its file when nothing is sensitive"
+        (is (= :ok (sci/eval-string* ctx "(git/add \"./src/../src/x.clj\")")))
+        (is (= ["src/x.clj"] (staged))))
+      (testing "a file name with a line break cannot forge a status record"
+        ;; seeded host-side
+        (mfs/mkdir filesystem "/dir")
+        (mfs/write-string! filesystem "/dir/.env" "S=1\n" false)
+        (mfs/write-string! filesystem "/bait" "b\n" false)
+        (mfs/write-string! filesystem "/bait\n?? dir" "b\n" false)
+        (is (= :ok (sci/eval-string* ctx "(git/add \".\")")))
+        (is (not (some #{"dir/.env"} (staged))) (pr-str (staged))))
+      (testing "a recursive copy, move or delete cannot take a sensitive file along"
+        (mfs/mkdir filesystem "/.ssh")
+        (mfs/write-string! filesystem "/.ssh/key" "SECRET\n" false)
+        (doseq [code ["(babashka.fs/copy-tree \".ssh\" \"public\")"
+                      "(babashka.fs/move \".ssh\" \"public2\")"
+                      "(babashka.fs/delete-tree \".ssh\")"
+                      "(babashka.fs/copy-tree \"dir\" \"dir2\")"]]
+          (is (thrown-with-msg? Exception #"sensitive path" (sci/eval-string* ctx code)) code))
+        (is (thrown? Exception (sci/eval-string* ctx "(slurp \"public/key\")")))
+        (is (= "SECRET\n" (mfs/read-file filesystem "/.ssh/key")) "still there"))
+      (testing "ordinary tree ops still work"
+        (sci/eval-string* ctx "(spit \"tree/sub/y.txt\" \"y\")")
+        (sci/eval-string* ctx "(babashka.fs/copy-tree \"tree\" \"tree2\")")
+        (is (= "y" (sci/eval-string* ctx "(slurp \"tree2/sub/y.txt\")")))
+        (sci/eval-string* ctx "(babashka.fs/delete-tree \"tree2\")")
+        (is (false? (sci/eval-string* ctx "(babashka.fs/exists? \"tree2\")"))))
+      (finally (close!)))))
+
 (deftest sensitive-path-policy-blocks-secrets
   (testing "known-sensitive OS paths are rejected"
     (doseq [p ["/etc/passwd" "/etc/shadow" "/home/u/.ssh/id_rsa" "/app/.env"

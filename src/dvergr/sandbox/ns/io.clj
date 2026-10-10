@@ -483,6 +483,14 @@
 
 (defn- add-virtual-fs-ns! [sci-ctx filesystem effects]
   (let [resolve! #(virtual-path filesystem %)
+        ;; A recursive copy, move or delete takes everything under its root:
+        ;; refuse when any path under it, or where it would land, is sensitive
+        ;; (`.ssh` passes, `.ssh/key` does not).
+        check-tree! (fn [source target]
+                      (doseq [p (virtual-walk filesystem source)]
+                        (sensitive-path-policy p)
+                        (when target
+                          (sensitive-path-policy (str target (subs p (count source)))))))
         relative #(str/replace % #"^/+" "")
         stat-map (fn [path]
                    (when-let [stat (mfs/stat filesystem path)]
@@ -542,18 +550,25 @@
         'delete-if-exists (write-fx :fs/delete #(let [path (resolve! %)]
                                                   (if (mfs/exists? filesystem path)
                                                     (mfs/delete filesystem path) false)))
-        'delete-tree (write-fx :fs/delete #(delete-tree! (resolve! %)))
+        'delete-tree (write-fx :fs/delete #(let [path (resolve! %)]
+                                             (check-tree! path nil)
+                                             (delete-tree! path)))
         'move (fn [source target & _]
                 (fx effects :fs/move {:src (str source) :dst (str target)}
                     #(let [source (resolve! source) target (resolve! target)]
+                       (check-tree! source target)
                        (mfs/rename filesystem source target)
                        (relative target))))
         'copy (fn [source target & _]
                 (fx effects :fs/copy {:src (str source) :dst (str target)}
-                    #(relative (copy-tree! (resolve! source) (resolve! target)))))
+                    #(let [source (resolve! source) target (resolve! target)]
+                       (check-tree! source target)
+                       (relative (copy-tree! source target)))))
         'copy-tree (fn [source target & _]
                      (fx effects :fs/copy {:src (str source) :dst (str target)}
-                         #(relative (copy-tree! (resolve! source) (resolve! target)))))
+                         #(let [source (resolve! source) target (resolve! target)]
+                            (check-tree! source target)
+                            (relative (copy-tree! source target)))))
         'parent (fn [path] (let [path (resolve! path)]
                              (when-not (= path "/") (relative (virtual-parent path)))))
         'file-name #(last (str/split (str %) #"/"))
@@ -781,19 +796,31 @@
                                  ;; after `--`: a dash-led operand is refused,
                                  ;; and names go back root-anchored (`/-A` is
                                  ;; the file `-A`).
+                                 ;; Names come from Geschichte's structured status
+                                 ;; entries (a file name with a line break is one
+                                 ;; name, not a forged record).
                                  (let [_ (doseq [p paths :when (str/starts-with? p "-")]
                                            (git-arg-refused! (str "git/add path may not start with -: " p) {:path p}))
-                                       names (->> (str/split-lines (run! "status" "--porcelain=v1" "--untracked-files=all"))
-                                                  (keep (fn [l] (when (> (count l) 3) (subs l 3)))))
+                                       {:keys [conn]} (if workspace-resolver (workspace-resolver) workspace)
+                                       rules ((requiring-resolve 'geschichte.ignore/rules) conn)
+                                       ignored? (requiring-resolve 'geschichte.ignore/ignored?)
+                                       names (->> ((requiring-resolve 'geschichte.repo/status-entries) conn)
+                                                  (remove (fn [{:keys [path worktree index]}]
+                                                            (and (= :untracked worktree) (nil? index)
+                                                                 (ignored? rules path))))
+                                                  (map :path))
                                        rel (fn [p] (-> (java.nio.file.Paths/get "/" (into-array String [(str p)]))
                                                        .normalize str (str/replace #"^/+|/+$" "")))
+                                       ;; operands normalised the same way on both
+                                       ;; branches, root-anchored
+                                       anchored (mapv (fn [p] (let [r (rel p)] (if (= "" r) "." (str "/" r)))) paths)
                                        selected? (fn [n] (some (fn [p] (let [p (rel p)]
                                                                          (or (= "" p) (= n p)
                                                                              (str/starts-with? n (str p "/")))))
                                                                paths))
                                        sensitive (filter sensitive-name? names)]
                                    (cond
-                                     (empty? sensitive) (apply run! "add" "--" paths)
+                                     (empty? sensitive) (apply run! "add" "--" anchored)
                                      (some (fn [p] (re-find #"[*?\[]" p)) paths)
                                      (git-arg-refused! "git/add glob not allowed while a sensitive file has changes"
                                                        {:paths paths})
