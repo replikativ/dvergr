@@ -33,6 +33,15 @@
   [room attempt]
   (effect-log room (get-in attempt [:attempt/receipt :attempt/metrics :effects :log])))
 
+(defn- request-source
+  "A request's source: its URL with the query it asked (appended to any query
+   the URL already carries) and, for a request with a body, the body's digest."
+  [url {:keys [query body-digest]}]
+  (cond-> url
+    (seq query) (str (if (str/includes? url "?") "&" "?")
+                     (str/join "&" (map (fn [[k v]] (str k "=" v)) (sort query))))
+    body-digest (str "#body=" body-digest)))
+
 (defn source
   "The source receipt `r` read, as `[:external id]` or `[:local id]`, or nil
    when `r` is not a completed read: a write, a denial, a failure, a model
@@ -41,9 +50,7 @@
   (when (and (= :allowed decision) (nil? error))
     (case effect
       :http/request (when-let [url (:url resource)]
-                      [:external (if-let [q (seq (:query resource))]
-                                   (str url "?" (str/join "&" (map (fn [[k v]] (str k "=" v)) (sort q))))
-                                   url)])
+                      [:external (request-source url resource)])
       :fs/read [:local (str "file:" (if (map? resource) (:path resource) resource))]
       :room/read [:local (str "room:" (or (:room resource) (pr-str resource)))]
       nil)))

@@ -48,7 +48,8 @@
         pair [:map [:src :string] [:dst :string]]]
     {:http/request {:class #{:network}
                     :resource [:map [:method :keyword] [:url [:maybe :string]]
-                               [:query {:optional true} [:map-of :string :string]]]
+                               [:query {:optional true} [:map-of :string :string]]
+                               [:body-digest {:optional true} :string]]
                     :result [:map [:status [:maybe :int]] [:headers :map] [:body :any]]}
      :fs/read   {:class #{:read}  :resource path :result :string}
      :fs/list   {:class #{:read}  :resource [:map [:path :string] [:glob {:optional true} :string]]

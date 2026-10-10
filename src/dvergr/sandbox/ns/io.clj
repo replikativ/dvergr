@@ -749,7 +749,11 @@
                                      (seq (:query-params opts))
                                      (assoc :query (into (sorted-map)
                                                          (map (fn [[k v]] [(name k) (str v)]))
-                                                         (:query-params opts))))
+                                                         (:query-params opts)))
+                                     ;; so does a request's body: two POSTed
+                                     ;; searches of one endpoint ask different things
+                                     (some opts [:body :json :form-params :multipart])
+                                     (assoc :body-digest (effects/digest (some opts [:body :json :form-params :multipart]))))
                          ;; a request that sends data is egress, not only network
                          :class (when-not (#{:get :head} method) #{:egress})
                          :result-of :body}

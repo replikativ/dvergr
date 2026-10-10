@@ -2,7 +2,10 @@
   "An Attempt's grounds from its receipts, and the overlap that makes two
    agreeing Attempts one source counted twice."
   (:require [clojure.test :refer [deftest is testing]]
-            [dvergr.agent.grounds :as grounds]))
+            [dvergr.agent.grounds :as grounds]
+            [dvergr.effects :as effects]
+            [dvergr.sandbox.ns.io :as io]
+            [sci.core :as sci]))
 
 (defn- fetch [url digest]
   {:effect :http/request :resource {:method :get :url url}
@@ -52,6 +55,21 @@
     (is (= #{"https://api.search/s?count=10&q=agent teams"} (:shared r)))
     (is (= 0.5 (:overlap r)))))
 
+(deftest a-query-joins-the-one-in-the-url
+  (is (= {"https://api.search/s?lang=en&q=x" #{"d"}}
+         (:external (grounds/grounds [{:effect :http/request
+                                       :resource {:method :get :url "https://api.search/s?lang=en" :query {"q" "x"}}
+                                       :decision :allowed :digest "d"}])))))
+
+(deftest a-posted-search-is-its-endpoint-and-body
+  (let [post (fn [body-digest] {:effect :http/request
+                                :resource {:method :post :url "https://api.search/graphql" :body-digest body-digest}
+                                :decision :allowed :digest body-digest})
+        r (grounds/independence (grounds/grounds [(post "b1")])
+                                (grounds/grounds [(post "b1") (post "b2")]))]
+    (is (= #{"https://api.search/graphql#body=b1"} (:shared r)))
+    (is (= 0.5 (:overlap r)))))
+
 (deftest no-external-reads-is-no-evidence-not-independence
   (is (nil? (:overlap (grounds/independence (grounds/grounds [(read-file "a" "x")])
                                             (grounds/grounds []))))))
@@ -66,3 +84,19 @@
             {:attempts [0 2] :overlap 0.33 :shared ["https://p/2"]}
             {:attempts [1 2] :overlap 0.33 :shared ["https://p/2"]}]
            (grounds/shared-sources gs)))))
+
+(deftest sandbox-requests-receipt-what-they-asked
+  (let [sink (effects/make-sink)
+        ctx (sci/init {})
+        offline (fn [_] {:status 200 :headers {} :body "ok"})]
+    (io/add-http-ns! ctx :effects (constantly {:handlers [(effects/receipts sink nil)]})
+                     :fixture-transport offline)
+    (sci/eval-string* ctx (str "(babashka.http-client/post \"https://api.search/graphql\" {:body \"{\\\"q\\\":\\\"a\\\"}\"})"
+                               "(babashka.http-client/post \"https://api.search/graphql\" {:json {:q \"b\"}})"
+                               "(babashka.http-client/get \"https://api.search/s?lang=en\" {:query-params {:q \"x\"}})"))
+    (let [[a b c] (mapv :resource @sink)
+          sources (mapv #(grounds/source (assoc % :decision :allowed)) @sink)]
+      (is (string? (:body-digest a)))
+      (is (not= (:body-digest a) (:body-digest b)) "two bodies, two sources")
+      (is (nil? (:body-digest c)) "a GET without a body has none")
+      (is (= [:external "https://api.search/s?lang=en&q=x"] (nth sources 2))))))
