@@ -116,3 +116,114 @@
     (is (contains? bash/git-local-subcommands "diff"))
     (doseq [forbidden ["clone" "push" "fetch" "pull" "remote" "submodule" "config"]]
       (is (not (contains? bash/git-local-subcommands forbidden)) forbidden))))
+
+(deftest ssrf-guard-blocks-unique-local-and-carrier-grade-nat
+  ;; Neither range is "site local" to java.net.InetAddress: fc00::/7 is IPv6's
+  ;; private range (RFC 4193) and 100.64.0.0/10 is shared address space (RFC
+  ;; 6598) that cloud VPCs and k8s pod networks use for internal services.
+  (doseq [u ["http://[fd00::1]/" "http://[fc00::1]/" "http://[fdff:ffff::1]/x"
+             "http://100.64.0.1/" "http://100.100.100.200/latest/meta-data/"
+             "http://100.127.255.254/"]]
+    (is (thrown? Exception (io/ssrf-guard! u)) u))
+  (testing "neighbouring public ranges still pass"
+    (doseq [u ["http://100.63.255.255/" "http://100.128.0.1/" "http://[2001:4860:4860::8888]/"
+               "http://[fe00::1]/"]]
+      (is (nil? (io/ssrf-guard! u)) u))))
+
+(defn- temp-dir! [prefix]
+  (.toFile (java.nio.file.Files/createTempDirectory
+            prefix (make-array java.nio.file.attribute.FileAttribute 0))))
+
+(defn- sh! [dir & args]
+  (let [p (.start (doto (ProcessBuilder. ^java.util.List (vec args))
+                    (.directory dir)
+                    (.redirectErrorStream true)))]
+    (slurp (.getInputStream p))
+    (.waitFor p)))
+
+(defn- git-repo! []
+  (let [dir (temp-dir! "dvergr-git-diff")]
+    (sh! dir "git" "init" "-q")
+    (sh! dir "git" "config" "user.email" "t@example.com")
+    (sh! dir "git" "config" "user.name" "t")
+    (.mkdirs (java.io.File. dir "src"))
+    (spit (java.io.File. dir "src/a.clj") "(ns a)\n")
+    (sh! dir "git" "add" ".")
+    (sh! dir "git" "-c" "commit.gpgsign=false" "commit" "-q" "-m" "init")
+    (spit (java.io.File. dir "src/a.clj") "(ns a)\n(def changed 1)\n")
+    dir))
+
+(defn- diff-argv [& args]
+  ;; resolved at run time so the suite compiles against a tree without it
+  (apply (requiring-resolve 'dvergr.sandbox.ns.io/git-diff-argv) args))
+
+(defn- refused?
+  "Did `code` throw the sandbox's own git-argument refusal — not merely some
+   git failure? A `--no-index` diff exits 1 on differences, so a bare
+   `thrown?` passes while the exception carries the host file's content."
+  [eval! code]
+  (try (eval! code) false
+       (catch Exception e
+         (boolean (some #(= :dvergr/git-arg-refused (:type (ex-data %)))
+                        (take-while some? (iterate ex-cause e)))))))
+
+(deftest physical-git-diff-is-confined-to-the-workspace
+  ;; `git/diff` passed its arguments straight to host git: `--no-index` diffs
+  ;; any two host files (the exit-1 exception carried the content), and
+  ;; `--output=<file>` writes anywhere the daemon user can.
+  (let [dir (git-repo!)
+        ctx (sci/init {})
+        eval! #(sci/eval-string* ctx %)
+        out (java.io.File. (temp-dir! "dvergr-git-out") "diff-proof")]
+    (io/add-git-ns! ctx :base-path (str dir))
+    (testing "options outside the allowlist are refused"
+      (doseq [code ["(git/diff \"--no-index\" \"/dev/null\" \"/etc/hostname\")"
+                    (str "(git/diff \"--output=" out "\")")
+                    "(git/diff \"--output\" \"/tmp/x\")"
+                    "(git/diff \"--ext-diff\")"
+                    "(git/diff \"-O/etc/passwd\")"]]
+        (is (refused? eval! code) code))
+      (is (not (.exists out)) "nothing was written outside the workspace"))
+    (testing "paths outside the workspace are refused"
+      (doseq [code ["(git/diff \"/etc/passwd\")" "(git/diff \"../../etc/passwd\")"
+                    "(git/diff \"--staged\" \"src/../../x\")"]]
+        (is (refused? eval! code) code)))
+    (testing "arguments after the options are always paths"
+      (is (= ["diff" "--staged" "--stat" "--" "src/a.clj" "HEAD"]
+             (diff-argv (str dir) ["--staged" "--stat" "src/a.clj" "HEAD"])))
+      (is (= ["diff" "--"] (diff-argv (str dir) []))))
+    (testing "ordinary diffs keep working"
+      (is (str/includes? (sci/eval-string* ctx "(git/diff)") "changed"))
+      (is (str/includes? (sci/eval-string* ctx "(git/diff \"src/a.clj\")") "changed"))
+      (is (str/includes? (sci/eval-string* ctx "(git/diff \"--stat\")") "src/a.clj"))
+      (is (= "" (sci/eval-string* ctx "(git/diff \"--staged\")")))
+      (is (str/includes? (sci/eval-string* ctx "(git/diff \"-U0\" \"src\")") "changed")))
+    (testing "git/log's :n is a count, not an option"
+      (is (refused? eval! (str "(git/log {:n \"-output=" out "\"})")))
+      (is (not (.exists out)))
+      (is (= 1 (count (sci/eval-string* ctx "(git/log {:n 1})")))))))
+
+(deftest physical-grep-is-confined
+  ;; The host-grep branch of the `grep` tool (no virtual filesystem) passed the
+  ;; pattern where grep reads options, and searched dot-files like `.env`
+  ;; that every other file tool refuses.
+  (let [dir (temp-dir! "dvergr-grep")]
+    (.mkdirs (java.io.File. dir "src"))
+    (.mkdirs (java.io.File. dir ".ssh"))
+    (spit (java.io.File. dir "src/a.txt") "SECRET is mentioned here\nuse --help for help\n")
+    (spit (java.io.File. dir ".env") "SECRET=hunter2\n")
+    (spit (java.io.File. dir ".env.local") "SECRET=hunter3\n")
+    (spit (java.io.File. dir ".ssh/id_rsa") "SECRET key\n")
+    (let [run (fn [input] (tools/execute "grep" input {:cwd (str dir)}))]
+      (testing "sensitive files are not searched"
+        (let [{:keys [content]} (run {:pattern "SECRET"})]
+          (is (str/includes? content "src/a.txt:1:SECRET is mentioned here"))
+          (is (not (str/includes? content "hunter")) content)
+          (is (not (str/includes? content "id_rsa")) content)))
+      (testing "the pattern is a pattern, never an option"
+        (let [{:keys [content]} (run {:pattern "--help"})]
+          (is (str/includes? content "src/a.txt:2:use --help for help") content)
+          (is (not (str/includes? content "Usage")) content)))
+      (testing "-i and glob still apply"
+        (is (str/includes? (:content (run {:pattern "secret" :-i true :glob "*.txt"})) "src/a.txt:1:"))
+        (is (= "No matches found" (:content (run {:pattern "SECRET" :glob "*.md"}))))))))

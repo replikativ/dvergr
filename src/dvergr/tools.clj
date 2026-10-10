@@ -577,21 +577,37 @@
                  {:type :success
                   :content (if (seq lines) (str/join "\n" lines) "No matches found")
                   :metadata {:pattern pattern :matches (count lines)}})
-               (let [cmd (cond-> ["grep" "-rn" "--color=never"]
+               ;; Host grep, for a physical workspace. The pattern goes after
+               ;; `-e` and the options end at `--`, so neither the pattern nor
+               ;; the glob is ever read as an option; `-Z` NUL-terminates each
+               ;; file name so the sensitive-path filter (the one every other
+               ;; file tool applies) sees the real path. `-r` does not follow
+               ;; symlinks, so the search stays under `cwd`.
+               (let [cmd (cond-> ["grep" "-rnZ" "--color=never"]
                            -i (conj "-i")
-                           true (conj pattern ".")
-                           glob (into ["--include" glob]))
-                     pb (ProcessBuilder. cmd)
-                     _ (.directory pb (io/file cwd))
+                           glob (conj (str "--include=" glob))
+                           true (into ["-e" pattern "--" "."]))
+                     pb (doto (ProcessBuilder. ^java.util.List cmd)
+                          (.directory (io/file cwd))
+                          (.redirectError java.lang.ProcessBuilder$Redirect/DISCARD))
                      proc (.start pb)
                      stdout (slurp (.getInputStream proc))
-                     _ (.waitFor proc)]
+                     _ (.waitFor proc)
+                     sensitive? #(try ((requiring-resolve 'dvergr.sandbox.ns.io/sensitive-path-policy) %)
+                                      false
+                                      (catch clojure.lang.ExceptionInfo _ true))
+                     lines (for [line (str/split-lines stdout)
+                                 :let [i (str/index-of line "\u0000")]
+                                 :when i
+                                 :let [path (subs line 0 i)]
+                                 :when (not (sensitive? path))]
+                             (str path ":" (subs line (inc i))))]
                  {:type :success
-                  :content (if (str/blank? stdout)
-                             "No matches found"
-                             stdout)
+                  :content (if (seq lines)
+                             (str/join "\n" lines)
+                             "No matches found")
                   :metadata {:pattern pattern
-                             :matches (count (str/split-lines stdout))}})))})
+                             :matches (count lines)}})))})
 
 (defn- native-eval
   "Evaluate Clojure code natively (not in SCI sandbox).

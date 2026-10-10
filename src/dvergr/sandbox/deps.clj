@@ -327,13 +327,22 @@
    "^kontor($|\\..*)"
    "^konserve($|\\..*)"
    "^kabel($|\\..*)"
+   ;; Host eval and raw network. `clojure.main/main "-e" ...` evaluates on the
+   ;; host as the daemon user; `clojure.core.server` starts a host socket REPL.
+   ;; hato, http-kit and clj-http are HTTP clients that bypass the sandbox's
+   ;; SSRF guard and domain policy (agents get the gated `http` namespace).
+   "^clojure\\.main$"
+   "^clojure\\.core\\.server$"
+   "^hato($|\\..*)"
+   "^org\\.httpkit($|\\..*)"
+   "^clj-http($|\\..*)"
    "^clojure\\.repl$"
    "^clojure\\.repl\\..*"
    "^clojure\\.tools\\.deps.*"
    "^clojure\\.java\\..*"])
 
 (def ^:private NS-ALLOWLIST-KEY [:dvergr/deps-policy :ns-allowlist])
-(def ^:private NS-PROVENANCE-KEY [:dvergr/deps-policy :ns-added-prefixes])
+(def ^:private NS-PROVENANCE-KEY [:dvergr/deps-policy :ns-added])
 
 (defn set-namespace-allowlist!
   "Override the default mirror allowlist with regex patterns. The hard denylist
@@ -348,25 +357,65 @@
          patterns)))
 
 (defn allow-added-lib-namespaces!
-  "Record that an APPROVED `add-libs!` brought `lib-coords` onto the classpath,
-   so the agent may then require what it just asked for. Each coord's own
-   namespace root becomes mirrorable (`org.clojure/data.csv` → `clojure.data.csv`
-   is NOT inferable, so we allow the artifact id and the group's last segment,
-   which covers the common conventions and nothing broader)."
-  [lib-coords]
-  (let [prefixes (into #{}
-                       (mapcat (fn [coord]
-                                 (let [s (str coord)
-                                       [grp art] (if (re-find #"/" s)
-                                                   (str/split s #"/" 2)
-                                                   [s s])]
-                                   [(str "^" (java.util.regex.Pattern/quote art) "($|\\..*)")
-                                    (str "^" (java.util.regex.Pattern/quote
-                                              (last (str/split grp #"\.")))
-                                         "($|\\..*)")])))
-                       lib-coords)]
-    (ec/swap-state! NS-PROVENANCE-KEY #(into (or % #{}) prefixes))
-    prefixes))
+  "Record that an approved, SUCCESSFUL `add-libs!` put `ns-syms` on the
+   classpath, so the agent may require exactly those namespaces. Each entry is
+   one namespace, never a prefix: no name is inferred from a coord's group or
+   artifact id (`org.clojure/x` once opened every `clojure.*` namespace,
+   `clojure.main` included). The hard denylist still applies."
+  [ns-syms]
+  (let [added (into #{} (map symbol) ns-syms)]
+    (ec/swap-state! NS-PROVENANCE-KEY #(into (or % #{}) added))
+    added))
+
+(defn lib-paths
+  "The classpath roots (jars or directories) the current basis records for
+   `lib` — after `add-libs`, the ones it just added."
+  [lib]
+  (some-> (requiring-resolve 'clojure.java.basis/current-basis)
+          (as-> current (current))
+          (get-in [:libs lib :paths])))
+
+(defn- path->ns
+  "`foo_bar/baz.clj` (or `.cljc`, or AOT `baz__init.class`) → `foo-bar.baz`."
+  [entry]
+  (when-let [[_ base] (or (re-matches #"(.+)\.cljc?" entry)
+                          (re-matches #"(.+)__init\.class" entry))]
+    (when-not (str/starts-with? base "META-INF/")
+      (symbol (-> base (str/replace "/" ".") (str/replace "_" "-"))))))
+
+(defn- root-entries
+  "`[entry-name url-of-entry-in-this-root]` for every file under `root`."
+  [root]
+  (let [f (io/file root)]
+    (cond
+      (.isDirectory f)
+      (let [base (.toPath f)]
+        (for [^java.io.File file (file-seq f)
+              :when (.isFile file)]
+          [(str/replace (str (.relativize base (.toPath file))) java.io.File/separator "/")
+           (str (.toURL (.toURI file)))]))
+
+      (.isFile f)
+      (with-open [jar (java.util.jar.JarFile. f)]
+        (let [prefix (str "jar:" (.toURL (.toURI f)) "!/")]
+          (doall (for [^java.util.jar.JarEntry e (enumeration-seq (.entries jar))
+                       :when (not (.isDirectory e))]
+                   [(.getName e) (str prefix (.getName e))])))))))
+
+(defn namespaces-provided
+  "Namespaces that the roots in `paths` NEWLY provide: a namespace counts only
+   when it is not loaded yet and the class loader resolves its file to this
+   root. A jar that also ships `clojure/main.clj` (or anything else the host
+   already has earlier on the classpath) does not provide it."
+  [paths]
+  (let [loader (clojure.lang.RT/baseLoader)]
+    (into #{}
+          (keep (fn [[entry url]]
+                  (when-let [ns-sym (path->ns entry)]
+                    (when (and (not (find-ns ns-sym))
+                               (= url (some-> (.getResource loader entry) str)))
+                      ns-sym))))
+          (mapcat root-entries paths))))
 
 (defn- policy-state
   "Read a policy key, falling back to `default` when no execution context is
@@ -381,13 +430,14 @@
 (defn namespace-mirrorable?
   "May `ns-sym` be mirrored from the host classpath into an SCI ctx?
 
-   Deny by default. Allowed only when it matches the allowlist or a prefix an
-   approved `add-libs!` recorded — and never when it matches the hard denylist."
+   Deny by default. Allowed only when it matches the allowlist or is a namespace
+   a successful `add-libs!` recorded — and never when it matches the hard
+   denylist."
   [ns-sym]
   (let [s (str ns-sym)]
     (and (not (matches-any? hard-namespace-denylist s))
          (or (matches-any? (policy-state NS-ALLOWLIST-KEY default-namespace-allowlist) s)
-             (matches-any? (policy-state NS-PROVENANCE-KEY #{}) s)))))
+             (contains? (policy-state NS-PROVENANCE-KEY #{}) (symbol s))))))
 
 (defn namespace-denied?
   "Inverse of `namespace-mirrorable?`. Kept because the mirror path reads as a
@@ -586,25 +636,31 @@
                          :reason deny})))
 
       :else
-      (let [pre-ns (set (all-ns))]
-        ;; Every coord passed the gate, so the agent is now entitled to require
-        ;; what it just asked for: record the provenance BEFORE loading, since
-        ;; `mirror-namespaces-into-sci!` below consults the mirror policy.
-        (allow-added-lib-namespaces! coords)
-        ;; clojure.repl.deps/add-libs guards on `clojure.core/*repl*`
-        ;; being bound to true. We're a server-side call, not a REPL,
-        ;; but the gate has already enforced human approval — so bind
-        ;; the flag while we invoke.
-        (with-bindings {#'clojure.core/*repl* true}
-          (host-add-libs (if (map? libs)
-                           libs
-                           (into {} (for [c coords] [c {:mvn/version "RELEASE"}])))))
+      (let [pre-ns (set (all-ns))
+            ;; clojure.repl.deps/add-libs guards on `clojure.core/*repl*`
+            ;; being bound to true. We're a server-side call, not a REPL,
+            ;; but the gate has already enforced human approval — so bind
+            ;; the flag while we invoke. It returns the libs it ADDED: a lib
+            ;; the basis already has is skipped and adds nothing.
+            added (with-bindings {#'clojure.core/*repl* true}
+                    (host-add-libs (if (map? libs)
+                                     libs
+                                     (into {} (for [c coords] [c {:mvn/version "RELEASE"}])))))
+            ;; Only now, after the load succeeded, is the agent entitled to
+            ;; require what it asked for: the namespaces the requested libs'
+            ;; new jars provide (transitive deps load on the host as needed,
+            ;; but are not mirrored on their own).
+            requested (set coords)
+            provided (namespaces-provided
+                      (mapcat lib-paths (filter requested added)))]
+        (allow-added-lib-namespaces! provided)
         (tel/log! {:id :sandbox.deps/approved
-                   :data {:coords coords}}
+                   :data {:coords coords :added (vec added) :namespaces provided}}
                   "Deps approved + loaded")
         (let [new-nss (mirror-namespaces-into-sci! sci-ctx pre-ns)]
           {:status :loaded
            :coords (vec coords)
+           :provenance (vec (sort provided))
            :namespaces (mapv ns-name new-nss)})))))
 
 ;; ============================================================================

@@ -8,6 +8,8 @@
    `ensure-mirrored!` copies every public var of whatever it mirrors, so that
    included the host's credentials and live database connections."
   (:require [clojure.test :refer [deftest testing is]]
+            [clojure.repl.deps]
+            [sci.core :as sci]
             [dvergr.sandbox.deps :as deps]
             [org.replikativ.spindel.engine.context :as ctx]
             [org.replikativ.spindel.engine.core :as rtc]))
@@ -71,14 +73,93 @@
 
 (deftest add-libs-provenance-widens-but-not-past-the-hard-denylist
   (with-ctx
-    (testing "an approved add-libs makes its own namespaces requirable"
-      (deps/allow-added-lib-namespaces! '[org.clojure/data.csv])
+    (testing "an approved add-libs makes the namespaces it loaded requirable"
+      (deps/allow-added-lib-namespaces! '[clojure.data.csv])
       (is (deps/namespace-mirrorable? 'clojure.data.csv)))
+    (testing "provenance is per namespace, never a prefix of one"
+      ;; Recording `my.lib.core` must not open `my.lib.core.impl` or `my.lib`.
+      (deps/allow-added-lib-namespaces! '[my.lib.core])
+      (is (deps/namespace-mirrorable? 'my.lib.core))
+      (is (not (deps/namespace-mirrorable? 'my.lib.core.impl)))
+      (is (not (deps/namespace-mirrorable? 'my.lib))))
     (testing "provenance cannot be used to reach the host application"
-      ;; A coord whose name collides with a denied prefix must not open it up.
-      (deps/allow-added-lib-namespaces! '[is.simm/model my.group/tx-preds])
+      (deps/allow-added-lib-namespaces! '[is.simm.model.system-db datahike.tx-preds])
       (is (not (deps/namespace-mirrorable? 'is.simm.model.system-db)))
       (is (not (deps/namespace-mirrorable? 'datahike.tx-preds))))))
+
+(deftest host-eval-and-raw-http-are-hard-denied
+  ;; `org.clojure/*` and `hato/*` coords auto-approve, and provenance used to
+  ;; open the coord's group segment as a namespace prefix: `org.clojure/x`
+  ;; opened `^clojure(\..*)?`, which mirrored `clojure.main/main` — and
+  ;; `(clojure.main/main "-e" "...")` is host eval as the daemon user.
+  ;; `clojure.core.server` starts a host socket REPL; hato / http-kit are raw
+  ;; HTTP clients that bypass the sandbox's SSRF guard and domain policy.
+  (with-ctx
+    (deps/allow-added-lib-namespaces! '[clojure.main clojure.core.server
+                                        hato.client hato.middleware
+                                        org.httpkit.client org.httpkit.server])
+    (deps/set-namespace-allowlist! [".*"])
+    (doseq [ns- '[clojure.main clojure.core.server hato.client hato.middleware
+                  org.httpkit.client org.httpkit.server]]
+      (is (not (deps/namespace-mirrorable? ns-)) (str ns- " must never be mirrorable")))))
+
+(defn- probe-lib-dir!
+  "A directory laid out like a library jar: one namespace of its own, and one
+   file that collides with a namespace the host already provides."
+  []
+  (let [dir (.toFile (java.nio.file.Files/createTempDirectory
+                      "dvergr-probe-lib" (make-array java.nio.file.attribute.FileAttribute 0)))
+        own (java.io.File. dir "dvergr_probe_lib/core.clj")
+        shadow (java.io.File. dir "clojure/string.clj")]
+    (.mkdirs (.getParentFile own))
+    (spit own "(ns dvergr-probe-lib.core)\n(defn answer [] 42)\n")
+    (.mkdirs (.getParentFile shadow))
+    (spit shadow "(ns clojure.string)\n")
+    dir))
+
+(deftest add-libs-records-provenance-only-after-a-successful-load
+  (testing "a failed host load records nothing"
+    (with-ctx
+      (with-redefs [clojure.repl.deps/add-libs
+                    (fn [_] (throw (ex-info "resolution failed" {})))]
+        (is (thrown? Exception
+                     (deps/add-libs! nil '{org.clojure/data.csv {:mvn/version "1.1.0"}}))))
+      (is (not (deps/namespace-mirrorable? 'clojure.main)))
+      (is (not (deps/namespace-mirrorable? 'clojure.instant)))))
+  (testing "a coord already on the classpath adds no jar, so records nothing"
+    ;; The host add-libs returns nil for libs the basis already has.
+    (with-ctx
+      (with-redefs [clojure.repl.deps/add-libs (fn [_] nil)]
+        (deps/add-libs! nil '{org.clojure/clojure {:mvn/version "1.12.5"}}))
+      (is (not (deps/namespace-mirrorable? 'clojure.main)))
+      (is (not (deps/namespace-mirrorable? 'clojure.instant)))))
+  (testing "a real new library: exactly the namespaces its jar newly provides"
+    (with-ctx
+      (deps/install-policy! (fn [_ _] :approve))
+      (let [dir (probe-lib-dir!)
+            loader (clojure.lang.DynamicClassLoader.
+                    (.getContextClassLoader (Thread/currentThread)))]
+        (with-bindings {clojure.lang.Compiler/LOADER loader}
+          (with-redefs-fn {#'clojure.repl.deps/add-libs
+                           (fn [_] (.addURL loader (.toURL (.toURI dir))) '[probe/lib])
+                           ;; resolved at run time so the suite compiles before the fix
+                           (resolve 'dvergr.sandbox.deps/lib-paths)
+                           (fn [lib] (when (= 'probe/lib lib) [(str dir)]))}
+            #(let [r (deps/add-libs! nil '{probe/lib {:mvn/version "1.0"}})]
+               (is (= :loaded (:status r)))
+               (is (deps/namespace-mirrorable? 'dvergr-probe-lib.core)
+                   "the library's own namespace is requirable")
+               (is (not (deps/namespace-mirrorable? 'dvergr-probe-lib))
+                   "but not a prefix of it")
+               (is (not (deps/namespace-mirrorable? 'clojure.instant))
+                   "a group segment opens nothing")
+               (is (contains? (set (:provenance r)) 'dvergr-probe-lib.core))
+               (is (not (contains? (set (:provenance r)) 'clojure.string))
+                   "a file shadowing a namespace the host already provides is not newly defined")
+               (testing "and the agent can require and call it"
+                 (let [sci-ctx (sci/init {})]
+                   (is (deps/ensure-mirrored! sci-ctx 'dvergr-probe-lib.core))
+                   (is (= 42 (sci/eval-string* sci-ctx "(dvergr-probe-lib.core/answer)"))))))))))))
 
 (deftest caller-allowlist-cannot-widen-past-the-hard-denylist
   (with-ctx

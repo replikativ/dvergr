@@ -23,6 +23,7 @@
    were once tagged `^:security-open` and skipped while open; that tag is gone
    now that they pass, so they run as ordinary green guards."
   (:require [clojure.string :as str]
+            [clojure.repl.deps]
             [clojure.test :refer [deftest is testing]]
             [dvergr.sandbox :as sandbox]
             [org.replikativ.spindel.engine.core :as rtc]
@@ -266,3 +267,52 @@
         (is (:err r) "clojure.java.io must not mirror a host reader")
         (is (not (str/includes? (str (:ok r)) "root:"))
             "no unclamped host filesystem read")))))
+
+;; ===========================================================================
+;; GROUP 3 — add-libs provenance
+;;
+;; `org.clojure/*` and `hato/*` coords auto-approve. An approved add-libs used
+;; to record the coord's artifact id AND its group's last segment as namespace
+;; PREFIXES — before the host load ran. `org.clojure/clojure` therefore opened
+;; `^clojure(\..*)?` even though the host load added nothing (the lib is
+;; already on the classpath) or failed outright, and `clojure.main/main "-e"`
+;; is host eval as the daemon user. Provenance is now recorded after a
+;; successful load, per namespace, for the namespaces the new jars newly
+;; provide; host eval and raw HTTP namespaces are hard-denied regardless.
+;; ===========================================================================
+
+(defn- reaches?
+  "Did `code` evaluate to `:reached` (i.e. the escape got through)?"
+  [sci ec code]
+  (= :reached (:ok (eval-in sci ec code))))
+
+(deftest add-libs-cannot-open-host-eval-or-raw-http
+  (with-sandbox
+    (fn [sci ec]
+      (testing "an auto-approved coord already on the classpath opens nothing"
+        (eval-in sci ec "(require '[clojure.repl.deps :as deps])
+                         (try (deps/add-libs '{org.clojure/clojure {:mvn/version \"1.12.5\"}})
+                              (catch Exception _ nil))")
+        (is (not (reaches? sci ec "(require 'clojure.main) :reached"))
+            "clojure.main/main \"-e\" is host eval")
+        (is (not (reaches? sci ec "(require 'clojure.core.server) :reached"))
+            "clojure.core.server starts a host socket REPL")
+        (is (not (reaches? sci ec "(require 'clojure.instant) :reached"))
+            "the group segment `clojure` is not a namespace grant"))
+      (testing "hato's coord does not mirror the raw HTTP client"
+        (eval-in sci ec "(try (clojure.repl.deps/add-libs '{hato/hato {:mvn/version \"1.0.0\"}})
+                              (catch Exception _ nil))")
+        (is (not (reaches? sci ec "(require 'hato.client) :reached"))
+            "hato.client bypasses the SSRF guard and the domain policy")))))
+
+(deftest a-failed-add-libs-grants-nothing
+  (with-redefs [clojure.repl.deps/add-libs
+                (fn [_] (throw (ex-info "could not resolve" {})))]
+    (with-sandbox
+      (fn [sci ec]
+        (let [r (eval-in sci ec "(try (clojure.repl.deps/add-libs '{org.clojure/data.csv {:mvn/version \"9.9.9\"}})
+                                      :loaded
+                                      (catch Exception _ :failed))")]
+          (is (= :failed (:ok r)) "the host failure reaches the agent"))
+        (is (not (reaches? sci ec "(require 'clojure.main) :reached"))
+            "catching the failure must not leave a grant behind")))))

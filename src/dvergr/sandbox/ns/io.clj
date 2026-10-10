@@ -203,14 +203,26 @@
           (update :body scrub)
           (update :headers (fn [hs] (into {} (map (fn [[k v]] [k (scrub v)]) hs))))))))
 
-(defn- internal-address? [^java.net.InetAddress addr]
-  (or (.isLoopbackAddress addr) (.isLinkLocalAddress addr)
-      (.isSiteLocalAddress addr) (.isAnyLocalAddress addr)
-      (.isMulticastAddress addr)
-      (let [h (.getHostAddress addr)]
-        (or (str/starts-with? h "169.254.")          ; link-local / cloud metadata
-            (str/starts-with? h "127.")
-            (str/starts-with? h "0.")))))
+(defn- internal-address?
+  "Loopback, link-local, private, wildcard, multicast — plus the two private
+   ranges `InetAddress` does not call site-local: IPv6 unique-local fc00::/7
+   (RFC 4193) and IPv4 shared address space 100.64.0.0/10 (RFC 6598, used for
+   cloud VPC and pod-network services, e.g. a metadata endpoint at
+   100.100.100.200)."
+  [^java.net.InetAddress addr]
+  (let [b (.getAddress addr)]
+    (or (.isLoopbackAddress addr) (.isLinkLocalAddress addr)
+        (.isSiteLocalAddress addr) (.isAnyLocalAddress addr)
+        (.isMulticastAddress addr)
+        (and (instance? java.net.Inet6Address addr)
+             (= 0xfc (bit-and (aget b 0) 0xfe)))
+        (and (instance? java.net.Inet4Address addr)
+             (= 100 (bit-and (aget b 0) 0xff))
+             (= 0x40 (bit-and (aget b 1) 0xc0)))
+        (let [h (.getHostAddress addr)]
+          (or (str/starts-with? h "169.254.")          ; link-local / cloud metadata
+              (str/starts-with? h "127.")
+              (str/starts-with? h "0."))))))
 
 (defn ssrf-guard!
   "Reject non-http(s) schemes and any URL whose host resolves to a loopback /
@@ -528,6 +540,61 @@
                         (:effects options))
     (apply add-physical-fs-ns! sci-ctx (mapcat identity options))))
 
+(defn- git-arg-refused! [msg data]
+  (throw (ex-info msg (assoc data :type :dvergr/git-arg-refused :muschel/denied true))))
+
+(def ^:private git-diff-flags
+  "The `git/diff` options an agent may pass: output shape and whitespace only.
+   Anything else is refused — host git has options that read or write outside
+   the workspace (`--no-index`, `--output=`, `-O<file>`, `--ext-diff`, …), and
+   the virtual workspace implements this same subset."
+  #{"--cached" "--staged" "--stat" "--shortstat" "--numstat" "--name-only"
+    "--name-status" "-p" "-u" "--patch" "-w" "--ignore-all-space" "-b"
+    "--ignore-space-change" "--no-color" "--no-renames" "-R"})
+
+(defn- workspace-pathspec!
+  "Refuse a diff path that leaves the workspace. With a physical `base-path`
+   the path (relative to it, or absolute) is canonicalised, so `..` and a
+   symlink out of the workspace are refused alike. In the virtual workspace a
+   leading `/` names the repository root and no path may climb above it."
+  [base-path path]
+  (let [refuse! #(git-arg-refused! (str "git/diff path outside the workspace: " path)
+                                   {:path path})]
+    (if base-path
+      (let [base (.getCanonicalFile (java.io.File. (str base-path)))
+            f (java.io.File. (str path))
+            file (.getCanonicalFile (if (.isAbsolute f) f (java.io.File. base (str path))))]
+        (when-not (.startsWith (.toPath file) (.toPath base))
+          (refuse!)))
+      (when (neg? (reduce (fn [d seg]
+                            (case seg
+                              ("" ".") d
+                              ".." (if (zero? d) (reduced -1) (dec d))
+                              (inc d)))
+                          0 (str/split (str/replace path #"^/+" "") #"/")))
+        (refuse!)))
+    path))
+
+(defn git-diff-argv
+  "The argv for `(git/diff & args)`: allowlisted options, then `--`, then
+   paths — so no argument is ever read as an option it was not checked as, and
+   every path stays inside the workspace (`base-path`, or the virtual
+   workspace's root when nil). Operands are always paths, never revisions."
+  [base-path args]
+  (let [args (map str args)
+        options (filter #(str/starts-with? % "-") args)
+        paths (remove #(or (= "--" %) (str/starts-with? % "-")) args)]
+    (doseq [o options
+            :when (not= "--" o)
+            :when (not (or (contains? git-diff-flags o) (re-matches #"-U\d{1,4}" o)))]
+      (git-arg-refused! (str "git/diff option not allowed: " o
+                             " (allowed: " (str/join " " (sort git-diff-flags)) " -U<n>)")
+                        {:option o}))
+    (-> ["diff"]
+        (into (remove #{"--"}) options)
+        (conj "--")
+        (into (map #(workspace-pathspec! base-path %)) paths))))
+
 (defn add-git-ns!
   "Expose structured git operations as 'git namespace in SCI.
 
@@ -576,20 +643,28 @@
                           (run! "status" "--porcelain=v1" "--branch"))))
 
         log-fn    (fn [& [opts]]
-                    (fx effects :git/read {:op :log}
-                        #(let [n (str "-" (or (:n opts) 10))]
-                           (parse-git-log
-                            (run! "log" git-log-format n)))))
+                    (let [n (or (:n opts) 10)]
+                      ;; `(str "-" n)` with a string :n was any option
+                      ;; (`{:n "-output=/x"}` → `--output=/x`).
+                      (when-not (and (integer? n) (pos? n))
+                        (git-arg-refused! "git/log :n must be a positive integer" {:n n}))
+                      (fx effects :git/read {:op :log}
+                          #(parse-git-log
+                            (run! "log" git-log-format (str "-" n))))))
 
+        ;; Validate before the effect boundary, so a refusal is not audited as
+        ;; a read that happened. Physical paths are checked against the
+        ;; workspace on disk; virtual ones against the repository root.
         diff-fn   (fn [& args]
-                    (fx effects :git/read {:op :diff :args (vec args)}
-                        #(if (seq args)
-                           (apply run! "diff" args)
-                           (run! "diff"))))
+                    (let [argv (git-diff-argv (when-not (or workspace workspace-resolver)
+                                                base-path)
+                                              args)]
+                      (fx effects :git/read {:op :diff :args (vec args)}
+                          #(apply run! argv))))
 
         add-fn    (fn [& paths]
                     (fx effects :git/add {:paths (vec paths)}
-                        #(do (apply run! "add" paths)
+                        #(do (apply run! "add" "--" paths)
                              :ok)))
 
         commit-fn (fn [message & [opts]]
@@ -611,7 +686,7 @@
                             log    [([] [opts]) "Recent commits as maps of :hash/:message/:author/:date. `opts` takes :n (default 10)."
                                     [:=> [:cat [:? [:maybe [:map [:n {:optional true} :int]]]]]
                                      [:vector [:map [:hash :string] [:message :string] [:author :string] [:date :string]]]]]
-                            diff   [([] [& args]) "Unified diff text. No args = unstaged changes; extra args pass through to `git diff` (e.g. \"--staged\", a path)."
+                            diff   [([] [& args]) "Unified diff text. No args = unstaged changes. Options: --staged/--cached, --stat, --shortstat, --numstat, --name-only, --name-status, -U<n>, -w, -b, -R, --no-renames; every other argument is a path inside the workspace."
                                     [:=> [:cat [:* :string]] :string]]
                             add    [([& paths]) "Stage paths for commit. Audited. Returns :ok."
                                     [:=> [:cat [:+ :string]] [:= :ok]]]
