@@ -137,6 +137,9 @@
     (.mkdirs (.getParentFile own))
     (spit own "(ns dvergr-probe-lib.core)\n(defn answer [] 42)\n")
     (spit (java.io.File. dir "dvergr_probe_lib/readers.clj") "(ns dvergr-probe-lib.readers)\n")
+    ;; a namespace under an allowlisted prefix (`^medley`), shipped by the new jar
+    (.mkdirs (java.io.File. dir "medley"))
+    (spit (java.io.File. dir "medley/dvergr_probe.clj") "(ns medley.dvergr-probe)\n")
     (.mkdirs (.getParentFile shadow))
     (spit shadow "(ns clojure.string)\n")
     ;; A `.cljc` beside a namespace the host has as `.clj`/AOT but has not
@@ -203,7 +206,7 @@
             #(let [r (deps/add-libs! nil '{probe/lib {:mvn/version "1.0"}})
                    granted (set (:provenance r))]
                (is (= :loaded (:status r)))
-               (is (= '#{dvergr-probe-lib.core dvergr-probe-lib.readers} granted)
+               (is (= '#{dvergr-probe-lib.core dvergr-probe-lib.readers medley.dvergr-probe} granted)
                    "its own namespaces, including one the load created for its data readers")
                (is (deps/namespace-mirrorable? 'dvergr-probe-lib.core))
                (is (not (deps/namespace-mirrorable? 'dvergr-probe-lib))
@@ -218,12 +221,19 @@
                  (let [sci-ctx (sci/init {})]
                    (is (deps/ensure-mirrored! sci-ctx 'dvergr-probe-lib.core))
                    (is (= 42 (sci/eval-string* sci-ctx "(dvergr-probe-lib.core/answer)")))))
+               (testing "a context that did not request it cannot reach it through the allowlist"
+                 ;; `^medley` is allowlisted for the launch classpath; this
+                 ;; namespace came with another context's approved jar.
+                 (binding [rtc/*execution-context* (ctx/create-execution-context)]
+                   (is (not (deps/namespace-mirrorable? 'medley.dvergr-probe)))
+                   (is (not (deps/namespace-mirrorable? 'dvergr-probe-lib.core))))
+                 (is (deps/namespace-mirrorable? 'medley.dvergr-probe) "the requesting context keeps it"))
                (testing "another context requesting the same source later is granted it too"
                  ;; The jar is on the classpath now, so the host add-libs adds nothing.
                  (binding [rtc/*execution-context* (ctx/create-execution-context)]
                    (deps/install-policy! (fn [_ _] :approve))
                    (with-redefs [clojure.repl.deps/add-libs (fn [_] nil)]
-                     (is (= '#{dvergr-probe-lib.core dvergr-probe-lib.readers}
+                     (is (= '#{dvergr-probe-lib.core dvergr-probe-lib.readers medley.dvergr-probe}
                             (set (:provenance (deps/add-libs! nil '{probe/lib {:mvn/version "1.0"}}))))))
                    (is (deps/namespace-mirrorable? 'dvergr-probe-lib.core))))
                (testing "but not when it asked for another source than the loaded one"
@@ -246,6 +256,10 @@
       (is (same? {:git/sha (subs sha 0 7) :git/tag "v1"} git) "inferred URL, short SHA")
       (is (same? {:git/url "https://example.com/r.git" :git/sha sha} git))
       (is (same? {:local/root "."} {:local/root (.getCanonicalPath (java.io.File. "."))})))
+    (testing "Maven version expressions resolve to a concrete version"
+      (doseq [v ["RELEASE" "LATEST" "[1.0,2.0)" "(,2.0]"]]
+        (is (same? {:mvn/version v} {:mvn/version "1.2.3"}) v)
+        (is (not (same? {:mvn/version v} {:local/root "/tmp/x"})) v)))
     (testing "another source does not"
       (is (not (same? {:mvn/version "2.0"} {:mvn/version "1.0"})))
       (is (not (same? {:local/root "/tmp/x"} {:mvn/version "1.0"})))

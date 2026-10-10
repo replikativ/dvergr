@@ -452,7 +452,12 @@
            (nil? spec) (contains? source :mvn/version)
 
            (:mvn/version spec)
-           (= (:mvn/version spec) (:mvn/version source))
+           (let [v (str (:mvn/version spec))]
+             (if (or (#{"RELEASE" "LATEST"} v) (re-find #"^[\[(]" v))
+               ;; resolution picks the concrete version; any Maven source of
+               ;; the lib is what such a request asked for
+               (contains? source :mvn/version)
+               (= v (:mvn/version source))))
 
            (:local/root spec)
            (and (:local/root source)
@@ -547,17 +552,27 @@
   (or (try (ec/get-state k) (catch Throwable _ nil))
       default))
 
+(defn- runtime-provided?
+  "Did a jar that `add-libs!` put on the classpath provide `ns-sym`?"
+  [ns-sym]
+  (boolean (some #(contains? (:namespaces %) ns-sym) (vals @runtime-lib-namespaces))))
+
 (defn namespace-mirrorable?
   "May `ns-sym` be mirrored from the host classpath into an SCI ctx?
 
-   Deny by default. Allowed only when it matches the allowlist or is a namespace
-   a successful `add-libs!` recorded — and never when it matches the hard
-   denylist."
+   Deny by default. Allowed only when it is a namespace a successful
+   `add-libs!` recorded for this ctx, or matches the allowlist and comes from
+   the launch classpath — and never when it matches the hard denylist."
   [ns-sym]
   (let [s (str ns-sym)]
     (and (not (matches-any? hard-namespace-denylist s))
-         (or (matches-any? (policy-state NS-ALLOWLIST-KEY default-namespace-allowlist) s)
-             (contains? (policy-state NS-PROVENANCE-KEY #{}) (symbol s))))))
+         (or (contains? (policy-state NS-PROVENANCE-KEY #{}) (symbol s))
+             ;; The allowlist speaks for the launch classpath. A namespace an
+             ;; add-libs jar provides (even one under an allowlisted prefix,
+             ;; `medley.probe`) is reachable only with that grant: another
+             ;; context's load is not this one's approval.
+             (and (matches-any? (policy-state NS-ALLOWLIST-KEY default-namespace-allowlist) s)
+                  (not (runtime-provided? (symbol s))))))))
 
 (defn namespace-denied?
   "Inverse of `namespace-mirrorable?`. Kept because the mirror path reads as a

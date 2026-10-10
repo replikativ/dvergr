@@ -251,6 +251,38 @@
           (is (str/includes? d "public.txt") code)
           (is (not (str/includes? d ".env")) (str code ": " d)))))))
 
+(deftest physical-git-does-not-enter-submodules
+  ;; A submodule is a repository of its own: its files, config and filters are
+  ;; outside every check the host git call makes.
+  (let [dir (git-repo!)
+        child (java.io.File. dir "child")
+        sentinel (java.io.File. (temp-dir! "dvergr-sub-sentinel") "ran")
+        script (java.io.File. (temp-dir! "dvergr-sub-script") "probe.sh")
+        ctx (sci/init {})]
+    (spit script (str "#!/bin/sh\ntouch " sentinel "\ncat\n"))
+    (.setExecutable script true)
+    (.mkdirs child)
+    (sh! child "git" "init" "-q")
+    (sh! child "git" "config" "user.email" "t@example.com")
+    (sh! child "git" "config" "user.name" "t")
+    (spit (java.io.File. child ".env") "TOKEN=child-old\n")
+    (spit (java.io.File. child "f.txt") "one\n")
+    (sh! child "git" "add" ".")
+    (sh! child "git" "-c" "commit.gpgsign=false" "commit" "-q" "-m" "child")
+    (sh! dir "git" "add" "child")
+    (sh! dir "git" "-c" "commit.gpgsign=false" "commit" "-q" "-m" "gitlink")
+    (sh! dir "git" "config" "diff.submodule" "diff")
+    (sh! child "git" "config" "filter.probe.clean" (str script))
+    (spit (java.io.File. child ".gitattributes") "*.txt filter=probe\n")
+    (spit (java.io.File. child ".env") "TOKEN=child-secret\n")
+    (spit (java.io.File. child "f.txt") "two\n")
+    (io/add-git-ns! ctx :base-path (str dir))
+    (let [d (sci/eval-string* ctx "(git/diff)")]
+      (is (str/includes? d "changed") "the parent's own change shows")
+      (is (not (str/includes? d "child-secret")) d))
+    (is (map? (sci/eval-string* ctx "(git/status)")))
+    (is (not (.exists sentinel)) "no filter configured inside the submodule ran")))
+
 (deftest physical-git-runs-no-repository-supplied-commands
   ;; In physical mode the repository's config and hooks live in the workspace.
   ;; Host git must not run an external diff, a textconv driver or a hook that

@@ -1121,7 +1121,14 @@
    "-c" "core.attributesFile=/dev/null"
    "-c" "core.fsmonitor=false"
    "-c" "commit.gpgSign=false"
-   "-c" "log.showSignature=false"])
+   "-c" "log.showSignature=false"
+   ;; A submodule is another repository with its own config, filters and
+   ;; files, none of which the overrides here or the sensitive-file filter
+   ;; see: never recurse into one, never expand its contents.
+   "-c" "submodule.recurse=false"
+   "-c" "diff.submodule=short"
+   "-c" "diff.ignoreSubmodules=all"
+   "-c" "status.submoduleSummary=false"])
 
 (defn- filter-overrides
   "`-c filter.<name>.<key>=` for every filter driver git's config defines, so
@@ -1152,8 +1159,11 @@
 (defn- git-run*
   "Run git in base-path. Returns stdout string or throws on non-zero exit."
   [base-path & args]
-  (let [all-args (-> ["git"] (into git-safety-config) (into (filter-overrides base-path))
-                     (into (map str args)))
+  (let [[cmd & more] (map str args)
+        all-args (-> ["git"] (into git-safety-config) (into (filter-overrides base-path))
+                     (conj cmd)
+                     (into (when (#{"diff" "status"} cmd) ["--ignore-submodules=all"]))
+                     (into more))
         pb       (doto (ProcessBuilder. ^java.util.List all-args)
                    (.directory (java.io.File. (str base-path))))
         ;; Attributes come from the empty tree, not the worktree's
