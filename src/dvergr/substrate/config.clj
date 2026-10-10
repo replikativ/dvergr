@@ -118,7 +118,8 @@
    `[[user-path] [pass-path]]` (pre-encodes Authorization: Basic for Basic-auth
    intakes). Here we resolve config-path sources → :value/:basic-auth (env is left
    for the host-side registry builder); a blank or placeholder config value
-   resolves to nil, so an accompanying `:env` source is used. Empty by default."
+   resolves to nil: a `:config-path` spec then falls back to its `:env` source, a
+   Basic-auth slot is sent empty. Empty by default."
   []
   (mapv (fn [{:keys [config-path basic-auth-config-paths] :as spec}]
           (cond-> spec
