@@ -18,9 +18,12 @@
    happens on the room's yggdrasil composite (spindel `register!` / `detach!`).
    Generalises simmis's `is.simm.model.system-db` from `:kb/*` to any `:system/*`."
   (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.string :as str]
             [datahike.api :as d]
             [dvergr.chat.schema :as cschema]
-            [dvergr.substrate.paths :as paths])
+            [dvergr.substrate.paths :as paths]
+            [dvergr.substrate.store-ids :as store-ids])
   (:import [java.nio.charset StandardCharsets]
            [java.util UUID]))
 
@@ -118,7 +121,7 @@
 (defn- cfg []
   (let [path (paths/system-db-dir)]
     {:store {:backend :file :path path
-             :id (java.util.UUID/nameUUIDFromBytes (.getBytes ^String path))}
+             :id (store-ids/store-id path store-ids/path-derived-default-charset)}
      :schema-flexibility :write}))
 
 (defonce ^:private conn-atom (atom nil))
@@ -129,7 +132,9 @@
   (or @conn-atom
       (let [c (cfg)]
         (when-not (d/database-exists? c) (d/create-database c))
-        (let [conn (d/connect c)]
+        (let [conn (try (d/connect c)
+                        (catch clojure.lang.ExceptionInfo e
+                          (throw (store-ids/identity-mismatch-hint (get-in c [:store :path]) e))))]
           (d/transact conn (vec (concat schema actor-schema assignment-schema
                                         pricing-schema task-schema)))
           (reset! conn-atom conn)))))
@@ -138,8 +143,14 @@
   "Drop the cached system-DB connection so the next `get-conn` reconnects at the
    *current* `paths/system-db-dir`. For tests that re-root
    `dvergr.substrate.paths` to an isolated temp dir (call after
-   `paths/set-home!`), so they neither read nor pollute the real `.dvergr`."
+   `paths/set-home!`), so they neither read nor pollute the real `.dvergr`.
+
+   Releases the connection: Datahike caches connections by store id, so an
+   unreleased one would be handed out again for the same id, also after the
+   home was moved."
   []
+  (when-let [conn @conn-atom]
+    (try (d/release conn) (catch Throwable _ nil)))
   (reset! conn-atom nil))
 
 (defn- now [] (java.util.Date.))
@@ -174,6 +185,59 @@
   []
   (d/q '[:find [(pull ?e [:system/id :system/type :system/scope :system/name]) ...]
          :where [?e :system/id]] @(get-conn)))
+
+(defn- foreign-scope
+  "When `scope` is a store of another home's `systems/` directory: that store's
+   counterpart under `systems-dir`, else nil."
+  [scope systems-dir]
+  (when (string? scope)
+    (let [f (io/file scope)
+          parent (.getParentFile f)]
+      (when (and (.isAbsolute f) parent (= "systems" (.getName parent))
+                 (not= (.getCanonicalFile parent) (.getCanonicalFile (io/file systems-dir))))
+        (io/file systems-dir (.getName f))))))
+
+(defn- legacy-ids
+  "The store paths under `here` of a system of `type`, with the ids versions
+   before store id files derived for them from the system's original `scope`."
+  [type scope ^java.io.File here]
+  (if (= :repo type)
+    {(.getCanonicalPath (io/file here "datahike"))
+     (store-ids/path-derived "dvergr-geschichte:" (.getCanonicalPath (io/file scope)))}
+    {(str here) (store-ids/path-derived-default-charset scope)}))
+
+(defn rehome-scopes!
+  "Point every registered system whose scope is a store of another home's
+   `systems/` directory at the same store under this home: the home was moved.
+   Run before any room store is opened. A store that predates store id files
+   gets the id that was derived from its original path recorded first, so it
+   opens with the id it was created with.
+
+   Throws when such a store is missing here while it still exists at its
+   original place: opening it there would write into another home. One
+   missing in both places is a stale entry and is left alone. Scopes outside a
+   `systems/` directory (a drive's filesystem path) are not touched.
+   Idempotent; returns the number of scopes rewritten."
+  []
+  (let [conn (get-conn)
+        dir (paths/systems-dir)
+        moved (for [{:system/keys [id scope type]} (all-systems)
+                    :let [here (foreign-scope scope dir)]
+                    :when here]
+                {:id id :scope scope :type type :here here})
+        elsewhere (filter #(and (not (.exists ^java.io.File (:here %))) (.exists (io/file (:scope %)))) moved)]
+    (when (seq elsewhere)
+      (throw (ex-info (str "This home's registry names stores of another home that are not here: "
+                           (str/join ", " (map :scope elsewhere)))
+                      {:type ::foreign-stores :scopes (mapv :scope elsewhere)})))
+    (let [present (filter #(.exists ^java.io.File (:here %)) moved)]
+      (doseq [{:keys [type scope here]} present
+              [path id] (legacy-ids type scope here)]
+        (store-ids/record! path id))
+      (when (seq present)
+        (d/transact conn (vec (for [{:keys [id here]} present]
+                                [:db/add [:system/id id] :system/scope (str here)]))))
+      (count present))))
 
 ;; ---------------------------------------------------------------------------
 ;; Rooms (projects)

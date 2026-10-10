@@ -97,7 +97,11 @@
                                  (throw (ex-info "registration failed" {}))))
                              dh/release #(swap! released conj %)]
                  (#'rooms/register-system-into-current!
-                  {:system/type :msgs :system/scope "shared"}))))
+                  ;; a scope in the test's temp dir: building its config
+                  ;; records a store id beside it
+                  {:system/type :msgs
+                   :system/scope (str (java.io.File. (System/getProperty "java.io.tmpdir")
+                                                     (str "shared-" (random-uuid))))}))))
           (is (= [conn] @released)
               "the failed registration releases its attempted connection")
           (is (identical? installed (tx-preds/tx-pred-for store-id))

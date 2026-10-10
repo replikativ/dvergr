@@ -78,8 +78,7 @@
   "Register a fresh in-memory workspace in `room`'s context (see
    `ensure-workspace!`)."
   [room]
-  (let [cfg (assoc (gs/repository-config (str "/memory/" (random-uuid)))
-                   :store {:backend :memory :id (random-uuid)})]
+  (let [cfg (assoc gs/repository-options :store {:backend :memory :id (random-uuid)})]
     (d/create-database cfg)
     (let [conn (d/connect cfg)]
       (repo/init! conn {:name "attempt workspace"})

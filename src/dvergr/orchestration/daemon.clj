@@ -43,6 +43,7 @@
             [dvergr.tools :as tools]
             [dvergr.system.rooms :as srooms]
             [dvergr.system.db :as sdb]
+            [dvergr.system.home :as home]
             [dvergr.system.mail :as mail]
             [dvergr.drive.blobs :as blobs]
             [dvergr.drive.integration :as drive-integration]
@@ -775,6 +776,12 @@
   (registry/ensure-models-loaded!)
   (configure-claude-code! (:claude-code config))
 
+  ;; Before any store of the home opens: a copied home is refused, a moved one
+  ;; adopted (dvergr.system.home).
+  (home/claim!)
+  ;; A moved home's registry still names the old home's stores: point it here.
+  (sdb/rehome-scopes!)
+
   ;; Create execution context, daemon-wide discourse room, and the
   ;; :_system receiver that drains all agent replies into the sink fan-out.
   ;; RF5 (Option B): the daemon root does NOT register the legacy `.dvergr/workspace`
@@ -1096,7 +1103,6 @@
   ;; Drop all cached per-room working ctxs (the cache is a defonce surviving a
   ;; same-process restart; a fresh start must re-seed rather than reuse them).
   (room-context/clear-all!)
-  (srooms/clear-room-ctxs!)
 
   ;; Stop the reactive clock heartbeat (per-room scheduler spins go quiet with
   ;; it; their rows persist in each room's store and resume on next boot).
@@ -1132,6 +1138,10 @@
   (when-let [room (:discourse-room daemon)]
     (try (d/close-room! room)
          (catch Exception _)))
+
+  ;; Last, once nothing writes: release every room store's connection and drop
+  ;; the room contexts, so a same-process restart does not inherit them.
+  (srooms/release-room-stores!)
 
   (reset! (:status daemon) :stopped)
   (reset! current-daemon nil)

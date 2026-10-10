@@ -31,6 +31,7 @@
             [dvergr.room.store.datahike :as dhs]
             [dvergr.substrate.datahike :as sdh]
             [dvergr.substrate.paths :as paths]
+            [dvergr.substrate.store-ids :as store-ids]
             [dvergr.system.db :as sdb]
             [hasch.core :as hasch])
   (:import [java.security MessageDigest]))
@@ -75,7 +76,8 @@
 (defn- store-config [dir]
   (let [path (.getAbsolutePath (io/file dir "store"))]
     {:store {:backend :file :path path
-             :id (java.util.UUID/nameUUIDFromBytes (.getBytes (str "dvergr-experiment:" path) "UTF-8"))}
+             ;; the id the store was created with: an experiment directory can move
+             :id (store-ids/store-id path (partial store-ids/path-derived "dvergr-experiment:"))}
      :keep-history? true
      :schema-flexibility :write}))
 
@@ -96,7 +98,7 @@
     ;; Datahike creates the directory itself; it must not pre-exist.
     (when fresh?
       (dh/create-database cfg))
-    (let [conn (dh/connect cfg)]
+    (let [conn (sdh/connect cfg)]
       (schema/ensure-full-schema! conn)
       {:dir (str dir) :cfg cfg :conn conn
        :store (dhs/make conn (file-artifact-store (io/file dir "artifacts")))})))

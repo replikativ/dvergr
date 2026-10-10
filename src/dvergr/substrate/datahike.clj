@@ -13,7 +13,8 @@
   (:require [datahike.api :as d]
             [yggdrasil.adapters.datahike :as dh-adapter]
             [org.replikativ.spindel.yggdrasil :as ygg]
-            [dvergr.chat.schema :as cschema]))
+            [dvergr.chat.schema :as cschema]
+            [dvergr.substrate.store-ids :as store-ids]))
 
 (def diff-buf-size
   "Content-only child diffs buffered into the ancestor, cutting stored-object
@@ -35,12 +36,34 @@
      256         78 MB   12436     13.4 ms  31.7 ms"
   128)
 
+(defn delete-database!
+  "Delete the database `cfg` names and the id recorded beside it, so a store
+   created again at the same path gets its own."
+  [cfg]
+  (d/delete-database cfg)
+  ;; only once the store is gone (the file backend can fail to delete without
+  ;; saying so): a store that is left still needs its id
+  (when-let [path (get-in cfg [:store :path])]
+    (when-not (store-ids/store-exists? path)
+      (store-ids/forget! path))))
+
+(defn connect
+  "`d/connect` for a dvergr store: a store that refuses the id recorded beside
+   it gets that explained, and a derived id it refused dropped
+   (`store-ids/identity-mismatch-hint`)."
+  [cfg]
+  (try (d/connect cfg)
+       (catch clojure.lang.ExceptionInfo e
+         (throw (if-let [path (get-in cfg [:store :path])]
+                  (store-ids/identity-mismatch-hint path e)
+                  e)))))
+
 (defn connect!
   "Connect to `cfg`, creating the database first when it doesn't exist.
    Plain create+connect — no schema, no registration. Returns the conn."
   [cfg]
   (when-not (d/database-exists? cfg) (d/create-database cfg))
-  (d/connect cfg))
+  (connect cfg))
 
 (defn provision!
   "Provision a dvergr-shaped datahike DB. Idempotent — safe to call on every

@@ -29,6 +29,7 @@
             [dvergr.substrate.geschichte :as geschichte]
             [geschichte.workspace :as gworkspace]
             [dvergr.substrate.paths :as paths]
+            [dvergr.substrate.store-ids :as store-ids]
             [dvergr.substrate.datahike :as sdh]
             [dvergr.substrate.kontor-book :as kontor-book]
             [org.replikativ.spindel.yggdrasil :as ygg]
@@ -53,6 +54,23 @@
                     error))
     (get @room-ctxs room-id)))
 
+(declare clear-room-ctxs!)
+
+(defn release-room-stores!
+  "Release the Datahike connection of every store registered in a room's
+   context, all of its leases, and drop the room contexts: the daemon owns
+   them and is stopping. Datahike caches connections by store id, so a
+   connection left open would be handed out again to a same-process restart.
+   Best-effort per store; call once everything that writes has stopped."
+  []
+  (doseq [[_ ctx] @room-ctxs]
+    (binding [ec/*execution-context* ctx]
+      (doseq [[_ system] (try (ygg/registered-systems) (catch Throwable _ {}))
+              :let [conn (:conn system)]
+              :when conn]
+        (try (d/release conn true) (catch Throwable _ nil)))))
+  (clear-room-ctxs!))
+
 (defn clear-room-ctxs!
   "Drop all per-room execution contexts. Call on daemon stop! so a same-process
    restart doesn't reuse stale forked ctxs pointing at the previous daemon root."
@@ -62,16 +80,23 @@
 
 (defn- scope-path [scope] (str (io/file (paths/systems-dir) scope)))
 
+(defn legacy-store-id
+  "The id versions before store id files derived from a room store's `path`."
+  [path]
+  (store-ids/path-derived-default-charset path))
+
 (defn store-id
-  "Konserve store id for a room store `path`. Deterministic in the path, so the
-   id is stable across restarts and derivable without touching the store.
+  "Konserve store id for a room store `path`: the id recorded beside the store
+   (`dvergr.substrate.store-ids`), so it is stable across restarts and survives
+   moving the home. Not derivable from the path: a store created by an older
+   version has a path-derived id, a new one a random id.
 
    Public because it is the konserve-sync SCOPE: a consumer that collapses its
    own per-room database onto the room store (simmis binds
    `:room/content-db-scope` to it) must name the same store the writer uses, and
    must not re-derive the formula on its own."
   [path]
-  (java.util.UUID/nameUUIDFromBytes (.getBytes ^String path)))
+  (store-ids/store-id path legacy-store-id))
 
 (defn- store-cfg
   "ONE config for every datom store a room owns — messages, KB, agent `:data`.
@@ -126,10 +151,10 @@
    flexibility, silently turning a :read store into :write.)"
   [scope]
   (let [cfg (store-cfg scope)]
-    (try (d/connect cfg)
+    (try (sdh/connect cfg)
          (catch clojure.lang.ExceptionInfo e
            (if (= :config-does-not-match-stored-db (:type (ex-data e)))
-             (d/connect (assoc cfg :schema-flexibility :read))
+             (sdh/connect (assoc cfg :schema-flexibility :read))
              (throw e))))))
 
 (defn- book-system-name
@@ -179,7 +204,7 @@
   ;; Declare the messages fulltext (scriptum) secondary index once, after the
   ;; chat schema is installed. It's schema data in the store, so it forks with
   ;; the room; datahike maintains it on every message transact. Best-effort.
-  (search-secondary/declare-message-fulltext! (d/connect (msgs-cfg path)) path))
+  (search-secondary/declare-message-fulltext! (sdh/connect (msgs-cfg path)) path))
 
 (defn register-room-systems!
   "Register a room's messages store + KB (DatahikeSystems) + repo (GitSystem) as
@@ -330,7 +355,7 @@
             ;; Declare the KB fulltext (scriptum) secondary index over entity
             ;; title/summary/contexts — forks with the KB store, maintained on
             ;; every knowledge_add. Best-effort.
-            _         (search-secondary/declare-kb-fulltext! (d/connect (kb-cfg kb-path)) kb-path)
+            _         (search-secondary/declare-kb-fulltext! (sdh/connect (kb-cfg kb-path)) kb-path)
             _         (seed-msgs-store! msgs-path slug name)
             repo-id   (sdb/register-system! {:type :repo :name (str slug "-repo")
                                              :scope repo-path :owner-id owner-id})
@@ -599,7 +624,7 @@
    scratch DBs don't linger / resurrect."
   [pending-grants]
   (doseq [{:keys [scope]} pending-grants]
-    (try (d/delete-database (data-cfg scope)) (catch Throwable _))))
+    (try (sdh/delete-database! (data-cfg scope)) (catch Throwable _))))
 
 (defn delete-room-db!
   "Remove an agent-created data DB `db-name` from the room: detach + retract the
@@ -609,7 +634,7 @@
   (when-let [{:keys [path]} (first (filter #(= (name db-name) (:slug %)) (room-data-dbs room-id)))]
     (try (ygg/unregister! (data-system-name path)) (catch Throwable _))
     (sdb/delete-system-by-scope! room-id path)
-    (try (d/delete-database (data-cfg path)) (catch Throwable _))
+    (try (sdh/delete-database! (data-cfg path)) (catch Throwable _))
     true))
 
 (defn room-databases
@@ -701,12 +726,12 @@
                     (delete-tree! scope))
           :kb   (do (ygg/unregister! (kb-system-name scope))
                     (try (when (d/database-exists? (kb-cfg scope))
-                           (d/delete-database (kb-cfg scope)))
+                           (sdh/delete-database! (kb-cfg scope)))
                          (catch Throwable _ nil))
                     (delete-tree! scope))
           :msgs (do (ygg/unregister! (msgs-system-name scope))
                     (try (when (d/database-exists? (msgs-cfg scope))
-                           (d/delete-database (msgs-cfg scope)))
+                           (sdh/delete-database! (msgs-cfg scope)))
                          (catch Throwable _ nil))
                     (delete-tree! scope))
           nil)))

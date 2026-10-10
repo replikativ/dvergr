@@ -10,6 +10,7 @@
             [clojure.string :as str]
             [datahike.api :as d]
             [dvergr.substrate.paths :as paths]
+            [dvergr.substrate.store-ids :as store-ids]
             [geschichte.git.command :as command]
             [geschichte.git.http :as git-http]
             [geschichte.git.local :as git-local]
@@ -35,46 +36,57 @@
            (catch Throwable _ nil))
       (default-sandbox-repo)))
 
+(defn legacy-store-id
+  "The id versions before store id files derived for the repository store at
+   `path`: from its scope, the directory holding it."
+  [path]
+  (store-ids/path-derived "dvergr-geschichte:" (.getParent (io/file path))))
+
+(def repository-options
+  "A Geschichte repository's Datahike options, without the store: shared by a
+   file repository (`repository-config`) and an in-memory one."
+  {;; 128, not 256 — measured knee on a room-shaped store; see
+   ;; `dvergr.substrate.datahike/diff-buf-size` for the table.
+   :index-config {:diff-buf-size sdh/diff-buf-size}
+   :schema-flexibility :write
+   ;; `:crypto-hash?` matches every other room store, so ONE mechanism
+   ;; (`datahike.audit/verify-chain`) verifies books, wiki, chat AND code.
+   ;; Geschichte needs it: its own hashing covers CONTENT only —
+   ;; `:geschichte.content/id` is a hash of the bytes, verified on read — while
+   ;; `:geschichte.commit/id` is a random uuid and refs are ordinary datoms. So
+   ;; repointing a path at other content, or rewriting commit parentage, is
+   ;; invisible to geschichte and visible only to datahike's merkle.
+   ;;
+   ;; It costs `:fuse-index-roots?`, which datahike disables under crypto-hash
+   ;; (measured: 296 -> 840 objects over 60 commits). Accepted because the
+   ;; object count matters most for a full-store sync handshake, and the
+   ;; roadmap is windowed partial loading rather than full handshakes.
+   :crypto-hash? true
+   :commit-graph? true
+   ;; The ONE flag that differs from the datom stores, and the reason is that
+   ;; Geschichte already implements history at a higher layer: its commit graph
+   ;; IS the version history, so datahike's temporal index is redundant here.
+   ;; Keeping it would be actively harmful — under `:keep-history? true` a
+   ;; retracted store-ref survives in the temporal AEVT and keeps its blob
+   ;; whitelisted forever, so deleted files and media could NEVER be reclaimed
+   ;; (measured: 10 MB retracted -> 10 MB retained; with history off the same
+   ;; test freed 10.57 MB -> 0.017 MB). Repos hold media; unbounded growth is
+   ;; not a trade worth making for a redundant index.
+   :keep-history? false})
+
 (defn repository-config
   "Portable Datahike configuration for one persistent Geschichte repository."
   [scope]
-  (let [scope-path (.getCanonicalPath (io/file scope))
-        ;; Keep the store below the repository scope. Besides leaving room for
+  (let [;; Keep the store below the repository scope. Besides leaving room for
         ;; future repository metadata, this lets callers hand us an existing
         ;; empty scope directory (the old native-worktree API commonly did).
         path (.getCanonicalPath (io/file scope "datahike"))]
-    {:store {:backend :file
-             :path path
-             :id (java.util.UUID/nameUUIDFromBytes
-                  (.getBytes (str "dvergr-geschichte:" scope-path) "UTF-8"))}
-     ;; 128, not 256 — measured knee on a room-shaped store; see
-     ;; `dvergr.substrate.datahike/diff-buf-size` for the table.
-     :index-config {:diff-buf-size sdh/diff-buf-size}
-     :schema-flexibility :write
-     ;; `:crypto-hash?` matches every other room store, so ONE mechanism
-     ;; (`datahike.audit/verify-chain`) verifies books, wiki, chat AND code.
-     ;; Geschichte needs it: its own hashing covers CONTENT only —
-     ;; `:geschichte.content/id` is a hash of the bytes, verified on read — while
-     ;; `:geschichte.commit/id` is a random uuid and refs are ordinary datoms. So
-     ;; repointing a path at other content, or rewriting commit parentage, is
-     ;; invisible to geschichte and visible only to datahike's merkle.
-     ;;
-     ;; It costs `:fuse-index-roots?`, which datahike disables under crypto-hash
-     ;; (measured: 296 -> 840 objects over 60 commits). Accepted because the
-     ;; object count matters most for a full-store sync handshake, and the
-     ;; roadmap is windowed partial loading rather than full handshakes.
-     :crypto-hash? true
-     :commit-graph? true
-     ;; The ONE flag that differs from the datom stores, and the reason is that
-     ;; Geschichte already implements history at a higher layer: its commit graph
-     ;; IS the version history, so datahike's temporal index is redundant here.
-     ;; Keeping it would be actively harmful — under `:keep-history? true` a
-     ;; retracted store-ref survives in the temporal AEVT and keeps its blob
-     ;; whitelisted forever, so deleted files and media could NEVER be reclaimed
-     ;; (measured: 10 MB retracted -> 10 MB retained; with history off the same
-     ;; test freed 10.57 MB -> 0.017 MB). Repos hold media; unbounded growth is
-     ;; not a trade worth making for a redundant index.
-     :keep-history? false}))
+    (assoc repository-options
+           :store {:backend :file
+                   :path path
+                   ;; the id recorded beside the store, not one derived from
+                   ;; the path: a moved home keeps its repositories
+                   :id (store-ids/store-id path legacy-store-id)})))
 
 (defn- fallback-workspace! [conn source error]
   (tel/log! {:level :warn :id :workspace/seed-clone-failed
@@ -106,7 +118,7 @@
        (when-let [parent (.getParentFile (io/file scope))]
          (.mkdirs parent))
        (d/create-database cfg)
-       (let [conn (d/connect cfg)]
+       (let [conn (sdh/connect cfg)]
          (try
            (repo/init! conn {:name "dvergr workspace"})
            (let [source (or source (sandbox-repo))]
@@ -116,7 +128,7 @@
                  (if fallback?
                    (fallback-workspace! conn source error)
                    (do (d/release conn)
-                       (d/delete-database cfg)
+                       (sdh/delete-database! cfg)
                        (throw (ex-info (str "Could not import " source ": " (ex-message error))
                                        {:type ::import-failed :source source}
                                        error)))))))
@@ -128,12 +140,12 @@
   [& {:keys [scope system-name source]}]
   (let [scope (or scope (paths/workspace-store))
         cfg (ensure-repository! scope (cond-> {} source (assoc :source source)))]
-    (gy/create (d/connect cfg) {:system-name system-name})))
+    (gy/create (sdh/connect cfg) {:system-name system-name})))
 
 (defn delete-repository! [scope]
   (let [cfg (repository-config scope)]
     (when (d/database-exists? cfg)
-      (d/delete-database cfg))))
+      (sdh/delete-database! cfg))))
 
 (defn current-system
   "The room-owned Geschichte system in the bound Spindel context."
