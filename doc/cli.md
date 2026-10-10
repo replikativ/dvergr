@@ -28,7 +28,7 @@ clojure -M:cli --no-tui --web
 | `--no-tui` | — | run without the TUI (daemon + nREPL only) |
 | `--web` | — | also start the web dashboard |
 | `--web-port PORT` | `17880` | web dashboard port (with `--web`) |
-| `--web-bind IP` | `127.0.0.1` | web bind address — the UI/API are unauthenticated, so default is loopback |
+| `--web-bind IP` | `127.0.0.1` | web bind address — the UI/API are unauthenticated, so default is loopback. Loopback does not keep out the pages your browser shows, so the server also checks the Host header (DNS rebinding), the Origin of every state-changing request and a per-session CSRF token; a reverse proxy's name and origin go in `:http {:allowed-hosts […] :allowed-origins […]}` |
 | `--mcp` | — | also serve MCP on loopback TCP (clients connect through `bin/dvergr-mcp`; [mcp.md](mcp.md)) |
 | `--mcp-port PORT` | `17888` | MCP port (with `--mcp`) |
 | `-h`, `--help` | — | show usage |

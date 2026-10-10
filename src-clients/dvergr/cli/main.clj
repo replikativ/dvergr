@@ -50,7 +50,7 @@
    [nil  "--mcp-port PORT" "MCP port (with --mcp)"
     :default  17888
     :parse-fn #(Integer/parseInt %)]
-   [nil  "--web-bind IP" "Web dashboard bind address (with --web); the UI/API are unauthenticated, so default is loopback"
+   [nil  "--web-bind IP" "Web dashboard bind address (with --web); the UI/API are unauthenticated, so default is loopback (see :http :allowed-hosts for a proxy)"
     :default  "127.0.0.1"]
    ["-h" "--help"       "Show this help"]])
 
@@ -163,7 +163,9 @@
                       (System/exit 1)))]
             (reset! d-ref d)
             (when web-start
-              (try (web-start d :port web-port :ip web-bind)
+              (try (web-start d :port web-port :ip web-bind
+                              :allowed-hosts (:allowed-hosts (config/http-config))
+                              :allowed-origins (:allowed-origins (config/http-config)))
                    (catch Throwable t
                      (.println console (str "[dvergr] web dashboard failed to start: "
                                             (.getMessage t))))))

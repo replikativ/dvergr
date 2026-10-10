@@ -1023,7 +1023,9 @@
                       daemon-with-tg)
                   :else
                   (try
-                    (start-fn daemon-with-tg :port port :ip ip)
+                    (start-fn daemon-with-tg :port port :ip ip
+                              :allowed-hosts (:allowed-hosts http-config)
+                              :allowed-origins (:allowed-origins http-config))
                     (assoc daemon-with-tg :http-server @@server-state-var)
                     (catch java.net.BindException e
                       (tel/log! {:level :warn

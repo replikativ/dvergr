@@ -17,6 +17,7 @@
             [dvergr.substrate.geschichte :as geschichte]
             [dvergr.system.db :as sdb]
             [dvergr.system.rooms :as srooms]
+            [hiccup.util :as hu]
             [muschel.fs :as mfs]
             [org.replikativ.spindel.engine.core :as ec]))
 
@@ -84,7 +85,7 @@
               "display:grid;place-items:center;height:100vh;margin:0\">"
               "<div style=\"max-width:34em;text-align:center\">"
               "<h2 style=\"color:#52b788\">No app here (yet)</h2>"
-              "<p>Room <code>" slug "</code> has no <code>app/index.html</code> "
+              "<p>Room <code>" (hu/escape-html slug) "</code> has no <code>app/index.html</code> "
               "in its workspace. Ask an agent in the room to build one — files "
               "written under <code>app/</code> are served live at this URL.</p>"
               "</div></body>")})
@@ -108,7 +109,7 @@
             ;; /apps/<slug> (no trailing slash) → redirect so relative asset
             ;; URLs inside index.html resolve under /apps/<slug>/.
             (nil? path)
-            {:status 301 :headers {"Location" (str "/apps/" slug "/")} :body ""}
+            {:status 301 :headers {"Location" (str uri "/")} :body ""}
 
             :else
             (let [room (sdb/room-by-slug slug)
