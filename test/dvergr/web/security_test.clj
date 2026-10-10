@@ -28,9 +28,10 @@
 
 (def ^:private host "127.0.0.1:17880")
 
-(defn- req [method uri & {:keys [headers body]}]
+(defn- req [method uri & {:keys [headers body query]}]
   (cond-> {:request-method method :uri uri
            :headers (merge {"host" host} headers)}
+    query (assoc :query-string query)
     body (assoc :body (ByteArrayInputStream. (.getBytes ^String body "UTF-8")))))
 
 (defn- session
@@ -199,7 +200,7 @@
             (is (#{404 405} (:status resp)) (str op " is not a GET"))))
         (testing "a file export is one of them"
           (is (= :write (:kind (ops/specification :attempt/export))))
-          (is (#{404 405} (:status (app (req :get "/api/v1/attempt_export?room=r&file=x.jsonl")))))))
+          (is (#{404 405} (:status (app (req :get "/api/v1/attempt_export" :query "room=r&file=x.jsonl")))))))
       (testing "a machine client (JSON, no Origin) needs no session"
         (is (= 200 (:status (app (req :post "/api/v1/room_create"
                                       :headers {"content-type" "application/json"}
