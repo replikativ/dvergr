@@ -757,7 +757,23 @@
                     (let [host-base (when-not (or workspace workspace-resolver) base-path)
                           paths (mapv #(workspace-pathspec! host-base (str %)) paths)]
                       (fx effects :git/add {:paths paths}
-                          #(do (apply run! "add" "--" paths)
+                          ;; `.` or a directory takes every file under it, a
+                          ;; tracked `.env` too: on the host, list what the add
+                          ;; would stage and stage only the non-sensitive files
+                          ;; (as literal, root-relative pathspecs — that is how
+                          ;; status names them).
+                          #(do (if host-base
+                                 (let [names (->> (apply run! (concat ["status" "--porcelain=v1" "-z"
+                                                                       "--untracked-files=all" "--no-renames" "--"]
+                                                                      paths))
+                                                  (re-seq #"[^\u0000]+")
+                                                  (keep (fn [e] (when (> (count e) 3) (subs e 3)))))
+                                       safe (remove sensitive-name? names)]
+                                   (cond
+                                     (= (count safe) (count names)) (apply run! "add" "--" paths)
+                                     (seq safe) (apply run! "add" "--" (map (fn [n] (str ":(top,literal)" n)) safe))
+                                     :else nil))
+                                 (apply run! "add" "--" paths))
                                :ok))))
 
         commit-fn (fn [message & [opts]]
@@ -1172,9 +1188,18 @@
         ;; command. Filters are also emptied above (that holds on git < 2.40,
         ;; which ignores GIT_ATTR_SOURCE, and for `.git/info/attributes`);
         ;; diffs pass --no-ext-diff --no-textconv.
-        _        (doto (.environment pb)
+        env      (doto (.environment pb)
                    (.put "GIT_ATTR_SOURCE" "4b825dc642cb6eb9a060e54bf8d69288fbee4904")
                    (.put "GIT_ATTR_NOSYSTEM" "1"))
+        ;; The worktree is the directory that holds `.git` above base-path,
+        ;; not whatever `core.worktree` (possibly from an included config
+        ;; file) says: every path check here is against that directory.
+        _        (when-let [top (->> (iterate #(.getParentFile ^java.io.File %)
+                                              (.getCanonicalFile (java.io.File. (str base-path))))
+                                     (take-while some?)
+                                     (filter #(.exists (java.io.File. ^java.io.File % ".git")))
+                                     first)]
+                   (.put env "GIT_WORK_TREE" (str top)))
         proc     (.start pb)
         out      (future (slurp (.getInputStream proc)))
         err      (future (slurp (.getErrorStream proc)))

@@ -443,21 +443,18 @@
    (a Maven version after someone else's `:local/root`) gets the loaded code,
    not the code it was approved for. Compared the way resolution fills a coord
    in: a git request may leave out the URL (inferred from the lib name), name a
-   tag, and abbreviate the SHA; a `:local/root` may be relative. nil `spec` is
-   the vector form (`RELEASE`): any Maven source."
+   tag, and abbreviate the SHA; a `:local/root` may be relative. A Maven
+   version compares literally: `RELEASE`, `LATEST` or a range names no
+   particular version, so such a request (and the vector form, `RELEASE`) is
+   granted only when its own load put the lib on the classpath."
   [spec source]
   (let [canonical #(some-> % io/file .getCanonicalPath)]
     (and (same-root? spec source)
          (cond
-           (nil? spec) (contains? source :mvn/version)
+           (nil? spec) false
 
            (:mvn/version spec)
-           (let [v (str (:mvn/version spec))]
-             (if (or (#{"RELEASE" "LATEST"} v) (re-find #"^[\[(]" v))
-               ;; resolution picks the concrete version; any Maven source of
-               ;; the lib is what such a request asked for
-               (contains? source :mvn/version)
-               (= v (:mvn/version source))))
+           (= (:mvn/version spec) (:mvn/version source))
 
            (:local/root spec)
            (and (:local/root source)
@@ -507,32 +504,61 @@
       (str (.toURL (.toURI f)))
       (str "jar:" (.toURL (.toURI f)) "!/"))))
 
+(defn- resource-urls
+  "The URLs `require` could load `ns-sym`'s code from, through `loader`: the AOT
+   `__init.class`, the `.clj`, the `.cljc`."
+  [loader base]
+  (keep #(some-> (.getResource ^ClassLoader loader (str base %)) str)
+        ["__init.class" ".clj" ".cljc"]))
+
 (defn namespaces-provided
-  "Namespaces that the roots in `paths` NEWLY provide: a namespace counts only
-   when it was not in `pre-existing` (the namespace names before the load —
-   `add-libs` itself creates the namespaces a jar's `data_readers.clj` names)
-   and every file `require` could load it from — the AOT `__init.class`, the
-   `.clj`, the `.cljc` — resolves, through the class loader, to this root. A
-   jar that also ships `clojure/main.clj`, or a `.cljc` beside a host `.clj` or
-   AOT class, does not provide that namespace."
+  "Namespaces that the roots in `paths` (one lib's jars or directories) NEWLY
+   provide: a namespace counts only when it was not in `pre-existing` (the
+   namespace names before the load — `add-libs` itself creates the namespaces
+   a jar's `data_readers.clj` names) and every file `require` could load it
+   from — the AOT `__init.class`, the `.clj`, the `.cljc` — resolves, through
+   the class loader, to one of these roots. A jar that also ships
+   `clojure/main.clj`, or a `.cljc` beside a host `.clj` or AOT class, does
+   not provide that namespace."
   ([paths] (namespaces-provided paths (set (map ns-name (all-ns)))))
   ([paths pre-existing]
-   (let [loader (clojure.lang.RT/baseLoader)]
+   (let [loader (clojure.lang.RT/baseLoader)
+         prefixes (mapv root-url-prefix paths)]
      (into #{}
-           (mapcat
-            (fn [root]
-              (let [prefix (root-url-prefix root)]
-                (keep (fn [entry]
-                        (when-let [ns-sym (path->ns entry)]
-                          (let [base (str/replace entry #"(__init\.class|\.cljc?)$" "")
-                                urls (keep #(some-> (.getResource loader (str base %)) str)
-                                           ["__init.class" ".clj" ".cljc"])]
-                            (when (and (not (contains? pre-existing ns-sym))
-                                       (seq urls)
-                                       (every? #(str/starts-with? % prefix) urls))
-                              ns-sym))))
-                      (root-entries root)))))
+           (comp (mapcat root-entries)
+                 (keep (fn [entry]
+                         (when-let [ns-sym (path->ns entry)]
+                           (let [urls (resource-urls loader (str/replace entry #"(__init\.class|\.cljc?)$" ""))]
+                             (when (and (not (contains? pre-existing ns-sym))
+                                        (seq urls)
+                                        (every? (fn [u] (some #(str/starts-with? u %) prefixes)) urls))
+                               ns-sym))))))
            paths))))
+
+(defonce ^:private launch-root-prefixes
+  ;; URL prefixes of the classpath the JVM started with. add-libs never
+  ;; changes java.class.path, so this names exactly what the daemon shipped.
+  (delay
+    (into []
+          (comp (remove str/blank?)
+                (map io/file)
+                (filter #(.exists ^java.io.File %))
+                (mapcat (fn [^java.io.File f]
+                          (distinct [(root-url-prefix (.getAbsoluteFile f))
+                                     (root-url-prefix (.getCanonicalFile f))]))))
+          (str/split (System/getProperty "java.class.path" "")
+                     (re-pattern (java.util.regex.Pattern/quote java.io.File/pathSeparator))))))
+
+(defn- launch-classpath-namespace?
+  "Does every file `require` could load `ns-sym` from come from the launch
+   classpath? The namespace allowlist speaks for what the daemon shipped, not
+   for whatever a later add-libs jar (approved for some other context, or
+   attached by a load that then failed) put under an allowlisted name."
+  [ns-sym]
+  (let [base (-> (str ns-sym) (str/replace "-" "_") (str/replace "." "/"))
+        urls (resource-urls (clojure.lang.RT/baseLoader) base)]
+    (and (seq urls)
+         (every? (fn [u] (some #(str/starts-with? u %) @launch-root-prefixes)) urls))))
 
 (defonce ^:private runtime-lib-namespaces
   ;; lib → {:source <basis coord> :namespaces #{…}}: what its jars newly
@@ -552,11 +578,6 @@
   (or (try (ec/get-state k) (catch Throwable _ nil))
       default))
 
-(defn- runtime-provided?
-  "Did a jar that `add-libs!` put on the classpath provide `ns-sym`?"
-  [ns-sym]
-  (boolean (some #(contains? (:namespaces %) ns-sym) (vals @runtime-lib-namespaces))))
-
 (defn namespace-mirrorable?
   "May `ns-sym` be mirrored from the host classpath into an SCI ctx?
 
@@ -570,9 +591,10 @@
              ;; The allowlist speaks for the launch classpath. A namespace an
              ;; add-libs jar provides (even one under an allowlisted prefix,
              ;; `medley.probe`) is reachable only with that grant: another
-             ;; context's load is not this one's approval.
+             ;; context's load, or a load that failed half way, is not this
+             ;; one's approval.
              (and (matches-any? (policy-state NS-ALLOWLIST-KEY default-namespace-allowlist) s)
-                  (not (runtime-provided? (symbol s))))))))
+                  (launch-classpath-namespace? (symbol s)))))))
 
 (defn namespace-denied?
   "Inverse of `namespace-mirrorable?`. Kept because the mirror path reads as a
@@ -797,7 +819,10 @@
             provided (into #{}
                            (mapcat (fn [c]
                                      (let [{:keys [source namespaces]} (get @runtime-lib-namespaces c)]
-                                       (when (same-source? (spec-of c) source)
+                                       ;; Added by this very call: what is loaded
+                                       ;; is what this request resolved to.
+                                       (when (or (contains? (set added) c)
+                                                 (same-source? (spec-of c) source))
                                          namespaces))))
                            coords)]
         (allow-added-lib-namespaces! provided)

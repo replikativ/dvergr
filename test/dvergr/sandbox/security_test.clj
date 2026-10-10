@@ -251,6 +251,38 @@
           (is (str/includes? d "public.txt") code)
           (is (not (str/includes? d ".env")) (str code ": " d)))))))
 
+(deftest physical-git-uses-the-workspace-worktree
+  ;; `core.worktree` (set directly or through an included config file) would
+  ;; point git at another directory than the one every check here is about.
+  (let [dir (git-repo!)
+        sibling (temp-dir! "dvergr-sibling")
+        ctx (sci/init {})]
+    (.mkdirs (java.io.File. sibling "src"))
+    (spit (java.io.File. sibling "src/a.clj") "(ns a)\n(def SIBLING-SENTINEL 1)\n")
+    (sh! dir "git" "config" "core.worktree" (str sibling))
+    (io/add-git-ns! ctx :base-path (str dir))
+    (let [d (sci/eval-string* ctx "(git/diff \".\")")]
+      (is (str/includes? d "changed"))
+      (is (not (str/includes? d "SIBLING-SENTINEL")) d))))
+
+(deftest physical-git-add-does-not-stage-sensitive-files
+  ;; `git/add "."` (or a glob) takes every file under it; a tracked `.env` and
+  ;; an untracked `.env.local` must stay out, as every other file tool keeps them.
+  (doseq [operand ["." "*"]]
+    (let [dir (git-repo!)
+          ctx (sci/init {})]
+      (spit (java.io.File. dir ".env") "TOKEN=old\n")
+      (sh! dir "git" "add" ".env")
+      (sh! dir "git" "-c" "commit.gpgsign=false" "commit" "-q" "-m" "env")
+      (spit (java.io.File. dir ".env") "TOKEN=hunter2\n")
+      (spit (java.io.File. dir ".env.local") "TOKEN=hunter3\n")
+      (io/add-git-ns! ctx :base-path (str dir))
+      (is (= :ok (sci/eval-string* ctx (str "(git/add \"" operand "\")"))))
+      (let [p (.start (doto (ProcessBuilder. ["git" "diff" "--cached" "--name-only"]) (.directory dir)))
+            staged (slurp (.getInputStream p))]
+        (is (str/includes? staged "src/a.clj") operand)
+        (is (not (str/includes? staged ".env")) (str operand ": " staged))))))
+
 (deftest physical-git-does-not-enter-submodules
   ;; A submodule is a repository of its own: its files, config and filters are
   ;; outside every check the host git call makes.

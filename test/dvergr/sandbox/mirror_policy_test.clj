@@ -121,7 +121,8 @@
 (deftest launch-classpath-data-libraries-stay-requirable
   ;; A lib the daemon already ships adds no jar, so add-libs grants nothing for
   ;; it; the namespace allowlist is what makes such a lib requirable.
-  (doseq [ns- '[jsonista.core cheshire.core babashka.fs babashka.json]]
+  ;; (babashka.json is allowlisted but not shipped: nothing to mirror)
+  (doseq [ns- '[jsonista.core cheshire.core babashka.fs]]
     (is (deps/namespace-mirrorable? ns-) (str ns-)))
   (doseq [ns- '[babashka.http-client babashka.pods babashka.deps babashka.process]]
     (is (not (deps/namespace-mirrorable? ns-)) (str ns-))))
@@ -203,7 +204,9 @@
                            (fn [lib] (when (= 'probe/lib lib) [(str dir)]))
                            #'deps/lib-source
                            (fn [lib] (when (= 'probe/lib lib) {:mvn/version "1.0"}))}
-            #(let [r (deps/add-libs! nil '{probe/lib {:mvn/version "1.0"}})
+            ;; RELEASE: the load itself added the lib, so what is loaded is
+            ;; what this request resolved to
+            #(let [r (deps/add-libs! nil '{probe/lib {:mvn/version "RELEASE"}})
                    granted (set (:provenance r))]
                (is (= :loaded (:status r)))
                (is (= '#{dvergr-probe-lib.core dvergr-probe-lib.readers medley.dvergr-probe} granted)
@@ -236,6 +239,11 @@
                      (is (= '#{dvergr-probe-lib.core dvergr-probe-lib.readers medley.dvergr-probe}
                             (set (:provenance (deps/add-libs! nil '{probe/lib {:mvn/version "1.0"}}))))))
                    (is (deps/namespace-mirrorable? 'dvergr-probe-lib.core))))
+               (testing "a later RELEASE request, which loads nothing, is granted nothing"
+                 (binding [rtc/*execution-context* (ctx/create-execution-context)]
+                   (deps/install-policy! (fn [_ _] :approve))
+                   (with-redefs [clojure.repl.deps/add-libs (fn [_] nil)]
+                     (is (= [] (:provenance (deps/add-libs! nil '{probe/lib {:mvn/version "RELEASE"}})))))))
                (testing "but not when it asked for another source than the loaded one"
                  ;; The lib is not reloaded, so that request would get code it
                  ;; was not approved for.
@@ -252,14 +260,15 @@
         git {:git/url "https://example.com/r.git" :git/sha sha :git/tag "v1"}]
     (testing "the forms resolution fills in match"
       (is (same? {:mvn/version "1.0"} {:mvn/version "1.0"}))
-      (is (same? nil {:mvn/version "1.0"}) "vector form = any Maven version")
       (is (same? {:git/sha (subs sha 0 7) :git/tag "v1"} git) "inferred URL, short SHA")
       (is (same? {:git/url "https://example.com/r.git" :git/sha sha} git))
       (is (same? {:local/root "."} {:local/root (.getCanonicalPath (java.io.File. "."))})))
-    (testing "Maven version expressions resolve to a concrete version"
-      (doseq [v ["RELEASE" "LATEST" "[1.0,2.0)" "(,2.0]"]]
-        (is (same? {:mvn/version v} {:mvn/version "1.2.3"}) v)
-        (is (not (same? {:mvn/version v} {:local/root "/tmp/x"})) v)))
+    (testing "a Maven version expression names no loaded version"
+      ;; granted only when the request's own load added the lib (see the
+      ;; probe test); an already-loaded 1.0 is not what `[2.0,3.0)` approved
+      (doseq [v ["RELEASE" "LATEST" "[2.0,3.0)" "(,2.0]"]]
+        (is (not (same? {:mvn/version v} {:mvn/version "1.0"})) v))
+      (is (not (same? nil {:mvn/version "1.0"})) "nor the vector form"))
     (testing "another source does not"
       (is (not (same? {:mvn/version "2.0"} {:mvn/version "1.0"})))
       (is (not (same? {:local/root "/tmp/x"} {:mvn/version "1.0"})))
@@ -281,6 +290,44 @@
           (is (same? {:local/root "."} {:local/root root :deps/root root}))
           (is (same? {:local/root "." :deps/root "src"} {:local/root root :deps/root (str root "/src")}))
           (is (not (same? {:local/root "."} {:local/root root :deps/root (str root "/src")}))))))))
+
+(deftest a-failed-load-that-attached-a-jar-opens-nothing
+  ;; The host add-libs attaches the jars before it reloads data readers, which
+  ;; can throw: the jar is then on the classpath with no grant recorded. The
+  ;; allowlist must not admit its namespaces either.
+  (with-ctx
+    (deps/install-policy! (fn [_ _] :approve))
+    (let [dir (.getAbsoluteFile (.toFile (java.nio.file.Files/createTempDirectory
+                                          "dvergr-partial" (make-array java.nio.file.attribute.FileAttribute 0))))
+          loader (clojure.lang.DynamicClassLoader. (.getContextClassLoader (Thread/currentThread)))]
+      (.mkdirs (java.io.File. dir "medley"))
+      (spit (java.io.File. dir "medley/dvergr_partial.clj") "(ns medley.dvergr-partial)\n")
+      (with-bindings {clojure.lang.Compiler/LOADER loader}
+        (with-redefs [clojure.repl.deps/add-libs
+                      (fn [_] (.addURL loader (.toURL (.toURI dir)))
+                        (throw (ex-info "data reader failed" {})))]
+          (is (thrown? Exception (deps/add-libs! nil '{partial/lib {:mvn/version "1.0"}}))))
+        (is (some? (.getResource loader "medley/dvergr_partial.clj")) "precondition: attached")
+        (is (not (deps/namespace-mirrorable? 'medley.dvergr-partial)))
+        (is (deps/namespace-mirrorable? 'cheshire.core) "launch-classpath namespaces still pass")))))
+
+(deftest a-lib-with-several-roots-provides-its-namespaces
+  ;; AOT classes in one root, sources in another: both are the lib's.
+  (let [mk #(.getAbsoluteFile (.toFile (java.nio.file.Files/createTempDirectory
+                                        % (make-array java.nio.file.attribute.FileAttribute 0))))
+        classes (mk "dvergr-classes")
+        src (mk "dvergr-src")
+        loader (clojure.lang.DynamicClassLoader. (.getContextClassLoader (Thread/currentThread)))]
+    (.mkdirs (java.io.File. classes "dvergr_multi"))
+    (spit (java.io.File. classes "dvergr_multi/core__init.class") "not really a class")
+    (.mkdirs (java.io.File. src "dvergr_multi"))
+    (spit (java.io.File. src "dvergr_multi/core.clj") "(ns dvergr-multi.core)\n")
+    (.addURL loader (.toURL (.toURI classes)))
+    (.addURL loader (.toURL (.toURI src)))
+    (with-bindings {clojure.lang.Compiler/LOADER loader}
+      (is (= '#{dvergr-multi.core} (deps/namespaces-provided [(str classes) (str src)])))
+      (is (= #{} (deps/namespaces-provided [(str src)]))
+          "one root alone does not account for the other's file"))))
 
 (deftest caller-allowlist-cannot-widen-past-the-hard-denylist
   (with-ctx
