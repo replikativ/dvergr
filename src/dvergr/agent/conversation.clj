@@ -31,6 +31,7 @@
             [dvergr.room.store.datahike :as dhs]
             [dvergr.substrate.datahike :as sdh]
             [dvergr.substrate.paths :as paths]
+            [dvergr.substrate.store-ids :as store-ids]
             [dvergr.system.db :as sdb]
             [hasch.core :as hasch])
   (:import [java.security MessageDigest]))
@@ -76,7 +77,7 @@
   (let [path (.getAbsolutePath (io/file dir "store"))]
     {:store {:backend :file :path path
              ;; the id the store was created with: an experiment directory can move
-             :id (sdh/file-store-id path)}
+             :id (store-ids/store-id path (partial store-ids/path-derived "dvergr-experiment:"))}
      :keep-history? true
      :schema-flexibility :write}))
 

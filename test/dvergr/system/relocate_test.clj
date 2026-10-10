@@ -1,25 +1,29 @@
 (ns dvergr.system.relocate-test
-  "A home moved or copied to another directory opens its own stores: store ids
-   are the ones the stores were created with, not hashes of their paths, and
-   the registry's scopes are rehomed before any room store opens, so a copy
-   never writes into the original."
-  (:require [clojure.java.io :as io]
+  "A home moved to another directory opens its stores: each store's id is kept
+   beside it, not derived from its path, and the registry's scopes are rehomed
+   before any room store opens. A copy of a home whose original still exists is
+   refused: it is the same stores under the same ids, not a home of its own."
+  (:require [clojure.edn]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [datahike.api :as dh]
             [dvergr.ops :as ops]
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.substrate.datahike :as sdh]
+            [dvergr.substrate.store-ids :as store-ids]
+            [dvergr.system.home :as home]
             [dvergr.substrate.paths :as paths]
             [dvergr.system.db :as sdb]
             [dvergr.system.rooms :as srooms]
             [org.replikativ.spindel.engine.core :as ec])
   (:import [java.nio.file Files LinkOption Path StandardCopyOption]
+           [java.io File]
            [java.security MessageDigest]))
 
 (defn- tmp [label]
   (.getAbsolutePath (io/file (System/getProperty "java.io.tmpdir")
-                              (str "dvergr-relocate-" label "-" (random-uuid)))))
+                             (str "dvergr-relocate-" label "-" (random-uuid)))))
 
 (defn- copy-tree! [^String from ^String to]
   (let [src (.toPath (io/file from)) dst (.toPath (io/file to))]
@@ -52,83 +56,144 @@
     (set (dh/q '[:find [?n ...] :where [?e :tool-call/name ?n]]
                @(srooms/msgs-conn-for-slug "moved")))))
 
-(deftest a-copied-home-opens-its-own-stores-and-leaves-the-original-alone
+(defn- start-room-home!
+  "Create home `dir` with room \"moved\" holding one note; stopped afterwards."
+  [dir]
+  (paths/set-home! dir)
+  (sdb/reset-conn!)
+  (let [d (daemon/start! {:agents {}})]
+    (try
+      (ops/invoke d :room/create {:title "moved" :slug "moved"})
+      (note! (ops/resolve-room d "moved") "written-in-a")
+      (finally (daemon/stop! d))))
+  (let [room-id (:room/id (sdb/room-by-slug "moved"))]
+    (sdb/reset-conn!)
+    {:room-id room-id}))
+
+(defn- move! [^String from ^String to]
+  (Files/move (.toPath (io/file from)) (.toPath (io/file to))
+              (into-array java.nio.file.CopyOption [StandardCopyOption/ATOMIC_MOVE])))
+
+(defn- open-moved-room
+  "Start the daemon at `dir` and check the moved room; returns its sync scope."
+  [dir room-id]
+  (paths/set-home! dir)
+  (sdb/reset-conn!)
+  (let [d (daemon/start! {:agents {}})]
+    (try
+      (let [room (ops/resolve-room d "moved")]
+        (testing "the registry names this home's stores"
+          (is (every? #(.startsWith (str (:system/scope %)) dir)
+                      (filter #(#{:msgs :kb :repo} (:system/type %)) (sdb/all-systems)))))
+        (testing "the moved home reads what was written before and writes on"
+          (is (contains? (notes room) "written-in-a"))
+          (note! room "written-in-b")
+          (is (contains? (notes room) "written-in-b")))
+        (srooms/room-msgs-store-id room-id))
+      (finally (daemon/stop! d) (sdb/reset-conn!)))))
+
+(deftest a-moved-home-opens-its-stores
   (let [prev-home (paths/home)
         a (tmp "a")
         b (tmp "b")]
     (try
-      (paths/set-home! a)
-      (sdb/reset-conn!)
-      (let [d (daemon/start! {:agents {}})]
-        (try
-          (ops/invoke d :room/create {:title "moved" :slug "moved"})
-          (note! (ops/resolve-room d "moved") "written-in-a")
-          (finally (daemon/stop! d))))
-      (let [room-id (:room/id (sdb/room-by-slug "moved"))
-            sync-scope (srooms/room-msgs-store-id room-id)
-            kinds (into {} (map (fn [{:system/keys [scope type name]}]
-                                  [(.getName (io/file (str scope))) [type name]]))
-                        (sdb/all-systems))]
+      (let [{:keys [room-id]} (start-room-home! a)
+            sync-scope (do (paths/set-home! a) (srooms/room-msgs-store-id room-id))]
         (sdb/reset-conn!)
-        (copy-tree! a b)
-        (let [original (tree-digest a)]
-          (paths/set-home! b)
-          (sdb/reset-conn!)
-          (let [d (daemon/start! {:agents {}})]
-            (try
-              (let [room (ops/resolve-room d "moved")]
-              (testing "the registry names this home's stores"
-                (is (every? #(.startsWith (str (:system/scope %)) b)
-                            (filter #(#{:msgs :kb :repo} (:system/type %)) (sdb/all-systems)))))
-              (testing "the copy reads what was written before and writes to itself"
-                (is (contains? (notes room) "written-in-a"))
-                (note! room "written-in-b")
-                (is (contains? (notes room) "written-in-b")))
-              (testing "the sync scope a consumer bound to is unchanged"
-                (is (= sync-scope (srooms/room-msgs-store-id room-id)))))
-              (finally (daemon/stop! d))))
-          (testing "the original home was not written"
-            (let [after (tree-digest a)]
-              (is (= #{} (set (for [f (distinct (concat (keys original) (keys after)))
-                                    :when (not= (original f) (after f))
-                                    :let [[top sys] (str/split f #"/")]]
-                                (if (= "systems" top) (kinds sys [:unknown sys]) top)))))))))
+        (move! a b)
+        (testing "the sync scope a consumer bound to is unchanged"
+          (is (= sync-scope (open-moved-room b room-id))))
+        (testing "the home records where it lives now"
+          (is (= (.getCanonicalPath (io/file b))
+                 (:home/path (clojure.edn/read-string (slurp (io/file b "home.edn")))))))
+        (is (= :same (home/claim!)) "and opens as itself afterwards"))
       (finally
         (sdb/reset-conn!)
         (paths/set-home! prev-home)))))
 
-(deftest store-ids-are-created-not-derived-from-paths
+(deftest a-copied-home-is-refused-while-its-original-exists
+  (let [prev-home (paths/home)
+        a (tmp "a")
+        b (tmp "b")]
+    (try
+      (start-room-home! a)
+      (copy-tree! a b)
+      (let [original (tree-digest a)]
+        (paths/set-home! b)
+        (sdb/reset-conn!)
+        (is (= ::home/copied-home
+               (try (daemon/start! {:agents {}}) nil
+                    (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))
+        (is (= original (tree-digest a)) "the original was not written"))
+      (finally
+        (sdb/reset-conn!)
+        (paths/set-home! prev-home)))))
+
+(deftest a-home-moved-before-its-stores-had-id-files-is-rehomed
+  ;; An older version kept no id files for room stores; the registry's
+  ;; original scopes still give the ids they were derived with.
+  (let [prev-home (paths/home)
+        a (tmp "a")
+        b (tmp "b")]
+    (try
+      (let [store-id store-ids/store-id
+            {:keys [room-id]} (with-redefs [store-ids/store-id
+                                            ;; the older version: room stores'
+                                            ;; ids derived from their paths, kept nowhere
+                                            (fn [path legacy]
+                                              (if (str/includes? (str path) "/systems/")
+                                                (legacy path)
+                                                (store-id path legacy)))]
+                                (start-room-home! a))]
+        (is (empty? (filter #(.endsWith (.getName ^File %) ".id") (file-seq (io/file a "systems")))))
+        (store-ids/forget-all!)
+        (move! a b)
+        (open-moved-room b room-id)
+        (testing "the ids derived from the original paths are recorded beside the stores"
+          (is (seq (filter #(.endsWith (.getName ^File %) ".id") (file-seq (io/file b "systems")))))))
+      (finally
+        (sdb/reset-conn!)
+        (paths/set-home! prev-home)))))
+
+(deftest a-new-store-gets-a-fresh-id-kept-beside-it
   (let [path (str (tmp "store") "/db")
-        cfg {:store {:backend :file :path path :id (sdh/file-store-id path)}}]
+        id (store-ids/store-id path (fn [_] (throw (ex-info "not a legacy store" {}))))
+        cfg {:store {:backend :file :path path :id id}}]
     (try
       (dh/create-database cfg)
-      (testing "a new store's id is not its path's hash"
-        (is (not= (java.util.UUID/nameUUIDFromBytes (.getBytes ^String path))
-                  (sdh/stored-store-id {:backend :file :path path}))))
-      (testing "the id is the stored one, also after the cache is dropped"
-        (let [id (get-in cfg [:store :id])]
-          (sdh/forget-file-store-id! path)
-          (is (= id (sdh/file-store-id path)))))
-      (finally (sdh/delete-database! cfg)))))
+      (is (not= (store-ids/path-derived "" path) id))
+      (is (.exists (store-ids/id-file path)))
+      (store-ids/forget-all!)
+      (is (= id (store-ids/store-id path (constantly nil))) "read back after the cache is dropped")
+      (finally (sdh/delete-database! cfg)))
+    (is (not (.exists (store-ids/id-file path))) "deleting the store deletes its id")))
+
+(deftest a-store-deleted-with-its-directory-gets-a-new-id
+  (let [dir (tmp "repo")
+        path (str dir "/datahike")
+        first-id (store-ids/store-id path (constantly nil))]
+    (.mkdirs (io/file path))
+    (spit (io/file path "x") "store")
+    (doseq [^File f (reverse (file-seq (io/file dir)))] (.delete f))
+    (is (not= first-id (store-ids/store-id path (constantly :legacy))))
+    (is (.exists (store-ids/id-file path)))))
 
 (deftest a-store-created-with-a-path-derived-id-keeps-it
   (let [path (str (tmp "legacy") "/db")
-        legacy (java.util.UUID/nameUUIDFromBytes (.getBytes ^String path))
+        legacy (store-ids/path-derived "" path)
         cfg {:store {:backend :file :path path :id legacy}}]
     (try
       (dh/create-database cfg)
-      (sdh/forget-file-store-id! path)
-      (is (= legacy (sdh/file-store-id path)))
-      (dh/release (dh/connect (assoc-in cfg [:store :id] (sdh/file-store-id path))))
+      (is (= legacy (store-ids/store-id path (partial store-ids/path-derived ""))))
+      (dh/release (dh/connect (assoc-in cfg [:store :id] (store-ids/store-id path (constantly nil)))))
       (finally (sdh/delete-database! cfg)))))
 
-(deftest scopes-outside-a-systems-directory-are-not-rehomed
-  (let [rehomed-scope @#'sdb/rehomed-scope
+(deftest only-another-homes-systems-stores-are-foreign
+  (let [foreign-scope @#'sdb/foreign-scope
         here (tmp "here")
         sys (str here "/systems")]
     (.mkdirs (io/file sys "abc"))
-    (is (= (str (io/file sys "abc")) (rehomed-scope "/elsewhere/old-home/systems/abc" sys)))
-    (is (nil? (rehomed-scope "/elsewhere/old-home/systems/missing" sys)) "not in this home")
-    (is (nil? (rehomed-scope "/home/someone/drive/abc" sys)) "a drive path")
-    (is (nil? (rehomed-scope (str (io/file sys "abc")) sys)) "already here")
-    (is (nil? (rehomed-scope "abc" sys)) "not a path")))
+    (is (= (io/file sys "abc") (foreign-scope "/elsewhere/old-home/systems/abc" sys)))
+    (is (nil? (foreign-scope "/home/someone/drive/abc" sys)) "a drive path")
+    (is (nil? (foreign-scope (str (io/file sys "abc")) sys)) "already here")
+    (is (nil? (foreign-scope "abc" sys)) "not a path")))

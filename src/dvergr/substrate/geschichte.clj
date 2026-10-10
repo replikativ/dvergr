@@ -10,6 +10,7 @@
             [clojure.string :as str]
             [datahike.api :as d]
             [dvergr.substrate.paths :as paths]
+            [dvergr.substrate.store-ids :as store-ids]
             [geschichte.git.command :as command]
             [geschichte.git.http :as git-http]
             [geschichte.git.local :as git-local]
@@ -35,6 +36,12 @@
            (catch Throwable _ nil))
       (default-sandbox-repo)))
 
+(defn legacy-store-id
+  "The id versions before store id files derived for the repository store at
+   `path`: from its scope, the directory holding it."
+  [path]
+  (store-ids/path-derived "dvergr-geschichte:" (.getParent (io/file path))))
+
 (defn repository-config
   "Portable Datahike configuration for one persistent Geschichte repository."
   [scope]
@@ -46,7 +53,7 @@
              :path path
              ;; the id the store was created with, not one derived from the
              ;; path: a moved home keeps its repositories
-             :id (sdh/file-store-id path)}
+             :id (store-ids/store-id path legacy-store-id)}
      ;; 128, not 256 — measured knee on a room-shaped store; see
      ;; `dvergr.substrate.datahike/diff-buf-size` for the table.
      :index-config {:diff-buf-size sdh/diff-buf-size}

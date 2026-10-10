@@ -29,6 +29,7 @@
             [dvergr.substrate.geschichte :as geschichte]
             [geschichte.workspace :as gworkspace]
             [dvergr.substrate.paths :as paths]
+            [dvergr.substrate.store-ids :as store-ids]
             [dvergr.substrate.datahike :as sdh]
             [dvergr.substrate.kontor-book :as kontor-book]
             [org.replikativ.spindel.yggdrasil :as ygg]
@@ -53,27 +54,22 @@
                     error))
     (get @room-ctxs room-id)))
 
+(declare clear-room-ctxs!)
+
 (defn release-room-stores!
   "Release the Datahike connection of every store registered in a room's
-   context, all of its leases: the daemon owns them and is stopping. Datahike
-   caches connections by store id and a home copied to another directory keeps
-   its stores' ids, so a connection left open would be handed out again for
-   the copy (or to a same-process restart). Best-effort per store. `ctxs`:
-   the room contexts by room id, `room-ctxs-snapshot` taken before
-   `clear-room-ctxs!`; release after everything that writes has stopped."
-  [ctxs]
-  (doseq [[_ ctx] ctxs]
+   context, all of its leases, and drop the room contexts: the daemon owns
+   them and is stopping. Datahike caches connections by store id, so a
+   connection left open would be handed out again to a same-process restart.
+   Best-effort per store; call once everything that writes has stopped."
+  []
+  (doseq [[_ ctx] @room-ctxs]
     (binding [ec/*execution-context* ctx]
       (doseq [[_ system] (try (ygg/registered-systems) (catch Throwable _ {}))
               :let [conn (:conn system)]
               :when conn]
-        (try (d/release conn true) (catch Throwable _ nil))))))
-
-(defn room-ctxs-snapshot
-  "The room contexts by room id, for `release-room-stores!` after
-   `clear-room-ctxs!`."
-  []
-  @room-ctxs)
+        (try (d/release conn true) (catch Throwable _ nil)))))
+  (clear-room-ctxs!))
 
 (defn clear-room-ctxs!
   "Drop all per-room execution contexts. Call on daemon stop! so a same-process
@@ -84,18 +80,23 @@
 
 (defn- scope-path [scope] (str (io/file (paths/systems-dir) scope)))
 
+(defn legacy-store-id
+  "The id versions before store id files derived from a room store's `path`."
+  [path]
+  (store-ids/path-derived "" path))
+
 (defn store-id
-  "Konserve store id for a room store `path`: the id the store was created
-   with (`substrate.datahike/file-store-id`), so it is stable across restarts
-   and survives moving the home. Not derivable from the path: a store created
-   by an older version has a path-derived id, a new one a random id.
+  "Konserve store id for a room store `path`: the id recorded beside the store
+   (`dvergr.substrate.store-ids`), so it is stable across restarts and survives
+   moving the home. Not derivable from the path: a store created by an older
+   version has a path-derived id, a new one a random id.
 
    Public because it is the konserve-sync SCOPE: a consumer that collapses its
    own per-room database onto the room store (simmis binds
    `:room/content-db-scope` to it) must name the same store the writer uses, and
    must not re-derive the formula on its own."
   [path]
-  (sdh/file-store-id path))
+  (store-ids/store-id path legacy-store-id))
 
 (defn- store-cfg
   "ONE config for every datom store a room owns — messages, KB, agent `:data`.
@@ -289,8 +290,6 @@
    system DB is up. Requires a bound ctx (its `current-root` is the fork parent).
    Best-effort per room."
   []
-  ;; a moved or copied home: its registry still names the old home's stores
-  (sdb/rehome-scopes!)
   (doseq [{:room/keys [id]} (sdb/all-rooms)]
     (let [room-ctx (fork-room-ctx)]
       (try

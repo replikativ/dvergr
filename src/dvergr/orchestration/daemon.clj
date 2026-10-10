@@ -43,6 +43,7 @@
             [dvergr.tools :as tools]
             [dvergr.system.rooms :as srooms]
             [dvergr.system.db :as sdb]
+            [dvergr.system.home :as home]
             [dvergr.system.mail :as mail]
             [dvergr.drive.blobs :as blobs]
             [dvergr.drive.integration :as drive-integration]
@@ -775,6 +776,12 @@
   (registry/ensure-models-loaded!)
   (configure-claude-code! (:claude-code config))
 
+  ;; Before any store of the home opens: a copied home is refused, a moved one
+  ;; adopted (dvergr.system.home).
+  (home/claim!)
+  ;; A moved home's registry still names the old home's stores: point it here.
+  (sdb/rehome-scopes!)
+
   ;; Create execution context, daemon-wide discourse room, and the
   ;; :_system receiver that drains all agent replies into the sink fan-out.
   ;; RF5 (Option B): the daemon root does NOT register the legacy `.dvergr/workspace`
@@ -1077,71 +1084,69 @@
    3. Disconnect channels, close sessions
    4. Unregister execution context"
   [daemon]
-  (let [room-ctxs (srooms/room-ctxs-snapshot)]
-    (tel/log! {:id :daemon/stopping} "Stopping daemon")
-    (reset! (:status daemon) :stopping)
-    (stop-gc-loop!)
+  (tel/log! {:id :daemon/stopping} "Stopping daemon")
+  (reset! (:status daemon) :stopping)
+  (stop-gc-loop!)
 
-    ;; Leave all registered participants from the discourse room and
-    ;; unregister them. Driver pumps + participant spins remain on the
-    ;; executor (discourse has no per-spin cancel today) but no further
-    ;; messages are routed to them. Reserved `_`-prefixed ids (e.g. the
-    ;; `:_activity` lane) are not agents — skip them.
-    (binding [rtc/*execution-context* (:execution-ctx daemon)]
-      (doseq [agent-id (->> (some-> (:discourse-room daemon) :participants deref keys)
-                            (remove #(.startsWith (name %) "_")))]
-        (tel/log! {:id :daemon/stop-agent :data {:agent-id agent-id}} "Stopping agent")
-        (try (stop-agent! daemon agent-id)
-             (catch Exception _))))
+  ;; Leave all registered participants from the discourse room and
+  ;; unregister them. Driver pumps + participant spins remain on the
+  ;; executor (discourse has no per-spin cancel today) but no further
+  ;; messages are routed to them. Reserved `_`-prefixed ids (e.g. the
+  ;; `:_activity` lane) are not agents — skip them.
+  (binding [rtc/*execution-context* (:execution-ctx daemon)]
+    (doseq [agent-id (->> (some-> (:discourse-room daemon) :participants deref keys)
+                          (remove #(.startsWith (name %) "_")))]
+      (tel/log! {:id :daemon/stop-agent :data {:agent-id agent-id}} "Stopping agent")
+      (try (stop-agent! daemon agent-id)
+           (catch Exception _))))
 
-    ;; Drop all cached per-room working ctxs (the cache is a defonce surviving a
-    ;; same-process restart; a fresh start must re-seed rather than reuse them).
-    (room-context/clear-all!)
-    (srooms/clear-room-ctxs!)
+  ;; Drop all cached per-room working ctxs (the cache is a defonce surviving a
+  ;; same-process restart; a fresh start must re-seed rather than reuse them).
+  (room-context/clear-all!)
 
-    ;; Stop the reactive clock heartbeat (per-room scheduler spins go quiet with
-    ;; it; their rows persist in each room's store and resume on next boot).
-    (clock/stop!)
+  ;; Stop the reactive clock heartbeat (per-room scheduler spins go quiet with
+  ;; it; their rows persist in each room's store and resume on next boot).
+  (clock/stop!)
 
-    ;; Stop HTTP server (only if dvergr.web.server is on the classpath)
-    (when (:http-server daemon)
-      (when-let [stop-fn (try (requiring-resolve 'dvergr.web.server/stop!)
-                              (catch Throwable _ nil))]
-        (stop-fn)))
+  ;; Stop HTTP server (only if dvergr.web.server is on the classpath)
+  (when (:http-server daemon)
+    (when-let [stop-fn (try (requiring-resolve 'dvergr.web.server/stop!)
+                            (catch Throwable _ nil))]
+      (stop-fn)))
 
-    (when-let [stop (get-in daemon [:mcp-http :stop])]
-      (try (stop) (catch Throwable _ nil)))
-    (when (:mcp-server daemon)
-      (try ((requiring-resolve 'dvergr.mcp.server/stop!)) (catch Throwable _ nil)))
+  (when-let [stop (get-in daemon [:mcp-http :stop])]
+    (try (stop) (catch Throwable _ nil)))
+  (when (:mcp-server daemon)
+    (try ((requiring-resolve 'dvergr.mcp.server/stop!)) (catch Throwable _ nil)))
 
-    ;; Stop the mail IMAP sync loop (if running)
-    (mail/stop-sync!)
+  ;; Stop the mail IMAP sync loop (if running)
+  (mail/stop-sync!)
 
-    ;; Disconnect Telegram
-    (when-let [tg-ch (:telegram-ch daemon)]
-      (tel/log! {:id :daemon/telegram-disconnecting} "Disconnecting Telegram")
-      (channels/disconnect! (:id tg-ch)))
+  ;; Disconnect Telegram
+  (when-let [tg-ch (:telegram-ch daemon)]
+    (tel/log! {:id :daemon/telegram-disconnecting} "Disconnecting Telegram")
+    (channels/disconnect! (:id tg-ch)))
 
-    ;; Unregister execution context
-    (sdist/unregister-context! :default)
+  ;; Unregister execution context
+  (sdist/unregister-context! :default)
 
-    ;; Tear down the discourse room — clears participants, stops the
-    ;; spindel ExecutionContext drain thread. Without this, dvergr tests
-    ;; (or any short-lived embedding) accumulate one drain thread per
-    ;; start!/stop! cycle. Virtual-thread-backed since spindel 0.1.10, so
-    ;; the leak is invisible — but explicit teardown is the right contract.
-    (when-let [room (:discourse-room daemon)]
-      (try (d/close-room! room)
-           (catch Exception _)))
+  ;; Tear down the discourse room — clears participants, stops the
+  ;; spindel ExecutionContext drain thread. Without this, dvergr tests
+  ;; (or any short-lived embedding) accumulate one drain thread per
+  ;; start!/stop! cycle. Virtual-thread-backed since spindel 0.1.10, so
+  ;; the leak is invisible — but explicit teardown is the right contract.
+  (when-let [room (:discourse-room daemon)]
+    (try (d/close-room! room)
+         (catch Exception _)))
 
-    ;; Last, once nothing writes: release every room store's connection, so a
-    ;; same-process restart, or a copy of this home, does not inherit it.
-    (srooms/release-room-stores! room-ctxs)
+  ;; Last, once nothing writes: release every room store's connection and drop
+  ;; the room contexts, so a same-process restart does not inherit them.
+  (srooms/release-room-stores!)
 
-    (reset! (:status daemon) :stopped)
-    (reset! current-daemon nil)
-    (tel/log! {:id :daemon/stopped} "Daemon stopped")
-    :stopped))
+  (reset! (:status daemon) :stopped)
+  (reset! current-daemon nil)
+  (tel/log! {:id :daemon/stopped} "Daemon stopped")
+  :stopped)
 
 ;; ============================================================================
 ;; Inspection

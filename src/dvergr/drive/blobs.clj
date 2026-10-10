@@ -15,6 +15,7 @@
   (:require [konserve.store :as kstore]
             [konserve.core :as k]
             [dvergr.substrate.paths :as paths]
+            [dvergr.substrate.store-ids :as store-ids]
             [taoensso.telemere :as log])
   (:import [java.security MessageDigest]))
 
@@ -29,11 +30,11 @@
 (defn- resolve-config []
   (or @store-config
       (let [path (paths/dir "blobs")]
-        ;; konserve requires a UUID :id (stable store identity across restarts /
-        ;; backends). Derive it deterministically from the path.
+        ;; konserve requires a UUID :id: the one recorded beside the store,
+        ;; so a moved home keeps it (see dvergr.substrate.store-ids)
         {:backend :file
          :path    path
-         :id      (java.util.UUID/nameUUIDFromBytes (.getBytes (str "dvergr-blobs:" path) "UTF-8"))
+         :id      (store-ids/store-id path (partial store-ids/path-derived "dvergr-blobs:"))
          :opts    {:sync? true}})))
 
 (defn- connect-or-create!
