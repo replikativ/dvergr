@@ -82,7 +82,10 @@
         ;; no longer nests a trampoline per iteration (a work/parallel runner
         ;; with a backlog died of StackOverflowError and hung its completion);
         ;; a dead work runner fails its completion.
-        org.replikativ/spindel     {:mvn/version "0.1.106"}
+        ;; 0.1.107: a body started inside another body (spawn!, an inline
+        ;; executor's child, a generator step) runs in its own trampoline, so
+        ;; its loop no longer stops at the first synchronous await.
+        org.replikativ/spindel     {:mvn/version "0.1.107"}
         ;; probabilistic inference in forkable worlds, split out of spindel:
         ;; the sandbox's infer/ and dist/ namespaces (foerster.core, .dist).
         ;; 0.1.45: savepoint inference throughout, resample-move, tempering,
