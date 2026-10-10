@@ -76,6 +76,12 @@
       (testing "an opaque (null) origin is refused"
         (is (= 403 (:status (form-post app "/rooms/r/post" (str eval-cmd "&csrf=" (:token s)) s
                                        :headers {"origin" "null"})))))
+      (testing "another scheme is another origin (Origin and Referer)"
+        (is (= 403 (:status (form-post app "/rooms/r/post" (str eval-cmd "&csrf=" (:token s)) s
+                                       :headers {"origin" (str "https://" host)}))))
+        (is (= 403 (:status (form-post app "/rooms/r/post" (str eval-cmd "&csrf=" (:token s)) s
+                                       :headers {"origin" nil
+                                                 "referer" (str "https://" host "/dashboard")})))))
       (testing "a localhost page on another port is another origin"
         (is (= 403 (:status (form-post app "/rooms/r/post" (str eval-cmd "&csrf=" (:token s)) s
                                        :headers {"origin" "http://127.0.0.1:3000"})))))
@@ -160,6 +166,9 @@
   (let [app (app {:allowed-hosts ["127.0.0.1"] :allowed-origins ["https://dvergr.example.com"]})
         s (session app) calls (atom [])]
     (with-room calls
+      (testing "the same Host over the request's own scheme is same-origin"
+        (is (= 303 (:status (form-post app "/rooms/r/post" (str "content=hi&csrf=" (:token s)) s
+                                       :headers {"origin" (str "http://" host)})))))
       (is (= 303 (:status (form-post app "/rooms/r/post" (str "content=hi&csrf=" (:token s)) s
                                      :headers {"origin" "https://dvergr.example.com"}))))
       (is (= 403 (:status (form-post app "/rooms/r/post" (str "content=hi&csrf=" (:token s)) s
@@ -183,6 +192,14 @@
                                       :headers {"content-type" "text/plain"}
                                       :body "{\"title\":\"x\"}"))))))
       (is (empty? @calls))
+      (testing "no generated API GET reaches an op with side effects"
+        (doseq [[op {:keys [kind]}] ops/specification
+                :when (not= :read kind)]
+          (let [resp (app (req :get (str "/api/v1/" (ops/op->name op))))]
+            (is (#{404 405} (:status resp)) (str op " is not a GET"))))
+        (testing "a file export is one of them"
+          (is (= :write (:kind (ops/specification :attempt/export))))
+          (is (#{404 405} (:status (app (req :get "/api/v1/attempt_export?room=r&file=x.jsonl")))))))
       (testing "a machine client (JSON, no Origin) needs no session"
         (is (= 200 (:status (app (req :post "/api/v1/room_create"
                                       :headers {"content-type" "application/json"}

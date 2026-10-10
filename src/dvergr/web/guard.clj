@@ -135,11 +135,14 @@
 
 (defn same-origin?
   "True when `url` (an Origin or Referer) is the origin the request was sent
-   to — its Host header — or one of the `allowed` origins."
-  [url host-header allowed]
+   to — its scheme (`req-scheme`, \"http\" or \"https\") and Host header — or
+   one of the `allowed` origins. A TLS-terminating proxy makes the two schemes
+   differ, so its origin goes in `allowed`."
+  [url req-scheme host-header allowed]
   (when-let [[scheme host port] (url-origin url)]
     (or (let [[h p] (split-authority host-header)]
-          (and (= host h) (= port (or p (if (= "https" scheme) 443 80)))))
+          (and (= scheme req-scheme) (= host h)
+               (= port (or p (if (= "https" scheme) 443 80)))))
         (contains? (into #{} (keep normalize-origin) allowed)
                    (normalize-origin url)))))
 
@@ -210,7 +213,7 @@
           (not (host-allowed? host hosts))
           (forbidden "Forbidden: unknown Host")
 
-          (and unsafe? origin (not (same-origin? origin host allowed-origins)))
+          (and unsafe? origin (not (same-origin? origin (name (or (:scheme req) :http)) host allowed-origins)))
           (forbidden "Forbidden: cross-origin request")
 
           (and unsafe? api? (not (json-content? req)))

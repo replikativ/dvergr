@@ -71,7 +71,7 @@ Priority: `(paths/set-home! …)` → `$DVERGR_HOME` → `./.dvergr`. Layout:
 
  ;; Daemon services.
  :http          {:port 17880 :ip "127.0.0.1"}   ; web dashboard + JSON API (needs the web deps);
-                                                ; behind a proxy add :allowed-hosts ["dvergr.lan"]
+                                                ; behind a proxy (or TLS terminator) add :allowed-hosts ["dvergr.lan"]
                                                 ; and :allowed-origins ["https://dvergr.lan"]
  :mcp           {:port 17888 :bind "127.0.0.1" :profile "offload"
                  :http {:port 17889}}           ; MCP over loopback TCP, optionally Streamable HTTP; doc/mcp.md

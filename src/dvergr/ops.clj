@@ -770,7 +770,9 @@
               "digest) and the verdict (reward, checks, verifier trust, spend). Inline (at most "
               "`limit`, default 20), or with `file` written as JSON lines under the state root's "
               "exports/ directory. `min-reward` keeps only Attempts scoring at least that.")
-    :kind :read
+    ;; A write: with `file` it creates or overwrites a file, so it must not be a
+    ;; GET (the HTTP API routes reads as GETs, which a cross-site page can issue).
+    :kind :write
     :schema [:map [:room Room]
              [:limit {:optional true} [:int {:min 1 :max 1000 :description "max attempts (default 20)"}]]
              [:environment {:optional true} [:string {:description "environment id"}]]
