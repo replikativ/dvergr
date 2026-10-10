@@ -42,6 +42,38 @@
   [path]
   (store-ids/path-derived "dvergr-geschichte:" (.getParent (io/file path))))
 
+(def repository-options
+  "A Geschichte repository's Datahike options, without the store: shared by a
+   file repository (`repository-config`) and an in-memory one."
+  {;; 128, not 256 — measured knee on a room-shaped store; see
+   ;; `dvergr.substrate.datahike/diff-buf-size` for the table.
+   :index-config {:diff-buf-size sdh/diff-buf-size}
+   :schema-flexibility :write
+   ;; `:crypto-hash?` matches every other room store, so ONE mechanism
+   ;; (`datahike.audit/verify-chain`) verifies books, wiki, chat AND code.
+   ;; Geschichte needs it: its own hashing covers CONTENT only —
+   ;; `:geschichte.content/id` is a hash of the bytes, verified on read — while
+   ;; `:geschichte.commit/id` is a random uuid and refs are ordinary datoms. So
+   ;; repointing a path at other content, or rewriting commit parentage, is
+   ;; invisible to geschichte and visible only to datahike's merkle.
+   ;;
+   ;; It costs `:fuse-index-roots?`, which datahike disables under crypto-hash
+   ;; (measured: 296 -> 840 objects over 60 commits). Accepted because the
+   ;; object count matters most for a full-store sync handshake, and the
+   ;; roadmap is windowed partial loading rather than full handshakes.
+   :crypto-hash? true
+   :commit-graph? true
+   ;; The ONE flag that differs from the datom stores, and the reason is that
+   ;; Geschichte already implements history at a higher layer: its commit graph
+   ;; IS the version history, so datahike's temporal index is redundant here.
+   ;; Keeping it would be actively harmful — under `:keep-history? true` a
+   ;; retracted store-ref survives in the temporal AEVT and keeps its blob
+   ;; whitelisted forever, so deleted files and media could NEVER be reclaimed
+   ;; (measured: 10 MB retracted -> 10 MB retained; with history off the same
+   ;; test freed 10.57 MB -> 0.017 MB). Repos hold media; unbounded growth is
+   ;; not a trade worth making for a redundant index.
+   :keep-history? false})
+
 (defn repository-config
   "Portable Datahike configuration for one persistent Geschichte repository."
   [scope]
@@ -49,39 +81,12 @@
         ;; future repository metadata, this lets callers hand us an existing
         ;; empty scope directory (the old native-worktree API commonly did).
         path (.getCanonicalPath (io/file scope "datahike"))]
-    {:store {:backend :file
-             :path path
-             ;; the id the store was created with, not one derived from the
-             ;; path: a moved home keeps its repositories
-             :id (store-ids/store-id path legacy-store-id)}
-     ;; 128, not 256 — measured knee on a room-shaped store; see
-     ;; `dvergr.substrate.datahike/diff-buf-size` for the table.
-     :index-config {:diff-buf-size sdh/diff-buf-size}
-     :schema-flexibility :write
-     ;; `:crypto-hash?` matches every other room store, so ONE mechanism
-     ;; (`datahike.audit/verify-chain`) verifies books, wiki, chat AND code.
-     ;; Geschichte needs it: its own hashing covers CONTENT only —
-     ;; `:geschichte.content/id` is a hash of the bytes, verified on read — while
-     ;; `:geschichte.commit/id` is a random uuid and refs are ordinary datoms. So
-     ;; repointing a path at other content, or rewriting commit parentage, is
-     ;; invisible to geschichte and visible only to datahike's merkle.
-     ;;
-     ;; It costs `:fuse-index-roots?`, which datahike disables under crypto-hash
-     ;; (measured: 296 -> 840 objects over 60 commits). Accepted because the
-     ;; object count matters most for a full-store sync handshake, and the
-     ;; roadmap is windowed partial loading rather than full handshakes.
-     :crypto-hash? true
-     :commit-graph? true
-     ;; The ONE flag that differs from the datom stores, and the reason is that
-     ;; Geschichte already implements history at a higher layer: its commit graph
-     ;; IS the version history, so datahike's temporal index is redundant here.
-     ;; Keeping it would be actively harmful — under `:keep-history? true` a
-     ;; retracted store-ref survives in the temporal AEVT and keeps its blob
-     ;; whitelisted forever, so deleted files and media could NEVER be reclaimed
-     ;; (measured: 10 MB retracted -> 10 MB retained; with history off the same
-     ;; test freed 10.57 MB -> 0.017 MB). Repos hold media; unbounded growth is
-     ;; not a trade worth making for a redundant index.
-     :keep-history? false}))
+    (assoc repository-options
+           :store {:backend :file
+                   :path path
+                   ;; the id recorded beside the store, not one derived from
+                   ;; the path: a moved home keeps its repositories
+                   :id (store-ids/store-id path legacy-store-id)})))
 
 (defn- fallback-workspace! [conn source error]
   (tel/log! {:level :warn :id :workspace/seed-clone-failed
