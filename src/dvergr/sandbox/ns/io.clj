@@ -776,12 +776,19 @@
                                  ;; Virtual: geschichte's status takes no
                                  ;; pathspecs, so select its names by path
                                  ;; prefix ourselves; a glob is refused when
-                                 ;; any sensitive file has changes.
-                                 (let [names (->> (str/split-lines (run! "status" "--porcelain=v1" "--untracked-files=all"))
+                                 ;; any sensitive file has changes. Its add
+                                 ;; reads `-A`/`-u`/`-f` anywhere in argv, even
+                                 ;; after `--`: a dash-led operand is refused,
+                                 ;; and names go back root-anchored (`/-A` is
+                                 ;; the file `-A`).
+                                 (let [_ (doseq [p paths :when (str/starts-with? p "-")]
+                                           (git-arg-refused! (str "git/add path may not start with -: " p) {:path p}))
+                                       names (->> (str/split-lines (run! "status" "--porcelain=v1" "--untracked-files=all"))
                                                   (keep (fn [l] (when (> (count l) 3) (subs l 3)))))
-                                       rel (fn [p] (str/replace (str p) #"^/+|/+$" ""))
+                                       rel (fn [p] (-> (java.nio.file.Paths/get "/" (into-array String [(str p)]))
+                                                       .normalize str (str/replace #"^/+|/+$" "")))
                                        selected? (fn [n] (some (fn [p] (let [p (rel p)]
-                                                                         (or (contains? #{"" "."} p) (= n p)
+                                                                         (or (= "" p) (= n p)
                                                                              (str/starts-with? n (str p "/")))))
                                                                paths))
                                        sensitive (filter sensitive-name? names)]
@@ -791,7 +798,8 @@
                                      (git-arg-refused! "git/add glob not allowed while a sensitive file has changes"
                                                        {:paths paths})
                                      :else (let [safe (remove sensitive-name? (filter selected? names))]
-                                             (when (seq safe) (apply run! "add" "--" safe))))))
+                                             (when (seq safe)
+                                               (apply run! "add" "--" (map (fn [n] (str "/" n)) safe)))))))
                                :ok))))
 
         commit-fn (fn [message & [opts]]

@@ -227,11 +227,17 @@
 
 (defn- tool-path [{:keys [filesystem cwd]} path]
   (if filesystem
-    (or (mfs/resolve filesystem
-                     (if (str/starts-with? (str path) "/")
-                       path
-                       (str (str/replace (or cwd "/") #"/$" "") "/" path)))
-        (throw (ex-info "Path escapes the virtual workspace" {:path path})))
+    ;; The same sensitive-path policy as the physical side and the SCI file
+    ;; functions, on the path as given and as resolved.
+    (let [policy (requiring-resolve 'dvergr.sandbox.ns.io/sensitive-path-policy)
+          _ (policy (str path))
+          resolved (or (mfs/resolve filesystem
+                                    (if (str/starts-with? (str path) "/")
+                                      path
+                                      (str (str/replace (or cwd "/") #"/$" "") "/" path)))
+                       (throw (ex-info "Path escapes the virtual workspace" {:path path})))]
+      (policy (str resolved))
+      resolved)
     (physical-path cwd path)))
 
 (defn- workspace-read [ctx path]

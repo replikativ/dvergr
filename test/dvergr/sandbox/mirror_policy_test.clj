@@ -7,7 +7,8 @@
    which meant every namespace nobody thought to name was reachable — and
    `ensure-mirrored!` copies every public var of whatever it mirrors, so that
    included the host's credentials and live database connections."
-  (:require [clojure.test :refer [deftest testing is]]
+  (:require [clojure.set :as set]
+            [clojure.test :refer [deftest testing is]]
             [clojure.repl.deps]
             [sci.core :as sci]
             [dvergr.sandbox.deps :as deps]
@@ -141,6 +142,8 @@
     ;; a namespace declared with underscores loads from the same file name
     (.mkdirs (java.io.File. dir "dvergr_under"))
     (spit (java.io.File. dir "dvergr_under/core.clj") "(ns dvergr_under.core)\n(defn hi [] :hi)\n")
+    (.mkdirs (java.io.File. dir "dvergr_mix"))
+    (spit (java.io.File. dir "dvergr_mix/foo_bar.clj") "(ns dvergr-mix.foo_bar)\n(defn f [] :mix)\n")
     ;; a namespace under an allowlisted prefix (`^medley`), shipped by the new jar
     (.mkdirs (java.io.File. dir "medley"))
     (spit (java.io.File. dir "medley/dvergr_probe.clj") "(ns medley.dvergr-probe)\n")
@@ -212,10 +215,15 @@
             #(let [r (deps/add-libs! nil '{probe/lib {:mvn/version "RELEASE"}})
                    granted (set (:provenance r))]
                (is (= :loaded (:status r)))
-               (is (= '#{dvergr-probe-lib.core dvergr-probe-lib.readers medley.dvergr-probe
-                         dvergr_probe_lib.core dvergr_probe_lib.readers
-                         dvergr-under.core dvergr_under.core medley.dvergr_probe} granted)
-                   "its own namespaces, including one the load created for its data readers")
+               (is (set/subset? '#{dvergr-probe-lib.core dvergr-probe-lib.readers medley.dvergr-probe
+                                   dvergr_probe_lib.core dvergr_probe_lib.readers
+                                   dvergr-under.core dvergr_under.core medley.dvergr_probe
+                                   dvergr-mix.foo_bar dvergr-mix.foo-bar}
+                                granted)
+                   (str "its own namespaces, including one the load created for its data readers: "
+                        (pr-str granted)))
+               (is (every? (fn [n] (re-find #"^(dvergr.probe.lib|dvergr.under|dvergr.mix|medley\.dvergr.probe)(\.|$)" (str n))) granted)
+                   "and nothing but the jar's own")
                (is (deps/namespace-mirrorable? 'dvergr-probe-lib.core))
                (is (not (deps/namespace-mirrorable? 'dvergr-probe-lib))
                    "but not a prefix of it")
@@ -230,7 +238,9 @@
                    (is (deps/ensure-mirrored! sci-ctx 'dvergr-probe-lib.core))
                    (is (= 42 (sci/eval-string* sci-ctx "(dvergr-probe-lib.core/answer)")))
                    (is (deps/ensure-mirrored! sci-ctx 'dvergr_under.core) "the underscore name as declared")
-                   (is (= :hi (sci/eval-string* sci-ctx "(dvergr_under.core/hi)")))))
+                   (is (= :hi (sci/eval-string* sci-ctx "(dvergr_under.core/hi)")))
+                   (is (deps/ensure-mirrored! sci-ctx 'dvergr-mix.foo_bar) "a mixed name as declared")
+                   (is (= :mix (sci/eval-string* sci-ctx "(dvergr-mix.foo_bar/f)")))))
                (testing "a context that did not request it cannot reach it through the allowlist"
                  ;; `^medley` is allowlisted for the launch classpath; this
                  ;; namespace came with another context's approved jar.
@@ -243,9 +253,7 @@
                  (binding [rtc/*execution-context* (ctx/create-execution-context)]
                    (deps/install-policy! (fn [_ _] :approve))
                    (with-redefs [clojure.repl.deps/add-libs (fn [_] nil)]
-                     (is (= '#{dvergr-probe-lib.core dvergr-probe-lib.readers medley.dvergr-probe
-                               dvergr_probe_lib.core dvergr_probe_lib.readers
-                               dvergr-under.core dvergr_under.core medley.dvergr_probe}
+                     (is (= granted
                             (set (:provenance (deps/add-libs! nil '{probe/lib {:mvn/version "1.0"}}))))))
                    (is (deps/namespace-mirrorable? 'dvergr-probe-lib.core))))
                (testing "a later RELEASE request, which loads nothing, is granted nothing"

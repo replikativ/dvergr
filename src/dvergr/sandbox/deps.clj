@@ -472,15 +472,23 @@
 
 (defn- path->nss
   "`foo_bar/baz.clj` (or `.cljc`, or AOT `baz__init.class`) → the namespace
-   names that load from it: `foo-bar.baz`, and `foo_bar.baz` as written (an
-   underscore in a file name is either). Both name the same file, so granting
-   both grants nothing more."
+   names that load from it: each underscore in a file name is an `_` or a `-`
+   in the namespace (`my_lib/foo_bar.clj` → `my-lib.foo-bar`, `my-lib.foo_bar`,
+   …). All name the same file, so granting them all grants nothing more."
   [entry]
   (when-let [[_ base] (or (re-matches #"(.+)\.cljc?" entry)
                           (re-matches #"(.+)__init\.class" entry))]
     (when-not (str/starts-with? base "META-INF/")
-      (let [dotted (str/replace base "/" ".")]
-        (into #{} (map symbol) [(str/replace dotted "_" "-") dotted])))))
+      ;; every underscore is a `_` or a `-` in the namespace name; at most
+      ;; 2^6 combinations, beyond that the two uniform readings
+      (let [dotted (str/replace base "/" ".")
+            parts (str/split dotted #"_" -1)]
+        (if (<= (count parts) 7)
+          (into #{}
+                (map symbol)
+                (reduce (fn [acc part] (for [a acc sep ["_" "-"]] (str a sep part)))
+                        [(first parts)] (rest parts)))
+          (into #{} (map symbol) [(str/replace dotted "_" "-") dotted]))))))
 
 (defn- root-entries
   "Every file name under `root` (a jar or a directory), `/`-separated."

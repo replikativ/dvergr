@@ -77,11 +77,22 @@
     (try
       (io/add-fs-ns! ctx :filesystem filesystem)
       (io/add-git-ns! ctx :workspace workspace)
-      (tools/execute "write_file" {:path ".env" :content "REVIEW_SECRET=123\n"} tctx)
+      ;; seeded host-side: no agent route writes a sensitive path
+      (mfs/write-string! filesystem "/.env" "REVIEW_SECRET=123\n" false)
+      (mfs/write-string! filesystem "/-A" "dash-led name\n" false)
+      (doseq [[tool input] [["read_file" {:path ".env"}]
+                            ["write_file" {:path ".env" :content "x"}]
+                            ["edit_file" {:path ".env" :old_string "123" :new_string "456"}]]]
+        (is (= :error (:type (tools/execute tool input tctx))) tool))
       (sci/eval-string* ctx "(spit \"src/x.clj\" \"(ns x) ; REVIEW_SECRET mention\")")
       (let [{:keys [content]} (tools/execute "grep" {:pattern "REVIEW_SECRET"} tctx)]
         (is (str/includes? content "src/x.clj") content)
         (is (not (str/includes? content "123")) content))
+      (is (refused? #(sci/eval-string* ctx %) "(git/add \"-A\")")
+          "geschichte reads -A anywhere in argv")
+      (is (= :ok (sci/eval-string* ctx "(git/add \"./src/../src/x.clj\")")))
+      (let [{:keys [staged]} (sci/eval-string* ctx "(git/status)")]
+        (is (= ["src/x.clj"] staged) "a normalised path stages that file, and only it"))
       (is (= :ok (sci/eval-string* ctx "(git/add \".\")")))
       (let [{:keys [staged untracked]} (sci/eval-string* ctx "(git/status)")]
         (is (some #{"src/x.clj"} staged) (pr-str staged))
