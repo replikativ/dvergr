@@ -151,10 +151,10 @@
    flexibility, silently turning a :read store into :write.)"
   [scope]
   (let [cfg (store-cfg scope)]
-    (try (d/connect cfg)
+    (try (sdh/connect cfg)
          (catch clojure.lang.ExceptionInfo e
            (if (= :config-does-not-match-stored-db (:type (ex-data e)))
-             (d/connect (assoc cfg :schema-flexibility :read))
+             (sdh/connect (assoc cfg :schema-flexibility :read))
              (throw e))))))
 
 (defn- book-system-name
@@ -204,7 +204,7 @@
   ;; Declare the messages fulltext (scriptum) secondary index once, after the
   ;; chat schema is installed. It's schema data in the store, so it forks with
   ;; the room; datahike maintains it on every message transact. Best-effort.
-  (search-secondary/declare-message-fulltext! (d/connect (msgs-cfg path)) path))
+  (search-secondary/declare-message-fulltext! (sdh/connect (msgs-cfg path)) path))
 
 (defn register-room-systems!
   "Register a room's messages store + KB (DatahikeSystems) + repo (GitSystem) as
@@ -355,7 +355,7 @@
             ;; Declare the KB fulltext (scriptum) secondary index over entity
             ;; title/summary/contexts — forks with the KB store, maintained on
             ;; every knowledge_add. Best-effort.
-            _         (search-secondary/declare-kb-fulltext! (d/connect (kb-cfg kb-path)) kb-path)
+            _         (search-secondary/declare-kb-fulltext! (sdh/connect (kb-cfg kb-path)) kb-path)
             _         (seed-msgs-store! msgs-path slug name)
             repo-id   (sdb/register-system! {:type :repo :name (str slug "-repo")
                                              :scope repo-path :owner-id owner-id})

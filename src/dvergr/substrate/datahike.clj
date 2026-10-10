@@ -47,16 +47,23 @@
     (when-not (store-ids/store-exists? path)
       (store-ids/forget! path))))
 
-(defn connect!
-  "Connect to `cfg`, creating the database first when it doesn't exist.
-   Plain create+connect — no schema, no registration. Returns the conn."
+(defn connect
+  "`d/connect` for a dvergr store: a store that refuses the id recorded beside
+   it gets that explained, and a derived id it refused dropped
+   (`store-ids/identity-mismatch-hint`)."
   [cfg]
-  (when-not (d/database-exists? cfg) (d/create-database cfg))
   (try (d/connect cfg)
        (catch clojure.lang.ExceptionInfo e
          (throw (if-let [path (get-in cfg [:store :path])]
                   (store-ids/identity-mismatch-hint path e)
                   e)))))
+
+(defn connect!
+  "Connect to `cfg`, creating the database first when it doesn't exist.
+   Plain create+connect — no schema, no registration. Returns the conn."
+  [cfg]
+  (when-not (d/database-exists? cfg) (d/create-database cfg))
+  (connect cfg))
 
 (defn provision!
   "Provision a dvergr-shaped datahike DB. Idempotent — safe to call on every

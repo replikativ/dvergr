@@ -11,6 +11,7 @@
             [dvergr.ops :as ops]
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.substrate.datahike :as sdh]
+            [dvergr.substrate.geschichte :as geschichte]
             [dvergr.substrate.store-ids :as store-ids]
             [dvergr.system.home :as home]
             [dvergr.substrate.paths :as paths]
@@ -256,3 +257,19 @@
       (finally
         (sdb/reset-conn!)
         (paths/set-home! prev-home)))))
+
+(deftest a-repository-moved-before-it-kept-an-id-opens-again-when-moved-back
+  (let [a (tmp "repo-a")
+        b (tmp "repo-b")]
+    (with-redefs [store-ids/store-id (fn [path legacy] (legacy (str path)))]
+      (geschichte/ensure-repository! a {:fallback? true}))
+    (is (not (.exists (store-ids/id-file (str (.getCanonicalPath (io/file a "datahike")))))))
+    (move! a b)
+    (is (= ::store-ids/identity-mismatch
+           (try (dh/release (sdh/connect (geschichte/repository-config b))) nil
+                (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))
+    (is (not (.exists (store-ids/id-file (.getCanonicalPath (io/file b "datahike")))))
+        "the refused derived id is not kept")
+    (move! b a)
+    (dh/release (sdh/connect (geschichte/repository-config a)))
+    (is (.exists (store-ids/id-file (.getCanonicalPath (io/file a "datahike")))))))

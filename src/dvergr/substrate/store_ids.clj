@@ -47,11 +47,16 @@
 
 (defonce ^:private durable (atom #{}))
 
+(defn- file-key [^java.io.File f]
+  (.fileKey (Files/readAttributes (.toPath f) java.nio.file.attribute.BasicFileAttributes
+                                  ^"[Ljava.nio.file.LinkOption;" (make-array java.nio.file.LinkOption 0))))
+
 (defn- durable!
-  "Make `f`'s directory entry durable (once per file in this process): every
-   id returned may be one a store is created with next."
+  "Make `f` and its directory entry durable: every id returned may be one a
+   store is created with next. Once per file in this process, by the file's
+   identity, so a file replaced at the same name is synced again."
   [^java.io.File f]
-  (let [k (str f)]
+  (let [k [(str f) (file-key f)]]
     (when-not (@durable k)
       (fsync! (.toPath f))
       (fsync! (.toPath (.getParentFile (.getAbsoluteFile f))))
@@ -72,6 +77,9 @@
        (spit (.toFile tmp) (str id (when derived? " derived") "\n"))
        (fsync! tmp)
        (try (Files/createLink target tmp)
+            ;; published: its directory entry is new, sync it whatever was
+            ;; synced at this name before
+            (fsync! (.getParent target))
             (catch FileAlreadyExistsException _ nil))
        (durable! f)
        (read-id f)
@@ -115,7 +123,6 @@
   [path]
   (locking lock
     (Files/deleteIfExists (.toPath (id-file path)))
-    (swap! durable disj (str (id-file path)))
     nil))
 
 (defn path-derived

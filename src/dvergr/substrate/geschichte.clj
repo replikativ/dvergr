@@ -118,7 +118,7 @@
        (when-let [parent (.getParentFile (io/file scope))]
          (.mkdirs parent))
        (d/create-database cfg)
-       (let [conn (d/connect cfg)]
+       (let [conn (sdh/connect cfg)]
          (try
            (repo/init! conn {:name "dvergr workspace"})
            (let [source (or source (sandbox-repo))]
@@ -140,7 +140,7 @@
   [& {:keys [scope system-name source]}]
   (let [scope (or scope (paths/workspace-store))
         cfg (ensure-repository! scope (cond-> {} source (assoc :source source)))]
-    (gy/create (d/connect cfg) {:system-name system-name})))
+    (gy/create (sdh/connect cfg) {:system-name system-name})))
 
 (defn delete-repository! [scope]
   (let [cfg (repository-config scope)]

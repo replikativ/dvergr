@@ -98,7 +98,7 @@
     ;; Datahike creates the directory itself; it must not pre-exist.
     (when fresh?
       (dh/create-database cfg))
-    (let [conn (dh/connect cfg)]
+    (let [conn (sdh/connect cfg)]
       (schema/ensure-full-schema! conn)
       {:dir (str dir) :cfg cfg :conn conn
        :store (dhs/make conn (file-artifact-store (io/file dir "artifacts")))})))
