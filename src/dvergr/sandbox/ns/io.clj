@@ -683,25 +683,25 @@
   (if (some? json) (j/write-value-as-string json) body))
 
 (defn- body-digest
-  "A digest of the `body` a request sends, for its receipt; nil for none or a
-   stream (read once, by the transport)."
+  "A digest of the `body` a request sends, for its receipt: of its bytes as
+   transmitted (a string goes out as UTF-8); nil for none or a stream (read
+   once, by the transport)."
   [body]
   (cond
     (nil? body) nil
-    (bytes? body) (effects/digest (String. ^bytes body "ISO-8859-1"))
     (instance? java.io.InputStream body) nil
-    :else (effects/digest body)))
-
-(defn- url-encode [x]
-  (java.net.URLEncoder/encode (str x) "UTF-8"))
+    :else (let [^bytes bs (if (bytes? body) body (.getBytes (str body) "UTF-8"))
+                md (java.security.MessageDigest/getInstance "SHA-256")]
+            (apply str (map #(format "%02x" %) (take 12 (.digest md bs)))))))
 
 (defn- encoded-query
-  "`query-params` as the transport encodes them: a sequential value is one
-   parameter per element; names and values URL-encoded."
+  "`query-params` as the transport sends them: hato's own nesting
+   (`{:a {:b 1}}` is `a[b]=1`) and encoding (a vector is one parameter per
+   element)."
   [query-params]
-  (str/join "&" (for [[k v] query-params
-                      v (if (sequential? v) v [v])]
-                  (str (url-encode (name k)) "=" (url-encode v)))))
+  (let [nest (requiring-resolve 'hato.middleware/nest-params-request)
+        generate (requiring-resolve 'hato.middleware/generate-query-string)]
+    (generate (:query-params (nest {:query-params query-params})))))
 
 (defn add-http-ns!
   "Expose HTTP client as 'http namespace in SCI.

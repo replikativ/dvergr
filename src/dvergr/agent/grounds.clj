@@ -45,12 +45,13 @@
 
 (defn- request-source
   "A request's source: its URL without fragment, with every query parameter it
-   sent (those in the URL and its `:query`) decoded, sorted and encoded again,
-   so one request written two ways is one source; and, for a request with a
+   sent (those in the URL and its `:query`) decoded, ordered by name (repeated
+   values keep their order, which a server may read) and encoded again, so one
+   request written two ways is one source; and, for a request with a
    body, the body's digest after a space (no URL contains one)."
   [url {:keys [query body-digest]}]
   (let [[base url-query] (str/split (first (str/split url #"#" 2)) #"\?" 2)
-        pairs (sort (concat (query-pairs url-query) (query-pairs query)))]
+        pairs (sort-by first (concat (query-pairs url-query) (query-pairs query)))]
     (cond-> base
       (seq pairs) (str "?" (str/join "&" (map (fn [[k v]] (str (encode k) "=" (encode v))) pairs)))
       body-digest (str " body=" body-digest))))

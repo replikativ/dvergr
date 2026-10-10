@@ -5,6 +5,7 @@
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.grounds :as grounds]
             [dvergr.artifact :as artifact]
+            [malli.core :as m]
             [dvergr.effects :as effects]
             [dvergr.sandbox.ns.io :as io]
             [sci.core :as sci]))
@@ -118,7 +119,27 @@
     (is (= "https://api/s?t=a&t=b" vec) "a vector is one parameter per element, as sent")
     (is (not= vec lit))
     (testing "and replay tells them apart"
-      (is (= 4 (count (distinct (map effects/effect-key rs))))))))
+      (is (= 4 (count (distinct (map effects/effect-key rs))))))
+    (testing "receipts have the vocabulary's shape"
+      (is (every? #(m/validate (get-in effects/vocabulary [:http/request :resource]) (:resource %)) rs)))))
+
+(deftest nested-parameters-and-the-order-of-repeated-ones-are-kept
+  (let [[nested literal ab ba] (sources (sandbox-receipts
+                                         (str "(babashka.http-client/get \"https://api/s\" {:query-params {:filter {:q \"x\"}}})"
+                                              "(babashka.http-client/get \"https://api/s\" {:query-params {:filter \"{:q \\\"x\\\"}\"}})"
+                                              "(babashka.http-client/get \"https://api/s?t=a&t=b\")"
+                                              "(babashka.http-client/get \"https://api/s?t=b&t=a\")")))]
+    (is (= "https://api/s?filter%5Bq%5D=x" nested) "as hato sends it")
+    (is (not= nested literal))
+    (is (not= ab ba))))
+
+(deftest a-byte-body-is-digested-as-sent
+  (let [[bytes-e9 string-e] (map (comp :body-digest :resource)
+                                 (sandbox-receipts
+                                  (str "(babashka.http-client/post \"https://api/g\" {:body (byte-array [(unchecked-byte 0xE9)])})"
+                                       "(babashka.http-client/post \"https://api/g\" {:body \"\u00e9\"})")))]
+    (is (and bytes-e9 string-e))
+    (is (not= bytes-e9 string-e) "0xE9 is not the UTF-8 bytes of é")))
 
 (deftest the-digest-is-of-the-body-the-transport-sends
   (let [[same-body-a same-body-b form-only] (map :resource
