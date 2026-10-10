@@ -566,7 +566,11 @@
                (let [flags (if -i java.util.regex.Pattern/CASE_INSENSITIVE 0)
                      re (java.util.regex.Pattern/compile pattern flags)
                      paths (workspace-glob ctx (or glob "**"))
+                     sensitive? #(try ((requiring-resolve 'dvergr.sandbox.ns.io/sensitive-path-policy) (str %))
+                                      false
+                                      (catch clojure.lang.ExceptionInfo _ true))
                      lines (for [path paths
+                                 :when (not (sensitive? path))
                                  :when (= :file (:type (mfs/stat filesystem
                                                                  (tool-path ctx path))))
                                  [line-number line] (map-indexed vector

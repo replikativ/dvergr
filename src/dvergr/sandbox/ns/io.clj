@@ -773,7 +773,25 @@
                                      (= (count safe) (count names)) (apply run! "add" "--" paths)
                                      (seq safe) (apply run! "add" "--" (map (fn [n] (str ":(top,literal)" n)) safe))
                                      :else nil))
-                                 (apply run! "add" "--" paths))
+                                 ;; Virtual: geschichte's status takes no
+                                 ;; pathspecs, so select its names by path
+                                 ;; prefix ourselves; a glob is refused when
+                                 ;; any sensitive file has changes.
+                                 (let [names (->> (str/split-lines (run! "status" "--porcelain=v1" "--untracked-files=all"))
+                                                  (keep (fn [l] (when (> (count l) 3) (subs l 3)))))
+                                       rel (fn [p] (str/replace (str p) #"^/+|/+$" ""))
+                                       selected? (fn [n] (some (fn [p] (let [p (rel p)]
+                                                                         (or (contains? #{"" "."} p) (= n p)
+                                                                             (str/starts-with? n (str p "/")))))
+                                                               paths))
+                                       sensitive (filter sensitive-name? names)]
+                                   (cond
+                                     (empty? sensitive) (apply run! "add" "--" paths)
+                                     (some (fn [p] (re-find #"[*?\[]" p)) paths)
+                                     (git-arg-refused! "git/add glob not allowed while a sensitive file has changes"
+                                                       {:paths paths})
+                                     :else (let [safe (remove sensitive-name? (filter selected? names))]
+                                             (when (seq safe) (apply run! "add" "--" safe))))))
                                :ok))))
 
         commit-fn (fn [message & [opts]]
@@ -1144,6 +1162,10 @@
    "-c" "diff.submodule=short"
    "-c" "diff.ignoreSubmodules=all"
    "-c" "status.submoduleSummary=false"
+   ;; No automatic gc/maintenance: it runs repository-configured commands
+   ;; (gc.recentObjectsHook) that no hook override reaches.
+   "-c" "gc.auto=0"
+   "-c" "maintenance.auto=false"
    ;; No transport at all (a promisor remote would lazily fetch missing
    ;; objects, and `ext::` runs a command): per-protocol keys win over
    ;; protocol.allow, so each is pinned; GIT_ALLOW_PROTOCOL and

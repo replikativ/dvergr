@@ -63,6 +63,32 @@
       (is (string? (sci/eval-string* ctx "(git/commit \"SCI virtual\")")))
       (finally (close!)))))
 
+(declare refused?)
+
+(deftest virtual-workspace-keeps-sensitive-files-out-of-grep-and-staging
+  ;; The virtual (Geschichte) backend gets the same sensitive-file treatment as
+  ;; the physical one: grep does not search a `.env`, `git/add "."` leaves it.
+  (let [{:keys [conn close!] :as repository} (gfs/memory-repository! {:name "virtual-sensitive"})
+        workspace {:conn conn :id [(get-in @conn [:config :store :id]) :db]
+                   :repository repository}
+        filesystem (gfs/make-root repository)
+        tctx (tools/make-context {:cwd "/" :filesystem filesystem})
+        ctx (sci/init {})]
+    (try
+      (io/add-fs-ns! ctx :filesystem filesystem)
+      (io/add-git-ns! ctx :workspace workspace)
+      (tools/execute "write_file" {:path ".env" :content "REVIEW_SECRET=123\n"} tctx)
+      (sci/eval-string* ctx "(spit \"src/x.clj\" \"(ns x) ; REVIEW_SECRET mention\")")
+      (let [{:keys [content]} (tools/execute "grep" {:pattern "REVIEW_SECRET"} tctx)]
+        (is (str/includes? content "src/x.clj") content)
+        (is (not (str/includes? content "123")) content))
+      (is (= :ok (sci/eval-string* ctx "(git/add \".\")")))
+      (let [{:keys [staged untracked]} (sci/eval-string* ctx "(git/status)")]
+        (is (some #{"src/x.clj"} staged) (pr-str staged))
+        (is (not (some #{".env"} staged)) (pr-str staged)))
+      (is (refused? #(sci/eval-string* ctx %) "(git/add \"*\")"))
+      (finally (close!)))))
+
 (deftest sensitive-path-policy-blocks-secrets
   (testing "known-sensitive OS paths are rejected"
     (doseq [p ["/etc/passwd" "/etc/shadow" "/home/u/.ssh/id_rsa" "/app/.env"
@@ -284,6 +310,13 @@
     (sci/eval-string* ctx "(git/add \"src/crlf.txt\")")
     (let [p (.start (doto (ProcessBuilder. ["git" "show" ":src/crlf.txt"]) (.directory dir)))]
       (is (= "one\ntwo\n" (slurp (.getInputStream p))) "staged with LF"))))
+
+(deftest physical-git-runs-no-automatic-maintenance
+  ;; Auto gc runs gc.recentObjectsHook, a repository-configured command that
+  ;; no hook override reaches.
+  (let [safety @#'io/git-safety-config]
+    (is (some #{"gc.auto=0"} safety))
+    (is (some #{"maintenance.auto=false"} safety))))
 
 (deftest physical-git-uses-the-workspace-worktree
   ;; `core.worktree` (set directly or through an included config file) would

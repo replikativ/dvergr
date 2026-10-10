@@ -470,13 +470,17 @@
 
            :else false))))
 
-(defn- path->ns
-  "`foo_bar/baz.clj` (or `.cljc`, or AOT `baz__init.class`) → `foo-bar.baz`."
+(defn- path->nss
+  "`foo_bar/baz.clj` (or `.cljc`, or AOT `baz__init.class`) → the namespace
+   names that load from it: `foo-bar.baz`, and `foo_bar.baz` as written (an
+   underscore in a file name is either). Both name the same file, so granting
+   both grants nothing more."
   [entry]
   (when-let [[_ base] (or (re-matches #"(.+)\.cljc?" entry)
                           (re-matches #"(.+)__init\.class" entry))]
     (when-not (str/starts-with? base "META-INF/")
-      (symbol (-> base (str/replace "/" ".") (str/replace "_" "-"))))))
+      (let [dotted (str/replace base "/" ".")]
+        (into #{} (map symbol) [(str/replace dotted "_" "-") dotted])))))
 
 (defn- root-entries
   "Every file name under `root` (a jar or a directory), `/`-separated."
@@ -526,13 +530,13 @@
          prefixes (mapv root-url-prefix paths)]
      (into #{}
            (comp (mapcat root-entries)
-                 (keep (fn [entry]
-                         (when-let [ns-sym (path->ns entry)]
-                           (let [urls (resource-urls loader (str/replace entry #"(__init\.class|\.cljc?)$" ""))]
-                             (when (and (not (contains? pre-existing ns-sym))
-                                        (seq urls)
-                                        (every? (fn [u] (some #(str/starts-with? u %) prefixes)) urls))
-                               ns-sym))))))
+                 (mapcat (fn [entry]
+                           (let [urls (delay (resource-urls loader (str/replace entry #"(__init\.class|\.cljc?)$" "")))]
+                             (filter (fn [ns-sym]
+                                       (and (not (contains? pre-existing ns-sym))
+                                            (seq @urls)
+                                            (every? (fn [u] (some #(str/starts-with? u %) prefixes)) @urls)))
+                                     (path->nss entry))))))
            paths))))
 
 (defonce ^:private launch-root-prefixes

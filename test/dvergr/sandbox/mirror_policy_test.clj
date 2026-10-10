@@ -138,6 +138,9 @@
     (.mkdirs (.getParentFile own))
     (spit own "(ns dvergr-probe-lib.core)\n(defn answer [] 42)\n")
     (spit (java.io.File. dir "dvergr_probe_lib/readers.clj") "(ns dvergr-probe-lib.readers)\n")
+    ;; a namespace declared with underscores loads from the same file name
+    (.mkdirs (java.io.File. dir "dvergr_under"))
+    (spit (java.io.File. dir "dvergr_under/core.clj") "(ns dvergr_under.core)\n(defn hi [] :hi)\n")
     ;; a namespace under an allowlisted prefix (`^medley`), shipped by the new jar
     (.mkdirs (java.io.File. dir "medley"))
     (spit (java.io.File. dir "medley/dvergr_probe.clj") "(ns medley.dvergr-probe)\n")
@@ -209,7 +212,9 @@
             #(let [r (deps/add-libs! nil '{probe/lib {:mvn/version "RELEASE"}})
                    granted (set (:provenance r))]
                (is (= :loaded (:status r)))
-               (is (= '#{dvergr-probe-lib.core dvergr-probe-lib.readers medley.dvergr-probe} granted)
+               (is (= '#{dvergr-probe-lib.core dvergr-probe-lib.readers medley.dvergr-probe
+                         dvergr_probe_lib.core dvergr_probe_lib.readers
+                         dvergr-under.core dvergr_under.core medley.dvergr_probe} granted)
                    "its own namespaces, including one the load created for its data readers")
                (is (deps/namespace-mirrorable? 'dvergr-probe-lib.core))
                (is (not (deps/namespace-mirrorable? 'dvergr-probe-lib))
@@ -223,7 +228,9 @@
                (testing "and the agent can require and call it"
                  (let [sci-ctx (sci/init {})]
                    (is (deps/ensure-mirrored! sci-ctx 'dvergr-probe-lib.core))
-                   (is (= 42 (sci/eval-string* sci-ctx "(dvergr-probe-lib.core/answer)")))))
+                   (is (= 42 (sci/eval-string* sci-ctx "(dvergr-probe-lib.core/answer)")))
+                   (is (deps/ensure-mirrored! sci-ctx 'dvergr_under.core) "the underscore name as declared")
+                   (is (= :hi (sci/eval-string* sci-ctx "(dvergr_under.core/hi)")))))
                (testing "a context that did not request it cannot reach it through the allowlist"
                  ;; `^medley` is allowlisted for the launch classpath; this
                  ;; namespace came with another context's approved jar.
@@ -236,7 +243,9 @@
                  (binding [rtc/*execution-context* (ctx/create-execution-context)]
                    (deps/install-policy! (fn [_ _] :approve))
                    (with-redefs [clojure.repl.deps/add-libs (fn [_] nil)]
-                     (is (= '#{dvergr-probe-lib.core dvergr-probe-lib.readers medley.dvergr-probe}
+                     (is (= '#{dvergr-probe-lib.core dvergr-probe-lib.readers medley.dvergr-probe
+                               dvergr_probe_lib.core dvergr_probe_lib.readers
+                               dvergr-under.core dvergr_under.core medley.dvergr_probe}
                             (set (:provenance (deps/add-libs! nil '{probe/lib {:mvn/version "1.0"}}))))))
                    (is (deps/namespace-mirrorable? 'dvergr-probe-lib.core))))
                (testing "a later RELEASE request, which loads nothing, is granted nothing"
@@ -325,7 +334,7 @@
     (.addURL loader (.toURL (.toURI classes)))
     (.addURL loader (.toURL (.toURI src)))
     (with-bindings {clojure.lang.Compiler/LOADER loader}
-      (is (= '#{dvergr-multi.core} (deps/namespaces-provided [(str classes) (str src)])))
+      (is (= '#{dvergr-multi.core dvergr_multi.core} (deps/namespaces-provided [(str classes) (str src)])))
       (is (= #{} (deps/namespaces-provided [(str src)]))
           "one root alone does not account for the other's file"))))
 
