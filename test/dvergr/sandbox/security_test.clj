@@ -227,6 +227,10 @@
     (sh! dir "git" "config" "filter.probe.process" (str script))
     (spit (java.io.File. dir "src/b.txt") "filtered\n")
     (spit (java.io.File. dir ".gitattributes") "*.clj diff=probe\n*.txt filter=probe\n")
+    ;; the attribute sources outside the worktree: global (core.attributesFile)
+    ;; is neutralised; `.git/info/attributes` is unwritable from the workspace
+    (spit (java.io.File. dir "global-attributes") "*.txt filter=probe\n")
+    (sh! dir "git" "config" "core.attributesFile" (str (java.io.File. dir "global-attributes")))
     (let [hook (java.io.File. dir ".git/hooks/pre-commit")]
       (.mkdirs (.getParentFile hook))
       (spit hook (str "#!/bin/sh\ntouch " sentinel "\n"))

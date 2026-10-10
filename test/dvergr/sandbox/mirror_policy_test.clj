@@ -68,8 +68,11 @@
 
 (deftest allows-the-curated-library-surface
   (testing "pure data/format libraries remain available"
-    (doseq [ns- '[cheshire.core clojure.data.xml clojure.zip clojure.test babashka.fs]]
-      (is (deps/namespace-mirrorable? ns-) (str ns- " should stay mirrorable")))))
+    (doseq [ns- '[cheshire.core clojure.zip clojure.test babashka.fs]]
+      (is (deps/namespace-mirrorable? ns-) (str ns- " should stay mirrorable"))))
+  (testing "but never the real XML parser: agents get the hardened shim under its name"
+    (doseq [ns- '[clojure.data.xml clojure.data.xml.jvm.parse clojure.data.xml.impl]]
+      (is (not (deps/namespace-mirrorable? ns-)) (str ns-)))))
 
 (deftest add-libs-provenance-widens-but-not-past-the-hard-denylist
   (with-ctx
@@ -105,16 +108,14 @@
       (doseq [ns- nss]
         (is (not (deps/namespace-mirrorable? ns-)) (str ns- " must never be mirrorable"))))))
 
-(deftest only-named-pure-libraries-auto-approve
-  ;; An approved lib's namespaces become callable host code, so auto-approval
-  ;; names libraries; it does not admit whole groups.
+(deftest nothing-auto-approves-by-default
+  ;; An approved lib's namespaces become callable host code, and each curated
+  ;; list still held a lib that reaches the host, so every request asks a human.
   (with-ctx
-    (doseq [c '[org.clojure/data.csv org.clojure/data.json org.clojure/math.combinatorics
-                cheshire/cheshire hiccup/hiccup metosin/malli]]
-      (is (= :approve (deps/allowlist-policy c {:spec {:mvn/version "1.0"}})) (str c)))
-    (doseq [c '[org.clojure/clojure org.clojure/tools.nrepl org.clojure/tools.reader
-                org.clojure/tools.deps org.clojure/data.csv.evil hato/hato http-kit/http-kit
-                babashka/babashka.pods babashka/process ring/ring-core nrepl/nrepl]]
+    (doseq [c '[org.clojure/data.csv org.clojure/data.json org.clojure/data.xml
+                cheshire/cheshire metosin/jsonista org.clojure/clojure
+                org.clojure/tools.nrepl org.clojure/tools.reader hato/hato
+                http-kit/http-kit babashka/babashka.pods nrepl/nrepl]]
       (is (= :ask-human (deps/allowlist-policy c {:spec {:mvn/version "1.0"}})) (str c)))))
 
 (deftest launch-classpath-data-libraries-stay-requirable
@@ -126,8 +127,8 @@
     (is (not (deps/namespace-mirrorable? ns-)) (str ns-))))
 
 (defn- probe-lib-dir!
-  "A directory laid out like a library jar: one namespace of its own, and one
-   file that collides with a namespace the host already provides."
+  "A directory laid out like a library jar: namespaces of its own, and files
+   that collide with namespaces the host already provides."
   []
   (let [dir (.toFile (java.nio.file.Files/createTempDirectory
                       "dvergr-probe-lib" (make-array java.nio.file.attribute.FileAttribute 0)))
@@ -135,6 +136,7 @@
         shadow (java.io.File. dir "clojure/string.clj")]
     (.mkdirs (.getParentFile own))
     (spit own "(ns dvergr-probe-lib.core)\n(defn answer [] 42)\n")
+    (spit (java.io.File. dir "dvergr_probe_lib/readers.clj") "(ns dvergr-probe-lib.readers)\n")
     (.mkdirs (.getParentFile shadow))
     (spit shadow "(ns clojure.string)\n")
     ;; A `.cljc` beside a namespace the host has as `.clj`/AOT but has not
@@ -146,6 +148,7 @@
   ;; The allowlist names libraries; a `:local/root` or `:git/url` spec loads
   ;; whatever code sits there under that name, so it is not auto-approved.
   (with-ctx
+    (deps/set-allowlist! ["^org\\.clojure/data\\.csv$"]) ; an operator's opt-in
     (is (= :approve (deps/allowlist-policy 'org.clojure/data.csv {:spec {:mvn/version "1.1.0"}})))
     (is (= :approve (deps/allowlist-policy 'org.clojure/data.csv {})) "vector form = RELEASE")
     (doseq [spec [{:local/root "/tmp/evil"}
@@ -163,6 +166,7 @@
 (deftest add-libs-records-provenance-only-after-a-successful-load
   (testing "a failed host load records nothing"
     (with-ctx
+      (deps/install-policy! (fn [_ _] :approve)) ; as if a human approved it
       (with-redefs [clojure.repl.deps/add-libs
                     (fn [_] (throw (ex-info "resolution failed" {})))]
         (is (thrown? Exception
@@ -183,27 +187,54 @@
       (let [dir (probe-lib-dir!)
             loader (clojure.lang.DynamicClassLoader.
                     (.getContextClassLoader (Thread/currentThread)))]
+        (is (nil? (find-ns 'clojure.inspector)) "precondition: the host has not loaded it")
         (with-bindings {clojure.lang.Compiler/LOADER loader}
           (with-redefs-fn {#'clojure.repl.deps/add-libs
-                           (fn [_] (.addURL loader (.toURL (.toURI dir))) '[probe/lib])
-                           ;; resolved at run time so the suite compiles before the fix
-                           (resolve 'dvergr.sandbox.deps/lib-paths)
-                           (fn [lib] (when (= 'probe/lib lib) [(str dir)]))}
-            #(let [r (deps/add-libs! nil '{probe/lib {:mvn/version "1.0"}})]
+                           (fn [_]
+                             (.addURL loader (.toURL (.toURI dir)))
+                             ;; the real add-libs reloads data_readers.clj, which
+                             ;; creates the reader namespaces before returning
+                             (create-ns 'dvergr-probe-lib.readers)
+                             '[probe/lib])
+                           #'deps/lib-paths
+                           (fn [lib] (when (= 'probe/lib lib) [(str dir)]))
+                           #'deps/lib-source
+                           (fn [lib] (when (= 'probe/lib lib) {:mvn/version "1.0"}))}
+            #(let [r (deps/add-libs! nil '{probe/lib {:mvn/version "1.0"}})
+                   granted (set (:provenance r))]
                (is (= :loaded (:status r)))
-               (is (deps/namespace-mirrorable? 'dvergr-probe-lib.core)
-                   "the library's own namespace is requirable")
+               (is (= '#{dvergr-probe-lib.core dvergr-probe-lib.readers} granted)
+                   "its own namespaces, including one the load created for its data readers")
+               (is (deps/namespace-mirrorable? 'dvergr-probe-lib.core))
                (is (not (deps/namespace-mirrorable? 'dvergr-probe-lib))
                    "but not a prefix of it")
                (is (not (deps/namespace-mirrorable? 'clojure.instant))
                    "a group segment opens nothing")
-               (is (contains? (set (:provenance r)) 'dvergr-probe-lib.core))
-               (is (not (contains? (set (:provenance r)) 'clojure.string))
-                   "a file shadowing a namespace the host already provides is not newly defined")
+               (is (not (contains? granted 'clojure.string))
+                   "a file shadowing a loaded host namespace is not newly provided")
+               (is (not (contains? granted 'clojure.inspector))
+                   "nor a .cljc whose namespace require would load from the host's jar")
                (testing "and the agent can require and call it"
                  (let [sci-ctx (sci/init {})]
                    (is (deps/ensure-mirrored! sci-ctx 'dvergr-probe-lib.core))
-                   (is (= 42 (sci/eval-string* sci-ctx "(dvergr-probe-lib.core/answer)"))))))))))))
+                   (is (= 42 (sci/eval-string* sci-ctx "(dvergr-probe-lib.core/answer)")))))
+               (testing "another context requesting the same source later is granted it too"
+                 ;; The jar is on the classpath now, so the host add-libs adds nothing.
+                 (binding [rtc/*execution-context* (ctx/create-execution-context)]
+                   (deps/install-policy! (fn [_ _] :approve))
+                   (with-redefs [clojure.repl.deps/add-libs (fn [_] nil)]
+                     (is (= '#{dvergr-probe-lib.core dvergr-probe-lib.readers}
+                            (set (:provenance (deps/add-libs! nil '{probe/lib {:mvn/version "1.0"}}))))))
+                   (is (deps/namespace-mirrorable? 'dvergr-probe-lib.core))))
+               (testing "but not when it asked for another source than the loaded one"
+                 ;; The lib is not reloaded, so that request would get code it
+                 ;; was not approved for.
+                 (doseq [spec [{:local/root "/tmp/other"} {:mvn/version "2.0"}]]
+                   (binding [rtc/*execution-context* (ctx/create-execution-context)]
+                     (deps/install-policy! (fn [_ _] :approve))
+                     (with-redefs [clojure.repl.deps/add-libs (fn [_] nil)]
+                       (is (= [] (:provenance (deps/add-libs! nil {'probe/lib spec}))) (pr-str spec)))
+                     (is (not (deps/namespace-mirrorable? 'dvergr-probe-lib.core)))))))))))))
 
 (deftest caller-allowlist-cannot-widen-past-the-hard-denylist
   (with-ctx

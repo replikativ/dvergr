@@ -28,9 +28,9 @@
    parked on a clojure.core/promise, posted to the peer-bus, and the
    call blocks until a human / manager calls `decide!` to resolve it.
 
-   The default policy: a coord-pattern allowlist. If the coord's
-   group-id matches one of the patterns, auto-approve; else return
-   `:ask-human`. The allowlist lives in `(ec/get-state [:dvergr/deps-policy :allowlist])`
+   The default policy: a coord-pattern allowlist, EMPTY by default, so every
+   request goes to a human. If a coord matches a pattern (and asks for a
+   plain Maven version), auto-approve; else return `:ask-human`. The allowlist lives in `(ec/get-state [:dvergr/deps-policy :allowlist])`
    (a vector of regex patterns); install via `set-allowlist!`."
   (:require [dvergr.substrate.load :as load]
             [clojure.edn :as edn]
@@ -57,19 +57,14 @@
 ;; ============================================================================
 
 (def default-allowlist
-  "Lib coords that auto-approve: specific, pure data/format libraries, named
-   one by one. Not whole groups: an approved lib's namespaces become callable
-   host code, and a group such as `org.clojure/*` also holds a network REPL
-   (`tools.nrepl`), a reader that evaluates `#=` (`tools.reader`) and the
-   language itself. Anything else asks a human. Override per ctx via
-   (set-allowlist! ctx patterns)."
-  ["^org\\.clojure/(data\\.(csv|json|xml|zip|priority-map|int-map|avl|finger-tree)|math\\.(combinatorics|numeric-tower)|core\\.(match|logic|cache|memoize|rrb-vector)|algo\\.generic|test\\.check)$"
-   "^hiccup/hiccup$"
-   "^cheshire/cheshire$"
-   "^metosin/(malli|jsonista)$"
-   "^(dev\\.weavejester|medley)/medley$"
-   "^camel-snake-kebab/camel-snake-kebab$"
-   "^clj-commons/clj-yaml$"])
+  "Lib coords that auto-approve: none. An approved lib's namespaces become
+   callable host code, and every curated list so far still held one that
+   reaches the host (a network REPL in `org.clojure/tools.nrepl`, a reader
+   that evaluates `#=`, an XML parser that fetches external entities). So
+   every `add-libs` waits for an operator's decision (`decide!`). A deployment
+   that wants auto-approval sets patterns per ctx with `set-allowlist!`; even
+   then only a plain Maven spec auto-approves."
+  [])
 
 (defn- coord-matches-allowlist?
   "Does `coord` (a symbol like `'io.foo/bar`) match any pattern in
@@ -302,7 +297,9 @@
    ;; Named, not `^babashka`: that prefix also holds the host process, HTTP,
    ;; pod and deps APIs. `babashka.fs` itself is a pre-registered clamped shim.
    "^babashka\\.(fs|json|cli)$"
-   "^jsonista($|\\..*)"
+   ;; Shipped with the daemon, so add-libs grants nothing for it (it adds no
+   ;; jar); named here because `metosin/jsonista` add-libs used to open it.
+   "^jsonista\\.core$"
    "^medley($|\\..*)"
    "^camel-snake-kebab($|\\..*)"
    "^clj-yaml($|\\..*)"
@@ -366,6 +363,10 @@
    "^hato($|\\..*)"
    "^org\\.httpkit($|\\..*)"
    "^clj-http($|\\..*)"
+   ;; Agents get our hardened parser under the name `clojure.data.xml` (a
+   ;; registered shim, dvergr.sandbox.ns.codec); the real one and its
+   ;; subnamespaces resolve external entities (file://, http://).
+   "^clojure\\.data\\.xml($|\\..*)"
    "^clojure\\.repl$"
    "^clojure\\.repl\\..*"
    "^clojure\\.tools\\.deps.*"
@@ -405,6 +406,27 @@
           (as-> current (current))
           (get-in [:libs lib :paths])))
 
+(defn lib-source
+  "The source the current basis records for `lib` — `{:mvn/version …}`,
+   `{:local/root …}`, `{:git/url … :git/sha …}` — or nil."
+  [lib]
+  (some-> (requiring-resolve 'clojure.java.basis/current-basis)
+          (as-> current (current))
+          (get-in [:libs lib])
+          (select-keys [:mvn/version :local/root :git/url :git/sha :git/tag])
+          not-empty))
+
+(defn- same-source?
+  "Did a request for `spec` get what the classpath has for that lib? A lib
+   already on the classpath is not reloaded, so a request for another source
+   (a Maven version after someone else's `:local/root`) gets the loaded code,
+   not the code it was approved for. nil `spec` is the vector form (`RELEASE`):
+   any Maven source."
+  [spec source]
+  (if (nil? spec)
+    (contains? source :mvn/version)
+    (= (select-keys spec [:mvn/version :local/root :git/url :git/sha :git/tag]) source)))
+
 (defn- path->ns
   "`foo_bar/baz.clj` (or `.cljc`, or AOT `baz__init.class`) → `foo-bar.baz`."
   [entry]
@@ -441,33 +463,37 @@
 
 (defn namespaces-provided
   "Namespaces that the roots in `paths` NEWLY provide: a namespace counts only
-   when it is not loaded yet and every file `require` could load it from — the
-   AOT `__init.class`, the `.clj`, the `.cljc` — resolves, through the class
-   loader, to this root. A jar that also ships `clojure/main.clj`, or a `.cljc`
-   beside a host `.clj` or AOT class, does not provide that namespace."
-  [paths]
-  (let [loader (clojure.lang.RT/baseLoader)]
-    (into #{}
-          (mapcat
-           (fn [root]
-             (let [prefix (root-url-prefix root)]
-               (keep (fn [entry]
-                       (when-let [ns-sym (path->ns entry)]
-                         (let [base (str/replace entry #"(__init\.class|\.cljc?)$" "")
-                               urls (keep #(some-> (.getResource loader (str base %)) str)
-                                          ["__init.class" ".clj" ".cljc"])]
-                           (when (and (not (find-ns ns-sym))
-                                      (seq urls)
-                                      (every? #(str/starts-with? % prefix) urls))
-                             ns-sym))))
-                     (root-entries root)))))
-          paths)))
+   when it was not in `pre-existing` (the namespace names before the load —
+   `add-libs` itself creates the namespaces a jar's `data_readers.clj` names)
+   and every file `require` could load it from — the AOT `__init.class`, the
+   `.clj`, the `.cljc` — resolves, through the class loader, to this root. A
+   jar that also ships `clojure/main.clj`, or a `.cljc` beside a host `.clj` or
+   AOT class, does not provide that namespace."
+  ([paths] (namespaces-provided paths (set (map ns-name (all-ns)))))
+  ([paths pre-existing]
+   (let [loader (clojure.lang.RT/baseLoader)]
+     (into #{}
+           (mapcat
+            (fn [root]
+              (let [prefix (root-url-prefix root)]
+                (keep (fn [entry]
+                        (when-let [ns-sym (path->ns entry)]
+                          (let [base (str/replace entry #"(__init\.class|\.cljc?)$" "")
+                                urls (keep #(some-> (.getResource loader (str base %)) str)
+                                           ["__init.class" ".clj" ".cljc"])]
+                            (when (and (not (contains? pre-existing ns-sym))
+                                       (seq urls)
+                                       (every? #(str/starts-with? % prefix) urls))
+                              ns-sym))))
+                      (root-entries root)))))
+           paths))))
 
 (defonce ^:private runtime-lib-namespaces
-  ;; lib → the namespaces its jars newly provided when an `add-libs!` first put
-  ;; it on the classpath (JVM-wide, like the classpath itself). A later request
-  ;; for the same lib, from any context, adds no jar, so this is where its
-  ;; grant comes from. Libs of the launch basis are never here.
+  ;; lib → {:source <basis coord> :namespaces #{…}}: what its jars newly
+  ;; provided when an `add-libs!` first put it on the classpath (JVM-wide, like
+  ;; the classpath itself). A later request for the same lib, from any context,
+  ;; adds no jar, so this is where its grant comes from — when it asked for
+  ;; the source that is loaded. Libs of the launch basis are never here.
   (atom {}))
 
 (defn- policy-state
@@ -706,10 +732,18 @@
             ;; in any context) put them on the classpath. Transitive deps are
             ;; recorded too, so a later request for one of them is granted,
             ;; but they are not mirrored unless requested.
+            pre-names (set (map ns-name pre-ns))
             _ (doseq [lib added]
                 (swap! runtime-lib-namespaces assoc lib
-                       (namespaces-provided (lib-paths lib))))
-            provided (into #{} (mapcat #(get @runtime-lib-namespaces %)) coords)]
+                       {:source (lib-source lib)
+                        :namespaces (namespaces-provided (lib-paths lib) pre-names)}))
+            spec-of #(when (map? libs) (get libs %))
+            provided (into #{}
+                           (mapcat (fn [c]
+                                     (let [{:keys [source namespaces]} (get @runtime-lib-namespaces c)]
+                                       (when (same-source? (spec-of c) source)
+                                         namespaces))))
+                           coords)]
         (allow-added-lib-namespaces! provided)
         (tel/log! {:id :sandbox.deps/approved
                    :data {:coords coords :added (vec added) :namespaces provided}}

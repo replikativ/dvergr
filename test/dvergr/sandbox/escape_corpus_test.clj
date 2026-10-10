@@ -289,8 +289,8 @@
 
 (defn- approve-every-dep!
   "Install an approve-everything deps policy on `ec` — as if a manager
-   approved each request. Auto-approval no longer covers these coords, and an
-   unapproved request would park waiting for a human."
+   approved each request. Nothing auto-approves by default, and an unapproved
+   request would park waiting for a human."
   [ec]
   (binding [rtc/*execution-context* ec]
     (deps/install-policy! (fn [_ _] :approve))))
@@ -330,3 +330,14 @@
         (is (not (reaches? sci ec "(require 'clojure.main) :reached"))
             "catching the failure must not leave a grant behind")
         (is (not (reaches? sci ec "(require 'clojure.instant) :reached")))))))
+
+(deftest raw-xml-parser-stays-out-while-the-hardened-one-works
+  ;; `clojure.data.xml` in the sandbox is our hardened parser; the real
+  ;; library's subnamespaces (reachable through `^clojure.data`) resolve
+  ;; external entities.
+  (with-sandbox
+    (fn [sci ec]
+      (is (= "x" (:ok (eval-in sci ec "(require '[clojure.data.xml :as xml])
+                                        (first (:content (xml/parse-str \"<a>x</a>\")))"))))
+      (is (not (reaches? sci ec "(require 'clojure.data.xml.jvm.parse) :reached")))
+      (is (not (reaches? sci ec "(require 'clojure.data.xml.impl) :reached"))))))

@@ -122,7 +122,12 @@ cancellable.
   Timeout is enforced by a watchdog thread plus a `future`/deref outer fence, so even a
   non-interruptible blocking syscall unblocks the caller.
 - **Gated deps**: `clojure.repl.deps/add-libs` is available (`dvergr.sandbox.deps`) but
-  passes through a policy gate with a denylist before adding/mirroring libraries.
+  every request waits for an operator's decision (nothing auto-approves by default;
+  `set-allowlist!` opts in, for plain Maven specs only). After a successful load the
+  agent may require exactly the namespaces the new jars provide, bound to the loaded
+  source; a hard denylist (host eval, REPL servers, raw HTTP, the real XML parser)
+  applies on top. Libraries the daemon already ships are requirable only through the
+  namespace allowlist.
 
 ### Real programs in the shell: the jail (bubblewrap)
 

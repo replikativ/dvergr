@@ -1047,6 +1047,7 @@
    `git/status` or `git/commit` into host command execution (hooks, the
    fsmonitor hook, a signing program)."
   ["-c" "core.hooksPath=/dev/null"
+   "-c" "core.attributesFile=/dev/null"
    "-c" "core.fsmonitor=false"
    "-c" "commit.gpgSign=false"
    "-c" "log.showSignature=false"])
@@ -1058,12 +1059,14 @@
         pb       (doto (ProcessBuilder. ^java.util.List all-args)
                    (.directory (java.io.File. (str base-path))))
         ;; Attributes come from the empty tree, not the worktree's
-        ;; `.gitattributes`: an attribute selects a `clean`/`process` filter
-        ;; or a diff driver, which git runs as a command. (Git < 2.40 ignores
-        ;; the variable; the `.git` write block and the overrides above still
-        ;; hold there.)
-        _        (.put (.environment pb) "GIT_ATTR_SOURCE"
-                       "4b825dc642cb6eb9a060e54bf8d69288fbee4904")
+        ;; `.gitattributes`, and no system or global attributes file is read:
+        ;; an attribute selects a `clean`/`process` filter or a diff driver,
+        ;; which git runs as a command. `.git/info/attributes` is still read,
+        ;; and is not writable from the workspace (`.git` is a sensitive
+        ;; path). Git < 2.40 ignores GIT_ATTR_SOURCE.
+        _        (doto (.environment pb)
+                   (.put "GIT_ATTR_SOURCE" "4b825dc642cb6eb9a060e54bf8d69288fbee4904")
+                   (.put "GIT_ATTR_NOSYSTEM" "1"))
         proc     (.start pb)
         out      (future (slurp (.getInputStream proc)))
         err      (future (slurp (.getErrorStream proc)))
