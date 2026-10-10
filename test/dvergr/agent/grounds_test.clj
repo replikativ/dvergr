@@ -55,7 +55,7 @@
                         :decision :allowed :digest q})
         r (grounds/independence (grounds/grounds [(search "agent+teams")])
                                 (grounds/grounds [(search "agent+teams") (search "memory")]))]
-    (is (= #{"https://api.search/s?count=10&q=agent+teams"} (:shared r)))
+    (is (= #{"https://api.search/s?count=10&q=agent%20teams"} (:shared r)))
     (is (= 0.5 (:overlap r)))))
 
 (deftest a-query-joins-the-one-in-the-url
@@ -70,8 +70,14 @@
                                 :decision :allowed :digest body-digest})
         r (grounds/independence (grounds/grounds [(post "b1")])
                                 (grounds/grounds [(post "b1") (post "b2")]))]
-    (is (= #{"https://api.search/graphql body=b1"} (:shared r)))
+    (is (= #{"POST https://api.search/graphql body=b1"} (:shared r)))
     (is (= 0.5 (:overlap r)))))
+
+(deftest writes-are-not-grounds-and-the-method-names-the-source
+  (let [req (fn [method] {:effect :http/request :resource {:method method :url "https://api/doc/1"}
+                          :decision :allowed :digest "d"})
+        g (grounds/grounds (map req [:get :head :delete :put :patch]))]
+    (is (= #{"https://api/doc/1" "HEAD https://api/doc/1"} (set (keys (:external g)))))))
 
 (deftest no-external-reads-is-no-evidence-not-independence
   (is (nil? (:overlap (grounds/independence (grounds/grounds [(read-file "a" "x")])
@@ -130,6 +136,9 @@
                                               "(babashka.http-client/get \"https://api/s?t=a&t=b\")"
                                               "(babashka.http-client/get \"https://api/s?t=b&t=a\")")))]
     (is (= "https://api/s?filter%5Bq%5D=x" nested) "as hato sends it")
+    (is (not= (first (sources (sandbox-receipts "(babashka.http-client/get \"https://api/s?q=%E9\")")))
+              (first (sources (sandbox-receipts "(babashka.http-client/get \"https://api/s?q=%FF\")"))))
+        "bytes that are not UTF-8 stay distinct")
     (is (not= nested literal))
     (is (not= ab ba))))
 

@@ -33,28 +33,65 @@
   [room attempt]
   (effect-log room (get-in attempt [:attempt/receipt :attempt/metrics :effects :log])))
 
-(defn- decode [s] (java.net.URLDecoder/decode ^String s "UTF-8"))
-(defn- encode [s] (java.net.URLEncoder/encode ^String s "UTF-8"))
+(defn- component-bytes
+  "The bytes a query component stands for: `%XY` is one byte, `+` a space, any
+   other character its UTF-8 bytes. Not decoded as text, so bytes that are not
+   UTF-8 stay what they are."
+  [^String s]
+  (let [out (java.io.ByteArrayOutputStream.)
+        n (count s)]
+    (loop [i 0]
+      (when (< i n)
+        (let [c (.charAt s i)]
+          (cond
+            (and (= c \%) (<= (+ i 3) n)
+                 (re-matches #"[0-9A-Fa-f]{2}" (subs s (inc i) (+ i 3))))
+            (do (.write out (Integer/parseInt (subs s (inc i) (+ i 3)) 16)) (recur (+ i 3)))
+            (= c \+) (do (.write out 32) (recur (inc i)))
+            :else (let [cp (.codePointAt s i)
+                        bs (.getBytes (String. (Character/toChars cp)) "UTF-8")]
+                    (.write out bs 0 (alength bs))
+                    (recur (+ i (Character/charCount cp))))))))
+    (.toByteArray out)))
+
+(defn- canonical-component
+  "A query component in one spelling: its bytes, unreserved ones as they are,
+   every other one as `%XY`."
+  [s]
+  (apply str (map (fn [b]
+                    (let [c (char (bit-and b 0xff))]
+                      (if (re-matches #"[A-Za-z0-9\-._~]" (str c)) c (format "%%%02X" (bit-and b 0xff)))))
+                  (component-bytes s))))
 
 (defn- query-pairs
-  "The decoded name/value pairs of an encoded query string."
+  "The name/value pairs of an encoded query string, each in one spelling."
   [s]
   (for [kv (str/split (or s "") #"&") :when (seq kv)
         :let [[k v] (str/split kv #"=" 2)]]
-    [(decode k) (decode (or v ""))]))
+    [(canonical-component k) (canonical-component (or v ""))]))
+
+(def ^:private read-methods
+  "HTTP methods whose answer can be evidence: a GET, a HEAD, and a POST (many
+   search APIs take their query as a body). PUT, PATCH and DELETE change what
+   they name; they are not reads."
+  #{:get :head :post})
 
 (defn- request-source
-  "A request's source: its URL without fragment, with every query parameter it
-   sent (those in the URL and its `:query`) decoded, ordered by name (repeated
-   values keep their order, which a server may read) and encoded again, so one
-   request written two ways is one source; and, for a request with a
-   body, the body's digest after a space (no URL contains one)."
-  [url {:keys [query body-digest]}]
-  (let [[base url-query] (str/split (first (str/split url #"#" 2)) #"\?" 2)
-        pairs (sort-by first (concat (query-pairs url-query) (query-pairs query)))]
-    (cond-> base
-      (seq pairs) (str "?" (str/join "&" (map (fn [[k v]] (str (encode k) "=" (encode v))) pairs)))
-      body-digest (str " body=" body-digest))))
+  "A request's source, or nil when the request is not a read: its URL without
+   fragment, with every query parameter it sent (those in the URL and its
+   `:query`) in one spelling, ordered by name (repeated values keep their
+   order, which a server may read), so one request written two ways is one
+   source; a method other than GET in front; and, for a request with a body,
+   the body's digest after it. (No URL contains a space.)"
+  [url {:keys [method query body-digest]}]
+  (let [method (or method :get)]
+    (when (read-methods method)
+      (let [[base url-query] (str/split (first (str/split url #"#" 2)) #"\?" 2)
+            pairs (sort-by first (concat (query-pairs url-query) (query-pairs query)))]
+        (cond->> (cond-> base
+                   (seq pairs) (str "?" (str/join "&" (map (fn [[k v]] (str k "=" v)) pairs)))
+                   body-digest (str " body=" body-digest))
+          (not= :get method) (str (str/upper-case (name method)) " "))))))
 
 (defn source
   "The source receipt `r` read, as `[:external id]` or `[:local id]`, or nil
@@ -63,8 +100,8 @@
   [{:keys [effect resource decision error]}]
   (when (and (= :allowed decision) (nil? error))
     (case effect
-      :http/request (when-let [url (:url resource)]
-                      [:external (request-source url resource)])
+      :http/request (when-let [src (some-> (:url resource) (request-source resource))]
+                      [:external src])
       :fs/read [:local (str "file:" (if (map? resource) (:path resource) resource))]
       :room/read [:local (str "room:" (or (:room resource) (pr-str resource)))]
       nil)))
