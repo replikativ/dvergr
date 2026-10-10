@@ -251,6 +251,40 @@
           (is (str/includes? d "public.txt") code)
           (is (not (str/includes? d ".env")) (str code ": " d)))))))
 
+(deftest physical-git-fetches-nothing
+  ;; A promisor remote lazily fetches a missing object — and an `ext::` URL
+  ;; runs a command to do it. Host git must use no transport at all and fail
+  ;; rather than fetch.
+  (let [dir (git-repo!)
+        sentinel (java.io.File. (temp-dir! "dvergr-fetch-sentinel") "ran")
+        ctx (sci/init {})
+        blob (str/trim (with-out-str
+                         (print (slurp (.getInputStream
+                                        (.start (doto (ProcessBuilder. ["git" "rev-parse" "HEAD:src/a.clj"])
+                                                  (.directory dir))))))))]
+    (sh! dir "git" "config" "core.repositoryformatversion" "1")
+    (sh! dir "git" "config" "extensions.partialClone" "origin")
+    (sh! dir "git" "config" "remote.origin.url" (str "ext::sh -c touch% " sentinel))
+    (sh! dir "git" "config" "remote.origin.promisor" "true")
+    (sh! dir "git" "config" "protocol.ext.allow" "always")
+    (.delete (java.io.File. dir (str ".git/objects/" (subs blob 0 2) "/" (subs blob 2))))
+    (io/add-git-ns! ctx :base-path (str dir))
+    (try (sci/eval-string* ctx "(git/diff)") (catch Exception _ nil))
+    (try (sci/eval-string* ctx "(git/diff \"--stat\")") (catch Exception _ nil))
+    (is (not (.exists sentinel)) "no transport helper ran")))
+
+(deftest physical-git-keeps-line-ending-attributes
+  ;; Filters and diff drivers are disabled by name; the repository's
+  ;; non-executable attributes (text, eol) still normalise what is staged.
+  (let [dir (git-repo!)
+        ctx (sci/init {})]
+    (spit (java.io.File. dir ".gitattributes") "*.txt text eol=lf\n")
+    (spit (java.io.File. dir "src/crlf.txt") "one\r\ntwo\r\n")
+    (io/add-git-ns! ctx :base-path (str dir))
+    (sci/eval-string* ctx "(git/add \"src/crlf.txt\")")
+    (let [p (.start (doto (ProcessBuilder. ["git" "show" ":src/crlf.txt"]) (.directory dir)))]
+      (is (= "one\ntwo\n" (slurp (.getInputStream p))) "staged with LF"))))
+
 (deftest physical-git-uses-the-workspace-worktree
   ;; `core.worktree` (set directly or through an included config file) would
   ;; point git at another directory than the one every check here is about.
@@ -331,12 +365,12 @@
     (sh! dir "git" "config" "filter.probe.process" (str script))
     (spit (java.io.File. dir "src/b.txt") "filtered\n")
     (spit (java.io.File. dir ".gitattributes") "*.clj diff=probe\n*.txt filter=probe\n")
-    ;; the attribute sources outside the worktree: global (core.attributesFile)
-    ;; is neutralised; `.git/info/attributes` is unwritable from the workspace
+    ;; every attribute source selects the filter — worktree, global
+    ;; (core.attributesFile) and `.git/info/attributes`: filters are emptied
+    ;; by name, whichever source names them
     (spit (java.io.File. dir "global-attributes") "*.txt filter=probe\n")
     (sh! dir "git" "config" "core.attributesFile" (str (java.io.File. dir "global-attributes")))
-    ;; and `.git/info/attributes`, which git reads whatever GIT_ATTR_SOURCE
-    ;; says (written here directly, as if the workspace had reached it)
+    ;; (`.git/info/attributes` written directly, as if the workspace had reached it)
     (.mkdirs (java.io.File. dir ".git/info"))
     (spit (java.io.File. dir ".git/info/attributes") "*.txt filter=probe\n*.md filter=probe\n")
     (sh! dir "git" "config" "filter.probe.required" "true")

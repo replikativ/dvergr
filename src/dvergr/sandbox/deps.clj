@@ -763,6 +763,12 @@
             ;; the alias / refers from the original require form.
             {:dvergr/mirrored ns-sym})))))
 
+(defonce ^:private load-lock
+  ;; One add-libs at a time, JVM-wide: the classpath and the basis are
+  ;; JVM-wide, and what a load added (its `added` result, the basis entry it
+  ;; reads afterwards) must be this call's own, not a concurrent call's.
+  (Object.))
+
 (defn add-libs!
   "Gated add-libs: invoke the policy, on approve call the host
    `clojure.repl.deps/add-libs` and mirror newly-loaded namespaces
@@ -794,46 +800,47 @@
                          :reason deny})))
 
       :else
-      (let [pre-ns (set (all-ns))
+      (locking load-lock
+        (let [pre-ns (set (all-ns))
             ;; clojure.repl.deps/add-libs guards on `clojure.core/*repl*`
             ;; being bound to true. We're a server-side call, not a REPL,
             ;; but the gate has already enforced human approval — so bind
             ;; the flag while we invoke. It returns the libs it ADDED: a lib
             ;; the basis already has is skipped and adds nothing.
-            added (with-bindings {#'clojure.core/*repl* true}
-                    (host-add-libs (if (map? libs)
-                                     libs
-                                     (into {} (for [c coords] [c {:mvn/version "RELEASE"}])))))
+              added (with-bindings {#'clojure.core/*repl* true}
+                      (host-add-libs (if (map? libs)
+                                       libs
+                                       (into {} (for [c coords] [c {:mvn/version "RELEASE"}])))))
             ;; Only now, after the load succeeded, is the agent entitled to
             ;; require what it asked for: the namespaces the requested libs'
             ;; jars newly provided when add-libs (this call, or an earlier one
             ;; in any context) put them on the classpath. Transitive deps are
             ;; recorded too, so a later request for one of them is granted,
             ;; but they are not mirrored unless requested.
-            pre-names (set (map ns-name pre-ns))
-            _ (doseq [lib added]
-                (swap! runtime-lib-namespaces assoc lib
-                       {:source (lib-source lib)
-                        :namespaces (namespaces-provided (lib-paths lib) pre-names)}))
-            spec-of #(when (map? libs) (get libs %))
-            provided (into #{}
-                           (mapcat (fn [c]
-                                     (let [{:keys [source namespaces]} (get @runtime-lib-namespaces c)]
+              pre-names (set (map ns-name pre-ns))
+              _ (doseq [lib added]
+                  (swap! runtime-lib-namespaces assoc lib
+                         {:source (lib-source lib)
+                          :namespaces (namespaces-provided (lib-paths lib) pre-names)}))
+              spec-of #(when (map? libs) (get libs %))
+              provided (into #{}
+                             (mapcat (fn [c]
+                                       (let [{:keys [source namespaces]} (get @runtime-lib-namespaces c)]
                                        ;; Added by this very call: what is loaded
                                        ;; is what this request resolved to.
-                                       (when (or (contains? (set added) c)
-                                                 (same-source? (spec-of c) source))
-                                         namespaces))))
-                           coords)]
-        (allow-added-lib-namespaces! provided)
-        (tel/log! {:id :sandbox.deps/approved
-                   :data {:coords coords :added (vec added) :namespaces provided}}
-                  "Deps approved + loaded")
-        (let [new-nss (mirror-namespaces-into-sci! sci-ctx pre-ns)]
-          {:status :loaded
-           :coords (vec coords)
-           :provenance (vec (sort provided))
-           :namespaces (mapv ns-name new-nss)})))))
+                                         (when (or (contains? (set added) c)
+                                                   (same-source? (spec-of c) source))
+                                           namespaces))))
+                             coords)]
+          (allow-added-lib-namespaces! provided)
+          (tel/log! {:id :sandbox.deps/approved
+                     :data {:coords coords :added (vec added) :namespaces provided}}
+                    "Deps approved + loaded")
+          (let [new-nss (mirror-namespaces-into-sci! sci-ctx pre-ns)]
+            {:status :loaded
+             :coords (vec coords)
+             :provenance (vec (sort provided))
+             :namespaces (mapv ns-name new-nss)}))))))
 
 ;; ============================================================================
 ;; sync-deps — reconcile classpath with the fork's deps.edn

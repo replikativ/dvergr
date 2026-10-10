@@ -1134,7 +1134,6 @@
    `git/status` or `git/commit` into host command execution (hooks, the
    fsmonitor hook, a signing program)."
   ["-c" "core.hooksPath=/dev/null"
-   "-c" "core.attributesFile=/dev/null"
    "-c" "core.fsmonitor=false"
    "-c" "commit.gpgSign=false"
    "-c" "log.showSignature=false"
@@ -1144,7 +1143,18 @@
    "-c" "submodule.recurse=false"
    "-c" "diff.submodule=short"
    "-c" "diff.ignoreSubmodules=all"
-   "-c" "status.submoduleSummary=false"])
+   "-c" "status.submoduleSummary=false"
+   ;; No transport at all (a promisor remote would lazily fetch missing
+   ;; objects, and `ext::` runs a command): per-protocol keys win over
+   ;; protocol.allow, so each is pinned; GIT_ALLOW_PROTOCOL and
+   ;; GIT_NO_LAZY_FETCH below back this up.
+   "-c" "protocol.allow=never"
+   "-c" "protocol.ext.allow=never"
+   "-c" "protocol.file.allow=never"
+   "-c" "protocol.git.allow=never"
+   "-c" "protocol.ssh.allow=never"
+   "-c" "protocol.http.allow=never"
+   "-c" "protocol.https.allow=never"])
 
 (defn- filter-overrides
   "`-c filter.<name>.<key>=` for every filter driver git's config defines, so
@@ -1182,15 +1192,14 @@
                      (into more))
         pb       (doto (ProcessBuilder. ^java.util.List all-args)
                    (.directory (java.io.File. (str base-path))))
-        ;; Attributes come from the empty tree, not the worktree's
-        ;; `.gitattributes`, and no system or global attributes file is read:
-        ;; an attribute selects a filter or a diff driver, which git runs as a
-        ;; command. Filters are also emptied above (that holds on git < 2.40,
-        ;; which ignores GIT_ATTR_SOURCE, and for `.git/info/attributes`);
-        ;; diffs pass --no-ext-diff --no-textconv.
+        ;; Attributes stay as the repository has them (text, eol, encoding):
+        ;; the commands an attribute can select are disabled by name — every
+        ;; configured filter emptied above, diffs run --no-ext-diff
+        ;; --no-textconv.
         env      (doto (.environment pb)
-                   (.put "GIT_ATTR_SOURCE" "4b825dc642cb6eb9a060e54bf8d69288fbee4904")
-                   (.put "GIT_ATTR_NOSYSTEM" "1"))
+                   (.put "GIT_ALLOW_PROTOCOL" "none")
+                   (.put "GIT_NO_LAZY_FETCH" "1")
+                   (.put "GIT_TERMINAL_PROMPT" "0"))
         ;; The worktree is the directory that holds `.git` above base-path,
         ;; not whatever `core.worktree` (possibly from an included config
         ;; file) says: every path check here is against that directory.

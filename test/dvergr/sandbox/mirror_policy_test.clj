@@ -329,6 +329,29 @@
       (is (= #{} (deps/namespaces-provided [(str src)]))
           "one root alone does not account for the other's file"))))
 
+(deftest add-libs-loads-one-at-a-time
+  ;; The classpath and basis are JVM-wide: what a load added, and the basis
+  ;; entry it reads afterwards, must be its own — so loads do not overlap.
+  (let [a-in (promise) release (promise) b-in (promise)
+        stub (fn [libs]
+               (if (contains? libs 'conc/a)
+                 (do (deliver a-in true) @release nil)
+                 (do (deliver b-in true) nil)))
+        run (fn [libs]
+              (future
+                (binding [rtc/*execution-context* (ctx/create-execution-context)]
+                  (deps/install-policy! (fn [_ _] :approve))
+                  (deps/add-libs! nil libs))))]
+    (with-redefs [clojure.repl.deps/add-libs stub]
+      (let [fa (run '{conc/a {:mvn/version "1.0"}})
+            _ (is (deref a-in 5000 false) "first load entered")
+            fb (run '{conc/b {:mvn/version "1.0"}})]
+        (is (= ::waiting (deref b-in 500 ::waiting)) "the second waits while the first loads")
+        (deliver release true)
+        (is (= :loaded (:status (deref fa 5000 nil))))
+        (is (= :loaded (:status (deref fb 5000 nil))))
+        (is (true? (deref b-in 5000 false)))))))
+
 (deftest caller-allowlist-cannot-widen-past-the-hard-denylist
   (with-ctx
     (testing "set-namespace-allowlist! is bounded by the hard denylist"
