@@ -31,14 +31,16 @@
 ;; ---------------------------------------------------------------------------
 
 (def ^:private routes
-  [;; Room lifecycle — GET /api/rooms/:slug/<action>, <action> == the op name.
-   {:op :room/delete  :method :get  :path #"/api/rooms/(.+)/delete"  :slots [:slug]
+  [;; Room lifecycle — POST /api/rooms/:slug/<action>, <action> == the op name.
+   ;; Every action is a POST (a GET must not change state: links, prefetch and
+   ;; <img> tags issue GETs), and the dvergr.web.guard CSRF check covers POSTs.
+   {:op :room/delete  :method :post :path #"/api/rooms/(.+)/delete"  :slots [:slug]
     :args (fn [[slug] _] {:room slug}) :respond (fn [_ _] (redirect "/dashboard"))}
-   {:op :room/fork    :method :get  :path #"/api/rooms/(.+)/fork"    :slots [:slug]
+   {:op :room/fork    :method :post :path #"/api/rooms/(.+)/fork"    :slots [:slug]
     :args (fn [[slug] _] {:room slug}) :respond (fn [_ _] (redirect "/dashboard"))}
-   {:op :room/merge   :method :get  :path #"/api/rooms/(.+)/merge"   :slots [:slug]
+   {:op :room/merge   :method :post :path #"/api/rooms/(.+)/merge"   :slots [:slug]
     :args (fn [[slug] _] {:room slug}) :respond (fn [_ _] (redirect "/dashboard"))}
-   {:op :room/discard :method :get  :path #"/api/rooms/(.+)/discard" :slots [:slug]
+   {:op :room/discard :method :post :path #"/api/rooms/(.+)/discard" :slots [:slug]
     :args (fn [[slug] _] {:room slug}) :respond (fn [_ _] (redirect "/dashboard"))}
 
    ;; Room create — POST /api/rooms (form: slug, title)
@@ -62,9 +64,9 @@
     :respond (fn [_ [id]] (redirect (str "/agents/" id "/config")))}
 
    ;; Agent lifecycle — `agent/delete` stops-then-deletes inside the op now.
-   {:op :agent/delete :method :get :path #"/agents/([^/]+)/delete" :slots [:id]
+   {:op :agent/delete :method :post :path #"/agents/([^/]+)/delete" :slots [:id]
     :args (fn [[id] _] {:id id}) :respond (fn [_ _] (redirect "/agents"))}
-   {:op :agent/open   :method :get :path #"/agents/([^/]+)/open"   :slots [:id]
+   {:op :agent/open   :method :post :path #"/agents/([^/]+)/open"   :slots [:id]
     :args (fn [[id] _] {:id id})
     :respond (fn [result _]
                (if result

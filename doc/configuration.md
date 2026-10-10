@@ -70,7 +70,9 @@ Priority: `(paths/set-home! …)` → `$DVERGR_HOME` → `./.dvergr`. Layout:
  :sandbox-repo  "https://github.com/replikativ/dvergr-sandbox"
 
  ;; Daemon services.
- :http          {:port 17880 :ip "127.0.0.1"}   ; web dashboard + JSON API (needs the web deps)
+ :http          {:port 17880 :ip "127.0.0.1"}   ; web dashboard + JSON API (needs the web deps);
+                                                ; behind a proxy add :allowed-hosts ["dvergr.lan"]
+                                                ; and :allowed-origins ["https://dvergr.lan"]
  :mcp           {:port 17888 :bind "127.0.0.1" :profile "offload"
                  :http {:port 17889}}           ; MCP over loopback TCP, optionally Streamable HTTP; doc/mcp.md
  :gc            {:interval-ms 21600000          ; storage GC every 6 h (default)

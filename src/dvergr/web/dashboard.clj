@@ -14,7 +14,8 @@
             [nextjournal.markdown.transform :as mdt]
             [dvergr.activity :as activity]
             [dvergr.rooms.tree :as rooms-tree]
-            [dvergr.rooms.stats :as rstats]))
+            [dvergr.rooms.stats :as rstats]
+            [dvergr.web.guard :as guard]))
 
 (def ^:private css
   "body {
@@ -179,12 +180,17 @@
      background: #0d0d0d; border: 1px solid #2a2a2a; border-radius: 4px;
      padding: 8px; overflow-x: auto; font-size: 0.82em; color: #9aa; margin: 6px 0 0;
    }
-   .fork-banner a.btn-merge, .fork-banner a.btn-discard {
+   .fork-banner .btn-merge, .fork-banner .btn-discard {
      display: inline-block; margin: 8px 8px 0 0; padding: 4px 14px;
      border-radius: 6px; text-decoration: none; font-size: 0.9em;
    }
-   .fork-banner a.btn-merge { background: #1b4332; color: #52b788; border: 1px solid #2a2a2a; }
-   .fork-banner a.btn-discard { background: #3d0000; color: #f38ba8; border: 1px solid #2a2a2a; }")
+   .fork-banner .btn-merge { background: #1b4332; color: #52b788; border: 1px solid #2a2a2a; }
+   .fork-banner .btn-discard { background: #3d0000; color: #f38ba8; border: 1px solid #2a2a2a; }
+   .post-action { display: inline; margin: 0; }
+   .post-action button { font-family: inherit; cursor: pointer; }
+   button.fork-act { background: none; border: none; padding: 0; }
+   button.room-del { color: #777; font-size: 0.8em; margin-left: 8px; background: none;
+                     border: none; padding: 0; }")
 
 ;; =============================================================================
 ;; Shared page chrome — ONE shell for every dvergr web page
@@ -196,9 +202,28 @@
 ;; dashboard at `/` IS the index (rooms + agents + schedules), and sub-pages link
 ;; back to it via their own header.
 
+(defn csrf-field
+  "The hidden form field carrying the request's CSRF token (`dvergr.web.guard`).
+   Every POST form of the UI includes it."
+  []
+  [:input {:type "hidden" :name "csrf" :value guard/*csrf-token*}])
+
+(defn post-button
+  "A one-button POST form: the state-changing counterpart of a link (a GET must
+   not change state). `:confirm` asks first; its text sits in a data attribute,
+   so ids in it cannot break out of the script."
+  [action label & {:keys [class confirm]}]
+  [:form.post-action (cond-> {:method "post" :action action}
+                       confirm (assoc :data-confirm confirm
+                                      :onsubmit "return confirm(this.dataset.confirm);"))
+   (csrf-field)
+   [:button {:type "submit" :class class} label]])
+
 (defn shell
   "Wrap hiccup `body` in the shared <html> chrome. Opts: :title (appended to the
-   page title) and :extra-css (page-specific styles, e.g. the config form)."
+   page title) and :extra-css (page-specific styles, e.g. the config form). The
+   request's CSRF token goes into a meta tag (for scripts) and the body's
+   hx-headers (for htmx requests)."
   [{:keys [title extra-css]} & body]
   (str
    (h/html
@@ -206,11 +231,14 @@
      [:head
       [:meta {:charset "utf-8"}]
       [:meta {:name "viewport" :content "width=device-width, initial-scale=1"}]
+      (when-let [t guard/*csrf-token*] [:meta {:name "csrf-token" :content t}])
       [:title (str "dvergr" (when title (str " · " title)))]
       [:script {:src "https://unpkg.com/htmx.org@2.0.4" :crossorigin "anonymous"}]
       [:style (hu/raw-string css)]
       (when extra-css [:style (hu/raw-string extra-css)])]
-     [:body [:div.container body]]])))
+     [:body (when-let [t guard/*csrf-token*]
+              {:hx-headers (str "{\"X-CSRF-Token\": \"" t "\"}")})
+      [:div.container body]]])))
 
 ;; =============================================================================
 ;; Tree rendering — same data source as the TUI tree view
@@ -258,12 +286,10 @@
            (str " · " (:commits fd) " commit" (when (not= 1 (:commits fd)) "s")))
          (when (seq (:files fd)) (str " · " (count (:files fd)) " files"))
          " · " (:msgs-since fd) " new"])
-      [:a.fork-act {:href (str "/api/rooms/" slug "/merge")
-                    :onclick "return confirm('Merge this fork into its parent?');"}
-       "merge"]
-      [:a.fork-act.danger {:href (str "/api/rooms/" slug "/discard")
-                           :onclick "return confirm('Discard this fork? This deletes its branch.');"}
-       "discard"]]
+      (post-button (str "/api/rooms/" slug "/merge") "merge"
+                   :class "fork-act" :confirm "Merge this fork into its parent?")
+      (post-button (str "/api/rooms/" slug "/discard") "discard"
+                   :class "fork-act danger" :confirm "Discard this fork? This deletes its branch.")]
      (when (seq children)
        [:div {:style "padding-left:1em; border-left:1px dotted #333; margin-left:0.5em;"}
         (map (fn [c] (node-hiccup c agents-by-id)) children)])]))
@@ -300,14 +326,11 @@
          (when (:last-active-str st) (str " · " (:last-active-str st)))
          (when (pos? (:fork-count st 0))
            (str " · " (:fork-count st) " fork" (when (not= 1 (:fork-count st)) "s")))])
-      [:a.fork-act {:href (str "/api/rooms/" slug "/fork")
-                    :onclick "return confirm('Fork this room into an isolated branch?');"}
-       "fork"]
+      (post-button (str "/api/rooms/" slug "/fork") "fork"
+                   :class "fork-act" :confirm "Fork this room into an isolated branch?")
       " "
-      [:a {:href (str "/api/rooms/" slug "/delete")
-           :style "color:#777;font-size:0.8em;margin-left:8px;text-decoration:none;"
-           :onclick "return confirm('Delete this room?');"}
-       "×"]]
+      (post-button (str "/api/rooms/" slug "/delete") "×"
+                   :class "room-del" :confirm "Delete this room?")]
      (when (seq room-agents)
        [:div (map agent-line-hiccup room-agents)])
      (when (seq children)
@@ -638,7 +661,7 @@
              (str " · " (:commits fd) " commit" (when (not= 1 (:commits fd)) "s")))
            " · " (:msgs-since fd) " new messages"]
           (when (and (:diff-stat fd) (seq (str/trim (:diff-stat fd))))
-            [:pre (hu/escape-html (:diff-stat fd))])
+            [:pre (:diff-stat fd)])
                 ;; Database (datahike) diff — what the KB / messages-&-schedules
                 ;; stores gained in the fork, alongside the git diff above. Both
                 ;; are what `merge!` collapses into the parent. (`:db-changes` is
@@ -653,12 +676,10 @@
                 ": +" added " / −" removed " datoms · " entities
                 " entit" (if (= 1 entities) "y" "ies")])])
           (when (:mergeable? fd)
-            [:a.btn-merge {:href (str "/api/rooms/" slug "/merge")
-                           :onclick "return confirm('Merge this fork into its parent?');"}
-             "Merge into parent"])
-          [:a.btn-discard {:href (str "/api/rooms/" slug "/discard")
-                           :onclick "return confirm('Discard this fork? This deletes its branch.');"}
-           "Discard"]])
+            (post-button (str "/api/rooms/" slug "/merge") "Merge into parent"
+                         :class "btn-merge" :confirm "Merge this fork into its parent?"))
+          (post-button (str "/api/rooms/" slug "/discard") "Discard"
+                       :class "btn-discard" :confirm "Discard this fork? This deletes its branch.")])
        (when room
          [:div#room-stats
           {:hx-get (str "/api/rooms/" slug "/stats")
@@ -690,6 +711,7 @@
            [:p {:style "color:#666;"} "Loading messages…"]]
           [:form {:method "post" :action (str "/rooms/" slug "/post")
                   :style "margin-top:12px;display:flex;gap:8px;"}
+           (csrf-field)
            [:input {:type "text" :name "content" :placeholder "Type a message…"
                     :required true
                     :style "flex:1;background:#18181b;border:1px solid #333;
@@ -732,7 +754,8 @@
                            btn.textContent='…';btn.style.borderColor='#333';
                            var blob=new Blob(chunks,{type:'audio/webm'});
                            fetch('/rooms/'+btn.dataset.slug+'/voice',
-                                 {method:'POST',headers:{'Content-Type':'audio/webm'},body:blob})
+                                 {method:'POST',body:blob,headers:{'Content-Type':'audio/webm',
+                                  'X-CSRF-Token':document.querySelector('meta[name=csrf-token]').content}})
                              .then(function(r){return r.json();})
                              .then(function(j){btn.textContent='🎤';
                                if(j.error){btn.title=j.error;}})
@@ -796,6 +819,7 @@
    [:h2 "Agents"]
    [:form {:method "post" :action "/agents/new"
            :style "margin:0 0 12px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap;"}
+    (csrf-field)
     [:input {:type "text" :name "id" :placeholder "new-agent-id" :required true
              :style (str (field-input-style) "flex:1;max-width:240px;")}]
     [:input {:type "text" :name "model" :placeholder "model (optional)"
@@ -813,6 +837,7 @@
    [:h2 "Rooms"]
    [:form {:method "post" :action "/api/rooms"
            :style "margin:0 0 12px 0;display:flex;gap:8px;align-items:center;"}
+    (csrf-field)
     [:input {:type "text" :name "slug" :placeholder "slug" :required true
              :style (str (field-input-style) "flex:1;max-width:240px;")}]
     [:input {:type "text" :name "title" :placeholder "title (optional)"

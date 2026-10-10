@@ -1,15 +1,18 @@
 (ns dvergr.web.server
-  "HTTP server for dvergr — dashboard, API endpoints, and agent-mounted UIs.
+  "HTTP server for dvergr: the HTMX dashboard, its HTML fragments and actions,
+   room apps (`/apps/`) and the spec-derived JSON API (`/api/v1/`, see
+   `dvergr.web.api`).
 
-   Uses http-kit with manual prefix routing (no Ring/reitit/compojure deps).
-   Agent handlers are mounted at /agents/{id}/ with automatic prefix stripping
-   so agents write standard Ring handlers seeing '/' as root.
+   http-kit with hand-written routing for the HTML routes. Every request passes
+   `dvergr.web.guard` first (Host, Origin and CSRF checks): loopback binding
+   keeps other machines out, not the pages the user's browser shows.
 
    Lifecycle follows daemon pattern:
      (start! daemon :port 17880)   ; binds 127.0.0.1 by default
      (stop!)
 
-   API endpoints return JSON by default, HTML fragments when Accept: text/html."
+   API endpoints return JSON by default, HTML fragments when Accept: text/html.
+   Every state-changing route is a POST."
   (:require [org.httpkit.server :as http]
             [jsonista.core :as json]
             [clojure.string :as str]
@@ -22,6 +25,8 @@
             [dvergr.web.apps :as web-apps]
             [dvergr.web.ops :as web-ops]
             [dvergr.web.api :as web-api]
+            [dvergr.web.guard :as guard]
+            [hiccup2.core :as h]
             [taoensso.telemere :as tel]))
 
 ;; ============================================================================
@@ -40,8 +45,7 @@
 
 (defn- json-response [status body]
   {:status status
-   :headers {"Content-Type" "application/json"
-             "Access-Control-Allow-Origin" "*"}
+   :headers {"Content-Type" "application/json"}
    :body (json/write-value-as-string body json-mapper)})
 
 (defn- html-response [status body]
@@ -113,20 +117,17 @@
                       (list-all))]
       (if (wants-html? req)
         (html-response 200
-                       (str "<div>"
-                            (if (seq schedules)
-                              (str/join "\n"
-                                        (map (fn [s]
-                                               (str "<div class=\"schedule-card\">"
-                                                    "<strong>" (or (:description s) (:task s)) "</strong>"
-                                                    " — " (name (or (:agent-id s) "?"))
-                                                    " in #" (:room s)
-                                                    (when (:next-fire s)
-                                                      (str " (next: " (:next-fire s) ")"))
-                                                    "</div>"))
-                                             schedules))
-                              "<p>No schedules active.</p>")
-                            "</div>"))
+                       (str (h/html
+                             [:div
+                              (if (seq schedules)
+                                (for [s schedules]
+                                  [:div.schedule-card
+                                   [:strong (str (or (:description s) (:task s)))]
+                                   " — " (name (or (:agent-id s) "?"))
+                                   " in #" (str (:room s))
+                                   (when (:next-fire s)
+                                     (str " (next: " (:next-fire s) ")"))])
+                                [:p "No schedules active."])])))
         (json-response 200 {:schedules schedules})))
     (catch Exception _
       (json-response 200 {:schedules []}))))
@@ -256,13 +257,12 @@
                   (json-response 200 {:text text}))))))
 
       ;; Send a message to a room
+        (and (re-matches #"/rooms/.+/post" uri) (not= :post (:request-method req)))
+        (json-response 405 {:error "POST a form with `content`"})
+
         (re-matches #"/rooms/.+/post" uri)
         (let [slug (subs uri (count "/rooms/") (- (count uri) (count "/post")))
-              body (slurp (:body req))
-              params (into {} (for [pair (str/split body #"&")
-                                    :let [[k v] (str/split pair #"=" 2)]
-                                    :when (and k v)]
-                                [k (java.net.URLDecoder/decode (str/replace v #"\+" " ") "UTF-8")]))
+              params (if (:body req) (parse-form-params req) {})
               content (some-> (get params "content") str/trim)]
           (require 'dvergr.discourse 'dvergr.room.registry 'dvergr.room.store
                    'dvergr.discourse.commands)
@@ -326,6 +326,15 @@
 ;; Lifecycle
 ;; ============================================================================
 
+(defn handler
+  "The ring handler of the web server for `daemon`, behind the browser-boundary
+   checks of `dvergr.web.guard`. Opts: `:ip` (the bind address), `:allowed-hosts`
+   and `:allowed-origins` (names and origins a reverse proxy adds), `:secret`
+   (the CSRF secret; a fresh one by default)."
+  [daemon {:keys [secret] :as opts}]
+  (guard/wrap (fn [req] (root-handler daemon req))
+              (assoc opts :secret (or secret (guard/new-secret)))))
+
 (defn start!
   "Start the HTTP server.
 
@@ -335,15 +344,20 @@
      :ip    - Bind address (default \"127.0.0.1\" — loopback only). The dashboard
               and JSON API are UNAUTHENTICATED, so they bind to localhost; pass
               \"0.0.0.0\" explicitly (--web-bind / :http {:ip}) to expose them.
+     :allowed-hosts   - extra Host names to answer (beside loopback and the bind
+                        address), e.g. a reverse proxy's name
+     :allowed-origins - extra origins whose state-changing requests are accepted,
+                        e.g. \"https://dvergr.example.com\" behind a proxy
 
    Returns the server state map."
-  [daemon & {:keys [port ip] :or {port 17880 ip "127.0.0.1"}}]
+  [daemon & {:keys [port ip allowed-hosts allowed-origins] :or {port 17880 ip "127.0.0.1"}}]
   (when @server-state
     (tel/log! {:level :warn :id ::already-running :data {:port (:port @server-state)}})
     (throw (ex-info "Server already running" {:port (:port @server-state)})))
   (tel/log! {:level :info :id ::starting :data {:ip ip :port port}} "Starting HTTP server")
   (let [stop-fn (http/run-server
-                 (fn [req] (root-handler daemon req))
+                 (handler daemon {:ip ip :allowed-hosts allowed-hosts
+                                  :allowed-origins allowed-origins})
                  {:port port
                   :ip   ip
                   :max-body (* 1024 1024)  ; 1MB max body

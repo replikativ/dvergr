@@ -11,10 +11,10 @@
      GET  /agents/:id/config     — config + persona edit page
      POST /agents/:id/config     — save edits
      POST /agents/new            — create an agent
-     GET  /agents/:id/delete     — delete an agent"
+     POST /agents/:id/delete     — delete an agent
+     POST /agents/:id/open       — open (ensure) the agent's DM room"
   (:require [clojure.string :as str]
             [hiccup2.core :as h]
-            [hiccup.util :as hu]
             [dvergr.web.dashboard :as dash]
             [dvergr.agent.ops :as ops]
             [dvergr.agent.fields :as fields]
@@ -58,13 +58,13 @@
     [:div.agent-card
      [:div.agent-actions
       [:a.btn {:href (str "/agents/" id-str "/config")} "Configure"]
-      [:a.btn {:href (str "/agents/" id-str "/open")} "Chat"]]
+      (dash/post-button (str "/agents/" id-str "/open") "Chat" :class "btn")]
      [:div.agent-header
       [:span.agent-name [:a {:href (str "/agents/" id-str "/config")} id-str]]
       (when (:online? a) [:span.live-dot "● live"])
       [:span {:class (status-class (:status a))} (name (or (:status a) :unknown))]]
      (when (seq (:description a))
-       [:span.agent-desc (hu/escape-html (:description a))])
+       [:span.agent-desc (:description a)])
      [:div.agent-meta
       [:span (or (:model a) "—")]
       (when (:provider a) [:span [:span.sep "·"] (name (:provider a))])
@@ -144,21 +144,21 @@
          {:title (str "configure " id-str) :extra-css config-css}
          [:h1 [:a {:href "/dashboard"
                    :style "color:#52b788;text-decoration:none;font-size:0.6em;margin-right:12px;"} "←"]
-          (hu/escape-html (or (:name a) id-str))
+          (or (:name a) id-str)
           [:span {:class (status-class (:status a))
                   :style "font-size:0.45em;margin-left:12px;vertical-align:middle;"}
            (name (or (:status a) :unknown))]
           [:span.agent-actions
-           [:a.btn {:href (str "/agents/" id-str "/open")} "Chat"]
-           [:a.btn.btn-danger
-            {:href (str "/agents/" id-str "/delete")
-             :onclick (str "return confirm('Delete agent " id-str "? This removes its row and project persona.');")}
-            "Delete"]]]
+           (dash/post-button (str "/agents/" id-str "/open") "Chat" :class "btn")
+           (dash/post-button (str "/agents/" id-str "/delete") "Delete"
+                             :class "btn btn-danger"
+                             :confirm (str "Delete agent " id-str "? This removes its row and project persona."))]]
          [:div {:style "color:#666;font-size:0.85em;margin-bottom:8px;"}
           (str "id " id-str
                (when (:cost-dollars st) (format " · $%.3f spent" (double (:cost-dollars st))))
                (when (:last-active-str st) (str " · last active " (:last-active-str st))))]
          [:form.cfg-form {:method "post" :action (str "/agents/" id-str "/config")}
+          (dash/csrf-field)
           (config-form-body a)
           [:div.cfg-actions
            [:button.btn {:type "submit"} "Save"]
