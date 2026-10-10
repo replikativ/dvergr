@@ -256,7 +256,17 @@
       (is (not (same? {:git/sha sha :git/tag "v2"} git)))
       (is (not (same? (assoc git :deps/root "b") (assoc git :deps/root "a")))
           "another subdirectory of the same commit")
-      (is (not (same? git (assoc git :deps/root "a")))))))
+      (is (not (same? git (assoc git :deps/root "a")))))
+    (testing "the absolute :deps/root resolution records"
+      (let [checkout (str "/home/u/.gitlibs/libs/r/r/" sha)]
+        (is (same? {:git/sha sha} (assoc git :deps/root checkout)))
+        (is (same? {:git/sha sha :deps/root "sub"} (assoc git :deps/root (str checkout "/sub"))))
+        (is (not (same? {:git/sha sha :deps/root "other"} (assoc git :deps/root (str checkout "/sub")))))
+        (is (not (same? {:git/sha sha} (assoc git :deps/root (str checkout "/sub")))))
+        (let [root (.getCanonicalPath (java.io.File. "."))]
+          (is (same? {:local/root "."} {:local/root root :deps/root root}))
+          (is (same? {:local/root "." :deps/root "src"} {:local/root root :deps/root (str root "/src")}))
+          (is (not (same? {:local/root "."} {:local/root root :deps/root (str root "/src")}))))))))
 
 (deftest caller-allowlist-cannot-widen-past-the-hard-denylist
   (with-ctx

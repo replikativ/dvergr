@@ -230,9 +230,26 @@
         (is (str/includes? d "a.clj") (str code " still shows the other change"))
         (is (not (str/includes? d "hunter2")) code)
         (is (not (str/includes? d ".env")) code)))
+    (testing "a file named * is a file, not a pathspec that brings .env back"
+      (spit (java.io.File. dir "*") "star-before\n")
+      (sh! dir "git" "add" "--" ":(literal)*")
+      (sh! dir "git" "-c" "commit.gpgsign=false" "commit" "-q" "-m" "star")
+      (spit (java.io.File. dir "*") "star-after\n")
+      (let [d (sci/eval-string* ctx "(git/diff)")]
+        (is (str/includes? d "star-after"))
+        (is (not (str/includes? d "hunter2")) d))
+      (sh! dir "git" "checkout" "--" ":(literal)*"))
     (testing "a diff of only sensitive changes is empty"
       (sh! dir "git" "checkout" "--" "src/a.clj")
-      (is (= "" (sci/eval-string* ctx "(git/diff)"))))))
+      (is (= "" (sci/eval-string* ctx "(git/diff)"))))
+    (testing "a rename does not carry a sensitive source into the diff"
+      (sh! dir "git" "checkout" "--" ".env")
+      (sh! dir "git" "mv" ".env" "public.txt")
+      (doseq [code ["(git/diff \"--staged\")" "(git/diff \"--staged\" \"--no-renames\")"
+                    "(git/diff \"--staged\" \"--stat\")"]]
+        (let [d (sci/eval-string* ctx code)]
+          (is (str/includes? d "public.txt") code)
+          (is (not (str/includes? d ".env")) (str code ": " d)))))))
 
 (deftest physical-git-runs-no-repository-supplied-commands
   ;; In physical mode the repository's config and hooks live in the workspace.
@@ -336,6 +353,22 @@
     ;; (No positive copy-tree case: babashka.fs 0.5.21's copy-tree fails on
     ;; this JDK inside its own permission handling, before and after this
     ;; check.)
+    (testing "a recursive delete or a move cannot take .git along"
+      (is (thrown-with-msg? Exception #"sensitive path"
+                            (sci/eval-string* ctx "(babashka.fs/delete-tree \".\")")))
+      (is (.exists (java.io.File. dir ".git/config")))
+      (.mkdirs (java.io.File. dir "box"))
+      (spit (java.io.File. dir "box/.env") "S=1")
+      (is (thrown-with-msg? Exception #"sensitive path"
+                            (sci/eval-string* ctx "(babashka.fs/move \"box\" \"box2\")")))
+      (is (.exists (java.io.File. dir "box/.env"))))
+    (testing "ordinary recursive deletes and moves still work"
+      (.mkdirs (java.io.File. dir "tree/sub"))
+      (spit (java.io.File. dir "tree/sub/x.txt") "x")
+      (sci/eval-string* ctx "(babashka.fs/move \"tree\" \"tree2\")")
+      (is (= "x" (slurp (java.io.File. dir "tree2/sub/x.txt"))))
+      (sci/eval-string* ctx "(babashka.fs/delete-tree \"tree2\")")
+      (is (not (.exists (java.io.File. dir "tree2")))))
     (is (not (str/includes? (slurp (java.io.File. dir ".git/config")) "/bin/true")))
     (testing "ordinary workspace writes still work"
       (is (some? (sci/eval-string* ctx "(spit \"src/b.clj\" \"(ns b)\")")))

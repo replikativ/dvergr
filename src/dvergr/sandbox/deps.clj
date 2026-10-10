@@ -420,6 +420,23 @@
           (select-keys source-keys)
           not-empty))
 
+(defn- same-root?
+  "Does the requested `:deps/root` (nil, or a subdirectory) name the root the
+   resolver recorded? Resolution writes it absolute: the local root itself, or
+   the git checkout `<gitlibs>/…/<sha>[/<subdir>]`."
+  [spec source]
+  (let [r (some-> (:deps/root spec) (str/replace #"^\./|/$" ""))
+        sr (some-> (:deps/root source) str)
+        canonical #(.getCanonicalPath (io/file %))]
+    (cond
+      (nil? sr) (nil? r)
+      (not (.isAbsolute (io/file sr))) (= r sr)
+      (:local/root spec) (= (canonical sr)
+                            (canonical (cond-> (io/file (:local/root spec)) r (io/file r))))
+      (:git/sha source) (str/ends-with? (str/replace sr #"/$" "")
+                                        (str (:git/sha source) (when r (str "/" r))))
+      :else (nil? r))))
+
 (defn- same-source?
   "Did a request for `spec` get what the classpath has for that lib? A lib
    already on the classpath is not reloaded, so a request for another source
@@ -430,7 +447,7 @@
    the vector form (`RELEASE`): any Maven source."
   [spec source]
   (let [canonical #(some-> % io/file .getCanonicalPath)]
-    (and (= (:deps/root spec) (:deps/root source))
+    (and (same-root? spec source)
          (cond
            (nil? spec) (contains? source :mvn/version)
 

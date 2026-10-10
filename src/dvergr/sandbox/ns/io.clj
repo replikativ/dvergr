@@ -327,10 +327,28 @@
                                                 (when (and (.isDirectory f)
                                                            (not (java.nio.file.Files/isSymbolicLink (.toPath f))))
                                                   (.listFiles f))))))))))
+        ;; A recursive delete or a move takes everything under its root along:
+        ;; refuse when anything under it is sensitive (`.git`, `.env`, …).
+        check-descendants! (fn [a]
+                             (let [fa (sr a)]
+                               (when (.isDirectory fa)
+                                 (loop [pending (vec (.listFiles fa))]
+                                   (when-let [^java.io.File f (peek pending)]
+                                     (let [p (str a "/" (.relativize (.toPath fa) (.toPath f)))
+                                           link? (java.nio.file.Files/isSymbolicLink (.toPath f))]
+                                       ;; a symlink is deleted or moved itself, not
+                                       ;; its target: judge it by its name
+                                       (if link? (sensitive-path-policy p) (sr p))
+                                       (recur (into (pop pending)
+                                                    (when (and (.isDirectory f) (not link?))
+                                                      (.listFiles f))))))))))
         cpmv           (fn [op bb & [tree?]]
                          (fn [a b & m] (fx effects op {:src (str a) :dst (str b)}
                                            #(let [fa (sr a) fb (sr b)]
-                                              (when tree? (check-tree! a b))
+                                              (case tree?
+                                                :copy (check-tree! a b)
+                                                :move (check-descendants! a)
+                                                nil)
                                               (apply bb fa fb m) (rel fb)))))
         pred           (fn [bb] (fn [p] (fx effects :fs/stat {:path (str p)} #(bb (sr p)))))]
     ;; The real babashka.fs SUBSET, every path clamped to base-path. Returns strings
@@ -363,10 +381,11 @@
                          'create-dirs        mkdir
                          'delete             (del (r 'delete))
                          'delete-if-exists   (del (r 'delete-if-exists))
-                         'delete-tree        (del (r 'delete-tree))
-                         'move               (cpmv :fs/move (r 'move))
+                         'delete-tree        (let [d (del (r 'delete-tree))]
+                                               (fn [p] (check-descendants! p) (d p)))
+                         'move               (cpmv :fs/move (r 'move) :move)
                          'copy               (cpmv :fs/copy (r 'copy))
-                         'copy-tree          (cpmv :fs/copy (r 'copy-tree) true)
+                         'copy-tree          (cpmv :fs/copy (r 'copy-tree) :copy)
                          'parent             (fn [p] (some-> (bb-parent (sr p)) rel))
                          'file-name          (fn [p] (str ((r 'file-name) p)))
                          'absolutize         (fn [p] (rel (sr p)))
@@ -715,18 +734,24 @@
                           ;; Which files does this diff cover? A sensitive one
                           ;; (a tracked `.env`) is left out, as every other
                           ;; file tool leaves it out; the diff then runs on
-                          ;; the rest by name.
+                          ;; the rest by name. Listed without rename
+                          ;; detection, so both sides of a rename are seen,
+                          ;; and rerun without it, so a sensitive source
+                          ;; cannot come back as a rename's old side. Names
+                          ;; are split on NUL only and passed back as literal
+                          ;; pathspecs (a file named `*` is that file).
                           #(let [names (->> (apply run! (concat ["diff"]
                                                                 (filter #{"--cached" "--staged" "--no-ext-diff" "--no-textconv"} opts)
-                                                                ["--name-only" "-z"]
+                                                                ["--no-renames" "--name-only" "-z"]
                                                                 (when host-base ["--relative"])
                                                                 ["--"] paths))
-                                            (re-seq #"[^\u0000\n]+"))
+                                            (re-seq #"[^\u0000]+"))
                                  safe (remove sensitive-name? names)]
                              (cond
                                (= (count safe) (count names)) (apply run! argv)
                                (empty? safe) ""
-                               :else (apply run! (concat ["diff"] opts ["--"] safe)))))))
+                               :else (apply run! (concat ["diff"] opts ["--no-renames" "--"]
+                                                         (map (fn [n] (str ":(literal)" n)) safe))))))))
 
         add-fn    (fn [& paths]
                     (let [host-base (when-not (or workspace workspace-resolver) base-path)
