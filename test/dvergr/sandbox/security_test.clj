@@ -130,9 +130,13 @@
                "http://[fe00::1]/"]]
       (is (nil? (io/ssrf-guard! u)) u))))
 
-(defn- temp-dir! [prefix]
-  (.toFile (java.nio.file.Files/createTempDirectory
-            prefix (make-array java.nio.file.attribute.FileAttribute 0))))
+(defn- temp-dir!
+  "An absolute temp dir: the test JVM's java.io.tmpdir is relative, and a
+   relative symlink target would dangle."
+  [prefix]
+  (.getAbsoluteFile
+   (.toFile (java.nio.file.Files/createTempDirectory
+             prefix (make-array java.nio.file.attribute.FileAttribute 0)))))
 
 (defn- sh! [dir & args]
   (let [p (.start (doto (ProcessBuilder. ^java.util.List (vec args))
@@ -211,6 +215,25 @@
       (is (not (.exists out)))
       (is (= 1 (count (sci/eval-string* ctx "(git/log {:n 1})")))))))
 
+(deftest physical-git-diff-leaves-out-sensitive-files
+  ;; A tracked `.env` is as secret in a diff as it is to `slurp` and grep.
+  (let [dir (git-repo!)
+        ctx (sci/init {})]
+    (spit (java.io.File. dir ".env") "TOKEN=old\n")
+    (sh! dir "git" "add" ".env")
+    (sh! dir "git" "-c" "commit.gpgsign=false" "commit" "-q" "-m" "env")
+    (spit (java.io.File. dir ".env") "TOKEN=hunter2\n")
+    (io/add-git-ns! ctx :base-path (str dir))
+    (is (refused? #(sci/eval-string* ctx %) "(git/diff \".env\")"))
+    (doseq [code ["(git/diff)" "(git/diff \".\")" "(git/diff \"--stat\")" "(git/diff \"--name-only\")"]]
+      (let [d (sci/eval-string* ctx code)]
+        (is (str/includes? d "a.clj") (str code " still shows the other change"))
+        (is (not (str/includes? d "hunter2")) code)
+        (is (not (str/includes? d ".env")) code)))
+    (testing "a diff of only sensitive changes is empty"
+      (sh! dir "git" "checkout" "--" "src/a.clj")
+      (is (= "" (sci/eval-string* ctx "(git/diff)"))))))
+
 (deftest physical-git-runs-no-repository-supplied-commands
   ;; In physical mode the repository's config and hooks live in the workspace.
   ;; Host git must not run an external diff, a textconv driver or a hook that
@@ -231,6 +254,12 @@
     ;; is neutralised; `.git/info/attributes` is unwritable from the workspace
     (spit (java.io.File. dir "global-attributes") "*.txt filter=probe\n")
     (sh! dir "git" "config" "core.attributesFile" (str (java.io.File. dir "global-attributes")))
+    ;; and `.git/info/attributes`, which git reads whatever GIT_ATTR_SOURCE
+    ;; says (written here directly, as if the workspace had reached it)
+    (.mkdirs (java.io.File. dir ".git/info"))
+    (spit (java.io.File. dir ".git/info/attributes") "*.txt filter=probe\n*.md filter=probe\n")
+    (sh! dir "git" "config" "filter.probe.required" "true")
+    (spit (java.io.File. dir "src/c.md") "info attributes\n")
     (let [hook (java.io.File. dir ".git/hooks/pre-commit")]
       (.mkdirs (.getParentFile hook))
       (spit hook (str "#!/bin/sh\ntouch " sentinel "\n"))
@@ -240,6 +269,8 @@
     (is (str/includes? (sci/eval-string* ctx "(git/diff \"src/a.clj\")") "changed"))
     (sci/eval-string* ctx "(git/add \"src/a.clj\")")
     (sci/eval-string* ctx "(git/add \"src/b.txt\")")
+    (is (= :ok (sci/eval-string* ctx "(git/add \"src/c.md\")"))
+        "a required filter, emptied, does not fail the add")
     (is (map? (sci/eval-string* ctx "(git/status)")))
     (sci/eval-string* ctx "(git/commit \"probe\")")
     (is (not (.exists sentinel)) "no repository-supplied command ran")))
@@ -256,7 +287,17 @@
     (io/add-git-ns! ctx :base-path (str (java.io.File. dir "src")))
     (let [d (sci/eval-string* ctx "(git/diff)")]
       (is (str/includes? d "changed") "changes inside the workspace show")
-      (is (not (str/includes? d "after-outside")) "changes outside it do not"))))
+      (is (not (str/includes? d "after-outside")) "changes outside it do not"))
+    (testing "staging cannot reach outside it either"
+      (is (refused? #(sci/eval-string* ctx %) "(git/add \":(top)outside.txt\")"))
+      (is (refused? #(sci/eval-string* ctx %) "(git/add \"../outside.txt\")"))
+      (sci/eval-string* ctx "(git/add \".\")")
+      (let [staged (with-out-str
+                     (let [p (.start (doto (ProcessBuilder. ["git" "diff" "--cached" "--name-only"])
+                                       (.directory dir)))]
+                       (print (slurp (.getInputStream p)))))]
+        (is (str/includes? staged "src/a.clj"))
+        (is (not (str/includes? staged "outside.txt")) staged)))))
 
 (deftest physical-fs-cannot-write-git-internals
   ;; Writing `.git/config` or a hook is how a workspace turns the next host git
@@ -274,8 +315,27 @@
        (.toPath (java.io.File. dir "alias"))
        (.toPath (java.io.File. dir ".git"))
        (make-array java.nio.file.attribute.FileAttribute 0))
-      (is (thrown? Exception
-                   (sci/eval-string* ctx "(spit \"alias/config\" \"[diff]\\n external = /bin/true\\n\")"))))
+      (is (thrown-with-msg? Exception #"sensitive path"
+                            (sci/eval-string* ctx "(spit \"alias/config\" \"[diff]\\n external = /bin/true\\n\")"))))
+    (testing "nor by a tree copy through that symlink"
+      (.mkdirs (java.io.File. dir "payload/alias"))
+      (spit (java.io.File. dir "payload/alias/config") "[diff]\n external = /bin/true\n")
+      (is (thrown-with-msg? Exception #"sensitive path"
+                            (sci/eval-string* ctx "(babashka.fs/copy-tree \"payload\" \".\" {:replace-existing true})"))))
+    (testing "and a tree copy does not read out through a symlink in its source"
+      (let [outside (java.io.File. (temp-dir! "dvergr-outside") "secret.txt")]
+        (spit outside "outside-secret")
+        (.mkdirs (java.io.File. dir "src2"))
+        (java.nio.file.Files/createSymbolicLink
+         (.toPath (java.io.File. dir "src2/leak"))
+         (.toPath outside)
+         (make-array java.nio.file.attribute.FileAttribute 0))
+        (is (thrown-with-msg? Exception #"outside sandbox"
+                              (sci/eval-string* ctx "(babashka.fs/copy-tree \"src2\" \"dst2\" {:replace-existing true})")))
+        (is (not (.exists (java.io.File. dir "dst2/leak"))))))
+    ;; (No positive copy-tree case: babashka.fs 0.5.21's copy-tree fails on
+    ;; this JDK inside its own permission handling, before and after this
+    ;; check.)
     (is (not (str/includes? (slurp (java.io.File. dir ".git/config")) "/bin/true")))
     (testing "ordinary workspace writes still work"
       (is (some? (sci/eval-string* ctx "(spit \"src/b.clj\" \"(ns b)\")")))

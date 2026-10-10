@@ -310,9 +310,28 @@
         mkdir          (fn [p] (fx effects :fs/mkdir {:path (str p)}
                                    #(let [f (sr p)] (bb-create-dirs f) (rel f))))
         del            (fn [bb] (fn [p] (fx effects :fs/delete {:path (str p)} #(bb (sr p)))))
-        cpmv           (fn [op bb] (fn [a b & m] (fx effects op {:src (str a) :dst (str b)}
-                                                     #(let [fa (sr a) fb (sr b)]
-                                                        (apply bb fa fb m) (rel fb)))))
+        ;; A tree copy reads and writes every path under its roots, not just
+        ;; the roots: a symlink inside the source can point out of the
+        ;; workspace, and one inside the destination (`alias -> .git`) can
+        ;; redirect a write. Each entry is clamped on both sides; symlinked
+        ;; directories are checked, not descended (no cycles).
+        check-tree!    (fn [a b]
+                         (let [fa (sr a)]
+                           (when (.isDirectory fa)
+                             (loop [pending (vec (.listFiles fa))]
+                               (when-let [^java.io.File f (peek pending)]
+                                 (let [r (str (.relativize (.toPath fa) (.toPath f)))]
+                                   (sr (str a "/" r))
+                                   (sr (str b "/" r))
+                                   (recur (into (pop pending)
+                                                (when (and (.isDirectory f)
+                                                           (not (java.nio.file.Files/isSymbolicLink (.toPath f))))
+                                                  (.listFiles f))))))))))
+        cpmv           (fn [op bb & [tree?]]
+                         (fn [a b & m] (fx effects op {:src (str a) :dst (str b)}
+                                           #(let [fa (sr a) fb (sr b)]
+                                              (when tree? (check-tree! a b))
+                                              (apply bb fa fb m) (rel fb)))))
         pred           (fn [bb] (fn [p] (fx effects :fs/stat {:path (str p)} #(bb (sr p)))))]
     ;; The real babashka.fs SUBSET, every path clamped to base-path. Returns strings
     ;; (not Path objects) so SCI agents get serialisable values. Content read/write
@@ -347,7 +366,7 @@
                          'delete-tree        (del (r 'delete-tree))
                          'move               (cpmv :fs/move (r 'move))
                          'copy               (cpmv :fs/copy (r 'copy))
-                         'copy-tree          (cpmv :fs/copy (r 'copy-tree))
+                         'copy-tree          (cpmv :fs/copy (r 'copy-tree) true)
                          'parent             (fn [p] (some-> (bb-parent (sr p)) rel))
                          'file-name          (fn [p] (str ((r 'file-name) p)))
                          'absolutize         (fn [p] (rel (sr p)))
@@ -564,23 +583,28 @@
     "--ignore-space-change" "--no-color" "--no-renames" "-R"})
 
 (defn- workspace-pathspec!
-  "Refuse a diff path that leaves the workspace. Pathspec magic (`:(top)x`,
-   `:/x`) is refused outright — git resolves it against the repository root,
-   not the path as written. With a physical `base-path` the path (relative to
-   it, or absolute) is canonicalised, so `..` and a symlink out of the
-   workspace are refused alike. In the virtual workspace a leading `/` names
-   the repository root and no path may climb above it."
+  "Refuse a git path that leaves the workspace or names a sensitive file.
+   Pathspec magic (`:(top)x`, `:/x`) is refused outright — git resolves it
+   against the repository root, not the path as written. With a physical
+   `base-path` the path (relative to it, or absolute) is canonicalised, so `..`
+   and a symlink out of the workspace are refused alike. In the virtual
+   workspace a leading `/` names the repository root and no path may climb
+   above it."
   [base-path path]
-  (let [refuse! #(git-arg-refused! (str "git/diff path outside the workspace: " path)
+  (let [refuse! #(git-arg-refused! (str "git path outside the workspace: " path)
                                    {:path path})]
     (when (str/starts-with? path ":")
-      (git-arg-refused! (str "git/diff pathspec magic not allowed: " path) {:path path}))
+      (git-arg-refused! (str "git pathspec magic not allowed: " path) {:path path}))
+    (when (try (sensitive-path-policy path) false (catch clojure.lang.ExceptionInfo _ true))
+      (git-arg-refused! (str "git path is a sensitive file: " path) {:path path}))
     (if base-path
       (let [base (.getCanonicalFile (java.io.File. (str base-path)))
             f (java.io.File. (str path))
             file (.getCanonicalFile (if (.isAbsolute f) f (java.io.File. base (str path))))]
         (when-not (.startsWith (.toPath file) (.toPath base))
-          (refuse!)))
+          (refuse!))
+        (when (try (sensitive-path-policy (str file)) false (catch clojure.lang.ExceptionInfo _ true))
+          (git-arg-refused! (str "git path is a sensitive file: " path) {:path path})))
       (when (neg? (reduce (fn [d seg]
                             (case seg
                               ("" ".") d
@@ -589,6 +613,10 @@
                           0 (str/split (str/replace path #"^/+" "") #"/")))
         (refuse!)))
     path))
+
+(defn- sensitive-name? [path]
+  (try (sensitive-path-policy (str path)) false
+       (catch clojure.lang.ExceptionInfo _ true)))
 
 (defn git-diff-argv
   "The argv for `(git/diff & args)`: allowlisted options, then `--`, then
@@ -678,16 +706,34 @@
         ;; a read that happened. Physical paths are checked against the
         ;; workspace on disk; virtual ones against the repository root.
         diff-fn   (fn [& args]
-                    (let [argv (git-diff-argv (when-not (or workspace workspace-resolver)
-                                                base-path)
-                                              args)]
+                    (let [host-base (when-not (or workspace workspace-resolver) base-path)
+                          argv (git-diff-argv host-base args)
+                          sep (.indexOf ^java.util.List argv "--")
+                          opts (subvec argv 1 sep)
+                          paths (subvec argv (inc sep))]
                       (fx effects :git/read {:op :diff :args (vec args)}
-                          #(apply run! argv))))
+                          ;; Which files does this diff cover? A sensitive one
+                          ;; (a tracked `.env`) is left out, as every other
+                          ;; file tool leaves it out; the diff then runs on
+                          ;; the rest by name.
+                          #(let [names (->> (apply run! (concat ["diff"]
+                                                                (filter #{"--cached" "--staged" "--no-ext-diff" "--no-textconv"} opts)
+                                                                ["--name-only" "-z"]
+                                                                (when host-base ["--relative"])
+                                                                ["--"] paths))
+                                            (re-seq #"[^\u0000\n]+"))
+                                 safe (remove sensitive-name? names)]
+                             (cond
+                               (= (count safe) (count names)) (apply run! argv)
+                               (empty? safe) ""
+                               :else (apply run! (concat ["diff"] opts ["--"] safe)))))))
 
         add-fn    (fn [& paths]
-                    (fx effects :git/add {:paths (vec paths)}
-                        #(do (apply run! "add" "--" paths)
-                             :ok)))
+                    (let [host-base (when-not (or workspace workspace-resolver) base-path)
+                          paths (mapv #(workspace-pathspec! host-base (str %)) paths)]
+                      (fx effects :git/add {:paths paths}
+                          #(do (apply run! "add" "--" paths)
+                               :ok))))
 
         commit-fn (fn [message & [opts]]
                     (fx effects :git/commit {:message message}
@@ -1052,18 +1098,45 @@
    "-c" "commit.gpgSign=false"
    "-c" "log.showSignature=false"])
 
+(defn- filter-overrides
+  "`-c filter.<name>.<key>=` for every filter driver git's config defines, so
+   none runs whatever selects it (`.gitattributes`, `.git/info/attributes`, a
+   global attributes file) and on every git version. An empty command is no
+   filter. A driver name `-c` cannot express (one with `=`) refuses the call."
+  [base-path]
+  (let [pb (doto (ProcessBuilder. ^java.util.List ["git" "config" "-z" "--get-regexp" "^filter\\."])
+             (.directory (java.io.File. (str base-path)))
+             (.redirectError java.lang.ProcessBuilder$Redirect/DISCARD))
+        proc (.start pb)
+        out (slurp (.getInputStream proc))
+        _ (.waitFor proc)
+        names (into #{}
+                    (keep (fn [entry]
+                            (let [k (first (str/split entry #"\n" 2))]
+                              (when-let [[_ n] (re-matches #"(?s)filter\.(.+)\.[^.]+" k)]
+                                n))))
+                    (str/split out #"\u0000"))]
+    (when (some #(str/includes? % "=") names)
+      (git-arg-refused! "git filter driver name not overridable" {:names names}))
+    ;; `required` too: a required filter with no command fails the call.
+    (into [] (mapcat (fn [n] (concat (mapcat #(vector "-c" (str "filter." n "." % "="))
+                                             ["clean" "smudge" "process"])
+                                     ["-c" (str "filter." n ".required=false")])))
+          names)))
+
 (defn- git-run*
   "Run git in base-path. Returns stdout string or throws on non-zero exit."
   [base-path & args]
-  (let [all-args (-> ["git"] (into git-safety-config) (into (map str args)))
+  (let [all-args (-> ["git"] (into git-safety-config) (into (filter-overrides base-path))
+                     (into (map str args)))
         pb       (doto (ProcessBuilder. ^java.util.List all-args)
                    (.directory (java.io.File. (str base-path))))
         ;; Attributes come from the empty tree, not the worktree's
         ;; `.gitattributes`, and no system or global attributes file is read:
-        ;; an attribute selects a `clean`/`process` filter or a diff driver,
-        ;; which git runs as a command. `.git/info/attributes` is still read,
-        ;; and is not writable from the workspace (`.git` is a sensitive
-        ;; path). Git < 2.40 ignores GIT_ATTR_SOURCE.
+        ;; an attribute selects a filter or a diff driver, which git runs as a
+        ;; command. Filters are also emptied above (that holds on git < 2.40,
+        ;; which ignores GIT_ATTR_SOURCE, and for `.git/info/attributes`);
+        ;; diffs pass --no-ext-diff --no-textconv.
         _        (doto (.environment pb)
                    (.put "GIT_ATTR_SOURCE" "4b825dc642cb6eb9a060e54bf8d69288fbee4904")
                    (.put "GIT_ATTR_NOSYSTEM" "1"))

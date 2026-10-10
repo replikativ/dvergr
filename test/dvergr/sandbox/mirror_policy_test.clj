@@ -236,6 +236,28 @@
                        (is (= [] (:provenance (deps/add-libs! nil {'probe/lib spec}))) (pr-str spec)))
                      (is (not (deps/namespace-mirrorable? 'dvergr-probe-lib.core)))))))))))))
 
+(deftest a-grant-follows-the-loaded-source
+  (let [same? #'deps/same-source?
+        sha "0123456789abcdef0123456789abcdef01234567"
+        git {:git/url "https://example.com/r.git" :git/sha sha :git/tag "v1"}]
+    (testing "the forms resolution fills in match"
+      (is (same? {:mvn/version "1.0"} {:mvn/version "1.0"}))
+      (is (same? nil {:mvn/version "1.0"}) "vector form = any Maven version")
+      (is (same? {:git/sha (subs sha 0 7) :git/tag "v1"} git) "inferred URL, short SHA")
+      (is (same? {:git/url "https://example.com/r.git" :git/sha sha} git))
+      (is (same? {:local/root "."} {:local/root (.getCanonicalPath (java.io.File. "."))})))
+    (testing "another source does not"
+      (is (not (same? {:mvn/version "2.0"} {:mvn/version "1.0"})))
+      (is (not (same? {:local/root "/tmp/x"} {:mvn/version "1.0"})))
+      (is (not (same? {:mvn/version "1.0"} {:local/root "/tmp/x"})))
+      (is (not (same? nil {:local/root "/tmp/x"})))
+      (is (not (same? {:git/sha "0123"} git)) "a SHA prefix too short to name a commit")
+      (is (not (same? {:git/url "https://evil.example/r.git" :git/sha sha} git)))
+      (is (not (same? {:git/sha sha :git/tag "v2"} git)))
+      (is (not (same? (assoc git :deps/root "b") (assoc git :deps/root "a")))
+          "another subdirectory of the same commit")
+      (is (not (same? git (assoc git :deps/root "a")))))))
+
 (deftest caller-allowlist-cannot-widen-past-the-hard-denylist
   (with-ctx
     (testing "set-namespace-allowlist! is bounded by the hard denylist"

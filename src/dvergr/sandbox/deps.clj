@@ -406,26 +406,50 @@
           (as-> current (current))
           (get-in [:libs lib :paths])))
 
+(def ^:private source-keys
+  [:mvn/version :local/root :git/url :git/sha :git/tag :deps/root])
+
 (defn lib-source
   "The source the current basis records for `lib` — `{:mvn/version …}`,
-   `{:local/root …}`, `{:git/url … :git/sha …}` — or nil."
+   `{:local/root …}`, `{:git/url … :git/sha …}`, with any `:deps/root` — or
+   nil."
   [lib]
   (some-> (requiring-resolve 'clojure.java.basis/current-basis)
           (as-> current (current))
           (get-in [:libs lib])
-          (select-keys [:mvn/version :local/root :git/url :git/sha :git/tag])
+          (select-keys source-keys)
           not-empty))
 
 (defn- same-source?
   "Did a request for `spec` get what the classpath has for that lib? A lib
    already on the classpath is not reloaded, so a request for another source
    (a Maven version after someone else's `:local/root`) gets the loaded code,
-   not the code it was approved for. nil `spec` is the vector form (`RELEASE`):
-   any Maven source."
+   not the code it was approved for. Compared the way resolution fills a coord
+   in: a git request may leave out the URL (inferred from the lib name), name a
+   tag, and abbreviate the SHA; a `:local/root` may be relative. nil `spec` is
+   the vector form (`RELEASE`): any Maven source."
   [spec source]
-  (if (nil? spec)
-    (contains? source :mvn/version)
-    (= (select-keys spec [:mvn/version :local/root :git/url :git/sha :git/tag]) source)))
+  (let [canonical #(some-> % io/file .getCanonicalPath)]
+    (and (= (:deps/root spec) (:deps/root source))
+         (cond
+           (nil? spec) (contains? source :mvn/version)
+
+           (:mvn/version spec)
+           (= (:mvn/version spec) (:mvn/version source))
+
+           (:local/root spec)
+           (and (:local/root source)
+                (= (canonical (:local/root spec)) (canonical (:local/root source))))
+
+           (:git/sha spec)
+           (and (:git/sha source)
+                (>= (count (:git/sha spec)) 7)
+                (str/starts-with? (:git/sha source) (:git/sha spec))
+                (or (nil? (:git/url spec)) (= (:git/url spec) (:git/url source)))
+                (or (nil? (:git/tag spec)) (nil? (:git/tag source))
+                    (= (:git/tag spec) (:git/tag source))))
+
+           :else false))))
 
 (defn- path->ns
   "`foo_bar/baz.clj` (or `.cljc`, or AOT `baz__init.class`) → `foo-bar.baz`."
