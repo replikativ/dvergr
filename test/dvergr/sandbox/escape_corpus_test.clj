@@ -296,26 +296,30 @@
     (deps/install-policy! (fn [_ _] :approve))))
 
 (deftest add-libs-cannot-open-host-eval-or-raw-http
-  (with-sandbox
-    (fn [sci ec]
-      (approve-every-dep! ec)
-      (testing "an approved coord already on the classpath opens nothing"
-        (let [r (eval-in sci ec "(require '[clojure.repl.deps :as deps])
+  ;; The host add-libs returns nil for libs the basis already has (both of
+  ;; these are deps of the daemon); stubbed to that so the test does not depend
+  ;; on how the JVM was launched.
+  (with-redefs [clojure.repl.deps/add-libs (fn [_] nil)]
+    (with-sandbox
+      (fn [sci ec]
+        (approve-every-dep! ec)
+        (testing "an approved coord already on the classpath opens nothing"
+          (let [r (eval-in sci ec "(require '[clojure.repl.deps :as deps])
                                  (deps/add-libs '{org.clojure/clojure {:mvn/version \"1.12.5\"}})")]
-          (is (= {:status :loaded :provenance []}
-                 (select-keys (:ok r) [:status :provenance]))
-              (str "the request itself succeeds: " (pr-str r))))
-        (is (not (reaches? sci ec "(require 'clojure.main) :reached"))
-            "clojure.main/main \"-e\" is host eval")
-        (is (not (reaches? sci ec "(require 'clojure.core.server) :reached"))
-            "clojure.core.server starts a host socket REPL")
-        (is (not (reaches? sci ec "(require 'clojure.instant) :reached"))
-            "the group segment `clojure` is not a namespace grant"))
-      (testing "hato's coord does not mirror the raw HTTP client"
-        (let [r (eval-in sci ec "(clojure.repl.deps/add-libs '{hato/hato {:mvn/version \"1.0.0\"}})")]
-          (is (= :loaded (get-in r [:ok :status])) (pr-str r)))
-        (is (not (reaches? sci ec "(require 'hato.client) :reached"))
-            "hato.client bypasses the SSRF guard and the domain policy")))))
+            (is (= {:status :loaded :provenance []}
+                   (select-keys (:ok r) [:status :provenance]))
+                (str "the request itself succeeds: " (pr-str r))))
+          (is (not (reaches? sci ec "(require 'clojure.main) :reached"))
+              "clojure.main/main \"-e\" is host eval")
+          (is (not (reaches? sci ec "(require 'clojure.core.server) :reached"))
+              "clojure.core.server starts a host socket REPL")
+          (is (not (reaches? sci ec "(require 'clojure.instant) :reached"))
+              "the group segment `clojure` is not a namespace grant"))
+        (testing "hato's coord does not mirror the raw HTTP client"
+          (let [r (eval-in sci ec "(clojure.repl.deps/add-libs '{hato/hato {:mvn/version \"1.0.0\"}})")]
+            (is (= :loaded (get-in r [:ok :status])) (pr-str r)))
+          (is (not (reaches? sci ec "(require 'hato.client) :reached"))
+              "hato.client bypasses the SSRF guard and the domain policy"))))))
 
 (deftest a-failed-add-libs-grants-nothing
   (with-redefs [clojure.repl.deps/add-libs

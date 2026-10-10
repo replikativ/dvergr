@@ -15,7 +15,7 @@
             [dvergr.sandbox.ns.doc :as doc])
   (:import [java.io File]))
 
-(declare fs-safe-resolve git-run* parse-porcelain-status parse-git-log git-log-format)
+(declare fs-safe-resolve git-run* worktree-top parse-porcelain-status parse-git-log git-log-format)
 
 (defn install-http-fixture!
   "Host-only world setup: install an immutable offline capability in the current
@@ -347,7 +347,7 @@
                                            #(let [fa (sr a) fb (sr b)]
                                               (case tree?
                                                 :copy (check-tree! a b)
-                                                :move (check-descendants! a)
+                                                :move (do (check-descendants! a) (check-tree! a b))
                                                 nil)
                                               (apply bb fa fb m) (rel fb)))))
         pred           (fn [bb] (fn [p] (fx effects :fs/stat {:path (str p)} #(bb (sr p)))))]
@@ -770,6 +770,8 @@
 
         add-fn    (fn [& paths]
                     (let [host-base (when-not (or workspace workspace-resolver) base-path)
+                          _ (when (empty? paths)
+                              (git-arg-refused! "git/add needs at least one path (\".\" for everything)" {}))
                           paths (mapv #(workspace-pathspec! host-base (str %)) paths)]
                       (fx effects :git/add {:paths paths}
                           ;; `.` or a directory takes every file under it, a
@@ -783,6 +785,12 @@
                                                                       paths))
                                                   (re-seq #"[^\u0000]+")
                                                   (keep (fn [e] (when (> (count e) 3) (subs e 3)))))
+                                       ;; status names are root-relative: keep only
+                                       ;; those inside the workspace
+                                       top (worktree-top host-base)
+                                       base (.toPath (.getCanonicalFile (java.io.File. (str host-base))))
+                                       inside? (fn [n] (and top (.startsWith (.toPath (.getCanonicalFile (java.io.File. ^java.io.File top ^String n))) base)))
+                                       names (filter inside? names)
                                        safe (remove sensitive-name? names)]
                                    (cond
                                      (= (count safe) (count names)) (apply run! "add" "--" paths)
@@ -1239,6 +1247,16 @@
                                      ["-c" (str "filter." n ".required=false")])))
           names)))
 
+(defn- worktree-top
+  "The directory holding `.git` at or above `base-path` — the worktree host git
+   is pinned to."
+  [base-path]
+  (->> (iterate #(.getParentFile ^java.io.File %)
+                (.getCanonicalFile (java.io.File. (str base-path))))
+       (take-while some?)
+       (filter #(.exists (java.io.File. ^java.io.File % ".git")))
+       first))
+
 (defn- git-run*
   "Run git in base-path. Returns stdout string or throws on non-zero exit."
   [base-path & args]
@@ -1260,11 +1278,7 @@
         ;; The worktree is the directory that holds `.git` above base-path,
         ;; not whatever `core.worktree` (possibly from an included config
         ;; file) says: every path check here is against that directory.
-        _        (when-let [top (->> (iterate #(.getParentFile ^java.io.File %)
-                                              (.getCanonicalFile (java.io.File. (str base-path))))
-                                     (take-while some?)
-                                     (filter #(.exists (java.io.File. ^java.io.File % ".git")))
-                                     first)]
+        _        (when-let [top (worktree-top base-path)]
                    (.put env "GIT_WORK_TREE" (str top)))
         proc     (.start pb)
         out      (future (slurp (.getInputStream proc)))

@@ -487,6 +487,16 @@
     (let [d (sci/eval-string* ctx "(git/diff)")]
       (is (str/includes? d "changed") "changes inside the workspace show")
       (is (not (str/includes? d "after-outside")) "changes outside it do not"))
+    (testing "git/add needs a path, and with a sensitive file present stages only inside"
+      (spit (java.io.File. dir "src/.env") "S=1\n")
+      (is (refused? #(sci/eval-string* ctx %) "(git/add)"))
+      (sci/eval-string* ctx "(git/add \".\")")
+      (let [p (.start (doto (ProcessBuilder. ["git" "diff" "--cached" "--name-only"]) (.directory dir)))
+            staged (slurp (.getInputStream p))]
+        (is (not (str/includes? staged "outside.txt")) staged)
+        (is (not (str/includes? staged ".env")) staged))
+      (.delete (java.io.File. dir "src/.env"))
+      (sh! dir "git" "reset" "-q"))
     (testing "staging cannot reach outside it either"
       (is (refused? #(sci/eval-string* ctx %) "(git/add \":(top)outside.txt\")"))
       (is (refused? #(sci/eval-string* ctx %) "(git/add \"../outside.txt\")"))
@@ -544,6 +554,12 @@
       (is (thrown-with-msg? Exception #"sensitive path"
                             (sci/eval-string* ctx "(babashka.fs/move \"box\" \"box2\")")))
       (is (.exists (java.io.File. dir "box/.env"))))
+    (testing "nor a move put a file where a sensitive one would be"
+      (.mkdirs (java.io.File. dir "keys"))
+      (spit (java.io.File. dir "keys/authorized_keys") "ssh-ed25519 AAAA attacker")
+      (is (thrown-with-msg? Exception #"sensitive path"
+                            (sci/eval-string* ctx "(babashka.fs/move \"keys\" \".ssh\")")))
+      (is (not (.exists (java.io.File. dir ".ssh/authorized_keys")))))
     (testing "ordinary recursive deletes and moves still work"
       (.mkdirs (java.io.File. dir "tree/sub"))
       (spit (java.io.File. dir "tree/sub/x.txt") "x")
