@@ -8,13 +8,18 @@
    - default (strict? false): all users are permitted (backwards compat), but a
      warning is logged so the operator knows access is open.
    - strict? true: an empty allowlist DENIES everyone (fail-closed). Opt in via
-     `(set-strict! true)` / the daemon's :strict-allowlist? config.
+     the daemon's `:strict-allowlist? true` config (or `(set-strict! true)`).
+
+   The daemon calls `configure!` on every start, so both the user set and the
+   strict flag come from the current config — an empty list or an absent flag
+   resets what a previous start installed.
 
    The allowlist is stored in a global atom for runtime mutability:
      (add-user! \"@christian_w\")
      (remove-user! \"@spammer\")
      (list-users)"
-  (:require [taoensso.telemere :as tel]))
+  (:require [clojure.string :as str]
+            [taoensso.telemere :as tel]))
 
 ;; ============================================================================
 ;; State
@@ -67,6 +72,44 @@
   "Return the current allowed set."
   []
   @allowed-users)
+
+;; ============================================================================
+;; Configuration
+;; ============================================================================
+
+(defn- config-entries
+  "Allowlist entries for one config `:allowed-users` item: a user map
+   `{:id 123 :username \"alice\"}` yields its id and \"@alice\"; a number or an
+   \"@username\" string stands for itself."
+  [u]
+  (cond
+    (map? u) (remove nil? [(:id u)
+                           (when-let [n (:username u)]
+                             (if (str/starts-with? (str n) "@") (str n) (str "@" n)))])
+    :else    [u]))
+
+(defn open?
+  "True when the current policy admits every sender: no users and not strict."
+  []
+  (and (empty? @allowed-users) (not @strict?)))
+
+(defn configure!
+  "Install the whole access policy from config, replacing any previous state:
+   `:users` (config `:allowed-users`, user maps, ids or \"@username\" strings;
+   nil means none) and `:strict?` (config `:strict-allowlist?`; nil means false).
+   When `:telegram?` is true and the result admits everyone, logs a warning.
+   Returns `{:users #{…} :strict? bool :open? bool}`."
+  [{:keys [users telegram?] strict :strict?}]
+  (let [entries (mapv validate! (mapcat config-entries users))]
+    (reset! allowed-users (set entries))
+    (set-strict! strict)
+    (when (and telegram? (open?))
+      (tel/log! {:level :warn :id ::open-telegram}
+                (str "SECURITY: Telegram is enabled with an empty :allowed-users and "
+                     ":strict-allowlist? off — ANY Telegram user who finds the bot can use "
+                     "it and spend agent budget. Add :allowed-users or set "
+                     ":strict-allowlist? true.")))
+    {:users @allowed-users :strict? @strict? :open? (open?)}))
 
 ;; ============================================================================
 ;; Check

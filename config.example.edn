@@ -1,9 +1,13 @@
 ;; dvergr configuration example
 ;; Copy to config.local.edn and fill in your secrets.
 ;; config.local.edn is gitignored — never commit it.
+;; This file is documentation only: dvergr never loads it. Placeholder values
+;; (anything containing "YOUR_") count as unset, so the matching env var
+;; (TELEGRAM_BOT_TOKEN, GITHUB_DVERGR_TOKEN) is used instead.
 
 {;; ============================================================
- ;; Telegram
+ ;; Telegram — or leave the token out and set env TELEGRAM_BOT_TOKEN.
+ ;; Set :allowed-users below before exposing the bot.
  ;; ============================================================
  :telegram {:token "YOUR_TELEGRAM_BOT_TOKEN"}
 
@@ -103,16 +107,20 @@
  ;; ============================================================
  ;; Access control
  ;; Telegram user objects: {:id 123456 :username "handle"}
+ ;; An empty list admits EVERY Telegram user (the daemon logs a warning at
+ ;; start); :strict-allowlist? true makes an empty list deny everyone instead.
  ;; ============================================================
  :allowed-users []
+ :strict-allowlist? true
 
  ;; Default agent for new Telegram sessions
  :default-agent :var
 
  ;; ============================================================
- ;; HTTP server (optional)
+ ;; HTTP server (optional) — the web dashboard starts only when :http is set.
+ ;; Defaults: port 17880 on 127.0.0.1.
  ;; ============================================================
- :http {:port 8080}
+ ;; :http {:port 17880 :ip "127.0.0.1"}
 
  ;; ============================================================
  ;; Sandbox stdlib source (optional) — every room workspace is `git clone`d from

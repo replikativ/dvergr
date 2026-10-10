@@ -808,16 +808,13 @@
     ;; Register execution context for distributed addressing
     (sdist/register-context! :default exec-ctx)
 
-    ;; Initialize allowlist from config (can be changed at runtime via allowlist/add-user! etc.)
-    ;; Config stores full user maps; allowlist checks bare :id numbers or "@username" strings.
-    (when-let [users (seq (:allowed-users config))]
-      (allowlist/set-users!
-       (mapcat (fn [u]
-                 (cond
-                   (map? u)     (remove nil? [(:id u) (when (:username u) (str "@" (:username u)))])
-                   (number? u)  [u]
-                   (string? u)  [u]))
-               users)))
+    ;; Install the allowlist policy from config on EVERY start — users and strict
+    ;; flag, empty list included — so a restart never keeps a previous start's
+    ;; state (it lives in process-global atoms). Runtime changes go through
+    ;; allowlist/add-user! etc.
+    (allowlist/configure! {:users     (:allowed-users config)
+                           :strict?   (:strict-allowlist? config)
+                           :telegram? (some? (:telegram config))})
 
     ;; Initialize stats + persistent-room registry from the shared
     ;; datahike connection. The legacy dvergr.rooms.bus is gone —

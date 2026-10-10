@@ -4,7 +4,8 @@
    Config file location (in priority order):
    1. DVERGR_CONFIG env var path
    2. ./config.local.edn  (project root — gitignored, put secrets here)
-   3. ./config.example.edn (fallback for development, no secrets)
+   Neither present: the config is empty. `config.example.edn` is documentation
+   only and is never loaded, so its placeholder values never reach a service.
 
    Usage:
      (require '[dvergr.substrate.config :as cfg])
@@ -14,30 +15,39 @@
      (cfg/mail-account :datahike-contact)  ; get mail account config"
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
+            [clojure.string :as str]
             [dvergr.substrate.paths :as paths]
             [taoensso.telemere :as tel]))
 
 (def ^:private config-atom (atom nil))
 
-(defn- config-path []
-  (or (System/getenv "DVERGR_CONFIG")
-      (let [local (io/file "config.local.edn")]
-        (when (.exists local) (.getAbsolutePath local)))
-      (let [example (io/file "config.example.edn")]
-        (when (.exists example) (.getAbsolutePath example)))))
+(defn- getenv
+  "Environment lookup (a seam for tests)."
+  [k]
+  (System/getenv k))
+
+(defn- config-path
+  "The config file to load for project directory `dir`, or nil."
+  [dir]
+  (or (getenv "DVERGR_CONFIG")
+      (let [local (io/file dir "config.local.edn")]
+        (when (.exists local) (.getAbsolutePath local)))))
 
 (defn load-config
-  "Load config from disk. Returns the config map."
-  []
-  (if-let [path (config-path)]
-    (let [cfg (edn/read-string (slurp path))]
-      (reset! config-atom cfg)
-      (tel/log! {:level :info :id ::loaded :data {:path (str path)}} "Config loaded")
-      cfg)
-    (do
-      (tel/log! {:level :warn :id ::missing} "No config.local.edn found — using empty config")
-      (reset! config-atom {})
-      {})))
+  "Load config from disk (relative to `dir`, default the working directory).
+   Returns the config map; empty when no config file exists."
+  ([] (load-config (System/getProperty "user.dir")))
+  ([dir]
+   (if-let [path (config-path dir)]
+     (let [cfg (edn/read-string (slurp path))]
+       (reset! config-atom cfg)
+       (tel/log! {:level :info :id ::loaded :data {:path (str path)}} "Config loaded")
+       cfg)
+     (do
+       (tel/log! {:level :warn :id ::missing}
+                 "No config (DVERGR_CONFIG or ./config.local.edn) — using empty config")
+       (reset! config-atom {})
+       {}))))
 
 (defn config
   "Return current config map, loading from disk if not yet loaded."
@@ -48,17 +58,32 @@
 ;; Accessors
 ;; ============================================================================
 
+(defn- placeholder?
+  "True for a blank secret or an example placeholder such as
+   \"YOUR_TELEGRAM_BOT_TOKEN\" or \"ghp_YOUR_TOKEN_HERE\"."
+  [v]
+  (or (not (string? v)) (str/blank? v) (str/includes? v "YOUR_")))
+
+(defn- secret
+  "The configured secret at `path` unless it is a placeholder, else env `var`."
+  [path var]
+  (let [configured (get-in (config) path)
+        env        (getenv var)]
+    (cond
+      (not (placeholder? configured)) configured
+      (not (placeholder? env))        env)))
+
 (defn github-token
-  "GitHub API token. Checks config :github :token, then GITHUB_DVERGR_TOKEN env var."
+  "GitHub API token. Checks config :github :token, then GITHUB_DVERGR_TOKEN env var;
+   a placeholder value counts as unset."
   []
-  (or (get-in (config) [:github :token])
-      (System/getenv "GITHUB_DVERGR_TOKEN")))
+  (secret [:github :token] "GITHUB_DVERGR_TOKEN"))
 
 (defn telegram-token
-  "Telegram bot token."
+  "Telegram bot token. Checks config :telegram :token, then TELEGRAM_BOT_TOKEN env
+   var; a placeholder value (\"YOUR_TELEGRAM_BOT_TOKEN\") counts as unset."
   []
-  (or (get-in (config) [:telegram :token])
-      (System/getenv "TELEGRAM_BOT_TOKEN")))
+  (secret [:telegram :token] "TELEGRAM_BOT_TOKEN"))
 
 (defn mail-account
   "IMAP/SMTP config for a named mail account.
@@ -124,12 +149,14 @@
 
 (defn daemon-config
   "Build a daemon start! config map from the loaded config.
-   Merges telegram token, agent configs, allowed users, and defaults."
+   Merges telegram token, agent configs, the allowlist policy, and defaults.
+   Services start only when configured: no `:http` key, no web server."
   []
   (let [cfg (config)]
-    (cond-> {:agents       (agents-config)
-             :default-agent (default-agent)
-             :allowed-users (allowed-users)}
+    (cond-> {:agents            (agents-config)
+             :default-agent     (default-agent)
+             :allowed-users     (allowed-users)
+             :strict-allowlist? (boolean (:strict-allowlist? cfg))}
       (telegram-token) (assoc :telegram {:token (telegram-token)})
       (:http cfg)      (assoc :http (:http cfg))
       (:gc cfg)        (assoc :gc (:gc cfg))
