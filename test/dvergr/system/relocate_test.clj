@@ -146,7 +146,6 @@
                                                 (store-id path legacy)))]
                                 (start-room-home! a))]
         (is (empty? (filter #(.endsWith (.getName ^File %) ".id") (file-seq (io/file a "systems")))))
-        (store-ids/forget-all!)
         (move! a b)
         (open-moved-room b room-id)
         (testing "the ids derived from the original paths are recorded beside the stores"
@@ -163,7 +162,6 @@
       (dh/create-database cfg)
       (is (not= (store-ids/path-derived "" path) id))
       (is (.exists (store-ids/id-file path)))
-      (store-ids/forget-all!)
       (is (= id (store-ids/store-id path (constantly nil))) "read back after the cache is dropped")
       (finally (sdh/delete-database! cfg)))
     (is (not (.exists (store-ids/id-file path))) "deleting the store deletes its id")))
@@ -197,3 +195,51 @@
     (is (nil? (foreign-scope "/home/someone/drive/abc" sys)) "a drive path")
     (is (nil? (foreign-scope (str (io/file sys "abc")) sys)) "already here")
     (is (nil? (foreign-scope "abc" sys)) "not a path")))
+
+(deftest an-id-once-published-is-not-replaced
+  (let [path (str (tmp "race") "/db")
+        f (store-ids/id-file path)
+        first-id (random-uuid)]
+    (is (= first-id (#'store-ids/write-new! f first-id)))
+    (is (= first-id (#'store-ids/write-new! f (random-uuid))) "a second writer gets the published id")
+    (is (= first-id (store-ids/record! path (random-uuid))))
+    (is (= first-id (store-ids/store-id path (constantly nil))))))
+
+(deftest a-replaced-id-file-is-read-again
+  (let [path (str (tmp "replaced") "/db")
+        a (store-ids/store-id path (constantly nil))
+        b (random-uuid)]
+    (spit (store-ids/id-file path) (str b "\n"))
+    (is (not= a b))
+    (is (= b (store-ids/store-id path (constantly nil))) "another process replaced the store and its id")))
+
+(deftest a-failed-delete-keeps-the-id-of-the-store-that-is-left
+  (let [path (str (tmp "undeleted") "/db")
+        id (store-ids/store-id path (constantly nil))
+        cfg {:store {:backend :file :path path :id id}}]
+    (try
+      (dh/create-database cfg)
+      (with-redefs [dh/delete-database (fn [_] (throw (ex-info "disk busy" {})))]
+        (is (thrown? clojure.lang.ExceptionInfo (sdh/delete-database! cfg))))
+      (is (= id (store-ids/store-id path (constantly nil))))
+      (finally (sdh/delete-database! cfg)))))
+
+(deftest a-home-moved-before-it-kept-store-ids-says-what-to-do
+  ;; Every store as an older version made it: path-derived ids, no id files.
+  (let [prev-home (paths/home)
+        a (tmp "a")
+        b (tmp "b")]
+    (try
+      (with-redefs [store-ids/store-id (fn [path legacy] (legacy (str path)))]
+        (start-room-home! a))
+      (.delete (io/file a "home.edn"))
+      (is (empty? (filter #(.endsWith (.getName ^File %) ".id") (file-seq (io/file a)))))
+      (move! a b)
+      (paths/set-home! b)
+      (sdb/reset-conn!)
+      (is (= ::store-ids/identity-mismatch
+             (try (daemon/start! {:agents {}}) nil
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))
+      (finally
+        (sdb/reset-conn!)
+        (paths/set-home! prev-home)))))

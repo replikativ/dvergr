@@ -83,7 +83,7 @@
 (defn legacy-store-id
   "The id versions before store id files derived from a room store's `path`."
   [path]
-  (store-ids/path-derived "" path))
+  (store-ids/path-derived-default-charset path))
 
 (defn store-id
   "Konserve store id for a room store `path`: the id recorded beside the store

@@ -40,9 +40,11 @@
   "Delete the database `cfg` names and the id recorded beside it, so a store
    created again at the same path gets its own."
   [cfg]
-  (try (d/delete-database cfg)
-       (finally (when-let [path (get-in cfg [:store :path])]
-                  (store-ids/forget! path)))))
+  (d/delete-database cfg)
+  ;; only once the store is gone: a failed delete leaves a store that still
+  ;; needs its id
+  (when-let [path (get-in cfg [:store :path])]
+    (store-ids/forget! path)))
 
 (defn connect!
   "Connect to `cfg`, creating the database first when it doesn't exist.

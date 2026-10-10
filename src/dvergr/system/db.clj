@@ -121,7 +121,7 @@
 (defn- cfg []
   (let [path (paths/system-db-dir)]
     {:store {:backend :file :path path
-             :id (store-ids/store-id path (partial store-ids/path-derived ""))}
+             :id (store-ids/store-id path store-ids/path-derived-default-charset)}
      :schema-flexibility :write}))
 
 (defonce ^:private conn-atom (atom nil))
@@ -132,7 +132,9 @@
   (or @conn-atom
       (let [c (cfg)]
         (when-not (d/database-exists? c) (d/create-database c))
-        (let [conn (d/connect c)]
+        (let [conn (try (d/connect c)
+                        (catch clojure.lang.ExceptionInfo e
+                          (throw (store-ids/identity-mismatch-hint (get-in c [:store :path]) e))))]
           (d/transact conn (vec (concat schema actor-schema assignment-schema
                                         pricing-schema task-schema)))
           (reset! conn-atom conn)))))
@@ -202,7 +204,7 @@
   (if (= :repo type)
     {(.getCanonicalPath (io/file here "datahike"))
      (store-ids/path-derived "dvergr-geschichte:" (.getCanonicalPath (io/file scope)))}
-    {(str here) (store-ids/path-derived "" scope)}))
+    {(str here) (store-ids/path-derived-default-charset scope)}))
 
 (defn rehome-scopes!
   "Point every registered system whose scope is a store of another home's

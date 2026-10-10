@@ -21,7 +21,8 @@
    a copied home while its original exists."
   (:require [clojure.java.io :as io]
             [clojure.string :as str])
-  (:import [java.nio.file Files StandardCopyOption FileAlreadyExistsException]))
+  (:import [java.nio.channels FileChannel]
+           [java.nio.file Files FileAlreadyExistsException StandardOpenOption]))
 
 (defn id-file
   "The file holding the id of the store at `path`."
@@ -33,16 +34,27 @@
     (or (parse-uuid (str/trim (slurp f)))
         (throw (ex-info (str "Not a store id: " f) {:type ::malformed-id :file (str f)})))))
 
+(defn- fsync! [^java.nio.file.Path p]
+  (with-open [ch (FileChannel/open p (into-array [StandardOpenOption/READ]))]
+    (.force ch true)))
+
 (defn- write-new!
-  "Write `id` to `f` unless it exists; the id that is there afterwards."
+  "Publish `id` in `f` unless `f` exists, durably: the id that is there
+   afterwards. Exclusive across processes (a hard link fails when the name is
+   taken), and synced, file and directory, before it returns, so a store
+   created after it never outlives its id in a crash."
   [^java.io.File f id]
   (io/make-parents f)
-  (let [tmp (io/file (str f ".tmp-" (random-uuid)))]
-    (spit tmp (str id "\n"))
-    (try (Files/move (.toPath tmp) (.toPath f) (into-array [StandardCopyOption/ATOMIC_MOVE]))
-         id
-         (catch FileAlreadyExistsException _ (read-id f))
-         (finally (.delete tmp)))))
+  (let [target (.toPath f)
+        tmp (.toPath (io/file (str f ".tmp-" (random-uuid))))]
+    (try
+      (spit (.toFile tmp) (str id "\n"))
+      (fsync! tmp)
+      (try (Files/createLink target tmp)
+           (fsync! (.getParent target))
+           id
+           (catch FileAlreadyExistsException _ (read-id f)))
+      (finally (Files/deleteIfExists tmp)))))
 
 (defn store-exists?
   "Whether a store has been created at `path`: a non-empty directory."
@@ -50,53 +62,58 @@
   (let [f (io/file path)]
     (boolean (and (.isDirectory f) (seq (.list f))))))
 
-(defonce ^:private ids (atom {}))
+(defonce ^:private lock (Object.))
 
 (defn store-id
   "The id of the file store at `path`: the one recorded beside it, else, for a
    store an older version created, `(legacy path)`, else a fresh one. Recorded
-   before the store exists, so every config built for one store names one id."
+   before the store exists, so every config built for one store names one id.
+   Read from the file each time: another process may have replaced the store
+   and its id."
   [path legacy]
-  (let [path (str path)
-        ;; only while its file is there: a store deleted with its directory
-        ;; (not through `forget!`) gets a new id when it is created again
-        cached #(when (.exists (id-file path)) (get @ids path))]
-    (or (cached)
-        (locking ids
-          (or (cached)
-              (let [f (id-file path)
-                    id (or (read-id f)
-                           (write-new! f (if (store-exists? path) (legacy path) (random-uuid))))]
-                (swap! ids assoc path id)
-                id))))))
+  (let [f (id-file path)]
+    (or (read-id f)
+        (locking lock
+          (or (read-id f)
+              (write-new! f (if (store-exists? path) (legacy (str path)) (random-uuid))))))))
 
 (defn record!
   "Record `id` for the store at `path` when it has none (an older store whose
    id is known from elsewhere). The id recorded afterwards."
   [path id]
-  (let [path (str path)]
-    (locking ids
-      (let [id (or (read-id (id-file path)) (write-new! (id-file path) id))]
-        (swap! ids assoc path id)
-        id))))
+  (let [f (id-file path)]
+    (locking lock
+      (or (read-id f) (write-new! f id)))))
 
 (defn forget!
   "Remove the id of the store at `path`, after the store was deleted, so a store
    created again there gets its own."
   [path]
-  (let [path (str path)]
-    (locking ids
-      (.delete (id-file path))
-      (swap! ids dissoc path)
-      nil)))
-
-(defn forget-all!
-  "Drop the in-memory ids (tests: a store's id file is read again)."
-  []
-  (reset! ids {})
-  nil)
+  (locking lock
+    (Files/deleteIfExists (.toPath (id-file path)))
+    nil))
 
 (defn path-derived
-  "The id an older version derived from `prefix` and `path`."
+  "The id an older version derived from `prefix` and `path`, in UTF-8."
   [prefix path]
   (java.util.UUID/nameUUIDFromBytes (.getBytes (str prefix path) "UTF-8")))
+
+(defn path-derived-default-charset
+  "The id an older version derived from `path` in the JVM's default charset (room
+   stores and the system database did)."
+  [path]
+  (java.util.UUID/nameUUIDFromBytes (.getBytes (str path))))
+
+(defn identity-mismatch-hint
+  "`e`, or, when it is Datahike's store identity mismatch, an error that says
+   what it means here: the store at `path` was created with another id than
+   the one recorded beside it. For a store an older version created, that is a
+   home moved before a version that records store ids first opened it."
+  [path e]
+  (if (= :store-identity-mismatch (:type (ex-data e)))
+    (ex-info (str "The store at " path " was created with a different id than " (id-file path)
+                  " names. If this home was moved before a dvergr version that keeps store ids "
+                  "first opened it, open it once at its original place, then move it.")
+             {:type ::identity-mismatch :path (str path)}
+             e)
+    e))
