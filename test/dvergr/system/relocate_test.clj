@@ -183,6 +183,8 @@
     (try
       (dh/create-database cfg)
       (is (= legacy (store-ids/store-id path (partial store-ids/path-derived ""))))
+      (is (str/includes? (slurp (store-ids/id-file path)) "derived")
+          "marked as derived: the store has not confirmed it")
       (dh/release (dh/connect (assoc-in cfg [:store :id] (store-ids/store-id path (constantly nil)))))
       (finally (sdh/delete-database! cfg)))))
 
@@ -222,6 +224,10 @@
       (with-redefs [dh/delete-database (fn [_] (throw (ex-info "disk busy" {})))]
         (is (thrown? clojure.lang.ExceptionInfo (sdh/delete-database! cfg))))
       (is (= id (store-ids/store-id path (constantly nil))))
+      (testing "also when the backend fails to delete without saying so"
+        (with-redefs [dh/delete-database (constantly nil)]
+          (sdh/delete-database! cfg))
+        (is (= id (store-ids/store-id path (constantly nil)))))
       (finally (sdh/delete-database! cfg)))))
 
 (deftest a-home-moved-before-it-kept-store-ids-says-what-to-do
@@ -240,6 +246,13 @@
       (is (= ::store-ids/identity-mismatch
              (try (daemon/start! {:agents {}}) nil
                   (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))
+      (testing "moved back, it opens, as the error says"
+        (sdb/reset-conn!)
+        (move! b a)
+        (paths/set-home! a)
+        (let [d (daemon/start! {:agents {}})]
+          (try (is (contains? (notes (ops/resolve-room d "moved")) "written-in-a"))
+               (finally (daemon/stop! d)))))
       (finally
         (sdb/reset-conn!)
         (paths/set-home! prev-home)))))

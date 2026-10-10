@@ -29,32 +29,53 @@
   ^java.io.File [path]
   (io/file (str path ".id")))
 
-(defn- read-id [^java.io.File f]
+(defn- read-entry
+  "The id in `f` and whether it was derived from a path (not yet confirmed by
+   the store), or nil when there is no file."
+  [^java.io.File f]
   (when (.exists f)
-    (or (parse-uuid (str/trim (slurp f)))
-        (throw (ex-info (str "Not a store id: " f) {:type ::malformed-id :file (str f)})))))
+    (let [[id tag] (str/split (str/trim (slurp f)) #"\s+")]
+      (if-let [id (parse-uuid (str id))]
+        {:id id :derived? (= "derived" tag)}
+        (throw (ex-info (str "Not a store id: " f) {:type ::malformed-id :file (str f)}))))))
+
+(defn- read-id [f] (:id (read-entry f)))
 
 (defn- fsync! [^java.nio.file.Path p]
   (with-open [ch (FileChannel/open p (into-array [StandardOpenOption/READ]))]
     (.force ch true)))
 
+(defonce ^:private durable (atom #{}))
+
+(defn- durable!
+  "Make `f`'s directory entry durable (once per file in this process): every
+   id returned may be one a store is created with next."
+  [^java.io.File f]
+  (let [k (str f)]
+    (when-not (@durable k)
+      (fsync! (.toPath f))
+      (fsync! (.toPath (.getParentFile (.getAbsoluteFile f))))
+      (swap! durable conj k))))
+
 (defn- write-new!
   "Publish `id` in `f` unless `f` exists, durably: the id that is there
    afterwards. Exclusive across processes (a hard link fails when the name is
    taken), and synced, file and directory, before it returns, so a store
-   created after it never outlives its id in a crash."
-  [^java.io.File f id]
-  (io/make-parents f)
-  (let [target (.toPath f)
-        tmp (.toPath (io/file (str f ".tmp-" (random-uuid))))]
-    (try
-      (spit (.toFile tmp) (str id "\n"))
-      (fsync! tmp)
-      (try (Files/createLink target tmp)
-           (fsync! (.getParent target))
-           id
-           (catch FileAlreadyExistsException _ (read-id f)))
-      (finally (Files/deleteIfExists tmp)))))
+   created after it never outlives its id in a crash. `derived?` marks an id
+   derived from a path, which the store has not confirmed."
+  ([f id] (write-new! f id false))
+  ([^java.io.File f id derived?]
+   (io/make-parents f)
+   (let [target (.toPath f)
+         tmp (.toPath (io/file (str f ".tmp-" (random-uuid))))]
+     (try
+       (spit (.toFile tmp) (str id (when derived? " derived") "\n"))
+       (fsync! tmp)
+       (try (Files/createLink target tmp)
+            (catch FileAlreadyExistsException _ nil))
+       (durable! f)
+       (read-id f)
+       (finally (Files/deleteIfExists tmp))))))
 
 (defn store-exists?
   "Whether a store has been created at `path`: a non-empty directory."
@@ -72,10 +93,12 @@
    and its id."
   [path legacy]
   (let [f (id-file path)]
-    (or (read-id f)
+    (or (when-let [id (read-id f)] (durable! f) id)
         (locking lock
-          (or (read-id f)
-              (write-new! f (if (store-exists? path) (legacy (str path)) (random-uuid))))))))
+          (or (when-let [id (read-id f)] (durable! f) id)
+              (if (store-exists? path)
+                (write-new! f (legacy (str path)) true)
+                (write-new! f (random-uuid))))))))
 
 (defn record!
   "Record `id` for the store at `path` when it has none (an older store whose
@@ -83,7 +106,8 @@
   [path id]
   (let [f (id-file path)]
     (locking lock
-      (or (read-id f) (write-new! f id)))))
+      (or (when-let [id (read-id f)] (durable! f) id)
+          (write-new! f id true)))))
 
 (defn forget!
   "Remove the id of the store at `path`, after the store was deleted, so a store
@@ -91,6 +115,7 @@
   [path]
   (locking lock
     (Files/deleteIfExists (.toPath (id-file path)))
+    (swap! durable disj (str (id-file path)))
     nil))
 
 (defn path-derived
@@ -111,9 +136,15 @@
    home moved before a version that records store ids first opened it."
   [path e]
   (if (= :store-identity-mismatch (:type (ex-data e)))
-    (ex-info (str "The store at " path " was created with a different id than " (id-file path)
-                  " names. If this home was moved before a dvergr version that keeps store ids "
-                  "first opened it, open it once at its original place, then move it.")
-             {:type ::identity-mismatch :path (str path)}
-             e)
+    (do
+      ;; an id derived from a path that the store just refused is not its id:
+      ;; drop it, so the home opens again at its original place
+      (locking lock
+        (when (:derived? (read-entry (id-file path)))
+          (forget! path)))
+      (ex-info (str "The store at " path " was created with a different id than " (id-file path)
+                    " names. If this home was moved before a dvergr version that keeps store ids "
+                    "first opened it, open it once at its original place, then move it.")
+               {:type ::identity-mismatch :path (str path)}
+               e))
     e))

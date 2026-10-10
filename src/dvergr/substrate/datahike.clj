@@ -41,17 +41,22 @@
    created again at the same path gets its own."
   [cfg]
   (d/delete-database cfg)
-  ;; only once the store is gone: a failed delete leaves a store that still
-  ;; needs its id
+  ;; only once the store is gone (the file backend can fail to delete without
+  ;; saying so): a store that is left still needs its id
   (when-let [path (get-in cfg [:store :path])]
-    (store-ids/forget! path)))
+    (when-not (store-ids/store-exists? path)
+      (store-ids/forget! path))))
 
 (defn connect!
   "Connect to `cfg`, creating the database first when it doesn't exist.
    Plain create+connect — no schema, no registration. Returns the conn."
   [cfg]
   (when-not (d/database-exists? cfg) (d/create-database cfg))
-  (d/connect cfg))
+  (try (d/connect cfg)
+       (catch clojure.lang.ExceptionInfo e
+         (throw (if-let [path (get-in cfg [:store :path])]
+                  (store-ids/identity-mismatch-hint path e)
+                  e)))))
 
 (defn provision!
   "Provision a dvergr-shaped datahike DB. Idempotent — safe to call on every
