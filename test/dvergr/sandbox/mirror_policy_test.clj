@@ -95,13 +95,35 @@
   ;; `clojure.core.server` starts a host socket REPL; hato / http-kit are raw
   ;; HTTP clients that bypass the sandbox's SSRF guard and domain policy.
   (with-ctx
-    (deps/allow-added-lib-namespaces! '[clojure.main clojure.core.server
-                                        hato.client hato.middleware
-                                        org.httpkit.client org.httpkit.server])
-    (deps/set-namespace-allowlist! [".*"])
-    (doseq [ns- '[clojure.main clojure.core.server hato.client hato.middleware
-                  org.httpkit.client org.httpkit.server]]
-      (is (not (deps/namespace-mirrorable? ns-)) (str ns- " must never be mirrorable")))))
+    (let [nss '[clojure.main clojure.core.server clojure.tools.nrepl.server nrepl.server
+                clojure.tools.reader clojure.tools.reader.edn
+                hato.client hato.middleware org.httpkit.client org.httpkit.server
+                clj-http.client babashka.http-client babashka.pods babashka.deps
+                babashka.process]]
+      (deps/allow-added-lib-namespaces! nss)
+      (deps/set-namespace-allowlist! [".*"])
+      (doseq [ns- nss]
+        (is (not (deps/namespace-mirrorable? ns-)) (str ns- " must never be mirrorable"))))))
+
+(deftest only-named-pure-libraries-auto-approve
+  ;; An approved lib's namespaces become callable host code, so auto-approval
+  ;; names libraries; it does not admit whole groups.
+  (with-ctx
+    (doseq [c '[org.clojure/data.csv org.clojure/data.json org.clojure/math.combinatorics
+                cheshire/cheshire hiccup/hiccup metosin/malli]]
+      (is (= :approve (deps/allowlist-policy c {:spec {:mvn/version "1.0"}})) (str c)))
+    (doseq [c '[org.clojure/clojure org.clojure/tools.nrepl org.clojure/tools.reader
+                org.clojure/tools.deps org.clojure/data.csv.evil hato/hato http-kit/http-kit
+                babashka/babashka.pods babashka/process ring/ring-core nrepl/nrepl]]
+      (is (= :ask-human (deps/allowlist-policy c {:spec {:mvn/version "1.0"}})) (str c)))))
+
+(deftest launch-classpath-data-libraries-stay-requirable
+  ;; A lib the daemon already ships adds no jar, so add-libs grants nothing for
+  ;; it; the namespace allowlist is what makes such a lib requirable.
+  (doseq [ns- '[jsonista.core cheshire.core babashka.fs babashka.json]]
+    (is (deps/namespace-mirrorable? ns-) (str ns-)))
+  (doseq [ns- '[babashka.http-client babashka.pods babashka.deps babashka.process]]
+    (is (not (deps/namespace-mirrorable? ns-)) (str ns-))))
 
 (defn- probe-lib-dir!
   "A directory laid out like a library jar: one namespace of its own, and one
@@ -150,8 +172,9 @@
   (testing "a coord already on the classpath adds no jar, so records nothing"
     ;; The host add-libs returns nil for libs the basis already has.
     (with-ctx
+      (deps/install-policy! (fn [_ _] :approve)) ; as if a human approved it
       (with-redefs [clojure.repl.deps/add-libs (fn [_] nil)]
-        (deps/add-libs! nil '{org.clojure/clojure {:mvn/version "1.12.5"}}))
+        (is (= [] (:provenance (deps/add-libs! nil '{org.clojure/clojure {:mvn/version "1.12.5"}})))))
       (is (not (deps/namespace-mirrorable? 'clojure.main)))
       (is (not (deps/namespace-mirrorable? 'clojure.instant)))))
   (testing "a real new library: exactly the namespaces its jar newly provides"

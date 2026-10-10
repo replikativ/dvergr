@@ -26,6 +26,7 @@
             [clojure.repl.deps]
             [clojure.test :refer [deftest is testing]]
             [dvergr.sandbox :as sandbox]
+            [dvergr.sandbox.deps :as deps]
             [org.replikativ.spindel.engine.core :as rtc]
             [org.replikativ.spindel.engine.context :as ctx]
             [dvergr.sandbox.ns.io :as io]))
@@ -286,13 +287,24 @@
   [sci ec code]
   (= :reached (:ok (eval-in sci ec code))))
 
+(defn- approve-every-dep!
+  "Install an approve-everything deps policy on `ec` — as if a manager
+   approved each request. Auto-approval no longer covers these coords, and an
+   unapproved request would park waiting for a human."
+  [ec]
+  (binding [rtc/*execution-context* ec]
+    (deps/install-policy! (fn [_ _] :approve))))
+
 (deftest add-libs-cannot-open-host-eval-or-raw-http
   (with-sandbox
     (fn [sci ec]
-      (testing "an auto-approved coord already on the classpath opens nothing"
-        (eval-in sci ec "(require '[clojure.repl.deps :as deps])
-                         (try (deps/add-libs '{org.clojure/clojure {:mvn/version \"1.12.5\"}})
-                              (catch Exception _ nil))")
+      (approve-every-dep! ec)
+      (testing "an approved coord already on the classpath opens nothing"
+        (let [r (eval-in sci ec "(require '[clojure.repl.deps :as deps])
+                                 (deps/add-libs '{org.clojure/clojure {:mvn/version \"1.12.5\"}})")]
+          (is (= {:status :loaded :provenance []}
+                 (select-keys (:ok r) [:status :provenance]))
+              (str "the request itself succeeds: " (pr-str r))))
         (is (not (reaches? sci ec "(require 'clojure.main) :reached"))
             "clojure.main/main \"-e\" is host eval")
         (is (not (reaches? sci ec "(require 'clojure.core.server) :reached"))
@@ -300,8 +312,8 @@
         (is (not (reaches? sci ec "(require 'clojure.instant) :reached"))
             "the group segment `clojure` is not a namespace grant"))
       (testing "hato's coord does not mirror the raw HTTP client"
-        (eval-in sci ec "(try (clojure.repl.deps/add-libs '{hato/hato {:mvn/version \"1.0.0\"}})
-                              (catch Exception _ nil))")
+        (let [r (eval-in sci ec "(clojure.repl.deps/add-libs '{hato/hato {:mvn/version \"1.0.0\"}})")]
+          (is (= :loaded (get-in r [:ok :status])) (pr-str r)))
         (is (not (reaches? sci ec "(require 'hato.client) :reached"))
             "hato.client bypasses the SSRF guard and the domain policy")))))
 
@@ -310,9 +322,11 @@
                 (fn [_] (throw (ex-info "could not resolve" {})))]
     (with-sandbox
       (fn [sci ec]
-        (let [r (eval-in sci ec "(try (clojure.repl.deps/add-libs '{org.clojure/data.csv {:mvn/version \"9.9.9\"}})
+        (approve-every-dep! ec)
+        (let [r (eval-in sci ec "(try (clojure.repl.deps/add-libs '{org.clojure/clojure {:mvn/version \"9.9.9\"}})
                                       :loaded
                                       (catch Exception _ :failed))")]
           (is (= :failed (:ok r)) "the host failure reaches the agent"))
         (is (not (reaches? sci ec "(require 'clojure.main) :reached"))
-            "catching the failure must not leave a grant behind")))))
+            "catching the failure must not leave a grant behind")
+        (is (not (reaches? sci ec "(require 'clojure.instant) :reached")))))))

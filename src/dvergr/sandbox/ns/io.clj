@@ -279,7 +279,13 @@
         r              (fn [s] @(ns-resolve fs-ns s))
         base-canonical (-> (java.io.File. (str base-path)) .getCanonicalFile)
         ;; Path-clamp every user path: canonical check + sensitive-path guard.
-        sr             (fn [p] (let [ps (str p)] (sensitive-path-policy ps) (fs-safe-resolve base-canonical ps)))
+        ;; The policy is checked on the path as written AND on where it
+        ;; resolves: a symlink `alias -> .git` must not make `alias/config`
+        ;; writable.
+        sr             (fn [p] (let [ps (str p)]
+                                 (sensitive-path-policy ps)
+                                 (doto (fs-safe-resolve base-canonical ps)
+                                   (-> str sensitive-path-policy))))
         ;; Relativize a resolved (absolute) path back to a workspace-relative
         ;; string, so agents never see the real `.dvergr/systems/<uuid>/…`
         ;; location — and get paths they can pass straight back to fs/slurp
@@ -1051,6 +1057,13 @@
   (let [all-args (-> ["git"] (into git-safety-config) (into (map str args)))
         pb       (doto (ProcessBuilder. ^java.util.List all-args)
                    (.directory (java.io.File. (str base-path))))
+        ;; Attributes come from the empty tree, not the worktree's
+        ;; `.gitattributes`: an attribute selects a `clean`/`process` filter
+        ;; or a diff driver, which git runs as a command. (Git < 2.40 ignores
+        ;; the variable; the `.git` write block and the overrides above still
+        ;; hold there.)
+        _        (.put (.environment pb) "GIT_ATTR_SOURCE"
+                       "4b825dc642cb6eb9a060e54bf8d69288fbee4904")
         proc     (.start pb)
         out      (future (slurp (.getInputStream proc)))
         err      (future (slurp (.getErrorStream proc)))

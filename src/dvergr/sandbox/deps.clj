@@ -57,20 +57,19 @@
 ;; ============================================================================
 
 (def default-allowlist
-  "Group-id / lib coord patterns that auto-approve. These are common,
-   well-maintained Clojure libraries that an agent might reasonably
-   reach for in a coding session. Override per ctx via
+  "Lib coords that auto-approve: specific, pure data/format libraries, named
+   one by one. Not whole groups: an approved lib's namespaces become callable
+   host code, and a group such as `org.clojure/*` also holds a network REPL
+   (`tools.nrepl`), a reader that evaluates `#=` (`tools.reader`) and the
+   language itself. Anything else asks a human. Override per ctx via
    (set-allowlist! ctx patterns)."
-  ["^org\\.clojure/.*"
-   "^hiccup/.*"
-   "^http-kit/.*"
-   "^ring/.*"
-   "^metosin/.*"
-   "^cheshire/.*"
-   "^hato/.*"
-   "^babashka/.*"
-   "^clojure\\..*"
-   "^io\\.github\\.cognitect-labs/.*"])
+  ["^org\\.clojure/(data\\.(csv|json|xml|zip|priority-map|int-map|avl|finger-tree)|math\\.(combinatorics|numeric-tower)|core\\.(match|logic|cache|memoize|rrb-vector)|algo\\.generic|test\\.check)$"
+   "^hiccup/hiccup$"
+   "^cheshire/cheshire$"
+   "^metosin/(malli|jsonista)$"
+   "^(dev\\.weavejester|medley)/medley$"
+   "^camel-snake-kebab/camel-snake-kebab$"
+   "^clj-commons/clj-yaml$"])
 
 (defn- coord-matches-allowlist?
   "Does `coord` (a symbol like `'io.foo/bar`) match any pattern in
@@ -300,7 +299,10 @@
      - `konserve.*` / `kabel.*` — the store and wire layers underneath it."
   ["^cheshire($|\\..*)"
    "^hiccup($|\\..*)"
-   "^babashka($|\\..*)"
+   ;; Named, not `^babashka`: that prefix also holds the host process, HTTP,
+   ;; pod and deps APIs. `babashka.fs` itself is a pre-registered clamped shim.
+   "^babashka\\.(fs|json|cli)$"
+   "^jsonista($|\\..*)"
    "^medley($|\\..*)"
    "^camel-snake-kebab($|\\..*)"
    "^clj-yaml($|\\..*)"
@@ -332,10 +334,15 @@
    ;; `babashka.tasks` are NOT pre-registered (agents get gated `proc/*`
    ;; instead), so an innocuous `(require 'babashka.process)` would mirror the
    ;; RAW host API and hand back `sh`/`process` — a host shell as the daemon
-   ;; user. Hard-deny the process surfaces while keeping the prefix open for the
-   ;; data ones.
+   ;; user. Hard-deny the process surfaces (the allowlist now names the data
+   ;; ones instead of the prefix; this stays as a backstop for a wider one).
    "^babashka\\.process($|\\..*)"
    "^babashka\\.tasks($|\\..*)"
+   ;; Raw HTTP (the sandbox's own `babashka.http-client` is a registered,
+   ;; domain-gated shim), native pods, and spawning `clojure` processes.
+   "^babashka\\.http-client($|\\..*)"
+   "^babashka\\.pods($|\\..*)"
+   "^babashka\\.deps($|\\..*)"
    "^sci($|\\..*)"
    "^datahike\\.tx-preds($|\\..*)"
    "^dvergr($|\\..*)"
@@ -351,6 +358,11 @@
    ;; SSRF guard and domain policy (agents get the gated `http` namespace).
    "^clojure\\.main$"
    "^clojure\\.core\\.server$"
+   "^clojure\\.tools\\.nrepl($|\\..*)"
+   ;; `#=(...)` under the default `*read-eval*` evaluates on the host.
+   "^clojure\\.tools\\.reader($|\\..*)"
+   "^nrepl($|\\..*)"
+   "^cider($|\\..*)"
    "^hato($|\\..*)"
    "^org\\.httpkit($|\\..*)"
    "^clj-http($|\\..*)"

@@ -223,7 +223,10 @@
     (.setExecutable script true)
     (sh! dir "git" "config" "diff.external" (str script))
     (sh! dir "git" "config" "diff.probe.textconv" (str script))
-    (spit (java.io.File. dir ".gitattributes") "*.clj diff=probe\n")
+    (sh! dir "git" "config" "filter.probe.clean" (str script))
+    (sh! dir "git" "config" "filter.probe.process" (str script))
+    (spit (java.io.File. dir "src/b.txt") "filtered\n")
+    (spit (java.io.File. dir ".gitattributes") "*.clj diff=probe\n*.txt filter=probe\n")
     (let [hook (java.io.File. dir ".git/hooks/pre-commit")]
       (.mkdirs (.getParentFile hook))
       (spit hook (str "#!/bin/sh\ntouch " sentinel "\n"))
@@ -232,6 +235,8 @@
     (is (str/includes? (sci/eval-string* ctx "(git/diff)") "changed"))
     (is (str/includes? (sci/eval-string* ctx "(git/diff \"src/a.clj\")") "changed"))
     (sci/eval-string* ctx "(git/add \"src/a.clj\")")
+    (sci/eval-string* ctx "(git/add \"src/b.txt\")")
+    (is (map? (sci/eval-string* ctx "(git/status)")))
     (sci/eval-string* ctx "(git/commit \"probe\")")
     (is (not (.exists sentinel)) "no repository-supplied command ran")))
 
@@ -260,6 +265,13 @@
                   "(spit \"src/../.git/HEAD\" \"x\")"
                   "(spit \".git\" \"gitdir: /tmp/elsewhere\")"]]
       (is (thrown? Exception (sci/eval-string* ctx code)) code))
+    (testing "nor through a symlink to it"
+      (java.nio.file.Files/createSymbolicLink
+       (.toPath (java.io.File. dir "alias"))
+       (.toPath (java.io.File. dir ".git"))
+       (make-array java.nio.file.attribute.FileAttribute 0))
+      (is (thrown? Exception
+                   (sci/eval-string* ctx "(spit \"alias/config\" \"[diff]\\n external = /bin/true\\n\")"))))
     (is (not (str/includes? (slurp (java.io.File. dir ".git/config")) "/bin/true")))
     (testing "ordinary workspace writes still work"
       (is (some? (sci/eval-string* ctx "(spit \"src/b.clj\" \"(ns b)\")")))
