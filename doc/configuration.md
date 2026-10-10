@@ -25,8 +25,9 @@ empty: no Telegram (unless `TELEGRAM_BOT_TOKEN` is set), no web server.
 `config.example.edn` is documentation to copy from; dvergr never loads it.
 It's a single EDN map, gitignore it (it holds secrets). Every secret also has an
 **env fallback**, so you can keep tokens out of the file entirely. A configured
-secret that is blank or a placeholder (contains `YOUR_`, as in the example) counts
-as unset, so the env var is used.
+Telegram or GitHub token, or a `:secrets` `:config-path` value, that is blank or a
+placeholder (contains `YOUR_`, as in the example) counts as unset, so the env var
+is used.
 
 ### State root — `dvergr.substrate.paths`
 Priority: `(paths/set-home! …)` → `$DVERGR_HOME` → `./.dvergr`. Layout:

@@ -1151,12 +1151,15 @@
 ;; Inspection
 (defn start-from-config!
   "Start daemon using config.local.edn (or DVERGR_CONFIG env var path).
-   Convenience wrapper around start! for REPL and production use.
+   Convenience wrapper around start! for REPL and production use. Re-reads the
+   config file on every call, so a restart picks up an edited file (e.g. a
+   revoked Telegram user).
 
    (def d (start-from-config!))
    (daemon-status d)"
   ([] (start-from-config! nil))
   ([overrides]
+   (config/load-config)
    (start! (merge (config/daemon-config) overrides))))
 
 ;; ============================================================================

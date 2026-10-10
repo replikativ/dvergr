@@ -83,3 +83,24 @@
       (cfg/load-config dir)
       (is (false? (:strict-allowlist? (cfg/daemon-config)))
           "absent means the documented default: not strict"))))
+
+(deftest secret-specs-skip-placeholders
+  (let [dir (tmp-dir)]
+    (write-edn! dir "config.local.edn"
+                (assoc example
+                       :zulip {:email "bot@example.org" :api-key "YOUR_ZULIP_KEY"}
+                       :secrets [{:name "GITHUB_TOKEN" :config-path [:github :token]
+                                  :env "GITHUB_TOKEN"}
+                                 {:name "ZULIP_AUTH"
+                                  :basic-auth-config-paths [[:zulip :email] [:zulip :api-key]]}]))
+    (with-env {}
+      (cfg/load-config dir)
+      (let [[gh zulip] (cfg/secret-specs)]
+        (is (nil? (:value gh)) "a placeholder :config-path value leaves the :env source in charge")
+        (is (= ["bot@example.org" nil] (:basic-auth zulip)))))
+    (write-edn! dir "config.local.edn"
+                {:github {:token "ghp_real"}
+                 :secrets [{:name "GITHUB_TOKEN" :config-path [:github :token]}]})
+    (with-env {}
+      (cfg/load-config dir)
+      (is (= "ghp_real" (:value (first (cfg/secret-specs))))))))

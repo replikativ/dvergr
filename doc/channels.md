@@ -32,8 +32,9 @@ transcription, no file writes, no agent turn. Match by Telegram numeric `:id`
 (stable) or `:username`. An empty or absent `:allowed-users` allows everyone
 (only sensible for a private bot); the daemon then logs a `SECURITY` warning at
 start. Set `:strict-allowlist? true` to make an empty list deny everyone instead.
-The daemon installs both from config on every start, so removing a user from the
-config and restarting takes effect.
+The daemon installs both on every start, replacing the previous state, and
+`start-from-config!` (what `clojure -M:cli` uses) re-reads the config file, so
+removing a user from the config and restarting takes effect.
 
 ## What you can send
 

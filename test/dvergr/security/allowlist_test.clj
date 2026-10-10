@@ -57,3 +57,15 @@
     (al/configure! {:users [5]})
     (is (false? (al/open?)))
     (is (false? (al/allowed? {:id 6})))))
+
+(deftest configure-is-one-atomic-write
+  (testing "populated + open -> empty + strict never passes through an open state"
+    (al/configure! {:users [1]})
+    (let [policy @#'al/policy
+          seen   (atom [])]
+      (add-watch policy ::observe (fn [_ _ _ new] (swap! seen conj new)))
+      (try
+        (al/configure! {:users [] :strict? true})
+        (finally (remove-watch policy ::observe)))
+      (is (= [{:users #{} :strict? true}] @seen) "one write, straight to the new policy")
+      (is (false? (al/allowed? {:id 999}))))))

@@ -64,6 +64,11 @@
   [v]
   (or (not (string? v)) (str/blank? v) (str/includes? v "YOUR_")))
 
+(defn- real-secret
+  "`v` unless it is a placeholder, else nil."
+  [v]
+  (when-not (placeholder? v) v))
+
 (defn- secret
   "The configured secret at `path` unless it is a placeholder, else env `var`."
   [path var]
@@ -112,12 +117,13 @@
    existing config path, so creds stay in one place) or `:basic-auth-config-paths`
    `[[user-path] [pass-path]]` (pre-encodes Authorization: Basic for Basic-auth
    intakes). Here we resolve config-path sources → :value/:basic-auth (env is left
-   for the host-side registry builder). Empty by default."
+   for the host-side registry builder); a blank or placeholder config value
+   resolves to nil, so an accompanying `:env` source is used. Empty by default."
   []
   (mapv (fn [{:keys [config-path basic-auth-config-paths] :as spec}]
           (cond-> spec
-            config-path             (assoc :value (get-in (config) config-path))
-            basic-auth-config-paths (assoc :basic-auth (mapv #(get-in (config) %)
+            config-path             (assoc :value (real-secret (get-in (config) config-path)))
+            basic-auth-config-paths (assoc :basic-auth (mapv #(real-secret (get-in (config) %))
                                                              basic-auth-config-paths))))
         (get (config) :secrets [])))
 
