@@ -12,8 +12,8 @@
   (:require [clojure.java.io :as io]
             [jsonista.core :as j]
             [dvergr.agent.episode :as episode]
+            [dvergr.agent.grounds :as grounds]
             [dvergr.agent.program :as program]
-            [dvergr.artifact :as artifact]
             [dvergr.chat.context :as chat-context]))
 
 (defn- message [m]
@@ -22,14 +22,6 @@
     (:message/tool-uses m) (assoc :tool-uses (:message/tool-uses m))
     (:message/tool-use-id m) (assoc :tool-use-id (:message/tool-use-id m))
     (:message/turn-number m) (assoc :turn (:message/turn-number m))))
-
-(defn- effect-log [room ref]
-  (when ref
-    (let [store (or (some-> room :store :artifacts)
-                    (some-> room :store :conn artifact/datahike-store))]
-      (some-> store
-              (artifact/get-value (or (parse-uuid (str ref)) ref))
-              :dvergr/effect-log))))
 
 (defn- receipt [r]
   (-> (select-keys r [:effect :resource :decision :by :idempotency :digest :ms :error])
@@ -56,7 +48,7 @@
      :verifier-trust (some-> (:verifier-trust metrics) name)
      :spend-microdollars (get-in metrics [:spend :microdollars])
      :messages (mapv message messages)
-     :effects (mapv receipt (effect-log room (get-in metrics [:effects :log])))}))
+     :effects (mapv receipt (grounds/effect-log room (get-in metrics [:effects :log])))}))
 
 (defn trajectories
   "The trajectories of `room`'s certified Attempts, newest first; `opts` as

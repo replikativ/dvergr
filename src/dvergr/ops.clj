@@ -31,6 +31,7 @@
             [dvergr.agent.run :as run]
             [dvergr.agent.program :as program]
             [dvergr.agent.workflow :as workflow]
+            [dvergr.agent.grounds :as grounds]
             [dvergr.catalog :as catalog]
             [dvergr.catalog.casepack :as casepack]
             [dvergr.catalog.room :as room-wf]
@@ -421,15 +422,22 @@
 
 (defn- workflow-result
   "A workflow's rows as the data every binding shows: the attempts with their
-   worlds and reviews, the per-model table, and the room's wallet after."
+   worlds, reviews and grounds, the pairs that read the same external sources
+   (`:shared-sources`, indexing `:attempts`), the per-model table, and the room's wallet after."
   [daemon room task rows]
-  (let [attempts (mapv (fn [{:keys [attempt world review]}]
+  (let [gs (mapv #(grounds/grounds (grounds/attempt-receipts room (:attempt %))) rows)
+        attempts (mapv (fn [{:keys [attempt world review]} g]
                          (assoc (attempt-data attempt)
                                 :world (id->str world)
-                                :review review))
-                       rows)]
+                                :review review
+                                :grounds (grounds/summary g)))
+                       rows gs)
+        shared (grounds/shared-sources gs)]
     {:task task
      :attempts attempts
+     ;; Attempts that read the same external sources: their agreement is one
+     ;; source counted twice, not independent confirmation.
+     :shared-sources shared
      :by-model
      (->> attempts
           (group-by :model)
@@ -949,7 +957,8 @@
    :workflow/attempt
    {:doc (str "Run a task several times per model, each attempt on its own copy-on-write "
               "fork of the room (data, files, REPL), each with its own budget. Returns "
-              "every attempt's outcome, score, bill and diff, with the world to adopt: "
+              "every attempt's outcome, score, bill and diff, which attempts read the same external "
+              "sources (their agreement is not independent confirmation), with the world to adopt: "
               "room_merge one world, room_discard the others.")
     :kind :write
     :schema WorkflowArgs

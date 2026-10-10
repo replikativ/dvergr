@@ -79,6 +79,9 @@
           (is (= [{:model "claude-haiku-4-5" :attempts 2 :completed 2}]
                  (mapv #(select-keys % [:model :attempts :completed]) (:by-model out))))
           (is (pos? (:microdollars-per-completion (first (:by-model out)))))
+          (testing "each attempt shows its grounds; nothing was fetched, so nothing is shared"
+            (is (every? #(= {:external 0 :local 0} (:grounds %)) (:attempts out)))
+            (is (= [] (:shared-sources out))))
           (testing "adoption goes through the existing fork ops"
             (let [[a b] (map :world (:attempts out))]
               (is (= a (:merged (ops/invoke {:execution-ctx (:ctx room)} :room/merge {:room a}))))

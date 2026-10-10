@@ -676,6 +676,33 @@
                             keys [([]) "Every config key readable here, as names `env/get` accepts, including the names of injected secrets (whose values stay placeholders)."
                                   [:=> :cat [:vector :string]]]}))))
 
+(defn- sent-body
+  "The body a request sends: `:json` encoded, else `:body` as given. (The
+   transport sends no other body.)"
+  [{:keys [body json]}]
+  (if (some? json) (j/write-value-as-string json) body))
+
+(defn- body-digest
+  "A digest of the `body` a request sends, for its receipt: of its bytes as
+   transmitted (a string goes out as UTF-8); nil for none or a stream (read
+   once, by the transport)."
+  [body]
+  (cond
+    (nil? body) nil
+    (instance? java.io.InputStream body) nil
+    :else (let [^bytes bs (if (bytes? body) body (.getBytes (str body) "UTF-8"))
+                md (java.security.MessageDigest/getInstance "SHA-256")]
+            (apply str (map #(format "%02x" %) (take 12 (.digest md bs)))))))
+
+(defn- encoded-query
+  "`query-params` as the transport sends them: hato's own nesting
+   (`{:a {:b 1}}` is `a[b]=1`) and encoding (a vector is one parameter per
+   element)."
+  [query-params]
+  (let [nest (requiring-resolve 'hato.middleware/nest-params-request)
+        generate (requiring-resolve 'hato.middleware/generate-query-string)]
+    (generate (:query-params (nest {:query-params query-params})))))
+
 (defn add-http-ns!
   "Expose HTTP client as 'http namespace in SCI.
 
@@ -703,8 +730,8 @@
   [sci-ctx & {:keys [effects allowed-domains secrets fixture-transport]}]
   (let [domain-check (make-domain-policy allowed-domains)
         perform-request
-        (fn [{:keys [url method headers body json query-params timeout]
-              :or {method :get timeout 30000}}]
+        (fn [{:keys [url method headers json query-params timeout]
+              :or {method :get timeout 30000} :as request}]
           ;; The request is already receipted (do-request); a refused
           ;; domain is receipted with its error.
           (when domain-check (domain-check url))
@@ -717,9 +744,8 @@
                               :connect-timeout timeout
                               :socket-timeout timeout}
                        headers (assoc :headers headers)
-                       body (assoc :body body)
-                       json (-> (assoc :content-type :json
-                                       :body (j/write-value-as-string json))
+                       (some? (sent-body request)) (assoc :body (sent-body request))
+                       json (-> (assoc :content-type :json)
                                 (update :headers merge {"Content-Type" "application/json"}))
                        query-params (assoc :query-params query-params))
                 ;; Boundary secret injection: substitute placeholders → real values
@@ -743,7 +769,15 @@
                        (effects/perform!
                         effects
                         {:effect :http/request
-                         :resource {:method method :url (:url opts)}
+                         ;; the query names what was asked: two searches of one
+                         ;; endpoint are different sources
+                         :resource (cond-> {:method method :url (:url opts)}
+                                     (seq (:query-params opts))
+                                     (assoc :query (encoded-query (:query-params opts)))
+                                     ;; so does a request's body: two POSTed
+                                     ;; searches of one endpoint ask different things
+                                     (body-digest (sent-body opts))
+                                     (assoc :body-digest (body-digest (sent-body opts))))
                          ;; a request that sends data is egress, not only network
                          :class (when-not (#{:get :head} method) #{:egress})
                          :result-of :body}
