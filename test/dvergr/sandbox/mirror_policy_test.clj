@@ -115,7 +115,28 @@
     (spit own "(ns dvergr-probe-lib.core)\n(defn answer [] 42)\n")
     (.mkdirs (.getParentFile shadow))
     (spit shadow "(ns clojure.string)\n")
+    ;; A `.cljc` beside a namespace the host has as `.clj`/AOT but has not
+    ;; loaded: `require` would load the host's file, not this one.
+    (spit (java.io.File. dir "clojure/inspector.cljc") "(ns clojure.inspector)\n")
     dir))
+
+(deftest auto-approval-requires-a-maven-source
+  ;; The allowlist names libraries; a `:local/root` or `:git/url` spec loads
+  ;; whatever code sits there under that name, so it is not auto-approved.
+  (with-ctx
+    (is (= :approve (deps/allowlist-policy 'org.clojure/data.csv {:spec {:mvn/version "1.1.0"}})))
+    (is (= :approve (deps/allowlist-policy 'org.clojure/data.csv {})) "vector form = RELEASE")
+    (doseq [spec [{:local/root "/tmp/evil"}
+                  {:git/url "https://example.com/evil.git" :git/sha "abc"}
+                  {:mvn/version "1.1.0" :local/root "/tmp/evil"}
+                  {:mvn/version "1.1.0" :mvn/repos {"evil" {:url "https://example.com"}}}]]
+      (is (= :ask-human (deps/allowlist-policy 'org.clojure/data.csv {:spec spec})) (pr-str spec))))
+  (testing "add-libs! hands the policy the requested spec"
+    (with-ctx
+      (let [seen (atom nil)]
+        (deps/install-policy! (fn [coord ctx] (reset! seen [coord ctx]) {:deny "probe"}))
+        (is (thrown? Exception (deps/add-libs! nil '{org.clojure/probe {:local/root "/tmp/evil"}})))
+        (is (= '[org.clojure/probe {:spec {:local/root "/tmp/evil"}}] @seen))))))
 
 (deftest add-libs-records-provenance-only-after-a-successful-load
   (testing "a failed host load records nothing"

@@ -596,12 +596,20 @@
                      sensitive? #(try ((requiring-resolve 'dvergr.sandbox.ns.io/sensitive-path-policy) %)
                                       false
                                       (catch clojure.lang.ExceptionInfo _ true))
-                     lines (for [line (str/split-lines stdout)
-                                 :let [i (str/index-of line "\u0000")]
-                                 :when i
-                                 :let [path (subs line 0 i)]
-                                 :when (not (sensitive? path))]
-                             (str path ":" (subs line (inc i))))]
+                     ;; Each match is `<path> NUL <n>:<line> LF`. A file name may
+                     ;; itself contain LF (a line can't: it ends at LF, and a
+                     ;; file with NUL is binary and reported on stderr), so
+                     ;; take the name up to the NUL first, then the line.
+                     lines (loop [pos 0, acc []]
+                             (let [nul (str/index-of stdout "\u0000" pos)]
+                               (if-not nul
+                                 acc
+                                 (let [eol (or (str/index-of stdout "\n" nul) (count stdout))
+                                       path (subs stdout pos nul)]
+                                   (recur (inc eol)
+                                          (cond-> acc
+                                            (not (sensitive? path))
+                                            (conj (str path ":" (subs stdout (inc nul) eol)))))))))]
                  {:type :success
                   :content (if (seq lines)
                              (str/join "\n" lines)

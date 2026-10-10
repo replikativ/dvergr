@@ -53,10 +53,15 @@
    alternation becomes part of an alternative: when this was wrapped across
    three lines, `/etc/sudoers` and `~/.gcloud/` silently required a leading
    `\\n<spaces>` to match and so were never blocked at all — a dead branch that
-   read as covered. Keep it flat."
+   read as covered. Keep it flat.
+
+   `.git` is on it because a repository's config and hooks are host command
+   execution for whoever runs git there next (`diff.external`, a `clean`
+   filter, a `pre-commit` hook); a path through `.git` is never workspace
+   content."
   [path]
   (when (and path
-             (re-find #"(?i)(\.ssh[/\\]|\.gnupg[/\\]|/etc/shadow|/etc/passwd|/etc/sudoers|/proc/|/sys/|\.aws[/\\]|\.azure[/\\]|\.gcloud[/\\]|/run/secrets|\.env$|\.env\.)"
+             (re-find #"(?i)(\.ssh[/\\]|\.gnupg[/\\]|/etc/shadow|/etc/passwd|/etc/sudoers|/proc/|/sys/|\.aws[/\\]|\.azure[/\\]|\.gcloud[/\\]|/run/secrets|\.env$|\.env\.|(^|[/\\])\.git([/\\]|$))"
                       path))
     (throw (ex-info "Access denied: sensitive path" {:path path}))))
 
@@ -553,13 +558,17 @@
     "--ignore-space-change" "--no-color" "--no-renames" "-R"})
 
 (defn- workspace-pathspec!
-  "Refuse a diff path that leaves the workspace. With a physical `base-path`
-   the path (relative to it, or absolute) is canonicalised, so `..` and a
-   symlink out of the workspace are refused alike. In the virtual workspace a
-   leading `/` names the repository root and no path may climb above it."
+  "Refuse a diff path that leaves the workspace. Pathspec magic (`:(top)x`,
+   `:/x`) is refused outright — git resolves it against the repository root,
+   not the path as written. With a physical `base-path` the path (relative to
+   it, or absolute) is canonicalised, so `..` and a symlink out of the
+   workspace are refused alike. In the virtual workspace a leading `/` names
+   the repository root and no path may climb above it."
   [base-path path]
   (let [refuse! #(git-arg-refused! (str "git/diff path outside the workspace: " path)
                                    {:path path})]
+    (when (str/starts-with? path ":")
+      (git-arg-refused! (str "git/diff pathspec magic not allowed: " path) {:path path}))
     (if base-path
       (let [base (.getCanonicalFile (java.io.File. (str base-path)))
             f (java.io.File. (str path))
@@ -579,21 +588,28 @@
   "The argv for `(git/diff & args)`: allowlisted options, then `--`, then
    paths — so no argument is ever read as an option it was not checked as, and
    every path stays inside the workspace (`base-path`, or the virtual
-   workspace's root when nil). Operands are always paths, never revisions."
+   workspace's root when nil). Operands are always paths, never revisions; an
+   argument after a caller's own `--` is a path even if it starts with `-`.
+
+   On the host (`base-path` set) the diff also never runs an external diff or
+   textconv driver (repository config the agent may have written), and with no
+   paths it is limited to `base-path`, which can be a subdirectory of a larger
+   repository."
   [base-path args]
-  (let [args (map str args)
-        options (filter #(str/starts-with? % "-") args)
-        paths (remove #(or (= "--" %) (str/starts-with? % "-")) args)]
+  (let [[before after] (split-with #(not= "--" %) (map str args))
+        options (filter #(str/starts-with? % "-") before)
+        paths (concat (remove #(str/starts-with? % "-") before) (rest after))]
     (doseq [o options
-            :when (not= "--" o)
             :when (not (or (contains? git-diff-flags o) (re-matches #"-U\d{1,4}" o)))]
       (git-arg-refused! (str "git/diff option not allowed: " o
                              " (allowed: " (str/join " " (sort git-diff-flags)) " -U<n>)")
                         {:option o}))
     (-> ["diff"]
-        (into (remove #{"--"}) options)
+        (into (when base-path ["--no-ext-diff" "--no-textconv"]))
+        (into options)
         (conj "--")
-        (into (map #(workspace-pathspec! base-path %)) paths))))
+        (into (map #(workspace-pathspec! base-path %)) paths)
+        (cond-> (and base-path (empty? paths)) (conj ".")))))
 
 (defn add-git-ns!
   "Expose structured git operations as 'git namespace in SCI.
@@ -1019,10 +1035,20 @@
                       {:path user-path :base (str base-canonical)})))
     resolved))
 
+(def ^:private git-safety-config
+  "Config overrides for every host git call. The repository's own config is
+   writable from the workspace in physical mode; these keep it from turning a
+   `git/status` or `git/commit` into host command execution (hooks, the
+   fsmonitor hook, a signing program)."
+  ["-c" "core.hooksPath=/dev/null"
+   "-c" "core.fsmonitor=false"
+   "-c" "commit.gpgSign=false"
+   "-c" "log.showSignature=false"])
+
 (defn- git-run*
   "Run git in base-path. Returns stdout string or throws on non-zero exit."
   [base-path & args]
-  (let [all-args (into ["git"] (map str args))
+  (let [all-args (-> ["git"] (into git-safety-config) (into (map str args)))
         pb       (doto (ProcessBuilder. ^java.util.List all-args)
                    (.directory (java.io.File. (str base-path))))
         proc     (.start pb)

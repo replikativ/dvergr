@@ -186,12 +186,20 @@
       (is (not (.exists out)) "nothing was written outside the workspace"))
     (testing "paths outside the workspace are refused"
       (doseq [code ["(git/diff \"/etc/passwd\")" "(git/diff \"../../etc/passwd\")"
-                    "(git/diff \"--staged\" \"src/../../x\")"]]
+                    "(git/diff \"--staged\" \"src/../../x\")"
+                    ;; pathspec magic resolves against the repository root
+                    "(git/diff \":(top)outside.txt\")" "(git/diff \"--\" \":/x\")"]]
         (is (refused? eval! code) code)))
     (testing "arguments after the options are always paths"
-      (is (= ["diff" "--staged" "--stat" "--" "src/a.clj" "HEAD"]
+      (is (= ["diff" "--no-ext-diff" "--no-textconv" "--staged" "--stat" "--" "src/a.clj" "HEAD"]
              (diff-argv (str dir) ["--staged" "--stat" "src/a.clj" "HEAD"])))
-      (is (= ["diff" "--"] (diff-argv (str dir) []))))
+      (is (= ["diff" "--no-ext-diff" "--no-textconv" "--" "."] (diff-argv (str dir) []))
+          "with no paths, a host diff is limited to the workspace")
+      (is (= ["diff" "--no-ext-diff" "--no-textconv" "--stat" "--" "--name-only"]
+             (diff-argv (str dir) ["--stat" "--" "--name-only"]))
+          "after the caller's own --, a dash-led argument is a path")
+      (is (= ["diff" "--"] (diff-argv nil []))
+          "the virtual workspace gets the same shape without the host-only flags"))
     (testing "ordinary diffs keep working"
       (is (str/includes? (sci/eval-string* ctx "(git/diff)") "changed"))
       (is (str/includes? (sci/eval-string* ctx "(git/diff \"src/a.clj\")") "changed"))
@@ -202,6 +210,61 @@
       (is (refused? eval! (str "(git/log {:n \"-output=" out "\"})")))
       (is (not (.exists out)))
       (is (= 1 (count (sci/eval-string* ctx "(git/log {:n 1})")))))))
+
+(deftest physical-git-runs-no-repository-supplied-commands
+  ;; In physical mode the repository's config and hooks live in the workspace.
+  ;; Host git must not run an external diff, a textconv driver or a hook that
+  ;; someone put there.
+  (let [dir (git-repo!)
+        sentinel (java.io.File. (temp-dir! "dvergr-git-sentinel") "ran")
+        script (java.io.File. (temp-dir! "dvergr-git-script") "probe.sh")
+        ctx (sci/init {})]
+    (spit script (str "#!/bin/sh\ntouch " sentinel "\n"))
+    (.setExecutable script true)
+    (sh! dir "git" "config" "diff.external" (str script))
+    (sh! dir "git" "config" "diff.probe.textconv" (str script))
+    (spit (java.io.File. dir ".gitattributes") "*.clj diff=probe\n")
+    (let [hook (java.io.File. dir ".git/hooks/pre-commit")]
+      (.mkdirs (.getParentFile hook))
+      (spit hook (str "#!/bin/sh\ntouch " sentinel "\n"))
+      (.setExecutable hook true))
+    (io/add-git-ns! ctx :base-path (str dir))
+    (is (str/includes? (sci/eval-string* ctx "(git/diff)") "changed"))
+    (is (str/includes? (sci/eval-string* ctx "(git/diff \"src/a.clj\")") "changed"))
+    (sci/eval-string* ctx "(git/add \"src/a.clj\")")
+    (sci/eval-string* ctx "(git/commit \"probe\")")
+    (is (not (.exists sentinel)) "no repository-supplied command ran")))
+
+(deftest physical-git-diff-stays-in-a-nested-workspace
+  ;; A workspace can be a subdirectory of a larger repository; an argument-free
+  ;; diff must not show the rest of that repository.
+  (let [dir (git-repo!)
+        ctx (sci/init {})]
+    (spit (java.io.File. dir "outside.txt") "before\n")
+    (sh! dir "git" "add" "outside.txt")
+    (sh! dir "git" "-c" "commit.gpgsign=false" "commit" "-q" "-m" "outside")
+    (spit (java.io.File. dir "outside.txt") "after-outside\n")
+    (io/add-git-ns! ctx :base-path (str (java.io.File. dir "src")))
+    (let [d (sci/eval-string* ctx "(git/diff)")]
+      (is (str/includes? d "changed") "changes inside the workspace show")
+      (is (not (str/includes? d "after-outside")) "changes outside it do not"))))
+
+(deftest physical-fs-cannot-write-git-internals
+  ;; Writing `.git/config` or a hook is how a workspace turns the next host git
+  ;; call into command execution.
+  (let [dir (git-repo!)
+        ctx (sci/init {})]
+    (io/add-fs-ns! ctx :base-path (str dir))
+    (doseq [code ["(spit \".git/config\" \"[diff]\\n external = /bin/true\\n\")"
+                  "(spit \".git/hooks/pre-commit\" \"#!/bin/sh\")"
+                  "(spit \"src/../.git/HEAD\" \"x\")"
+                  "(spit \".git\" \"gitdir: /tmp/elsewhere\")"]]
+      (is (thrown? Exception (sci/eval-string* ctx code)) code))
+    (is (not (str/includes? (slurp (java.io.File. dir ".git/config")) "/bin/true")))
+    (testing "ordinary workspace writes still work"
+      (is (some? (sci/eval-string* ctx "(spit \"src/b.clj\" \"(ns b)\")")))
+      (is (nil? (io/sensitive-path-policy ".github/workflows/x.yml")))
+      (is (nil? (io/sensitive-path-policy "vendor/lib.git.bak"))))))
 
 (deftest physical-grep-is-confined
   ;; The host-grep branch of the `grep` tool (no virtual filesystem) passed the
@@ -224,6 +287,11 @@
         (let [{:keys [content]} (run {:pattern "--help"})]
           (is (str/includes? content "src/a.txt:2:use --help for help") content)
           (is (not (str/includes? content "Usage")) content)))
+      (testing "a file name with a line break cannot smuggle a sensitive match out"
+        (let [d (java.io.File. dir ".ssh/x\ninnocent")]
+          (when (try (spit d "SECRET in a newline name\n") true (catch Exception _ false))
+            (let [{:keys [content]} (run {:pattern "newline name"})]
+              (is (not (str/includes? content "SECRET in a newline name")) content)))))
       (testing "-i and glob still apply"
         (is (str/includes? (:content (run {:pattern "secret" :-i true :glob "*.txt"})) "src/a.txt:1:"))
         (is (= "No matches found" (:content (run {:pattern "SECRET" :glob "*.md"}))))))))

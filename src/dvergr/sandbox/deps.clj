@@ -21,6 +21,9 @@
 
        (fn [coord ctx] → :approve | {:deny <string>} | :ask-human)
 
+   where `ctx` carries the requested `:spec` (`{:mvn/version …}`,
+   `{:git/url …}`, …) — a policy must judge the source, not only the name.
+
    `:ask-human` is the asynchronous escape hatch: the request is
    parked on a clojure.core/promise, posted to the peer-bus, and the
    call blocks until a human / manager calls `decide!` to resolve it.
@@ -79,12 +82,25 @@
                  (catch Throwable _ nil)))
           patterns)))
 
+(defn- maven-release-spec?
+  "Is `spec` a plain Maven coordinate — resolved from the basis's configured
+   repositories, nothing the agent points elsewhere? A `:local/root` or
+   `:git/url` spec loads whatever code sits there under any lib name, so the
+   name allowlist says nothing about it. nil is the vector form (`RELEASE`)."
+  [spec]
+  (or (nil? spec)
+      (and (map? spec)
+           (string? (:mvn/version spec))
+           (every? #{:mvn/version :exclusions} (keys spec)))))
+
 (defn allowlist-policy
   "A policy that auto-approves coords matching the ctx's allowlist
-   (default: `default-allowlist`); anything else returns :ask-human."
-  [coord _ctx]
+   (default: `default-allowlist`) when the requested source is a plain Maven
+   version (`ctx`'s `:spec`); anything else returns :ask-human."
+  [coord ctx]
   (let [patterns (or (ec/get-state ALLOWLIST-KEY) default-allowlist)]
-    (if (coord-matches-allowlist? coord patterns)
+    (if (and (maven-release-spec? (:spec ctx))
+             (coord-matches-allowlist? coord patterns))
       :approve
       :ask-human)))
 
@@ -185,12 +201,13 @@
    fork-safe via ec-state and lets spin code observe / compose with
    the request if needed. We bridge to a thread-blocking read via
    `await-on-thread`."
-  [coord _ctx]
+  [coord policy-ctx]
   (let [ctx        (ec/current-execution-context)
         request-id (str (random-uuid))
         d          (sync/create-deferred ctx)
         req        {:id           request-id
                     :coord        coord
+                    :spec         (:spec policy-ctx)
                     :requested-at (java.util.Date.)
                     :deferred     d
                     :ctx          ctx}]
@@ -201,7 +218,8 @@
     (try
       (peer-bus/post! {:type      :dvergr/dep-approval-requested
                        :request-id request-id
-                       :coord     coord})
+                       :coord     coord
+                       :spec      (:spec policy-ctx)})
       (catch Throwable _))
     (await-on-thread ctx d)))
 
@@ -384,7 +402,7 @@
       (symbol (-> base (str/replace "/" ".") (str/replace "_" "-"))))))
 
 (defn- root-entries
-  "`[entry-name url-of-entry-in-this-root]` for every file under `root`."
+  "Every file name under `root` (a jar or a directory), `/`-separated."
   [root]
   (let [f (io/file root)]
     (cond
@@ -392,30 +410,53 @@
       (let [base (.toPath f)]
         (for [^java.io.File file (file-seq f)
               :when (.isFile file)]
-          [(str/replace (str (.relativize base (.toPath file))) java.io.File/separator "/")
-           (str (.toURL (.toURI file)))]))
+          (str/replace (str (.relativize base (.toPath file))) java.io.File/separator "/")))
 
       (.isFile f)
       (with-open [jar (java.util.jar.JarFile. f)]
-        (let [prefix (str "jar:" (.toURL (.toURI f)) "!/")]
-          (doall (for [^java.util.jar.JarEntry e (enumeration-seq (.entries jar))
-                       :when (not (.isDirectory e))]
-                   [(.getName e) (str prefix (.getName e))])))))))
+        (doall (for [^java.util.jar.JarEntry e (enumeration-seq (.entries jar))
+                     :when (not (.isDirectory e))]
+                 (.getName e)))))))
+
+(defn- root-url-prefix
+  "The prefix every resource URL the class loader serves from `root` starts
+   with."
+  [root]
+  (let [f (io/file root)]
+    (if (.isDirectory f)
+      (str (.toURL (.toURI f)))
+      (str "jar:" (.toURL (.toURI f)) "!/"))))
 
 (defn namespaces-provided
   "Namespaces that the roots in `paths` NEWLY provide: a namespace counts only
-   when it is not loaded yet and the class loader resolves its file to this
-   root. A jar that also ships `clojure/main.clj` (or anything else the host
-   already has earlier on the classpath) does not provide it."
+   when it is not loaded yet and every file `require` could load it from — the
+   AOT `__init.class`, the `.clj`, the `.cljc` — resolves, through the class
+   loader, to this root. A jar that also ships `clojure/main.clj`, or a `.cljc`
+   beside a host `.clj` or AOT class, does not provide that namespace."
   [paths]
   (let [loader (clojure.lang.RT/baseLoader)]
     (into #{}
-          (keep (fn [[entry url]]
-                  (when-let [ns-sym (path->ns entry)]
-                    (when (and (not (find-ns ns-sym))
-                               (= url (some-> (.getResource loader entry) str)))
-                      ns-sym))))
-          (mapcat root-entries paths))))
+          (mapcat
+           (fn [root]
+             (let [prefix (root-url-prefix root)]
+               (keep (fn [entry]
+                       (when-let [ns-sym (path->ns entry)]
+                         (let [base (str/replace entry #"(__init\.class|\.cljc?)$" "")
+                               urls (keep #(some-> (.getResource loader (str base %)) str)
+                                          ["__init.class" ".clj" ".cljc"])]
+                           (when (and (not (find-ns ns-sym))
+                                      (seq urls)
+                                      (every? #(str/starts-with? % prefix) urls))
+                             ns-sym))))
+                     (root-entries root)))))
+          paths)))
+
+(defonce ^:private runtime-lib-namespaces
+  ;; lib → the namespaces its jars newly provided when an `add-libs!` first put
+  ;; it on the classpath (JVM-wide, like the classpath itself). A later request
+  ;; for the same lib, from any context, adds no jar, so this is where its
+  ;; grant comes from. Libs of the launch basis are never here.
+  (atom {}))
 
 (defn- policy-state
   "Read a policy key, falling back to `default` when no execution context is
@@ -622,7 +663,8 @@
                                           {:type :dvergr/deps-arg})))
         coords        (libs->coords libs)
         ;; Check every coord; first denial wins
-        decisions     (mapv (fn [c] [c (check-coord! c {})]) coords)
+        decisions     (mapv (fn [c] [c (check-coord! c {:spec (when (map? libs) (get libs c))})])
+                            coords)
         denials       (filter (fn [[_ d]] (map? d)) decisions)]
     (cond
       (seq denials)
@@ -648,11 +690,14 @@
                                      (into {} (for [c coords] [c {:mvn/version "RELEASE"}])))))
             ;; Only now, after the load succeeded, is the agent entitled to
             ;; require what it asked for: the namespaces the requested libs'
-            ;; new jars provide (transitive deps load on the host as needed,
-            ;; but are not mirrored on their own).
-            requested (set coords)
-            provided (namespaces-provided
-                      (mapcat lib-paths (filter requested added)))]
+            ;; jars newly provided when add-libs (this call, or an earlier one
+            ;; in any context) put them on the classpath. Transitive deps are
+            ;; recorded too, so a later request for one of them is granted,
+            ;; but they are not mirrored unless requested.
+            _ (doseq [lib added]
+                (swap! runtime-lib-namespaces assoc lib
+                       (namespaces-provided (lib-paths lib))))
+            provided (into #{} (mapcat #(get @runtime-lib-namespaces %)) coords)]
         (allow-added-lib-namespaces! provided)
         (tel/log! {:id :sandbox.deps/approved
                    :data {:coords coords :added (vec added) :namespaces provided}}
