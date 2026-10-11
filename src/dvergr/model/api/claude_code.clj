@@ -49,6 +49,12 @@
 
 (defn settings-snapshot [] @settings)
 
+(defn restore-settings!
+  "Put back settings `settings-snapshot` took: what was configured since is
+   gone, not merged (`configure!` merges)."
+  [snapshot]
+  (reset! settings snapshot))
+
 (defn token-env
   "CLI environment for an isolated, token-authenticated CLI: an empty config
    directory (no stored account profile, hence no injected account email) and

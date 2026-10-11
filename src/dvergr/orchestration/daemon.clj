@@ -770,6 +770,9 @@
                        :description \"Default greeting agent\"}}
      :default-agent :var  ;; which agent handles new sessions
      :claude-code {:token-file \"…\" :cli \"…\"}  ;; see `configure-claude-code!`
+     :headless? true  ;; only the `:agents` given: no durable, autostart or
+                      ;; room-member agents are brought online (an
+                      ;; experiment's home, `runner/open-home!`)
 
    Returns Daemon record."
   [config]
@@ -924,7 +927,7 @@
     ;; membership) would be lost on every restart even though the actor row
     ;; persists. Build each one's config from its row (actor-row-first), skip
     ;; retired and already-configured ids.
-    (when-let [conn (daemon-sys-conn)]
+    (when-let [conn (when-not (:headless? config) (daemon-sys-conn))]
       (doseq [a (actors/list-actors conn :kind :agent)
               :let [aid (:id a)]
               :when (and (not (get-in config [:agents aid]))
@@ -946,7 +949,7 @@
             durable?  (fn [aid] (when conn
                                   (some-> (actors/lookup conn aid)
                                           :status (not= :retired))))]
-        (doseq [[aid cfg] (defs/autostart-agents)
+        (doseq [[aid cfg] (when-not (:headless? config) (defs/autostart-agents))
                 :when (and (not (get-in config [:agents aid]))
                            (not (durable? aid)))]
           (let [cfg (cond-> cfg
@@ -964,7 +967,7 @@
     ;; online, re-join each room's durable members — `join-agent-to-room!` is
     ;; idempotent, so this composes with the config/:rooms joins. (dvergr #12)
     (binding [rtc/*execution-context* exec-ctx]
-      (doseq [{:room/keys [slug agent-ids]} (sdb/all-rooms)
+      (doseq [{:room/keys [slug agent-ids]} (when-not (:headless? config) (sdb/all-rooms))
               :when (seq agent-ids)
               :let  [room (rreg/lookup (rstore/slug->room-id slug))]
               :when room
@@ -1161,6 +1164,19 @@
   (reset! current-daemon nil)
   (tel/log! {:id :daemon/stopped} "Daemon stopped")
   :stopped)
+
+(defn abort-start!
+  "Undo what a `start!` that threw had begun, with no daemon to `stop!`: the
+   GC loop, the default context's registration, the room contexts and their
+   stores. Best-effort; for a host that retries in the same process
+   (`runner/open-home!`)."
+  []
+  (stop-gc-loop!)
+  (try (mail/stop-sync!) (catch Throwable _ nil))
+  (try (sdist/unregister-context! :default) (catch Throwable _ nil))
+  (srooms/release-room-stores!)
+  (reset! current-daemon nil)
+  :aborted)
 
 ;; ============================================================================
 ;; Inspection

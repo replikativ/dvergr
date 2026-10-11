@@ -280,21 +280,30 @@
                          ":daemon, or run-in), not in a home of its own")
                     {:type ::daemon-running :dir (str dir)})))
   (let [prev @@#'paths/home-atom
-        mcp-before? (mcp-running?)]
+        mcp-before? (mcp-running?)
+        ;; the home's daemon configures Claude Code process-wide
+        cc-before (cc/settings-snapshot)
+        back! (fn []
+                (sdb/reset-conn!)
+                (paths/set-home! prev)
+                (cc/restore-settings! cc-before))]
     (paths/set-home! (.getCanonicalPath (io/file dir)))
     (sdb/reset-conn!)
     (try
-      {:dir (str dir) :prev-home prev :mcp-before? mcp-before?
-       :daemon ((requiring-resolve 'dvergr.orchestration.daemon/start!) {:agents {}})}
+      {:dir (str dir) :prev-home prev :mcp-before? mcp-before? :cc-before cc-before
+       :daemon ((requiring-resolve 'dvergr.orchestration.daemon/start!) {:agents {} :headless? true})}
       (catch Throwable t
-        (sdb/reset-conn!)
-        (paths/set-home! prev)
+        ;; a start that failed halfway returned no daemon to stop: undo what
+        ;; it began (the GC loop, the room contexts and their stores)
+        (try ((requiring-resolve 'dvergr.orchestration.daemon/abort-start!)) (catch Throwable _ nil))
+        (back!)
         (throw t)))))
 
 (defn close-home!
   "Stop the daemon `open-home!` started (and the MCP server a candidate
-   started) and give the process back the home it had."
-  [{:keys [daemon prev-home mcp-before?]}]
+   started) and give the process back the home and Claude Code settings it
+   had."
+  [{:keys [daemon prev-home mcp-before? cc-before]}]
   (try
     (when daemon ((requiring-resolve 'dvergr.orchestration.daemon/stop!) daemon))
     (finally
@@ -302,7 +311,8 @@
              ((requiring-resolve 'dvergr.mcp.server/stop!)))
            (catch Throwable _ nil))
       (sdb/reset-conn!)
-      (paths/set-home! prev-home))))
+      (paths/set-home! prev-home)
+      (when cc-before (cc/restore-settings! cc-before)))))
 
 (defn with-home
   "`(f daemon)` with `dir` as the home (`open-home!`), closed whatever happens."
@@ -515,7 +525,7 @@
                              nil)))})))
       (finally
         (try (evaluation/await-cleanups-for! room cleanup-group) (catch Throwable _ nil))
-        (cc/configure! cc-before)))))
+        (cc/restore-settings! cc-before)))))
 
 (defn run!
   "Run (or resume) an experiment. Returns `{:dir :room :experiment-room
@@ -569,7 +579,4 @@
   [{:keys [dir daemon] :as opts}]
   (if daemon
     (run-on daemon opts)
-    (let [cc-before (cc/settings-snapshot)]
-      (try (with-home dir #(run-on % opts))
-           ;; the home's daemon configures Claude Code too
-           (finally (cc/configure! cc-before))))))
+    (with-home dir #(run-on % opts))))

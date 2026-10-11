@@ -10,8 +10,12 @@
             [dvergr.catalog.wiki :as wiki]
             [dvergr.chat.agent :as chat-agent]
             [dvergr.mcp.server :as mcp]
+            [dvergr.model.api.claude-code :as cc]
             [dvergr.model.chat :as model-chat]
             [dvergr.model.providers :as providers]
+            [dvergr.discourse.definitions]
+            [dvergr.actors]
+            [dvergr.rooms]
             [dvergr.ops :as ops]
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.substrate.paths :as paths]))
@@ -108,3 +112,33 @@
           (daemon/stop! d)
           (dvergr.system.db/reset-conn!)
           (paths/set-home! prev))))))
+
+(deftest a-home-s-daemon-brings-no-agent-online
+  ;; neither a durable agent of the home nor a vetted autostart file of the
+  ;; user's or the project's
+  (let [created (atom [])]
+    (with-redefs [daemon/create-agent! (fn [_ cfg] (swap! created conj (:id cfg)) nil)
+                  dvergr.discourse.definitions/autostart-agents (constantly {:autostarter {:id :autostarter :rooms ["*"]}})
+                  dvergr.actors/list-actors (fn [& _] [{:id :durable-one :kind :agent :status :active}])]
+      (runner/with-home (tmp) (fn [_] nil)))
+    (is (= [] @created))))
+
+(deftest a-start-that-fails-halfway-is-undone
+  (let [prev (paths/home)
+        dir (tmp)]
+    (with-redefs [dvergr.rooms/hydrate-registry! (fn [_] (throw (ex-info "hydration broke" {})))]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"hydration broke" (runner/open-home! dir))))
+    (is (nil? @daemon/current-daemon))
+    (is (= prev (paths/home)))
+    (testing "and the home opens afterwards"
+      (is (= :opened (runner/with-home dir (fn [d] (when (some? d) :opened))))))))
+
+(deftest claude-code-settings-come-back-with-the-home
+  (let [before (cc/settings-snapshot)]
+    (with-redefs-fn {#'daemon/configure-claude-code!
+                     (fn [_] (cc/configure! {:env {"CLAUDE_CONFIG_DIR" "/elsewhere"} :system-note "the home's"}))}
+      (fn []
+        (runner/with-home (tmp) (fn [_] (is (= "the home's" (:system-note (cc/settings-snapshot))))))
+        (is (= before (cc/settings-snapshot)))
+        (is (thrown? Exception (runner/with-home (tmp) (fn [_] (throw (ex-info "x" {}))))))
+        (is (= before (cc/settings-snapshot)))))))

@@ -1130,6 +1130,9 @@
              [:repetitions {:optional true} [:int {:min 1 :max 10 :description "attempts per model (default 1)"}]]
              [:experiment {:optional true} [:string {:description "a name for the experiment, kept: benchmarking again with the same name, workflow and models into the same room resumes it (cells with a verdict are kept, faulted ones run again); default a new one"}]]
              [:cases {:optional true} [:int {:min 1 :description "a dataset workflow's first N cases of a fixed shuffle (default all)"}]]
+             [:parallelism {:optional true} [:int {:min 1 :max 16 :description "attempts at a time (default 1)"}]]
+             [:params {:optional true} [:map-of {:description "a room workflow's task parameters, over its workflow.edn :params"} :keyword :any]]
+             [:prompt {:optional true} [:string {:description "the candidates' system prompt (default the workflow's)"}]]
              [:budget-dollars {:optional true} [:double {:description "budget per attempt in USD (default 0.50)"}]]
              [:timeout-ms {:optional true} [:int {:description "per attempt (default 10 minutes)"}]]]
     :impl (fn [daemon {:keys [workflow models repetitions room] :as args}]
@@ -1150,7 +1153,7 @@
                   _ (when (and (:experiment args) (not (re-matches #"[a-z0-9][a-z0-9-]{0,63}" (:experiment args))))
                       (op-error! (str "An experiment name is lowercase letters, digits and dashes: " (:experiment args))
                                  ::invalid-experiment 400 {:experiment (:experiment args)}))
-                  plan (plan-fn (cond-> (select-keys args [:models :budget-dollars :timeout-ms :cases])
+                  plan (plan-fn (cond-> (select-keys args [:models :budget-dollars :timeout-ms :cases :params :prompt])
                                   (:environments args) (assoc :n (:environments args))
                                   (:split args) (assoc :split (keyword (:split args)))
                                   (:scale args) (assoc :scale (:scale args))
@@ -1164,7 +1167,8 @@
                                                     :repetitions (or repetitions 1)))
                   ;; no new cell once the run has taken its share of a
                   ;; subscription window (the user's own quota)
-                  plan (assoc plan :admit (runner/admit-for models))]
+                  plan (cond-> (assoc plan :admit (runner/admit-for models))
+                         (:parallelism args) (assoc :parallelism (:parallelism args)))]
               (-> (in-ctx daemon
                           (if control
                             ;; The records in `control`, the worlds forked from `r`.

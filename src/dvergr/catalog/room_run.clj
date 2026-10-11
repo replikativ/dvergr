@@ -116,16 +116,25 @@
    (created once), the bundle written into its workspace, `catalog_benchmark`
    into that room as the experiment <name> (so running again resumes it),
    once more when cells faulted (`:fault-retries`, default 1), and the report
-   from `experiment_report`. With `:check?`, only `catalog_calibrate`.
+   from `experiment_report`. `:parallelism`, `:params` and `:prompt` go to
+   `catalog_benchmark`; `:judge-fn` and `:tier` cannot cross an op and are
+   refused. With `:check?`, only `catalog_calibrate`.
    Returns `{:home :room :job :experiment :scorecard (the Scorecard) :failed-cells
    :report (Markdown)}`, or `{:home :room :calibration}`."
-  [{:keys [name files] :as b} {:keys [home models repetitions budget-dollars timeout-ms cases check? fault-retries]
+  [{:keys [name files] :as b} {:keys [home models repetitions budget-dollars timeout-ms cases check? fault-retries
+                                      parallelism params prompt]
                                :or {fault-retries 1} :as opts}]
   (when-not (re-matches #"[a-z0-9][a-z0-9-]*" (str name))
     (throw (ex-info (str "A bundle's name (its directory's) is lowercase letters, digits and dashes: " name)
                     {:type ::invalid-name :name name})))
   (when-not files
     (throw (ex-info "The bundle has no :files (read it with read-dir or bundle)" {:type ::no-files})))
+  ;; what crosses the op is data: a function, or trust granted by the
+  ;; caller, cannot
+  (when-let [unsupported (seq (filter #(contains? opts %) [:judge-fn :tier]))]
+    (throw (ex-info (str "Not through catalog_benchmark: " (vec unsupported)
+                         " (promote the bundle for its tier; a judge is the bundle's :judge model)")
+                    {:type ::unsupported-options :options (vec unsupported)})))
   (runner/with-home home
     (fn [daemon]
       (when-not (ops/resolve-room daemon name)
@@ -138,7 +147,10 @@
                             :repetitions (or repetitions 1)}
                      budget-dollars (assoc :budget-dollars (double budget-dollars))
                      timeout-ms (assoc :timeout-ms timeout-ms)
-                     cases (assoc :cases cases))
+                     cases (assoc :cases cases)
+                     parallelism (assoc :parallelism parallelism)
+                     params (assoc :params params)
+                     prompt (assoc :prompt prompt))
               report-of #(ops/invoke daemon :experiment/report
                                      {:room name :title (get-in b [:definition :title]) :experiment %})
               [done exp-id report]

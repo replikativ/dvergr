@@ -119,3 +119,23 @@
                           (room-run/benchmark! (room-wf/bundle "competitors" room-test/files)
                                                {:home home :models ["claude-haiku-4-5"]})))
     (is (= ["artifacts"] (mapv #(.getName ^java.io.File %) (.listFiles (io/file home)))) "left as it was")))
+
+(deftest options-cross-the-op-or-are-refused
+  (let [home (tmp "dvergr-room-run-home-")
+        b (room-wf/bundle "competitors" room-test/files)
+        calls (atom 0)]
+    (testing "a judge function or a granted tier cannot cross catalog_benchmark"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Not through catalog_benchmark"
+                            (room-run/benchmark! b {:home home :models ["claude-haiku-4-5"] :judge-fn identity}))))
+    (testing "params, prompt and parallelism reach the experiment"
+      (let [{:keys [scorecard]} (bench! (writer calls "Wato\nPromptQL\nDust\nBuzz\n") b home
+                                        :params {:product "Acme"} :prompt "You list competitors." :parallelism 2)
+            exp (:scorecard/experiment scorecard)]
+        (is (str/includes? (pr-str (get-in exp [:experiment/dataset :dataset/environments])) "competing with Acme"))
+        (is (= (map :candidate/agent-content-id
+                    (:experiment/candidates
+                     (runner/experiment-def (assoc (room-wf/experiment-plan b {:models ["claude-haiku-4-5"]
+                                                                               :prompt "You list competitors."})
+                                                   :id :any))))
+               (map :candidate/agent-content-id (:experiment/candidates exp)))
+            "the candidate is the one with that prompt")))))
