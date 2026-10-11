@@ -3,6 +3,7 @@
    add-libs via dvergr.sandbox.deps, inline-required), and hiccup HTML. Split out
    of dvergr.sandbox (Phase 4 decomposition)."
   (:require [dvergr.substrate.load :as load]
+            [dvergr.effects :as effects]
             [clojure.string :as str]
             [sci.core :as sci]
             [hiccup.compiler :as hc]
@@ -318,8 +319,12 @@
    namespace is mirrored into this SCI ctx so the agent's subsequent
    `(require ...)` finds them.
 
-   On deny, throws `ex-info` with :type :dvergr/dep-denied, :coord, :reason."
-  [sci-ctx]
+   On deny, throws `ex-info` with :type :dvergr/dep-denied, :coord, :reason.
+
+   Both are a `:deps/add` effect (`dvergr.effects`) through `effects`, the
+   sandbox's boundary: resolving from Maven reaches the network and changes
+   the host JVM's classpath."
+  [sci-ctx & [effects]]
   (load/require! 'dvergr.sandbox.deps)
   (let [add-libs!     @(ns-resolve 'dvergr.sandbox.deps 'add-libs!)
         sync-deps!    @(ns-resolve 'dvergr.sandbox.deps 'sync-deps!)
@@ -331,10 +336,17 @@
     ;; — SCI has its own namespace map separate from the host.
     (sci/merge-opts sci-ctx {:load-fn (make-load-fn* sci-ctx)})
     (sci/add-namespace! sci-ctx 'clojure.repl.deps
-                        {'add-libs  (fn [libs] (add-libs! sci-ctx libs))
+                        {'add-libs  (fn [libs]
+                                      (effects/perform! effects {:effect :deps/add
+                                                                 :resource {:libs (mapv str (keys libs))}}
+                                                        #(add-libs! sci-ctx libs)))
                          'sync-deps (fn
-                                      ([]     (sync-deps! sci-ctx))
-                                      ([_kvs] (sync-deps! sci-ctx)))})))
+                                      ([] (effects/perform! effects {:effect :deps/add
+                                                                     :resource {:libs ["deps.edn"]}}
+                                                            #(sync-deps! sci-ctx)))
+                                      ([_kvs] (effects/perform! effects {:effect :deps/add
+                                                                         :resource {:libs ["deps.edn"]}}
+                                                                #(sync-deps! sci-ctx))))})))
 
 ;; ---------------------------------------------------------------------------
 ;; Hiccup HTML Generation

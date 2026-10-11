@@ -9,7 +9,8 @@
 
    Only sources that genuinely can't be interpreted stay native and are mounted
    here — currently just `intake.mail` (briefkasten + javax.mail are too heavy)."
-  (:require [dvergr.substrate.load :as load]
+  (:require [dvergr.effects :as effects]
+            [dvergr.substrate.load :as load]
             [sci.core :as sci]))
 
 (def ^:private native-mail-vars
@@ -39,11 +40,25 @@
     (catch Throwable _
       nil)))
 
+(defn gate-mail-bindings
+  "`bindings` with `sync!`, which pulls an IMAP account into the local mail
+   store, performed through the boundary `effects` (`dvergr.effects`); the
+   reads of the local store are not effects."
+  [bindings effects]
+  (update bindings 'sync!
+          (fn [sync!]
+            (fn [& {:keys [account folders] :as opts}]
+              (effects/perform! effects {:effect :mail/sync
+                                         :resource {:account (str (or account :default))
+                                                    :folders (vec (or folders ["INBOX"]))}}
+                                #(apply sync! (mapcat identity opts)))))))
+
 (defn add-intake-namespaces!
-  "Mount the few NATIVE-only intake namespaces. Everything else is sandbox source."
-  [sci-ctx]
+  "Mount the few NATIVE-only intake namespaces. Everything else is sandbox
+   source. `effects` is the sandbox's boundary."
+  [sci-ctx & [effects]]
   ;; intake.mail — OPTIONAL: its clojure-mail/postal/briefkasten deps live in the
   ;; :cli/:tui/:dev aliases, not core. Mounted only when present.
   (when-let [bindings (load-mail-bindings)]
-    (sci/add-namespace! sci-ctx 'intake.mail bindings))
+    (sci/add-namespace! sci-ctx 'intake.mail (gate-mail-bindings bindings effects)))
   sci-ctx)
