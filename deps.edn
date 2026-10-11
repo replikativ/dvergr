@@ -85,7 +85,12 @@
         ;; 0.1.107: a body started inside another body (spawn!, an inline
         ;; executor's child, a generator step) runs in its own trampoline, so
         ;; its loop no longer stops at the first synchronous await.
-        org.replikativ/spindel     {:mvn/version "0.1.107"}
+        ;; 0.1.110/0.1.111: cancellation is claimed exactly once. A spin that
+        ;; parks while it is cancelled is rejected (#116, a cancelled job
+        ;; stayed :running); child awaits, inline child completion and a
+        ;; directly cancelled race no longer strand or double-run their
+        ;; continuations (#118).
+        org.replikativ/spindel     {:mvn/version "0.1.111"}
         ;; probabilistic inference in forkable worlds, split out of spindel:
         ;; the sandbox's infer/ and dist/ namespaces (foerster.core, .dist).
         ;; 0.1.45: savepoint inference throughout, resample-move, tempering,
