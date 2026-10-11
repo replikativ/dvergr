@@ -15,7 +15,8 @@
                  \"tags\"    {:rule :set}
                  \"vendor_name\" {:rule :ci}
                  \"due\"     {:rule :date}}
-      :task     \"…\"                          ; optional; else one is written
+      :task     \"…\"                          ; optional; else one is written;
+                                               ; the answer contract is appended either way
       :shared   {\"/docs/accounts.txt\" \"…\"}}  ; files every case's world has
 
    Every case becomes `cases/<id>/`: its inputs as `/docs/case.edn` (and its
@@ -174,15 +175,30 @@
 
 (defn- blank? [v] (or (nil? v) (and (string? v) (str/blank? v)) (and (coll? v) (empty? v))))
 
-(defn- default-task [{:keys [inputs attachments expected]}]
-  (str "A case is in /docs/case.edn: a map of " (str/join ", " (map pr-str inputs)) "."
-       (when (seq attachments) (str " Its documents are in /docs/ (" (str/join ", " attachments) " columns)."))
-       " Determine its outcome and write /out/answer.edn: an EDN map from each of these fields (the name as a"
+(defn answer-contract
+  "What every case pack's task ends with, whoever wrote the rest: where the
+   answer goes, its format, and the fields (the spec's expected columns) the
+   checker reads. Without it a candidate cannot know that the answer is
+   /out/answer.edn, and every attempt fails `answer-present`."
+  [{:keys [expected]}]
+  (str "Write your answer to /out/answer.edn: an EDN map from each of these fields (the name as a"
        " string) to its value:"
-       (str/join (for [[f {:keys [rule doc]}] expected]
+       (str/join (for [[f {:keys [rule doc]}] (sort-by key expected)]
                    (str "\n- " (pr-str f) (when doc (str ": " doc))
                         (case rule
                           :number " (a number)" :set " (a vector of values)" :date " (a date, yyyy-mm-dd)" ""))))))
+
+(defn- default-task [{:keys [inputs attachments]}]
+  (str "A case is in /docs/case.edn: a map of " (str/join ", " (map pr-str inputs)) "."
+       (when (seq attachments) (str " Its documents are in /docs/ (" (str/join ", " attachments) " columns)."))
+       " Determine its outcome."))
+
+(defn task
+  "The task of the bundle `spec` makes: its own `:task` (else one describing
+   the case's inputs), always followed by the answer contract."
+  [{custom :task :as spec}]
+  (str (if (str/blank? custom) (default-task spec) (str/trim custom))
+       "\n\n" (answer-contract spec)))
 
 (defn certify
   "Each row's verdict: `{:id :status :reasons [...]}`, status :certified or
@@ -220,7 +236,7 @@
   "The bundle files (`{relative-path text}`) and certification for `spec`
    over `rows`; `read-attachment` is a fn of an attachment's path (as the
    table names it) to its text, or nil when there is none."
-  [{:keys [title doc id inputs attachments expected task shared] :as spec} rows read-attachment]
+  [{:keys [title doc id inputs attachments expected shared] :as spec} rows read-attachment]
   (let [read-attachment (or read-attachment (constantly nil))
         verdicts (certify spec rows read-attachment)
         certified (into [] (keep (fn [[r v]] (when (= :certified (:status v)) [r (:id v)]))) (map vector rows verdicts))
@@ -241,7 +257,7 @@
      (when ref-row
        (merge
         {"workflow.edn" (pr-str (cond-> {:title (or title (:name spec))
-                                         :task (or task (default-task spec))
+                                         :task (task spec)
                                          :params {:fields expected}
                                          :capture ["/out"]}
                                   doc (assoc :doc doc)))

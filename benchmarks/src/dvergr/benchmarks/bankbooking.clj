@@ -167,10 +167,8 @@
    :task (str "You book bank transactions for Musterfirma GmbH, a German company that keeps its books with "
               "DATEV in SKR04. The transaction is in /docs/case.edn: date, amount in EUR (positive: received, "
               "negative: paid from the bank account 1800), and the bank's text. The accounts and tax keys the "
-              "firm uses are in /docs/kontenrahmen.txt. Write /out/answer.edn, an EDN map: "
-              "{\"gegenkonto\" \"<the SKR04 contra account>\" \"bu\" \"<the DATEV BU-Schlüssel, or - for none>\"}. "
-              "Note: 4400 and 4300 are Automatikkonten (no key); payroll, tax payments and settlements of "
-              "receivables or payables carry no key.")})
+              "firm uses are in /docs/kontenrahmen.txt. Note: 4400 and 4300 are Automatikkonten (no key); "
+              "payroll, tax payments and settlements of receivables or payables carry no key.")})
 
 (defn kontenrahmen []
   (str "SKR04 accounts of Musterfirma GmbH\n"

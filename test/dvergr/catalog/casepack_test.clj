@@ -1,8 +1,10 @@
 (ns dvergr.catalog.casepack-test
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [dvergr.catalog.casepack :as cp]
+            [dvergr.catalog.casepack-cli :as cli]
             [dvergr.catalog.room :as room]))
 
 (deftest csv-as-exports-write-it
@@ -74,3 +76,56 @@
       (is (= "Invoice 1: toner, 119,00 EUR" (get files "cases/1/fixtures/docs/inv1.txt")))
       (is (= {"vendor" "Acme"} (edn/read-string (get files "cases/1/fixtures/docs/case.edn"))))
       (is (= #{:missing-attachment} (set (map :reason (:reasons (second (:verdicts certification))))))))))
+
+(def ^:private vat-csv
+  ;; the table a newcomer's assistant wrote in a clean-machine trial
+  (str "id;description;supplier_country;net_amount;vat_code;vat_amount\n"
+       "INV-001;Office chairs (4 pcs);DE;1200.00;V19;228.00\n"
+       "INV-002;Printed books for the library;DE;350.00;V7;24.50\n"
+       "INV-003;Cloud hosting subscription, monthly;IE;480.00;RC;0.00\n"
+       "INV-010;Rent for office space;DE;2500.00;V19;475.00\n"
+       "INV-010;Rent duplicate row;DE;2500.00;V19;475.00\n"
+       "INV-012;Conference ticket;DE;450.00;;\n"))
+
+(def ^:private vat-spec
+  {:name "vat-codes" :id "id" :inputs ["description" "supplier_country" "net_amount"]
+   :expected {"vat_code" {:rule :exact :doc "one of V19, V7, V0, RC"} "vat_amount" {:rule :number :tolerance 0.01}}})
+
+(deftest a-supplied-task-keeps-the-answer-contract
+  ;; the trial's assistant wrote its own task; it replaced the only text
+  ;; that named /out/answer.edn, and every model scored 0/9
+  (let [rows (cp/table-rows vat-csv "cases.csv")
+        task-of #(:task (edn/read-string (get (:files (cp/case-pack % rows nil)) "workflow.edn")))]
+    (doseq [[label spec] {"supplied" (assoc vat-spec :task "For the invoice line in /docs/case.edn, determine the VAT code and the VAT amount.")
+                          "default" vat-spec}]
+      (testing label
+        (let [t (task-of spec)]
+          (is (str/includes? t "/out/answer.edn"))
+          (is (str/includes? t "EDN map"))
+          (is (str/includes? t "\"vat_code\": one of V19, V7, V0, RC"))
+          (is (str/includes? t "\"vat_amount\" (a number)")))))
+    (is (str/starts-with? (task-of (assoc vat-spec :task "For the invoice line, determine the VAT."))
+                          "For the invoice line, determine the VAT.")
+        "the supplied text comes first")))
+
+(deftest the-shell-writes-a-pack-from-a-csv
+  (let [dir (doto (io/file (System/getProperty "java.io.tmpdir") (str "casepack-cli-" (random-uuid))) .mkdirs)
+        table (io/file dir "cases.csv")
+        out (io/file dir "packs" "vat-codes")
+        _ (spit table vat-csv)
+        {:keys [exit lines]} (cli/run [(str table) "--id" "id" "--inputs" "description,supplier_country,net_amount"
+                                       "--outcome" "vat_code:exact" "--outcome" "vat_amount:number:0.01"
+                                       "--task" "Code the invoice line." "--out" (str out)])]
+    (is (zero? exit) (str/join "\n" lines))
+    (is (= "3 of 6 cases certified; excluded: 2 duplicate-id, 1 unlabelled" (first lines)))
+    (let [b (room/read-dir (str out))]
+      (is (= "vat-codes" (:name b)))
+      (is (= #{"INV-001" "INV-002" "INV-003"} (set (keys (:cases b)))) "a duplicate id drops every copy")
+      (is (= {"vat_code" {:rule :exact} "vat_amount" {:rule :number :tolerance 0.01}} (get-in b [:definition :params :fields])))
+      (is (str/includes? (get-in b [:definition :task]) "/out/answer.edn"))
+      (is (:ok? (room/calibrate b))))
+    (testing "a directory that holds something is not written into"
+      (is (= 1 (:exit (cli/run [(str table) "--id" "id" "--inputs" "description" "--outcome" "vat_code"
+                                "--out" (str out)])))))
+    (testing "what is missing is named"
+      (is (str/includes? (first (:lines (cli/run [(str table) "--id" "id"]))) "--inputs, --outcome, --out")))))
