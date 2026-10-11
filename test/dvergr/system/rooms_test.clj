@@ -4,6 +4,9 @@
             [datahike.tx-preds :as tx-preds]
             [dvergr.chat.schema :as chat-schema]
             [dvergr.resource :as resource]
+            [dvergr.room.registry :as rreg]
+            [dvergr.room.store :as rstore]
+            [dvergr.rooms :as droom]
             [dvergr.room.store.datahike :as datahike-store]
             [dvergr.substrate.datahike :as substrate-datahike]
             [dvergr.system.db :as system-db]
@@ -65,6 +68,34 @@
            #"hydration failed"
            (rooms/room-ctx-for room-id)))
       (finally
+        (rooms/clear-room-ctxs!)
+        (context/close-context! root)))))
+
+(deftest failed-hydration-keeps-the-room-unloaded
+  ;; The caller of `room-ctx-for` must not swallow its refusal and build a
+  ;; store-less stand-in Room on the daemon ctx (which would auto-register).
+  (let [root (context/create-execution-context)
+        room-id (random-uuid)
+        slug (str "broken-" (random-uuid))
+        room-kw (rstore/slug->room-id slug)]
+    (rooms/clear-room-ctxs!)
+    (try
+      (with-redefs-fn
+        {#'system-db/all-rooms (fn [] [{:room/id room-id :room/slug slug :room/name slug}])
+         #'system-db/room-by-slug (fn [s] (when (= s slug) {:room/id room-id :room/slug slug}))
+         #'system-db/systems-for-room
+         (fn [_] [{:system {:system/type :msgs :system/scope "broken"}}])
+         #'rooms/register-system-into-current!
+         (fn [_] (throw (ex-info "governance unavailable" {})))}
+        #(binding [ec/*execution-context* root]
+           (rooms/hydrate-rooms!)
+           (droom/hydrate-registry! root)))
+      (binding [ec/*execution-context* root]
+        (is (nil? (rreg/lookup room-kw))
+            "a room whose hydration failed is not registered"))
+      (finally
+        (binding [ec/*execution-context* root]
+          (when (rreg/lookup room-kw) (rreg/unregister! room-kw)))
         (rooms/clear-room-ctxs!)
         (context/close-context! root)))))
 

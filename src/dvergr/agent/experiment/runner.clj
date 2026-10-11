@@ -588,8 +588,9 @@
                     run a pilot first (one cell per candidate per stratum,
                     `experiment.preflight`), estimate the rest, and stop with
                     the estimate (`:stopped :over-budget`) when its
-                    conservative bound exceeds the budget; the result's
-                    `:preflight` is the estimate
+                    conservative bound exceeds the budget, or a candidate
+                    with cells left has no pilot Attempt (`:unpiloted`);
+                    the result's `:preflight` is the estimate
      :allowance     what the experiment may take of the subscriptions its
                     models use (`default-allowance`; nil: no bound): once
                     reached no new cell starts, the result carries

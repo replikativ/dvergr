@@ -61,3 +61,17 @@
           (is (= ["find_user_id_by_email" "modify_user_address"]
                  (keep #(get-in % [:tool-calls 0 :name]) (:messages ep)))
               "calls made inside clojure_eval are recorded as tau2 tool calls"))))))
+
+(deftest a-provider-failure-ends-the-episode-as-a-failure-not-a-grade
+  (if-not checkout?
+    (support/skip! "a-provider-failure-ends-the-episode-as-a-failure-not-a-grade: no ../tau2-bench checkout")
+    (let [dom (t2/load-domain "retail")
+          task (get-in dom [:tasks "0"])]
+      (with-redefs [model-chat/chat (fn [_ _] (throw (ex-info "HTTP 503 unavailable" {})))]
+        (let [{:keys [turn close]} (harness/make-agent-turn dom {:model "claude-code-sonnet"})]
+          (try
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Model provider failed"
+                                  (t2/run-episode dom task {:agent-turn turn
+                                                            :user (constantly {:content "Hi."})}))
+                "the runner records a thrown episode as a failure, never scores it")
+            (finally (close))))))))

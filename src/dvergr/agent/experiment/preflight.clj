@@ -21,6 +21,12 @@
    run (`subscription/points-per-token`) when they hold more tokens than the
    pilot, else from the pilot (which, moving whole points, bounds it coarsely).
 
+   A candidate with cells left but no pilot Attempt (its pilot cells faulted,
+   or were refused) has no bill to extrapolate: it is listed `:unpiloted`
+   and the gate refuses, since any number put in its place (a cap, a price
+   times a step bound) would be a guess the experiment has not measured.
+   Running again pilots it (resume keeps the other pilot cells).
+
    `gate` compares an estimate with a budget: `{:dollars d :subscription
    share}` (a share of a window, e.g. 0.10). This is the experiment predicting
    its own resource use before committing to it; the same measurements, kept,
@@ -101,13 +107,17 @@
   [{:keys [pilot-receipts remaining parallelism window-points resolution cell-caps calibration]
     :or {resolution 0.01}}]
   (let [by-candidate (group-by #(get-in % [:attempt/metrics :experiment-candidate]) pilot-receipts)
-        per-candidate (into {}
+        unpiloted (vec (for [[c left] remaining
+                             :when (and (pos? left) (not (contains? by-candidate c)))]
+                         c))
+        per-candidate (into (into {} (for [c unpiloted]
+                                       [c {:pilot-cells 0 :cells-left (get remaining c) :unpiloted? true}]))
                             (for [[c receipts] by-candidate
                                   :let [samples (map cell-costs receipts)]]
                               [c (assoc (extrapolate samples (get remaining c 0))
                                         :pilot-cells (count samples)
                                         :cells-left (get remaining c 0))]))
-        total (fn [k band] (reduce + 0.0 (map #(get-in % [k band]) (vals per-candidate))))
+        total (fn [k band] (reduce + 0.0 (keep #(get-in % [k band]) (vals per-candidate))))
         pilot-tokens (reduce + 0 (map (comp :tokens cell-costs) pilot-receipts))
         pilot-rate (when (and window-points (pos? pilot-tokens))
                      (/ (max (double window-points) resolution) pilot-tokens))
@@ -117,6 +127,9 @@
                      (:points-per-token calibration))
         points-per-token (or calibrated pilot-rate)]
     {:candidates per-candidate
+     ;; candidates with cells left and nothing measured: the totals leave them
+     ;; out, so the gate refuses (see the ns doc)
+     :unpiloted unpiloted
      ;; a hard bound, not an estimate: every Run's model spend is paid from a
      ;; wallet of its candidate's budget (`cell-caps`, {candidate microdollars})
      :cap-microdollars (when (seq cell-caps)
@@ -139,12 +152,15 @@
 
 (defn gate
   "Whether the conservative estimate fits `budget` (`{:dollars :subscription}`,
-   either may be nil): nil when it does, else what exceeds."
-  [{:keys [total window-points]} {:keys [dollars subscription]}]
+   either may be nil): nil when it does, else what exceeds. An estimate with
+   `:unpiloted` candidates fits no budget: their cost is unmeasured."
+  [{:keys [total window-points unpiloted]} {:keys [dollars subscription]}]
   (let [usd (/ (get-in total [:billed-microdollars :conservative] 0.0) 1e6)
         points (get window-points :conservative)]
     (not-empty
      (cond-> {}
+       (and (or dollars subscription) (seq unpiloted))
+       (assoc :unpiloted {:candidates (vec unpiloted)})
        (and dollars (> usd dollars)) (assoc :dollars {:estimate usd :budget dollars})
        (and subscription points (> points subscription))
        (assoc :subscription {:estimate points :budget subscription})))))

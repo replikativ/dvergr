@@ -411,8 +411,17 @@
        :run-turn-fn (fn [chat-ctx opts]
                       (if (> (swap! model-steps (fnil inc 0)) (or max-model-steps 100))
                         (do (end! episode :max-model-steps) :error)
-                        (let [outcome (binding [resource/*model-scope* (:model-scope episode)]
+                        (let [failure (volatile! nil)
+                              outcome (binding [resource/*model-scope* (:model-scope episode)
+                                                chat-agent/*turn-failure* failure]
                                         (chat-agent/run-agent-turn! chat-ctx (dissoc opts :system-suffix)))]
+                          ;; the path to the model failing (transport, provider
+                          ;; limits) is not the model's: the episode faults and
+                          ;; is run again, as for the reference candidate
+                          (when (and (= :error outcome) (= :infrastructure (:kind @failure)))
+                            (fault! episode :agent-model
+                                    (ex-info (str "Model provider failed: " (:cause @failure))
+                                             {:failure @failure})))
                           (when (= :continue outcome) (add-steps! episode 2))
                           outcome)))})
      ;; The working ctx hydrates from the store on first use, so it is

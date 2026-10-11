@@ -6,6 +6,7 @@
             [clojure.test :refer [deftest is testing]]
             [dvergr.agent.episode :as attempts]
             [dvergr.agent.evaluation :as evaluation]
+            [dvergr.agent.experiment :as experiment]
             [dvergr.agent.run :as run]
             [dvergr.benchmarks.bfcl.core :as bfcl]
             [dvergr.benchmarks.bfcl.equivalence :as eq]
@@ -191,3 +192,37 @@
         (is (thrown? clojure.lang.ExceptionInfo
                      (provider/candidate-roster [{:id :x :harness :dvergr :action-space :repl
                                                   :repl-guidance :nope :model "claude-code-sonnet"}])))))))
+
+;; -----------------------------------------------------------------------------
+;; A provider outage is a fault, not the model's verdict
+
+(def ^:private irrelevance-task
+  "An irrelevance task as `bfcl/load-category` reads one: the right answer is
+   to call nothing, which is also what a turn whose model call failed leaves."
+  {:id "irrelevance_outage" :category "irrelevance" :kind :irrelevance
+   :question [[{"role" "user" "content" "What is the capital of France?"}]]
+   :functions [{"name" "calculate_area"
+                "description" "The area of a circle."
+                "parameters" {"type" "dict"
+                              "properties" {"radius" {"type" "integer" "description" "The radius."}}
+                              "required" ["radius"]}}]})
+
+(deftest dvergr-step-provider-failure-is-a-fault
+  (let [tasks {"irrelevance_outage" irrelevance-task}
+        caps (provider/capabilities tasks {})
+        env (provider/environment-def irrelevance-task caps {:timeout-ms 60000})
+        team (provider/candidate-roster [{:id :dv :harness :dvergr :model "claude-code-sonnet"}])
+        room (d/make-room {:id :bfcl/dv-outage :store (memory/make)})]
+    (try
+      (with-redefs [model-chat/chat (fn [_ _] (throw (ex-info "HTTP 503 unavailable" {})))]
+        (binding [ec/*execution-context* (:ctx room)]
+          (let [result @(evaluation/evaluate room team :dv env (:evaluator caps)
+                                             {:world-setup (:world-setup caps)
+                                              :protocol (:protocol caps)})
+                attempt (first (attempts/attempts room {:limit 10}))]
+            (is (not (experiment/verdict? attempt))
+                (pr-str (get-in attempt [:attempt/receipt :attempt/status])))
+            (is (not= 1.0 (get-in result [:attempt-receipt :attempt/reward]))
+                "an outage does not pass an irrelevance task")
+            (is (empty? (run/active-runs (:id room)))))))
+      (finally (d/close-room! room)))))

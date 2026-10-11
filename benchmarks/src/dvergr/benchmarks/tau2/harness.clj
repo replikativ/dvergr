@@ -143,11 +143,19 @@
        (reset! state {:world world :log []})
        (chat-context/add-message! chat-ctx {:role :user :content message})
        (let [outcome (loop [step 0]
-                       (let [o (binding [ec/*execution-context* (:ctx room)]
+                       (let [failure (volatile! nil)
+                             o (binding [ec/*execution-context* (:ctx room)
+                                         chat-agent/*turn-failure* failure]
                                  (chat-agent/run-agent-turn!
                                   chat-ctx {:provider provider :model model-id
                                             :tools tool-map :tool-ctx tool-ctx
                                             :auto-compact? false :turn-number step}))]
+                         ;; the path to the model failing (transport, provider
+                         ;; limits) is not the model's: the episode fails and
+                         ;; is recorded as a failure, not graded
+                         (when (and (= :error o) (= :infrastructure (:kind @failure)))
+                           (throw (ex-info (str "Model provider failed: " (:cause @failure))
+                                           {:type ::provider-failed :failure @failure})))
                          (cond
                            (not= :continue o) o
                            (>= (inc step) max-model-steps) :max-model-steps

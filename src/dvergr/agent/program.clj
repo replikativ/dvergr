@@ -919,15 +919,26 @@
    allocated no `model-dispatches`), so they spend the Run's admissions. The
    binding is the worker thread's; a protocol whose model calls happen on
    other threads (Room participants, futures) gets the scope as `:model-scope`
-   and binds it there."
+   and binds it there.
+
+   A model turn the protocol runs on the worker thread (`chat.agent`'s
+   `run-agent-turn!`) that fails for `:infrastructure` (transport, provider
+   limits; see `chat-agent/*turn-failure*`) fails the Run, whatever the
+   protocol returns: the path to the model failed, so the Attempt is a fault
+   to re-run, not a verdict on the model (a failed turn leaves no answer, and
+   no answer can pass a task, e.g. BFCL irrelevance). A protocol that binds
+   `*turn-failure*` itself decides for its own turns; one whose turns run on
+   other threads must make such a failure fail its `:run`."
   [control-room work-room run-id agent task supervisor protocol]
   (sp/spin
-   (let [call (start-worker!
+   (let [failure (volatile! nil)
+         call (start-worker!
                supervisor
                (fn []
                  (let [scope (some-> (resource/model-scope control-room run-id)
                                      (assoc :cancel? #(run/cancel-requested? run-id)))]
-                   (binding [resource/*model-scope* scope]
+                   (binding [resource/*model-scope* scope
+                             chat-agent/*turn-failure* failure]
                      ((:run protocol)
                       {:control-room control-room
                        :room work-room
@@ -949,6 +960,13 @@
                        {:type ::protocol-failed
                         :agent/id (:agent/id agent)}
                        (::worker-error outcome)))
+
+       (= :infrastructure (:kind @failure))
+       (throw (ex-info (str "Environment protocol failed: a model turn failed: "
+                            (:cause @failure))
+                       {:type ::protocol-failed
+                        :agent/id (:agent/id agent)
+                        :failure @failure}))
 
        (not (roster/data-value? outcome))
        (throw (ex-info "Environment protocol must return portable data"
