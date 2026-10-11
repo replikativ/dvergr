@@ -154,7 +154,9 @@
                     {:type ::invalid-name :name name})))
   (let [dir (str "/workflows/" name)
         files (into {} (map (fn [[path text]] [(subs path (inc (count dir))) text]))
-                    (ws/read-tree room dir))]
+                    ;; whole, or refused: a bundle missing some of its
+                    ;; cases would still score
+                    (ws/read-tree room dir {:strict? true :max-files 20000 :max-bytes (* 256 1024 1024)}))]
     (when (empty? files)
       (throw (ex-info (str "No workflow " name " in this room (expected " dir "/)")
                       {:type ::no-bundle :name name})))

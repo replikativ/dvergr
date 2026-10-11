@@ -104,6 +104,15 @@
           (room-run/sync-bundle! daemon "competitors" "competitors" (assoc room-test/files "fixtures/notes/a.md" "now a directory"))
           (is (= "now a directory" (:text (ops/invoke daemon :room/read {:room "competitors"
                                                                          :path "workflows/competitors/fixtures/notes/a.md"})))))))
+    (testing "and a directory that became a file again, across a reopened home"
+      (runner/with-home home
+        (fn [daemon]
+          (room-run/sync-bundle! daemon "competitors" "competitors" (assoc room-test/files "fixtures/deep/er/a.md" "nested"))))
+      (runner/with-home home
+        (fn [daemon]
+          (room-run/sync-bundle! daemon "competitors" "competitors" (assoc room-test/files "fixtures/deep" "a file again"))
+          (is (= "a file again" (:text (ops/invoke daemon :room/read {:room "competitors"
+                                                                      :path "workflows/competitors/fixtures/deep"})))))))
     (testing "a file removed from the bundle is removed from the room"
       (let [smaller (room-wf/bundle "competitors" (dissoc room-test/files "gold.edn"))]
         (runner/with-home home
@@ -182,3 +191,19 @@
         (is (= 1 @benchmarks) "no second catalog_benchmark: it would grant a fresh share")
         (is (zero? @calls))
         (is (= 2 (:failed-cells r)))))))
+
+(deftest a-bundle-of-many-files-is-read-back-whole
+  ;; more files than a workspace listing reads: a bundle missing some of its
+  ;; cases would still score
+  (let [home (tmp "dvergr-room-run-home-")
+        many (into case-files
+                   (mapcat (fn [i] [[(str "cases/c" i "/gold.edn") (pr-str {:a (str i)})]
+                                    [(str "cases/c" i "/fixtures/docs/q.txt") (str i "+0")]]))
+                   (range 300))
+        b (room-wf/bundle "sums" many)
+        r (room-run/benchmark! b {:home home :check? true})]
+    (is (= "sums" (:room r)))
+    (is (map? (:calibration r)))
+    (runner/with-home home
+      (fn [daemon]
+        (is (= (str (:id b)) (:bundle (ops/invoke daemon :catalog/check {:room "sums" :name "sums"}))))))))

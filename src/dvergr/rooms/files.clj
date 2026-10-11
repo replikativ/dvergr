@@ -415,6 +415,10 @@
                                                    (str/join ", " conflicted))
                                               (assoc (ex-data e) :conflicted conflicted) e)
                                      e)))))))
+            ;; a directory a removal emptied goes too (git keeps none): a
+            ;; later write may put a file in its place
+            _ (when (seq @removed)
+                (d/transact conn [[:db.fn/call remove-empty-dirs-tx (vec (distinct (mapcat ancestors-of @removed)))]]))
             ids (content-ids conn)]
         {:commit commit
          :message message

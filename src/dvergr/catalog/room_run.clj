@@ -151,6 +151,13 @@
       (when-not (ops/resolve-room daemon name)
         (ops/invoke daemon :room/create {:title (str "Workflow " (get-in b [:definition :title] name)) :slug name}))
       (sync-bundle! daemon name name files)
+      ;; what the room now holds is exactly the bundle given: the benchmark
+      ;; reads it back from there
+      (let [{:keys [ok bundle problems]} (ops/invoke daemon :catalog/check {:room name :name name})]
+        (when-not (and ok (= (str (:id b)) bundle))
+          (throw (ex-info (str "The room's workflows/" name "/ is not the bundle given"
+                               (when (seq problems) (str ": " (str/join "; " problems))))
+                          {:type ::bundle-mismatch :expected (str (:id b)) :found bundle :problems problems}))))
       (if check?
         {:home (str home) :room name
          :calibration (ops/invoke daemon :catalog/calibrate {:room name :name name})}
