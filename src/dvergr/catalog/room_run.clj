@@ -168,7 +168,10 @@
                       report (report-of exp-id)]
                   ;; cells that faulted (a lost connection, a provider
                   ;; failure) run once more: the resume keeps the rest
-                  (if (and (= "completed" (:status st)) (not (:complete report)) (< n fault-retries))
+                  ;; not when admission refused cells (an allowance): each
+                  ;; call would grant a fresh share
+                  (if (and (= "completed" (:status st)) (not= "refused" (:reason st))
+                           (not (:complete report)) (< n fault-retries))
                     (recur (inc n))
                     [st exp-id report])))
               r (ops/resolve-room daemon name)

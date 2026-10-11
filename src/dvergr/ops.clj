@@ -401,6 +401,12 @@
             :review (when (and world (rreg/lookup world))
                       (workflow/review world))}))))
 
+(defonce ^:private job-experiments
+  ;; job id -> the ExperimentDef content id a `catalog/benchmark` job runs:
+  ;; what names its Scorecard when every cell resumed (no child Run to read
+  ;; it from). Process-local; after a restart the child Runs say it.
+  (atom {}))
+
 (defn- job-result
   "What a finished job produced, read from its room's store."
   [daemon {:keys [id kind room-value status]}]
@@ -415,11 +421,12 @@
                                    rows))
                 :experiment
                 ;; The Scorecard of this job's experiment: a room may keep several.
-                (let [exps (->> (run/runs room-value {:root-run-id id :limit 1000})
-                                (filter #(= id (:run/parent %)))
-                                (keep #(attempts/attempt room-value (:run/id %)))
-                                (keep #(get-in % [:attempt/receipt :attempt/metrics :experiment-content-id]))
-                                set)
+                (let [exps (or (some-> (get @job-experiments id) hash-set)
+                               (->> (run/runs room-value {:root-run-id id :limit 1000})
+                                    (filter #(= id (:run/parent %)))
+                                    (keep #(attempts/attempt room-value (:run/id %)))
+                                    (keep #(get-in % [:attempt/receipt :attempt/metrics :experiment-content-id]))
+                                    set))
                       sc (some #(first (experiment/scorecards room-value {:experiment-content-id % :limit 1}))
                                exps)]
                   (cond-> {:room (id->str (:id room-value))}
@@ -430,6 +437,11 @@
                               :scorecard (str (:scorecard/content-id sc)))
                     (nil? sc) (assoc :incomplete (experiment/progress room-value))))
                 nil)))))
+
+(defn- refused-reason
+  "The reason an experiment job records when cells were not admitted."
+  [result]
+  (when (:refused result) :refused))
 
 (defn- job-data
   "A job as plain data; `result?` adds what it produced once completed."
@@ -1174,22 +1186,27 @@
                   plan (cond-> (assoc plan :admit (runner/admit-for models))
                          (:parallelism args) (assoc :parallelism (:parallelism args)))]
               (-> (in-ctx daemon
-                          (if control
+                          (doto
+                           (if control
                             ;; The records in `control`, the worlds forked from `r`.
-                            (jobs/start! control {:kind :experiment :ctx (:ctx r)}
-                                         #(runner/run-in control (assoc plan :experiment exp :parent-run %
-                                                                        :world-parent r))
+                             (jobs/start! control {:kind :experiment :ctx (:ctx r)}
+                                          #(runner/run-in control (assoc plan :experiment exp :parent-run %
+                                                                         :world-parent r))
+                                         ;; an allowance stopped it: running again resumes
+                                          :reason-of refused-reason
                                          ;; The fixture room's work is done once the job is
                                          ;; over (every cell's world settled, every record in
                                          ;; `control`): retire it, keeping its history.
-                                         :settled (fn [_ _]
-                                                    (let [{:keys [ok? error]} (in-ctx daemon (rooms/archive-room! r))]
-                                                      (when-not ok?
-                                                        (tel/log! {:level :warn :id ::fixture-room-not-archived
-                                                                   :data {:room (id->str (:id r)) :error error}}
-                                                                  "A benchmark's fixture room could not be archived")))))
-                            (jobs/start! r {:kind :experiment}
-                                         #(runner/run-in r (assoc plan :experiment exp :parent-run %)))))
+                                          :settled (fn [_ _]
+                                                     (let [{:keys [ok? error]} (in-ctx daemon (rooms/archive-room! r))]
+                                                       (when-not ok?
+                                                         (tel/log! {:level :warn :id ::fixture-room-not-archived
+                                                                    :data {:room (id->str (:id r)) :error error}}
+                                                                   "A benchmark's fixture room could not be archived")))))
+                             (jobs/start! r {:kind :experiment}
+                                          #(runner/run-in r (assoc plan :experiment exp :parent-run %))
+                                          :reason-of refused-reason))
+                            (#(swap! job-experiments assoc (:id %) (:experiment/content-id exp)))))
                   (->> (job-data daemon))
                   (assoc :op "catalog/benchmark" :task workflow :models models
                          ;; its ExperimentDef: experiment_report {room, experiment}

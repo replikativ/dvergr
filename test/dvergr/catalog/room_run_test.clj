@@ -80,6 +80,8 @@
       (let [again (bench! (writer calls "nothing") b home)]
         (is (= 4 @calls))
         (is (= (:experiment first-run) (:experiment again)))
+        (is (some? (get-in again [:job :result :scorecard])) "the fully resumed job names its Scorecard")
+        (is (= (get-in first-run [:job :result :scorecard]) (get-in again [:job :result :scorecard])))
         (is (= 1.0 (get-in again [:scorecard :scorecard/summary 0 :reward-mean])))))
     (testing "another library version is another experiment: nothing resumes into it"
       (let [bumped (with-redefs [runner/library-versions (constantly {"org.replikativ/spindel" "9.9.9"})]
@@ -157,3 +159,19 @@
         failed (bench! broken b home :repetitions 1 :fault-retries 0 :cases ["two"])]
     (is (= 1 (:failed-cells failed)) "one selected case, one cell")
     (is (str/includes? (:report failed) "**Incomplete:**"))))
+
+(deftest refused-cells-are-not-retried-with-a-fresh-allowance
+  (let [home (tmp "dvergr-room-run-home-")
+        b (room-wf/bundle "competitors" room-test/files)
+        asked (atom 0)
+        benchmarks (atom 0)
+        calls (atom 0)
+        invoke ops/invoke]
+    (with-redefs [runner/admit-for (fn [& _] (fn [_] (swap! asked inc) {:reason "allowance reached"}))
+                  ops/invoke (fn [d k args] (when (= :catalog/benchmark k) (swap! benchmarks inc)) (invoke d k args))]
+      (let [r (bench! (writer calls "Wato") b home)]
+        (is (= "refused" (get-in r [:job :reason])) (pr-str (:job r)))
+        (is (pos? @asked))
+        (is (= 1 @benchmarks) "no second catalog_benchmark: it would grant a fresh share")
+        (is (zero? @calls))
+        (is (= 2 (:failed-cells r)))))))

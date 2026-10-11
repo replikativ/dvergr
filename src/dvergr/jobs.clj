@@ -61,10 +61,11 @@
    `:parent-run`. `:parent` makes the job itself a child Run (a sub-experiment
    of the Run that started it); `:ctx` is the context `work`'s Spin runs in
    (default `room`'s, where the job Run is stored). `finish`, a fn of the
-   Spin's value, runs before the Run completes; `settled`, a fn of the final
-   status and the value (or the error), after it has settled, whatever the
-   outcome."
-  [room {:keys [kind parent ctx]} work & {:keys [finish settled]}]
+   Spin's value, runs before the Run completes; `reason-of`, a fn of the
+   value, the reason a completed Run records (a keyword, or nil); `settled`, a
+   fn of the final status and the value (or the error), after it has settled,
+   whatever the outcome."
+  [room {:keys [kind parent ctx]} work & {:keys [finish settled reason-of]}]
   (when-not (contains? kinds kind)
     (throw (ex-info "Unknown job kind" {:type ::unknown-kind :kind kind :kinds kinds})))
   (let [ctx (or ctx (:ctx room))
@@ -100,7 +101,10 @@
                             [:failed t]))))]
               (try
                 (binding [ec/*execution-context* ctx]
-                  (run/finish! id status (cond-> {} error (assoc :error error))))
+                  (run/finish! id status (cond-> {}
+                                           error (assoc :error error)
+                                           (and reason-of (= :completed status))
+                                           (merge (when-let [r (reason-of @value)] {:reason r})))))
                 (catch Throwable t
                   (tel/log! {:level :error :id ::finish-failed
                              :data {:job id :status status :error (ex-message t)}}
