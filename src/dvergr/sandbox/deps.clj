@@ -21,14 +21,17 @@
 
        (fn [coord ctx] → :approve | {:deny <string>} | :ask-human)
 
+   where `ctx` carries the requested `:spec` (`{:mvn/version …}`,
+   `{:git/url …}`, …) — a policy must judge the source, not only the name.
+
    `:ask-human` is the asynchronous escape hatch: the request is
    parked on a clojure.core/promise, posted to the peer-bus, and the
    call blocks until a human / manager calls `decide!` to resolve it.
 
-   The default policy: a coord-pattern allowlist. If the coord's
-   group-id matches one of the patterns, auto-approve; else return
-   `:ask-human`. The allowlist lives in `(ec/get-state [:dvergr/deps-policy :allowlist])`
-   (a vector of regex patterns); install via `set-allowlist!`."
+   The default policy asks a human for every request: an approved lib's
+   namespaces become callable host code, so nothing is approved by pattern.
+   A `:local/root` source is refused outright — the agent could rewrite it
+   after approval."
   (:require [dvergr.substrate.load :as load]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
@@ -46,47 +49,19 @@
 ;; ============================================================================
 
 (def ^:private POLICY-KEY    [:dvergr/deps-policy :fn])
-(def ^:private ALLOWLIST-KEY [:dvergr/deps-policy :allowlist])
 (def ^:private PENDING-KEY   [:dvergr/deps-policy :pending])
 
 ;; ============================================================================
 ;; Default policy: coord-pattern allowlist
 ;; ============================================================================
 
-(def default-allowlist
-  "Group-id / lib coord patterns that auto-approve. These are common,
-   well-maintained Clojure libraries that an agent might reasonably
-   reach for in a coding session. Override per ctx via
-   (set-allowlist! ctx patterns)."
-  ["^org\\.clojure/.*"
-   "^hiccup/.*"
-   "^http-kit/.*"
-   "^ring/.*"
-   "^metosin/.*"
-   "^cheshire/.*"
-   "^hato/.*"
-   "^babashka/.*"
-   "^clojure\\..*"
-   "^io\\.github\\.cognitect-labs/.*"])
-
-(defn- coord-matches-allowlist?
-  "Does `coord` (a symbol like `'io.foo/bar`) match any pattern in
-   `patterns`? Both group-id and full coord are tried."
-  [coord patterns]
-  (let [s (str coord)]
-    (some (fn [p]
-            (try (re-find (re-pattern p) s)
-                 (catch Throwable _ nil)))
-          patterns)))
-
-(defn allowlist-policy
-  "A policy that auto-approves coords matching the ctx's allowlist
-   (default: `default-allowlist`); anything else returns :ask-human."
-  [coord _ctx]
-  (let [patterns (or (ec/get-state ALLOWLIST-KEY) default-allowlist)]
-    (if (coord-matches-allowlist? coord patterns)
-      :approve
-      :ask-human)))
+(defn default-policy
+  "Every request goes to a human (`:ask-human`). An approved lib's namespaces
+   become callable host code, and every curated auto-approve list so far still
+   held one that reaches the host, so none is offered; an operator who wants
+   automation installs their own policy fn."
+  [_coord _ctx]
+  :ask-human)
 
 ;; ============================================================================
 ;; Policy installation
@@ -94,20 +69,14 @@
 
 (defn install-policy!
   "Install a custom policy fn `(fn [coord ctx])` for the current ctx.
-   Defaults to `allowlist-policy` if never installed."
+   Defaults to `default-policy` (ask a human) if never installed."
   [policy-fn]
   (ec/swap-state! POLICY-KEY (constantly policy-fn)))
 
-(defn set-allowlist!
-  "Override the default allowlist with `patterns` (a vector of regex
-   strings) on the current ctx."
-  [patterns]
-  (ec/swap-state! ALLOWLIST-KEY (constantly (vec patterns))))
-
 (defn current-policy
-  "The currently installed policy fn, or `allowlist-policy` if none."
+  "The currently installed policy fn, or `default-policy` if none."
   []
-  (or (ec/get-state POLICY-KEY) allowlist-policy))
+  (or (ec/get-state POLICY-KEY) default-policy))
 
 ;; ============================================================================
 ;; Pending requests (for human / manager escalation)
@@ -185,12 +154,13 @@
    fork-safe via ec-state and lets spin code observe / compose with
    the request if needed. We bridge to a thread-blocking read via
    `await-on-thread`."
-  [coord _ctx]
+  [coord policy-ctx]
   (let [ctx        (ec/current-execution-context)
         request-id (str (random-uuid))
         d          (sync/create-deferred ctx)
         req        {:id           request-id
                     :coord        coord
+                    :spec         (:spec policy-ctx)
                     :requested-at (java.util.Date.)
                     :deferred     d
                     :ctx          ctx}]
@@ -201,7 +171,8 @@
     (try
       (peer-bus/post! {:type      :dvergr/dep-approval-requested
                        :request-id request-id
-                       :coord     coord})
+                       :coord     coord
+                       :spec      (:spec policy-ctx)})
       (catch Throwable _))
     (await-on-thread ctx d)))
 
@@ -282,7 +253,12 @@
      - `konserve.*` / `kabel.*` — the store and wire layers underneath it."
   ["^cheshire($|\\..*)"
    "^hiccup($|\\..*)"
-   "^babashka($|\\..*)"
+   ;; Named, not `^babashka`: that prefix also holds the host process, HTTP,
+   ;; pod and deps APIs. `babashka.fs` itself is a pre-registered clamped shim.
+   "^babashka\\.(fs|json|cli)$"
+   ;; Shipped with the daemon, so add-libs grants nothing for it (it adds no
+   ;; jar); named here because `metosin/jsonista` add-libs used to open it.
+   "^jsonista\\.core$"
    "^medley($|\\..*)"
    "^camel-snake-kebab($|\\..*)"
    "^clj-yaml($|\\..*)"
@@ -314,10 +290,15 @@
    ;; `babashka.tasks` are NOT pre-registered (agents get gated `proc/*`
    ;; instead), so an innocuous `(require 'babashka.process)` would mirror the
    ;; RAW host API and hand back `sh`/`process` — a host shell as the daemon
-   ;; user. Hard-deny the process surfaces while keeping the prefix open for the
-   ;; data ones.
+   ;; user. Hard-deny the process surfaces (the allowlist now names the data
+   ;; ones instead of the prefix; this stays as a backstop for a wider one).
    "^babashka\\.process($|\\..*)"
    "^babashka\\.tasks($|\\..*)"
+   ;; Raw HTTP (the sandbox's own `babashka.http-client` is a registered,
+   ;; domain-gated shim), native pods, and spawning `clojure` processes.
+   "^babashka\\.http-client($|\\..*)"
+   "^babashka\\.pods($|\\..*)"
+   "^babashka\\.deps($|\\..*)"
    "^sci($|\\..*)"
    "^datahike\\.tx-preds($|\\..*)"
    "^dvergr($|\\..*)"
@@ -327,13 +308,31 @@
    "^kontor($|\\..*)"
    "^konserve($|\\..*)"
    "^kabel($|\\..*)"
+   ;; Host eval and raw network. `clojure.main/main "-e" ...` evaluates on the
+   ;; host as the daemon user; `clojure.core.server` starts a host socket REPL.
+   ;; hato, http-kit and clj-http are HTTP clients that bypass the sandbox's
+   ;; SSRF guard and domain policy (agents get the gated `http` namespace).
+   "^clojure\\.main$"
+   "^clojure\\.core\\.server$"
+   "^clojure\\.tools\\.nrepl($|\\..*)"
+   ;; `#=(...)` under the default `*read-eval*` evaluates on the host.
+   "^clojure\\.tools\\.reader($|\\..*)"
+   "^nrepl($|\\..*)"
+   "^cider($|\\..*)"
+   "^hato($|\\..*)"
+   "^org\\.httpkit($|\\..*)"
+   "^clj-http($|\\..*)"
+   ;; Agents get our hardened parser under the name `clojure.data.xml` (a
+   ;; registered shim, dvergr.sandbox.ns.codec); the real one and its
+   ;; subnamespaces resolve external entities (file://, http://).
+   "^clojure\\.data\\.xml($|\\..*)"
    "^clojure\\.repl$"
    "^clojure\\.repl\\..*"
    "^clojure\\.tools\\.deps.*"
    "^clojure\\.java\\..*"])
 
 (def ^:private NS-ALLOWLIST-KEY [:dvergr/deps-policy :ns-allowlist])
-(def ^:private NS-PROVENANCE-KEY [:dvergr/deps-policy :ns-added-prefixes])
+(def ^:private NS-PROVENANCE-KEY [:dvergr/deps-policy :ns-added])
 
 (defn set-namespace-allowlist!
   "Override the default mirror allowlist with regex patterns. The hard denylist
@@ -347,26 +346,223 @@
                       (catch Throwable _ nil)))
          patterns)))
 
+(declare served-from? current-prefixes)
+
 (defn allow-added-lib-namespaces!
-  "Record that an APPROVED `add-libs!` brought `lib-coords` onto the classpath,
-   so the agent may then require what it just asked for. Each coord's own
-   namespace root becomes mirrorable (`org.clojure/data.csv` → `clojure.data.csv`
-   is NOT inferable, so we allow the artifact id and the group's last segment,
-   which covers the common conventions and nothing broader)."
-  [lib-coords]
-  (let [prefixes (into #{}
-                       (mapcat (fn [coord]
-                                 (let [s (str coord)
-                                       [grp art] (if (re-find #"/" s)
-                                                   (str/split s #"/" 2)
-                                                   [s s])]
-                                   [(str "^" (java.util.regex.Pattern/quote art) "($|\\..*)")
-                                    (str "^" (java.util.regex.Pattern/quote
-                                              (last (str/split grp #"\.")))
-                                         "($|\\..*)")])))
-                       lib-coords)]
-    (ec/swap-state! NS-PROVENANCE-KEY #(into (or % #{}) prefixes))
-    prefixes))
+  "Record that an approved, SUCCESSFUL `add-libs!` put namespaces on the
+   classpath, so the agent may require exactly those. `grants` maps each
+   namespace to the URL prefixes of the roots it came from (its lib's jars);
+   a plain seq of namespaces binds each to the roots serving it now. Each entry
+   is one namespace, never a prefix: no name is inferred from a coord's group
+   or artifact id (`org.clojure/x` once opened every `clojure.*` namespace,
+   `clojure.main` included). Mirroring rechecks the roots, so a jar attached
+   later cannot take over a granted name. The hard denylist still applies."
+  [grants]
+  (let [grants (if (map? grants)
+                 (update-keys grants symbol)
+                 (into {} (map (fn [n] [(symbol n) (current-prefixes (symbol n))])) grants))]
+    (ec/swap-state! NS-PROVENANCE-KEY #(merge-with into (or % {}) grants))
+    (set (keys grants))))
+
+(defn lib-paths
+  "The classpath roots (jars or directories) the current basis records for
+   `lib` — after `add-libs`, the ones it just added."
+  [lib]
+  (some-> (requiring-resolve 'clojure.java.basis/current-basis)
+          (as-> current (current))
+          (get-in [:libs lib :paths])))
+
+(def ^:private source-keys
+  [:mvn/version :local/root :git/url :git/sha :git/tag :deps/root])
+
+(defn lib-source
+  "The source the current basis records for `lib` — `{:mvn/version …}`,
+   `{:local/root …}`, `{:git/url … :git/sha …}`, with any `:deps/root` — or
+   nil."
+  [lib]
+  (some-> (requiring-resolve 'clojure.java.basis/current-basis)
+          (as-> current (current))
+          (get-in [:libs lib])
+          (select-keys source-keys)
+          not-empty))
+
+(defn- same-root?
+  "Does the requested `:deps/root` (nil, or a subdirectory) name the root the
+   resolver recorded? Resolution writes it absolute: the local root itself, or
+   the git checkout `<gitlibs>/…/<sha>[/<subdir>]`."
+  [spec source]
+  (let [r (some-> (:deps/root spec) (str/replace #"^\./|/$" ""))
+        sr (some-> (:deps/root source) str)
+        canonical #(.getCanonicalPath (io/file %))]
+    (cond
+      (nil? sr) (nil? r)
+      (not (.isAbsolute (io/file sr))) (= r sr)
+      (:local/root spec) (= (canonical sr)
+                            (canonical (cond-> (io/file (:local/root spec)) r (io/file r))))
+      (:git/sha source) (str/ends-with? (str/replace sr #"/$" "")
+                                        (str (:git/sha source) (when r (str "/" r))))
+      :else (nil? r))))
+
+(defn- same-source?
+  "Did a request for `spec` get what the classpath has for that lib? A lib
+   already on the classpath is not reloaded, so a request for another source
+   (a Maven version after someone else's `:local/root`) gets the loaded code,
+   not the code it was approved for. Compared the way resolution fills a coord
+   in: a git request may leave out the URL (inferred from the lib name), name a
+   tag, and abbreviate the SHA; a `:local/root` may be relative. A Maven
+   version compares literally: `RELEASE`, `LATEST` or a range names no
+   particular version, so such a request (and the vector form, `RELEASE`) is
+   granted only when its own load put the lib on the classpath."
+  [spec source]
+  (let [canonical #(some-> % io/file .getCanonicalPath)]
+    (and (same-root? spec source)
+         (cond
+           (nil? spec) false
+
+           (:mvn/version spec)
+           (= (:mvn/version spec) (:mvn/version source))
+
+           (:local/root spec)
+           (and (:local/root source)
+                (= (canonical (:local/root spec)) (canonical (:local/root source))))
+
+           (:git/sha spec)
+           (and (:git/sha source)
+                (>= (count (:git/sha spec)) 7)
+                (str/starts-with? (:git/sha source) (:git/sha spec))
+                (or (nil? (:git/url spec)) (= (:git/url spec) (:git/url source)))
+                (or (nil? (:git/tag spec)) (nil? (:git/tag source))
+                    (= (:git/tag spec) (:git/tag source))))
+
+           :else false))))
+
+(defn- path->nss
+  "`foo_bar/baz.clj` (or `.cljc`, or AOT `baz__init.class`) → the namespace
+   names that load from it: each underscore in a file name is an `_` or a `-`
+   in the namespace (`my_lib/foo_bar.clj` → `my-lib.foo-bar`, `my-lib.foo_bar`,
+   …). All name the same file, so granting them all grants nothing more."
+  [entry]
+  (when-let [[_ base] (or (re-matches #"(.+)\.cljc?" entry)
+                          (re-matches #"(.+)__init\.class" entry))]
+    (when-not (str/starts-with? base "META-INF/")
+      ;; every underscore is a `_` or a `-` in the namespace name; at most
+      ;; 2^6 combinations, beyond that the two uniform readings
+      (let [dotted (str/replace base "/" ".")
+            parts (str/split dotted #"_" -1)]
+        (if (<= (count parts) 7)
+          (into #{}
+                (map symbol)
+                (reduce (fn [acc part] (for [a acc sep ["_" "-"]] (str a sep part)))
+                        [(first parts)] (rest parts)))
+          (into #{} (map symbol) [(str/replace dotted "_" "-") dotted]))))))
+
+(defn- root-entries
+  "Every file name under `root` (a jar or a directory), `/`-separated."
+  [root]
+  (let [f (io/file root)]
+    (cond
+      (.isDirectory f)
+      (let [base (.toPath f)]
+        (for [^java.io.File file (file-seq f)
+              :when (.isFile file)]
+          (str/replace (str (.relativize base (.toPath file))) java.io.File/separator "/")))
+
+      (.isFile f)
+      (with-open [jar (java.util.jar.JarFile. f)]
+        (doall (for [^java.util.jar.JarEntry e (enumeration-seq (.entries jar))
+                     :when (not (.isDirectory e))]
+                 (.getName e)))))))
+
+(defn- root-url-prefix
+  "The prefix every resource URL the class loader serves from `root` starts
+   with."
+  [root]
+  (let [f (io/file root)]
+    (if (.isDirectory f)
+      (str (.toURL (.toURI f)))
+      (str "jar:" (.toURL (.toURI f)) "!/"))))
+
+(defn- resource-urls
+  "The URLs `require` could load `ns-sym`'s code from, through `loader`: the AOT
+   `__init.class`, the `.clj`, the `.cljc`."
+  [loader base]
+  (keep #(some-> (.getResource ^ClassLoader loader (str base %)) str)
+        ["__init.class" ".clj" ".cljc"]))
+
+(defn- ns->base
+  "The resource path (without extension) `require` loads `ns-sym` from."
+  [ns-sym]
+  (-> (str ns-sym) (str/replace "-" "_") (str/replace "." "/")))
+
+(defn- served-from?
+  "Does every file `require` could load `ns-sym` from resolve to one of
+   `prefixes`?"
+  [ns-sym prefixes]
+  (let [urls (resource-urls (clojure.lang.RT/baseLoader) (ns->base ns-sym))]
+    (boolean (and (seq urls) (seq prefixes)
+                  (every? (fn [u] (some #(str/starts-with? u %) prefixes)) urls)))))
+
+(defn- current-prefixes
+  "The URL prefixes of the roots serving `ns-sym` now."
+  [ns-sym]
+  (let [base (ns->base ns-sym)]
+    (into #{}
+          (keep (fn [u] (let [i (str/last-index-of u base)] (when (pos? (or i -1)) (subs u 0 i)))))
+          (resource-urls (clojure.lang.RT/baseLoader) base))))
+
+(defn namespaces-provided
+  "Namespaces that the roots in `paths` (one lib's jars or directories) NEWLY
+   provide: a namespace counts only when it was not in `pre-existing` (the
+   namespace names before the load — `add-libs` itself creates the namespaces
+   a jar's `data_readers.clj` names), its file is where `require` looks for
+   that name (not `clojure.inspector.clj` for `clojure.inspector`), and every
+   file `require` could load it from — the AOT `__init.class`, the `.clj`, the
+   `.cljc` — resolves, through the class loader, to one of these roots. A jar
+   that also ships `clojure/main.clj`, or a `.cljc` beside a host `.clj` or
+   AOT class, does not provide that namespace."
+  ([paths] (namespaces-provided paths (set (map ns-name (all-ns)))))
+  ([paths pre-existing]
+   (let [prefixes (mapv root-url-prefix paths)]
+     (into #{}
+           (comp (mapcat root-entries)
+                 (mapcat (fn [entry]
+                           (let [entry-base (str/replace entry #"(__init\.class|\.cljc?)$" "")]
+                             (filter (fn [ns-sym]
+                                       (and (not (contains? pre-existing ns-sym))
+                                            (= entry-base (ns->base ns-sym))
+                                            (served-from? ns-sym prefixes)))
+                                     (path->nss entry))))))
+           paths))))
+
+(defonce ^:private launch-root-prefixes
+  ;; URL prefixes of the classpath the JVM started with. add-libs never
+  ;; changes java.class.path, so this names exactly what the daemon shipped.
+  (delay
+    (into []
+          (comp (remove str/blank?)
+                (map io/file)
+                (filter #(.exists ^java.io.File %))
+                (mapcat (fn [^java.io.File f]
+                          (distinct [(root-url-prefix (.getAbsoluteFile f))
+                                     (root-url-prefix (.getCanonicalFile f))]))))
+          (str/split (System/getProperty "java.class.path" "")
+                     (re-pattern (java.util.regex.Pattern/quote java.io.File/pathSeparator))))))
+
+(defn- launch-classpath-namespace?
+  "Does every file `require` could load `ns-sym` from come from the launch
+   classpath? The namespace allowlist speaks for what the daemon shipped, not
+   for whatever a later add-libs jar (approved for some other context, or
+   attached by a load that then failed) put under an allowlisted name."
+  [ns-sym]
+  (served-from? ns-sym @launch-root-prefixes))
+
+(defonce ^:private runtime-lib-namespaces
+  ;; lib → {:source <basis coord> :namespaces #{…}}: what its jars newly
+  ;; provided when an `add-libs!` first put it on the classpath (JVM-wide, like
+  ;; the classpath itself). A later request for the same lib, from any context,
+  ;; adds no jar, so this is where its grant comes from — when it asked for
+  ;; the source that is loaded. Libs of the launch basis are never here.
+  (atom {}))
 
 (defn- policy-state
   "Read a policy key, falling back to `default` when no execution context is
@@ -381,13 +577,22 @@
 (defn namespace-mirrorable?
   "May `ns-sym` be mirrored from the host classpath into an SCI ctx?
 
-   Deny by default. Allowed only when it matches the allowlist or a prefix an
-   approved `add-libs!` recorded — and never when it matches the hard denylist."
+   Deny by default. Allowed only when it is a namespace a successful
+   `add-libs!` recorded for this ctx, or matches the allowlist and comes from
+   the launch classpath — and never when it matches the hard denylist."
   [ns-sym]
   (let [s (str ns-sym)]
     (and (not (matches-any? hard-namespace-denylist s))
-         (or (matches-any? (policy-state NS-ALLOWLIST-KEY default-namespace-allowlist) s)
-             (matches-any? (policy-state NS-PROVENANCE-KEY #{}) s)))))
+         (or (when-let [prefixes (get (policy-state NS-PROVENANCE-KEY {}) (symbol s))]
+               ;; still loaded from the roots it was granted for
+               (served-from? (symbol s) prefixes))
+             ;; The allowlist speaks for the launch classpath. A namespace an
+             ;; add-libs jar provides (even one under an allowlisted prefix,
+             ;; `medley.probe`) is reachable only with that grant: another
+             ;; context's load, or a load that failed half way, is not this
+             ;; one's approval.
+             (and (matches-any? (policy-state NS-ALLOWLIST-KEY default-namespace-allowlist) s)
+                  (launch-classpath-namespace? (symbol s)))))))
 
 (defn namespace-denied?
   "Inverse of `namespace-mirrorable?`. Kept because the mirror path reads as a
@@ -556,6 +761,12 @@
             ;; the alias / refers from the original require form.
             {:dvergr/mirrored ns-sym})))))
 
+(defonce ^:private load-lock
+  ;; One add-libs at a time, JVM-wide: the classpath and the basis are
+  ;; JVM-wide, and what a load added (its `added` result, the basis entry it
+  ;; reads afterwards) must be this call's own, not a concurrent call's.
+  (Object.))
+
 (defn add-libs!
   "Gated add-libs: invoke the policy, on approve call the host
    `clojure.repl.deps/add-libs` and mirror newly-loaded namespaces
@@ -571,8 +782,16 @@
                           (throw (ex-info "clojure.repl.deps/add-libs not available — needs Clojure 1.12+"
                                           {:type :dvergr/deps-arg})))
         coords        (libs->coords libs)
+        ;; A local root stays writable after approval: what is approved is not
+        ;; what would be loaded. Libs from local roots belong in the daemon's
+        ;; own deps.
+        _             (when (map? libs)
+                        (doseq [[c spec] libs :when (and (map? spec) (contains? spec :local/root))]
+                          (throw (ex-info (str "Dep denied: " c " — a :local/root source is not loadable from the sandbox")
+                                          {:type :dvergr/dep-denied :coord c :reason :local-root}))))
         ;; Check every coord; first denial wins
-        decisions     (mapv (fn [c] [c (check-coord! c {})]) coords)
+        decisions     (mapv (fn [c] [c (check-coord! c {:spec (when (map? libs) (get libs c))})])
+                            coords)
         denials       (filter (fn [[_ d]] (map? d)) decisions)]
     (cond
       (seq denials)
@@ -586,26 +805,48 @@
                          :reason deny})))
 
       :else
-      (let [pre-ns (set (all-ns))]
-        ;; Every coord passed the gate, so the agent is now entitled to require
-        ;; what it just asked for: record the provenance BEFORE loading, since
-        ;; `mirror-namespaces-into-sci!` below consults the mirror policy.
-        (allow-added-lib-namespaces! coords)
-        ;; clojure.repl.deps/add-libs guards on `clojure.core/*repl*`
-        ;; being bound to true. We're a server-side call, not a REPL,
-        ;; but the gate has already enforced human approval — so bind
-        ;; the flag while we invoke.
-        (with-bindings {#'clojure.core/*repl* true}
-          (host-add-libs (if (map? libs)
-                           libs
-                           (into {} (for [c coords] [c {:mvn/version "RELEASE"}])))))
-        (tel/log! {:id :sandbox.deps/approved
-                   :data {:coords coords}}
-                  "Deps approved + loaded")
-        (let [new-nss (mirror-namespaces-into-sci! sci-ctx pre-ns)]
-          {:status :loaded
-           :coords (vec coords)
-           :namespaces (mapv ns-name new-nss)})))))
+      (locking load-lock
+        (let [pre-ns (set (all-ns))
+            ;; clojure.repl.deps/add-libs guards on `clojure.core/*repl*`
+            ;; being bound to true. We're a server-side call, not a REPL,
+            ;; but the gate has already enforced human approval — so bind
+            ;; the flag while we invoke. It returns the libs it ADDED: a lib
+            ;; the basis already has is skipped and adds nothing.
+              added (with-bindings {#'clojure.core/*repl* true}
+                      (host-add-libs (if (map? libs)
+                                       libs
+                                       (into {} (for [c coords] [c {:mvn/version "RELEASE"}])))))
+            ;; Only now, after the load succeeded, is the agent entitled to
+            ;; require what it asked for: the namespaces the requested libs'
+            ;; jars newly provided when add-libs (this call, or an earlier one
+            ;; in any context) put them on the classpath. Transitive deps are
+            ;; recorded too, so a later request for one of them is granted,
+            ;; but they are not mirrored unless requested.
+              pre-names (set (map ns-name pre-ns))
+              _ (doseq [lib added]
+                  (swap! runtime-lib-namespaces assoc lib
+                         {:source (lib-source lib)
+                          :prefixes (set (map root-url-prefix (lib-paths lib)))
+                          :namespaces (namespaces-provided (lib-paths lib) pre-names)}))
+              spec-of #(when (map? libs) (get libs %))
+              provided (into {}
+                             (mapcat (fn [c]
+                                       (let [{:keys [source namespaces prefixes]} (get @runtime-lib-namespaces c)]
+                                       ;; Added by this very call: what is loaded
+                                       ;; is what this request resolved to.
+                                         (when (or (contains? (set added) c)
+                                                   (same-source? (spec-of c) source))
+                                           (map (fn [n] [n prefixes]) namespaces)))))
+                             coords)]
+          (allow-added-lib-namespaces! provided)
+          (tel/log! {:id :sandbox.deps/approved
+                     :data {:coords coords :added (vec added) :namespaces (set (keys provided))}}
+                    "Deps approved + loaded")
+          (let [new-nss (mirror-namespaces-into-sci! sci-ctx pre-ns)]
+            {:status :loaded
+             :coords (vec coords)
+             :provenance (vec (sort (keys provided)))
+             :namespaces (mapv ns-name new-nss)}))))))
 
 ;; ============================================================================
 ;; sync-deps — reconcile classpath with the fork's deps.edn

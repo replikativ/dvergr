@@ -15,7 +15,7 @@
             [dvergr.sandbox.ns.doc :as doc])
   (:import [java.io File]))
 
-(declare fs-safe-resolve git-run* parse-porcelain-status parse-git-log git-log-format)
+(declare fs-safe-resolve parse-porcelain-status parse-git-log git-log-format)
 
 (defn install-http-fixture!
   "Host-only world setup: install an immutable offline capability in the current
@@ -53,10 +53,15 @@
    alternation becomes part of an alternative: when this was wrapped across
    three lines, `/etc/sudoers` and `~/.gcloud/` silently required a leading
    `\\n<spaces>` to match and so were never blocked at all — a dead branch that
-   read as covered. Keep it flat."
+   read as covered. Keep it flat.
+
+   `.git` is on it because a repository's config and hooks are host command
+   execution for whoever runs git there next (`diff.external`, a `clean`
+   filter, a `pre-commit` hook); a path through `.git` is never workspace
+   content."
   [path]
   (when (and path
-             (re-find #"(?i)(\.ssh[/\\]|\.gnupg[/\\]|/etc/shadow|/etc/passwd|/etc/sudoers|/proc/|/sys/|\.aws[/\\]|\.azure[/\\]|\.gcloud[/\\]|/run/secrets|\.env$|\.env\.)"
+             (re-find #"(?i)(\.ssh[/\\]|\.gnupg[/\\]|/etc/shadow|/etc/passwd|/etc/sudoers|/proc/|/sys/|\.aws[/\\]|\.azure[/\\]|\.gcloud[/\\]|/run/secrets|\.env$|\.env\.|(^|[/\\])\.git([/\\]|$))"
                       path))
     (throw (ex-info "Access denied: sensitive path" {:path path}))))
 
@@ -203,14 +208,26 @@
           (update :body scrub)
           (update :headers (fn [hs] (into {} (map (fn [[k v]] [k (scrub v)]) hs))))))))
 
-(defn- internal-address? [^java.net.InetAddress addr]
-  (or (.isLoopbackAddress addr) (.isLinkLocalAddress addr)
-      (.isSiteLocalAddress addr) (.isAnyLocalAddress addr)
-      (.isMulticastAddress addr)
-      (let [h (.getHostAddress addr)]
-        (or (str/starts-with? h "169.254.")          ; link-local / cloud metadata
-            (str/starts-with? h "127.")
-            (str/starts-with? h "0.")))))
+(defn- internal-address?
+  "Loopback, link-local, private, wildcard, multicast — plus the two private
+   ranges `InetAddress` does not call site-local: IPv6 unique-local fc00::/7
+   (RFC 4193) and IPv4 shared address space 100.64.0.0/10 (RFC 6598, used for
+   cloud VPC and pod-network services, e.g. a metadata endpoint at
+   100.100.100.200)."
+  [^java.net.InetAddress addr]
+  (let [b (.getAddress addr)]
+    (or (.isLoopbackAddress addr) (.isLinkLocalAddress addr)
+        (.isSiteLocalAddress addr) (.isAnyLocalAddress addr)
+        (.isMulticastAddress addr)
+        (and (instance? java.net.Inet6Address addr)
+             (= 0xfc (bit-and (aget b 0) 0xfe)))
+        (and (instance? java.net.Inet4Address addr)
+             (= 100 (bit-and (aget b 0) 0xff))
+             (= 0x40 (bit-and (aget b 1) 0xc0)))
+        (let [h (.getHostAddress addr)]
+          (or (str/starts-with? h "169.254.")          ; link-local / cloud metadata
+              (str/starts-with? h "127.")
+              (str/starts-with? h "0."))))))
 
 (defn ssrf-guard!
   "Reject non-http(s) schemes and any URL whose host resolves to a loopback /
@@ -262,7 +279,13 @@
         r              (fn [s] @(ns-resolve fs-ns s))
         base-canonical (-> (java.io.File. (str base-path)) .getCanonicalFile)
         ;; Path-clamp every user path: canonical check + sensitive-path guard.
-        sr             (fn [p] (let [ps (str p)] (sensitive-path-policy ps) (fs-safe-resolve base-canonical ps)))
+        ;; The policy is checked on the path as written AND on where it
+        ;; resolves: a symlink `alias -> .git` must not make `alias/config`
+        ;; writable.
+        sr             (fn [p] (let [ps (str p)]
+                                 (sensitive-path-policy ps)
+                                 (doto (fs-safe-resolve base-canonical ps)
+                                   (-> str sensitive-path-policy))))
         ;; Relativize a resolved (absolute) path back to a workspace-relative
         ;; string, so agents never see the real `.dvergr/systems/<uuid>/…`
         ;; location — and get paths they can pass straight back to fs/slurp
@@ -287,9 +310,46 @@
         mkdir          (fn [p] (fx effects :fs/mkdir {:path (str p)}
                                    #(let [f (sr p)] (bb-create-dirs f) (rel f))))
         del            (fn [bb] (fn [p] (fx effects :fs/delete {:path (str p)} #(bb (sr p)))))
-        cpmv           (fn [op bb] (fn [a b & m] (fx effects op {:src (str a) :dst (str b)}
-                                                     #(let [fa (sr a) fb (sr b)]
-                                                        (apply bb fa fb m) (rel fb)))))
+        ;; A tree copy reads and writes every path under its roots, not just
+        ;; the roots: a symlink inside the source can point out of the
+        ;; workspace, and one inside the destination (`alias -> .git`) can
+        ;; redirect a write. Each entry is clamped on both sides; symlinked
+        ;; directories are checked, not descended (no cycles).
+        check-tree!    (fn [a b]
+                         (let [fa (sr a)]
+                           (when (.isDirectory fa)
+                             (loop [pending (vec (.listFiles fa))]
+                               (when-let [^java.io.File f (peek pending)]
+                                 (let [r (str (.relativize (.toPath fa) (.toPath f)))]
+                                   (sr (str a "/" r))
+                                   (sr (str b "/" r))
+                                   (recur (into (pop pending)
+                                                (when (and (.isDirectory f)
+                                                           (not (java.nio.file.Files/isSymbolicLink (.toPath f))))
+                                                  (.listFiles f))))))))))
+        ;; A recursive delete or a move takes everything under its root along:
+        ;; refuse when anything under it is sensitive (`.git`, `.env`, …).
+        check-descendants! (fn [a]
+                             (let [fa (sr a)]
+                               (when (.isDirectory fa)
+                                 (loop [pending (vec (.listFiles fa))]
+                                   (when-let [^java.io.File f (peek pending)]
+                                     (let [p (str a "/" (.relativize (.toPath fa) (.toPath f)))
+                                           link? (java.nio.file.Files/isSymbolicLink (.toPath f))]
+                                       ;; a symlink is deleted or moved itself, not
+                                       ;; its target: judge it by its name
+                                       (if link? (sensitive-path-policy p) (sr p))
+                                       (recur (into (pop pending)
+                                                    (when (and (.isDirectory f) (not link?))
+                                                      (.listFiles f))))))))))
+        cpmv           (fn [op bb & [tree?]]
+                         (fn [a b & m] (fx effects op {:src (str a) :dst (str b)}
+                                           #(let [fa (sr a) fb (sr b)]
+                                              (case tree?
+                                                :copy (check-tree! a b)
+                                                :move (do (check-descendants! a) (check-tree! a b))
+                                                nil)
+                                              (apply bb fa fb m) (rel fb)))))
         pred           (fn [bb] (fn [p] (fx effects :fs/stat {:path (str p)} #(bb (sr p)))))]
     ;; The real babashka.fs SUBSET, every path clamped to base-path. Returns strings
     ;; (not Path objects) so SCI agents get serialisable values. Content read/write
@@ -321,10 +381,11 @@
                          'create-dirs        mkdir
                          'delete             (del (r 'delete))
                          'delete-if-exists   (del (r 'delete-if-exists))
-                         'delete-tree        (del (r 'delete-tree))
-                         'move               (cpmv :fs/move (r 'move))
+                         'delete-tree        (let [d (del (r 'delete-tree))]
+                                               (fn [p] (check-descendants! p) (d p)))
+                         'move               (cpmv :fs/move (r 'move) :move)
                          'copy               (cpmv :fs/copy (r 'copy))
-                         'copy-tree          (cpmv :fs/copy (r 'copy-tree))
+                         'copy-tree          (cpmv :fs/copy (r 'copy-tree) :copy)
                          'parent             (fn [p] (some-> (bb-parent (sr p)) rel))
                          'file-name          (fn [p] (str ((r 'file-name) p)))
                          'absolutize         (fn [p] (rel (sr p)))
@@ -422,6 +483,14 @@
 
 (defn- add-virtual-fs-ns! [sci-ctx filesystem effects]
   (let [resolve! #(virtual-path filesystem %)
+        ;; A recursive copy, move or delete takes everything under its root:
+        ;; refuse when any path under it, or where it would land, is sensitive
+        ;; (`.ssh` passes, `.ssh/key` does not).
+        check-tree! (fn [source target]
+                      (doseq [p (virtual-walk filesystem source)]
+                        (sensitive-path-policy p)
+                        (when target
+                          (sensitive-path-policy (str target (subs p (count source)))))))
         relative #(str/replace % #"^/+" "")
         stat-map (fn [path]
                    (when-let [stat (mfs/stat filesystem path)]
@@ -481,18 +550,25 @@
         'delete-if-exists (write-fx :fs/delete #(let [path (resolve! %)]
                                                   (if (mfs/exists? filesystem path)
                                                     (mfs/delete filesystem path) false)))
-        'delete-tree (write-fx :fs/delete #(delete-tree! (resolve! %)))
+        'delete-tree (write-fx :fs/delete #(let [path (resolve! %)]
+                                             (check-tree! path nil)
+                                             (delete-tree! path)))
         'move (fn [source target & _]
                 (fx effects :fs/move {:src (str source) :dst (str target)}
                     #(let [source (resolve! source) target (resolve! target)]
+                       (check-tree! source target)
                        (mfs/rename filesystem source target)
                        (relative target))))
         'copy (fn [source target & _]
                 (fx effects :fs/copy {:src (str source) :dst (str target)}
-                    #(relative (copy-tree! (resolve! source) (resolve! target)))))
+                    #(let [source (resolve! source) target (resolve! target)]
+                       (check-tree! source target)
+                       (relative (copy-tree! source target)))))
         'copy-tree (fn [source target & _]
                      (fx effects :fs/copy {:src (str source) :dst (str target)}
-                         #(relative (copy-tree! (resolve! source) (resolve! target)))))
+                         #(let [source (resolve! source) target (resolve! target)]
+                            (check-tree! source target)
+                            (relative (copy-tree! source target)))))
         'parent (fn [path] (let [path (resolve! path)]
                              (when-not (= path "/") (relative (virtual-parent path)))))
         'file-name #(last (str/split (str %) #"/"))
@@ -528,6 +604,58 @@
                         (:effects options))
     (apply add-physical-fs-ns! sci-ctx (mapcat identity options))))
 
+(defn- git-arg-refused! [msg data]
+  (throw (ex-info msg (assoc data :type :dvergr/git-arg-refused :muschel/denied true))))
+
+(def ^:private git-diff-flags
+  "The `git/diff` options an agent may pass: output shape and whitespace only.
+   Anything else is refused; this is the subset the virtual workspace
+   implements."
+  #{"--cached" "--staged" "--stat" "--shortstat" "--numstat" "--name-only"
+    "--name-status" "-p" "-u" "--patch" "-w" "--ignore-all-space" "-b"
+    "--ignore-space-change" "--no-color" "--no-renames" "-R"})
+
+(defn- workspace-pathspec!
+  "Refuse a git path that names a sensitive file, uses pathspec magic
+   (`:(top)x`), or climbs above the repository root (a leading `/` names the
+   root)."
+  [path]
+  (when (str/starts-with? path ":")
+    (git-arg-refused! (str "git pathspec magic not allowed: " path) {:path path}))
+  (when (try (sensitive-path-policy path) false (catch clojure.lang.ExceptionInfo _ true))
+    (git-arg-refused! (str "git path is a sensitive file: " path) {:path path}))
+  (when (neg? (reduce (fn [d seg]
+                        (case seg
+                          ("" ".") d
+                          ".." (if (zero? d) (reduced -1) (dec d))
+                          (inc d)))
+                      0 (str/split (str/replace path #"^/+" "") #"/")))
+    (git-arg-refused! (str "git path outside the workspace: " path) {:path path}))
+  path)
+
+(defn- sensitive-name? [path]
+  (try (sensitive-path-policy (str path)) false
+       (catch clojure.lang.ExceptionInfo _ true)))
+
+(defn git-diff-argv
+  "The argv for `(git/diff & args)`: allowlisted options, then `--`, then
+   paths, each checked by `workspace-pathspec!`. Operands are always paths,
+   never revisions; an argument after a caller's own `--` is a path even if
+   it starts with `-`."
+  [args]
+  (let [[before after] (split-with #(not= "--" %) (map str args))
+        options (filter #(str/starts-with? % "-") before)
+        paths (concat (remove #(str/starts-with? % "-") before) (rest after))]
+    (doseq [o options
+            :when (not (or (contains? git-diff-flags o) (re-matches #"-U\d{1,4}" o)))]
+      (git-arg-refused! (str "git/diff option not allowed: " o
+                             " (allowed: " (str/join " " (sort git-diff-flags)) " -U<n>)")
+                        {:option o}))
+    (-> ["diff"]
+        (into options)
+        (conj "--")
+        (into (map workspace-pathspec!) paths))))
+
 (defn add-git-ns!
   "Expose structured git operations as 'git namespace in SCI.
 
@@ -535,7 +663,8 @@
    to understand workspace state before committing. This namespace returns
    structured Clojure data rather than raw strings.
 
-   :base-path - git working directory (default: user.dir)
+   :workspace / :workspace-resolver - the room's Geschichte workspace. Without
+                 one every function refuses: agents get no host git.
    :effects   - boundary fn (`dvergr.effects/boundary-resolver`); add/commit are effects
 
    Usage in SCI:
@@ -555,8 +684,7 @@
 
      (git/commit \"Add feature\")
      ;; => \"[main abc1234] Add feature\""
-  [sci-ctx & {:keys [base-path effects workspace workspace-resolver]
-              :or   {base-path ((requiring-resolve 'dvergr.substrate.git/safe-workspace-root))}}]
+  [sci-ctx & {:keys [effects workspace workspace-resolver]}]
   (let [run!      (if (or workspace workspace-resolver)
                     (fn [& args]
                       (let [workspace (if workspace-resolver
@@ -568,7 +696,15 @@
                         (if (zero? (:exit result))
                           (:stdout result)
                           (throw (ex-info (str/trim (:stderr result)) result)))))
-                    (fn [& args] (apply git-run* base-path args)))
+                    ;; No room workspace: agents get no host git. Host git
+                    ;; executes repository-configured commands (hooks,
+                    ;; filters, diff drivers, transports, gc hooks) from a
+                    ;; repository the agent can write to; there is no
+                    ;; argument-level confinement of that worth trusting.
+                    nil)
+        no-room! (fn [& _]
+                   (git-arg-refused! "git needs a room workspace; host git is not available to agents"
+                                     {:reason :no-room-workspace}))
 
         status-fn (fn []
                     (fx effects :git/read {:op :status}
@@ -576,21 +712,82 @@
                           (run! "status" "--porcelain=v1" "--branch"))))
 
         log-fn    (fn [& [opts]]
-                    (fx effects :git/read {:op :log}
-                        #(let [n (str "-" (or (:n opts) 10))]
-                           (parse-git-log
-                            (run! "log" git-log-format n)))))
+                    (let [n (or (:n opts) 10)]
+                      ;; `(str "-" n)` with a string :n was any option
+                      ;; (`{:n "-output=/x"}` → `--output=/x`).
+                      (when-not (and (integer? n) (pos? n))
+                        (git-arg-refused! "git/log :n must be a positive integer" {:n n}))
+                      (fx effects :git/read {:op :log}
+                          #(parse-git-log
+                            (run! "log" git-log-format (str "-" n))))))
 
+        ;; Validate before the effect boundary, so a refusal is not audited as
+        ;; a read that happened.
         diff-fn   (fn [& args]
-                    (fx effects :git/read {:op :diff :args (vec args)}
-                        #(if (seq args)
-                           (apply run! "diff" args)
-                           (run! "diff"))))
+                    (let [argv (git-diff-argv args)
+                          sep (.indexOf ^java.util.List argv "--")
+                          opts (subvec argv 1 sep)
+                          paths (subvec argv (inc sep))]
+                      (fx effects :git/read {:op :diff :args (vec args)}
+                          ;; Which files does this diff cover? A sensitive one
+                          ;; (a tracked `.env`) is left out, as the file tools
+                          ;; leave it out; the diff then runs on the rest by
+                          ;; name. Listed without rename detection, so both
+                          ;; sides of a rename are seen, and rerun without it.
+                          ;; Names are split on NUL only and passed back as
+                          ;; literal pathspecs. (Partial; see #271.)
+                          #(let [names (->> (apply run! (concat ["diff"]
+                                                                (filter #{"--cached" "--staged"} opts)
+                                                                ["--no-renames" "--name-only" "-z" "--"] paths))
+                                            (re-seq #"[^\u0000]+"))
+                                 safe (remove sensitive-name? names)]
+                             (cond
+                               (= (count safe) (count names)) (apply run! argv)
+                               (empty? safe) ""
+                               :else (apply run! (concat ["diff"] opts ["--no-renames" "--"]
+                                                         (map (fn [n] (str ":(literal)" n)) safe))))))))
 
         add-fn    (fn [& paths]
-                    (fx effects :git/add {:paths (vec paths)}
-                        #(do (apply run! "add" paths)
-                             :ok)))
+                    (let [_ (when (empty? paths)
+                              (git-arg-refused! "git/add needs at least one path (\".\" for everything)" {}))
+                          paths (mapv #(workspace-pathspec! (str %)) paths)]
+                      (fx effects :git/add {:paths paths}
+                          ;; Geschichte's status takes no pathspecs, so select
+                          ;; its names by path prefix here and stage only the
+                          ;; non-sensitive ones; a glob is refused when any
+                          ;; sensitive file has changes. Its add reads
+                          ;; `-A`/`-u`/`-f` anywhere in argv, even after `--`:
+                          ;; a dash-led operand is refused and names go back
+                          ;; root-anchored (`/-A` is the file `-A`). Names come
+                          ;; from the structured status entries, so a file name
+                          ;; with a line break is one name. (Partial; see #271.)
+                          #(let [_ (doseq [p paths :when (str/starts-with? p "-")]
+                                     (git-arg-refused! (str "git/add path may not start with -: " p) {:path p}))
+                                 {:keys [conn]} (if workspace-resolver (workspace-resolver) workspace)
+                                 rules ((requiring-resolve 'geschichte.ignore/rules) conn)
+                                 ignored? (requiring-resolve 'geschichte.ignore/ignored?)
+                                 names (->> ((requiring-resolve 'geschichte.repo/status-entries) conn)
+                                            (remove (fn [{:keys [path worktree index]}]
+                                                      (and (= :untracked worktree) (nil? index)
+                                                           (ignored? rules path))))
+                                            (map :path))
+                                 rel (fn [p] (-> (java.nio.file.Paths/get "/" (into-array String [(str p)]))
+                                                 .normalize str (str/replace #"^/+|/+$" "")))
+                                 anchored (mapv (fn [p] (let [r (rel p)] (if (= "" r) "." (str "/" r)))) paths)
+                                 selected? (fn [n] (some (fn [p] (let [p (rel p)]
+                                                                   (or (= "" p) (= n p)
+                                                                       (str/starts-with? n (str p "/")))))
+                                                         paths))
+                                 sensitive (filter sensitive-name? names)]
+                             (cond
+                               (empty? sensitive) (apply run! "add" "--" anchored)
+                               (some (fn [p] (re-find #"[*?\[]" p)) paths)
+                               (git-arg-refused! "git/add glob not allowed while a sensitive file has changes"
+                                                 {:paths paths})
+                               :else (let [safe (remove sensitive-name? (filter selected? names))]
+                                       (when (seq safe)
+                                         (apply run! "add" "--" (map (fn [n] (str "/" n)) safe)))))
+                             :ok))))
 
         commit-fn (fn [message & [opts]]
                     (fx effects :git/commit {:message message}
@@ -600,18 +797,20 @@
 
     (sci/add-namespace! sci-ctx 'git
                         (doc/with-docs
-                          {'status status-fn
-                           'log    log-fn
-                           'diff   diff-fn
-                           'add    add-fn
-                           'commit commit-fn}
+                          (cond-> {'status status-fn
+                                   'log    log-fn
+                                   'diff   diff-fn
+                                   'add    add-fn
+                                   'commit commit-fn}
+                            ;; no room workspace: every call refuses, first
+                            (nil? run!) (update-vals (constantly no-room!)))
                           '{status [([]) "Working-tree status of YOUR room's repo, PARSED into a map (not porcelain text) — branch plus changed paths."
                                     [:=> :cat [:map [:branch :string] [:staged [:vector :string]]
                                                [:unstaged [:vector :string]] [:untracked [:vector :string]]]]]
                             log    [([] [opts]) "Recent commits as maps of :hash/:message/:author/:date. `opts` takes :n (default 10)."
                                     [:=> [:cat [:? [:maybe [:map [:n {:optional true} :int]]]]]
                                      [:vector [:map [:hash :string] [:message :string] [:author :string] [:date :string]]]]]
-                            diff   [([] [& args]) "Unified diff text. No args = unstaged changes; extra args pass through to `git diff` (e.g. \"--staged\", a path)."
+                            diff   [([] [& args]) "Unified diff text. No args = unstaged changes. Options: --staged/--cached, --stat, --shortstat, --numstat, --name-only, --name-status, -U<n>, -w, -b, -R, --no-renames; every other argument is a path inside the workspace."
                                     [:=> [:cat [:* :string]] :string]]
                             add    [([& paths]) "Stage paths for commit. Audited. Returns :ok."
                                     [:=> [:cat [:+ :string]] [:= :ok]]]
@@ -943,21 +1142,6 @@
       (throw (ex-info "Path escape attempt: resolved path is outside sandbox"
                       {:path user-path :base (str base-canonical)})))
     resolved))
-
-(defn- git-run*
-  "Run git in base-path. Returns stdout string or throws on non-zero exit."
-  [base-path & args]
-  (let [all-args (into ["git"] (map str args))
-        pb       (doto (ProcessBuilder. ^java.util.List all-args)
-                   (.directory (java.io.File. (str base-path))))
-        proc     (.start pb)
-        out      (future (slurp (.getInputStream proc)))
-        err      (future (slurp (.getErrorStream proc)))
-        exit     (.waitFor proc)]
-    (if (zero? exit)
-      @out
-      (throw (ex-info (str "git " (first args) " failed")
-                      {:exit exit :out @out :err @err :args args})))))
 
 (defn- parse-porcelain-status
   "Parse `git status --porcelain=v1 --branch` into a structured map."
