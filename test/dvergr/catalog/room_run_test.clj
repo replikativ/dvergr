@@ -207,3 +207,19 @@
     (runner/with-home home
       (fn [daemon]
         (is (= (str (:id b)) (:bundle (ops/invoke daemon :catalog/check {:room "sums" :name "sums"}))))))))
+
+(deftest a-bundle-that-cannot-be-listed-whole-is-not-read
+  (let [home (tmp "dvergr-room-run-home-")
+        list-dir muschel.fs/list-dir]
+    (runner/with-home home
+      (fn [daemon]
+        (ops/invoke daemon :room/create {:title "Sums" :slug "sums"})
+        (room-run/sync-bundle! daemon "sums" "sums" case-files)
+        (let [r (ops/resolve-room daemon "sums")]
+          (with-redefs [muschel.fs/list-dir (fn [fs path]
+                                              (if (str/includes? (str path) "cases/two")
+                                                (throw (ex-info "listing failed" {}))
+                                                (list-dir fs path)))]
+            (is (thrown-with-msg? Exception #"listing failed"
+                                  (binding [org.replikativ.spindel.engine.core/*execution-context* (:ctx r)]
+                                    (room-wf/bundle-files r "sums"))))))))))

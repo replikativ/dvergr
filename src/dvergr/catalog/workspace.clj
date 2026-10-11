@@ -52,7 +52,9 @@
                                  (assoc acc entry-path text)))
                              :else acc))
                          acc
-                         (try (mfs/list-dir fs path) (catch Throwable _ nil))))]
+                         ;; a listing that fails is an empty directory, or,
+                         ;; strict, the read's failure
+                         (try (mfs/list-dir fs path) (catch Throwable t (when strict? (throw t)) nil))))]
          (if (mfs/exists? fs dir) (walk dir {}) {})))
      {})))
 
