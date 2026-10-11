@@ -101,46 +101,58 @@
     ;; KB + repo as yggdrasil systems on the room's OWN execution context (RF5 S2).
     ;; The system-db room row IS the registry (RF5 S4), carrying the registry
     ;; fields. Returns the room's ctx; forking it branches only the room's systems.
-    (let [prov     (when ctx
-                     (try (binding [ec/*execution-context* ctx]
-                            (srooms/provision-room!
-                             (cond-> {:slug slug :name (or title slug)
-                                      :type (or type :internal)}
-                               telegram-chat-id (assoc :telegram-chat-id telegram-chat-id)
-                               (seq agent-ids)  (assoc :agent-ids (set agent-ids))
-                               parent-slug      (assoc :parent-slug parent-slug)
-                               repo-source      (assoc :repo-source repo-source)
-                               repo-branch      (assoc :repo-branch repo-branch))))
-                          ;; An import that fails must say so, not leave a room
-                          ;; without the repository it was made for.
-                          (catch Throwable t (when repo-source (throw t)) nil)))
+    ;; A room that cannot be provisioned fails loudly: returning its id with
+    ;; nothing (or half of it) provisioned leaves the caller a room that
+    ;; looks created, but does not register, persist or run.
+    (when-not ctx
+      (throw (ex-info "create-room!: no execution context to provision the room in"
+                      {:slug slug})))
+    (let [prov     (try (binding [ec/*execution-context* ctx]
+                          (srooms/provision-room!
+                           (cond-> {:slug slug :name (or title slug)
+                                    :type (or type :internal)}
+                             telegram-chat-id (assoc :telegram-chat-id telegram-chat-id)
+                             (seq agent-ids)  (assoc :agent-ids (set agent-ids))
+                             parent-slug      (assoc :parent-slug parent-slug)
+                             repo-source      (assoc :repo-source repo-source)
+                             repo-branch      (assoc :repo-branch repo-branch))))
+                        (catch Throwable t
+                          (tel/log! {:level :error :id :rooms/provisioning-failed
+                                     :data {:slug slug :error (ex-message t)}}
+                                    "Room provisioning failed")
+                          (throw (ex-info (str "Room " slug " could not be provisioned: " (ex-message t))
+                                          {:slug slug :repo-source repo-source} t))))
           ;; never the daemon ctx: a room runs on its own (see hydrate-registry!)
-          room-ctx (:room-ctx prov)]
+          room-ctx (:room-ctx prov)
+          store    (when room-ctx
+                     (binding [ec/*execution-context* room-ctx] (room-store slug)))]
+      (when-not store
+        (throw (ex-info (str "Room " slug " has no "
+                             (if room-ctx "messages store" "execution context")
+                             " after provisioning")
+                        {:slug slug :room-ctx? (some? room-ctx)})))
       (tel/log! {:id :rooms/created :data {:slug slug}} "Room created")
       ;; Build the discourse Room ON its own ctx, with its per-room store.
       ;; rreg/register! roots the registry write (Tier-1), so the room is visible
       ;; to the UI even though it runs on its own ctx.
-      (when room-ctx
-        (let [store (binding [ec/*execution-context* room-ctx] (room-store slug))]
-          (when store
-            (let [new-room (binding [ec/*execution-context* room-ctx]
-                             (d/make-room {:id        (rstore/slug->room-id slug)
-                                           :slug      slug
-                                           :title     (or title slug)
-                                           :parent-id parent-kw
-                                           :ctx       room-ctx
-                                           :store     store
-                                           :meta      (cond-> {:type (or type :internal)
-                                                               :chat-id (srooms/msgs-chat-id slug)
-                                                               :agent-ids (set agent-ids)}
-                                                        telegram-chat-id
-                                                        (assoc :telegram-chat-id telegram-chat-id))}))]
+      (let [new-room (binding [ec/*execution-context* room-ctx]
+                       (d/make-room {:id        (rstore/slug->room-id slug)
+                                     :slug      slug
+                                     :title     (or title slug)
+                                     :parent-id parent-kw
+                                     :ctx       room-ctx
+                                     :store     store
+                                     :meta      (cond-> {:type (or type :internal)
+                                                         :chat-id (srooms/msgs-chat-id slug)
+                                                         :agent-ids (set agent-ids)}
+                                                  telegram-chat-id
+                                                  (assoc :telegram-chat-id telegram-chat-id))}))]
               ;; Discourse-level join for every agent in :agent-ids. Only
               ;; effective for agents currently in the runtime registry —
               ;; missing ones get a warning but don't fail the create.
-              (doseq [aid (seq agent-ids)]
-                (binding [ec/*execution-context* room-ctx]
-                  (discourse-join! new-room aid))))))))
+        (doseq [aid (seq agent-ids)]
+          (binding [ec/*execution-context* room-ctx]
+            (discourse-join! new-room aid)))))
     (rstore/slug->room-id slug)))
 
 (defn archive-room!

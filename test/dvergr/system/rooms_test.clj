@@ -141,3 +141,26 @@
           (governance/ungovern! conn)
           (dh/release conn)
           (dh/delete-database cfg))))))
+
+(deftest a-room-that-cannot-be-provisioned-is-not-created
+  ;; without a repository source too: the caller learns the room is missing
+  ;; instead of receiving the id of a room that never registered
+  (let [root (context/create-execution-context)
+        slug (str "unprovisioned-" (random-uuid))
+        room-kw (rstore/slug->room-id slug)]
+    (try
+      (binding [ec/*execution-context* root]
+        (with-redefs [rooms/provision-room! (fn [_] (throw (ex-info "store unavailable" {})))]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"could not be provisioned: store unavailable"
+                                (droom/create-room! {:slug slug :parent-id false}))))
+        (with-redefs [rooms/provision-room! (fn [_] {:room-ctx root})
+                      droom/room-store (fn [_] nil)]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"has no messages store"
+                                (droom/create-room! {:slug slug :parent-id false}))))
+        (is (nil? (rreg/lookup room-kw)) "nothing registered"))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no execution context"
+                            (droom/create-room! {:slug slug :parent-id false :ctx nil})))
+      (finally
+        (binding [ec/*execution-context* root]
+          (when (rreg/lookup room-kw) (rreg/unregister! room-kw)))
+        (context/close-context! root)))))
