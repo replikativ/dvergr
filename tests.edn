@@ -15,6 +15,9 @@
  :reporter [kaocha.report/dots]
  ;; Tests write under java.io.tmpdir (target/test-tmp, see the :test alias);
  ;; dvergr.test-tmp creates it before the run and empties it after.
- :plugins [:kaocha.plugin/hooks]
- :kaocha.hooks/pre-load [dvergr.test-tmp/pre-load]
- :kaocha.hooks/post-run [dvergr.test-tmp/post-run]}
+ :plugins [:kaocha.plugin/hooks :kaocha.plugin/profiling]
+ ;; The profiling plugin prints the slowest namespaces and tests after the run.
+ :kaocha.plugin.profiling/count 40
+ :kaocha.hooks/pre-load [dvergr.test-tmp/pre-load dvergr.test-phases/pre-load]
+ :kaocha.hooks/post-load [dvergr.test-phases/post-load]
+ :kaocha.hooks/post-run [dvergr.test-phases/post-run dvergr.test-tmp/post-run]}
