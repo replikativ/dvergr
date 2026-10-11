@@ -77,18 +77,23 @@ stays what it is for: reproducing an Attempt and freezing a benchmark.
   cannot be persisted costs resumability, never progress. Only LLM Runs whose control room
   has a store get the handler.
 - **Resume.** `program/resume!` (MCP `run_resume {room run}`, admin toolset) takes a stopped
-  Run (terminal) with a savepoint, claims it once (`run/claim-resume!`, `:run/resumed-by`),
-  and hires a new Run: its world forked at the savepoint's snapshot ids (`world/open!`
-  `:snapshots`), its chat seeded with the old Run's persisted messages, its step count on from
-  the savepoint, the old Run as its cause (`:run/caused-by`). `run_detail` shows
+  Run (terminal) with a savepoint and hires a new Run: its world forked at the savepoint's
+  snapshot ids (`world/open!` `:snapshots`), its chat seeded with the old Run's persisted
+  messages, its step count on from the savepoint, the old Run as its cause (`:run/caused-by`,
+  recorded with its admission). The resume is atomic for the caller: `run/reserve-resume!`
+  excludes a concurrent resume in the process without writing anything; the new Run's grant
+  comes straight from the old Run's wallet; and only then, before it executes, the new Run
+  claims the old one once (`run/claim-resume!`, `:run/resumed-by`). A resume that fails
+  leaves the old Run with its wallet, resumable again; a successor that failed before it
+  executed (admission, allocation or spawn) does not count as a resume. `run_detail` shows
   `resumable-from-step` and `resumed-by`.
 - **Through spindel.** The world is a Run world of the room forked at the recorded
   snapshots (so registry, settlement and review are as for any Run), and
   `savepoint.portable/hydrate-into!` (spindel 0.1.67+) makes it the savepoint's continuation
   before the first step: `continue-llm-run` runs there and resolves with the resumed Run's
   result (doc/unified-worlds.md, step 3). The budget moves with dvergr's resource wallets (the
-  old Run's remainder returned to its parent and granted to the new Run); spindel's escrow is
-  for a planned handoff (doc/unified-worlds.md, step 2).
+  old Run's remainder granted from its wallet to the new Run's, which returns what it leaves to
+  the parent); spindel's escrow is for a planned handoff (doc/unified-worlds.md, step 2).
 - **Open.** Receipts of a running Run are not yet durable per step, so the step a Run stopped
   in is redone without checking its `:once` effects; `run_resume`'s doc says so. Automatic
   resume on start comes after on-request resume has been exercised. Protocol Runs (tau2) are

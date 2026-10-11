@@ -14,6 +14,7 @@
      - `with-self-filter` — drop :source events the participant authored
      - `with-silence`     — treat [SKIP] or blank replies as no-reply"
   (:require [clojure.string :as str]
+            [dvergr.discourse :as d]
             [org.replikativ.spindel.core :as sp]))
 
 ;; ============================================================================
@@ -76,7 +77,8 @@
 
 (defn with-silence
   "Filter out replies that opt for silence (see `silent-reply?`): the reply is
-   treated as no-reply (returns nil).
+   treated as no-reply (returns nil), and the lifecycle it carries is settled
+   as `:silent` (`dvergr.discourse/withhold-reply!`): a silent turn completes.
 
    This is the soft half of multi-agent loop control — an agent that has nothing
    substantive to add stays quiet instead of chiming in. Pairs with the
@@ -88,7 +90,8 @@
      (fn [pp env]
        (sp/spin
         (let [reply (sp/await (orig pp env))]
-          (when (and reply (not (silent-reply? (:content reply))))
+          (if (and reply (silent-reply? (:content reply)))
+            (d/withhold-reply! pp reply :silent)
             reply))))
      with-silence)))
 

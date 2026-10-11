@@ -7,13 +7,18 @@
             [dvergr.agent.program :as program]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.run :as run]
+            [dvergr.agent.world :as world]
             [dvergr.chat.agent :as chat-agent]
             [dvergr.chat.context :as chat-context]
             [dvergr.chat.schema :as chat-schema]
             [dvergr.discourse :as d]
             [dvergr.model.providers :as providers]
+            [dvergr.resource :as resource]
+            [dvergr.room.store :as room-store]
             [dvergr.room.store.datahike :as datahike-store]
-            [org.replikativ.spindel.engine.core :as ec]))
+            [kontor.governance :as kontor-governance]
+            [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.savepoint.portable :as portable]))
 
 (defn- durable-room [id]
   (let [cfg {:store {:backend :memory :id (random-uuid)} :keep-history? false :schema-flexibility :write}]
@@ -100,3 +105,91 @@
                 (is (thrown-with-msg? Exception #"resumed before"
                                       (program/resume! room room first-run))))))))
       (finally (d/close-room! room)))))
+
+(defn- resource-room [id]
+  (let [cfg {:store {:backend :memory :id (random-uuid)} :keep-history? true :schema-flexibility :write}
+        chat-id (random-uuid)]
+    (dh/create-database cfg)
+    (let [conn (dh/connect cfg)]
+      (chat-schema/ensure-full-schema! conn)
+      (dh/transact conn [(merge (chat-schema/create-chat-entity {:id chat-id :title (name id)})
+                                {:room/slug (room-store/room-id->slug id) :room/type :internal})])
+      (resource/install-connection! conn id chat-id)
+      [(d/make-room {:id id :store (datahike-store/make conn)}) conn])))
+
+(deftest a-failed-resume-leaves-the-old-run-untouched
+  (let [[room conn] (resource-room :resume-failure-room)]
+    (try
+      (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 10000000M}})
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [first-run
+              ;; a process that stopped mid-Run: failed, its wallet not returned
+              (with-redefs [providers/ensure-initialized! (constantly nil)
+                            program/return-unused-resources! (fn [& _] nil)
+                            chat-agent/run-agent-turn!
+                            (fn [chat-ctx opts]
+                              (if (zero? (:turn-number opts))
+                                (tool-step! chat-ctx 0)
+                                (throw (ex-info "the process stopped" {}))))]
+                (let [h (program/hire! room team :worker
+                                       {:task "calculate"
+                                        :resources {resource/microdollars 4000000M}})]
+                  @h
+                  (program/run-id h)))
+              wallet (resource/run-balance room first-run)
+              room-balance (resource/balance room)
+              untouched? (fn []
+                           (and (nil? (:run/resumed-by (run/run room first-run)))
+                                (= wallet (resource/run-balance room first-run))
+                                (= room-balance (resource/balance room))
+                                (empty? (run/active-runs :resume-failure-room))))]
+          (is (pos? (get wallet resource/microdollars 0M)) "the stopped Run kept its wallet")
+          (testing "a world that cannot open"
+            (with-redefs [providers/ensure-initialized! (constantly nil)
+                          world/open! (fn [& _] (throw (ex-info "no world" {})))]
+              (is (thrown-with-msg? Exception #"no world"
+                                    (program/resume! room room first-run))))
+            (is (untouched?) "no claim, no transfer"))
+          (testing "a savepoint that cannot hydrate"
+            (with-redefs [providers/ensure-initialized! (constantly nil)
+                          portable/hydrate-into!
+                          (fn [& _] (fn [_ok fail] (fail (ex-info "no hydration" {}))))]
+              (is (thrown-with-msg? Exception #"no hydration"
+                                    (program/resume! room room first-run))))
+            (is (untouched?) "no claim, no transfer"))
+          (testing "a Run that cannot be admitted"
+            (with-redefs [providers/ensure-initialized! (constantly nil)
+                          run/start! (fn [& _] (throw (ex-info "no admission" {})))]
+              (is (thrown-with-msg? Exception #"no admission"
+                                    (program/resume! room room first-run))))
+            (is (untouched?) "no claim, no transfer"))
+          (testing "a wallet that cannot be split"
+            (with-redefs [providers/ensure-initialized! (constantly nil)
+                          resource/allocate-run! (fn [& _] (throw (ex-info "no allocation" {})))]
+              (is (thrown-with-msg? Exception #"no allocation"
+                                    (program/resume! room room first-run))))
+            (is (untouched?) "the claim is released and the wallet stays"))
+          (testing "the Run still resumes, and the new Run owns the old wallet"
+            (let [observed (promise)
+                  second-run
+                  (with-redefs [providers/ensure-initialized! (constantly nil)
+                                chat-agent/run-agent-turn!
+                                (fn [chat-ctx _opts]
+                                  (deliver observed
+                                           (resource/run-balance
+                                            room (:run/id (first (run/active-runs :resume-failure-room)))))
+                                  (chat-context/add-message! chat-ctx {:role :assistant :content "The result is 2."})
+                                  :complete)]
+                    (let [h (program/resume! room room first-run)]
+                      (is (= :completed (:run/status @h)))
+                      (program/run-id h)))]
+              (is (= wallet (deref observed 1000 ::timeout))
+                  "while it ran, the new Run held what the old one left")
+              (is (= second-run (:run/resumed-by (run/run room first-run))))
+              (is (contains? (:run/caused-by (run/run room second-run)) first-run))
+              (is (= {} (resource/run-balance room first-run)))
+              (is (= (merge-with + room-balance wallet) (resource/balance room))
+                  "its remainder returned to the Room when it finished")))))
+      (finally
+        (kontor-governance/ungovern! conn)
+        (d/close-room! room)))))

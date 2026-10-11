@@ -480,9 +480,20 @@
       {:id :agent
        :ctx (:ctx room)
        :on-message
-       (fn [_p msg]
+       (fn [p msg]
          (sp/spin
           (let [run-id (:run/id (run/start! room :agent msg nil))
+                ;; the participant settles the Run with the reply, or when the
+                ;; turn ends any other way (it threw, or the agent left)
+                obligation
+                (d/reply-obligation!
+                 p {:on-emitted (fn [_] (run/finish! run-id :completed))
+                    :on-failed (fn [_] (run/finish! run-id :failed))
+                    :on-dropped (fn [reason error]
+                                  (when (= :abandoned reason) (run/cancel-run! run-id))
+                                  (run/finish! run-id (if (= :abandoned reason) :cancelled :failed)
+                                               (cond-> {:reason reason}
+                                                 error (assoc :error error))))})
                 h (gen/future-handle
                    (:ctx room)
                    (fn []
@@ -494,17 +505,17 @@
                 reply (sp/await (:done h))]
             (cond
               (gen/error-result? reply)
-              (do (fault! episode :agent-model (::gen/error reply))
+              (do (d/release-obligation! p obligation)
+                  (fault! episode :agent-model (::gen/error reply))
                   (run/finish! run-id :failed {:reason :provider-error})
                   nil)
 
               (and (string? reply) (not (str/blank? reply)))
-              (d/after-reply-emission {:to :customer :content reply}
-                                      (fn [_] (run/finish! run-id :completed))
-                                      (fn [_] (run/finish! run-id :failed)))
+              (d/carry-obligation {:to :customer :content reply} obligation)
 
               :else
-              (do (run/finish! run-id (if (ended? episode) :cancelled :failed)
+              (do (d/release-obligation! p obligation)
+                  (run/finish! run-id (if (ended? episode) :cancelled :failed)
                                {:reason :no-reply})
                   (when-not (ended? episode) (end! episode :agent-error))
                   nil)))))})

@@ -1474,7 +1474,7 @@
     :or {from :repl settlement :automatic}
     :as raw-opts}
    prepare-world! & [protocol {resume-from :resume snapshots :snapshots preset-id :id
-                               on-world :on-world}]]
+                               on-world :on-world resources-from :resources-from}]]
   (when-not (or (nil? prepare-world!) (fn? prepare-world!))
     (throw (ex-info "Run world preparer must be a function"
                     {:type ::invalid-world-preparer})))
@@ -1486,18 +1486,33 @@
         actor     (:agent/id agent)
         id        (or preset-id (random-uuid))
         chat-id   (run-chat-id id)
+        ;; A resumed Run takes over its predecessor's wallet: its grant comes
+        ;; from there, and goes back there if the Run is not admitted. What it
+        ;; leaves once it ran returns to its parent, as for any Run.
+        grantor   (or resources-from parent-run)
         run-world (world/open! world-parent id settlement control-room
                                (when snapshots {:snapshots snapshots}))
         work-room (:work run-world)
         supervisor (make-supervisor (:ctx world-parent) (:ctx work-room))
+        session-close (atom nil)
         _ (when (and (= :llm (get-in agent [:agent/program :kind])) (:store control-room))
             (when-let [session (install-turn-savepoints! control-room work-room)]
-              (when on-world (on-world work-room session))
-              (register-cleanup! supervisor
-                                 #(let [done (promise)]
-                                    ((savepoint/close! session) (fn [_] (deliver done :closed))
-                                                                (fn [e] (deliver done e)))
-                                    (deref done 10000 :timeout)))))
+              (let [close-session!
+                    #(let [done (promise)]
+                       ((savepoint/close! session) (fn [_] (deliver done :closed))
+                                                   (fn [e] (deliver done e)))
+                       (deref done 10000 :timeout))]
+                (try
+                  (when on-world (on-world work-room session))
+                  (catch Throwable t
+                    ;; Not admitted: the world and its session were never the
+                    ;; Run's. Drop them and keep the setup error.
+                    (try (close-session!) (catch Throwable _ nil))
+                    (try ((if (= :deferred settlement) d/discard-deferred d/discard) work-room)
+                         (catch Throwable _ nil))
+                    (throw t)))
+                (reset! session-close close-session!)
+                (register-cleanup! supervisor close-session!))))
         allocation-state
         (atom (if (seq resources) :not-started :not-requested))
         ;; Private Run facts are still Room messages, but never addressed to an
@@ -1521,10 +1536,13 @@
     (try
       (run/start! control-room actor trigger nil
                   (cond-> {:id id :kind :agent-task :provenance provenance}
-                    parent-run (assoc :parent parent-run)))
+                    parent-run (assoc :parent parent-run)
+                    (:from resume-from) (assoc :caused-by #{(:from resume-from)})))
       (catch Throwable t
         ;; Drop the world the Run never owned, by its own policy (a deferred
         ;; world refuses a plain discard), and keep the admission error.
+        (when-let [close-session! @session-close]
+          (try (close-session!) (catch Throwable _ nil)))
         (try ((if (= :deferred settlement) d/discard-deferred d/discard) work-room)
              (catch Throwable _ nil))
         (throw t)))
@@ -1553,7 +1571,7 @@
     (when-not prepare-world!
       (when (seq resources) (reset! allocation-state :attempting))
       (try
-        (resource/allocate-run! control-room id parent-run resources)
+        (resource/allocate-run! control-room id grantor resources)
         (when (seq resources) (reset! allocation-state :allocated))
         (catch Throwable t
           ;; The durable transfer may have committed even when its caller saw an
@@ -1561,10 +1579,22 @@
           ;; before publishing the failed Run; hire! retains its synchronous
           ;; admission-failure contract without leaking a committed grant.
           (when (seq resources) (reset! allocation-state :uncertain))
-          (return-unused-resources! control-room id parent-run allocation-state)
+          (return-unused-resources! control-room id grantor allocation-state)
           (let [{:keys [status reason]} (world/settle! run-world :failed)]
             (run/finish! id :failed {:reason :resource-allocation-failed
                                      :error t
+                                     :settlement-status status
+                                     :settlement-reason reason}))
+          (throw t))))
+    ;; A resumed Run claims its predecessor last, once it holds the
+    ;; predecessor's wallet: until here a failure leaves that Run as it was.
+    (when-let [predecessor (:from resume-from)]
+      (try
+        (run/claim-resume! control-room predecessor id)
+        (catch Throwable t
+          (return-unused-resources! control-room id grantor allocation-state)
+          (let [{:keys [status reason]} (world/settle! run-world :failed)]
+            (run/finish! id :failed {:reason :resume-claim-failed :error t
                                      :settlement-status status
                                      :settlement-reason reason}))
           (throw t))))
@@ -1654,7 +1684,7 @@
                                       completion outcome-promise)
         handle)
       (catch Throwable t
-        (return-unused-resources! control-room id parent-run allocation-state)
+        (return-unused-resources! control-room id grantor allocation-state)
         (let [{:keys [status reason]} (world/settle! run-world :failed)]
           (run/finish! id :failed {:reason :spawn-failed :error t
                                    :settlement-status status
@@ -1677,6 +1707,11 @@
    start) and is resumed once; what was left in its wallet moves to the new
    Run. Returns the new Run's handle.
 
+   Atomic for the caller: when it throws, the old Run keeps its wallet and can
+   be resumed again (it is unclaimed, or claimed by a successor that failed
+   before it ran, which does not count); when it returns, the new Run is
+   admitted, holds that wallet and has claimed the old Run.
+
    The step the old Run was in when it stopped is redone from the savepoint;
    `:once` effects it had already performed (its receipts) are the caller's to
    reconcile."
@@ -1692,42 +1727,52 @@
       (throw (ex-info "The Run has no savepoint to resume from" {:type ::no-savepoint :run/id run-id})))
     (let [{:keys [agent task step]} (:savepoint/payload data)
           new-id (random-uuid)
-          _ (run/claim-resume! control-room run-id new-id)
-          parent (:run/parent old)
-          ;; conserved: the old Run's remainder, returned to its parent and
-          ;; granted to the new one
-          remaining (try (resource/run-balance control-room run-id) (catch Throwable _ nil))
-          _ (when (seq remaining) (resource/return! control-room run-id parent remaining))
-          roster (assoc-in (roster/make-roster) [:roster/agents (:agent/id agent)] agent)
-          handle (hire-prepared-in!
-                  control-room world-parent roster (:agent/id agent)
-                  (cond-> {:task task :from :resume
-                           :settlement (or (:run/settlement-policy old) :automatic)}
-                    parent (assoc :parent-run parent)
-                    (seq remaining) (assoc :resources remaining))
-                  nil nil
-                  {:id new-id :snapshots (not-empty (:world/systems data))
-                   ;; spindel's own resume: the new world becomes the
-                   ;; savepoint's continuation (seed, sequence, bookkeeping,
-                   ;; pinned components as recorded; `continue-llm-run` its
-                   ;; computation) before the Run's first step
-                   :on-world (fn [_work-room session]
-                               (let [done (promise)]
-                                 ((portable/hydrate-into! session (:root session) data
-                                                          (:savepoint/payload data))
-                                  (fn [_] (deliver done :ok)) (fn [e] (deliver done e)))
-                                 (let [r (deref done 10000 (ex-info "hydrate-into! timed out" {}))]
-                                   (when (instance? Throwable r) (throw r)))))
-                   :resume {:from run-id :chat (:run/chat-id old) :step step
-                            ;; what the stopped Run's chat spent (microdollars):
-                            ;; its budget is not spent again
-                            :spent (chat-spent control-room (:run/chat-id old))}})]
-      (run/record-cause! new-id run-id)
-      ;; the hydrated continuation resolves with the resumed Run's result
-      (sync/spawn! (result-spin handle)
-                   {:on-success #(resumed! run-id %)
-                    :on-error #(resumed! run-id {:run/status :failed :run/error (ex-message %)})})
-      handle)))
+          ;; excludes a concurrent resume; nothing durable changes until the
+          ;; new Run is admitted and holds the old Run's wallet
+          _ (run/reserve-resume! control-room run-id)]
+      (try
+        (let [parent (:run/parent old)
+              ;; conserved: the old Run's remainder, granted from its wallet to
+              ;; the new Run's when that Run is admitted
+              remaining (try (resource/run-balance control-room run-id) (catch Throwable _ nil))
+              roster (assoc-in (roster/make-roster) [:roster/agents (:agent/id agent)] agent)
+              handle
+              (try
+                (hire-prepared-in!
+                 control-room world-parent roster (:agent/id agent)
+                 (cond-> {:task task :from :resume
+                          :settlement (or (:run/settlement-policy old) :automatic)}
+                   parent (assoc :parent-run parent)
+                   (seq remaining) (assoc :resources remaining))
+                 nil nil
+                 {:id new-id :snapshots (not-empty (:world/systems data))
+                  :resources-from (when (seq remaining) run-id)
+                  ;; spindel's own resume: the new world becomes the
+                  ;; savepoint's continuation (seed, sequence, bookkeeping,
+                  ;; pinned components as recorded; `continue-llm-run` its
+                  ;; computation) before the Run's first step
+                  :on-world (fn [_work-room session]
+                              (let [done (promise)]
+                                ((portable/hydrate-into! session (:root session) data
+                                                         (:savepoint/payload data))
+                                 (fn [_] (deliver done :ok)) (fn [e] (deliver done e)))
+                                (let [r (deref done 10000 (ex-info "hydrate-into! timed out" {}))]
+                                  (when (instance? Throwable r) (throw r)))))
+                  :resume {:from run-id :chat (:run/chat-id old) :step step
+                           ;; what the stopped Run's chat spent (microdollars):
+                           ;; its budget is not spent again
+                           :spent (chat-spent control-room (:run/chat-id old))}})
+                (catch Throwable t
+                  ;; a continuation hydrated into the dropped world ends with it
+                  (resumed! run-id {:run/status :failed :run/error (ex-message t)})
+                  (throw t)))]
+          ;; the hydrated continuation resolves with the resumed Run's result
+          (sync/spawn! (result-spin handle)
+                       {:on-success #(resumed! run-id %)
+                        :on-error #(resumed! run-id {:run/status :failed :run/error (ex-message %)})})
+          handle)
+        (finally
+          (run/release-resume! run-id))))))
 
 (defn hire-in!
   "Start one AgentDef execution with separate control and work parents.

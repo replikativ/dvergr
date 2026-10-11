@@ -171,10 +171,12 @@
 
    `trigger` is the precise triggering message (or its UUID). `:parent` is
    optional explicit structural containment (the Run that spawned this Run),
-   never inferred from causal message succession. Returns the public Run map."
+   never inferred from causal message succession. `:caused-by` names terminal
+   Runs this one continues (a resumed Run's predecessor), recorded with its
+   admission. Returns the public Run map."
   ([room actor trigger live-chat-ctx]
    (start! room actor trigger live-chat-ctx {}))
-  ([room actor trigger live-chat-ctx {:keys [id kind parent now provenance]
+  ([room actor trigger live-chat-ctx {:keys [id kind parent caused-by now provenance]
                                       :or {kind :agent-turn}}]
    (when-let [unknown (seq (remove provenance-keys (keys provenance)))]
      (throw (ex-info "Run provenance may not override causal identity"
@@ -194,7 +196,8 @@
                                :run/created-at now
                                :run/started-at now
                                :run/updated-at now}
-                        parent (assoc :run/parent parent))
+                        parent (assoc :run/parent parent)
+                        (seq caused-by) (assoc :run/caused-by (set caused-by)))
                       provenance))
          entry      {:run run
                      :chat-ctx live-chat-ctx
@@ -429,33 +432,80 @@
   [run]
   (some-> (:run/savepoint run) clojure.edn/read-string))
 
+(defonce ^:private resume-reservations
+  ;; Run ids a `resume!` in this process is resuming right now: excludes a
+  ;; second resume of the same Run before the first one's successor is admitted
+  (atom #{}))
+
+(def ^:private unexecuted-reasons
+  "Reasons a successor Run failed before it executed anything. Such a Run did
+   not resume its predecessor, so the predecessor can be resumed again."
+  #{:trigger-emission-failed :resource-allocation-failed :resume-claim-failed
+    :spawn-failed})
+
+(defn- resume-blocker
+  "Why stored Run `existing` of `room` cannot be resumed now, as ex-info, or nil."
+  [room run-id existing]
+  (let [successor-id (:run/resumed-by existing)
+        successor (when successor-id
+                    (store/-load-run (:store room) (store/conversation-id room) successor-id))]
+    (cond
+      (nil? existing)
+      (ex-info "No such Run" {:type ::run-not-found :run/id run-id})
+      (contains? @active run-id)
+      (ex-info "The Run is live in this process: nothing to resume"
+               {:type ::run-live :run/id run-id})
+      (nil? (:run/savepoint existing))
+      (ex-info "The Run has no savepoint to resume from"
+               {:type ::no-savepoint :run/id run-id})
+      (and successor-id
+           (not (and (= :failed (:run/status successor))
+                     (contains? unexecuted-reasons (:run/reason successor)))))
+      (ex-info "The Run was resumed before"
+               {:type ::already-resumed :run/id run-id
+                :run/resumed-by successor-id}))))
+
+(defn reserve-resume!
+  "Reserve stored Run `run-id` of `room` for one resume in this process and
+   return it; throws when it has no savepoint, is live, was resumed before, or
+   is being resumed. Nothing durable changes: `claim-resume!` records the
+   successor once it is admitted, and `release-resume!` ends the reservation
+   either way."
+  [room run-id]
+  (locking (room-lock (:id room))
+    (let [existing (some-> (:store room) (store/-load-run (store/conversation-id room) run-id))]
+      (when-let [blocker (resume-blocker room run-id existing)]
+        (throw blocker))
+      (when (contains? @resume-reservations run-id)
+        (throw (ex-info "The Run is being resumed"
+                        {:type ::resume-in-progress :run/id run-id})))
+      (swap! resume-reservations conj run-id)
+      existing)))
+
+(defn release-resume!
+  "End this process's resume reservation of `run-id`."
+  [run-id]
+  (swap! resume-reservations disj run-id)
+  nil)
+
 (defn claim-resume!
   "Mark the stored Run `run-id` of `room` as continued by `resumed-by`, once:
-   a Run is resumed at most one time. Returns the updated Run; throws when it
-   has no savepoint, is live, or was resumed before."
+   a Run is resumed at most one time. The successor claims it once admitted,
+   holding the wallet it took over, so a failed resume leaves the Run as it
+   was. Returns the updated Run; throws when it has no savepoint, is live, or
+   was resumed before."
   [room run-id resumed-by]
-  (locking lifecycle-lock
+  (locking (room-lock (:id room))
     (let [room-store (:store room)
           room-id (store/conversation-id room)
           existing (some-> room-store (store/-load-run room-id run-id))]
-      (cond
-        (nil? existing)
-        (throw (ex-info "No such Run" {:type ::run-not-found :run/id run-id}))
-        (contains? @active run-id)
-        (throw (ex-info "The Run is live in this process: nothing to resume"
-                        {:type ::run-live :run/id run-id}))
-        (nil? (:run/savepoint existing))
-        (throw (ex-info "The Run has no savepoint to resume from"
-                        {:type ::no-savepoint :run/id run-id}))
-        (:run/resumed-by existing)
-        (throw (ex-info "The Run was resumed before"
-                        {:type ::already-resumed :run/id run-id
-                         :run/resumed-by (:run/resumed-by existing)}))
-        :else
-        (let [updated (assoc existing :run/resumed-by resumed-by
-                             :run/updated-at (java.util.Date.))]
-          (or (store/-store-run! room-store room-id updated)
-              (throw (ex-info "Resume claim was not durable" {:type ::claim-not-durable :run/id run-id}))))))))
+      (when-let [blocker (resume-blocker room run-id existing)]
+        (throw blocker))
+      (let [updated (assoc existing :run/resumed-by resumed-by
+                           :run/updated-at (java.util.Date.))]
+        (or (store/-store-run! room-store room-id updated)
+            (throw (ex-info "Resume claim was not durable"
+                            {:type ::claim-not-durable :run/id run-id})))))))
 
 (defn cancel-requested?
   "True when targeted cancellation has been requested for this live Run. The
