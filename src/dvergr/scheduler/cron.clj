@@ -3,16 +3,18 @@
 
   Supports simple schedule specs without a cron expression parser:
     {:every :hour}
+    {:every :hour :at \"00:15\"}     ; the minute (and second) of :at, every hour
     {:every :day :at \"09:00\"}
     {:every :week :on :monday :at \"09:00\"}
     {:every :month :on-day 1 :at \"09:00\"}
-    {:at \"2026-03-20T14:00\" :once true}
+    {:at \"2026-03-20T14:00\" :once true}   ; in :tz; or with its own zone/offset
     {:every-ms 300000}
 
   All times are timezone-aware (default: system timezone)."
   (:require [clojure.string])
-  (:import [java.time ZonedDateTime ZoneId LocalTime
+  (:import [java.time ZonedDateTime ZoneId LocalTime LocalDateTime
             DayOfWeek Instant]
+           [java.time.format DateTimeParseException]
            [java.time.temporal ChronoUnit TemporalAdjusters]))
 
 ;; =============================================================================
@@ -42,6 +44,15 @@
 (defn- zone [tz]
   (ZoneId/of (or tz (str (ZoneId/systemDefault)))))
 
+(defn- parse-datetime
+  "A one-shot `:at`: an ISO datetime with a zone or offset keeps it; a local
+   one (\"2026-04-01T09:00\", what `scheduler/at` and the docs pass) is read
+   in `zone-id`."
+  ^ZonedDateTime [s zone-id]
+  (try (ZonedDateTime/parse s)
+       (catch DateTimeParseException _
+         (.atZone (LocalDateTime/parse s) zone-id))))
+
 ;; =============================================================================
 ;; Next Fire Time
 ;; =============================================================================
@@ -54,7 +65,8 @@
   Spec keys:
     :every    - :minute, :hour, :day, :week, :month
     :every-ms - interval in milliseconds (simple recurring)
-    :at       - time string \"HH:MM\" or ISO datetime for :once
+    :at       - time string \"HH:MM\" (for :hour, only its minute and second
+                count) or ISO datetime for :once (local ones in :tz)
     :on       - day keyword for :week (:monday, :tuesday, etc.)
     :on-day   - day number for :month (1-28)
     :once     - true for one-shot scheduling
@@ -72,13 +84,18 @@
        (.toInstant (.plusMinutes now 1))
 
        :hour
-       (let [target (-> now
-                        (.truncatedTo ChronoUnit/HOURS)
-                        (.plusHours 1))]
-         (if time-of-day
-           (.toInstant (.with target (LocalTime/of (.getHour (parse-time (:at spec)))
-                                                   (.getMinute (parse-time (:at spec))))))
-           (.toInstant target)))
+       ;; the minute (and second) of `:at` past the current hour, else past
+       ;; the next one: always strictly after `now`. Each candidate is built
+       ;; from its own hour, so a DST gap that shifts one hour's minute does
+       ;; not carry into the next.
+       (let [start (.truncatedTo now ChronoUnit/HOURS)
+             at-hour (fn [^ZonedDateTime h]
+                       (cond-> h
+                         time-of-day (-> (.withMinute (.getMinute time-of-day))
+                                         (.withSecond (.getSecond time-of-day)))))]
+         (.toInstant ^ZonedDateTime
+          (some #(let [c (at-hour (.plusHours start (long %)))] (when (.isAfter c now) c))
+                (range 3))))
 
        :day
        (let [target-time (or time-of-day (LocalTime/of 9 0))
@@ -112,8 +129,7 @@
          (.plusMillis from-instant (:every-ms spec))
 
          (:once spec)
-         (let [dt (ZonedDateTime/parse (:at spec))]
-           (.toInstant dt))
+         (.toInstant (parse-datetime (:at spec) tz-id))
 
          :else
          (throw (ex-info "Invalid schedule spec" {:spec spec})))))))
