@@ -434,6 +434,44 @@
                               (sci/eval-string* ctx "(spit \"meta\\ndata/config\" \"CHANGED\")")))
         (is (= before (slurp (java.io.File. meta "config"))))))))
 
+(deftest physical-git-paths-are-confined-lexically
+  ;; git resolves `..` textually; a symlink must not make `link/../../x`
+  ;; look inside the workspace.
+  (let [dir (git-repo!)
+        ws (java.io.File. dir "src")
+        ctx (sci/init {})]
+    (.mkdirs (java.io.File. ws "sub/deep"))
+    (java.nio.file.Files/createSymbolicLink (.toPath (java.io.File. ws "link"))
+                                            (.toPath (java.io.File. ws "sub/deep"))
+                                            (make-array java.nio.file.attribute.FileAttribute 0))
+    (spit (java.io.File. dir "outside.txt") "OUTSIDE-SECRET\n")
+    (sh! dir "git" "add" "outside.txt")
+    (io/add-git-ns! ctx :base-path (str ws))
+    (doseq [code ["(git/diff \"--cached\" \"link/../../outside.txt\")"
+                  "(git/add \"link/../../outside.txt\")"]]
+      (is (refused? #(sci/eval-string* ctx %) code) code))))
+
+(deftest physical-nested-repository-metadata-is-protected
+  ;; `child/.git` is a gitfile pointing to `child/metadata`.
+  (let [dir (git-repo!)
+        child (java.io.File. dir "child")
+        ctx (sci/init {})]
+    (.mkdirs child)
+    (sh! child "git" "init" "-q")
+    (.renameTo (java.io.File. child ".git") (java.io.File. child "metadata"))
+    (spit (java.io.File. child ".git") "gitdir: metadata\n")
+    (io/add-fs-ns! ctx :base-path (str dir))
+    (let [before (slurp (java.io.File. child "metadata/config"))]
+      (doseq [code ["(spit \"child/metadata/config\" \"CHANGED\")"
+                    "(spit \"child/metadata/hooks/pre-commit\" \"#!/bin/sh\")"
+                    "(babashka.fs/delete-tree \"child\")"
+                    "(babashka.fs/move \"child/metadata\" \"m\")"]]
+        (is (thrown-with-msg? Exception #"sensitive path" (sci/eval-string* ctx code)) code))
+      (is (= before (slurp (java.io.File. child "metadata/config")))))
+    (testing "the nested repository's own content stays writable"
+      (sci/eval-string* ctx "(spit \"child/src/x.clj\" \"(ns x)\")")
+      (is (= "(ns x)" (slurp (java.io.File. child "src/x.clj")))))))
+
 (deftest physical-git-uses-the-workspace-worktree
   ;; `core.worktree` (set directly or through an included config file) would
   ;; point git at another directory than the one every check here is about.

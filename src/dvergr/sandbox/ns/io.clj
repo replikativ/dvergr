@@ -636,6 +636,16 @@
       (git-arg-refused! (str "git pathspec magic not allowed: " path) {:path path}))
     (when (try (sensitive-path-policy path) false (catch clojure.lang.ExceptionInfo _ true))
       (git-arg-refused! (str "git path is a sensitive file: " path) {:path path}))
+    ;; Lexically first: git resolves `..` in the operand textually, not
+    ;; through symlinks, so `link/../../x` can name a file outside even when
+    ;; its canonical form is inside. No `..` may climb above where it starts.
+    (when (neg? (reduce (fn [d seg]
+                          (case seg
+                            ("" ".") d
+                            ".." (if (zero? d) (reduced -1) (dec d))
+                            (inc d)))
+                        0 (str/split (str/replace path #"^/+" "") #"/")))
+      (refuse!))
     (if base-path
       (let [base (.getCanonicalFile (java.io.File. (str base-path)))
             f (java.io.File. (str path))
@@ -795,9 +805,10 @@
                                        top (worktree-top host-base)
                                        base (.toPath (.getCanonicalFile (java.io.File. (str host-base))))
                                        inside? (fn [n] (and top (.startsWith (.toPath (.getCanonicalFile (java.io.File. ^java.io.File top ^String n))) base)))
-                                       names (filter inside? names)
-                                       safe (remove sensitive-name? names)]
+                                       safe (remove sensitive-name? (filter inside? names))]
                                    (cond
+                                     ;; every listed name is inside and safe: the
+                                     ;; operands as given select exactly these
                                      (= (count safe) (count names)) (apply run! "add" "--" paths)
                                      (seq safe) (apply run! "add" "--" (map (fn [n] (str ":(top,literal)" n)) safe))
                                      :else nil))
@@ -1290,11 +1301,29 @@
                    (read-git-pointer common-file "" gitdir))]
       (into #{} (remove nil?) [gitdir common]))))
 
+(defn- git-dir-like?
+  "Does directory `d` look like a git directory — HEAD plus objects, or the
+   commondir/gitdir of a linked worktree? Relocated metadata of any repository
+   in the workspace (a nested `child/.git` gitfile pointing to
+   `child/metadata`) is found this way, whatever points to it."
+  [^java.io.File d]
+  (and (.isFile (java.io.File. d "HEAD"))
+       (or (.isDirectory (java.io.File. d "objects"))
+           (.isFile (java.io.File. d "commondir"))
+           (.isFile (java.io.File. d "gitdir")))))
+
 (defn in-git-metadata?
-  "Is canonical `file` inside a git directory of `base-path`'s repository?"
+  "Is canonical `file` inside a git directory: the one of `base-path`'s
+   repository (however `.git` points to it), or any directory between `file`
+   and the workspace that looks like a git directory?"
   [base-path ^java.io.File file]
-  (boolean (some #(.startsWith (.toPath file) (.toPath ^java.io.File %))
-                 (git-metadata-dirs base-path))))
+  (let [base (.getCanonicalFile (java.io.File. (str base-path)))]
+    (boolean
+     (or (some #(.startsWith (.toPath file) (.toPath ^java.io.File %))
+               (git-metadata-dirs base-path))
+         (some git-dir-like?
+               (->> (iterate #(.getParentFile ^java.io.File %) file)
+                    (take-while #(and % (.startsWith (.toPath ^java.io.File %) (.toPath base))))))))))
 
 (defn- git-run*
   "Run git in base-path. Returns stdout string or throws on non-zero exit."
