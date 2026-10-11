@@ -312,7 +312,11 @@
           (repo/stage! conn paths)
           (let [index (repo/index-tree conn)
                 staged (:staged (repo/status conn))
-                differs (concat (filter #(not= (get expected %) (some-> (get index %) :content str)) paths)
+                ;; the content, and a regular file: a link to the same text has the same id
+                link? #(= 0120000 (bit-and (long (or (:mode (get index %)) 0)) 0170000))
+                differs (concat (filter #(or (not= (get expected %) (some-> (get index %) :content str))
+                                             (link? %))
+                                        paths)
                                 (remove (set paths) staged))]
             (when (seq differs)
               (throw (ex-info (str "Changed while it was written: " (str/join ", " differs))

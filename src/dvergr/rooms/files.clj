@@ -303,12 +303,15 @@
    keeps its change."
   [db before expected paths]
   (vec (mapcat (fn [p]
-                 (let [[eid cid] (first (d/q '[:find ?e ?cid :in $ ?p
-                                               :where [?e :geschichte.work/path ?p]
-                                               [?e :geschichte.work/content ?c]
-                                               [?c :geschichte.content/id ?cid]]
-                                             db (rel p)))]
-                   (when (= (some-> cid str) (get expected p))
+                 (let [[eid cid mode] (first (d/q '[:find ?e ?cid ?m :in $ ?p
+                                                    :where [?e :geschichte.work/path ?p]
+                                                    [?e :geschichte.work/content ?c]
+                                                    [?c :geschichte.content/id ?cid]
+                                                    [?e :geschichte.work/mode ?m]]
+                                                  db (rel p)))]
+                   ;; the batch's own: its content, as a regular file (never a link)
+                   (when (and (= (some-> cid str) (get expected p))
+                              (not= symlink-mode (bit-and (long (or mode 0)) 0170000)))
                      (if-let [{:keys [content size mode]} (get before p)]
                        ;; a removed file comes back only where nothing took its place
                        (when (or eid (not (beneath? db (rel p))))

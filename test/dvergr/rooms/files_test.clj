@@ -401,3 +401,20 @@
     (is (= before (head)) "nothing committed")
     (is (= :dir (:type (mfs/stat (ws/room-fs r) "/a"))))
     (is (= "mine" (worktree-text r "/a/agent.txt")))))
+
+(deftest a-link-with-the-same-text-is-not-the-batch-s-file
+  ;; a link's content is its target: `a.txt -> target` hashes as the text "target"
+  (let [r (room)
+        head #(set (keys (repo/tree (conn r) :head)))
+        before (head)
+        write! tools/workspace-write!]
+    (with-redefs [tools/workspace-write! (fn [ctx p c & opts]
+                                           (let [res (apply write! ctx p c opts)]
+                                             (mfs/delete (ws/room-fs r) "/a.txt")
+                                             (mfs/symlink (ws/room-fs r) "target" "/a.txt")
+                                             res))]
+      (let [e (try (files/write! r {"a.txt" {:text "target"}} {}) nil
+                   (catch clojure.lang.ExceptionInfo e e))]
+        (is (= :dvergr.rooms.forks/concurrent-change (:type (ex-data e))) (pr-str (ex-data e)))))
+    (is (= before (head)) "nothing committed")
+    (is (= :symlink (:type (mfs/stat (ws/room-fs r) "/a.txt"))) "the other writer's link is kept")))
