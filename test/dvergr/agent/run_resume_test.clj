@@ -186,25 +186,35 @@
                                       (program/resume! room room first-run))))
               (is (uuid? (:run/resumed-by @claimed)) "the successor had claimed the Run")
               (is (untouched?) "the claim is withdrawn and the wallet returned")))
-          (testing "a failed spawn whose terminal write is refused once"
+          (testing "a failed spawn whose claim withdrawal and terminal write are refused once"
             (let [finish! run/finish!
-                  failed-finishes (atom 0)]
+                  release-resume-claim! run/release-resume-claim!
+                  failed-finishes (atom 0)
+                  withdrawals (atom 0)]
               (with-redefs [providers/ensure-initialized! (constantly nil)
                             program/execution-spin (fn [& _] (throw (ex-info "no spawn" {})))
+                            run/release-resume-claim!
+                            (fn [& args]
+                              (if (= 1 (swap! withdrawals inc))
+                                (throw (ex-info "store refused" {}))
+                                (apply release-resume-claim! args)))
                             run/finish! (fn [run-id status & opts]
                                           (if (and (= :failed status) (= 1 (swap! failed-finishes inc)))
                                             (throw (ex-info "store refused" {}))
                                             (apply finish! run-id status opts)))]
                 (is (thrown-with-msg? Exception #"no spawn"
                                       (program/resume! room room first-run)))
-                (is (nil? (:run/resumed-by (run/run room first-run)))
-                    "the claim is withdrawn before the refused write")
+                (is (= first-run (:run/id (run/reserve-resume! room first-run)))
+                    "at once resumable again, although the withdrawal is not durable yet")
+                (run/release-resume! first-run)
                 (let [deadline (+ (System/currentTimeMillis) 3000)]
-                  (while (and (seq (run/active-runs :resume-failure-room))
+                  (while (and (or (seq (run/active-runs :resume-failure-room))
+                                  (:run/resumed-by (run/run room first-run)))
                               (< (System/currentTimeMillis) deadline))
                     (Thread/sleep 10))))
-              (is (<= 2 @failed-finishes) "refused once, then retried")
-              (is (untouched?) "the successor's finish was retried")))
+              (is (<= 2 @failed-finishes) "the refused finish was retried")
+              (is (<= 2 @withdrawals) "the refused withdrawal was retried")
+              (is (untouched?) "the claim is withdrawn durably and the wallet returned")))
           (testing "a resume in progress excludes another"
             (run/reserve-resume! room first-run)
             (try

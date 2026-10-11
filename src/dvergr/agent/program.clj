@@ -1604,6 +1604,8 @@
       (try
         (run/claim-resume! control-room predecessor id)
         (catch Throwable t
+          ;; the claim write may have committed although it reported an error
+          (run/withdraw-resume-claim! control-room predecessor id)
           (return-unused-resources! control-room id grantor allocation-state)
           (let [{:keys [status reason]} (settle-unadmitted! run-world)]
             (run/finish-durably! id :failed (cond-> {:reason :resume-claim-failed :error t}
@@ -1721,12 +1723,7 @@
           (when-let [predecessor (:from resume-from)]
             ;; First, and whatever fails after: the predecessor is as it was
             ;; before the claim.
-            (try (run/release-resume-claim! control-room predecessor id)
-                 (catch Throwable release-error
-                   (tel/log! {:level :warn :id ::resume-claim-not-released
-                              :data {:run/id predecessor :resumed-by id
-                                     :error (ex-message release-error)}}
-                             "A resume claim was not released; the failed successor does not count"))))
+            (run/withdraw-resume-claim! control-room predecessor id))
           (return-unused-resources! control-room id grantor allocation-state)
           (let [{:keys [status reason]} (settle-unadmitted! run-world)]
             (run/finish-durably! id :failed (cond-> {:reason :spawn-failed :error t}

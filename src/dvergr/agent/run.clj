@@ -305,12 +305,36 @@
            (notify! {:type :run/finished :run run}))
          run)))))
 
+(defn- retry-in-background!
+  "Retry `attempt!` on a daemon thread with backoff (up to 5 s apart) while
+   `pending?` holds, until it returns without throwing. Never gives up: what
+   it retries would otherwise stay undone once the store recovers."
+  [thread-name pending? attempt! log-data]
+  (doto (Thread.
+         ^Runnable
+         (fn []
+           (loop [delay-ms 25 attempt 1]
+             (Thread/sleep (long delay-ms))
+             (when (pending?)
+               (let [outcome (try (attempt!) :done (catch Throwable t t))]
+                 (when (instance? Throwable outcome)
+                   (when (zero? (mod attempt 20))
+                     (tel/log! {:level :error :id ::durable-write-still-refused
+                                :data (assoc log-data :attempts attempt
+                                             :error (ex-message outcome))}
+                               "A durable Run write is still refused; retrying"))
+                   (recur (min 5000 (* 2 delay-ms)) (inc attempt)))))))
+         thread-name)
+    (.setDaemon true)
+    (.start))
+  nil)
+
 (defn finish-durably!
   "`finish!` for a caller that cannot wait for the store. When the terminal
    write is refused the Run stays live, as `finish!` leaves it, and the write
-   is retried on a background thread with backoff (up to 5 s apart) until it
-   is durable or the Run is no longer live; nothing is lost and Room teardown
-   sees the Run until it is. Returns the finished Run, or nil while the write is retried."
+   is retried on a background thread until it is durable or the Run is no
+   longer live; nothing is lost and Room teardown sees the Run until it is.
+   Returns the finished Run, or nil while the write is retried."
   ([run-id status] (finish-durably! run-id status {}))
   ([run-id status opts]
    (try
@@ -321,27 +345,10 @@
        (tel/log! {:level :warn :id ::finish-retrying
                   :data {:run/id run-id :run/status status :error (ex-message t)}}
                  "Run finish refused; retrying off the caller's thread")
-       (doto (Thread.
-              ^Runnable
-              (fn []
-                ;; Until the write is durable: giving up would leave a live Run
-                ;; that nothing finishes once the store recovers.
-                (loop [delay-ms 25 attempt 1]
-                  (Thread/sleep (long delay-ms))
-                  (when (contains? @active run-id)
-                    (let [outcome (try (finish! run-id status opts) :finished
-                                       (catch Throwable t t))]
-                      (when (instance? Throwable outcome)
-                        (when (zero? (mod attempt 20))
-                          (tel/log! {:level :error :id ::finish-still-refused
-                                     :data {:run/id run-id :run/status status
-                                            :attempts attempt
-                                            :error (ex-message outcome)}}
-                                    "Run finish still refused; retrying"))
-                        (recur (min 5000 (* 2 delay-ms)) (inc attempt)))))))
-              (str "dvergr-run-finish-" run-id))
-         (.setDaemon true)
-         (.start))
+       (retry-in-background! (str "dvergr-run-finish-" run-id)
+                             #(contains? @active run-id)
+                             #(finish! run-id status opts)
+                             {:run/id run-id :run/status status})
        nil))))
 
 (defn retain-finished!
@@ -476,6 +483,11 @@
   ;; second resume of the same Run before the first one's successor is admitted
   (atom #{}))
 
+(defonce ^:private void-successors
+  ;; successor Run ids whose resume claim is withdrawn but whose withdrawal is
+  ;; not durable yet: their claims do not count while it is retried
+  (atom #{}))
+
 (def ^:private unexecuted-reasons
   "Reasons a successor Run failed before it executed anything. Such a Run did
    not resume its predecessor, so the predecessor can be resumed again."
@@ -498,6 +510,7 @@
       (ex-info "The Run has no savepoint to resume from"
                {:type ::no-savepoint :run/id run-id})
       (and successor-id
+           (not (contains? @void-successors successor-id))
            (not (and (= :failed (:run/status successor))
                      (contains? unexecuted-reasons (:run/reason successor)))))
       (ex-info "The Run was resumed before"
@@ -562,6 +575,29 @@
           (or (store/-store-run! room-store room-id updated)
               (throw (ex-info "Resume claim release was not durable"
                               {:type ::claim-not-durable :run/id run-id}))))))))
+
+(defn withdraw-resume-claim!
+  "Withdraw `resumed-by`'s claim on Run `run-id` of `room`, whether or not the
+   claim was written: its successor did not execute. The claim stops counting
+   at once in this process; when its durable withdrawal is refused, that is
+   retried in the background until it is durable (or another Run claimed the
+   Run since)."
+  [room run-id resumed-by]
+  (swap! void-successors conj resumed-by)
+  (let [withdraw! (fn []
+                    (release-resume-claim! room run-id resumed-by)
+                    (swap! void-successors disj resumed-by))]
+    (try
+      (withdraw!)
+      (catch Throwable t
+        (tel/log! {:level :warn :id ::claim-withdrawal-retrying
+                   :data {:run/id run-id :resumed-by resumed-by :error (ex-message t)}}
+                  "A resume claim withdrawal was refused; retrying off the caller's thread")
+        (retry-in-background! (str "dvergr-resume-claim-" run-id)
+                              #(contains? @void-successors resumed-by)
+                              withdraw!
+                              {:run/id run-id :resumed-by resumed-by}))))
+  nil)
 
 (defn cancel-requested?
   "True when targeted cancellation has been requested for this live Run. The
