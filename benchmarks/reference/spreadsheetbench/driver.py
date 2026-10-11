@@ -20,7 +20,8 @@ Changed, and why:
 - The LLM call goes through bridge.clj (Dvergr's model layer) instead of llm_api.py's
   OpenAI client: no temperature or other parameters are set.
 - Code runs in a per-task Docker container (image sbref-exec:1, exec/): no network,
-  read-only root, non-root, and only the task's input file mounted at /mnt/data. Upstream
+  read-only root, running as the invoking user's uid/gid (so it can write the
+  staged mount), and only the task's input file mounted at /mnt/data. Upstream
   runs one Jupyter kernel gateway (conv_id EVAL) shared by all tasks, with the whole
   dataset directory mounted, answers included. Here each task gets a fresh IPython kernel.
 - verified_400 names its files 1_<id>_init.xlsx (or initial.xlsx); upstream's scripts
@@ -134,8 +135,8 @@ class Sandbox:
     def __init__(self, mount, name):
         self.name = name
         self.p = subprocess.Popen(['docker', 'run', '-i', '--rm', '--name', name, '--network', 'none', '--read-only',
-                                   '--tmpfs', '/tmp:size=512m,uid=1000', '--memory', '4g', '--cpus', '2',
-                                   '--pids-limit', '256', '--cap-drop', 'ALL', '--user', '1000:1000',
+                                   '--tmpfs', f'/tmp:size=512m,uid={os.getuid()}', '--memory', '4g', '--cpus', '2',
+                                   '--pids-limit', '256', '--cap-drop', 'ALL', '--user', f'{os.getuid()}:{os.getgid()}',
                                    '-v', f'{mount}:/mnt/data', IMAGE],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                   text=True, bufsize=1)

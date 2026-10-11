@@ -21,7 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 def extract(content):
     t = content or ""
-    blocks = re.findall(r"```(?:sql|sqlite)?\s*(.*?)```", t, re.S | re.I)
+    blocks = re.findall(r"```(?:sqlite|sql)?\s*(.*?)```", t, re.S | re.I)
     if blocks:
         return blocks[-1].strip()
     t = t.strip()

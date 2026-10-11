@@ -18,7 +18,8 @@ and Python is needed only to run them. Kaocha and CI do not see them.
 
 ```
 mcnemar.py              exact McNemar test between two verdict files (both benchmarks)
-dvergr_verdicts.py      per-case verdicts of a Dvergr experiment's candidate, to pair with
+dvergr_verdicts.clj     per-case verdicts of a Dvergr experiment's candidate, to pair with
+dvergr_verdicts.py      the same for experiment directories of the layout before homes
 bird/
   ids.txt               the 100 question ids
   prompts.py            builds the reference prompts (upstream code), --columns adds one line
@@ -116,8 +117,8 @@ after the question. Tokens are input (including cached) plus output, the mean `g
 prints. Haiku's input is larger (about 4,500 tokens) because the Claude Code CLI adds its own
 context to the prompt.
 
-The models are not deterministic: a rerun gives scores near these, not necessarily equal.
-With the replies of the post's runs, `grade.py` reproduces the four numbers exactly.
+The models are not deterministic: a rerun gives scores near these, not necessarily equal
+(see "What a rerun reproduces" below).
 
 Paired tests (below): Luna 51 against 61, 2 and 12 questions one way and the other, p = 0.013;
 Haiku 53 against 64, 1 and 12, p = 0.0034.
@@ -137,7 +138,7 @@ bash benchmarks/reference/spreadsheetbench/fetch.sh
 ```
 
 Each task's code runs in a fresh container of that image: no network, read-only root, a
-non-root user, 4 GB and 2 CPUs, and only the task's input workbook mounted at `/mnt/data`
+the invoking user's uid/gid (not root), 4 GB and 2 CPUs, and only the task's input workbook mounted at `/mnt/data`
 (upstream runs one shared Jupyter kernel gateway with the whole dataset directory mounted,
 answers included). `driver.py`'s docstring lists every change from upstream's
 inference scripts; the prompts, the 5-row preview, code extraction and execution feedback
@@ -173,8 +174,7 @@ recalculation*, the produced workbook and the golden file both go through LibreO
 conversion (as upstream's `evaluation/open_spreadsheet.py` does) before the same comparison.
 `summarize.py` prints both scores, tokens (input including cached, plus output) and wall
 time per task, the turns, and the replies without code (29 of 124 in the multi-round run).
-As for BIRD, a rerun gives scores near these; with the post's outputs `grade.py` and
-`summarize.py` reproduce them exactly.
+As for BIRD, a rerun gives scores near these, not necessarily equal.
 
 Upstream's `evaluation.py` main cannot score verified_400 as shipped: it reads each task's
 input file (the output path is commented out) and expects earlier file names. `grade.py`
@@ -191,15 +191,20 @@ count. Verdict files are `{case-id: 0|1}`; for SpreadsheetBench's `grade.json` n
 field: `grade.json:lo` or `grade.json:raw`.
 
 To pair a reference run with a Dvergr run of the same model on the same cases, extract the
-Dvergr experiment's verdicts (its `:dir`, and the candidate id) and test:
+Dvergr experiment's verdicts (its `:dir` and the candidate's `:id`) and test. Both files must
+grade the same cases; `mcnemar.py` refuses otherwise.
 
 ```bash
-python3 benchmarks/reference/dvergr_verdicts.py ~/.cache/dvergr-bench/<bird-experiment> luna-sqlite $B/dvergr-luna.json
+clojure -J-Xmx2g -M:benchmarks benchmarks/reference/dvergr_verdicts.clj ~/.cache/dvergr-bench/<bird-experiment> luna-sqlite $B/dvergr-luna.json
 python3 benchmarks/reference/mcnemar.py $B/verdicts-replies-cols-codex-subscription-luna.json $B/dvergr-luna.json
 
-python3 benchmarks/reference/dvergr_verdicts.py ~/.cache/dvergr-bench/<sb-experiment> luna ~/.cache/dvergr-bench/sbref/dvergr-luna.json
+clojure -J-Xmx2g -M:benchmarks benchmarks/reference/dvergr_verdicts.clj ~/.cache/dvergr-bench/<sb-experiment> luna ~/.cache/dvergr-bench/sbref/dvergr-luna.json
 python3 benchmarks/reference/mcnemar.py ~/.cache/dvergr-bench/sbref/rre/grade.json:lo ~/.cache/dvergr-bench/sbref/dvergr-luna.json
 ```
+
+`dvergr_verdicts.clj` opens the experiment's home, so run it in a JVM of its own, not beside a
+daemon. The post's Dvergr experiments predate homes (an `artifacts/` directory); for those,
+`python3 benchmarks/reference/dvergr_verdicts.py DIR CANDIDATE OUT.json` reads the artifacts.
 
 For the post's runs this gives, on SpreadsheetBench, the multi-round harness after
 recalculation (41) against Luna on Dvergr's harness and checker (51): 5 and 15, p = 0.041;
@@ -211,6 +216,20 @@ the input workbooks and is not part of these scripts.
 
 The Dvergr experiments are run as `benchmarks/README.md` and `doc/benchmarks.md` describe,
 with `:split :eval` and these ids (`:question-ids` for BIRD, `:ids` for SpreadsheetBench).
+
+## What a rerun reproduces
+
+The prompts are deterministic: `prompts.py` and `driver.py` build, byte for byte, the prompts
+the post's runs sent (checked for all 100 BIRD questions in both variants and all 59
+SpreadsheetBench tasks in both settings). The grading is deterministic too: run on the
+post's recorded replies and workbooks, `bird/grade.py`, `spreadsheetbench/grade.py`,
+`summarize.py` and `mcnemar.py` give every number above exactly.
+
+The model replies are not deterministic, and this repository carries no model outputs. A
+rerun therefore measures the same setup again: expect scores within a few points of the
+post's, and McNemar counts that differ case by case. The conclusions to check are the
+differences the post draws (the columns line against the plain prompt; graded as shipped
+against recalculated), each re-tested on the rerun's own paired verdicts.
 
 ## Upstream code and licenses
 

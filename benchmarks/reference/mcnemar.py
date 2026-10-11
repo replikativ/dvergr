@@ -5,7 +5,7 @@ boolean, or an object; for objects name the field after a colon (FILE.json:lo re
 verdict["lo"], as in spreadsheetbench/grade.py's output). Only the cases two candidates
 disagree on count: b = A right and B wrong, c = the reverse, and
 p = min(1, 2 * sum_{i <= min(b, c)} C(b + c, i) / 2^(b + c)), the two-sided exact binomial
-test of b against Binomial(b + c, 1/2). Both files must cover the same case ids.
+test of b against Binomial(b + c, 1/2). Both files must grade the same cases (or every case of --ids).
 
 usage: python3 mcnemar.py A.json[:field] B.json[:field] [--ids FILE]
 """
@@ -33,7 +33,13 @@ def main():
     ap.add_argument("--ids", help="restrict to these case ids (whitespace-separated)")
     x = ap.parse_args()
     a, b = load(x.a), load(x.b)
-    ids = open(x.ids).read().split() if x.ids else sorted(a)
+    if x.ids:
+        ids = open(x.ids).read().split()
+    elif set(a) != set(b):
+        raise SystemExit(f"the files grade different cases: only in A {sorted(set(a) - set(b))[:10]}, "
+                         f"only in B {sorted(set(b) - set(a))[:10]} (pass --ids to compare a subset)")
+    else:
+        ids = sorted(a)
     missing = [i for i in ids if i not in a or i not in b]
     if missing:
         raise SystemExit(f"not graded in both files: {missing[:10]} ({len(missing)})")

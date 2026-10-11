@@ -93,11 +93,15 @@ def uncached_formulas(proc, t):
 
 
 def recalc(src_dir, dst_dir):
+    """Convert every workbook of src_dir into dst_dir; returns the names LibreOffice did not convert."""
     files = sorted(glob.glob(f'{src_dir}/*.xlsx'))
     if files:
-        subprocess.run([LO, f'-env:UserInstallation=file://{LOS}/profile', '--headless', '--calc',
-                        '--convert-to', 'xlsx:Calc MS Excel 2007 XML', '--outdir', dst_dir] + files,
-                       capture_output=True, text=True, timeout=3600)
+        p = subprocess.run([LO, f'-env:UserInstallation=file://{LOS}/profile', '--headless', '--calc',
+                            '--convert-to', 'xlsx:Calc MS Excel 2007 XML', '--outdir', dst_dir] + files,
+                           capture_output=True, text=True, timeout=3600)
+        if p.returncode != 0:
+            print(f'LibreOffice exited with {p.returncode}:', p.stdout[-2000:], p.stderr[-2000:], file=sys.stderr)
+    return [os.path.basename(f) for f in files if not os.path.exists(f'{dst_dir}/{os.path.basename(f)}')]
 
 
 def main():
@@ -116,8 +120,10 @@ def main():
         if os.path.exists(f):
             shutil.copy(f, f'{stage}/in/{t}.xlsx')
         shutil.copy(gold(t), f'{stage}/gold-in/{t}.xlsx')
-    recalc(f'{stage}/in', f'{stage}/lo')
-    recalc(f'{stage}/gold-in', f'{stage}/gold')
+    failed = recalc(f'{stage}/in', f'{stage}/lo') + recalc(f'{stage}/gold-in', f'{stage}/gold')
+    if failed:
+        # a missing conversion would be scored as a wrong answer: stop instead
+        sys.exit(f'LibreOffice did not convert {len(failed)} workbooks ({failed[:10]}); no grades written')
     res = {}
     for t in ids:
         d = ds[t]; out = outs[t]; lo = f'{stage}/lo/{t}.xlsx'; lo_gold = f'{stage}/gold/{t}.xlsx'
