@@ -299,3 +299,38 @@
                     (if-let [n (:next-offset pg)] (recur n (conj acc pg)) (conj acc pg))))]
       (is (< 1 (count pages)))
       (is (= (set names) (set (mapcat #(map :name (:entries %)) pages)))))))
+
+(deftest blank-segments-are-refused-as-geschichte-would-drop-them
+  (let [r (room)]
+    (mfs/write-string! (ws/room-fs r) "/.env" "SECRET=1" false)
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank" (files/read-file r ".env/ " {})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank" (files/write! r {"a/ /b" {:text "x"}} {})))
+    (is (not (mfs/exists? (ws/room-fs r) "/a")))))
+
+(deftest a-batch-cannot-write-a-file-and-beneath-it
+  (let [r (room)
+        before (commits r)]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"also writes /a as a file"
+                          (files/write! r {"a" {:text "x"} "a/b" {:text "y"}} {})))
+    (is (not (mfs/exists? (ws/room-fs r) "/a")))
+    (is (= before (commits r)))))
+
+(deftest the-undo-keeps-a-write-made-while-it-runs
+  (let [r (room)
+        execute-git gs/execute-git
+        restore-paths! repo/restore-paths!]
+    (files/write! r {"a.txt" {:text "old"}} {})
+    (with-redefs [gs/execute-git (fn [ws argv]
+                                   (if (= "commit" (first argv))
+                                     {:exit 1 :stdout "" :stderr "boom"}
+                                     (execute-git ws argv)))
+                  ;; the undo's first step; an agent writes right after it
+                  repo/restore-paths! (fn [& args]
+                                        (let [res (apply restore-paths! args)]
+                                          (mfs/write-string! (ws/room-fs r) "/a.txt" "the agent's" false)
+                                          (mfs/write-string! (ws/room-fs r) "/new.txt" "the agent's too" false)
+                                          res))]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (files/write! r {"a.txt" {:text "mine"} "new.txt" {:text "mine"}} {}))))
+    (is (= "the agent's" (worktree-text r "/a.txt")))
+    (is (= "the agent's too" (worktree-text r "/new.txt")) "not deleted as the batch's own")))

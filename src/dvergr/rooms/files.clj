@@ -69,6 +69,9 @@
        (refuse (str "Invalid path: " (pr-str p)) {:path p}))
      (when (some #{".."} segs)
        (refuse (str "A path may not contain '..': " p) {:path p}))
+     ;; Geschichte drops blank segments: `.env/ ` would name `.env`
+     (when (some str/blank? segs)
+       (refuse (str "A path segment may not be blank: " (pr-str p)) {:path p}))
      (when (and (empty? segs) (not root?))
        (refuse (str "Not a file path: " (pr-str p)) {:path p}))
      (let [abs (str "/" (str/join "/" segs))]
@@ -238,6 +241,9 @@
 
 (defn- size-of [c] (if (bytes? c) (alength ^bytes c) 0))
 
+(defn- ancestors-of [abs]
+  (->> (str/split abs #"/") (remove str/blank?) butlast (reductions #(str %1 "/" %2) "") rest))
+
 (defn- plan
   "The validated batch: `[[absolute-path bytes-or-::remove] …]`, sorted."
   [files]
@@ -249,14 +255,17 @@
         dupes (keep (fn [[p n]] (when (< 1 n) p)) (frequencies (map first entries)))]
     (when (seq dupes)
       (refuse (str "Paths name the same file: " (str/join ", " dupes)) {:paths (vec dupes)}))
+    (let [written (set (keep (fn [[p c]] (when (not= ::remove c) p)) entries))]
+      (doseq [[p c] entries
+              :when (not= ::remove c)
+              :let [parent (some written (ancestors-of p))]
+              :when parent]
+        (refuse (str p ": the batch also writes " parent " as a file") {:path p})))
     (doseq [[p c] entries :when (< max-file-bytes (size-of c))]
       (refuse (str p " is larger than " max-file-bytes " bytes") {:path p}))
     (when (< max-batch-bytes (reduce + (map (comp size-of second) entries)))
       (refuse (str "A room_write writes at most " max-batch-bytes " bytes") {}))
     (vec (sort-by first entries))))
-
-(defn- ancestors-of [abs]
-  (->> (str/split abs #"/") (remove str/blank?) butlast (reductions #(str %1 "/" %2) "") rest))
 
 (defn- check-shape!
   "Refuse a batch that would overwrite or remove a directory or a symbolic
@@ -272,25 +281,37 @@
                                   (ancestors-of p))]
       (refuse (str p ": " blocked " is " (if (= :file bt) "a file" "a symbolic link")) {:path p}))))
 
+(defn- restore-tx
+  "Transaction function: put the worktree entries of `paths` back as they
+   were `before`, each only while it still holds what the batch left there
+   (`expected`). Run in the transactor, so a writer that changed a path since
+   keeps its change."
+  [db before expected paths]
+  (vec (mapcat (fn [p]
+                 (let [[eid cid] (first (d/q '[:find ?e ?cid :in $ ?p
+                                               :where [?e :geschichte.work/path ?p]
+                                               [?e :geschichte.work/content ?c]
+                                               [?c :geschichte.content/id ?cid]]
+                                             db (rel p)))]
+                   (when (= (some-> cid str) (get expected p))
+                     (if-let [{:keys [content size mode]} (get before p)]
+                       [{:geschichte.work/path (rel p) :geschichte.work/content [:geschichte.content/id content]
+                         :geschichte.work/size size :geschichte.work/mode mode}]
+                       (when eid [[:db/retractEntity eid]])))))
+               paths)))
+
 (defn- restore!
   "Undo this batch's changes: the index of its paths back to HEAD (where it
    was: nothing was staged), the files it wrote or removed back to `before`
-   unless someone else changed them since (their content is no longer what
-   this batch left), and the directories it created, when empty."
+   unless someone else changed them since (`restore-tx`), and the
+   directories it created, when empty."
   [conn fs before expected touched created]
   (try (repo/restore-paths! conn (mapv rel (keys expected)) {:source :head :staged? true :worktree? false})
        (catch Throwable _ nil))
-  (let [now (content-ids conn)
-        ours (filter #(= (get expected %) (get now %)) touched)
-        tx (vec (keep (fn [p]
-                        (if-let [{:keys [content size mode]} (get before p)]
-                          {:geschichte.work/path (rel p) :geschichte.work/content [:geschichte.content/id content]
-                           :geschichte.work/size size :geschichte.work/mode mode}
-                          (when (contains? now p) [:db/retractEntity [:geschichte.work/path (rel p)]])))
-                      ours))]
-    (try (when (seq tx) (d/transact conn tx)) (catch Throwable _ nil))
-    (doseq [dir (sort-by count > created)]
-      (try (when (empty? (mfs/list-dir fs dir)) (mfs/delete fs dir)) (catch Throwable _ nil)))))
+  (try (when (seq touched) (d/transact conn [[:db.fn/call restore-tx before expected (vec touched)]]))
+       (catch Throwable _ nil))
+  (doseq [dir (sort-by count > created)]
+    (try (when (empty? (mfs/list-dir fs dir)) (mfs/delete fs dir)) (catch Throwable _ nil))))
 
 (defn host-boundary
   "The effect boundary for a write made on `room` by a client outside it: the
