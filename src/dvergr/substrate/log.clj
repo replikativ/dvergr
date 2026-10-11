@@ -20,6 +20,8 @@
   []
   (paths/log-file))
 
+(declare to-file!)
+
 (defn init!
   "Configure logging. Call once at program entry before starting the daemon.
    - Redirects System.err to the log file (captures JVM module warnings, JUL)
@@ -41,24 +43,39 @@
      (alter-var-root #'*out* (constantly pw))
      (alter-var-root #'*err* (constantly pw)))
 
+   (to-file! path)))
+
+(defn to-file!
+  "Send the log records (Telemere, Trove, Timbre, java.util.logging) to the file at
+   `path` instead of the console, leaving stdout and stderr alone: a command
+   line tool keeps stdout for its own output (`dvergr.catalog.room-run`)."
+  [path]
+  (some-> (java.io.File. ^String (str path)) .getAbsoluteFile .getParentFile .mkdirs)
    ;; Remove all JUL (java.util.logging) ConsoleHandlers from the root logger.
    ;; Lucene uses JUL and would otherwise write to the terminal.
-   (let [root (java.util.logging.Logger/getLogger "")]
-     (doseq [h (into [] (.getHandlers root))]
-       (.removeHandler root h)))
+  (let [root (java.util.logging.Logger/getLogger "")]
+    (doseq [h (into [] (.getHandlers root))]
+      (.removeHandler root h)))
 
    ;; Telemere: silence console, write to file
-   (tel/remove-handler! :default/console)
-   (tel/add-handler! :file/main
-                     (tel/handler:file
-                      {:path     path
-                       :interval nil}))
+  (tel/remove-handler! :default/console)
+  (tel/add-handler! :file/main
+                    (tel/handler:file
+                     {:path     (str path)
+                      :interval nil}))
+
+   ;; Trove (datahike's warnings, e.g. :datahike/value-caps-unset): into
+   ;; Telemere, else its console backend prints them to stdout
+  (try
+    (let [log-fn ((requiring-resolve 'taoensso.trove.telemere/get-log-fn))]
+      (alter-var-root (requiring-resolve 'taoensso.trove/*log-fn*) (constantly log-fn)))
+    (catch Throwable _ nil))
 
    ;; Timbre (datahike, other libs): redirect into Telemere
    ;; Set min-level :info to drop the noisy DEBUG transact messages
    ;; (Timbre 4.10 calls it set-level!; v5 renamed to set-min-level!)
-   (timbre/set-level! :info)
-   (timbre/merge-config!
-    {:appenders
-     {:println  {:enabled? false}
-      :telemere (tel-timbre/timbre->telemere-appender)}})))
+  (timbre/set-level! :info)
+  (timbre/merge-config!
+   {:appenders
+    {:println  {:enabled? false}
+     :telemere (tel-timbre/timbre->telemere-appender)}}))

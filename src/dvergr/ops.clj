@@ -407,6 +407,28 @@
   ;; it from). Process-local; after a restart the child Runs say it.
   (atom {}))
 
+(defonce ^:private job-cells
+  ;; job id -> how many cells its experiment has (candidates × cases ×
+  ;; repetitions): the total its progress counts towards. Process-local.
+  (atom {}))
+
+(defn- job-progress
+  "How far an experiment job is, for a poll to show: cells with a verdict of
+   the total, faults so far, and the phase (`running`, or
+   `settling` while its worlds are archived after the last cell, `done`)."
+  [daemon {:keys [id kind room-value status settled?]}]
+  (when-let [exp (and (= :experiment kind) room-value (get @job-experiments id))]
+    (let [p (in-ctx daemon (binding [ec/*execution-context* (:ctx room-value)] (experiment/progress room-value)))
+          cands (:candidates (some #(when (= exp (:experiment/content-id %)) %) (:experiments p)))
+          total (get @job-cells id)
+          verdicts (reduce + 0 (map :verdicts cands))]
+      (cond-> {:cells-done (cond-> verdicts total (min total))
+               :faults (reduce + 0 (map :faults cands))
+               :phase (cond (= :running status) "running"
+                            (false? settled?) "settling"
+                            :else "done")}
+        total (assoc :cells-total total)))))
+
 (defn- job-result
   "What a finished job produced, read from its room's store."
   [daemon {:keys [id kind room-value status]}]
@@ -682,7 +704,9 @@
               "names the columns: id (the case's), inputs (into the case's /docs/case.edn), "
               "attachments (text files beside the table), expected {column {rule exact|ci|number|set|"
               "date, tolerance, doc}} (what the answer must get right), and optionally title and "
-              "task. Certification keeps only the cases that can grade an answer and says why the "
+              "task (else one describing the inputs is written). Either way the task ends with the "
+              "answer contract: write /out/answer.edn, an EDN map from each expected column to its "
+              "value; a supplied task need not say it. Certification keeps only the cases that can grade an answer and says why the "
               "others cannot (no or duplicate id, an outcome left empty, the same inputs with "
               "different outcomes, an outcome its rule cannot read); the result counts them. "
               "Then catalog_calibrate and catalog_benchmark the bundle as any other.")
@@ -695,7 +719,7 @@
                      [:expected [:map-of :any :map]]
                      [:attachments {:optional true} [:vector :string]]
                      [:title {:optional true} :string]
-                     [:task {:optional true} :string]
+                     [:task {:optional true} [:string {:description "what to do with a case; the answer contract (/out/answer.edn, the expected fields) is appended"}]]
                      [:doc {:optional true} :string]]]
              [:delimiter {:optional true} :string]]
     :impl (fn [daemon {:keys [room name table spec delimiter]}]
@@ -803,14 +827,17 @@
                                          (catch Exception e {:error (ex-message e)})))))))))}
 
    :job/status
-   {:doc (str "A job's status, and its result once completed. `wait-ms` (at most 25000) "
-              "waits that long for it to finish before answering.")
+   {:doc (str "A job's status, and its result once completed. `wait-ms` (at most 25000, below "
+              "common client call timeouts) waits that long for it to finish before answering. "
+              "A benchmark job's status has `progress`: cells with a verdict of the total, faults, "
+              "the phase.")
     :kind :read
     :schema [:map [:job [:string {:description "job id"}]]
              [:wait-ms {:optional true} [:int {:min 0 :max 25000 :description "wait up to this long (default 0)"}]]]
     :impl (fn [daemon {:keys [job wait-ms]}]
             (or (some-> (in-ctx daemon (jobs/status (uuid-arg job) (or wait-ms 0)))
-                        (#(job-data daemon % true)))
+                        (#(let [p (job-progress daemon %)]
+                            (cond-> (job-data daemon % true) p (assoc :progress p)))))
                 (throw (ex-info (str "No job " job) {:type ::no-job}))))}
 
    :job/list
@@ -1207,7 +1234,11 @@
                              (jobs/start! r {:kind :experiment}
                                           #(runner/run-in r (assoc plan :experiment exp :parent-run %))
                                           :reason-of refused-reason))
-                            (#(swap! job-experiments assoc (:id %) (:experiment/content-id exp)))))
+                            (#(do (swap! job-experiments assoc (:id %) (:experiment/content-id exp))
+                                  (swap! job-cells assoc (:id %)
+                                         (* (count (:experiment/candidates exp))
+                                            (count (get-in exp [:experiment/dataset :dataset/environments]))
+                                            (:experiment/repetitions exp)))))))
                   (->> (job-data daemon))
                   (assoc :op "catalog/benchmark" :task workflow :models models
                          ;; its ExperimentDef: experiment_report {room, experiment}

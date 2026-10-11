@@ -11,10 +11,12 @@
             [dvergr.catalog.room-run :as room-run]
             [dvergr.catalog.room-test :as room-test]
             [dvergr.chat.agent :as chat-agent]
+            [dvergr.model.api.claude-code :as claude-code]
             [dvergr.model.chat :as model-chat]
             [dvergr.model.providers :as providers]
             [dvergr.ops :as ops]
-            [dvergr.substrate.paths :as paths]))
+            [dvergr.substrate.paths :as paths]
+            [dvergr.test-support]))
 
 (defn- tmp [prefix] (str (System/getProperty "java.io.tmpdir") "/" prefix (random-uuid)))
 
@@ -229,3 +231,71 @@
             (is (thrown-with-msg? Exception #"listing failed"
                                   (binding [org.replikativ.spindel.engine.core/*execution-context* (:ctx r)]
                                     (room-wf/bundle-files r "sums"))))))))))
+
+(def ^:private fake-claude
+  ;; `claude -p` as far as a room workflow sees it: it launches the MCP relay
+  ;; its --mcp-config names (with that config's env), lists the tools,
+  ;; writes the answer through write_file, and reports a result
+  "#!/usr/bin/env bb
+(require '[cheshire.core :as json] '[babashka.process :as p])
+(def args *command-line-args*)
+(when (some #{\"--version\"} args) (println \"2.1.999 (Claude Code)\") (System/exit 0))
+(defn opt [f] (second (drop-while #(not= % f) args)))
+(slurp *in*)
+(when-let [cfg (get-in (json/parse-string (opt \"--mcp-config\")) [\"mcpServers\" \"dvergr\"])]
+  (let [proc (p/process (into [(get cfg \"command\")] (get cfg \"args\")) {:extra-env (get cfg \"env\") :err :inherit})
+        w (java.io.PrintWriter. (:in proc) true)
+        r (java.io.BufferedReader. (java.io.InputStreamReader. (:out proc)))
+        rpc (fn [id method params]
+              (.println w (json/generate-string {:jsonrpc \"2.0\" :id id :method method :params params}))
+              (loop [] (let [m (json/parse-string (.readLine r) true)] (if (= id (:id m)) m (recur)))))]
+    (rpc 1 \"initialize\" {:protocolVersion \"2025-06-18\" :capabilities {} :clientInfo {:name \"fake-claude\" :version \"0\"}})
+    (.println w (json/generate-string {:jsonrpc \"2.0\" :method \"notifications/initialized\"}))
+    (rpc 2 \"tools/list\" {})
+    (rpc 3 \"tools/call\" {:name \"write_file\" :arguments {:path \"/out/competitors.md\" :content \"Wato\\nPromptQL\\nDust\\nBuzz\\n\"}})
+    (.close w)
+    (p/destroy proc)))
+(println (json/generate-string {:type \"result\" :result \"Done.\" :session_id \"s\" :total_cost_usd 0
+                                :usage {:input_tokens 10 :output_tokens 2} :modelUsage {(opt \"--model\") {}}}))
+")
+
+(defn- bb? []
+  (some #(.canExecute (io/file % "bb")) (str/split (str (System/getenv "PATH")) #":")))
+
+(deftest a-claude-code-candidate-writes-nothing-into-the-checkout
+  ;; the CLI's MCP relay was launched without DVERGR_HOME, so it kept its
+  ;; tool cache in <checkout>/.dvergr/mcp, whatever the home
+  (if-not (bb?)
+    (dvergr.test-support/skip! "a-claude-code-candidate-writes-nothing-into-the-checkout: no bb on PATH")
+    (let [home (tmp "dvergr-room-run-cc-")
+          script (doto (io/file (tmp "fake-claude-") "claude") io/make-parents (spit fake-claude) (.setExecutable true))
+          checkout-mcp (io/file (System/getProperty "user.dir") ".dvergr" "mcp")
+          listing #(set (map str (file-seq checkout-mcp)))
+          before (listing)
+          settings (claude-code/settings-snapshot)
+          b (room-wf/bundle "competitors" room-test/files)]
+      (try
+        (claude-code/configure! {:cli (.getAbsolutePath ^java.io.File script)})
+        (let [r (with-redefs [providers/ensure-initialized! (fn [] (providers/register-claude-code! {}))]
+                  (room-run/benchmark! b {:home home :models ["claude-code-haiku"] :repetitions 1 :timeout-ms 120000}))]
+          (is (zero? (:failed-cells r)) (pr-str (dissoc (:job r) :result)))
+          (is (= 1.0 (get-in r [:scorecard :scorecard/summary 0 :reward-mean])) "it answered through the relay")
+          (is (= before (listing)) "nothing new under the checkout's .dvergr")
+          (is (seq (filter #(re-find #"tools-.*-room-.*\.json$" (str %)) (file-seq (io/file home "mcp"))))
+              "the relay's tool cache is in the home, keyed by its room"))
+        (finally (claude-code/restore-settings! settings))))))
+
+(deftest a-poll-says-how-far-the-benchmark-is
+  ;; job_status waits at most 25 s (below the clients' call timeouts); a
+  ;; newcomer's assistant polled twenty times and learnt nothing
+  (let [home (tmp "dvergr-room-run-home-")
+        seen (atom [])
+        r (bench! (writer (atom 0) "Wato\nPromptQL\nDust\nBuzz\n") (room-wf/bundle "competitors" room-test/files) home
+                  :on-progress #(swap! seen conj %))]
+    (is (zero? (:failed-cells r)))
+    (is (seq @seen))
+    (is (every? #(= 2 (:cells-total %)) @seen) (pr-str @seen))
+    (is (= {:cells-done 2 :cells-total 2 :faults 0 :phase "done"} (last @seen)))))
+
+(deftest the-default-home-is-under-dvergr-home
+  (is (str/ends-with? (room-run/default-home "vat-codes") "workflow-runs/vat-codes")))
