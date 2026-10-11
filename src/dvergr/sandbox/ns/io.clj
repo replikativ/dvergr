@@ -1264,25 +1264,37 @@
        (filter #(.exists (java.io.File. ^java.io.File % ".git")))
        first))
 
-(defn git-metadata-dir
-  "The canonical git directory of the repository `base-path` is in — `.git`,
-   or where a `.git` file (`gitdir: …`) or a `.git` symlink points — or nil.
-   Writes, deletes and moves must not reach it however it is spelled."
+(defn- read-git-pointer
+  "A gitfile's or commondir's target as git reads it: the whole content (after
+   the `gitdir: ` prefix for a gitfile) minus trailing CR/LF — a name may
+   contain a newline — resolved against `relative-to`."
+  [^java.io.File f prefix ^java.io.File relative-to]
+  (let [content (str/replace (slurp f) #"[\r\n]+$" "")]
+    (when (str/starts-with? content prefix)
+      (let [target (java.io.File. (subs content (count prefix)))]
+        (.getCanonicalFile (if (.isAbsolute target) target (java.io.File. relative-to (str target))))))))
+
+(defn git-metadata-dirs
+  "The canonical git directories of the repository `base-path` is in: the git
+   dir (`.git`, or where a `.git` symlink or gitfile points) and, for a linked
+   worktree, its common dir (shared config, hooks, objects). Writes, deletes
+   and moves must not reach either however it is spelled."
   [base-path]
   (when-let [top (worktree-top base-path)]
-    (let [dotgit (java.io.File. ^java.io.File top ".git")]
-      (.getCanonicalFile
-       (if (.isFile dotgit)
-         (let [[_ target] (re-find #"(?m)^gitdir:\s*(.+)$" (slurp dotgit))
-               f (java.io.File. (str/trim (str target)))]
-           (if (.isAbsolute f) f (java.io.File. ^java.io.File top (str/trim (str target)))))
-         dotgit)))))
+    (let [dotgit (java.io.File. ^java.io.File top ".git")
+          gitdir (if (.isFile dotgit)
+                   (read-git-pointer dotgit "gitdir: " top)
+                   (.getCanonicalFile dotgit))
+          common-file (some-> gitdir (java.io.File. "commondir"))
+          common (when (and common-file (.isFile common-file))
+                   (read-git-pointer common-file "" gitdir))]
+      (into #{} (remove nil?) [gitdir common]))))
 
 (defn in-git-metadata?
-  "Is canonical `file` inside the git directory of `base-path`'s repository?"
+  "Is canonical `file` inside a git directory of `base-path`'s repository?"
   [base-path ^java.io.File file]
-  (boolean (when-let [g (git-metadata-dir base-path)]
-             (.startsWith (.toPath file) (.toPath ^java.io.File g)))))
+  (boolean (some #(.startsWith (.toPath file) (.toPath ^java.io.File %))
+                 (git-metadata-dirs base-path))))
 
 (defn- git-run*
   "Run git in base-path. Returns stdout string or throws on non-zero exit."

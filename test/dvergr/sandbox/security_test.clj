@@ -402,6 +402,38 @@
       (is (= before (slurp (java.io.File. meta "config"))))
       (is (.exists (java.io.File. meta "HEAD"))))))
 
+(deftest physical-git-metadata-is-protected-through-gitfiles
+  (testing "a linked worktree's common dir (shared config and hooks)"
+    (let [dir (git-repo!)
+          shared (java.io.File. dir "shared")
+          ctx (sci/init {})]
+      (.renameTo (java.io.File. dir ".git") shared)
+      (.mkdirs (java.io.File. shared "worktrees/ws"))
+      (spit (java.io.File. shared "worktrees/ws/commondir") "../..\n")
+      (spit (java.io.File. shared "worktrees/ws/HEAD") "ref: refs/heads/main\n")
+      (spit (java.io.File. dir ".git") "gitdir: shared/worktrees/ws\n")
+      (io/add-fs-ns! ctx :base-path (str dir))
+      (let [before (slurp (java.io.File. shared "config"))]
+        (doseq [code ["(spit \"shared/config\" \"CHANGED\")"
+                      "(spit \"shared/hooks/pre-commit\" \"#!/bin/sh\")"
+                      "(babashka.fs/delete-tree \"shared\")"
+                      "(babashka.fs/move \"shared\" \"s2\")"]]
+          (is (thrown-with-msg? Exception #"sensitive path" (sci/eval-string* ctx code)) code))
+        (is (= :error (:type (tools/execute "write_file" {:path "shared/config" :content "x"}
+                                            {:cwd (str dir)}))))
+        (is (= before (slurp (java.io.File. shared "config")))))))
+  (testing "a gitfile target whose name contains a newline"
+    (let [dir (git-repo!)
+          meta (java.io.File. dir "meta\ndata")
+          ctx (sci/init {})]
+      (.renameTo (java.io.File. dir ".git") meta)
+      (spit (java.io.File. dir ".git") "gitdir: meta\ndata\n")
+      (io/add-fs-ns! ctx :base-path (str dir))
+      (let [before (slurp (java.io.File. meta "config"))]
+        (is (thrown-with-msg? Exception #"sensitive path"
+                              (sci/eval-string* ctx "(spit \"meta\\ndata/config\" \"CHANGED\")")))
+        (is (= before (slurp (java.io.File. meta "config"))))))))
+
 (deftest physical-git-uses-the-workspace-worktree
   ;; `core.worktree` (set directly or through an included config file) would
   ;; point git at another directory than the one every check here is about.
