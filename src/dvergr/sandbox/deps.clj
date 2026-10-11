@@ -28,10 +28,10 @@
    parked on a clojure.core/promise, posted to the peer-bus, and the
    call blocks until a human / manager calls `decide!` to resolve it.
 
-   The default policy: a coord-pattern allowlist, EMPTY by default, so every
-   request goes to a human. If a coord matches a pattern (and asks for a
-   plain Maven version), auto-approve; else return `:ask-human`. The allowlist lives in `(ec/get-state [:dvergr/deps-policy :allowlist])`
-   (a vector of regex patterns); install via `set-allowlist!`."
+   The default policy asks a human for every request: an approved lib's
+   namespaces become callable host code, so nothing is approved by pattern.
+   A `:local/root` source is refused outright — the agent could rewrite it
+   after approval."
   (:require [dvergr.substrate.load :as load]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
@@ -49,54 +49,19 @@
 ;; ============================================================================
 
 (def ^:private POLICY-KEY    [:dvergr/deps-policy :fn])
-(def ^:private ALLOWLIST-KEY [:dvergr/deps-policy :allowlist])
 (def ^:private PENDING-KEY   [:dvergr/deps-policy :pending])
 
 ;; ============================================================================
 ;; Default policy: coord-pattern allowlist
 ;; ============================================================================
 
-(def default-allowlist
-  "Lib coords that auto-approve: none. An approved lib's namespaces become
-   callable host code, and every curated list so far still held one that
-   reaches the host (a network REPL in `org.clojure/tools.nrepl`, a reader
-   that evaluates `#=`, an XML parser that fetches external entities). So
-   every `add-libs` waits for an operator's decision (`decide!`). A deployment
-   that wants auto-approval sets patterns per ctx with `set-allowlist!`; even
-   then only a plain Maven spec auto-approves."
-  [])
-
-(defn- coord-matches-allowlist?
-  "Does `coord` (a symbol like `'io.foo/bar`) match any pattern in
-   `patterns`? Both group-id and full coord are tried."
-  [coord patterns]
-  (let [s (str coord)]
-    (some (fn [p]
-            (try (re-find (re-pattern p) s)
-                 (catch Throwable _ nil)))
-          patterns)))
-
-(defn- maven-release-spec?
-  "Is `spec` a plain Maven coordinate — resolved from the basis's configured
-   repositories, nothing the agent points elsewhere? A `:local/root` or
-   `:git/url` spec loads whatever code sits there under any lib name, so the
-   name allowlist says nothing about it. nil is the vector form (`RELEASE`)."
-  [spec]
-  (or (nil? spec)
-      (and (map? spec)
-           (string? (:mvn/version spec))
-           (every? #{:mvn/version :exclusions} (keys spec)))))
-
-(defn allowlist-policy
-  "A policy that auto-approves coords matching the ctx's allowlist
-   (default: `default-allowlist`) when the requested source is a plain Maven
-   version (`ctx`'s `:spec`); anything else returns :ask-human."
-  [coord ctx]
-  (let [patterns (or (ec/get-state ALLOWLIST-KEY) default-allowlist)]
-    (if (and (maven-release-spec? (:spec ctx))
-             (coord-matches-allowlist? coord patterns))
-      :approve
-      :ask-human)))
+(defn default-policy
+  "Every request goes to a human (`:ask-human`). An approved lib's namespaces
+   become callable host code, and every curated auto-approve list so far still
+   held one that reaches the host, so none is offered; an operator who wants
+   automation installs their own policy fn."
+  [_coord _ctx]
+  :ask-human)
 
 ;; ============================================================================
 ;; Policy installation
@@ -104,20 +69,14 @@
 
 (defn install-policy!
   "Install a custom policy fn `(fn [coord ctx])` for the current ctx.
-   Defaults to `allowlist-policy` if never installed."
+   Defaults to `default-policy` (ask a human) if never installed."
   [policy-fn]
   (ec/swap-state! POLICY-KEY (constantly policy-fn)))
 
-(defn set-allowlist!
-  "Override the default allowlist with `patterns` (a vector of regex
-   strings) on the current ctx."
-  [patterns]
-  (ec/swap-state! ALLOWLIST-KEY (constantly (vec patterns))))
-
 (defn current-policy
-  "The currently installed policy fn, or `allowlist-policy` if none."
+  "The currently installed policy fn, or `default-policy` if none."
   []
-  (or (ec/get-state POLICY-KEY) allowlist-policy))
+  (or (ec/get-state POLICY-KEY) default-policy))
 
 ;; ============================================================================
 ;; Pending requests (for human / manager escalation)
@@ -823,6 +782,13 @@
                           (throw (ex-info "clojure.repl.deps/add-libs not available — needs Clojure 1.12+"
                                           {:type :dvergr/deps-arg})))
         coords        (libs->coords libs)
+        ;; A local root stays writable after approval: what is approved is not
+        ;; what would be loaded. Libs from local roots belong in the daemon's
+        ;; own deps.
+        _             (when (map? libs)
+                        (doseq [[c spec] libs :when (and (map? spec) (contains? spec :local/root))]
+                          (throw (ex-info (str "Dep denied: " c " — a :local/root source is not loadable from the sandbox")
+                                          {:type :dvergr/dep-denied :coord c :reason :local-root}))))
         ;; Check every coord; first denial wins
         decisions     (mapv (fn [c] [c (check-coord! c {:spec (when (map? libs) (get libs c))})])
                             coords)

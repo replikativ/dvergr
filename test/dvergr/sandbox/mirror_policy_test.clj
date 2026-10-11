@@ -114,7 +114,7 @@
                 cheshire/cheshire metosin/jsonista org.clojure/clojure
                 org.clojure/tools.nrepl org.clojure/tools.reader hato/hato
                 http-kit/http-kit babashka/babashka.pods nrepl/nrepl]]
-      (is (= :ask-human (deps/allowlist-policy c {:spec {:mvn/version "1.0"}})) (str c)))))
+      (is (= :ask-human (deps/default-policy c {:spec {:mvn/version "1.0"}})) (str c)))))
 
 (deftest launch-classpath-data-libraries-stay-requirable
   ;; A lib the daemon already ships adds no jar, so add-libs grants nothing for
@@ -155,24 +155,28 @@
     (spit (java.io.File. dir "clojure/inspector.cljc") "(ns clojure.inspector)\n")
     dir))
 
-(deftest auto-approval-requires-a-maven-source
-  ;; The allowlist names libraries; a `:local/root` or `:git/url` spec loads
-  ;; whatever code sits there under that name, so it is not auto-approved.
+(deftest every-add-libs-asks-a-human
+  ;; No pattern auto-approves; a :local/root source is refused before any
+  ;; decision (it stays writable after approval).
   (with-ctx
-    (deps/set-allowlist! ["^org\\.clojure/data\\.csv$"]) ; an operator's opt-in
-    (is (= :approve (deps/allowlist-policy 'org.clojure/data.csv {:spec {:mvn/version "1.1.0"}})))
-    (is (= :approve (deps/allowlist-policy 'org.clojure/data.csv {})) "vector form = RELEASE")
-    (doseq [spec [{:local/root "/tmp/evil"}
-                  {:git/url "https://example.com/evil.git" :git/sha "abc"}
-                  {:mvn/version "1.1.0" :local/root "/tmp/evil"}
-                  {:mvn/version "1.1.0" :mvn/repos {"evil" {:url "https://example.com"}}}]]
-      (is (= :ask-human (deps/allowlist-policy 'org.clojure/data.csv {:spec spec})) (pr-str spec))))
+    (doseq [c '[org.clojure/data.csv cheshire/cheshire metosin/jsonista]]
+      (is (= :ask-human (deps/default-policy c {:spec {:mvn/version "1.0"}})) (str c)))
+    (is (nil? (resolve 'dvergr.sandbox.deps/set-allowlist!)) "no auto-approve allowlist to configure"))
+  (testing "a :local/root source is refused, even with an approving policy"
+    (with-ctx
+      (deps/install-policy! (fn [_ _] :approve))
+      (let [called (atom false)]
+        (with-redefs [clojure.repl.deps/add-libs (fn [_] (reset! called true) nil)]
+          (is (thrown-with-msg? Exception #"local/root"
+                                (deps/add-libs! nil '{probe/local {:local/root "/tmp/evil"}}))))
+        (is (false? @called) "nothing was loaded"))))
   (testing "add-libs! hands the policy the requested spec"
     (with-ctx
-      (let [seen (atom nil)]
+      (let [seen (atom nil)
+            spec {:git/url "https://example.com/r.git" :git/sha "0123456789abcdef0123456789abcdef01234567"}]
         (deps/install-policy! (fn [coord ctx] (reset! seen [coord ctx]) {:deny "probe"}))
-        (is (thrown? Exception (deps/add-libs! nil '{org.clojure/probe {:local/root "/tmp/evil"}})))
-        (is (= '[org.clojure/probe {:spec {:local/root "/tmp/evil"}}] @seen))))))
+        (is (thrown? Exception (deps/add-libs! nil {'org.clojure/probe spec})))
+        (is (= ['org.clojure/probe {:spec spec}] @seen))))))
 
 (deftest add-libs-records-provenance-only-after-a-successful-load
   (testing "a failed host load records nothing"
@@ -275,7 +279,9 @@
                (testing "but not when it asked for another source than the loaded one"
                  ;; The lib is not reloaded, so that request would get code it
                  ;; was not approved for.
-                 (doseq [spec [{:local/root "/tmp/other"} {:mvn/version "2.0"}]]
+                 (doseq [spec [{:git/url "https://example.com/other.git"
+                                :git/sha "0123456789abcdef0123456789abcdef01234567"}
+                               {:mvn/version "2.0"}]]
                    (binding [rtc/*execution-context* (ctx/create-execution-context)]
                      (deps/install-policy! (fn [_ _] :approve))
                      (with-redefs [clojure.repl.deps/add-libs (fn [_] nil)]
