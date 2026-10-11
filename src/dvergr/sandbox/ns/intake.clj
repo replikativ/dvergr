@@ -43,10 +43,15 @@
     (catch Throwable _
       nil)))
 
-(defn- account-of
-  "The `:account` keyword argument in `args`, or the default account."
-  [args]
-  (or (second (drop-while #(not= :account %) args)) :datahike-contact))
+(defn- split-options
+  "`args` as `[positional options]`: the first `n` positional, then keyword
+   options given as pairs or as one trailing map (as `& {:as opts}` takes
+   them)."
+  [n args]
+  (let [[pos more] (split-at n args)]
+    [(vec pos) (if (and (= 1 (count more)) (map? (first more)))
+                 (first more)
+                 (apply hash-map more))]))
 
 (defn gate-mail-bindings
   "`bindings` for the sandbox, through the boundary `effects`
@@ -55,17 +60,21 @@
    opens it, a `:mail/open` (a write); reads of an open store are not effects.
    `open?` (host-side, not mounted) answers whether an account is open."
   [{open? 'open? :as bindings} effects]
-  (let [opening (fn [read]
+  (let [;; the options are normalized once, and the read gets exactly what
+        ;; was decided on
+        opening (fn [n read]
                   (fn [& args]
-                    (let [account (account-of args)]
+                    (let [[pos opts] (split-options n args)
+                          account (get opts :account :datahike-contact)
+                          call #(apply read (concat pos (mapcat identity opts)))]
                       (if (and open? (open? account))
-                        (apply read args)
-                        (effects/perform! effects {:effect :mail/open :resource {:account (name account)}}
-                                          #(apply read args))))))]
+                        (call)
+                        (effects/perform! effects {:effect :mail/open :resource {:account (str (name account))}}
+                                          call)))))]
     (-> (dissoc bindings 'open?)
-        (update 'inbox opening)
-        (update 'search opening)
-        (update 'read opening)
+        (update 'inbox #(opening 0 %))
+        (update 'search #(opening 1 %))
+        (update 'read #(opening 1 %))
         (update 'sync!
                 (fn [sync!]
                   (fn [& {:keys [account folders] :as opts}]

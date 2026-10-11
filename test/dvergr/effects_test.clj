@@ -762,12 +762,32 @@
       (is (empty? @touched) "no refused writer ran"))
     (testing "reading an open mail store is not an effect"
       (let [touched (atom [])]
-        (with-redefs [dvergr.intake.mail/list-inbox (fn [& _] (swap! touched conj :inbox) [])
-                      dvergr.intake.mail/account-open? (constantly true)]
+        (with-redefs [dvergr.intake.mail/list-inbox (fn [& args] (swap! touched conj (vec args)) [])
+                      dvergr.intake.mail/account-open? #(= :datahike-contact %)]
           (with-world-sandbox {:effects {:handlers [[:read-only]]}}
             (fn [{:keys [eval]}]
-              (is (= [] (:ok (eval "(intake.mail/inbox)")))))))
-        (is (= [:inbox] @touched))))))
+              (is (= [] (:ok (eval "(intake.mail/inbox)"))))
+              (is (= [] (:ok (eval "(intake.mail/inbox {:limit 3})"))) "options as a map")
+              (testing "but another account, however the options are given, opens a store"
+                (is (re-find #"read-only" (str (:err (eval "(intake.mail/inbox {:account :other})")))))
+                (is (re-find #"read-only" (str (:err (eval "(intake.mail/inbox :account :other)")))))))))
+        (is (= [[] [:limit 3]] @touched) "the read gets the options decided on")))))
+
+(deftest skill-writes-count-against-a-quota
+  (with-sys-conn
+    (fn [conn]
+      (let [q (effects/quota! {:bytes 100})
+            sci-ctx (sci/init {})]
+        (agent-ns/add-skills-ns! sci-ctx conn (constantly {:handlers (effects/handlers [[:quota {:id q}]])}))
+        (is (thrown-with-msg? Exception #"quota"
+                              (sci/eval-string* sci-ctx (str "(dvergr.skills/author! \"s\" {:note \""
+                                                             (apply str (repeat 200 "a")) "\"} \"b\")")))
+            "the frontmatter is part of what is written")
+        (is (thrown-with-msg? Exception #"quota"
+                              (sci/eval-string* sci-ctx (str "(dvergr.skills/lift! \"s\" \""
+                                                             (apply str (repeat 200 "a")) "\" \"b\")"))))
+        (is (zero? (effects/quota-used q)))
+        (effects/release! q)))))
 
 (def ^:private gen-host
   (gen/elements ["a.com" "docs.a.com" "x.docs.a.com" "b.com" "c.org" "docs.c.org"]))

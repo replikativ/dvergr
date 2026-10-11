@@ -850,9 +850,20 @@
                                           {:op (symbol op)}))))
         provides?   (fn [tag s] (some #(= tag %) (:provides s)))
         ;; a skill file written into the room repo is a file write (dvergr.effects)
-        skill-write (fn [skill-name & [body]]
-                      (cond-> {:effect :fs/write :resource {:path (str "skills/" skill-name ".md")}}
-                        body (assoc :bytes (alength (.getBytes (str body) "UTF-8")))))]
+        ;; its size is what a quota counts: the frontmatter and the body (an
+        ;; upper bound of the rendered file)
+        utf8        (fn [x] (alength (.getBytes (str x) "UTF-8")))
+        skill-write (fn [skill-name frontmatter body]
+                      {:effect :fs/write :resource {:path (str "skills/" skill-name ".md")}
+                       :bytes (+ (utf8 (pr-str frontmatter)) (utf8 body))})
+        ;; promoting rewrites the room skill's file: its size, read here
+        ;; (reads are free); unknown when there is no such skill, which then
+        ;; fails before writing
+        promote-write (fn [skill-name by date]
+                        (let [d (try (get (load-all* (room-repo)) (str skill-name)) (catch Throwable _ nil))]
+                          (cond-> {:effect :fs/write :resource {:path (str "skills/" skill-name ".md")}}
+                            d (assoc :bytes (+ (:bytes (skill-write skill-name (dissoc d :body) (:body d)))
+                                               (utf8 (str "vetted_by: " by "\nvetted_at: " date "\n")))))))]
     (sci/add-namespace! sci-ctx 'dvergr.skills
                         (doc/with-docs
                           {'all       (fn [] (load-all* (room-dir)))
@@ -874,13 +885,13 @@
                          ;; versioned + forkable + mergeable). Agent-authored
                          ;; skills land `vetted: false`, so the vetting gate keeps
                          ;; them out of prompts until a reviewer promotes them.
-                           'author!   (gated effects (fn [skill-name _ body] (skill-write skill-name body))
+                           'author!   (gated effects skill-write
                                              (fn [skill-name frontmatter body]
                                                (author* "skills" (room-repo! "author!") (str skill-name)
                                                         frontmatter (str body))))
                          ;; Lift external content (an openclaw/Claude skill, a URL
                          ;; you fetched) into the room as an UNVETTED skill.
-                           'lift!     (gated effects (fn [skill-name _ body] (skill-write skill-name body))
+                           'lift!     (gated effects (fn [skill-name source body] (skill-write skill-name {:source source} body))
                                              (fn [skill-name source body]
                                                (author* "skills" (room-repo! "lift!") (str skill-name)
                                                         {:source (str source) :vetted false} (str body))))
@@ -888,7 +899,7 @@
                          ;; Only the ROOM's own skills: user/project/builtin
                          ;; definitions live outside the room repo (a sandbox
                          ;; must not rewrite ~/.dvergr or the classpath).
-                           'promote!  (gated effects (fn [skill-name & _] (skill-write skill-name))
+                           'promote!  (gated effects promote-write
                                              (fn [skill-name by date]
                                                (let [definition (get (load-all* (room-repo! "promote!"))
                                                                      (str skill-name))]
