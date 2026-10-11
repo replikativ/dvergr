@@ -1,9 +1,9 @@
 (ns dvergr.substrate.spin-test
   "Cancelling a spin that parks on an await while it is being cancelled (the
-   race that left a cancelled job :running, see `dvergr.substrate.spin`), on
-   its own and as the child its cancelled parent awaits."
+   race that left a cancelled job :running; fixed in spindel 0.1.110, #116,
+   and 0.1.111, #118), on its own and as the child its cancelled parent
+   awaits."
   (:require [clojure.test :refer [deftest is]]
-            [dvergr.substrate.spin :as dspin]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.context :as context]
             [org.replikativ.spindel.engine.core :as ec]
@@ -26,7 +26,7 @@
                             (s (fn [v] (deliver outcome [:resolved v]))
                                (fn [e] (deliver outcome [:rejected (:type (ex-data e))]))))
                           (abort sid err))]
-            (dspin/cancel! s))
+            (spin-core/cancel-spin! s))
           (is (= [:rejected spin-core/spin-cancelled] (deref outcome 5000 ::stranded))
               "the parked await is rejected with the cancellation")
           (is (empty? (ec/get-state [:await-conts (spin-core/spin-id s)]))
@@ -59,7 +59,7 @@
                             (let [[_ cont] (first (ec/get-state [:await-conts child-id]))]
                               ((:resolve-fn cont) :d1)))
                           (abort sid err))]
-            (dspin/cancel! parent))
+            (spin-core/cancel-spin! parent))
           (is @moved? "the child moved on to its second await")
           (is (= [:rejected spin-core/spin-cancelled] (deref outcome 5000 ::stranded)))
           (is (empty? (ec/get-state [:await-conts child-id]))

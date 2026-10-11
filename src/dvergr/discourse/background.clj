@@ -28,7 +28,7 @@
    reference."
   (:require [dvergr.discourse :as d]
             [org.replikativ.spindel.core :as sp]
-            [dvergr.substrate.spin :as dspin]
+            [org.replikativ.spindel.spin.core :as spin-core]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.spin.combinators :as comb]))
 
@@ -147,7 +147,7 @@
     {:task-id task-id
      :status  (fn [] @status)
      :spin    spin
-     :cancel! (fn [] (dspin/cancel! spin) (reset! status :cancelled) (dereg!) nil)}))
+     :cancel! (fn [] (spin-core/cancel-spin! spin) (reset! status :cancelled) (dereg!) nil)}))
 
 (defn list-tasks
   "Live background tasks on `room`'s ctx as a vector of registry entries
@@ -162,7 +162,7 @@
   [room task-id]
   (when-let [entry (binding [ec/*execution-context* (:ctx room)]
                      (get (ec/get-state [:dvergr/background-tasks]) task-id))]
-    (dspin/cancel! (:spin entry))
+    (spin-core/cancel-spin! (:spin entry))
     (reset! (:status entry) :cancelled)
     (binding [ec/*execution-context* (:ctx room)]
       (ec/swap-state! [:dvergr/background-tasks]

@@ -29,7 +29,6 @@
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.context :as ctx]
-            [dvergr.substrate.spin :as dspin]
             [org.replikativ.spindel.spin.core :as spin-core]
             [org.replikativ.spindel.spin.sync :as sync]
             [org.replikativ.spindel.spin.combinators :as comb]
@@ -528,7 +527,7 @@
     (binding [ec/*execution-context* (:ctx room)]
       (let [spin-id (spin-core/spin-id spin)]
         (when-not (ec/spin-current-result spin-id)
-          (dspin/cancel! spin))
+          (spin-core/cancel-spin! spin))
         (ec/graph-clear-deps! spin-id))))
   nil)
 
