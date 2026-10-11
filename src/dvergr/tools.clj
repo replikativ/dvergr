@@ -291,15 +291,36 @@
                db rel)
           str))
 
+(defn- shape-conflict
+  "Why worktree path `rel` cannot take a file in `db`, or nil: a directory
+   there (explicit, or something beneath it), a symbolic link there, or a file
+   or link where one of its parents should be a directory."
+  [db rel]
+  (let [files (into {} (d/q '[:find ?p ?m :where [?e :geschichte.work/path ?p] [?e :geschichte.work/mode ?m]] db))
+        dirs (set (map first (d/q '[:find ?p :where [_ :geschichte.work-dir/path ?p]] db)))
+        prefix (str rel "/")
+        parents (some->> (str/split rel #"/") butlast seq (reductions #(str %1 "/" %2)))]
+    (cond
+      (or (dirs rel) (some #(str/starts-with? % prefix) (concat (keys files) dirs)))
+      (str "/" rel " is a directory")
+      (= 0120000 (bit-and (long (or (get files rel) 0)) 0170000))
+      (str "/" rel " is a symbolic link")
+      :else
+      (when-let [p (some #(when (contains? files %) %) parents)]
+        (str "/" p " is not a directory")))))
+
 (defn- expect-guard
   "Transaction function: throw unless worktree file `rel` holds `expected`
-   (a content id, or nil for no file). Runs in the transactor, in the same
-   transaction as the write it guards."
-  [db rel expected]
-  (let [now (work-content db rel)]
-    (when (not= now expected)
-      (throw (ex-info (str "/" rel " changed underneath the write")
-                      {:type ::changed-underneath :path (str "/" rel) :expected expected :found now})))
+   (a content id, or nil for no file) and, for a write (`write?`), the path
+   can still take a file (`shape-conflict`). Runs in the transactor, in the
+   same transaction as the write it guards."
+  [db rel expected write?]
+  (let [now (work-content db rel)
+        conflict (when write? (shape-conflict db rel))]
+    (when (or (not= now expected) conflict)
+      (throw (ex-info (str "/" rel " changed underneath the write" (when conflict (str ": " conflict)))
+                      {:type ::changed-underneath :path (str "/" rel) :expected expected :found now
+                       :conflict conflict})))
     []))
 
 (defn- guarded-connection
@@ -321,7 +342,7 @@
     (geschichte.content/transact-content!
      conn bytes (:content old)
      (fn [id]
-       [[:db.fn/call expect-guard rel expected]
+       [[:db.fn/call expect-guard rel expected true]
         {:geschichte.work/path rel
          :geschichte.work/content [:geschichte.content/id id]
          :geschichte.work/size (long (alength ^bytes bytes))
@@ -339,7 +360,9 @@
   (try (f)
        (catch Throwable e
          (if-let [data (changed-underneath e)]
-           (throw (ex-info (str (:path data) " changed underneath the write") data))
+           (throw (ex-info (str (:path data) " changed underneath the write"
+                                (when-let [c (:conflict data)] (str ": " c)))
+                           data))
            (throw e)))))
 
 (defn workspace-write!
@@ -395,7 +418,7 @@
                              (let [conn (guarded-connection ctx)
                                    rel (subs resolved 1)
                                    present? (some? (get (geschichte.repo/worktree conn) rel))]
-                               (d/transact conn (cond-> [[:db.fn/call expect-guard rel (:expect opts)]]
+                               (d/transact conn (cond-> [[:db.fn/call expect-guard rel (:expect opts) false]]
                                                   present? (conj [:db/retractEntity [:geschichte.work/path rel]])))
                                (when present? resolved))))
 

@@ -384,3 +384,20 @@
         (is (re-find #"not undone" (ex-message e)))))
     (is (= :dir (:type (mfs/stat (ws/room-fs r) "/a"))))
     (is (= "mine" (worktree-text r "/a/agent.txt")))))
+
+(deftest a-directory-made-before-the-batch-writes-is-not-written-over
+  (let [r (room)
+        head #(set (keys (repo/tree (conn r) :head)))
+        before (head)
+        write! tools/workspace-write!]
+    (with-redefs [tools/workspace-write! (fn [ctx p c & opts]
+                                           (when (= "/a" p)
+                                             (mfs/write-string! (ws/room-fs r) "/a/agent.txt" "mine" false))
+                                           (apply write! ctx p c opts))]
+      (let [e (try (files/write! r {"a" {:text "mine"}} {}) nil
+                   (catch clojure.lang.ExceptionInfo e e))]
+        (is (= :dvergr.tools/changed-underneath (:type (ex-data e))) (pr-str (ex-data e)))
+        (is (re-find #"is a directory" (ex-message e)))))
+    (is (= before (head)) "nothing committed")
+    (is (= :dir (:type (mfs/stat (ws/room-fs r) "/a"))))
+    (is (= "mine" (worktree-text r "/a/agent.txt")))))
