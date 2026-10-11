@@ -122,7 +122,10 @@ agent costs are heavy-tailed), for list-price and billed dollars, tokens, wall t
 run's parallelism and subscription window points (the points the pilot moved per token; a
 pilot that moved no whole point counts as one, an upper bound). When the conservative
 estimate exceeds the budget the run stops with the estimate (`:stopped :over-budget`);
-running again with a larger budget resumes from the pilot. This is the experiment predicting
+running again with a larger budget resumes from the pilot. A candidate with cells left
+whose pilot left no Attempt (its pilot cells faulted or were refused) has no measured cost:
+the estimate lists it under `:unpiloted` and the gate refuses (`:over {:unpiloted …}`)
+rather than pass on the other candidates' bills; running again pilots it. This is the experiment predicting
 its own resource use before committing to it; the measurements it keeps are what later
 predictions, and tuning on pilots before a full run, build on.
 

@@ -65,3 +65,22 @@
       (is (= :pilot (get-in (preflight/estimate {:pilot-receipts pilot :remaining {:c 1} :window-points 0.0
                                                  :calibration {:points-per-token 1e-9 :tokens 10}})
                             [:window-rate :from]))))))
+
+(deftest a-candidate-without-pilot-cells-does-not-pass-the-gate
+  ;; A candidate whose pilot cells produced no Attempt (a fault, a refusal)
+  ;; has no measured cost: the estimate cannot bound it, so the gate refuses
+  ;; rather than pass the run on the other candidates' bills alone.
+  (let [est (preflight/estimate {:pilot-receipts [(receipt :cheap 0.01 1000 1000)]
+                                 :remaining {:cheap 10 :expensive 100}
+                                 :cell-caps {:expensive 10000000}})]
+    (is (= [:expensive] (:unpiloted est)))
+    (is (= {:pilot-cells 0 :cells-left 100 :unpiloted? true}
+           (get-in est [:candidates :expensive])))
+    (is (= {:candidates [:expensive]} (:unpiloted (preflight/gate est {:dollars 1}))))
+    (is (contains? (preflight/gate est {:subscription 0.5}) :unpiloted))
+    (is (nil? (preflight/gate est {})) "no budget, no gate"))
+  (testing "a candidate with nothing left to run needs no pilot"
+    (let [est (preflight/estimate {:pilot-receipts [(receipt :cheap 0.01 1000 1000)]
+                                   :remaining {:cheap 10 :done 0}})]
+      (is (empty? (:unpiloted est)))
+      (is (nil? (preflight/gate est {:dollars 1}))))))
