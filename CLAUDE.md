@@ -45,7 +45,9 @@ benchmarks/              tau2, BFCL, BIRD, SpreadsheetBench, AutomationBench, CU
                          classpath with -A:benchmarks (included in :dev and :test)
 ```
 
-Tests: `clojure -M:test` (kaocha, both artefacts); one namespace with `--focus <ns>`.
+Tests: `clojure -M:test` (kaocha, both artefacts); one namespace with `--focus <ns>`. CI runs the
+suite in 3 parallel containers, each on its share of the namespaces (`dvergr.test-split`, one
+`test` check); `doc/testing.md` shows how to run a share locally and how to write waits that hold.
 Format before committing: `clojure -M:ffix`.
 
 ## Models

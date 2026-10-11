@@ -7,6 +7,7 @@ New to dvergr? Start with **[Getting Started](getting-started.md)**.
 - **[Main README](../README.md)** — project overview + quickstart
 - **[Getting Started](getting-started.md)** — first-room tutorial: REPL + CLI paths, tagged messages, streaming
 - **[REPL meta-harness contract](repl-contract-test.md)** — deterministic, provider-free end-to-end test
+- **[Testing](testing.md)** — running the suite, how CI splits it across containers, waits that hold
 - **[Configuration](configuration.md)** — config + state layers, the `.dvergr/` layout
 - **[Provider & model setup](provider-setup.md)** — API keys, providers, the `models.edn` registry
 - **[CLI reference](cli.md)** — `dvergr-cli`: flags, persistence, telemetry

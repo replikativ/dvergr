@@ -197,6 +197,7 @@
   :test {:extra-paths ["test" "src-clients"
                        "benchmarks/src" "benchmarks/resources" "benchmarks/test"]
          :extra-deps  {lambdaisland/kaocha {:mvn/version "1.91.1392"}
+                       lambdaisland/kaocha-junit-xml {:mvn/version "1.17.101"} ; CI: test results and split timings
                        metosin/reitit-ring {:mvn/version "0.7.2"} metosin/reitit-malli {:mvn/version "0.7.2"} metosin/reitit-middleware {:mvn/version "0.7.2"} metosin/reitit-swagger {:mvn/version "0.7.2"} io.github.nextjournal/markdown {:mvn/version "0.7.222"} ; web (reitit, sans swagger-ui — add reitit-swagger-ui for the /docs page)
                        io.forward/clojure-mail {:mvn/version "1.0.8"} ; mail intake
                        org.replikativ/briefkasten {:mvn/version "0.1.2"} ; briefkasten (mail)
