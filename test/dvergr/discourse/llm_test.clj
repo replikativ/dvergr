@@ -49,14 +49,31 @@
 ;; Test helpers
 ;; ============================================================================
 
+(def ^:private wait-ms
+  "How long a test waits for something that must happen: a turn starting, a
+   reply, a Run settling. Generous, because the first llm-agent turn of a cold
+   JVM pays one-time system-DB and sandbox initialization; a passing test
+   never waits it out, since every wait ends as soon as its condition holds."
+  30000)
+
+(def ^:private quiet-ms
+  "How long a test watches for something that must NOT happen (a stale reply)
+   after the event that would have caused it has settled."
+  1000)
+
+(defn- ask-promise
+  "Start `(spin-fn room)` and return a promise of its value."
+  [room spin-fn]
+  (let [p (promise)]
+    (binding [ec/*execution-context* (:ctx room)]
+      (sp/spawn!
+       (sp/spin (deliver p (sp/await (spin-fn room))))))
+    p))
+
 (defn- await-spin
-  ([room spin-fn] (await-spin room spin-fn 3000))
+  ([room spin-fn] (await-spin room spin-fn wait-ms))
   ([room spin-fn wait-ms]
-   (let [p (promise)]
-     (binding [ec/*execution-context* (:ctx room)]
-       (sp/spawn!
-        (sp/spin (deliver p (sp/await (spin-fn room))))))
-     (deref p wait-ms ::timeout))))
+   (deref (ask-promise room spin-fn) wait-ms ::timeout)))
 
 (defn- await-condition [pred wait-ms]
   (let [deadline (+ (System/currentTimeMillis) wait-ms)]
@@ -360,14 +377,14 @@
         ;; Creating the first room-bound interpreter can compile SCI/Spindel
         ;; namespaces. Leave enough wall-clock headroom for contended CI hosts;
         ;; the cancellation assertions below still test the semantic deadline.
-        (is (= true (deref first-started 10000 ::timeout)))
+        (is (= true (deref first-started wait-ms ::timeout)))
         (let [run-id (:run/id (first (run/active-runs :run-cancel-reuse)))]
           (is (uuid? run-id))
           (is (run/cancel-run! run-id))
           (is (await-condition
                #(= :cancelled (:run/status (run/run r run-id)))
-               10000)))
-        (let [reply (await-spin r #(d/ask % :worker {:content "next run"}) 10000)]
+               wait-ms)))
+        (let [reply (await-spin r #(d/ask % :worker {:content "next run"}))]
           (is (= "second completed" (:content reply)))
           (is (= :completed
                  (:run/status (run/run r (get-in reply [:metadata :run-id])))))
@@ -401,9 +418,9 @@
           (d/join r (llm/llm-agent {:id :worker
                                     :spec {:provider :mock :model "mock"}
                                     :run-turn-fn turn-fn})))
-        (let [reply (await-spin r #(d/ask % :worker {:content "go"}) 3000)]
+        (let [reply (await-spin r #(d/ask % :worker {:content "go"}))]
           (is (= "durable output" (:content reply)))
-          (is (= true (deref observed 2000 ::timeout))))
+          (is (= true (deref observed wait-ms ::timeout))))
         (finally
           (run/unwatch-runs! watch-key)
           (d/close-room! r))))))
@@ -422,7 +439,7 @@
                                   :run-turn-fn turn-fn})))
       (try
         (d/post! r (d/message :alice :worker "go"))
-        (is (await-condition #(= :failed (:run/status (first (run/runs r)))) 3000))
+        (is (await-condition #(= :failed (:run/status (first (run/runs r)))) wait-ms))
         (let [failed (first (run/runs r))]
           (is (= :reply-emission-failed (:run/reason failed)))
           (is (empty? (filter #(= (:run/id failed) (get-in % [:metadata :run-id]))
@@ -446,7 +463,7 @@
                                   :run-turn-fn turn-fn})))
       (try
         (d/post! r (d/message :alice :worker "anything to add?"))
-        (is (await-condition #(= :completed (:run/status (first (run/runs r)))) 5000))
+        (is (await-condition #(= :completed (:run/status (first (run/runs r)))) wait-ms))
         (let [completed (first (run/runs r))]
           (is (= :silent (:run/reason completed)))
           (is (empty? (filter #(= :worker (:from %)) (d/messages r {:limit 20})))
@@ -473,7 +490,7 @@
         (d/join r dropping))
       (try
         (d/post! r (d/message :alice :worker "go"))
-        (is (await-condition #(= :completed (:run/status (first (run/runs r)))) 5000))
+        (is (await-condition #(= :completed (:run/status (first (run/runs r)))) wait-ms))
         (is (= :withheld (:run/reason (first (run/runs r)))))
         (is (empty? (run/active-runs :run-withheld-reply)))
         (finally
@@ -484,16 +501,16 @@
     (let [st (memory/make)
           r (d/make-room {:id :run-leave-mid-turn :store st})
           entered (promise)
-          turn-fn (block-until-cancelled-step entered 8000)]
+          turn-fn (block-until-cancelled-step entered wait-ms)]
       (binding [ec/*execution-context* (:ctx r)]
         (d/join r (llm/llm-agent {:id :worker
                                   :spec {:provider :mock :model "mock"}
                                   :run-turn-fn turn-fn})))
       (try
         (d/post! r (d/message :alice :worker "go"))
-        (is (= true (deref entered 10000 ::timeout)))
+        (is (= true (deref entered wait-ms ::timeout)))
         (d/leave r :worker)
-        (is (await-condition #(= :cancelled (:run/status (first (run/runs r)))) 5000))
+        (is (await-condition #(= :cancelled (:run/status (first (run/runs r)))) wait-ms))
         (is (= :participant-left (:run/reason (first (run/runs r))))
             (str (:run/error (first (run/runs r)))))
         (is (empty? (run/active-runs :run-leave-mid-turn)))
@@ -518,13 +535,13 @@
                                   :run-turn-fn turn-fn})))
       (try
         (d/post! r (d/message :alice :worker "go"))
-        (is (= true (deref entered 10000 ::timeout)))
+        (is (= true (deref entered wait-ms ::timeout)))
         (d/leave r :worker)
         (Thread/sleep 100)
         (is (= [:cancelling] (mapv :run/status (run/active-runs :run-leave-in-flight)))
             "the Run is cancelled but its call still runs")
         (deliver gate true)
-        (is (await-condition #(= :cancelled (:run/status (first (run/runs r)))) 5000))
+        (is (await-condition #(= :cancelled (:run/status (first (run/runs r)))) wait-ms))
         (is (= :participant-left (:run/reason (first (run/runs r)))))
         (is (empty? (run/active-runs :run-leave-in-flight)))
         (finally
@@ -565,7 +582,7 @@
                                   :run-turn-fn turn-fn})))
       (try
         (d/post! r (d/message :alice :worker "anything?"))
-        (is (await-condition #(= :completed (:run/status (first (run/runs r)))) 5000))
+        (is (await-condition #(= :completed (:run/status (first (run/runs r)))) wait-ms))
         (is (= :silent (:run/reason (first (run/runs r)))))
         (is (empty? (run/active-runs :run-silent-retry)))
         (finally
@@ -732,7 +749,7 @@
             folds in, and the next call answers — nothing lost, nothing stale"
     (let [r        (d/room :steer-room)
           entered  (promise)
-          steps    (atom [(block-until-cancelled-step entered 8000)
+          steps    (atom [(block-until-cancelled-step entered wait-ms)
                           (reply-step "steered answer")])
           calls    (atom [])]
       (binding [ec/*execution-context* (:ctx r)]
@@ -741,8 +758,8 @@
                                   :budget {:dollars 10.0}
                                   :run-turn-fn (make-queued-turn-fn steps calls)})))
       ;; ask drives the triggering message and awaits the FINAL reply
-      (let [reply-f (future (await-spin r #(d/ask % :steer-worker {:content "go"}) 10000))]
-        (is (true? (deref entered 3000 ::timeout)) "call 1 in flight")
+      (let [reply-f (future (await-spin r #(d/ask % :steer-worker {:content "go"}) wait-ms))]
+        (is (true? (deref entered wait-ms ::timeout)) "call 1 in flight")
         ;; Reply inside the active topic: this is steering, not a new job.
         (let [trigger (some #(when (= "go" (:content %)) %) (d/log r))]
           (is trigger "the triggering message is visible in the room log")
@@ -770,8 +787,8 @@
                                   :budget {:dollars 10.0}
                                   :run-turn-fn (make-queued-turn-fn steps calls)})))
       (let [first-reply-f
-            (future (await-spin r #(d/ask % :thread-worker {:content "topic A"}) 10000))]
-        (is (true? (deref entered 3000 ::timeout)) "topic A call is in flight")
+            (future (await-spin r #(d/ask % :thread-worker {:content "topic A"}) wait-ms))]
+        (is (true? (deref entered wait-ms ::timeout)) "topic A call is in flight")
         ;; Top-level Messages self-root, so each is a distinct thread.
         (d/post! r (d/message :tester :thread-worker "topic B"))
         (d/post! r (d/message :tester :thread-worker "topic C"))
@@ -783,10 +800,8 @@
         ;; and C and therefore must run after both.
         (d/post! r (d/message :tester :thread-worker "topic D"))
         (is (= "first answer" (:content @first-reply-f)))
-        (let [deadline (+ (System/currentTimeMillis) 5000)]
-          (while (and (< (System/currentTimeMillis) deadline)
-                      (< (count (filter #(= :thread-worker (:from %)) (d/log r))) 4))
-            (Thread/sleep 10)))
+        (await-condition #(<= 4 (count (filter (fn [m] (= :thread-worker (:from m))) (d/log r))))
+                         wait-ms)
         (is (= 4 (count @calls)) "all queued topics start after topic A")
         (let [responses (filter #(= :thread-worker (:from %)) (d/log r))]
           (is (= ["first answer" "second answer" "third answer" "fourth answer"]
@@ -814,18 +829,15 @@
                                   :budget {:dollars 10.0}
                                   :attention-policy policy
                                   :run-turn-fn (make-queued-turn-fn steps calls)})))
-      (let [reply-f (future (await-spin r #(d/ask % :policy-worker {:content "root"}) 10000))]
-        (is (true? (deref entered 3000 ::timeout)) "root call is in flight")
+      (let [reply-f (future (await-spin r #(d/ask % :policy-worker {:content "root"}) wait-ms))]
+        (is (true? (deref entered wait-ms ::timeout)) "root call is in flight")
         (let [trigger (some #(when (= "root" (:content %)) %) (d/log r))]
           (d/post! r (d/reply :peer :policy-worker "peer note" trigger)))
         (Thread/sleep 150)
         (is (= 1 (count @calls)) "peer note did not preempt the root call")
         (deliver gate true)
         (is (= "primary answer" (:content @reply-f)))
-        (let [deadline (+ (System/currentTimeMillis) 3000)]
-          (while (and (< (System/currentTimeMillis) deadline)
-                      (< (count @calls) 2))
-            (Thread/sleep 10)))
+        (await-condition #(<= 2 (count @calls)) wait-ms)
         (is (= 2 (count @calls)) "peer note became a later execution")
         (let [applied (some #(when (and (= :applied (:attention/status %))
                                         (= :test/peer-chatter
@@ -843,7 +855,7 @@
 (deftest attention-policy-cancel-is-run-local-and-future-work-recovers
   (let [r (d/make-room {:id :policy-cancel-room :store (memory/make)})
         entered (promise)
-        steps (atom [(block-until-cancelled-step entered 8000)
+        steps (atom [(block-until-cancelled-step entered wait-ms)
                      (reply-step "recovered answer")])
         calls (atom [])
         policy (fn [_]
@@ -858,18 +870,17 @@
                                   :budget {:dollars 10.0}
                                   :attention-policy policy
                                   :run-turn-fn (make-queued-turn-fn steps calls)})))
-      (let [first-reply
-            (future (await-spin r #(d/ask % :policy-cancel-worker {:content "start"})
-                                2500))]
-        (is (true? (deref entered 3000 ::timeout)))
+      (let [first-reply (ask-promise r #(d/ask % :policy-cancel-worker {:content "start"}))]
+        (is (true? (deref entered wait-ms ::timeout)))
         (let [trigger (some #(when (= "start" (:content %)) %) (d/log r))]
           (d/post! r (d/reply :reviewer :policy-cancel-worker "stop this run" trigger)))
-        (is (= ::timeout @first-reply) "policy cancellation emits no stale reply")
-        (is (await-condition #(empty? (run/active-runs (:id r))) 2000))
+        (is (await-condition #(empty? (run/active-runs (:id r))) wait-ms))
+        (is (= ::timeout (deref first-reply quiet-ms ::timeout))
+            "policy cancellation emits no stale reply")
         (is (= :cancelled (:run/status (first (run/runs r)))))
         (is (= "recovered answer"
                (:content (await-spin r #(d/ask % :policy-cancel-worker
-                                               {:content "new work"}) 4000)))
+                                               {:content "new work"}) wait-ms)))
             "attention cancellation does not poison later executions"))
       (finally
         (d/close-room! r)))))
@@ -888,7 +899,7 @@
             (cc/add-message! chat-ctx {:role :assistant
                                        :content (if included? "included" "missing")})
             :complete))
-        steps (atom [(block-until-cancelled-step entered 8000) inspect-memory])
+        steps (atom [(block-until-cancelled-step entered wait-ms) inspect-memory])
         calls (atom [])
         policy (fn [_]
                  (attention/decision {:memory :include
@@ -902,22 +913,18 @@
                                   :budget {:dollars 10.0}
                                   :attention-policy policy
                                   :run-turn-fn (make-queued-turn-fn steps calls)})))
-      (let [first-reply
-            (future (await-spin r #(d/ask % :policy-suspend-worker {:content "start"})
-                                2500))]
-        ;; Generous: run alone, this is the JVM's first llm-agent turn and
-        ;; pays one-time system-DB and sandbox initialization.
-        (is (true? (deref entered 30000 ::timeout)))
+      (let [first-reply (ask-promise r #(d/ask % :policy-suspend-worker {:content "start"}))]
+        (is (true? (deref entered wait-ms ::timeout)))
         (let [trigger (some #(when (= "start" (:content %)) %) (d/log r))]
           (d/post! r (d/reply :reviewer :policy-suspend-worker
                               "remember before waiting" trigger)))
-        (is (= ::timeout @first-reply))
-        (is (await-condition #(empty? (run/active-runs (:id r))) 2000))
+        (is (await-condition #(empty? (run/active-runs (:id r))) wait-ms))
+        (is (= ::timeout (deref first-reply quiet-ms ::timeout)))
         (is (= :waiting (:run/status (first (run/runs r)))))
         (is (= :attention-suspended (:run/reason (first (run/runs r)))))
         (is (= "included"
                (:content (await-spin r #(d/ask % :policy-suspend-worker
-                                               {:content "resume"}) 4000)))
+                                               {:content "resume"}) wait-ms)))
             (pr-str @observed)))
       (finally
         (d/close-room! r)))))
@@ -949,8 +956,8 @@
                                   :attention-policy policy
                                   :run-turn-fn (make-queued-turn-fn steps calls)})))
       (let [reply-f (future (await-spin r #(d/ask % :include-worker {:content "start"})
-                                        5000))]
-        (is (true? (deref entered 3000 ::timeout)))
+                                        wait-ms))]
+        (is (true? (deref entered wait-ms ::timeout)))
         (let [trigger (some #(when (= "start" (:content %)) %) (d/log r))]
           (d/post! r (d/reply :reviewer :include-worker "use this next" trigger)))
         (is (await-condition
@@ -958,7 +965,7 @@
                       (= :test/include-next-round (:attention/reason fact)))
                     (store/-list-attention (:store r) (:id r)
                                            {:participant :include-worker}))
-             2000))
+             wait-ms))
         (deliver gate true)
         (is (= "done" (:content @reply-f)))
         (is (some #(re-find #"use this next"
@@ -991,15 +998,15 @@
                                   :attention-policy policy
                                   :run-turn-fn (make-queued-turn-fn steps calls)})))
       (let [reply-f (future (await-spin r #(d/ask % :deferred-worker {:content "start"})
-                                        5000))]
-        (is (true? (deref entered 3000 ::timeout)))
+                                        wait-ms))]
+        (is (true? (deref entered wait-ms ::timeout)))
         (let [trigger (some #(when (= "start" (:content %)) %) (d/log r))]
           (d/post! r (d/reply :reviewer :deferred-worker "after the tool" trigger)))
         (is (await-condition
              #(some (fn [fact] (= :deferred (:attention/status fact)))
                     (store/-list-attention st (:id r)
                                            {:participant :deferred-worker}))
-             2000))
+             wait-ms))
         (deliver gate true)
         (is (= "first" (:content @reply-f)))
         (Thread/sleep 150)
@@ -1041,8 +1048,8 @@
                                   :attention-policy policy
                                   :run-turn-fn (make-queued-turn-fn steps calls)})))
       (let [reply-f (future (await-spin r #(d/ask % :now-worker {:content "start"})
-                                        5000))]
-        (is (true? (deref entered 3000 ::timeout)))
+                                        wait-ms))]
+        (is (true? (deref entered wait-ms ::timeout)))
         (let [trigger (some #(when (= "start" (:content %)) %) (d/log r))]
           (d/post! r (d/reply :reviewer :now-worker "visible immediately" trigger)))
         (is (await-condition
@@ -1050,7 +1057,7 @@
                       (and (= :applied (:attention/status fact))
                            (= :test/include-now (:attention/reason fact))))
                     (store/-list-attention st (:id r) {:participant :now-worker}))
-             2000))
+             wait-ms))
         (is (some #(re-find #"visible immediately"
                             (or (:content %) (:message/content %) ""))
                   (cc/get-messages (room-context/lookup (:id r) :now-worker)))
@@ -1092,12 +1099,12 @@
                                   :attention-policy policy
                                   :run-turn-fn turn-fn})))
       (let [reply-f (future (await-spin r #(d/ask % :restart-now-worker
-                                                  {:content "start"}) 5000))]
-        (is (true? (deref entered 3000 ::timeout)))
+                                                  {:content "start"}) wait-ms))]
+        (is (true? (deref entered wait-ms ::timeout)))
         (let [trigger (some #(when (= "start" (:content %)) %) (d/log r))]
           (d/post! r (d/reply :reviewer :restart-now-worker
                               "admit before settle" trigger)))
-        (is (true? (deref cancel-seen 2000 ::timeout)))
+        (is (true? (deref cancel-seen wait-ms ::timeout)))
         (is (some #(re-find #"admit before settle"
                             (or (:content %) (:message/content %) ""))
                   (cc/get-messages
@@ -1144,8 +1151,8 @@
                                   :attention-policy policy
                                   :run-turn-fn (make-queued-turn-fn steps calls)})))
       (let [reply-f (future (await-spin r #(d/ask % :quiescent-worker
-                                                  {:content "start"}) 5000))]
-        (is (true? (deref entered 10000 ::timeout)))
+                                                  {:content "start"}) wait-ms))]
+        (is (true? (deref entered wait-ms ::timeout)))
         (let [trigger (some #(when (= "start" (:content %)) %) (d/log r))]
           (d/post! r (d/reply :reviewer :quiescent-worker
                               "only at quiescence" trigger)))
@@ -1154,14 +1161,14 @@
                       (= :test/include-quiescent (:attention/reason fact)))
                     (store/-list-attention st (:id r)
                                            {:participant :quiescent-worker}))
-             2000))
+             wait-ms))
         (deliver gate true)
         (is (= "first done" (:content @reply-f)))
         (is (not (contains-note? @before-quiescence))
             "provider continuation is earlier than quiescence")
         (is (= "second done"
                (:content (await-spin r #(d/ask % :quiescent-worker
-                                               {:content "next run"}) 5000))))
+                                               {:content "next run"}) wait-ms))))
         (is (contains-note? @after-quiescence)))
       (finally
         (d/close-room! r)))))
@@ -1170,17 +1177,18 @@
   (testing ":directive/cancel PREEMPTS a running turn (it used to queue behind it)"
     (let [r       (d/room :cancel-room)
           entered (promise)
-          steps   (atom [(block-until-cancelled-step entered 8000)])
+          steps   (atom [(block-until-cancelled-step entered wait-ms)])
           calls   (atom [])]
       (binding [ec/*execution-context* (:ctx r)]
         (d/join r (llm/llm-agent {:id :cancel-worker
                                   :spec {:provider :mock :model "mock"}
                                   :budget {:dollars 10.0}
                                   :run-turn-fn (make-queued-turn-fn steps calls)})))
-      (let [reply-f (future (await-spin r #(d/ask % :cancel-worker {:content "go"}) 4000))]
-        (is (true? (deref entered 3000 ::timeout)) "call in flight")
+      (let [reply-p (ask-promise r #(d/ask % :cancel-worker {:content "go"}))]
+        (is (true? (deref entered wait-ms ::timeout)) "call in flight")
         (d/post! r {:to :cancel-worker :type :directive/cancel})
-        (let [reply @reply-f]
+        (is (await-condition #(empty? (run/active-runs (:id r))) wait-ms))
+        (let [reply (deref reply-p quiet-ms ::timeout)]
           ;; turn ended without a reply: ask times out (no stale answer posted)
           (is (= ::timeout reply))
           (is (= 1 (count @calls)) "no second call after cancel"))))))
@@ -1197,7 +1205,7 @@
                                   :spec {:provider :mock :model "mock"}
                                   :budget {:dollars 1.0}
                                   :run-turn-fn (make-queued-turn-fn steps calls)})))
-      (let [reply-f (future (await-spin r #(d/ask % :budget-worker {:content "go"}) 10000))]
+      (let [reply-f (future (await-spin r #(d/ask % :budget-worker {:content "go"}) wait-ms))]
         ;; give the turn a moment to start, then raise budget mid-call
         (Thread/sleep 100)
         (d/post! r {:to :budget-worker :type :directive/raise-budget :payload {:dollars 2.0}})
@@ -1212,7 +1220,7 @@
             under the swapped spec"
     (let [r       (d/room :switch-room)
           entered (promise)
-          steps   (atom [(block-until-cancelled-step entered 8000)
+          steps   (atom [(block-until-cancelled-step entered wait-ms)
                          (reply-step "answer from new model")])
           calls   (atom [])]
       (binding [ec/*execution-context* (:ctx r)]
@@ -1220,8 +1228,8 @@
                                   :spec {:provider :mock :model "mock-1"}
                                   :budget {:dollars 10.0}
                                   :run-turn-fn (make-queued-turn-fn steps calls)})))
-      (let [reply-f (future (await-spin r #(d/ask % :switch-worker {:content "go"}) 10000))]
-        (is (true? (deref entered 3000 ::timeout)))
+      (let [reply-f (future (await-spin r #(d/ask % :switch-worker {:content "go"}) wait-ms))]
+        (is (true? (deref entered wait-ms ::timeout)))
         (d/post! r {:to :switch-worker :type :directive/switch-model :payload {:model "mock-2"}})
         (let [reply @reply-f]
           (is (= "answer from new model" (:content reply)))
