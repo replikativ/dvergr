@@ -94,14 +94,15 @@
         (sh "add" "a.txt")
         (sh "-c" "user.email=t@t" "-c" "user.name=Pipe | Author"
             "commit" "-q" "-m" pipe-subject)
-        (let [ctx (sci/init {})]
-          (io/add-git-ns! ctx :base-path (str dir))
-          (let [[entry :as log] (sci/eval-string* ctx "(git/log {:n 5})")]
-            (is (= 1 (count log)))
-            (is (= pipe-subject (:message entry)))
-            (is (= "Pipe | Author" (:author entry)))
-            (is (re-matches #"[0-9a-f]{40}" (:hash entry)))
-            (is (re-find #"^\d{4}-\d{2}-\d{2}" (:date entry)))))
+        ;; agents get no host git (no room workspace): the parser is
+        ;; exercised on real git output directly
+        (let [out (:out (sh "log" @#'io/git-log-format "-5"))
+              [entry :as log] (#'io/parse-git-log out)]
+          (is (= 1 (count log)))
+          (is (= pipe-subject (:message entry)))
+          (is (= "Pipe | Author" (:author entry)))
+          (is (re-matches #"[0-9a-f]{40}" (:hash entry)))
+          (is (re-find #"^\d{4}-\d{2}-\d{2}" (:date entry))))
         (finally (delete-tree! dir)))))
   (testing "virtual Geschichte workspace"
     (let [{:keys [conn close!] :as repository}

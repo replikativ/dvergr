@@ -222,16 +222,24 @@
         file (.getCanonicalFile (if (fs/absolute? path) (java.io.File. (str path)) (java.io.File. base (str path))))]
     (when-not (.startsWith (.toPath file) (.toPath base))
       (throw (ex-info (str "Path outside the workspace: " path) {:path (str path) :workspace (str base)})))
+    ;; as written and as resolved
+    ((requiring-resolve 'dvergr.sandbox.ns.io/sensitive-path-policy) (str path))
     ((requiring-resolve 'dvergr.sandbox.ns.io/sensitive-path-policy) (str file))
     (str file)))
 
 (defn- tool-path [{:keys [filesystem cwd]} path]
   (if filesystem
-    (or (mfs/resolve filesystem
-                     (if (str/starts-with? (str path) "/")
-                       path
-                       (str (str/replace (or cwd "/") #"/$" "") "/" path)))
-        (throw (ex-info "Path escapes the virtual workspace" {:path path})))
+    ;; The same sensitive-path policy as the physical side and the SCI file
+    ;; functions, on the path as given and as resolved.
+    (let [policy (requiring-resolve 'dvergr.sandbox.ns.io/sensitive-path-policy)
+          _ (policy (str path))
+          resolved (or (mfs/resolve filesystem
+                                    (if (str/starts-with? (str path) "/")
+                                      path
+                                      (str (str/replace (or cwd "/") #"/$" "") "/" path)))
+                       (throw (ex-info "Path escapes the virtual workspace" {:path path})))]
+      (policy (str resolved))
+      resolved)
     (physical-path cwd path)))
 
 (defn- workspace-read [ctx path]
@@ -566,7 +574,11 @@
                (let [flags (if -i java.util.regex.Pattern/CASE_INSENSITIVE 0)
                      re (java.util.regex.Pattern/compile pattern flags)
                      paths (workspace-glob ctx (or glob "**"))
+                     sensitive? #(try ((requiring-resolve 'dvergr.sandbox.ns.io/sensitive-path-policy) (str %))
+                                      false
+                                      (catch clojure.lang.ExceptionInfo _ true))
                      lines (for [path paths
+                                 :when (not (sensitive? path))
                                  :when (= :file (:type (mfs/stat filesystem
                                                                  (tool-path ctx path))))
                                  [line-number line] (map-indexed vector
@@ -577,21 +589,45 @@
                  {:type :success
                   :content (if (seq lines) (str/join "\n" lines) "No matches found")
                   :metadata {:pattern pattern :matches (count lines)}})
-               (let [cmd (cond-> ["grep" "-rn" "--color=never"]
+               ;; Host grep, for a physical workspace. The pattern goes after
+               ;; `-e` and the options end at `--`, so neither the pattern nor
+               ;; the glob is ever read as an option; `-Z` NUL-terminates each
+               ;; file name so the sensitive-path filter (the one every other
+               ;; file tool applies) sees the real path. `-r` does not follow
+               ;; symlinks, so the search stays under `cwd`.
+               (let [cmd (cond-> ["grep" "-rnZ" "--color=never"]
                            -i (conj "-i")
-                           true (conj pattern ".")
-                           glob (into ["--include" glob]))
-                     pb (ProcessBuilder. cmd)
-                     _ (.directory pb (io/file cwd))
+                           glob (conj (str "--include=" glob))
+                           true (into ["-e" pattern "--" "."]))
+                     pb (doto (ProcessBuilder. ^java.util.List cmd)
+                          (.directory (io/file cwd))
+                          (.redirectError java.lang.ProcessBuilder$Redirect/DISCARD))
                      proc (.start pb)
                      stdout (slurp (.getInputStream proc))
-                     _ (.waitFor proc)]
+                     _ (.waitFor proc)
+                     sensitive? #(try ((requiring-resolve 'dvergr.sandbox.ns.io/sensitive-path-policy) %)
+                                      false
+                                      (catch clojure.lang.ExceptionInfo _ true))
+                     ;; Each match is `<path> NUL <n>:<line> LF`. A file name may
+                     ;; itself contain LF (a line can't: it ends at LF, and a
+                     ;; file with NUL is binary and reported on stderr), so
+                     ;; take the name up to the NUL first, then the line.
+                     lines (loop [pos 0, acc []]
+                             (let [nul (str/index-of stdout "\u0000" pos)]
+                               (if-not nul
+                                 acc
+                                 (let [eol (or (str/index-of stdout "\n" nul) (count stdout))
+                                       path (subs stdout pos nul)]
+                                   (recur (inc eol)
+                                          (cond-> acc
+                                            (not (sensitive? path))
+                                            (conj (str path ":" (subs stdout (inc nul) eol)))))))))]
                  {:type :success
-                  :content (if (str/blank? stdout)
-                             "No matches found"
-                             stdout)
+                  :content (if (seq lines)
+                             (str/join "\n" lines)
+                             "No matches found")
                   :metadata {:pattern pattern
-                             :matches (count (str/split-lines stdout))}})))})
+                             :matches (count lines)}})))})
 
 (defn- native-eval
   "Evaluate Clojure code natively (not in SCI sandbox).
