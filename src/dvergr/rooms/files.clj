@@ -286,6 +286,16 @@
                                   (ancestors-of p))]
       (refuse (str p ": " blocked " is " (if (= :file bt) "a file" "a symbolic link")) {:path p}))))
 
+(defn- beneath?
+  "Whether a directory now stands at worktree path `rel` in `db`: an explicit
+   directory there, or a file or directory beneath it."
+  [db rel]
+  (let [prefix (str rel "/")]
+    (boolean (or (d/q '[:find ?e . :in $ ?p :where [?e :geschichte.work-dir/path ?p]] db rel)
+                 (some #(str/starts-with? % prefix)
+                       (concat (map first (d/q '[:find ?p :where [_ :geschichte.work/path ?p]] db))
+                               (map first (d/q '[:find ?p :where [_ :geschichte.work-dir/path ?p]] db))))))))
+
 (defn- restore-tx
   "Transaction function: put the worktree entries of `paths` back as they
    were `before`, each only while it still holds what the batch left there
@@ -300,8 +310,10 @@
                                              db (rel p)))]
                    (when (= (some-> cid str) (get expected p))
                      (if-let [{:keys [content size mode]} (get before p)]
-                       [{:geschichte.work/path (rel p) :geschichte.work/content [:geschichte.content/id content]
-                         :geschichte.work/size size :geschichte.work/mode mode}]
+                       ;; a removed file comes back only where nothing took its place
+                       (when (or eid (not (beneath? db (rel p))))
+                         [{:geschichte.work/path (rel p) :geschichte.work/content [:geschichte.content/id content]
+                           :geschichte.work/size size :geschichte.work/mode mode}])
                        (when eid [[:db/retractEntity eid]])))))
                paths)))
 
@@ -327,14 +339,17 @@
   "Undo this batch's changes: the index of its paths back to HEAD (where it
    was: nothing was staged), the files it wrote or removed back to `before`
    unless someone else changed them since (`restore-tx`), and the
-   directories it created, when empty."
+   directories it created, when empty. Returns the paths it could not put
+   back (changed meanwhile, or a directory now in a removed file's place)."
   [conn before expected touched created]
   (try (repo/restore-paths! conn (mapv rel (keys expected)) {:source :head :staged? true :worktree? false})
        (catch Throwable _ nil))
   (try (when (seq touched) (d/transact conn [[:db.fn/call restore-tx before expected (vec touched)]]))
        (catch Throwable _ nil))
   (try (when (seq created) (d/transact conn [[:db.fn/call remove-empty-dirs-tx (vec created)]]))
-       (catch Throwable _ nil)))
+       (catch Throwable _ nil))
+  (let [now (content-ids conn)]
+    (vec (sort (remove #(= (get now %) (some-> (get before %) :content str)) touched)))))
 
 (defn host-boundary
   "The effect boundary for a write made on `room` by a client outside it: the
@@ -350,8 +365,11 @@
    as one commit with `message` (`forks/commit-paths!`). The batch is a
    `:git/commit` effect, decided before anything is written; each write and
    removal is an effect too. Every path is checked first, and the index may
-   hold nothing staged (`git add` without a commit). When any step fails, the batch's changes
-   are undone (`restore!`) and nothing is committed. Returns `{:commit
+   hold nothing staged (`git add` without a commit). Each write and removal
+   is a compare-and-write against the batch's snapshot (`:expect`), so a file
+   changed underneath fails the batch. When any step fails, the batch's
+   changes are undone (`restore!`; what could not be put back is reported as
+   `:conflicted`) and nothing is committed. Returns `{:commit
    :message :written [{:path :size :content-id}] :removed [path]}`;
    `:commit` is nil when the files already were as given."
   [room files {:keys [message boundary]}]
@@ -359,7 +377,8 @@
         {:keys [conn] :as ws} (workspace! room)
         fs (gs/filesystem ws)
         boundary (or boundary (host-boundary room (effects/make-sink)))
-        ctx {:filesystem fs :cwd "/" :effect-boundary boundary}
+        ;; `:workspace`: the gate's compare-and-write needs the repository
+        ctx {:filesystem fs :workspace ws :cwd "/" :effect-boundary boundary}
         paths (mapv first entries)
         message (or (not-empty (some-> message str str/trim))
                     (str "Write " (if (= 1 (count paths)) (rel (first paths)) (str (count paths) " files"))))
@@ -385,17 +404,23 @@
                     boundary {:effect :git/commit :resource {:message message}}
                     (fn []
                       (try
-                        (doseq [[p c] entries]
+                        (doseq [[p c] entries
+                                ;; compare-and-write: what the snapshot saw, or fail
+                                :let [opts {:expect (some-> (get before p) :content str)}]]
                           (if (= ::remove c)
-                            (when (tools/workspace-delete! ctx p)
+                            (when (tools/workspace-delete! ctx p opts)
                               (swap! touched conj p)
                               (swap! removed conj p))
-                            (do (tools/workspace-write! ctx p c)
+                            (do (tools/workspace-write! ctx p c opts)
                                 (swap! touched conj p))))
                         (forks/commit-paths! room expected message)
                         (catch Throwable e
-                          (restore! conn before expected @touched created)
-                          (throw e)))))
+                          (let [conflicted (restore! conn before expected @touched created)]
+                            (throw (if (seq conflicted)
+                                     (ex-info (str (ex-message e) "; not undone, changed meanwhile: "
+                                                   (str/join ", " conflicted))
+                                              (assoc (ex-data e) :conflicted conflicted) e)
+                                     e)))))))
             ids (content-ids conn)]
         {:commit commit
          :message message

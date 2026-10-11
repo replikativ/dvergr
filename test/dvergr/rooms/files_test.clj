@@ -241,8 +241,8 @@
 (deftest a-concurrent-writer-fails-the-batch-and-keeps-its-change
   (let [r (room)
         write! tools/workspace-write!]
-    (with-redefs [tools/workspace-write! (fn [ctx p c]
-                                           (let [res (write! ctx p c)]
+    (with-redefs [tools/workspace-write! (fn [ctx p c & opts]
+                                           (let [res (apply write! ctx p c opts)]
                                              ;; an agent writes the same path right after
                                              (mfs/write-string! (ws/room-fs r) p "the agent's" false)
                                              res))]
@@ -349,3 +349,38 @@
                                     (mfs/symlink (ws/room-fs r) ".env" "/public.txt")
                                     (read-entry conn entry))]
       (is (= "public" (:text (files/read-file r "public.txt" {})))))))
+
+(deftest a-file-changed-before-the-batch-writes-it-fails-the-batch
+  ;; compare-and-write at the gate: the batch's snapshot saw "old"
+  (let [r (room)
+        write! tools/workspace-write!]
+    (files/write! r {"a.txt" {:text "old"}} {})
+    (with-redefs [tools/workspace-write! (fn [ctx p c & opts]
+                                           (when (= "/a.txt" p)
+                                             (mfs/write-string! (ws/room-fs r) "/a.txt" "the agent's" false))
+                                           (apply write! ctx p c opts))]
+      (let [e (try (files/write! r {"a.txt" {:text "mine"} "b.txt" {:text "b"}} {}) nil
+                   (catch clojure.lang.ExceptionInfo e e))]
+        (is (= :dvergr.tools/changed-underneath (:type (ex-data e))) (pr-str (ex-data e)))))
+    (is (= "the agent's" (worktree-text r "/a.txt")) "the agent's edit is kept")
+    (is (not (mfs/exists? (ws/room-fs r) "/b.txt")) "the batch is undone")
+    (is (= "old" (String. ^bytes (repo/read-entry (conn r) (get (repo/tree (conn r) :head) "a.txt")) "UTF-8")))
+    (testing "a plain write has no check"
+      (is (tools/workspace-write! {:filesystem (ws/room-fs r) :cwd "/"} "/a.txt" "plain")))))
+
+(deftest a-removed-file-is-not-restored-over-a-new-directory
+  (let [r (room)
+        restore-paths! repo/restore-paths!]
+    (files/write! r {"a" {:text "a file"}} {})
+    (with-redefs [repo/commit! (fn [& _] (throw (ex-info "boom" {})))
+                  repo/restore-paths! (fn [& args]
+                                        (let [res (apply restore-paths! args)]
+                                          ;; an agent makes a directory where the file was
+                                          (mfs/write-string! (ws/room-fs r) "/a/agent.txt" "mine" false)
+                                          res))]
+      (let [e (try (files/write! r {"a" nil} {}) nil
+                   (catch clojure.lang.ExceptionInfo e e))]
+        (is (= ["/a"] (:conflicted (ex-data e))) (pr-str (ex-data e)))
+        (is (re-find #"not undone" (ex-message e)))))
+    (is (= :dir (:type (mfs/stat (ws/room-fs r) "/a"))))
+    (is (= "mine" (worktree-text r "/a/agent.txt")))))

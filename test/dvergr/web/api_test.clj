@@ -93,3 +93,13 @@
                                :body (java.io.ByteArrayInputStream. (.getBytes body "UTF-8"))}))]
       (is (= 200 (:status resp)))
       (is (= {"data/cases.csv" {:text "a"} "x.bin" {:base64 "AAE="} "gone.txt" nil} (:files @seen))))))
+
+(deftest room-file-failures-carry-their-status
+  (with-redefs [ops/resolve-room (fn [_ room] (when (= "r" room) {:id :r}))
+                dvergr.rooms.files/write! (fn [_ files _]
+                                            (if (contains? files "stale.txt")
+                                              (throw (ex-info "changed" {:type :dvergr.tools/changed-underneath}))
+                                              (throw (ex-info "bad path" {:type :dvergr.rooms.files/invalid}))))]
+    (is (= 404 (:status (POST "/api/v1/room_write" {:room "nowhere" :files {"a" {:text "x"}}}))))
+    (is (= 400 (:status (POST "/api/v1/room_write" {:room "r" :files {"../a" {:text "x"}}}))))
+    (is (= 409 (:status (POST "/api/v1/room_write" {:room "r" :files {"stale.txt" {:text "x"}}}))))))

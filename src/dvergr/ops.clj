@@ -104,6 +104,26 @@
   (let [s (::status (ex-data e))]
     (if (and (int? s) (<= 400 s 599)) s 500)))
 
+(def ^:private file-error-status
+  "The HTTP status of a room file op's failure, by its `:type`."
+  {:dvergr.rooms.files/invalid 400 :dvergr.rooms.files/directory 400
+   :dvergr.rooms.files/not-a-directory 400 :dvergr.rooms.files/not-found 404
+   :dvergr.rooms.files/no-workspace 404 :dvergr.rooms.files/staged-changes 409
+   :dvergr.rooms.forks/staged-changes 409 :dvergr.rooms.forks/concurrent-change 409
+   :dvergr.tools/changed-underneath 409 :effect/denied 403})
+
+(defn- files-op
+  "Run `f` on the room `room` names, for the room file ops: an unknown room
+   and the failures of `dvergr.rooms.files` as op errors with their status."
+  [daemon room f]
+  (let [r (or (resolve-room daemon room)
+              (op-error! (str "No room " room) ::no-room 404 {:room room}))]
+    (try (f r)
+         (catch clojure.lang.ExceptionInfo e
+           (if-let [status (file-error-status (:type (ex-data e)))]
+             (throw (ex-info (ex-message e) (assoc (ex-data e) ::status status) e))
+             (throw e))))))
+
 ;; ---- plain-data projections (serializable for any binding) ----
 
 (defn- room-data [r]
@@ -894,8 +914,7 @@
              [:path {:optional true} [:string {:description "directory, e.g. /data (default /)"}]]
              [:offset {:optional true} [:int {:min 0 :description "entry to start at (default 0)"}]]]
     :impl (fn [daemon {:keys [room path offset]}]
-            (when-let [r (resolve-room daemon room)]
-              (in-ctx daemon (room-files/list-dir r path {:offset offset}))))}
+            (files-op daemon room #(in-ctx daemon (room-files/list-dir % path {:offset offset}))))}
 
    :room/read
    {:doc (str "Read a file of a room's workspace: {text} for UTF-8 text, {base64, media-type} for "
@@ -911,8 +930,7 @@
                                               :description (str "bytes to read (default and at most "
                                                                 room-files/max-read-bytes ")")}]]]
     :impl (fn [daemon {:keys [room path offset length]}]
-            (when-let [r (resolve-room daemon room)]
-              (in-ctx daemon (room-files/read-file r path {:offset offset :length length}))))}
+            (files-op daemon room #(in-ctx daemon (room-files/read-file % path {:offset offset :length length}))))}
 
    :room/diff
    {:doc "The diff of a fork against its parent (what reconcile-merge would apply)."
@@ -1212,10 +1230,11 @@
                                [:base64 {:optional true} :string]]]]]
              [:message {:optional true} [:string {:description "commit message (default: Write <path>)"}]]]
     :impl (fn [daemon {:keys [room files message]}]
-            (when-let [r (resolve-room daemon room)]
-              (in-ctx daemon
-                      (assoc (room-files/write! r files {:message message})
-                             :room (id->str (:id r))))))}
+            (files-op daemon room
+                      (fn [r]
+                        (in-ctx daemon
+                                (assoc (room-files/write! r files {:message message})
+                                       :room (id->str (:id r)))))))}
 
    :room/import
    {:doc (str "Create a room from a Git repository: its workspace is a clone of a local checkout "
