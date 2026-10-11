@@ -181,3 +181,27 @@
                         "every tool call, including those made inside clojure_eval, is in the graded log")
                     (is (empty? (run/active-runs (:id room)))))))
               (finally (d/close-room! room)))))))))
+
+(deftest dvergr-candidate-provider-failure-is-a-fault
+  ;; The candidate's provider fails; the customer is scripted and fine. The
+  ;; episode must fault (re-run), not be graded as the model's failure.
+  (if-not checkout?
+    (support/skip! "dvergr-candidate-provider-failure-is-a-fault: no ../tau2-bench checkout")
+    (let [dom (without-nl (t2/load-domain "retail"))
+          caps (provider/capabilities dom {:user-fn (constantly {:content "I need help with an exchange."})})
+          env (provider/environment-def dom "0" caps {:timeout-ms 120000})
+          team (tx/candidate-roster [{:id :dv :harness :dvergr :model "claude-code-sonnet"}] dom)
+          room (d/make-room {:id :tau2/provider-dv-outage :store (memory/make)})]
+      (try
+        (with-redefs [model-chat/chat (fn [_ _] (throw (ex-info "HTTP 503 unavailable" {})))]
+          (binding [ec/*execution-context* (:ctx room)]
+            (let [result @(evaluation/evaluate room team :dv env (:evaluator caps)
+                                               {:world-setup (:world-setup caps)
+                                                :protocol (:protocol caps)})
+                  attempt (first (attempts/attempts room {:limit 10}))]
+              (is (not (experiment/verdict? attempt))
+                  (pr-str (select-keys (:attempt/receipt attempt)
+                                       [:attempt/status :attempt/reward])))
+              (is (empty? (run/active-runs (:id room))))
+              (is (some? result)))))
+        (finally (d/close-room! room))))))
