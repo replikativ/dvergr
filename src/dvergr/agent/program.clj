@@ -1458,6 +1458,17 @@
         (recur (ex-cause error)))
       :execution-error)))
 
+(defn- settle-unadmitted!
+  "Settle the world of a Run that failed before it executed, as failed; a
+   settlement error is logged, not raised over the admission error."
+  [run-world]
+  (try (world/settle! run-world :failed)
+       (catch Throwable t
+         (tel/log! {:level :warn :id ::unadmitted-world-not-settled
+                    :data {:world (:id run-world) :error (ex-message t)}}
+                   "The world of a Run that was not admitted could not be settled")
+         nil)))
+
 (defn ^:no-doc hire-prepared-in!
   "Host-only Run admission with a trusted fork-local world preparer.
 
@@ -1594,10 +1605,10 @@
         (run/claim-resume! control-room predecessor id)
         (catch Throwable t
           (return-unused-resources! control-room id grantor allocation-state)
-          (let [{:keys [status reason]} (world/settle! run-world :failed)]
-            (run/finish! id :failed {:reason :resume-claim-failed :error t
-                                     :settlement-status status
-                                     :settlement-reason reason}))
+          (let [{:keys [status reason]} (settle-unadmitted! run-world)]
+            (run/finish-durably! id :failed (cond-> {:reason :resume-claim-failed :error t}
+                                              status (assoc :settlement-status status
+                                                            :settlement-reason reason))))
           (throw t))))
     (let [finalizing? (atom false)]
       (try
@@ -1707,20 +1718,20 @@
           ;; Not admitted to the watcher: nothing executed, and nothing waits.
           (when @finalizing?
             (throw t))
-          (return-unused-resources! control-room id grantor allocation-state)
-          (let [{:keys [status reason]} (world/settle! run-world :failed)]
-            (run/finish! id :failed {:reason :spawn-failed
-                                     :error t
-                                     :settlement-status status
-                                     :settlement-reason reason}))
           (when-let [predecessor (:from resume-from)]
-            ;; the predecessor is as it was before the claim
+            ;; First, and whatever fails after: the predecessor is as it was
+            ;; before the claim.
             (try (run/release-resume-claim! control-room predecessor id)
                  (catch Throwable release-error
                    (tel/log! {:level :warn :id ::resume-claim-not-released
                               :data {:run/id predecessor :resumed-by id
                                      :error (ex-message release-error)}}
                              "A resume claim was not released; the failed successor does not count"))))
+          (return-unused-resources! control-room id grantor allocation-state)
+          (let [{:keys [status reason]} (settle-unadmitted! run-world)]
+            (run/finish-durably! id :failed (cond-> {:reason :spawn-failed :error t}
+                                              status (assoc :settlement-status status
+                                                            :settlement-reason reason))))
           (throw t))))))
 
 (defn- chat-spent

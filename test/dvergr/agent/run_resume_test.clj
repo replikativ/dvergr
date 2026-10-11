@@ -186,6 +186,25 @@
                                       (program/resume! room room first-run))))
               (is (uuid? (:run/resumed-by @claimed)) "the successor had claimed the Run")
               (is (untouched?) "the claim is withdrawn and the wallet returned")))
+          (testing "a failed spawn whose terminal write is refused once"
+            (let [finish! run/finish!
+                  failed-finishes (atom 0)]
+              (with-redefs [providers/ensure-initialized! (constantly nil)
+                            program/execution-spin (fn [& _] (throw (ex-info "no spawn" {})))
+                            run/finish! (fn [run-id status & opts]
+                                          (if (and (= :failed status) (= 1 (swap! failed-finishes inc)))
+                                            (throw (ex-info "store refused" {}))
+                                            (apply finish! run-id status opts)))]
+                (is (thrown-with-msg? Exception #"no spawn"
+                                      (program/resume! room room first-run)))
+                (is (nil? (:run/resumed-by (run/run room first-run)))
+                    "the claim is withdrawn before the refused write")
+                (let [deadline (+ (System/currentTimeMillis) 3000)]
+                  (while (and (seq (run/active-runs :resume-failure-room))
+                              (< (System/currentTimeMillis) deadline))
+                    (Thread/sleep 10))))
+              (is (<= 2 @failed-finishes) "refused once, then retried")
+              (is (untouched?) "the successor's finish was retried")))
           (testing "a resume in progress excludes another"
             (run/reserve-resume! room first-run)
             (try
