@@ -81,14 +81,17 @@
   (let [dir (str "workflows/" name)
         wanted (into {} (map (fn [[p t]] [(str dir "/" p) {"text" t}])) files)
         stale (remove #(contains? wanted %) (room-tree daemon room dir))
-        all (merge (zipmap stale (repeat nil)) wanted)
-        b (room-wf/bundle name files)]
-    (into [] (keep (fn [batch]
-                     (when (seq batch)
-                       (:commit (ops/invoke daemon :room/write
-                                            {:room room :files (into {} batch)
-                                             :message (str "Workflow bundle " name " " (subs (str (:id b)) 0 8))})))))
-          (batches all))))
+        b (room-wf/bundle name files)
+        write! (fn [batch]
+                 (when (seq batch)
+                   (:commit (ops/invoke daemon :room/write
+                                        {:room room :files (into {} batch)
+                                         :message (str "Workflow bundle " name " " (subs (str (:id b)) 0 8))}))))]
+    ;; removals first, on their own: a file the bundle turned into a
+    ;; directory (fixtures/docs → fixtures/docs/q.txt) is gone before its
+    ;; descendants are written
+    (into [] (keep write!)
+          (concat (batches (zipmap stale (repeat nil))) (batches wanted)))))
 
 ;; ---------------------------------------------------------------------------
 ;; The benchmark, through catalog_benchmark / job_status / experiment_report

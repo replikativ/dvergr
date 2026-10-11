@@ -97,6 +97,13 @@
           (is (= (get room-test/files "checker.clj")
                  (:text (ops/invoke daemon :room/read {:room "competitors"
                                                        :path "workflows/competitors/checker.clj"})))))))
+    (testing "a file of the bundle that became a directory syncs"
+      (runner/with-home home
+        (fn [daemon]
+          (room-run/sync-bundle! daemon "competitors" "competitors" (assoc room-test/files "fixtures/notes" "a file"))
+          (room-run/sync-bundle! daemon "competitors" "competitors" (assoc room-test/files "fixtures/notes/a.md" "now a directory"))
+          (is (= "now a directory" (:text (ops/invoke daemon :room/read {:room "competitors"
+                                                                         :path "workflows/competitors/fixtures/notes/a.md"})))))))
     (testing "a file removed from the bundle is removed from the room"
       (let [smaller (room-wf/bundle "competitors" (dissoc room-test/files "gold.edn"))]
         (runner/with-home home
