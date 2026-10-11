@@ -20,9 +20,14 @@ writes runtime state, not your `config.local.edn`.
 ## Where things resolve from
 
 ### Config file — `dvergr.substrate.config`
-Priority: `$DVERGR_CONFIG` → `./config.local.edn` → `./config.example.edn`.
+Priority: `$DVERGR_CONFIG` → `./config.local.edn`. With neither, the config is
+empty: no Telegram (unless `TELEGRAM_BOT_TOKEN` is set), no web server.
+`config.example.edn` is documentation to copy from; dvergr never loads it.
 It's a single EDN map, gitignore it (it holds secrets). Every secret also has an
-**env fallback**, so you can keep tokens out of the file entirely.
+**env fallback**, so you can keep tokens out of the file entirely. A configured
+Telegram or GitHub token, or a `:secrets` `:config-path` value, that is blank or a
+placeholder (contains `YOUR_`, as in the example) counts as unset, so the env var
+is used.
 
 ### State root — `dvergr.substrate.paths`
 Priority: `(paths/set-home! …)` → `$DVERGR_HOME` → `./.dvergr`. Layout:
@@ -53,7 +58,8 @@ Priority: `(paths/set-home! …)` → `$DVERGR_HOME` → `./.dvergr`. Layout:
  ;; Channels (secrets fall back to env). See doc/channels.md.
  :telegram      {:token "…"                   ; or env TELEGRAM_BOT_TOKEN
                  :tool-commands? false}       ; allow /clojure_eval etc. from Telegram (default off)
- :allowed-users [{:id 12345 :username "…"}]   ; Telegram access control
+ :allowed-users [{:id 12345 :username "…"}]   ; Telegram access control (empty = everyone)
+ :strict-allowlist? true                      ; empty :allowed-users denies everyone (default false)
  :notify-chat-ids [12345]                     ; route intake output to these chats
  :zulip         {:email "…" :api-key "…" :site "…"}
  :github        {:token "…"}                  ; or env GITHUB_DVERGR_TOKEN
@@ -70,7 +76,7 @@ Priority: `(paths/set-home! …)` → `$DVERGR_HOME` → `./.dvergr`. Layout:
  :sandbox-repo  "https://github.com/replikativ/dvergr-sandbox"
 
  ;; Daemon services.
- :http          {:port 17880 :ip "127.0.0.1"}   ; web dashboard + JSON API (needs the web deps);
+ :http          {:port 17880 :ip "127.0.0.1"}   ; web dashboard + JSON API (needs the web deps); starts only when set (or `--web`);
                                                 ; behind a proxy (or TLS terminator) add :allowed-hosts ["dvergr.lan"]
                                                 ; and :allowed-origins ["https://dvergr.lan"]
  :mcp           {:port 17888 :bind "127.0.0.1" :profile "offload"

@@ -39,3 +39,33 @@
     (is (thrown? clojure.lang.ExceptionInfo (al/add-user! {:bad :map})))
     (is (thrown? clojure.lang.ExceptionInfo (al/add-user! "no-at-prefix")))
     (is (thrown? clojure.lang.ExceptionInfo (al/set-users! [7 :keyword])))))
+
+(deftest configure-replaces-all-state
+  (testing "config user maps normalise to ids and @usernames"
+    (al/configure! {:users [{:id 1 :username "alice"} {:id 2} 3 "@carol"]})
+    (is (= #{1 "@alice" 2 3 "@carol"} (al/list-users))))
+  (testing "strict + empty list denies everyone"
+    (al/configure! {:users [] :strict? true})
+    (is (false? (al/allowed? {:id 999 :username "outsider"})))
+    (is (false? (al/allowed? {:id 1 :username "alice"}))
+        "the previous configuration's users are gone"))
+  (testing "a later non-strict configuration clears strict mode"
+    (al/configure! {:users []})
+    (is (true? (al/allowed? {:id 999})))
+    (is (true? (al/open?))))
+  (testing "a populated list is never open"
+    (al/configure! {:users [5]})
+    (is (false? (al/open?)))
+    (is (false? (al/allowed? {:id 6})))))
+
+(deftest configure-is-one-atomic-write
+  (testing "populated + open -> empty + strict never passes through an open state"
+    (al/configure! {:users [1]})
+    (let [policy @#'al/policy
+          seen   (atom [])]
+      (add-watch policy ::observe (fn [_ _ _ new] (swap! seen conj new)))
+      (try
+        (al/configure! {:users [] :strict? true})
+        (finally (remove-watch policy ::observe)))
+      (is (= [{:users #{} :strict? true}] @seen) "one write, straight to the new policy")
+      (is (false? (al/allowed? {:id 999}))))))

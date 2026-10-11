@@ -29,8 +29,12 @@ slash-command menu (`setMyCommands`, derived from `dvergr.ops`).
 Every inbound message is gated by `:allowed-users` **before any side effect**:
 an unauthorized sender gets a polite refusal and nothing else runs — no paid
 transcription, no file writes, no agent turn. Match by Telegram numeric `:id`
-(stable) or `:username`. Omit `:allowed-users` to allow everyone (only sensible
-for a private bot).
+(stable) or `:username`. An empty or absent `:allowed-users` allows everyone
+(only sensible for a private bot); the daemon then logs a `SECURITY` warning at
+start. Set `:strict-allowlist? true` to make an empty list deny everyone instead.
+The daemon installs both on every start, replacing the previous state, and
+`start-from-config!` (what `clojure -M:cli` uses) re-reads the config file, so
+removing a user from the config and restarting takes effect.
 
 ## What you can send
 

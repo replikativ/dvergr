@@ -16,6 +16,8 @@
             [dvergr.substrate.paths :as paths]
             [dvergr.channels.core :as ch]
             [dvergr.channels.telegram :as tg]
+            [dvergr.security.allowlist :as allowlist]
+            [dvergr.substrate.config :as config]
             [dvergr.tools :as tools]
             [dvergr.mcp.server :as mcp]
             [org.replikativ.spindel.engine.core :as ec]
@@ -143,6 +145,52 @@
       ;; Stop
       (is (= :stopped (daemon/stop! d)))
       (is (= :stopped @(:status d))))))
+
+(deftest test-daemon-start-initialises-allowlist
+  (testing "every start installs the configured allowlist policy, empty lists included,
+            so a restart never keeps the previous process's state"
+    (let [outsider {:id 999 :username "outsider"}]
+      (try
+        (let [d (daemon/start! {:db-path (tmp-db-path) :allowed-users [{:id 123}]})]
+          (try
+            (is (true? (allowlist/allowed? {:id 123})))
+            (is (false? (allowlist/allowed? outsider)))
+            (finally (daemon/stop! d))))
+        (let [d (daemon/start! {:db-path (tmp-db-path)
+                                :allowed-users [] :strict-allowlist? true})]
+          (try
+            (is (false? (allowlist/allowed? {:id 123})) "previous users are cleared")
+            (is (false? (allowlist/allowed? outsider)) "strict + empty denies")
+            (finally (daemon/stop! d))))
+        (let [d (daemon/start! {:db-path (tmp-db-path)})]
+          (try
+            (is (true? (allowlist/allowed? outsider))
+                "no allowlist and no strict flag: open, as documented")
+            (finally (daemon/stop! d))))
+        (finally
+          (allowlist/configure! {:users []}))))))
+
+(deftest test-start-from-config-rereads-the-file
+  (testing "a restart through start-from-config! applies an edited config file"
+    (let [file   (java.io.File/createTempFile "dvergr-daemon-config" ".edn")
+          cfg    @#'config/config-atom
+          saved  @cfg
+          start! (fn [m]
+                   (spit file (pr-str m))
+                   (with-redefs-fn {#'config/getenv (fn [k] (when (= k "DVERGR_CONFIG")
+                                                              (str file)))}
+                     #(daemon/start-from-config! {:db-path (tmp-db-path)})))]
+      (try
+        (let [d (start! {:allowed-users [{:id 123}]})]
+          (try (is (true? (allowlist/allowed? {:id 123})))
+               (finally (daemon/stop! d))))
+        (let [d (start! {:allowed-users [] :strict-allowlist? true})]
+          (try (is (false? (allowlist/allowed? {:id 123})) "the revoked user is out")
+               (finally (daemon/stop! d))))
+        (finally
+          (reset! cfg saved)
+          (.delete file)
+          (allowlist/configure! {:users []}))))))
 
 (deftest test-daemon-multiple-agents
   (testing "Daemon hosts multiple agents simultaneously"
