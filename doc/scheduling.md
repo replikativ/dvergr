@@ -43,7 +43,7 @@ Two kinds of scheduled task:
 |---|---|
 | `{:every :day :at "07:00"}` | daily at a wall-clock time |
 | `{:every :week :on :monday}` | calendar cadence (day-of-week) |
-| `{:every :hour :at "00:15"}` | every hour at a minute past it (the hour of `:at` is ignored) |
+| `{:every :hour :at "00:15"}` | every hour at a minute (and second, `"00:15:30"`) past it (the hour of `:at` is ignored) |
 | `{:every :hour :n 4}` | every 4 hours — `:n` multiplies a fixed unit |
 | `{:interval-ms N}` / `{:every-ms N}` | raw fixed interval |
 | `{:at "2026-08-01T09:00" :once true}` | one-shot at an instant (a local datetime is read in `:tz`, default the system zone; `"…Z"` or `"…+02:00"` keeps its own) |

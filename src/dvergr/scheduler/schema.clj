@@ -13,6 +13,13 @@
      :recurring  — cron-like: `:schedule/every` (+ time-of-day / weekday / day-of-month / tz)
      :once       — fire once at `:schedule/next-fire`, then deactivate")
 
+(declare schema)
+
+(defn attribute
+  "The schema entry of attribute `ident`."
+  [ident]
+  (first (filter #(= ident (:db/ident %)) schema)))
+
 (def schema
   [{:db/ident       :schedule/id
     :db/valueType   :db.type/uuid
@@ -88,6 +95,11 @@ Output/errors post to the room as :_activity."}
     :db/valueType   :db.type/long
     :db/cardinality :db.cardinality/one
     :db/doc         "Minutes since midnight (sortable/queryable); nil ⇒ default 09:00"}
+
+   {:db/ident       :schedule/second
+    :db/valueType   :db.type/long
+    :db/cardinality :db.cardinality/one
+    :db/doc         "Seconds past `:schedule/time-of-day`'s minute (0–59); nil ⇒ 0"}
 
    {:db/ident       :schedule/weekday
     :db/valueType   :db.type/keyword

@@ -49,3 +49,20 @@
   (testing "spec->attrs accepts the documented one-shot form"
     (is (= :once (:schedule/kind (cron/spec->attrs {:at "2026-08-01T09:00" :once true}
                                                    (java.util.Date.)))))))
+
+(deftest hourly-at-keeps-its-seconds-through-the-stored-entity
+  ;; the stored rule, not the spec, decides every fire after the first
+  (let [created (java.util.Date/from (inst "2026-10-10T12:00:00Z"))
+        e (cron/spec->attrs {:every :hour :at "00:15:30" :tz "UTC"} created)]
+    (is (= 15 (:schedule/time-of-day e)))
+    (is (= 30 (:schedule/second e)))
+    (is (= {:every :hour :at "00:15:30" :tz "UTC"} (cron/entity->spec e)))
+    (is (= (inst "2026-10-10T12:15:30Z") (.toInstant ^java.util.Date (:schedule/next-fire e))))
+    (let [fired (java.util.Date/from (inst "2026-10-10T12:15:30Z"))]
+      (is (= (inst "2026-10-10T13:15:30Z")
+             (.toInstant (cron/compute-next-fire (assoc e :schedule/last-run fired) fired))))))
+  (testing "no seconds, no attribute: a room without it stores the schedule as before"
+    (is (not (contains? (cron/spec->attrs {:every :hour :at "00:15"} (java.util.Date.))
+                        :schedule/second)))
+    (is (not (contains? (cron/spec->attrs {:every :day :at "09:00:00"} (java.util.Date.))
+                        :schedule/second)))))
