@@ -6,6 +6,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [jsonista.core :as json]
             [muuntaja.core :as muu]
+            [dvergr.agent.ops :as aops]
             [dvergr.ops :as ops]
             [dvergr.web.api :as api]))
 
@@ -62,3 +63,12 @@
   (testing "an op error without a status is a 500"
     (with-redefs [ops/invoke (fn [& _] (throw (ex-info "boom" {})))]
       (is (= 500 (:status (POST "/api/v1/agent_create" {:id "x"})))))))
+
+(deftest agent-and-invite-failures-carry-their-status
+  (with-redefs [aops/get-agent (fn [id] (when (= :taken id) {:id id}))
+                aops/update-agent! (fn [& _] nil)
+                ops/resolve-room (fn [& _] nil)]
+    (is (= 409 (:status (POST "/api/v1/agent_create" {:id "taken"}))))
+    (is (= 404 (:status (POST "/api/v1/agent_update" {:id "x" :patch {:budget-dollars 1.0 :tags ""}})))
+        "unknown agent after a valid patch")
+    (is (= 404 (:status (POST "/api/v1/room_invite" {:room "nowhere" :agent "x"}))))))

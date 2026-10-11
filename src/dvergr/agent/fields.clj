@@ -106,19 +106,6 @@
 ;; Derivations
 ;; ---------------------------------------------------------------------------
 
-(defn parse-params
-  "Build an update-agent! patch from a string-keyed param map (web form / wire).
-   A field contributes iff its param is present AND its :parse yields non-nil —
-   so a blank box never clobbers, while an explicit empty (tags -> #{}) applies."
-  [params]
-  (reduce (fn [m f]
-            (let [p (param-name f)]
-              (if (contains? params p)
-                (let [v ((:parse f) (get params p))]
-                  (cond-> m (some? v) (assoc (:k f) v)))
-                m)))
-          {} fields))
-
 (defn- field-entry
   "Malli :map entry for field `f` — keyed by the patch key, optional, typed from
    :json, carrying the label as its description."
@@ -146,10 +133,24 @@
                   {:type ::invalid-field :field k :value v :dvergr.ops/status 400})))
 
 (defn- ->tag [k x]
-  (let [s (cond (keyword? x) (name x) (string? x) (str/replace (str/trim x) #"^:" "") :else nil)]
-    (if (str/blank? s)
-      (invalid! k x "a tag is a non-blank name")
-      (keyword s))))
+  (cond
+    (keyword? x) x
+    (and (string? x) (not (str/blank? (str/replace (str/trim x) #"^:" ""))))
+    (keyword (str/replace (str/trim x) #"^:" ""))
+    :else (invalid! k x "a tag is a non-blank name")))
+
+(defn- ->tools
+  "An agent's :tools: a `dvergr.tools` profile keyword, or a collection of
+   tool names (keywords or strings) as a set of keywords."
+  [v]
+  (cond
+    (keyword? v) v
+    (or (set? v) (sequential? v))
+    (into #{} (map #(cond (keyword? %) %
+                          (and (string? %) (not (str/blank? %))) (keyword (str/trim %))
+                          :else (invalid! :tools % "a tool is a name")))
+          v)
+    :else (invalid! :tools v "tools are a profile name or a collection of tool names")))
 
 (defn- normalize-value
   "Field `k`'s value `v` in the typed shape the agent ops store, or nil to omit
@@ -178,12 +179,24 @@
    `:provider \"openai\"`), the web form and host callers typed values
    (`#{:a :b}`, `:openai`). A field whose value parses to nothing is omitted,
    so a blank box never clobbers; a blank tag box clears the tags. Keys that
-   are not fields pass through. A value of the wrong type throws (status 400)
-   before anything is written."
+   are not fields pass through, except :tools (the agent's tool names, a set
+   of keywords, or a profile keyword). A value of the wrong type throws
+   (status 400) before anything is written."
   [m]
   (reduce-kv (fn [acc k v]
-               (if (contains? by-k k)
-                 (let [v' (normalize-value k v)]
-                   (if (some? v') (assoc acc k v') acc))
-                 (assoc acc k v)))
+               (cond
+                 (contains? by-k k) (let [v' (normalize-value k v)]
+                                      (if (some? v') (assoc acc k v') acc))
+                 (= :tools k) (if (some? v) (assoc acc k (->tools v)) acc)
+                 :else (assoc acc k v)))
              {} (or m {})))
+
+(defn form-fields
+  "The field values of a string-keyed param map (a web form), keyed by field
+   `:k` and still as text: what `normalize` parses and validates, so a form
+   is held to the same rules as every other surface."
+  [params]
+  (into {} (for [f fields
+                 :let [p (param-name f)]
+                 :when (contains? params p)]
+             [(:k f) (get params p)])))

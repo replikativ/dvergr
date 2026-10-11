@@ -322,6 +322,16 @@
       (is (true? (get-in resp [:result :isError])) (pr-str resp))
       (is (re-find #"id" (-> resp :result :content first :text))))))
 
+(deftest a-failed-invite-is-an-error-result
+  (with-redefs [server/current-daemon (fn [] {:execution-ctx nil})
+                ops/resolve-room (fn [& _] nil)]
+    (let [resp (json-rpc/handle-message (session {:dvergr/profile "admin"})
+                                        {:jsonrpc "2.0" :id 3 :method "tools/call"
+                                         :params {:name "room_invite"
+                                                  :arguments {:room "nowhere" :agent "x"}}})]
+      (is (true? (get-in resp [:result :isError])) (pr-str resp))
+      (is (re-find #"No room nowhere" (-> resp :result :content first :text))))))
+
 (deftest a-tool-registered-after-load-is-served
   ;; mail_* and schedule_* register when the daemon starts, after this
   ;; namespace loaded: the coding-tool list follows the registry.

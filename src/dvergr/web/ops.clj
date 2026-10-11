@@ -56,13 +56,13 @@
    ;; web and MCP create/update go through the identical op. Config GET (render the
    ;; page) stays hand-written (it renders hiccup; a read is not a derivable action).
    {:op :agent/create :method :post :path #"/agents/new" :slots []
-    :args (fn [_ form] (assoc (fields/parse-params form)
+    :args (fn [_ form] (assoc (fields/form-fields form)
                               :id (some-> (get form "id") str/trim)))
     :respond (fn [result _]
                (redirect (if-let [id (:created result)]
                            (str "/agents/" id "/config") "/dashboard#agents")))}
    {:op :agent/update :method :post :path #"/agents/([^/]+)/config" :slots [:id]
-    :args (fn [[id] form] {:id id :patch (fields/parse-params form)})
+    :args (fn [[id] form] {:id id :patch (fields/form-fields form)})
     :respond (fn [_ [id]] (redirect (str "/agents/" id "/config")))}
 
    ;; Agent lifecycle — `agent/delete` stops-then-deletes inside the op now.

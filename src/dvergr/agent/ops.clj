@@ -84,9 +84,9 @@
    keyword or string. Returns the new agent view (`get-agent`), or nil if the
    id already exists / there's no ctx.
 
-   Accepts the UI-level field map: :id :name :model :provider :tags
+   Accepts the UI-level field map: :id :name :model :provider :tags :tools
    :description :budget-dollars :rooms :prompt."
-  [{:keys [id name model provider tags description budget-dollars rooms prompt]}]
+  [{:keys [id name model provider tags tools description budget-dollars rooms prompt]}]
   (when-let [conn (chat-conn)]
     (let [id (->id id)]
       (when (and id (not (actors/lookup conn id)))
@@ -95,7 +95,8 @@
                        model                   (assoc :model model)
                        (not (str/blank? description)) (assoc :description description)
                        budget-dollars          (assoc :budget-dollars budget-dollars)
-                       (seq rooms)             (assoc :rooms rooms))]
+                       (seq rooms)             (assoc :rooms rooms)
+                       (some? tools)           (assoc :tools tools))]
           (actors/spawn-agent! conn
                                (cond-> {:id          id
                                         :name        (or (not-empty name) (clojure.core/name id))

@@ -158,9 +158,17 @@
          (fields/normalize {:tags #{:a} :provider :fireworks :budget-dollars 2})))
   (is (= {:tags #{:a :b}} (fields/normalize {:tags ["a" :b]})))
   (is (= {:tags #{}} (fields/normalize {:tags ""})) "a blank tag box clears")
+  (is (= {:tags #{:team/reviewer :x}} (fields/normalize {:tags "team/reviewer x"}))
+      (fields/normalize {:tags #{:team/reviewer "x"}}))
+  (is (= {:tags #{:team/reviewer}} (fields/normalize {:tags [:team/reviewer]}))
+      "a namespaced keyword tag is kept as it is")
+  (is (= {:tools #{:read-file :shell}} (fields/normalize {:tools ["read-file" :shell]})))
+  (is (= {:tools #{}} (fields/normalize {:tools []})) "an empty tool list is no tools")
+  (is (= {:tools :readonly} (fields/normalize {:tools :readonly})))
   (is (= {:rooms ["x"]} (fields/normalize {:rooms ["x"] :name "  "}))
       "a blank field is omitted; non-field keys pass through")
-  (doseq [bad [{:tags 42} {:provider 7} {:budget-dollars "lots"} {:model :m} {:tags [1]}]]
+  (doseq [bad [{:tags 42} {:provider 7} {:budget-dollars "lots"} {:model :m} {:tags [1]}
+               {:tools 3} {:tools [1]}]]
     (is (= 400 (status-of #(fields/normalize bad))) (pr-str bad))))
 
 (def ^:private dmn {:execution-ctx nil})

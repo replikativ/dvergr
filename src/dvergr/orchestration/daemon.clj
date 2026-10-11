@@ -444,7 +444,7 @@
   (let [view (binding [rtc/*execution-context* (:execution-ctx daemon)]
                (ops/create-agent! fields))]
     (when view
-      (create-agent! daemon (-> (select-keys fields [:provider :model :tags
+      (create-agent! daemon (-> (select-keys fields [:provider :model :tags :tools
                                                      :description :budget-dollars :rooms])
                                 (assoc :id (:id view)))))
     view))
