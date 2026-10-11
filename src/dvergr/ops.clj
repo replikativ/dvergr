@@ -1188,7 +1188,8 @@
     :kind :write
     :schema (fields/create-schema)
     :impl (fn [daemon {:keys [id] :as args}]
-            (let [id (some-> id (#(if (keyword? %) (name %) (str %))) str/trim not-empty)]
+            ;; a keyword id keeps its namespace: :team/reviewer is "team/reviewer"
+            (let [id (some-> id (#(if (keyword? %) (subs (str %) 1) (str %))) str/trim not-empty)]
               (when-not id
                 (op-error! "id required: a non-blank agent id" ::invalid-args 400))
               (let [kid (keyword id)

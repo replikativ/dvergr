@@ -219,3 +219,15 @@
                 daemon/agent-join-config (fn [_ _] nil)]
     (is (= 404 (status-of #(spec/invoke dmn :room/invite {:room "r" :agent "nobody"}))))
     (is (= 404 (status-of #(spec/invoke dmn :room/invite {:room "nowhere" :agent "nobody"}))))))
+
+(deftest create-op-keeps-a-keyword-ids-namespace
+  (with-redefs [daemon/provision-agent! (fn [_ fields] (ops/create-agent! fields))]
+    (is (= {:created "team/reviewer"} (spec/invoke dmn :agent/create {:id :team/reviewer})))
+    (is (some? (ops/get-agent :team/reviewer)))
+    (is (= 409 (status-of #(spec/invoke dmn :agent/create {:id "team/reviewer"})))
+        "the keyword and the string name the same agent")))
+
+(deftest tags-round-trip-through-the-form
+  (let [f (fields/by-k :tags)
+        tags #{:team/reviewer :plain}]
+    (is (= tags (:tags (fields/normalize {:tags ((:format f) {:tags tags})}))))))

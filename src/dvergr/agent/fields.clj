@@ -91,7 +91,8 @@
     :options model-options}
    {:k :tags :label "Tags / skills (space or comma separated)" :type :text :json "string" :row 2
     :parse parse-tags
-    :format #(str/join " " (map name (:tags %)))}
+    ;; a tag's full name: :team/reviewer as "team/reviewer", which parses back
+    :format #(str/join " " (map (fn [t] (subs (str t) 1)) (sort (:tags %))))}
    {:k :budget-dollars :param "budget" :label "Budget ($ / task)" :type :number :json "number" :row 2
     :parse parse-double*
     :format #(or (some-> (:budget-dollars %) str) "")}
@@ -115,7 +116,7 @@
    :json, carrying the label as its description."
   [f]
   [(:k f) {:optional true}
-   [(if (= "number" (:json f)) :double :string) {:description (:label f)}]])
+   [(if (= "number" (:json f)) 'number? :string) {:description (:label f)}]])
 
 (def ^:private tools-entry
   "The agent's own tools on the wire: tool names; without them its tags choose."
