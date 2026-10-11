@@ -11,8 +11,11 @@
    all integers → long, all numbers → double, anything else → string (a
    number in such a column is kept as SQLite's text of it).
 
-   A loaded database is a file store under the cache, built once and reused
-   (an Attempt's world forks it, copy-on-write)."
+   A loaded database is a file store under the cache, built once and shared
+   by every Attempt, not forked: candidates only read it. SQLite is opened
+   read-only per query (`mode=ro`), pg-datahike gets a fresh read-only
+   session per query, and Datalog queries an immutable db value
+   (`bird.provider`)."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [datahike.api :as d]

@@ -13,6 +13,7 @@
             [dvergr.benchmarks.bird.core :as bird]
             [dvergr.benchmarks.bird.provider :as provider]
             [dvergr.benchmarks.pyjson :as pj]
+            [clojure.string :as str]
             [hasch.core :as hasch])
   (:import [java.util ArrayList Collections Random]))
 
@@ -41,6 +42,13 @@
                                (filterv #(chosen (:question-id %)) qs))))))
             (sort-by key (group-by :db-id qs))))))
 
+(defn title
+  "The report title of a BIRD experiment: the set, the split and the
+   databases."
+  [{:keys [split db-ids]}]
+  (str "BIRD dev set" (when split (str ", " (name split) " split"))
+       (when (seq db-ids) (str " (" (str/join ", " db-ids) ")"))))
+
 (defn run!
   [{:keys [candidates agent-generate max-turns] :or {max-turns 20} :as opts}]
   (let [selected (select-questions opts)
@@ -50,7 +58,10 @@
       (select-keys opts [:dir :daemon :repetitions :parallelism :experiment-id :fault-retries :claude-cli :claude-env
                          :host-context-note :usage-pause-threshold :usage-retries
                          :preflight :allowance])
-      {:benchmark :bird
+      ;; the experiment's id stays the :dir's name (what resumes it); the
+      ;; title says what was run
+      {:title (title opts)
+       :benchmark :bird
        :capabilities caps
        :environments (mapv #(provider/environment-def % caps {:max-turns max-turns}) selected)
        :team (provider/candidate-roster candidates)

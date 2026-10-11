@@ -430,7 +430,7 @@
   [daemon
    {:keys [dir benchmark capabilities environments team models dataset metadata
            repetitions parallelism experiment-id claude-cli claude-env
-           usage-pause-threshold usage-retries fault-retries]
+           usage-pause-threshold usage-retries fault-retries title]
     :or {repetitions 1 parallelism 1 usage-pause-threshold 0.97 usage-retries 3 fault-retries 1}
     :as opts}]
   (let [started-ms (System/currentTimeMillis)
@@ -462,8 +462,10 @@
                                                     host (assoc :host host))})
         ;; the home's room for exactly this ExperimentDef: a Claude Code
         ;; candidate's MCP tool calls reach its forks through the daemon
-        room (experiment-room! daemon experiment-def
-                               (str (name benchmark) " experiment " (name room-id)))
+        ;; the title is display only: the ExperimentDef's id (and so what
+        ;; resumes) stays the one above
+        title (or title (str (name benchmark) " — " (name room-id)))
+        room (experiment-room! daemon experiment-def title)
         slug (:slug room)
         ;; an embedder that serves the experiment's rooms learns the room
         ;; they fork from
@@ -508,8 +510,7 @@
                 ;; every Attempt this invocation ran, the pilot's included
                 ran (filter #(>= (or (get-in % [:attempt/receipt :attempt/started-at]) 0) started-ms)
                             (keep :attempt (:results result)))
-                _ (record-calibration! metered started-ms ran)
-                title (str (name benchmark) " — " (name room-id))]
+                _ (record-calibration! metered started-ms ran)]
             {:dir dir :room slug :experiment-room room-id :experiment experiment-def
              :results (count (:results result)) :failed-cells failed-cells
              ;; the receipts of the Attempts this invocation has (a report's
@@ -575,6 +576,9 @@
      :dataset       `{:id kw :metadata map}`
      :metadata      goes into the ExperimentDef
      :repetitions :parallelism :experiment-id
+     :title         the report's (and a new experiment room's) title; display
+                    only, not part of the ExperimentDef (default
+                    `<benchmark> — <experiment id>`)
      :claude-cli :claude-env :host-context-note (`:auto`, a string, or nil)
      :usage-pause-threshold :usage-retries
      :fault-retries how often cells that faulted or errored are re-run within

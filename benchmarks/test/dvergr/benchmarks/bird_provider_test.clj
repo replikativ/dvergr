@@ -2,8 +2,12 @@
   "BIRD on the generic evaluation path, with scripted candidates, on every
    engine. Skipped without the BIRD dev set (see `dvergr.benchmarks.bird.core`)."
   (:require [clojure.test :refer [deftest is testing]]
+            [datahike.api :as dh]
+            [datahike.pg.server :as pg]
+            [dvergr.benchmarks.bird.compat :as compat]
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.benchmarks.bird.core :as bird]
+            [dvergr.benchmarks.bird.experiment :as bird-experiment]
             [dvergr.benchmarks.bird.provider :as provider]
             [dvergr.discourse :as d]
             [dvergr.room.store.memory :as memory]
@@ -235,6 +239,21 @@
       (support/skip! "a-candidate-query-may-only-read: no BIRD data")
       (is (empty? (keep #(provider/read-only-sql (:sql %)) (bird/questions)))))))
 
+(deftest a-pg-datahike-session-refuses-writes-itself
+  ;; behind the keyword filter: the session is read only
+  (let [cfg {:store {:backend :memory :id (random-uuid)} :schema-flexibility :write}
+        _ (dh/create-database cfg)
+        conn (dh/connect cfg)
+        rw (pg/make-query-handler conn)]
+    (try
+      (compat/pg-execute rw "CREATE TABLE t (id int)")
+      (compat/pg-execute rw "INSERT INTO t VALUES (1)")
+      (let [h (provider/read-only-handler conn)]
+        (doseq [q ["INSERT INTO t VALUES (2)" "UPDATE t SET id = 3" "DELETE FROM t" "CREATE TABLE u (id int)" "DROP TABLE t"]]
+          (is (= "25006" (:sqlstate (compat/pg-execute h q))) q))
+        (is (= [[1]] (:rows (compat/pg-execute h "SELECT count(*) FROM t")))))
+      (finally (dh/release conn) (dh/delete-database cfg)))))
+
 (deftest a-sqlite-connection-cannot-attach
   (if-not (bird/available?)
     (support/skip! "a-sqlite-connection-cannot-attach: no BIRD data")
@@ -244,3 +263,9 @@
         (is (thrown? java.sql.SQLException
                      (bird/execute c (str "ATTACH DATABASE '" f "' AS x")))))
       (is (not (.exists f)) "no file was created"))))
+
+(deftest the-report-title-names-the-split-not-the-directory
+  ;; it was "bird — home", the :dir's name; the id (what resumes) still is
+  (is (= "BIRD dev set, eval split (superhero, toxicology)"
+         (bird-experiment/title {:split :eval :db-ids ["superhero" "toxicology"]})))
+  (is (= "BIRD dev set" (bird-experiment/title {}))))
