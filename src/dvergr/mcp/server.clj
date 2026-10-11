@@ -146,7 +146,9 @@
                                      " (dvergr.ops/job-status {:job id}); (dir dvergr.ops) lists them.")))
             :inputSchema (with-room-param (:parameters tdef))
             :annotations annotations
-            :dvergr/toolset (surface/tool-toolset tname nil true)}
+            :dvergr/toolset (surface/tool-toolset tname nil true)
+            ;; derived from the dvergr.tools registry, kept in step with it
+            :dvergr/registry? true}
      :handler
      (fn [context arguments]
        (if-let [dmn (current-daemon)]
@@ -164,10 +166,6 @@
                (catch Throwable e
                  (surface/error-result (str "Error: " (.getMessage e)))))))
          (surface/error-result no-daemon)))}))
-
-(def ^:private coding-tools
-  (mapv (fn [[tname tdef]] (coding-tool tname tdef))
-        (deref (deref (requiring-resolve 'dvergr.tools/registry)))))
 
 ;; ---- repl_describe: the REPL's API, for REPL-first clients (the `code` profile)
 
@@ -236,16 +234,53 @@
                  (surface/error-result (str "Error: " (.getMessage e)))))))
          (surface/error-result no-daemon)))}))
 
-(def ^:private all-tools (conj (into ops-tools coding-tools) describe-tool))
+(def ^:private fixed-tools (conj ops-tools describe-tool))
 
 (def tool-definitions
   "MCP tool defs: dvergr.ops (rooms/agents/forks) + the room-scoped coding tools
-   (dvergr.tools registry). An atom so `register-tool!` can add dynamic tools."
-  (atom (mapv :def all-tools)))
+   (dvergr.tools registry, kept in step with it by `sync-registry-tools!`). An
+   atom so `register-tool!` can add dynamic tools."
+  (atom (mapv :def fixed-tools)))
 
 (def tool-handlers
   "tool-name -> handler, for all derived tools."
-  (atom (into {} (map (juxt :name :handler)) all-tools)))
+  (atom (into {} (map (juxt :name :handler)) fixed-tools)))
+
+(def ^:private tools-lock (Object.))
+
+(declare broadcast-notification!)
+
+(defn- tools-registry [] (deref (requiring-resolve 'dvergr.tools/registry)))
+
+(defn sync-registry-tools!
+  "Serve every tool of the `dvergr.tools` registry as a room-scoped coding tool,
+   as the registry is now: tools register as their namespaces load (mail and
+   schedule tools when the daemon starts, after this namespace), so the list
+   follows the registry rather than a snapshot. A name an op, `repl_describe`
+   or an explicit `register-tool!` holds is left to it. Clients hear of a
+   change through tools/list_changed."
+  []
+  (let [changed?
+        (locking tools-lock
+          (let [defs @tool-definitions
+                held (into #{} (comp (remove :dvergr/registry?) (map :name)) defs)
+                want (into (sorted-map)
+                           (for [[tname tdef] @(tools-registry)
+                                 :when (not (held tname))]
+                             [tname (coding-tool tname tdef)]))
+                old  (into {} (comp (filter :dvergr/registry?) (map (juxt :name identity))) defs)
+                new  (into {} (map (fn [[n t]] [n (:def t)])) want)]
+            (when (not= old new)
+              (reset! tool-definitions (into (vec (remove :dvergr/registry? defs)) (vals new)))
+              (swap! tool-handlers
+                     (fn [hs]
+                       (merge (apply dissoc hs (remove new (keys old)))
+                              ;; a handler closes over nothing that changes: keep it
+                              (into {} (for [[n t] want :when (not= (get old n) (get new n))]
+                                         [n (:handler t)])))))
+              true)))]
+    (when changed?
+      (broadcast-notification! "notifications/tools/list_changed" {} :toolsListChanged))))
 
 ;; ============================================================================
 ;; Resources — DERIVED from dvergr.ops :read ops (each room is a live resource)
@@ -437,18 +472,30 @@
    tool-def: {:name \"...\" :description \"...\" :inputSchema {...}}
    handler-fn: (fn [context arguments] -> {:content [...] :isError bool})"
   [tool-def handler-fn]
-  (swap! tool-definitions conj (merge {:dvergr/toolset :extra
-                                       :annotations (surface/tool-annotations (:name tool-def))}
-                                      tool-def))
-  (swap! tool-handlers assoc (:name tool-def) handler-fn)
+  (locking tools-lock
+    ;; replaces a tool of the same name (one derived from the registry, say)
+    (swap! tool-definitions (fn [defs]
+                              (conj (vec (remove #(= (:name %) (:name tool-def)) defs))
+                                    (merge {:dvergr/toolset :extra
+                                            :annotations (surface/tool-annotations (:name tool-def))}
+                                           (dissoc tool-def :dvergr/registry?)))))
+    (swap! tool-handlers assoc (:name tool-def) handler-fn))
   (broadcast-notification! "notifications/tools/list_changed" {} :toolsListChanged))
 
 (defn unregister-tool!
-  "Remove a tool by name. Broadcasts tools/list_changed to all clients."
+  "Remove a tool by name. Broadcasts tools/list_changed to all clients. A
+   registry tool of that name is served again as a coding tool."
   [tool-name]
-  (swap! tool-definitions (fn [defs] (vec (remove #(= (:name %) tool-name) defs))))
-  (swap! tool-handlers dissoc tool-name)
-  (broadcast-notification! "notifications/tools/list_changed" {} :toolsListChanged))
+  (locking tools-lock
+    (swap! tool-definitions (fn [defs] (vec (remove #(= (:name %) tool-name) defs))))
+    (swap! tool-handlers dissoc tool-name))
+  (broadcast-notification! "notifications/tools/list_changed" {} :toolsListChanged)
+  (sync-registry-tools!))
+
+;; The registry as it is at load, then every change to it.
+(sync-registry-tools!)
+(add-watch (tools-registry) ::registry-tools
+           (fn [_ _ old new] (when-not (identical? old new) (sync-registry-tools!))))
 
 ;; ============================================================================
 ;; Session factory

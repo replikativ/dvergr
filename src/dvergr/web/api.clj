@@ -46,7 +46,8 @@
       (try
         {:status 200 :body (ops/invoke d op (or (:body parameters) (:query parameters) {}))}
         (catch Throwable e
-          {:status 500 :body {:error (.getMessage e) :op (ops/op->name op)}}))
+          ;; an op's failure carries its status: 4xx when the request is wrong
+          {:status (ops/error-status e) :body {:error (.getMessage e) :op (ops/op->name op)}}))
       {:status 503 :body {:error "No dvergr daemon running."}})))
 
 (defn- op-route [op {:keys [doc kind]}]

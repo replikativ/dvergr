@@ -10,6 +10,7 @@
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.actors :as actors]
             [dvergr.discourse :as disc]
+            [dvergr.discourse.llm :as llm]
             [dvergr.room.registry :as rreg]
             [dvergr.room.store :as rstore]
             [dvergr.system.db :as sdb]
@@ -215,6 +216,25 @@
       (is (contains? (into #{} (map :id) (daemon/list-agents d)) :dynamic)
           "appears in list-agents after create")
       (is (actors/online? :dynamic)))))
+
+(deftest create-agent-honors-explicit-tools
+  (testing "an agent's :tools decide its tools; without them its tags do"
+    (let [d *shared-daemon*
+          captured (atom {})
+          orig llm/llm-agent]
+      (try
+        (with-redefs [llm/llm-agent (fn [o] (swap! captured assoc (:id o) o) (orig o))]
+          (daemon/create-agent! d {:id :tools-none :provider :fireworks :model "t" :tools #{}})
+          (daemon/create-agent! d {:id :tools-read :provider :fireworks :model "t" :tools #{:read-file}})
+          (daemon/create-agent! d {:id :tools-default :provider :fireworks :model "t"}))
+        (is (= {} (:tools (:tools-none @captured))) "an empty :tools is no tools")
+        (is (= #{"read_file"} (set (keys (:tools (:tools-read @captured))))))
+        (is (= (set (keys (daemon/safe-tools)))
+               (set (keys (:tools (:tools-default @captured)))))
+            "no :tools and no tags: the tag-based default")
+        (finally
+          (doseq [id [:tools-none :tools-read :tools-default]]
+            (daemon/stop-agent! d id)))))))
 
 (deftest test-daemon-stop-agent
   (testing "stop-agent! removes one agent from a running daemon"

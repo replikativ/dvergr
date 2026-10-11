@@ -87,6 +87,18 @@
       (is (= "New" (:name a)))
       (is (= "b"   (-> a :config :model))))))
 
+(deftest update-replaces-skills
+  (testing "a :skills patch replaces the set: removed skills are retracted"
+    (actors/spawn-agent! *conn* {:id :x :skills #{:old :kept}})
+    (actors/update-actor! *conn* :x {:skills #{:kept :new}})
+    (is (= #{:kept :new} (:skills (actors/lookup *conn* :x))))
+    (actors/update-actor! *conn* :x {:skills #{}})
+    (is (= #{} (:skills (actors/lookup *conn* :x)))))
+  (testing "a patch without :skills leaves them alone"
+    (actors/spawn-agent! *conn* {:id :y :skills #{:a}})
+    (actors/update-actor! *conn* :y {:name "Y"})
+    (is (= #{:a} (:skills (actors/lookup *conn* :y))))))
+
 (deftest external-refs-round-trip
   (testing ":external-refs is EDN-serialized and restored as a map"
     (actors/spawn-agent! *conn*

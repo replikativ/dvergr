@@ -94,7 +94,7 @@
     :reply (fn [r] (str "Discarded " (:discarded r) "."))}
    {:cmd "invite"  :op :room/invite   :room? true
     :args-fn (fn [argv] {:agent (first argv)})
-    :reply (fn [r] (if (:error r) (str "⚠ " (:error r)) (str "Invited " (:invited r) ".")))}])
+    :reply (fn [r] (str "Invited " (:invited r) "."))}])
 
 (def ^:private by-cmd (into {} (map (juxt :cmd identity)) commands))
 

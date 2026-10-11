@@ -262,14 +262,19 @@
 (defn update-actor!
   "Patch fields on an existing actor row. Pass any subset of the
    :name :skills :profile-ref :status :cost :config :external-refs
-   fields. Skill sets replace (cardinality/many handles add/retract on
-   reset). For partial skill updates use add-skill! / remove-skill!."
+   fields. A :skills set replaces the stored one: the skills it leaves out
+   are retracted in the same transaction (an entity map only asserts
+   cardinality-many values). For partial skill updates use add-skill! /
+   remove-skill!."
   [conn id patch]
   (let [existing (lookup conn id)]
     (when existing
-      (let [merged (merge existing (assoc patch :id id))
-            tx     (actor->tx merged)]
-        (dh/transact conn [tx])
+      (let [merged  (merge existing (assoc patch :id id))
+            removed (when (contains? patch :skills)
+                      (remove (set (:skills patch)) (:skills existing)))]
+        (dh/transact conn (into [(actor->tx merged)]
+                                (map (fn [s] [:db/retract [:actor/id id] :actor/skills s]))
+                                removed))
         (lookup conn id)))))
 
 (defn add-skill!

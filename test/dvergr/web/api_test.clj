@@ -47,3 +47,18 @@
           s (slurp (muu/encode @#'api/m "application/json" sample))]
       (is (string? s))
       (is (re-find #"boardroom" s)))))
+
+(defn- POST [uri body]
+  (api/handler {:request-method :post :uri uri
+                :headers {"content-type" "application/json"}
+                :body (java.io.ByteArrayInputStream. (.getBytes (json/write-value-as-string body) "UTF-8"))
+                :dvergr/daemon {:execution-ctx nil}}))
+
+(deftest a-failed-op-is-an-http-error
+  (testing "an op's client error is a 4xx with the message, never a 200"
+    (let [resp (POST "/api/v1/agent_create" {:id "   "})]
+      (is (= 400 (:status resp)))
+      (is (re-find #"id" (str (:error (body-json resp)))))))
+  (testing "an op error without a status is a 500"
+    (with-redefs [ops/invoke (fn [& _] (throw (ex-info "boom" {})))]
+      (is (= 500 (:status (POST "/api/v1/agent_create" {:id "x"})))))))

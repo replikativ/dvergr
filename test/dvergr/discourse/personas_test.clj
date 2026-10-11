@@ -10,7 +10,9 @@
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
             [dvergr.discourse :as d]
+            [dvergr.discourse.llm :as llm]
             [dvergr.discourse.personas :as personas]
+            [dvergr.tools :as tools]
             [dvergr.chat.context :as cc]))
 
 (defn- await-spin
@@ -116,3 +118,12 @@
   (testing "Missing prompt file throws a clear error, not silent nil"
     (is (thrown-with-msg? Exception #"Persona prompt not found"
                           (personas/from-prompt "does-not-exist.md" {:id :nope})))))
+
+(deftest from-prompt-defaults-to-the-read-only-tools
+  (testing "without :tools, a custom persona gets the minimal read-only set, not everything"
+    (let [captured (atom nil)]
+      (with-redefs [llm/llm-agent (fn [opts] (reset! captured opts) {:id (:id opts)})]
+        (personas/from-prompt "researcher.md" {:id :custom}))
+      (is (seq (:tools @captured)))
+      (is (= (set (keys (tools/normalize-tools tools/minimal-readonly-tools)))
+             (set (keys (:tools @captured))))))))

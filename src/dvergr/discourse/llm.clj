@@ -995,6 +995,12 @@
                           :compaction  compaction
                           :run-turn-fn run-turn-fn
                           :attention-policy attention-policy
+                          :on-reply    on-reply
+                          ;; Built bare: the room-safety wrappers below re-thread
+                          ;; through this factory and wrap the clone themselves, so
+                          ;; a room-safe agent's clone is wrapped once and a bare
+                          ;; one (:room-safe? false) stays bare.
+                          :room-safe?  false
                           :ctx         new-ctx}))})]
       ;; Room-safe by DEFAULT: self-filter (never answer your own messages —
       ;; the echo-loop guard), silence ([SKIP] → no post), plain-reply. The

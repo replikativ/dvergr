@@ -12,7 +12,9 @@
    in the hand-written handler (rendering is the per-binding overlay, not derived)."
   (:require [clojure.string :as str]
             [dvergr.ops :as ops]
-            [dvergr.agent.fields :as fields]))
+            [dvergr.agent.fields :as fields]
+            [hiccup.util :as hu]
+            [taoensso.telemere :as tel]))
 
 (defn- redirect [loc] {:status 303 :headers {"Location" loc} :body ""})
 
@@ -84,7 +86,13 @@
               (when-let [m (re-matches (:path entry) uri)]
                 (let [slots (if (vector? m) (vec (rest m)) [])
                       form  (when (= :post method) (parse-form req))
-                      args  ((:args entry) slots form)
-                      res   (ops/invoke daemon (:op entry) args)]
-                  ((:respond entry) res slots)))))
+                      args  ((:args entry) slots form)]
+                  (try
+                    ((:respond entry) (ops/invoke daemon (:op entry) args) slots)
+                    ;; a failed op answers with its status (4xx for a bad request)
+                    (catch clojure.lang.ExceptionInfo e
+                      (tel/log! {:level :warn :id :web.ops/failed
+                                 :data {:op (:op entry) :error (ex-message e)}})
+                      {:status (ops/error-status e) :headers {"Content-Type" "text/html; charset=utf-8"}
+                       :body (str "<p>" (hu/escape-html (ex-message e)) "</p>")}))))))
           routes)))

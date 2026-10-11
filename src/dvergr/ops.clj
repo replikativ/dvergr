@@ -87,6 +87,22 @@
                       (try (rreg/lookup (java.util.UUID/fromString room)) (catch Throwable _ nil))
                       (some-> (rstore/slug->room-id room) rreg/lookup)))))))
 
+;; ---- errors: an op that fails throws, so every binding reports a failure ----
+
+(defn op-error!
+  "Throw the failure of an op: `msg` for the caller, `type` for code, and the
+   HTTP `status` (4xx when the caller can fix the request) that the JSON API
+   answers with; MCP reports it as a tool error, the REPL as an exception."
+  ([msg type status] (op-error! msg type status nil))
+  ([msg type status data]
+   (throw (ex-info msg (merge data {:type type ::status status})))))
+
+(defn error-status
+  "The HTTP status for the exception `e` an op threw: its `::status`, else 500."
+  [e]
+  (let [s (::status (ex-data e))]
+    (if (and (int? s) (<= 400 s 599)) s 500)))
+
 ;; ---- plain-data projections (serializable for any binding) ----
 
 (defn- room-data [r]
@@ -1171,13 +1187,20 @@
    {:doc "Create an agent (provision a durable row + bring it online)."
     :kind :write
     :schema (fields/create-schema)
-    :impl (fn [daemon {:keys [id] :as fields}]
-            (let [id (some-> id str str/trim not-empty)]
-              (if-not id
-                {:error "id required"}
+    :impl (fn [daemon {:keys [id] :as args}]
+            (let [id (some-> id (#(if (keyword? %) (name %) (str %))) str/trim not-empty)]
+              (when-not id
+                (op-error! "id required: a non-blank agent id" ::invalid-args 400))
+              (let [kid (keyword id)
+                    ;; the typed shape, whatever surface sent it; refused before any write
+                    fields (fields/normalize (dissoc args :id))]
                 (in-ctx daemon
-                        ((requiring-resolve 'dvergr.orchestration.daemon/provision-agent!)
-                         daemon (assoc fields :id (keyword id)))
+                        (when (aops/get-agent kid)
+                          (op-error! (str "Agent " id " already exists") ::agent-exists 409 {:id id}))
+                        (when-not ((requiring-resolve 'dvergr.orchestration.daemon/provision-agent!)
+                                   daemon (assoc fields :id kid))
+                          (op-error! (str "Could not create agent " id ": no system database")
+                                     ::create-failed 500 {:id id}))
                         {:created id}))))}
 
    :agent/update
@@ -1185,7 +1208,11 @@
     :kind :write
     :schema [:map [:id AgentId] [:patch (fields/update-schema)]]
     :impl (fn [daemon {:keys [id patch]}]
-            (in-ctx daemon (aops/update-agent! (keyword id) patch) {:updated id}))}
+            (let [patch (fields/normalize patch)]
+              (in-ctx daemon
+                      (when-not (aops/update-agent! (keyword id) patch)
+                        (op-error! (str "Unknown agent: " id) ::no-agent 404 {:id id}))
+                      {:updated id})))}
 
    :agent/open
    {:doc "Open (ensure) a direct-message room with an agent; returns the room."
@@ -1202,15 +1229,15 @@
     :kind :write
     :schema [:map [:room Room] [:agent AgentId]]
     :impl (fn [daemon {:keys [room agent]}]
-            (when-let [r (resolve-room daemon room)]
+            (let [r (or (resolve-room daemon room)
+                        (op-error! (str "No room " room) ::no-room 404 {:room room}))]
               (in-ctx daemon
-                      (let [aid  (keyword agent)
-                            cfg  ((requiring-resolve 'dvergr.orchestration.daemon/agent-join-config) daemon aid)]
-                        (if-not cfg
-                          {:error (str "Unknown agent: " agent)}
-                          (let [safe ((requiring-resolve 'dvergr.orchestration.daemon/resolve-safe-config) cfg)]
-                            ((requiring-resolve 'dvergr.orchestration.daemon/join-agent-to-room!) daemon safe r)
-                            {:invited agent :room (id->str (:id r))}))))))}
+                      (let [aid (keyword agent)
+                            cfg (or ((requiring-resolve 'dvergr.orchestration.daemon/agent-join-config) daemon aid)
+                                    (op-error! (str "Unknown agent: " agent) ::no-agent 404 {:agent agent}))
+                            safe ((requiring-resolve 'dvergr.orchestration.daemon/resolve-safe-config) cfg)]
+                        ((requiring-resolve 'dvergr.orchestration.daemon/join-agent-to-room!) daemon safe r)
+                        {:invited agent :room (id->str (:id r))}))))}
 
    :agent/delete
    {:doc "Delete an agent — stop the live participant, then retract its row + persona."

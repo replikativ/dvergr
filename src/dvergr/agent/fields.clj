@@ -136,3 +136,54 @@
   "Malli schema for :agent/create — id (required) plus the editable fields."
   []
   (into [:map [:id [:string {:description "agent id"}]]] (map field-entry) fields))
+
+;; ---------------------------------------------------------------------------
+;; Normalization: one shape for every surface
+;; ---------------------------------------------------------------------------
+
+(defn- invalid! [k v why]
+  (throw (ex-info (str "Invalid " (name k) " " (pr-str v) ": " why)
+                  {:type ::invalid-field :field k :value v :dvergr.ops/status 400})))
+
+(defn- ->tag [k x]
+  (let [s (cond (keyword? x) (name x) (string? x) (str/replace (str/trim x) #"^:" "") :else nil)]
+    (if (str/blank? s)
+      (invalid! k x "a tag is a non-blank name")
+      (keyword s))))
+
+(defn- normalize-value
+  "Field `k`'s value `v` in the typed shape the agent ops store, or nil to omit
+   it. A string is parsed as the field's wire text (`:parse`); a typed value
+   (keyword provider, set of keyword tags, number budget) is kept. Anything
+   else is refused."
+  [k v]
+  (let [{:keys [parse json]} (by-k k)]
+    (cond
+      (nil? v) nil
+      (string? v) (let [parsed (parse v)]
+                    (when (and (nil? parsed) (= "number" json) (not (str/blank? v)))
+                      (invalid! k v "not a number"))
+                    parsed)
+      (= :tags k) (if (or (set? v) (sequential? v))
+                    (into #{} (map #(->tag k %)) v)
+                    (invalid! k v "tags are a string or a collection of names"))
+      (= :provider k) (if (keyword? v) v (invalid! k v "a provider is a name"))
+      (= "number" json) (if (number? v) (double v) (invalid! k v "not a number"))
+      :else (invalid! k v "expected a string"))))
+
+(defn normalize
+  "The agent field map `m` (an :agent/create body or an :agent/update patch) in
+   the typed shape `dvergr.agent.ops` stores, whichever surface it came from:
+   MCP, the JSON API and the REPL send wire text (`:tags \"a b\"`,
+   `:provider \"openai\"`), the web form and host callers typed values
+   (`#{:a :b}`, `:openai`). A field whose value parses to nothing is omitted,
+   so a blank box never clobbers; a blank tag box clears the tags. Keys that
+   are not fields pass through. A value of the wrong type throws (status 400)
+   before anything is written."
+  [m]
+  (reduce-kv (fn [acc k v]
+               (if (contains? by-k k)
+                 (let [v' (normalize-value k v)]
+                   (if (some? v') (assoc acc k v') acc))
+                 (assoc acc k v)))
+             {} (or m {})))

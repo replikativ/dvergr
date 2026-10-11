@@ -1246,3 +1246,28 @@
         (when-let [fork @fork*]
           (d/discard fork))
         (d/close-room! parent)))))
+
+(deftest a-fork-clone-keeps-the-reply-hook-and-room-safety
+  (testing "the fork factory rebuilds the agent with its :on-reply and :room-safe?"
+    (let [r (d/room :llm-factory-options)
+          hook (fn [content] {:content content :notes []})
+          captured (atom [])
+          orig llm/llm-agent]
+      (try
+        (binding [ec/*execution-context* (:ctx r)]
+          (let [bare (llm/llm-agent {:id :bare :spec {:provider :mock :model "mock"}
+                                     :room-safe? false :on-reply hook
+                                     :run-turn-fn (make-mock-turn-fn (atom []))})
+                safe (llm/llm-agent {:id :safe :spec {:provider :mock :model "mock"}
+                                     :on-reply hook
+                                     :run-turn-fn (make-mock-turn-fn (atom []))})]
+            (with-redefs [llm/llm-agent (fn [opts] (swap! captured conj opts) (orig opts))]
+              ((:factory bare) (:ctx r))
+              ((:factory safe) (:ctx r)))))
+        (let [[bare-clone safe-clone] @captured]
+          (is (identical? hook (:on-reply bare-clone)))
+          (is (false? (:room-safe? bare-clone)) "a bare agent's clone stays bare")
+          (is (identical? hook (:on-reply safe-clone)))
+          (is (false? (:room-safe? safe-clone))
+              "a room-safe agent's clone is built bare: its wrappers re-wrap it through the factory, once"))
+        (finally (d/close-room! r))))))
