@@ -1,4 +1,5 @@
-"""Verdicts of one candidate of a Dvergr experiment, for pairing with a reference run (mcnemar.py).
+"""Verdicts of one candidate of a Dvergr experiment of the layout before homes (an artifacts/
+directory), for pairing with a reference run (mcnemar.py); dvergr_verdicts.clj reads current homes.
 
 Reads the attempt artifacts an experiment writes (DIR/artifacts/*.edn) and keeps, per case,
 the latest certified attempt that has a reward and did not end in an infrastructure error.
@@ -28,6 +29,8 @@ def main():
         if env.group(1) not in best or rec > best[env.group(1)]:
             best[env.group(1)] = rec
     v = {k: int(rew >= 1.0) for k, (_, rew) in sorted(best.items())}
+    if not v:
+        sys.exit(f"no verdicts of candidate {cand} in {exp_dir}/artifacts")
     json.dump(v, open(out, "w"))
     print(f"{exp_dir} {cand}: {sum(v.values())} / {len(v)} pass")
 
