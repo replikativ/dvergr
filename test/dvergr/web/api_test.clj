@@ -8,6 +8,7 @@
             [muuntaja.core :as muu]
             [dvergr.agent.ops :as aops]
             [dvergr.ops :as ops]
+            [dvergr.orchestration.daemon :as daemon]
             [dvergr.web.api :as api]))
 
 (defn- GET  [uri] (api/handler {:request-method :get  :uri uri :headers {}}))
@@ -72,3 +73,12 @@
     (is (= 404 (:status (POST "/api/v1/agent_update" {:id "x" :patch {:budget-dollars 1.0 :tags ""}})))
         "unknown agent after a valid patch")
     (is (= 404 (:status (POST "/api/v1/room_invite" {:room "nowhere" :agent "x"}))))))
+
+(deftest create-takes-the-agents-tools-over-the-wire
+  (let [seen (atom nil)]
+    (with-redefs [aops/get-agent (fn [_] nil)
+                  daemon/provision-agent! (fn [_ fields] (reset! seen fields) {:id (:id fields)})]
+      (is (= 200 (:status (POST "/api/v1/agent_create" {:id "t" :tools []}))))
+      (is (= #{} (:tools @seen)) "an empty list is no tools")
+      (is (= 200 (:status (POST "/api/v1/agent_create" {:id "t" :tools ["read_file"]}))))
+      (is (= #{:read_file} (:tools @seen))))))

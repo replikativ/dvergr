@@ -15,6 +15,8 @@
             [dvergr.room.registry :as rreg]
             [dvergr.room.store.memory :as memory]
             [dvergr.tools :as tools]
+            [dvergr.agent.ops]
+            [dvergr.orchestration.daemon]
             [jsonista.core]
             [org.replikativ.spindel.engine.core :as ec]))
 
@@ -321,6 +323,21 @@
                                                   :arguments {:id "   "}}})]
       (is (true? (get-in resp [:result :isError])) (pr-str resp))
       (is (re-find #"id" (-> resp :result :content first :text))))))
+
+(deftest create-takes-the-agents-tools
+  (testing "the advertised schema has :tools, and an empty list reaches provisioning"
+    (let [schema (:inputSchema (some #(when (= "agent_create" (:name %)) %) @server/tool-definitions))]
+      (is (= "array" (get-in schema [:properties :tools :type]))))
+    (let [seen (atom nil)]
+      (with-redefs [server/current-daemon (fn [] {:execution-ctx nil})
+                    dvergr.agent.ops/get-agent (fn [_] nil)
+                    dvergr.orchestration.daemon/provision-agent! (fn [_ fields] (reset! seen fields) {:id (:id fields)})]
+        (let [resp (json-rpc/handle-message (session {:dvergr/profile "admin"})
+                                            {:jsonrpc "2.0" :id 3 :method "tools/call"
+                                             :params {:name "agent_create"
+                                                      :arguments {:id "t" :tools []}}})]
+          (is (false? (get-in resp [:result :isError])) (pr-str resp))
+          (is (= #{} (:tools @seen))))))))
 
 (deftest a-failed-invite-is-an-error-result
   (with-redefs [server/current-daemon (fn [] {:execution-ctx nil})

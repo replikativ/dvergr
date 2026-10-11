@@ -168,7 +168,9 @@
   (is (= {:rooms ["x"]} (fields/normalize {:rooms ["x"] :name "  "}))
       "a blank field is omitted; non-field keys pass through")
   (doseq [bad [{:tags 42} {:provider 7} {:budget-dollars "lots"} {:model :m} {:tags [1]}
-               {:tools 3} {:tools [1]}]]
+               {:tools 3} {:tools [1]} {:tools :typo}
+               {:budget-dollars "Infinity"} {:budget-dollars "1e309"} {:budget-dollars ##Inf}
+               {:budget-dollars ##NaN} {:budget-dollars -1} {:budget-dollars "1e13"}]]
     (is (= 400 (status-of #(fields/normalize bad))) (pr-str bad))))
 
 (def ^:private dmn {:execution-ctx nil})
@@ -186,6 +188,16 @@
   (let [a (ops/get-agent :w)]
     (is (= "m1" (:model a)) "nothing of the patch was applied")
     (is (= #{:old} (:tags a)))))
+
+(deftest update-op-refuses-unknown-tool-profiles-and-unbounded-budgets
+  (ops/create-agent! {:id :w :model "m1" :budget-dollars 0.5})
+  (is (= 400 (status-of #(spec/invoke dmn :agent/update {:id "w" :patch {:tools :typo}}))))
+  (is (= 400 (status-of #(spec/invoke dmn :agent/update {:id "w" :patch {:budget-dollars "Infinity"}}))))
+  (let [a (ops/get-agent :w)]
+    (is (nil? (:tools a)))
+    (is (= 0.5 (:budget-dollars a))))
+  (spec/invoke dmn :agent/update {:id "w" :patch {:tools ["read_file"]}})
+  (is (= #{:read_file} (:tools (ops/get-agent :w))) "tool names are stored"))
 
 (deftest update-op-of-an-unknown-agent-is-an-error
   (is (= 404 (status-of #(spec/invoke dmn :agent/update {:id "ghost" :patch {:model "x"}})))))

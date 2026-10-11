@@ -42,6 +42,10 @@
   (when-not (str/blank? s)
     (try (Double/parseDouble (str/trim s)) (catch Exception _ nil))))
 
+(def max-budget-dollars
+  "The largest budget a wallet can hold: budgets are kept as long microdollars."
+  1.0e12)
+
 (defn- non-blank [s] (let [s (some-> s str/trim)] (when (seq s) s)))
 
 ;; ---------------------------------------------------------------------------
@@ -113,16 +117,23 @@
   [(:k f) {:optional true}
    [(if (= "number" (:json f)) :double :string) {:description (:label f)}]])
 
+(def ^:private tools-entry
+  "The agent's own tools on the wire: tool names; without them its tags choose."
+  [:tools {:optional true}
+   [:sequential {:description "Tool names (e.g. read_file, shell, clojure_eval); [] for none. Omitted: the agent's tags choose."}
+    :string]])
+
 (defn update-schema
   "Malli schema for the :agent/update patch object — every editable field, all
-   optional (a partial patch)."
+   optional (a partial patch), and the agent's tools."
   []
-  (into [:map] (map field-entry) fields))
+  (conj (into [:map] (map field-entry) fields) tools-entry))
 
 (defn create-schema
-  "Malli schema for :agent/create — id (required) plus the editable fields."
+  "Malli schema for :agent/create — id (required) plus the editable fields and
+   the agent's tools."
   []
-  (into [:map [:id [:string {:description "agent id"}]]] (map field-entry) fields))
+  (conj (into [:map [:id [:string {:description "agent id"}]]] (map field-entry) fields) tools-entry))
 
 ;; ---------------------------------------------------------------------------
 ;; Normalization: one shape for every surface
@@ -144,7 +155,10 @@
    tool names (keywords or strings) as a set of keywords."
   [v]
   (cond
-    (keyword? v) v
+    (keyword? v) (if (contains? @(requiring-resolve 'dvergr.tools/tool-profiles) v)
+                   v
+                   (invalid! :tools v (str "no such tool profile; known: "
+                                           (str/join ", " (sort (keys @(requiring-resolve 'dvergr.tools/tool-profiles)))))))
     (or (set? v) (sequential? v))
     (into #{} (map #(cond (keyword? %) %
                           (and (string? %) (not (str/blank? %))) (keyword (str/trim %))
@@ -158,18 +172,23 @@
    (keyword provider, set of keyword tags, number budget) is kept. Anything
    else is refused."
   [k v]
-  (let [{:keys [parse json]} (by-k k)]
+  (let [{:keys [parse json]} (by-k k)
+        budget (fn [x]
+                 (if (and (Double/isFinite x) (<= 0.0 x max-budget-dollars))
+                   x
+                   (invalid! k v (str "a budget is between 0 and " max-budget-dollars " dollars"))))]
     (cond
       (nil? v) nil
       (string? v) (let [parsed (parse v)]
-                    (when (and (nil? parsed) (= "number" json) (not (str/blank? v)))
-                      (invalid! k v "not a number"))
-                    parsed)
+                    (cond
+                      (and (nil? parsed) (= "number" json) (not (str/blank? v))) (invalid! k v "not a number")
+                      (and (some? parsed) (= "number" json)) (budget parsed)
+                      :else parsed))
       (= :tags k) (if (or (set? v) (sequential? v))
                     (into #{} (map #(->tag k %)) v)
                     (invalid! k v "tags are a string or a collection of names"))
       (= :provider k) (if (keyword? v) v (invalid! k v "a provider is a name"))
-      (= "number" json) (if (number? v) (double v) (invalid! k v "not a number"))
+      (= "number" json) (if (number? v) (budget (double v)) (invalid! k v "not a number"))
       :else (invalid! k v "expected a string"))))
 
 (defn normalize
