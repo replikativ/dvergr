@@ -19,6 +19,7 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.tools.cli :as cli]
+            [datahike.blob :as blob]
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.experiment :as experiment]
             [dvergr.agent.experiment.runner :as runner]
@@ -43,8 +44,8 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- room-tree
-  "Every file path under `dir` of `room`'s workspace (relative to the
-   workspace root, no leading slash), through `room_files`."
+  "`{path content-id}` of every file under `dir` of `room`'s workspace
+   (relative to the workspace root, no leading slash), through `room_files`."
   [daemon room dir]
   (loop [todo [dir] acc []]
     (if-let [[d & more] (seq todo)]
@@ -56,8 +57,8 @@
                             acc (into acc entries)]
                         (if next-offset (recur next-offset acc) acc)))]
         (recur (into (vec more) (keep #(when (= "dir" (name (:kind %))) (:path %)) entries))
-               (into acc (keep #(when (= "file" (name (:kind %))) (:path %)) entries))))
-      (mapv #(str/replace % #"^/+" "") acc))))
+               (into acc (keep #(when (= "file" (name (:kind %))) [(:path %) (:content-id %)]) entries))))
+      (into {} (map (fn [[p id]] [(str/replace p #"^/+" "") id])) acc))))
 
 (defn- batches
   "`files` (`{path content}`) in batches one `room_write` takes."
@@ -79,8 +80,15 @@
    nothing). Returns the commits."
   [daemon room name files]
   (let [dir (str "workflows/" name)
-        wanted (into {} (map (fn [[p t]] [(str dir "/" p) {"text" t}])) files)
-        stale (remove #(contains? wanted %) (room-tree daemon room dir))
+        there (room-tree daemon room dir)
+        ;; what is already there as given is not written again: a resumed
+        ;; run writes nothing
+        wanted (into {} (keep (fn [[p t]]
+                                (let [path (str dir "/" p)]
+                                  (when-not (= (get there path) (str (blob/blob-id (.getBytes ^String t "UTF-8"))))
+                                    [path {"text" t}]))))
+                     files)
+        stale (remove #(contains? files (subs % (inc (count dir)))) (keys there))
         b (room-wf/bundle name files)
         write! (fn [batch]
                  (when (seq batch)
@@ -121,6 +129,14 @@
        (filter #(= experiment-id (str (:experiment/content-id %))))
        (mapcat :candidates) (map :verdicts) (reduce + 0)))
 
+(defn- verify!
+  "Throw unless `found` (the content id of the bundle an op read from the
+   room) is `b`'s."
+  [b found]
+  (when-not (= (str (:id b)) (some-> found str))
+    (throw (ex-info (str "The room's workflows/" (:name b) "/ is not the bundle given")
+                    {:type ::bundle-mismatch :expected (str (:id b)) :found found}))))
+
 (defn benchmark!
   "Benchmark bundle `b` (with its `:files`, e.g. from `room-wf/read-dir`) in
    the home `home`, through the ops an MCP client calls: the room <name>
@@ -151,16 +167,12 @@
       (when-not (ops/resolve-room daemon name)
         (ops/invoke daemon :room/create {:title (str "Workflow " (get-in b [:definition :title] name)) :slug name}))
       (sync-bundle! daemon name name files)
-      ;; what the room now holds is exactly the bundle given: the benchmark
-      ;; reads it back from there
-      (let [{:keys [ok bundle problems]} (ops/invoke daemon :catalog/check {:room name :name name})]
-        (when-not (and ok (= (str (:id b)) bundle))
-          (throw (ex-info (str "The room's workflows/" name "/ is not the bundle given"
-                               (when (seq problems) (str ": " (str/join "; " problems))))
-                          {:type ::bundle-mismatch :expected (str (:id b)) :found bundle :problems problems}))))
+      ;; what the benchmark reads back from the room must be exactly the
+      ;; bundle given (`verify!` on what calibrate/benchmark report)
       (if check?
-        {:home (str home) :room name
-         :calibration (ops/invoke daemon :catalog/calibrate {:room name :name name})}
+        (let [c (ops/invoke daemon :catalog/calibrate {:room name :name name})]
+          (verify! b (:bundle c))
+          {:home (str home) :room name :calibration c})
         (let [args (cond-> {:workflow (str name "/" name) :models (vec models) :room name :experiment name
                             :repetitions (or repetitions 1)}
                      budget-dollars (assoc :budget-dollars (double budget-dollars))
@@ -175,6 +187,10 @@
               [done exp-id report]
               (loop [n 0]
                 (let [{exp-id :experiment :as job} (ops/invoke daemon :catalog/benchmark args)
+                      _ (try (verify! b (:bundle job))
+                             (catch Throwable t
+                               (ops/invoke daemon :job/cancel {:job (:id job)})
+                               (throw t)))
                       st (wait-for daemon job)
                       report (report-of exp-id)]
                   ;; cells that faulted (a lost connection, a provider

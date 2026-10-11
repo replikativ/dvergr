@@ -1212,6 +1212,8 @@
                   (assoc :op "catalog/benchmark" :task workflow :models models
                          ;; its ExperimentDef: experiment_report {room, experiment}
                          :experiment (str (:experiment/content-id exp))
+                         ;; a room workflow: the content id of the bundle it read
+                         :bundle (get-in plan [:dataset :metadata :bundle])
                          :room (if control (id->str (:id control)) slug)
                          :poll-after-ms 30000)
                   (cond-> control (assoc :fixture-room slug)))))}

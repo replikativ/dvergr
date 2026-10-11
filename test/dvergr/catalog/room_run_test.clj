@@ -192,21 +192,27 @@
         (is (zero? @calls))
         (is (= 2 (:failed-cells r)))))))
 
-(deftest a-bundle-of-many-files-is-read-back-whole
-  ;; more files than a workspace listing reads: a bundle missing some of its
-  ;; cases would still score
+(deftest a-bundle-of-more-files-than-a-listing-reads-is-read-back-whole
+  ;; a workspace listing reads at most `max-files` (500): with it at 3, the
+  ;; bundle (six files) is still read whole, else it would lose cases and
+  ;; still score
   (let [home (tmp "dvergr-room-run-home-")
-        many (into case-files
-                   (mapcat (fn [i] [[(str "cases/c" i "/gold.edn") (pr-str {:a (str i)})]
-                                    [(str "cases/c" i "/fixtures/docs/q.txt") (str i "+0")]]))
-                   (range 300))
-        b (room-wf/bundle "sums" many)
-        r (room-run/benchmark! b {:home home :check? true})]
-    (is (= "sums" (:room r)))
-    (is (map? (:calibration r)))
-    (runner/with-home home
-      (fn [daemon]
-        (is (= (str (:id b)) (:bundle (ops/invoke daemon :catalog/check {:room "sums" :name "sums"}))))))))
+        b (room-wf/bundle "sums" case-files)]
+    (with-redefs-fn {#'dvergr.catalog.workspace/max-files 3}
+      (fn []
+        (let [r (room-run/benchmark! b {:home home :check? true})]
+          (is (= (str (:id b)) (get-in r [:calibration :bundle]))))
+        (runner/with-home home
+          (fn [daemon]
+            (let [room (ops/resolve-room daemon "sums")]
+              (is (= 3 (count (dvergr.catalog.workspace/read-tree room "/workflows/sums")))
+                  "an ordinary listing stops at its bound"))))))
+    (testing "a second run writes nothing: the room already holds the bundle"
+      (let [writes (atom 0)
+            invoke ops/invoke]
+        (with-redefs [ops/invoke (fn [d k a] (when (= :room/write k) (swap! writes inc)) (invoke d k a))]
+          (room-run/benchmark! b {:home home :check? true}))
+        (is (zero? @writes))))))
 
 (deftest a-bundle-that-cannot-be-listed-whole-is-not-read
   (let [home (tmp "dvergr-room-run-home-")
