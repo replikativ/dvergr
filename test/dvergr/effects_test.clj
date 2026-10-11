@@ -587,7 +587,9 @@
                           llm-call/cheap-llm-call (fn [& _] (swap! touched conj :model) {:text "x"})
                           dvergr.scheduler.core/create-schedule! (touch :schedule)
                           dvergr.scheduler.core/cancel-schedule! (touch :unschedule)
-                          dvergr.intake.mail/sync-inbox! (touch :mail)]
+                          dvergr.intake.mail/sync-inbox! (touch :mail)
+                          dvergr.intake.mail/list-inbox (touch :inbox)
+                          dvergr.intake.mail/account-open? (constantly false)]
               (testing "file writers: structural edits too"
                 (is (denied? (run "clojure_edit" {:file_path "x.clj" :form_type "def" :form_name "x"
                                                   :operation "replace" :new_source "(def x 2)"})))
@@ -611,7 +613,8 @@
                 (is (denied? (run "spawn_agent" {:task "t"})))
                 (is (denied? (run "propose_change" {:task "t"})))
                 (let [r (run "mail_sync" {})]
-                  (is (re-find #"read-only" (str (:error r) (:result r))) (pr-str r))))
+                  (is (re-find #"read-only" (str (:error r) (:result r))) (pr-str r)))
+                (is (denied? (run "mail_inbox" {})) "a read that first opens the store writes"))
               (testing "native evaluation runs past every capability, so it is the effect"
                 (is (denied? (run "clojure_eval" {:code "(spit \"z.txt\" \"x\")"})))
                 (is (not (.exists (io/file root "z.txt")))))
@@ -653,16 +656,40 @@
     (is (some? (tools/effect-classification @(requiring-resolve 'dvergr.agent.arenas.renewal/renewal-plan-tool)))))
   (testing "a tool handed to an agent that declares nothing is assumed to write and reach out"
     (let [ec (ctx/create-execution-context)
-          ran (atom false)]
+          ran (atom [])
+          root (.getAbsoluteFile (doto (io/file (System/getProperty "java.io.tmpdir") (str "unclassified-" (random-uuid))) .mkdirs))]
       (try
         (let [cctx (turn/new-working-ctx {:execution-ctx ec :title "unclassified" :durable? false :agent-id :mcp/code
                                           :effects [[:read-only]]})
-              tool {:name "mystery" :execute (fn [_ _] (reset! ran true) {:type :success :content "did it"})}
-              tctx (tools/make-context {:cwd (System/getProperty "java.io.tmpdir") :chat-ctx cctx :execution-ctx ec
-                                        :tools {"mystery" tool}})]
-          (is (denied? (binding [rtc/*execution-context* ec] (tools/execute "mystery" {} tctx))))
-          (is (false? @ran)))
-        (finally (ctx/stop-context! ec))))))
+              tool (fn [n & {:as more}]
+                     (merge {:name n :execute (fn [_ _] (swap! ran conj n) {:type :success :content "did it"})} more))
+              tctx (tools/make-context {:cwd (str root) :chat-ctx cctx :execution-ctx ec
+                                        :tools {"mystery" (tool "mystery")
+                                                ;; a replacement under a built-in's name does
+                                                ;; not inherit the built-in's classification
+                                                "write_file" (tool "write_file")
+                                                "nil-effect" (tool "nil-effect" :effect (fn [_] nil))
+                                                "bogus" (tool "bogus" :effect :bogus)
+                                                "reads" (tool "reads" :effect (fn [_] :reads))}})
+              run #(binding [rtc/*execution-context* ec] (tools/execute % {} tctx))]
+          (doseq [n ["mystery" "write_file" "nil-effect" "bogus"]]
+            (is (denied? (run n)) n))
+          (is (= :success (:type (run "reads"))) "a tool that says it reads runs")
+          (is (= ["reads"] @ran)))
+        (finally (ctx/stop-context! ec) (doseq [f (reverse (file-seq root))] (.delete f)))))))
+
+(deftest native-evaluation-needs-every-class
+  (let [ec (ctx/create-execution-context)
+        root (.getAbsoluteFile (doto (io/file (System/getProperty "java.io.tmpdir") (str "native-" (random-uuid))) .mkdirs))]
+    (try
+      (let [cctx (turn/new-working-ctx {:execution-ctx ec :title "native" :durable? false :agent-id :mcp/code
+                                        :effects [[:admit #{:process :global}]]})
+            tctx (tools/make-context {:cwd (str root) :chat-ctx cctx :execution-ctx ec :isolation :native})
+            r (binding [rtc/*execution-context* ec]
+                (tools/execute "clojure_eval" {:code "(+ 1 2)"} tctx))]
+        (is (= :error (:type r)))
+        (is (re-find #"not granted" (str (:error r)))))
+      (finally (ctx/stop-context! ec) (doseq [f (reverse (file-seq root))] (.delete f))))))
 
 (deftest read-only-denies-every-sandbox-writer
   (testing "actors, tasks and skills: the global registry surface"
@@ -716,6 +743,8 @@
       (with-redefs [dvergr.sandbox.deps/add-libs! (touch :add-libs)
                     dvergr.sandbox.deps/sync-deps! (touch :sync-deps)
                     dvergr.intake.mail/sync-inbox! (touch :mail)
+                    dvergr.intake.mail/list-inbox (touch :inbox)
+                    dvergr.intake.mail/account-open? (constantly false)
                     org.replikativ.spindel.yggdrasil/gc! (touch :gc)
                     llm-call/cheap-llm-call (fn [& _] (swap! touched conj :model) {:text "x"})]
         (with-world-sandbox {:effects {:handlers [[:read-only]]}}
@@ -725,11 +754,20 @@
                           "(clojure.repl.deps/add-libs '{foo/bar {:mvn/version \"1.0\"}})"
                           "(clojure.repl.deps/sync-deps)"
                           "(intake.mail/sync!)"
+                          "(intake.mail/inbox)"
                           "(llm/call \"s\" \"c\")"]]
               (is (re-find #"read-only" (str (:err (eval code)))) code))
             (testing "reads still run"
               (is (contains? (eval "(dvergr.room/databases)") :ok) "a read is not refused")))))
-      (is (empty? @touched) "no refused writer ran"))))
+      (is (empty? @touched) "no refused writer ran"))
+    (testing "reading an open mail store is not an effect"
+      (let [touched (atom [])]
+        (with-redefs [dvergr.intake.mail/list-inbox (fn [& _] (swap! touched conj :inbox) [])
+                      dvergr.intake.mail/account-open? (constantly true)]
+          (with-world-sandbox {:effects {:handlers [[:read-only]]}}
+            (fn [{:keys [eval]}]
+              (is (= [] (:ok (eval "(intake.mail/inbox)")))))))
+        (is (= [:inbox] @touched))))))
 
 (def ^:private gen-host
   (gen/elements ["a.com" "docs.a.com" "x.docs.a.com" "b.com" "c.org" "docs.c.org"]))

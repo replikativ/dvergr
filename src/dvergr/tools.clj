@@ -309,7 +309,8 @@
    reach out), and a test fails on it. A value is one of:
 
    - a function of the input returning the effect, decided before the tool
-     runs;
+     runs (or `:reads` when this input reads only; anything else that is not
+     an effect is performed as `:tool/call`);
    - `:inner`: the tool's effects pass the boundary inside it, at the shared
      gates (`workspace-write!`, `transact!`; `run_tests` evaluates in the
      sandbox, whose capabilities perform their own);
@@ -319,7 +320,10 @@
    - `:reads`: it only reads (a database query, the session's code index, the
      budget), which is not an effect, as a sandbox query is not.
 
-   A tool defined elsewhere declares the same under `:effect`."
+   These are stamped onto the tool definitions registered here (`:effect`), so
+   a classification belongs to its implementation, not to a name: another
+   tool under the same name (an agent-local replacement) is unclassified
+   until it declares its own. A tool defined elsewhere declares `:effect`."
   {"read_file"  (fn [{:keys [path]}] {:effect :fs/read :resource {:path (str path)}})
    "write_file" :inner
    "edit_file"  :inner
@@ -344,11 +348,10 @@
                             {:effect :actor/write :resource {:op :system-prompt :actor (str agent-name)}})})
 
 (defn effect-classification
-  "How `tool` passes the effect boundary (see `tool-effects`): its own
-   `:effect`, else the registry's entry for its name; nil when it has none,
-   or one that is not a classification."
+  "How `tool` passes the effect boundary (see `tool-effects`): its `:effect`;
+   nil when it has none, or one that is not a classification."
   [tool]
-  (let [c (or (:effect tool) (get tool-effects (:name tool)))]
+  (let [c (:effect tool)]
     (when (or (fn? c) (contains? #{:inner :eval :reads} c)) c)))
 
 (defn- unclassified-effect [tool-name]
@@ -423,10 +426,16 @@
                            (when-let [handler-fn (:handler tool)]
                              (handler-fn input)))
                     effect-of (or (effect-classification tool)
-                                  (effect-classification {:name tool-name})
                                   (unclassified-effect tool-name))
                     effect (cond
-                             (fn? effect-of) (effect-of input)
+                             (fn? effect-of)
+                             (let [e (effect-of input)]
+                               (cond
+                                 (= :reads e) nil
+                                 (and (map? e) (keyword? (:effect e))) e
+                                 ;; not an effect: fail closed
+                                 :else ((unclassified-effect tool-name) input)))
+
                              (and (= :eval effect-of) (= :native (:isolation ctx)))
                              {:effect :eval/native :resource {:code (effects/digest (str (:code input)))}})
                     result (try
@@ -1564,7 +1573,9 @@ Note: changes take effect on the next agent restart or reload."
                      run! (ns-resolve kondo-ns 'run!)
                       ;; Paths under cwd only, like the file tools
                      paths (mapv #(physical-path cwd %) lint)
-                     opts (cond-> {:lint paths}
+                     ;; no cache: linting reads, and the cache would write
+                     ;; `.clj-kondo/.cache` past the boundary
+                     opts (cond-> {:lint paths :cache false}
                             config (assoc :config config))
                      result (run! opts)
                      findings (:findings result)
@@ -1927,6 +1938,15 @@ Note: changes take effect on the next agent restart or reload."
  (delegation-tool
   "propose_change" :review
   "Delegate a bounded task to a specialized AgentDef and retain its isolated Run world for review instead of merging it. Returns the Run and world identities used by the canonical proposal flow. Paid recursive delegation requires explicit provider-effect authority."))
+
+(defn- classify-registered!
+  "Stamp `tool-effects` onto the tools registered above (see there)."
+  []
+  (doseq [[tool-name classification] tool-effects]
+    (swap! registry (fn [r] (cond-> r (contains? r tool-name)
+                                    (assoc-in [tool-name :effect] classification))))))
+
+(classify-registered!)
 
 (comment
   ;; Test tools
