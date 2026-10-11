@@ -176,13 +176,9 @@
     (is (= before (commits r)))))
 
 (deftest a-failure-after-staging-undoes-index-and-files
-  (let [r (room)
-        execute-git gs/execute-git]
+  (let [r (room)]
     (files/write! r {"a.txt" {:text "old"} "gone.txt" {:text "keep me"}} {})
-    (with-redefs [gs/execute-git (fn [ws argv]
-                                   (if (= "commit" (first argv))
-                                     {:exit 1 :stdout "" :stderr "boom"}
-                                     (execute-git ws argv)))]
+    (with-redefs [repo/commit! (fn [& _] (throw (ex-info "boom" {})))]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"boom"
                             (files/write! r {"a.txt" {:text "new"} "b/c.txt" {:text "c"} "gone.txt" nil} {}))))
     (is (= "old" (worktree-text r "/a.txt")))
@@ -317,20 +313,39 @@
 
 (deftest the-undo-keeps-a-write-made-while-it-runs
   (let [r (room)
-        execute-git gs/execute-git
         restore-paths! repo/restore-paths!]
     (files/write! r {"a.txt" {:text "old"}} {})
-    (with-redefs [gs/execute-git (fn [ws argv]
-                                   (if (= "commit" (first argv))
-                                     {:exit 1 :stdout "" :stderr "boom"}
-                                     (execute-git ws argv)))
+    (with-redefs [repo/commit! (fn [& _] (throw (ex-info "boom" {})))
                   ;; the undo's first step; an agent writes right after it
                   repo/restore-paths! (fn [& args]
                                         (let [res (apply restore-paths! args)]
                                           (mfs/write-string! (ws/room-fs r) "/a.txt" "the agent's" false)
                                           (mfs/write-string! (ws/room-fs r) "/new.txt" "the agent's too" false)
+                                          (mfs/write-string! (ws/room-fs r) "/d/agent.txt" "beneath" false)
                                           res))]
       (is (thrown? clojure.lang.ExceptionInfo
-                   (files/write! r {"a.txt" {:text "mine"} "new.txt" {:text "mine"}} {}))))
+                   (files/write! r {"a.txt" {:text "mine"} "new.txt" {:text "mine"} "d/e/mine.txt" {:text "m"}} {}))))
     (is (= "the agent's" (worktree-text r "/a.txt")))
-    (is (= "the agent's too" (worktree-text r "/new.txt")) "not deleted as the batch's own")))
+    (is (= "the agent's too" (worktree-text r "/new.txt")) "not deleted as the batch's own")
+    (is (= "beneath" (worktree-text r "/d/agent.txt")) "a directory the batch made stays while it holds a file")
+    (is (not (mfs/exists? (ws/room-fs r) "/d/e")) "an empty one it made is gone")))
+
+(deftest a-file-named-like-an-option-commits-only-itself
+  (let [r (room)]
+    (mfs/write-string! (ws/room-fs r) "/scratch.txt" "a draft" false)
+    (is (string? (:commit (files/write! r {"-A" {:text "x"}} {}))))
+    (is (contains? (repo/tree (conn r) :head) "-A"))
+    (is (not (contains? (repo/tree (conn r) :head) "scratch.txt")) "only the named path")
+    (is (some #(str/includes? % "scratch.txt") (forks/workspace-changes r)))))
+
+(deftest a-read-reads-what-it-checked
+  (let [r (room)
+        read-entry repo/read-entry]
+    (files/write! r {"public.txt" {:text "public"}} {})
+    (mfs/write-string! (ws/room-fs r) "/.env" "SECRET=1" false)
+    (with-redefs [repo/read-entry (fn [conn entry]
+                                    ;; the path becomes a link to .env before the bytes are read
+                                    (mfs/delete (ws/room-fs r) "/public.txt")
+                                    (mfs/symlink (ws/room-fs r) ".env" "/public.txt")
+                                    (read-entry conn entry))]
+      (is (= "public" (:text (files/read-file r "public.txt" {})))))))

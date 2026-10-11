@@ -278,45 +278,48 @@
                                 {:type ::workspace-commit-failed :room (:id room) :argv argv}))))))))
     changes))
 
+(defn- configured-author
+  "The author a Git commit in this repository gets: its user.name and
+   user.email, as geschichte's `git commit` reads them."
+  [conn]
+  (let [cfg (repo/configuration conn)
+        n (get cfg "user.name") e (get cfg "user.email")]
+    (cond (and n e) (str n " <" e ">") n n :else "unknown")))
+
 (defn commit-paths!
   "Commit exactly the paths of `expected` (`{path content-id}`, nil for a
    removed path) in `room`'s workspace as one commit with `message`, under
-   the workspace lock. The index must hold nothing else staged, and once the
+   the workspace lock. The paths are staged by name (`repo/stage!`, no
+   pathspec parsing). The index must hold nothing else staged, and once the
    paths are staged they must hold the expected content: otherwise nothing is
    committed (a concurrent writer changed them) and it throws. Returns the
    commit id, or nil when the paths already match HEAD."
   [room expected message]
   (binding [ec/*execution-context* (:ctx room)]
-    (let [{:keys [conn] :as workspace} (or (git/current-workspace)
-                                           (throw (ex-info "Room has no workspace"
-                                                           {:type ::no-workspace :room (:id room)})))
+    (let [{:keys [conn]} (or (git/current-workspace)
+                             (throw (ex-info "Room has no workspace"
+                                             {:type ::no-workspace :room (:id room)})))
           rel #(str/replace (str %) #"^/+" "")
           expected (update-keys expected rel)
-          git! (fn [argv]
-                 (let [{:keys [exit stderr]} (git/execute-git workspace argv)]
-                   (when-not (zero? exit)
-                     (throw (ex-info (str "git " (first argv) " failed in " (:id room) ": " stderr)
-                                     {:type ::workspace-commit-failed :room (:id room) :argv argv})))))]
+          paths (vec (sort (keys expected)))]
       (locking (git/workspace-lock conn)
         (let [staged (:staged (repo/status conn))]
-          (when (seq (remove (set (keys expected)) staged))
+          (when (seq (remove (set paths) staged))
             (throw (ex-info (str "The workspace of " (name (:id room)) " has staged changes ("
                                  (str/join ", " (take 5 staged)) "); commit them first")
                             {:type ::staged-changes :room (:id room) :staged staged}))))
-        (let [known (into (set (keys (repo/index-tree conn))) (repo/files conn))
-              paths (vec (sort (filter known (keys expected))))]
-          (when (seq paths)
-            ;; -f: a path the caller names is committed even when .gitignore matches it
-            (git! (into ["add" "-f" "--"] paths))
-            (let [index (repo/index-tree conn)
-                  differs (filter #(not= (some-> (get expected %) str) (some-> (get index %) :content str))
-                                  (keys expected))]
-              (when (seq differs)
-                (throw (ex-info (str "Changed while it was written: " (str/join ", " differs))
-                                {:type ::concurrent-change :room (:id room) :paths (vec differs)}))))
-            (when (seq (:staged (repo/status conn)))
-              (git! ["commit" "-q" "-m" message])
-              (some-> (repo/head-commit conn) :geschichte.commit/id str))))))))
+        (when (seq paths)
+          (repo/stage! conn paths)
+          (let [index (repo/index-tree conn)
+                staged (:staged (repo/status conn))
+                differs (concat (filter #(not= (get expected %) (some-> (get index %) :content str)) paths)
+                                (remove (set paths) staged))]
+            (when (seq differs)
+              (throw (ex-info (str "Changed while it was written: " (str/join ", " differs))
+                              {:type ::concurrent-change :room (:id room) :paths (vec differs)})))
+            (when (seq staged)
+              (some-> (repo/commit! conn {:message message :author (configured-author conn)})
+                      :geschichte.commit/id str))))))))
 
 (defn- prepare-workspaces!
   "Make `fork` mergeable into `parent`: commit the fork's work (a merge adopts

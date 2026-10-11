@@ -165,6 +165,8 @@
       (not (re-find #"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]" text)))
     (catch CharacterCodingException _ false)))
 
+(def ^:private symlink-mode "Git's mode of a symbolic link (0120000)." 0120000)
+
 (defn- continuation? [^bytes bytes i]
   (and (< i (alength bytes)) (= 0x80 (bit-and (aget bytes i) 0xC0))))
 
@@ -178,16 +180,19 @@
    `:next-offset` says where."
   [room path {:keys [offset length max] :or {max max-read-bytes}}]
   (let [{:keys [conn] :as ws} (workspace! room)
-        fs (gs/filesystem ws)
         p (workspace-path path)
-        st (mfs/stat fs p)]
-    (case (:type st)
-      :file nil
-      :dir (throw (ex-info (str "A directory: " p " (room_files lists it)") {:type ::directory :path p}))
-      nil (throw (ex-info (str "No such file: " p) {:type ::not-found :path p}))
+        ;; one worktree entry, read by its content id: what is checked is
+        ;; what is read, whatever replaces the path meanwhile
+        {:keys [content mode] :as entry} (get (repo/worktree conn) (rel p))]
+    (cond
+      (nil? entry)
+      (if (= :dir (:type (mfs/stat (gs/filesystem ws) p)))
+        (throw (ex-info (str "A directory: " p " (room_files lists it)") {:type ::directory :path p}))
+        (throw (ex-info (str "No such file: " p) {:type ::not-found :path p})))
       ;; a link's target is not checked against the path rules: not followed
+      (= symlink-mode (bit-and (long (or mode 0)) 0170000))
       (refuse (str p " is a symbolic link, which room_read does not follow") {:path p}))
-    (let [^bytes bytes (or (mfs/read-bytes fs p) (byte-array 0))
+    (let [^bytes bytes (or (repo/read-entry conn entry) (byte-array 0))
           size (alength bytes)
           offset (long (or offset 0))
           length (long (min max (or length max)))
@@ -204,7 +209,7 @@
               (refuse (str "length " length " is shorter than the character at offset " offset)
                       {:path p :offset offset :length length}))
           n (- end offset)]
-      (cond-> {:path p :size size :content-id (get (content-ids conn) p)
+      (cond-> {:path p :size size :content-id (str content)
                :media-type (media-type p text?) :offset offset :length n}
         text? (assoc :text (String. bytes (int offset) (int n) StandardCharsets/UTF_8))
         (not text?) (assoc :base64 (.encodeToString (Base64/getEncoder)
@@ -300,18 +305,36 @@
                        (when eid [[:db/retractEntity eid]])))))
                paths)))
 
+(defn- remove-empty-dirs-tx
+  "Transaction function: retract the explicit directories `dirs` (absolute)
+   that nothing lies beneath, deepest first, in the transactor. A file that
+   took a directory's place is not a directory entry, so it is left alone."
+  [db dirs]
+  (let [files (map first (d/q '[:find ?p :where [_ :geschichte.work/path ?p]] db))
+        explicit (into {} (d/q '[:find ?p ?e :where [?e :geschichte.work-dir/path ?p]] db))]
+    (loop [[dir & more] (sort-by count > (map rel dirs)) gone #{} tx []]
+      (if-not dir
+        tx
+        (let [prefix (str dir "/")
+              eid (get explicit dir)
+              beneath (some #(str/starts-with? % prefix)
+                            (concat files (remove gone (keys explicit))))]
+          (if (and eid (not beneath))
+            (recur more (conj gone dir) (conj tx [:db/retractEntity eid]))
+            (recur more gone tx)))))))
+
 (defn- restore!
   "Undo this batch's changes: the index of its paths back to HEAD (where it
    was: nothing was staged), the files it wrote or removed back to `before`
    unless someone else changed them since (`restore-tx`), and the
    directories it created, when empty."
-  [conn fs before expected touched created]
+  [conn before expected touched created]
   (try (repo/restore-paths! conn (mapv rel (keys expected)) {:source :head :staged? true :worktree? false})
        (catch Throwable _ nil))
   (try (when (seq touched) (d/transact conn [[:db.fn/call restore-tx before expected (vec touched)]]))
        (catch Throwable _ nil))
-  (doseq [dir (sort-by count > created)]
-    (try (when (empty? (mfs/list-dir fs dir)) (mfs/delete fs dir)) (catch Throwable _ nil))))
+  (try (when (seq created) (d/transact conn [[:db.fn/call remove-empty-dirs-tx (vec created)]]))
+       (catch Throwable _ nil)))
 
 (defn host-boundary
   "The effect boundary for a write made on `room` by a client outside it: the
@@ -371,7 +394,7 @@
                                 (swap! touched conj p))))
                         (forks/commit-paths! room expected message)
                         (catch Throwable e
-                          (restore! conn fs before expected @touched created)
+                          (restore! conn before expected @touched created)
                           (throw e)))))
             ids (content-ids conn)]
         {:commit commit
