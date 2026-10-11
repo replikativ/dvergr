@@ -45,7 +45,8 @@
           {:content "All done. ###STOP###"})))))
 
 (defn- lab [dir dom task-id specs]
-  (conv/isolate-home! dir)
+  (paths/set-home! (str dir "/home"))
+  (sdb/reset-conn!)
   (let [xs (conv/open-store! dir)
         room (d/make-room {:id :tau2/lab-test :store (:store xs)})
         team (tx/candidate-roster specs dom)]

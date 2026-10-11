@@ -34,6 +34,7 @@
             [dvergr.agent.grounds :as grounds]
             [dvergr.catalog :as catalog]
             [dvergr.catalog.casepack :as casepack]
+            [dvergr.catalog.report :as report]
             [dvergr.catalog.room :as room-wf]
             [dvergr.catalog.workspace :as catalog-ws]
             [dvergr.agent.trajectory :as trajectory]
@@ -400,6 +401,12 @@
             :review (when (and world (rreg/lookup world))
                       (workflow/review world))}))))
 
+(defonce ^:private job-experiments
+  ;; job id -> the ExperimentDef content id a `catalog/benchmark` job runs:
+  ;; what names its Scorecard when every cell resumed (no child Run to read
+  ;; it from). Process-local; after a restart the child Runs say it.
+  (atom {}))
+
 (defn- job-result
   "What a finished job produced, read from its room's store."
   [daemon {:keys [id kind room-value status]}]
@@ -414,17 +421,27 @@
                                    rows))
                 :experiment
                 ;; The Scorecard of this job's experiment: a room may keep several.
-                (let [exps (->> (run/runs room-value {:root-run-id id :limit 1000})
-                                (filter #(= id (:run/parent %)))
-                                (keep #(attempts/attempt room-value (:run/id %)))
-                                (keep #(get-in % [:attempt/receipt :attempt/metrics :experiment-content-id]))
-                                set)
+                (let [exps (or (some-> (get @job-experiments id) hash-set)
+                               (->> (run/runs room-value {:root-run-id id :limit 1000})
+                                    (filter #(= id (:run/parent %)))
+                                    (keep #(attempts/attempt room-value (:run/id %)))
+                                    (keep #(get-in % [:attempt/receipt :attempt/metrics :experiment-content-id]))
+                                    set))
                       sc (some #(first (experiment/scorecards room-value {:experiment-content-id % :limit 1}))
                                exps)]
                   (cond-> {:room (id->str (:id room-value))}
-                    sc (assoc :summary (:scorecard/summary sc))
+                    ;; its ExperimentDef (one per job) and Scorecard: what
+                    ;; experiment_report and scorecard_detail take
+                    (= 1 (count exps)) (assoc :experiment (str (first exps)))
+                    sc (assoc :summary (:scorecard/summary sc)
+                              :scorecard (str (:scorecard/content-id sc)))
                     (nil? sc) (assoc :incomplete (experiment/progress room-value))))
                 nil)))))
+
+(defn- refused-reason
+  "The reason an experiment job records when cells were not admitted."
+  [result]
+  (when (:refused result) :refused))
 
 (defn- job-data
   "A job as plain data; `result?` adds what it produced once completed."
@@ -438,6 +455,7 @@
             :finished-at (:finished-at job)}
      (:error job) (assoc :error (:error job))
      (:reason job) (assoc :reason (name (:reason job)))
+     (contains? job :settled?) (assoc :settled (:settled? job))
      result? (assoc :result (job-result daemon job)))))
 
 (defn- start-workflow-job
@@ -572,6 +590,26 @@
     :impl (fn [daemon {:keys [room]}]
             (when-let [r (resolve-room daemon room)]
               (in-ctx daemon (experiment/progress r))))}
+
+   :experiment/report
+   {:doc (str "The report of an experiment kept in a room, as Markdown: per candidate how often it "
+              "passed (95% interval), mean reward, cost per attempt and per pass at list price, tokens "
+              "and time; which checks fail; for a case pack, which cases could not grade an answer. "
+              "From the room's store: the Scorecard `scorecard`, else the newest of the ExperimentDef "
+              "`experiment`, else the room's newest; without a Scorecard, what it has certified so far.")
+    :kind :read
+    :schema [:map [:room Room]
+             [:scorecard {:optional true} [:string {:description "scorecard content id"}]]
+             [:experiment {:optional true} [:string {:description "ExperimentDef content id"}]]
+             [:title {:optional true} :string]]
+    :impl (fn [daemon {:keys [room scorecard experiment title]}]
+            (let [r (or (resolve-room daemon room)
+                        (op-error! (str "No room " room) ::no-room 404 {:room room}))]
+              (in-ctx daemon
+                      (binding [ec/*execution-context* (:ctx r)]
+                        (report/room-report r {:scorecard (some-> scorecard uuid-arg)
+                                               :experiment (some-> experiment uuid-arg)
+                                               :title title})))))}
 
    :catalog/list
    {:doc (str "Workflows that come with their own checker and benchmark set; run one with catalog_start. "
@@ -1103,6 +1141,12 @@
              [:noise {:optional true} [:int {:min 0 :max 4 :description "kinds of noise in generated documents: 1 scan artefacts, 2 and an erratum, 3 and short names, 4 and retyped documents (wiki/v3; default 0)"}]]
              [:split {:optional true} [:enum {:description "dev (public, the default), test (held out: the host's key) or real (real corpora)"} "dev" "test" "real"]]
              [:repetitions {:optional true} [:int {:min 1 :max 10 :description "attempts per model (default 1)"}]]
+             [:experiment {:optional true} [:string {:description "a name for the experiment, kept: benchmarking again with the same name, workflow and models into the same room resumes it (cells with a verdict are kept, faulted ones run again); default a new one"}]]
+             [:cases {:optional true} [:int {:min 1 :description "a dataset workflow's first N cases of a fixed shuffle (default all)"}]]
+             [:case-ids {:optional true} [:vector {:description "instead of cases: the ids of the cases to run"} :string]]
+             [:parallelism {:optional true} [:int {:min 1 :max 16 :description "attempts at a time (default 1)"}]]
+             [:params {:optional true} [:map-of {:description "a room workflow's task parameters, over its workflow.edn :params"} :keyword :any]]
+             [:prompt {:optional true} [:string {:description "the candidates' system prompt (default the workflow's)"}]]
              [:budget-dollars {:optional true} [:double {:description "budget per attempt in USD (default 0.50)"}]]
              [:timeout-ms {:optional true} [:int {:description "per attempt (default 10 minutes)"}]]]
     :impl (fn [daemon {:keys [workflow models repetitions room] :as args}]
@@ -1120,7 +1164,11 @@
                   control (when room
                             (or (resolve-room daemon room)
                                 (throw (ex-info (str "No room " room) {:type ::no-room :room room}))))
-                  plan (plan-fn (cond-> (select-keys args [:models :budget-dollars :timeout-ms])
+                  _ (when (and (:experiment args) (not (re-matches #"[a-z0-9][a-z0-9-]{0,63}" (:experiment args))))
+                      (op-error! (str "An experiment name is lowercase letters, digits and dashes: " (:experiment args))
+                                 ::invalid-experiment 400 {:experiment (:experiment args)}))
+                  plan (plan-fn (cond-> (cond-> (select-keys args [:models :budget-dollars :timeout-ms :cases :params :prompt])
+                                          (:case-ids args) (assoc :cases (vec (:case-ids args))))
                                   (:environments args) (assoc :n (:environments args))
                                   (:split args) (assoc :split (keyword (:split args)))
                                   (:scale args) (assoc :scale (:scale args))
@@ -1130,29 +1178,42 @@
                   r (in-ctx daemon
                             (rooms/create-room! {:title (str (:title wf) " (benchmark)") :slug slug})
                             (rreg/lookup (keyword slug)))
-                  exp (runner/experiment-def (assoc plan :id (keyword slug) :repetitions (or repetitions 1)))
+                  exp (runner/experiment-def (assoc plan :id (keyword (or (:experiment args) slug))
+                                                    :repetitions (or repetitions 1)
+                                                    ;; the host's versions: a resume never mixes two
+                                                    :metadata (merge (:metadata plan) (runner/runtime-identity models))))
                   ;; no new cell once the run has taken its share of a
                   ;; subscription window (the user's own quota)
-                  plan (assoc plan :admit (runner/admit-for models))]
+                  plan (cond-> (assoc plan :admit (runner/admit-for models))
+                         (:parallelism args) (assoc :parallelism (:parallelism args)))]
               (-> (in-ctx daemon
-                          (if control
+                          (doto
+                           (if control
                             ;; The records in `control`, the worlds forked from `r`.
-                            (jobs/start! control {:kind :experiment :ctx (:ctx r)}
-                                         #(runner/run-in control (assoc plan :experiment exp :parent-run %
-                                                                        :world-parent r))
+                             (jobs/start! control {:kind :experiment :ctx (:ctx r)}
+                                          #(runner/run-in control (assoc plan :experiment exp :parent-run %
+                                                                         :world-parent r))
+                                         ;; an allowance stopped it: running again resumes
+                                          :reason-of refused-reason
                                          ;; The fixture room's work is done once the job is
                                          ;; over (every cell's world settled, every record in
                                          ;; `control`): retire it, keeping its history.
-                                         :settled (fn [_ _]
-                                                    (let [{:keys [ok? error]} (in-ctx daemon (rooms/archive-room! r))]
-                                                      (when-not ok?
-                                                        (tel/log! {:level :warn :id ::fixture-room-not-archived
-                                                                   :data {:room (id->str (:id r)) :error error}}
-                                                                  "A benchmark's fixture room could not be archived")))))
-                            (jobs/start! r {:kind :experiment}
-                                         #(runner/run-in r (assoc plan :experiment exp :parent-run %)))))
+                                          :settled (fn [_ _]
+                                                     (let [{:keys [ok? error]} (in-ctx daemon (rooms/archive-room! r))]
+                                                       (when-not ok?
+                                                         (tel/log! {:level :warn :id ::fixture-room-not-archived
+                                                                    :data {:room (id->str (:id r)) :error error}}
+                                                                   "A benchmark's fixture room could not be archived")))))
+                             (jobs/start! r {:kind :experiment}
+                                          #(runner/run-in r (assoc plan :experiment exp :parent-run %))
+                                          :reason-of refused-reason))
+                            (#(swap! job-experiments assoc (:id %) (:experiment/content-id exp)))))
                   (->> (job-data daemon))
                   (assoc :op "catalog/benchmark" :task workflow :models models
+                         ;; its ExperimentDef: experiment_report {room, experiment}
+                         :experiment (str (:experiment/content-id exp))
+                         ;; a room workflow: the content id of the bundle it read
+                         :bundle (get-in plan [:dataset :metadata :bundle])
                          :room (if control (id->str (:id control)) slug)
                          :poll-after-ms 30000)
                   (cond-> control (assoc :fixture-room slug)))))}

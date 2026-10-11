@@ -678,13 +678,13 @@
 (defn experiment!
   "Run a benchmark set as an experiment in its own process: `repetitions`
    attempts per model in `models`, each in a discarded world, folded into a
-   Scorecard, stored under `dir` (the runner moves Dvergr's state root into
-   `dir`: a dedicated JVM or REPL). In a daemon, use the `catalog/benchmark`
-   op instead, which runs the same plan in one of its rooms."
+   Scorecard, kept in a room of the home `dir` (`runner/run!`: a dedicated
+   JVM or REPL; `:daemon` runs it in a running daemon's home instead). The
+   `catalog/benchmark` op runs the same plan in a daemon room as a job."
   [{:keys [dir repetitions parallelism] :or {repetitions 1} :as opts}]
   ((requiring-resolve 'dvergr.agent.experiment.runner/run!)
    (merge (assoc (experiment-plan opts)
                  :dir dir
                  :repetitions repetitions
                  :parallelism (or parallelism 1))
-          (select-keys opts [:fault-retries]))))
+          (select-keys opts [:fault-retries :daemon :experiment-id]))))

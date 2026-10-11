@@ -93,6 +93,10 @@
 ;; Global daemon atom for REPL access: @current-daemon, (stop! @current-daemon)
 (defonce current-daemon (atom nil))
 
+;; The root discourse room of a `start!` in progress (nil once it completed):
+;; what `abort-start!` closes when the start threw.
+(defonce ^:private starting-room (atom nil))
+
 ;; Tool-activity id + the room-turn registry moved to `dvergr.agent.turn` — a
 ;; lower layer shared with `discourse.llm/llm-agent` (no daemon↔discourse.llm
 ;; cycle, and ONE registry so Esc-cancel sees persona turns too). Re-export the
@@ -673,22 +677,36 @@
              (tel/log! {:level :warn :id :rooms/gc-failed :data {:error (.getMessage e)}}
                        "Storage GC sweep failed"))))))
 
-(defn- start-gc-loop! [exec-ctx {:keys [interval-ms] :or {interval-ms 21600000} :as gc-cfg}]
-  (let [t (Thread.
+(defn- start-gc-loop!
+  "The storage GC loop: a boot sweep, then one every `interval-ms`. It waits
+   on a stop promise, not in `Thread/sleep`: an interrupt can be swallowed
+   inside a sweep (store I/O), and a loop that then slept on would hold
+   `stop-gc-loop!` for its whole timeout."
+  [exec-ctx {:keys [interval-ms] :or {interval-ms 21600000} :as gc-cfg}]
+  (let [stop (promise)
+        t (Thread.
            (fn []
-             (run-gc-sweep! exec-ctx gc-cfg)          ; boot sweep
-             (while (not (.isInterrupted (Thread/currentThread)))
-               (try (Thread/sleep (long interval-ms))
-                    (run-gc-sweep! exec-ctx gc-cfg)
-                    (catch InterruptedException _
-                      (.interrupt (Thread/currentThread))))))
+             (when-not (realized? stop)
+               (run-gc-sweep! exec-ctx gc-cfg))          ; boot sweep
+             (loop []
+               (when (= ::sweep (deref stop (long interval-ms) ::sweep))
+                 (run-gc-sweep! exec-ctx gc-cfg)
+                 (recur))))
            "dvergr-storage-gc")]
     (.setDaemon t true)
     (.start t)
-    (reset! gc-thread t)))
+    (reset! gc-thread {:thread t :stop stop})))
 
-(defn- stop-gc-loop! []
-  (when-let [t @gc-thread] (.interrupt t) (reset! gc-thread nil)))
+(defn- stop-gc-loop!
+  "Stop the GC loop and wait (a minute at most) for a sweep in flight: the
+   stores it sweeps are released next, and a daemon that stops right after
+   it started (an experiment's home, `runner/open-home!`) would pull them
+   from under its boot sweep."
+  []
+  (when-let [{:keys [^Thread thread stop]} @gc-thread]
+    (deliver stop true)
+    (reset! gc-thread nil)
+    (when-not (= thread (Thread/currentThread)) (.join thread 60000))))
 
 (defn- start-mcp!
   "Start the MCP server on the daemon's loopback TCP port when `mcp-config` is
@@ -762,6 +780,9 @@
                        :description \"Default greeting agent\"}}
      :default-agent :var  ;; which agent handles new sessions
      :claude-code {:token-file \"…\" :cli \"…\"}  ;; see `configure-claude-code!`
+     :headless? true  ;; only the `:agents` given: no durable, autostart or
+                      ;; room-member agents are brought online (an
+                      ;; experiment's home, `runner/open-home!`)
 
    Returns Daemon record."
   [config]
@@ -801,7 +822,9 @@
   (let [exec-ctx       (create-shared-context :with-git? false
                                               :with-datahike? true
                                               :db-path (:db-path config))
-        discourse-room (d/room :daemon exec-ctx)
+        discourse-room (doto (d/room :daemon exec-ctx)
+                         ;; until the start completes, `abort-start!` closes it
+                         (->> (reset! starting-room)))
         status-a       (atom :starting)
         daemon         (->Daemon config exec-ctx discourse-room
                                  nil nil status-a)]
@@ -867,7 +890,10 @@
         ;; Storage GC loop (datahike index reclamation) on a dedicated thread —
         ;; boot sweep + periodic. Prevents the unbounded `.dvergr` growth that
         ;; took the old monolithic store to tens of GB.
-        (start-gc-loop! exec-ctx (:gc config))
+        ;; `:gc false`: none (an experiment's home: its stores live as long
+        ;; as the experiment, as they did before homes)
+        (when-not (false? (:gc config))
+          (start-gc-loop! exec-ctx (:gc config)))
 
         ;; Auto-create THE global room — the single default channel
         ;; every registered agent auto-joins. Slug is configurable via
@@ -916,7 +942,7 @@
     ;; membership) would be lost on every restart even though the actor row
     ;; persists. Build each one's config from its row (actor-row-first), skip
     ;; retired and already-configured ids.
-    (when-let [conn (daemon-sys-conn)]
+    (when-let [conn (when-not (:headless? config) (daemon-sys-conn))]
       (doseq [a (actors/list-actors conn :kind :agent)
               :let [aid (:id a)]
               :when (and (not (get-in config [:agents aid]))
@@ -938,7 +964,7 @@
             durable?  (fn [aid] (when conn
                                   (some-> (actors/lookup conn aid)
                                           :status (not= :retired))))]
-        (doseq [[aid cfg] (defs/autostart-agents)
+        (doseq [[aid cfg] (when-not (:headless? config) (defs/autostart-agents))
                 :when (and (not (get-in config [:agents aid]))
                            (not (durable? aid)))]
           (let [cfg (cond-> cfg
@@ -956,7 +982,7 @@
     ;; online, re-join each room's durable members — `join-agent-to-room!` is
     ;; idempotent, so this composes with the config/:rooms joins. (dvergr #12)
     (binding [rtc/*execution-context* exec-ctx]
-      (doseq [{:room/keys [slug agent-ids]} (sdb/all-rooms)
+      (doseq [{:room/keys [slug agent-ids]} (when-not (:headless? config) (sdb/all-rooms))
               :when (seq agent-ids)
               :let  [room (rreg/lookup (rstore/slug->room-id slug))]
               :when room
@@ -1079,6 +1105,7 @@
         (let [daemon-final (start-mcp! daemon-with-http (:mcp config))]
           (reset! status-a :running)
           (reset! current-daemon daemon-final)
+          (reset! starting-room nil)
           (tel/log! {:id :daemon/started :data {:agent-count (count (:agents config))}} "Daemon started")
           daemon-final)))))
 
@@ -1153,6 +1180,22 @@
   (reset! current-daemon nil)
   (tel/log! {:id :daemon/stopped} "Daemon stopped")
   :stopped)
+
+(defn abort-start!
+  "Undo what a `start!` that threw had begun, with no daemon to `stop!`: the
+   GC loop, the default context's registration, the root discourse room (its
+   context's drain), the room contexts and their stores. Best-effort; for a
+   host that retries in the same process (`runner/open-home!`)."
+  []
+  (stop-gc-loop!)
+  (try (mail/stop-sync!) (catch Throwable _ nil))
+  (try (sdist/unregister-context! :default) (catch Throwable _ nil))
+  (when-let [room @starting-room]
+    (try (d/close-room! room) (catch Throwable _ nil))
+    (reset! starting-room nil))
+  (srooms/release-room-stores!)
+  (reset! current-daemon nil)
+  :aborted)
 
 ;; ============================================================================
 ;; Inspection

@@ -25,25 +25,38 @@
 
 (defn read-tree
   "`{path text}` of the files under `dir` in `room`'s workspace (recursive,
-   bounded by file count and total size); `{}` without a workspace."
-  [room dir]
-  (if-let [fs (room-fs room)]
-    (let [total (atom 0)]
-      (letfn [(walk [path acc]
-                (reduce (fn [acc {:keys [type] entry-path :path}]
-                          (cond
-                            (<= max-files (count acc)) (reduced acc)
-                            (= :dir type) (walk entry-path acc)
-                            (= :file type)
-                            (let [text (str (mfs/read-file fs entry-path))]
-                              (if (< max-bytes (swap! total + (count text)))
-                                (reduced acc)
-                                (assoc acc entry-path text)))
-                            :else acc))
-                        acc
-                        (try (mfs/list-dir fs path) (catch Throwable _ nil))))]
-        (if (mfs/exists? fs dir) (walk dir {}) {})))
-    {}))
+   bounded by file count and total size: `:max-files`, `:max-bytes`); `{}`
+   without a workspace. Past a bound the rest is left out, or, with
+   `:strict? true`, the read throws (what must be read whole, a bundle)."
+  ([room dir] (read-tree room dir nil))
+  ([room dir {:keys [strict?] :as opts}]
+   (if-let [fs (room-fs room)]
+     (let [max-files (or (:max-files opts) max-files)
+           max-bytes (or (:max-bytes opts) max-bytes)
+           total (atom 0)
+           over! (fn [acc what]
+                   (if strict?
+                     (throw (ex-info (str dir " holds more than " what " (read whole, or not at all)")
+                                     {:type ::too-large :dir dir :max-files max-files :max-bytes max-bytes}))
+                     (reduced acc)))]
+       (letfn [(walk [path acc]
+                 (reduce (fn [acc {:keys [type] entry-path :path}]
+                           (cond
+                             (and (<= max-files (count acc)) (#{:dir :file} type))
+                             (if (= :file type) (over! acc (str max-files " files")) (walk entry-path acc))
+                             (= :dir type) (walk entry-path acc)
+                             (= :file type)
+                             (let [text (str (mfs/read-file fs entry-path))]
+                               (if (< max-bytes (swap! total + (count text)))
+                                 (over! acc (str max-bytes " characters"))
+                                 (assoc acc entry-path text)))
+                             :else acc))
+                         acc
+                         ;; a listing that fails is an empty directory, or,
+                         ;; strict, the read's failure
+                         (try (mfs/list-dir fs path) (catch Throwable t (when strict? (throw t)) nil))))]
+         (if (mfs/exists? fs dir) (walk dir {}) {})))
+     {})))
 
 (defn seed!
   "Write `files` (`{path text}`, absolute workspace paths) into `room`'s

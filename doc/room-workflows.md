@@ -93,31 +93,40 @@ content on the same host is already promoted).
 An export is an EDN map, not an archive. To run it from a directory, write its `:files`
 under a directory named like the bundle: `(dvergr.catalog.casepack/write-dir!
 "competitors" export)` writes every path of `:files` under `competitors/`. Then run it
-without a daemon:
+from the shell, without a daemon of your own:
 
 ```
 clojure -M -m dvergr.catalog.room-run path/to/competitors --check
-clojure -M -m dvergr.catalog.room-run path/to/competitors --models claude-haiku-4-5,codex-subscription-luna --repetitions 2
+clojure -M -m dvergr.catalog.room-run path/to/competitors --models claude-haiku-4-5,codex-subscription-luna --repetitions 2 --home runs/competitors
 ```
 
-`room-run` keeps the experiment in `<--out>/<bundle name>` (default `workflow-runs/`):
-running it again resumes, keeping cells that have a verdict. `--cases N` takes the first N
-cases of a dataset in a fixed shuffle (seed 20261001), so the same N gives the same cases
-every time. It prints each candidate's reward and two costs, writes `report.md` beside the
-experiment, and exits 1 when cells did not finish. A `claude-code-*` candidate works through
-dvergr's MCP tools; in a process without a daemon, the runner serves them from a headless
-one on an ephemeral loopback port.
+`room-run` is a client of the room path, the one an MCP client takes. It opens the dvergr
+home `--home` (default `workflow-runs/<bundle name>`) with a headless daemon, creates the room
+`<bundle name>` there once, writes the bundle into its workspace as `workflows/<bundle name>/`
+with `room_write` (and removes what the bundle no longer has), and runs `catalog_benchmark`
+into that room as the experiment `<bundle name>`; `--check` runs `catalog_calibrate` instead.
+Everything it keeps is in the home's stores: the bundle in the room's repository, the Runs,
+Attempts and Scorecard in the room's Datahike store. Running it again resumes, keeping cells
+that have a verdict; cells that faulted run once more within the run. `--cases N` takes the
+first N cases of a dataset in a fixed shuffle (seed 20261001), so the same N gives the same
+cases every time. It prints each candidate's reward and two costs, then the report from
+`experiment_report` (to stdout, or to `--report FILE` when given), and exits 1 when cells did
+not finish. A `claude-code-*` candidate works through dvergr's MCP tools, which the home's
+daemon serves on an ephemeral loopback port. `dvergr.catalog.room/experiment!` (and
+`dvergr.catalog.room-run/benchmark!`) is the same path from the REPL.
 
 **Billed and list price.** `billed` is what the run was charged: about $0 for subscription
 candidates (`codex-subscription-*`, `claude-code-*`). `list price` is the same tokens at the
 list price of the API model a subscription model corresponds to (its registry entry's
 `:list-price-of`; for any other model it equals the bill), which is what compares models
-(`dvergr.agent.spend`); report.md uses it.
+(`dvergr.agent.spend`); the report uses it.
 
-**In a daemon**, `catalog_benchmark` runs the experiment in a room (`runner/run-in`): it
-writes no report.md, does not re-run faulted cells, and has no `cases` parameter, so a
-dataset runs every case per model (budget per attempt: $0.50 unless given). Only `room-run`
-and `runner/run!` write report.md.
+**In a daemon**, `catalog_benchmark` runs the experiment in a room (`runner/run-in`) as a
+job (budget per attempt: $0.50 unless given; `cases` takes the first N cases, as above).
+With `experiment` (a name) the experiment keeps its identity: benchmarking again with the
+same name, workflow and models into the same `room` resumes it. `experiment_report {room,
+experiment?}` renders the report from the room's store; the job's result names its
+`experiment` and `scorecard`.
 
 A bundle with `:fetched true` in `workflow.edn` records its Attempts' effects (`:world
 :effects {:record true}`), and its checker is given `:fetched {url body}`: the successful GET

@@ -25,9 +25,11 @@ Regenerate with `(dvergr.benchmarks.bankbooking/write-example! "examples/workflo
 (benchmarks alias). Benchmark a sample:
 
     clojure -M -m dvergr.catalog.room-run examples/workflows/bank-booking \
-      --models codex-subscription-luna,claude-code-haiku --cases 30 --out runs
+      --models codex-subscription-luna,claude-code-haiku --cases 30 --home runs/bank-booking
 
-Claude Code CLI models call the attempt's tools over MCP; `room-run` serves them from a
-headless daemon of its own. The state lives in `runs/bank-booking`: running the same
-command again resumes it. `report.md` there is the pilot report: the frontier, which
-checks fail, tokens, time and list-price cost, and the certification.
+`room-run` opens the dvergr home `runs/bank-booking` with a headless daemon, writes the
+bundle into the room `bank-booking` there and benchmarks it with `catalog_benchmark`, as an
+MCP client would; Claude Code CLI models call the attempt's tools over MCP through that
+daemon. Running the same command again resumes it. The pilot report (`experiment_report`:
+the frontier, which checks fail, tokens, time and list-price cost, and the certification) is
+printed at the end, or written to `--report FILE`.

@@ -24,17 +24,13 @@
             [dvergr.agent.environment :as environment]
             [dvergr.agent.run :as run]
             [dvergr.agent.turn :as turn]
-            [dvergr.artifact :as artifact]
             [dvergr.chat.schema :as schema]
             [dvergr.discourse :as d]
             [dvergr.room.store :as store]
             [dvergr.room.store.datahike :as dhs]
             [dvergr.substrate.datahike :as sdh]
-            [dvergr.substrate.paths :as paths]
             [dvergr.substrate.store-ids :as store-ids]
-            [dvergr.system.db :as sdb]
-            [hasch.core :as hasch])
-  (:import [java.security MessageDigest]))
+            [hasch.core :as hasch]))
 
 (def interpreter-version
   "Version of the conversational episode interpreter recorded on episode Runs
@@ -43,35 +39,6 @@
 
 ;; ---------------------------------------------------------------------------
 ;; Experiment-local storage
-
-(defn- sha256-hex [^bytes bytes]
-  (apply str (map #(format "%02x" (bit-and % 0xff))
-                  (.digest (MessageDigest/getInstance "SHA-256") bytes))))
-
-(defrecord FileArtifactStore [dir]
-  artifact/PArtifactStore
-  (-put-value! [_ value]
-    (let [bytes (.getBytes (binding [*print-length* nil *print-level* nil] (pr-str value)) "UTF-8")
-          ref (sha256-hex bytes)
-          f (io/file dir (str ref ".edn"))]
-      (when-not (.exists f)
-        (io/make-parents f)
-        ;; Unique temp name: parallel writers of the same value must not share it.
-        (let [tmp (io/file dir (str ref "." (random-uuid) ".tmp"))]
-          (with-open [out (io/output-stream tmp)] (.write out bytes))
-          (when-not (or (.renameTo tmp f) (.exists f))
-            (throw (ex-info "Artifact write failed" {:ref ref :dir dir})))
-          (.delete tmp)))
-      ref))
-  (-get-value [_ ref]
-    (let [f (io/file dir (str ref ".edn"))]
-      (when (.exists f) (edn/read-string (slurp f))))))
-
-(defn file-artifact-store
-  "Immutable EDN values addressed by the sha256 of their printed form, one
-   file each under `dir` (inspectable with ordinary tools)."
-  [dir]
-  (->FileArtifactStore (str dir)))
 
 (defn- store-config [dir]
   (let [path (.getAbsolutePath (io/file dir "store"))]
@@ -82,9 +49,12 @@
      :schema-flexibility :write}))
 
 (defn open-store!
-  "Open (creating on first use) the durable experiment store under `dir`:
-   a file-backed Datahike database with the chat schema plus an
-   experiment-local artifact store. Returns `{:dir :cfg :conn :store}`."
+  "Open (creating on first use) a standalone durable episode store under
+   `dir` (`store/`): a file-backed Datahike database with the chat schema,
+   whose exact payloads are blobs in that database's own store, as in a
+   daemon room's. For tests and labs; `dvergr.agent.experiment.runner/run!`
+   keeps an experiment in a room of its home instead. Returns `{:dir :cfg
+   :conn :store}`."
   [dir]
   (let [base (store-config dir)
         fresh? (not (dh/database-exists? base))
@@ -101,19 +71,10 @@
     (let [conn (sdh/connect cfg)]
       (schema/ensure-full-schema! conn)
       {:dir (str dir) :cfg cfg :conn conn
-       :store (dhs/make conn (file-artifact-store (io/file dir "artifacts")))})))
+       :store (dhs/make conn)})))
 
 (defn close-store! [{:keys [conn]}]
   (when conn (dh/release conn)))
-
-(defn isolate-home!
-  "Point Dvergr's state root (system DB, workspaces, blobs) at `dir` so an
-   experiment never writes into a daemon's `.dvergr`. Process-wide: use a
-   dedicated benchmark JVM or REPL."
-  [dir]
-  (paths/set-home! (str (io/file dir "home")))
-  (sdb/reset-conn!)
-  (str (io/file dir "home")))
 
 ;; ---------------------------------------------------------------------------
 ;; Episode Runs

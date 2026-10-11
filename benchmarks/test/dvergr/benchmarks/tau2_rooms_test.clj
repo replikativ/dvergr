@@ -8,7 +8,7 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
-            [dvergr.agent.conversation :as conv]
+            [dvergr.agent.experiment.runner :as runner]
             [dvergr.benchmarks.tau2.core :as t2]
             [dvergr.benchmarks.tau2.experiment :as tx]
             [dvergr.benchmarks.tau2.inspect :as insp]
@@ -59,8 +59,8 @@
                :agent-generate gold-agent}
           first-run (tx/run! cfg)
           resumed (tx/run! cfg)
-          xs (conv/open-store! dir)
-          room-id (:experiment-room first-run)]
+          xs (runner/open-experiment dir (:room first-run))
+          room-id (:room-id xs)]
       (try
         (is (= 6 (:results first-run)))
         (is (contains? (:scorecard first-run) :scorecard/content-id))
@@ -79,7 +79,7 @@
             (is (:match? (insp/verify-world dom task e)))
             (is (= {:applicable? false} (insp/verify-episode e))
                 "the episode's world was a discarded fork: the evidence is the record")))
-        (finally (conv/close-store! xs))))))
+        (finally (runner/close-experiment xs))))))
 
 (defn- gold-through-rooms
   "Replay each task's gold actions through `tx/run!` (Rooms, certified
@@ -87,39 +87,43 @@
    gold sequence: whichever side owns the next action performs it, the other
    hands the turn over. Returns the experiment's Attempts with their episodes."
   [dom experiment-id task-ids]
-  (let [dir (temp-dir)]
-    (doseq [task-id task-ids
-            :let [task (get-in dom [:tasks task-id])
-                  actions (vec (get-in task ["evaluation_criteria" "actions"]))
-                  cursor (atom 0)
-                  user? #(= "user" (get % "requestor"))
-                  emit (fn [] (let [{:strs [name arguments action_id]} (nth actions @cursor)]
-                                (swap! cursor inc)
-                                {:tool-calls [{:id (or action_id (str "a" @cursor))
-                                               :name name :arguments arguments}]}))
-                  agent-gen (fn [_]
-                              (fn [_]
-                                (let [a (get actions @cursor)]
-                                  (cond (nil? a) {:content (str "All done. "
-                                                                (str/join " " (get-in task ["evaluation_criteria" "communicate_info"]))
-                                                                " ###STOP###")}
-                                        (user? a) {:content "Please go ahead on your side."}
-                                        :else (emit)))))
-                  user (fn [_]
-                         (let [a (get actions @cursor)]
-                           (if (and a (user? a)) (emit) {:content "Done on my side."})))
-                  r (tx/run! {:dir dir :domain dom :task-ids [task-id] :experiment-id experiment-id
-                              :candidates [{:id :gold :harness :reference :model "claude-code-sonnet"}]
-                              :user-fn user :agent-generate agent-gen})]]
-      (is (= 1 (:results r)) task-id))
-    (let [xs (conv/open-store! dir)]
-      (try
-        (mapv (fn [a]
-                {:attempt a
-                 :episode (insp/episode xs experiment-id (:attempt/id a))
-                 :task (get-in dom [:tasks (get-in a [:attempt/environment :environment/task :task-id])])})
-              (insp/attempts xs experiment-id))
-        (finally (conv/close-store! xs))))))
+  (let [dir (temp-dir)
+        rs (for [task-id task-ids
+                 :let [task (get-in dom [:tasks task-id])
+                       actions (vec (get-in task ["evaluation_criteria" "actions"]))
+                       cursor (atom 0)
+                       user? #(= "user" (get % "requestor"))
+                       emit (fn [] (let [{:strs [name arguments action_id]} (nth actions @cursor)]
+                                     (swap! cursor inc)
+                                     {:tool-calls [{:id (or action_id (str "a" @cursor))
+                                                    :name name :arguments arguments}]}))
+                       agent-gen (fn [_]
+                                   (fn [_]
+                                     (let [a (get actions @cursor)]
+                                       (cond (nil? a) {:content (str "All done. "
+                                                                     (str/join " " (get-in task ["evaluation_criteria" "communicate_info"]))
+                                                                     " ###STOP###")}
+                                             (user? a) {:content "Please go ahead on your side."}
+                                             :else (emit)))))
+                       user (fn [_]
+                              (let [a (get actions @cursor)]
+                                (if (and a (user? a)) (emit) {:content "Done on my side."})))
+                       r (tx/run! {:dir dir :domain dom :task-ids [task-id] :experiment-id experiment-id
+                                   :candidates [{:id :gold :harness :reference :model "claude-code-sonnet"}]
+                                   :user-fn user :agent-generate agent-gen})]]
+             (do (is (= 1 (:results r)) task-id)
+                 r))]
+    ;; each task is an ExperimentDef of its own, so a room of its own
+    (vec (for [room (distinct (map :room (doall rs)))
+               :let [xs (runner/open-experiment dir room)]
+               row (try
+                     (mapv (fn [a]
+                             {:attempt a
+                              :episode (insp/episode xs (:room-id xs) (:attempt/id a))
+                              :task (get-in dom [:tasks (get-in a [:attempt/environment :environment/task :task-id])])})
+                           (insp/attempts xs (:room-id xs)))
+                     (finally (runner/close-experiment xs)))]
+           row))))
 
 (defn- tasks-with-user-actions [dom split n]
   (->> (get-in dom [:splits split])
@@ -191,16 +195,16 @@
                                   :candidates [{:id :dv :harness :dvergr :action-space action-space
                                                 :model "claude-code-sonnet"}]
                                   :user-fn (constantly {:content "I need help with an exchange."})}))
-                    xs (conv/open-store! dir)]]
+                    xs (runner/open-experiment dir (:room r))]]
         (try
-          (let [[a] (insp/attempts xs (:experiment-room r))
-                e (insp/episode xs (:experiment-room r) (:attempt/id a))]
+          (let [[a] (insp/attempts xs (:room-id xs))
+                e (insp/episode xs (:room-id xs) (:attempt/id a))]
             (is (= 1.0 (get-in a [:attempt/receipt :attempt/reward])) (str action-space))
             (is (= (count gold) (count (:effects e))) (str action-space))
             (is (seq (:activities e)) "the candidate's tool uses are recorded")
             (is (every? #(= :completed (:run/status %)) (:runs e)))
             (is (:match? (insp/verify-world dom (get-in dom [:tasks "0"]) e))))
-          (finally (conv/close-store! xs)))))))
+          (finally (runner/close-experiment xs)))))))
 
 (deftest faults-are-certified-but-never-scored
   (if-not checkout?
@@ -213,10 +217,10 @@
                       :fault-retries 0
                       :user-fn (fn [_] (throw (ex-info "provider 529" {:status 529})))
                       :agent-generate gold-agent})
-          xs (conv/open-store! dir)]
+          xs (runner/open-experiment dir (:room r))]
       (try
-        (let [[a] (insp/attempts xs (:experiment-room r))
-              e (insp/episode xs (:experiment-room r) (:attempt/id a))]
+        (let [[a] (insp/attempts xs (:room-id xs))
+              e (insp/episode xs (:room-id xs) (:attempt/id a))]
           (is (= :failed (get-in a [:attempt/receipt :attempt/status])))
           (is (= :infrastructure-error (:termination (insp/attempt-row a))))
           (is (re-find #"user-model.*provider 529"
@@ -226,8 +230,8 @@
           (is (contains? (:scorecard r) :incomplete) "no Scorecard for a faulted experiment")
           (is (= [{:candidate :gold :attempts 1 :failed 1 :episodes 0}]
                  (mapv #(select-keys % [:candidate :attempts :failed :episodes])
-                       (insp/summary xs (:experiment-room r))))))
-        (finally (conv/close-store! xs))))))
+                       (insp/summary xs (:room-id xs))))))
+        (finally (runner/close-experiment xs))))))
 
 (deftest step-bound-ends-the-episode-without-another-turn
   (if-not checkout?
@@ -240,10 +244,10 @@
           r (tx/run! {:dir dir :domain dom :task-ids ["0"] :limits {:max-steps 9 :max-errors 10}
                       :candidates [{:id :looping :harness :reference :model "claude-code-sonnet"}]
                       :user-fn (constantly {:content "Hi."}) :agent-generate looping})
-          xs (conv/open-store! dir)]
+          xs (runner/open-experiment dir (:room r))]
       (try
-        (let [[a] (insp/attempts xs (:experiment-room r))
-              e (insp/episode xs (:experiment-room r) (:attempt/id a))]
+        (let [[a] (insp/attempts xs (:room-id xs))
+              e (insp/episode xs (:room-id xs) (:attempt/id a))]
           (is (= :completed (get-in a [:attempt/receipt :attempt/status])) "a model outcome, scored")
           (is (= :max-steps (:termination (insp/attempt-row a))))
           (is (= 0.0 (get-in a [:attempt/receipt :attempt/reward])))
@@ -251,7 +255,7 @@
             (is (= 1 (count turns)) "no further candidate turn after the bound")
             (is (every? #(not= :running (second %)) turns)))
           (is (= 4 (count (:effects e))) "1 message + 4 batches x 2 steps reaches 9"))
-        (finally (conv/close-store! xs))))))
+        (finally (runner/close-experiment xs))))))
 
 (deftest repl-candidate-discovers-documented-tools
   (if-not checkout?

@@ -8,10 +8,15 @@
    - where candidates fail: per check, how often it failed;
    - which cases could not grade an answer, and why (certification).
 
-   As Markdown, to read or to publish."
+   As Markdown, to read or to publish. `room-report` renders it from what an
+   experiment Room stores (its Scorecard and certified Attempts): the
+   `experiment/report` op, which every binding (MCP, the REPL, the
+   `room-run` shell) reads."
   (:require [clojure.string :as str]
+            [dvergr.agent.experiment :as experiment]
             [dvergr.agent.experiment.stats :as xstats]
-            [dvergr.agent.spend :as spend]))
+            [dvergr.agent.spend :as spend]
+            [dvergr.room.store :as store]))
 
 (defn- money [microdollars] (format "$%.4f" (/ (double microdollars) 1e6)))
 
@@ -127,3 +132,61 @@
                      (str/join ", " (for [[k v] ex] (str v " " (str/replace (name k) "-" " "))))
                      " (`certification.edn` lists each)")))
             ".\n")))))
+
+;; ---------------------------------------------------------------------------
+;; From an experiment Room's store
+;; ---------------------------------------------------------------------------
+
+(defn- bundle-certification
+  "The certification of the room-workflow bundle `exp` ran, when that very
+   bundle (same content id) is in `room`'s workspace."
+  [room exp]
+  (let [{:dataset/keys [id metadata]} (:experiment/dataset exp)]
+    (when (= "room-workflow" (some-> id namespace))
+      (try (let [b ((requiring-resolve 'dvergr.catalog.room/read-bundle) room (name id))]
+             (when (= (str (:id b)) (:bundle metadata))
+               (:certification b)))
+           (catch Exception _ nil)))))
+
+(defn- progress-note
+  "What an experiment without a Scorecard has certified so far."
+  [room experiment-content-id]
+  (let [xs (cond->> (:experiments (experiment/progress room))
+             experiment-content-id (filter #(= (str experiment-content-id) (str (:experiment/content-id %)))))
+        cs (mapcat :candidates xs)]
+    (str "**Incomplete:** there is no Scorecard yet: " (reduce + 0 (map :verdicts cs)) " cells have a verdict and "
+         (reduce + 0 (map :faults cs)) " faulted. Running the experiment again resumes it: cells with a "
+         "verdict are kept, faulted ones run again."
+         (when (seq cs)
+           (str "\n\n| Candidate | Verdicts | Faults | Mean reward |\n|---|---:|---:|---:|\n"
+                (str/join (for [{:keys [verdicts faults reward-mean] cid :candidate/id} cs]
+                            (format "| %s | %d | %d | %s |\n" (name cid) verdicts faults
+                                    (if reward-mean (format "%.3f" (double reward-mean)) "–")))))))))
+
+(defn room-report
+  "The report of an experiment kept in `room`, from its store: the Scorecard
+   `scorecard` (a content id), else the newest one of the ExperimentDef
+   `experiment` (a content id), else the room's newest. Its Attempts' receipts
+   are loaded from the store, and a room-workflow bundle's certification from
+   the room's workspace. Without a Scorecard, what the experiment has
+   certified so far. Returns `{:scorecard :experiment :complete :markdown}`."
+  [room {:keys [scorecard experiment title]}]
+  (let [sc (if scorecard
+             (experiment/scorecard room scorecard)
+             (first (experiment/scorecards room (cond-> {:limit 1}
+                                                  experiment (assoc :experiment-content-id experiment)))))
+        exp (:scorecard/experiment sc)
+        st (:store room)
+        cid (store/conversation-id room)
+        receipts (vec (keep (fn [{:attempt/keys [id]}]
+                              (some-> (store/-load-attempt st cid id) :attempt/receipt (assoc :attempt/id id)))
+                            (:scorecard/entries sc)))
+        title (or title
+                  (some-> (:experiment/id exp) (#(str (namespace %) " — " (name %))))
+                  (:title room))]
+    {:scorecard (some-> (:scorecard/content-id sc) str)
+     :experiment (some-> (or (:experiment/content-id exp) experiment) str)
+     :complete (some? sc)
+     :markdown (markdown (cond-> {:title title :result {:scorecard sc :receipts receipts}}
+                           sc (assoc :certification (bundle-certification room exp))
+                           (nil? sc) (assoc :note (progress-note room experiment))))}))

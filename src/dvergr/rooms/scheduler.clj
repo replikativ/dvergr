@@ -124,11 +124,21 @@
                                :error (.getMessage t)}}
                        "Scheduled fire failed"))))))
 
+(defonce ^:private suspended (atom false))
+
+(defn suspend!
+  "With `true`, rooms registered from now on get no scheduler: nothing of
+   theirs fires (an experiment's home, `runner/open-home!`, whose daemon
+   must not run a room's schedules); `false` lifts it."
+  [on?]
+  (reset! suspended (boolean on?)))
+
 (defn start-room-scheduler!
   "Spawn the room's scheduler spin (idempotent). Tracks the clock; fires due
-   schedules each minute. Created on the ROOT ctx (clock visibility)."
+   schedules each minute. Created on the ROOT ctx (clock visibility). None
+   while `suspend!`ed."
   [room]
-  (when-not (get @room-schedulers (:id room))
+  (when-not (or @suspended (get @room-schedulers (:id room)))
     (let [handle (atom {:running? true})]
       (swap! room-schedulers assoc (:id room) handle)
       (binding [ec/*execution-context* (rctx/root-ctx (:ctx room))]

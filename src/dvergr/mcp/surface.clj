@@ -40,7 +40,8 @@
    :catalog/list :catalog, :catalog/start :catalog
 
    :catalog/benchmark :bench, :catalog/check :bench, :catalog/calibrate :bench,
-   :catalog/export :bench, :catalog/import :bench, :catalog/cases :bench, :catalog/deploy :bench, :catalog/freeze :bench, :experiment/progress :bench
+   :catalog/export :bench, :catalog/import :bench, :catalog/cases :bench, :catalog/deploy :bench, :catalog/freeze :bench, :experiment/progress :bench,
+   :experiment/report :bench
 
    :room/wallet :wallets, :models/list :wallets
 

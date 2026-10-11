@@ -93,3 +93,24 @@
         (is (= :running (:status (jobs/status (:id job) 100000)))))
       (is (< (- (System/currentTimeMillis) t0) 5000))
       (jobs/cancel! (:id job)))))
+
+(deftest a-waiter-is-released-once-the-job-has-settled
+  ;; a host closes the job's stores once it is settled: `settled` (a
+  ;; benchmark archiving its fixture room) must be done by then
+  (with-room [room :jobs-settled]
+    (let [release (promise)
+          settled (atom nil)
+          job (jobs/start! room {:kind :workflow}
+                           (fn [_] (blocking-spin room (constantly 42)))
+                           :settled (fn [status _] @release (reset! settled status)))]
+      (testing "a short wait may see the Run over, but not settled"
+        (let [st (loop [n 0]
+                   (let [st (jobs/status (:id job) 100)]
+                     (if (and (= :running (:status st)) (< n 100)) (recur (inc n)) st)))]
+          (is (= :completed (:status st)))
+          (is (false? (:settled? st)))))
+      (deliver release true)
+      (testing "a waiter returns once it has settled"
+        (let [st (jobs/status (:id job) 5000)]
+          (is (true? (:settled? st)))
+          (is (= :completed @settled)))))))

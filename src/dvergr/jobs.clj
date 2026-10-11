@@ -61,10 +61,11 @@
    `:parent-run`. `:parent` makes the job itself a child Run (a sub-experiment
    of the Run that started it); `:ctx` is the context `work`'s Spin runs in
    (default `room`'s, where the job Run is stored). `finish`, a fn of the
-   Spin's value, runs before the Run completes; `settled`, a fn of the final
-   status and the value (or the error), after it has settled, whatever the
-   outcome."
-  [room {:keys [kind parent ctx]} work & {:keys [finish settled]}]
+   Spin's value, runs before the Run completes; `reason-of`, a fn of the
+   value, the reason a completed Run records (a keyword, or nil); `settled`, a
+   fn of the final status and the value (or the error), after it has settled,
+   whatever the outcome."
+  [room {:keys [kind parent ctx]} work & {:keys [finish settled reason-of]}]
   (when-not (contains? kinds kind)
     (throw (ex-info "Unknown job kind" {:type ::unknown-kind :kind kind :kinds kinds})))
   (let [ctx (or ctx (:ctx room))
@@ -100,23 +101,30 @@
                             [:failed t]))))]
               (try
                 (binding [ec/*execution-context* ctx]
-                  (run/finish! id status (cond-> {} error (assoc :error error))))
+                  (run/finish! id status (cond-> {}
+                                           error (assoc :error error)
+                                           (and reason-of (= :completed status))
+                                           (merge (when-let [r (reason-of @value)] {:reason r})))))
                 (catch Throwable t
                   (tel/log! {:level :error :id ::finish-failed
                              :data {:job id :status status :error (ex-message t)}}
                             "Job Run could not be finished")))
-              (deliver done true)
-              (swap! live dissoc id)
               (when settled
                 (try (settled status (or error @value))
                      (catch Throwable t
                        (tel/log! {:level :warn :id ::settled-failed
                                   :data {:job id :error (ex-message t)}}
-                                 "Job settled callback failed"))))))))
+                                 "Job settled callback failed"))))
+              ;; a waiter (`status` with wait-ms) is released once the job
+              ;; has settled too: a host that then closes the job's stores
+              ;; must not pull them from under `settled`
+              (swap! live dissoc id)
+              (deliver done true)))))
       (catch Throwable t
         ;; `work` itself failed (validation, say): the Run must not stay open.
         (binding [ec/*execution-context* ctx]
           (run/finish! id :failed {:error t}))
+        (swap! live dissoc id)
         (deliver done true)
         (throw t)))
     (job room r)))
@@ -132,7 +140,9 @@
        (when-let [done (get-in @live [id :done])]
          (deref done (min max-wait-ms (long wait-ms)) nil)))
      (let [r (binding [ec/*execution-context* (:ctx room)] (run/run room id))]
-       (some-> (job room r) (assoc :room-value room))))))
+       ;; `:settled?`: its Run is over and so is its `settled` callback
+       ;; (until then the job is live here, however its Run reads)
+       (some-> (job room r) (assoc :room-value room :settled? (not (contains? @live id))))))))
 
 (defn cancel!
   "Stop the job `id`: request cancellation of its Run, which stops its work

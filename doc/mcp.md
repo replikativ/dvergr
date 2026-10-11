@@ -105,7 +105,7 @@ neither listed nor callable.
 | `attempts` | `workflow_start` and the job tools; Attempts, Scorecards |
 | `runs` | the blocking `workflow_attempt`; Runs |
 | `catalog` | `catalog_list`, `catalog_start`: workflows with their own checker |
-| `bench` | `catalog_benchmark`, `catalog_check`, `catalog_calibrate`, `catalog_cases`, `catalog_freeze`, `catalog_deploy`, `catalog_export`, `catalog_import`, `experiment_progress`, `attempt_export` |
+| `bench` | `catalog_benchmark`, `catalog_check`, `catalog_calibrate`, `catalog_cases`, `catalog_freeze`, `catalog_deploy`, `catalog_export`, `catalog_import`, `experiment_progress`, `experiment_report`, `attempt_export` |
 | `wallets` | `room_wallet`, `models_list` |
 | `repl` | `clojure_eval` in the room's SCI sandbox |
 | `describe` | `repl_describe`: the REPL's API (dvergr namespaces, functions, signatures, docs), filtered by a query |

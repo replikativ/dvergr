@@ -37,7 +37,7 @@ dvergr.model.*           providers (api/{anthropic,openai,codex_subscription,cla
 dvergr.tools             tool registry + effects boundary (dvergr.agent.effects)
 dvergr.agent.program     Runs: hire, supervisor, workers (blocking work off the engine)
 dvergr.agent.{evaluation,experiment,world,attempt,spend}   evaluation path
-dvergr.agent.experiment.runner   run!/run-in: experiments, resume, report.md
+dvergr.agent.experiment.runner   run!/run-in/open-home!: experiments in a home's rooms, resume
 dvergr.catalog.*         room workflows, case packs, wiki benchmark, report
 dvergr.mcp.*             MCP server (profiles; the `bench` profile has the catalog tools)
 benchmarks/              tau2, BFCL, BIRD, SpreadsheetBench, AutomationBench, CUAD, bank booking:
@@ -73,13 +73,20 @@ shared with interactive use: the runner stops admitting cells at 80 % (`:usage-p
 ## Running benchmarks
 
 - Each benchmark has `dvergr.benchmarks.<name>.experiment/run!`, or a room workflow
-  (`clojure -M -m dvergr.catalog.room-run <dir> --models … --cases N`). `run!` re-roots Dvergr's
-  state into its `:dir`: run it in its own JVM, never in a daemon (use `runner/run-in` there).
-- Running again on the same `:dir` resumes: cells with a verdict are kept, faulted cells re-run
-  (and once more within the same run, `:fault-retries`). A prompt or grader version bump changes the
-  experiment's identity, so no resume mixes versions.
-- Every experiment writes `report.md` beside it: frontier with 95 % intervals, failed checks,
-  tokens (input incl. cached, output), median/p90/summed/wall time, list-price cost.
+  (`clojure -M -m dvergr.catalog.room-run <bundle-dir> --models … --cases N --home DIR`). Both
+  keep the experiment in a room of a dvergr **home** (`:dir` / `--home`: system DB + the rooms'
+  stores, nothing else). `run!` is `runner/open-home!` (a headless daemon on that home, the
+  process's for the call) + `runner/run-in` + `runner/close-home!`: run it in its own JVM; in a
+  process with a daemon pass `:daemon` (and `:experiment-id`) and it uses that daemon's home.
+  `room-run` is a client of the MCP path: `room_write` the bundle, `catalog_benchmark`, `job_status`.
+- The experiment's room is one per ExperimentDef (`runner/experiment-slug`): running again on the
+  same home resumes in it: cells with a verdict are kept, faulted cells re-run (and once more
+  within the same run, `:fault-retries`). A prompt or grader version bump is a new ExperimentDef,
+  hence a new room, so no resume mixes versions. An old-layout dir (`artifacts/`) is refused.
+- The report is the room's, read through the `experiment_report` op (`runner/report dir`, the
+  result's `:report`, `room-run` prints it or writes `--report FILE`): frontier with 95 %
+  intervals, failed checks, tokens (input incl. cached, output), median/p90/summed/wall time,
+  list-price cost. `runner/progress dir` and `runner/open-experiment` read a home back.
 - Tune on the `:dev` split, report on `:eval`, and confirm a tuned change on questions not used
   for tuning. Compare candidates paired (same cases).
 - One experiment JVM at a time on this machine, with an `-Xmx` cap.

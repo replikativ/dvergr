@@ -1,10 +1,11 @@
 (ns dvergr.benchmarks.tau2.inspect
   "Read-only inspection of a recorded tau2 experiment store.
 
-     (def xs (conv/open-store! \".dvergr/benchmarks/<experiment>\"))
-     (summary xs :tau2/<experiment>)               ; per candidate: reward, pass^k
-     (attempts xs :tau2/<experiment>)              ; certified Attempts
-     (def e (episode xs :tau2/<experiment> attempt-id))
+     (def xs (runner/open-experiment \".dvergr/benchmarks/<experiment>\")) ; its home
+     (summary xs (:room-id xs))                    ; per candidate: reward, pass^k
+     (attempts xs (:room-id xs))                   ; certified Attempts
+     (def e (episode xs (:room-id xs) attempt-id))
+     (runner/close-experiment xs)
      (print-transcript e)                          ; dialogue + tool effects + agent code
      (verify-world dom task e)                     ; replay effects -> recorded world hash
 
