@@ -291,7 +291,7 @@
                db rel)
           str))
 
-(defn- shape-conflict
+(defn shape-conflict
   "Why worktree path `rel` cannot take a file in `db`, or nil: a directory
    there (explicit, or something beneath it), a symbolic link there, or a file
    or link where one of its parents should be a directory."
@@ -311,11 +311,13 @@
 
 (defn- expect-guard
   "Transaction function: throw unless worktree file `rel` holds `expected`
-   (a content id, or nil for no file) and, for a write (`write?`), the path
+   (a content id, or nil for no file) as a regular file and, for a write (`write?`), the path
    can still take a file (`shape-conflict`). Runs in the transactor, in the
    same transaction as the write it guards."
   [db rel expected write?]
-  (let [now (work-content db rel)
+  (let [mode (d/q '[:find ?m . :in $ ?p :where [?e :geschichte.work/path ?p] [?e :geschichte.work/mode ?m]] db rel)
+        ;; a link is never the file expected, whatever its text
+        now (if (= 0120000 (bit-and (long (or mode 0)) 0170000)) :symbolic-link (work-content db rel))
         conflict (when write? (shape-conflict db rel))]
     (when (or (not= now expected) conflict)
       (throw (ex-info (str "/" rel " changed underneath the write" (when conflict (str ": " conflict)))

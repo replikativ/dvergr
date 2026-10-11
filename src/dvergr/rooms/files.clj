@@ -286,16 +286,6 @@
                                   (ancestors-of p))]
       (refuse (str p ": " blocked " is " (if (= :file bt) "a file" "a symbolic link")) {:path p}))))
 
-(defn- beneath?
-  "Whether a directory now stands at worktree path `rel` in `db`: an explicit
-   directory there, or a file or directory beneath it."
-  [db rel]
-  (let [prefix (str rel "/")]
-    (boolean (or (d/q '[:find ?e . :in $ ?p :where [?e :geschichte.work-dir/path ?p]] db rel)
-                 (some #(str/starts-with? % prefix)
-                       (concat (map first (d/q '[:find ?p :where [_ :geschichte.work/path ?p]] db))
-                               (map first (d/q '[:find ?p :where [_ :geschichte.work-dir/path ?p]] db))))))))
-
 (defn- restore-tx
   "Transaction function: put the worktree entries of `paths` back as they
    were `before`, each only while it still holds what the batch left there
@@ -313,8 +303,9 @@
                    (when (and (= (some-> cid str) (get expected p))
                               (not= symlink-mode (bit-and (long (or mode 0)) 0170000)))
                      (if-let [{:keys [content size mode]} (get before p)]
-                       ;; a removed file comes back only where nothing took its place
-                       (when (or eid (not (beneath? db (rel p))))
+                       ;; a removed file comes back only where its path can take a file
+                       ;; again: no directory there, and only directories above it
+                       (when (or eid (nil? (tools/shape-conflict db (rel p))))
                          [{:geschichte.work/path (rel p) :geschichte.work/content [:geschichte.content/id content]
                            :geschichte.work/size size :geschichte.work/mode mode}])
                        (when eid [[:db/retractEntity eid]])))))

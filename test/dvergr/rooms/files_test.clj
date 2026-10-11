@@ -418,3 +418,38 @@
         (is (= :dvergr.rooms.forks/concurrent-change (:type (ex-data e))) (pr-str (ex-data e)))))
     (is (= before (head)) "nothing committed")
     (is (= :symlink (:type (mfs/stat (ws/room-fs r) "/a.txt"))) "the other writer's link is kept")))
+
+(deftest a-removal-does-not-take-a-link-with-the-file-s-text
+  (let [r (room)
+        delete! tools/workspace-delete!]
+    (files/write! r {"a.txt" {:text "target"}} {})
+    (let [head-before (repo/head-commit (conn r))]
+      (with-redefs [tools/workspace-delete! (fn [ctx p & opts]
+                                              (mfs/delete (ws/room-fs r) "/a.txt")
+                                              (mfs/symlink (ws/room-fs r) "target" "/a.txt")
+                                              (apply delete! ctx p opts))]
+        (let [e (try (files/write! r {"a.txt" nil} {}) nil
+                     (catch clojure.lang.ExceptionInfo e e))]
+          (is (= :dvergr.tools/changed-underneath (:type (ex-data e))) (pr-str (ex-data e)))))
+      (is (= :symlink (:type (mfs/stat (ws/room-fs r) "/a.txt"))) "the link is kept")
+      (is (= (:geschichte.commit/id head-before) (:geschichte.commit/id (repo/head-commit (conn r))))
+          "nothing committed"))))
+
+(deftest a-removed-file-is-not-restored-beneath-a-new-file
+  (let [r (room)
+        restore-paths! repo/restore-paths!]
+    (files/write! r {"a/b.txt" {:text "b"}} {})
+    (with-redefs [repo/commit! (fn [& _] (throw (ex-info "boom" {})))
+                  repo/restore-paths! (fn [& args]
+                                        (let [res (apply restore-paths! args)
+                                              fs (ws/room-fs r)]
+                                          ;; the directory the removal emptied becomes a file
+                                          (mfs/delete fs "/a")
+                                          (mfs/write-string! fs "/a" "the agent's" false)
+                                          res))]
+      (let [e (try (files/write! r {"a/b.txt" nil} {}) nil
+                   (catch clojure.lang.ExceptionInfo e e))]
+        (is (= ["/a/b.txt"] (:conflicted (ex-data e))) (pr-str (ex-data e)))))
+    (is (= :file (:type (mfs/stat (ws/room-fs r) "/a"))))
+    (is (= "the agent's" (worktree-text r "/a")))
+    (is (nil? (get (repo/worktree (conn r)) "a/b.txt")) "not put back beneath a file")))
