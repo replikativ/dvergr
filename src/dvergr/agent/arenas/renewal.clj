@@ -339,6 +339,8 @@
    (str "After hiring and awaiting the :sales and :support specialists, propose "
         "the verified Acme intervention using the exact signal UUID returned by "
         "each child. Consumes one renewal-review unit.")
+   ;; writes the plan and debits a review unit (dvergr.effects)
+   :effect (fn [_] {:effect :db/transact :resource {:datoms 1} :class #{:spend}})
    :parameters
    {:type "object"
     :properties
@@ -409,11 +411,12 @@
 (defn exact-tool-installed?
   "Whether `tool` is this arena's exact stable tool contract.
 
-   The executable closure is deliberately excluded: reloading this namespace
-   creates a fresh function object without changing the durable tool contract."
+   The executable closures (`:execute`, `:effect`) are deliberately excluded:
+   reloading this namespace creates fresh function objects without changing
+   the durable tool contract."
   [tool]
-  (= (dissoc renewal-plan-tool :execute)
-     (some-> tool (dissoc :execute))))
+  (= (dissoc renewal-plan-tool :execute :effect)
+     (some-> tool (dissoc :execute :effect))))
 
 (defn register-tool! []
   (if-let [installed (tools/get-tool "renewal_plan")]

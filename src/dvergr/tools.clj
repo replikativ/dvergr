@@ -240,7 +240,9 @@
       (mfs/read-file filesystem path)
       (slurp path))))
 
-(defn- workspace-write! [ctx path content]
+(declare effect-boundary)
+
+(defn- write-file! [ctx path content]
   (let [path (tool-path ctx path)]
     (if-let [filesystem (:filesystem ctx)]
       (do
@@ -253,6 +255,30 @@
         (mfs/write-string! filesystem path (str content) false))
       (do (fs/create-dirs (fs/parent path)) (spit path content)))
     path))
+
+(defn workspace-write!
+  "Write `content` to `path` in the workspace of the tool context `ctx` (its
+   virtual filesystem, else its `cwd`, clamped), through the effect boundary:
+   an `:fs/write` the world's read-only mode, quota and receipts decide, the
+   same effect a sandbox `spit` performs. The one gate for every tool that
+   writes workspace files. `ctx` may carry `:effect-boundary` (a boundary
+   function, `dvergr.effects/boundary-resolver`) for callers without a chat;
+   else the chat's boundary applies (none without a chat: host calls). Returns
+   the resolved path."
+  [ctx path content]
+  (let [content (str content)]
+    (effects/perform! (effect-boundary ctx)
+                      {:effect :fs/write :resource {:path (str path)}
+                       :result-of (constantly content)
+                       :bytes (alength (.getBytes content "UTF-8"))}
+                      #(write-file! ctx path content))))
+
+(defn- transact!
+  "Transact `tx-data` into `conn` for a tool, through the effect boundary (a
+   `:db/transact`, as a sandbox `datahike.api/transact` is)."
+  [ctx conn tx-data]
+  (effects/perform! (effect-boundary ctx) (effects/transact-effect tx-data)
+                    #(d/transact conn tx-data)))
 
 (defn- virtual-walk [filesystem root]
   (letfn [(walk [path]
@@ -276,19 +302,60 @@
     (fs/glob cwd pattern)))
 
 (def ^:private tool-effects
-  "The effect a registry tool performs, from its input: tools that touch the
-   workspace pass the same boundary as the sandbox (`dvergr.effects`), so a
-   world's read-only mode, quota, receipts and denials cover them too.
-   `clojure_eval` is not here: the effects inside it are its own."
+  "How each registry tool passes the effect boundary (`dvergr.effects`), so a
+   world's read-only mode, quota, receipts and denials cover it as they cover
+   the sandbox. Exhaustive: a registered tool with no entry here and no
+   `:effect` of its own is performed as a `:tool/call` (assumed to write and
+   reach out), and a test fails on it. A value is one of:
+
+   - a function of the input returning the effect, decided before the tool
+     runs (or `:reads` when this input reads only; anything else that is not
+     an effect is performed as `:tool/call`);
+   - `:inner`: the tool's effects pass the boundary inside it, at the shared
+     gates (`workspace-write!`, `transact!`; `run_tests` evaluates in the
+     sandbox, whose capabilities perform their own);
+   - `:eval`: as `:inner` in the sandbox; under `:isolation :native` the code
+     runs on the host JVM past every capability, so the eval itself is the
+     effect (`:eval/native`), admitted only where every class is;
+   - `:reads`: it only reads (a database query, the session's code index, the
+     budget), which is not an effect, as a sandbox query is not.
+
+   These are stamped onto the tool definitions registered here (`:effect`), so
+   a classification belongs to its implementation, not to a name: another
+   tool under the same name (an agent-local replacement) is unclassified
+   until it declares its own. A tool defined elsewhere declares `:effect`."
   {"read_file"  (fn [{:keys [path]}] {:effect :fs/read :resource {:path (str path)}})
-   "write_file" (fn [{:keys [path content]}] {:effect :fs/write :resource {:path (str path)}
-                                              :bytes (alength (.getBytes (str content) "UTF-8"))})
-   "edit_file"  (fn [{:keys [path new_string new-string]}]
-                  {:effect :fs/write :resource {:path (str path)}
-                   :bytes (alength (.getBytes (str (or new_string new-string)) "UTF-8"))})
+   "write_file" :inner
+   "edit_file"  :inner
+   "clojure_edit" :inner
    "glob"       (fn [{:keys [pattern path]}] {:effect :fs/list :resource {:path (str (or path ".")) :glob (str pattern)}})
    "grep"       (fn [{:keys [path]}] {:effect :fs/list :resource {:path (str (or path "."))}})
-   "shell"      (fn [{:keys [command]}] {:effect :process/run :resource {:cmd (str command)}})})
+   "clj_kondo"  (fn [{:keys [lint]}] {:effect :fs/read :resource {:path (str/join " " (map str lint))}})
+   "shell"      (fn [{:keys [command]}] {:effect :process/run :resource {:cmd (str command)}})
+   "clojure_eval" :eval
+   "run_tests"  :inner
+   "code_query" :reads
+   "budget"     :reads
+   "task_list"  :reads
+   "knowledge_search" :reads
+   "task_create" :inner
+   "task_update" :inner
+   "knowledge_add" :inner
+   ;; a child Run (dvergr.agent/hire!): a forked world, model spend
+   "spawn_agent"    (fn [{:keys [profile]}] {:effect :run/start :resource {:agent (str (or profile "worker"))}})
+   "propose_change" (fn [{:keys [profile]}] {:effect :run/start :resource {:agent (str (or profile "worker"))}})
+   "update_agent_profile" (fn [{:keys [agent-name]}]
+                            {:effect :actor/write :resource {:op :system-prompt :actor (str agent-name)}})})
+
+(defn effect-classification
+  "How `tool` passes the effect boundary (see `tool-effects`): its `:effect`;
+   nil when it has none, or one that is not a classification."
+  [tool]
+  (let [c (:effect tool)]
+    (when (or (fn? c) (contains? #{:inner :eval :reads} c)) c)))
+
+(defn- unclassified-effect [tool-name]
+  (fn [_] {:effect :tool/call :resource {:tool (str tool-name)}}))
 
 (defn- tool-boundary
   "The boundary a tool call passes: its chat's (receipts, world binding) and
@@ -304,6 +371,12 @@
       (effects/boundary-resolver binding (:receipts cctx)
                                  (when ec {:world #(effects/world-handlers (world))
                                            :world-sink #(effects/world-sink (world))})))))
+
+(defn effect-boundary
+  "The boundary for effects performed on behalf of the tool context `ctx`:
+   its `:effect-boundary` when the caller set one, else its chat's."
+  [ctx]
+  (or (:effect-boundary ctx) (tool-boundary ctx)))
 
 (defn execute
   "Execute a tool by name with given input and context.
@@ -352,10 +425,22 @@
                            (exec-fn input ctx)
                            (when-let [handler-fn (:handler tool)]
                              (handler-fn input)))
-                    effect-of (get tool-effects tool-name)
+                    effect-of (or (effect-classification tool)
+                                  (unclassified-effect tool-name))
+                    effect (cond
+                             (fn? effect-of)
+                             (let [e (effect-of input)]
+                               (cond
+                                 (= :reads e) nil
+                                 (and (map? e) (keyword? (:effect e))) e
+                                 ;; not an effect: fail closed
+                                 :else ((unclassified-effect tool-name) input)))
+
+                             (and (= :eval effect-of) (= :native (:isolation ctx)))
+                             {:effect :eval/native :resource {:code (effects/digest (str (:code input)))}})
                     result (try
-                             (if effect-of
-                               (effects/perform! (tool-boundary ctx) (effect-of input) run)
+                             (if effect
+                               (effects/perform! (effect-boundary ctx) effect run)
                                (run))
                              (catch clojure.lang.ExceptionInfo e
                                (if (= :effect/denied (:type (ex-data e)))
@@ -1030,7 +1115,7 @@
                                    :description "Tags for categorization"}}
                :required ["title"]}
   :execute (fn [{:keys [title description priority status assigned_to tags]}
-                {:keys [db-conn]}]
+                {:keys [db-conn] :as ctx}]
              (if db-conn
                (try
                  (let [task-id (random-uuid)
@@ -1043,7 +1128,7 @@
                               description (assoc :task/description description)
                               assigned_to (assoc :task/assigned-to assigned_to)
                               (coerce-tags tags) (assoc :task/tags (coerce-tags tags)))]
-                   (d/transact db-conn [task])
+                   (transact! ctx db-conn [task])
                    {:type :success
                     :content (str "Created task: " title "\nID: " task-id)
                     :metadata {:task-id (str task-id)
@@ -1145,7 +1230,7 @@
                             :description {:type "string"
                                           :description "Updated description"}}
                :required ["id"]}
-  :execute (fn [{:keys [id status priority assigned_to description]} {:keys [db-conn]}]
+  :execute (fn [{:keys [id status priority assigned_to description]} {:keys [db-conn] :as ctx}]
              (if db-conn
                (try
                  (let [task-id (parse-uuid id)
@@ -1162,7 +1247,7 @@
                                      description (assoc :task/description description)
                                      (= status "completed") (assoc :task/completed-at (java.util.Date.)))
                            tx-data [(merge {:task/id task-id} updates)]]
-                       (d/transact db-conn tx-data)
+                       (transact! ctx db-conn tx-data)
                        {:type :success
                         :content (str "Updated task: " (:task/title existing)
                                       (when status (str "\n  Status: " status))
@@ -1315,7 +1400,7 @@
                                        :items {:type "string"}
                                        :description "Tags for categorization (e.g. [\"database\" \"clojure\"])"}}
                :required ["title"]}
-  :execute (fn [{:keys [title summary context source url relevance entity_type tags]} {:keys [db-conn kb-conn chat-ctx]}]
+  :execute (fn [{:keys [title summary context source url relevance entity_type tags]} {:keys [db-conn kb-conn chat-ctx] :as ctx}]
               ;; RF4: write into the room's own KB when present.
              (let [db-conn (or kb-conn db-conn)]
                (cond
@@ -1358,7 +1443,7 @@
                                        (coerce-tags tags) (assoc :entity/tags (coerce-tags tags))
                                        session-id (update :entity/from-sessions
                                                           (fnil conj []) session-id))]
-                         (d/transact db-conn [tx-data])
+                         (transact! ctx db-conn [tx-data])
                          {:type :success
                           :content (str "Updated: [[" title "]] (mentions: " (inc mc) ")"
                                         (when etype (str " type:" (name etype))))})
@@ -1377,7 +1462,7 @@
                                       url (assoc :entity/url url)
                                       (coerce-tags tags) (assoc :entity/tags (coerce-tags tags))
                                       session-id (assoc :entity/from-sessions [session-id]))]
-                         (d/transact db-conn [entity])
+                         (transact! ctx db-conn [entity])
                          {:type :success
                           :content (str "Stored: [[" title "]]"
                                         (when etype (str " type:" (name etype)))
@@ -1488,7 +1573,9 @@ Note: changes take effect on the next agent restart or reload."
                      run! (ns-resolve kondo-ns 'run!)
                       ;; Paths under cwd only, like the file tools
                      paths (mapv #(physical-path cwd %) lint)
-                     opts (cond-> {:lint paths}
+                     ;; no cache: linting reads, and the cache would write
+                     ;; `.clj-kondo/.cache` past the boundary
+                     opts (cond-> {:lint paths :cache false}
                             config (assoc :config config))
                      result (run! opts)
                      findings (:findings result)
@@ -1851,6 +1938,15 @@ Note: changes take effect on the next agent restart or reload."
  (delegation-tool
   "propose_change" :review
   "Delegate a bounded task to a specialized AgentDef and retain its isolated Run world for review instead of merging it. Returns the Run and world identities used by the canonical proposal flow. Paid recursive delegation requires explicit provider-effect authority."))
+
+(defn- classify-registered!
+  "Stamp `tool-effects` onto the tools registered above (see there)."
+  []
+  (doseq [[tool-name classification] tool-effects]
+    (swap! registry (fn [r] (cond-> r (contains? r tool-name)
+                                    (assoc-in [tool-name :effect] classification))))))
+
+(classify-registered!)
 
 (comment
   ;; Test tools

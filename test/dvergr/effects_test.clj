@@ -8,23 +8,32 @@
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
+            [datahike.api :as dh]
+            [dvergr.actors :as actors]
+            [dvergr.agent.persona]
             [dvergr.agent.turn :as turn]
+            [dvergr.chat.schema :as schema]
             [dvergr.chat.context :as chat-context]
             [dvergr.authority :as authority]
             [dvergr.discourse :as d]
             [dvergr.effects :as effects]
+            [dvergr.intake.mail]
+            [dvergr.orchestration.tasks :as tasks]
             [dvergr.room.registry :as rreg]
             [dvergr.room.store.memory :as memory]
             [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.sandbox :as sandbox]
+            [dvergr.sandbox.deps]
             [dvergr.sandbox.ns.agent :as agent-ns]
             [dvergr.sandbox.ns.io :as ns-io]
             [dvergr.sandbox.ns.kb :as ns-kb]
             [dvergr.tools :as tools]
+            [dvergr.scheduler.core]
             [dvergr.tools.llm-call :as llm-call]
             [sci.core :as sci]
             [org.replikativ.spindel.engine.context :as ctx]
-            [org.replikativ.spindel.engine.core :as rtc]))
+            [org.replikativ.spindel.engine.core :as rtc]
+            [org.replikativ.spindel.yggdrasil]))
 
 (defn- boundary
   "A stack as a world would have it: receipts into `sink`, then `specs`."
@@ -539,6 +548,255 @@
       (finally
         (ctx/stop-context! ec)
         (doseq [f (reverse (file-seq root))] (.delete f))))))
+
+(defn- with-sys-conn
+  "A fresh in-memory database with dvergr's schema: what the system DB, a
+   chat DB and a room KB all are."
+  [f]
+  (let [cfg {:store {:backend :memory :id (random-uuid)}
+             :keep-history? false :schema-flexibility :write}]
+    (dh/create-database cfg)
+    (let [conn (dh/connect cfg)]
+      (schema/install-schema! conn)
+      (try (f conn) (finally (dh/release conn) (dh/delete-database cfg))))))
+
+(defn- denied? [r] (and (= :error (:type r)) (re-find #"read-only" (str (:error r)))))
+
+(deftest read-only-denies-every-registry-tool-that-writes
+  (require 'dvergr.scheduler.tools 'dvergr.intake.mail)
+  (let [ec (ctx/create-execution-context)
+        root (.getAbsoluteFile (doto (io/file (System/getProperty "java.io.tmpdir") (str "tools-ro-" (random-uuid))) .mkdirs))
+        touched (atom [])
+        touch (fn [k] (fn [& _] (swap! touched conj k) true))]
+    (try
+      (spit (io/file root "x.clj") "(ns x)\n\n(def x 1)\n")
+      (with-sys-conn
+        (fn [conn]
+          (let [task-id (random-uuid)
+                _ (dh/transact conn [{:task/id task-id :task/title "seed" :task/status :pending
+                                      :task/priority :medium :task/created-at (java.util.Date.)}
+                                     {:entity/id (random-uuid) :entity/title "Seed" :entity/mention-count 1
+                                      :entity/contexts [] :entity/created-at (java.util.Date.)}])
+                before @conn
+                cctx (turn/new-working-ctx {:execution-ctx ec :title "tools-ro" :durable? false :agent-id :mcp/code
+                                            :effects [[:read-only]]})
+                tctx (tools/make-context {:cwd (str root) :chat-ctx cctx :execution-ctx ec :db-conn conn
+                                          :isolation :native})
+                run #(binding [rtc/*execution-context* ec] (tools/execute %1 %2 tctx))]
+            (with-redefs [dvergr.agent.persona/write-prompt! (touch :profile)
+                          llm-call/cheap-llm-call (fn [& _] (swap! touched conj :model) {:text "x"})
+                          dvergr.scheduler.core/create-schedule! (touch :schedule)
+                          dvergr.scheduler.core/cancel-schedule! (touch :unschedule)
+                          dvergr.intake.mail/sync-inbox! (touch :mail)
+                          dvergr.intake.mail/list-inbox (touch :inbox)
+                          dvergr.intake.mail/account-open? (constantly false)]
+              (testing "file writers: structural edits too"
+                (is (denied? (run "clojure_edit" {:file_path "x.clj" :form_type "def" :form_name "x"
+                                                  :operation "replace" :new_source "(def x 2)"})))
+                (is (denied? (run "edit_file" {:path "x.clj" :old_string "(def x 1)" :new_string "(def x 3)"})))
+                (is (denied? (run "write_file" {:path "y.clj" :content "(def y 1)"})))
+                (is (= "(ns x)\n\n(def x 1)\n" (slurp (io/file root "x.clj"))) "the file is unchanged")
+                (is (not (.exists (io/file root "y.clj")))))
+              (testing "database writers"
+                (is (denied? (run "knowledge_add" {:title "New" :summary "s"})))
+                (is (denied? (run "knowledge_add" {:title "Seed" :context "more"})))
+                (is (denied? (run "task_create" {:title "t2"})))
+                (is (denied? (run "task_update" {:id (str task-id) :status "completed"})))
+                (is (= (dh/q '[:find ?e ?a ?v :where [?e ?a ?v]] before)
+                       (dh/q '[:find ?e ?a ?v :where [?e ?a ?v]] @conn))
+                    "no datom was written"))
+              (testing "the prompt, model calls, schedules and mail"
+                (is (denied? (run "update_agent_profile" {:agent-name "code" :content "# me"})))
+                (is (denied? (run "llm_call" {:prompt "p" :content "c"})))
+                (is (denied? (run "schedule_create" {:agent_id "var" :task "t" :interval_minutes 5})))
+                (is (denied? (run "schedule_cancel" {:id "s1"})))
+                (is (denied? (run "spawn_agent" {:task "t"})))
+                (is (denied? (run "propose_change" {:task "t"})))
+                (let [r (run "mail_sync" {})]
+                  (is (re-find #"read-only" (str (:error r) (:result r))) (pr-str r)))
+                (is (denied? (run "mail_inbox" {})) "a read that first opens the store writes"))
+              (testing "native evaluation runs past every capability, so it is the effect"
+                (is (denied? (run "clojure_eval" {:code "(spit \"z.txt\" \"x\")"})))
+                (is (not (.exists (io/file root "z.txt")))))
+              (is (empty? @touched) "no refused writer ran")
+              (testing "reads still run"
+                (is (re-find #"def x 1" (str (:content (run "read_file" {:path "x.clj"})))))
+                (is (re-find #"x.clj" (str (:content (run "glob" {:pattern "*.clj"})))))
+                (is (re-find #"seed" (str (:content (run "task_list" {})))))
+                (is (re-find #"Seed" (str (:content (run "knowledge_search" {:operation "top"})))))
+                (is (= :success (:type (run "budget" {})))))))))
+      (finally
+        (ctx/stop-context! ec)
+        (doseq [f (reverse (file-seq root))] (.delete f))))))
+
+(deftest the-workspace-write-gate-is-one-function
+  (let [root (.getAbsoluteFile (doto (io/file (System/getProperty "java.io.tmpdir") (str "ws-gate-" (random-uuid))) .mkdirs))
+        sink (effects/make-sink)]
+    (try
+      (testing "a caller without a chat passes its own boundary"
+        (is (thrown-with-msg? Exception #"read-only"
+                              (tools/workspace-write! {:cwd (str root) :effect-boundary (boundary sink [[:read-only]])}
+                                                      "a.md" "x")))
+        (is (not (.exists (io/file root "a.md"))))
+        (tools/workspace-write! {:cwd (str root) :effect-boundary (boundary sink [])} "sub/b.md" "hello")
+        (is (= "hello" (slurp (io/file root "sub/b.md")))))
+      (testing "each write is an :fs/write receipt with its size"
+        (is (= [[:fs/write :denied] [:fs/write :allowed]] (mapv (juxt :effect :decision) @sink))))
+      (testing "the clamp still holds"
+        (is (thrown? Exception (tools/workspace-write! {:cwd (str root) :effect-boundary (boundary sink [])}
+                                                       "../escape.md" "x"))))
+      (finally (doseq [f (reverse (file-seq root))] (.delete f))))))
+
+(deftest every-registered-tool-has-an-effect-classification
+  (require 'dvergr.tools.llm-call 'dvergr.scheduler.tools 'dvergr.intake.mail)
+  (testing "a tool without one cannot be registered unnoticed"
+    (doseq [t (tools/all-tools)]
+      (is (some? (tools/effect-classification t)) (str (:name t) " declares no effect"))))
+  (testing "the renewal arena's tool, registered on demand"
+    (is (some? (tools/effect-classification @(requiring-resolve 'dvergr.agent.arenas.renewal/renewal-plan-tool)))))
+  (testing "a tool handed to an agent that declares nothing is assumed to write and reach out"
+    (let [ec (ctx/create-execution-context)
+          ran (atom [])
+          root (.getAbsoluteFile (doto (io/file (System/getProperty "java.io.tmpdir") (str "unclassified-" (random-uuid))) .mkdirs))]
+      (try
+        (let [cctx (turn/new-working-ctx {:execution-ctx ec :title "unclassified" :durable? false :agent-id :mcp/code
+                                          :effects [[:read-only]]})
+              tool (fn [n & {:as more}]
+                     (merge {:name n :execute (fn [_ _] (swap! ran conj n) {:type :success :content "did it"})} more))
+              tctx (tools/make-context {:cwd (str root) :chat-ctx cctx :execution-ctx ec
+                                        :tools {"mystery" (tool "mystery")
+                                                ;; a replacement under a built-in's name does
+                                                ;; not inherit the built-in's classification
+                                                "write_file" (tool "write_file")
+                                                "nil-effect" (tool "nil-effect" :effect (fn [_] nil))
+                                                "bogus" (tool "bogus" :effect :bogus)
+                                                "reads" (tool "reads" :effect (fn [_] :reads))}})
+              run #(binding [rtc/*execution-context* ec] (tools/execute % {} tctx))]
+          (doseq [n ["mystery" "write_file" "nil-effect" "bogus"]]
+            (is (denied? (run n)) n))
+          (is (= :success (:type (run "reads"))) "a tool that says it reads runs")
+          (is (= ["reads"] @ran)))
+        (finally (ctx/stop-context! ec) (doseq [f (reverse (file-seq root))] (.delete f)))))))
+
+(deftest native-evaluation-needs-every-class
+  (let [ec (ctx/create-execution-context)
+        root (.getAbsoluteFile (doto (io/file (System/getProperty "java.io.tmpdir") (str "native-" (random-uuid))) .mkdirs))]
+    (try
+      (let [cctx (turn/new-working-ctx {:execution-ctx ec :title "native" :durable? false :agent-id :mcp/code
+                                        :effects [[:admit #{:process :global}]]})
+            tctx (tools/make-context {:cwd (str root) :chat-ctx cctx :execution-ctx ec :isolation :native})
+            r (binding [rtc/*execution-context* ec]
+                (tools/execute "clojure_eval" {:code "(+ 1 2)"} tctx))]
+        (is (= :error (:type r)))
+        (is (re-find #"not granted" (str (:error r)))))
+      (finally (ctx/stop-context! ec) (doseq [f (reverse (file-seq root))] (.delete f))))))
+
+(deftest read-only-denies-every-sandbox-writer
+  (testing "actors, tasks and skills: the global registry surface"
+    (with-sys-conn
+      (fn [conn]
+        (actors/spawn-agent! conn {:id :var :name "Var"})
+        (let [task (tasks/create-task! conn {:actor-id :alice :room-id :ops :content "b"})
+              sink (effects/make-sink)
+              ro (boundary sink [[:read-only]])
+              sci-ctx (sci/init {})
+              ev #(sci/eval-string* sci-ctx %)
+              before @conn]
+          (agent-ns/add-actors-ns! sci-ctx conn nil ro)
+          (agent-ns/add-tasks-ns! sci-ctx conn nil ro)
+          (agent-ns/add-skills-ns! sci-ctx conn ro)
+          (doseq [code ["(dvergr.actors/spawn-agent! {:id :scribe :name \"Scribe\"})"
+                        "(dvergr.actors/spawn-human! {:id :eve :external-refs {:telegram 1}})"
+                        "(dvergr.actors/update! :var {:name \"Mallory\"})"
+                        "(dvergr.actors/add-skill! :var :prose)"
+                        "(dvergr.actors/remove-skill! :var :prose)"
+                        "(dvergr.actors/dismiss! :var)"
+                        (str "(dvergr.tasks/accept! #uuid \"" (:id task) "\")")
+                        (str "(dvergr.tasks/complete! #uuid \"" (:id task) "\" \"done\")")
+                        (str "(dvergr.tasks/ignore! #uuid \"" (:id task) "\")")
+                        "(dvergr.skills/author! \"s\" {} \"body\")"
+                        "(dvergr.skills/lift! \"s\" \"https://x\" \"body\")"
+                        "(dvergr.skills/promote! \"s\" \"me\" \"2026-10-11\")"
+                        "(dvergr.skills/dispatch! :research {:task \"t\"})"]]
+            (is (thrown-with-msg? Exception #"read-only" (ev code)) code))
+          (is (= (dh/q '[:find ?e ?a ?v :where [?e ?a ?v]] before)
+                 (dh/q '[:find ?e ?a ?v :where [?e ?a ?v]] @conn))
+              "the system DB is unchanged")
+          (testing "reads still run"
+            (is (= "Var" (:name (ev "(dvergr.actors/lookup :var)"))))
+            (is (= 1 (count (ev "(dvergr.tasks/list)"))))
+            (is (map? (ev "(dvergr.skills/all)"))))))))
+  (testing "Runs: hiring and cancelling"
+    (let [ec (ctx/create-execution-context)
+          sci-ctx (sci/init {})
+          ro (boundary (effects/make-sink) [[:read-only]])]
+      (try
+        (agent-ns/add-programming-ns! sci-ctx nil ec nil nil ro)
+        (doseq [code ["(dvergr.agent/hire! (dvergr.agent/roster) :x {})"
+                      "(dvergr.agent/run-experiment! (dvergr.agent/roster) {})"
+                      "(dvergr.agent/cancel! #uuid \"00000000-0000-0000-0000-000000000001\")"]]
+          (is (thrown-with-msg? Exception #"read-only" (sci/eval-string* sci-ctx code)) code))
+        (finally (ctx/stop-context! ec)))))
+  (testing "a sandbox's room GC, dependency loading, mail sync and model calls"
+    (let [touched (atom [])
+          touch (fn [k] (fn [& _] (swap! touched conj k) :done))]
+      (with-redefs [dvergr.sandbox.deps/add-libs! (touch :add-libs)
+                    dvergr.sandbox.deps/sync-deps! (touch :sync-deps)
+                    dvergr.intake.mail/sync-inbox! (touch :mail)
+                    dvergr.intake.mail/list-inbox (touch :inbox)
+                    dvergr.intake.mail/account-open? (constantly false)
+                    org.replikativ.spindel.yggdrasil/gc! (touch :gc)
+                    llm-call/cheap-llm-call (fn [& _] (swap! touched conj :model) {:text "x"})]
+        (with-world-sandbox {:effects {:handlers [[:read-only]]}}
+          (fn [{:keys [eval]}]
+            (doseq [code ["(dvergr.room/gc!)"
+                          "(dvergr.room/gc! {:remove-before (java.util.Date.)})"
+                          "(clojure.repl.deps/add-libs '{foo/bar {:mvn/version \"1.0\"}})"
+                          "(clojure.repl.deps/sync-deps)"
+                          "(intake.mail/sync!)"
+                          "(intake.mail/inbox)"
+                          "(llm/call \"s\" \"c\")"]]
+              (is (re-find #"read-only" (str (:err (eval code)))) code))
+            (testing "reads still run"
+              (is (contains? (eval "(dvergr.room/databases)") :ok) "a read is not refused")))))
+      (is (empty? @touched) "no refused writer ran"))
+    (testing "reading an open mail store is not an effect"
+      (let [touched (atom [])]
+        (with-redefs [dvergr.intake.mail/list-inbox (fn [& args] (swap! touched conj (vec args)) [])
+                      dvergr.intake.mail/account-open? #(= :datahike-contact %)]
+          (with-world-sandbox {:effects {:handlers [[:read-only]]}}
+            (fn [{:keys [eval]}]
+              (is (= [] (:ok (eval "(intake.mail/inbox)"))))
+              (is (= [] (:ok (eval "(intake.mail/inbox {:limit 3})"))) "options as a map")
+              (testing "but another account, however the options are given, opens a store"
+                (is (re-find #"read-only" (str (:err (eval "(intake.mail/inbox {:account :other})")))))
+                (is (re-find #"read-only" (str (:err (eval "(intake.mail/inbox :account :other)")))))))))
+        (is (= [[] [:limit 3]] @touched) "the read gets the options decided on")))))
+
+(deftest a-dispatch-reaches-out
+  (with-sys-conn
+    (fn [conn]
+      (let [sci-ctx (sci/init {})]
+        (agent-ns/add-skills-ns! sci-ctx conn (boundary (effects/make-sink) [[:admit #{:read :write :global}]]))
+        (is (thrown-with-msg? Exception #"not granted"
+                              (sci/eval-string* sci-ctx "(dvergr.skills/dispatch! :review {:task \"t\"})"))
+            "a transport may deliver it, so writing is not enough")))))
+
+(deftest skill-writes-count-against-a-quota
+  (with-sys-conn
+    (fn [conn]
+      (let [q (effects/quota! {:bytes 100})
+            sci-ctx (sci/init {})]
+        (agent-ns/add-skills-ns! sci-ctx conn (constantly {:handlers (effects/handlers [[:quota {:id q}]])}))
+        (is (thrown-with-msg? Exception #"quota"
+                              (sci/eval-string* sci-ctx (str "(dvergr.skills/author! \"s\" {:note \""
+                                                             (apply str (repeat 200 "a")) "\"} \"b\")")))
+            "the frontmatter is part of what is written")
+        (is (thrown-with-msg? Exception #"quota"
+                              (sci/eval-string* sci-ctx (str "(dvergr.skills/lift! \"s\" \""
+                                                             (apply str (repeat 200 "a")) "\" \"b\")"))))
+        (is (zero? (effects/quota-used q)))
+        (effects/release! q)))))
 
 (def ^:private gen-host
   (gen/elements ["a.com" "docs.a.com" "x.docs.a.com" "b.com" "c.org" "docs.c.org"]))

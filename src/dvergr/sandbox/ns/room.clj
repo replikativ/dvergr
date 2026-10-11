@@ -22,6 +22,7 @@
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.yggdrasil :as ygg]
             [dvergr.sandbox.ns.doc :as doc]
+            [dvergr.effects :as effects]
             [sci.core :as sci]))
 
 (defn- safe [f] (try (f) (catch Throwable t {:error (.getMessage t)})))
@@ -280,11 +281,16 @@
                                        (srooms/room-conn-by-name room-id db-name)))))))
         ;; Reclaim unreachable storage for THIS room/fork's workspace (datahike
         ;; index blobs + git objects). Default keeps all history (orphan garbage
-        ;; only); pass {:remove-before <Date>} to collapse old history.
+        ;; only); pass {:remove-before <Date>} to collapse old history. It
+        ;; deletes storage: an effect (dvergr.effects), refused before `safe`.
         gc!            (fn gc!
                          ([] (gc! {}))
-                         ([opts] (safe #(binding [ec/*execution-context* (selected-ctx)]
-                                          (ygg/gc! opts)))))
+                         ([opts]
+                          (effects/perform! effects {:effect :room/gc
+                                                     :resource {:room (str (current-room-id))
+                                                                :remove-before (some? (:remove-before opts))}}
+                                            (fn [] (safe #(binding [ec/*execution-context* (selected-ctx)]
+                                                            (ygg/gc! opts)))))))
         ;; Which KBs this room may WRITE, and which one `*kb*` is. A room's own
         ;; KB is the default, but a room whose knowledge lives in an ATTACHED KB
         ;; would otherwise write into its own empty one with nothing saying so —

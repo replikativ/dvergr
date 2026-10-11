@@ -41,6 +41,20 @@
         (swap! accounts assoc account-id acct)
         acct)))
 
+(defn account-open?
+  "Whether `account-id`'s local store is already open. Opening it creates the
+   store and transacts the account row, a write; reading it after is not."
+  [account-id]
+  (contains? @accounts account-id))
+
+(defn- reads-mail
+  "The effect of a read of the default account's mirror: none once it is open,
+   else opening it (`:mail/open`)."
+  [_]
+  (if (account-open? :datahike-contact)
+    :reads
+    {:effect :mail/open :resource {:account "datahike-contact"}}))
+
 (defn default-account! []
   (get-account! :datahike-contact))
 
@@ -146,6 +160,7 @@
 
 (tools/register!
  {:name "mail_inbox"
+  :effect reads-mail
   :description "List recent messages in the datahike.io contact inbox (local cache).
 Returns subject, from, date, flags. Does not fetch body. Use mail_read for full content.
 Options: :limit (default 20)."
@@ -163,6 +178,7 @@ Options: :limit (default 20)."
 
 (tools/register!
  {:name "mail_search"
+  :effect reads-mail
   :description "Fulltext search across all synced datahike.io mail.
 Returns matching messages with relevance scores. Useful for finding specific threads,
 senders, or topics. Options: :limit (default 10)."
@@ -184,6 +200,7 @@ senders, or topics. Options: :limit (default 10)."
 
 (tools/register!
  {:name "mail_read"
+  :effect reads-mail
   :description "Read the full body of a specific email message.
 Requires the folder name and UID (get these from mail_inbox or mail_search).
 Example: {:folder \"INBOX\" :uid 4}"
@@ -204,6 +221,7 @@ Example: {:folder \"INBOX\" :uid 4}"
 
 (tools/register!
  {:name "mail_sync"
+  :effect (fn [{:keys [folders]}] {:effect :mail/sync :resource {:folders (vec (or folders ["INBOX"]))}})
   :description "Pull new messages from the IMAP server into local cache.
 Run this to check for mail since the last sync. Syncs INBOX by default.
 Returns count of new messages stored per folder."
