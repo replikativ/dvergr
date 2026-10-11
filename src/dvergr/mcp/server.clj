@@ -28,6 +28,7 @@
             [dvergr.rooms.files :as room-files]
             [dvergr.rooms.facts :as facts]
             [dvergr.chat.context :as chat-context]
+            [dvergr.substrate.paths :as paths]
             [org.replikativ.spindel.engine.core :as ec]
             [jsonista.core :as json])
   (:import (java.net ServerSocket Socket)
@@ -550,7 +551,8 @@
   []
   (atom (json-rpc/create-session
          {:server-info {:name "dvergr" :title "dvergr" :version "0.1.0"}
-          :instructions surface/instructions})))
+          :instructions surface/instructions
+          :home (paths/home)})))
 
 (defn- meta-selection
   "The tool selection a client asks for in `_meta` (`dvergr/profile`,

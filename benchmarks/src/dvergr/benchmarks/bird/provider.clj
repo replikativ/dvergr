@@ -78,11 +78,23 @@
 ;; ---------------------------------------------------------------------------
 ;; Engines: run a query, get rows
 
+(defn read-only-handler
+  "A fresh pg-datahike session over the Datahike connection `conn`, read
+   only (`SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY`): pg-datahike
+   itself refuses every write, DDL included (SQLSTATE 25006), behind
+   `read-only-sql`'s keyword filter."
+  [conn]
+  (let [h (pg/make-query-handler conn {:max-result-rows 100000})
+        {:keys [error]} (compat/pg-execute h "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")]
+    (when error
+      (throw (ex-info (str "pg-datahike session not read-only: " error) {:type ::not-read-only})))
+    h))
+
 (defn- handler
-  "A fresh pg-datahike session over database `db-id`: no session state
-   (SET, an open transaction) carries from one query to the next."
+  "A fresh read-only pg-datahike session over database `db-id`: no session
+   state (SET, an open transaction) carries from one query to the next."
   [db-id]
-  (pg/make-query-handler (load/load! db-id) {:max-result-rows 100000}))
+  (read-only-handler (load/load! db-id)))
 
 (def ^:private writing-words
   "Keywords of statements that change data, schema, files or the session."

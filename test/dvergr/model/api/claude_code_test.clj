@@ -5,6 +5,7 @@
             [clojure.test :refer [deftest is testing]]
             [dvergr.model.api.claude-code :as claude-code]
             [dvergr.model.provider]
+            [dvergr.substrate.paths]
             [dvergr.model.subscription :as subscription])
   (:import [java.util.concurrent CancellationException]))
 
@@ -241,6 +242,8 @@
         (is (= ["mcp__dvergr__read_file" "mcp__dvergr__write_file"] (:allowed agent)))
         (is (= ["--port" "4711" "--no-start" "--room" "world-1" "--tools" "read_file,write_file"]
                (get-in config ["mcpServers" "dvergr" "args"])) "pinned to its room and tools")
+        (is (= (dvergr.substrate.paths/home) (get-in config ["mcpServers" "dvergr" "env" "DVERGR_HOME"]))
+            "the relay keeps its files in this process's home")
         (is (= "mcp__dvergr__read_file mcp__dvergr__write_file" (after "--allowedTools")))
         (is (= "" (after "--tools")) "no built-in tools")
         (is (not (some #{"--safe-mode"} cmd)) "safe mode would drop the MCP config")

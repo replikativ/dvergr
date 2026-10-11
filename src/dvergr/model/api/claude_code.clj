@@ -23,6 +23,7 @@
             [dvergr.model.quirks :as quirks]
             [dvergr.model.subscription :as subscription]
             [dvergr.chat.tool-schema :as tool-schema]
+            [dvergr.substrate.paths :as paths]
             [jsonista.core :as json]
             [clojure.string :as str]
             [taoensso.telemere :as tel])
@@ -478,14 +479,18 @@
 (defn- agent-mcp-config
   "The --mcp-config of a CLI agent working in room `room-id` with exactly
    `tool-names`: dvergr's MCP server through the stdio relay, the connection
-   pinned to that room. Nil when no relay or server is available."
+   pinned to that room. The relay gets this process's state root as
+   `DVERGR_HOME`: it keeps its files there (never in the checkout's
+   `.dvergr`) and refuses a daemon on that port with another home. Nil when
+   no relay or server is available."
   [room-id tool-names]
   (when-let [relay (relay-command)]
     (let [port ((requiring-resolve 'dvergr.mcp.server/listening-port))]
       (json/write-value-as-string
        {:mcpServers {:dvergr {:type "stdio" :command relay
                               :args ["--port" (str port) "--no-start"
-                                     "--room" room-id "--tools" (str/join "," tool-names)]}}}))))
+                                     "--room" room-id "--tools" (str/join "," tool-names)]
+                              :env {"DVERGR_HOME" (paths/home)}}}}))))
 
 (defn- agent-invocation
   "When `opts` name a work room (`:room-id`) and tools, the CLI runs as an

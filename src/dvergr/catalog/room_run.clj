@@ -6,16 +6,19 @@
        --models claude-haiku-4-5,codex-subscription-luna --repetitions 2 --home runs/competitors
 
    The directory is a bundle (workflow.edn, checker.clj, gold.edn, fixtures/),
-   e.g. an export from `catalog_export` unpacked. `--home` is a dvergr home
-   (default workflow-runs/<bundle name>): this process opens it with a
+   e.g. an export from `catalog_export` unpacked, or one `casepack-cli`
+   wrote. `--home` is a dvergr home (default
+   $DVERGR_HOME/workflow-runs/<bundle name>, or workflow-runs/<bundle name>
+   without DVERGR_HOME): this process opens it with a
    headless daemon, creates the room <bundle name> there (once), writes the
    bundle into its workspace as workflows/<bundle name>/ (`room_write`), and
    runs `catalog_benchmark` into that room as the experiment <bundle name>.
    Running again resumes it: cells with a verdict are kept, faulted ones run
    again. The Scorecard is printed (billed and list-price cost) and the
    report (`experiment_report`) printed to stdout, or written to `--report
-   FILE`; the exit code is 1 when cells did not finish. Nothing is written
-   outside the home's stores."
+   FILE`; the exit code is 1 when cells did not finish. stdout has progress
+   lines and the report; the log goes to <home>/dvergr.log. Nothing is
+   written outside the home."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.tools.cli :as cli]
@@ -26,6 +29,7 @@
             [dvergr.catalog.room :as room-wf]
             [dvergr.ops :as ops]
             [dvergr.rooms.files :as room-files]
+            [dvergr.substrate.log :as log]
             [org.replikativ.spindel.engine.core :as ec]))
 
 (def ^:private options
@@ -34,7 +38,8 @@
    [nil "--budget-dollars USD" "Budget per attempt" :parse-fn #(Double/parseDouble %)]
    [nil "--timeout-ms MS" "Per attempt" :parse-fn #(Integer/parseInt %)]
    [nil "--cases N" "A dataset's first N cases of a fixed shuffle (default all)" :parse-fn #(Integer/parseInt %)]
-   [nil "--home DIR" "The dvergr home the experiment is kept in (default workflow-runs/<bundle name>)"]
+   [nil "--home DIR" (str "The dvergr home the experiment is kept in (default $DVERGR_HOME/workflow-runs/<bundle name>, "
+                          "or workflow-runs/<bundle name> without DVERGR_HOME)")]
    [nil "--report FILE" "Write the report to FILE instead of printing it"]
    [nil "--check" "Only check and calibrate the bundle (in its room)"]
    ["-h" "--help"]])
@@ -107,11 +112,14 @@
 
 (defn- wait-for
   "The job's status once it is over and settled (its fixture room archived):
-   the home closes after this."
-  [daemon job]
-  (loop []
-    (let [st (ops/invoke daemon :job/status {:job (:id job) :wait-ms 20000})]
-      (if (or (= "running" (:status st)) (false? (:settled st))) (recur) st))))
+   the home closes after this. `on-progress` gets each new `:progress` (cells
+   done of the total, faults, phase)."
+  [daemon job on-progress]
+  (loop [seen nil]
+    (let [st (ops/invoke daemon :job/status {:job (:id job) :wait-ms 20000})
+          p (:progress st)]
+      (when (and on-progress p (not= p seen)) (on-progress p))
+      (if (or (= "running" (:status st)) (false? (:settled st))) (recur (or p seen)) st))))
 
 (defn- cell-count
   "How many cells the experiment of `b` on `models` has."
@@ -145,11 +153,12 @@
    once more when cells faulted (`:fault-retries`, default 1), and the report
    from `experiment_report`. `:parallelism`, `:params` and `:prompt` go to
    `catalog_benchmark`; `:judge-fn` and `:tier` cannot cross an op and are
-   refused. With `:check?`, only `catalog_calibrate`.
+   refused. With `:check?`, only `catalog_calibrate`. `:on-progress`, a fn,
+   gets the job's progress whenever it changes.
    Returns `{:home :room :job :experiment :scorecard (the Scorecard) :failed-cells
    :report (Markdown)}`, or `{:home :room :calibration}`."
   [{:keys [name files] :as b} {:keys [home models repetitions budget-dollars timeout-ms cases check? fault-retries
-                                      parallelism params prompt]
+                                      parallelism params prompt on-progress]
                                :or {fault-retries 1} :as opts}]
   (when-not (re-matches #"[a-z0-9][a-z0-9-]*" (str name))
     (throw (ex-info (str "A bundle's name (its directory's) is lowercase letters, digits and dashes: " name)
@@ -191,7 +200,7 @@
                              (catch Throwable t
                                (ops/invoke daemon :job/cancel {:job (:id job)})
                                (throw t)))
-                      st (wait-for daemon job)
+                      st (wait-for daemon job on-progress)
                       report (report-of exp-id)]
                   ;; cells that faulted (a lost connection, a provider
                   ;; failure) run once more: the resume keeps the rest
@@ -212,6 +221,16 @@
            :failed-cells (if scorecard 0 (- (cell-count b opts) (verdicts daemon name exp-id)))
            :report (:markdown report)})))))
 
+(defn default-home
+  "Where `room-run` keeps the bundle `name`'s experiment without `--home`:
+   `$DVERGR_HOME/workflow-runs/<name>` when DVERGR_HOME is set (a home of its
+   own beside the daemon's stores: a daemon may have the home itself open),
+   else `workflow-runs/<name>` in the working directory."
+  [name]
+  (if-let [h (not-empty (System/getenv "DVERGR_HOME"))]
+    (str (io/file h "workflow-runs" name))
+    (str "workflow-runs/" name)))
+
 (defn -main [& args]
   (let [{:keys [options arguments errors summary]} (cli/parse-opts args options)
         [dir] arguments]
@@ -222,11 +241,22 @@
 
       :else
       (let [b (room-wf/read-dir dir)
-            home (or (:home options) (str "workflow-runs/" (:name b)))
+            home (or (:home options) (default-home (:name b)))
+            log-file (str (io/file home "dvergr.log"))
+            ;; stdout is for progress and the report; the daemon's log goes
+            ;; to the home
+            _ (log/to-file! log-file)
             _ (println "Bundle" (:name b) (str (:id b)) "in home" home)
+            _ (println "Log:" log-file)
             {:keys [calibration scorecard failed-cells report job]}
             (benchmark! b (cond-> {:home home :models (:models options) :repetitions (:repetitions options)
-                                   :check? (:check options)}
+                                   :check? (:check options)
+                                   :on-progress (fn [{:keys [cells-done cells-total faults phase]}]
+                                                  (println (str "Progress: " cells-done
+                                                                (when cells-total (str "/" cells-total))
+                                                                " cells done"
+                                                                (when (pos? (or faults 0)) (str ", " faults " faulted"))
+                                                                " (" phase ")")))}
                             (:budget-dollars options) (assoc :budget-dollars (:budget-dollars options))
                             (:timeout-ms options) (assoc :timeout-ms (:timeout-ms options))
                             (:cases options) (assoc :cases (:cases options))))]

@@ -316,7 +316,7 @@
     "- Attempts: `workflow_start` runs a task several times per model, each on its own fork, as a job;"
     "  poll `job_status {job, wait-ms}`. The result has per-attempt status, spend and a review of each world."
     "  Adopt one with `room_merge {room: world, expect-state: review.state}`, `room_discard` the rest."
-    "- Long work is a job: start it, then `job_status` (waits up to 25 s per call), `job_cancel`."
+    "- Long work is a job: start it, then `job_status` (waits up to 25 s per call; a benchmark's shows cells done of total), `job_cancel`."
     "- Catalog: `catalog_list` shows workflows with their own checker; `catalog_start` runs one on its"
     "  benchmark set (no room: compare models) or on your room's files, scored per attempt."
     "- Money: every model call is billed to the room's wallet (`room_wallet`); a spent wallet refuses work."
