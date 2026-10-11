@@ -878,7 +878,10 @@
                            'dispatch  (fn [skill] (dispatch conn skill))
                            'dispatch! (gated effects
                                              (fn [skill & _] {:effect :task/write
-                                                              :resource {:op :dispatch :skill (str skill)}})
+                                                              :resource {:op :dispatch :skill (str skill)}
+                                                              ;; a transport may deliver it
+                                                              ;; (Telegram, MCP): it reaches out
+                                                              :class #{:network :egress}})
                                              (fn [skill opts]
                                                (dispatch!* conn skill opts)))
                          ;; Authoring lifecycle (writes into THIS room's repo —

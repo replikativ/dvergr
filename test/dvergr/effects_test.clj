@@ -773,6 +773,15 @@
                 (is (re-find #"read-only" (str (:err (eval "(intake.mail/inbox :account :other)")))))))))
         (is (= [[] [:limit 3]] @touched) "the read gets the options decided on")))))
 
+(deftest a-dispatch-reaches-out
+  (with-sys-conn
+    (fn [conn]
+      (let [sci-ctx (sci/init {})]
+        (agent-ns/add-skills-ns! sci-ctx conn (boundary (effects/make-sink) [[:admit #{:read :write :global}]]))
+        (is (thrown-with-msg? Exception #"not granted"
+                              (sci/eval-string* sci-ctx "(dvergr.skills/dispatch! :review {:task \"t\"})"))
+            "a transport may deliver it, so writing is not enough")))))
+
 (deftest skill-writes-count-against-a-quota
   (with-sys-conn
     (fn [conn]

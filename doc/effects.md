@@ -176,7 +176,8 @@ gate of its capability rather than per call site.
 - **Databases**: the tools' transacts (`task_create`, `task_update`, `knowledge_add`) are
   `:db/transact`, as the sandbox's `datahike.api/transact` is.
 - **The global registry**: actor rows and a prompt (`dvergr.actors/*`, `update_agent_profile`)
-  are `:actor/write`, task settlement and skill dispatch `:task/write`, both `#{:write :global}`;
+  are `:actor/write`, task settlement and skill dispatch `:task/write`, both `#{:write :global}`
+  (a dispatch also `:network :egress`: a transport may deliver it);
   skill files (`dvergr.skills/author!`, `lift!`, `promote!`) are `:fs/write` into the room repo.
   The ownership checks (hardening 8) still run, inside the effect.
 - **Runs**: `dvergr.agent/hire!`, `run-experiment!`, `spawn_agent`, `propose_change` are
