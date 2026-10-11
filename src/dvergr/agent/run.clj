@@ -329,6 +329,21 @@
     (.start))
   nil)
 
+(defn- finish-durably-at! [run-id status opts]
+  (try
+    (finish! run-id status opts)
+    (catch Throwable t
+      (when (= ::invalid-finish-status (:type (ex-data t)))
+        (throw t))
+      (tel/log! {:level :warn :id ::finish-retrying
+                 :data {:run/id run-id :run/status status :error (ex-message t)}}
+                "Run finish refused; retrying off the caller's thread")
+      (retry-in-background! (str "dvergr-run-finish-" run-id)
+                            #(contains? @active run-id)
+                            #(finish! run-id status opts)
+                            {:run/id run-id :run/status status})
+      nil)))
+
 (defn finish-durably!
   "`finish!` for a caller that cannot wait for the store. When the terminal
    write is refused the Run stays live, as `finish!` leaves it, and the write
@@ -337,19 +352,11 @@
    Returns the finished Run, or nil while the write is retried."
   ([run-id status] (finish-durably! run-id status {}))
   ([run-id status opts]
-   (try
-     (finish! run-id status opts)
-     (catch Throwable t
-       (when (= ::invalid-finish-status (:type (ex-data t)))
-         (throw t))
-       (tel/log! {:level :warn :id ::finish-retrying
-                  :data {:run/id run-id :run/status status :error (ex-message t)}}
-                 "Run finish refused; retrying off the caller's thread")
-       (retry-in-background! (str "dvergr-run-finish-" run-id)
-                             #(contains? @active run-id)
-                             #(finish! run-id status opts)
-                             {:run/id run-id :run/status status})
-       nil))))
+   ;; One end for every attempt: a write that was stored although it reported
+   ;; failure is then repeated exactly, which the store accepts (a terminal
+   ;; Run's end is immutable).
+   (let [opts (update opts :now #(or % (java.util.Date.)))]
+     (finish-durably-at! run-id status opts))))
 
 (defn retain-finished!
   "Durably write a final/waiting Run projection while retaining its live
