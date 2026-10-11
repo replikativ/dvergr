@@ -91,7 +91,7 @@
                     chat-agent/messages->api-format (fn [messages _ _] messages)
                     model-chat/chat (scripted-model calls answer)]
         (room-wf/experiment! (room-wf/bundle "competitors" files)
-                             {:dir dir :models ["claude-haiku-4-5"] :repetitions 2 :timeout-ms 60000}))
+                             {:home dir :models ["claude-haiku-4-5"] :repetitions 2 :timeout-ms 60000}))
       (finally
         (paths/set-home! prev)
         (sdb/reset-conn!)))))
@@ -263,7 +263,7 @@
                           chat-agent/messages->api-format (fn [messages _ _] messages)
                           model-chat/chat (fetching-model calls)]
               (let [{:keys [scorecard failed-cells]}
-                    (room-wf/experiment! frozen {:dir (str (System/getProperty "java.io.tmpdir") "/dvergr-frozen-" (random-uuid))
+                    (room-wf/experiment! frozen {:home (str (System/getProperty "java.io.tmpdir") "/dvergr-frozen-" (random-uuid))
                                                  :models ["claude-haiku-4-5"] :timeout-ms 60000})]
                 (is (zero? failed-cells) (pr-str (:incomplete scorecard)))
                 (is (= 1.0 (:reward-mean (first (:scorecard/summary scorecard)))))))
@@ -354,15 +354,3 @@
     (testing "and is scored against its case's gold"
       (is (= 1.0 (:reward ((:verify ev) (second envs) {:run-status :completed :files {"/out/a.txt" "4"}}))))
       (is (= 0.0 (:reward ((:verify ev) (first envs) {:run-status :completed :files {"/out/a.txt" "4"}})))))))
-
-(deftest a-cli-candidate-gets-a-headless-daemon-for-the-experiment
-  ;; its MCP tools are the daemon's: without one every read and write of the
-  ;; attempt's world failed and the candidate scored a silent zero (room
-  ;; workflows and wiki benchmarks alike: the runner installs it)
-  (let [current @(requiring-resolve 'dvergr.orchestration.daemon/current-daemon)
-        h (dvergr.agent.experiment.runner/serve-headless! {:ctx ::the-room-ctx})]
-    (try
-      (is (= {:headless? true :execution-ctx ::the-room-ctx} @current) "the experiment room's context finds its rooms")
-      (is (nil? (dvergr.agent.experiment.runner/serve-headless! {:ctx ::another})) "a daemon is there: none installed")
-      (finally (dvergr.agent.experiment.runner/release-headless! h)))
-    (is (nil? @current) "gone after the experiment")))

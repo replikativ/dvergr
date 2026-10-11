@@ -5,15 +5,18 @@
    `org.replikativ/dvergr-benchmarks` artefact has tau2, BFCL, BIRD,
    AutomationBench and SpreadsheetBench; a user's own benchmark is one more:
    doc/benchmarks.md). This namespace brings the
-   rest: the durable experiment directory, the experiment Room, Claude Code
+   rest: the experiment's home, the experiment Room, Claude Code
    settings for the run, waiting out subscription usage windows, resume, and
    the Scorecard. Every cell (candidate x environment x repetition) is one
    `dvergr.agent.evaluation/evaluate` through `dvergr.agent.experiment/run`.
 
-   The durable record lives under `:dir`: `store/` (Datahike: experiment Room,
-   Runs, Attempts, Scorecard) and `artifacts/`. Re-running with the same
-   directory resumes: cells with a certified Attempt are skipped, and a
-   Scorecard is persisted only when every cell has one.
+   `:dir` is a dvergr home (`open-home!`): its system DB and the stores of its
+   rooms. The experiment is kept in a room of that home, one per ExperimentDef
+   (`experiment-slug`): its Runs, Attempts (their exact payloads as blobs of
+   the room's Datahike store) and Scorecard, as any daemon room keeps them.
+   The report is read from there (the `experiment/report` op). Re-running
+   with the same home resumes: cells with a verdict are kept, faulted ones
+   run again, and a Scorecard is persisted only when every cell has one.
 
    Claude Code models (subscription via `claude -p`): the CLI can be pinned
    with `:claude-cli`, `:claude-env` adds CLI environment entries (see
@@ -22,17 +25,18 @@
    be disabled). The CLI version and the note are part of the ExperimentDef,
    so changing either never resumes into old cells."
   (:require [clojure.java.io :as io]
-            [dvergr.agent.conversation :as conv]
+            [clojure.string :as str]
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.environment :as environment]
             [dvergr.agent.experiment :as experiment]
             [dvergr.agent.experiment.preflight :as preflight]
             [dvergr.agent.roster :as roster]
-            [dvergr.discourse :as d]
             [dvergr.model.api.claude-code :as cc]
             [dvergr.model.registry :as registry]
             [dvergr.model.subscription :as subscription]
             [dvergr.room.store :as store]
+            [dvergr.substrate.paths :as paths]
+            [dvergr.system.db :as sdb]
             [hasch.core :as hasch]
             [taoensso.telemere :as tel]
             [org.replikativ.spindel.engine.core :as ec]))
@@ -239,51 +243,294 @@
         :world-parent world-parent
         :admit admit}))))
 
-(defn progress
-  "The progress of the experiment stored in `dir` (a `run!` directory),
-   derived from its store: see `dvergr.agent.experiment/progress`."
+;; ---------------------------------------------------------------------------
+;; A home of its own: an experiment's directory is a dvergr home
+;; ---------------------------------------------------------------------------
+
+(defn old-layout?
+  "Is `dir` an experiment directory of the layout before homes (`artifacts/`
+   beside `store/`, `home/` inside)?"
   [dir]
-  (let [xs (conv/open-store! dir)]
+  (let [has? #(.exists (io/file dir %))]
+    (boolean (or (has? "artifacts") (and (has? "store") (has? "home"))))))
+
+(defn- current-daemon [] @@(requiring-resolve 'dvergr.orchestration.daemon/current-daemon))
+
+(defn- mcp-running? [] (:running ((requiring-resolve 'dvergr.mcp.server/status))))
+
+(defn open-home!
+  "Make `dir` the process's dvergr home and start a headless daemon on it:
+   no Telegram, web, MCP listener or agents (a Claude Code candidate's MCP
+   calls get a loopback server on an ephemeral port, `dvergr.mcp.server/
+   listening-port`). The home holds the system DB and the rooms' stores
+   registered there; a moved home is adopted, a copied one refused
+   (`dvergr.system.home/claim!`). Refuses a directory of the old experiment
+   layout, and a process that already runs a daemon (run in its home with
+   `run!`'s `:daemon`, or `run-in`). Returns the handle `close-home!` takes."
+  [dir]
+  (when-not dir
+    (throw (ex-info "An experiment needs a home directory (:dir)" {:type ::no-home})))
+  (when (old-layout? dir)
+    (throw (ex-info (str dir " is an experiment directory of the old layout (artifacts/, store/, "
+                         "home/), which this version neither reads nor resumes. Start a new home "
+                         "elsewhere; the old directory stays as it is.")
+                    {:type ::old-layout :dir (str dir)})))
+  (when (current-daemon)
+    (throw (ex-info (str "This process runs a daemon: an experiment runs in its home (run! with "
+                         ":daemon, or run-in), not in a home of its own")
+                    {:type ::daemon-running :dir (str dir)})))
+  (let [prev @@#'paths/home-atom
+        mcp-before? (mcp-running?)]
+    (paths/set-home! (.getCanonicalPath (io/file dir)))
+    (sdb/reset-conn!)
     (try
-      (let [room-id (some->> (store/-list-rooms (:store xs)) first :id)]
-        (experiment/progress {:id room-id :store (:store xs)}))
-      (finally (conv/close-store! xs)))))
+      {:dir (str dir) :prev-home prev :mcp-before? mcp-before?
+       :daemon ((requiring-resolve 'dvergr.orchestration.daemon/start!) {:agents {}})}
+      (catch Throwable t
+        (sdb/reset-conn!)
+        (paths/set-home! prev)
+        (throw t)))))
 
-(defn- write-report!
-  "`result` with its report written beside the experiment (`report.md`: the
-   frontier, where answers fail, tokens, time and cost). A report that cannot
-   be written is logged, never the experiment's failure."
-  [dir title result]
-  (try (spit (io/file dir "report.md")
-             ((requiring-resolve 'dvergr.catalog.report/markdown) {:title title :result result}))
-       (catch Throwable e
-         (tel/log! {:level :warn :id :experiment/report-failed :data {:dir (str dir) :error (ex-message e)}})))
-  result)
+(defn close-home!
+  "Stop the daemon `open-home!` started (and the MCP server a candidate
+   started) and give the process back the home it had."
+  [{:keys [daemon prev-home mcp-before?]}]
+  (try
+    (when daemon ((requiring-resolve 'dvergr.orchestration.daemon/stop!) daemon))
+    (finally
+      (try (when (and (not mcp-before?) (mcp-running?))
+             ((requiring-resolve 'dvergr.mcp.server/stop!)))
+           (catch Throwable _ nil))
+      (sdb/reset-conn!)
+      (paths/set-home! prev-home))))
 
-(defn ^:no-doc serve-headless!
-  "Install a headless daemon serving `room`'s forks when the process has no
-   daemon; returns it (for `release-headless!`), or nil when one is there."
-  [room]
-  (let [current @(requiring-resolve 'dvergr.orchestration.daemon/current-daemon)
-        headless {:headless? true :execution-ctx (:ctx room)}]
-    (when (compare-and-set! current nil headless)
-      headless)))
+(defn with-home
+  "`(f daemon)` with `dir` as the home (`open-home!`), closed whatever happens."
+  [dir f]
+  (let [h (open-home! dir)]
+    (try (f (:daemon h))
+         (finally (close-home! h)))))
 
-(defn ^:no-doc release-headless!
-  "Remove the headless daemon `serve-headless!` installed, if it still is."
-  [headless]
-  (when headless
-    (compare-and-set! @(requiring-resolve 'dvergr.orchestration.daemon/current-daemon) headless nil)))
+(defn- op [daemon k args] ((requiring-resolve 'dvergr.ops/invoke) daemon k args))
+
+(defn- live-room [daemon slug] ((requiring-resolve 'dvergr.ops/resolve-room) daemon slug))
+
+(defn- slug-part [s]
+  (-> (str s) str/lower-case (str/replace #"[^a-z0-9]+" "-") (str/replace #"(^-+|-+$)" "")))
+
+(defn experiment-slug
+  "The slug of the room an ExperimentDef is kept in: its readable id (cut to
+   40 characters) and the start of its content id. A change of prompt, grader,
+   candidates or library versions is a new ExperimentDef, so a new room:
+   nothing resumes into another version's cells."
+  [experiment]
+  (let [id (:experiment/id experiment)
+        readable (slug-part (str (namespace id) "-" (name id)))
+        readable (str/replace (subs readable 0 (min 40 (count readable))) #"-+$" "")]
+    (str (if (str/blank? readable) "experiment" readable)
+         "-" (subs (str (:experiment/content-id experiment)) 0 8))))
+
+(defn experiment-room!
+  "The room of the daemon's home `experiment` is kept in, created (through
+   the `room/create` op) on first use; its title names the experiment."
+  [daemon experiment title]
+  (let [slug (experiment-slug experiment)]
+    (or (live-room daemon slug)
+        (do (op daemon :room/create {:title title :slug slug})
+            (live-room daemon slug))
+        (throw (ex-info (str "The experiment room " slug " could not be created") {:type ::no-room :slug slug})))))
+
+(defn- experiment-rooms
+  "The live rooms of the daemon's home other than its global room."
+  [daemon]
+  (let [global (or (:global-room-slug (:config daemon)) "boardroom")]
+    (->> (binding [ec/*execution-context* (:execution-ctx daemon)] (sdb/all-rooms))
+         (map :room/slug)
+         (remove #{global})
+         sort
+         (keep #(live-room daemon %)))))
+
+(defn progress
+  "What the experiments kept in the home `dir` have done so far, derived from
+   their rooms' stores (the `experiment/progress` op of each): see
+   `dvergr.agent.experiment/progress`."
+  [dir]
+  (with-home dir
+    (fn [daemon]
+      (let [ps (mapv #(op daemon :experiment/progress {:room (:slug %)}) (experiment-rooms daemon))]
+        {:rooms (mapv :slug (experiment-rooms daemon))
+         :experiments (vec (mapcat :experiments ps))
+         :running (vec (mapcat :running ps))
+         :microdollars (reduce + 0 (keep :microdollars ps))}))))
+
+(defn- only-room [daemon room]
+  (or (some->> room (live-room daemon))
+      (let [rs (experiment-rooms daemon)]
+        (if (and (nil? room) (= 1 (count rs)))
+          (first rs)
+          (throw (ex-info (str "The home keeps " (count rs) " experiment rooms; name one"
+                               (when room (str " (no room " room ")")) ": " (str/join ", " (map :slug rs)))
+                          {:type ::which-room :rooms (mapv :slug rs)}))))))
+
+(defn report
+  "The report (`experiment/report` op) of an experiment kept in the home
+   `dir`: of room `room` (a slug), else of its only experiment room."
+  ([dir] (report dir nil))
+  ([dir room]
+   (with-home dir
+     (fn [daemon] (op daemon :experiment/report {:room (:slug (only-room daemon room))})))))
+
+(defn open-experiment
+  "Open the home `dir` to read the experiment kept in room `room` (a slug;
+   default its only experiment room) with the store functions:
+   `{:home :room :store :room-id}`, `:room-id` the id its records are kept
+   under. `close-experiment` closes it."
+  ([dir] (open-experiment dir nil))
+  ([dir room]
+   (let [h (open-home! dir)]
+     (try
+       (let [r (only-room (:daemon h) room)]
+         {:home h :room r :store (:store r) :room-id (store/conversation-id r)})
+       (catch Throwable t (close-home! h) (throw t))))))
+
+(defn close-experiment [{:keys [home]}] (close-home! home))
+
+;; ---------------------------------------------------------------------------
+;; run!
+;; ---------------------------------------------------------------------------
+
+(defn- run-on
+  "`run!` in `daemon`'s home."
+  [daemon
+   {:keys [dir benchmark capabilities environments team models dataset metadata
+           repetitions parallelism experiment-id claude-cli claude-env
+           usage-pause-threshold usage-retries fault-retries]
+    :or {repetitions 1 parallelism 1 usage-pause-threshold 0.97 usage-retries 3 fault-retries 1}
+    :as opts}]
+  (let [started-ms (System/currentTimeMillis)
+        allowance (get opts :allowance default-allowance)
+        metered (metered-providers models)
+        before (select-keys (subscription/all-readings) metered)
+        admit (admit-for models allowance)
+        cc-before (cc/settings-snapshot)
+        uses-cc? (boolean (some #{:claude-code} (map model-provider models)))
+        note (let [n (get opts :host-context-note :auto)]
+               (cond (= :auto n) (when uses-cc? host-context-note)
+                     (string? n) n))
+        _ (when uses-cc? (cc/configure! (cond-> {:system-note note}
+                                          claude-cli (assoc :cli claude-cli)
+                                          claude-env (assoc :env claude-env))))
+        host (when uses-cc?
+               {:claude-cli (or (cc/cli-version)
+                                (throw (ex-info "Claude Code CLI not runnable"
+                                                {:cli (:cli (cc/settings-snapshot))})))
+                :host-context-note-id (some-> note hasch/uuid str)
+                :claude-env-keys (vec (sort (keys claude-env)))})
+        room-id (or experiment-id
+                    (when dir (keyword (name benchmark) (.getName (io/file dir))))
+                    (throw (ex-info "An experiment in a running daemon needs an :experiment-id"
+                                    {:type ::no-experiment-id})))
+        experiment-def (experiment-def {:benchmark benchmark :id room-id
+                                        :environments environments :team team
+                                        :dataset dataset :repetitions repetitions
+                                        :metadata (cond-> (assoc (or metadata {}) :libraries (library-versions))
+                                                    host (assoc :host host))})
+        ;; the home's room for exactly this ExperimentDef: a Claude Code
+        ;; candidate's MCP tool calls reach its forks through the daemon
+        room (experiment-room! daemon experiment-def
+                               (str (name benchmark) " experiment " (name room-id)))
+        slug (:slug room)
+        ;; an embedder that serves the experiment's rooms learns the room
+        ;; they fork from
+        _ (when-let [f (:on-room opts)] (f room))
+        ;; Detached evaluation cleanup of this operation is joined before the
+        ;; call returns.
+        cleanup-group (evaluation/cleanup-group)
+        run-once (fn run-once
+                   ([] (run-once admit))
+                   ([admit]
+                   ;; Wait outside the Runs: inside one, the wait would count
+                   ;; against the evaluation's own timeout.
+                    (when uses-cc? (cc/await-usage-window! {:threshold usage-pause-threshold}))
+                    (let [spin (run-in room {:capabilities capabilities :team team :admit admit
+                                             :experiment experiment-def :parallelism parallelism
+                                             :cleanup-group cleanup-group :benchmark benchmark})]
+                      (binding [ec/*execution-context* (:ctx room)] @spin))))]
+    (try
+      (let [estimate (when-let [pf (:preflight opts)]
+                       (run-preflight! {:preflight pf :experiment experiment-def :team team :metered metered
+                                        :parallelism parallelism :admit admit :run-once run-once}))]
+        (if (:over estimate)
+        ;; the pilot's cells are kept: running again with a larger budget
+        ;; (or none) resumes from them
+          (do (record-calibration! metered started-ms (:attempts (meta estimate)))
+              {:dir dir :room slug :experiment-room room-id :experiment experiment-def
+               :preflight estimate :stopped :over-budget})
+          (let [result (loop [n 0]
+                         (let [r (run-once)]
+                       ;; Cells a rejected subscription call failed are re-run
+                       ;; (resume skips the completed ones) after the reset.
+                           ;; So are cells that faulted or failed (a lost
+                           ;; connection): a fresh run with one such cell had
+                           ;; no Scorecard, its report nothing to show.
+                           (if (let [inc (:incomplete (:scorecard r))]
+                                 (and inc (not (:refused r))
+                                      (or (and (< n fault-retries) (or (pos? (:faults inc 0)) (seq (:errors inc))))
+                                          (and uses-cc? (< n usage-retries) (cc/usage-limited?)))))
+                             (recur (inc n))
+                             r)))
+                failed-cells (get-in result [:scorecard :incomplete :cells] 0)
+                ;; every Attempt this invocation ran, the pilot's included
+                ran (filter #(>= (or (get-in % [:attempt/receipt :attempt/started-at]) 0) started-ms)
+                            (keep :attempt (:results result)))
+                _ (record-calibration! metered started-ms ran)
+                title (str (name benchmark) " — " (name room-id))]
+            {:dir dir :room slug :experiment-room room-id :experiment experiment-def
+             :results (count (:results result)) :failed-cells failed-cells
+             ;; the receipts of the Attempts this invocation has (a report's
+             ;; checks and times), by Attempt id
+             :receipts (mapv (fn [a] (assoc (:attempt/receipt a) :attempt/id (:attempt/id a)))
+                             (keep :attempt (:results result)))
+             :refused (:refused result)
+             :preflight estimate
+             ;; a fresh process has no reading before its first call: then
+             ;; the first one taken during the run
+             :subscription (into {} (map (fn [p] [p {:before (or (get before p)
+                                                                 (first (filter #(>= (:at-ms %) started-ms)
+                                                                                (subscription/samples p))))
+                                                     :after (subscription/reading p)}]))
+                                 metered)
+             :scorecard (:scorecard result)
+             ;; the report is the room's, read through the op every binding
+             ;; uses (experiment_report): nothing beside the stores
+             :report (:markdown
+                      (try (op daemon :experiment/report
+                               (cond-> {:room slug :title title
+                                        :experiment (str (:experiment/content-id experiment-def))}
+                                 (:scorecard/content-id (:scorecard result))
+                                 (assoc :scorecard (str (:scorecard/content-id (:scorecard result))))))
+                           (catch Throwable e
+                             (tel/log! {:level :warn :id :experiment/report-failed
+                                        :data {:room slug :error (ex-message e)}})
+                             nil)))})))
+      (finally
+        (try (evaluation/await-cleanups-for! room cleanup-group) (catch Throwable _ nil))
+        (cc/configure! cc-before)))))
 
 (defn run!
-  "Run (or resume) an experiment. Returns `{:dir :experiment-room :experiment
-   :results :failed-cells :scorecard :receipts :refused :preflight
-   :subscription}` (`:results` is the number of cell results, `:receipts` the
-   Attempts' receipts) and writes `<dir>/report.md`. A preflight stop returns
-   `{:dir :experiment-room :experiment :preflight :stopped :over-budget}` and
-   writes no report.
+  "Run (or resume) an experiment. Returns `{:dir :room :experiment-room
+   :experiment :results :failed-cells :scorecard :receipts :refused :preflight
+   :subscription :report}` (`:room` is the slug of the room that keeps it,
+   `:results` the number of cell results, `:receipts` the Attempts' receipts,
+   `:report` the `experiment/report` Markdown). A preflight stop returns
+   `{:dir :room :experiment-room :experiment :preflight :stopped :over-budget}`.
 
-     :dir           the experiment directory
+     :dir           the experiment's home (`open-home!`): its system DB and
+                    the stores of its rooms; the experiment is kept in a room
+                    of its own there (`experiment-slug`), so running the same
+                    ExperimentDef again resumes it
+     :daemon        instead of `:dir`: run in this running daemon's home
+                    (needs `:experiment-id`)
      :benchmark     keyword; namespaces the experiment and dataset ids
      :capabilities  `{:world-setup :protocol :evaluator}`; the setup and the
                     protocol only when the environments name them (an
@@ -316,117 +563,13 @@
    readings around the run: with the tokens on the Scorecard, what a unit of
    work costs in window points.
 
-   Calls `conv/isolate-home!`: Dvergr's state root becomes `<dir>/home` for
-   the whole process. This is the separate-process host (a dedicated JVM or
-   REPL, never a daemon); in a daemon, run an experiment in one of its rooms
-   with `run-in` (e.g. the `catalog/benchmark` op)."
-  [{:keys [dir benchmark capabilities environments team models dataset metadata
-           repetitions parallelism experiment-id claude-cli claude-env
-           usage-pause-threshold usage-retries fault-retries]
-    :or {repetitions 1 parallelism 1 usage-pause-threshold 0.97 usage-retries 3 fault-retries 1}
-    :as opts}]
-  (conv/isolate-home! dir)
-  (let [started-ms (System/currentTimeMillis)
-        allowance (get opts :allowance default-allowance)
-        metered (metered-providers models)
-        before (select-keys (subscription/all-readings) metered)
-        admit (admit-for models allowance)
-        cc-before (cc/settings-snapshot)
-        uses-cc? (boolean (some #{:claude-code} (map model-provider models)))
-        note (let [n (get opts :host-context-note :auto)]
-               (cond (= :auto n) (when uses-cc? host-context-note)
-                     (string? n) n))
-        _ (when uses-cc? (cc/configure! (cond-> {:system-note note}
-                                          claude-cli (assoc :cli claude-cli)
-                                          claude-env (assoc :env claude-env))))
-        host (when uses-cc?
-               {:claude-cli (or (cc/cli-version)
-                                (throw (ex-info "Claude Code CLI not runnable"
-                                                {:cli (:cli (cc/settings-snapshot))})))
-                :host-context-note-id (some-> note hasch/uuid str)
-                :claude-env-keys (vec (sort (keys claude-env)))})
-        xs (conv/open-store! dir)
-        room-id (or experiment-id (keyword (name benchmark) (.getName (io/file dir))))
-        room (d/make-room {:id room-id :store (:store xs)
-                           :title (str (name benchmark) " experiment " (name room-id))})
-        ;; A Claude Code CLI candidate calls the attempt's tools over MCP,
-        ;; which resolve its room by id through the daemon: in a process with
-        ;; no daemon, a headless one (only that) serves them for the
-        ;; experiment's length; its context finds the attempts' rooms, forks
-        ;; of this one. Without it every tool call failed and a candidate's
-        ;; certified score was a silent 0 (wiki benchmarks, room workflows).
-        headless (when uses-cc? (serve-headless! room))
-        ;; an embedder that serves the experiment's rooms learns the room
-        ;; they fork from
-        _ (when-let [f (:on-room opts)] (f room))
-        experiment-def (experiment-def {:benchmark benchmark :id room-id
-                                        :environments environments :team team
-                                        :dataset dataset :repetitions repetitions
-                                        :metadata (cond-> (assoc (or metadata {}) :libraries (library-versions))
-                                                    host (assoc :host host))})
-        ;; Detached evaluation cleanup of this operation is joined before the
-        ;; Room and its store are closed.
-        cleanup-group (evaluation/cleanup-group)
-        run-once (fn run-once
-                   ([] (run-once admit))
-                   ([admit]
-                   ;; Wait outside the Runs: inside one, the wait would count
-                   ;; against the evaluation's own timeout.
-                    (when uses-cc? (cc/await-usage-window! {:threshold usage-pause-threshold}))
-                    (let [spin (run-in room {:capabilities capabilities :team team :admit admit
-                                             :experiment experiment-def :parallelism parallelism
-                                             :cleanup-group cleanup-group :benchmark benchmark})]
-                      (binding [ec/*execution-context* (:ctx room)] @spin))))]
-    (try
-      (let [estimate (when-let [pf (:preflight opts)]
-                       (run-preflight! {:preflight pf :experiment experiment-def :team team :metered metered
-                                        :parallelism parallelism :admit admit :run-once run-once}))]
-        (if (:over estimate)
-        ;; the pilot's cells are kept: running again with a larger budget
-        ;; (or none) resumes from them
-          (do (record-calibration! metered started-ms (:attempts (meta estimate)))
-              {:dir dir :experiment-room room-id :experiment experiment-def
-               :preflight estimate :stopped :over-budget})
-          (let [result (loop [n 0]
-                         (let [r (run-once)]
-                       ;; Cells a rejected subscription call failed are re-run
-                       ;; (resume skips the completed ones) after the reset.
-                           ;; So are cells that faulted or failed (a lost
-                           ;; connection): a fresh run with one such cell had
-                           ;; no Scorecard, its report nothing to show.
-                           (if (let [inc (:incomplete (:scorecard r))]
-                                 (and inc (not (:refused r))
-                                      (or (and (< n fault-retries) (or (pos? (:faults inc 0)) (seq (:errors inc))))
-                                          (and uses-cc? (< n usage-retries) (cc/usage-limited?)))))
-                             (recur (inc n))
-                             r)))
-                failed-cells (get-in result [:scorecard :incomplete :cells] 0)
-                ;; every Attempt this invocation ran, the pilot's included
-                ran (filter #(>= (or (get-in % [:attempt/receipt :attempt/started-at]) 0) started-ms)
-                            (keep :attempt (:results result)))
-                _ (record-calibration! metered started-ms ran)]
-            (write-report!
-             dir (str (name benchmark) " — " (name room-id))
-             {:dir dir :experiment-room room-id :experiment experiment-def
-              :results (count (:results result)) :failed-cells failed-cells
-             ;; the receipts of the Attempts this invocation has (a report's
-             ;; checks and times), by Attempt id
-              :receipts (mapv (fn [a] (assoc (:attempt/receipt a) :attempt/id (:attempt/id a)))
-                              (keep :attempt (:results result)))
-              :refused (:refused result)
-              :preflight estimate
-         ;; a fresh process has no reading before its first call: then
-         ;; the first one taken during the run
-              :subscription (into {} (map (fn [p] [p {:before (or (get before p)
-                                                                  (first (filter #(>= (:at-ms %) started-ms)
-                                                                                 (subscription/samples p))))
-                                                      :after (subscription/reading p)}]))
-                                  metered)
-              :scorecard (:scorecard result)}))))
-      (finally
-        (try (evaluation/await-cleanups-for! room cleanup-group) (catch Throwable _ nil))
-        (try (evaluation/await-cleanups! room) (catch Throwable _ nil))
-        (try (d/close-room! room) (catch Throwable _ nil))
-        (conv/close-store! xs)
-        (release-headless! headless)
-        (cc/configure! cc-before)))))
+   With `:dir`, `run!` is `open-home!` + the run + `close-home!`: the process's
+   home is `dir` for the call's length (a dedicated JVM or REPL; a process
+   with a daemon passes `:daemon`)."
+  [{:keys [dir daemon] :as opts}]
+  (if daemon
+    (run-on daemon opts)
+    (let [cc-before (cc/settings-snapshot)]
+      (try (with-home dir #(run-on % opts))
+           ;; the home's daemon configures Claude Code too
+           (finally (cc/configure! cc-before))))))

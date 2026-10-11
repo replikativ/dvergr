@@ -96,7 +96,7 @@
                                       search (assoc :run-episode (search-episode search export))))]
     (runner/run!
      (merge
-      (select-keys opts [:dir :repetitions :parallelism :experiment-id :fault-retries :preflight :allowance
+      (select-keys opts [:dir :daemon :repetitions :parallelism :experiment-id :fault-retries :preflight :allowance
                          :usage-pause-threshold :usage-retries])
       {:benchmark :spreadsheetbench
        :capabilities caps

@@ -94,9 +94,12 @@ Faults are seeded by `(seed, effect, occurrence)`: every Attempt meets the same 
 candidates are compared on the same draws (paired). Robustness is then the difference
 between a candidate's Scorecard on the environment with and without `:faults`.
 
-`dvergr.agent.experiment.runner/run!` is everything else: the experiment directory
-and Room, Claude Code settings for the run, waiting out subscription usage
-windows, resume, the Scorecard. A provider's `experiment/run!` is a call to it.
+`dvergr.agent.experiment.runner/run!` is everything else: the experiment's home (its
+`:dir`, opened with a headless daemon, `runner/open-home!`) and the Room kept there for the
+ExperimentDef, Claude Code settings for the run, waiting out subscription usage windows,
+resume, the Scorecard, and the report (`experiment_report`, the result's `:report`). A
+provider's `experiment/run!` is a call to it; with `:daemon` instead of `:dir` it runs in a
+running daemon's home (`runner/run-in` underneath, as `catalog_benchmark`).
 
 **Subscription allowance.** A subscription (Codex, Claude Code) has no bill, but it is the
 user's own quota. `dvergr.model.subscription` meters it from what the provider reports with
@@ -105,7 +108,7 @@ window; Claude Code: utilization per window), and an experiment runs under an al
 by default `{:share 0.10 :pause-at 0.80}`: no new cell starts once the experiment has used
 ten points of any window since it started, or once a window is 80% used by anyone. Refused
 cells do not run, the result says why (`:refused`), no Scorecard is persisted, and running
-the same directory again resumes them. `catalog_benchmark` runs under the same default. The
+the same home again resumes them. `catalog_benchmark` runs under the same default. The
 result's `:subscription` holds the readings before and after, which with the Scorecard's
 tokens measure what a unit of work costs in window points.
 
@@ -1216,22 +1219,23 @@ record: the graded log, the candidate's own transcript (REPL code and tool
 results), its per-turn Runs and, for a failed Run, what failed. Every Attempt
 records its verifier's trust tier (`:verifier-trust`) and its experiment cell.
 
-Each experiment directory holds one durable store with the experiment Room,
-a certified Attempt per cell, and a Scorecard once every cell completed (an
+Each experiment directory is a dvergr home whose experiment Room (one per
+ExperimentDef) keeps a certified Attempt per cell, and a Scorecard once every cell completed (an
 infrastructure fault is not a verdict: `runner/run!` re-runs faulted or errored cells
 within the same call, `:fault-retries` times, default 1, and re-running the same
-directory resumes and re-runs exactly the cells still without a verdict). `run!` writes
-`<dir>/report.md`, except when a preflight stops it (`:stopped :over-budget`). Records made before 2026-09-20 used episode Rooms instead;
-`inspect` reads both shapes.
+home resumes and re-runs exactly the cells still without a verdict). The result's
+`:report` is the room's report (`experiment_report`), except when a preflight stops it
+(`:stopped :over-budget`). A directory of the layout before homes (`store/` and
+`artifacts/`) is refused.
 
-Run it in a dedicated JVM, because it isolates Dvergr's home to the
-experiment directory:
+Run it in a dedicated JVM, because the experiment directory is the process's
+home for the call (`runner/open-home!`):
 
 ```clojure
 (require '[dvergr.benchmarks.tau2.core :as t2]
          '[dvergr.benchmarks.tau2.experiment :as tx]
          '[dvergr.benchmarks.tau2.inspect :as insp]
-         '[dvergr.agent.conversation :as conv])
+         '[dvergr.agent.experiment.runner :as runner])
 (def dom (t2/load-domain "retail"))
 (tx/run! {:dir ".dvergr/benchmarks/retail-cmp" :domain dom :split "base"
           :repetitions 4 :parallelism 3
@@ -1241,12 +1245,13 @@ experiment directory:
           :user {:model "claude-code-opus"} :judge {:model "claude-code-opus"}})
 ;; Re-running the same call resumes: completed cells are skipped.
 
-(def xs (conv/open-store! ".dvergr/benchmarks/retail-cmp"))
-(insp/summary xs :tau2/retail-cmp)                ; reward, pass^k, failures
-(def e (insp/episode xs :tau2/retail-cmp attempt-id))
+(def xs (runner/open-experiment ".dvergr/benchmarks/retail-cmp")) ; the home, its room
+(insp/summary xs (:room-id xs))                   ; reward, pass^k, failures
+(def e (insp/episode xs (:room-id xs) attempt-id))
 (insp/print-transcript e)                        ; dialogue, REPL code, effects
 (insp/verify-world dom task e)                   ; replay reproduces the certified hash
 (insp/verify-episode e)                          ; Room-path records only
+(runner/close-experiment xs)
 ```
 
 The host runner (`dvergr.benchmarks.tau2.runner/run!`) remains available for

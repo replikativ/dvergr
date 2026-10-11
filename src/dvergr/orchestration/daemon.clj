@@ -687,8 +687,16 @@
     (.start t)
     (reset! gc-thread t)))
 
-(defn- stop-gc-loop! []
-  (when-let [t @gc-thread] (.interrupt t) (reset! gc-thread nil)))
+(defn- stop-gc-loop!
+  "Stop the GC loop and wait (a minute at most) for a sweep in flight: the
+   stores it sweeps are released next, and a daemon that stops right after
+   it started (an experiment's home, `runner/open-home!`) would pull them
+   from under its boot sweep."
+  []
+  (when-let [^Thread t @gc-thread]
+    (.interrupt t)
+    (reset! gc-thread nil)
+    (when-not (= t (Thread/currentThread)) (.join t 60000))))
 
 (defn- start-mcp!
   "Start the MCP server on the daemon's loopback TCP port when `mcp-config` is

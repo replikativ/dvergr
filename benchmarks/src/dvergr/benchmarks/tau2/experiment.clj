@@ -3,10 +3,10 @@
 
    Every cell (candidate x task x repetition) is a certified conversational
    episode (`dvergr.benchmarks.tau2.episode`); cells run on bounded host
-   threads. The durable record lives under the experiment directory:
-   `store/` (Datahike: experiment Room, episode Rooms, Runs, messages,
-   Attempts, Scorecard) and `artifacts/` (immutable values). Re-running with
-   the same directory resumes: cells with a certified Attempt are skipped.
+   threads. The experiment directory is a dvergr home: the experiment Room
+   (episode Rooms, Runs, messages, Attempts, Scorecard) is a room of it, in
+   that room's Datahike store (`dvergr.agent.experiment.runner/run!`).
+   Re-running with the same home resumes: cells with a verdict are kept.
    When every cell has an Attempt the Scorecard is persisted.
 
      (run! {:dir \".dvergr/benchmarks/retail-cmp\" :domain dom
@@ -109,9 +109,9 @@
    `:split` defaults to \"base\" (upstream's train and test together); tune
    on \"train\" and report on \"test\" (nothing enforces it).
 
-   Calls `conv/isolate-home!`: Dvergr's state root becomes `<dir>/home` for
-   the whole process. Run experiments in a dedicated JVM or REPL, never in a
-   daemon process."
+   `:dir` is the experiment's home, the process's for the call's length
+   (`runner/open-home!`): a dedicated JVM or REPL. In a process with a
+   daemon, pass `:daemon` (and `:experiment-id`) instead."
   [{:keys [domain task-ids split candidates user judge limits timeout-ms
            user-fn judge-fn user-generate agent-generate]
     :or {split "base" limits {:max-steps 200 :max-errors 10} timeout-ms (* 30 60 1000)}
@@ -123,7 +123,7 @@
                :user-generate user-generate :agent-generate agent-generate})]
     (runner/run!
      (merge
-      (select-keys opts [:dir :repetitions :parallelism :experiment-id :fault-retries :claude-cli :claude-env
+      (select-keys opts [:dir :daemon :repetitions :parallelism :experiment-id :fault-retries :claude-cli :claude-env
                          :host-context-note :usage-pause-threshold :usage-retries
                          :preflight :allowance])
       {:benchmark :tau2

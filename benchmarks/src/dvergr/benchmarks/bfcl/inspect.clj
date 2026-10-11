@@ -5,18 +5,18 @@
      (report xs)      ; per candidate: accuracy by category, why it loses
      (failures xs :luna-repl)
      (close xs)"
-  (:require [clojure.java.io :as io]
-            [clojure.string :as str]
-            [dvergr.agent.conversation :as conv]
+  (:require [clojure.string :as str]
+            [dvergr.agent.experiment.runner :as runner]
             [dvergr.benchmarks.bfcl.core :as bfcl]
             [dvergr.room.store :as store]))
 
 (defn open
-  "Open the experiment's store (read it with the functions below, then `close`)."
-  [dir]
-  (assoc (conv/open-store! dir) :room-id (keyword "bfcl" (.getName (io/file dir)))))
+  "Open the experiment's home and room (read it with the functions below, then
+   `close`); `room` names the room when the home keeps several."
+  ([dir] (open dir nil))
+  ([dir room] (runner/open-experiment dir room)))
 
-(defn close [xs] (conv/close-store! xs))
+(defn close [xs] (runner/close-experiment xs))
 
 (defn attempts
   "Certified Attempts of the experiment, oldest first."

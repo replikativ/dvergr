@@ -35,7 +35,7 @@ task and one answer.
 ### Entities
 
 ```
-experiment Room  (durable DatahikeStore, one per experiment directory)
+experiment Room  (a room of the experiment's home, one per ExperimentDef)
  ├─ ExperimentDef / DatasetDef / EnvironmentDefs (content-addressed, portable)
  ├─ episode Run  :run/kind :episode, actor :environment, one per cell
  │    └─ certified Attempt (attempt/id = episode run id)  → Scorecard
@@ -224,11 +224,12 @@ An explicit `:episode` Run can own a certified Attempt, and nothing needs
    - The `watch-runs!` callback only delivers a promise, because it runs under
      the lifecycle lock.
 5. **Process isolation.**
-   - Benchmark experiments run with `paths/set-home!` pointed at the
-     experiment directory and a reset system DB, or in their own JVM.
-   - They use an experiment-local artifact store (EDN files by content hash)
-     instead of the global blob CAS, so a running daemon's `.dvergr` is never
-     touched.
+   - A benchmark experiment's directory is a dvergr home of its own
+     (`runner/open-home!`: a headless daemon on it for the call), so a
+     running daemon's `.dvergr` is never touched; inside a daemon it runs in
+     that daemon's home instead (`:daemon`).
+   - Exact payloads are blobs of the experiment room's own Datahike store,
+     as in every daemon room, not files beside it.
 6. **No new `llm-agent` option.**
    - The now-note is stripped by a `:run-turn-fn` wrapper that dissociates
      `:system-suffix`. The wrapper also counts model steps.

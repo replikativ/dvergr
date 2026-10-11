@@ -233,7 +233,7 @@ graph TD
 | `agent/{turn,prompt,process,tool_commands,persona,ops,fields}` | L5/L6 | shared turn mechanics; system-prompt assembler; checkpoint/resume process; tool commands; persona resolution; agent-management ops + field spec |
 | `agent/{program,run,world,roster,workflow}` | L5/L6 | `hire!` and agent programs; durable Runs; a Run's forked work world; immutable rosters; one task run N times on forks |
 | `agent/{evaluation,environment,experiment,experiment/*,verifiers,evaluators,attempt,spend,trajectory,conversation,episode}` | L5/L6 | the evaluation path (doc/evaluation-model.md): Attempts, EnvironmentDefs, experiments and their runner, preflight and statistics, verifier trust tiers, spend, trajectory export, certified conversations |
-| `catalog` + `catalog/{wiki,wiki_gen,room,room_run,casepack,report,workspace}` | L6 | catalog workflows (the wiki family) and room workflows (doc/room-workflows.md): bundles, case packs, `room-run`, report.md |
+| `catalog` + `catalog/{wiki,wiki_gen,room,room_run,casepack,report,workspace}` | L6 | catalog workflows (the wiki family) and room workflows (doc/room-workflows.md): bundles, case packs, `room-run` (a client of the room path), the report |
 | `jobs`, `artifact`, `activity` | L6 | long operations as durable Runs; content-addressed portable values; durable observations on room messages |
 | `orchestration/{daemon,skills,tasks,stats}` | L6 | the runtime daemon (lifecycle/registry/turn loop/sessions/Telegram); skill registry; task ledger; stats cache |
 | `actors` + `actors/transport` | L6 | durable actor identity table; PActorTransport impls |

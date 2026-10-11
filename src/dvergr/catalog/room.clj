@@ -106,6 +106,8 @@
                     {:type ::invalid-bundle :problems (vec problems)})))
   (let [definition (read-edn files "workflow.edn")]
     {:name name
+     ;; what it was made of: what travels into a room (`room-run`)
+     :files files
      :definition definition
      :checker (get files "checker.clj")
      :gold (read-edn files "gold.edn")
@@ -494,14 +496,14 @@
                            (seq (:cases b)) (assoc :cases case-ids))}}))
 
 (defn experiment!
-  "Benchmark bundle `b` in its own process (see `dvergr.catalog.wiki/experiment!`).
-   A Claude Code CLI candidate works in the attempt's world through dvergr's
-   MCP tools; without a daemon in the process, the runner serves them from a
-   headless one."
-  [b {:keys [dir repetitions parallelism] :or {repetitions 1} :as opts}]
-  ((requiring-resolve 'dvergr.agent.experiment.runner/run!)
-   (assoc (experiment-plan b opts) :dir dir :repetitions repetitions
-          :parallelism (or parallelism 1))))
+  "Benchmark bundle `b` (made by `bundle` or `read-dir`) in the dvergr home
+   `:home` the way an MCP client does: the bundle into the room <name> of
+   that home and `catalog_benchmark` into it (`dvergr.catalog.room-run/
+   benchmark!`, the `room-run` shell's path). Running again on the same home
+   resumes. A Claude Code CLI candidate works in the attempt's world through
+   the home's daemon's MCP tools."
+  [b opts]
+  ((requiring-resolve 'dvergr.catalog.room-run/benchmark!) b opts))
 
 ;; ---------------------------------------------------------------------------
 ;; Export and import: a bundle travels as its files and a manifest

@@ -7,8 +7,14 @@ benchmark; `doc/room-workflows.md` the bundle format.
 ## Run one
 
 Every benchmark has an `experiment/run!` in `benchmarks/` (on the classpath
-with `-M:benchmarks`, included in `:dev` and `:test`). Run it in its own JVM:
-`run!` moves Dvergr's state root into its `:dir`.
+with `-M:benchmarks`, included in `:dev` and `:test`). Its `:dir` is a dvergr
+**home**: the system DB and the stores of the rooms registered there, nothing
+else. `run!` opens it with a headless daemon (no Telegram, web or MCP
+listener; `runner/open-home!`), keeps the experiment in a room of it, runs it
+(`runner/run-in`) and closes the home again, whatever happens. The home is the
+process's for the call, so run it in its own JVM; in a process that runs a
+daemon, pass `:daemon` (and an `:experiment-id`) and it runs in that daemon's
+home. A moved home is adopted; a copied one is refused.
 
 ```clojure
 (require '[dvergr.benchmarks.bird.experiment :as bird])
@@ -25,12 +31,16 @@ command line:
 
 ```bash
 clojure -M -m dvergr.catalog.room-run examples/workflows/bank-booking \
-  --models codex-subscription-luna,claude-code-haiku --cases 30 --out runs
+  --models codex-subscription-luna,claude-code-haiku --cases 30 --home runs/bank-booking
 ```
 
-The experiment lives in `runs/bank-booking`; `report.md` is written there.
-The exit code is 1 when cells did not finish. Inside a daemon, use the
-`catalog_benchmark` MCP tool (the `bench` profile) or `runner/run-in`.
+`room-run` does what an MCP client does: it opens the home (default
+`workflow-runs/<bundle name>`), creates the room `bank-booking` there, writes
+the bundle into its workspace with `room_write`, runs `catalog_benchmark` into
+that room and prints the report from `experiment_report` (or writes it to
+`--report FILE`). The exit code is 1 when cells did not finish. Inside a
+daemon, use the `catalog_benchmark` MCP tool (the `bench` profile) or
+`runner/run-in`.
 
 A table of historical cases becomes a case pack with
 `dvergr.catalog.casepack/from-table` and `write-dir!`; certification
@@ -53,8 +63,12 @@ then discarded. What lives in the fork differs:
 
 ## Resume, identity and faults
 
-- Running again on the same `:dir` resumes: cells with a verdict are kept,
-  the rest run.
+- Running again on the same home resumes: cells with a verdict are kept,
+  the rest run. Each ExperimentDef is kept in a room of its own
+  (`runner/experiment-slug`: its readable id and the start of its content
+  id), so a changed experiment never resumes into another's room. A
+  directory of the layout before homes (`artifacts/` beside `store/`) is
+  refused, not read.
 - A cell that faults (the path to the model failed: transport, provider
   limits, a sidecar) has no verdict and runs again, once more within the same
   run by default (`:fault-retries`, default 1), and on every resume. A model
@@ -68,7 +82,9 @@ then discarded. What lives in the fork differs:
 
 ## The report
 
-`report.md` beside every experiment:
+The report is the experiment room's, rendered from its store by the
+`experiment_report` op (MCP, REPL `runner/report dir`, the `:report` of
+`run!`'s result, `room-run`'s output). It is no file beside the store:
 
 - **Frontier**: per candidate, attempts, passes with a 95 % interval
   (Jeffreys), mean reward, cost per attempt and per pass, tokens per attempt,
@@ -96,7 +112,7 @@ variance, which is several points on 100 questions.
   Anthropic API) call tools natively.
 - **Claude Code CLI models** (`claude-code-haiku/-sonnet/-opus`): in a room
   workflow they work in the attempt's world through Dvergr's MCP tools (the
-  runner serves them from a headless daemon when none runs in the process);
+  home's daemon serves them on a loopback server on an ephemeral port);
   in a protocol benchmark (BIRD, SpreadsheetBench, BFCL, tau2) they use a text
   tool protocol: only the calls a response opens with run (later ones were
   written without seeing a result), arguments are typed by the tool's
@@ -116,7 +132,8 @@ variance, which is several points on 100 questions.
 
 ## Limits today
 
-- One experiment per JVM; not inside a daemon (`run!` re-roots the process).
+- One home per JVM at a time (`run!` makes `:dir` the process's home for
+  the call); inside a daemon, `run!` takes `:daemon`.
 - At `:parallelism` 8 a scripted experiment spends about 0.35 s per cell in
   the harness: every cell writes to the experiment's one store (datahike's
   single writer), and a cell's admission (forking its world, the Run's
