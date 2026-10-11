@@ -204,6 +204,18 @@
         (finally
           (d/close-room! r))))))
 
+(deftest an-obligation-registered-after-leave-is-settled-at-once
+  (let [r (d/room :late-obligation)
+        settled (atom [])
+        bot (d/echo :bot)]
+    (try
+      (let [joined (binding [ec/*execution-context* (:ctx r)] (d/join r bot))]
+        (d/leave r :bot)
+        (d/reply-obligation! joined {:on-dropped (fn [reason _] (swap! settled conj reason))})
+        (is (= [:abandoned] @settled) "a handler still running after leave cannot leak it"))
+      (finally
+        (d/close-room! r)))))
+
 (deftest capability-and-broadcast-overlap-delivers-once
   (testing "a message matching SEVERAL of a participant's subscriptions is
             delivered ONCE — a broadcast (`:to nil`) carrying a subscribed

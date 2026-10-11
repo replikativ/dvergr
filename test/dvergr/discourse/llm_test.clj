@@ -501,6 +501,76 @@
         (finally
           (d/close-room! r))))))
 
+(deftest an-abandoned-turn-keeps-its-run-until-its-call-returns
+  (testing "leaving cancels the Run, which stays live until the in-flight call returns"
+    (let [st (memory/make)
+          r (d/make-room {:id :run-leave-in-flight :store st})
+          entered (promise)
+          gate (promise)
+          turn-fn (fn [_chat-ctx _opts]
+                    (deliver entered true)
+                    ;; a call that does not poll :cancel?
+                    (deref gate 10000 nil)
+                    :complete)]
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent {:id :worker
+                                  :spec {:provider :mock :model "mock"}
+                                  :run-turn-fn turn-fn})))
+      (try
+        (d/post! r (d/message :alice :worker "go"))
+        (is (= true (deref entered 10000 ::timeout)))
+        (d/leave r :worker)
+        (Thread/sleep 100)
+        (is (= [:cancelling] (mapv :run/status (run/active-runs :run-leave-in-flight)))
+            "the Run is cancelled but its call still runs")
+        (deliver gate true)
+        (is (await-condition #(= :cancelled (:run/status (first (run/runs r)))) 5000))
+        (is (= :participant-left (:run/reason (first (run/runs r)))))
+        (is (empty? (run/active-runs :run-leave-in-flight)))
+        (finally
+          (deliver gate true)
+          (d/close-room! r))))))
+
+(defn- refuse-terminal-writes [delegate n]
+  (let [refused (atom 0)]
+    (reify store/PRoomStore
+      (-store-room! [_ room-id metadata] (store/-store-room! delegate room-id metadata))
+      (-load-room [_ id-or-slug] (store/-load-room delegate id-or-slug))
+      (-delete-room! [_ room-id] (store/-delete-room! delegate room-id))
+      (-list-rooms [_] (store/-list-rooms delegate))
+      (-store-message! [_ room-id message] (store/-store-message! delegate room-id message))
+      (-message-thread-root [_ room-id message-id]
+        (store/-message-thread-root delegate room-id message-id))
+      (-list-messages [_ room-id opts] (store/-list-messages delegate room-id opts))
+      (-store-run! [_ room-id run]
+        (when-not (and (contains? store/terminal-run-statuses (:run/status run))
+                       (<= (swap! refused inc) n))
+          (store/-store-run! delegate room-id run)))
+      (-load-run [_ room-id run-id] (store/-load-run delegate room-id run-id))
+      (-list-runs [_ room-id opts] (store/-list-runs delegate room-id opts))
+      store/PAttentionStore
+      (-store-attention! [_ room-id fact] (store/-store-attention! delegate room-id fact))
+      (-list-attention [_ room-id opts] (store/-list-attention delegate room-id opts)))))
+
+(deftest a-refused-terminal-write-of-a-silent-turn-is-retried
+  (testing "the Run stays live while its finish is refused, then completes"
+    (let [st (refuse-terminal-writes (memory/make) 2)
+          r (d/make-room {:id :run-silent-retry :store st})
+          turn-fn (fn [chat-ctx _opts]
+                    (cc/add-message! chat-ctx {:role :assistant :content "[SKIP]"})
+                    :complete)]
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent {:id :worker
+                                  :spec {:provider :mock :model "mock"}
+                                  :run-turn-fn turn-fn})))
+      (try
+        (d/post! r (d/message :alice :worker "anything?"))
+        (is (await-condition #(= :completed (:run/status (first (run/runs r)))) 5000))
+        (is (= :silent (:run/reason (first (run/runs r)))))
+        (is (empty? (run/active-runs :run-silent-retry)))
+        (finally
+          (d/close-room! r))))))
+
 (deftest multi-turn-loop-continues-until-complete
   (testing "Agent loops :continue → :continue → :complete; reply is the last"
     (let [r (d/room :t)

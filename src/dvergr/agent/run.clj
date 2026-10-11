@@ -305,6 +305,42 @@
            (notify! {:type :run/finished :run run}))
          run)))))
 
+(defn finish-durably!
+  "`finish!` for a caller that cannot wait for the store. When the terminal
+   write is refused the Run stays live, as `finish!` leaves it, and the write
+   is retried on a background thread with backoff until it is durable or the
+   Run is no longer live; nothing is lost and Room teardown sees the Run until
+   it is. Returns the finished Run, or nil while the write is retried."
+  ([run-id status] (finish-durably! run-id status {}))
+  ([run-id status opts]
+   (try
+     (finish! run-id status opts)
+     (catch Throwable t
+       (when (= ::invalid-finish-status (:type (ex-data t)))
+         (throw t))
+       (tel/log! {:level :warn :id ::finish-retrying
+                  :data {:run/id run-id :run/status status :error (ex-message t)}}
+                 "Run finish refused; retrying off the caller's thread")
+       (doto (Thread.
+              ^Runnable
+              (fn []
+                (loop [delay-ms 25 attempt 1]
+                  (Thread/sleep (long delay-ms))
+                  (when (contains? @active run-id)
+                    (let [outcome (try (finish! run-id status opts) :finished
+                                       (catch Throwable t t))]
+                      (when (instance? Throwable outcome)
+                        (if (< attempt 40)
+                          (recur (min 1000 (* 2 delay-ms)) (inc attempt))
+                          (tel/log! {:level :error :id ::finish-abandoned
+                                     :data {:run/id run-id :run/status status
+                                            :error (ex-message outcome)}}
+                                    "Run finish still refused; the Run stays live")))))))
+              (str "dvergr-run-finish-" run-id))
+         (.setDaemon true)
+         (.start))
+       nil))))
+
 (defn retain-finished!
   "Durably write a final/waiting Run projection while retaining its live
    execution lease. Interpreters use this before publishing fork-local result
@@ -506,6 +542,23 @@
         (or (store/-store-run! room-store room-id updated)
             (throw (ex-info "Resume claim was not durable"
                             {:type ::claim-not-durable :run/id run-id})))))))
+
+(defn release-resume-claim!
+  "Withdraw `resumed-by`'s claim on stored Run `run-id` of `room`: its
+   successor failed before it executed. A claim by another Run is left alone.
+   Returns the updated Run, or nil when there was nothing to withdraw."
+  [room run-id resumed-by]
+  (locking (room-lock (:id room))
+    (let [room-store (:store room)
+          room-id (store/conversation-id room)
+          existing (some-> room-store (store/-load-run room-id run-id))]
+      (when (and existing (= resumed-by (:run/resumed-by existing)))
+        (let [updated (-> existing
+                          (dissoc :run/resumed-by)
+                          (assoc :run/updated-at (java.util.Date.)))]
+          (or (store/-store-run! room-store room-id updated)
+              (throw (ex-info "Resume claim release was not durable"
+                              {:type ::claim-not-durable :run/id run-id}))))))))
 
 (defn cancel-requested?
   "True when targeted cancellation has been requested for this live Run. The

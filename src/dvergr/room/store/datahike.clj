@@ -1087,9 +1087,14 @@
                           #(store/-load-run this room-id %)))]
             (when (persist/persist-tx!
                    conn
-                   [(run->entity (:chat/id ent) run)
-                    {:db/id [:chat/id (:chat/id ent)]
-                     :chat/updated-at (java.util.Date.)}]
+                   (cond-> [(run->entity (:chat/id ent) run)
+                            {:db/id [:chat/id (:chat/id ent)]
+                             :chat/updated-at (java.util.Date.)}]
+                     ;; a stored Run is the map stored: a withdrawn resume
+                     ;; claim is gone, as in the memory store
+                     (and (:run/resumed-by existing) (not (:run/resumed-by run)))
+                     (conj [:db/retract [:run/id (:run/id run)]
+                            :run/resumed-by (:run/resumed-by existing)]))
                    {:op :store-run :room-id room-id :run-id (:run/id run)})
               run))))))
 

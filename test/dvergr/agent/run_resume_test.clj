@@ -169,6 +169,30 @@
               (is (thrown-with-msg? Exception #"no allocation"
                                     (program/resume! room room first-run))))
             (is (untouched?) "the claim is released and the wallet stays"))
+          (testing "a wallet that cannot be read"
+            (with-redefs [providers/ensure-initialized! (constantly nil)
+                          resource/run-balance (fn [& _] (throw (ex-info "store down" {})))]
+              (is (thrown-with-msg? Exception #"store down"
+                                    (program/resume! room room first-run))))
+            (is (untouched?) "the resume stops before anything changes"))
+          (testing "an execution that cannot be spawned, after the claim"
+            (let [claimed (atom nil)
+                  claim-resume! run/claim-resume!]
+              (with-redefs [providers/ensure-initialized! (constantly nil)
+                            run/claim-resume! (fn [& args]
+                                                (reset! claimed (apply claim-resume! args)))
+                            program/execution-spin (fn [& _] (throw (ex-info "no spawn" {})))]
+                (is (thrown-with-msg? Exception #"no spawn"
+                                      (program/resume! room room first-run))))
+              (is (uuid? (:run/resumed-by @claimed)) "the successor had claimed the Run")
+              (is (untouched?) "the claim is withdrawn and the wallet returned")))
+          (testing "a resume in progress excludes another"
+            (run/reserve-resume! room first-run)
+            (try
+              (is (thrown-with-msg? Exception #"being resumed"
+                                    (program/resume! room room first-run)))
+              (finally (run/release-resume! first-run)))
+            (is (untouched?)))
           (testing "the Run still resumes, and the new Run owns the old wallet"
             (let [observed (promise)
                   second-run

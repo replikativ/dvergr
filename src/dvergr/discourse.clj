@@ -73,11 +73,10 @@
   ;;               owned by this participant and cancelled with its process
   ;; active     :: atom of nil | Spin | ::participant-closed; the handler Spin
   ;;               currently awaited by the participant process
-  ;; obligations :: atom of {token → callbacks}; reply obligations of the
-  ;;               running handler that the participant settles exactly once
-  ;;               (see `reply-obligation!`)
-  ;; factory    :: (fn [new-ctx] -> Participant) — for cloning into a fork
-  ;; process    :: the spindel spin driving this participant (set by `join`)
+  ;; obligations :: atom of {:pending {token → callbacks} :closed? bool}; reply
+  ;;               obligations of the running handler, settled exactly once
+  ;;               (see `reply-obligation!`); closed while the participant has
+  ;;               left
            [id inbox-sub inbox-mbx deferred-inbox subs pumps active obligations on-message
             factory process])
 
@@ -335,7 +334,7 @@
   [{:keys [id on-message factory ctx]}]
   (let [_ctx (or ctx ec/*execution-context*)]
     (->Participant id nil nil (atom clojure.lang.PersistentQueue/EMPTY)
-                   (atom {}) (atom {}) (atom nil) (atom {}) on-message factory nil)))
+                   (atom {}) (atom {}) (atom nil) (atom {:pending {}}) on-message factory nil)))
 
 ;; ============================================================================
 ;; Built-in participant helpers
@@ -374,6 +373,17 @@
 
 (def ^:private obligation-key ::reply-obligation)
 
+(defn- run-callback! [p id f & args]
+  (try (apply f args)
+       (catch Throwable t
+         (tel/log! {:level :error :id id
+                    :data {:participant (:id p) :error (.getMessage t)}}
+                   "reply obligation callback failed"))))
+
+(defn- drop-obligation! [p callbacks reason error]
+  (when-let [on-dropped (:on-dropped callbacks)]
+    (run-callback! p ::reply-dropped-callback-error on-dropped reason error)))
+
 (defn reply-obligation!
   "Register a reply obligation for the handler `p` is running and return its
    token. The participant settles the obligation exactly once, by calling one
@@ -395,7 +405,15 @@
   [p callbacks]
   (let [token (Object.)]
     (when-let [obligations (:obligations p)]
-      (swap! obligations assoc token callbacks))
+      (let [[before _] (swap-vals! obligations
+                                   (fn [state]
+                                     (if (:closed? state)
+                                       state
+                                       (assoc-in state [:pending token] callbacks))))]
+        ;; Registered after the participant left: nothing will settle it
+        ;; later, so it is settled now.
+        (when (:closed? before)
+          (drop-obligation! p callbacks :abandoned nil))))
     token))
 
 (defn carry-obligation
@@ -409,25 +427,14 @@
    was settled before."
   [p token]
   (when-let [obligations (when token (:obligations p))]
-    (let [[before _] (swap-vals! obligations dissoc token)]
-      (get before token))))
+    (let [[before _] (swap-vals! obligations update :pending dissoc token)]
+      (get-in before [:pending token]))))
 
 (defn release-obligation!
   "Take obligation `token` back from `p`: true when the caller now settles the
    lifecycle itself, false when the participant settled it already (it left)."
   [p token]
   (boolean (claim-obligation! p token)))
-
-(defn- run-callback! [p id f & args]
-  (try (apply f args)
-       (catch Throwable t
-         (tel/log! {:level :error :id id
-                    :data {:participant (:id p) :error (.getMessage t)}}
-                   "reply obligation callback failed"))))
-
-(defn- drop-obligation! [p callbacks reason error]
-  (when-let [on-dropped (:on-dropped callbacks)]
-    (run-callback! p ::reply-dropped-callback-error on-dropped reason error)))
 
 (defn withhold-reply!
   "Settle the obligation `reply-spec` carries as dropped for `reason`. A wrapper
@@ -439,13 +446,19 @@
   nil)
 
 (defn- settle-obligations!
-  "Settle every obligation `p` still holds as dropped for `reason`."
-  [p reason error]
-  (when-let [obligations (:obligations p)]
-    (let [[before _] (swap-vals! obligations (constantly {}))]
-      (doseq [callbacks (vals before)]
-        (drop-obligation! p callbacks reason error))))
-  nil)
+  "Settle every obligation `p` still holds as dropped for `reason`. With
+   `close?` (the participant leaves) obligations registered later are settled
+   as `:abandoned` when they are registered."
+  ([p reason error] (settle-obligations! p reason error false))
+  ([p reason error close?]
+   (when-let [obligations (:obligations p)]
+     (let [[before _] (swap-vals! obligations
+                                  (fn [state]
+                                    (cond-> (assoc state :pending {})
+                                      close? (assoc :closed? true))))]
+       (doseq [callbacks (vals (:pending before))]
+         (drop-obligation! p callbacks reason error))))
+   nil))
 
 (defn spin-cancellation?
   "True when `t` is (or is caused by) Spindel cancelling a Spin: a handler
@@ -900,6 +913,7 @@
           ;; A Participant may be explicitly left and then joined again. Re-open
           ;; its active-handler slot before the new process can receive work.
             _ (reset! (:active p) nil)
+            _ (some-> (:obligations p) (swap! assoc :closed? false))
           ;; Merge all subscriptions into one mailbox so the spin awaits
           ;; a single source. Each sub gets a small pump.
             merge-mbx (sync/create-mailbox (:ctx room))
@@ -995,7 +1009,7 @@
       (cleanup-owned-spin! room (:process p))
       (cleanup-owned-spin! room active-spin)
       ;; The cancelled handler cannot settle what it owes; the participant does.
-      (settle-obligations! p :abandoned nil))
+      (settle-obligations! p :abandoned nil true))
     ;; Closing subscriptions releases their sequence waits; engine cleanup below
     ;; removes any pump continuation that has not observed closure yet.
     (when-let [sub (:inbox-sub p)]

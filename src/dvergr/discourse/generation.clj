@@ -96,6 +96,45 @@
                     (sync/deliver! done {::error (.getMessage t)}))))))
     (->GenerationHandle nil nil done cancel)))
 
+(defn call-fence
+  "A fence over a turn's native calls (each `future-handle` body), so a turn
+   abandoned from outside ends its lifecycle only once its in-flight call has
+   returned: the execution acknowledges termination, and nothing waits for it.
+   See `fenced-call` and `abandon-fence!`."
+  []
+  (atom {:state :idle}))
+
+(defn fenced-call
+  "Run `(f)` as the fence's in-flight call. When the fence was abandoned before
+   the call starts, return `abandoned-value` without calling `f`; when it is
+   abandoned while the call runs, run the abandoning `on-quiet` on this thread
+   after `f` returns."
+  [fence f abandoned-value]
+  (let [[before _] (swap-vals! fence #(if (= :idle (:state %)) {:state :calling} %))]
+    (if-not (= :idle (:state before))
+      abandoned-value
+      (try
+        (f)
+        (finally
+          (let [[before _] (swap-vals! fence #(case (:state %)
+                                                :calling {:state :idle}
+                                                :abandoning {:state :abandoned}
+                                                %))]
+            (when (= :abandoning (:state before))
+              ((:on-quiet before)))))))))
+
+(defn abandon-fence!
+  "Abandon `fence`: run `on-quiet` now when no call is in flight, else once the
+   in-flight call returns (`fenced-call`). Later calls are not started.
+   Returns true when this call abandoned the fence."
+  [fence on-quiet]
+  (let [[before _] (swap-vals! fence #(case (:state %)
+                                        :idle {:state :abandoned}
+                                        :calling {:state :abandoning :on-quiet on-quiet}
+                                        %))]
+    (when (= :idle (:state before)) (on-quiet))
+    (contains? #{:idle :calling} (:state before))))
+
 (defn external-handle
   "F is fed in by external post! to `done-deferred`. Use when the
    decider is out-of-band — a human typing into the UI which posts back,

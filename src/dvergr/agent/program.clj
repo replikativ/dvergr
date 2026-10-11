@@ -1598,98 +1598,114 @@
                                      :settlement-status status
                                      :settlement-reason reason}))
           (throw t))))
-    (try
-      (let [completion (sync/deferred)
-            outcome-promise (promise)
-            worker-execution
+    (let [spawned? (atom false)]
+      (try
+        (let [completion (sync/deferred)
+              outcome-promise (promise)
+              worker-execution
             ;; The protocol rides on the agent value like `::limits`; it
             ;; is attached after the provenance hash above was taken.
-            (let [agent (cond-> agent
-                          protocol (assoc ::protocol protocol)
-                          resume-from (assoc ::resume resume-from))]
-              (if prepare-world!
-                (prepared-execution-spin control-room work-room agent task trigger
-                                         id chat-id parent-run resources supervisor
-                                         allocation-state limits outcome-promise
-                                         prepare-world!)
-                (execution-spin control-room work-room agent task trigger id chat-id
-                                supervisor limits outcome-promise)))
-            execution-terminal (promise)
-            execution (sp/spin (sp/await completion))
-            owner-fork-id (:fork-id (ec/current-execution-context))
-            handle    (RunHandle. id (:id control-room) owner-fork-id execution completion
-                                  worker-execution)
-            cancel! (fn []
-                      (cancel-supervisor! supervisor)
+              (let [agent (cond-> agent
+                            protocol (assoc ::protocol protocol)
+                            resume-from (assoc ::resume resume-from))]
+                (if prepare-world!
+                  (prepared-execution-spin control-room work-room agent task trigger
+                                           id chat-id parent-run resources supervisor
+                                           allocation-state limits outcome-promise
+                                           prepare-world!)
+                  (execution-spin control-room work-room agent task trigger id chat-id
+                                  supervisor limits outcome-promise)))
+              execution-terminal (promise)
+              execution (sp/spin (sp/await completion))
+              owner-fork-id (:fork-id (ec/current-execution-context))
+              handle    (RunHandle. id (:id control-room) owner-fork-id execution completion
+                                    worker-execution)
+              cancel! (fn []
+                        (cancel-supervisor! supervisor)
                       ;; Cancellation closes admission to further native work.
                       ;; Cleanup may still be registered by an already-running
                       ;; initialization worker while the phase is :pending; the
                       ;; supervisor starts it after that worker terminates.
                       ;; The already-running process-local watcher settles only
                       ;; after the execution and supervisor quiescence fences.
-                      (seal-supervisor! supervisor))]
+                        (seal-supervisor! supervisor))]
         ;; Replace the early sticky worker hook with the complete cancellation
         ;; boundary. register-cancel-hook! immediately invokes it if cancellation
         ;; won between durable admission and construction of this execution.
-        (run/register-cancel-hook! id ::native-worker cancel!)
+          (run/register-cancel-hook! id ::native-worker cancel!)
         ;; Use Spindel's fire-and-forget GC pin together with exact terminal
         ;; callbacks instead of polling internal context state.
-        (sync/spawn!
-         worker-execution
-         {:on-success
-          (fn [_]
-            (deliver execution-terminal true))
-          :on-error
-          (fn [t]
+          (reset! spawned? true)
+          (sync/spawn!
+           worker-execution
+           {:on-success
+            (fn [_]
+              (deliver execution-terminal true))
+            :on-error
+            (fn [t]
             ;; This callback is invoked only after the Spin rejects, including
             ;; cancellation before its body begins.
-            (deliver execution-terminal true)
+              (deliver execution-terminal true)
             ;; Graph-level cancellation is settled outside the cancelled Spin:
             ;; this callback may safely block on stable supervisor quiescence,
             ;; while the cancelled body may not cross another await breakpoint.
             ;; finish! is idempotent if another terminal path already won.
-            (let [cancelled? (cancelled-error? t id)
-                  setup-cancelled?
-                  (and cancelled?
-                       prepare-world!
-                       (not= :candidate
-                             (:execution-phase @(:state supervisor))))
-                  failure-reason (if setup-cancelled?
-                                   :world-setup-cancelled
-                                   (execution-failure-reason t))
-                  result (if cancelled?
-                           {:run/id id :run/status :cancelled}
-                           {:run/id id :run/status :failed
-                            :run/error (ex-message t)})]
-              (when (= :cancelled (:run/status result))
-                (run/cancel-room-run! (:id control-room) id))
-              (cancel-supervisor! supervisor)
+              (let [cancelled? (cancelled-error? t id)
+                    setup-cancelled?
+                    (and cancelled?
+                         prepare-world!
+                         (not= :candidate
+                               (:execution-phase @(:state supervisor))))
+                    failure-reason (if setup-cancelled?
+                                     :world-setup-cancelled
+                                     (execution-failure-reason t))
+                    result (if cancelled?
+                             {:run/id id :run/status :cancelled}
+                             {:run/id id :run/status :failed
+                              :run/error (ex-message t)})]
+                (when (= :cancelled (:run/status result))
+                  (run/cancel-room-run! (:id control-room) id))
+                (cancel-supervisor! supervisor)
               ;; The spawned orchestration graph is terminal here. In
               ;; particular, a cancellation during the gap after setup cannot
               ;; release its resources before this callback acknowledges that
               ;; the enclosing body has stopped using them.
-              (mark-cleanup-safe! supervisor)
-              (seal-supervisor! supervisor)
-              (deliver outcome-promise
-                       {:result result
-                        :finish-opts
-                        (if (= :cancelled (:run/status result))
-                          {:reason (if (= :world-setup-cancelled failure-reason)
-                                     failure-reason
-                                     :structured-cancellation)}
-                          {:reason failure-reason
-                           :error t})})))})
-        (finalize-execution-external! world-parent control-room run-world id parent-run
-                                      allocation-state supervisor execution-terminal
-                                      completion outcome-promise)
-        handle)
-      (catch Throwable t
-        (return-unused-resources! control-room id grantor allocation-state)
-        (let [{:keys [status reason]} (world/settle! run-world :failed)]
-          (run/finish! id :failed {:reason :spawn-failed :error t
-                                   :settlement-status status
-                                   :settlement-reason reason}))
-        (throw t)))))
+                (mark-cleanup-safe! supervisor)
+                (seal-supervisor! supervisor)
+                (deliver outcome-promise
+                         {:result result
+                          :finish-opts
+                          (if (= :cancelled (:run/status result))
+                            {:reason (if (= :world-setup-cancelled failure-reason)
+                                       failure-reason
+                                       :structured-cancellation)}
+                            {:reason failure-reason
+                             :error t})})))})
+          (finalize-execution-external! world-parent control-room run-world id parent-run
+                                        allocation-state supervisor execution-terminal
+                                        completion outcome-promise)
+          handle)
+        (catch Throwable t
+          (when @spawned?
+          ;; The execution may have started: stop it. It executed, so a
+          ;; resumed predecessor stays claimed by it.
+            (run/cancel-run! id)
+            (cancel-supervisor! supervisor))
+          (return-unused-resources! control-room id grantor allocation-state)
+          (let [{:keys [status reason]} (world/settle! run-world :failed)]
+            (run/finish! id :failed {:reason (if @spawned? :finalizer-failed :spawn-failed)
+                                     :error t
+                                     :settlement-status status
+                                     :settlement-reason reason}))
+          (when-let [predecessor (and (not @spawned?) (:from resume-from))]
+          ;; nothing executed: the predecessor is as it was before the claim
+            (try (run/release-resume-claim! control-room predecessor id)
+                 (catch Throwable release-error
+                   (tel/log! {:level :warn :id ::resume-claim-not-released
+                              :data {:run/id predecessor :resumed-by id
+                                     :error (ex-message release-error)}}
+                             "A resume claim was not released; the failed successor does not count"))))
+          (throw t))))))
 
 (defn- chat-spent
   "Microdollars the chat `chat-id` recorded as used, in `room`'s store."
@@ -1734,7 +1750,9 @@
         (let [parent (:run/parent old)
               ;; conserved: the old Run's remainder, granted from its wallet to
               ;; the new Run's when that Run is admitted
-              remaining (try (resource/run-balance control-room run-id) (catch Throwable _ nil))
+              ;; a Run without a wallet moves none; a failed read stops the
+              ;; resume before anything changes
+              remaining (resource/run-wallet-balance control-room run-id)
               roster (assoc-in (roster/make-roster) [:roster/agents (:agent/id agent)] agent)
               handle
               (try

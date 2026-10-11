@@ -88,6 +88,19 @@
 (defn run-balance [room run-id]
   (balance room (kontor/account-ref (run-wallet-id run-id))))
 
+(defn run-wallet-balance
+  "The balance of Run `run-id`'s wallet, or nil when the Run has none: its
+   Room has no conserved-resource store, or the Run was never granted a
+   wallet. A failed read throws."
+  [room run-id]
+  (try
+    (run-balance room run-id)
+    (catch clojure.lang.ExceptionInfo e
+      (if (contains? #{::resource-store-unavailable :kontor.resource/account-not-found}
+                     (:type (ex-data e)))
+        nil
+        (throw e)))))
+
 (defn mint!
   "Trusted host provisioning operation. `spec` requires a stable UUID `:id`
    plus a positive `:resources` vector; minting is never exposed inside SCI."

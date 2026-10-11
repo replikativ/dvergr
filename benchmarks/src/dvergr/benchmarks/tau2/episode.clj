@@ -483,24 +483,33 @@
        (fn [p msg]
          (sp/spin
           (let [run-id (:run/id (run/start! room :agent msg nil))
+                ;; an abandoned turn finishes once its model call returned
+                calls (gen/call-fence)
                 ;; the participant settles the Run with the reply, or when the
                 ;; turn ends any other way (it threw, or the agent left)
                 obligation
                 (d/reply-obligation!
-                 p {:on-emitted (fn [_] (run/finish! run-id :completed))
-                    :on-failed (fn [_] (run/finish! run-id :failed))
-                    :on-dropped (fn [reason error]
-                                  (when (= :abandoned reason) (run/cancel-run! run-id))
-                                  (run/finish! run-id (if (= :abandoned reason) :cancelled :failed)
-                                               (cond-> {:reason reason}
-                                                 error (assoc :error error))))})
+                 p {:on-emitted (fn [_] (run/finish-durably! run-id :completed))
+                    :on-failed (fn [_] (run/finish-durably! run-id :failed))
+                    :on-dropped
+                    (fn [reason error]
+                      (if (= :abandoned reason)
+                        (do (run/cancel-run! run-id)
+                            (gen/abandon-fence!
+                             calls #(run/finish-durably! run-id :cancelled {:reason reason})))
+                        (run/finish-durably! run-id :failed
+                                             (cond-> {:reason reason}
+                                               error (assoc :error error)))))})
                 h (gen/future-handle
                    (:ctx room)
-                   (fn []
-                     (swap! history conj {:role :user :content (:content msg)})
-                     (generate-loop episode :agent generate
-                                    (fn [h] {:system system :messages h :tools tools})
-                                    history :assistant)))
+                   #(gen/fenced-call
+                     calls
+                     (fn []
+                       (swap! history conj {:role :user :content (:content msg)})
+                       (generate-loop episode :agent generate
+                                      (fn [h] {:system system :messages h :tools tools})
+                                      history :assistant))
+                     {::gen/error "the agent left"}))
                 _ (run/register-cancel-hook! run-id ::model-call (:cancel! h))
                 reply (sp/await (:done h))]
             (cond
