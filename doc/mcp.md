@@ -8,11 +8,18 @@ what it cost. The tools are derived from `dvergr.ops/specification` (and the roo
 ## Connecting a client
 
 A client launches `bin/dvergr-mcp` (babashka) as a stdio server. It relays to the daemon's
-loopback TCP port (default `127.0.0.1:17888`):
+loopback TCP port (default `127.0.0.1:17888`). Its files live under the state root,
+`DVERGR_HOME` (default `<checkout>/.dvergr`):
 
 - when no daemon listens, it starts one (`clojure -M:cli --no-tui --mcp …`, log in
-  `.dvergr/logs/mcp-daemon.log`) and answers `initialize` itself meanwhile, from the last tool
-  list it saw (`.dvergr/mcp/`), so clients with short startup timeouts connect;
+  `$DVERGR_HOME/logs/mcp-daemon.log`, nREPL port in `$DVERGR_HOME/mcp-daemon.nrepl-port`) and
+  answers `initialize` itself meanwhile, from the last tool list it saw for the same selection
+  (`$DVERGR_HOME/mcp/`), so clients with short startup timeouts connect. The first boot takes
+  about two minutes (dependencies, then the stores); the tools appear when it is up
+  (`tools/list_changed`);
+- it attaches only to a daemon of its own state root: one on the port that reports another
+  home (`server/discover`'s `_meta` `dvergr/home`) is refused, and every call says so. Give the
+  relay another `--port` for another home (one daemon per home, one port per daemon);
 - when the daemon restarts, it reconnects, replays the handshake and sends
   `tools/list_changed`; a call in flight gets an error result saying the connection dropped;
 - it never starts a second daemon on a state root whose daemon (`.dvergr/daemon.pid`) runs
@@ -92,7 +99,7 @@ neither listed nor callable.
 | Profile | Toolsets | Tools |
 | --- | --- | --- |
 | `offload` (default) | rooms, worlds, attempts, catalog, wallets, repl | 26 |
-| `bench` | rooms, files, attempts, catalog, bench, wallets | 31 |
+| `bench` | rooms, files, attempts, catalog, bench, wallets | 32 |
 | `code` | repl, describe (its REPL calls the ops of rooms, files, worlds, attempts, catalog, bench, wallets) | 2 |
 | `readonly` | every read op | read-only only |
 | `admin` | everything | all |

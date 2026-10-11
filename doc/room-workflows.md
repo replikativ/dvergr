@@ -44,11 +44,16 @@ It is ordinary room content: versioned, forked and merged with the room, reviewa
    seeded from the fixtures or the generator; Scorecards, ranges, the baseline comparison and
    cost as for any workflow (billed and list price, see below). Candidates include external agents (a CLI or any
    MCP client working in the Attempt's world).
-4. **Promote**: the room's owner promotes a calibrated bundle (like skills' `promote!`); its
-   verifier trust moves from `:ad-hoc` to `:room` (`dvergr.agent.evaluation/trust-tiers`),
-   which Scorecards show. Only host code is `:trusted`.
-5. **Deploy**: a schedule in a room (`dvergr.scheduler`) runs the workflow on the room's own
-   data, e.g. "competitor watch, weekly", with the winning candidate.
+4. **Promote**: `catalog_promote` (the `admin` profile only) calibrates the bundle again and,
+   when that holds, raises its checker's trust from `:ad-hoc` to `:room`
+   (`dvergr.agent.evaluation/trust-tiers`), recorded on the host in
+   `<home>/workflow-promotions.edn` (outside every workspace). Scorecards show the tier. It
+   does not pick a winning candidate or variant, and nothing requires it: an unpromoted
+   bundle benchmarks and deploys as well, its Scorecards say `ad-hoc`. Only host code is
+   `:trusted`.
+5. **Deploy**: `catalog_deploy` puts a schedule in a room (`dvergr.scheduler`) that gives the
+   workflow's task to an agent you name (a participant of the room), e.g. "competitor watch,
+   weekly"; you pick the agent, e.g. from the Scorecard.
 6. **Export / import**: `catalog_export` returns the bundle (its files and a manifest:
    content id, the dvergr version it was exported from, the calibration result);
    `catalog_import` installs it in another room or on another machine, where
@@ -205,13 +210,17 @@ them, applications with the decision.
   JSON lines or EDN. `spec` names its columns: `id`, `inputs` (written to the case's
   `/docs/case.edn`), `attachments` (text files beside the table, copied to `/docs/`),
   `expected {column {:rule …}}`, and optionally `title`, `task` (else one is written from the
-  fields) and `doc`.
+  fields) and `doc`. The task always ends with the answer contract, generated from
+  `expected`: write `/out/answer.edn`, an EDN map from each expected column (as a string) to
+  its value. A task you write says what to do with a case; it need not repeat where the
+  answer goes.
 - **Rules** per expected field: `exact` (numbers as numbers), `ci` (ignoring case and
   spacing), `number` (within `tolerance`; `1.234,56` and `1,234.56` both read), `set` (a
   vector, or text split on `, ; |`) and `date` (`yyyy-mm-dd` or `dd.mm.yyyy`). The generated
   checker scores the attempt's `/out/answer.edn` field by field; the reward is the share right.
 - **Certification** keeps only cases that can grade an answer and says why the others
-  cannot: no id or a duplicate one, an outcome left empty, a missing attachment, the same
+  cannot: no id or a duplicate one (every row with that id is dropped, not just the second:
+  which one is right is not known), an outcome left empty, a missing attachment, the same
   inputs with different outcomes (the history disagrees with itself), or an outcome the
   checker does not accept as right (an amount that is not a number). `certification.edn` in
   the bundle lists every excluded case with its reasons; the op returns the counts. On real
@@ -222,14 +231,25 @@ them, applications with the decision.
 
 Attachments are text for now (a PDF needs its text extracted first).
 
-**Without a daemon.** The table need not be in a room: `dvergr.catalog.casepack/from-table`
-reads it (attachments beside it) and `write-dir!` writes the bundle, which `room-run` then
-benchmarks:
+**Without a daemon.** The table need not be in a room. From the shell,
+`dvergr.catalog.casepack-cli` writes the bundle directory (its name is the bundle's), which
+`room-run` then benchmarks:
+
+```bash
+clojure -M -m dvergr.catalog.casepack-cli export/bookings.csv \
+  --id no --inputs vendor,text --outcome account:exact --outcome amount:number:0.01 \
+  [--attachments document] [--task "…"] [--title "…"] [--delimiter ";"] --out packs/bookings
+clojure -M -m dvergr.catalog.room-run packs/bookings --check
+clojure -M -m dvergr.catalog.room-run packs/bookings --models claude-code-haiku,codex-subscription-luna
+```
+
+`--outcome column:rule[:tolerance]` is given once per expected column. The same from Clojure:
+`dvergr.catalog.casepack/from-table` reads the table (attachments beside it) and `write-dir!`
+writes the bundle:
 
 ```clojure
 (require '[dvergr.catalog.casepack :as casepack])
 (casepack/write-dir! "bookings" (casepack/from-table spec "export/bookings.csv"))
-;; clojure -M -m dvergr.catalog.room-run bookings --check
 ```
 
 **Over MCP, from scratch.** In a daemon, `catalog_cases` reads `table` from the room's
@@ -246,7 +266,11 @@ checkout and no agent in the room. The whole flow:
 4. `catalog_calibrate {room: "books", name: "invoice-coding"}`
 5. `catalog_benchmark {workflow: "books/invoice-coding", models: [...], room: "books"}`, then
    `job_status` until it completes.
+   Each `job_status` waits up to 25 s and shows `progress` (cells done of the total).
 6. `scorecard_list {room: "books"}` and `scorecard_detail {room: "books", id}`.
+7. `experiment_report {room: "books", experiment}` (the `experiment` id `catalog_benchmark`
+   returned): the report as Markdown, with the frontier, the failing checks and the cases
+   that could not grade.
 
 To change the table, `room_write` it again and rerun `catalog_cases`; the room's history keeps
-every version (`room_fork` first to try a change aside).
+every version.

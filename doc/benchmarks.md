@@ -590,10 +590,20 @@ Datalog.
     Ranking uses the map query form's `:order-by`, `:limit` and `:offset` (since #210; a
     vector query with `:order-by` reads as the map form).
 - **Read-only SQL** (provider version 14): a candidate's SQL must be one read statement
-  (SELECT or WITH); pg-datahike runs each query in a fresh session, and SQLite connections
-  cannot ATTACH files.
+  (SELECT or WITH); pg-datahike runs each query in a fresh session that is itself read only
+  (`SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY`: pg-datahike refuses any write or
+  DDL with SQLSTATE 25006), SQLite connections open the file read-only (`mode=ro`) and cannot
+  ATTACH files, and Datalog queries an immutable db value. The databases are shared host
+  stores, not forked per Attempt.
 - **Grading:** the evaluator re-runs the submitted query on the candidate's engine and
   compares rows with the gold.
+- **Grader cross-check** (2026-10-08): for 200 stored SQLite answers (100 Haiku 5.5 from
+  `bird-haiku55`, 100 Luna from `bird-a4`), the reward our grader certified was compared with
+  upstream's `execute_sql` from `evaluation.py` (DAMO-ConvAI `bird/llm/src`: `set(fetchall
+  (pred)) == set(fetchall(gold))`, an exception scores 0), run on the same SQLite files opened
+  read-only with a 30 s timeout. They agreed on 200/200 (134 right, 66 wrong; no answer
+  where one said right and the other wrong). The pg-datahike and Datalog answers have no
+  upstream grader to compare with.
 
 **Substrate check (zero tokens, `bird.compat`).** Every gold query on SQLite and through
 pg-datahike on the same data, raw and through a SQLite→PostgreSQL rewrite (`bird.dialect`:

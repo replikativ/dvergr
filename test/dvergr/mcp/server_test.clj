@@ -394,3 +394,12 @@
       (finally
         (swap! tools/registry dissoc tname)
         (server/unregister-tool! tname)))))
+
+(deftest the-profile-table-in-the-docs-counts-the-tools
+  ;; doc/mcp.md's profile table said 31 bench tools when there were 32
+  (let [doc (slurp "doc/mcp.md")]
+    (doseq [profile ["offload" "bench" "code"]]
+      (let [n (count (list-tools (session {:dvergr/profile profile})))
+            row (re-find (re-pattern (str "(?m)^\\| `" profile "`[^\\n]*\\| (\\d+) \\|$")) doc)]
+        (is row (str "doc/mcp.md has a row for " profile))
+        (is (= (str n) (second row)) (str "doc/mcp.md's tool count of " profile))))))

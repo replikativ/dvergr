@@ -141,6 +141,53 @@ clojure -T:build harness            # → target/dvergr-<ver>-harness.jar
 java -jar dvergr-<ver>-harness.jar  # run it
 ```
 
+## Benchmark models on your own cases
+
+Prerequisites: a JDK (22 or newer, as CI uses), the [Clojure CLI](https://clojure.org/guides/install_clojure),
+git, and [babashka](https://babashka.org) (`bb`, for the MCP relay `bin/dvergr-mcp`). For
+subscription models, the `claude` CLI (Claude Code) and/or the `codex` CLI, logged in.
+
+**Where state goes.** Everything dvergr writes lives under one state root, `DVERGR_HOME`
+(default `<checkout>/.dvergr`): the stores, logs, the MCP relay's tool cache. `rm -rf` it to
+reset.
+
+**Claude Code models without your email in their prompts.** With the interactive login the
+`claude` CLI adds the signed-in account's email to every prompt. Run `claude setup-token` once
+and save the token to `~/.dvergr/secrets/claude-oauth-token` (per user, not under
+`DVERGR_HOME`; `DVERGR_CLAUDE_TOKEN_FILE` names another file): `claude-code-*` candidates then
+run on that token with an empty config directory and no account details
+([details](doc/benchmarks.md#claude-code-as-the-model-backend)).
+
+**From the shell**, a CSV of past cases (an id, the inputs, the outcome a person recorded)
+becomes a case pack, which `room-run` certifies, benchmarks and reports on:
+
+```bash
+clojure -M -m dvergr.catalog.casepack-cli cases.csv \
+  --id id --inputs description,supplier_country,net_amount \
+  --outcome vat_code:exact --outcome vat_amount:number:0.01 --out packs/vat-codes
+clojure -M -m dvergr.catalog.room-run packs/vat-codes \
+  --models claude-code-haiku,codex-subscription-luna --cases 10
+```
+
+`certification.edn` in the pack says which cases can grade an answer and why the others
+cannot. `room-run` keeps the experiment in its own home, `--home` (default
+`$DVERGR_HOME/workflow-runs/<pack>`, or `workflow-runs/<pack>` without `DVERGR_HOME`);
+running it again resumes. stdout has progress and the report; the log is `<home>/dvergr.log`.
+
+**From an MCP client** (Claude Code, Codex, …), the `bench` profile has the same path as
+tools (`room_write` the table, `catalog_cases`, `catalog_benchmark`, `job_status`,
+`experiment_report`):
+
+```json
+{"mcpServers": {"dvergr": {"type": "stdio", "command": "/path/to/dvergr/bin/dvergr-mcp",
+                           "args": ["--profile", "bench"]}}}
+```
+
+The relay starts the daemon on first use. The first boot takes about two minutes
+(dependencies, then the stores); the tools appear only then. See [doc/mcp.md](doc/mcp.md),
+[doc/room-workflows.md](doc/room-workflows.md#case-packs-a-benchmark-from-your-own-history)
+and [doc/running-benchmarks.md](doc/running-benchmarks.md).
+
 ## REPL quickstart
 
 ```clojure

@@ -35,17 +35,23 @@ clojure -M -m dvergr.catalog.room-run examples/workflows/bank-booking \
 ```
 
 `room-run` does what an MCP client does: it opens the home (default
-`workflow-runs/<bundle name>`), creates the room `bank-booking` there, writes
+`$DVERGR_HOME/workflow-runs/<bundle name>` when `DVERGR_HOME` is set, else
+`workflow-runs/<bundle name>` in the working directory; a home of its own, since a
+daemon may have `DVERGR_HOME` itself open), creates the room `bank-booking` there, writes
 the bundle into its workspace with `room_write`, runs `catalog_benchmark` into
 that room and prints the report from `experiment_report` (or writes it to
-`--report FILE`). The exit code is 1 when cells did not finish. Inside a
+`--report FILE`). stdout has progress lines (cells done of the total) and the report; the
+log goes to `<home>/dvergr.log`. The exit code is 1 when cells did not finish. Inside a
 daemon, use the `catalog_benchmark` MCP tool (the `bench` profile) or
 `runner/run-in`.
 
 A table of historical cases becomes a case pack with
-`dvergr.catalog.casepack/from-table` and `write-dir!`; certification
-(`certification.edn`) lists the cases that cannot grade an answer and why
-(no id, duplicate id, unlabelled, conflicting outcomes, missing attachment).
+`clojure -M -m dvergr.catalog.casepack-cli <table.csv> --id … --inputs … --outcome col:rule
+--out <dir>` (or `dvergr.catalog.casepack/from-table` and `write-dir!`); certification
+(`certification.edn`) lists the cases that cannot grade an answer and why: no id, a
+duplicate id (every row with it is dropped), unlabelled, conflicting outcomes, a missing
+attachment, or a recorded outcome the checker does not accept as the right answer
+(`outcome-not-gradable`, e.g. an amount that is not a number).
 
 ## What runs where
 
@@ -58,7 +64,7 @@ then discarded. What lives in the fork differs:
 | Room workflows, case packs, wiki | the fork's files and sandbox (Claude Code CLI candidates reach them over MCP) |
 | tau2, AutomationBench | world state in the fork's context; tools are host functions over it |
 | SpreadsheetBench | an immutable workbook value per episode (isolated by immutability) |
-| BIRD | shared databases on the host, read-only: one SELECT/WITH statement per query, no ATTACH, a fresh pg-datahike session per query |
+| BIRD | shared databases on the host, read-only: one SELECT/WITH statement per query, no ATTACH, a fresh read-only pg-datahike session per query |
 | BFCL | nothing executes; calls are recorded and compared |
 
 ## Resume, identity and faults
