@@ -4,6 +4,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [datahike.api :as dh]
             [dvergr.chat.schema :as cschema]
+            [dvergr.agent.room-context :as room-context]
             [dvergr.discourse :as d]
             [dvergr.room.store.datahike :as store-dh]
             [dvergr.rooms.messages :as rmsg]
@@ -23,10 +24,11 @@
      conn cfg]))
 
 (defn- add-ledger!
-  "A ledger entry of `microdollars` for a chat titled `title` in `conn`."
-  [conn title microdollars]
-  (let [cid (random-uuid)]
-    (dh/transact conn [{:chat/id cid :chat/title title}
+  "A ledger entry of `microdollars` for `agent`'s working chat in the room
+   `room-id` (the chat id and title `room-context/ensure-ctx!` gives it)."
+  [conn room-id agent microdollars]
+  (let [cid (room-context/stable-chat-id room-id agent)]
+    (dh/transact conn [{:chat/id cid :chat/title (str (name agent) "-" (name room-id))}
                        {:ledger/id (random-uuid)
                         :ledger/context [:chat/id cid]
                         :ledger/timestamp (java.util.Date.)
@@ -40,18 +42,24 @@
       (let [[ra ca cfga] (datahike-room c "rmA")
             [rb cb cfgb] (datahike-room c "rmB")]
         (try
-          ;; var: $1 in rmA, $2 in rmB ; huginn: $0.50 in rmA
-          (add-ledger! ca "var-rmA"    1000000)
-          (add-ledger! cb "var-rmB"    2000000)
-          (add-ledger! ca "huginn-rmA"  500000)
+          ;; var: $1 in rmA, $2 in rmB ; huginn: $0.50 in rmA ;
+          ;; variant (a name var is a prefix of): $4 in rmA
+          (add-ledger! ca :rmA :var    1000000)
+          (add-ledger! cb :rmB :var    2000000)
+          (add-ledger! ca :rmA :huginn  500000)
+          (add-ledger! ca :rmA :variant 4000000)
           (testing "per-room cost reads that room's OWN store"
-            (is (= 1.5 (:cost-dollars (rstats/room-stats ra))) "rmA = var $1 + huginn $0.50")
+            (is (= 5.5 (:cost-dollars (rstats/room-stats ra))) "rmA = var $1 + huginn $0.50 + variant $4")
             (is (= 2.0 (:cost-dollars (rstats/room-stats rb))) "rmB = var $2"))
           (testing "system rollup sums every room's ledger"
-            (is (= 3.5 (:cost-dollars (rstats/system-stats)))))
-          (testing "per-agent cost fans out across rooms (chat-title prefix)"
-            (is (= 3.0 (#'ostats/query-cost "var"))    "var = $1 (rmA) + $2 (rmB)")
-            (is (= 0.5 (#'ostats/query-cost "huginn")) "huginn = $0.50 (rmA)"))
+            (is (= 7.5 (:cost-dollars (rstats/system-stats)))))
+          (testing "per-agent cost fans out across rooms, by agent id"
+            (is (= 3.0 (#'ostats/query-cost :var))     "var = $1 (rmA) + $2 (rmB), not variant's $4")
+            (is (= 0.5 (#'ostats/query-cost :huginn))  "huginn = $0.50 (rmA)")
+            (is (= 4.0 (#'ostats/query-cost :variant)) "variant = $4 (rmA)"))
+          (testing "last activity is the agent's own"
+            (is (some? (#'ostats/query-last-active :var)))
+            (is (nil? (#'ostats/query-last-active :va))))
           (finally
             (rmsg/drop-room! (:id ra)) (rmsg/drop-room! (:id rb))
             (dh/release ca) (dh/delete-database cfga)

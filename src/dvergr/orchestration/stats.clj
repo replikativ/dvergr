@@ -21,6 +21,7 @@
             [dvergr.model.registry :as model-registry]
             [dvergr.actors :as actors]
             [dvergr.room.registry :as rreg]
+            [dvergr.agent.room-context :as room-context]
             [clojure.string :as str]
             [org.replikativ.spindel.engine.core :as ec]
             [taoensso.telemere :as tel]))
@@ -78,71 +79,75 @@
 
 ;; RF5 S4: the cost ledger lives in each ROOM's own msgs store now (not the
 ;; legacy chat-db). Per-agent stats are therefore a FAN-OUT over every room's
-;; store — an agent's chats are titled "<agent>-<room>", so the same chat-title
-;; prefix match attributes its ledger across rooms. Needs a bound ctx (to list
-;; rooms via the root-anchored registry).
+;; store. An agent's working chat in a room has a stable id derived from the
+;; (room, agent) pair (`room-context/stable-chat-id`), so the fan-out matches
+;; that exact chat: matching the "<agent>-<room>" title by prefix would count
+;; `:variant`'s spend as `:var`'s. Needs a bound ctx (to list rooms via the
+;; root-anchored registry).
 
-(defn- room-dbs
-  "Deref'd datahike DBs of every registered room's own store. Bound-ctx required."
-  []
-  (->> (rreg/list-rooms) (keep #(some-> % :store :conn)) (mapv deref)))
+(defn- agent-chats
+  "`[db chat-id]` of `agent-id`'s working chat in every registered room's own
+   store (deref'd). Bound-ctx required."
+  [agent-id]
+  (->> (rreg/list-rooms)
+       (keep (fn [room]
+               (when-let [conn (some-> room :store :conn)]
+                 [@conn (room-context/stable-chat-id (:id room) agent-id)])))
+       vec))
 
 (defn- query-cost-db
-  "Spend (dollars) in one room DB, or nil when the query FAILS — unknown is
-   not zero (a fabricated 0.0 reads as \"free\" on the dashboard; nil renders
-   as an em-dash via fmt-cost, same contract as rooms/stats)."
-  [db prefix]
+  "Spend (dollars) of chat `chat-id` in one room DB, or nil when the query
+   FAILS — unknown is not zero (a fabricated 0.0 reads as \"free\" on the
+   dashboard; nil renders as an em-dash via fmt-cost, same contract as
+   rooms/stats)."
+  [db chat-id]
   (try
-    (let [res (dh/q '[:find (sum ?cost) :with ?e :in $ ?prefix
-                      :where [?e :ledger/context ?c] [?c :chat/title ?t]
-                      [?e :ledger/cost-microdollars ?cost]
-                      [(clojure.string/starts-with? ?t ?prefix)]]
-                    db prefix)]
+    (let [res (dh/q '[:find (sum ?cost) :with ?e :in $ ?cid
+                      :where [?c :chat/id ?cid] [?e :ledger/context ?c]
+                      [?e :ledger/cost-microdollars ?cost]]
+                    db chat-id)]
       (/ (double (or (ffirst res) 0)) 1000000.0))
     (catch Exception e
       (tel/log! {:level :warn :id ::cost-query-failed
-                 :data {:prefix prefix :error (.getMessage e)}})
+                 :data {:chat-id chat-id :error (.getMessage e)}})
       nil)))
 
 (defn- query-cost
-  "Total spend (dollars) for chats titled with `prefix`, summed over all
-   rooms whose query succeeded; nil when EVERY room errored (unknown ≠ 0)."
-  [prefix]
-  (let [costs (keep #(query-cost-db % prefix) (room-dbs))]
+  "Total spend (dollars) of `agent-id`'s chats, summed over all rooms whose
+   query succeeded; nil when EVERY room errored (unknown ≠ 0)."
+  [agent-id]
+  (let [costs (keep (fn [[db cid]] (query-cost-db db cid)) (agent-chats agent-id))]
     (when (seq costs) (reduce + 0.0 costs))))
 
-(defn- query-last-active-db [db prefix]
+(defn- query-last-active-db [db chat-id]
   (try
-    (ffirst (dh/q '[:find (max ?ts) :in $ ?prefix
-                    :where [?e :ledger/context ?c] [?c :chat/title ?t]
-                    [?e :ledger/timestamp ?ts]
-                    [(clojure.string/starts-with? ?t ?prefix)]]
-                  db prefix))
+    (ffirst (dh/q '[:find (max ?ts) :in $ ?cid
+                    :where [?c :chat/id ?cid] [?e :ledger/context ?c]
+                    [?e :ledger/timestamp ?ts]]
+                  db chat-id))
     (catch Exception _ nil)))
 
 (defn- query-last-active
-  "Most recent ledger timestamp for `prefix` chats across all rooms."
-  [prefix]
-  (->> (room-dbs)
-       (keep #(query-last-active-db % prefix))
+  "Most recent ledger timestamp of `agent-id`'s chats across all rooms."
+  [agent-id]
+  (->> (agent-chats agent-id)
+       (keep (fn [[db cid]] (query-last-active-db db cid)))
        (sort #(compare %2 %1))
        first))
 
-(defn- query-recent-content-db [db prefix]
+(defn- query-recent-content-db [db chat-id]
   (try
-    (seq (dh/q '[:find ?content ?ts :in $ ?prefix
-                 :where [?c :chat/title ?t]
-                 [(clojure.string/starts-with? ?t ?prefix)]
+    (seq (dh/q '[:find ?content ?ts :in $ ?cid
+                 :where [?c :chat/id ?cid]
                  [?m :message/chat ?c] [?m :message/role :assistant]
                  [?m :message/content ?content] [?m :message/created-at ?ts]]
-               db prefix))
+               db chat-id))
     (catch Exception _ nil)))
 
 (defn- query-recent-content
   "Most recent assistant message body (≤800 chars) for `agent-id` across rooms."
   [agent-id]
-  (let [prefix (name agent-id)
-        rows   (mapcat #(or (query-recent-content-db % prefix) []) (room-dbs))]
+  (let [rows (mapcat (fn [[db cid]] (or (query-recent-content-db db cid) [])) (agent-chats agent-id))]
     (when (seq rows)
       (let [content (first (first (sort-by second #(compare %2 %1) rows)))]
         (when (seq content)
@@ -159,9 +164,8 @@
   [ctx agent-id]
   (try
     (binding [ec/*execution-context* ctx]
-      (let [prefix  (name agent-id)
-            cost    (query-cost prefix)
-            last-at (query-last-active prefix)]
+      (let [cost    (query-cost agent-id)
+            last-at (query-last-active agent-id)]
         (cache-update! agent-id (fnil merge {})
                        {:cost-dollars        cost
                         :last-active         last-at
