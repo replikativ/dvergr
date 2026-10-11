@@ -886,7 +886,7 @@
    :room/files
    {:doc (str "List a directory of a room's workspace (its Git repository; default the root): each "
               "entry's name, path, kind (file or dir) and, for a file, its size and content id (a hash "
-              "of its bytes). At most " room-files/max-list-entries " entries from `offset`; "
+              "of its bytes). At most " room-files/max-list-entries " entries (fewer for long names) from `offset`; "
               "`next-offset` when more follow, `total` counts them. room_read reads a file, room_write "
               "writes files.")
     :kind :read
@@ -1193,8 +1193,8 @@
               "nothing (commit null). Paths stay in the workspace: no '..', nothing under .git. At most "
               room-files/max-batch-files " paths and " (quot room-files/max-batch-bytes (* 1024 1024)) " MiB per call, "
               (quot room-files/max-file-bytes (* 1024 1024)) " MiB per file. It is all or nothing: a "
-              "refused or failed write undoes the batch. Refused while the workspace has other staged "
-              "changes. A read-only world refuses it. "
+              "refused or failed write undoes the batch. Refused while the workspace has staged "
+              "changes, and for a path that is a symbolic link. A read-only world refuses it. "
               "History is the room's: room_fork to try changes, room_diff/room_merge to adopt them.")
     :kind :write
     :schema [:map [:room Room]

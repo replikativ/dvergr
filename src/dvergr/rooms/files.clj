@@ -21,6 +21,7 @@
             [dvergr.substrate.geschichte :as gs]
             [dvergr.tools :as tools]
             [geschichte.repo :as repo]
+            [jsonista.core :as json]
             [muschel.fs :as mfs]
             [org.replikativ.spindel.engine.core :as ec])
   (:import [java.nio ByteBuffer]
@@ -39,6 +40,11 @@
   (* 4 1024 1024))
 
 (def max-list-entries "The most entries one `room_files` returns (`offset` pages)." 200)
+
+(def ^:private max-list-chars
+  "What one `room_files` page's entries may take as JSON: a page ends before
+   this, so the result fits the MCP result limit whatever the names' length."
+  40000)
 (def max-file-bytes "The largest file one `room_write` writes." (* 8 1024 1024))
 (def max-batch-bytes "What one `room_write` writes in all." (* 16 1024 1024))
 (def max-batch-files "How many paths one `room_write` names." 200)
@@ -109,15 +115,20 @@
      (when (neg? offset) (refuse "offset must not be negative" {:offset offset}))
      (let [ids (content-ids conn)
            all (vec (remove #(= ".git" (:name %)) (mfs/list-dir fs dir)))
-           page (take max-list-entries (drop offset all))
+           entry (fn [{entry-name :name entry-type :type size :size}]
+                   (let [p (str (when-not (= "/" dir) dir) "/" entry-name)]
+                     (cond-> {:name entry-name :path p :kind (name (or entry-type :file))}
+                       (= :file entry-type) (assoc :size size :content-id (get ids p)))))
+           ;; whole entries, at least one, until the count or the size runs out
+           page (loop [es (drop offset all) acc [] chars 0]
+                  (if-let [e (some-> (first es) entry)]
+                    (let [n (+ chars 1 (count (json/write-value-as-string e)))]
+                      (if (and (seq acc) (or (<= max-list-entries (count acc)) (< max-list-chars n)))
+                        acc
+                        (recur (rest es) (conj acc e) n)))
+                    acc))
            end (+ offset (count page))]
-       (cond-> {:path dir
-                :total (count all)
-                :entries (vec (for [{entry-name :name entry-type :type size :size} page
-                                    :let [p (str (when-not (= "/" dir) dir) "/" entry-name)
-                                          file? (= :file entry-type)]]
-                                (cond-> {:name entry-name :path p :kind (name (or entry-type :file))}
-                                  file? (assoc :size size :content-id (get ids p)))))}
+       (cond-> {:path dir :total (count all) :entries page}
          (< end (count all)) (assoc :next-offset end))))))
 
 (def ^:private media-types
@@ -168,9 +179,11 @@
         p (workspace-path path)
         st (mfs/stat fs p)]
     (case (:type st)
+      :file nil
       :dir (throw (ex-info (str "A directory: " p " (room_files lists it)") {:type ::directory :path p}))
       nil (throw (ex-info (str "No such file: " p) {:type ::not-found :path p}))
-      nil)
+      ;; a link's target is not checked against the path rules: not followed
+      (refuse (str p " is a symbolic link, which room_read does not follow") {:path p}))
     (let [^bytes bytes (or (mfs/read-bytes fs p) (byte-array 0))
           size (alength bytes)
           offset (long (or offset 0))
@@ -246,20 +259,22 @@
   (->> (str/split abs #"/") (remove str/blank?) butlast (reductions #(str %1 "/" %2) "") rest))
 
 (defn- check-shape!
-  "Refuse a batch that would overwrite or remove a directory, or put a file
-   beneath a file."
+  "Refuse a batch that would overwrite or remove a directory or a symbolic
+   link, or reach a path beneath a file or a link."
   [fs entries]
   (doseq [[p c] entries
           :let [t (:type (mfs/stat fs p))]]
-    (when (and t (not= :file t))
-      (refuse (str p " is a directory; name its files") {:path p}))
-    (when (not= ::remove c)
-      (when-let [blocked (some #(when (= :file (:type (mfs/stat fs %))) %) (ancestors-of p))]
-        (refuse (str p ": " blocked " is a file") {:path p})))))
+    (case t
+      (nil :file) nil
+      :dir (refuse (str p " is a directory; name its files") {:path p})
+      (refuse (str p " is a symbolic link; room_write does not write through or remove links") {:path p}))
+    (when-let [[blocked bt] (some #(let [t (:type (mfs/stat fs %))] (when (and t (not= :dir t)) [% t]))
+                                  (ancestors-of p))]
+      (refuse (str p ": " blocked " is " (if (= :file bt) "a file" "a symbolic link")) {:path p}))))
 
 (defn- restore!
-  "Undo this batch's changes: the index of its paths back to HEAD (it held
-   nothing else staged), the files it wrote or removed back to `before`
+  "Undo this batch's changes: the index of its paths back to HEAD (where it
+   was: nothing was staged), the files it wrote or removed back to `before`
    unless someone else changed them since (their content is no longer what
    this batch left), and the directories it created, when empty."
   [conn fs before expected touched created]
@@ -290,8 +305,8 @@
    to remove the file) into `room`'s workspace and commit exactly those paths
    as one commit with `message` (`forks/commit-paths!`). The batch is a
    `:git/commit` effect, decided before anything is written; each write and
-   removal is an effect too. Every path is checked first; the index may hold
-   nothing staged beyond the batch. When any step fails, the batch's changes
+   removal is an effect too. Every path is checked first, and the index may
+   hold nothing staged (`git add` without a commit). When any step fails, the batch's changes
    are undone (`restore!`) and nothing is committed. Returns `{:commit
    :message :written [{:path :size :content-id}] :removed [path]}`;
    `:commit` is nil when the files already were as given."
@@ -309,7 +324,8 @@
     ;; in between (`gs/workspace-lock`)
     (locking (gs/workspace-lock conn)
       (check-shape! fs entries)
-      (let [staged (remove (set (map rel paths)) (:staged (repo/status conn)))]
+      ;; the undo restores the index to HEAD: so it must be at HEAD
+      (let [staged (:staged (repo/status conn))]
         (when (seq staged)
           (throw (ex-info (str "The workspace has staged changes (" (str/join ", " (take 5 staged))
                                "); commit them before a room_write")

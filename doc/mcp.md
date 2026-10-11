@@ -154,15 +154,16 @@ around 40, and every definition costs context in every session.
   since the import as a patch: `git apply` it in your checkout. Only these two ops reach a
   repository outside the room; a room's own sandbox Git has no network transport.
 - **A room's files without a checkout.** `room_files {room, path}` lists a directory of the room's
-  workspace (name, kind, size, content id; 200 entries per call, `offset`/`next-offset` for more),
+  workspace (name, kind, size, content id; up to 200 entries per call, `offset`/`next-offset` for more),
   `room_read {room, path}` returns a file as `text` (UTF-8) or `base64` with its `media-type`
   (.xlsx, PDF), at most 24 KiB per call (`offset`, `next-offset` for the rest), and `room_write
   {room, files, message}` writes a batch as one commit of the room's repository: `files` maps a
   path to `{"text": …}`, `{"base64": …}` or `null` (remove it), and only those paths are
   committed. It is all or nothing: a refused or failed write undoes the batch, and a path another
   writer changed meanwhile fails it rather than committing their bytes. It refuses while the
-  workspace has other staged changes. Paths stay in the workspace (no `..`, nothing under
-  `.git`); a read-only world refuses the write and receipts the refusal. There is no Git API:
+  workspace has staged changes; symbolic links are neither read nor written through. Paths stay
+  in the workspace (no `..`, nothing under `.git`); a read-only world refuses the write and
+  receipts the refusal. There is no Git API:
   history is the room's (`room_fork`, `room_diff`, `room_review`, `room_merge`, `room_export`).
   Files are also resources, `room://{room}/files/{+path}` (a file whole up to 4 MiB, a directory as
   JSON).

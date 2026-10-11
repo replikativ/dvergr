@@ -7,6 +7,7 @@
             [dvergr.catalog.workspace :as ws]
             [dvergr.discourse :as d]
             [dvergr.effects :as effects]
+            [dvergr.intake.bash :as bash]
             [dvergr.mcp.surface :as surface]
             [dvergr.room.store.memory :as memory]
             [dvergr.rooms.files :as files]
@@ -189,6 +190,48 @@
     (is (not (mfs/exists? (ws/room-fs r) "/b")) "the directory it made is gone too")
     (is (empty? (forks/workspace-changes r)) "nothing staged, nothing dirty")))
 
+(deftest a-staged-version-of-a-batch-path-refuses-the-batch
+  ;; HEAD, index and worktree each hold another version: all are kept
+  (let [r (room)]
+    (files/write! r {"a.txt" {:text "head"}} {})
+    (mfs/write-string! (ws/room-fs r) "/a.txt" "index" false)
+    (binding [ec/*execution-context* (:ctx r)] (gs/execute-git ["add" "a.txt"]))
+    (mfs/write-string! (ws/room-fs r) "/a.txt" "worktree" false)
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"staged changes"
+                          (files/write! r {"a.txt" {:text "mine"}} {})))
+    (is (= "worktree" (worktree-text r "/a.txt")))
+    (is (= "index" (String. ^bytes (repo/read-entry (conn r) (get (repo/tree (conn r) :index) "a.txt")) "UTF-8")))
+    (is (= "head" (String. ^bytes (repo/read-entry (conn r) (get (repo/tree (conn r) :head) "a.txt")) "UTF-8")))))
+
+(deftest symbolic-links-are-not-followed
+  (let [r (room)
+        fs (ws/room-fs r)]
+    (mfs/write-string! fs "/.env" "SECRET=1" false)
+    (mfs/symlink fs ".env" "/public.txt")
+    (mfs/symlink fs "public.txt" "/chained.txt")
+    (doseq [p ["public.txt" "chained.txt"]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"symbolic link" (files/read-file r p {})) p)
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"symbolic link" (files/write! r {p {:text "x"}} {})) p)
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"symbolic link" (files/write! r {p nil} {})) p))
+    (is (thrown? clojure.lang.ExceptionInfo (files/read-file r ".env" {})))
+    (is (= "SECRET=1" (worktree-text r "/.env")))))
+
+(deftest a-shell-git-waits-for-a-batch
+  ;; the room shell's git builtin takes the same lock as a room_write batch
+  (let [r (room)
+        ws (binding [ec/*execution-context* (:ctx r)] (gs/current-workspace))
+        host (bash/make-host {:workspace ws})
+        git (get (:builtins host) "git")
+        fs (:fs host)]
+    (mfs/write-string! fs "/scratch.md" "x" false)
+    (let [f (locking (gs/workspace-lock (:conn ws))
+              (let [f (future (git ["git" "add" "scratch.md"] fs {:cwd "/"}))]
+                (Thread/sleep 300)
+                (is (not (realized? f)) "blocked while the batch holds the repository")
+                f))]
+      (is (= 0 (:exit (deref f 10000 {:exit :timeout}))))
+      (is (= ["scratch.md"] (:staged (repo/status (conn r))))))))
+
 (deftest staged-changes-of-others-refuse-the-batch
   (let [r (room)]
     (mfs/write-string! (ws/room-fs r) "/scratch.md" "staged by an agent" false)
@@ -245,3 +288,14 @@
       (is (= 5 (count (:entries b))))
       (is (nil? (:next-offset b)))
       (is (= 205 (count (distinct (map :path (concat (:entries a) (:entries b))))))))))
+
+(deftest a-page-of-long-names-fits-an-mcp-result
+  (let [r (room)
+        names (for [i (range 200)] (str (apply str (repeat 190 "n")) (format "%03d.txt" i)))]
+    (files/write! r (into {} (for [n names] [(str "long/" n) {:text "x"}])) {})
+    (let [pages (loop [offset 0 acc []]
+                  (let [pg (files/list-dir r "/long" {:offset offset})]
+                    (is (:structuredContent (surface/data-result pg)) "a whole page, not a cut result")
+                    (if-let [n (:next-offset pg)] (recur n (conj acc pg)) (conj acc pg))))]
+      (is (< 1 (count pages)))
+      (is (= (set names) (set (mapcat #(map :name (:entries %)) pages)))))))
