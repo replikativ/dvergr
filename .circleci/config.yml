@@ -88,6 +88,15 @@ jobs:
             - v1-deps-
       - install-clojure
       - run:
+          # bin/dvergr-mcp (the MCP relay) is a babashka script: its tests
+          # skip without bb
+          name: Install babashka 1.12.200
+          command: |
+            curl -sSL -o /tmp/bb.tar.gz \
+              https://github.com/babashka/babashka/releases/download/v1.12.200/babashka-1.12.200-linux-amd64-static.tar.gz
+            sudo tar -xzf /tmp/bb.tar.gz -C /usr/local/bin bb
+            bb --version
+      - run:
           name: Run tests (kaocha), this container's share of the namespaces
           command: |
             mkdir -p target/test-split test-results/kaocha

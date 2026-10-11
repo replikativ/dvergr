@@ -79,13 +79,19 @@
 (defn- write-nrepl-port-file!
   "Write the nREPL port to `path` (default `.nrepl-port` in the current
    working directory) so editors (CIDER, Calva, Cursive) and `clj-nrepl-eval`
-   can auto-discover the connection without flags. Deletes on exit."
+   can auto-discover the connection without flags. Deletes on exit. A file
+   that cannot be written stops the start, loudly: whoever asked for it
+   (`bin/dvergr-mcp`) finds the daemon by it."
   [port path]
-  (let [f (io/file path)]
+  (let [f (.getAbsoluteFile (io/file path))]
     (try
+      (io/make-parents f)
       (spit f (str port))
       (.deleteOnExit f)
-      (catch Throwable _))))
+      (catch Throwable e
+        (binding [*out* *err*]
+          (println (str "[dvergr] Cannot write the nREPL port file " f ": " (.getMessage e))))
+        (System/exit 1)))))
 
 (defn- write-pid-file!
   "Record this daemon's pid in the state root (`daemon.pid`), so that

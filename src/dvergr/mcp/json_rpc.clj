@@ -253,7 +253,9 @@
   (let [session @(:session context)]
     (cond-> {:supportedVersions (into (vec stateless-versions) (rseq supported-versions))
              :capabilities stateless-capabilities}
-      (:instructions session) (assoc :instructions (:instructions session)))))
+      (:instructions session) (assoc :instructions (:instructions session))
+      ;; the server's state root: a relay checks it is the daemon of its home
+      (:home session) (assoc-in [:_meta :dvergr/home] (:home session)))))
 
 (def ^:private stateless-handlers
   {"server/discover" discover-handler
@@ -334,10 +336,12 @@
   "Create a fresh MCP session state map.
    Options:
      :server-info  - {:name \"...\" :version \"...\"}
-     :instructions - text returned from initialize (optional)"
-  [{:keys [server-info instructions]}]
+     :instructions - text returned from initialize (optional)
+     :home         - the server's state root, in server/discover's _meta (optional)"
+  [{:keys [server-info instructions home]}]
   {:initialized false
    :instructions instructions
+   :home home
    :handler-by-method nil ;; set during first handle-message
    :server-info (or server-info {:name "mcp-server" :version "0.1.0"})
    :protocol-version nil
