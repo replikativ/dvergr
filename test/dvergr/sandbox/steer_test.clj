@@ -13,6 +13,16 @@
 (def ^:private lambda 0.8)
 (def ^:private exact-mean (* 5 (/ (Math/exp lambda) (+ 1 (Math/exp lambda)))))
 
+;; The steps draw with `rand-int`, as a model call would, outside any seeded
+;; stream, so the estimate is random. Its error has a standard deviation of
+;; about 1.4/√N for N particles (measured: 0.093 over 30 runs at N = 200,
+;; 0.044 over 15 at N = 1000, 0.033 over 10 at N = 2000). At N = 200 the
+;; tolerance was 2.7 σ, and about one run in 150 failed. At N = 1000 it is
+;; above 5 σ: a correct sampler fails about once in ten million runs, while
+;; a sampler that lost the tilt (mean 2.5, an error of 0.95) still fails.
+(def ^:private particles 1000)
+(def ^:private tolerance 0.25)
+
 (deftest a-sandbox-program-steers-a-process
   (let [root (context/create-execution-context)]
     (try
@@ -32,7 +42,7 @@
                          "                          :reward (fn [heads] (* lambda heads)) "
                          "                          :done? (fn [_] false) "
                          "                          :max-steps 5}) "
-                         "      posterior @(spin (await (infer/smc-infer model 200 {:resampling :stratified})))] "
+                         "      posterior @(spin (await (infer/smc-infer model " particles " {:resampling :stratified})))] "
                          "  {:values (infer/values posterior) :weights (infer/log-weights posterior)})")
                         :timeout-ms 120000)
                 {:keys [values weights]} (:value result)
@@ -40,8 +50,8 @@
                 ws (map #(Math/exp (- % top)) weights)
                 mean (/ (reduce + (map * ws values)) (reduce + ws))]
             (is (:success result) (pr-str (:error result)))
-            (is (= 200 (count values)))
+            (is (= particles (count values)))
             (is (every? #(<= 0 % 5) values))
-            (is (< (Math/abs (- mean exact-mean)) 0.25) (str mean " vs " exact-mean)))))
+            (is (< (Math/abs (- mean exact-mean)) tolerance) (str mean " vs " exact-mean)))))
       (finally
         (context/stop-context! root)))))
