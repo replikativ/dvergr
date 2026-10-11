@@ -36,22 +36,43 @@
 (defn- load-mail-bindings []
   (try
     (load/require! 'dvergr.intake.mail)
-    (resolve-mail-bindings (find-ns 'dvergr.intake.mail))
+    (let [mail-ns (find-ns 'dvergr.intake.mail)]
+      (some-> (resolve-mail-bindings mail-ns)
+              ;; host-side, not mounted: whether a read must open the store
+              (assoc 'open? (some-> (ns-resolve mail-ns 'account-open?) deref))))
     (catch Throwable _
       nil)))
 
+(defn- account-of
+  "The `:account` keyword argument in `args`, or the default account."
+  [args]
+  (or (second (drop-while #(not= :account %) args)) :datahike-contact))
+
 (defn gate-mail-bindings
-  "`bindings` with `sync!`, which pulls an IMAP account into the local mail
-   store, performed through the boundary `effects` (`dvergr.effects`); the
-   reads of the local store are not effects."
-  [bindings effects]
-  (update bindings 'sync!
-          (fn [sync!]
-            (fn [& {:keys [account folders] :as opts}]
-              (effects/perform! effects {:effect :mail/sync
-                                         :resource {:account (str (or account :default))
-                                                    :folders (vec (or folders ["INBOX"]))}}
-                                #(apply sync! (mapcat identity opts)))))))
+  "`bindings` for the sandbox, through the boundary `effects`
+   (`dvergr.effects`): `sync!`, which pulls an IMAP account into the local
+   store, is `:mail/sync`; a read of an account whose store is not open yet
+   opens it, a `:mail/open` (a write); reads of an open store are not effects.
+   `open?` (host-side, not mounted) answers whether an account is open."
+  [{open? 'open? :as bindings} effects]
+  (let [opening (fn [read]
+                  (fn [& args]
+                    (let [account (account-of args)]
+                      (if (and open? (open? account))
+                        (apply read args)
+                        (effects/perform! effects {:effect :mail/open :resource {:account (name account)}}
+                                          #(apply read args))))))]
+    (-> (dissoc bindings 'open?)
+        (update 'inbox opening)
+        (update 'search opening)
+        (update 'read opening)
+        (update 'sync!
+                (fn [sync!]
+                  (fn [& {:keys [account folders] :as opts}]
+                    (effects/perform! effects {:effect :mail/sync
+                                               :resource {:account (name (or account :datahike-contact))
+                                                          :folders (vec (or folders ["INBOX"]))}}
+                                      #(apply sync! (mapcat identity opts)))))))))
 
 (defn add-intake-namespaces!
   "Mount the few NATIVE-only intake namespaces. Everything else is sandbox
