@@ -387,16 +387,23 @@
                       (catch Throwable _ nil)))
          patterns)))
 
+(declare served-from? current-prefixes)
+
 (defn allow-added-lib-namespaces!
-  "Record that an approved, SUCCESSFUL `add-libs!` put `ns-syms` on the
-   classpath, so the agent may require exactly those namespaces. Each entry is
-   one namespace, never a prefix: no name is inferred from a coord's group or
-   artifact id (`org.clojure/x` once opened every `clojure.*` namespace,
-   `clojure.main` included). The hard denylist still applies."
-  [ns-syms]
-  (let [added (into #{} (map symbol) ns-syms)]
-    (ec/swap-state! NS-PROVENANCE-KEY #(into (or % #{}) added))
-    added))
+  "Record that an approved, SUCCESSFUL `add-libs!` put namespaces on the
+   classpath, so the agent may require exactly those. `grants` maps each
+   namespace to the URL prefixes of the roots it came from (its lib's jars);
+   a plain seq of namespaces binds each to the roots serving it now. Each entry
+   is one namespace, never a prefix: no name is inferred from a coord's group
+   or artifact id (`org.clojure/x` once opened every `clojure.*` namespace,
+   `clojure.main` included). Mirroring rechecks the roots, so a jar attached
+   later cannot take over a granted name. The hard denylist still applies."
+  [grants]
+  (let [grants (if (map? grants)
+                 (update-keys grants symbol)
+                 (into {} (map (fn [n] [(symbol n) (current-prefixes (symbol n))])) grants))]
+    (ec/swap-state! NS-PROVENANCE-KEY #(merge-with into (or % {}) grants))
+    (set (keys grants))))
 
 (defn lib-paths
   "The classpath roots (jars or directories) the current basis records for
@@ -523,27 +530,48 @@
   (keep #(some-> (.getResource ^ClassLoader loader (str base %)) str)
         ["__init.class" ".clj" ".cljc"]))
 
+(defn- ns->base
+  "The resource path (without extension) `require` loads `ns-sym` from."
+  [ns-sym]
+  (-> (str ns-sym) (str/replace "-" "_") (str/replace "." "/")))
+
+(defn- served-from?
+  "Does every file `require` could load `ns-sym` from resolve to one of
+   `prefixes`?"
+  [ns-sym prefixes]
+  (let [urls (resource-urls (clojure.lang.RT/baseLoader) (ns->base ns-sym))]
+    (boolean (and (seq urls) (seq prefixes)
+                  (every? (fn [u] (some #(str/starts-with? u %) prefixes)) urls)))))
+
+(defn- current-prefixes
+  "The URL prefixes of the roots serving `ns-sym` now."
+  [ns-sym]
+  (let [base (ns->base ns-sym)]
+    (into #{}
+          (keep (fn [u] (let [i (str/last-index-of u base)] (when (pos? (or i -1)) (subs u 0 i)))))
+          (resource-urls (clojure.lang.RT/baseLoader) base))))
+
 (defn namespaces-provided
   "Namespaces that the roots in `paths` (one lib's jars or directories) NEWLY
    provide: a namespace counts only when it was not in `pre-existing` (the
    namespace names before the load — `add-libs` itself creates the namespaces
-   a jar's `data_readers.clj` names) and every file `require` could load it
-   from — the AOT `__init.class`, the `.clj`, the `.cljc` — resolves, through
-   the class loader, to one of these roots. A jar that also ships
-   `clojure/main.clj`, or a `.cljc` beside a host `.clj` or AOT class, does
-   not provide that namespace."
+   a jar's `data_readers.clj` names), its file is where `require` looks for
+   that name (not `clojure.inspector.clj` for `clojure.inspector`), and every
+   file `require` could load it from — the AOT `__init.class`, the `.clj`, the
+   `.cljc` — resolves, through the class loader, to one of these roots. A jar
+   that also ships `clojure/main.clj`, or a `.cljc` beside a host `.clj` or
+   AOT class, does not provide that namespace."
   ([paths] (namespaces-provided paths (set (map ns-name (all-ns)))))
   ([paths pre-existing]
-   (let [loader (clojure.lang.RT/baseLoader)
-         prefixes (mapv root-url-prefix paths)]
+   (let [prefixes (mapv root-url-prefix paths)]
      (into #{}
            (comp (mapcat root-entries)
                  (mapcat (fn [entry]
-                           (let [urls (delay (resource-urls loader (str/replace entry #"(__init\.class|\.cljc?)$" "")))]
+                           (let [entry-base (str/replace entry #"(__init\.class|\.cljc?)$" "")]
                              (filter (fn [ns-sym]
                                        (and (not (contains? pre-existing ns-sym))
-                                            (seq @urls)
-                                            (every? (fn [u] (some #(str/starts-with? u %) prefixes)) @urls)))
+                                            (= entry-base (ns->base ns-sym))
+                                            (served-from? ns-sym prefixes)))
                                      (path->nss entry))))))
            paths))))
 
@@ -567,10 +595,7 @@
    for whatever a later add-libs jar (approved for some other context, or
    attached by a load that then failed) put under an allowlisted name."
   [ns-sym]
-  (let [base (-> (str ns-sym) (str/replace "-" "_") (str/replace "." "/"))
-        urls (resource-urls (clojure.lang.RT/baseLoader) base)]
-    (and (seq urls)
-         (every? (fn [u] (some #(str/starts-with? u %) @launch-root-prefixes)) urls))))
+  (served-from? ns-sym @launch-root-prefixes))
 
 (defonce ^:private runtime-lib-namespaces
   ;; lib → {:source <basis coord> :namespaces #{…}}: what its jars newly
@@ -599,7 +624,9 @@
   [ns-sym]
   (let [s (str ns-sym)]
     (and (not (matches-any? hard-namespace-denylist s))
-         (or (contains? (policy-state NS-PROVENANCE-KEY #{}) (symbol s))
+         (or (when-let [prefixes (get (policy-state NS-PROVENANCE-KEY {}) (symbol s))]
+               ;; still loaded from the roots it was granted for
+               (served-from? (symbol s) prefixes))
              ;; The allowlist speaks for the launch classpath. A namespace an
              ;; add-libs jar provides (even one under an allowlisted prefix,
              ;; `medley.probe`) is reachable only with that grant: another
@@ -833,25 +860,26 @@
               _ (doseq [lib added]
                   (swap! runtime-lib-namespaces assoc lib
                          {:source (lib-source lib)
+                          :prefixes (set (map root-url-prefix (lib-paths lib)))
                           :namespaces (namespaces-provided (lib-paths lib) pre-names)}))
               spec-of #(when (map? libs) (get libs %))
-              provided (into #{}
+              provided (into {}
                              (mapcat (fn [c]
-                                       (let [{:keys [source namespaces]} (get @runtime-lib-namespaces c)]
+                                       (let [{:keys [source namespaces prefixes]} (get @runtime-lib-namespaces c)]
                                        ;; Added by this very call: what is loaded
                                        ;; is what this request resolved to.
                                          (when (or (contains? (set added) c)
                                                    (same-source? (spec-of c) source))
-                                           namespaces))))
+                                           (map (fn [n] [n prefixes]) namespaces)))))
                              coords)]
           (allow-added-lib-namespaces! provided)
           (tel/log! {:id :sandbox.deps/approved
-                     :data {:coords coords :added (vec added) :namespaces provided}}
+                     :data {:coords coords :added (vec added) :namespaces (set (keys provided))}}
                     "Deps approved + loaded")
           (let [new-nss (mirror-namespaces-into-sci! sci-ctx pre-ns)]
             {:status :loaded
              :coords (vec coords)
-             :provenance (vec (sort provided))
+             :provenance (vec (sort (keys provided)))
              :namespaces (mapv ns-name new-nss)}))))))
 
 ;; ============================================================================

@@ -77,13 +77,10 @@
 
 (deftest add-libs-provenance-widens-but-not-past-the-hard-denylist
   (with-ctx
-    (testing "an approved add-libs makes the namespaces it loaded requirable"
-      (deps/allow-added-lib-namespaces! '[clojure.data.csv])
-      (is (deps/namespace-mirrorable? 'clojure.data.csv)))
-    (testing "provenance is per namespace, never a prefix of one"
-      ;; Recording `my.lib.core` must not open `my.lib.core.impl` or `my.lib`.
-      (deps/allow-added-lib-namespaces! '[my.lib.core])
-      (is (deps/namespace-mirrorable? 'my.lib.core))
+    (testing "a grant is one namespace bound to its roots, never a prefix"
+      ;; (the probe test below covers a served grant end to end)
+      (deps/allow-added-lib-namespaces! {'my.lib.core #{"file:/nowhere/"}})
+      (is (not (deps/namespace-mirrorable? 'my.lib.core)) "not served from the roots it was granted for")
       (is (not (deps/namespace-mirrorable? 'my.lib.core.impl)))
       (is (not (deps/namespace-mirrorable? 'my.lib))))
     (testing "provenance cannot be used to reach the host application"
@@ -139,6 +136,10 @@
     (.mkdirs (.getParentFile own))
     (spit own "(ns dvergr-probe-lib.core)\n(defn answer [] 42)\n")
     (spit (java.io.File. dir "dvergr_probe_lib/readers.clj") "(ns dvergr-probe-lib.readers)\n")
+    ;; granted as .cljc here; a later root's .clj would take over the name
+    (spit (java.io.File. dir "dvergr_probe_lib/swap.cljc") "(ns dvergr-probe-lib.swap)\n(defn who [] :a)\n")
+    ;; a dotted file name is not where require looks for clojure.inspector
+    (spit (java.io.File. dir "clojure.inspector.clj") "(ns clojure.inspector)\n")
     ;; a namespace declared with underscores loads from the same file name
     (.mkdirs (java.io.File. dir "dvergr_under"))
     (spit (java.io.File. dir "dvergr_under/core.clj") "(ns dvergr_under.core)\n(defn hi [] :hi)\n")
@@ -231,6 +232,16 @@
                    "a group segment opens nothing")
                (is (not (contains? granted 'clojure.string))
                    "a file shadowing a loaded host namespace is not newly provided")
+               (testing "a root attached later cannot take over a granted name"
+                 (is (deps/namespace-mirrorable? 'dvergr-probe-lib.swap))
+                 (let [b (.getAbsoluteFile (.toFile (java.nio.file.Files/createTempDirectory
+                                                     "dvergr-root-b" (make-array java.nio.file.attribute.FileAttribute 0))))]
+                   (.mkdirs (java.io.File. b "dvergr_probe_lib"))
+                   (spit (java.io.File. b "dvergr_probe_lib/swap.clj") "(ns dvergr-probe-lib.swap)\n(defn who [] :b)\n")
+                   (.addURL loader (.toURL (.toURI b)))
+                   (is (not (deps/namespace-mirrorable? 'dvergr-probe-lib.swap))
+                       "require would now load root B's .clj, which was never granted")
+                   (is (not (deps/ensure-mirrored! (sci/init {}) 'dvergr-probe-lib.swap)))))
                (is (not (contains? granted 'clojure.inspector))
                    "nor a .cljc whose namespace require would load from the host's jar")
                (testing "and the agent can require and call it"
