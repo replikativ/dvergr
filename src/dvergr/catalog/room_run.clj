@@ -94,10 +94,13 @@
 ;; The benchmark, through catalog_benchmark / job_status / experiment_report
 ;; ---------------------------------------------------------------------------
 
-(defn- wait-for [daemon job]
+(defn- wait-for
+  "The job's status once it is over and settled (its fixture room archived):
+   the home closes after this."
+  [daemon job]
   (loop []
     (let [st (ops/invoke daemon :job/status {:job (:id job) :wait-ms 20000})]
-      (if (= "running" (:status st)) (recur) st))))
+      (if (or (= "running" (:status st)) (false? (:settled st))) (recur) st))))
 
 (defn- cell-count
   "How many cells the experiment of `b` on `models` has."

@@ -114,12 +114,13 @@
               ;; a waiter (`status` with wait-ms) is released once the job
               ;; has settled too: a host that then closes the job's stores
               ;; must not pull them from under `settled`
-              (deliver done true)
-              (swap! live dissoc id)))))
+              (swap! live dissoc id)
+              (deliver done true)))))
       (catch Throwable t
         ;; `work` itself failed (validation, say): the Run must not stay open.
         (binding [ec/*execution-context* ctx]
           (run/finish! id :failed {:error t}))
+        (swap! live dissoc id)
         (deliver done true)
         (throw t)))
     (job room r)))
@@ -135,7 +136,9 @@
        (when-let [done (get-in @live [id :done])]
          (deref done (min max-wait-ms (long wait-ms)) nil)))
      (let [r (binding [ec/*execution-context* (:ctx room)] (run/run room id))]
-       (some-> (job room r) (assoc :room-value room))))))
+       ;; `:settled?`: its Run is over and so is its `settled` callback
+       ;; (until then the job is live here, however its Run reads)
+       (some-> (job room r) (assoc :room-value room :settled? (not (contains? @live id))))))))
 
 (defn cancel!
   "Stop the job `id`: request cancellation of its Run, which stops its work

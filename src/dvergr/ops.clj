@@ -443,6 +443,7 @@
             :finished-at (:finished-at job)}
      (:error job) (assoc :error (:error job))
      (:reason job) (assoc :reason (name (:reason job)))
+     (contains? job :settled?) (assoc :settled (:settled? job))
      result? (assoc :result (job-result daemon job)))))
 
 (defn- start-workflow-job
