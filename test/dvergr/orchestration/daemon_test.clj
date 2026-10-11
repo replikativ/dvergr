@@ -16,12 +16,10 @@
             [dvergr.room.store :as rstore]
             [dvergr.system.db :as sdb]
             [dvergr.substrate.paths :as paths]
-            [dvergr.channels.core :as ch]
             [dvergr.channels.telegram :as tg]
             [dvergr.security.allowlist :as allowlist]
             [dvergr.substrate.config :as config]
-            [dvergr.tools :as tools]
-            [dvergr.mcp.server :as mcp]
+            [dvergr.test-registries :as test-registries]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.yggdrasil :as ygg]))
 
@@ -36,18 +34,6 @@
   (str (System/getProperty "java.io.tmpdir") "/dvergr-daemon-test-" (random-uuid)))
 
 (def ^:dynamic *shared-daemon* nil)
-
-(defn- snapshot-globals []
-  {:channels     @ch/channels
-   :tools        @tools/registry
-   :mcp-tools    @mcp/tool-definitions
-   :mcp-handlers @mcp/tool-handlers})
-
-(defn- restore-globals! [snap]
-  (reset! ch/channels           (:channels snap))
-  (reset! tools/registry        (:tools snap))
-  (reset! mcp/tool-definitions  (:mcp-tools snap))
-  (reset! mcp/tool-handlers     (:mcp-handlers snap)))
 
 (defn- snapshot-daemon [d]
   (when d
@@ -78,7 +64,7 @@
 ;; are membership-based, not exact global counts.)
 (use-fixtures :once
   (fn [f]
-    (let [snap     (snapshot-globals)
+    (let [snap     (test-registries/snapshot)
           prev-home (paths/home)
           _        (paths/set-home! (str (System/getProperty "java.io.tmpdir")
                                          "/dvergr-daemon-test-home-" (random-uuid)))
@@ -89,7 +75,7 @@
           (f))
         (finally
           (try (daemon/stop! d) (catch Exception _))
-          (restore-globals! snap)
+          (test-registries/restore! snap)
           (sdb/reset-conn!)
           (paths/set-home! prev-home))))))
 
@@ -106,13 +92,13 @@
     (let [d *shared-daemon*
           ctx (when d (:execution-ctx d))]
       (binding [ec/*execution-context* (or ctx ec/*execution-context*)]
-        (let [g-snap (snapshot-globals)
+        (let [g-snap (test-registries/snapshot)
               d-snap (snapshot-daemon *shared-daemon*)]
           (try
             (f)
             (finally
               (restore-daemon! *shared-daemon* d-snap)
-              (restore-globals! g-snap))))))))
+              (test-registries/restore! g-snap))))))))
 
 ;; ============================================================================
 ;; Tests
