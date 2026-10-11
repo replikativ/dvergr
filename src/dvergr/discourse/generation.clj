@@ -76,7 +76,9 @@
 (defn future-handle
   "Run `f` on a Clojure future (a separate thread). Result is bridged
    into spindel via :done. :cancel! cancels the underlying future
-   (best-effort — interrupts the thread if it's blocked in I/O).
+   (best-effort — interrupts the thread if it's blocked in I/O); :done is
+   delivered either way, by the body or, when the body never started, by
+   :cancel!.
 
    This is the current llm-agent shape: blocking LLM call kept off the
    spin executor so the participant-spin stays reactive."
@@ -84,16 +86,25 @@
   (let [done   (binding [ec/*execution-context* ctx]
                  (sync/create-deferred ctx))
         fut-a  (atom nil)
-        cancel (fn [] (when-let [f @fut-a] (future-cancel f)) nil)]
+        ;; :pending → :running (the body delivers :done) or :cancelled (cancel!
+        ;; won before the body started, so cancel! delivers it)
+        phase  (atom :pending)
+        cancel (fn []
+                 (when (compare-and-set! phase :pending :cancelled)
+                   (binding [ec/*execution-context* ctx]
+                     (sync/deliver! done {::error "cancelled before it started"})))
+                 (when-let [f @fut-a] (future-cancel f))
+                 nil)]
     (reset! fut-a
             (future
-              (binding [ec/*execution-context* ctx]
-                (try
-                  (sync/deliver! done (f))
-                  (catch Throwable t
-                    (tel/log! {:level :warn :id ::future-handle-error
-                               :data {:err (.getMessage t)}})
-                    (sync/deliver! done {::error (.getMessage t)}))))))
+              (when (compare-and-set! phase :pending :running)
+                (binding [ec/*execution-context* ctx]
+                  (try
+                    (sync/deliver! done (f))
+                    (catch Throwable t
+                      (tel/log! {:level :warn :id ::future-handle-error
+                                 :data {:err (.getMessage t)}})
+                      (sync/deliver! done {::error (.getMessage t)})))))))
     (->GenerationHandle nil nil done cancel)))
 
 (defn call-fence

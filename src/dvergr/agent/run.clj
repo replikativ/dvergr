@@ -308,9 +308,9 @@
 (defn finish-durably!
   "`finish!` for a caller that cannot wait for the store. When the terminal
    write is refused the Run stays live, as `finish!` leaves it, and the write
-   is retried on a background thread with backoff until it is durable or the
-   Run is no longer live; nothing is lost and Room teardown sees the Run until
-   it is. Returns the finished Run, or nil while the write is retried."
+   is retried on a background thread with backoff (up to 5 s apart) until it
+   is durable or the Run is no longer live; nothing is lost and Room teardown
+   sees the Run until it is. Returns the finished Run, or nil while the write is retried."
   ([run-id status] (finish-durably! run-id status {}))
   ([run-id status opts]
    (try
@@ -324,18 +324,21 @@
        (doto (Thread.
               ^Runnable
               (fn []
+                ;; Until the write is durable: giving up would leave a live Run
+                ;; that nothing finishes once the store recovers.
                 (loop [delay-ms 25 attempt 1]
                   (Thread/sleep (long delay-ms))
                   (when (contains? @active run-id)
                     (let [outcome (try (finish! run-id status opts) :finished
                                        (catch Throwable t t))]
                       (when (instance? Throwable outcome)
-                        (if (< attempt 40)
-                          (recur (min 1000 (* 2 delay-ms)) (inc attempt))
-                          (tel/log! {:level :error :id ::finish-abandoned
+                        (when (zero? (mod attempt 20))
+                          (tel/log! {:level :error :id ::finish-still-refused
                                      :data {:run/id run-id :run/status status
+                                            :attempts attempt
                                             :error (ex-message outcome)}}
-                                    "Run finish still refused; the Run stays live")))))))
+                                    "Run finish still refused; retrying"))
+                        (recur (min 5000 (* 2 delay-ms)) (inc attempt)))))))
               (str "dvergr-run-finish-" run-id))
          (.setDaemon true)
          (.start))

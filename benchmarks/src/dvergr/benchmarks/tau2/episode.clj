@@ -515,8 +515,8 @@
             (cond
               (gen/error-result? reply)
               (do (d/release-obligation! p obligation)
+                  (run/finish-durably! run-id :failed {:reason :provider-error})
                   (fault! episode :agent-model (::gen/error reply))
-                  (run/finish! run-id :failed {:reason :provider-error})
                   nil)
 
               (and (string? reply) (not (str/blank? reply)))
@@ -524,8 +524,8 @@
 
               :else
               (do (d/release-obligation! p obligation)
-                  (run/finish! run-id (if (ended? episode) :cancelled :failed)
-                               {:reason :no-reply})
+                  (run/finish-durably! run-id (if (ended? episode) :cancelled :failed)
+                                       {:reason :no-reply})
                   (when-not (ended? episode) (end! episode :agent-error))
                   nil)))))})
      :after-greeting (fn [])
