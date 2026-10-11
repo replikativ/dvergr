@@ -6,7 +6,9 @@ Status: **implemented** (see Landed); the Lifecycle below is the original design
 Over MCP, the ops on this page (`catalog_check`, `catalog_calibrate`, `catalog_benchmark`,
 `catalog_cases`, `catalog_freeze`, `catalog_deploy`, `catalog_export`, `catalog_import`) are in
 the `bench` toolset: connect with `--profile bench` (the default `offload` profile does not
-list them; doc/mcp.md). `catalog_promote` is in the `admin` toolset.
+list them; doc/mcp.md). The profile also has the `files` toolset (`room_files`, `room_read`,
+`room_write`), so a client can put a table into a room and read a bundle back. `catalog_promote`
+is in the `admin` toolset.
 
 ## Why
 
@@ -221,5 +223,21 @@ benchmarks:
 ;; clojure -M -m dvergr.catalog.room-run bookings --check
 ```
 
-In a daemon, `catalog_cases` reads `table` from the room's workspace: write the file there
-first (e.g. with the room's file tools).
+**Over MCP, from scratch.** In a daemon, `catalog_cases` reads `table` from the room's
+workspace, and `room_write` puts it there (the `bench` profile has both): a client needs no
+checkout and no agent in the room. The whole flow:
+
+1. `room_create {title: "Books", slug: "books"}`
+2. `room_write {room: "books", files: {"data/cases.csv": {"text": "no;vendor;…"}, "data/inv1.txt":
+   {"text": "…"}}, message: "Cases from 2025"}`: one commit with exactly these paths. Binary
+   files (an .xlsx export, a scanned PDF) go as `{"base64": …}`; `null` removes a path.
+3. `catalog_cases {room: "books", name: "invoice-coding", table: "/data/cases.csv", spec: {…}}`
+   writes the bundle to `/workflows/invoice-coding/`; `room_files` and `room_read` show it
+   (`certification.edn` says which cases were kept and why the others were not).
+4. `catalog_calibrate {room: "books", name: "invoice-coding"}`
+5. `catalog_benchmark {workflow: "books/invoice-coding", models: [...], room: "books"}`, then
+   `job_status` until it completes.
+6. `scorecard_list {room: "books"}` and `scorecard_detail {room: "books", id}`.
+
+To change the table, `room_write` it again and rerun `catalog_cases`; the room's history keeps
+every version (`room_fork` first to try a change aside).

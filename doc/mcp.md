@@ -92,14 +92,15 @@ neither listed nor callable.
 | Profile | Toolsets | Tools |
 | --- | --- | --- |
 | `offload` (default) | rooms, worlds, attempts, catalog, wallets, repl | 26 |
-| `bench` | rooms, attempts, catalog, bench, wallets | 28 |
-| `code` | repl, describe (its REPL calls the ops of rooms, worlds, attempts, catalog, bench, wallets) | 2 |
+| `bench` | rooms, files, attempts, catalog, bench, wallets | 31 |
+| `code` | repl, describe (its REPL calls the ops of rooms, files, worlds, attempts, catalog, bench, wallets) | 2 |
 | `readonly` | every read op | read-only only |
 | `admin` | everything | all |
 
 | Toolset | What |
 | --- | --- |
 | `rooms` | create, list, detail, delete (archives: history kept), messages, post |
+| `files` | `room_files`, `room_read`, `room_write`: the room's workspace files (in `bench`; add with `--toolsets files`) |
 | `worlds` | fork, review, diff, merge, discard |
 | `attempts` | `workflow_start` and the job tools; Attempts, Scorecards |
 | `runs` | the blocking `workflow_attempt`; Runs |
@@ -152,6 +153,20 @@ around 40, and every definition costs context in every session.
   `workflow_start`, adopt an attempt with `room_merge`, then `room_export {room}` returns the changes
   since the import as a patch: `git apply` it in your checkout. Only these two ops reach a
   repository outside the room; a room's own sandbox Git has no network transport.
+- **A room's files without a checkout.** `room_files {room, path}` lists a directory of the room's
+  workspace (name, kind, size, content id; up to 200 entries per call, `offset`/`next-offset` for more),
+  `room_read {room, path}` returns a file as `text` (UTF-8) or `base64` with its `media-type`
+  (.xlsx, PDF), at most 24 KiB per call (`offset`, `next-offset` for the rest), and `room_write
+  {room, files, message}` writes a batch as one commit of the room's repository: `files` maps a
+  path to `{"text": …}`, `{"base64": …}` or `null` (remove it), and only those paths are
+  committed. It is all or nothing: a refused or failed write undoes the batch, and a path another
+  writer changed meanwhile fails it rather than committing their bytes. It refuses while the
+  workspace has staged changes; symbolic links are neither read nor written through. Paths stay
+  in the workspace (no `..`, nothing under `.git`); a read-only world refuses the write and
+  receipts the refusal. There is no Git API:
+  history is the room's (`room_fork`, `room_diff`, `room_review`, `room_merge`, `room_export`).
+  Files are also resources, `room://{room}/files/{+path}` (a file whole up to 4 MiB, a directory as
+  JSON).
 - **Merges are pinned to the review.** `room_review` (and every workflow attempt's review)
   carries the fork's `state`, a hash of its systems' snapshot ids; `room_merge {room,
   expect-state}` refuses a fork that changed since. A failed merge is an error, not a success.
@@ -163,6 +178,24 @@ around 40, and every definition costs context in every session.
   without a room runs on the benchmark set (fixtures seeded into a new room, ten known facts);
   with a room, on its own `/docs`, scored by citations, links and structure. Each attempt's
   `checks` say what it got right (one per fact), `reward` weighs them.
+- **A benchmark from your own cases, over MCP alone** (`bench` profile; the case-pack section of
+  [room-workflows.md](room-workflows.md) has the details):
+
+  ```
+  room_create       {title: "Books", slug: "books"}
+  room_write        {room: "books", message: "Cases from 2025",
+                     files: {"data/cases.csv": {"text": "no;vendor;text;doc;account;amount\n1;Acme;toner;inv1.txt;4930;119,00\n…"},
+                             "data/inv1.txt":  {"text": "Invoice 1: toner 119,00 EUR"}}}
+  catalog_cases     {room: "books", name: "invoice-coding", table: "/data/cases.csv",
+                     spec: {id: "no", inputs: ["vendor", "text"], attachments: ["doc"],
+                            expected: {account: {rule: "exact"}, amount: {rule: "number", tolerance: 0.01}}}}
+  room_files        {room: "books", path: "/workflows/invoice-coding"}     # the bundle it wrote
+  room_read         {room: "books", path: "/workflows/invoice-coding/certification.edn"}
+  catalog_calibrate {room: "books", name: "invoice-coding"}
+  catalog_benchmark {workflow: "books/invoice-coding", models: ["…", "…"], room: "books"}
+  job_status        {job: <id>, wait-ms: 25000}                         # until completed
+  scorecard_list    {room: "books"}  →  scorecard_detail {room: "books", id: <id>}
+  ```
 - **A benchmark can report into your room.** `catalog_benchmark {workflow, models, room}` (the
   `bench` profile) still
   runs every cell in a world forked from a new fixture room, but keeps the job, its Attempts and

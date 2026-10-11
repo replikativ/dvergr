@@ -183,17 +183,33 @@
    (when workspace
      (mgeschichte/make-root repository))))
 
+(defonce ^:private workspace-locks (java.util.WeakHashMap.))
+
+(defn workspace-lock
+  "The monitor that serializes dvergr's Git operations on the repository of
+   `conn` (`execute-git`, and the add-then-commit sequences built on it), so a
+   commit is made of the index its caller staged. Not the connection itself:
+   Datahike may synchronize on that."
+  [conn]
+  (locking workspace-locks
+    (or (.get ^java.util.WeakHashMap workspace-locks conn)
+        (let [lock (Object.)]
+          (.put ^java.util.WeakHashMap workspace-locks conn lock)
+          lock))))
+
 (defn execute-git
-  "Execute Git-compatible argv against a virtual workspace."
+  "Execute Git-compatible argv against a virtual workspace, under its
+   `workspace-lock`."
   ([argv] (execute-git (current-workspace) argv))
   ([workspace argv]
    (if-let [{:keys [conn]} workspace]
-     (command/execute {:conn conn :root "/" :config (atom {})
-                       :repo-relative #(let [path (str %)]
-                                         (if (contains? #{"." "/"} path)
-                                           ""
-                                           (str/replace path #"^/+" "")))}
-                      argv)
+     (locking (workspace-lock conn)
+       (command/execute {:conn conn :root "/" :config (atom {})
+                         :repo-relative #(let [path (str %)]
+                                           (if (contains? #{"." "/"} path)
+                                             ""
+                                             (str/replace path #"^/+" "")))}
+                        argv))
      {:stdout "" :stderr "fatal: not a Geschichte repository\n" :exit 128})))
 
 (def review-excluded-prefixes

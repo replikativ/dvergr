@@ -45,6 +45,7 @@
             [dvergr.resource :as resource]
             [dvergr.agent.fields :as fields]
             [dvergr.rooms :as rooms]
+            [dvergr.rooms.files :as room-files]
             [dvergr.rooms.forks :as forks]
             [dvergr.rooms.repo :as room-repo]
             [dvergr.rooms.stats :as stats]
@@ -102,6 +103,26 @@
   [e]
   (let [s (::status (ex-data e))]
     (if (and (int? s) (<= 400 s 599)) s 500)))
+
+(def ^:private file-error-status
+  "The HTTP status of a room file op's failure, by its `:type`."
+  {:dvergr.rooms.files/invalid 400 :dvergr.rooms.files/directory 400
+   :dvergr.rooms.files/not-a-directory 400 :dvergr.rooms.files/not-found 404
+   :dvergr.rooms.files/no-workspace 404 :dvergr.rooms.files/staged-changes 409
+   :dvergr.rooms.forks/staged-changes 409 :dvergr.rooms.forks/concurrent-change 409
+   :dvergr.tools/changed-underneath 409 :effect/denied 403})
+
+(defn- files-op
+  "Run `f` on the room `room` names, for the room file ops: an unknown room
+   and the failures of `dvergr.rooms.files` as op errors with their status."
+  [daemon room f]
+  (let [r (or (resolve-room daemon room)
+              (op-error! (str "No room " room) ::no-room 404 {:room room}))]
+    (try (f r)
+         (catch clojure.lang.ExceptionInfo e
+           (if-let [status (file-error-status (:type (ex-data e)))]
+             (throw (ex-info (ex-message e) (assoc (ex-data e) ::status status) e))
+             (throw e))))))
 
 ;; ---- plain-data projections (serializable for any binding) ----
 
@@ -881,6 +902,36 @@
                                           (remove #(str/starts-with? (name %) "_"))
                                           (mapv id->str))})))}
 
+   ;; ---- a room's workspace files (dvergr.rooms.files) ----
+   :room/files
+   {:doc (str "List a directory of a room's workspace (its Git repository; default the root): each "
+              "entry's name, path, kind (file or dir) and, for a file, its size and content id (a hash "
+              "of its bytes). At most " room-files/max-list-entries " entries (fewer for long names) from `offset`; "
+              "`next-offset` when more follow, `total` counts them. room_read reads a file, room_write "
+              "writes files.")
+    :kind :read
+    :schema [:map [:room Room]
+             [:path {:optional true} [:string {:description "directory, e.g. /data (default /)"}]]
+             [:offset {:optional true} [:int {:min 0 :description "entry to start at (default 0)"}]]]
+    :impl (fn [daemon {:keys [room path offset]}]
+            (files-op daemon room #(in-ctx daemon (room-files/list-dir % path {:offset offset}))))}
+
+   :room/read
+   {:doc (str "Read a file of a room's workspace: {text} for UTF-8 text, {base64, media-type} for "
+              "anything else (.xlsx, PDF, images, text with control characters), with its size and content "
+              "id. One call returns at most " room-files/max-read-bytes " bytes from `offset`, whole "
+              "characters for text; when the file goes on, `next-offset` says where to continue. The "
+              "resource room://{room}/files/{path} returns a file up to 4 MiB whole.")
+    :kind :read
+    :schema [:map [:room Room]
+             [:path [:string {:description "file path in the workspace, e.g. /data/cases.csv"}]]
+             [:offset {:optional true} [:int {:min 0 :description "byte to start at (default 0)"}]]
+             [:length {:optional true} [:int {:min 1 :max room-files/max-read-bytes
+                                              :description (str "bytes to read (default and at most "
+                                                                room-files/max-read-bytes ")")}]]]
+    :impl (fn [daemon {:keys [room path offset length]}]
+            (files-op daemon room #(in-ctx daemon (room-files/read-file % path {:offset offset :length length}))))}
+
    :room/diff
    {:doc "The diff of a fork against its parent (what reconcile-merge would apply)."
     :kind :read
@@ -1152,6 +1203,38 @@
     :impl (fn [daemon {:keys [room]}]
             (when-let [r (resolve-room daemon room)]
               (in-ctx daemon (workflow/review (:id r)))))}
+
+   :room/write
+   {:doc (str "Write files into a room's workspace as ONE commit of its repository: `files` maps a path "
+              "(e.g. data/cases.csv) to {text} (UTF-8) or {base64} (binary, e.g. .xlsx), or to null to "
+              "remove the file. Only these paths are committed; writing what is already there commits "
+              "nothing (commit null). Paths stay in the workspace: no '..', nothing under .git. At most "
+              room-files/max-batch-files " paths and " (quot room-files/max-batch-bytes (* 1024 1024)) " MiB per call, "
+              (quot room-files/max-file-bytes (* 1024 1024)) " MiB per file. It is all or nothing: a "
+              "refused or failed write undoes the batch. Refused while the workspace has staged "
+              "changes, and for a path that is a symbolic link. A read-only world refuses it. "
+              "History is the room's: room_fork to try changes, room_diff/room_merge to adopt them.")
+    :kind :write
+    :schema [:map [:room Room]
+             [:files [:map-of {:description "path -> {text} | {base64} | null (remove)"
+                               :json-schema {:type "object"
+                                             :description "path -> {text} | {base64} | null (remove)"
+                                             :additionalProperties
+                                             {:type ["object" "null"]
+                                              :properties {:text {:type "string" :description "UTF-8 content"}
+                                                           :base64 {:type "string" :description "binary content, base64"}}
+                                              :additionalProperties false}}}
+                      :string
+                      [:maybe [:map {:closed true}
+                               [:text {:optional true} :string]
+                               [:base64 {:optional true} :string]]]]]
+             [:message {:optional true} [:string {:description "commit message (default: Write <path>)"}]]]
+    :impl (fn [daemon {:keys [room files message]}]
+            (files-op daemon room
+                      (fn [r]
+                        (in-ctx daemon
+                                (assoc (room-files/write! r files {:message message})
+                                       :room (id->str (:id r)))))))}
 
    :room/import
    {:doc (str "Create a room from a Git repository: its workspace is a clone of a local checkout "

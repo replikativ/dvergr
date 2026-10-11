@@ -14,6 +14,8 @@
             [dvergr.tools.structural :as structural]
             [dvergr.chat.compaction :as compaction]
             [dvergr.chat.tool-schema :as tool-schema]
+            [geschichte.content]
+            [geschichte.repo]
             [muschel.fs :as mfs]
             [org.replikativ.spindel.engine.core :as rtc])
   (:import [java.util.concurrent TimeUnit]))
@@ -250,36 +252,187 @@
 
 (declare effect-boundary)
 
-(defn- write-file! [ctx path content]
+(defn- make-parents!
+  "Create the missing directories above the resolved virtual `path`."
+  [filesystem ^String path]
+  (loop [parent (subs path 0 (max 1 (.lastIndexOf path "/")))
+         pending []]
+    (if (or (= parent "/") (mfs/exists? filesystem parent))
+      (doseq [directory (reverse pending)] (mfs/mkdir filesystem directory))
+      (recur (subs parent 0 (max 1 (.lastIndexOf ^String parent "/")))
+             (conj pending parent)))))
+
+(defn- write-file!
+  "Write `content` (a string, or bytes) to `path`, creating its directories."
+  [ctx path content]
   (let [path (tool-path ctx path)]
     (if-let [filesystem (:filesystem ctx)]
       (do
-        (loop [parent (subs path 0 (max 1 (.lastIndexOf ^String path "/")))
-               pending []]
-          (if (or (= parent "/") (mfs/exists? filesystem parent))
-            (doseq [directory (reverse pending)] (mfs/mkdir filesystem directory))
-            (recur (subs parent 0 (max 1 (.lastIndexOf ^String parent "/")))
-                   (conj pending parent))))
-        (mfs/write-string! filesystem path (str content) false))
-      (do (fs/create-dirs (fs/parent path)) (spit path content)))
+        (make-parents! filesystem path)
+        (when-not (if (bytes? content)
+                    (when-let [sink (mfs/open-sink filesystem path false)]
+                      (with-open [^java.io.OutputStream o sink] (.write o ^bytes content))
+                      true)
+                    (mfs/write-string! filesystem path (str content) false))
+          (throw (ex-info (str "Could not write " path) {:path path}))))
+      (do (fs/create-dirs (fs/parent path))
+          (if (bytes? content)
+            (with-open [o (io/output-stream path)] (.write o ^bytes content))
+            (spit path content))))
     path))
+
+(defn- work-content
+  "The content id (a string) of the worktree file `rel` in `db`, or nil."
+  [db rel]
+  (some-> (d/q '[:find ?cid . :in $ ?p
+                 :where [?e :geschichte.work/path ?p]
+                 [?e :geschichte.work/content ?c]
+                 [?c :geschichte.content/id ?cid]]
+               db rel)
+          str))
+
+(defn shape-conflict
+  "Why worktree path `rel` cannot take a file in `db`, or nil: a directory
+   there (explicit, or something beneath it), a symbolic link there, or a file
+   or link where one of its parents should be a directory."
+  [db rel]
+  (let [files (into {} (d/q '[:find ?p ?m :where [?e :geschichte.work/path ?p] [?e :geschichte.work/mode ?m]] db))
+        dirs (set (map first (d/q '[:find ?p :where [_ :geschichte.work-dir/path ?p]] db)))
+        prefix (str rel "/")
+        parents (some->> (str/split rel #"/") butlast seq (reductions #(str %1 "/" %2)))]
+    (cond
+      (or (dirs rel) (some #(str/starts-with? % prefix) (concat (keys files) dirs)))
+      (str "/" rel " is a directory")
+      (= 0120000 (bit-and (long (or (get files rel) 0)) 0170000))
+      (str "/" rel " is a symbolic link")
+      :else
+      (when-let [p (some #(when (contains? files %) %) parents)]
+        (str "/" p " is not a directory")))))
+
+(defn- expect-guard
+  "Transaction function: throw unless worktree file `rel` holds `expected`
+   (a content id, or nil for no file) as a regular file and, for a write (`write?`), the path
+   can still take a file (`shape-conflict`). Runs in the transactor, in the
+   same transaction as the write it guards."
+  [db rel expected write?]
+  (let [mode (d/q '[:find ?m . :in $ ?p :where [?e :geschichte.work/path ?p] [?e :geschichte.work/mode ?m]] db rel)
+        ;; a link is never the file expected, whatever its text
+        now (if (= 0120000 (bit-and (long (or mode 0)) 0170000)) :symbolic-link (work-content db rel))
+        conflict (when write? (shape-conflict db rel))]
+    (when (or (not= now expected) conflict)
+      (throw (ex-info (str "/" rel " changed underneath the write" (when conflict (str ": " conflict)))
+                      {:type ::changed-underneath :path (str "/" rel) :expected expected :found now
+                       :conflict conflict})))
+    []))
+
+(defn- guarded-connection
+  "The repository connection a compare-and-write needs, or throws: only a
+   Geschichte workspace can compare and write in one transaction."
+  [ctx]
+  (or (get-in ctx [:workspace :conn])
+      (throw (ex-info "A compare-and-write needs the workspace's repository (:workspace in the tool context)"
+                      {:type ::no-repository}))))
+
+(defn- guarded-write!
+  "Write `content` to the workspace file at `resolved` in one transaction
+   with a check that it still holds `expected` (`expect-guard`)."
+  [ctx resolved content expected]
+  (let [conn (guarded-connection ctx)
+        rel (subs resolved 1)
+        bytes (if (bytes? content) content (.getBytes (str content) "UTF-8"))
+        old (get (geschichte.repo/worktree conn) rel)]
+    (geschichte.content/transact-content!
+     conn bytes (:content old)
+     (fn [id]
+       [[:db.fn/call expect-guard rel expected true]
+        {:geschichte.work/path rel
+         :geschichte.work/content [:geschichte.content/id id]
+         :geschichte.work/size (long (alength ^bytes bytes))
+         :geschichte.work/mode (long (or (:mode old) 33188))}]))
+    resolved))
+
+(defn- changed-underneath
+  "The `::changed-underneath` data in `e` or its causes (the transactor may
+   wrap what a transaction function throws), or nil."
+  [^Throwable e]
+  (some #(when (= ::changed-underneath (:type (ex-data %))) (ex-data %))
+        (take-while some? (iterate #(.getCause ^Throwable %) e))))
+
+(defn- rethrow-changed [f]
+  (try (f)
+       (catch Throwable e
+         (if-let [data (changed-underneath e)]
+           (throw (ex-info (str (:path data) " changed underneath the write"
+                                (when-let [c (:conflict data)] (str ": " c)))
+                           data))
+           (throw e)))))
 
 (defn workspace-write!
   "Write `content` to `path` in the workspace of the tool context `ctx` (its
    virtual filesystem, else its `cwd`, clamped), through the effect boundary:
    an `:fs/write` the world's read-only mode, quota and receipts decide, the
    same effect a sandbox `spit` performs. The one gate for every tool that
-   writes workspace files. `ctx` may carry `:effect-boundary` (a boundary
-   function, `dvergr.effects/boundary-resolver`) for callers without a chat;
-   else the chat's boundary applies (none without a chat: host calls). Returns
-   the resolved path."
-  [ctx path content]
-  (let [content (str content)]
-    (effects/perform! (effect-boundary ctx)
-                      {:effect :fs/write :resource {:path (str path)}
-                       :result-of (constantly content)
-                       :bytes (alength (.getBytes content "UTF-8"))}
-                      #(write-file! ctx path content))))
+   writes workspace files; `content` is a string (UTF-8) or bytes. `ctx` may
+   carry `:effect-boundary` (a boundary function,
+   `dvergr.effects/boundary-resolver`) for callers without a chat; else the
+   chat's boundary applies (none without a chat: host calls). Returns the
+   resolved path.
+
+   With `:expect` in `opts` (a content id, or nil for no file), a
+   compare-and-write: the file is written only while it still holds that,
+   checked in the same transaction (`ctx` needs its `:workspace`); else it
+   throws `::changed-underneath`. Without it, no check."
+  ([ctx path content] (workspace-write! ctx path content {}))
+  ([ctx path content opts]
+   (let [content (if (bytes? content) content (str content))
+         n (if (bytes? content) (alength ^bytes content) (alength (.getBytes ^String content "UTF-8")))]
+     (effects/perform! (effect-boundary ctx)
+                       {:effect :fs/write :resource {:path (str path)}
+                        ;; bytes are digested as they are (a byte array prints by identity)
+                        :result-of (constantly (if (bytes? content)
+                                                 (String. ^bytes content "ISO-8859-1")
+                                                 content))
+                        :bytes n}
+                       (if (contains? opts :expect)
+                         #(rethrow-changed
+                           (fn []
+                             (let [resolved (tool-path ctx path)]
+                               ;; the directories first, as a plain write makes them
+                               (make-parents! (:filesystem ctx) resolved)
+                               (guarded-write! ctx resolved content (:expect opts)))))
+                         #(write-file! ctx path content))))))
+
+(defn workspace-delete!
+  "Delete the file at `path` in the workspace of the tool context `ctx`,
+   through the effect boundary as an `:fs/delete` (see `workspace-write!`).
+   Returns the resolved path, or nil when there was no file. With `:expect`
+   in `opts`, a compare-and-delete: only while the file holds that content
+   id, checked in the deleting transaction, else `::changed-underneath`."
+  ([ctx path] (workspace-delete! ctx path {}))
+  ([ctx path opts]
+   (effects/perform! (effect-boundary ctx)
+                     {:effect :fs/delete :resource {:path (str path)}}
+                     #(let [resolved (tool-path ctx path)]
+                        (cond
+                          (contains? opts :expect)
+                          (rethrow-changed
+                           (fn []
+                             (let [conn (guarded-connection ctx)
+                                   rel (subs resolved 1)
+                                   present? (some? (get (geschichte.repo/worktree conn) rel))]
+                               (d/transact conn (cond-> [[:db.fn/call expect-guard rel (:expect opts) false]]
+                                                  present? (conj [:db/retractEntity [:geschichte.work/path rel]])))
+                               (when present? resolved))))
+
+                          (:filesystem ctx)
+                          (when (= :file (:type (mfs/stat (:filesystem ctx) resolved)))
+                            (mfs/delete (:filesystem ctx) resolved)
+                            resolved)
+
+                          :else
+                          (when (fs/regular-file? resolved)
+                            (fs/delete resolved)
+                            resolved))))))
 
 (defn- transact!
   "Transact `tx-data` into `conn` for a tool, through the effect boundary (a

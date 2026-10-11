@@ -13,6 +13,7 @@
             [dvergr.agent.run :as agent-run]
             [dvergr.discourse :as d]
             [dvergr.substrate.geschichte :as git]
+            [geschichte.repo :as repo]
             [clojure.string :as str]
             [hasch.core :as hasch]
             [org.replikativ.spindel.engine.core :as ec]
@@ -267,12 +268,62 @@
   [room message]
   (when-let [changes (workspace-changes room)]
     (binding [ec/*execution-context* (:ctx room)]
-      (doseq [argv [["add" "."] ["commit" "-m" message]]]
-        (let [{:keys [exit stderr]} (git/execute-git argv)]
-          (when-not (zero? exit)
-            (throw (ex-info (str "git " (first argv) " failed in " (:id room) ": " stderr)
-                            {:type ::workspace-commit-failed :room (:id room) :argv argv}))))))
+      (let [workspace (git/current-workspace)]
+        ;; add and commit as one step: no other git operation stages between
+        (locking (git/workspace-lock (:conn workspace))
+          (doseq [argv [["add" "."] ["commit" "-m" message]]]
+            (let [{:keys [exit stderr]} (git/execute-git workspace argv)]
+              (when-not (zero? exit)
+                (throw (ex-info (str "git " (first argv) " failed in " (:id room) ": " stderr)
+                                {:type ::workspace-commit-failed :room (:id room) :argv argv}))))))))
     changes))
+
+(defn- configured-author
+  "The author a Git commit in this repository gets: its user.name and
+   user.email, as geschichte's `git commit` reads them."
+  [conn]
+  (let [cfg (repo/configuration conn)
+        n (get cfg "user.name") e (get cfg "user.email")]
+    (cond (and n e) (str n " <" e ">") n n :else "unknown")))
+
+(defn commit-paths!
+  "Commit exactly the paths of `expected` (`{path content-id}`, nil for a
+   removed path) in `room`'s workspace as one commit with `message`, under
+   the workspace lock. The paths are staged by name (`repo/stage!`, no
+   pathspec parsing). The index must hold nothing else staged, and once the
+   paths are staged they must hold the expected content: otherwise nothing is
+   committed (a concurrent writer changed them) and it throws. Returns the
+   commit id, or nil when the paths already match HEAD."
+  [room expected message]
+  (binding [ec/*execution-context* (:ctx room)]
+    (let [{:keys [conn]} (or (git/current-workspace)
+                             (throw (ex-info "Room has no workspace"
+                                             {:type ::no-workspace :room (:id room)})))
+          rel #(str/replace (str %) #"^/+" "")
+          expected (update-keys expected rel)
+          paths (vec (sort (keys expected)))]
+      (locking (git/workspace-lock conn)
+        (let [staged (:staged (repo/status conn))]
+          (when (seq (remove (set paths) staged))
+            (throw (ex-info (str "The workspace of " (name (:id room)) " has staged changes ("
+                                 (str/join ", " (take 5 staged)) "); commit them first")
+                            {:type ::staged-changes :room (:id room) :staged staged}))))
+        (when (seq paths)
+          (repo/stage! conn paths)
+          (let [index (repo/index-tree conn)
+                staged (:staged (repo/status conn))
+                ;; the content, and a regular file: a link to the same text has the same id
+                link? #(= 0120000 (bit-and (long (or (:mode (get index %)) 0)) 0170000))
+                differs (concat (filter #(or (not= (get expected %) (some-> (get index %) :content str))
+                                             (link? %))
+                                        paths)
+                                (remove (set paths) staged))]
+            (when (seq differs)
+              (throw (ex-info (str "Changed while it was written: " (str/join ", " differs))
+                              {:type ::concurrent-change :room (:id room) :paths (vec differs)})))
+            (when (seq staged)
+              (some-> (repo/commit! conn {:message message :author (configured-author conn)})
+                      :geschichte.commit/id str))))))))
 
 (defn- prepare-workspaces!
   "Make `fork` mergeable into `parent`: commit the fork's work (a merge adopts

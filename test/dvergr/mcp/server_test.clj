@@ -114,6 +114,21 @@
     (is (not-any? #{"room_post" "workflow_start" "clojure_eval"} (map :name ro)))
     (is (some #{"job_status"} (map :name ro)))))
 
+(deftest the-bench-profile-builds-a-case-pack-from-scratch
+  ;; the table in (room_write), the bundle made (catalog_cases), read back,
+  ;; calibrated and benchmarked: no file has to come from outside the room
+  (let [bench (set (map :name (list-tools (session {:dvergr/profile "bench"}))))
+        ro (set (map :name (list-tools (session {:dvergr/profile "readonly"}))))
+        write (first (filter #(= "room_write" (:name %)) @server/tool-definitions))]
+    (is (every? bench ["room_create" "room_write" "room_files" "room_read" "catalog_cases"
+                       "catalog_calibrate" "catalog_benchmark" "scorecard_detail"]))
+    (is (and (ro "room_files") (ro "room_read") (not (ro "room_write"))))
+    (is (= {:readOnlyHint false :destructiveHint true :idempotentHint true :openWorldHint false}
+           (select-keys (:annotations write) [:readOnlyHint :destructiveHint :idempotentHint :openWorldHint])))
+    (is (some #(= "room://{room}/files/{+path}" (:uriTemplate %)) (:templates @server/resource-definitions)))
+    (is (not-any? #(= "room_read" (:name %)) (:templates @server/resource-definitions))
+        "room_read's path is in the file template, not a template of its own")))
+
 (deftest an-unknown-profile-fails-at-connect
   (let [c (server/session-context (fn [_] nil) (surface/selection {}))
         resp (json-rpc/handle-message c {:jsonrpc "2.0" :id 1 :method "initialize"

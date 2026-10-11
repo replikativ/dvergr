@@ -352,6 +352,16 @@
                           {:muschel/denied true :cmd cmd :args args})))
         (host/-spawn inner opts)))))
 
+(defn- locked-git
+  "Muschel's Git builtin for the repository of `conn`, under its
+   `geschichte/workspace-lock`: a shell `git add`/`commit` cannot interleave
+   with dvergr's own add-then-commit sequences (a `room_write` batch)."
+  [conn]
+  (let [git ((requiring-resolve 'muschel.builtins.git/make) {})]
+    (fn [argv filesystem env]
+      (locking (geschichte/workspace-lock conn)
+        (git argv filesystem env)))))
+
 (defn make-host
   "Build a BuiltinHost rooted in a Geschichte workspace. A string `:workspace`
   remains as a transitional test/runner projection, but the normal room path is
@@ -395,9 +405,10 @@
                                ((requiring-resolve 'dvergr.intake.jail/host)
                                 (host.jvm/make) filesystem (:mirror jail) jail)
                                (host.jvm/make))
-              :builtins builtins
-              :fallback-allowlist (into (set fallback-allowlist) (:commands jail))
-              :geschichte (when (map? workspace) true)})))
+              ;; Git over the workspace's repository: muschel's builtin, locked
+              :builtins (cond-> builtins
+                          (map? workspace) (assoc "git" (locked-git (:conn workspace))))
+              :fallback-allowlist (into (set fallback-allowlist) (:commands jail))})))
 
 (defonce ^{:doc "Embedder hook: (fn [chat-ctx] {\"/drive\" <muschel FS>, …})
   or nil. Consulted once per host build (per workspace); errors are
