@@ -173,6 +173,10 @@ clojure -M -m dvergr.catalog.room-run packs/vat-codes \
 cannot. `room-run` keeps the experiment in its own home, `--home` (default
 `$DVERGR_HOME/workflow-runs/<pack>`, or `workflow-runs/<pack>` without `DVERGR_HOME`);
 running it again resumes. stdout has progress and the report; the log is `<home>/dvergr.log`.
+The report gives each candidate's pass rate with a 95 % interval, cost, tokens and time, and
+compares the candidates **paired**: on the cases both answered, how many each passed where the
+other failed, the exact McNemar p and a verdict ("a better", or "no detectable difference at
+these cases"); see [doc/running-benchmarks.md](doc/running-benchmarks.md#the-report).
 
 **From an MCP client** (Claude Code, Codex, …), the `bench` profile has the same path as
 tools (`room_write` the table, `catalog_cases`, `catalog_benchmark`, `job_status`,

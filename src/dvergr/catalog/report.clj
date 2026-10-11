@@ -5,6 +5,9 @@
    - the frontier: per candidate, how often it passed (95% interval), its
      mean reward, what an attempt and a pass cost at list price, tokens and
      time per attempt;
+   - paired comparisons: each pair of candidates (or each against a
+     baseline) on the cases both have a verdict for, the cases where they
+     disagree, the exact McNemar p and a verdict;
    - where candidates fail: per check, how often it failed;
    - which cases could not grade an answer, and why (certification).
 
@@ -70,11 +73,132 @@
                         (/ (- (reduce max (map second spans)) (reduce min (map first spans))) 1000.0))
         :failed-checks (into (sorted-map) failed)}))))
 
+;; ---------------------------------------------------------------------------
+;; Paired comparisons
+;; ---------------------------------------------------------------------------
+
+(defn- id-str
+  "A candidate id as a string: a namespaced keyword in full, a bare one by name."
+  [k]
+  (cond (keyword? k) (if (namespace k) (str (namespace k) "/" (name k)) (name k))
+        :else (str k)))
+
+(defn paired-cells
+  "`{candidate {case {repetition passed?}}}` (`xstats/paired-verdicts`) from
+   Scorecard `entries`: a case is an environment (its content id), the pass
+   is the entry's `:passed?` (every check held, whatever the reward), and
+   only cells with a verdict count. With `receipts` (the Attempts' receipts
+   with their `:attempt/id`), an entry counts only when its receipt is there
+   and is a verdict (`experiment/verdict?`): a fault, or a receipt that could
+   not be loaded, is left out. `receipts` nil trusts every entry (a run
+   result without receipts). Every candidate and every case it ran keeps a
+   key, so one without verdicts still shows, with its cases excluded."
+  [entries receipts]
+  (let [receipt (when receipts (into {} (map (juxt :attempt/id identity)) receipts))]
+    (reduce (fn [m e]
+              (let [c (id-str (:candidate/id e))
+                    case-id (get-in e [:environment :environment/content-id])
+                    verdict? (or (nil? receipt)
+                                 (some-> (receipt (:attempt/id e)) (#(experiment/verdict? {:attempt/receipt %}))))]
+                (cond-> (update m c #(or % {}))
+                  case-id (update-in [c case-id] #(or % {}))
+                  (and case-id verdict?) (assoc-in [c case-id (or (:repetition e) 0)] (boolean (:passed? e))))))
+            {} entries)))
+
+(defn- paired-data
+  "`xstats/paired-comparisons` of `cells` as plain data (keywords as strings).
+   A `baseline` that names no candidate is refused."
+  [cells baseline]
+  (when (and baseline (seq cells) (not (contains? cells (id-str baseline))))
+    (throw (ex-info (str "No candidate " (id-str baseline) " to compare against; the candidates are "
+                         (str/join ", " (sort (keys cells))))
+                    {:type ::unknown-baseline :baseline (id-str baseline)})))
+  (when-let [p (and (some seq (vals cells))
+                    (xstats/paired-comparisons cells {:baseline (some-> baseline id-str)}))]
+    (-> p
+        (update :policy name)
+        (update :correction name)
+        (update :comparisons (fn [cs] (mapv #(update % :verdict name) cs))))))
+
+(defn paired
+  "The paired comparisons of a run result (`{:scorecard :receipts}`), each
+   pair of candidates on the cases both have a verdict for: the counts, the
+   exact McNemar p (Holm-adjusted over the pairs compared) and a verdict
+   (`xstats/paired-comparisons`). `baseline` (a candidate id) compares every
+   other candidate against it. Nil without two candidates with entries."
+  [{:keys [scorecard receipts]} & [{:keys [baseline]}]]
+  (when-let [entries (seq (:scorecard/entries scorecard))]
+    (paired-data (paired-cells entries receipts) baseline)))
+
+(defn- p-str [p]
+  (if (< p 1e-4)
+    "< 0.0001"
+    (.toPlainString (.round (bigdec p) (java.math.MathContext. 2)))))
+
+(defn paired-markdown
+  "The \"Paired comparisons\" section of the `paired` data."
+  [{:keys [policy baseline alpha comparisons pairs-omitted family-size]}]
+  (when (seq comparisons)
+    (let [reps? (some #(< 1 (:repetitions %)) comparisons)
+          m (or family-size (count comparisons))
+          excluded (filter #(or (pos? (:excluded-cases %)) (pos? (:excluded-cells %))) comparisons)]
+      (str
+       "\n## Paired comparisons\n\n"
+       "Every candidate answers the same cases, so two of them compare on the cases where they disagree: "
+       "*A only* counts the cases A passed and B failed, *B only* the reverse. The exact McNemar test asks "
+       "whether that split could be chance; cases both passed or both failed do not count. "
+       (if reps?
+         (str "With repetitions, a case counts once: the candidate with the higher pass rate over the case's "
+              "repetitions wins it (an exact sign test, McNemar's with one repetition); *Tied* are cases both "
+              "passed equally often but not always or never. ")
+         "")
+       (format "A difference is a p below %s" (str alpha))
+       (cond (= m (count comparisons) 1) ""
+             (= m (count comparisons)) (str ", after Holm's correction for the " m " comparisons shown")
+             :else (str ", after Holm's correction for all " m " pairs (choosing the best looked at all of them)"))
+       ". A pass is the Frontier's: every check held.\n\n"
+       (case policy
+         "against-baseline" (str "Each candidate against the baseline, " baseline ".\n\n")
+         "against-best" (str "Each candidate against the one with the highest pass rate, " baseline
+                             " (the other " pairs-omitted " pairs are not shown).\n\n")
+         "")
+       "| A | B | Cases | Both passed | A only | B only | Both failed | " (when reps? "Tied | ")
+       "p | " (when (< 1 m) "p (Holm) | ") "Verdict |\n"
+       "|---|---|---:|---:|---:|---:|---:|" (when reps? "---:|") "---:|" (when (< 1 m) "---:|") "---|\n"
+       (str/join
+        (for [{:keys [a b cases both-passed a-only b-only both-failed tied-mixed p p-adjusted verdict decidable?]} comparisons]
+          (str "| " a " | " b " | " cases " | " both-passed " | " a-only " | " b-only " | " both-failed " | "
+               (when reps? (str tied-mixed " | "))
+               (p-str p) " | " (when (< 1 m) (str (p-str p-adjusted) " | "))
+               (case verdict
+                 "a-better" (str a " better")
+                 "b-better" (str b " better")
+                 (if decidable?
+                   "no detectable difference at these cases"
+                   "no detectable difference: too few disagreements to decide"))
+               " |\n")))
+       (when (seq excluded)
+         (str "\nLeft out, where only one candidate (or neither) has a verdict (a fault, or not run yet): "
+              (str/join "; " (for [{:keys [a b excluded-cases excluded-cells]} excluded]
+                               (str a " / " b ": "
+                                    (str/join ", "
+                                              (cond-> []
+                                                (pos? excluded-cases)
+                                                (conj (str excluded-cases " case" (when (not= 1 excluded-cases) "s")))
+                                                (pos? excluded-cells)
+                                                (conj (str excluded-cells " cell" (when (not= 1 excluded-cells) "s")
+                                                           " without a counterpart")))))))
+              ".\n"))
+       "\n\"No detectable difference\" is not \"equal\": more cases, or cases where the candidates differ, can still "
+       "separate them.\n"))))
+
 (defn markdown
   "The pilot report: `title`, the run `result`, and optionally the bundle's
-   `certification` (`dvergr.catalog.casepack`) and a `note`."
-  [{:keys [title result certification note]}]
+   `certification` (`dvergr.catalog.casepack`), a `note`, a `baseline`
+   candidate for the paired comparisons, or their data as `paired`."
+  [{:keys [title result certification note baseline] :as opts}]
   (let [rs (rows result)
+        comparisons (if (contains? opts :paired) (:paired opts) (paired result {:baseline baseline}))
         checks (sort (distinct (mapcat (comp keys :failed-checks) rs)))]
     (str
      "# " (or title "Benchmark report") "\n\n"
@@ -96,6 +220,7 @@
                 (if notional-per-pass (money notional-per-pass) "–")
                 (or tokens-per-attempt "–")
                 (if median-seconds (format "%.0f s" median-seconds) "–"))))
+     (paired-markdown comparisons)
      "\n## Resources\n\n"
      "| Candidate | Input tokens / attempt | Output tokens / attempt | Cached input | Median time | p90 time | Summed time | Wall clock | Total cost |\n"
      "|---|---:|---:|---:|---:|---:|---:|---:|---:|\n"
@@ -163,14 +288,46 @@
                             (format "| %s | %d | %d | %s |\n" (name cid) verdicts faults
                                     (if reward-mean (format "%.3f" (double reward-mean)) "–")))))))))
 
+(defn- progress-cells
+  "`paired-cells` of an experiment without a Scorecard, from the certified
+   Attempts in `room`'s store: those of the ExperimentDef
+   `experiment-content-id`, or of the room's only one. Faults are left out,
+   as in a Scorecard; nil when the room has several experiments and none is named."
+  [room experiment-content-id]
+  (let [st (:store room)
+        attempts (if (satisfies? store/PAttemptStore st)
+                   (store/-list-attempts st (store/conversation-id room) {:limit 1000000})
+                   [])
+        of-exp #(get-in % [:attempt/receipt :attempt/metrics :experiment-content-id])
+        ids (set (keep of-exp attempts))
+        exp-id (if experiment-content-id
+                 (some #(when (= (str experiment-content-id) (str %)) %) ids)
+                 (when (= 1 (count ids)) (first ids)))]
+    (when exp-id
+      (paired-cells
+       (for [a attempts
+             :when (= exp-id (of-exp a))
+             :let [r (:attempt/receipt a) m (:attempt/metrics r)]]
+         {:candidate/id (:experiment-candidate m)
+          :environment {:environment/content-id (get-in r [:attempt/environment :environment/content-id])}
+          :repetition (:experiment-repetition m)
+          :attempt/id (:attempt/id a)
+          :passed? (experiment/passed? r)})
+       (for [a attempts :when (= exp-id (of-exp a))]
+         (assoc (:attempt/receipt a) :attempt/id (:attempt/id a)))))))
+
 (defn room-report
   "The report of an experiment kept in `room`, from its store: the Scorecard
    `scorecard` (a content id), else the newest one of the ExperimentDef
    `experiment` (a content id), else the room's newest. Its Attempts' receipts
    are loaded from the store, and a room-workflow bundle's certification from
    the room's workspace. Without a Scorecard, what the experiment has
-   certified so far. Returns `{:scorecard :experiment :complete :markdown}`."
-  [room {:keys [scorecard experiment title]}]
+   certified so far. With `baseline` (a candidate id), the paired
+   comparisons are every candidate against it. Returns `{:scorecard
+   :experiment :complete :markdown :paired}`: `:paired` is the paired
+   comparisons as data (`paired`), over the Attempts certified so far while
+   there is no Scorecard."
+  [room {:keys [scorecard experiment title baseline]}]
   (let [sc (if scorecard
              (experiment/scorecard room scorecard)
              (first (experiment/scorecards room (cond-> {:limit 1}
@@ -183,10 +340,14 @@
                             (:scorecard/entries sc)))
         title (or title
                   (some-> (:experiment/id exp) (#(str (namespace %) " — " (name %))))
-                  (:title room))]
+                  (:title room))
+        comparisons (if sc
+                      (paired {:scorecard sc :receipts receipts} {:baseline baseline})
+                      (some-> (progress-cells room experiment) (paired-data baseline)))]
     {:scorecard (some-> (:scorecard/content-id sc) str)
      :experiment (some-> (or (:experiment/content-id exp) experiment) str)
      :complete (some? sc)
-     :markdown (markdown (cond-> {:title title :result {:scorecard sc :receipts receipts}}
+     :paired comparisons
+     :markdown (markdown (cond-> {:title title :result {:scorecard sc :receipts receipts} :paired comparisons}
                            sc (assoc :certification (bundle-certification room exp))
                            (nil? sc) (assoc :note (progress-note room experiment))))}))

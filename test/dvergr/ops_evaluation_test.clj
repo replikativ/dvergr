@@ -129,3 +129,25 @@
         entries [{:candidate/id :m :attempt/id 1} {:candidate/id :m :attempt/id 2}]]
     (is (= {"m" {"fact/a" 1.0 "fact/b" 0.5 "fact/c" 1.0}}
            (check-rates entries attempts)))))
+
+(deftest scorecard-detail-pairs-the-candidates
+  (let [scorecard-data @#'ops/scorecard-data
+        env (fn [i] {:environment/content-id (keyword (str "env" i))})
+        entry (fn [c i passed?] {:candidate/id c :environment (env i) :repetition 0 :attempt/id (keyword (str (name c) i))
+                                 :reward (if passed? 1.0 0.0) :passed? passed?})
+        entries (vec (concat (for [i (range 10)] (entry :big i true))
+                             (for [i (range 10)] (entry :small i (< i 3)))))
+        summary (for [c [:big :small]
+                      :let [es (filter #(= c (:candidate/id %)) entries)]]
+                  {:candidate/id c :attempt-count 10 :passed-count (count (filter :passed? es))
+                   :reward-mean (/ (reduce + (map :reward es)) 10.0)})
+        sc {:scorecard/experiment {} :scorecard/entries entries :scorecard/summary summary}
+        ;; one of small's cells faulted: its case leaves the pair
+        attempts (assoc (into {} (map (fn [e] [(:attempt/id e) {:attempt/receipt {:attempt/status :completed}}])) entries)
+                        :small9 {:attempt/receipt {:attempt/status :failed :attempt/metrics {:failure {:kind :transport}}}})
+        {:keys [paired]} (scorecard-data sc {:compare? true :load-attempt #(get attempts %)})
+        [c] (:comparisons paired)]
+    (is (= "all-pairs" (:policy paired)))
+    (is (= ["big" "small"] ((juxt :a :b) c)))
+    (is (= [9 1 6 0 "a-better"] ((juxt :cases :excluded-cases :a-only :b-only :verdict) c)) "6 against 0: p = 0.031")
+    (is (= "against-baseline" (:policy (:paired (scorecard-data sc {:compare? true :baseline "big"})))))))

@@ -210,6 +210,47 @@ An attempt may designate a child Room as its control plane, so a bulk
 experiment does not flood its parent (what tau2's experiment Room does
 informally).
 
+### Comparing candidates
+
+Every candidate of an experiment runs on every case, so two candidates
+compare **paired**: on the same cases, looking only at the ones where they
+disagree. The report's *Paired comparisons* section (`experiment_report`;
+the data is its `:paired`, and `scorecard_detail`'s) gives, per pair: the
+cases compared, both passed / A only / B only / both failed, the exact
+McNemar p (the two-sided exact binomial test of "A only" against
+Binomial(A only + B only, 1/2), `dvergr.agent.experiment.stats/mcnemar-p`)
+and a verdict: A better, B better, or no detectable difference at these
+cases. 12 cases against 2 decides (p = 0.013); 6 against 5 says nothing
+(p = 1).
+
+- **The pass** is the Scorecard's `:passed?`: every check of the receipt
+  held. A reward in (0, 1) that is not a pass is a fail here, whatever its
+  value; the reward difference stays in `scorecard_detail`'s `comparison`.
+- **Only verdicts count.** A case enters a pair when both candidates have a
+  verdict on it; a faulted cell (a failure of the path to the model) or one
+  not run yet leaves its case out of that pair, and the report says how
+  many; so does a Scorecard entry whose Attempt cannot be loaded. Without a
+  Scorecard the section covers the Attempts certified so far (cases no
+  candidate has reached yet are not counted).
+- **Repetitions.** Repetitions of a case are exchangeable, not paired with
+  each other (repetition 2 of A has nothing to do with repetition 2 of B),
+  and they are not independent cases either. So a case counts once: on the
+  repetitions both candidates have, the one with the higher pass rate wins
+  the case, equal rates tie (*Tied*: neither always nor never). That is the
+  exact sign test over cases, which is McNemar's test at one repetition.
+- **Many candidates.** Up to five candidates every pair is compared (ten
+  pairs); beyond that, each candidate against the one with the highest pass
+  rate. With `baseline`, each candidate against that one.
+- **Multiple comparisons.** The p-values are Holm-adjusted, and the verdict
+  uses the adjusted p (below 0.05). The family is every pair, also when only
+  those against the best are shown (choosing the best looked at all of
+  them); against a `baseline` named in advance, its comparisons. A pair whose
+  disagreements are too few for even a clean sweep to reach 0.05 (five or
+  fewer) says so.
+
+"No detectable difference" is not "equal": it means these cases do not
+separate the two. More cases, or harder ones, may.
+
 ### Accounting
 
 Today two accounting systems are not connected:

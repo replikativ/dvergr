@@ -99,6 +99,8 @@ The report is the experiment room's, rendered from its store by the
   tokens, the share of input read from the provider's cache (– where not
   recorded), median and p90 time per attempt, *summed* time (every attempt's
   own time added up) and *wall clock* (first start to last end), total cost.
+- **Paired comparisons**: each pair of candidates on the cases both have a
+  verdict for (see below).
 - **Where answers fail**: how often each check failed.
 - **Cases**: for a case pack, which cases could grade an answer.
 
@@ -110,7 +112,33 @@ The console of `room-run` prints both what was billed and the list price.
 To compare two candidates, compare them on the same cases (paired): the
 experiment runs every candidate on every case, and a paired test (McNemar on
 the cases where they differ) separates a difference from run-to-run
-variance, which is several points on 100 questions.
+variance, which is several points on 100 questions. The report's **Paired
+comparisons** table does this for you:
+
+| A | B | Cases | Both passed | A only | B only | Both failed | p | p (Holm) | Verdict |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| a | b | 100 | 50 | 12 | 2 | 36 | 0.013 | 0.039 | a better |
+| a | c | 99 | 44 | 18 | 7 | 30 | 0.043 | 0.087 | no detectable difference at these cases |
+
+- Read *A only* against *B only*: the cases one passed and the other failed.
+  Cases both passed or both failed say nothing about which is better.
+- *p* is the exact McNemar test on those two counts; the verdict takes the
+  Holm-adjusted p (when more than one pair is shown) below 0.05. 12 against 2
+  decides; 6 against 5 does not, and five or fewer disagreements never can
+  ("too few disagreements to decide").
+- A pass is the Frontier's: every check held (a partial reward is a fail).
+- A case counts only where both candidates have a verdict; faulted cells
+  leave their case out, and the report says how many.
+- With repetitions, a case counts once: the candidate with the higher pass
+  rate over the case's repetitions wins it (an exact sign test; *Tied* are
+  equal rates that are neither all passes nor all fails).
+- Up to five candidates every pair is shown; beyond, each against the one with
+  the highest pass rate (Holm still over every pair: picking the best looked
+  at all of them). `experiment_report` and `scorecard_detail` take
+  `baseline` to compare each candidate against one of your choice, and both
+  return the table as data (`paired`).
+- "No detectable difference" is not "equal": more cases, or cases where the
+  candidates differ, can still separate them.
 
 ## Candidates
 

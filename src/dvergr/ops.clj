@@ -287,7 +287,8 @@
    the mean reward (`dvergr.agent.experiment.stats`). With `:full?`, also
    every cell, and with `:load-attempt` (id → certified Attempt) the pass rate
    of every check per candidate; with `:compare?`, every candidate against
-   `:baseline` (`comparison`)."
+   `:baseline` (`comparison`) and the paired comparisons
+   (`dvergr.catalog.report/paired`: exact McNemar per pair)."
   [sc & [{:keys [full? load-attempt compare? baseline]}]]
   (when sc
     (let [exp (:scorecard/experiment sc)
@@ -330,7 +331,17 @@
                                                                           :attempt/receipt :attempt/metrics
                                                                           :verifier-trust name)
                                                                  (:scorecard/entries sc)))))
-        compare? (assoc :comparison (comparison (:scorecard/entries sc) rows baseline))
+        compare? (assoc :comparison (comparison (:scorecard/entries sc) rows baseline)
+                        ;; McNemar on the cases where two candidates disagree
+                        ;; (every pair, or each against `baseline`); faults
+                        ;; left out when the Attempts are at hand
+                        :paired (report/paired
+                                 {:scorecard sc
+                                  :receipts (when load-attempt
+                                              (keep #(some-> (load-attempt (:attempt/id %)) :attempt/receipt
+                                                             (assoc :attempt/id (:attempt/id %)))
+                                                    (:scorecard/entries sc)))}
+                                 {:baseline baseline}))
         full? (assoc :entries (mapv (fn [e]
                                       {:candidate (kw->str (:candidate/id e))
                                        :environment (some-> (get-in e [:environment :environment/content-id]) str)
@@ -618,19 +629,24 @@
               "passed (95% interval), mean reward, cost per attempt and per pass at list price, tokens "
               "and time; which checks fail; for a case pack, which cases could not grade an answer. "
               "From the room's store: the Scorecard `scorecard`, else the newest of the ExperimentDef "
-              "`experiment`, else the room's newest; without a Scorecard, what it has certified so far.")
+              "`experiment`, else the room's newest; without a Scorecard, what it has certified so far. "
+              "Paired comparisons: every pair of candidates (or each against `baseline`; beyond five "
+              "candidates each against the best) on the cases both have a verdict for, with the exact "
+              "McNemar p (Holm-adjusted) and a verdict; also as data in `paired`.")
     :kind :read
     :schema [:map [:room Room]
              [:scorecard {:optional true} [:string {:description "scorecard content id"}]]
              [:experiment {:optional true} [:string {:description "ExperimentDef content id"}]]
+             [:baseline {:optional true} [:string {:description "candidate to compare every other one against (default: every pair, beyond five candidates each against the best)"}]]
              [:title {:optional true} :string]]
-    :impl (fn [daemon {:keys [room scorecard experiment title]}]
+    :impl (fn [daemon {:keys [room scorecard experiment title baseline]}]
             (let [r (or (resolve-room daemon room)
                         (op-error! (str "No room " room) ::no-room 404 {:room room}))]
               (in-ctx daemon
                       (binding [ec/*execution-context* (:ctx r)]
                         (report/room-report r {:scorecard (some-> scorecard uuid-arg)
                                                :experiment (some-> experiment uuid-arg)
+                                               :baseline baseline
                                                :title title})))))}
 
    :catalog/list
@@ -918,7 +934,11 @@
                                                        experiment (assoc :experiment-id (keyword experiment))))))))}
 
    :scorecard/detail
-   {:doc "One Scorecard with every cell (candidate x environment x repetition: reward, pass, spend), each candidate's pass rate per check, and every candidate against a baseline: probability of a higher / no-worse pass rate, paired reward difference, cost per pass saved."
+   {:doc (str "One Scorecard with every cell (candidate x environment x repetition: reward, pass, spend), each "
+              "candidate's pass rate per check, and every candidate against a baseline: probability of a "
+              "higher / no-worse pass rate, paired reward difference, cost per pass saved. `paired`: the "
+              "paired comparisons (every pair, or each against `baseline`): on the cases both have a verdict "
+              "for, both passed / A only / B only / both failed, the exact McNemar p, Holm-adjusted, and a verdict.")
     :kind :read
     :schema [:map [:room Room] [:id [:string {:description "scorecard content id"}]]
              [:baseline {:optional true} [:string {:description "candidate to compare the others against (default: the top of the leaderboard)"}]]]
