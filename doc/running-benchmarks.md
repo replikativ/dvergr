@@ -133,7 +133,8 @@ comparisons** table does this for you:
   rate over the case's repetitions wins it (an exact sign test; *Tied* are
   equal rates that are neither all passes nor all fails).
 - Up to five candidates every pair is shown; beyond, each against the one with
-  the highest pass rate. `experiment_report` and `scorecard_detail` take
+  the highest pass rate (Holm still over every pair: picking the best looked
+  at all of them). `experiment_report` and `scorecard_detail` take
   `baseline` to compare each candidate against one of your choice, and both
   return the table as data (`paired`).
 - "No detectable difference" is not "equal": more cases, or cases where the

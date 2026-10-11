@@ -87,18 +87,22 @@
   "`{candidate {case {repetition passed?}}}` (`xstats/paired-verdicts`) from
    Scorecard `entries`: a case is an environment (its content id), the pass
    is the entry's `:passed?` (every check held, whatever the reward), and
-   only cells with a verdict count: an entry whose receipt (by Attempt id, in
-   `receipts`) is no verdict, a fault, is left out. Every candidate keeps a
-   key, so one without verdicts still shows (with its cases excluded)."
+   only cells with a verdict count. With `receipts` (the Attempts' receipts
+   with their `:attempt/id`), an entry counts only when its receipt is there
+   and is a verdict (`experiment/verdict?`): a fault, or a receipt that could
+   not be loaded, is left out. `receipts` nil trusts every entry (a run
+   result without receipts). Every candidate and every case it ran keeps a
+   key, so one without verdicts still shows, with its cases excluded."
   [entries receipts]
-  (let [receipt (into {} (map (juxt :attempt/id identity)) receipts)]
+  (let [receipt (when receipts (into {} (map (juxt :attempt/id identity)) receipts))]
     (reduce (fn [m e]
               (let [c (id-str (:candidate/id e))
                     case-id (get-in e [:environment :environment/content-id])
-                    r (receipt (:attempt/id e))]
+                    verdict? (or (nil? receipt)
+                                 (some-> (receipt (:attempt/id e)) (#(experiment/verdict? {:attempt/receipt %}))))]
                 (cond-> (update m c #(or % {}))
-                  (and case-id (or (nil? r) (experiment/verdict? {:attempt/receipt r})))
-                  (assoc-in [c case-id (or (:repetition e) 0)] (boolean (:passed? e))))))
+                  case-id (update-in [c case-id] #(or % {}))
+                  (and case-id verdict?) (assoc-in [c case-id (or (:repetition e) 0)] (boolean (:passed? e))))))
             {} entries)))
 
 (defn- paired-data
@@ -133,11 +137,11 @@
 
 (defn paired-markdown
   "The \"Paired comparisons\" section of the `paired` data."
-  [{:keys [policy baseline alpha comparisons pairs-omitted]}]
+  [{:keys [policy baseline alpha comparisons pairs-omitted family-size]}]
   (when (seq comparisons)
     (let [reps? (some #(< 1 (:repetitions %)) comparisons)
-          m (count comparisons)
-          excluded (filter #(pos? (:excluded-cases %)) comparisons)]
+          m (or family-size (count comparisons))
+          excluded (filter #(or (pos? (:excluded-cases %)) (pos? (:excluded-cells %))) comparisons)]
       (str
        "\n## Paired comparisons\n\n"
        "Every candidate answers the same cases, so two of them compare on the cases where they disagree: "
@@ -149,12 +153,14 @@
               "passed equally often but not always or never. ")
          "")
        (format "A difference is a p below %s" (str alpha))
-       (if (< 1 m) (str ", after Holm's correction for the " m " comparisons shown") "")
+       (cond (= m (count comparisons) 1) ""
+             (= m (count comparisons)) (str ", after Holm's correction for the " m " comparisons shown")
+             :else (str ", after Holm's correction for all " m " pairs (choosing the best looked at all of them)"))
        ". A pass is the Frontier's: every check held.\n\n"
        (case policy
          "against-baseline" (str "Each candidate against the baseline, " baseline ".\n\n")
          "against-best" (str "Each candidate against the one with the highest pass rate, " baseline
-                             " (the other " pairs-omitted " pairs are not compared).\n\n")
+                             " (the other " pairs-omitted " pairs are not shown).\n\n")
          "")
        "| A | B | Cases | Both passed | A only | B only | Both failed | " (when reps? "Tied | ")
        "p | " (when (< 1 m) "p (Holm) | ") "Verdict |\n"
@@ -172,12 +178,16 @@
                    "no detectable difference: too few disagreements to decide"))
                " |\n")))
        (when (seq excluded)
-         (str "\nCases without a verdict of both candidates (a fault, or not run yet) are left out: "
+         (str "\nLeft out, where only one candidate (or neither) has a verdict (a fault, or not run yet): "
               (str/join "; " (for [{:keys [a b excluded-cases excluded-cells]} excluded]
-                               (str a " / " b ": " excluded-cases " case" (when (not= 1 excluded-cases) "s")
-                                    (when (pos? excluded-cells)
-                                      (str " (" excluded-cells " cell" (when (not= 1 excluded-cells) "s")
-                                           " without a counterpart)")))))
+                               (str a " / " b ": "
+                                    (str/join ", "
+                                              (cond-> []
+                                                (pos? excluded-cases)
+                                                (conj (str excluded-cases " case" (when (not= 1 excluded-cases) "s")))
+                                                (pos? excluded-cells)
+                                                (conj (str excluded-cells " cell" (when (not= 1 excluded-cells) "s")
+                                                           " without a counterpart")))))))
               ".\n"))
        "\n\"No detectable difference\" is not \"equal\": more cases, or cases where the candidates differ, can still "
        "separate them.\n"))))

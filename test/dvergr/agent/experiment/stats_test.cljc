@@ -145,10 +145,15 @@
         (is (= "c0" (:baseline p)))
         (is (= 7 (count (:comparisons p))))
         (is (= 21 (:pairs-omitted p)))
-        (is (= ["c0" "c7"] ((juxt :a :b) (last (:comparisons p)))))))
+        (is (= ["c0" "c7"] ((juxt :a :b) (last (:comparisons p)))))
+        (is (= 28 (:family-size p)) "Holm over every pair: picking the best looked at all of them")
+        (let [all (vec (for [i (range 8) j (range (inc i) 8)]
+                         (:p (stats/paired-verdicts (get (cells 8) (str "c" i)) (get (cells 8) (str "c" j))))))]
+          (is (= (take 7 (stats/holm all)) (map :p-adjusted (:comparisons p)))))))
     (testing "with a baseline: each against it, the baseline as B"
       (let [p (stats/paired-comparisons (cells 3) {:baseline "c2"})]
         (is (= :against-baseline (:policy p)))
+        (is (= 2 (:family-size p)) "a baseline named in advance: its comparisons are the family")
         (is (= [["c0" "c2"] ["c1" "c2"]] (mapv (juxt :a :b) (:comparisons p)))))))
   (testing "a clear difference survives Holm; a raw p < 0.05 alone may not"
     (let [p (stats/paired-comparisons {"a" (verdicts (str (apply str (repeat 14 \1)) "000000"))

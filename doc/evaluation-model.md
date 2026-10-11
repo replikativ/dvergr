@@ -229,7 +229,9 @@ cases. 12 cases against 2 decides (p = 0.013); 6 against 5 says nothing
 - **Only verdicts count.** A case enters a pair when both candidates have a
   verdict on it; a faulted cell (a failure of the path to the model) or one
   not run yet leaves its case out of that pair, and the report says how
-  many. Without a Scorecard the section covers the Attempts certified so far.
+  many; so does a Scorecard entry whose Attempt cannot be loaded. Without a
+  Scorecard the section covers the Attempts certified so far (cases no
+  candidate has reached yet are not counted).
 - **Repetitions.** Repetitions of a case are exchangeable, not paired with
   each other (repetition 2 of A has nothing to do with repetition 2 of B),
   and they are not independent cases either. So a case counts once: on the
@@ -239,8 +241,10 @@ cases. 12 cases against 2 decides (p = 0.013); 6 against 5 says nothing
 - **Many candidates.** Up to five candidates every pair is compared (ten
   pairs); beyond that, each candidate against the one with the highest pass
   rate. With `baseline`, each candidate against that one.
-- **Multiple comparisons.** The p-values are Holm-adjusted over the pairs
-  shown, and the verdict uses the adjusted p (below 0.05). A pair whose
+- **Multiple comparisons.** The p-values are Holm-adjusted, and the verdict
+  uses the adjusted p (below 0.05). The family is every pair, also when only
+  those against the best are shown (choosing the best looked at all of
+  them); against a `baseline` named in advance, its comparisons. A pair whose
   disagreements are too few for even a clean sweep to reach 0.05 (five or
   fewer) says so.
 

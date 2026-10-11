@@ -265,13 +265,17 @@
    five candidates, and beyond that every candidate against the best. In each
    pair A ranks above B (against a baseline B is the baseline).
 
-   The p-values are Holm-adjusted over the comparisons made, and a pair
-   differs when its adjusted p is below `:alpha` (default 0.05): `:verdict`
+   The p-values are Holm-adjusted over the family of comparisons
+   (`:family-size`): against a baseline, its comparisons; else every pair,
+   also when only those against the best are shown, since picking the best
+   looked at all of them. A pair differs when its adjusted p is below
+   `:alpha` (default 0.05): `:verdict`
    `:a-better`, `:b-better` or `:no-difference`; `:decidable?` false when
    even a clean sweep of its disagreeing cases could not reach `:alpha`.
 
    `{:policy (:all-pairs | :against-baseline | :against-best) :baseline
-   :alpha :correction :holm :pairs-omitted :comparisons [{:a :b ...}]}`, nil
+   :alpha :correction :holm :family-size :pairs-omitted :comparisons [{:a :b
+   ...}]}`, nil
    with fewer than two candidates."
   [cells & [{:keys [baseline alpha] :or {alpha 0.05}}]]
   (let [rate (fn [c] (let [vs (mapcat vals (vals (get cells c)))]
@@ -282,20 +286,28 @@
         policy (cond baseline :against-baseline
                      (<= m all-pairs-up-to) :all-pairs
                      :else :against-best)
-        pairs (case policy
-                :against-baseline (for [c ranked :when (not= c baseline)] [c baseline])
-                :all-pairs (for [i (range m) j (range (inc i) m)] [(ranked i) (ranked j)])
-                :against-best (for [c (rest ranked)] [(first ranked) c]))]
+        all-pairs (for [i (range m) j (range (inc i) m)] [(ranked i) (ranked j)])
+        ;; the family Holm covers: against a baseline named in advance, its
+        ;; comparisons; else every pair, also when only those against the
+        ;; observed best are shown (choosing it looked at all of them)
+        family (if baseline
+                 (for [c ranked :when (not= c baseline)] [c baseline])
+                 all-pairs)
+        shown? (case policy
+                 :against-best (fn [[x _]] (= x (first ranked)))
+                 (constantly true))]
     (when (<= 2 m)
-      (let [results (mapv (fn [[x y]] (assoc (paired-verdicts (get cells x) (get cells y)) :a x :b y)) pairs)
-            adjusted (holm (mapv :p results))]
+      (let [results (mapv (fn [[x y]] (assoc (paired-verdicts (get cells x) (get cells y)) :a x :b y)) family)
+            adjusted (holm (mapv :p results))
+            shown (filterv (comp shown? (juxt :a :b) first) (map vector results adjusted))]
         {:policy policy
          :baseline (case policy :against-baseline baseline :against-best (first ranked) nil)
          :alpha alpha
          :correction :holm
-         :pairs-omitted (- (quot (* m (dec m)) 2) (count pairs))
+         :family-size (count family)
+         :pairs-omitted (- (quot (* m (dec m)) 2) (count shown))
          :comparisons
-         (mapv (fn [r p-adj]
+         (mapv (fn [[r p-adj]]
                  (let [discordant (+ (:a-only r) (:b-only r))]
                    (assoc r
                           :p-adjusted p-adj
@@ -303,4 +315,4 @@
                           :verdict (cond (<= alpha p-adj) :no-difference
                                          (> (:a-only r) (:b-only r)) :a-better
                                          :else :b-better))))
-               results adjusted)}))))
+               shown)}))))

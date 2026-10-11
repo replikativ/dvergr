@@ -1,6 +1,6 @@
 (ns dvergr.catalog.report-test
   (:require [clojure.string :as str]
-            [clojure.test :refer [deftest is]]
+            [clojure.test :refer [deftest is testing]]
             [dvergr.catalog.report :as report]))
 
 (def ^:private result
@@ -71,8 +71,10 @@
                             (cell-entries :b (bits 50 \1 12 \0 2 \1 36 \0))
                             (cell-entries :c (bits 44 \1 6 \0 12 \0 2 \1 5 \1 31 \0))))}
    ;; one of C's cells faulted (a transport error is no verdict)
-   :receipts [{:attempt/id :c-99-0 :attempt/status :failed
-               :attempt/metrics {:failure {:kind :transport}}}]})
+   :receipts (vec (for [p [:a :b :c] i (range 100) :let [id (keyword (str (name p) "-" i "-0"))]]
+                    (if (= id :c-99-0)
+                      {:attempt/id id :attempt/status :failed :attempt/metrics {:failure {:kind :transport}}}
+                      {:attempt/id id :attempt/status :completed})))})
 
 (deftest the-report-compares-candidates-paired
   (let [{:keys [policy comparisons]} (report/paired paired-result)
@@ -105,3 +107,20 @@
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"No candidate z"
                         (report/paired paired-result {:baseline :z})))
   (is (nil? (report/paired result)) "entries without cases: no pairs to show"))
+
+(deftest only-verdicts-are-paired
+  (let [entries (vec (concat (cell-entries :a "1111") (cell-entries :b "0000")))
+        ok #(hash-map :attempt/id % :attempt/status :completed)
+        fault #(hash-map :attempt/id % :attempt/status :failed :attempt/metrics {:failure {:kind :transport}})
+        pair #(first (:comparisons (report/paired {:scorecard {:scorecard/entries entries} :receipts %})))]
+    (testing "a receipt that could not be loaded is no verdict"
+      (is (= [3 1] ((juxt :cases :excluded-cases) (pair (mapv ok [:a-0-0 :a-1-0 :a-2-0 :b-0-0 :b-1-0 :b-2-0 :b-3-0]))))))
+    (testing "a case both faulted on is left out, and counted"
+      (let [c (pair (into (mapv ok [:a-0-0 :a-1-0 :a-2-0 :b-0-0 :b-1-0 :b-2-0]) (map fault [:a-3-0 :b-3-0])))]
+        (is (= [3 1 0] ((juxt :cases :excluded-cases :excluded-cells) c)))))
+    (testing "repetitions only one candidate has are left out, and said so"
+      (let [result {:scorecard {:scorecard/entries (vec (concat (cell-entries :a "11" 2)
+                                                                (remove #(= :b-1-1 (:attempt/id %)) (cell-entries :b "10" 2))))}}
+            c (first (:comparisons (report/paired result)))]
+        (is (= [2 0 1] ((juxt :cases :excluded-cases :excluded-cells) c)))
+        (is (str/includes? (report/markdown {:title "t" :result result}) "a / b: 1 cell without a counterpart"))))))

@@ -143,7 +143,8 @@
                    :reward-mean (/ (reduce + (map :reward es)) 10.0)})
         sc {:scorecard/experiment {} :scorecard/entries entries :scorecard/summary summary}
         ;; one of small's cells faulted: its case leaves the pair
-        attempts {:small9 {:attempt/receipt {:attempt/status :failed :attempt/metrics {:failure {:kind :transport}}}}}
+        attempts (assoc (into {} (map (fn [e] [(:attempt/id e) {:attempt/receipt {:attempt/status :completed}}])) entries)
+                        :small9 {:attempt/receipt {:attempt/status :failed :attempt/metrics {:failure {:kind :transport}}}})
         {:keys [paired]} (scorecard-data sc {:compare? true :load-attempt #(get attempts %)})
         [c] (:comparisons paired)]
     (is (= "all-pairs" (:policy paired)))
