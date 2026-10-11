@@ -589,7 +589,8 @@
                     `experiment.preflight`), estimate the rest, and stop with
                     the estimate (`:stopped :over-budget`) when its
                     conservative bound exceeds the budget, or a candidate
-                    with cells left has no pilot Attempt (`:unpiloted`);
+                    with cells left has no pilot Attempt with a verdict
+                    (`:unpiloted`; a faulted pilot cell measures nothing);
                     the result's `:preflight` is the estimate
      :allowance     what the experiment may take of the subscriptions its
                     models use (`default-allowance`; nil: no bound): once

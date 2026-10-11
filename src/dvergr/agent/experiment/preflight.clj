@@ -21,16 +21,28 @@
    run (`subscription/points-per-token`) when they hold more tokens than the
    pilot, else from the pilot (which, moving whole points, bounds it coarsely).
 
-   A candidate with cells left but no pilot Attempt (its pilot cells faulted,
-   or were refused) has no bill to extrapolate: it is listed `:unpiloted`
-   and the gate refuses, since any number put in its place (a cap, a price
-   times a step bound) would be a guess the experiment has not measured.
-   Running again pilots it (resume keeps the other pilot cells).
+   Only pilot Attempts with a verdict (`experiment/verdict?`) are
+   measurements: a faulted one (a provider outage, a transport failure)
+   stopped wherever the fault struck, often before spending anything, so its
+   bill says nothing about what a cell costs. Its spend is real and is
+   reported (`:faulted`, per candidate and for the pilot) but never
+   extrapolated. A candidate with cells left but no pilot verdict (its pilot
+   cells faulted, or were refused) has no bill to extrapolate: it is listed
+   `:unpiloted` and the gate refuses, since any number put in its place (a
+   cap, a price times a step bound, a faulted cell's bill) would be a guess
+   the experiment has not measured. Running again pilots it (resume keeps
+   the other pilot cells).
 
    `gate` compares an estimate with a budget: `{:dollars d :subscription
    share}` (a share of a window, e.g. 0.10). This is the experiment predicting
    its own resource use before committing to it; the same measurements, kept,
-   make the next prediction better.")
+   make the next prediction better."
+  (:require [dvergr.agent.experiment :as experiment]))
+
+(defn- measured?
+  "Whether a pilot Attempt `receipt` measures its cell: it has a verdict."
+  [receipt]
+  (experiment/verdict? {:attempt/receipt receipt}))
 
 (defn stratum
   "The default stratum of an environment ref: its id's namespace
@@ -97,16 +109,29 @@
               :conservative (* left (ucb95 xs))
               :worst-seen (* left (reduce max xs))}])))
 
+(defn- fault-spend
+  "What faulted pilot Attempt `receipts` spent: kept, never extrapolated."
+  [receipts]
+  (let [costs (map cell-costs receipts)]
+    (into {:cells (count costs)}
+          (for [k [:list-microdollars :billed-microdollars :tokens :elapsed-ms]]
+            [k (reduce + 0 (map k costs))]))))
+
 (defn estimate
   "The estimate for the cells not yet run, from `pilot-receipts` (Attempt
-   receipts of pilot cells, carrying `:attempt/metrics :experiment-candidate`).
+   receipts of pilot cells, carrying `:attempt/metrics :experiment-candidate`;
+   only those with a verdict are extrapolated, faulted ones are reported
+   under `:faulted`).
    `remaining` is `{candidate-id cells-left}`; `parallelism` the run's;
    `window-points` the fraction of a subscription window the pilot moved (nil
    when unmetered); a reading shows whole points, so a pilot that moved none
    is counted as having moved one (`resolution`), an upper bound."
   [{:keys [pilot-receipts remaining parallelism window-points resolution cell-caps calibration]
     :or {resolution 0.01}}]
-  (let [by-candidate (group-by #(get-in % [:attempt/metrics :experiment-candidate]) pilot-receipts)
+  (let [candidate-of #(get-in % [:attempt/metrics :experiment-candidate])
+        {measured true faulted false} (group-by (comp boolean measured?) pilot-receipts)
+        by-candidate (group-by candidate-of measured)
+        faulted-by (group-by candidate-of faulted)
         unpiloted (vec (for [[c left] remaining
                              :when (and (pos? left) (not (contains? by-candidate c)))]
                          c))
@@ -117,6 +142,12 @@
                               [c (assoc (extrapolate samples (get remaining c 0))
                                         :pilot-cells (count samples)
                                         :cells-left (get remaining c 0))]))
+        ;; faulted pilot cells: real spend, reported beside the estimate
+        per-candidate (reduce-kv (fn [m c receipts]
+                                   (if (contains? m c)
+                                     (assoc-in m [c :faulted] (fault-spend receipts))
+                                     m))
+                                 per-candidate faulted-by)
         total (fn [k band] (reduce + 0.0 (keep #(get-in % [k band]) (vals per-candidate))))
         pilot-tokens (reduce + 0 (map (comp :tokens cell-costs) pilot-receipts))
         pilot-rate (when (and window-points (pos? pilot-tokens))
@@ -148,7 +179,11 @@
                      :from (if calibrated :recorded-runs :pilot)
                      :pilot pilot-rate
                      :recorded (select-keys calibration [:points-per-token :tokens :points :runs])})
-     :pilot {:cells (count pilot-receipts) :tokens pilot-tokens :window-points window-points}}))
+     ;; every pilot cell's tokens moved the window, faulted or not; only
+     ;; the measured ones are cells of the estimate
+     :pilot {:cells (count pilot-receipts) :measured (count measured)
+             :tokens pilot-tokens :window-points window-points
+             :faulted (fault-spend faulted)}}))
 
 (defn gate
   "Whether the conservative estimate fits `budget` (`{:dollars :subscription}`,

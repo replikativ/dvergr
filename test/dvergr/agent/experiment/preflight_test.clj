@@ -21,7 +21,8 @@
     (is (= :preflight-pilot (:reason ((preflight/pilot-admit pilot) (cell :a :bench.sales/t2 2 0)))))))
 
 (defn- receipt [candidate usd tokens ms]
-  {:attempt/elapsed-ms ms
+  {:attempt/status :completed
+   :attempt/elapsed-ms ms
    :attempt/metrics {:experiment-candidate candidate
                      :spend {:microdollars 0 :notional-microdollars (* usd 1e6)
                              :tokens {:input tokens :output 0}}}})
@@ -84,3 +85,44 @@
                                    :remaining {:cheap 10 :done 0}})]
       (is (empty? (:unpiloted est)))
       (is (nil? (preflight/gate est {:dollars 1}))))))
+
+(defn- faulted [candidate usd tokens ms]
+  (-> (receipt candidate usd tokens ms)
+      (assoc :attempt/status :failed)
+      (assoc-in [:attempt/metrics :failure] {:kind :infrastructure})))
+
+(deftest a-candidate-whose-pilot-cells-all-faulted-does-not-pass-the-gate
+  ;; A provider outage ends the pilot cell before it spends anything: the
+  ;; zero bill is no measurement, so the candidate is unpiloted.
+  (let [est (preflight/estimate {:pilot-receipts [(receipt :cheap 0.01 1000 1000)
+                                                  (faulted :flaky 0 0 50) (faulted :flaky 0.002 200 80)]
+                                 :remaining {:cheap 10 :flaky 100}})]
+    (is (= [:flaky] (:unpiloted est)))
+    (is (true? (get-in est [:candidates :flaky :unpiloted?])))
+    (is (= 0 (get-in est [:candidates :flaky :pilot-cells])))
+    (is (= {:cells 2 :list-microdollars 2000.0 :billed-microdollars 0 :tokens 200 :elapsed-ms 130}
+           (get-in est [:candidates :flaky :faulted]))
+        "the faults' spend is kept, beside the estimate")
+    (is (= {:candidates [:flaky]} (:unpiloted (preflight/gate est {:dollars 1}))))
+    (is (contains? (preflight/gate est {:subscription 0.5}) :unpiloted))
+    (is (= 3 (get-in est [:pilot :cells])))
+    (is (= 1 (get-in est [:pilot :measured])))
+    (is (= 2 (get-in est [:pilot :faulted :cells]))))
+  (testing "a failure of the candidate's own is a verdict, so it measures"
+    (let [own (-> (receipt :c 0.05 5000 1000)
+                  (assoc :attempt/status :failed)
+                  (assoc-in [:attempt/metrics :failure] {:kind :model}))
+          est (preflight/estimate {:pilot-receipts [own] :remaining {:c 2}})]
+      (is (empty? (:unpiloted est)))
+      (is (= 1 (get-in est [:candidates :c :pilot-cells]))))))
+
+(deftest faulted-pilot-cells-do-not-enter-the-estimate
+  (let [est (preflight/estimate {:pilot-receipts [(receipt :c 0.10 1000 1000) (receipt :c 0.30 3000 3000)
+                                                  (faulted :c 0 0 10)]
+                                 :remaining {:c 10}})]
+    (is (empty? (:unpiloted est)))
+    (is (= 2 (get-in est [:candidates :c :pilot-cells])))
+    (is (< (Math/abs (- 2000000.0 (get-in est [:candidates :c :list-microdollars :expected]))) 1e-6)
+        "the mean of the verdict cells only: a zero-cost fault would pull it down")
+    (is (< (Math/abs (- 3000000.0 (get-in est [:candidates :c :list-microdollars :worst-seen]))) 1e-6))
+    (is (= 1 (get-in est [:candidates :c :faulted :cells])))))
