@@ -21,23 +21,7 @@
 
    spindel#116 reads the continuations after the cache write. On a spindel
    release with it, drop the patch and call `cancel-spin!` directly."
-  (:require [org.replikativ.spindel.engine.core :as ec]
-            [org.replikativ.spindel.spin.core :as spin-core]))
-
-(defn- repeating-cancel
-  "`cancel-spin!` that cancels again while the cancellation is cached."
-  [cancel-spin!]
-  (with-meta
-    (fn cancel-spin-closing-the-park-race [spin]
-      (cancel-spin! spin)
-      (when (ec/spin-is-cancelled? (spin-core/spin-id spin))
-        (cancel-spin! spin))
-      nil)
-    {::repeats true}))
-
-(defonce ^:private patched
-  (alter-var-root #'spin-core/cancel-spin!
-                  (fn [f] (if (::repeats (meta f)) f (repeating-cancel f)))))
+  (:require [org.replikativ.spindel.spin.core :as spin-core]))
 
 (defn cancel!
   "Cancel `spin` from any thread, also when it (or a child it awaits) is about
