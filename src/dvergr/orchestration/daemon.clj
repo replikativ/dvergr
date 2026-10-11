@@ -677,19 +677,25 @@
              (tel/log! {:level :warn :id :rooms/gc-failed :data {:error (.getMessage e)}}
                        "Storage GC sweep failed"))))))
 
-(defn- start-gc-loop! [exec-ctx {:keys [interval-ms] :or {interval-ms 21600000} :as gc-cfg}]
-  (let [t (Thread.
+(defn- start-gc-loop!
+  "The storage GC loop: a boot sweep, then one every `interval-ms`. It waits
+   on a stop promise, not in `Thread/sleep`: an interrupt can be swallowed
+   inside a sweep (store I/O), and a loop that then slept on would hold
+   `stop-gc-loop!` for its whole timeout."
+  [exec-ctx {:keys [interval-ms] :or {interval-ms 21600000} :as gc-cfg}]
+  (let [stop (promise)
+        t (Thread.
            (fn []
-             (run-gc-sweep! exec-ctx gc-cfg)          ; boot sweep
-             (while (not (.isInterrupted (Thread/currentThread)))
-               (try (Thread/sleep (long interval-ms))
-                    (run-gc-sweep! exec-ctx gc-cfg)
-                    (catch InterruptedException _
-                      (.interrupt (Thread/currentThread))))))
+             (when-not (realized? stop)
+               (run-gc-sweep! exec-ctx gc-cfg))          ; boot sweep
+             (loop []
+               (when (= ::sweep (deref stop (long interval-ms) ::sweep))
+                 (run-gc-sweep! exec-ctx gc-cfg)
+                 (recur))))
            "dvergr-storage-gc")]
     (.setDaemon t true)
     (.start t)
-    (reset! gc-thread t)))
+    (reset! gc-thread {:thread t :stop stop})))
 
 (defn- stop-gc-loop!
   "Stop the GC loop and wait (a minute at most) for a sweep in flight: the
@@ -697,10 +703,10 @@
    it started (an experiment's home, `runner/open-home!`) would pull them
    from under its boot sweep."
   []
-  (when-let [^Thread t @gc-thread]
-    (.interrupt t)
+  (when-let [{:keys [^Thread thread stop]} @gc-thread]
+    (deliver stop true)
     (reset! gc-thread nil)
-    (when-not (= t (Thread/currentThread)) (.join t 60000))))
+    (when-not (= thread (Thread/currentThread)) (.join thread 60000))))
 
 (defn- start-mcp!
   "Start the MCP server on the daemon's loopback TCP port when `mcp-config` is
@@ -884,7 +890,10 @@
         ;; Storage GC loop (datahike index reclamation) on a dedicated thread —
         ;; boot sweep + periodic. Prevents the unbounded `.dvergr` growth that
         ;; took the old monolithic store to tens of GB.
-        (start-gc-loop! exec-ctx (:gc config))
+        ;; `:gc false`: none (an experiment's home: its stores live as long
+        ;; as the experiment, as they did before homes)
+        (when-not (false? (:gc config))
+          (start-gc-loop! exec-ctx (:gc config)))
 
         ;; Auto-create THE global room — the single default channel
         ;; every registered agent auto-joins. Slug is configurable via

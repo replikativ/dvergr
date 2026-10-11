@@ -165,7 +165,8 @@
                             :repetitions (or repetitions 1)}
                      budget-dollars (assoc :budget-dollars (double budget-dollars))
                      timeout-ms (assoc :timeout-ms timeout-ms)
-                     cases (assoc :cases cases)
+                     (number? cases) (assoc :cases cases)
+                     (and cases (not (number? cases))) (assoc :case-ids (vec cases))
                      parallelism (assoc :parallelism parallelism)
                      params (assoc :params params)
                      prompt (assoc :prompt prompt))

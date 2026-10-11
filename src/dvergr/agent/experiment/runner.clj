@@ -270,7 +270,7 @@
 
 (defn open-home!
   "Make `dir` the process's dvergr home and start a headless daemon on it:
-   no Telegram, web, MCP listener or agents (a Claude Code candidate's MCP
+   no Telegram, web, MCP listener, agents, schedules or storage GC (a Claude Code candidate's MCP
    calls get a loopback server on an ephemeral port, `dvergr.mcp.server/
    listening-port`). The home holds the system DB and the rooms' stores
    registered there; a moved home is adopted, a copied one refused
@@ -306,7 +306,7 @@
     (suspend! true)
     (try
       {:dir (str dir) :prev-home prev :mcp-before? mcp-before? :cc-before cc-before
-       :daemon ((requiring-resolve 'dvergr.orchestration.daemon/start!) {:agents {} :headless? true})}
+       :daemon ((requiring-resolve 'dvergr.orchestration.daemon/start!) {:agents {} :headless? true :gc false})}
       (catch Throwable t
         ;; a start that failed halfway returned no daemon to stop: undo what
         ;; it began (the GC loop, the room contexts and their stores)
