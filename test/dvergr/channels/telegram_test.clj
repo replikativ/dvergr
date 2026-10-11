@@ -4,25 +4,13 @@
             [dvergr.channels.core :as ch]
             [dvergr.channels.telegram :as tg]
             [dvergr.tools :as tools]
-            [dvergr.mcp.server :as mcp]))
+            [dvergr.test-registries :as test-registries]))
 
 ;; ============================================================================
 ;; Fixtures
 ;; ============================================================================
 
-(use-fixtures :each
-  (fn [f]
-    (let [orig-channels @ch/channels
-          orig-tools @tools/registry
-          orig-mcp-tools @mcp/tool-definitions
-          orig-mcp-handlers @mcp/tool-handlers]
-      (try
-        (f)
-        (finally
-          (reset! ch/channels orig-channels)
-          (reset! tools/registry orig-tools)
-          (reset! mcp/tool-definitions orig-mcp-tools)
-          (reset! mcp/tool-handlers orig-mcp-handlers))))))
+(use-fixtures :each test-registries/fixture)
 
 ;; ============================================================================
 ;; Mock Telegram API

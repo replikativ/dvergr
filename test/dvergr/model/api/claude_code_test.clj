@@ -96,6 +96,7 @@
                         "exec sleep 30")]
           process-ref (atom nil)
           start-process @#'claude-code/start-process
+          t0 (System/currentTimeMillis)
           outcome
           (with-redefs-fn
             {#'claude-code/build-command (constantly command)
@@ -111,12 +112,15 @@
                                      (throw (ex-info "callback failed" {})))})}
                 (catch Throwable t
                   {:throwable t}))))
+          elapsed (- (System/currentTimeMillis) t0)
           process @process-ref
           {:keys [throwable]} outcome]
       (is (not= ::not-started process))
       (is (not= ::timeout outcome))
       (is (= "callback failed" (ex-message throwable)))
-      (is (false? (.isAlive ^Process process))))))
+      (is (false? (.isAlive ^Process process)))
+      (is (< elapsed 20000)
+          "the failure ends the call at once, not when the CLI exits by itself (sleep 30)"))))
 
 (deftest unwrapped-tool-calls-are-recovered-only-when-unambiguous
   (let [parse #(@#'claude-code/parse-tool-calls %1 #{"cancel_pending_order"})

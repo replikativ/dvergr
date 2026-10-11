@@ -225,27 +225,32 @@
    attributes must have the same durable shape; only absent attributes are
    returned for installation. In particular, do not rely on Datahike rejecting
    a redeclaration: under `:schema-flexibility :write` it may legally rewrite
-   an unused attribute before an older serialized message reaches the writer."
+   an unused attribute before an older serialized message reaches the writer.
+   An attribute proposed twice in one claim (two tools installed together)
+   must have one shape too; it is installed once."
   [db attrs]
   (let [installed (d/schema db)]
-    (reduce
-     (fn [missing attr]
-       (let [ident (:db/ident attr)]
-         (if-let [current (get installed ident)]
-           (let [current-shape (durable-attr-shape current)
-                 proposed-shape (durable-attr-shape attr)]
-             (when-not (= current-shape proposed-shape)
-               (throw
-                (ex-info
-                 "Incompatible durable tool schema is already installed"
-                 {:type ::incompatible-installed-tool-schema
-                  :attribute ident
-                  :installed current-shape
-                  :proposed proposed-shape})))
-             missing)
-           (conj missing attr))))
-     []
-     attrs)))
+    (:missing
+     (reduce
+      (fn [{:keys [claimed] :as acc} attr]
+        (let [ident (:db/ident attr)
+              proposed-shape (durable-attr-shape attr)]
+          (if-let [current (or (get installed ident) (get claimed ident))]
+            (let [current-shape (durable-attr-shape current)]
+              (when-not (= current-shape proposed-shape)
+                (throw
+                 (ex-info
+                  "Incompatible durable tool schema is already installed"
+                  {:type ::incompatible-installed-tool-schema
+                   :attribute ident
+                   :installed current-shape
+                   :proposed proposed-shape})))
+              acc)
+            (-> acc
+                (update :missing conj attr)
+                (assoc-in [:claimed ident] attr)))))
+      {:missing [] :claimed {}}
+      attrs))))
 
 (defn- install-compatible-schema! [conn schema]
   (d/transact conn [[:db.fn/call install-compatible-attrs schema]]))
@@ -286,12 +291,15 @@
   ;; Always install the raw-EDN fallback attributes. serialize-tool-use degrades
   ;; a tool input it cannot type into :tool-input.raw/*, so persistence stays
   ;; total — these MUST exist before any such write can land.
-  (install-compatible-schema! conn raw-input-schema)
-  (->> registry
-       (map (fn [[tool-name tool-def]]
-              [tool-name (install-tool-schema! conn tool-def)]))
-       (filter (fn [[_ count]] count))
-       (into {})))
+  ;; One claim for all of them: a transaction per tool made provisioning a
+  ;; room's store cost one durable write per registered tool (seconds).
+  (let [schemas (->> registry
+                     (keep (fn [[tool-name tool-def]]
+                             (when-let [schema (seq (generate-tool-schema tool-def))]
+                               [tool-name (vec schema)])))
+                     (into {}))]
+    (install-compatible-schema! conn (into (vec raw-input-schema) cat (vals schemas)))
+    (update-vals schemas count)))
 
 ;; ============================================================================
 ;; Input Conversion (Map → Entity)

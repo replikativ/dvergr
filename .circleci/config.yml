@@ -74,6 +74,11 @@ jobs:
 
   test:
     executor: clojure-java22
+    # The suite runs in parallel containers, each on its share of the test
+    # namespaces (CircleCI balances the shares by the timings of earlier
+    # runs). dvergr.test-split checks that the shares cover every test
+    # namespace, so nothing is skipped. One check, `test`, for all of them.
+    parallelism: 3
     steps:
       - attach_workspace:
           at: ~/
@@ -83,12 +88,22 @@ jobs:
             - v1-deps-
       - install-clojure
       - run:
-          name: Run tests (kaocha)
-          command: clojure -M:test
+          name: Run tests (kaocha), this container's share of the namespaces
+          command: |
+            mkdir -p target/test-split test-results/kaocha
+            .circleci/test-namespaces.sh > target/test-split/all.txt
+            circleci tests split --split-by=timings --timings-type=classname \
+              target/test-split/all.txt > target/test-split/mine.txt
+            DVERGR_TEST_ALL_NAMESPACES=target/test-split/all.txt \
+            DVERGR_TEST_NAMESPACES=target/test-split/mine.txt \
+              clojure -M:test --plugin kaocha.plugin/junit-xml \
+                --junit-xml-file test-results/kaocha/results.xml
           # The dots reporter may produce no newline while a compilation-heavy
           # namespace runs. Keep CircleCI's inactivity watchdog above the
           # suite's bounded test waits; assertion failures still exit normally.
           no_output_timeout: 20m
+      - store_test_results:
+          path: test-results
 
   build-harness:
     executor: clojure-java22
