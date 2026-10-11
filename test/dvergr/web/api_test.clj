@@ -82,3 +82,14 @@
       (is (= #{} (:tools @seen)) "an empty list is no tools")
       (is (= 200 (:status (POST "/api/v1/agent_create" {:id "t" :tools ["read_file"]}))))
       (is (= #{:read_file} (:tools @seen))))))
+
+(deftest room-write-takes-text-base64-and-null-from-json
+  (testing "a JSON body's files reach the op as path -> {:text}/{:base64}/nil"
+    (let [seen (atom nil)
+          body "{\"room\":\"r\",\"files\":{\"data/cases.csv\":{\"text\":\"a\"},\"x.bin\":{\"base64\":\"AAE=\"},\"gone.txt\":null}}"
+          resp (with-redefs [ops/invoke (fn [_ _ args] (reset! seen args) {:ok true})]
+                 (api/handler {:request-method :post :uri "/api/v1/room_write" :dvergr/daemon {}
+                               :headers {"content-type" "application/json" "accept" "application/json"}
+                               :body (java.io.ByteArrayInputStream. (.getBytes body "UTF-8"))}))]
+      (is (= 200 (:status resp)))
+      (is (= {"data/cases.csv" {:text "a"} "x.bin" {:base64 "AAE="} "gone.txt" nil} (:files @seen))))))

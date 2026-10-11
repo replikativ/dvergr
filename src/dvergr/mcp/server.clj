@@ -25,6 +25,7 @@
             [dvergr.mcp.repl :as repl]
             [dvergr.mcp.surface :as surface]
             [dvergr.ops :as ops]
+            [dvergr.rooms.files :as room-files]
             [dvergr.rooms.facts :as facts]
             [dvergr.chat.context :as chat-context]
             [org.replikativ.spindel.engine.core :as ec]
@@ -306,12 +307,20 @@
                :description doc :mimeType "application/json"}}))))
 
 (def ^:private ops-resources
-  (mapv (fn [[op spec]] (op->resource op spec)) (ops/reads)))
+  ;; room_read takes a path, which its own template carries (`file-template`)
+  (mapv (fn [[op spec]] (op->resource op spec)) (dissoc (ops/reads) :room/read)))
+
+(def ^:private file-template
+  "A room's workspace files as resources: a file's contents (text, or a blob
+   for binary), a directory's listing (room_files) as JSON."
+  {:uriTemplate "room://{room}/files/{+path}" :name "room_file"
+   :description (str "A file of a room's workspace: its contents (text, or a base64 blob for binary, "
+                     "up to 4 MiB; room_read reads larger ones in chunks), or a directory's listing as JSON.")})
 
 (def resource-definitions
   "Fixed resources + resource templates, derived from dvergr.ops reads."
   (atom {:resources (mapv :def (filter #(= :fixed (:kind %)) ops-resources))
-         :templates (mapv :def (filter #(= :template (:kind %)) ops-resources))}))
+         :templates (conj (mapv :def (filter #(= :template (:kind %)) ops-resources)) file-template)}))
 
 (def ^:private fixed-by-uri
   (into {} (for [{:keys [kind uri op]} ops-resources :when (= :fixed kind)] [uri op])))
@@ -326,15 +335,49 @@
         segs (str/split (or rst "") #"/")]
     (cond
       (get fixed-by-uri uri) {:op (get fixed-by-uri uri) :args {}}
+      ;; room://{room}/files/{+path}: a workspace file or directory
+      (and (= "room" scheme) (< 2 (count segs)) (= "files" (second segs)))
+      {:op :room/read :file? true
+       :args {:room (first segs)
+              :path (str "/" (str/join "/" (map #(java.net.URLDecoder/decode (str/replace % "+" "%2B") "UTF-8")
+                                                (drop 2 segs))))}}
       (= 2 (count segs))     (when-let [{:keys [op arg]} (get template-by-key [scheme (second segs)])]
                                {:op op :args {arg (first segs)}})
       :else nil)))
 
+(defn- file-contents
+  "The contents of the workspace file resource `uri`: the file whole (text or
+   blob), or a directory's listing as JSON."
+  [dmn uri {:keys [room path]}]
+  (let [json-text #(-> (surface/data-result %) :content first :text)]
+    (if-let [r (ops/resolve-room dmn room)]
+      (binding [ec/*execution-context* (:execution-ctx dmn)]
+        (try
+          (let [{:keys [text base64 media-type size length]}
+                (room-files/read-file r path {:max room-files/max-resource-bytes})]
+            (when (< length size)
+              (throw (ex-info (str path " has " size " bytes, more than a resource returns ("
+                                   room-files/max-resource-bytes "); read it with room_read and offset")
+                              {:json-rpc/code -32602 :json-rpc/data {:uri uri}})))
+            [(cond-> {:uri uri :mimeType media-type}
+               text (assoc :text text)
+               base64 (assoc :blob base64))])
+          (catch clojure.lang.ExceptionInfo e
+            (case (:type (ex-data e))
+              ::room-files/directory
+              [{:uri uri :mimeType "application/json" :text (json-text (room-files/list-dir r path))}]
+              ::room-files/not-found
+              (throw (ex-info (str "Resource not found: " uri) {:json-rpc/code -32002 :json-rpc/data {:uri uri}}))
+              (throw e)))))
+      (throw (ex-info (str "Resource not found: " uri) {:json-rpc/code -32002 :json-rpc/data {:uri uri}})))))
+
 (defn- read-resource [uri]
-  (if-let [{:keys [op args]} (uri->op+args uri)]
+  (if-let [{:keys [op args file?]} (uri->op+args uri)]
     (if-let [dmn (current-daemon)]
-      {:contents [{:uri uri :mimeType "application/json"
-                   :text (-> (surface/data-result (ops/invoke dmn op args)) :content first :text)}]}
+      {:contents (if file?
+                   (file-contents dmn uri args)
+                   [{:uri uri :mimeType "application/json"
+                     :text (-> (surface/data-result (ops/invoke dmn op args)) :content first :text)}])}
       {:contents []})
     ;; the protocol's error for a resource that does not exist (the
     ;; stateless era answers it as -32602, `json-rpc/handle-stateless`)

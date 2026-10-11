@@ -21,6 +21,8 @@
   "Every `dvergr.ops` op, by toolset."
   {:room/list :rooms, :room/detail :rooms, :room/create :rooms,
    :room/delete :rooms, :room/messages :rooms, :room/post :rooms
+   ;; the room's workspace files: with catalog_cases, a case pack from scratch
+   :room/files :files, :room/read :files, :room/write :files
 
    :room/unarchive :admin, :room/purge :admin, :catalog/promote :admin, :run/resume :admin
 
@@ -58,6 +60,7 @@
 (def toolsets
   "Every toolset, with what it is for."
   {:rooms    "Rooms: create, list, read messages, post a task"
+   :files    "A room's workspace files: list, read (text or base64), write a batch as one commit"
    :worlds   "Forks of a room: fork, diff, merge, discard"
    :attempts "Run a task N times per model on forks, as a job; Attempts, Scorecards"
    :runs     "The blocking workflow_attempt, and Runs (lower level)"
@@ -77,11 +80,12 @@
    `:repl-toolsets` are the toolsets whose ops the REPL's `dvergr.ops` may
    call when they differ from the listed ones (`dvergr.mcp.repl`)."
   {:offload  {:toolsets #{:rooms :worlds :attempts :catalog :wallets :repl}}
-   :bench    {:toolsets #{:rooms :attempts :catalog :bench :wallets}}
+   ;; :files: a case pack's table goes in with room_write (catalog_cases reads it)
+   :bench    {:toolsets #{:rooms :files :attempts :catalog :bench :wallets}}
    ;; REPL-first: the whole API as `dvergr.ops` functions in `clojure_eval`
    :code     {:toolsets #{:repl :describe}
-              :repl-toolsets #{:rooms :worlds :attempts :catalog :bench :wallets}}
-   :readonly {:toolsets #{:rooms :worlds :attempts :catalog :bench :wallets :agents :system}
+              :repl-toolsets #{:rooms :files :worlds :attempts :catalog :bench :wallets}}
+   :readonly {:toolsets #{:rooms :files :worlds :attempts :catalog :bench :wallets :agents :system}
               :read-only? true}
    :admin    {:toolsets (set (keys toolsets))}})
 
@@ -180,6 +184,8 @@
    overwrite (clients confirm them); `openWorldHint` marks ops that start agent
    or model work."
   {:room/post        {:destructiveHint false :idempotentHint false :openWorldHint true}
+   ;; overwrites and removes files; the same batch again commits nothing
+   :room/write       {:destructiveHint true  :idempotentHint true  :openWorldHint false}
    :room/create      {:destructiveHint false :idempotentHint false :openWorldHint false}
    :room/delete      {:destructiveHint true  :idempotentHint true  :openWorldHint false}
    :room/unarchive   {:destructiveHint false :idempotentHint true  :openWorldHint false}

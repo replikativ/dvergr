@@ -13,6 +13,7 @@
             [dvergr.agent.run :as agent-run]
             [dvergr.discourse :as d]
             [dvergr.substrate.geschichte :as git]
+            [geschichte.repo :as repo]
             [clojure.string :as str]
             [hasch.core :as hasch]
             [org.replikativ.spindel.engine.core :as ec]
@@ -273,6 +274,30 @@
             (throw (ex-info (str "git " (first argv) " failed in " (:id room) ": " stderr)
                             {:type ::workspace-commit-failed :room (:id room) :argv argv}))))))
     changes))
+
+(defn commit-paths!
+  "Commit exactly `paths` (written, changed or removed) in `room`'s workspace
+   as one commit with `message`; other uncommitted changes stay as they are.
+   Returns the commit id, or nil when the paths already match HEAD."
+  [room paths message]
+  (binding [ec/*execution-context* (:ctx room)]
+    (let [{:keys [conn] :as workspace} (or (git/current-workspace)
+                                           (throw (ex-info "Room has no workspace"
+                                                           {:type ::no-workspace :room (:id room)})))
+          rel #(str/replace (str %) #"^/+" "")
+          known (into (set (keys (repo/index-tree conn))) (repo/files conn))
+          paths (vec (distinct (filter known (map rel paths))))
+          git! (fn [argv]
+                 (let [{:keys [exit stderr]} (git/execute-git workspace argv)]
+                   (when-not (zero? exit)
+                     (throw (ex-info (str "git " (first argv) " failed in " (:id room) ": " stderr)
+                                     {:type ::workspace-commit-failed :room (:id room) :argv argv})))))]
+      (when (seq paths)
+        ;; -f: a path the caller names is committed even when .gitignore matches it
+        (git! (into ["add" "-f" "--"] paths))
+        (when (seq (:staged (repo/status conn)))
+          (git! ["commit" "-q" "-m" message])
+          (some-> (repo/head-commit conn) :geschichte.commit/id str))))))
 
 (defn- prepare-workspaces!
   "Make `fork` mergeable into `parent`: commit the fork's work (a merge adopts

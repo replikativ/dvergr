@@ -250,7 +250,9 @@
 
 (declare effect-boundary)
 
-(defn- write-file! [ctx path content]
+(defn- write-file!
+  "Write `content` (a string, or bytes) to `path`, creating its directories."
+  [ctx path content]
   (let [path (tool-path ctx path)]
     (if-let [filesystem (:filesystem ctx)]
       (do
@@ -260,8 +262,16 @@
             (doseq [directory (reverse pending)] (mfs/mkdir filesystem directory))
             (recur (subs parent 0 (max 1 (.lastIndexOf ^String parent "/")))
                    (conj pending parent))))
-        (mfs/write-string! filesystem path (str content) false))
-      (do (fs/create-dirs (fs/parent path)) (spit path content)))
+        (when-not (if (bytes? content)
+                    (when-let [sink (mfs/open-sink filesystem path false)]
+                      (with-open [^java.io.OutputStream o sink] (.write o ^bytes content))
+                      true)
+                    (mfs/write-string! filesystem path (str content) false))
+          (throw (ex-info (str "Could not write " path) {:path path}))))
+      (do (fs/create-dirs (fs/parent path))
+          (if (bytes? content)
+            (with-open [o (io/output-stream path)] (.write o ^bytes content))
+            (spit path content))))
     path))
 
 (defn workspace-write!
@@ -269,17 +279,37 @@
    virtual filesystem, else its `cwd`, clamped), through the effect boundary:
    an `:fs/write` the world's read-only mode, quota and receipts decide, the
    same effect a sandbox `spit` performs. The one gate for every tool that
-   writes workspace files. `ctx` may carry `:effect-boundary` (a boundary
+   writes workspace files; `content` is a string (UTF-8) or bytes. `ctx` may carry `:effect-boundary` (a boundary
    function, `dvergr.effects/boundary-resolver`) for callers without a chat;
    else the chat's boundary applies (none without a chat: host calls). Returns
    the resolved path."
   [ctx path content]
-  (let [content (str content)]
+  (let [content (if (bytes? content) content (str content))
+        n (if (bytes? content) (alength ^bytes content) (alength (.getBytes ^String content "UTF-8")))]
     (effects/perform! (effect-boundary ctx)
                       {:effect :fs/write :resource {:path (str path)}
-                       :result-of (constantly content)
-                       :bytes (alength (.getBytes content "UTF-8"))}
+                       ;; bytes are digested as they are (a byte array prints by identity)
+                       :result-of (constantly (if (bytes? content)
+                                                (String. ^bytes content "ISO-8859-1")
+                                                content))
+                       :bytes n}
                       #(write-file! ctx path content))))
+
+(defn workspace-delete!
+  "Delete the file at `path` in the workspace of the tool context `ctx`,
+   through the effect boundary as an `:fs/delete` (see `workspace-write!`).
+   Returns the resolved path, or nil when there was no file."
+  [ctx path]
+  (effects/perform! (effect-boundary ctx)
+                    {:effect :fs/delete :resource {:path (str path)}}
+                    #(let [resolved (tool-path ctx path)]
+                       (if-let [filesystem (:filesystem ctx)]
+                         (when (= :file (:type (mfs/stat filesystem resolved)))
+                           (mfs/delete filesystem resolved)
+                           resolved)
+                         (when (fs/regular-file? resolved)
+                           (fs/delete resolved)
+                           resolved)))))
 
 (defn- transact!
   "Transact `tx-data` into `conn` for a tool, through the effect boundary (a

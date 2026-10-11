@@ -397,3 +397,60 @@
       (is (= {:certified 2 :unlabelled 1} (:by-reason res)) "case 3 has no account")
       (is (:ok (ops/invoke *daemon* :catalog/check {:room "books" :name "invoice-coding"})))
       (is (:ok? (ops/invoke *daemon* :catalog/calibrate {:room "books" :name "invoice-coding"}))))))
+
+(deftest a-case-pack-is-built-from-scratch-over-the-room-file-ops
+  ;; What an MCP client does with no checkout of its own: the table goes in
+  ;; with room_write, the bundle comes back out with room_files/room_read.
+  (ops/invoke *daemon* :room/create {:title "Ledger" :slug "ledger"})
+  (let [w (ops/invoke *daemon* :room/write
+                      {:room "ledger" :message "Cases from the 2025 books"
+                       :files {"data/cases.csv" {"text" (str "no;vendor;text;doc;account;amount\n"
+                                                             "1;Acme;toner;inv1.txt;4930;119,00\n"
+                                                             "2;Acme;toner refill;inv2.txt;4930;119,00\n")}
+                               "data/inv1.txt" {"text" "Invoice 1: toner 119,00 EUR"}
+                               "data/inv2.txt" {"text" "Invoice 2: toner refill 119,00 EUR"}
+                               "data/scan.pdf" {"base64" "JVBERi0xLjQKJcfsj6IK"}}})]
+    (is (string? (:commit w)) (pr-str w))
+    (is (= 4 (count (:written w))))
+    (let [res (ops/invoke *daemon* :catalog/cases
+                          {:room "ledger" :name "coding" :table "/data/cases.csv"
+                           :spec {:id "no" :inputs ["vendor" "text"] :attachments ["doc"]
+                                  :expected {"account" {"rule" "exact"} "amount" {"rule" "number" "tolerance" 0.01}}}})]
+      (is (= "ledger/coding" (:workflow res)) (pr-str res))
+      (is (= 2 (:certified res))))
+    (testing "the bundle is in the workspace: listed and read back"
+      (let [names (set (map :name (:entries (ops/invoke *daemon* :room/files {:room "ledger" :path "/workflows/coding"}))))]
+        (is (every? names ["workflow.edn" "checker.clj" "calibration.edn" "certification.edn" "cases"]) (pr-str names)))
+      (is (str/includes? (:text (ops/invoke *daemon* :room/read {:room "ledger" :path "/workflows/coding/workflow.edn"}))
+                         ":task"))
+      (is (= "application/pdf" (:media-type (ops/invoke *daemon* :room/read {:room "ledger" :path "data/scan.pdf"}))))
+      (testing "and as MCP resources"
+        (let [read-resource @(requiring-resolve 'dvergr.mcp.server/read-resource)
+              [c] (:contents (read-resource "room://ledger/files/data/cases.csv"))
+              [pdf] (:contents (read-resource "room://ledger/files/data/scan.pdf"))
+              [dir] (:contents (read-resource "room://ledger/files/workflows/coding"))]
+          (is (str/starts-with? (:text c) "no;vendor"))
+          (is (= "JVBERi0xLjQKJcfsj6IK" (:blob pdf)))
+          (is (str/includes? (:text dir) "checker.clj")))))
+    (is (:ok? (ops/invoke *daemon* :catalog/calibrate {:room "ledger" :name "coding"})))
+    (testing "benchmarked into the room, scored by the generated checker"
+      (with-redefs [providers/ensure-initialized! (constantly nil)
+                    chat-agent/messages->api-format (fn [messages _ _] messages)
+                    model-chat/chat (fn [messages _]
+                                      (if (not-any? #(= :tool-result (or (:role %) (:message/role %))) messages)
+                                        {:content "" :tool-calls [{:id (str (random-uuid)) :name "write_file"
+                                                                   :input {:path "/out/answer.edn"
+                                                                           :content (pr-str {"account" "4930" "amount" "119,00"})}}]
+                                         :usage {:input-tokens 500 :output-tokens 20} :stop-reason :tool-use}
+                                        {:content "Booked." :tool-calls nil
+                                         :usage {:input-tokens 600 :output-tokens 5} :stop-reason :end-turn}))]
+        (let [started (ops/invoke *daemon* :catalog/benchmark
+                                  {:workflow "ledger/coding" :models ["claude-haiku-4-5"] :room "ledger"})
+              done (loop [n 0]
+                     (let [st (ops/invoke *daemon* :job/status {:job (:id started) :wait-ms 20000})]
+                       (if (or (not= "running" (:status st)) (< 8 n)) st (recur (inc n)))))]
+          (is (= "completed" (:status done)) (pr-str (dissoc done :result)))
+          (let [[sc] (ops/invoke *daemon* :scorecard/list {:room "ledger"})
+                detail (ops/invoke *daemon* :scorecard/detail {:room "ledger" :id (:id sc)})]
+            (is (= 1.0 (get-in detail [:leaderboard 0 :reward-mean])) (pr-str detail))
+            (is (= 2 (get-in detail [:leaderboard 0 :attempts])))))))))
