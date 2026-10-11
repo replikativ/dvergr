@@ -409,8 +409,8 @@
 ;; run!
 ;; ---------------------------------------------------------------------------
 
-(defn- run-on
-  "`run!` in `daemon`'s home."
+(defn- run-on*
+  "`run!` in `daemon`'s home; `run-on` restores Claude Code's settings."
   [daemon
    {:keys [dir benchmark capabilities environments team models dataset metadata
            repetitions parallelism experiment-id claude-cli claude-env
@@ -422,7 +422,6 @@
         metered (metered-providers models)
         before (select-keys (subscription/all-readings) metered)
         admit (admit-for models allowance)
-        cc-before (cc/settings-snapshot)
         uses-cc? (boolean (some #{:claude-code} (map model-provider models)))
         note (let [n (get opts :host-context-note :auto)]
                (cond (= :auto n) (when uses-cc? host-context-note)
@@ -524,8 +523,15 @@
                                         :data {:room slug :error (ex-message e)}})
                              nil)))})))
       (finally
-        (try (evaluation/await-cleanups-for! room cleanup-group) (catch Throwable _ nil))
-        (cc/restore-settings! cc-before)))))
+        (try (evaluation/await-cleanups-for! room cleanup-group) (catch Throwable _ nil))))))
+
+(defn- run-on
+  "`run!` in `daemon`'s home, giving Claude Code's process-wide settings back
+   however it ends, setup failures included."
+  [daemon opts]
+  (let [cc-before (cc/settings-snapshot)]
+    (try (run-on* daemon opts)
+         (finally (cc/restore-settings! cc-before)))))
 
 (defn run!
   "Run (or resume) an experiment. Returns `{:dir :room :experiment-room

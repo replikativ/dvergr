@@ -139,3 +139,16 @@
                                                    :id :any))))
                (map :candidate/agent-content-id (:experiment/candidates exp)))
             "the candidate is the one with that prompt")))))
+
+(def ^:private case-files
+  {"workflow.edn" (pr-str {:title "Sums" :task "Answer /docs/q.txt in /out/a.txt." :capture ["/out"]})
+   "checker.clj" "(ns s) (defn check [{:keys [files gold]}] (let [ok (= (:a gold) (get files \"/out/a.txt\"))] {:checks {:right? ok} :reward (if ok 1.0 0.0)}))"
+   "cases/one/gold.edn" (pr-str {:a "2"}) "cases/one/fixtures/docs/q.txt" "1+1"
+   "cases/two/gold.edn" (pr-str {:a "4"}) "cases/two/fixtures/docs/q.txt" "2+2"})
+
+(deftest a-case-selection-by-id-faults-and-resumes
+  (let [home (tmp "dvergr-room-run-home-")
+        b (room-wf/bundle "sums" case-files)
+        failed (bench! broken b home :repetitions 1 :fault-retries 0 :cases ["two"])]
+    (is (= 1 (:failed-cells failed)) "one selected case, one cell")
+    (is (str/includes? (:report failed) "**Incomplete:**"))))

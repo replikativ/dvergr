@@ -103,7 +103,11 @@
   [b {:keys [models repetitions cases]}]
   (* (count models) (or repetitions 1)
      (let [n (count (:cases b))]
-       (cond (zero? n) 1 cases (min n cases) :else n))))
+       (cond (zero? n) 1
+             (number? cases) (min n cases)
+             ;; case ids, as `room-wf/experiment-plan` selects them
+             (seq cases) (count (filter (set cases) (keys (:cases b))))
+             :else n))))
 
 (defn- verdicts [daemon room experiment-id]
   (->> (:experiments (ops/invoke daemon :experiment/progress {:room room}))

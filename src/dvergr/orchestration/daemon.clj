@@ -93,6 +93,10 @@
 ;; Global daemon atom for REPL access: @current-daemon, (stop! @current-daemon)
 (defonce current-daemon (atom nil))
 
+;; The root discourse room of a `start!` in progress (nil once it completed):
+;; what `abort-start!` closes when the start threw.
+(defonce ^:private starting-room (atom nil))
+
 ;; Tool-activity id + the room-turn registry moved to `dvergr.agent.turn` — a
 ;; lower layer shared with `discourse.llm/llm-agent` (no daemon↔discourse.llm
 ;; cycle, and ONE registry so Esc-cancel sees persona turns too). Re-export the
@@ -812,7 +816,9 @@
   (let [exec-ctx       (create-shared-context :with-git? false
                                               :with-datahike? true
                                               :db-path (:db-path config))
-        discourse-room (d/room :daemon exec-ctx)
+        discourse-room (doto (d/room :daemon exec-ctx)
+                         ;; until the start completes, `abort-start!` closes it
+                         (->> (reset! starting-room)))
         status-a       (atom :starting)
         daemon         (->Daemon config exec-ctx discourse-room
                                  nil nil status-a)]
@@ -1090,6 +1096,7 @@
         (let [daemon-final (start-mcp! daemon-with-http (:mcp config))]
           (reset! status-a :running)
           (reset! current-daemon daemon-final)
+          (reset! starting-room nil)
           (tel/log! {:id :daemon/started :data {:agent-count (count (:agents config))}} "Daemon started")
           daemon-final)))))
 
@@ -1167,13 +1174,16 @@
 
 (defn abort-start!
   "Undo what a `start!` that threw had begun, with no daemon to `stop!`: the
-   GC loop, the default context's registration, the room contexts and their
-   stores. Best-effort; for a host that retries in the same process
-   (`runner/open-home!`)."
+   GC loop, the default context's registration, the root discourse room (its
+   context's drain), the room contexts and their stores. Best-effort; for a
+   host that retries in the same process (`runner/open-home!`)."
   []
   (stop-gc-loop!)
   (try (mail/stop-sync!) (catch Throwable _ nil))
   (try (sdist/unregister-context! :default) (catch Throwable _ nil))
+  (when-let [room @starting-room]
+    (try (d/close-room! room) (catch Throwable _ nil))
+    (reset! starting-room nil))
   (srooms/release-room-stores!)
   (reset! current-daemon nil)
   :aborted)

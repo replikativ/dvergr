@@ -16,6 +16,7 @@
             [dvergr.discourse.definitions]
             [dvergr.actors]
             [dvergr.rooms]
+            [dvergr.discourse]
             [dvergr.ops :as ops]
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.substrate.paths :as paths]))
@@ -107,7 +108,14 @@
           (is (= d @daemon/current-daemon) "no second daemon")
           (is (= 1 (:attempt-count (first (get-in r [:scorecard :scorecard/summary])))))
           (is (some? (ops/resolve-room d (:room r))) "a room of the daemon's home")
-          (is (:complete (ops/invoke d :experiment/report {:room (:room r)}))))
+          (is (:complete (ops/invoke d :experiment/report {:room (:room r)})))
+          (testing "a setup that fails gives Claude Code's settings back"
+            (let [before (cc/settings-snapshot)]
+              (with-redefs [cc/cli-version (constantly nil)]
+                (is (thrown-with-msg? clojure.lang.ExceptionInfo #"CLI not runnable"
+                                      (run-wiki nil calls :daemon d :experiment-id :wiki-cc
+                                                :models ["claude-code-haiku"] :host-context-note "a note"))))
+              (is (= before (cc/settings-snapshot))))))
         (finally
           (daemon/stop! d)
           (dvergr.system.db/reset-conn!)
@@ -126,8 +134,13 @@
 (deftest a-start-that-fails-halfway-is-undone
   (let [prev (paths/home)
         dir (tmp)]
-    (with-redefs [dvergr.rooms/hydrate-registry! (fn [_] (throw (ex-info "hydration broke" {})))]
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"hydration broke" (runner/open-home! dir))))
+    (let [closed (atom [])
+          close! dvergr.discourse/close-room!]
+      (with-redefs [dvergr.rooms/hydrate-registry! (fn [_] (throw (ex-info "hydration broke" {})))
+                    dvergr.discourse/close-room! (fn [r] (swap! closed conj (:id r)) (close! r))]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"hydration broke" (runner/open-home! dir))))
+      (is (some #{:daemon} @closed) "the root room (its context's drain) is closed")
+      (is (nil? @@#'daemon/starting-room)))
     (is (nil? @daemon/current-daemon))
     (is (= prev (paths/home)))
     (testing "and the home opens afterwards"

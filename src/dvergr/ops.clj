@@ -1129,7 +1129,8 @@
              [:split {:optional true} [:enum {:description "dev (public, the default), test (held out: the host's key) or real (real corpora)"} "dev" "test" "real"]]
              [:repetitions {:optional true} [:int {:min 1 :max 10 :description "attempts per model (default 1)"}]]
              [:experiment {:optional true} [:string {:description "a name for the experiment, kept: benchmarking again with the same name, workflow and models into the same room resumes it (cells with a verdict are kept, faulted ones run again); default a new one"}]]
-             [:cases {:optional true} [:int {:min 1 :description "a dataset workflow's first N cases of a fixed shuffle (default all)"}]]
+             [:cases {:optional true} [:or {:description "a dataset workflow's first N cases of a fixed shuffle, or the ids of its cases (default all)"}
+                                       [:int {:min 1}] [:vector :string]]]
              [:parallelism {:optional true} [:int {:min 1 :max 16 :description "attempts at a time (default 1)"}]]
              [:params {:optional true} [:map-of {:description "a room workflow's task parameters, over its workflow.edn :params"} :keyword :any]]
              [:prompt {:optional true} [:string {:description "the candidates' system prompt (default the workflow's)"}]]
