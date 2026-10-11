@@ -22,6 +22,23 @@
 
 (declare to-file!)
 
+(defn- jul->telemere
+  "A java.util.logging handler that hands each record (INFO and up) to
+   Telemere."
+  ^java.util.logging.Handler []
+  (let [fmt (java.util.logging.SimpleFormatter.)]
+    (doto (proxy [java.util.logging.Handler] []
+            (publish [^java.util.logging.LogRecord r]
+              (when (.isLoggable ^java.util.logging.Handler this r)
+                (let [v (.intValue (.getLevel r))
+                      level (cond (>= v 1000) :error (>= v 900) :warn :else :info)]
+                  (tel/log! {:level level :id :jul/record
+                             :data {:logger (.getLoggerName r)}}
+                            (.formatMessage fmt r)))))
+            (flush [])
+            (close []))
+      (.setLevel java.util.logging.Level/INFO))))
+
 (defn init!
   "Configure logging. Call once at program entry before starting the daemon.
    - Redirects System.err to the log file (captures JVM module warnings, JUL)
@@ -51,11 +68,12 @@
    line tool keeps stdout for its own output (`dvergr.catalog.room-run`)."
   [path]
   (some-> (java.io.File. ^String (str path)) .getAbsoluteFile .getParentFile .mkdirs)
-   ;; Remove all JUL (java.util.logging) ConsoleHandlers from the root logger.
-   ;; Lucene uses JUL and would otherwise write to the terminal.
+  ;; JUL (java.util.logging; Lucene uses it): its console handlers go, and
+  ;; its records reach Telemere, so the same file
   (let [root (java.util.logging.Logger/getLogger "")]
     (doseq [h (into [] (.getHandlers root))]
-      (.removeHandler root h)))
+      (.removeHandler root h))
+    (.addHandler root (jul->telemere)))
 
    ;; Telemere: silence console, write to file
   (tel/remove-handler! :default/console)
