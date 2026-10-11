@@ -155,6 +155,67 @@
       (is (= :driver (:from (first log))))
       (is (= :bot (:from (second log)))))))
 
+(defn- await-settled [settled n]
+  (let [deadline (+ (System/currentTimeMillis) 3000)]
+    (loop []
+      (if (or (>= (count @settled) n) (> (System/currentTimeMillis) deadline))
+        @settled
+        (do (Thread/sleep 5) (recur))))))
+
+(deftest every-handler-end-settles-its-reply-obligation
+  (testing "emitted, dropped by a wrapper, thrown, released: each settles once"
+    (let [r (d/room :obligations)
+          settled (atom [])
+          callbacks (fn [label]
+                      {:on-emitted (fn [m] (swap! settled conj [label :emitted (:content m)]))
+                       :on-failed (fn [e] (swap! settled conj [label :failed (ex-message e)]))
+                       :on-dropped (fn [reason e]
+                                     (swap! settled conj [label :dropped reason (some-> e ex-message)]))})
+          bot (d/participant
+               {:id :bot
+                :on-message
+                (fn [p msg]
+                  (sp/spin
+                   (let [token (d/reply-obligation! p (callbacks (:content msg)))]
+                     (case (:content msg)
+                       "reply" (d/carry-obligation {:to (:from msg) :content "answer"} token)
+                       "silent" (d/carry-obligation {:to (:from msg) :content "[SKIP]"} token)
+                       "throw" (throw (ex-info "handler broke" {}))
+                       "release" (do (d/release-obligation! p token) nil)))))})
+          dropping (update bot :on-message
+                           (fn [inner]
+                             (fn [p msg]
+                               (sp/spin
+                                (let [reply (sp/await (inner p msg))]
+                                  (if (= "[SKIP]" (:content reply))
+                                    (d/withhold-reply! p reply :silent)
+                                    reply))))))]
+      (try
+        (binding [ec/*execution-context* (:ctx r)]
+          (d/join r dropping))
+        (doseq [content ["reply" "silent" "throw" "release"]]
+          (d/post! r (d/message :driver :bot content)))
+        (is (= [["reply" :emitted "answer"]
+                ["silent" :dropped :silent nil]
+                ["throw" :dropped :handler-failed "handler broke"]]
+               (await-settled settled 3)))
+        (Thread/sleep 50)
+        (is (= 3 (count @settled)) "a released obligation is not settled again")
+        (finally
+          (d/close-room! r))))))
+
+(deftest an-obligation-registered-after-leave-is-settled-at-once
+  (let [r (d/room :late-obligation)
+        settled (atom [])
+        bot (d/echo :bot)]
+    (try
+      (let [joined (binding [ec/*execution-context* (:ctx r)] (d/join r bot))]
+        (d/leave r :bot)
+        (d/reply-obligation! joined {:on-dropped (fn [reason _] (swap! settled conj reason))})
+        (is (= [:abandoned] @settled) "a handler still running after leave cannot leak it"))
+      (finally
+        (d/close-room! r)))))
+
 (deftest capability-and-broadcast-overlap-delivers-once
   (testing "a message matching SEVERAL of a participant's subscriptions is
             delivered ONCE — a broadcast (`:to nil`) carrying a subscribed

@@ -317,3 +317,43 @@
       (finally
         (run/finish! (:run/id live) :completed)
         (d/close-room! room)))))
+
+(defn- lost-receipt-store
+  "Stores the first terminal write but reports it refused."
+  [delegate]
+  (let [lost? (atom false)]
+    (reify store/PRoomStore
+      (-store-room! [_ room-id metadata] (store/-store-room! delegate room-id metadata))
+      (-load-room [_ id-or-slug] (store/-load-room delegate id-or-slug))
+      (-delete-room! [_ room-id] (store/-delete-room! delegate room-id))
+      (-list-rooms [_] (store/-list-rooms delegate))
+      (-store-message! [_ room-id message] (store/-store-message! delegate room-id message))
+      (-message-thread-root [_ room-id message-id]
+        (store/-message-thread-root delegate room-id message-id))
+      (-list-messages [_ room-id opts] (store/-list-messages delegate room-id opts))
+      (-store-run! [_ room-id run]
+        (let [stored (store/-store-run! delegate room-id run)]
+          (if (and (contains? store/terminal-run-statuses (:run/status run))
+                   (compare-and-set! lost? false true))
+            nil
+            stored)))
+      (-load-run [_ room-id run-id] (store/-load-run delegate room-id run-id))
+      (-list-runs [_ room-id opts] (store/-list-runs delegate room-id opts)))))
+
+(deftest a-finish-stored-but-reported-refused-is-retried-to-the-same-end
+  (let [delegate (memory/make)
+        room (d/make-room {:id :run-lost-receipt :store (lost-receipt-store delegate)})
+        r (run/start! room :worker (random-uuid) (live-ctx))]
+    (is (nil? (run/finish-durably! (:run/id r) :completed {:reason :silent}))
+        "the first write was reported refused")
+    (let [stored (store/-load-run delegate (store/conversation-id room) (:run/id r))]
+      (is (= :completed (:run/status stored)) "although it was stored")
+      (let [deadline (+ (System/currentTimeMillis) 3000)]
+        (while (and (seq (run/active-runs :run-lost-receipt))
+                    (< (System/currentTimeMillis) deadline))
+          (Thread/sleep 10)))
+      (is (empty? (run/active-runs :run-lost-receipt))
+          "the retry carries the same end, so the store accepts it")
+      (is (= (:run/ended-at stored)
+             (:run/ended-at (run/run room (:run/id r))))))
+    (d/close-room! room)))

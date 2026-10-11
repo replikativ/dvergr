@@ -73,9 +73,12 @@
   ;;               owned by this participant and cancelled with its process
   ;; active     :: atom of nil | Spin | ::participant-closed; the handler Spin
   ;;               currently awaited by the participant process
-  ;; factory    :: (fn [new-ctx] -> Participant) — for cloning into a fork
-  ;; process    :: the spindel spin driving this participant (set by `join`)
-           [id inbox-sub inbox-mbx deferred-inbox subs pumps active on-message factory process])
+  ;; obligations :: atom of {:pending {token → callbacks} :closed? bool}; reply
+  ;;               obligations of the running handler, settled exactly once
+  ;;               (see `reply-obligation!`); closed while the participant has
+  ;;               left
+           [id inbox-sub inbox-mbx deferred-inbox subs pumps active obligations on-message
+            factory process])
 
 (defrecord Room
   ;; id            : keyword — stable identity (e.g. :daemon, :boardroom)
@@ -331,7 +334,7 @@
   [{:keys [id on-message factory ctx]}]
   (let [_ctx (or ctx ec/*execution-context*)]
     (->Participant id nil nil (atom clojure.lang.PersistentQueue/EMPTY)
-                   (atom {}) (atom {}) (atom nil) on-message factory nil)))
+                   (atom {}) (atom {}) (atom nil) (atom {:pending {}}) on-message factory nil)))
 
 ;; ============================================================================
 ;; Built-in participant helpers
@@ -368,17 +371,104 @@
 ;; Participant lifecycle in a room
 ;; ============================================================================
 
-(def ^:private reply-emitted-key ::reply-emitted)
-(def ^:private reply-emit-failed-key ::reply-emit-failed)
+(def ^:private obligation-key ::reply-obligation)
 
-(defn after-reply-emission
-  "Attach process-local lifecycle callbacks to a ReplySpec. `on-emitted` runs
-   only after the reply is durably posted to the Room; `on-failed` receives a
-   posting error. The callbacks are control data and never enter the Message."
-  [reply-spec on-emitted on-failed]
-  (cond-> reply-spec
-    on-emitted (assoc reply-emitted-key on-emitted)
-    on-failed (assoc reply-emit-failed-key on-failed)))
+(defn- run-callback! [p id f & args]
+  (try (apply f args)
+       (catch Throwable t
+         (tel/log! {:level :error :id id
+                    :data {:participant (:id p) :error (.getMessage t)}}
+                   "reply obligation callback failed"))))
+
+(defn- drop-obligation! [p callbacks reason error]
+  (when-let [on-dropped (:on-dropped callbacks)]
+    (run-callback! p ::reply-dropped-callback-error on-dropped reason error)))
+
+(defn reply-obligation!
+  "Register a reply obligation for the handler `p` is running and return its
+   token. The participant settles the obligation exactly once, by calling one
+   of `callbacks`:
+
+   - `:on-emitted` `(fn [message])` after a reply carrying the token (see
+     `carry-obligation`) is durably posted to the Room;
+   - `:on-failed` `(fn [error])` when posting that reply fails;
+   - `:on-dropped` `(fn [reason error])` when no carrying reply reaches the
+     Room: `:withheld` (a wrapper dropped it), a wrapper's own reason given
+     to `withhold-reply!` (e.g. `:silent`), `:handler-failed` (the handler
+     threw; `error` is the cause) or `:abandoned` (the participant left
+     before the handler ended).
+
+   A handler that ends its work without handing a reply over takes the
+   obligation back with `release-obligation!`. This is how a handler that owns
+   a lifecycle (an LLM turn owns a Run) learns how its turn ended even when the
+   reply passes through wrappers it does not know."
+  [p callbacks]
+  (let [token (Object.)]
+    (when-let [obligations (:obligations p)]
+      (let [[before _] (swap-vals! obligations
+                                   (fn [state]
+                                     (if (:closed? state)
+                                       state
+                                       (assoc-in state [:pending token] callbacks))))]
+        ;; Registered after the participant left: nothing will settle it
+        ;; later, so it is settled now.
+        (when (:closed? before)
+          (drop-obligation! p callbacks :abandoned nil))))
+    token))
+
+(defn carry-obligation
+  "Mark `reply-spec` as the reply that settles obligation `token`. The token is
+   control data and never enters the Message."
+  [reply-spec token]
+  (assoc reply-spec obligation-key token))
+
+(defn- claim-obligation!
+  "Remove obligation `token` from `p` and return its callbacks, or nil when it
+   was settled before."
+  [p token]
+  (when-let [obligations (when token (:obligations p))]
+    (let [[before _] (swap-vals! obligations update :pending dissoc token)]
+      (get-in before [:pending token]))))
+
+(defn release-obligation!
+  "Take obligation `token` back from `p`: true when the caller now settles the
+   lifecycle itself, false when the participant settled it already (it left)."
+  [p token]
+  (boolean (claim-obligation! p token)))
+
+(defn withhold-reply!
+  "Settle the obligation `reply-spec` carries as dropped for `reason`. A wrapper
+   that decides not to emit a reply calls this, so its reason reaches the
+   lifecycle owner; a wrapper that omits it is still settled, as `:withheld`."
+  [p reply-spec reason]
+  (when-let [callbacks (claim-obligation! p (get reply-spec obligation-key))]
+    (drop-obligation! p callbacks reason nil))
+  nil)
+
+(defn- settle-obligations!
+  "Settle every obligation `p` still holds as dropped for `reason`. With
+   `close?` (the participant leaves) obligations registered later are settled
+   as `:abandoned` when they are registered."
+  ([p reason error] (settle-obligations! p reason error false))
+  ([p reason error close?]
+   (when-let [obligations (:obligations p)]
+     (let [[before _] (swap-vals! obligations
+                                  (fn [state]
+                                    (cond-> (assoc state :pending {})
+                                      close? (assoc :closed? true))))]
+       (doseq [callbacks (vals (:pending before))]
+         (drop-obligation! p callbacks reason error))))
+   nil))
+
+(defn spin-cancellation?
+  "True when `t` is (or is caused by) Spindel cancelling a Spin: a handler
+   cancelled from outside, e.g. because its participant left."
+  [t]
+  (loop [error t]
+    (when error
+      (or (= spin-core/spin-cancelled (:type (ex-data error)))
+          (contains? #{"Spin cancelled" "Spin cancelled by user"} (ex-message error))
+          (recur (ex-cause error))))))
 
 (defn- emit-reply!
   "Route a reply-spec from `p` into `room`, preserving the triggering Message's
@@ -386,8 +476,7 @@
    thread if they produce conversational output."
   [room p reply-spec parent-message]
   (when reply-spec
-    (let [on-emitted (get reply-spec reply-emitted-key)
-          on-failed  (get reply-spec reply-emit-failed-key)
+    (let [callbacks (claim-obligation! p (get reply-spec obligation-key))
           emitted
           (try
             (route-and-log!
@@ -398,23 +487,14 @@
                (message (:id p) (:to reply-spec) (:content reply-spec)
                         nil (:metadata reply-spec))))
             (catch Throwable t
-              (when on-failed
-                (try (on-failed t)
-                     (catch Throwable callback-error
-                       (tel/log! {:level :error :id ::reply-failure-callback-error
-                                  :data {:participant (:id p)
-                                         :error (.getMessage callback-error)}}
-                                 "reply failure callback failed"))))
+              (when-let [on-failed (:on-failed callbacks)]
+                (run-callback! p ::reply-failure-callback-error on-failed t))
               (throw t)))]
-      (when on-emitted
-        (try (on-emitted emitted)
-             (catch Throwable t
-               ;; The reply is already durable. Do not misreport this as an
-               ;; emission failure; the lifecycle owner retained its retryable
-               ;; active projection when its terminal write failed.
-               (tel/log! {:level :error :id ::reply-emitted-callback-error
-                          :data {:participant (:id p) :error (.getMessage t)}}
-                         "reply emitted but its lifecycle callback failed"))))
+      (when-let [on-emitted (:on-emitted callbacks)]
+        ;; The reply is already durable. A failing callback is not an emission
+        ;; failure; the lifecycle owner retained its retryable active
+        ;; projection when its terminal write failed.
+        (run-callback! p ::reply-emitted-callback-error on-emitted emitted))
       emitted)))
 
 (defn- drain-into!
@@ -521,11 +601,13 @@
                ;; teardown. CAS prevents a concurrently entering handler from
                ;; escaping the participant's lifecycle boundary.
                handler-owned? (compare-and-set! (:active p) nil handler)
+               handler-error (atom nil)
                reply-spec
                (when handler-owned?
                  (try
                    (sp/await handler)
                    (catch Throwable t
+                     (reset! handler-error t)
                      (tel/log! {:level :error :id ::on-message-error
                                 :data {:participant (:id p) :error (.getMessage t)}}
                                "participant on-message error — turn dropped, participant continues")
@@ -537,6 +619,16 @@
                   (tel/log! {:level :error :id ::emit-reply-error
                              :data {:participant (:id p) :error (.getMessage t)}}
                             "participant emit-reply error")))
+           ;; Every way this handler ended settles what it still owes: a reply
+           ;; that a wrapper dropped, or a handler that threw before handing
+           ;; its reply over.
+           (let [error @handler-error]
+             (settle-obligations! p
+                                  (cond
+                                    (nil? error) :withheld
+                                    (spin-cancellation? error) :abandoned
+                                    :else :handler-failed)
+                                  error))
            (if id
              (let [order' (conj order id)
                    seen'  (conj seen id)]
@@ -821,6 +913,7 @@
           ;; A Participant may be explicitly left and then joined again. Re-open
           ;; its active-handler slot before the new process can receive work.
             _ (reset! (:active p) nil)
+            _ (some-> (:obligations p) (swap! assoc :closed? false))
           ;; Merge all subscriptions into one mailbox so the spin awaits
           ;; a single source. Each sub gets a small pump.
             merge-mbx (sync/create-mailbox (:ctx room))
@@ -914,7 +1007,9 @@
                               (swap-vals! active (constantly ::participant-closed))]
                           (when-not (= ::participant-closed before) before)))]
       (cleanup-owned-spin! room (:process p))
-      (cleanup-owned-spin! room active-spin))
+      (cleanup-owned-spin! room active-spin)
+      ;; The cancelled handler cannot settle what it owes; the participant does.
+      (settle-obligations! p :abandoned nil true))
     ;; Closing subscriptions releases their sequence waits; engine cleanup below
     ;; removes any pump continuation that has not observed closure yet.
     (when-let [sub (:inbox-sub p)]

@@ -76,7 +76,9 @@
 (defn future-handle
   "Run `f` on a Clojure future (a separate thread). Result is bridged
    into spindel via :done. :cancel! cancels the underlying future
-   (best-effort — interrupts the thread if it's blocked in I/O).
+   (best-effort — interrupts the thread if it's blocked in I/O); :done is
+   delivered either way, by the body or, when the body never started, by
+   :cancel!.
 
    This is the current llm-agent shape: blocking LLM call kept off the
    spin executor so the participant-spin stays reactive."
@@ -84,17 +86,65 @@
   (let [done   (binding [ec/*execution-context* ctx]
                  (sync/create-deferred ctx))
         fut-a  (atom nil)
-        cancel (fn [] (when-let [f @fut-a] (future-cancel f)) nil)]
+        ;; :pending → :running (the body delivers :done) or :cancelled (cancel!
+        ;; won before the body started, so cancel! delivers it)
+        phase  (atom :pending)
+        cancel (fn []
+                 (when (compare-and-set! phase :pending :cancelled)
+                   (binding [ec/*execution-context* ctx]
+                     (sync/deliver! done {::error "cancelled before it started"})))
+                 (when-let [f @fut-a] (future-cancel f))
+                 nil)]
     (reset! fut-a
             (future
-              (binding [ec/*execution-context* ctx]
-                (try
-                  (sync/deliver! done (f))
-                  (catch Throwable t
-                    (tel/log! {:level :warn :id ::future-handle-error
-                               :data {:err (.getMessage t)}})
-                    (sync/deliver! done {::error (.getMessage t)}))))))
+              (when (compare-and-set! phase :pending :running)
+                (binding [ec/*execution-context* ctx]
+                  (try
+                    (sync/deliver! done (f))
+                    (catch Throwable t
+                      (tel/log! {:level :warn :id ::future-handle-error
+                                 :data {:err (.getMessage t)}})
+                      (sync/deliver! done {::error (.getMessage t)})))))))
     (->GenerationHandle nil nil done cancel)))
+
+(defn call-fence
+  "A fence over a turn's native calls (each `future-handle` body), so a turn
+   abandoned from outside ends its lifecycle only once its in-flight call has
+   returned: the execution acknowledges termination, and nothing waits for it.
+   See `fenced-call` and `abandon-fence!`."
+  []
+  (atom {:state :idle}))
+
+(defn fenced-call
+  "Run `(f)` as the fence's in-flight call. When the fence was abandoned before
+   the call starts, return `abandoned-value` without calling `f`; when it is
+   abandoned while the call runs, run the abandoning `on-quiet` on this thread
+   after `f` returns."
+  [fence f abandoned-value]
+  (let [[before _] (swap-vals! fence #(if (= :idle (:state %)) {:state :calling} %))]
+    (if-not (= :idle (:state before))
+      abandoned-value
+      (try
+        (f)
+        (finally
+          (let [[before _] (swap-vals! fence #(case (:state %)
+                                                :calling {:state :idle}
+                                                :abandoning {:state :abandoned}
+                                                %))]
+            (when (= :abandoning (:state before))
+              ((:on-quiet before)))))))))
+
+(defn abandon-fence!
+  "Abandon `fence`: run `on-quiet` now when no call is in flight, else once the
+   in-flight call returns (`fenced-call`). Later calls are not started.
+   Returns true when this call abandoned the fence."
+  [fence on-quiet]
+  (let [[before _] (swap-vals! fence #(case (:state %)
+                                        :idle {:state :abandoned}
+                                        :calling {:state :abandoning :on-quiet on-quiet}
+                                        %))]
+    (when (= :idle (:state before)) (on-quiet))
+    (contains? #{:idle :calling} (:state before))))
 
 (defn external-handle
   "F is fed in by external post! to `done-deferred`. Use when the

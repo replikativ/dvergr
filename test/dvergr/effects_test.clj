@@ -563,7 +563,10 @@
 (defn- denied? [r] (and (= :error (:type r)) (re-find #"read-only" (str (:error r)))))
 
 (deftest read-only-denies-every-registry-tool-that-writes
-  (require 'dvergr.scheduler.tools 'dvergr.intake.mail)
+  (require 'dvergr.intake.mail)
+  ;; :reload registers the schedule tools again: a test fixture that restores
+  ;; a registry snapshot may have dropped them after their first load (#278)
+  (require 'dvergr.scheduler.tools :reload)
   (let [ec (ctx/create-execution-context)
         root (.getAbsoluteFile (doto (io/file (System/getProperty "java.io.tmpdir") (str "tools-ro-" (random-uuid))) .mkdirs))
         touched (atom [])

@@ -74,3 +74,32 @@
       (binding [ec/*execution-context* c]
         (sync/deliver! d :externally-decided)))
     (is (= :externally-decided (await-ctx c (:done h))))))
+
+(deftest a-cancelled-future-handle-always-completes
+  (testing ":done is delivered whether cancel! wins before the body starts or interrupts it"
+    (dotimes [_ 20]
+      (let [c (ctx/create-execution-context)
+            h (gen/future-handle c (fn [] (deref (promise) 5000 :late)))]
+        ((:cancel! h))
+        (let [p (promise)]
+          (future (deliver p (await-ctx c (:done h))))
+          (is (gen/error-result? (deref p 2000 ::timeout))))))))
+
+(deftest a-call-fence-ends-an-abandoned-turn-after-its-call
+  (let [fence (gen/call-fence)
+        ended (atom 0)
+        entered (promise)
+        release (promise)
+        call (future (gen/fenced-call fence
+                                      (fn [] (deliver entered true) @release :done)
+                                      :abandoned))]
+    @entered
+    (is (gen/abandon-fence! fence #(swap! ended inc)))
+    (is (zero? @ended) "the call is still running")
+    (deliver release true)
+    (is (= :done @call))
+    (is (= 1 @ended) "ended once the call returned")
+    (is (= :abandoned (gen/fenced-call fence (fn [] :ran) :abandoned))
+        "no call starts after abandonment")
+    (is (not (gen/abandon-fence! fence #(swap! ended inc))))
+    (is (= 1 @ended))))

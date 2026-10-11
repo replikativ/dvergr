@@ -480,32 +480,52 @@
       {:id :agent
        :ctx (:ctx room)
        :on-message
-       (fn [_p msg]
+       (fn [p msg]
          (sp/spin
           (let [run-id (:run/id (run/start! room :agent msg nil))
+                ;; an abandoned turn finishes once its model call returned
+                calls (gen/call-fence)
+                ;; the participant settles the Run with the reply, or when the
+                ;; turn ends any other way (it threw, or the agent left)
+                obligation
+                (d/reply-obligation!
+                 p {:on-emitted (fn [_] (run/finish-durably! run-id :completed))
+                    :on-failed (fn [_] (run/finish-durably! run-id :failed))
+                    :on-dropped
+                    (fn [reason error]
+                      (if (= :abandoned reason)
+                        (do (run/cancel-run! run-id)
+                            (gen/abandon-fence!
+                             calls #(run/finish-durably! run-id :cancelled {:reason reason})))
+                        (run/finish-durably! run-id :failed
+                                             (cond-> {:reason reason}
+                                               error (assoc :error error)))))})
                 h (gen/future-handle
                    (:ctx room)
-                   (fn []
-                     (swap! history conj {:role :user :content (:content msg)})
-                     (generate-loop episode :agent generate
-                                    (fn [h] {:system system :messages h :tools tools})
-                                    history :assistant)))
+                   #(gen/fenced-call
+                     calls
+                     (fn []
+                       (swap! history conj {:role :user :content (:content msg)})
+                       (generate-loop episode :agent generate
+                                      (fn [h] {:system system :messages h :tools tools})
+                                      history :assistant))
+                     {::gen/error "the agent left"}))
                 _ (run/register-cancel-hook! run-id ::model-call (:cancel! h))
                 reply (sp/await (:done h))]
             (cond
               (gen/error-result? reply)
-              (do (fault! episode :agent-model (::gen/error reply))
-                  (run/finish! run-id :failed {:reason :provider-error})
+              (do (d/release-obligation! p obligation)
+                  (run/finish-durably! run-id :failed {:reason :provider-error})
+                  (fault! episode :agent-model (::gen/error reply))
                   nil)
 
               (and (string? reply) (not (str/blank? reply)))
-              (d/after-reply-emission {:to :customer :content reply}
-                                      (fn [_] (run/finish! run-id :completed))
-                                      (fn [_] (run/finish! run-id :failed)))
+              (d/carry-obligation {:to :customer :content reply} obligation)
 
               :else
-              (do (run/finish! run-id (if (ended? episode) :cancelled :failed)
-                               {:reason :no-reply})
+              (do (d/release-obligation! p obligation)
+                  (run/finish-durably! run-id (if (ended? episode) :cancelled :failed)
+                                       {:reason :no-reply})
                   (when-not (ended? episode) (end! episode :agent-error))
                   nil)))))})
      :after-greeting (fn [])

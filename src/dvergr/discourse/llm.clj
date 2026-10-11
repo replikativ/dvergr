@@ -442,6 +442,43 @@
                                           (assoc :room room)))
                          run-ref           (when room (run/start! room id msg chat-ctx))
                          run-id            (:run/id run-ref)
+                         ;; This handler's Spin was cancelled (the participant
+                         ;; left): the in-flight call stops at its next poll.
+                         abandoned?        (atom false)
+                         ;; The turn's native calls. An abandoned turn finishes
+                         ;; its Run once its in-flight call has returned, so
+                         ;; Room teardown never closes a context a call still
+                         ;; uses.
+                         calls             (gen/call-fence)
+                         abandon!
+                         (fn []
+                           (reset! abandoned? true)
+                           (run/cancel-run! run-id)
+                           (gen/abandon-fence!
+                            calls
+                            #(run/finish-durably! run-id :cancelled
+                                                  {:reason :participant-left})))
+                         ;; The Run ends with the turn, however the turn ends.
+                         ;; The turn finishes it itself, or hands that to the
+                         ;; participant along with its reply: posted, failed to
+                         ;; post, dropped by a wrapper ([SKIP]), or abandoned
+                         ;; because the participant left mid-turn.
+                         obligation
+                         (when run-id
+                           (d/reply-obligation!
+                            p
+                            {:on-emitted (fn [_emitted] (run/finish-durably! run-id :completed))
+                             :on-failed (fn [error]
+                                          (run/finish-durably! run-id :failed
+                                                               {:reason :reply-emission-failed
+                                                                :error error}))
+                             :on-dropped
+                             (fn [reason error]
+                               (case reason
+                                 :abandoned (abandon!)
+                                 :handler-failed
+                                 (run/finish-durably! run-id :failed {:reason :error :error error})
+                                 (run/finish-durably! run-id :completed {:reason reason})))}))
                          ;; Convenience delegation tools still target the same
                          ;; Run interpreter. Give them the current structural
                          ;; parent and world instead of making them rediscover
@@ -458,7 +495,8 @@
                                 ;; SSE-abort predicate (Esc-cancel flips status).
                                     :cancel?          (turn/cancel?-fn
                                                        chat-ctx turn-ctx
-                                                       #(run/cancel-requested? run-id))
+                                                       #(or @abandoned?
+                                                            (run/cancel-requested? run-id)))
                                 ;; TRANSIENT per-turn system note(s) — applied to
                                 ;; THIS call only, never persisted (run-agent-turn!
                                 ;; appends to the first system message): always the
@@ -605,15 +643,19 @@
                                                        [:provider :model]))
                                    h (gen/future-handle
                                       turn-ctx
-                                      #(run-turn-fn chat-ctx
-                                                    (assoc turn-opts
-                                                           :provider (:provider admitted-spec)
-                                                           :model (:model admitted-spec)
-                                                           :tool-ctx admitted-tool-ctx
-                                                           :turn-number turn
-                                                           :spec admitted-spec
-                                                           :tools tools
-                                                           :run-id run-id)))
+                                      #(gen/fenced-call
+                                        calls
+                                        (fn []
+                                          (run-turn-fn chat-ctx
+                                                       (assoc turn-opts
+                                                              :provider (:provider admitted-spec)
+                                                              :model (:model admitted-spec)
+                                                              :tool-ctx admitted-tool-ctx
+                                                              :turn-number turn
+                                                              :spec admitted-spec
+                                                              :tools tools
+                                                              :run-id run-id)))
+                                        :cancelled))
                                    call-id (random-uuid)
                                    mbx     (:inbox-mbx p)
                                  ;; Bridge the call's completion into the SAME
@@ -948,22 +990,22 @@
                                  (do
                                    ;; The outer participant owns Room emission.
                                    ;; Completion is acknowledged only after its
-                                   ;; durability-first post succeeds.
+                                   ;; durability-first post succeeds, or when
+                                   ;; the reply is dropped on its way there.
                                    (reset! finish-after-reply? true)
-                                   (d/after-reply-emission
-                                    reply-spec
-                                    (fn [_emitted]
-                                      (run/finish! run-id :completed))
-                                    (fn [error]
-                                      (run/finish! run-id :failed
-                                                   {:reason :reply-emission-failed
-                                                    :error error})))))))))
+                                   (d/carry-obligation reply-spec obligation)))))))
                        (catch Throwable t
-                         (reset! errored t)
+                         (if (d/spin-cancellation? t)
+                           (reset! abandoned? true)
+                           (reset! errored t))
                          (throw t))
                        (finally
-                         (when (and run-id (not @finish-after-reply?))
+                         (when (and run-id (not @finish-after-reply?)
+                                    ;; false: the participant left mid-turn and
+                                    ;; abandoned the Run already
+                                    (d/release-obligation! p obligation))
                            (let [cancelled-run? (or @cancelled?
+                                                    @abandoned?
                                                     @policy-cancelled?
                                                     (run/cancel-requested? run-id)
                                                     (= :cancelled (cc/get-status chat-ctx)))
@@ -972,11 +1014,13 @@
                                           @errored :failed
                                           @wait-reason :waiting
                                           :else :completed)]
-                             (run/finish! run-id status
-                                          (cond-> {}
-                                            cancelled-run? (assoc :reason :cancel-requested)
-                                            @wait-reason (assoc :reason @wait-reason)
-                                            @errored (assoc :reason :error :error @errored))))))))))))
+                             (if @abandoned?
+                               (abandon!)
+                               (run/finish-durably! run-id status
+                                                    (cond-> {}
+                                                      cancelled-run? (assoc :reason :cancel-requested)
+                                                      @wait-reason (assoc :reason @wait-reason)
+                                                      @errored (assoc :reason :error :error @errored)))))))))))))
 
             :factory
             (fn [new-ctx]
