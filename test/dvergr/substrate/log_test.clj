@@ -14,4 +14,8 @@
     (is (= :warn (:level signal)))
     (is (= "disk /x is slow" (force (:msg_ signal))))
     (is (= {:logger "org.apache.lucene"} (:data signal)))
-    (is (nil? (tel/with-signal (.publish h (LogRecord. Level/FINE "noise")))) "below INFO is dropped")))
+    (is (nil? (tel/with-signal (.publish h (LogRecord. Level/FINE "noise")))) "below INFO is dropped")
+    (let [e (ex-info "index corrupt" {})
+          signal (tel/with-signal (.publish h (doto (LogRecord. Level/SEVERE "merge failed") (.setThrown e))))]
+      (is (= :error (:level signal)))
+      (is (identical? e (:error signal)) "the exception comes along"))))

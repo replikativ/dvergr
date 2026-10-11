@@ -106,7 +106,8 @@ clojure -M -m dvergr.catalog.room-run path/to/competitors --models claude-haiku-
 ```
 
 `room-run` is a client of the room path, the one an MCP client takes. It opens the dvergr
-home `--home` (default `workflow-runs/<bundle name>`) with a headless daemon, creates the room
+home `--home` (default `$DVERGR_HOME/workflow-runs/<bundle name>` when `DVERGR_HOME` is set,
+else `workflow-runs/<bundle name>` in the working directory) with a headless daemon, creates the room
 `<bundle name>` there once, writes the bundle into its workspace as `workflows/<bundle name>/`
 with `room_write` (and removes what the bundle no longer has), and runs `catalog_benchmark`
 into that room as the experiment `<bundle name>`; `--check` runs `catalog_calibrate` instead.

@@ -33,7 +33,8 @@
                 (let [v (.intValue (.getLevel r))
                       level (cond (>= v 1000) :error (>= v 900) :warn :else :info)]
                   (tel/log! {:level level :id :jul/record
-                             :data {:logger (.getLoggerName r)}}
+                             :data {:logger (.getLoggerName r)}
+                             :error (.getThrown r)}
                             (.formatMessage fmt r)))))
             (flush [])
             (close []))
