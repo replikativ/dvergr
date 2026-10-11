@@ -260,8 +260,8 @@
 
 (defn- daemon-home
   "The state root the daemon on `conn` reports (server/discover's `_meta`),
-   :unknown when it reports none (an older daemon), nil when it does not
-   answer within 15 s."
+   :unknown when it answers without one (an older dvergr, or not dvergr),
+   nil when it does not answer within 15 s."
   [conn ^Socket s ^BufferedReader reader]
   (let [id (str "dvergr-shim-home-" (random-uuid))]
     (send! conn {:jsonrpc "2.0" :id id :method "server/discover"
@@ -284,8 +284,13 @@
   [conn s reader]
   (let [home (daemon-home conn s reader)]
     (cond
-      (= :unknown home) (do (log "the daemon on port" port "does not report its home; not checked") nil)
-      (nil? home) (str "the daemon on " host ":" port " did not answer server/discover")
+      (= :unknown home)
+      (str "the server on " host ":" port " does not report its home (an older dvergr daemon, or not "
+           "dvergr), so it may keep its state elsewhere than this relay's home " state-root
+           " (DVERGR_HOME). Refusing to attach to it: restart that daemon from this checkout, or "
+           "give this relay another --port (DVERGR_MCP_PORT).")
+      (nil? home) (str "the server on " host ":" port " did not answer server/discover; refusing to attach "
+                       "to it: give this relay another --port (DVERGR_MCP_PORT)")
       (not= (canonical home) (canonical state-root))
       (str "the dvergr daemon on " host ":" port " keeps its state in " home
            ", not in this relay's home " state-root " (DVERGR_HOME). Refusing to attach to it: "

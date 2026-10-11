@@ -164,3 +164,46 @@
           (is (re-find #"--port" text) "it says what to do"))
         (is (not (.exists (java.io.File. other "mcp"))) "and wrote no tool cache from that daemon")
         (finally (.destroy p))))))
+
+(deftest the-relay-refuses-a-server-that-does-not-say-its-home
+  ;; an older daemon (or another program) on the port: not known to be the
+  ;; relay's home, so not attached to
+  (if-not (some #(.canExecute (java.io.File. (str % "/bb")))
+                (clojure.string/split (System/getenv "PATH") #":"))
+    (support/skip! "the-relay-refuses-a-server-that-does-not-say-its-home: no bb on PATH")
+    (with-open [server (java.net.ServerSocket. 0 50 (java.net.InetAddress/getLoopbackAddress))]
+      (future
+        (try
+          (loop []
+            (let [s (.accept server)]
+              (future
+                (try
+                  (let [in (BufferedReader. (InputStreamReader. (.getInputStream s)))
+                        out (BufferedWriter. (OutputStreamWriter. (.getOutputStream s)))]
+                    (loop []
+                      (when-some [line (.readLine in)]
+                        (let [{:keys [id]} (j/read-value line j/keyword-keys-object-mapper)]
+                          (when id
+                            (.write out (j/write-value-as-string {:jsonrpc "2.0" :id id :result {:supportedVersions ["2025-06-18"]}}))
+                            (.write out "\n")
+                            (.flush out)))
+                        (recur))))
+                  (catch Exception _ nil)))
+              (recur)))
+          (catch Exception _ nil)))
+      (let [p (.start (doto (ProcessBuilder. ["bb" "bin/dvergr-mcp" "--no-start" "--port" (str (.getLocalPort server))])
+                        (-> .environment (.put "DVERGR_HOME" (paths/home)))))
+            out (BufferedWriter. (OutputStreamWriter. (.getOutputStream p)))
+            in (BufferedReader. (InputStreamReader. (.getInputStream p)))
+            send! (fn [m] (.write out (j/write-value-as-string m)) (.write out "\n") (.flush out))
+            read! (fn [] (j/read-value (.readLine in) j/keyword-keys-object-mapper))
+            await (fn [pred] (loop [n 0] (let [m (read!)] (if (or (pred m) (> n 50)) m (recur (inc n))))))]
+        (try
+          (send! {:jsonrpc "2.0" :id 1 :method "initialize"
+                  :params {:protocolVersion "2025-06-18" :capabilities {} :clientInfo {:name "t" :version "0"}}})
+          (await #(= 1 (:id %)))
+          (send! {:jsonrpc "2.0" :method "notifications/initialized"})
+          (send! {:jsonrpc "2.0" :id 2 :method "tools/call" :params {:name "room_list" :arguments {}}})
+          (let [r (await #(= 2 (:id %)))]
+            (is (re-find #"does not report its home" (str (get-in r [:result :content 0 :text]))) (pr-str r)))
+          (finally (.destroy p)))))))
