@@ -167,14 +167,16 @@
 
    Use this for project-specific personas without baking them into this
    ns. `opts` is the `llm-agent` option map plus `:tools` and
-   `:isolation` for the context block.
+   `:isolation` for the context block. Without `:tools` the persona gets the
+   minimal read-only set (`tools/minimal-readonly-tools`: read_file, shell,
+   clojure_eval); name the tools it needs to grant more.
 
      (personas/from-prompt \"domain-expert.md\"
-                           {:id :expert :tools #{:read-file :code-query}})"
+                           {:id :expert :tools #{:read-file :write-file :shell}})"
   [prompt-filename opts]
   (build-persona {:id                (or (:id opts) :custom)
                   :prompt-file       prompt-filename
-                  :default-tools     (or (:tools opts) :all)
+                  :default-tools     (or (:tools opts) tools/minimal-readonly-tools)
                   :default-isolation (or (:isolation opts) :native)
                   :default-model     "claude-sonnet-4-5"
                   :default-provider  :anthropic}

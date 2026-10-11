@@ -42,6 +42,10 @@
   (when-not (str/blank? s)
     (try (Double/parseDouble (str/trim s)) (catch Exception _ nil))))
 
+(def max-budget-dollars
+  "The largest budget a wallet can hold: budgets are kept as long microdollars."
+  1.0e12)
+
 (defn- non-blank [s] (let [s (some-> s str/trim)] (when (seq s) s)))
 
 ;; ---------------------------------------------------------------------------
@@ -87,7 +91,8 @@
     :options model-options}
    {:k :tags :label "Tags / skills (space or comma separated)" :type :text :json "string" :row 2
     :parse parse-tags
-    :format #(str/join " " (map name (:tags %)))}
+    ;; a tag's full name: :team/reviewer as "team/reviewer", which parses back
+    :format #(str/join " " (map (fn [t] (subs (str t) 1)) (sort (:tags %))))}
    {:k :budget-dollars :param "budget" :label "Budget ($ / task)" :type :number :json "number" :row 2
     :parse parse-double*
     :format #(or (some-> (:budget-dollars %) str) "")}
@@ -106,33 +111,112 @@
 ;; Derivations
 ;; ---------------------------------------------------------------------------
 
-(defn parse-params
-  "Build an update-agent! patch from a string-keyed param map (web form / wire).
-   A field contributes iff its param is present AND its :parse yields non-nil —
-   so a blank box never clobbers, while an explicit empty (tags -> #{}) applies."
-  [params]
-  (reduce (fn [m f]
-            (let [p (param-name f)]
-              (if (contains? params p)
-                (let [v ((:parse f) (get params p))]
-                  (cond-> m (some? v) (assoc (:k f) v)))
-                m)))
-          {} fields))
-
 (defn- field-entry
   "Malli :map entry for field `f` — keyed by the patch key, optional, typed from
    :json, carrying the label as its description."
   [f]
   [(:k f) {:optional true}
-   [(if (= "number" (:json f)) :double :string) {:description (:label f)}]])
+   [(if (= "number" (:json f)) 'number? :string) {:description (:label f)}]])
+
+(def ^:private tools-entry
+  "The agent's own tools on the wire: tool names; without them its tags choose."
+  [:tools {:optional true}
+   [:sequential {:description "Tool names (e.g. read_file, shell, clojure_eval); [] for none. Omitted: the agent's tags choose."}
+    :string]])
 
 (defn update-schema
   "Malli schema for the :agent/update patch object — every editable field, all
-   optional (a partial patch)."
+   optional (a partial patch), and the agent's tools."
   []
-  (into [:map] (map field-entry) fields))
+  (conj (into [:map] (map field-entry) fields) tools-entry))
 
 (defn create-schema
-  "Malli schema for :agent/create — id (required) plus the editable fields."
+  "Malli schema for :agent/create — id (required) plus the editable fields and
+   the agent's tools."
   []
-  (into [:map [:id [:string {:description "agent id"}]]] (map field-entry) fields))
+  (conj (into [:map [:id [:string {:description "agent id"}]]] (map field-entry) fields) tools-entry))
+
+;; ---------------------------------------------------------------------------
+;; Normalization: one shape for every surface
+;; ---------------------------------------------------------------------------
+
+(defn- invalid! [k v why]
+  (throw (ex-info (str "Invalid " (name k) " " (pr-str v) ": " why)
+                  {:type ::invalid-field :field k :value v :dvergr.ops/status 400})))
+
+(defn- ->tag [k x]
+  (cond
+    (keyword? x) x
+    (and (string? x) (not (str/blank? (str/replace (str/trim x) #"^:" ""))))
+    (keyword (str/replace (str/trim x) #"^:" ""))
+    :else (invalid! k x "a tag is a non-blank name")))
+
+(defn- ->tools
+  "An agent's :tools: a `dvergr.tools` profile keyword, or a collection of
+   tool names (keywords or strings) as a set of keywords."
+  [v]
+  (cond
+    (keyword? v) (if (contains? @(requiring-resolve 'dvergr.tools/tool-profiles) v)
+                   v
+                   (invalid! :tools v (str "no such tool profile; known: "
+                                           (str/join ", " (sort (keys @(requiring-resolve 'dvergr.tools/tool-profiles)))))))
+    (or (set? v) (sequential? v))
+    (into #{} (map #(cond (keyword? %) %
+                          (and (string? %) (not (str/blank? %))) (keyword (str/trim %))
+                          :else (invalid! :tools % "a tool is a name")))
+          v)
+    :else (invalid! :tools v "tools are a profile name or a collection of tool names")))
+
+(defn- normalize-value
+  "Field `k`'s value `v` in the typed shape the agent ops store, or nil to omit
+   it. A string is parsed as the field's wire text (`:parse`); a typed value
+   (keyword provider, set of keyword tags, number budget) is kept. Anything
+   else is refused."
+  [k v]
+  (let [{:keys [parse json]} (by-k k)
+        budget (fn [x]
+                 (if (and (Double/isFinite x) (<= 0.0 x max-budget-dollars))
+                   x
+                   (invalid! k v (str "a budget is between 0 and " max-budget-dollars " dollars"))))]
+    (cond
+      (nil? v) nil
+      (string? v) (let [parsed (parse v)]
+                    (cond
+                      (and (nil? parsed) (= "number" json) (not (str/blank? v))) (invalid! k v "not a number")
+                      (and (some? parsed) (= "number" json)) (budget parsed)
+                      :else parsed))
+      (= :tags k) (if (or (set? v) (sequential? v))
+                    (into #{} (map #(->tag k %)) v)
+                    (invalid! k v "tags are a string or a collection of names"))
+      (= :provider k) (if (keyword? v) v (invalid! k v "a provider is a name"))
+      (= "number" json) (if (number? v) (budget (double v)) (invalid! k v "not a number"))
+      :else (invalid! k v "expected a string"))))
+
+(defn normalize
+  "The agent field map `m` (an :agent/create body or an :agent/update patch) in
+   the typed shape `dvergr.agent.ops` stores, whichever surface it came from:
+   MCP, the JSON API and the REPL send wire text (`:tags \"a b\"`,
+   `:provider \"openai\"`), the web form and host callers typed values
+   (`#{:a :b}`, `:openai`). A field whose value parses to nothing is omitted,
+   so a blank box never clobbers; a blank tag box clears the tags. Keys that
+   are not fields pass through, except :tools (the agent's tool names, a set
+   of keywords, or a profile keyword). A value of the wrong type throws
+   (status 400) before anything is written."
+  [m]
+  (reduce-kv (fn [acc k v]
+               (cond
+                 (contains? by-k k) (let [v' (normalize-value k v)]
+                                      (if (some? v') (assoc acc k v') acc))
+                 (= :tools k) (if (some? v) (assoc acc k (->tools v)) acc)
+                 :else (assoc acc k v)))
+             {} (or m {})))
+
+(defn form-fields
+  "The field values of a string-keyed param map (a web form), keyed by field
+   `:k` and still as text: what `normalize` parses and validates, so a form
+   is held to the same rules as every other surface."
+  [params]
+  (into {} (for [f fields
+                 :let [p (param-name f)]
+                 :when (contains? params p)]
+             [(:k f) (get params p)])))

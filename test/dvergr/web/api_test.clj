@@ -6,7 +6,9 @@
   (:require [clojure.test :refer [deftest is testing]]
             [jsonista.core :as json]
             [muuntaja.core :as muu]
+            [dvergr.agent.ops :as aops]
             [dvergr.ops :as ops]
+            [dvergr.orchestration.daemon :as daemon]
             [dvergr.web.api :as api]))
 
 (defn- GET  [uri] (api/handler {:request-method :get  :uri uri :headers {}}))
@@ -47,3 +49,36 @@
           s (slurp (muu/encode @#'api/m "application/json" sample))]
       (is (string? s))
       (is (re-find #"boardroom" s)))))
+
+(defn- POST [uri body]
+  (api/handler {:request-method :post :uri uri
+                :headers {"content-type" "application/json"}
+                :body (java.io.ByteArrayInputStream. (.getBytes (json/write-value-as-string body) "UTF-8"))
+                :dvergr/daemon {:execution-ctx nil}}))
+
+(deftest a-failed-op-is-an-http-error
+  (testing "an op's client error is a 4xx with the message, never a 200"
+    (let [resp (POST "/api/v1/agent_create" {:id "   "})]
+      (is (= 400 (:status resp)))
+      (is (re-find #"id" (str (:error (body-json resp)))))))
+  (testing "an op error without a status is a 500"
+    (with-redefs [ops/invoke (fn [& _] (throw (ex-info "boom" {})))]
+      (is (= 500 (:status (POST "/api/v1/agent_create" {:id "x"})))))))
+
+(deftest agent-and-invite-failures-carry-their-status
+  (with-redefs [aops/get-agent (fn [id] (when (= :taken id) {:id id}))
+                aops/update-agent! (fn [& _] nil)
+                ops/resolve-room (fn [& _] nil)]
+    (is (= 409 (:status (POST "/api/v1/agent_create" {:id "taken"}))))
+    (is (= 404 (:status (POST "/api/v1/agent_update" {:id "x" :patch {:budget-dollars 1.0 :tags ""}})))
+        "unknown agent after a valid patch")
+    (is (= 404 (:status (POST "/api/v1/room_invite" {:room "nowhere" :agent "x"}))))))
+
+(deftest create-takes-the-agents-tools-over-the-wire
+  (let [seen (atom nil)]
+    (with-redefs [aops/get-agent (fn [_] nil)
+                  daemon/provision-agent! (fn [_ fields] (reset! seen fields) {:id (:id fields)})]
+      (is (= 200 (:status (POST "/api/v1/agent_create" {:id "t" :tools []}))))
+      (is (= #{} (:tools @seen)) "an empty list is no tools")
+      (is (= 200 (:status (POST "/api/v1/agent_create" {:id "t" :tools ["read_file"]}))))
+      (is (= #{:read_file} (:tools @seen))))))

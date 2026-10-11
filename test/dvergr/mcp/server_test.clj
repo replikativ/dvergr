@@ -14,6 +14,9 @@
             [dvergr.ops :as ops]
             [dvergr.room.registry :as rreg]
             [dvergr.room.store.memory :as memory]
+            [dvergr.tools :as tools]
+            [dvergr.agent.ops]
+            [dvergr.orchestration.daemon]
             [jsonista.core]
             [org.replikativ.spindel.engine.core :as ec]))
 
@@ -311,3 +314,68 @@
                                                       :params {:uri "dvergr://nope/nothing"}})]
         (is (= -32002 (get-in r [:error :code])))
         (is (nil? (:result r)))))))
+
+(deftest a-failed-op-is-an-error-result
+  (with-redefs [server/current-daemon (fn [] {:execution-ctx nil})]
+    (let [resp (json-rpc/handle-message (session {:dvergr/profile "admin"})
+                                        {:jsonrpc "2.0" :id 3 :method "tools/call"
+                                         :params {:name "agent_create"
+                                                  :arguments {:id "   "}}})]
+      (is (true? (get-in resp [:result :isError])) (pr-str resp))
+      (is (re-find #"id" (-> resp :result :content first :text))))))
+
+(deftest create-takes-the-agents-tools
+  (testing "the advertised schema has :tools, and an empty list reaches provisioning"
+    (let [schema (:inputSchema (some #(when (= "agent_create" (:name %)) %) @server/tool-definitions))]
+      (is (= "array" (get-in schema [:properties :tools :type]))))
+    (let [seen (atom nil)]
+      (with-redefs [server/current-daemon (fn [] {:execution-ctx nil})
+                    dvergr.agent.ops/get-agent (fn [_] nil)
+                    dvergr.orchestration.daemon/provision-agent! (fn [_ fields] (reset! seen fields) {:id (:id fields)})]
+        (let [resp (json-rpc/handle-message (session {:dvergr/profile "admin"})
+                                            {:jsonrpc "2.0" :id 3 :method "tools/call"
+                                             :params {:name "agent_create"
+                                                      :arguments {:id "t" :tools []}}})]
+          (is (false? (get-in resp [:result :isError])) (pr-str resp))
+          (is (= #{} (:tools @seen))))))))
+
+(deftest a-failed-invite-is-an-error-result
+  (with-redefs [server/current-daemon (fn [] {:execution-ctx nil})
+                ops/resolve-room (fn [& _] nil)]
+    (let [resp (json-rpc/handle-message (session {:dvergr/profile "admin"})
+                                        {:jsonrpc "2.0" :id 3 :method "tools/call"
+                                         :params {:name "room_invite"
+                                                  :arguments {:room "nowhere" :agent "x"}}})]
+      (is (true? (get-in resp [:result :isError])) (pr-str resp))
+      (is (re-find #"No room nowhere" (-> resp :result :content first :text))))))
+
+(deftest a-tool-registered-after-load-is-served
+  ;; mail_* and schedule_* register when the daemon starts, after this
+  ;; namespace loaded: the coding-tool list follows the registry.
+  (let [tname "late_probe_tool"
+        names #(set (map :name @server/tool-definitions))]
+    (try
+      (tools/register! {:name tname :description "probe"
+                        :parameters {:type "object" :properties {}}
+                        :execute (fn [_ _] {:type :success :content "ok"})})
+      (is (contains? (names) tname))
+      (is (fn? (get @server/tool-handlers tname)))
+      (is (= :code (:dvergr/toolset (some #(when (= tname (:name %)) %) @server/tool-definitions))))
+      (testing "an explicitly registered MCP tool of the same name replaces it, once"
+        (server/register-tool! {:name tname :description "explicit" :inputSchema {:type "object"}}
+                               (fn [_ _] {:content [] :isError false}))
+        (is (= 1 (count (filter #(= tname (:name %)) @server/tool-definitions))))
+        (is (= "explicit" (:description (some #(when (= tname (:name %)) %) @server/tool-definitions))))
+        (tools/register! {:name tname :description "probe again"
+                          :parameters {:type "object" :properties {}}
+                          :execute (fn [_ _] {:type :success :content "ok"})})
+        (is (= "explicit" (:description (some #(when (= tname (:name %)) %) @server/tool-definitions)))
+            "a registry change does not displace the explicit tool")
+        (server/unregister-tool! tname))
+      (testing "a tool removed from the registry leaves the list"
+        (swap! tools/registry dissoc tname)
+        (is (not (contains? (names) tname)))
+        (is (nil? (get @server/tool-handlers tname))))
+      (finally
+        (swap! tools/registry dissoc tname)
+        (server/unregister-tool! tname)))))

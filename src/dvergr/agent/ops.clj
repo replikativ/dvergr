@@ -15,8 +15,7 @@
 
    ctx-bound: every fn resolves the chat-db conn from the bound
    `*execution-context*` and returns nil when there is none."
-  (:require [clojure.set :as set]
-            [clojure.string :as str]
+  (:require [clojure.string :as str]
             [datahike.api :as dh]
             [dvergr.actors :as actors]
             [dvergr.agent.persona :as persona]
@@ -85,9 +84,9 @@
    keyword or string. Returns the new agent view (`get-agent`), or nil if the
    id already exists / there's no ctx.
 
-   Accepts the UI-level field map: :id :name :model :provider :tags
+   Accepts the UI-level field map: :id :name :model :provider :tags :tools
    :description :budget-dollars :rooms :prompt."
-  [{:keys [id name model provider tags description budget-dollars rooms prompt]}]
+  [{:keys [id name model provider tags tools description budget-dollars rooms prompt]}]
   (when-let [conn (chat-conn)]
     (let [id (->id id)]
       (when (and id (not (actors/lookup conn id)))
@@ -96,7 +95,8 @@
                        model                   (assoc :model model)
                        (not (str/blank? description)) (assoc :description description)
                        budget-dollars          (assoc :budget-dollars budget-dollars)
-                       (seq rooms)             (assoc :rooms rooms))]
+                       (seq rooms)             (assoc :rooms rooms)
+                       (some? tools)           (assoc :tools tools))]
           (actors/spawn-agent! conn
                                (cond-> {:id          id
                                         :name        (or (not-empty name) (clojure.core/name id))
@@ -125,17 +125,12 @@
                             (contains? patch :prompt) (assoc :system-prompt (or (:prompt patch) ""))
                             (seq cfg-updates)         (assoc :config (merge (:config existing)
                                                                             cfg-updates)))]
-          (when (seq actor-patch)
-            (actors/update-actor! conn id actor-patch))
-          ;; Skills are cardinality/many — a plain set-assert only adds, never
-          ;; retracts. Diff explicitly so a tag edit truly replaces the set.
-          (when (contains? patch :tags)
-            (let [new-tags (set (:tags patch))
-                  old-tags (set (:skills existing))]
-              (doseq [s (set/difference old-tags new-tags)]
-                (actors/remove-skill! conn id s))
-              (doseq [s (set/difference new-tags old-tags)]
-                (actors/add-skill! conn id s))))
+          ;; One transaction: tags replace the stored skills (update-actor!
+          ;; retracts the ones left out) together with the other fields.
+          (let [actor-patch (cond-> actor-patch
+                              (contains? patch :tags) (assoc :skills (set (:tags patch))))]
+            (when (seq actor-patch)
+              (actors/update-actor! conn id actor-patch)))
           (tel/log! {:id :agent-ops/updated :data {:id id :fields (keys patch)}}
                     "Agent updated")
           (get-agent id))))))

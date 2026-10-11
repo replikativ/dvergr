@@ -7,7 +7,10 @@
             [clojure.java.io :as io]
             [datahike.api :as dh]
             [dvergr.actors :as actors]
+            [dvergr.agent.fields :as fields]
             [dvergr.agent.ops :as ops]
+            [dvergr.ops :as spec]
+            [dvergr.orchestration.daemon :as daemon]
             [dvergr.agent.persona :as persona]
             [dvergr.chat.schema :as schema]
             [dvergr.substrate.paths :as paths]
@@ -140,3 +143,91 @@
     (is (nil? (actors/lookup (sdb/get-conn) :tmp)) "actor row gone")
     (is (= :none (persona/source :tmp)) "no stored prompt, no builtin resource")
     (is (nil? (ops/delete-agent! :tmp)) "second delete is a no-op")))
+
+;; ============================================================================
+;; Wire values: what MCP, the JSON API and the REPL send (strings)
+;; ============================================================================
+
+(defn- status-of [f]
+  (try (f) nil (catch clojure.lang.ExceptionInfo e (spec/error-status e))))
+
+(deftest normalize-coerces-wire-values-and-keeps-typed-ones
+  (is (= {:tags #{:a :b} :provider :openai :budget-dollars 1.5 :name "N"}
+         (fields/normalize {:tags "a, :b" :provider "openai" :budget-dollars "1.5" :name " N "})))
+  (is (= {:tags #{:a} :provider :fireworks :budget-dollars 2.0}
+         (fields/normalize {:tags #{:a} :provider :fireworks :budget-dollars 2})))
+  (is (= {:tags #{:a :b}} (fields/normalize {:tags ["a" :b]})))
+  (is (= {:tags #{}} (fields/normalize {:tags ""})) "a blank tag box clears")
+  (is (= {:tags #{:team/reviewer :x}} (fields/normalize {:tags "team/reviewer x"}))
+      (fields/normalize {:tags #{:team/reviewer "x"}}))
+  (is (= {:tags #{:team/reviewer}} (fields/normalize {:tags [:team/reviewer]}))
+      "a namespaced keyword tag is kept as it is")
+  (is (= {:tools #{:read-file :shell}} (fields/normalize {:tools ["read-file" :shell]})))
+  (is (= {:tools #{}} (fields/normalize {:tools []})) "an empty tool list is no tools")
+  (is (= {:tools :readonly} (fields/normalize {:tools :readonly})))
+  (is (= {:rooms ["x"]} (fields/normalize {:rooms ["x"] :name "  "}))
+      "a blank field is omitted; non-field keys pass through")
+  (doseq [bad [{:tags 42} {:provider 7} {:budget-dollars "lots"} {:model :m} {:tags [1]}
+               {:tools 3} {:tools [1]} {:tools :typo}
+               {:budget-dollars "Infinity"} {:budget-dollars "1e309"} {:budget-dollars ##Inf}
+               {:budget-dollars ##NaN} {:budget-dollars -1} {:budget-dollars "1e13"}]]
+    (is (= 400 (status-of #(fields/normalize bad))) (pr-str bad))))
+
+(def ^:private dmn {:execution-ctx nil})
+
+(deftest update-op-stores-wire-tags-and-provider-typed
+  (ops/create-agent! {:id :w :model "m1" :tags #{:old}})
+  (spec/invoke dmn :agent/update {:id "w" :patch {:tags "a b" :provider "openai"}})
+  (let [a (ops/get-agent :w)]
+    (is (= #{:a :b} (:tags a)) "tags are keywords, the old one replaced")
+    (is (= :openai (:provider a)) "provider is a keyword")))
+
+(deftest update-op-rejects-an-invalid-patch-before-writing
+  (ops/create-agent! {:id :w :model "m1" :tags #{:old}})
+  (is (= 400 (status-of #(spec/invoke dmn :agent/update {:id "w" :patch {:model "m2" :tags 42}}))))
+  (let [a (ops/get-agent :w)]
+    (is (= "m1" (:model a)) "nothing of the patch was applied")
+    (is (= #{:old} (:tags a)))))
+
+(deftest update-op-refuses-unknown-tool-profiles-and-unbounded-budgets
+  (ops/create-agent! {:id :w :model "m1" :budget-dollars 0.5})
+  (is (= 400 (status-of #(spec/invoke dmn :agent/update {:id "w" :patch {:tools :typo}}))))
+  (is (= 400 (status-of #(spec/invoke dmn :agent/update {:id "w" :patch {:budget-dollars "Infinity"}}))))
+  (let [a (ops/get-agent :w)]
+    (is (nil? (:tools a)))
+    (is (= 0.5 (:budget-dollars a))))
+  (spec/invoke dmn :agent/update {:id "w" :patch {:tools ["read_file"]}})
+  (is (= #{:read_file} (:tools (ops/get-agent :w))) "tool names are stored"))
+
+(deftest update-op-of-an-unknown-agent-is-an-error
+  (is (= 404 (status-of #(spec/invoke dmn :agent/update {:id "ghost" :patch {:model "x"}})))))
+
+(deftest create-op-stores-wire-values-typed-and-refuses-bad-ids
+  (with-redefs [daemon/provision-agent! (fn [_ fields] (ops/create-agent! fields))]
+    (is (= {:created "probe"}
+           (spec/invoke dmn :agent/create {:id " probe " :tags "a b" :provider "openai"})))
+    (let [a (ops/get-agent :probe)]
+      (is (= #{:a :b} (:tags a)))
+      (is (= :openai (:provider a))))
+    (is (= 400 (status-of #(spec/invoke dmn :agent/create {:id "   "}))) "a blank id")
+    (is (= 409 (status-of #(spec/invoke dmn :agent/create {:id "probe"}))) "a taken id")
+    (is (= 400 (status-of #(spec/invoke dmn :agent/create {:id "p2" :tags 42}))))
+    (is (nil? (ops/get-agent :p2)) "an invalid create writes nothing")))
+
+(deftest invite-op-of-an-unknown-agent-or-room-is-an-error
+  (with-redefs [spec/resolve-room (fn [_ room] (when (= "r" room) {:id :r}))
+                daemon/agent-join-config (fn [_ _] nil)]
+    (is (= 404 (status-of #(spec/invoke dmn :room/invite {:room "r" :agent "nobody"}))))
+    (is (= 404 (status-of #(spec/invoke dmn :room/invite {:room "nowhere" :agent "nobody"}))))))
+
+(deftest create-op-keeps-a-keyword-ids-namespace
+  (with-redefs [daemon/provision-agent! (fn [_ fields] (ops/create-agent! fields))]
+    (is (= {:created "team/reviewer"} (spec/invoke dmn :agent/create {:id :team/reviewer})))
+    (is (some? (ops/get-agent :team/reviewer)))
+    (is (= 409 (status-of #(spec/invoke dmn :agent/create {:id "team/reviewer"})))
+        "the keyword and the string name the same agent")))
+
+(deftest tags-round-trip-through-the-form
+  (let [f (fields/by-k :tags)
+        tags #{:team/reviewer :plain}]
+    (is (= tags (:tags (fields/normalize {:tags ((:format f) {:tags tags})}))))))

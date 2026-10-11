@@ -59,3 +59,16 @@
   (let [code (set (keys (ns-map "code")))]
     (is (every? code '[room-list catalog-benchmark job-status scorecard-detail room-fork]))
     (is (not-any? code '[room-purge room-unarchive agent-delete]) "admin ops stay admin")))
+
+(deftest agent-ops-take-their-wire-values-through-the-repl
+  ;; the REPL validates against the op's schema before the op normalizes:
+  ;; the schema must let through what the op accepts
+  (reset! calls [])
+  (let [m (ns-map "admin")]
+    (with-redefs [dvergr.ops/invoke (fn [_ op args] (swap! calls conj [op args]) {:op op})]
+      ((get m 'agent-update) {:id "a" :patch {:budget-dollars 2 :tags "a b"}})
+      ((get m 'agent-update) {:id "a" :patch {:budget-dollars 1.5}})
+      ((get m 'agent-create) {:id "b" :tools ["read_file"] :budget-dollars 3})
+      (is (= 3 (count @calls)) "integer and double budgets, tag text and tool names pass")
+      (is (thrown? clojure.lang.ExceptionInfo
+                   ((get m 'agent-update) {:id "a" :patch {:budget-dollars "lots"}}))))))

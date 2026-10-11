@@ -277,10 +277,11 @@
 
 (defn resolve-safe-config
   "Apply security defaults to a raw agent-config; explicit values override.
-   Resolves :id, :tools (→ the minimal coding set unless given) and :system-prompt
-   (→ profile markdown unless given). Pure; shared by create-agent! and the
-   medium adapter's on-demand room joins. Pass `:tools (safe-tools)` (or any
-   explicit set) to widen the surface beyond the lean default."
+   Resolves :id, :tools and :system-prompt (→ profile markdown unless given).
+   :tools is the agent's own (a set of tool names, a `dvergr.tools` profile
+   keyword or a tool map, normalized to a tool map; `#{}` is no tools); without
+   it, the agent's tags choose (`resolve-tools-fn`: chat, huginn or safe tools).
+   Shared by create-agent! and the medium adapter's on-demand room joins."
   [agent-config]
   (let [agent-id (or (:id agent-config) (keyword (gensym "agent-")))]
     (merge {:isolation                  :sci
@@ -288,11 +289,11 @@
             :budget-checkpoint-grace-ms 60000}
            agent-config
            {:id agent-id
-            ;; Lean by default: structured file tools + jailed shell +
-            ;; clojure_eval (the escape hatch). Everything functional goes through
-            ;; clojure_eval in the SCI sandbox, not a wide tool surface.
-            :tools (or (:tools agent-config)
-                       (tools/normalize-tools tools/minimal-coding-tools))}
+            ;; The agent's own tools when it names them (an empty set is no
+            ;; tools); else the set its tags choose.
+            :tools (if (some? (:tools agent-config))
+                     (tools/normalize-tools (:tools agent-config))
+                     ((resolve-tools-fn agent-config)))}
            (when-let [sp (resolve-system-prompt (assoc agent-config :id agent-id))]
              {:system-prompt sp}))))
 
@@ -302,7 +303,8 @@
    — the SAME turn handler personas run on — wrapped in the daemon's standard
    enrichments. There is no daemon-specific turn handler and no agent-'type':
 
-     - the tool set follows the agent's tags (chat / huginn / safe), resolved once;
+     - the tool set is the safe-config's :tools (the agent's own, else the one
+       its tags choose: chat / huginn / safe), resolved once;
      - the system prompt is assembled once here (preamble + profile + skills +
        tool-use guideline + sandbox pointer) — the ONE assembler personas use;
      - llm-agent owns the per-[room,agent] working ctx (room-context fold),
@@ -328,7 +330,9 @@
                                ", an AI agent in a shared dvergr workspace."
                                (when-let [d (not-empty (str/trim (str (:description safe-config))))]
                                  (str " " d))))
-        tools-map     ((resolve-tools-fn safe-config))
+        tools-map     (if (some? (:tools safe-config))
+                        (tools/normalize-tools (:tools safe-config))
+                        ((resolve-tools-fn safe-config)))
         system-prompt (prompt/assemble-system-prompt base-prompt {:tools tools-map})]
     ;; Room-safety (self-filter / silence / plain-reply) is the DEFAULT in
     ;; llm-agent now, so a daemon agent is just a plain llm-agent.
@@ -369,7 +373,10 @@
 
    Security defaults applied unless explicitly overridden:
      :isolation                 - :sci (sandboxed Clojure eval)
-     :tools                     - safe-tools (excludes shell, run_tests, telegram_*)
+     :tools                     - the agent's :tools; without them, the set its
+                                  tags choose (`resolve-tools-fn`; untagged:
+                                  safe-tools, which excludes shell, run_tests,
+                                  telegram_*)
      :budget-dollars            - 0.25 per task
      (budget exhaustion no longer has a grace window: the turn ENDS, the
       process is marked :awaiting-decision, and nothing further is spent —
@@ -377,7 +384,7 @@
 
    To grant extra power, pass explicit overrides in agent-config:
      :isolation :native       — full JVM (trusted agents only, never Telegram)
-     :tools (tools/all-tools) — unrestricted (trusted agents only)
+     :tools @tools/registry — unrestricted (trusted agents only)
 
    Returns the registered Participant."
   [daemon agent-config]
@@ -437,7 +444,7 @@
   (let [view (binding [rtc/*execution-context* (:execution-ctx daemon)]
                (ops/create-agent! fields))]
     (when view
-      (create-agent! daemon (-> (select-keys fields [:provider :model :tags
+      (create-agent! daemon (-> (select-keys fields [:provider :model :tags :tools
                                                      :description :budget-dollars :rooms])
                                 (assoc :id (:id view)))))
     view))

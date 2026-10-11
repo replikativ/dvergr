@@ -192,6 +192,37 @@
           (is (not-any? #(= 7 (:id %)) @seen))))
       (finally (server/unregister-tool! "listen_probe")))))
 
+(deftest a-registry-tool-registered-later-is-listed-and-announced
+  ;; mail_* and schedule_* register when the daemon starts, after the server
+  ;; namespace loaded: a subscribed client hears of them and then lists them.
+  (let [{:keys [seen send!]} (recording-connection)
+        tname "late_listed_probe"
+        register! (requiring-resolve 'dvergr.tools/register!)
+        registry @(requiring-resolve 'dvergr.tools/registry)
+        listed (fn []
+                 (send! {:jsonrpc "2.0" :id 9 :method "tools/list" :params (listen-meta)})
+                 (->> @seen (filter #(and (= 9 (:id %)) (:result %))) last
+                      :result :tools (map :name) set))]
+    (send! {:jsonrpc "2.0" :id 8 :method "subscriptions/listen"
+            :params (merge (listen-meta) {:notifications {:toolsListChanged true}})})
+    (try
+      (register! {:name tname :description "probe" :parameters {:type "object" :properties {}}
+                  :execute (fn [_ _] {:type :success :content "ok"})})
+      (is (= "notifications/tools/list_changed" (:method (last @seen))))
+      (is (contains? (listed) tname))
+      (testing "an explicit tool of that name, once removed, gives the name back to the registry tool"
+        (server/register-tool! {:name tname :description "explicit" :inputSchema {:type "object"}}
+                               (fn [_ _] {:content [] :isError false}))
+        (server/unregister-tool! tname)
+        (is (contains? (listed) tname))
+        (is (:dvergr/registry? (some #(when (= tname (:name %)) %) @server/tool-definitions))))
+      (testing "removed from the registry, it leaves the list"
+        (swap! registry dissoc tname)
+        (is (not (contains? (listed) tname))))
+      (finally
+        (swap! registry dissoc tname)
+        (send! {:jsonrpc "2.0" :method "notifications/cancelled" :params (merge (listen-meta) {:requestId 8})})))))
+
 (deftest the-server-ends-a-subscription-gracefully
   (let [{:keys [seen send!]} (recording-connection)]
     (send! {:jsonrpc "2.0" :id "s1" :method "subscriptions/listen"

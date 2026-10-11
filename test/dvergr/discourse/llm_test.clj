@@ -1246,3 +1246,42 @@
         (when-let [fork @fork*]
           (d/discard fork))
         (d/close-room! parent)))))
+
+(deftest a-fork-clone-keeps-the-reply-hook-and-room-safety
+  (testing "the fork factory rebuilds the agent with its :on-reply and :room-safe?"
+    (let [r (d/room :llm-factory-options)
+          hook (fn [content] {:content content :notes []})
+          captured (atom [])
+          orig llm/llm-agent]
+      (try
+        (binding [ec/*execution-context* (:ctx r)]
+          (let [bare (llm/llm-agent {:id :bare :spec {:provider :mock :model "mock"}
+                                     :room-safe? false :on-reply hook
+                                     :run-turn-fn (make-mock-turn-fn (atom []))})
+                safe (llm/llm-agent {:id :safe :spec {:provider :mock :model "mock"}
+                                     :on-reply hook
+                                     :run-turn-fn (make-mock-turn-fn (atom []))})]
+            (with-redefs [llm/llm-agent (fn [opts] (swap! captured conj opts) (orig opts))]
+              ((:factory bare) (:ctx r))
+              ((:factory safe) (:ctx r)))))
+        (let [[bare-clone safe-clone] @captured]
+          (is (identical? hook (:on-reply bare-clone)))
+          (is (false? (:room-safe? bare-clone)) "a bare agent's clone stays bare")
+          (is (identical? hook (:on-reply safe-clone)))
+          (is (false? (:room-safe? safe-clone))
+              "a room-safe agent's clone is built bare: its wrappers re-wrap it through the factory, once"))
+        (finally (d/close-room! r))))))
+
+(deftest a-fork-clone-behaves-like-its-original
+  (testing "a room-safe agent's clone strips a leaked annotation; a bare agent's clone does not"
+    (doseq [[safe? expected] [[true "hi"] [false "[bob · 10:00] hi"]]]
+      (let [r (d/room (keyword (str "llm-clone-" safe?)))]
+        (try
+          (binding [ec/*execution-context* (:ctx r)]
+            (let [p (llm/llm-agent {:id :cl :spec {:provider :mock :model "mock"}
+                                    :room-safe? safe?
+                                    :run-turn-fn (make-mock-turn-fn (atom [[:complete "[bob · 10:00] hi"]]))})]
+              (d/join r ((:factory p) (:ctx r)))))
+          (is (= expected (:content (await-spin r #(d/ask % :cl {:content "go"}) 10000)))
+              (str "room-safe? " safe?))
+          (finally (d/close-room! r)))))))

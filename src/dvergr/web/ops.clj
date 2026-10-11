@@ -12,7 +12,9 @@
    in the hand-written handler (rendering is the per-binding overlay, not derived)."
   (:require [clojure.string :as str]
             [dvergr.ops :as ops]
-            [dvergr.agent.fields :as fields]))
+            [dvergr.agent.fields :as fields]
+            [hiccup.util :as hu]
+            [taoensso.telemere :as tel]))
 
 (defn- redirect [loc] {:status 303 :headers {"Location" loc} :body ""})
 
@@ -54,13 +56,13 @@
    ;; web and MCP create/update go through the identical op. Config GET (render the
    ;; page) stays hand-written (it renders hiccup; a read is not a derivable action).
    {:op :agent/create :method :post :path #"/agents/new" :slots []
-    :args (fn [_ form] (assoc (fields/parse-params form)
+    :args (fn [_ form] (assoc (fields/form-fields form)
                               :id (some-> (get form "id") str/trim)))
     :respond (fn [result _]
                (redirect (if-let [id (:created result)]
                            (str "/agents/" id "/config") "/dashboard#agents")))}
    {:op :agent/update :method :post :path #"/agents/([^/]+)/config" :slots [:id]
-    :args (fn [[id] form] {:id id :patch (fields/parse-params form)})
+    :args (fn [[id] form] {:id id :patch (fields/form-fields form)})
     :respond (fn [_ [id]] (redirect (str "/agents/" id "/config")))}
 
    ;; Agent lifecycle — `agent/delete` stops-then-deletes inside the op now.
@@ -84,7 +86,13 @@
               (when-let [m (re-matches (:path entry) uri)]
                 (let [slots (if (vector? m) (vec (rest m)) [])
                       form  (when (= :post method) (parse-form req))
-                      args  ((:args entry) slots form)
-                      res   (ops/invoke daemon (:op entry) args)]
-                  ((:respond entry) res slots)))))
+                      args  ((:args entry) slots form)]
+                  (try
+                    ((:respond entry) (ops/invoke daemon (:op entry) args) slots)
+                    ;; a failed op answers with its status (4xx for a bad request)
+                    (catch clojure.lang.ExceptionInfo e
+                      (tel/log! {:level :warn :id :web.ops/failed
+                                 :data {:op (:op entry) :error (ex-message e)}})
+                      {:status (ops/error-status e) :headers {"Content-Type" "text/html; charset=utf-8"}
+                       :body (str "<p>" (hu/escape-html (ex-message e)) "</p>")}))))))
           routes)))
