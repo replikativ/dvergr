@@ -55,9 +55,14 @@
 (defn- canonical [path] (.getCanonicalPath (java.io.File. (str path))))
 (def start? (not (flag? "--no-start")))
 (def wait-ms (* 1000 (parse-long (or (arg "--wait-s") "120"))))
-(def start-cmd (or (env "DVERGR_MCP_START")
-                   (str "clojure -M:cli --no-tui --mcp --mcp-port " port
-                        " -p 0 --nrepl-port-file '" (fs/file state-root "mcp-daemon.nrepl-port") "'")))
+(def start-argv
+  "The daemon's start command: DVERGR_MCP_START (split as a shell would), else
+   the CLI with MCP on `port`, its nREPL port file in the state root (one
+   argument, whatever the path holds)."
+  (if-let [cmd (env "DVERGR_MCP_START")]
+    (p/tokenize cmd)
+    ["clojure" "-M:cli" "--no-tui" "--mcp" "--mcp-port" (str port)
+     "-p" "0" "--nrepl-port-file" (str (fs/file state-root "mcp-daemon.nrepl-port"))]))
 
 (def versions ["2024-11-05" "2025-03-26" "2025-06-18" "2025-11-25"])
 (def stateless-versions ["2026-07-28"])
@@ -224,13 +229,13 @@
     (swap! state assoc :starting? true)
     (let [logf (fs/file state-root "logs" "mcp-daemon.log")]
       (fs/create-dirs (fs/parent logf))
-      (log "starting daemon:" start-cmd "(log:" (str logf) ")")
+      (log "starting daemon:" (str/join " " start-argv) "(log:" (str logf) ")")
       ;; setsid: the daemon outlives this relay (the client kills its server).
       (swap! state assoc :daemon
-             (p/process {:dir dir :out :append :out-file (fs/file logf) :err :out
-                         ;; absolute: the daemon runs in the checkout
-                         :extra-env {"DVERGR_HOME" state-root}}
-                        (str (if (fs/which "setsid") "setsid " "nohup ") start-cmd))))))
+             (apply p/process {:dir dir :out :append :out-file (fs/file logf) :err :out
+                               ;; absolute: the daemon runs in the checkout
+                               :extra-env {"DVERGR_HOME" state-root}}
+                    (into [(if (fs/which "setsid") "setsid" "nohup")] start-argv))))))
 
 (def ^:private log-file (str (fs/file state-root "logs" "mcp-daemon.log")))
 
