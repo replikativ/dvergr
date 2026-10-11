@@ -105,14 +105,17 @@
                   (tel/log! {:level :error :id ::finish-failed
                              :data {:job id :status status :error (ex-message t)}}
                             "Job Run could not be finished")))
-              (deliver done true)
-              (swap! live dissoc id)
               (when settled
                 (try (settled status (or error @value))
                      (catch Throwable t
                        (tel/log! {:level :warn :id ::settled-failed
                                   :data {:job id :error (ex-message t)}}
-                                 "Job settled callback failed"))))))))
+                                 "Job settled callback failed"))))
+              ;; a waiter (`status` with wait-ms) is released once the job
+              ;; has settled too: a host that then closes the job's stores
+              ;; must not pull them from under `settled`
+              (deliver done true)
+              (swap! live dissoc id)))))
       (catch Throwable t
         ;; `work` itself failed (validation, say): the Run must not stay open.
         (binding [ec/*execution-context* ctx]

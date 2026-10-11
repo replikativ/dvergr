@@ -19,6 +19,7 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.tools.cli :as cli]
+            [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.experiment :as experiment]
             [dvergr.agent.experiment.runner :as runner]
             [dvergr.catalog.room :as room-wf]
@@ -168,6 +169,8 @@
                     (recur (inc n))
                     [st exp-id report])))
               r (ops/resolve-room daemon name)
+              ;; detached evaluation cleanup, before the home closes
+              _ (try (evaluation/await-cleanups! r) (catch Throwable _ nil))
               scorecard (when-let [id (:scorecard report)]
                           (binding [ec/*execution-context* (:ctx r)]
                             (experiment/scorecard r (parse-uuid id))))]

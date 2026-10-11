@@ -178,6 +178,16 @@
           [(str g "/" a) (with-open [in (io/input-stream r)]
                            (.getProperty (doto (java.util.Properties.) (.load in)) "version"))])))
 
+(defn runtime-identity
+  "What an experiment's identity takes from the host it runs on: the
+   `library-versions`, and the Claude Code CLI's version when `models` (specs
+   or ids) include a Claude Code model. Part of the ExperimentDef's metadata,
+   so a resume never mixes Attempts of two versions."
+  [models]
+  (cond-> {:libraries (library-versions)}
+    (some #{:claude-code} (map #(model-provider (if (map? %) % {:model %})) models))
+    (assoc :claude-cli (cc/cli-version))))
+
 (defn experiment-def
   "The ExperimentDef of a provider's pieces: `benchmark` (namespaces the ids),
    `id`, `environments`, the candidate `team`, `dataset` `{:id :metadata}`,
@@ -283,12 +293,17 @@
         mcp-before? (mcp-running?)
         ;; the home's daemon configures Claude Code process-wide
         cc-before (cc/settings-snapshot)
+        suspend! (requiring-resolve 'dvergr.rooms.scheduler/suspend!)
         back! (fn []
+                (suspend! false)
                 (sdb/reset-conn!)
                 (paths/set-home! prev)
                 (cc/restore-settings! cc-before))]
     (paths/set-home! (.getCanonicalPath (io/file dir)))
     (sdb/reset-conn!)
+    ;; the home's rooms run no schedules: a benchmark (or reading a report)
+    ;; must not fire what was deployed there
+    (suspend! true)
     (try
       {:dir (str dir) :prev-home prev :mcp-before? mcp-before? :cc-before cc-before
        :daemon ((requiring-resolve 'dvergr.orchestration.daemon/start!) {:agents {} :headless? true})}
@@ -310,6 +325,7 @@
       (try (when (and (not mcp-before?) (mcp-running?))
              ((requiring-resolve 'dvergr.mcp.server/stop!)))
            (catch Throwable _ nil))
+      ((requiring-resolve 'dvergr.rooms.scheduler/suspend!) false)
       (sdb/reset-conn!)
       (paths/set-home! prev-home)
       (when cc-before (cc/restore-settings! cc-before)))))

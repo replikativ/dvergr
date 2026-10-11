@@ -17,6 +17,7 @@
             [dvergr.actors]
             [dvergr.rooms]
             [dvergr.discourse]
+            [dvergr.rooms.scheduler]
             [dvergr.ops :as ops]
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.substrate.paths :as paths]))
@@ -33,6 +34,9 @@
           (is (identical? (:daemon h) @daemon/current-daemon))
           (is (every? nil? (map #(get (:daemon h) %) [:telegram-ch :http-server :mcp-server :mcp-http])))
           (is (not (:running (mcp/status))) "no MCP server on a fixed port")
+          (testing "its rooms run no schedules"
+            (ops/invoke (:daemon h) :room/create {:title "Deployed" :slug "deployed"})
+            (is (nil? (get @@#'dvergr.rooms.scheduler/room-schedulers :deployed))))
           (testing "a second home in the same process is refused"
             (is (thrown-with-msg? clojure.lang.ExceptionInfo #"runs a daemon" (runner/open-home! (tmp)))))
           (testing "a candidate's MCP server is loopback, on an ephemeral port, and closed with the home"
@@ -40,6 +44,7 @@
               (is (not (#{7888 8080 17880 17888 17889} port)))))
           (finally (runner/close-home! h))))
       (is (not (:running (mcp/status))))
+      (is (false? @@#'dvergr.rooms.scheduler/suspended) "schedules run again outside it")
       (is (nil? @daemon/current-daemon))
       (is (= prev (paths/home))))
     (testing "an exception inside closes the home too"

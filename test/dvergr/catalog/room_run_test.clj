@@ -81,6 +81,11 @@
         (is (= 4 @calls))
         (is (= (:experiment first-run) (:experiment again)))
         (is (= 1.0 (get-in again [:scorecard :scorecard/summary 0 :reward-mean])))))
+    (testing "another library version is another experiment: nothing resumes into it"
+      (let [bumped (with-redefs [runner/library-versions (constantly {"org.replikativ/spindel" "9.9.9"})]
+                     (bench! (writer calls "Wato\nPromptQL\nDust\nBuzz\n") b home))]
+        (is (not= (:experiment first-run) (:experiment bumped)))
+        (is (= 8 @calls) "its cells ran")))
     (testing "the report reads back through experiment_report, and the bundle is in the room"
       (runner/with-home home
         (fn [daemon]

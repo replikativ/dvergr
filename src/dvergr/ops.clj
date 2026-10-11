@@ -1165,7 +1165,9 @@
                             (rooms/create-room! {:title (str (:title wf) " (benchmark)") :slug slug})
                             (rreg/lookup (keyword slug)))
                   exp (runner/experiment-def (assoc plan :id (keyword (or (:experiment args) slug))
-                                                    :repetitions (or repetitions 1)))
+                                                    :repetitions (or repetitions 1)
+                                                    ;; the host's versions: a resume never mixes two
+                                                    :metadata (merge (:metadata plan) (runner/runtime-identity models))))
                   ;; no new cell once the run has taken its share of a
                   ;; subscription window (the user's own quota)
                   plan (cond-> (assoc plan :admit (runner/admit-for models))
