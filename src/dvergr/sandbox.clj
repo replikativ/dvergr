@@ -1184,15 +1184,15 @@
         ;; dvergr.mail/*inbox* — the room's attached mailbox conn (fork-aware),
         ;; nil when no mailbox attached. Read helpers are seed source (dvergr/mail/).
         (ns-mail/add-mail-ns! sci-ctx)
-        (ns-agent/add-actors-ns! sci-ctx sys-conn binding-resolver)
-        (ns-agent/add-skills-ns! sci-ctx sys-conn)
-        (ns-agent/add-tasks-ns! sci-ctx sys-conn binding-resolver)))
+        (ns-agent/add-actors-ns! sci-ctx sys-conn binding-resolver boundary)
+        (ns-agent/add-skills-ns! sci-ctx sys-conn boundary)
+        (ns-agent/add-tasks-ns! sci-ctx sys-conn binding-resolver boundary)))
     (ns-agent/add-agents-ns! sci-ctx)
     ;; Pure AgentDef/Roster construction plus the explicit, Run-backed `hire!`
     ;; effect. No roster is kept in a host atom: callers thread the immutable
     ;; value, and live execution state belongs to the Room's Spindel context.
     (ns-agent/add-programming-ns! sci-ctx (or room-runtime-id room-id) spindel-ctx
-                                  agent-program-ceiling binding-resolver)
+                                  agent-program-ceiling binding-resolver boundary)
     (ns-data/add-spindel-extras-ns!
      sci-ctx spindel-ctx
      {:room-id (or room-runtime-id room-id)
@@ -1200,7 +1200,7 @@
       :ceiling (:work-admission agent-program-ceiling)
       :world-binding binding-resolver})
     (ns-codec/add-codec-namespaces! sci-ctx)   ; cheshire.core / clojure.data.xml / dvergr.codec
-    (ns-intake/add-intake-namespaces! sci-ctx)
+    (ns-intake/add-intake-namespaces! sci-ctx boundary)
     (ns-io/add-fs-ns!   sci-ctx :base-path cwd :filesystem filesystem
                         :filesystem-resolver
                         (when workspace
@@ -1213,7 +1213,7 @@
     (ns-io/add-git-ns!  sci-ctx :base-path cwd :workspace workspace
                         :workspace-resolver (when workspace workspace-resolver)
                         :effects boundary)
-    (ns-kb/add-llm-ns!  sci-ctx agent-program-ceiling)
+    (ns-kb/add-llm-ns!  sci-ctx agent-program-ceiling nil boundary)
     ;; Boundary secret injection (doc/boundary-secret-injection.md): build the
     ;; host-side secret registry from config `:secrets` (resolved against the host
     ;; env), and share it between `env` (returns placeholders) and `http`
@@ -1253,7 +1253,7 @@
     ;; safe and useful for any coding agent regardless of role. Each
     ;; is still individually callable if a caller wants just one.
     (ns-dev/add-clojure-repl-ns! sci-ctx)
-    (ns-dev/add-clojure-repl-deps-ns! sci-ctx)
+    (ns-dev/add-clojure-repl-deps-ns! sci-ctx boundary)
     (ns-dev/add-hiccup-ns! sci-ctx)
     ;; Consumer-registered injectors (register-ns-injector!) — domain kernels
     ;; expose their surface here without dvergr depending on them. Run before

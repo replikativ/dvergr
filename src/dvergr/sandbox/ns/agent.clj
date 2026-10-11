@@ -432,6 +432,14 @@
   [d job-id]
   (sp/spin (assoc (sp/await d) :job job-id)))
 
+(defn- gated
+  "`f`, performing the effect `(apply effect-of args)` through the boundary
+   `effects` (`dvergr.effects`) around each call: the world's read-only mode,
+   admission and receipts decide it before `f` runs."
+  [effects effect-of f]
+  (with-meta (fn [& args] (effects/perform! effects (apply effect-of args) #(apply f args)))
+    (meta f)))
+
 (defn add-programming-ns!
   "Expose immutable AgentDefs and Run-backed hiring as `dvergr.agent` in SCI.
 
@@ -470,7 +478,7 @@
           (-> (await (comb/race (agent/owned-result-spin a)
                                 (agent/owned-result-spin b)))
               :run/value)))"
-  [sci-ctx room-id spindel-ctx agent-program-ceiling & [binding-resolver]]
+  [sci-ctx room-id spindel-ctx agent-program-ceiling & [binding-resolver effects]]
   (let [make-roster*   (requiring-resolve 'dvergr.agent.roster/make-roster)
         make-agent*    (requiring-resolve 'dvergr.agent.roster/make-agent)
         revise-agent*  (requiring-resolve 'dvergr.agent.roster/revise-agent)
@@ -699,12 +707,17 @@
         'experiment   (via-var make-experiment*)
         'experiment-ref (via-var experiment-ref*)
         'room-id      (fn [] (:id (room!)))
-        'hire!        hire-fn
-        'run-experiment! run-experiment-fn
+        'hire!        (gated effects (fn [_ agent-ref & _] {:effect :run/start :resource {:agent (str agent-ref)}})
+                             hire-fn)
+        'run-experiment! (gated effects (fn [_ experiment & _]
+                                          {:effect :run/start
+                                           :resource {:experiment (str (or (:id experiment) (:experiment/id experiment)))}})
+                                run-experiment-fn)
         'offered      (fn [] (offered*))
         'observe      observe-fn
         'inspect      inspect-fn
-        'cancel!      cancel-fn
+        'cancel!      (gated effects (fn [handle] {:effect :run/cancel :resource {:run (str (or (:run/id handle) handle))}})
+                             cancel-fn)
         'balance      balance-fn
         'run-id       (via-var run-id*)
         'result-spin  result-spin-fn
@@ -808,7 +821,7 @@
      (skills/providers :research)        ; actor-ids that declare :research
      (skills/rank :research)             ; ranked online providers
      (skills/dispatch :research)         ; the single best provider (actor map or nil)"
-  [sci-ctx conn]
+  [sci-ctx conn & [effects]]
   (load/require! 'dvergr.orchestration.skills)
   (let [load-all*   @(ns-resolve 'dvergr.orchestration.skills 'load-all)
         read-skill* @(ns-resolve 'dvergr.orchestration.skills 'read-skill)
@@ -835,7 +848,11 @@
                       (or (room-repo)
                           (throw (ex-info (str "skills/" op " needs a room sandbox repo (no room workspace bound)")
                                           {:op (symbol op)}))))
-        provides?   (fn [tag s] (some #(= tag %) (:provides s)))]
+        provides?   (fn [tag s] (some #(= tag %) (:provides s)))
+        ;; a skill file written into the room repo is a file write (dvergr.effects)
+        skill-write (fn [skill-name & [body]]
+                      (cond-> {:effect :fs/write :resource {:path (str "skills/" skill-name ".md")}}
+                        body (assoc :bytes (alength (.getBytes (str body) "UTF-8")))))]
     (sci/add-namespace! sci-ctx 'dvergr.skills
                         (doc/with-docs
                           {'all       (fn [] (load-all* (room-dir)))
@@ -848,39 +865,45 @@
                            'providers (fn [skill] (find-prov conn skill))
                            'rank      (fn [skill] (rank-prov conn skill))
                            'dispatch  (fn [skill] (dispatch conn skill))
-                           'dispatch! (fn [skill opts]
-                                        (dispatch!* conn skill opts))
+                           'dispatch! (gated effects
+                                             (fn [skill & _] {:effect :task/write
+                                                              :resource {:op :dispatch :skill (str skill)}})
+                                             (fn [skill opts]
+                                               (dispatch!* conn skill opts)))
                          ;; Authoring lifecycle (writes into THIS room's repo —
                          ;; versioned + forkable + mergeable). Agent-authored
                          ;; skills land `vetted: false`, so the vetting gate keeps
                          ;; them out of prompts until a reviewer promotes them.
-                           'author!   (fn [skill-name frontmatter body]
-                                        (author* "skills" (room-repo! "author!") (str skill-name)
-                                                 frontmatter (str body)))
+                           'author!   (gated effects (fn [skill-name _ body] (skill-write skill-name body))
+                                             (fn [skill-name frontmatter body]
+                                               (author* "skills" (room-repo! "author!") (str skill-name)
+                                                        frontmatter (str body))))
                          ;; Lift external content (an openclaw/Claude skill, a URL
                          ;; you fetched) into the room as an UNVETTED skill.
-                           'lift!     (fn [skill-name source body]
-                                        (author* "skills" (room-repo! "lift!") (str skill-name)
-                                                 {:source (str source) :vetted false} (str body)))
+                           'lift!     (gated effects (fn [skill-name _ body] (skill-write skill-name body))
+                                             (fn [skill-name source body]
+                                               (author* "skills" (room-repo! "lift!") (str skill-name)
+                                                        {:source (str source) :vetted false} (str body))))
                          ;; Promote a room skill to vetted (reviewer action).
                          ;; Only the ROOM's own skills: user/project/builtin
                          ;; definitions live outside the room repo (a sandbox
                          ;; must not rewrite ~/.dvergr or the classpath).
-                           'promote!  (fn [skill-name by date]
-                                        (let [definition (get (load-all* (room-repo! "promote!"))
-                                                              (str skill-name))]
-                                          (cond
-                                            (nil? definition)
-                                            (throw (ex-info (str "no such skill to promote: " skill-name) {}))
+                           'promote!  (gated effects (fn [skill-name & _] (skill-write skill-name))
+                                             (fn [skill-name by date]
+                                               (let [definition (get (load-all* (room-repo! "promote!"))
+                                                                     (str skill-name))]
+                                                 (cond
+                                                   (nil? definition)
+                                                   (throw (ex-info (str "no such skill to promote: " skill-name) {}))
 
-                                            (not= :room (:scope definition))
-                                            (throw (ex-info (str "skills/promote!: " skill-name
-                                                                 " is a " (name (:scope definition))
-                                                                 " skill, not one of this room's — only room skills can be promoted here")
-                                                            {:skill (str skill-name) :scope (:scope definition)}))
+                                                   (not= :room (:scope definition))
+                                                   (throw (ex-info (str "skills/promote!: " skill-name
+                                                                        " is a " (name (:scope definition))
+                                                                        " skill, not one of this room's — only room skills can be promoted here")
+                                                                   {:skill (str skill-name) :scope (:scope definition)}))
 
-                                            :else
-                                            (do (promote* definition (str by) (str date)) true))))}
+                                                   :else
+                                                   (do (promote* definition (str by) (str date)) true)))))}
                           (with-schemas
                             '{all       [([]) "Every skill visible here — on disk plus any this room defines (the room's own take precedence). A map of skill-name → definition."]
                               read      [([skill-name]) "The FULL instructions for one skill. The system prompt carries only a brief index; pull the body with this before following a skill."]
@@ -942,7 +965,7 @@
      (actors/update! :scribe {:skills #{:prose :writing}})
      (actors/add-skill! :scribe :prose)
      (actors/remove-skill! :scribe :writing)"
-  [sci-ctx conn & [binding-resolver]]
+  [sci-ctx conn & [binding-resolver effects]]
   (load/require! 'dvergr.actors)
   (let [acting          (acting-agent-fn binding-resolver)
         list-fn         @(ns-resolve 'dvergr.actors 'list-actors)
@@ -954,6 +977,10 @@
         update-fn       @(ns-resolve 'dvergr.actors 'update-actor!)
         add-skill-fn    @(ns-resolve 'dvergr.actors 'add-skill!)
         remove-skill-fn @(ns-resolve 'dvergr.actors 'remove-skill!)
+        ;; every write is an effect (dvergr.effects) on the system-wide registry
+        write (fn [op f] (gated effects (fn [x & _] {:effect :actor/write
+                                                     :resource {:op op :actor (str (if (map? x) (:id x) x))}})
+                                f))
         ;; An agent writes its own row and the rows of agents it spawned
         ;; (recorded as `:spawned-by` in their config), nothing else.
         own!  (fn [id]
@@ -978,19 +1005,20 @@
                           {'list          (fn [& kvs] (apply list-fn conn kvs))
                            'lookup        (fn [id]      (lookup-fn conn id))
                            'online?       (fn [id]      (online?-fn id))
-                           'spawn-agent!  spawn!
+                           'spawn-agent!  (write :spawn spawn!)
                            ;; a human actor maps channel identities (e.g. a
                            ;; Telegram id) onto a person: the owner's to do
-                           'spawn-human!  (fn [opts]
-                                            (let [me (acting)]
-                                              (when-not (effects/full-reach? me)
-                                                (refuse! "spawn-human! is for the room's owner, not an agent"
-                                                         {:acting me}))
-                                              (spawn-human-fn conn opts)))
-                           'dismiss!      (fn [id]      (own! id) (dismiss-fn conn id))
-                           'update!       (fn [id patch] (own! id) (update-fn conn id patch))
-                           'add-skill!    (fn [id skill] (own! id) (add-skill-fn conn id skill))
-                           'remove-skill! (fn [id skill] (own! id) (remove-skill-fn conn id skill))}
+                           'spawn-human!  (write :spawn-human
+                                                 (fn [opts]
+                                                   (let [me (acting)]
+                                                     (when-not (effects/full-reach? me)
+                                                       (refuse! "spawn-human! is for the room's owner, not an agent"
+                                                                {:acting me}))
+                                                     (spawn-human-fn conn opts))))
+                           'dismiss!      (write :dismiss (fn [id] (own! id) (dismiss-fn conn id)))
+                           'update!       (write :update (fn [id patch] (own! id) (update-fn conn id patch)))
+                           'add-skill!    (write :add-skill (fn [id skill] (own! id) (add-skill-fn conn id skill)))
+                           'remove-skill! (write :remove-skill (fn [id skill] (own! id) (remove-skill-fn conn id skill)))}
                           (with-schemas
                             '{list          [([] [& {:keys [kind status]}]) "Every DURABLE actor the system knows — including offline and retired ones (contrast dvergr.agents/list, which is who is alive now). Filter with :kind (:agent/:human) and :status (e.g. :online, :retired)."]
                               lookup        [([id]) "The durable row for one actor id, or nil. Persisted state, not runtime state."]
@@ -1033,7 +1061,7 @@
      (tasks/accept!   task-uuid)
      (tasks/complete! task-uuid \"done — here's what I found\")
      (tasks/ignore!   task-uuid)"
-  [sci-ctx conn & [binding-resolver]]
+  [sci-ctx conn & [binding-resolver effects]]
   (load/require! 'dvergr.orchestration.tasks)
   (let [acting      (acting-agent-fn binding-resolver)
         list-fn     @(ns-resolve 'dvergr.orchestration.tasks 'list-tasks)
@@ -1043,6 +1071,8 @@
         ignore-fn   @(ns-resolve 'dvergr.orchestration.tasks 'ignore!)
         ;; An agent settles tasks assigned to it, dispatched by it, or posted
         ;; in the room it works in; another room's (or a person's) are not its.
+        ;; settling a task writes the system-wide ledger (dvergr.effects)
+        write (fn [op f] (gated effects (fn [id & _] {:effect :task/write :resource {:op op :task (str id)}}) f))
         ours! (fn [id]
                 (let [me (acting)]
                   (when-not (effects/full-reach? me)
@@ -1056,9 +1086,9 @@
                         (doc/with-docs
                           {'list      (fn [& kvs] (apply list-fn conn kvs))
                            'lookup    (fn [id]    (lookup-fn conn id))
-                           'accept!   (fn [id]    (ours! id) (accept-fn conn id))
-                           'complete! (fn [id r]  (ours! id) (complete-fn conn id r))
-                           'ignore!   (fn [id]    (ours! id) (ignore-fn conn id))}
+                           'accept!   (write :accept (fn [id] (ours! id) (accept-fn conn id)))
+                           'complete! (write :complete (fn [id r] (ours! id) (complete-fn conn id r)))
+                           'ignore!   (write :ignore (fn [id] (ours! id) (ignore-fn conn id)))}
                           (with-schemas
                             '{list      [([] [& {:keys [actor-id status]}]) "The shared task ledger — persistent rows for work dispatched to non-agent actors (humans). Filter with :actor-id and :status (e.g. :pending). Agents themselves just react to inbox messages and need no task row."]
                               lookup    [([id]) "One task by its uuid, or nil."]

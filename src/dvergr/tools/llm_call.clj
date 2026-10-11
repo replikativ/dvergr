@@ -64,6 +64,7 @@
 
 (tools/register!
  {:name        "llm_call"
+  :effect      (fn [{:keys [model]}] {:effect :model/call :resource {:model (str (or model "cheap"))}})
   :description "Make a cheap one-shot LLM call for summarization, extraction, or classification. Does NOT start a new agent turn — just returns text. Use to condense long content (transcripts, web pages, search results) before it enters your context window. Deducts from the calling agent's budget."
   :parameters  {:type       "object"
                 :properties {:prompt     {:type        "string"

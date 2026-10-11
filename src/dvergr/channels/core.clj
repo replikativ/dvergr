@@ -103,6 +103,8 @@
            {:name (:name tool-def)
             :description (:description tool-def)
             :parameters (:parameters tool-def)
+            :effect (fn [_] {:effect :channel/call
+                             :resource {:tool (str (:name tool-def)) :channel (str (:id channel))}})
             :execute (wrap-handler channel cap handler)})
           ;; Register in MCP server
           (mcp/register-tool!
