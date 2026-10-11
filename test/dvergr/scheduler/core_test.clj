@@ -74,7 +74,13 @@
     (is (= "00:15:30" (:at (first (scheduler/list-schedules *room*)))))
     (is (= (java.time.Instant/parse "2026-10-10T13:15:30Z")
            (.toInstant (cron/compute-next-fire (assoc e :schedule/last-run fired) fired)))
-        "the stored rule fires at :15:30, not :15:00")))
+        "the stored rule fires at :15:30, not :15:00")
+    (testing "re-created under the same id without seconds, it loses them"
+      (scheduler/create-schedule! *room* {:id id :agent-id :a :task "hourly"
+                                          :schedule {:every :hour :at "00:15" :tz "UTC"}})
+      (let [e (dh/pull @conn '[*] [:schedule/id id])]
+        (is (nil? (:schedule/second e)))
+        (is (= "00:15" (:at (first (scheduler/list-schedules *room*)))))))))
 
 (deftest a-room-without-the-seconds-attribute-installs-it
   (let [cfg {:store {:backend :memory :id (random-uuid)} :schema-flexibility :write}

@@ -80,7 +80,14 @@
       (when (and (:schedule/second row)
                  (not (contains? (d/schema @conn) :schedule/second)))
         (d/transact conn [(schema/attribute :schedule/second)]))
-      (d/transact conn [row])
+      (d/transact conn
+                  (cond-> [row]
+                    ;; re-created under the same id without seconds: the
+                    ;; stored ones must not outlive the rule they belonged to
+                    (not (:schedule/second row))
+                    (into (when-let [old (when (contains? (d/schema @conn) :schedule/second)
+                                           (:schedule/second (d/entity @conn [:schedule/id id])))]
+                            [[:db/retract [:schedule/id id] :schedule/second old]]))))
       id)))
 
 (defn cancel-schedule!
