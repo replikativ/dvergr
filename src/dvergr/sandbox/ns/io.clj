@@ -15,7 +15,7 @@
             [dvergr.sandbox.ns.doc :as doc])
   (:import [java.io File]))
 
-(declare fs-safe-resolve git-run* worktree-top parse-porcelain-status parse-git-log git-log-format)
+(declare fs-safe-resolve git-run* worktree-top in-git-metadata? parse-porcelain-status parse-git-log git-log-format)
 
 (defn install-http-fixture!
   "Host-only world setup: install an immutable offline capability in the current
@@ -285,7 +285,12 @@
         sr             (fn [p] (let [ps (str p)]
                                  (sensitive-path-policy ps)
                                  (doto (fs-safe-resolve base-canonical ps)
-                                   (-> str sensitive-path-policy))))
+                                   (-> str sensitive-path-policy)
+                                   ;; the repository's git directory, whatever
+                                   ;; it is called (`.git -> metadata`)
+                                   (as-> f (when (in-git-metadata? base-canonical f)
+                                             (throw (ex-info "Access denied: sensitive path (git metadata)"
+                                                             {:path ps})))))))
         ;; Relativize a resolved (absolute) path back to a workspace-relative
         ;; string, so agents never see the real `.dvergr/systems/<uuid>/…`
         ;; location — and get paths they can pass straight back to fs/slurp
@@ -1236,10 +1241,12 @@
         names (into #{}
                     (keep (fn [entry]
                             (let [k (first (str/split entry #"\n" 2))]
-                              (when-let [[_ n] (re-matches #"(?s)filter\.(.+)\.[^.]+" k)]
+                              (when-let [[_ n] (re-matches #"(?s)filter\.(.*)\.[^.]+" k)]
                                 n))))
                     (str/split out #"\u0000"))]
-    (when (some #(str/includes? % "=") names)
+    ;; `-c` can express neither an empty driver name (`filter..clean`, which
+    ;; `filter=` selects) nor one with `=`; git would run it, so refuse.
+    (when (some #(or (str/blank? %) (str/includes? % "=")) names)
       (git-arg-refused! "git filter driver name not overridable" {:names names}))
     ;; `required` too: a required filter with no command fails the call.
     (into [] (mapcat (fn [n] (concat (mapcat #(vector "-c" (str "filter." n "." % "="))
@@ -1256,6 +1263,26 @@
        (take-while some?)
        (filter #(.exists (java.io.File. ^java.io.File % ".git")))
        first))
+
+(defn git-metadata-dir
+  "The canonical git directory of the repository `base-path` is in — `.git`,
+   or where a `.git` file (`gitdir: …`) or a `.git` symlink points — or nil.
+   Writes, deletes and moves must not reach it however it is spelled."
+  [base-path]
+  (when-let [top (worktree-top base-path)]
+    (let [dotgit (java.io.File. ^java.io.File top ".git")]
+      (.getCanonicalFile
+       (if (.isFile dotgit)
+         (let [[_ target] (re-find #"(?m)^gitdir:\s*(.+)$" (slurp dotgit))
+               f (java.io.File. (str/trim (str target)))]
+           (if (.isAbsolute f) f (java.io.File. ^java.io.File top (str/trim (str target)))))
+         dotgit)))))
+
+(defn in-git-metadata?
+  "Is canonical `file` inside the git directory of `base-path`'s repository?"
+  [base-path ^java.io.File file]
+  (boolean (when-let [g (git-metadata-dir base-path)]
+             (.startsWith (.toPath file) (.toPath ^java.io.File g)))))
 
 (defn- git-run*
   "Run git in base-path. Returns stdout string or throws on non-zero exit."

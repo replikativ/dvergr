@@ -369,6 +369,39 @@
     (is (some #{"gc.auto=0"} safety))
     (is (some #{"maintenance.auto=false"} safety))))
 
+(deftest physical-git-refuses-a-filter-it-cannot-disable
+  ;; `filter=` selects the driver with the empty name, `filter..clean`, which
+  ;; no `-c` override can express: host git must not run at all then.
+  (let [dir (git-repo!)
+        sentinel (java.io.File. (temp-dir! "dvergr-empty-filter") "ran")
+        ctx (sci/init {})]
+    (sh! dir "git" "config" "filter..clean" (str "sh -c 'touch " sentinel "; cat'"))
+    (spit (java.io.File. dir ".gitattributes") "*.txt filter=\n")
+    (spit (java.io.File. dir "x.txt") "x\n")
+    (io/add-git-ns! ctx :base-path (str dir))
+    (is (refused? #(sci/eval-string* ctx %) "(git/add \"x.txt\")"))
+    (is (not (.exists sentinel)) "the empty-name filter did not run")))
+
+(deftest physical-git-metadata-is-protected-under-any-name
+  ;; `.git -> metadata`: the repository's git directory under another name.
+  (let [dir (git-repo!)
+        meta (java.io.File. dir "metadata")
+        ctx (sci/init {})]
+    (.renameTo (java.io.File. dir ".git") meta)
+    (java.nio.file.Files/createSymbolicLink (.toPath (java.io.File. dir ".git")) (.toPath meta)
+                                            (make-array java.nio.file.attribute.FileAttribute 0))
+    (io/add-fs-ns! ctx :base-path (str dir))
+    (let [before (slurp (java.io.File. meta "config"))
+          tctx {:cwd (str dir)}]
+      (doseq [path [".git/config" "metadata/config"]]
+        (is (= :error (:type (tools/execute "write_file" {:path path :content "[core]\n"} tctx))) path))
+      (doseq [code ["(spit \"metadata/config\" \"[core]\")"
+                    "(babashka.fs/delete-tree \"metadata\")"
+                    "(babashka.fs/move \"metadata\" \"m2\")"]]
+        (is (thrown-with-msg? Exception #"sensitive path" (sci/eval-string* ctx code)) code))
+      (is (= before (slurp (java.io.File. meta "config"))))
+      (is (.exists (java.io.File. meta "HEAD"))))))
+
 (deftest physical-git-uses-the-workspace-worktree
   ;; `core.worktree` (set directly or through an included config file) would
   ;; point git at another directory than the one every check here is about.
