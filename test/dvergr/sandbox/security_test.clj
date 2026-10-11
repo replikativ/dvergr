@@ -448,7 +448,9 @@
     (sh! dir "git" "add" "outside.txt")
     (io/add-git-ns! ctx :base-path (str ws))
     (doseq [code ["(git/diff \"--cached\" \"link/../../outside.txt\")"
-                  "(git/add \"link/../../outside.txt\")"]]
+                  "(git/add \"link/../../outside.txt\")"
+                  (str "(git/diff \"--cached\" \"" ws "/link/../../outside.txt\")")
+                  (str "(git/add \"" ws "/link/../../outside.txt\")")]]
       (is (refused? #(sci/eval-string* ctx %) code) code))))
 
 (deftest physical-nested-repository-metadata-is-protected
@@ -471,6 +473,27 @@
     (testing "the nested repository's own content stays writable"
       (sci/eval-string* ctx "(spit \"child/src/x.clj\" \"(ns x)\")")
       (is (= "(ns x)" (slurp (java.io.File. child "src/x.clj")))))))
+
+(deftest physical-git-needs-a-dotgit-worktree
+  ;; A bare-layout directory (HEAD, objects, refs) with core.worktree pointing
+  ;; elsewhere is a repository to git, but has no `.git` to pin the worktree to.
+  ;; Under /tmp, not the test tmpdir: that sits inside this checkout, whose
+  ;; own .git would (correctly) become the pinned worktree.
+  (let [mk #(.toFile (java.nio.file.Files/createTempDirectory
+                      (java.nio.file.Paths/get "/tmp" (make-array String 0)) %
+                      (make-array java.nio.file.attribute.FileAttribute 0)))
+        w (mk "dvergr-bare")
+        other (mk "dvergr-other")
+        ctx (sci/init {})]
+    (sh! w "git" "init" "-q" "--bare")
+    (sh! w "git" "config" "core.bare" "false")
+    (sh! w "git" "config" "core.worktree" (str other))
+    (spit (java.io.File. other "elsewhere.txt") "ELSEWHERE\n")
+    (io/add-git-ns! ctx :base-path (str w))
+    (is (refused? #(sci/eval-string* ctx %) "(git/diff)"))
+    (is (refused? #(sci/eval-string* ctx %) "(git/status)"))
+    (is (not (str/includes? (try (str (sci/eval-string* ctx "(git/diff)")) (catch Exception e (str (ex-data e))))
+                            "ELSEWHERE")))))
 
 (deftest physical-git-uses-the-workspace-worktree
   ;; `core.worktree` (set directly or through an included config file) would

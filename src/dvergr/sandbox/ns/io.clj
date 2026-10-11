@@ -652,6 +652,13 @@
             file (.getCanonicalFile (if (.isAbsolute f) f (java.io.File. base (str path))))]
         (when-not (.startsWith (.toPath file) (.toPath base))
           (refuse!))
+        ;; and lexically, as git reads it: an absolute operand is normalised
+        ;; textually and must stay under the workspace as spelled or as
+        ;; canonical
+        (let [lex (.normalize (.toPath (if (.isAbsolute f) f (java.io.File. (str base-path) (str path)))))
+              spelled (.normalize (.toPath (.getAbsoluteFile (java.io.File. (str base-path)))))]
+          (when-not (or (.startsWith lex spelled) (.startsWith lex (.toPath base)))
+            (refuse!)))
         (when (try (sensitive-path-policy (str file)) false (catch clojure.lang.ExceptionInfo _ true))
           (git-arg-refused! (str "git path is a sensitive file: " path) {:path path})))
       (when (neg? (reduce (fn [d seg]
@@ -1272,7 +1279,13 @@
   (->> (iterate #(.getParentFile ^java.io.File %)
                 (.getCanonicalFile (java.io.File. (str base-path))))
        (take-while some?)
-       (filter #(.exists (java.io.File. ^java.io.File % ".git")))
+       ;; a real one, as git's discovery would accept: a directory with HEAD
+       ;; (or a symlink to one), or a `gitdir:` file — not any stray `.git`
+       (filter (fn [^java.io.File d]
+                 (let [g (java.io.File. d ".git")]
+                   (or (.isFile (java.io.File. g "HEAD"))
+                       (and (.isFile g)
+                            (str/starts-with? (slurp g) "gitdir: "))))))
        first))
 
 (defn- read-git-pointer
@@ -1346,8 +1359,13 @@
         ;; The worktree is the directory that holds `.git` above base-path,
         ;; not whatever `core.worktree` (possibly from an included config
         ;; file) says: every path check here is against that directory.
-        _        (when-let [top (worktree-top base-path)]
-                   (.put env "GIT_WORK_TREE" (str top)))
+        ;; No `.git` above base-path (a bare-layout directory, which git also
+        ;; accepts, would let its `core.worktree` choose): refuse.
+        top      (or (worktree-top base-path)
+                     (git-arg-refused! "no git worktree (.git) at or above the workspace" {}))
+        _        (doto env
+                   (.put "GIT_WORK_TREE" (str top))
+                   (.put "GIT_DIR" (str (java.io.File. ^java.io.File top ".git"))))
         proc     (.start pb)
         out      (future (slurp (.getInputStream proc)))
         err      (future (slurp (.getErrorStream proc)))
