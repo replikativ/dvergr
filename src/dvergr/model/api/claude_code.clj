@@ -760,12 +760,16 @@
           (throw t)))
       (finally
         (reset! monitor-done? true)
-        ;; Closing all streams plus process termination releases reader futures
-        ;; on success, cancellation, callback failure, and malformed output.
+        ;; Process termination plus closing all streams releases reader
+        ;; futures on success, cancellation, callback failure, and malformed
+        ;; output. Terminate first: closing a reader waits for the reader's
+        ;; lock, which the stderr future holds while it blocks in a read, so
+        ;; with the process still alive (a callback that threw) the close
+        ;; would wait for the CLI to exit by itself.
+        (terminate-process! process)
         (close-quietly! stdin)
         (close-quietly! stdout-reader)
         (close-quietly! stderr-reader)
-        (terminate-process! process)
         (when cancel-monitor
           (future-cancel cancel-monitor))
         (when-not (realized? stderr-future)
