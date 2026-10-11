@@ -431,7 +431,8 @@
               [dir] (:contents (read-resource "room://ledger/files/workflows/coding"))]
           (is (str/starts-with? (:text c) "no;vendor"))
           (is (= "JVBERi0xLjQKJcfsj6IK" (:blob pdf)))
-          (is (str/includes? (:text dir) "checker.clj")))))
+          (is (some #{"checker.clj"} (map :name (:entries (jsonista.core/read-value (:text dir) jsonista.core/keyword-keys-object-mapper))))
+              "a directory as a whole JSON listing"))))
     (is (:ok? (ops/invoke *daemon* :catalog/calibrate {:room "ledger" :name "coding"})))
     (testing "benchmarked into the room, scored by the generated checker"
       (with-redefs [providers/ensure-initialized! (constantly nil)

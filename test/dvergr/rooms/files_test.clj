@@ -7,10 +7,12 @@
             [dvergr.catalog.workspace :as ws]
             [dvergr.discourse :as d]
             [dvergr.effects :as effects]
+            [dvergr.mcp.surface :as surface]
             [dvergr.room.store.memory :as memory]
             [dvergr.rooms.files :as files]
             [dvergr.rooms.forks :as forks]
             [dvergr.substrate.geschichte :as gs]
+            [dvergr.tools :as tools]
             [geschichte.repo :as repo]
             [muschel.fs :as mfs]
             [org.replikativ.spindel.engine.core :as ec])
@@ -112,10 +114,10 @@
                  (catch clojure.lang.ExceptionInfo e e))]
       (is (= :effect/denied (:type (ex-data e))) (pr-str (ex-data e)))
       (is (re-find #"read-only" (ex-message e))))
-    (is (some #(and (= :fs/write (:effect %)) (= :denied (:decision %))
-                    (= "/data/cases.csv" (get-in % [:resource :path])))
+    (is (some #(and (= :git/commit (:effect %)) (= :denied (:decision %)) (= :read-only (:by %))
+                    (= "Write data/cases.csv" (get-in % [:resource :message])))
               @sink)
-        "the denial is receipted in the world's sink")
+        "the denial is receipted in the world's sink, before anything is written")
     (is (= before (commits r)))
     (is (not (mfs/exists? (ws/room-fs r) "/data/cases.csv")))))
 
@@ -145,3 +147,101 @@
     (is (= text (apply str (map :text chunks))) "no character is split")
     (is (= 10 (:length (files/read-file r "big.txt" {:offset 0 :length 10}))))
     (is (thrown? clojure.lang.ExceptionInfo (files/read-file r "big.txt" {:offset (* 10 files/max-read-bytes)})))))
+
+(defn- worktree-text [r p] (some-> (mfs/read-file (ws/room-fs r) p) str))
+
+(deftest a-refused-batch-leaves-other-peoples-files-alone
+  ;; an untracked draft and an unstaged edit, both named by the batch
+  (let [r (room)]
+    (files/write! r {"a.txt" {:text "committed"}} {})
+    (mfs/write-string! (ws/room-fs r) "/draft.txt" "untracked draft" false)
+    (mfs/write-string! (ws/room-fs r) "/a.txt" "unstaged edit" false)
+    (effects/install-world! (:ctx r) [[:read-only]])
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (files/write! r {"a.txt" {:text "x"} "draft.txt" {:text "y"} "z.txt" nil} {})))
+    (is (= "unstaged edit" (worktree-text r "/a.txt")))
+    (is (= "untracked draft" (worktree-text r "/draft.txt")))))
+
+(deftest the-commit-is-decided-before-anything-is-written
+  (let [r (room)
+        before (commits r)
+        boundary (constantly {:handlers [(fn [effect next]
+                                           (if (= :git/commit (:effect effect))
+                                             (effects/deny! effect :admission "no commits")
+                                             (next effect)))]})]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no commits"
+                          (files/write! r {"a.txt" {:text "a"}} {:boundary boundary})))
+    (is (nil? (worktree-text r "/a.txt")))
+    (is (= before (commits r)))))
+
+(deftest a-failure-after-staging-undoes-index-and-files
+  (let [r (room)
+        execute-git gs/execute-git]
+    (files/write! r {"a.txt" {:text "old"} "gone.txt" {:text "keep me"}} {})
+    (with-redefs [gs/execute-git (fn [ws argv]
+                                   (if (= "commit" (first argv))
+                                     {:exit 1 :stdout "" :stderr "boom"}
+                                     (execute-git ws argv)))]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"boom"
+                            (files/write! r {"a.txt" {:text "new"} "b/c.txt" {:text "c"} "gone.txt" nil} {}))))
+    (is (= "old" (worktree-text r "/a.txt")))
+    (is (= "keep me" (worktree-text r "/gone.txt")))
+    (is (not (mfs/exists? (ws/room-fs r) "/b")) "the directory it made is gone too")
+    (is (empty? (forks/workspace-changes r)) "nothing staged, nothing dirty")))
+
+(deftest staged-changes-of-others-refuse-the-batch
+  (let [r (room)]
+    (mfs/write-string! (ws/room-fs r) "/scratch.md" "staged by an agent" false)
+    (binding [ec/*execution-context* (:ctx r)] (gs/execute-git ["add" "scratch.md"]))
+    (let [e (try (files/write! r {"notes.md" {:text "mine"}} {}) nil
+                 (catch clojure.lang.ExceptionInfo e e))]
+      (is (= ::files/staged-changes (:type (ex-data e))) (pr-str (ex-data e))))
+    (is (not (mfs/exists? (ws/room-fs r) "/notes.md")))
+    (is (not (contains? (repo/tree (conn r) :head) "scratch.md")))))
+
+(deftest a-concurrent-writer-fails-the-batch-and-keeps-its-change
+  (let [r (room)
+        write! tools/workspace-write!]
+    (with-redefs [tools/workspace-write! (fn [ctx p c]
+                                           (let [res (write! ctx p c)]
+                                             ;; an agent writes the same path right after
+                                             (mfs/write-string! (ws/room-fs r) p "the agent's" false)
+                                             res))]
+      (let [e (try (files/write! r {"a.txt" {:text "mine"}} {}) nil
+                   (catch clojure.lang.ExceptionInfo e e))]
+        (is (= :dvergr.rooms.forks/concurrent-change (:type (ex-data e))) (pr-str (ex-data e)))))
+    (is (= "the agent's" (worktree-text r "/a.txt")) "not overwritten by the undo")
+    (is (not (contains? (repo/tree (conn r) :head) "a.txt")) "nothing committed")))
+
+(deftest text-reads-whole-characters
+  (let [r (room)]
+    (files/write! r {"e.txt" {:text "éé"}} {})
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"shorter than the character"
+                          (files/read-file r "e.txt" {:length 1})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"inside a character"
+                          (files/read-file r "e.txt" {:offset 1})))
+    (is (= {:text "é" :next-offset 2} (select-keys (files/read-file r "e.txt" {:length 3}) [:text :next-offset])))
+    (is (= "é" (:text (files/read-file r "e.txt" {:offset 2}))))))
+
+(deftest a-full-chunk-fits-an-mcp-result
+  (let [r (room)
+        n files/max-read-bytes]
+    (files/write! r {"quotes.txt" {:text (apply str (repeat n "\""))}
+                     "ctl.txt" {:text (apply str (repeat n "\u0001"))}
+                     "bin.dat" {:base64 (b64 (byte-array n (unchecked-byte 0xff)))}} {})
+    (testing "control characters read as base64, not six-fold escaped text"
+      (is (:base64 (files/read-file r "ctl.txt" {}))))
+    (doseq [p ["quotes.txt" "ctl.txt" "bin.dat"]]
+      (is (:structuredContent (surface/data-result (files/read-file r p {})))
+          (str p ": the whole chunk, not a cut result")))))
+
+(deftest a-large-directory-lists-in-pages
+  (let [r (room)]
+    (doseq [part (partition-all 150 (range 205))]   ; at most 200 paths per batch
+      (files/write! r (into {} (for [i part] [(format "many/f%03d.txt" i) {:text (str i)}])) {}))
+    (let [a (files/list-dir r "/many" {})
+          b (files/list-dir r "/many" {:offset (:next-offset a)})]
+      (is (= [205 200 200] [(:total a) (count (:entries a)) (:next-offset a)]))
+      (is (= 5 (count (:entries b))))
+      (is (nil? (:next-offset b)))
+      (is (= 205 (count (distinct (map :path (concat (:entries a) (:entries b))))))))))

@@ -886,19 +886,23 @@
    :room/files
    {:doc (str "List a directory of a room's workspace (its Git repository; default the root): each "
               "entry's name, path, kind (file or dir) and, for a file, its size and content id (a hash "
-              "of its bytes). room_read reads a file, room_write writes files.")
+              "of its bytes). At most " room-files/max-list-entries " entries from `offset`; "
+              "`next-offset` when more follow, `total` counts them. room_read reads a file, room_write "
+              "writes files.")
     :kind :read
     :schema [:map [:room Room]
-             [:path {:optional true} [:string {:description "directory, e.g. /data (default /)"}]]]
-    :impl (fn [daemon {:keys [room path]}]
+             [:path {:optional true} [:string {:description "directory, e.g. /data (default /)"}]]
+             [:offset {:optional true} [:int {:min 0 :description "entry to start at (default 0)"}]]]
+    :impl (fn [daemon {:keys [room path offset]}]
             (when-let [r (resolve-room daemon room)]
-              (in-ctx daemon (room-files/list-dir r path))))}
+              (in-ctx daemon (room-files/list-dir r path {:offset offset}))))}
 
    :room/read
    {:doc (str "Read a file of a room's workspace: {text} for UTF-8 text, {base64, media-type} for "
-              "anything else (.xlsx, PDF, images), with its size and content id. One call returns at most "
-              room-files/max-read-bytes " bytes from `offset`; when the file goes on, `next-offset` says "
-              "where to continue. The resource room://{room}/files/{path} returns a file up to 4 MiB whole.")
+              "anything else (.xlsx, PDF, images, text with control characters), with its size and content "
+              "id. One call returns at most " room-files/max-read-bytes " bytes from `offset`, whole "
+              "characters for text; when the file goes on, `next-offset` says where to continue. The "
+              "resource room://{room}/files/{path} returns a file up to 4 MiB whole.")
     :kind :read
     :schema [:map [:room Room]
              [:path [:string {:description "file path in the workspace, e.g. /data/cases.csv"}]]
@@ -1188,7 +1192,9 @@
               "remove the file. Only these paths are committed; writing what is already there commits "
               "nothing (commit null). Paths stay in the workspace: no '..', nothing under .git. At most "
               room-files/max-batch-files " paths and " (quot room-files/max-batch-bytes (* 1024 1024)) " MiB per call, "
-              (quot room-files/max-file-bytes (* 1024 1024)) " MiB per file. A read-only world refuses it. "
+              (quot room-files/max-file-bytes (* 1024 1024)) " MiB per file. It is all or nothing: a "
+              "refused or failed write undoes the batch. Refused while the workspace has other staged "
+              "changes. A read-only world refuses it. "
               "History is the room's: room_fork to try changes, room_diff/room_merge to adopt them.")
     :kind :write
     :schema [:map [:room Room]

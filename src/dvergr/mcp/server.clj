@@ -349,7 +349,8 @@
   "The contents of the workspace file resource `uri`: the file whole (text or
    blob), or a directory's listing as JSON."
   [dmn uri {:keys [room path]}]
-  (let [json-text #(-> (surface/data-result %) :content first :text)]
+  ;; uncut: a resource is a document, and a listing is a bounded page
+  (let [json-text #(json/write-value-as-string % json-write-mapper)]
     (if-let [r (ops/resolve-room dmn room)]
       (binding [ec/*execution-context* (:execution-ctx dmn)]
         (try
