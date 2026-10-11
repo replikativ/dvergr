@@ -222,12 +222,9 @@
         file (.getCanonicalFile (if (fs/absolute? path) (java.io.File. (str path)) (java.io.File. base (str path))))]
     (when-not (.startsWith (.toPath file) (.toPath base))
       (throw (ex-info (str "Path outside the workspace: " path) {:path (str path) :workspace (str base)})))
-    ;; as written and as resolved, and never the repository's git directory
-    ;; however it is called
+    ;; as written and as resolved
     ((requiring-resolve 'dvergr.sandbox.ns.io/sensitive-path-policy) (str path))
     ((requiring-resolve 'dvergr.sandbox.ns.io/sensitive-path-policy) (str file))
-    (when ((requiring-resolve 'dvergr.sandbox.ns.io/in-git-metadata?) base file)
-      (throw (ex-info "Access denied: sensitive path (git metadata)" {:path (str path)})))
     (str file)))
 
 (defn- tool-path [{:keys [filesystem cwd]} path]

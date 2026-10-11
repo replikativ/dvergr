@@ -234,10 +234,6 @@
     (spit (java.io.File. dir "src/a.clj") "(ns a)\n(def changed 1)\n")
     dir))
 
-(defn- diff-argv [& args]
-  ;; resolved at run time so the suite compiles against a tree without it
-  (apply (requiring-resolve 'dvergr.sandbox.ns.io/git-diff-argv) args))
-
 (defn- refused?
   "Did `code` throw the sandbox's own git-argument refusal — not merely some
    git failure? A `--no-index` diff exits 1 on differences, so a bare
@@ -247,392 +243,6 @@
        (catch Exception e
          (boolean (some #(= :dvergr/git-arg-refused (:type (ex-data %)))
                         (take-while some? (iterate ex-cause e)))))))
-
-(deftest physical-git-diff-is-confined-to-the-workspace
-  ;; `git/diff` passed its arguments straight to host git: `--no-index` diffs
-  ;; any two host files (the exit-1 exception carried the content), and
-  ;; `--output=<file>` writes anywhere the daemon user can.
-  (let [dir (git-repo!)
-        ctx (sci/init {})
-        eval! #(sci/eval-string* ctx %)
-        out (java.io.File. (temp-dir! "dvergr-git-out") "diff-proof")]
-    (io/add-git-ns! ctx :base-path (str dir))
-    (testing "options outside the allowlist are refused"
-      (doseq [code ["(git/diff \"--no-index\" \"/dev/null\" \"/etc/hostname\")"
-                    (str "(git/diff \"--output=" out "\")")
-                    "(git/diff \"--output\" \"/tmp/x\")"
-                    "(git/diff \"--ext-diff\")"
-                    "(git/diff \"-O/etc/passwd\")"]]
-        (is (refused? eval! code) code))
-      (is (not (.exists out)) "nothing was written outside the workspace"))
-    (testing "paths outside the workspace are refused"
-      (doseq [code ["(git/diff \"/etc/passwd\")" "(git/diff \"../../etc/passwd\")"
-                    "(git/diff \"--staged\" \"src/../../x\")"
-                    ;; pathspec magic resolves against the repository root
-                    "(git/diff \":(top)outside.txt\")" "(git/diff \"--\" \":/x\")"]]
-        (is (refused? eval! code) code)))
-    (testing "arguments after the options are always paths"
-      (is (= ["diff" "--no-ext-diff" "--no-textconv" "--staged" "--stat" "--" "src/a.clj" "HEAD"]
-             (diff-argv (str dir) ["--staged" "--stat" "src/a.clj" "HEAD"])))
-      (is (= ["diff" "--no-ext-diff" "--no-textconv" "--" "."] (diff-argv (str dir) []))
-          "with no paths, a host diff is limited to the workspace")
-      (is (= ["diff" "--no-ext-diff" "--no-textconv" "--stat" "--" "--name-only"]
-             (diff-argv (str dir) ["--stat" "--" "--name-only"]))
-          "after the caller's own --, a dash-led argument is a path")
-      (is (= ["diff" "--"] (diff-argv nil []))
-          "the virtual workspace gets the same shape without the host-only flags"))
-    (testing "ordinary diffs keep working"
-      (is (str/includes? (sci/eval-string* ctx "(git/diff)") "changed"))
-      (is (str/includes? (sci/eval-string* ctx "(git/diff \"src/a.clj\")") "changed"))
-      (is (str/includes? (sci/eval-string* ctx "(git/diff \"--stat\")") "src/a.clj"))
-      (is (= "" (sci/eval-string* ctx "(git/diff \"--staged\")")))
-      (is (str/includes? (sci/eval-string* ctx "(git/diff \"-U0\" \"src\")") "changed")))
-    (testing "git/log's :n is a count, not an option"
-      (is (refused? eval! (str "(git/log {:n \"-output=" out "\"})")))
-      (is (not (.exists out)))
-      (is (= 1 (count (sci/eval-string* ctx "(git/log {:n 1})")))))))
-
-(deftest physical-git-diff-leaves-out-sensitive-files
-  ;; A tracked `.env` is as secret in a diff as it is to `slurp` and grep.
-  (let [dir (git-repo!)
-        ctx (sci/init {})]
-    (spit (java.io.File. dir ".env") "TOKEN=old\n")
-    (sh! dir "git" "add" ".env")
-    (sh! dir "git" "-c" "commit.gpgsign=false" "commit" "-q" "-m" "env")
-    (spit (java.io.File. dir ".env") "TOKEN=hunter2\n")
-    (io/add-git-ns! ctx :base-path (str dir))
-    (is (refused? #(sci/eval-string* ctx %) "(git/diff \".env\")"))
-    (doseq [code ["(git/diff)" "(git/diff \".\")" "(git/diff \"--stat\")" "(git/diff \"--name-only\")"]]
-      (let [d (sci/eval-string* ctx code)]
-        (is (str/includes? d "a.clj") (str code " still shows the other change"))
-        (is (not (str/includes? d "hunter2")) code)
-        (is (not (str/includes? d ".env")) code)))
-    (testing "a file named * is a file, not a pathspec that brings .env back"
-      (spit (java.io.File. dir "*") "star-before\n")
-      (sh! dir "git" "add" "--" ":(literal)*")
-      (sh! dir "git" "-c" "commit.gpgsign=false" "commit" "-q" "-m" "star")
-      (spit (java.io.File. dir "*") "star-after\n")
-      (let [d (sci/eval-string* ctx "(git/diff)")]
-        (is (str/includes? d "star-after"))
-        (is (not (str/includes? d "hunter2")) d))
-      (sh! dir "git" "checkout" "--" ":(literal)*"))
-    (testing "a diff of only sensitive changes is empty"
-      (sh! dir "git" "checkout" "--" "src/a.clj")
-      (is (= "" (sci/eval-string* ctx "(git/diff)"))))
-    (testing "a rename does not carry a sensitive source into the diff"
-      (sh! dir "git" "checkout" "--" ".env")
-      (sh! dir "git" "mv" ".env" "public.txt")
-      (doseq [code ["(git/diff \"--staged\")" "(git/diff \"--staged\" \"--no-renames\")"
-                    "(git/diff \"--staged\" \"--stat\")"]]
-        (let [d (sci/eval-string* ctx code)]
-          (is (str/includes? d "public.txt") code)
-          (is (not (str/includes? d ".env")) (str code ": " d)))))))
-
-(deftest physical-git-fetches-nothing
-  ;; A promisor remote lazily fetches a missing object — and an `ext::` URL
-  ;; runs a command to do it. Host git must use no transport at all and fail
-  ;; rather than fetch.
-  (let [dir (git-repo!)
-        sentinel (java.io.File. (temp-dir! "dvergr-fetch-sentinel") "ran")
-        ctx (sci/init {})
-        blob (str/trim (with-out-str
-                         (print (slurp (.getInputStream
-                                        (.start (doto (ProcessBuilder. ["git" "rev-parse" "HEAD:src/a.clj"])
-                                                  (.directory dir))))))))]
-    (sh! dir "git" "config" "core.repositoryformatversion" "1")
-    (sh! dir "git" "config" "extensions.partialClone" "origin")
-    (sh! dir "git" "config" "remote.origin.url" (str "ext::sh -c touch% " sentinel))
-    (sh! dir "git" "config" "remote.origin.promisor" "true")
-    (sh! dir "git" "config" "protocol.ext.allow" "always")
-    (.delete (java.io.File. dir (str ".git/objects/" (subs blob 0 2) "/" (subs blob 2))))
-    (io/add-git-ns! ctx :base-path (str dir))
-    (try (sci/eval-string* ctx "(git/diff)") (catch Exception _ nil))
-    (try (sci/eval-string* ctx "(git/diff \"--stat\")") (catch Exception _ nil))
-    (is (not (.exists sentinel)) "no transport helper ran")))
-
-(deftest physical-git-keeps-line-ending-attributes
-  ;; Filters and diff drivers are disabled by name; the repository's
-  ;; non-executable attributes (text, eol) still normalise what is staged.
-  (let [dir (git-repo!)
-        ctx (sci/init {})]
-    (spit (java.io.File. dir ".gitattributes") "*.txt text eol=lf\n")
-    (spit (java.io.File. dir "src/crlf.txt") "one\r\ntwo\r\n")
-    (io/add-git-ns! ctx :base-path (str dir))
-    (sci/eval-string* ctx "(git/add \"src/crlf.txt\")")
-    (let [p (.start (doto (ProcessBuilder. ["git" "show" ":src/crlf.txt"]) (.directory dir)))]
-      (is (= "one\ntwo\n" (slurp (.getInputStream p))) "staged with LF"))))
-
-(deftest physical-git-runs-no-automatic-maintenance
-  ;; Auto gc runs gc.recentObjectsHook, a repository-configured command that
-  ;; no hook override reaches.
-  (let [safety @#'io/git-safety-config]
-    (is (some #{"gc.auto=0"} safety))
-    (is (some #{"maintenance.auto=false"} safety))))
-
-(deftest physical-git-refuses-a-filter-it-cannot-disable
-  ;; `filter=` selects the driver with the empty name, `filter..clean`, which
-  ;; no `-c` override can express: host git must not run at all then.
-  (let [dir (git-repo!)
-        sentinel (java.io.File. (temp-dir! "dvergr-empty-filter") "ran")
-        ctx (sci/init {})]
-    (sh! dir "git" "config" "filter..clean" (str "sh -c 'touch " sentinel "; cat'"))
-    (spit (java.io.File. dir ".gitattributes") "*.txt filter=\n")
-    (spit (java.io.File. dir "x.txt") "x\n")
-    (io/add-git-ns! ctx :base-path (str dir))
-    (is (refused? #(sci/eval-string* ctx %) "(git/add \"x.txt\")"))
-    (is (not (.exists sentinel)) "the empty-name filter did not run")))
-
-(deftest physical-git-metadata-is-protected-under-any-name
-  ;; `.git -> metadata`: the repository's git directory under another name.
-  (let [dir (git-repo!)
-        meta (java.io.File. dir "metadata")
-        ctx (sci/init {})]
-    (.renameTo (java.io.File. dir ".git") meta)
-    (java.nio.file.Files/createSymbolicLink (.toPath (java.io.File. dir ".git")) (.toPath meta)
-                                            (make-array java.nio.file.attribute.FileAttribute 0))
-    (io/add-fs-ns! ctx :base-path (str dir))
-    (let [before (slurp (java.io.File. meta "config"))
-          tctx {:cwd (str dir)}]
-      (doseq [path [".git/config" "metadata/config"]]
-        (is (= :error (:type (tools/execute "write_file" {:path path :content "[core]\n"} tctx))) path))
-      (doseq [code ["(spit \"metadata/config\" \"[core]\")"
-                    "(babashka.fs/delete-tree \"metadata\")"
-                    "(babashka.fs/move \"metadata\" \"m2\")"]]
-        (is (thrown-with-msg? Exception #"sensitive path" (sci/eval-string* ctx code)) code))
-      (is (= before (slurp (java.io.File. meta "config"))))
-      (is (.exists (java.io.File. meta "HEAD"))))))
-
-(deftest physical-git-metadata-is-protected-through-gitfiles
-  (testing "a linked worktree's common dir (shared config and hooks)"
-    (let [dir (git-repo!)
-          shared (java.io.File. dir "shared")
-          ctx (sci/init {})]
-      (.renameTo (java.io.File. dir ".git") shared)
-      (.mkdirs (java.io.File. shared "worktrees/ws"))
-      (spit (java.io.File. shared "worktrees/ws/commondir") "../..\n")
-      (spit (java.io.File. shared "worktrees/ws/HEAD") "ref: refs/heads/main\n")
-      (spit (java.io.File. dir ".git") "gitdir: shared/worktrees/ws\n")
-      (io/add-fs-ns! ctx :base-path (str dir))
-      (let [before (slurp (java.io.File. shared "config"))]
-        (doseq [code ["(spit \"shared/config\" \"CHANGED\")"
-                      "(spit \"shared/hooks/pre-commit\" \"#!/bin/sh\")"
-                      "(babashka.fs/delete-tree \"shared\")"
-                      "(babashka.fs/move \"shared\" \"s2\")"]]
-          (is (thrown-with-msg? Exception #"sensitive path" (sci/eval-string* ctx code)) code))
-        (is (= :error (:type (tools/execute "write_file" {:path "shared/config" :content "x"}
-                                            {:cwd (str dir)}))))
-        (is (= before (slurp (java.io.File. shared "config")))))))
-  (testing "a gitfile target whose name contains a newline"
-    (let [dir (git-repo!)
-          meta (java.io.File. dir "meta\ndata")
-          ctx (sci/init {})]
-      (.renameTo (java.io.File. dir ".git") meta)
-      (spit (java.io.File. dir ".git") "gitdir: meta\ndata\n")
-      (io/add-fs-ns! ctx :base-path (str dir))
-      (let [before (slurp (java.io.File. meta "config"))]
-        (is (thrown-with-msg? Exception #"sensitive path"
-                              (sci/eval-string* ctx "(spit \"meta\\ndata/config\" \"CHANGED\")")))
-        (is (= before (slurp (java.io.File. meta "config"))))))))
-
-(deftest physical-git-paths-are-confined-lexically
-  ;; git resolves `..` textually; a symlink must not make `link/../../x`
-  ;; look inside the workspace.
-  (let [dir (git-repo!)
-        ws (java.io.File. dir "src")
-        ctx (sci/init {})]
-    (.mkdirs (java.io.File. ws "sub/deep"))
-    (java.nio.file.Files/createSymbolicLink (.toPath (java.io.File. ws "link"))
-                                            (.toPath (java.io.File. ws "sub/deep"))
-                                            (make-array java.nio.file.attribute.FileAttribute 0))
-    (spit (java.io.File. dir "outside.txt") "OUTSIDE-SECRET\n")
-    (sh! dir "git" "add" "outside.txt")
-    (io/add-git-ns! ctx :base-path (str ws))
-    (doseq [code ["(git/diff \"--cached\" \"link/../../outside.txt\")"
-                  "(git/add \"link/../../outside.txt\")"
-                  (str "(git/diff \"--cached\" \"" ws "/link/../../outside.txt\")")
-                  (str "(git/add \"" ws "/link/../../outside.txt\")")]]
-      (is (refused? #(sci/eval-string* ctx %) code) code))))
-
-(deftest physical-nested-repository-metadata-is-protected
-  ;; `child/.git` is a gitfile pointing to `child/metadata`.
-  (let [dir (git-repo!)
-        child (java.io.File. dir "child")
-        ctx (sci/init {})]
-    (.mkdirs child)
-    (sh! child "git" "init" "-q")
-    (.renameTo (java.io.File. child ".git") (java.io.File. child "metadata"))
-    (spit (java.io.File. child ".git") "gitdir: metadata\n")
-    (io/add-fs-ns! ctx :base-path (str dir))
-    (let [before (slurp (java.io.File. child "metadata/config"))]
-      (doseq [code ["(spit \"child/metadata/config\" \"CHANGED\")"
-                    "(spit \"child/metadata/hooks/pre-commit\" \"#!/bin/sh\")"
-                    "(babashka.fs/delete-tree \"child\")"
-                    "(babashka.fs/move \"child/metadata\" \"m\")"]]
-        (is (thrown-with-msg? Exception #"sensitive path" (sci/eval-string* ctx code)) code))
-      (is (= before (slurp (java.io.File. child "metadata/config")))))
-    (testing "the nested repository's own content stays writable"
-      (sci/eval-string* ctx "(spit \"child/src/x.clj\" \"(ns x)\")")
-      (is (= "(ns x)" (slurp (java.io.File. child "src/x.clj")))))))
-
-(deftest physical-git-needs-a-dotgit-worktree
-  ;; A bare-layout directory (HEAD, objects, refs) with core.worktree pointing
-  ;; elsewhere is a repository to git, but has no `.git` to pin the worktree to.
-  ;; Under /tmp, not the test tmpdir: that sits inside this checkout, whose
-  ;; own .git would (correctly) become the pinned worktree.
-  (let [mk #(.toFile (java.nio.file.Files/createTempDirectory
-                      (java.nio.file.Paths/get "/tmp" (make-array String 0)) %
-                      (make-array java.nio.file.attribute.FileAttribute 0)))
-        w (mk "dvergr-bare")
-        other (mk "dvergr-other")
-        ctx (sci/init {})]
-    (sh! w "git" "init" "-q" "--bare")
-    (sh! w "git" "config" "core.bare" "false")
-    (sh! w "git" "config" "core.worktree" (str other))
-    (spit (java.io.File. other "elsewhere.txt") "ELSEWHERE\n")
-    (io/add-git-ns! ctx :base-path (str w))
-    (is (refused? #(sci/eval-string* ctx %) "(git/diff)"))
-    (is (refused? #(sci/eval-string* ctx %) "(git/status)"))
-    (is (not (str/includes? (try (str (sci/eval-string* ctx "(git/diff)")) (catch Exception e (str (ex-data e))))
-                            "ELSEWHERE")))))
-
-(deftest physical-git-uses-the-workspace-worktree
-  ;; `core.worktree` (set directly or through an included config file) would
-  ;; point git at another directory than the one every check here is about.
-  (let [dir (git-repo!)
-        sibling (temp-dir! "dvergr-sibling")
-        ctx (sci/init {})]
-    (.mkdirs (java.io.File. sibling "src"))
-    (spit (java.io.File. sibling "src/a.clj") "(ns a)\n(def SIBLING-SENTINEL 1)\n")
-    (sh! dir "git" "config" "core.worktree" (str sibling))
-    (io/add-git-ns! ctx :base-path (str dir))
-    (let [d (sci/eval-string* ctx "(git/diff \".\")")]
-      (is (str/includes? d "changed"))
-      (is (not (str/includes? d "SIBLING-SENTINEL")) d))))
-
-(deftest physical-git-add-does-not-stage-sensitive-files
-  ;; `git/add "."` (or a glob) takes every file under it; a tracked `.env` and
-  ;; an untracked `.env.local` must stay out, as every other file tool keeps them.
-  (doseq [operand ["." "*"]]
-    (let [dir (git-repo!)
-          ctx (sci/init {})]
-      (spit (java.io.File. dir ".env") "TOKEN=old\n")
-      (sh! dir "git" "add" ".env")
-      (sh! dir "git" "-c" "commit.gpgsign=false" "commit" "-q" "-m" "env")
-      (spit (java.io.File. dir ".env") "TOKEN=hunter2\n")
-      (spit (java.io.File. dir ".env.local") "TOKEN=hunter3\n")
-      (io/add-git-ns! ctx :base-path (str dir))
-      (is (= :ok (sci/eval-string* ctx (str "(git/add \"" operand "\")"))))
-      (let [p (.start (doto (ProcessBuilder. ["git" "diff" "--cached" "--name-only"]) (.directory dir)))
-            staged (slurp (.getInputStream p))]
-        (is (str/includes? staged "src/a.clj") operand)
-        (is (not (str/includes? staged ".env")) (str operand ": " staged))))))
-
-(deftest physical-git-does-not-enter-submodules
-  ;; A submodule is a repository of its own: its files, config and filters are
-  ;; outside every check the host git call makes.
-  (let [dir (git-repo!)
-        child (java.io.File. dir "child")
-        sentinel (java.io.File. (temp-dir! "dvergr-sub-sentinel") "ran")
-        script (java.io.File. (temp-dir! "dvergr-sub-script") "probe.sh")
-        ctx (sci/init {})]
-    (spit script (str "#!/bin/sh\ntouch " sentinel "\ncat\n"))
-    (.setExecutable script true)
-    (.mkdirs child)
-    (sh! child "git" "init" "-q")
-    (sh! child "git" "config" "user.email" "t@example.com")
-    (sh! child "git" "config" "user.name" "t")
-    (spit (java.io.File. child ".env") "TOKEN=child-old\n")
-    (spit (java.io.File. child "f.txt") "one\n")
-    (sh! child "git" "add" ".")
-    (sh! child "git" "-c" "commit.gpgsign=false" "commit" "-q" "-m" "child")
-    (sh! dir "git" "add" "child")
-    (sh! dir "git" "-c" "commit.gpgsign=false" "commit" "-q" "-m" "gitlink")
-    (sh! dir "git" "config" "diff.submodule" "diff")
-    (sh! child "git" "config" "filter.probe.clean" (str script))
-    (spit (java.io.File. child ".gitattributes") "*.txt filter=probe\n")
-    (spit (java.io.File. child ".env") "TOKEN=child-secret\n")
-    (spit (java.io.File. child "f.txt") "two\n")
-    (io/add-git-ns! ctx :base-path (str dir))
-    (let [d (sci/eval-string* ctx "(git/diff)")]
-      (is (str/includes? d "changed") "the parent's own change shows")
-      (is (not (str/includes? d "child-secret")) d))
-    (is (map? (sci/eval-string* ctx "(git/status)")))
-    (is (not (.exists sentinel)) "no filter configured inside the submodule ran")))
-
-(deftest physical-git-runs-no-repository-supplied-commands
-  ;; In physical mode the repository's config and hooks live in the workspace.
-  ;; Host git must not run an external diff, a textconv driver or a hook that
-  ;; someone put there.
-  (let [dir (git-repo!)
-        sentinel (java.io.File. (temp-dir! "dvergr-git-sentinel") "ran")
-        script (java.io.File. (temp-dir! "dvergr-git-script") "probe.sh")
-        ctx (sci/init {})]
-    (spit script (str "#!/bin/sh\ntouch " sentinel "\n"))
-    (.setExecutable script true)
-    (sh! dir "git" "config" "diff.external" (str script))
-    (sh! dir "git" "config" "diff.probe.textconv" (str script))
-    (sh! dir "git" "config" "filter.probe.clean" (str script))
-    (sh! dir "git" "config" "filter.probe.process" (str script))
-    (spit (java.io.File. dir "src/b.txt") "filtered\n")
-    (spit (java.io.File. dir ".gitattributes") "*.clj diff=probe\n*.txt filter=probe\n")
-    ;; every attribute source selects the filter — worktree, global
-    ;; (core.attributesFile) and `.git/info/attributes`: filters are emptied
-    ;; by name, whichever source names them
-    (spit (java.io.File. dir "global-attributes") "*.txt filter=probe\n")
-    (sh! dir "git" "config" "core.attributesFile" (str (java.io.File. dir "global-attributes")))
-    ;; (`.git/info/attributes` written directly, as if the workspace had reached it)
-    (.mkdirs (java.io.File. dir ".git/info"))
-    (spit (java.io.File. dir ".git/info/attributes") "*.txt filter=probe\n*.md filter=probe\n")
-    (sh! dir "git" "config" "filter.probe.required" "true")
-    (spit (java.io.File. dir "src/c.md") "info attributes\n")
-    (let [hook (java.io.File. dir ".git/hooks/pre-commit")]
-      (.mkdirs (.getParentFile hook))
-      (spit hook (str "#!/bin/sh\ntouch " sentinel "\n"))
-      (.setExecutable hook true))
-    (io/add-git-ns! ctx :base-path (str dir))
-    (is (str/includes? (sci/eval-string* ctx "(git/diff)") "changed"))
-    (is (str/includes? (sci/eval-string* ctx "(git/diff \"src/a.clj\")") "changed"))
-    (sci/eval-string* ctx "(git/add \"src/a.clj\")")
-    (sci/eval-string* ctx "(git/add \"src/b.txt\")")
-    (is (= :ok (sci/eval-string* ctx "(git/add \"src/c.md\")"))
-        "a required filter, emptied, does not fail the add")
-    (is (map? (sci/eval-string* ctx "(git/status)")))
-    (sci/eval-string* ctx "(git/commit \"probe\")")
-    (is (not (.exists sentinel)) "no repository-supplied command ran")))
-
-(deftest physical-git-diff-stays-in-a-nested-workspace
-  ;; A workspace can be a subdirectory of a larger repository; an argument-free
-  ;; diff must not show the rest of that repository.
-  (let [dir (git-repo!)
-        ctx (sci/init {})]
-    (spit (java.io.File. dir "outside.txt") "before\n")
-    (sh! dir "git" "add" "outside.txt")
-    (sh! dir "git" "-c" "commit.gpgsign=false" "commit" "-q" "-m" "outside")
-    (spit (java.io.File. dir "outside.txt") "after-outside\n")
-    (io/add-git-ns! ctx :base-path (str (java.io.File. dir "src")))
-    (let [d (sci/eval-string* ctx "(git/diff)")]
-      (is (str/includes? d "changed") "changes inside the workspace show")
-      (is (not (str/includes? d "after-outside")) "changes outside it do not"))
-    (testing "git/add needs a path, and with a sensitive file present stages only inside"
-      (spit (java.io.File. dir "src/.env") "S=1\n")
-      (is (refused? #(sci/eval-string* ctx %) "(git/add)"))
-      (sci/eval-string* ctx "(git/add \".\")")
-      (let [p (.start (doto (ProcessBuilder. ["git" "diff" "--cached" "--name-only"]) (.directory dir)))
-            staged (slurp (.getInputStream p))]
-        (is (not (str/includes? staged "outside.txt")) staged)
-        (is (not (str/includes? staged ".env")) staged))
-      (.delete (java.io.File. dir "src/.env"))
-      (sh! dir "git" "reset" "-q"))
-    (testing "staging cannot reach outside it either"
-      (is (refused? #(sci/eval-string* ctx %) "(git/add \":(top)outside.txt\")"))
-      (is (refused? #(sci/eval-string* ctx %) "(git/add \"../outside.txt\")"))
-      (sci/eval-string* ctx "(git/add \".\")")
-      (let [staged (with-out-str
-                     (let [p (.start (doto (ProcessBuilder. ["git" "diff" "--cached" "--name-only"])
-                                       (.directory dir)))]
-                       (print (slurp (.getInputStream p)))))]
-        (is (str/includes? staged "src/a.clj"))
-        (is (not (str/includes? staged "outside.txt")) staged)))))
 
 (deftest physical-fs-cannot-write-git-internals
   ;; Writing `.git/config` or a hook is how a workspace turns the next host git
@@ -698,6 +308,31 @@
       (is (some? (sci/eval-string* ctx "(spit \"src/b.clj\" \"(ns b)\")")))
       (is (nil? (io/sensitive-path-policy ".github/workflows/x.yml")))
       (is (nil? (io/sensitive-path-policy "vendor/lib.git.bak"))))))
+
+(deftest agents-get-no-host-git
+  ;; Without a room (Geschichte) workspace there is no git for agents: host
+  ;; git runs repository-configured commands (hooks, filters, diff drivers,
+  ;; transports, gc hooks) from a repository the agent can write to.
+  (let [dir (git-repo!)
+        ctx (sci/init {})]
+    (io/add-git-ns! ctx :base-path (str dir))
+    (doseq [code ["(git/status)" "(git/log {:n 1})" "(git/diff)"
+                  "(git/diff \"--no-index\" \"/dev/null\" \"/etc/hostname\")"
+                  "(git/add \"src/a.clj\")" "(git/commit \"x\")"]]
+      (let [r (try (sci/eval-string* ctx code) (catch Exception e e))]
+        (is (instance? Exception r) code)
+        (is (some #(= :no-room-workspace (:reason (ex-data %)))
+                  (take-while some? (iterate ex-cause r)))
+            code)))))
+
+(deftest virtual-git-diff-arguments-are-confined
+  (is (= ["diff" "--staged" "--stat" "--" "src/a.clj" "HEAD"]
+         (io/git-diff-argv ["--staged" "--stat" "src/a.clj" "HEAD"])))
+  (is (= ["diff" "--stat" "--" "--name-only"] (io/git-diff-argv ["--stat" "--" "--name-only"]))
+      "after the caller's own --, a dash-led argument is a path")
+  (doseq [args [["--no-index" "/dev/null" "/etc/hostname"] ["--output=/tmp/x"] ["--ext-diff"]
+                [":(top)x"] ["../../etc/passwd"] [".env"]]]
+    (is (thrown? Exception (io/git-diff-argv args)) (pr-str args))))
 
 (deftest physical-grep-is-confined
   ;; The host-grep branch of the `grep` tool (no virtual filesystem) passed the

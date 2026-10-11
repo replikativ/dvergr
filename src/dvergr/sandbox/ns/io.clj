@@ -15,7 +15,7 @@
             [dvergr.sandbox.ns.doc :as doc])
   (:import [java.io File]))
 
-(declare fs-safe-resolve git-run* worktree-top in-git-metadata? parse-porcelain-status parse-git-log git-log-format)
+(declare fs-safe-resolve parse-porcelain-status parse-git-log git-log-format)
 
 (defn install-http-fixture!
   "Host-only world setup: install an immutable offline capability in the current
@@ -285,12 +285,7 @@
         sr             (fn [p] (let [ps (str p)]
                                  (sensitive-path-policy ps)
                                  (doto (fs-safe-resolve base-canonical ps)
-                                   (-> str sensitive-path-policy)
-                                   ;; the repository's git directory, whatever
-                                   ;; it is called (`.git -> metadata`)
-                                   (as-> f (when (in-git-metadata? base-canonical f)
-                                             (throw (ex-info "Access denied: sensitive path (git metadata)"
-                                                             {:path ps})))))))
+                                   (-> str sensitive-path-policy))))
         ;; Relativize a resolved (absolute) path back to a workspace-relative
         ;; string, so agents never see the real `.dvergr/systems/<uuid>/…`
         ;; location — and get paths they can pass straight back to fs/slurp
@@ -614,61 +609,29 @@
 
 (def ^:private git-diff-flags
   "The `git/diff` options an agent may pass: output shape and whitespace only.
-   Anything else is refused — host git has options that read or write outside
-   the workspace (`--no-index`, `--output=`, `-O<file>`, `--ext-diff`, …), and
-   the virtual workspace implements this same subset."
+   Anything else is refused; this is the subset the virtual workspace
+   implements."
   #{"--cached" "--staged" "--stat" "--shortstat" "--numstat" "--name-only"
     "--name-status" "-p" "-u" "--patch" "-w" "--ignore-all-space" "-b"
     "--ignore-space-change" "--no-color" "--no-renames" "-R"})
 
 (defn- workspace-pathspec!
-  "Refuse a git path that leaves the workspace or names a sensitive file.
-   Pathspec magic (`:(top)x`, `:/x`) is refused outright — git resolves it
-   against the repository root, not the path as written. With a physical
-   `base-path` the path (relative to it, or absolute) is canonicalised, so `..`
-   and a symlink out of the workspace are refused alike. In the virtual
-   workspace a leading `/` names the repository root and no path may climb
-   above it."
-  [base-path path]
-  (let [refuse! #(git-arg-refused! (str "git path outside the workspace: " path)
-                                   {:path path})]
-    (when (str/starts-with? path ":")
-      (git-arg-refused! (str "git pathspec magic not allowed: " path) {:path path}))
-    (when (try (sensitive-path-policy path) false (catch clojure.lang.ExceptionInfo _ true))
-      (git-arg-refused! (str "git path is a sensitive file: " path) {:path path}))
-    ;; Lexically first: git resolves `..` in the operand textually, not
-    ;; through symlinks, so `link/../../x` can name a file outside even when
-    ;; its canonical form is inside. No `..` may climb above where it starts.
-    (when (neg? (reduce (fn [d seg]
-                          (case seg
-                            ("" ".") d
-                            ".." (if (zero? d) (reduced -1) (dec d))
-                            (inc d)))
-                        0 (str/split (str/replace path #"^/+" "") #"/")))
-      (refuse!))
-    (if base-path
-      (let [base (.getCanonicalFile (java.io.File. (str base-path)))
-            f (java.io.File. (str path))
-            file (.getCanonicalFile (if (.isAbsolute f) f (java.io.File. base (str path))))]
-        (when-not (.startsWith (.toPath file) (.toPath base))
-          (refuse!))
-        ;; and lexically, as git reads it: an absolute operand is normalised
-        ;; textually and must stay under the workspace as spelled or as
-        ;; canonical
-        (let [lex (.normalize (.toPath (if (.isAbsolute f) f (java.io.File. (str base-path) (str path)))))
-              spelled (.normalize (.toPath (.getAbsoluteFile (java.io.File. (str base-path)))))]
-          (when-not (or (.startsWith lex spelled) (.startsWith lex (.toPath base)))
-            (refuse!)))
-        (when (try (sensitive-path-policy (str file)) false (catch clojure.lang.ExceptionInfo _ true))
-          (git-arg-refused! (str "git path is a sensitive file: " path) {:path path})))
-      (when (neg? (reduce (fn [d seg]
-                            (case seg
-                              ("" ".") d
-                              ".." (if (zero? d) (reduced -1) (dec d))
-                              (inc d)))
-                          0 (str/split (str/replace path #"^/+" "") #"/")))
-        (refuse!)))
-    path))
+  "Refuse a git path that names a sensitive file, uses pathspec magic
+   (`:(top)x`), or climbs above the repository root (a leading `/` names the
+   root)."
+  [path]
+  (when (str/starts-with? path ":")
+    (git-arg-refused! (str "git pathspec magic not allowed: " path) {:path path}))
+  (when (try (sensitive-path-policy path) false (catch clojure.lang.ExceptionInfo _ true))
+    (git-arg-refused! (str "git path is a sensitive file: " path) {:path path}))
+  (when (neg? (reduce (fn [d seg]
+                        (case seg
+                          ("" ".") d
+                          ".." (if (zero? d) (reduced -1) (dec d))
+                          (inc d)))
+                      0 (str/split (str/replace path #"^/+" "") #"/")))
+    (git-arg-refused! (str "git path outside the workspace: " path) {:path path}))
+  path)
 
 (defn- sensitive-name? [path]
   (try (sensitive-path-policy (str path)) false
@@ -676,16 +639,10 @@
 
 (defn git-diff-argv
   "The argv for `(git/diff & args)`: allowlisted options, then `--`, then
-   paths — so no argument is ever read as an option it was not checked as, and
-   every path stays inside the workspace (`base-path`, or the virtual
-   workspace's root when nil). Operands are always paths, never revisions; an
-   argument after a caller's own `--` is a path even if it starts with `-`.
-
-   On the host (`base-path` set) the diff also never runs an external diff or
-   textconv driver (repository config the agent may have written), and with no
-   paths it is limited to `base-path`, which can be a subdirectory of a larger
-   repository."
-  [base-path args]
+   paths, each checked by `workspace-pathspec!`. Operands are always paths,
+   never revisions; an argument after a caller's own `--` is a path even if
+   it starts with `-`."
+  [args]
   (let [[before after] (split-with #(not= "--" %) (map str args))
         options (filter #(str/starts-with? % "-") before)
         paths (concat (remove #(str/starts-with? % "-") before) (rest after))]
@@ -695,11 +652,9 @@
                              " (allowed: " (str/join " " (sort git-diff-flags)) " -U<n>)")
                         {:option o}))
     (-> ["diff"]
-        (into (when base-path ["--no-ext-diff" "--no-textconv"]))
         (into options)
         (conj "--")
-        (into (map #(workspace-pathspec! base-path %)) paths)
-        (cond-> (and base-path (empty? paths)) (conj ".")))))
+        (into (map workspace-pathspec!) paths))))
 
 (defn add-git-ns!
   "Expose structured git operations as 'git namespace in SCI.
@@ -708,7 +663,8 @@
    to understand workspace state before committing. This namespace returns
    structured Clojure data rather than raw strings.
 
-   :base-path - git working directory (default: user.dir)
+   :workspace / :workspace-resolver - the room's Geschichte workspace. Without
+                 one every function refuses: agents get no host git.
    :effects   - boundary fn (`dvergr.effects/boundary-resolver`); add/commit are effects
 
    Usage in SCI:
@@ -728,8 +684,7 @@
 
      (git/commit \"Add feature\")
      ;; => \"[main abc1234] Add feature\""
-  [sci-ctx & {:keys [base-path effects workspace workspace-resolver]
-              :or   {base-path ((requiring-resolve 'dvergr.substrate.git/safe-workspace-root))}}]
+  [sci-ctx & {:keys [effects workspace workspace-resolver]}]
   (let [run!      (if (or workspace workspace-resolver)
                     (fn [& args]
                       (let [workspace (if workspace-resolver
@@ -741,7 +696,15 @@
                         (if (zero? (:exit result))
                           (:stdout result)
                           (throw (ex-info (str/trim (:stderr result)) result)))))
-                    (fn [& args] (apply git-run* base-path args)))
+                    ;; No room workspace: agents get no host git. Host git
+                    ;; executes repository-configured commands (hooks,
+                    ;; filters, diff drivers, transports, gc hooks) from a
+                    ;; repository the agent can write to; there is no
+                    ;; argument-level confinement of that worth trusting.
+                    nil)
+        no-room! (fn [& _]
+                   (git-arg-refused! "git needs a room workspace; host git is not available to agents"
+                                     {:reason :no-room-workspace}))
 
         status-fn (fn []
                     (fx effects :git/read {:op :status}
@@ -759,29 +722,23 @@
                             (run! "log" git-log-format (str "-" n))))))
 
         ;; Validate before the effect boundary, so a refusal is not audited as
-        ;; a read that happened. Physical paths are checked against the
-        ;; workspace on disk; virtual ones against the repository root.
+        ;; a read that happened.
         diff-fn   (fn [& args]
-                    (let [host-base (when-not (or workspace workspace-resolver) base-path)
-                          argv (git-diff-argv host-base args)
+                    (let [argv (git-diff-argv args)
                           sep (.indexOf ^java.util.List argv "--")
                           opts (subvec argv 1 sep)
                           paths (subvec argv (inc sep))]
                       (fx effects :git/read {:op :diff :args (vec args)}
                           ;; Which files does this diff cover? A sensitive one
-                          ;; (a tracked `.env`) is left out, as every other
-                          ;; file tool leaves it out; the diff then runs on
-                          ;; the rest by name. Listed without rename
-                          ;; detection, so both sides of a rename are seen,
-                          ;; and rerun without it, so a sensitive source
-                          ;; cannot come back as a rename's old side. Names
-                          ;; are split on NUL only and passed back as literal
-                          ;; pathspecs (a file named `*` is that file).
+                          ;; (a tracked `.env`) is left out, as the file tools
+                          ;; leave it out; the diff then runs on the rest by
+                          ;; name. Listed without rename detection, so both
+                          ;; sides of a rename are seen, and rerun without it.
+                          ;; Names are split on NUL only and passed back as
+                          ;; literal pathspecs. (Partial; see #271.)
                           #(let [names (->> (apply run! (concat ["diff"]
-                                                                (filter #{"--cached" "--staged" "--no-ext-diff" "--no-textconv"} opts)
-                                                                ["--no-renames" "--name-only" "-z"]
-                                                                (when host-base ["--relative"])
-                                                                ["--"] paths))
+                                                                (filter #{"--cached" "--staged"} opts)
+                                                                ["--no-renames" "--name-only" "-z" "--"] paths))
                                             (re-seq #"[^\u0000]+"))
                                  safe (remove sensitive-name? names)]
                              (cond
@@ -791,74 +748,46 @@
                                                          (map (fn [n] (str ":(literal)" n)) safe))))))))
 
         add-fn    (fn [& paths]
-                    (let [host-base (when-not (or workspace workspace-resolver) base-path)
-                          _ (when (empty? paths)
+                    (let [_ (when (empty? paths)
                               (git-arg-refused! "git/add needs at least one path (\".\" for everything)" {}))
-                          paths (mapv #(workspace-pathspec! host-base (str %)) paths)]
+                          paths (mapv #(workspace-pathspec! (str %)) paths)]
                       (fx effects :git/add {:paths paths}
-                          ;; `.` or a directory takes every file under it, a
-                          ;; tracked `.env` too: on the host, list what the add
-                          ;; would stage and stage only the non-sensitive files
-                          ;; (as literal, root-relative pathspecs — that is how
-                          ;; status names them).
-                          #(do (if host-base
-                                 (let [names (->> (apply run! (concat ["status" "--porcelain=v1" "-z"
-                                                                       "--untracked-files=all" "--no-renames" "--"]
-                                                                      paths))
-                                                  (re-seq #"[^\u0000]+")
-                                                  (keep (fn [e] (when (> (count e) 3) (subs e 3)))))
-                                       ;; status names are root-relative: keep only
-                                       ;; those inside the workspace
-                                       top (worktree-top host-base)
-                                       base (.toPath (.getCanonicalFile (java.io.File. (str host-base))))
-                                       inside? (fn [n] (and top (.startsWith (.toPath (.getCanonicalFile (java.io.File. ^java.io.File top ^String n))) base)))
-                                       safe (remove sensitive-name? (filter inside? names))]
-                                   (cond
-                                     ;; every listed name is inside and safe: the
-                                     ;; operands as given select exactly these
-                                     (= (count safe) (count names)) (apply run! "add" "--" paths)
-                                     (seq safe) (apply run! "add" "--" (map (fn [n] (str ":(top,literal)" n)) safe))
-                                     :else nil))
-                                 ;; Virtual: geschichte's status takes no
-                                 ;; pathspecs, so select its names by path
-                                 ;; prefix ourselves; a glob is refused when
-                                 ;; any sensitive file has changes. Its add
-                                 ;; reads `-A`/`-u`/`-f` anywhere in argv, even
-                                 ;; after `--`: a dash-led operand is refused,
-                                 ;; and names go back root-anchored (`/-A` is
-                                 ;; the file `-A`).
-                                 ;; Names come from Geschichte's structured status
-                                 ;; entries (a file name with a line break is one
-                                 ;; name, not a forged record).
-                                 (let [_ (doseq [p paths :when (str/starts-with? p "-")]
-                                           (git-arg-refused! (str "git/add path may not start with -: " p) {:path p}))
-                                       {:keys [conn]} (if workspace-resolver (workspace-resolver) workspace)
-                                       rules ((requiring-resolve 'geschichte.ignore/rules) conn)
-                                       ignored? (requiring-resolve 'geschichte.ignore/ignored?)
-                                       names (->> ((requiring-resolve 'geschichte.repo/status-entries) conn)
-                                                  (remove (fn [{:keys [path worktree index]}]
-                                                            (and (= :untracked worktree) (nil? index)
-                                                                 (ignored? rules path))))
-                                                  (map :path))
-                                       rel (fn [p] (-> (java.nio.file.Paths/get "/" (into-array String [(str p)]))
-                                                       .normalize str (str/replace #"^/+|/+$" "")))
-                                       ;; operands normalised the same way on both
-                                       ;; branches, root-anchored
-                                       anchored (mapv (fn [p] (let [r (rel p)] (if (= "" r) "." (str "/" r)))) paths)
-                                       selected? (fn [n] (some (fn [p] (let [p (rel p)]
-                                                                         (or (= "" p) (= n p)
-                                                                             (str/starts-with? n (str p "/")))))
-                                                               paths))
-                                       sensitive (filter sensitive-name? names)]
-                                   (cond
-                                     (empty? sensitive) (apply run! "add" "--" anchored)
-                                     (some (fn [p] (re-find #"[*?\[]" p)) paths)
-                                     (git-arg-refused! "git/add glob not allowed while a sensitive file has changes"
-                                                       {:paths paths})
-                                     :else (let [safe (remove sensitive-name? (filter selected? names))]
-                                             (when (seq safe)
-                                               (apply run! "add" "--" (map (fn [n] (str "/" n)) safe)))))))
-                               :ok))))
+                          ;; Geschichte's status takes no pathspecs, so select
+                          ;; its names by path prefix here and stage only the
+                          ;; non-sensitive ones; a glob is refused when any
+                          ;; sensitive file has changes. Its add reads
+                          ;; `-A`/`-u`/`-f` anywhere in argv, even after `--`:
+                          ;; a dash-led operand is refused and names go back
+                          ;; root-anchored (`/-A` is the file `-A`). Names come
+                          ;; from the structured status entries, so a file name
+                          ;; with a line break is one name. (Partial; see #271.)
+                          #(let [_ (doseq [p paths :when (str/starts-with? p "-")]
+                                     (git-arg-refused! (str "git/add path may not start with -: " p) {:path p}))
+                                 {:keys [conn]} (if workspace-resolver (workspace-resolver) workspace)
+                                 rules ((requiring-resolve 'geschichte.ignore/rules) conn)
+                                 ignored? (requiring-resolve 'geschichte.ignore/ignored?)
+                                 names (->> ((requiring-resolve 'geschichte.repo/status-entries) conn)
+                                            (remove (fn [{:keys [path worktree index]}]
+                                                      (and (= :untracked worktree) (nil? index)
+                                                           (ignored? rules path))))
+                                            (map :path))
+                                 rel (fn [p] (-> (java.nio.file.Paths/get "/" (into-array String [(str p)]))
+                                                 .normalize str (str/replace #"^/+|/+$" "")))
+                                 anchored (mapv (fn [p] (let [r (rel p)] (if (= "" r) "." (str "/" r)))) paths)
+                                 selected? (fn [n] (some (fn [p] (let [p (rel p)]
+                                                                   (or (= "" p) (= n p)
+                                                                       (str/starts-with? n (str p "/")))))
+                                                         paths))
+                                 sensitive (filter sensitive-name? names)]
+                             (cond
+                               (empty? sensitive) (apply run! "add" "--" anchored)
+                               (some (fn [p] (re-find #"[*?\[]" p)) paths)
+                               (git-arg-refused! "git/add glob not allowed while a sensitive file has changes"
+                                                 {:paths paths})
+                               :else (let [safe (remove sensitive-name? (filter selected? names))]
+                                       (when (seq safe)
+                                         (apply run! "add" "--" (map (fn [n] (str "/" n)) safe)))))
+                             :ok))))
 
         commit-fn (fn [message & [opts]]
                     (fx effects :git/commit {:message message}
@@ -868,11 +797,13 @@
 
     (sci/add-namespace! sci-ctx 'git
                         (doc/with-docs
-                          {'status status-fn
-                           'log    log-fn
-                           'diff   diff-fn
-                           'add    add-fn
-                           'commit commit-fn}
+                          (cond-> {'status status-fn
+                                   'log    log-fn
+                                   'diff   diff-fn
+                                   'add    add-fn
+                                   'commit commit-fn}
+                            ;; no room workspace: every call refuses, first
+                            (nil? run!) (update-vals (constantly no-room!)))
                           '{status [([]) "Working-tree status of YOUR room's repo, PARSED into a map (not porcelain text) — branch plus changed paths."
                                     [:=> :cat [:map [:branch :string] [:staged [:vector :string]]
                                                [:unstaged [:vector :string]] [:untracked [:vector :string]]]]]
@@ -1211,169 +1142,6 @@
       (throw (ex-info "Path escape attempt: resolved path is outside sandbox"
                       {:path user-path :base (str base-canonical)})))
     resolved))
-
-(def ^:private git-safety-config
-  "Config overrides for every host git call. The repository's own config is
-   writable from the workspace in physical mode; these keep it from turning a
-   `git/status` or `git/commit` into host command execution (hooks, the
-   fsmonitor hook, a signing program)."
-  ["-c" "core.hooksPath=/dev/null"
-   "-c" "core.fsmonitor=false"
-   "-c" "commit.gpgSign=false"
-   "-c" "log.showSignature=false"
-   ;; A submodule is another repository with its own config, filters and
-   ;; files, none of which the overrides here or the sensitive-file filter
-   ;; see: never recurse into one, never expand its contents.
-   "-c" "submodule.recurse=false"
-   "-c" "diff.submodule=short"
-   "-c" "diff.ignoreSubmodules=all"
-   "-c" "status.submoduleSummary=false"
-   ;; No automatic gc/maintenance: it runs repository-configured commands
-   ;; (gc.recentObjectsHook) that no hook override reaches.
-   "-c" "gc.auto=0"
-   "-c" "maintenance.auto=false"
-   ;; No transport at all (a promisor remote would lazily fetch missing
-   ;; objects, and `ext::` runs a command): per-protocol keys win over
-   ;; protocol.allow, so each is pinned; GIT_ALLOW_PROTOCOL and
-   ;; GIT_NO_LAZY_FETCH below back this up.
-   "-c" "protocol.allow=never"
-   "-c" "protocol.ext.allow=never"
-   "-c" "protocol.file.allow=never"
-   "-c" "protocol.git.allow=never"
-   "-c" "protocol.ssh.allow=never"
-   "-c" "protocol.http.allow=never"
-   "-c" "protocol.https.allow=never"])
-
-(defn- filter-overrides
-  "`-c filter.<name>.<key>=` for every filter driver git's config defines, so
-   none runs whatever selects it (`.gitattributes`, `.git/info/attributes`, a
-   global attributes file) and on every git version. An empty command is no
-   filter. A driver name `-c` cannot express (one with `=`) refuses the call."
-  [base-path]
-  (let [pb (doto (ProcessBuilder. ^java.util.List ["git" "config" "-z" "--get-regexp" "^filter\\."])
-             (.directory (java.io.File. (str base-path)))
-             (.redirectError java.lang.ProcessBuilder$Redirect/DISCARD))
-        proc (.start pb)
-        out (slurp (.getInputStream proc))
-        _ (.waitFor proc)
-        names (into #{}
-                    (keep (fn [entry]
-                            (let [k (first (str/split entry #"\n" 2))]
-                              (when-let [[_ n] (re-matches #"(?s)filter\.(.*)\.[^.]+" k)]
-                                n))))
-                    (str/split out #"\u0000"))]
-    ;; `-c` can express neither an empty driver name (`filter..clean`, which
-    ;; `filter=` selects) nor one with `=`; git would run it, so refuse.
-    (when (some #(or (str/blank? %) (str/includes? % "=")) names)
-      (git-arg-refused! "git filter driver name not overridable" {:names names}))
-    ;; `required` too: a required filter with no command fails the call.
-    (into [] (mapcat (fn [n] (concat (mapcat #(vector "-c" (str "filter." n "." % "="))
-                                             ["clean" "smudge" "process"])
-                                     ["-c" (str "filter." n ".required=false")])))
-          names)))
-
-(defn- worktree-top
-  "The directory holding `.git` at or above `base-path` — the worktree host git
-   is pinned to."
-  [base-path]
-  (->> (iterate #(.getParentFile ^java.io.File %)
-                (.getCanonicalFile (java.io.File. (str base-path))))
-       (take-while some?)
-       ;; a real one, as git's discovery would accept: a directory with HEAD
-       ;; (or a symlink to one), or a `gitdir:` file — not any stray `.git`
-       (filter (fn [^java.io.File d]
-                 (let [g (java.io.File. d ".git")]
-                   (or (.isFile (java.io.File. g "HEAD"))
-                       (and (.isFile g)
-                            (str/starts-with? (slurp g) "gitdir: "))))))
-       first))
-
-(defn- read-git-pointer
-  "A gitfile's or commondir's target as git reads it: the whole content (after
-   the `gitdir: ` prefix for a gitfile) minus trailing CR/LF — a name may
-   contain a newline — resolved against `relative-to`."
-  [^java.io.File f prefix ^java.io.File relative-to]
-  (let [content (str/replace (slurp f) #"[\r\n]+$" "")]
-    (when (str/starts-with? content prefix)
-      (let [target (java.io.File. (subs content (count prefix)))]
-        (.getCanonicalFile (if (.isAbsolute target) target (java.io.File. relative-to (str target))))))))
-
-(defn git-metadata-dirs
-  "The canonical git directories of the repository `base-path` is in: the git
-   dir (`.git`, or where a `.git` symlink or gitfile points) and, for a linked
-   worktree, its common dir (shared config, hooks, objects). Writes, deletes
-   and moves must not reach either however it is spelled."
-  [base-path]
-  (when-let [top (worktree-top base-path)]
-    (let [dotgit (java.io.File. ^java.io.File top ".git")
-          gitdir (if (.isFile dotgit)
-                   (read-git-pointer dotgit "gitdir: " top)
-                   (.getCanonicalFile dotgit))
-          common-file (some-> gitdir (java.io.File. "commondir"))
-          common (when (and common-file (.isFile common-file))
-                   (read-git-pointer common-file "" gitdir))]
-      (into #{} (remove nil?) [gitdir common]))))
-
-(defn- git-dir-like?
-  "Does directory `d` look like a git directory — HEAD plus objects, or the
-   commondir/gitdir of a linked worktree? Relocated metadata of any repository
-   in the workspace (a nested `child/.git` gitfile pointing to
-   `child/metadata`) is found this way, whatever points to it."
-  [^java.io.File d]
-  (and (.isFile (java.io.File. d "HEAD"))
-       (or (.isDirectory (java.io.File. d "objects"))
-           (.isFile (java.io.File. d "commondir"))
-           (.isFile (java.io.File. d "gitdir")))))
-
-(defn in-git-metadata?
-  "Is canonical `file` inside a git directory: the one of `base-path`'s
-   repository (however `.git` points to it), or any directory between `file`
-   and the workspace that looks like a git directory?"
-  [base-path ^java.io.File file]
-  (let [base (.getCanonicalFile (java.io.File. (str base-path)))]
-    (boolean
-     (or (some #(.startsWith (.toPath file) (.toPath ^java.io.File %))
-               (git-metadata-dirs base-path))
-         (some git-dir-like?
-               (->> (iterate #(.getParentFile ^java.io.File %) file)
-                    (take-while #(and % (.startsWith (.toPath ^java.io.File %) (.toPath base))))))))))
-
-(defn- git-run*
-  "Run git in base-path. Returns stdout string or throws on non-zero exit."
-  [base-path & args]
-  (let [[cmd & more] (map str args)
-        all-args (-> ["git"] (into git-safety-config) (into (filter-overrides base-path))
-                     (conj cmd)
-                     (into (when (#{"diff" "status"} cmd) ["--ignore-submodules=all"]))
-                     (into more))
-        pb       (doto (ProcessBuilder. ^java.util.List all-args)
-                   (.directory (java.io.File. (str base-path))))
-        ;; Attributes stay as the repository has them (text, eol, encoding):
-        ;; the commands an attribute can select are disabled by name — every
-        ;; configured filter emptied above, diffs run --no-ext-diff
-        ;; --no-textconv.
-        env      (doto (.environment pb)
-                   (.put "GIT_ALLOW_PROTOCOL" "none")
-                   (.put "GIT_NO_LAZY_FETCH" "1")
-                   (.put "GIT_TERMINAL_PROMPT" "0"))
-        ;; The worktree is the directory that holds `.git` above base-path,
-        ;; not whatever `core.worktree` (possibly from an included config
-        ;; file) says: every path check here is against that directory.
-        ;; No `.git` above base-path (a bare-layout directory, which git also
-        ;; accepts, would let its `core.worktree` choose): refuse.
-        top      (or (worktree-top base-path)
-                     (git-arg-refused! "no git worktree (.git) at or above the workspace" {}))
-        _        (doto env
-                   (.put "GIT_WORK_TREE" (str top))
-                   (.put "GIT_DIR" (str (java.io.File. ^java.io.File top ".git"))))
-        proc     (.start pb)
-        out      (future (slurp (.getInputStream proc)))
-        err      (future (slurp (.getErrorStream proc)))
-        exit     (.waitFor proc)]
-    (if (zero? exit)
-      @out
-      (throw (ex-info (str "git " (first args) " failed")
-                      {:exit exit :out @out :err @err :args args})))))
 
 (defn- parse-porcelain-status
   "Parse `git status --porcelain=v1 --branch` into a structured map."
