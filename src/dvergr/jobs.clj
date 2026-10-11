@@ -19,7 +19,7 @@
             [dvergr.room.registry :as rreg]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.impl.simple :as simple]
-            [org.replikativ.spindel.spin.core :as spin-core]
+            [dvergr.substrate.spin :as dspin]
             [taoensso.telemere :as tel]))
 
 (def kinds
@@ -78,7 +78,7 @@
       (let [spin (binding [ec/*execution-context* ctx] (work id))]
         (run/register-cancel-hook! id ::spin
                                    #(binding [ec/*execution-context* ctx]
-                                      (spin-core/cancel-spin! spin)))
+                                      (dspin/cancel! spin)))
         (future
           ;; A future conveys its caller's bindings; a job started from
           ;; inside a Spin (a sub-experiment) must not look like a drain.
