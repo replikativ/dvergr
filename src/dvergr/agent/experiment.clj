@@ -425,7 +425,10 @@
              ;; the controller has drained)
              (work/cancel! admission))))))))
 
-(defn- passed? [receipt]
+(defn passed?
+  "The pass criterion of a cell: every check of its receipt held. A Scorecard
+   entry's `:passed?`, whatever the reward: a partial reward is not a pass."
+  [receipt]
   (every? true? (vals (:attempt/checks receipt))))
 
 (defn- score-entry [{:keys [experiment/job attempt]}]

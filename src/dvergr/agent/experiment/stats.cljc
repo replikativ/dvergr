@@ -7,9 +7,10 @@
    ½, fails + ½) posterior, well behaved at 0 and n passes. Mean rewards
    (bounded in [0, 1]) use a t interval, clipped to [0, 1], from two attempts
    on. Two candidates compare by the probability that one pass rate beats
-   (or is no worse than) the other, and by their paired reward difference on
-   the worlds both ran. Pure functions, no dependencies, portable: the same
-   code runs on the JVM and in the browser (simmis's boards).")
+   (or is no worse than) the other, by their paired reward difference on the
+   worlds both ran, and by the exact McNemar (sign) test on the cases where
+   they disagree (`paired-comparisons`). Pure functions, no dependencies,
+   portable: the same code runs on the JVM and in the browser (simmis's boards).")
 
 ;; ============================================================================
 ;; The Beta distribution
@@ -157,3 +158,149 @@
       {:mean (/ (reduce + 0.0 ds) (count ds))
        :interval (mean-interval ds [-1.0 1.0])
        :n (count ds)})))
+
+;; ============================================================================
+;; Paired comparisons: the exact McNemar (sign) test
+;; ============================================================================
+
+(defn mcnemar-p
+  "The exact two-sided McNemar p-value of `b` cases where A passed and B
+   failed against `c` cases where B passed and A failed: the two-sided exact
+   binomial test of b against Binomial(b + c, ½),
+   p = min(1, 2 · Σ_{i ≤ min(b,c)} C(b+c, i) / 2^(b+c)). Cases both passed or
+   both failed do not count; with no disagreement p = 1. Computed in log space,
+   so it holds for thousands of discordant cases."
+  [b c]
+  (let [n (+ b c) k (min b c)]
+    (if (<= (dec n) (* 2 k))
+      ;; no disagreement, or the counts within one of each other: the tail
+      ;; holds half the mass or more, exactly 1 (not 1 − ε from the sum)
+      1.0
+      (let [lp0 (* (- n) (Math/log 2.0))
+            tail (loop [i 0 lp lp0 acc 0.0]
+                   (if (< k i)
+                     acc
+                     (recur (inc i)
+                            (+ lp (Math/log (- n i)) (- (Math/log (inc i))))
+                            (+ acc (Math/exp lp)))))]
+        (min 1.0 (* 2.0 tail))))))
+
+(defn holm
+  "Holm's step-down adjustment of the p-values `ps` (family-wise error rate),
+   in their order: the i-th smallest of m is multiplied by m − i (i from 0),
+   kept monotone and capped at 1."
+  [ps]
+  (let [m (count ps)
+        order (sort-by #(nth ps %) (range m))
+        adjusted (second (reduce (fn [[running out] [rank i]]
+                                   (let [a (max running (min 1.0 (* (- m rank) (double (nth ps i)))))]
+                                     [a (assoc out i a)]))
+                                 [0.0 (vec (repeat m nil))]
+                                 (map-indexed vector order)))]
+    adjusted))
+
+(defn paired-verdicts
+  "Two candidates on the same cases. `a` and `b` are `{case {repetition
+   passed?}}`, verdicts only (a faulted or missing cell is absent). A case
+   counts on the repetitions both have a verdict for; a case without one is
+   excluded, and so is every cell outside the common repetitions.
+
+   Each counted case is decided by its pass rates over those repetitions:
+   A higher (`:a-only`), B higher (`:b-only`), or equal: both always passed
+   (`:both-passed`), both never (`:both-failed`), or the same rate in between
+   (`:tied-mixed`, only with repetitions). With one repetition this is
+   McNemar's table and `:p` its exact test; with several it is the exact sign
+   test on the per-case differences, which needs no assumption that
+   repetitions of one case are independent (the case is the unit). Also the
+   mean per-case pass-rate difference A − B with its paired 95% interval.
+
+   `{:cases :excluded-cases :excluded-cells :repetitions :both-passed :a-only
+   :b-only :both-failed :tied-mixed :p :pass-rate-difference
+   :pass-rate-difference-interval}`; `:repetitions` is the largest number of
+   common repetitions of a case."
+  [a b]
+  (let [rows (for [id (distinct (concat (keys a) (keys b)))
+                   :let [ra (get a id {}) rb (get b id {})
+                         common (filter #(contains? rb %) (keys ra))
+                         n (count common)]]
+               (if (zero? n)
+                 {:excluded? true :cells (+ (count ra) (count rb))}
+                 (let [pa (count (filter #(true? (get ra %)) common))
+                       pb (count (filter #(true? (get rb %)) common))]
+                   {:n n
+                    :cells (- (+ (count ra) (count rb)) (* 2 n))
+                    :diff (/ (- pa pb) (double n))
+                    :kind (cond (> pa pb) :a-only
+                                (< pa pb) :b-only
+                                (= pa n) :both-passed
+                                (zero? pa) :both-failed
+                                :else :tied-mixed)})))
+        counted (remove :excluded? rows)
+        kinds (frequencies (map :kind counted))
+        k #(get kinds % 0)
+        diff (paired-difference (map (fn [r] [(:diff r) 0.0]) counted))]
+    {:cases (count counted)
+     :excluded-cases (count (filter :excluded? rows))
+     :excluded-cells (reduce + 0 (map :cells rows))
+     :repetitions (reduce max 0 (map :n counted))
+     :both-passed (k :both-passed)
+     :a-only (k :a-only)
+     :b-only (k :b-only)
+     :both-failed (k :both-failed)
+     :tied-mixed (k :tied-mixed)
+     :p (mcnemar-p (k :a-only) (k :b-only))
+     :pass-rate-difference (:mean diff)
+     :pass-rate-difference-interval (:interval diff)}))
+
+(def ^:private all-pairs-up-to
+  "Up to this many candidates every pair is compared (10 pairs at 5);
+   beyond, each against the best one."
+  5)
+
+(defn paired-comparisons
+  "Paired comparisons of the candidates of `cells` (`{candidate {case
+   {repetition passed?}}}`, `paired-verdicts`). Candidates rank by pass rate
+   over their verdicts (then by name). With `:baseline` (a key of `cells`),
+   every other candidate against it; else every pair while there are at most
+   five candidates, and beyond that every candidate against the best. In each
+   pair A ranks above B (against a baseline B is the baseline).
+
+   The p-values are Holm-adjusted over the comparisons made, and a pair
+   differs when its adjusted p is below `:alpha` (default 0.05): `:verdict`
+   `:a-better`, `:b-better` or `:no-difference`; `:decidable?` false when
+   even a clean sweep of its disagreeing cases could not reach `:alpha`.
+
+   `{:policy (:all-pairs | :against-baseline | :against-best) :baseline
+   :alpha :correction :holm :pairs-omitted :comparisons [{:a :b ...}]}`, nil
+   with fewer than two candidates."
+  [cells & [{:keys [baseline alpha] :or {alpha 0.05}}]]
+  (let [rate (fn [c] (let [vs (mapcat vals (vals (get cells c)))]
+                       (if (seq vs) (/ (count (filter true? vs)) (double (count vs))) 0.0)))
+        ranked (vec (sort-by (juxt (comp - rate) str) (keys cells)))
+        m (count ranked)
+        baseline (when (contains? cells baseline) baseline)
+        policy (cond baseline :against-baseline
+                     (<= m all-pairs-up-to) :all-pairs
+                     :else :against-best)
+        pairs (case policy
+                :against-baseline (for [c ranked :when (not= c baseline)] [c baseline])
+                :all-pairs (for [i (range m) j (range (inc i) m)] [(ranked i) (ranked j)])
+                :against-best (for [c (rest ranked)] [(first ranked) c]))]
+    (when (<= 2 m)
+      (let [results (mapv (fn [[x y]] (assoc (paired-verdicts (get cells x) (get cells y)) :a x :b y)) pairs)
+            adjusted (holm (mapv :p results))]
+        {:policy policy
+         :baseline (case policy :against-baseline baseline :against-best (first ranked) nil)
+         :alpha alpha
+         :correction :holm
+         :pairs-omitted (- (quot (* m (dec m)) 2) (count pairs))
+         :comparisons
+         (mapv (fn [r p-adj]
+                 (let [discordant (+ (:a-only r) (:b-only r))]
+                   (assoc r
+                          :p-adjusted p-adj
+                          :decidable? (< (mcnemar-p discordant 0) alpha)
+                          :verdict (cond (<= alpha p-adj) :no-difference
+                                         (> (:a-only r) (:b-only r)) :a-better
+                                         :else :b-better))))
+               results adjusted)}))))
