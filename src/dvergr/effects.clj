@@ -81,6 +81,29 @@
      :db/transact       {:class #{:write} :resource [:map [:datoms :int]] :result :any}
      :db/create         {:class #{:lifecycle} :resource [:map [:name :string]] :result :any}
      :db/delete         {:class #{:lifecycle} :resource [:map [:name :string]] :result :any}
+     ;; the room's own storage reclaimed: orphan blobs, or history before a date
+     :room/gc           {:class #{:write} :resource :map :result :any}
+     ;; system-wide rows (the actor registry, a prompt, the task ledger): beyond
+     ;; any one world, so also :global
+     :actor/write       {:class #{:write :global} :resource [:map [:op :keyword]] :result :any}
+     :task/write        {:class #{:write :global} :resource [:map [:op :keyword]] :result :any}
+     ;; a child Run: a forked world, an agent's model calls
+     :run/start         {:class #{:lifecycle :spend} :resource :map :result :any}
+     :run/cancel        {:class #{:lifecycle} :resource :map :result :any}
+     ;; libraries resolved from Maven onto the host JVM's classpath
+     :deps/add          {:class #{:network :global} :resource [:map [:libs [:vector :string]]] :result :any}
+     ;; a local mail store opened: created when missing, its account row written
+     :mail/open         {:class #{:write} :resource [:map [:account :string]] :result :any}
+     ;; an IMAP account pulled into the local mail store
+     :mail/sync         {:class #{:network :write} :resource :map :result :any}
+     ;; a messaging channel's API (Telegram, …), on the channel's account
+     :channel/call      {:class #{:network :egress} :resource [:map [:tool :string]] :result :any}
+     ;; a tool that declares no effect: assumed to write and reach out
+     :tool/call         {:class #{:write :network} :resource [:map [:tool :string]] :result :any}
+     ;; host code evaluated outside the sandbox (`:isolation :native`): it can
+     ;; do anything, so it carries every class (admitted only where all are)
+     :eval/native       {:class #{:read :write :network :egress :spend :process :lifecycle :schedule :global}
+                         :resource [:map [:code :string]] :result :any}
      :eval/run          {:class #{} :resource [:map [:cpu-ms :int] [:wall-ms :int]]}
      :http/secret-injected {:class #{} :resource :map}
      :http/secret-denied   {:class #{} :resource :map}}))
@@ -102,7 +125,10 @@
    :db/transact :once :db/create :once :db/delete :once
    :model/call :idempotent
    :process/run :once :process/directive :once
-   :schedule/create :once :schedule/cancel :idempotent})
+   :schedule/create :once :schedule/cancel :idempotent
+   :room/gc :idempotent :actor/write :once :task/write :once
+   :run/start :once :run/cancel :idempotent :deps/add :idempotent
+   :mail/sync :idempotent :mail/open :idempotent :channel/call :once :tool/call :once :eval/native :once})
 
 (defn effect-idempotency
   "The idempotency class of `effect` (see `idempotency`); nil for events."
@@ -120,6 +146,13 @@
    this request (an HTTP request that sends data is also `:egress`)."
   [{kind :effect extra :class}]
   (into (:class (operation kind)) extra))
+
+(defn transact-effect
+  "The effect of transacting `tx-data` into a database: its datom count, and
+   its printed size, what a quota counts."
+  [tx-data]
+  {:effect :db/transact :resource {:datoms (count tx-data)}
+   :bytes (count (pr-str tx-data))})
 
 (defn valid-result?
   "Whether `value` has the shape `kind` returns: what a replayed, injected or

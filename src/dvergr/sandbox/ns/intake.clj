@@ -9,7 +9,8 @@
 
    Only sources that genuinely can't be interpreted stay native and are mounted
    here — currently just `intake.mail` (briefkasten + javax.mail are too heavy)."
-  (:require [dvergr.substrate.load :as load]
+  (:require [dvergr.effects :as effects]
+            [dvergr.substrate.load :as load]
             [sci.core :as sci]))
 
 (def ^:private native-mail-vars
@@ -35,15 +36,59 @@
 (defn- load-mail-bindings []
   (try
     (load/require! 'dvergr.intake.mail)
-    (resolve-mail-bindings (find-ns 'dvergr.intake.mail))
+    (let [mail-ns (find-ns 'dvergr.intake.mail)]
+      (some-> (resolve-mail-bindings mail-ns)
+              ;; host-side, not mounted: whether a read must open the store
+              (assoc 'open? (some-> (ns-resolve mail-ns 'account-open?) deref))))
     (catch Throwable _
       nil)))
 
+(defn- split-options
+  "`args` as `[positional options]`: the first `n` positional, then keyword
+   options given as pairs or as one trailing map (as `& {:as opts}` takes
+   them)."
+  [n args]
+  (let [[pos more] (split-at n args)]
+    [(vec pos) (if (and (= 1 (count more)) (map? (first more)))
+                 (first more)
+                 (apply hash-map more))]))
+
+(defn gate-mail-bindings
+  "`bindings` for the sandbox, through the boundary `effects`
+   (`dvergr.effects`): `sync!`, which pulls an IMAP account into the local
+   store, is `:mail/sync`; a read of an account whose store is not open yet
+   opens it, a `:mail/open` (a write); reads of an open store are not effects.
+   `open?` (host-side, not mounted) answers whether an account is open."
+  [{open? 'open? :as bindings} effects]
+  (let [;; the options are normalized once, and the read gets exactly what
+        ;; was decided on
+        opening (fn [n read]
+                  (fn [& args]
+                    (let [[pos opts] (split-options n args)
+                          account (get opts :account :datahike-contact)
+                          call #(apply read (concat pos (mapcat identity opts)))]
+                      (if (and open? (open? account))
+                        (call)
+                        (effects/perform! effects {:effect :mail/open :resource {:account (str (name account))}}
+                                          call)))))]
+    (-> (dissoc bindings 'open?)
+        (update 'inbox #(opening 0 %))
+        (update 'search #(opening 1 %))
+        (update 'read #(opening 1 %))
+        (update 'sync!
+                (fn [sync!]
+                  (fn [& {:keys [account folders] :as opts}]
+                    (effects/perform! effects {:effect :mail/sync
+                                               :resource {:account (name (or account :datahike-contact))
+                                                          :folders (vec (or folders ["INBOX"]))}}
+                                      #(apply sync! (mapcat identity opts)))))))))
+
 (defn add-intake-namespaces!
-  "Mount the few NATIVE-only intake namespaces. Everything else is sandbox source."
-  [sci-ctx]
+  "Mount the few NATIVE-only intake namespaces. Everything else is sandbox
+   source. `effects` is the sandbox's boundary."
+  [sci-ctx & [effects]]
   ;; intake.mail — OPTIONAL: its clojure-mail/postal/briefkasten deps live in the
   ;; :cli/:tui/:dev aliases, not core. Mounted only when present.
   (when-let [bindings (load-mail-bindings)]
-    (sci/add-namespace! sci-ctx 'intake.mail bindings))
+    (sci/add-namespace! sci-ctx 'intake.mail (gate-mail-bindings bindings effects)))
   sci-ctx)

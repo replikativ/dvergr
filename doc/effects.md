@@ -159,6 +159,42 @@ database creation/deletion. Eval metering: every eval
 reports thread CPU and wall time (`:meter`), and `clojure_eval` records it as an `:eval/run`
 receipt (recorded, not charged).
 
+Also routed (read-only everywhere, 2026-10): every writer an agent reaches, at the shared
+gate of its capability rather than per call site.
+
+- **Registry tools** (`dvergr.tools/execute`): every tool carries `:effect`, stamped from
+  `tool-effects` onto the built-in definitions (so a classification belongs to an
+  implementation, not a name) and declared by tools defined elsewhere. It is the tool's effect
+  (a function of the input, decided before it runs), `:inner` (its effects pass the shared gates
+  inside it), `:eval` (`clojure_eval`: inner in the sandbox; under `:isolation :native` the eval
+  itself is `:eval/native`, which carries every class) or `:reads`. A tool with no
+  classification, or one whose function returns no effect, runs as `:tool/call`, assumed to
+  write and reach out; a test fails on any registered tool without one.
+- **Workspace files**: `dvergr.tools/workspace-write!` is the one gate for `write_file`,
+  `edit_file` and `clojure_edit` (an `:fs/write` with its size, as a sandbox `spit`); a caller
+  without a chat passes its own boundary as `:effect-boundary`.
+- **Databases**: the tools' transacts (`task_create`, `task_update`, `knowledge_add`) are
+  `:db/transact`, as the sandbox's `datahike.api/transact` is.
+- **The global registry**: actor rows and a prompt (`dvergr.actors/*`, `update_agent_profile`)
+  are `:actor/write`, task settlement and skill dispatch `:task/write`, both `#{:write :global}`
+  (a dispatch also `:network :egress`: a transport may deliver it);
+  skill files (`dvergr.skills/author!`, `lift!`, `promote!`) are `:fs/write` into the room repo.
+  The ownership checks (hardening 8) still run, inside the effect.
+- **Runs**: `dvergr.agent/hire!`, `run-experiment!`, `spawn_agent`, `propose_change` are
+  `:run/start` (`#{:lifecycle :spend}`), `cancel!` is `:run/cancel`.
+- **Room GC** (`dvergr.room/gc!`) is `:room/gc`; **dependency loading**
+  (`clojure.repl.deps/add-libs`, `sync-deps`) is `:deps/add` (`#{:network :global}`); **mail
+  sync** (`intake.mail/sync!`, `mail_sync`) is `:mail/sync`, and a mail read that first opens
+  the local store (creating it, writing the account row) is `:mail/open`; channel tools are
+  `:channel/call`; `llm_call` and the schedule tools perform `:model/call` and
+  `:schedule/*` like their sandbox counterparts; `clj_kondo` lints without its cache, so it
+  only reads.
+- Not effects: the runtime's own provenance records, written whatever the code asked for, as
+  receipts are: an `inspect` observation receipt and a Run's causal edge when a result is
+  awaited. Structural cancellation of a Run the agent owns (the losers of a race or timeout,
+  a cancelled parent's children) is the runtime retiring a Run it already admitted, not a new
+  effect; an explicit `dvergr.agent/cancel!` is `:run/cancel`.
+
 Not routed, and why: database queries (a query reads an immutable value of a database the
 world already holds); the mailbox is a connection handle (reads).
 

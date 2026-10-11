@@ -21,6 +21,7 @@
 
 (tools/register!
  {:name "schedule_create"
+  :effect (fn [{:keys [agent_id]}] {:effect :schedule/create :resource {:agent (str agent_id)}})
   :description "Create a recurring scheduled task in THIS room.
 
    The room's scheduler fires the task into this room (addressed to the given
@@ -69,6 +70,7 @@
 
 (tools/register!
  {:name "schedule_list"
+  :effect :reads
   :description "List this room's active schedules (agent, task, interval, next fire)."
   :parameters {:type "object" :properties {} :required []}
   :execute (fn [_input ctx]
@@ -95,6 +97,7 @@
 
 (tools/register!
  {:name "schedule_cancel"
+  :effect (fn [{:keys [id]}] {:effect :schedule/cancel :resource {:id (str id)}})
   :description "Cancel an active schedule in this room by its ID (UUID from schedule_list)."
   :parameters {:type "object"
                :properties {:id {:type "string" :description "Schedule ID to cancel (UUID)"}}
