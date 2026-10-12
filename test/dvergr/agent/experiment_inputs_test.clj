@@ -18,6 +18,7 @@
             [dvergr.model.registry :as registry]
             [dvergr.room.store.memory :as memory]
             [dvergr.sandbox]
+            [dvergr.substrate.paths :as paths]
             [org.replikativ.spindel.engine.core :as ec]))
 
 (def ^:private evaluator
@@ -353,3 +354,23 @@
         (swap! registry/defaults assoc :compaction-model "inputs-test-compactor-b")
         (is (not= a (id)) "another default compaction model is other inputs"))
       (finally (swap! registry/defaults assoc :compaction-model before)))))
+
+(deftest the-prediction-reads-the-workspace-the-run-seeds
+  ;; A room without a repository of its own reads the shared
+  ;; .dvergr/workspace, which the first sandbox seeds. The prediction runs
+  ;; before any sandbox exists: it must read the seeded workspace too, or a
+  ;; fresh home's first run disagrees with every Run it predicts.
+  (let [prev (paths/home)
+        home (str (System/getProperty "java.io.tmpdir") "/dvergr-inputs-home-" (random-uuid))]
+    (try
+      (paths/set-home! home)
+      (is (not (.exists (java.io.File. (str (paths/workspace-dir) "/.git")))) "a fresh home: not seeded yet")
+      (with-room :inputs-fresh-workspace
+        (fn [room]
+          (let [{:keys [team definition]} (fixture)
+                calls (atom 0)]
+            (with-model calls
+              (let [{:keys [results scorecard]} (run! room team definition)]
+                (is (not-any? :unpredicted? results))
+                (is (= 6 (count (:scorecard/entries scorecard)))))))))
+      (finally (paths/set-home! prev)))))
