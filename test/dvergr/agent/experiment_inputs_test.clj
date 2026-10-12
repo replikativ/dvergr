@@ -304,3 +304,25 @@
           (run! room team definition)
           (is (= #{"inputs-test-model-a" "inputs-test-plain"} (set @models))
               "the alias is resolved once, when the Run assembles its inputs"))))))
+
+(deftest a-run-whose-model-entry-changes-records-no-inputs
+  (with-room :inputs-entry-changed
+    (fn [room]
+      (let [{:keys [team definition]} (fixture)
+            id "inputs-test-model-a"
+            before (get @registry/registry id)]
+        (try
+          (swap! registry/registry assoc id {:id id :provider :test :api-type :test :max-output 100 :quirks {}})
+          (with-redefs [providers/ensure-initialized! (constantly nil)
+                        chat-agent/messages->api-format (fn [messages _ _] messages)
+                        model-chat/chat (fn [messages opts]
+                                          ;; a registry refresh while the Run calls its model
+                                          (when (= id (:model opts))
+                                            (swap! registry/registry update id update :max-output inc))
+                                          {:content (or (task-of messages) "no task") :tool-calls nil
+                                           :usage {:input-tokens 1 :output-tokens 1} :stop-reason :end-turn})]
+            (let [{:keys [attempts scorecard]} (run! room team definition)]
+              (is (= #{nil} (inputs-ids attempts :sandboxed)) "its calls were not all shaped alike")
+              (is (= {:cells 3 :unpredicted 3} (select-keys (:incomplete scorecard) [:cells :unpredicted])))))
+          (finally
+            (if before (swap! registry/registry assoc id before) (swap! registry/registry dissoc id))))))))

@@ -615,6 +615,24 @@
     (get-in agent [:agent/model-policy :model])
     (update-in [:agent/model-policy :model] registry/resolve-alias)))
 
+(defn- model-entry-changed!
+  "When the registry entry of the model a Run calls is no longer the one its
+   inputs id was computed from (`model-inputs` then, `before`), the Run drops
+   its inputs id: its model calls were not all shaped alike, so no single id
+   says what it was presented with, and it enters no Scorecard (a resume runs
+   its cell again)."
+  [supervisor run-id before model-spec]
+  (when (and before (not= before (model-inputs model-spec)))
+    (tel/log! {:level :warn :id ::model-entry-changed :data {:run/id run-id :model (:model model-spec)}}
+              "The model's registry entry changed during the Run: it records no inputs id")
+    (update-llm-metrics! supervisor dissoc :inputs-id)))
+
+(defmacro ^:private with-model-entry-checked
+  "`body` (one or more model calls), then `model-entry-changed!`."
+  [supervisor run-id before model-spec & body]
+  `(try ~@body
+        (finally (model-entry-changed! ~supervisor ~run-id ~before ~model-spec))))
+
 (defn- llm-inputs
   "The `run-inputs` of an LLM Run that starts with `instructions`, offers
    `tool-map` and calls the model `model-spec`."
@@ -844,7 +862,11 @@
                     {:keys [tool-map tool-ctx]}
                     (llm-tool-context control-room work-room chat-ctx agent run-id
                                       supervisor)
-                    model-spec (resolve-model-spec agent)
+                    ;; every model step calls the model the inputs id names:
+                    ;; an alias re-registered mid-Run does not move it
+                    model-spec (let [spec (resolve-model-spec agent)]
+                                 (cond-> spec
+                                   (:model spec) (update :model registry/resolve-alias)))
                     instructions (llm-instructions agent tool-map)
                     ;; resuming: the conversation so far is the stopped Run's,
                     ;; system prompt included
@@ -880,11 +902,8 @@
                 {:chat-ctx chat-ctx
                  :tool-map tool-map
                  :tool-ctx tool-ctx
-                 ;; every model step calls the model the inputs id names:
-                 ;; an alias re-registered mid-Run does not move it
-                 :model-spec (cond-> model-spec
-                               (get-in inputs [:model :model])
-                               (assoc :model (get-in inputs [:model :model])))})))
+                 :model-inputs (:model inputs)
+                 :model-spec model-spec})))
            initialized (sp/await (worker-result-spin init-worker))]
        (when (or (= ::worker-cancelled initialized)
                  (run/cancel-requested? run-id))
@@ -894,7 +913,7 @@
                          {:type ::runtime-initialization-failed
                           :agent/id (:agent/id agent)}
                          (::worker-error initialized))))
-       (let [{:keys [chat-ctx tool-map tool-ctx model-spec]} initialized
+       (let [{:keys [chat-ctx tool-map tool-ctx model-spec model-inputs]} initialized
              posted (ratom/create-atom 0)]
          (loop [model-step (if-let [{:keys [step]} (::resume agent)] (inc step) 0)]
            (when (run/cancel-requested? run-id)
@@ -909,29 +928,30 @@
                               resource/*model-scope*
                               (some-> (resource/model-scope control-room run-id)
                                       (assoc :cancel? #(run/cancel-requested? run-id)))]
-                      (chat-agent/run-agent-turn!
-                       chat-ctx
-                       {:provider (:provider model-spec)
-                        :model (:model model-spec)
+                      (with-model-entry-checked supervisor run-id model-inputs model-spec
+                        (chat-agent/run-agent-turn!
+                         chat-ctx
+                         {:provider (:provider model-spec)
+                          :model (:model model-spec)
                         ;; The SAME normalized map defines both the model schema
                         ;; and execute-side authority. Empty means no tools.
-                        :tools tool-map
-                        :tool-ctx tool-ctx
-                        :cancel? (turn/cancel?-fn
-                                  chat-ctx (:ctx work-room)
-                                  (fn [] (run/cancel-requested? run-id)))
-                        :auto-compact? auto-compact?
-                        :compaction-model compaction-model
+                          :tools tool-map
+                          :tool-ctx tool-ctx
+                          :cancel? (turn/cancel?-fn
+                                    chat-ctx (:ctx work-room)
+                                    (fn [] (run/cancel-requested? run-id)))
+                          :auto-compact? auto-compact?
+                          :compaction-model compaction-model
                       ;; The existing single-exchange core still calls this
                       ;; trace field `turn-number`; semantically it is a model
                       ;; integration step, not a conversational turn.
-                        :turn-number model-step
-                        :run-id run-id
+                          :turn-number model-step
+                          :run-id run-id
                         ;; The world this Run works in, for an adapter whose
                         ;; model is an external agent (claude -p): it invokes
                         ;; that agent INTO this room over MCP.
-                        :model-opts {:room-id (let [id (:id work-room)]
-                                                (if (keyword? id) (subs (str id) 1) (str id)))}}))))
+                          :model-opts {:room-id (let [id (:id work-room)]
+                                                  (if (keyword? id) (subs (str id) 1) (str id)))}})))))
                  outcome (sp/await (worker-result-spin call))
                  budget (chat-context/get-budget chat-ctx)]
              (update-llm-metrics!
@@ -1055,24 +1075,27 @@
                supervisor
                (fn []
                  (let [;; the model the inputs id names, resolved once
-                       pinned (pin-model (dissoc agent ::limits ::protocol))]
-                 ;; what the protocol presents, as `run-inputs` predicts it
+                       pinned (pin-model (dissoc agent ::limits ::protocol))
+                       inputs (run-inputs pinned protocol)]
+                   ;; what the protocol presents, as `run-inputs` predicts it
                    (update-llm-metrics!
                     supervisor
-                    (constantly {:inputs-id (inputs-id (run-inputs pinned protocol))}))
+                    (constantly {:inputs-id (inputs-id inputs)}))
                    (let [scope (some-> (resource/model-scope control-room run-id)
                                        (assoc :cancel? #(run/cancel-requested? run-id)))]
                      (binding [resource/*model-scope* scope
                                chat-agent/*turn-failure* failure]
-                       ((:run protocol)
-                        {:control-room control-room
-                         :room work-room
-                         :run/id run-id
-                         :agent pinned
-                         :task task
-                         :limits (::limits agent)
-                         :model-scope scope
-                         :cancelled? (fn [] (run/cancel-requested? run-id))}))))))
+                       (with-model-entry-checked supervisor run-id (:model inputs)
+                         (:agent/model-policy pinned)
+                         ((:run protocol)
+                          {:control-room control-room
+                           :room work-room
+                           :run/id run-id
+                           :agent pinned
+                           :task task
+                           :limits (::limits agent)
+                           :model-scope scope
+                           :cancelled? (fn [] (run/cancel-requested? run-id))})))))))
          outcome (sp/await (worker-result-spin call))]
      (cond
        (or (= ::worker-cancelled outcome)
