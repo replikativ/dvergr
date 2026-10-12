@@ -21,9 +21,11 @@ video transcript, a long-form chat log, or a local file.
 
 ## Tactics
 
-1. If the input is a URL, fetch via `(intake.web/fetch url)`.
-2. If it's a YouTube link, prefer `(intake.youtube/transcript url)`.
-3. For a long transcript, call `(llm/summarize text)` with a focused
+1. If the input is a URL, fetch via `(dvergr.intake.web-fetch/fetch-page url)`
+   (after `(require '[dvergr.intake.web-fetch])`).
+2. If it's a YouTube link, prefer `(dvergr.intake.youtube/get-transcript url)`
+   (after `(require '[dvergr.intake.youtube])`).
+3. For a long transcript, call `(llm/call prompt text)` with a focused
    prompt: "summarize for an engineer who wants the key claims and any
    counter-arguments, no filler".
 4. If the source is over 20k tokens, summarize in chunks and then

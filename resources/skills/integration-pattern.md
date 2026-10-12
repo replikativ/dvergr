@@ -11,12 +11,12 @@ source: dvergr
 
 # Building API Integrations
 
-You can build integrations with any REST API using the `http` and `env` namespaces.
+You can build integrations with any REST API using the `babashka.http-client` and `env` namespaces.
 
 ## Pattern
 
 ```clojure
-(require '[http] '[env] '[clojure.string :as str])
+(require '[babashka.http-client :as http] '[cheshire.core :as json] '[env] '[clojure.string :as str])
 
 ;; 1. Get API credentials from user config / env
 (def token (env/get "SERVICE_TOKEN"))
@@ -32,7 +32,7 @@ You can build integrations with any REST API using the `http` and `env` namespac
                                  "Content-Type" "application/json"}}
                       opts))]
     (if (< (:status resp) 400)
-      (:body resp)
+      (json/parse-string (:body resp) true)
       (throw (ex-info (str "API error " (:status resp)) resp)))))
 
 ;; 3. Define operations
@@ -43,11 +43,11 @@ You can build integrations with any REST API using the `http` and `env` namespac
 
 ## Available Facilities
 
-- `(http/get url opts?)` — GET request, auto-parses JSON
+- `(http/get url opts?)` — GET request; `:body` is the raw string, parse it with `(json/parse-string body true)`
 - `(http/post url opts?)` — POST with `:json` or `:body`
 - `(http/put url opts?)`, `(http/patch url opts?)`, `(http/delete url opts?)`
-- `(env/get "KEY")` — read API key from user config or system env
-- `(env/set "KEY" "value")` — store in user config
+- `(env/get "KEY")` — read a key granted to you (not the host environment; a configured secret comes back as a placeholder that HTTP substitutes at its bound API)
+- `(env/set "KEY" "value")` — set a key for this sandbox session
 - `(env/keys)` — list configured keys
 - `(llm/summarize text)` — summarize long API responses
 - `(llm/call prompt text)` — extract/transform data via LLM

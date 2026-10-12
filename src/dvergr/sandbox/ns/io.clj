@@ -824,14 +824,14 @@
    cloud/DB creds, the Telegram token, …) can never be read from inside SCI, by any
    name. Grant a key to an agent explicitly via `user-config`.
 
-   (Boundary key-INJECTION — `env/get` returning an opaque placeholder that the HTTP
-   primitive substitutes for the real value only at egress to a bound domain — is the
-   planned next step; see doc/boundary-secret-injection.md. Until then a granted key
-   is a real value the agent can read, so grant narrowly.)
+   A key configured as a secret (config `:secrets`) resolves to an opaque placeholder
+   that the HTTP primitive substitutes for the real value only at egress to its bound
+   domain (doc/boundary-secret-injection.md); any other granted key is a real value
+   the agent can read, so grant narrowly.
 
    Usage in SCI:
      (require '[env])
-     (env/get \"BRAVE_API_KEY\")        ;; => value if granted in user-config, else nil
+     (env/get \"BRAVE_API_KEY\")        ;; => value (or a secret's placeholder) if granted, else nil
      (env/get \"API_KEY\" \"default\")   ;; with fallback
      (env/keys)                        ;; list granted keys (no values)
      (env/set \"KEY\" \"value\")         ;; store in user config (session-local)"
@@ -903,11 +903,11 @@
     (generate (:query-params (nest {:query-params query-params})))))
 
 (defn add-http-ns!
-  "Expose HTTP client as 'http namespace in SCI.
+  "Expose the HTTP client as the `babashka.http-client` namespace in SCI.
 
    Agents can make HTTP requests to build integrations.
-   Responses are returned as maps with :status, :headers, :body.
-   JSON bodies are auto-parsed.
+   Responses are returned as maps with :status, :headers, :body; the body is
+   the raw string, as in babashka.http-client (parse JSON with cheshire.core).
 
    :effects        - boundary fn (`dvergr.effects/boundary-resolver`); every request is
                      an effect (method + URL; the response body by digest only)
@@ -920,7 +920,7 @@
                       Example: #{\"https://api.github.com\" \"https://slack.com\"}
 
    Usage in SCI:
-     (require '[http])
+     (require '[babashka.http-client :as http])
      (http/get \"https://api.github.com/repos/clojure/clojure\")
      (http/post \"https://slack.com/api/chat.postMessage\"
        {:headers {\"Authorization\" (str \"Bearer \" (env/get \"MY_SERVICE_TOKEN\"))}

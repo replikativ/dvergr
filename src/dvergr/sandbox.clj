@@ -1,11 +1,9 @@
 (ns dvergr.sandbox
-  "SCI sandbox for isolated evaluation contexts.
-
-   Each session gets its own SCI context via fork. Future enhancements:
-   - Agents can fork their own contexts for sub-agents
-   - Virtual filesystem in memory/datahike
-   - Integration with yggdrasil for CoW branching
-   - Integration with spindel for async execution (CPS works through SCI)"
+  "The SCI sandbox behind `clojure_eval`: one SCI context per session, forked
+   from a locked-down base, with the agent namespaces (`setup-agent-namespaces!`)
+   bound to the room's Spindel context, so files, databases and Runs fork and
+   merge with the room. Also holds the agent-facing text that teaches it: the
+   system-prompt pointer and the `(sandbox/overview)`/`(sandbox/doc …)` guide."
   (:require [dvergr.substrate.load :as load]
             [clojure.walk :as walk]
             [dvergr.sandbox.ns.malli :as ns-malli]
@@ -747,7 +745,7 @@
    "dvergr.codec" ["base64 / url / html helpers (dvergr extras — no babashka equivalent)."
                    "(dvergr.codec/base64-encode s)  (dvergr.codec/url-encode s)  (dvergr.codec/strip-tags html)"]
    "dvergr.room" ["YOUR room: *kb*/*room* conns, databases, fork!/merge!, post to other rooms, + queries"
-                  "(dvergr.room/kb-search \"datahike\")  (dvergr.room/post! \"research\" \"found a lead\")"]
+                  "(dvergr.room/kb-search \"datahike\")  (dvergr.room/post! \"research\" {:content \"found a lead\"})"]
    "dvergr.mail" ["YOUR room's attached mailbox conn (`*inbox*`, fork-aware; nil if none). Read helpers are seed source."
                   "(require '[dvergr.mail.inbox]) (dvergr.mail.inbox/recent :limit 10)"]
    "dvergr.intake" ["read-only world sources as require-able SOURCE (dvergr/intake/*.clj — read/extend): hn github sec stock rss arxiv wikidata …"
@@ -756,22 +754,22 @@
                "(llm/summarize text {:max-tokens 300})"]
    "git"      ["structured git for the workspace (dvergr convenience; or `(babashka.process/shell \"git …\")`)"
                "(git/status)   (git/diff)"]
-   "env"      ["read sandbox env vars (secrets redacted)"
-               "(env/get \"PATH\")"]
+   "env"      ["read config keys granted to you (not the host environment; a secret comes back as a placeholder that HTTP substitutes at its bound API)"
+               "(env/keys)   (env/get \"BRAVE_API_KEY\")"]
    "dvergr.scheduler" ["schedule recurring / one-off work — this IS your calendar. Cadence forms: {:every :day :at \"07:00\"} (daily wall-clock), {:every :hour :n 4} (every 4h — :n multiplies :minute/:hour/:day/:week into an interval), {:every-ms N}, {:at \"ISO\" :once true}. Unknown keys are rejected."
                        "(dvergr.scheduler/create {:agent-id :var :schedule {:every :hour :n 4} :code \"(require 'my.ns)(my.ns/run!)\" :description \"…\"})  (dvergr.scheduler/list)  (dvergr.scheduler/cancel id)"]
    "dvergr.tasks"    ["the shared task ledger — list/accept/complete work items"
-                      "(dvergr.tasks/list)   (dvergr.tasks/complete! id)"]
+                      "(dvergr.tasks/list)   (dvergr.tasks/complete! id \"what was done\")"]
    "dvergr.agent"    ["program specialized agents as immutable rosters; define content-addressed verified environments as portable data; exact programs are {:kind :echo :delay-ms n}, {:kind :scripted :delay-ms n :reply value}, or {:kind :llm ...}; hire! starts a durable Run with an explicit result Spin"
-                      "join with result-spin; for a first-result race that really cancels losing Runs: (let [team (-> (dvergr.agent/roster) (dvergr.agent/make-agent {:id :fast :program {:kind :scripted :delay-ms 10 :reply :fast}}) (dvergr.agent/make-agent {:id :slow :program {:kind :scripted :delay-ms 5000 :reply :slow}})) a (dvergr.agent/hire! team :fast {:task :solve}) b (dvergr.agent/hire! team :slow {:task :solve})] @(spin (-> (await (spindel.comb/race (dvergr.agent/owned-result-spin a) (dvergr.agent/owned-result-spin b))) :run/value)))"]
+                      "join with result-spin; for a first-result race that really cancels losing Runs: (require '[org.replikativ.spindel.spin.cps :refer [spin]] '[org.replikativ.spindel.effects.await :refer [await]]) (let [team (-> (dvergr.agent/roster) (dvergr.agent/make-agent {:id :fast :program {:kind :scripted :delay-ms 10 :reply :fast}}) (dvergr.agent/make-agent {:id :slow :program {:kind :scripted :delay-ms 5000 :reply :slow}})) a (dvergr.agent/hire! team :fast {:task :solve}) b (dvergr.agent/hire! team :slow {:task :solve})] @(spin (-> (await (spindel.comb/race (dvergr.agent/owned-result-spin a) (dvergr.agent/owned-result-spin b))) :run/value)))"]
    "spindel.work"    ["structured higher-order FRP admission: latest, serial, busy, and bounded parallel; each accepted value becomes owned work"
-                      "(let [c (spindel.work/latest (fn [x] (spindel.work/task x)))] (spindel.work/submit! c :first) (spindel.work/submit! c :newest) (spindel.work/close! c) @(spin (await (spindel.work/completion c))))"]
+                      "(require '[org.replikativ.spindel.spin.cps :refer [spin]] '[org.replikativ.spindel.effects.await :refer [await]]) (let [c (spindel.work/latest (fn [x] (spindel.work/task x)))] (spindel.work/submit! c :first) (spindel.work/submit! c :newest) (spindel.work/close! c) @(spin (await (spindel.work/completion c))))"]
    "dvergr.agents"   ["directory of agents (read-only): who exists / is online"
                       "(dvergr.agents/list)   (dvergr.agents/online? :var)"]
    "dvergr.actors"   ["durable participant identities — register/retire agents or humans and assign skills"
                       "(dvergr.actors/spawn-agent! {:id :scribe :name \"Scribe\" :profile-ref \"scribe.md\" :skills #{:writing} :config {}})"]
    "dvergr.skills"   ["reusable skills you can find + dispatch"
-                      "(dvergr.skills/find \"draft a brief\")"]
+                      "(dvergr.skills/find :research)"]
    "clojure.test"    ["how you test IN here — the real clojure.test, run inside clojure_eval; failures print expected/actual to your stdout. This is the ONLY runner available to you, by design: kaocha/lein/clj are not reachable (handing control to a second runtime would let it read+write outside the sandbox), so requiring kaocha fails and the shell has no `clj`. To exercise code that lives in a FILE, load it — (load-string (slurp \"src/foo.clj\")) — then deftest against it here."
                       "(require '[clojure.test :refer [deftest is]]) (deftest t (is (= 4 (+ 2 2)))) (clojure.test/run-tests)  ;=> {:test 1 :pass 1 :fail 0 …}"]})
 
@@ -928,7 +926,13 @@
 
 (def sandbox-prompt-pointer
   "System-prompt block teaching the agent how to use its `clojure_eval` sandbox
-   (a pointer + the essentials, not a full namespace dump — keeps tokens down)."
+   (a pointer + the essentials, not a full namespace dump — keeps tokens down).
+
+   This text is part of every eval-capable LLM Run's prompt id and so of its
+   inputs id (`dvergr.agent.program/run-inputs`, doc/benchmarks.md): any edit
+   makes those candidates' certified cells stale, and an experiment resumed
+   afterwards runs them again. Every call it shows must run as written
+   (test/dvergr/sandbox/prompt_examples_test.clj)."
   (str "## Your sandbox (`clojure_eval`)\n\n"
        "`clojure_eval` is your main tool: it runs Clojure in a sandbox preloaded "
        "with the libraries you already know, mounted under their REAL names (sandboxed): "
@@ -962,7 +966,7 @@
        "CODE task `(dvergr.scheduler/create {:agent-id <you> :schedule "
        "{:every :day :at \"07:00\"} :code \"(require 'my.ns)(my.ns/run!)\" "
        ":description \"…\"})` — code schedules run WITHOUT an LLM turn and "
-       "post their result to the room; use prompt schedules (`scheduler/every` "
+       "post their result to the room; use prompt schedules (`dvergr.scheduler/every` "
        "with a task string) only when each run needs your judgment. To publish a STATIC SITE for "
        "this room, write `app/index.html` (+ assets under `app/`) in your "
        "workspace — served at `/apps/<room-slug>/`.\n\n"
@@ -994,7 +998,7 @@
        "**Your databases.** Your room owns its data — NOT a shared global DB. "
        "`dvergr.room/*kb*` is your knowledge base, `dvergr.room/*room*` your room's "
        "own datahike (messages/state); query them with ordinary datahike, e.g. "
-       "`(d/q '[:find ?t :where [?e :entity/title ?t]] @dvergr.room/*kb*)`. "
+       "`(require '[datahike.api :as d])` then `(d/q '[:find ?t :where [?e :entity/title ?t]] @dvergr.room/*kb*)`. "
        "`(dvergr.room/databases)` lists them; `(dvergr.room/db \"name\")` connects "
        "one by name. Make a NEW room-owned database with real datahike — "
        "`(d/create-database {:store {:backend :file :id \"notes\"}})` then "
@@ -1009,7 +1013,7 @@
        "`(clojure.repl/apropos \"schedule\")`, `(clojure.repl/find-doc \"knowledge\")`.\n\n"
        "**Types:** `malli.core` (validate/explain, `malli.error/humanize`, "
        "`malli.provider/provide` to infer a schema from sample data) is loaded. Annotate "
-       "your fns with `(m/=> f [:=> [:cat …] ret])` or `{:malli/schema …}` metadata; "
+       "your fns with `(m/=> f [:=> [:cat …] ret])` (after `(require '[malli.core :as m])`) or `{:malli/schema …}` metadata; "
        "schemas belong to your room (they fork with it) and `sandbox/doc` shows them.\n\n"
        "**Your workspace is the room** — a persistent project with its OWN git repo "
        "(your code), knowledge base, and schedules. Read/write code with `fs`/`git`/"
@@ -1034,7 +1038,7 @@
        "clojure_eval for scripting). Destructive ops (rm -rf, sudo, git push --force) "
        "are blocked by design; that's expected, not a failure. `(dvergr.shell/builtins)` "
        "lists what this session actually has, if you are unsure.\n\n"
-       "**Knowledge:** recall with `knowledge_search`/`(search/find …)` BEFORE "
+       "**Knowledge:** recall with `knowledge_search`/`(dvergr.room/kb-search …)` BEFORE "
        "researching, and save findings with `knowledge_add` so they persist past "
        "this session (sandbox `(defn …)` do not)."))
 
@@ -1089,7 +1093,7 @@
    (which for worker agents is the forked context with isolated systems).
 
    Sets up (the live list: `(sandbox/overview)`):
-   - datahike.api, dh/q dh/pull dh/search ... - datahike (the real API; fork-local conns)
+   - datahike.api (alias d)          - datahike (the real API; fork-local conns)
    - sync, spindel.comb, spindel.sig, spindel.work - spindel primitives
    - dvergr.intake.*                 - intake SOURCE in the workspace (require + extend)
    - babashka.fs                     - filesystem (path-clamped to base-path)
@@ -1098,6 +1102,8 @@
    - git/status, git/log, git/diff, git/add, git/commit - structured git
    - llm/call, llm/summarize         - cheap one-shot LLM calls
    - dvergr.room/kb-find, kb-search, *kb* - the room's knowledge base
+   - dvergr.scheduler, dvergr.tasks, dvergr.skills, dvergr.actors, dvergr.agent,
+     env, clojure.repl, malli and `sandbox` reflection
 
    Because writes go to the fork-local datahike conn, transact! in a worker
    agent context writes to the isolated fork — nothing lands in the parent
