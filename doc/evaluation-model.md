@@ -280,7 +280,8 @@ Run is allocated microdollars: the LLM program binds the Run's wallet
 (`resource/*spend-wallet*`, `dvergr.agent.program`) around its model steps,
 and every model call's cost is debited from it with `consume!`
 (`charge-spend!`, called from `dvergr.chat.context`). An empty wallet ends
-the Run's budget; a resumed Run spends what the stopped one left. Model
+the Run's budget; a resumed Run spends what the stopped one left (a new Run,
+so new debit ids; what the stopped Run paid stays paid). Model
 dispatches can also be admitted one by one (`admit-model-dispatch!`), and
 arena commands debit their own units (`dvergr.agent.arenas.renewal`).
 
@@ -288,7 +289,7 @@ arena commands debit their own units (`dvergr.agent.arenas.renewal`).
 |---|---|---|
 | Lives in | control Room store; never forked | the working context; forks with the world |
 | Tracks | a grant at hire, model spend debited per call, the remainder returned | tokens x price; stops the Run on budget |
-| Gap | each debit has a fresh random id (`UUID/randomUUID`), so a retried call is not charged effectively once | not conserved; only capped by the wallet when one is bound |
+| Idempotence | each debit's id is derived from its charge scope (the Run and model step) and its ordinal there, so a retried step debits once | not conserved; only capped by the wallet when one is bound |
 
 What is not debited in microdollars: the model calls inside a protocol Run
 (a tau2 conversation's, the candidate's and the customer's alike) and a room
@@ -390,7 +391,7 @@ Refactor first. Each step keeps the suite green.
      alive. They move with step 3. The tau2 episode namespace is not renamed
      yet.
 2. **Widen the primitive.** First the prerequisite: debit model spend from
-   Run wallets (`consume!`; built, but not yet effectively once), then attempt wallets with
+   Run wallets (`consume!`; built, a debit once per charge), then attempt wallets with
    per-role sub-grants; this is also what lets `:provider-effects?` open for
    delegation generally. Then `:fn` candidates; agent-authored verifiers in
    the `:room` and `:ad-hoc` tiers; a minimum tier for Scorecards;

@@ -82,10 +82,11 @@
   [run-id supervisor]
   {:program-kinds #{:echo :scripted}
    ;; Conserved vectors split recursively, and model calls are debited from the
-   ;; Run wallet (`resource/*spend-wallet*`, `charge-spend!`), but each debit
-   ;; has a fresh random id, so a retried debit is a second one. Keep paid
-   ;; recursive effects closed until provider usage and Kontor receipts form
-   ;; one atomic/effectively-once path.
+   ;; Run wallet (`resource/*spend-wallet*`, `charge-spend!`) under ids of
+   ;; their charge scope, so a retried step debits once. Provider usage and
+   ;; the Kontor receipt are still two writes (a crash between the provider's
+   ;; answer and the debit loses the debit), so paid recursive effects stay
+   ;; closed until per-role attempt wallets bound them.
    :provider-effects? false
    :parent-run run-id
    ;; Process-local structured ownership. The sandbox may construct immutable
@@ -731,10 +732,10 @@
                    :room-id system-id
                    :room-runtime-id (:id work-room)
                    :room-incarnation (:incarnation work-room)
-                   ;; Paid model usage is debited, but not effectively once
-                   ;; (see `child-program-authority`). Permit only
-                   ;; provider-free child programs until that receipt path
-                   ;; exists.
+                   ;; Paid model usage is debited once per charge, but the
+                   ;; provider's answer and its debit are two writes (see
+                   ;; `child-program-authority`). Permit only provider-free
+                   ;; child programs until attempt wallets bound them.
                    :agent-program-ceiling (child-program-authority run-id supervisor)})]
     {:chat-ctx chat-ctx
      :owned-db? (nil? trace-db)}))
@@ -866,12 +867,15 @@
         ;; the one ledger (doc/worlds-and-forks.md, Worlds, savepoints and budgets): a Run allocated
         ;; microdollars spends its wallet, and a resumed Run what the stopped one
         ;; left, not a fresh budget
+        ;; A resumed Run's wallet holds what the stopped one left, so its
+        ;; budget is the configured one less the stopped Run's spend, capped by
+        ;; that wallet: the spend is subtracted once, not from the wallet again.
         spend-wallet (resource/spend-wallet control-room run-id)
         budget-dollars (cond-> budget-dollars
-                         spend-wallet
-                         (min (/ (double (resource/wallet-microdollars control-room run-id)) 1e6))
                          (::resume agent)
-                         (-> (- (/ (double (or (get-in agent [::resume :spent]) 0)) 1e6)) (max 0.0)))
+                         (-> (- (/ (double (or (get-in agent [::resume :spent]) 0)) 1e6)) (max 0.0))
+                         spend-wallet
+                         (min (/ (double (resource/wallet-microdollars control-room run-id)) 1e6)))
         effective-limits {:max-model-steps max-model-steps
                           :budget-dollars budget-dollars}]
     (sp/spin
@@ -957,7 +961,12 @@
                   supervisor
                   (fn []
                     (binding [chat-agent/*turn-failure* failure
-                              resource/*spend-wallet* spend-wallet
+                              ;; the step is the charge scope: its debits have
+                              ;; ids of this Run and step, so charging the step
+                              ;; again does not charge it twice
+                              resource/*spend-wallet*
+                              (some-> spend-wallet
+                                      (resource/spending [:llm-step run-id model-step]))
                               resource/*model-scope*
                               (some-> (resource/model-scope control-room run-id)
                                       (assoc :cancel? #(run/cancel-requested? run-id)))]

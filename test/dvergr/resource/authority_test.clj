@@ -162,3 +162,41 @@
       (finally
         (kontor-governance/ungovern! conn)
         (d/close-room! room)))))
+
+(deftest a-charge-scope-debits-each-charge-once
+  (let [[room conn] (ledger-room)
+        left #(get (resource/balance room) resource/microdollars 0M)]
+    (try
+      (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 1000M}})
+      (let [payer (resource/room-spend-wallet room)
+            step! (fn [scope costs]
+                    (binding [resource/*spend-wallet* (resource/spending payer scope)]
+                      (mapv resource/charge-spend! costs)))]
+        (is payer "a Room wallet holding microdollars pays")
+        (testing "two calls in one scope are two debits"
+          (step! [:llm-step :r 0] [100 50])
+          (is (= 850M (left))))
+        (testing "charging the same scope again (a retried step) debits nothing more"
+          (is (= [{:charged 100M :exhausted? false} {:charged 50M :exhausted? false}]
+                 (step! [:llm-step :r 0] [100 50])))
+          (is (= 850M (left))))
+        (testing "a further call in the retried step is a new debit"
+          (step! [:llm-step :r 0] [100 50 25])
+          (is (= 825M (left))))
+        (testing "another step is another scope"
+          (step! [:llm-step :r 1] [100])
+          (is (= 725M (left))))
+        (testing "provider usage is priced, recorded and charged"
+          (let [s (resource/spending payer [:judge :r])]
+            (with-redefs [dvergr.chat.accounting/get-model-pricing (fn [_] {:input 1 :output 2})]
+              (binding [resource/*spend-wallet* s]
+                (resource/charge-usage! "m" {:input-tokens 10 :output-tokens 5})))
+            (is (= [{:model "m" :usage {:input-tokens 10 :output-tokens 5}}] @(:calls s)))
+            (is (= 705M (left)))))
+        (testing "without a payer, nothing is charged"
+          (binding [resource/*spend-wallet* (resource/spending nil [:x])]
+            (is (nil? (resource/charge-spend! 100))))
+          (is (= 705M (left)))))
+      (finally
+        (kontor-governance/ungovern! conn)
+        (d/close-room! room)))))

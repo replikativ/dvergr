@@ -291,8 +291,9 @@ Model spend in `"microUSD"` is a separate debit: when a Run's allocation carries
 microdollars, the LLM program binds that wallet (`resource/*spend-wallet*`) and
 each model call's priced cost is consumed from it after the call
 (`resource/charge-spend!`); an empty wallet ends the Run's budget. Each such
-debit has a fresh id, so it is not effectively once, and a zero-priced
-subscription consumes nothing. Token reservation, unknown-usage reconciliation
+debit's id is derived from its charge scope (the Run and model step) and its
+ordinal there, so a retried step debits once, and a zero-priced subscription
+consumes nothing. Token reservation, unknown-usage reconciliation
 and agent-spawned paid LLM children remain follow-up work; the existing
 paid-child restriction is unchanged. No new turn-based programming
 semantics or fork-local spending counter is introduced.
@@ -325,8 +326,10 @@ the SCI `hire!` closure and model-tool adapters resolve them automatically.
 An LLM-created sandbox can still build and revise arbitrary immutable rosters,
 but its `hire!` authority currently accepts only provider-free `:echo` and
 `:scripted` children. Generic resource vectors can already split recursively,
-and model spend is debited from the wallet, but not effectively once (each debit
-has a fresh id); paid recursive LLM work stays closed until it is. A top-level Room REPL has no such program-kind ceiling.
+and model spend is debited from the wallet once per charge (ids derived from
+the Run and model step); paid recursive LLM work stays closed until per-role
+attempt wallets bound it, since the provider's answer and its debit are still
+two writes. A top-level Room REPL has no such program-kind ceiling.
 
 The `spawn_agent` and `propose_change` model tools are convenience adapters over
 this same boundary. They construct a portable one-agent Roster, call `hire!`,
