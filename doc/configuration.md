@@ -148,7 +148,8 @@ keywords. An agent's `provides` are its capability tags (routing) and skills; `r
 joins every room.
 
 **Scope chain.** Each kind (`agents/`, `skills/`) is read from four places; a later one
-overrides an earlier one by `name`:
+overrides an earlier one with the same file name (the path relative to the kind's directory,
+without `.md`; the frontmatter `name` does not decide it):
 
 1. built-in: `resources/agents/`, `resources/skills/` on the classpath (dvergr's own, or your
    project's resources);
@@ -157,7 +158,10 @@ overrides an earlier one by `name`:
    `$DVERGR_HOME`);
 4. room: `<kind>/` in a room's workspace, which an agent can write from the sandbox.
 
-**Vetting.** A definition takes effect only with `vetted: true`. An unvetted skill can be listed
+**Vetting.** `vetted: true` gates skills and file-driven agent autostart, not every use of a
+definition: an unvetted agent definition's body is still the fallback system prompt of a
+configured agent of that id with no prompt of its own (`dvergr.agent.persona/resolve-prompt`).
+An unvetted skill can be listed
 and read but is not offered in agent prompts (`dvergr.orchestration.skills/eligible?`; also
 `disabled: true`, a missing `requires_tools` tool or a missing `requires_env` variable keep it
 out); the externally lifted skills under `resources/skills/lifted/` are unvetted. Agents
