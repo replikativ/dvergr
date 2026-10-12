@@ -163,6 +163,9 @@
                   (is (false? (:complete r))
                       "the Scorecard of the old prompt is superseded: the report does not show it")
                   (is (= {:rerun 1 :awaiting 2 :superseded 3} (:inputs r)))
+                  (is (= {:rerun 1 :awaiting 2 :superseded 3}
+                         (:inputs (binding [ec/*execution-context* (:ctx room)] (report/room-report room {}))))
+                      "a report that names no experiment finds the room's only one")
                   (is (str/includes? (:markdown r) "1 cell ran again because"))
                   (is (str/includes? (:markdown r) "2 cells made with earlier inputs await a re-run"))
                   (let [p (binding [ec/*execution-context* (:ctx room)] (experiment/progress room))

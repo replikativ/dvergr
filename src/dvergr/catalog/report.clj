@@ -365,7 +365,13 @@
                    (experiment/scorecards room (cond-> {:limit 1000}
                                                  experiment (assoc :experiment-content-id experiment)))))
         exp (:scorecard/experiment sc)
-        exp-id (or (:experiment/content-id exp) experiment)
+        ;; without a Scorecard or a named one: the room's only ExperimentDef
+        exp-id (or (:experiment/content-id exp) experiment
+                   (let [st (:store room)
+                         ids (when (satisfies? store/PAttemptStore st)
+                               (into #{} (keep #(get-in % [:attempt/receipt :attempt/metrics :experiment-content-id]))
+                                     (store/-list-attempts st (store/conversation-id room) {:limit 1000000})))]
+                     (when (= 1 (count ids)) (first ids))))
         inputs (when exp-id (inputs-of exp-id))
         inputs-text (when inputs (inputs-note inputs (boolean (and sc (not (current? sc))))))
         st (:store room)
