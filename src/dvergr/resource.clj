@@ -220,10 +220,21 @@
   [room run-id]
   (get (run-balance room run-id) microdollars 0M))
 
+(defonce ^:private wallet-locks
+  ;; wallet uuid -> monitor: a capped debit reads what is left and then
+  ;; transfers, so charges to one wallet (parallel observations sharing the
+  ;; Room's or a parent's) are serialized within the process
+  (atom {}))
+
+(defn- wallet-lock [wallet]
+  (or (get @wallet-locks wallet)
+      (get (swap! wallet-locks #(if (contains? % wallet) % (assoc % wallet (Object.)))) wallet)))
+
 (defn charge-spend!
   "Consume `cost` microdollars of model spend from the bound spend wallet.
    The provider was already paid, so the ledger cannot refuse it: a cost
-   beyond what is left takes the rest. The debit's id is the next one of the
+   beyond what is left takes the rest; charges to one wallet are serialized
+   (the rest is read, then taken). The debit's id is the next one of the
    binding's charge scope (`spending`): when that debit was already made (the
    scope charged again, a retried step), it is not made twice. Returns
    `{:charged n :exhausted? bool}`, or nil when no wallet is bound or there is
@@ -233,20 +244,21 @@
     (when (and payer (pos? cost))
       (let [{:keys [room wallet]} payer
             id (spend-debit-id scope (swap! debits inc))]
-        (if-let [done (store/-resource-receipt (resource-store! room) id)]
-          {:charged (get-in done [:resources microdollars] 0M)
-           :exhausted? (<= (wallet-left payer) 0M)}
-          (let [left (wallet-left payer)
-                amount (min (bigdec cost) left)]
-            (when (pos? amount)
-              (store/-transfer-resources!
-               (resource-store! room)
-               {:id id
-                :kind :consume
-                :source (kontor/account-ref wallet)
-                :destination kontor/sink-account
-                :resources {microdollars amount}}))
-            {:charged amount :exhausted? (<= left (bigdec cost))}))))))
+        (locking (wallet-lock wallet)
+          (if-let [done (store/-resource-receipt (resource-store! room) id)]
+            {:charged (get-in done [:resources microdollars] 0M)
+             :exhausted? (<= (wallet-left payer) 0M)}
+            (let [left (wallet-left payer)
+                  amount (min (bigdec cost) left)]
+              (when (pos? amount)
+                (store/-transfer-resources!
+                 (resource-store! room)
+                 {:id id
+                  :kind :consume
+                  :source (kontor/account-ref wallet)
+                  :destination kontor/sink-account
+                  :resources {microdollars amount}}))
+              {:charged amount :exhausted? (<= left (bigdec cost))})))))))
 
 (defn charge-usage!
   "Record one model call's provider `usage` under `model` in the bound

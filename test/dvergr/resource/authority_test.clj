@@ -158,6 +158,8 @@
               result (binding [ec/*execution-context* (:ctx room)] @handle)]
           (is (= [600000M 0M] @wallets) "each model call is paid from the wallet; the overrun takes the rest")
           (is (= :waiting (:run/status result)) "an empty wallet is an exhausted budget")
+          (is (= 1100000 (get-in result [:run/metrics :usage :used]))
+              "the budget records what the calls cost, not the budget it ended")
           (is (= {resource/microdollars 9000000M} (resource/balance room)) "$1 spent on models, nothing created or lost")))
       (finally
         (kontor-governance/ungovern! conn)
@@ -193,10 +195,18 @@
                 (resource/charge-usage! "m" {:input-tokens 10 :output-tokens 5})))
             (is (= [{:model "m" :usage {:input-tokens 10 :output-tokens 5}}] @(:calls s)))
             (is (= 705M (left)))))
+        (testing "concurrent charges to one wallet take what is left, not fail"
+          (let [n (left)
+                charge! #(future (binding [resource/*spend-wallet*
+                                           (resource/spending payer [:parallel (random-uuid)])]
+                                   (resource/charge-spend! (* 2 (quot (long n) 3)))))
+                results (mapv deref (doall (repeatedly 2 charge!)))]
+            (is (= 0M (left)))
+            (is (= n (reduce + (map :charged results))))))
         (testing "without a payer, nothing is charged"
           (binding [resource/*spend-wallet* (resource/spending nil [:x])]
             (is (nil? (resource/charge-spend! 100))))
-          (is (= 705M (left)))))
+          (is (= 0M (left)))))
       (finally
         (kontor-governance/ungovern! conn)
         (d/close-room! room)))))
