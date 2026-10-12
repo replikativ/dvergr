@@ -2,7 +2,7 @@
 
 How agents act on the world in dvergr: a **tool registry** (`dvergr.tools`) the LLM
 calls by name, and a **SCI sandbox** (`dvergr.sandbox`) that `clojure_eval` runs code
-in. Companion to `doc/state-model.md` and `doc/process-model.md`.
+in. Companion to `doc/worlds-and-forks.md` and `doc/runs.md`.
 
 ## The tool registry
 
@@ -124,7 +124,7 @@ cancellable.
   `babashka.http-client` is domain-gated; `env` returns a *placeholder* for any configured
   API key, which the HTTP client substitutes only at the key's bound domain + slot and scrubs from the
   response — so the agent uses keys it never sees (see
-  [boundary-secret-injection.md](boundary-secret-injection.md)).
+  [effects.md, Secrets at the boundary](effects.md#secrets-at-the-boundary)).
 - **Resource limits**: an `interrupt-fn` fires at every fn-body entry to honour
   `Thread.interrupt()` (Esc / watchdog) and cap cumulative thread-allocated memory (default 4 GiB: allocation, garbage included, not retained memory; a runaway backstop, since 256 MiB killed real feed scans). A shell command's output is bounded as it is written (four times `:max-out` bytes kept, the rest counted and dropped), and an environment can bound what an attempt writes (`:world :effects {:quota-bytes n}`, doc/effects.md).
   Timeout is enforced by a watchdog thread plus a `future`/deref outer fence, so even a
@@ -167,7 +167,7 @@ so `read_file`/`write_file`/`shell` see the fork's files automatically. Likewise
 `dvergr.room/*room*` and `*kb*` are the **fork's** Datahike conns: nothing reaches the
 parent until the fork is merged. `spawn_agent` and `propose_change` construct ordinary
 AgentDefs and call the same Run-backed `hire!` exposed in SCI. Their tool I/O therefore
-resolves in the child world automatically. See `doc/state-model.md` for the full
+resolves in the child world automatically. See `doc/worlds-and-forks.md` for the full
 value-semantics picture.
 
 Clients outside the room reach the same workspace through the same gates. The MCP and

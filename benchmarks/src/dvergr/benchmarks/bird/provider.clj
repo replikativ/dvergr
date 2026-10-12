@@ -1,5 +1,5 @@
 (ns dvergr.benchmarks.bird.provider
-  "BIRD as a benchmark provider (doc/benchmarks.md): one question over one
+  "BIRD as a benchmark provider (benchmarks/doc/bird.md): one question over one
    database, answered by a query the candidate submits, graded by running it
    and comparing its rows with the gold SQL's rows on SQLite (upstream's
    execution accuracy).

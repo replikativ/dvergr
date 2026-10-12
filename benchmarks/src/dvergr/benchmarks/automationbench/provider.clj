@@ -1,6 +1,6 @@
 (ns dvergr.benchmarks.automationbench.provider
   "AutomationBench (Zapier) as a benchmark provider for the generic evaluation
-   path (doc/evaluation-model.md, doc/benchmarks.md). An adapter, not a
+   path (doc/evaluation-model.md, benchmarks/doc/automationbench.md). An adapter, not a
    transcription: 47 simulated SaaS apps are ~85k lines of Python and the
    rubric ~350 assertion types, so upstream's own code runs behind a
    stateless service (`automationbench.sidecar`) and dvergr owns the episode.

@@ -3,8 +3,11 @@
 Dvergr is a Clojure agent harness built on the spindel FRP runtime: rooms, agents and their Runs are
 reactive processes, each attempt runs in a forked world, and benchmarks are experiments over
 certified Attempts. README.md is the product overview; `doc/` holds the design
-(`doc/architecture.md`, `doc/programming-model.md`, `doc/fork-and-world-model.md`,
-`doc/evaluation-model.md`, `doc/benchmarks.md`, `doc/room-workflows.md`).
+(`doc/architecture.md`, `doc/programming-model.md`, `doc/worlds-and-forks.md`, `doc/runs.md`,
+`doc/evaluation-model.md`, `doc/benchmarks.md`, `doc/room-workflows.md`; per-benchmark notes in
+`benchmarks/doc/`, design history in `doc/design/`). `doc/homes.md` is what a home holds and how
+an experiment uses one. `dvergr.doc-claims-test` checks that the docs' links, backticked
+`ns/var` names and the `doc/…` paths in source exist: run it after moving or renaming either.
 
 ## Never use :reload-all
 
@@ -89,7 +92,7 @@ Claude Code experiment waits while a window is at least `:usage-pause-threshold`
   web or MCP listener, no agents, schedules suspended, no storage GC) + `runner/run-in` +
   `runner/close-home!`: run it in its own JVM; in a process with a daemon pass `:daemon` (and
   `:experiment-id`) and it uses that daemon's home. A moved home is adopted, a copied one
-  refused (`system.home/claim!`), and an old-layout dir (`artifacts/`) is refused.
+  refused (`system.home/claim!`), and an old-layout dir (`artifacts/`) is refused (`doc/homes.md`).
 - `room-run` calls in process the ops an MCP client calls (`ops/invoke` on the home's daemon,
   no MCP transport): `room_create` (once), `room_write` the bundle, `catalog_benchmark`, `job_status`
   until settled, `experiment_report`.
@@ -97,10 +100,10 @@ Claude Code experiment waits while a window is at least `:usage-pause-threshold`
   room of its own (`runner/experiment-slug`: readable id + the start of its content id), so a
   provider prompt or grader version bump is a new room. `room-run` keeps every version in the
   one room `<bundle name>`, as the experiment named `<bundle name>`; `catalog_benchmark` keeps it
-  in its `room` (default: the new fixture room) under its `experiment` name (default: a fresh
-  one). A changed bundle or model list is a new ExperimentDef in that same room. The
-  `experiment` argument is a name in `catalog_benchmark`, but the ExperimentDef content id
-  (what `catalog_benchmark` returns as `experiment`) in `experiment_report`.
+  in its `room` (default: the new fixture room) under its `name` (deprecated alias `experiment`;
+  default: a fresh one). A changed bundle or model list is a new ExperimentDef in that same
+  room. `experiment_report` takes the ExperimentDef content id, which `catalog_benchmark`'s job
+  returns as `experiment`.
 - Running again on the same home (same experiment) resumes: cells with a verdict are kept,
   faulted cells re-run (and once more within the same run, `:fault-retries`). What a Run
   resolves only when it starts (the assembled system prompt, e.g. the sandbox pointer; the tools
@@ -160,4 +163,5 @@ Rules:
 An agent is a long-lived reactive process (inbox mailbox, outbox, control deferred), not a
 function call; multi-agent patterns (pipeline, fan-out, race, debate, manager–worker,
 request–response) compose these primitives. `doc/programming-model.md` and
-`doc/process-model.md` describe the real ones; sketches elsewhere are pseudocode.
+`doc/runs.md` describe the real ones; sketches elsewhere (and `doc/design/`, the design history)
+are pseudocode.

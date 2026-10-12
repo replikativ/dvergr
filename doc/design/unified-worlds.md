@@ -1,6 +1,6 @@
 # One algebra for worlds, savepoints and budgets
 
-Status: steps 1-4 are built (spindel#74, released in 0.1.67; #195; resume through `hydrate-into!`; #196), with one difference from the plan: turn savepoints do not escrow, and a resume grants the stopped Run's remainder straight from its wallet (step 2). Step 5 was assessed and not done (a renaming without a new guarantee); step 6 is deferred until inference runs over Attempts (below). The map's "dvergr today" column describes the code before these steps.
+Status: history; the as-built mapping is in [worlds-and-forks.md](../worlds-and-forks.md#worlds-savepoints-and-budgets). Steps 1-4 are built (spindel#74, released in 0.1.67; #195; resume through `hydrate-into!`; #196), with one difference from the plan: turn savepoints do not escrow, and a resume grants the stopped Run's remainder straight from its wallet (step 2). Step 5 was assessed and not done (a renaming without a new guarantee); step 6 is deferred until inference runs over Attempts (below). The map's "dvergr today" column describes the code before these steps.
 
 dvergr grew its own versions of things spindel now provides: Run worlds beside spindel's
 savepoint worlds, a resource ledger beside spindel's resource authority, a resume path beside
@@ -38,7 +38,7 @@ states (and tests) hold for dvergr too.
    (`program.clj`, `savepoint/open!` with `:authority`). As built, turn savepoints persist
    without an escrow (`portable/persist`), and `resume!` grants the stopped Run's remainder
    from its wallet to the new Run's (`:resources-from`); escrow is for a planned handoff
-   across a process boundary (doc/run-resume.md).
+   across a process boundary ([runs.md](../runs.md)).
 3. **Resume through the law (done, spindel 0.1.70):** `resume!` opens a Run world forked at
    the savepoint's snapshots (dvergr owns the handle and settles it), and
    `portable/hydrate-into!` makes that world the savepoint's continuation: seed and sequence,
@@ -77,6 +77,6 @@ behaviour and come last.
 
 ## What does not change
 
-SCI effects stay tail-resumptive handlers (doc/effects.md): SCI code is not CPS-transformed,
+SCI effects stay tail-resumptive handlers ([effects.md](../effects.md)): SCI code is not CPS-transformed,
 so its effects cannot be spindel effects. The effect *configuration* unifies (step 5); the
 effect *mechanism* in the sandbox stays dvergr's.

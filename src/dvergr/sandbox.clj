@@ -1267,7 +1267,7 @@
                         :workspace-resolver (when workspace workspace-resolver)
                         :effects boundary)
     (ns-kb/add-llm-ns!  sci-ctx agent-program-ceiling nil boundary)
-    ;; Boundary secret injection (doc/boundary-secret-injection.md): build the
+    ;; Boundary secret injection (doc/effects.md, section Secrets at the boundary): build the
     ;; host-side secret registry from config `:secrets` (resolved against the host
     ;; env), and share it between `env` (returns placeholders) and `http`
     ;; (substitutes at egress + scrubs the response). requiring-resolve to avoid a

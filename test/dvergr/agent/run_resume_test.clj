@@ -1,5 +1,5 @@
 (ns dvergr.agent.run-resume-test
-  "Resuming a stopped Run from its turn savepoint (doc/run-resume.md): each
+  "Resuming a stopped Run from its turn savepoint (doc/runs.md, Resuming a Run): each
    gap between model steps is persisted on the Run; a new Run continues from
    the latest one, caused by the old, once."
   (:require [clojure.test :refer [deftest is testing]]

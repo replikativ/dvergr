@@ -1,5 +1,5 @@
 (ns dvergr.resource.authority
-  "spindel's resource authority over dvergr's ledger (doc/unified-worlds.md).
+  "spindel's resource authority over dvergr's ledger (doc/worlds-and-forks.md).
 
    `world.scope/PResourceAuthority` is what a spindel scope asks when its
    worlds may spend something forking must not duplicate: a fork MOVES

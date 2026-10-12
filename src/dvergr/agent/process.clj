@@ -3,7 +3,7 @@
    parks at checkpoints, awaits a directive, and resumes after manager-
    issued effects on chat-ctx have been applied.
 
-   See doc/process-model.md for the design rationale. In short:
+   See doc/runs.md (Processes: checkpoints and directives) for the design. In short:
 
      - `->process` wraps a spin body and registers it.
      - Inside the body, `checkpoint!` snapshots state and parks.

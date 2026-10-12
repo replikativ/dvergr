@@ -304,7 +304,7 @@
                         ;; sandbox `http` primitive (nil/empty ⇒ open).
                      :allowed-domains (some-> (actors/lookup (sdb/get-conn) agent-id)
                                               :config :allowed-domains)
-                        ;; The room store (bus→store listener) is the single durable
+                        ;; The room store (`post!`'s durable append) is the single durable
                         ;; writer for this conversation; the agent's own turn messages
                         ;; stay signal-only (no redundant datahike write). Token
                      ;; accounting still persists.

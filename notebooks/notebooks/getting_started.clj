@@ -101,11 +101,10 @@
 ;;
 ;; - **Humans + agents, fork & merge** — humans as participants, background
 ;;   tasks, and the propose → accept/reject pattern (`humans_and_agents`).
-;; - **Auditor** — capability subscriptions in depth (`auditor`).
-;; - **Escalation** — budget escalation via tagged messages + a bus-level
-;;   policy handler (`escalation`).
-;; - **Streaming** — per-consumer buffer/SLA policy on a token stream
-;;   (`streaming`).
-;; - **LLM agent** — drive a *real* model with tools (`llm_agent`).
+;; - **Programming model** — capability subscriptions beyond the inbox,
+;;   budget escalation via tagged messages + a bus-level policy handler, and
+;;   per-consumer buffer/SLA policy on a token stream (`programming_model`).
+;; - **Agents and tools** — drive a *real* model with tools
+;;   (`agents_and_tools`).
 
 (kind/hidden (d/close-room! room) nil)

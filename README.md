@@ -51,7 +51,7 @@ reactive runtime), [Datahike](https://github.com/replikativ/datahike)
   knowledge graph
 - 🔐 **Boundary credential handling** — intakes that need an API key get a *placeholder*
   in the sandbox; the gated HTTP egress swaps in the real key only at the bound domain
-  and scrubs it from the response, so **the agent uses keys it never sees** ([design](doc/boundary-secret-injection.md))
+  and scrubs it from the response, so **the agent uses keys it never sees** ([design](doc/effects.md#secrets-at-the-boundary))
 - 🔌 **Multiple LLM providers** — Anthropic API/Claude Code, a native Codex
   subscription transport, OpenAI API, Fireworks, or any OpenAI-compatible
   endpoint — swappable per agent
@@ -149,14 +149,14 @@ subscription models, the `claude` CLI (Claude Code) and/or the `codex` CLI, logg
 
 **Where state goes.** Everything dvergr writes lives under one state root, `DVERGR_HOME`
 (default `<checkout>/.dvergr`): the stores, logs, the MCP relay's tool cache. `rm -rf` it to
-reset.
+reset. [doc/homes.md](doc/homes.md) has the layout, experiment homes, and moved vs copied homes.
 
 **Claude Code models without your email in their prompts.** With the interactive login the
 `claude` CLI adds the signed-in account's email to every prompt. Run `claude setup-token` once
 and save the token to `~/.dvergr/secrets/claude-oauth-token` (per user, not under
 `DVERGR_HOME`; `DVERGR_CLAUDE_TOKEN_FILE` names another file): `claude-code-*` candidates then
 run on that token with an empty config directory and no account details
-([details](doc/benchmarks.md#claude-code-as-the-model-backend)).
+([details](benchmarks/doc/tau2.md#claude-code-as-the-model-backend)).
 
 **From the shell**, a CSV of past cases (an id, the inputs, the outcome a person recorded)
 becomes a case pack, which `room-run` certifies, benchmarks and reports on:

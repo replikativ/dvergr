@@ -216,33 +216,37 @@ graph TD
 
 | family | layer | role |
 |--------|-------|------|
-| `substrate/{config,geschichte,git,log,paths}` | L0 | EDN config load/cache; Geschichte room workspaces (a Datahike branch + a muschel filesystem); native git helpers (the sandbox stdlib clone, the safe fallback workspace); structured logging; `.dvergr/` state-root resolution |
+| `substrate/{config,geschichte,git,log,paths,load}` | L0 | EDN config load/cache; Geschichte room workspaces (a Datahike branch + a muschel filesystem); native git helpers (the sandbox stdlib clone, the safe fallback workspace); structured logging; `.dvergr/` state-root resolution; thread-safe runtime `require` |
+| `substrate/{datahike,store_ids,kontor_book}` | L0/L2 | the one helper that provisions a dvergr Datahike store and registers it as a forkable system; each file store's logical id kept beside it (`<store>.id`, so a moved home opens its stores); a room's Kontor business book, settled by replay |
 | `code` + `code/index` | L0/L2 | Clojure source parse/diff + in-memory katzen ACSet code index |
 | `kb/schema` | L0 | Knowledge-base schema (katzen canonical → Datahike idents) |
 | `scheduler/{schema,cron,core,tools}` | L0–L6 | persistent-schedule schema; pure cron math; spindel-native scheduler; agent schedule tools |
 | `runtime/{bus,peer_bus,clock,ctx}` | L1 | pub/sub substrate; control-plane peer-bus; the single reactive clock; CoW execution-context memory model |
-| `chat/{context,schema,accounting,compaction,agent,tool_schema}` | L2/L5 | per-chat signals+Datahike state; the unified schema; budgets; compaction; the core turn loop; tool→schema gen |
+| `chat/{context,schema,persist,accounting,compaction,agent,tool_schema}` | L2/L5 | per-chat signals+Datahike state; the unified schema; one durability policy for message persistence; budgets; compaction; the core turn loop; tool→schema gen |
 | `participant/context` | L2 | uniform participant context (LLM/human/hybrid) |
 | `agent/room_context` | L2 | per-[room,agent] long-lived ChatContext folded from the room bus |
-| `system/{db,rooms,mail}` | L2/L3 | the global system-db registry (identity backbone); rooms-as-projects provisioning/resolvers; attach a briefkasten mailbox as a ygg system |
+| `system/{db,home,rooms,mail}` | L2/L3 | the global system-db registry (identity backbone); `home.edn` and moved-vs-copied homes (doc/homes.md); rooms-as-projects provisioning/resolvers; attach a briefkasten mailbox as a ygg system |
 | `room/{registry,store,store/datahike,store/memory}` | L2/L3 | slug↔Room registry; PRoomStore protocol + Datahike/in-memory impls |
 | `discourse` (core) | L3 | Room/Participant/Message, fork/merge, algebra combinators |
 | `discourse/{background,enrichment,human,commands,personas,definitions,attention}` | L3/L6 | background spawner; on-message decorators; human participant; slash-command registry; pre-built personas; the unified skill+agent-identity loader; pure attention decisions |
 | `discourse/{llm,generation}` | L4/L5 | LLM participant factory; GenerationHandle bridge |
 | `rooms` + `rooms/{forks,messages,tree,stats,theme,scheduler}` | L3 | room CRUD + Datahike unification; fork describe/review/merge/discard; signal-backed transcript/tree/stats views; per-speaker theme; per-room reactive scheduler |
+| `rooms/{facts,files,repo,subsystems}` | L3/L6 | one change feed per room (a signal bumped on each durable change); workspace files for outside clients (`room_files`/`room_read`/`room_write`); import a Git repository into a room workspace and export its changes as a patch; the one call that starts every per-room subsystem |
 | `adapters/core` | L3 | transport-agnostic medium adapter: inbound posting + egress Participant |
 | `tools` + `tools/{structural,llm_call,approval}` | L4 | tool registry/executor (role-scoped); structural edits; one-shot LLM tool; approval workflow |
-| `effects`, `authority`, `resource` + `resource/authority` | L4 | the effect boundary between sandbox code and the world (doc/effects.md); the `can?` authorization seam; conserved budgets and spindel's resource authority over the ledger (doc/unified-worlds.md) |
+| `effects`, `authority`, `resource` + `resource/authority` | L4 | the effect boundary between sandbox code and the world (doc/effects.md); the `can?` authorization seam; conserved budgets and spindel's resource authority over the ledger (doc/worlds-and-forks.md) |
 | `drive/{core,fs,blobs,integration}` | L4 | the built-in room drive mounted at `/drive`: file nodes, the muschel FS, content-addressed blobs, host wiring |
 | `io/{frozen_web,acquisition}`, `search/secondary`, `media/{doc,vision}`, `audio/{stt,record}` | L4 | frozen web for discovery experiments; HTTP acquisition records; fulltext over Datahike's scriptum secondary index; document text and vision; speech-to-text |
-| `sandbox` + `sandbox/{deps,workspace}` + `sandbox/ns/*` | L4 | SCI runtime (ctx/eval/limits); gated add-libs; the workspace load-root; the injected namespaces (`io`/`data`/`datahike`/`agent`/`kb`/`room`/`mail`/`codec`/`dev`/`intake`) |
-| `intake/{bash,mail}` | L4 | the only in-tree intakes — muschel-jailed shell + briefkasten mail (all other data sources live in the dvergr-sandbox stdlib repo) |
+| `sandbox` + `sandbox/{deps,workspace,work,extensions}` + `sandbox/ns/*` | L4 | SCI runtime (ctx/eval/limits); gated add-libs; the workspace load-root; room-owned handles for spindel work-admission controllers; the extensions an AgentDef's `:sandbox` set names (`:foerster/inference`); the injected namespaces (`io`/`data`/`datahike`/`agent`/`kb`/`room`/`mail`/`codec`/`dev`/`intake`/`malli`), with `doc` attaching their docstrings |
+| `sci/clojure_test` + `sci/impl/clojure_test` | L4 | babashka's clojure.test, vendored and adapted for the SCI sandbox |
+| `intake/{bash,jail,mail}` | L4 | the only in-tree intakes — muschel-jailed shell (`jail`: listed programs such as python3 under bubblewrap, over a disk mirror of the worktree) + briefkasten mail (all other data sources live in the dvergr-sandbox stdlib repo) |
 | `channels/{core,telegram,telegram_commands,telegram_send}` | L4/L6 | channel framework; Telegram Bot API (polling/old dispatch); `dvergr.ops` slash-command binding; outbound Markdown→HTML rendering + chunking |
-| `model/{provider,providers,registry,chat,quirks,gateway}` + `model/api/{anthropic,openai,claude_code,codex_subscription,codex_auth}` | L5 | provider protocol + registry + metadata; origin-confined credential injection; HTTP/SSE, native Codex subscription, and CLI compatibility transports; provider quirks |
+| `model/{provider,providers,registry,chat,quirks,gateway,subscription}` + `model/api/{anthropic,openai,claude_code,codex_subscription,codex_auth}` | L5 | provider protocol + registry + metadata; origin-confined credential injection; HTTP/SSE, native Codex subscription, and CLI compatibility transports; provider quirks; the subscription usage meter and governor |
 | `agent/{turn,prompt,process,tool_commands,persona,ops,fields}` | L5/L6 | shared turn mechanics; system-prompt assembler; checkpoint/resume process; tool commands; persona resolution; agent-management ops + field spec |
 | `agent/{program,run,world,roster,workflow}` | L5/L6 | `hire!` and agent programs; durable Runs; a Run's forked work world; immutable rosters; one task run N times on forks |
-| `agent/{evaluation,environment,experiment,experiment/*,verifiers,evaluators,attempt,spend,trajectory,conversation,episode}` | L5/L6 | the evaluation path (doc/evaluation-model.md): Attempts, EnvironmentDefs, experiments and their runner, preflight and statistics, verifier trust tiers, spend, trajectory export, certified conversations |
-| `catalog` + `catalog/{wiki,wiki_gen,room,room_run,casepack,report,workspace}` | L6 | catalog workflows (the wiki family) and room workflows (doc/room-workflows.md): bundles, case packs, `room-run` (a client of the room path), the report |
+| `agent/{evaluation,environment,experiment,experiment/{runner,preflight,select,stats},verifiers,evaluators,attempt,attempt/governance,grounds,spend,trajectory,conversation,episode}` | L5/L6 | the evaluation path (doc/evaluation-model.md): Attempts, EnvironmentDefs, experiments and their runner, preflight, case selection and statistics, verifier trust tiers, the writer predicate that keeps certified rows immutable, what an Attempt's result rests on (its grounds), spend, trajectory export, certified conversations |
+| `agent/{observation,arenas/renewal}` | L5/L6 | bounded, scoped projections over one agent execution tree; a state-backed renewal-intervention arena |
+| `catalog` + `catalog/{wiki,wiki_gen,room,room_run,casepack,casepack_cli,report,workspace}` | L6 | catalog workflows (the wiki family) and room workflows (doc/room-workflows.md): bundles, case packs (and `casepack-cli`, a table of cases into a bundle from the shell), `room-run` (a client of the room path), the report |
 | `jobs`, `artifact`, `activity` | L6 | long operations as durable Runs; content-addressed portable values; durable observations on room messages |
 | `orchestration/{daemon,skills,tasks,stats}` | L6 | the runtime daemon (boot/shutdown, agent lifecycle, channel/MCP/web wiring, GC loop); skill registry; task ledger; stats cache |
 | `actors` + `actors/transport` | L6 | durable actor identity table; PActorTransport impls |
@@ -252,4 +256,4 @@ graph TD
 | `mcp/{server,json_rpc,http,surface,repl}` | L7 | TCP/stdio MCP server + JSON-RPC/MCP dispatch; Streamable HTTP; profiles, toolsets and result encoding; the REPL's `dvergr.ops` (doc/mcp.md) |
 | `clients/client` | L7 | nREPL client — inspect/interact + fork-task workflow over a daemon |
 | `cli/main` + `tui/app` (src-clients) | L7 | CLI entry point; the TUI app (a rich medium adapter onto rooms) |
-| `web/{server,dashboard,api,ops,agents}` | L7 | http-kit server; dashboard (hiccup+HTMX); spec-derived JSON API; web `ops` binding; agent config UI |
+| `web/{server,guard,dashboard,api,ops,agents,apps}` | L7 | http-kit server and its browser boundary (Host/Origin checks); dashboard (hiccup+HTMX); spec-derived JSON API; web `ops` binding; agent config UI; a room's `app/` served as a static app (doc/web.md) |

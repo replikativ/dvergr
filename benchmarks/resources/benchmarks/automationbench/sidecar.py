@@ -1,4 +1,4 @@
-"""AutomationBench as a stateless service for dvergr (doc/benchmarks.md).
+"""AutomationBench as a stateless service for dvergr (benchmarks/doc/automationbench.md).
 
 Runs inside an AutomationBench checkout's environment (`uv run python
 sidecar.py`) and answers one JSON request per stdin line with one JSON line on

@@ -93,7 +93,7 @@ What the TUI talks to are the **agents joined to each room**, configured in
 `config.local.edn` / `resources/agents/*.md` — not a CLI flag. Each agent's tool set
 is its capability boundary (a `:tools` allowlist or a role tag like `#{:coding}`);
 the default secretary (`var`) routes and chats. See
-[rooms-and-agents.md](rooms-and-agents.md) and
+[programming-model.md](programming-model.md#rooms-and-agents) and
 [tools-and-sandbox.md](tools-and-sandbox.md).
 
 ## Telemetry

@@ -347,7 +347,7 @@
          (when notify!
            (notify! (str "Worktree-isolated forks run in a separate execution "
                          "context the UI can't display yet — use /fork for a "
-                         "conversational fork. (Tracked in doc/command-systems.md.)")))
+                         "conversational fork.")))
          {:handled? true :no-turn? true})})
 
 (register!

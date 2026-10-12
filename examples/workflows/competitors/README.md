@@ -4,7 +4,7 @@ A workflow bundle (doc/room-workflows.md): find products competing with Simmis, 
 its site, a claim and a quote from a page the run fetched. Reference set: the simm.is
 comparison (Wato, PromptQL, Dust, Buzz). Needs web search: `BRAVE_API_KEY` as a sandbox
 secret: a `:secrets` entry in `config.local.edn` in the directory `room-run` is started from
-(or the file `DVERGR_CONFIG` names; see the example in doc/boundary-secret-injection.md). The
+(or the file `DVERGR_CONFIG` names; see the example in doc/effects.md, "Secrets at the boundary"). The
 config is the process's, not the home's: the home's headless daemon builds each sandbox's
 secrets from it, and the agent's `(env/get "BRAVE_API_KEY")` returns a placeholder that the
 sandbox's HTTP client replaces with the key only on a request to an allowed domain. The

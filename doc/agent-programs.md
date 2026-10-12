@@ -2,7 +2,7 @@
 
 Status: deterministic and native LLM/tool interpreters, conserved resource
 delegation, model-spend debiting from a Run's microdollar wallet, and resume
-from turn savepoints (doc/run-resume.md) are implemented. Simulation and
+from turn savepoints (doc/runs.md, "Resuming a Run") are implemented. Simulation and
 replay interpreters are not built.
 
 Dvergr agents can construct specialized workers and compose their executions
@@ -579,7 +579,7 @@ a separate FRP layer.
 Passing only one model is not sufficient evidence that the programming surface
 is clear. The broader business and machine-work portfolio, simulation ladder,
 and related Hermes reliability findings are tracked in
-[`practical-agent-evaluation.md`](practical-agent-evaluation.md).
+[`benchmarks/doc/discovery.md`](../benchmarks/doc/discovery.md).
 
 The first opt-in environments live in `dvergr.agent.program-bench` on the
 `:dev` classpath. They run through the production prompt, provider, tool, SCI,

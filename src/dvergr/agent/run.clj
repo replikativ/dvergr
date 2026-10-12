@@ -464,7 +464,7 @@
 
 (defn record-savepoint!
   "Keep `data` (a portable savepoint, `savepoint.portable/persist`) as the live
-   Run's latest point to resume from (doc/run-resume.md). Durable and in the
+   Run's latest point to resume from (doc/runs.md, Resuming a Run). Durable and in the
    live entry, so the Run's later updates carry it. nil when the Run is not
    live in this process."
   [run-id data]

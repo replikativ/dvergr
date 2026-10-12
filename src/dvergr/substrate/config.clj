@@ -109,7 +109,7 @@
   (get (config) :agents {}))
 
 (defn secret-specs
-  "Boundary-injection secret specs (doc/boundary-secret-injection.md): a vector of
+  "Boundary-injection secret specs (doc/effects.md, section Secrets at the boundary): a vector of
    `{:name :env|:value|:config-path|:basic-auth-config-paths :allowed-domains
      :allowed-locations :header-names}`. The sandbox binds each to a placeholder,
    so an agent can USE a key without SEEING it. The value is sourced from `:env`

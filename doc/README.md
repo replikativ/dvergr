@@ -5,28 +5,23 @@ New to dvergr? Start with **[Getting Started](getting-started.md)**.
 ## 🚀 Getting started
 
 - **[Main README](../README.md)** — project overview + quickstart
-- **[Getting Started](getting-started.md)** — first-room tutorial: REPL + CLI paths, tagged messages, streaming
-- **[REPL meta-harness contract](repl-contract-test.md)** — deterministic, provider-free end-to-end test
-- **[Testing](testing.md)** — running the suite, how CI splits it across containers, waits that hold
-- **[Configuration](configuration.md)** — config + state layers, the `.dvergr/` layout
+- **[Getting Started](getting-started.md)** — prerequisites, first-room tutorial: REPL + CLI paths, tagged messages, streaming
+- **[Configuration](configuration.md)** — config file, env, secrets, skills and agent definitions
+- **[Homes](homes.md)** — the directory a process keeps its state in: layout, moved vs copied homes, experiment homes, storage GC
 - **[Provider & model setup](provider-setup.md)** — API keys, providers, the `models.edn` registry
 - **[CLI reference](cli.md)** — `dvergr-cli`: flags, persistence, telemetry
 - **[MCP](mcp.md)** — dvergr as an MCP server: the relay, HTTP, profiles and toolsets, what each tool promises
+- **[Web dashboard and JSON API](web.md)** — the dashboard, room apps, `/api/v1`, the loopback stance
+- **[Testing](testing.md)** — running the suite, how CI splits it across containers, waits that hold, the REPL meta-harness contract
 
 ## 📚 Concepts
 
-- **[Rooms & Agents](rooms-and-agents.md)** — the core model: Rooms + Participants on a Bus, addressing (DM vs broadcast), forks
-- **[Programming Model](programming-model.md)** — the compositional kernel: tagged messages, capability routing, dynamic subscriptions, escalation
-- **[Recursive work orchestration](orchestration.md)** — Rooms, threads, tasks, executions, recursive Workrooms, and provider-neutral collaboration
-- **[Runs](runs.md)** — durable execution identity, lifecycle subscription, correlation, and targeted cancellation
+- **[Programming Model](programming-model.md)** — Rooms and Participants on a Bus, addressing, forks; tagged messages, capability routing, escalation; why "discourse"
+- **[Architecture](architecture.md)** — the L0–L7 layer map, subsystem graph, inbound message flow, per-namespace table
+- **[Runs](runs.md)** — durable execution identity, kinds, lifecycle and reasons, how a turn ends, cancellation, processes, resuming from savepoints
 - **[Agent programs](agent-programs.md)** — immutable specialized-agent rosters, Run-backed hiring, Spindel composition, and fork-safe state placement
-- **[Forks, worlds, and settlement](fork-and-world-model.md)** — the cross-project Yggdrasil/Spindel/Dvergr/Simmis fork contract, ownership laws, and use-case coverage
-- **[Discourse Theory](discourse-theory.md)** — why "discourse": speech acts, theory of mind, and the Rational-Speech-Acts/FRP lineage (short, optional)
-- **[Architecture](architecture.md)** — the L0–L7 layer map, subsystem graph, inbound message flow, per-file table
-- **[State Model](state-model.md)** — the three-tier copy-on-write state + workspace model
-- **[Effects](effects.md)** — one boundary between sandbox code and the world: handlers, faults, recording, replay
-- **[Unified worlds](unified-worlds.md)** — one algebra for worlds, savepoints and budgets
-- **[Resuming Runs](run-resume.md)** — resuming Runs from savepoints
+- **[Worlds, forks and state](worlds-and-forks.md)** — where every kind of state lives, what a fork forks, the fork contract, worlds, savepoints and budgets
+- **[Effects](effects.md)** — one boundary between sandbox code and the world: handlers, faults, recording, replay, secrets at the boundary
 
 ## 🔧 Reference
 
@@ -34,19 +29,29 @@ New to dvergr? Start with **[Getting Started](getting-started.md)**.
 - **[Media — voice, vision & files](media.md)** — speech-to-text across every frontend, image describe/extract, document text, the `/drive` mount
 - **[Channels — Telegram](channels.md)** — bridging a chat surface into Rooms: setup, allowlist, voice/documents, slash commands
 - **[Scheduling](scheduling.md)** — per-room recurring / one-shot tasks, incl. deterministic `:code` schedules
-- **[Boundary secret injection](boundary-secret-injection.md)** — how an agent uses an API key it never sees (credential handling + the `:secrets` config)
-- **[Process model](process-model.md)** — the pausable/resumable Process abstraction
 
 ## 📏 Evaluation and benchmarks
 
 - **[Workflows defined in a room](room-workflows.md)** — a room's own benchmark: bundles, checkers, calibration, case packs from your own history, `room-run`
-- **[Benchmarks](benchmarks.md)** — the providers (tau2-bench's four domains, BFCL, AutomationBench, BIRD, SpreadsheetBench, the wiki and room workflows), equivalence, results
+- **[Benchmarks](benchmarks.md)** — the catalog (tau2-bench's four domains, BFCL, AutomationBench, BIRD, SpreadsheetBench, the wiki, room workflows), the provider contract, results
 - **[Running benchmarks](running-benchmarks.md)** — how to run one, what its report means, resume, faults, cost at list price, held-out discipline
-- **[Reference setups](../benchmarks/reference/README.md)** — BIRD and SpreadsheetBench as their authors run them, on the cases a Dvergr experiment ran, and how to pair the two
 - **[Evaluation model](evaluation-model.md)** — Attempts, Evaluators, Experiments, Scorecards
-- **[Practical agent evaluation](practical-agent-evaluation.md)** — frozen-web discovery, citation verification, market evidence
-- **[Coding benchmarks](coding-benchmarks.md)** — coding repair in the SCI workspace
-- **[Conversation evaluation](conversation-evaluation.md)** — certified conversational episodes
+- Per-benchmark notes in [`benchmarks/doc/`](../benchmarks/doc/):
+  [tau2-bench](../benchmarks/doc/tau2.md), [BFCL](../benchmarks/doc/bfcl.md),
+  [BIRD](../benchmarks/doc/bird.md), [SpreadsheetBench](../benchmarks/doc/spreadsheetbench.md),
+  [AutomationBench](../benchmarks/doc/automationbench.md), [the wiki](../benchmarks/doc/wiki.md),
+  [coding repair](../benchmarks/doc/coding.md), [frozen-web discovery](../benchmarks/doc/discovery.md)
+- **[Reference setups](../benchmarks/reference/README.md)** — BIRD and SpreadsheetBench as their authors run them, on the cases a Dvergr experiment ran, and how to pair the two
+
+## 🗂 Design history
+
+[`design/`](design/) keeps proposals and plans as they were written, each with a status line
+saying what was built and where the as-built page is:
+[recursive work orchestration](design/orchestration.md),
+[certified conversational episodes](design/conversation-evaluation.md),
+[resuming Runs: the proposal](design/run-resume.md),
+[one algebra for worlds, savepoints and budgets](design/unified-worlds.md),
+[forks and worlds: use cases and migration](design/fork-and-world-migration.md).
 
 ## 🤝 Contributing
 

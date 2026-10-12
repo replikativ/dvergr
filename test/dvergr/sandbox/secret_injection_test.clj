@@ -1,5 +1,5 @@
 (ns dvergr.sandbox.secret-injection-test
-  "Boundary secret injection (doc/boundary-secret-injection.md): env/get hands the
+  "Boundary secret injection (doc/effects.md, section Secrets at the boundary): env/get hands the
    agent a placeholder; do-request substitutes the real value at egress, bound to a
    destination + slot, and scrubs reflected values. The agent never holds plaintext."
   (:require [clojure.test :refer [deftest is testing]]

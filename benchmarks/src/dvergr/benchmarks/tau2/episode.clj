@@ -18,7 +18,7 @@
    Whatever fails after admission, the episode Run is finished and an Attempt
    is certified: infrastructure faults as status :failed (reward 0, excluded
    from metrics), model outcomes as :completed. See
-   doc/conversation-evaluation.md."
+   doc/design/conversation-evaluation.md."
   (:refer-clojure :exclude [run!])
   (:require [clojure.string :as str]
             [dvergr.agent.conversation :as conv]

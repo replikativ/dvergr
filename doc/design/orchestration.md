@@ -1,7 +1,7 @@
 # Recursive work orchestration
 
 Status: partly built, partly superseded. Stage 2 is built (Runs for agent turns,
-[runs.md](runs.md)); of Stage 1, typed thread roots (`:message/thread-root-id`) and
+[runs.md](../runs.md)); of Stage 1, typed thread roots (`:message/thread-root-id`) and
 attention decisions (`dvergr.discourse.attention`) exist. The provider-neutral task protocol and Stage 3's
 `delegate!`/`message!`/`follow-up!` API were never built and are superseded by
 `hire!` (see the banner under *Provider-neutral task protocol*); Stages 4-6 are not
@@ -206,7 +206,7 @@ Workspace policy must be explicit:
 > or `await!` exists. Delegation is `hire!` (the sandbox's `dvergr.agent/hire!`, on the
 > host `dvergr.agent.program/hire!`): it starts a durable Run in a forked world and returns
 > a result Spin; `spawn_agent` and `propose_change` are tool adapters over it
-> ([agent-programs.md](agent-programs.md), [runs.md](runs.md)). The behavioral
+> ([agent-programs.md](../agent-programs.md), [runs.md](../runs.md)). The behavioral
 > distinctions below still hold.
 
 The first orchestration surface should be small and message-oriented:
@@ -438,7 +438,7 @@ The UI may say “three agents implemented token refresh” while still displayi
 
 ## State placement and fork safety
 
-Follow `doc/state-model.md`:
+Follow [worlds-and-forks.md](../worlds-and-forks.md#where-state-lives):
 
 - Durable task, event, thread, artifact, and summary facts belong in the room's
   forkable Datahike/Geschichte/Yggdrasil state.
@@ -483,7 +483,7 @@ This is the immediate dependency for Simmis's room UI.
 
 ### Stage 2: lightweight execution correlation
 
-Implemented for `:agent-turn` Runs; see [runs.md](runs.md):
+Implemented for `:agent-turn` Runs; see [runs.md](../runs.md):
 
 1. Allocate a Run ID before each agent turn and persist its precise trigger.
 2. Correlate tool activity and output messages by typed Run ID; derive Thread
@@ -511,7 +511,7 @@ The provider-free functional-programming precursor is implemented now: immutable
 AgentDefs/Rosters compose in room SCI, and `hire!` starts a Run-backed Spindel
 computation whose effects execute in an isolated Run world. Automatic settlement
 is the common path; review retains the world as a normal inspectable fork. See
-[agent-programs.md](agent-programs.md). Its `:roster/scope` is stored on the
+[agent-programs.md](../agent-programs.md). Its `:roster/scope` is stored on the
 Roster but nothing reads it; resources move through `hire!`'s `:resources`.
 
 ### Stage 4: recursive workrooms
