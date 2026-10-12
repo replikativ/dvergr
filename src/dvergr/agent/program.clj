@@ -584,18 +584,18 @@
 
 (defn- model-inputs
   "What the Run's model is, resolved now: the alias resolved to its registry
-   id, the provider, and the registry entry's API type and quirks (its
-   sampling defaults). Prices and context sizes are not in it: they change
-   what a call costs (models.dev refreshes them), not what the model is
-   asked."
+   id, the provider, and the registry entry that shapes every request (API
+   type, quirks such as sampling defaults, output limit, context size,
+   capabilities, instruction role, reasoning efforts). Its prices and display
+   names are not in it: they change what a call costs or is called, not what
+   the model is asked. A models.dev refresh that changes a limit changes it."
   [{:keys [provider model]}]
   (registry/ensure-models-loaded!)
   (let [id (when model (registry/resolve-alias model))
         definition (when id (registry/get-model id))]
-    {:provider (or provider (:provider definition))
-     :model id
-     :api-type (:api-type definition)
-     :quirks (:quirks definition)}))
+    (merge (dissoc definition :id :name :pricing :list-price-of)
+           {:provider (or provider (:provider definition))
+            :model id})))
 
 (defn- tool-inputs
   "The tools a model is offered, as it is offered them: each one's name,

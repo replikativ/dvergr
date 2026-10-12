@@ -112,15 +112,15 @@ ExperimentDef. Each Attempt records them as its inputs id (`:attempt/inputs-id`,
 
 | Candidate | In the inputs id |
 |---|---|
-| LLM program | the assembled system prompt (its prompt id: harness preamble, the agent's prompt, the skills eligible in the world's workspace, the tool-use guideline, the sandbox pointer, the workspace's AGENTS.md); the tools offered, each one's name, description and input schema (a Claude Code candidate is offered the same tools over MCP); the model: its alias resolved, provider, API type and quirks (sampling defaults) |
+| LLM program | the assembled system prompt (its prompt id: harness preamble, the agent's prompt, the skills eligible in the world's workspace, the tool-use guideline, the sandbox pointer, the workspace's AGENTS.md); the tools offered, each one's name, description and input schema (a Claude Code candidate is offered the same tools over MCP); the model: its alias resolved, provider, and the registry entry that shapes each request (API type, quirks such as sampling defaults, output limit, context size, capabilities, instruction role, reasoning efforts) |
 | Protocol | the protocol's ref, the resolved model of the AgentDef's policy, and what the protocol's own `:inputs` (`evaluation/make-protocol`) says it assembles |
 | `:echo`, `:scripted` | nothing (nil): a deterministic program resolves nothing |
 
 Not in it, because they are already in the ExperimentDef or do not change what the candidate is
 presented with: the task (an answer contract appended to a case pack's task is part of the
 EnvironmentDef), budgets and limits (the AgentDef, the EnvironmentDef), the Claude Code CLI
-version and host note (the metadata), prices and context sizes (they change what a call costs,
-and models.dev refreshes them), the date note and planning-mode guideline (a room
+version and host note (the metadata), the model's prices (they change what a call costs, not
+what it asks; a models.dev refresh that changes a limit does change the id), the date note and planning-mode guideline (a room
 participant's turns get them, a Run's model steps do not), and the files of the
 experiment room's repository other than AGENTS.md and its skills (world state, seeded once when
 the room is made; Attempts discard their forks).
