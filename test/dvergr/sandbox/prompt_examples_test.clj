@@ -133,23 +133,46 @@
        (filter qualified-symbol?)
        (remove #(= "clojure.core" (namespace %)))))
 
-(def ^:private binders
+(def ^:private let-like
   '#{let let* loop loop* binding when-let if-let when-some if-some for doseq dotimes
-     with-open fn fn* defn defn- defmacro letfn})
+     with-open with-redefs})
+
+(defn- binding-names
+  "The names a binding vector binds: its even positions (destructuring
+   included), and for `for`/`doseq` the names of a `:let` modifier; never the
+   init expressions."
+  [bvec]
+  (mapcat (fn [[target init]]
+            (cond
+              (= :let target) (binding-names init)
+              (keyword? target) nil
+              :else (filter symbol? (tree-seq coll? seq target))))
+          (partition 2 bvec)))
 
 (defn- bound-symbols
-  "The symbols `forms` define or bind (def names, params, let bindings):
+  "The symbols `forms` define or bind (def names, params, binding names):
    calls to these are the text's own code."
   [forms]
   (set (for [x (mapcat #(tree-seq coll? seq %) forms)
              :when (and (seq? x) (symbol? (first x)))
-             :let [[op a b] x]
+             :let [[op a & more] x]
              s (cond
-                 (#{'def 'defn 'defn- 'defmacro} op)
-                 (cons a (filter symbol? (tree-seq coll? seq (filter vector? (take 4 (rest x))))))
-                 (binders op)
-                 (filter symbol? (tree-seq coll? seq (filter vector? [a b])))
+                 (#{'def 'defn 'defn- 'defmacro 'defmulti} op) [a]
+                 (let-like op) (when (vector? a) (binding-names a))
+                 (#{'fn 'fn* 'defn 'defn- 'defmacro} op) nil
                  :else nil)
+             :when (symbol? s)]
+         s)))
+
+(defn- param-symbols
+  "The parameters of every fn in `forms`: the symbols of the vectors that
+   directly follow `fn`/`fn*`/`defn` (or open their arities)."
+  [forms]
+  (set (for [x (mapcat #(tree-seq coll? seq %) forms)
+             :when (and (seq? x) ('#{fn fn* defn defn- defmacro} (first x)))
+             v (concat (filter vector? (take 4 (rest x)))
+                       (keep #(when (and (seq? %) (vector? (first %))) (first %)) (rest x)))
+             s (tree-seq coll? seq v)
              :when (symbol? s)]
          s)))
 
@@ -265,32 +288,80 @@
       (map second (rest s))
       [(second s)])))
 
-(def ^:private regex-ops #{:? :* :+ :alt :cat :catn :altn :repeat})
+(defn- children
+  "A schema form's children, without its properties map."
+  [form]
+  (let [cs (rest form)] (if (map? (first cs)) (rest cs) cs)))
+
+(defn- expansions
+  "The positional schemas a sequence (regex) schema `form` can match, as
+   vectors of at most `n` element schemas: `[:cat :string [:? :map]]` is
+   `[[:string] [:string :map]]`."
+  [form n]
+  (letfn [(seqs [forms]
+            (reduce (fn [acc f]
+                      (for [a acc b (expansions f (- n (count a)))
+                            :when (<= (+ (count a) (count b)) n)]
+                        (into a b)))
+                    [[]] forms))
+          (star [f lo hi]
+            (loop [k 0 acc #{[]} out (if (zero? lo) #{[]} #{})]
+              (if (or (>= k hi) (empty? acc))
+                out
+                (let [acc (set (for [a acc b (expansions f (- n (count a)))
+                                     :when (and (seq b) (<= (+ (count a) (count b)) n))]
+                                 (into a b)))
+                      k (inc k)]
+                  (recur k acc (cond-> out (>= k lo) (into acc)))))))]
+    (let [op (when (vector? form) (first form))]
+      (case op
+        (:cat) (seqs (children form))
+        (:catn) (seqs (map second (children form)))
+        (:alt) (mapcat #(expansions % n) (children form))
+        (:altn) (mapcat #(expansions (second %) n) (children form))
+        (:?) (cons [] (expansions (first (children form)) n))
+        (:*) (star (first (children form)) 0 n)
+        (:+) (star (first (children form)) 1 n)
+        (:repeat) (let [{:keys [min max] :or {min 0 max n}} (second form)]
+                    (star (last form) min (clojure.core/min max n)))
+        (if (pos? n) [[form]] [])))))
 
 (defn- input-ok?
-  "Can arguments `args` (literal ones as given, the rest unknown) satisfy the
-   input schema `input`? Literal arguments are checked against the schema at
-   their position when the schema is a plain `[:cat …]`; otherwise only the
-   arity is, unless every argument is literal."
+  "Can arguments `args` (literal ones as given, symbols unknown) satisfy the
+   input schema `input`? Some way of matching `args` to the schema's positions
+   must accept every literal argument at its position; with every argument
+   literal, the schema itself decides."
   [input args]
-  (let [form (m/form input)
-        n (count args)
-        {:keys [min max]} (m/-regex-min-max (m/schema input) false)
-        arity? (and (<= (or min 0) n) (or (nil? max) (<= n max)))]
-    (cond
-      (not arity?) false
-      (literal? args) (m/validate input (vec args))
-      (and (vector? form) (= :cat (first form))
-           (not-any? #(and (vector? %) (regex-ops (first %))) (rest form)))
-      (every? (fn [[s a]] (or (not (literal? a)) (m/validate s a)))
-              (map vector (rest form) args))
-      :else true)))
+  (let [n (count args)
+        lits (map literal? args)]
+    (if (every? true? lits)
+      (m/validate input (vec args))
+      (boolean
+       (some (fn [positions]
+               (and (= n (count positions))
+                    (every? (fn [[s a lit?]] (or (not lit?) (m/validate s a)))
+                            (map vector positions args lits))))
+             (expansions (m/form input) n))))))
+
+(defn- referred-name
+  "The qualified name of the injected fn `user` refers as `sym`, or nil."
+  [sci-ctx sym]
+  (let [env @(:env sci-ctx)]
+    (when-let [v (get-in env [:namespaces 'user :refers sym])]
+      (first (for [[ns-sym vars] (:namespaces env)
+                   :when (symbol? ns-sym)
+                   [s x] vars
+                   :when (and (symbol? s) (identical? x v))]
+               (symbol (str ns-sym) (str s)))))))
 
 (defn- call-problem
-  "Why `call` (an injected fn called as shown) would not run, or nil."
+  "Why `call` (an injected fn called as shown, qualified or referred) would
+   not run, or nil."
   [sci-ctx registered call]
-  (let [[head & args] call]
-    (when-let [v (and (qualified-symbol? head) (sci-var sci-ctx head))]
+  (let [[head & args] call
+        head (if (simple-symbol? head) (referred-name sci-ctx head) head)
+        call (if head (cons head args) call)]
+    (when-let [v (and head (sci-var sci-ctx head))]
       (let [{:keys [arglists macro] :as md} (fn-meta v)
             schema (or (get-in registered [(:ns v) (symbol (name head)) :form])
                        (:malli/schema md))
@@ -326,7 +397,7 @@
       (let [forms (forms-in text)
             registered (ns-malli/fn-schemas)
             root (stdlib-root)
-            bound (bound-symbols forms)
+            bound (into (bound-symbols forms) (param-symbols forms))
             required (required-libs forms)]
         (doall
          (concat
@@ -403,7 +474,9 @@
           (is (empty? (problems sci-ctx (str "`" example "`") :prose? false)) n)))
       (testing "every example in an injected fn's docstring"
         (doseq [[n d] (docstrings sci-ctx)]
-          (is (empty? (problems sci-ctx (str "`" d "`") :prose? true)) n))))))
+          ;; its backticked code strictly, its bare calls as prose
+          (is (empty? (problems sci-ctx d)) n)
+          (is (empty? (problems sci-ctx (str "`" (str/replace d "`" "") "`") :prose? true)) n))))))
 
 (deftest the-guides-run-examples-run-in-a-room
   (testing "the `dvergr.agent` race and the `spindel.work` example evaluate as shown"
