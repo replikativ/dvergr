@@ -288,7 +288,10 @@
     (is (= #{2} (current [(attempt 2 :b 20 :completed) (attempt 1 nil 10 :completed)]))
         "Attempts from before inputs ids are superseded once one has them")
     (is (= #{1 2} (current [(attempt 2 nil 20 :completed) (attempt 1 nil 10 :completed)]))
-        "a deterministic candidate's (or an old experiment's) all count")))
+        "a deterministic candidate's (or an old experiment's) all count")
+    (is (= #{1} (current [(assoc-in (attempt 2 nil 20 :completed) [:attempt/receipt :attempt/metrics :inputs-drifted?] true)
+                          (attempt 1 nil 10 :completed)]))
+        "an Attempt whose inputs drifted counts for nothing")))
 
 (deftest a-run-calls-the-model-its-inputs-id-names
   (with-room :inputs-pinned
@@ -323,6 +326,12 @@
                                            :usage {:input-tokens 1 :output-tokens 1} :stop-reason :end-turn})]
             (let [{:keys [attempts scorecard]} (run! room team definition)]
               (is (= #{nil} (inputs-ids attempts :sandboxed)) "its calls were not all shaped alike")
-              (is (= {:cells 3 :unpredicted 3} (select-keys (:incomplete scorecard) [:cells :unpredicted])))))
+              (is (every? experiment/inputs-drifted?
+                          (filter #(= :sandboxed (get-in % [:attempt/receipt :attempt/metrics :experiment-candidate]))
+                                  attempts)))
+              (is (= {:cells 3 :unpredicted 3} (select-keys (:incomplete scorecard) [:cells :unpredicted])))
+              (let [p (binding [ec/*execution-context* (:ctx room)] (experiment/progress room))
+                    cs (set (map :candidate/id (:candidates (first (:experiments p)))))]
+                (is (= #{:plain} cs) "the store's views score none of its cells"))))
           (finally
             (if before (swap! registry/registry assoc id before) (swap! registry/registry dissoc id))))))))

@@ -310,6 +310,13 @@
   [attempt]
   (get-in attempt [:attempt/receipt :attempt/metrics :inputs-id]))
 
+(defn inputs-drifted?
+  "Whether `attempt`'s Run dropped its inputs id because its model's
+   registry entry changed while it ran: its calls were not shaped alike, so
+   it is current for no inputs, and no store view scores it."
+  [attempt]
+  (boolean (get-in attempt [:attempt/receipt :attempt/metrics :inputs-drifted?])))
+
 (defn- result-spin
   "One cell. With `contain?` (complete-only experiments) a cell whose
    evaluation fails to certify becomes an `:error` result, so the other cells
@@ -427,9 +434,11 @@
    they were recorded, or a Run that faulted before it assembled its inputs)
    says nothing about the current inputs: the newest Attempt with one
    decides, and only a candidate none of whose Attempts has one (a
-   deterministic program, or an experiment from before) has nil."
+   deterministic program, or an experiment from before) has nil. An Attempt
+   whose Run's inputs drifted (`inputs-drifted?`) is current for nothing."
   [attempts]
-  (let [k (fn [a] [(first (attempt-cell a)) (get-in a [:attempt/environment :environment/world :protocol])])
+  (let [attempts (remove inputs-drifted? attempts)
+        k (fn [a] [(first (attempt-cell a)) (get-in a [:attempt/environment :environment/world :protocol])])
         newest (reduce (fn [m a]
                          (let [t (or (:attempt/certified-at a) 0)
                                ;; an Attempt with an inputs id outranks one without

@@ -618,14 +618,14 @@
 (defn- model-entry-changed!
   "When the registry entry of the model a Run calls is no longer the one its
    inputs id was computed from (`model-inputs` then, `before`), the Run drops
-   its inputs id: its model calls were not all shaped alike, so no single id
+   its inputs id and says so (`:inputs-drifted?`): its model calls were not all shaped alike, so no single id
    says what it was presented with, and it enters no Scorecard (a resume runs
    its cell again)."
   [supervisor run-id before model-spec]
   (when (and before (not= before (model-inputs model-spec)))
     (tel/log! {:level :warn :id ::model-entry-changed :data {:run/id run-id :model (:model model-spec)}}
               "The model's registry entry changed during the Run: it records no inputs id")
-    (update-llm-metrics! supervisor dissoc :inputs-id)))
+    (update-llm-metrics! supervisor #(-> % (dissoc :inputs-id) (assoc :inputs-drifted? true)))))
 
 (defmacro ^:private with-model-entry-checked
   "`body` (one or more model calls), then `model-entry-changed!`."
