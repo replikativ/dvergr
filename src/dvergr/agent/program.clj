@@ -568,6 +568,7 @@
                    :chat-id chat-id
                    :title (str "agent-task " (name (:agent/id agent)))
                    :agent-id (:agent/id agent)
+                   :sandbox-extensions (:agent/sandbox agent)
                    :budget-dollars budget-dollars
                    :db-conn trace-db
                    :kb-conn (when system-id (system-rooms/room-kb-conn system-id))

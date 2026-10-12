@@ -315,8 +315,10 @@ Spindel's inference coordinator now accepts `:world-policy :fork`: initial and
 resampled particles are frozen canonical Yggdrasil forks, and the complete
 speculative tree is discarded after immutable particle results have been
 captured. Dvergr's SCI `infer/smc-infer`, `infer/importance-sampling`, and
-`infer/kernel-infer` wrappers select that policy by default. A caller may pass
-`:world-policy :fresh` only for a model known to be pure. `infer/values`,
+`infer/kernel-infer` wrappers run in fresh worlds unless a model asks for that
+policy: a fresh world cannot reach room state, since a stable handle called
+from an inference world outside its owner's lineage throws
+(`dvergr.runtime.ctx/selected-context`). `infer/values`,
 `infer/log-weights`, `infer/ess`, and `infer/worlds` project results and portable
 world descriptors without exposing live settlement handles.
 

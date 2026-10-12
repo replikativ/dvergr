@@ -68,6 +68,7 @@
    [:prompt {:optional true} :string]
    [:program {:optional true} AgentProgram]
    [:tools {:optional true} KeywordColl]
+   [:sandbox {:optional true} KeywordColl]
    [:model-policy {:optional true} ModelPolicy]
    [:metadata {:optional true} :any]])
 
@@ -81,6 +82,7 @@
    [:agent/prompt {:optional true} :string]
    [:agent/program {:optional true} AgentProgram]
    [:agent/tools {:optional true} [:set :keyword]]
+   [:agent/sandbox {:optional true} [:set :keyword]]
    [:agent/model-policy {:optional true} ModelPolicy]
    [:agent/metadata {:optional true} :any]])
 

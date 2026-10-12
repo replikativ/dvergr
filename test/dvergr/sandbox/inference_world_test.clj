@@ -14,7 +14,7 @@
   (g/gset id {:store-config {:backend :memory :id (random-uuid)}}
           {:sync? true}))
 
-(deftest sci-smc-defaults-to-isolated-canonical-worlds
+(deftest sci-smc-forks-canonical-worlds-on-request
   (let [root (context/create-execution-context)]
     (try
       (binding [ec/*execution-context* root]
@@ -54,7 +54,7 @@
                   "                (observe (dist/normal 0.0 1.0) 0.0 :id :evidence) "
                   "                (particle/values))) "
                   "      posterior @(spin (await (infer/smc-infer "
-                  "                              model 4 {:resample-threshold 2.0})))] "
+                  "                              model 4 {:resample-threshold 2.0 :world-policy :fork})))] "
                   "  {:values (infer/values posterior) "
                   "   :weights (infer/log-weights posterior) "
                   "   :ess (infer/ess posterior) "
@@ -82,6 +82,14 @@
               (is (nil? raw-particles))
               (is (nil? raw-executor)))
             (testing "particle writes do not contaminate the ambient room world"
+              (is (= #{:root} (g/elements @knowledge {:sync? true})))))
+          (testing "by default (fresh worlds) a model that needs room state fails, writing nothing"
+            (let [fresh (sandbox/eval-code
+                         sci-ctx
+                         (str "(let [model (spin (particle/write! (particle/id)) (particle/values))] "
+                              "  @(spin (await (infer/smc-infer model 2))))")
+                         :timeout-ms 60000)]
+              (is (not (:success fresh)))
               (is (= #{:root} (g/elements @knowledge {:sync? true})))))
           (let [pure
                 (sandbox/eval-code

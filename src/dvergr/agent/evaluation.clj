@@ -8,6 +8,7 @@
    these Spins with the existing Spindel combinators."
   (:require [dvergr.agent.environment :as environment]
             [dvergr.effects :as effects]
+            [dvergr.sandbox.extensions :as extensions]
             [dvergr.artifact :as artifact]
             [dvergr.agent.attempt :as attempt]
             [dvergr.agent.program :as program]
@@ -411,6 +412,9 @@
                                       program/interpreter-version)}
             (when-let [roster-id (:run/roster durable)]
               {:roster roster-id})
+            ;; what the AgentDef's :sandbox names resolved to in this process
+            (when-let [ids (seq (:agent/sandbox agent))]
+              {:sandbox-extensions (extensions/refs ids)})
             metrics)}))
 
 (defn- positive-timeout! [label value]

@@ -293,11 +293,14 @@
        (let [measure (await (infer/smc-infer (my-model) 100))]
          (infer/values measure)))
 
-   Dvergr defaults SMC, importance sampling, and the generic kernel runner to
-   `:world-policy :fork`. Each particle therefore executes in a frozen
-   canonical Yggdrasil world and only its immutable result projection survives;
-   particle worlds are discarded before the inference Spin completes. Callers
-   may explicitly request `:fresh` for a proven-pure model.
+   Inference runs in fresh worlds (`:world-policy :fresh`) unless asked
+   otherwise. A fresh world has no room state: a model there that calls a
+   sandbox capability fails (`dvergr.runtime.ctx/selected-context`), and a
+   registered Yggdrasil system is absent. A model that needs room state asks
+   for `:world-policy :fork`: each particle then executes in a frozen
+   canonical Yggdrasil world and only its immutable result projection
+   survives; particle worlds are discarded before the inference Spin
+   completes. Forks cost far more (a fork per particle).
 
    Namespaces added:
    - dist/   — foerster distributions: normal, uniform, exponential, gamma
@@ -435,16 +438,16 @@
                                 mvn student-t chi-squared])))
 
   ;; Inference runners — these take/return Spins and compose with await in Spin
-  ;; bodies. Room-capable sandboxes default to canonical particle worlds: a
-  ;; model that happens to touch a registered Yggdrasil system must not alias
-  ;; the ambient room merely because its author omitted an expert-only option.
-  ;; `:fresh` remains an explicit fast path for known-pure models.
+  ;; bodies. Fresh worlds by default: they cannot reach the ambient room (a
+  ;; capability call fails there, see dvergr.runtime.ctx/selected-context),
+  ;; and a fork per particle costs a few hundred times as much. A model that
+  ;; needs room state asks for :world-policy :fork.
   (let [smc*        @(resolve 'org.replikativ.foerster.core/smc-infer)
         importance* @(resolve 'org.replikativ.foerster.core/importance-sampling)
         kernel*     @(resolve 'org.replikativ.foerster.core/kernel-infer)
         steer*      @(resolve 'org.replikativ.foerster.steer/model)
         world-opts  (fn [opts]
-                      (merge {:world-policy :fork} (or opts {})))]
+                      (merge {:world-policy :fresh} (or opts {})))]
     (sci/add-namespace!
      sci-ctx 'infer
      (doc/with-docs
@@ -478,7 +481,7 @@
         'log-weights :posterior/log-weights
         'ess         :posterior/ess
         'worlds      :posterior/worlds}
-       '{smc-infer [([model particles] [model particles opts]) "Run SMC. Dvergr defaults opts :world-policy to :fork; pass :fresh only for a proven-pure model."]
+       '{smc-infer [([model particles] [model particles opts]) "Run SMC, in fresh worlds by default; pass {:world-policy :fork} for a model that needs room state."]
          importance-sampling [([model particles] [model particles opts]) "Run importance sampling with canonical particle worlds by default."]
          kernel-infer [([model kernel particles] [model kernel particles opts]) "Run a Spindel inference kernel with canonical particle worlds by default."]
          steer [([{:keys [init step value reward done? max-steps]}]) "A model that steers a process by SMC: `step` (state → next state, a spin or value; its randomness — a model call, a tool — is the proposal), `value` (state → log ψ, the reward to come: a verifier, judge or process reward), `reward` (final state → log potential), `done?`. Targets p(trajectory)·exp(reward); resamples at every step on the twist log ψ_t − log ψ_{t−1}. Run it with smc-infer, e.g. (infer/smc-infer (infer/steer {...}) 8 {:resampling :stratified})."]
@@ -488,3 +491,62 @@
          log-weights [([measure]) "Return posterior particle log weights."]
          ess [([measure]) "Return effective sample size."]
          worlds [([measure]) "Return portable canonical world descriptors retained in posterior projections; never live settlement handles."]}))))
+
+(defonce ^:private foerster-sessions
+  ;; sci env → {:namespaces foerster.sandbox maps :jobs atom}: the job
+  ;; registry and seed sequence belong to one interpreter, survive its
+  ;; rebinds, and are not shared with its forks (a fork has its own env)
+  (java.util.Collections/synchronizedMap (java.util.WeakHashMap.)))
+
+(def ^:private dvergr-infer
+  "dvergr's own infer/ entries (`add-inference-ns!`), which keep their meaning."
+  '#{smc-infer importance-sampling kernel-infer steer query predict values log-weights ess worlds})
+
+(def ^:private foerster-limits
+  "What one call may ask of the host (foerster.sandbox): particles or
+  iterations × chains, and optimizer target evaluations."
+  {:max-work 200000 :max-optimizer-work 10000000})
+
+(defn install-foerster!
+  "The `:foerster/inference` sandbox extension (`dvergr.sandbox.extensions`):
+   `add-inference-ns!`, plus foerster's sandbox namespaces — `infer/run` and
+   background jobs (`infer/start` …) over importance sampling, SMC, MH, RMH
+   and NUTS, `model/` blocks, `opt/` (MAP, Laplace, Pathfinder), `diag/` and
+   `lp/` — as plain data across the boundary. Particle runs default to
+   `:world-policy :fresh`, as the `infer/` runners do; Markov chains always
+   run in fresh worlds."
+  [sci-ctx execution-ctx]
+  (binding [rtc/*execution-context* execution-ctx]
+    (add-inference-ns! sci-ctx))
+  (let [namespaces @(requiring-resolve 'org.replikativ.foerster.sandbox/namespaces)
+        docs @(requiring-resolve 'org.replikativ.foerster.sandbox/docs)
+        nss (locking foerster-sessions
+              (:namespaces
+               (or (.get foerster-sessions (:env sci-ctx))
+                   (let [;; weak: a job is reachable through its spawned spin while
+                         ;; it runs, and needs no keeping once it is done
+                         jobs (java.util.Collections/synchronizedSet
+                               (java.util.Collections/newSetFromMap (java.util.WeakHashMap.)))
+                         session {:jobs jobs
+                                  :namespaces (namespaces (assoc foerster-limits
+                                                                 :world-policy :fresh
+                                                                 :on-start #(.add jobs %)))}]
+                     (.put foerster-sessions (:env sci-ctx) session)
+                     session))))]
+    ;; installed over whatever a parent interpreter's fork carried over: the
+    ;; jobs of this interpreter are its own
+    (doseq [[ns-sym ns-map] nss
+            :let [ns-map (cond-> ns-map (= 'infer ns-sym) (#(apply dissoc % dvergr-infer)))]]
+      (sci/add-namespace! sci-ctx ns-sym
+                          (doc/with-docs ns-map (apply dissoc (get docs ns-sym) dvergr-infer))))
+    sci-ctx))
+
+(defn release-foerster!
+  "Cancel the background inference jobs `sci-ctx` started (its release)."
+  [sci-ctx]
+  (when-let [{:keys [jobs]} (locking foerster-sessions
+                              (let [s (.get foerster-sessions (:env sci-ctx))]
+                                (.remove foerster-sessions (:env sci-ctx))
+                                s))]
+    (let [cancel-job! @(requiring-resolve 'org.replikativ.foerster.sandbox/cancel-job!)]
+      (doseq [job (locking jobs (vec jobs))] (try (cancel-job! job) (catch Throwable _ nil))))))

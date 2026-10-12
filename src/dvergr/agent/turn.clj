@@ -19,6 +19,7 @@
             [dvergr.agent.run :as run]
             [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.sandbox :as sandbox]
+            [dvergr.sandbox.extensions :as extensions]
             [dvergr.sandbox.ns.io :as ns-io]
             ;; loaded so add-process-ns! can (find-ns 'dvergr.agent.process)
             [dvergr.agent.process]))
@@ -46,7 +47,8 @@
    refresh keeps newly added APIs visible; it is not the isolation boundary."
   [cctx {:keys [execution-ctx db-conn kb-conn room-id room-runtime-id
                 room-incarnation capability-id fork-projection?
-                agent-program-ceiling allowed-domains agent-id effects]}]
+                agent-program-ceiling allowed-domains agent-id effects
+                sandbox-extensions]}]
   (let [capability-id (or capability-id (:capability-id cctx)
                           (throw (ex-info "Working context has no capability identity" {})))
         agent-id (or agent-id (:agent-id cctx))]
@@ -90,7 +92,10 @@
           (ns-io/add-media-ns!   sci cctx boundary)
           ;; model calls from code are the agent's spend, charged to this chat
           ((requiring-resolve 'dvergr.sandbox.ns.kb/add-llm-ns!) sci agent-program-ceiling cctx boundary)
-          (ns-io/add-process-ns! sci cctx boundary))))
+          (ns-io/add-process-ns! sci cctx boundary)
+          ;; the AgentDef's own extensions (:sandbox), after the standard surface
+          (when-let [ids (seq (or sandbox-extensions (:sandbox-extensions cctx)))]
+            (extensions/install! sci execution-ctx ids)))))
     cctx))
 
 (defn new-working-ctx
@@ -102,7 +107,7 @@
    writer). Returns the ChatContext."
   [{:keys [execution-ctx chat-id title budget-dollars db-conn kb-conn room-id
            room-runtime-id room-incarnation capability-id agent-program-ceiling
-           durable? allowed-domains agent-id effects]}]
+           durable? allowed-domains agent-id effects sandbox-extensions]}]
   (binding [rtc/*execution-context* execution-ctx]
     (let [capability-id (or capability-id (random-uuid))
           cctx (assoc (cond-> (chat-ctx/create-chat-context
@@ -117,6 +122,8 @@
                         room-id (assoc :room-id room-id)
                         agent-id (assoc :agent-id agent-id))
                       :capability-id capability-id
+                      ;; the AgentDef's sandbox extensions, installed on every rebind
+                      :sandbox-extensions (set sandbox-extensions)
                       ;; every effect the sandbox performs, newest last
                       :receipts (effects/make-sink))]
       ;; create-chat-context forks a sci-ctx but does NOT inject the ctx-bound
