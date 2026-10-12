@@ -6,8 +6,8 @@
         only through the API (`dvergr.agent.ops`, the web/TUI config, the REPL),
         so it is value-semantic (forks with the row) and versioned.
      2. the `agents/<id>` definition's body (`dvergr.discourse.definitions`): the
-        built-in `resources/agents/<id>.md` unless a user, project or room
-        scope overrides it.
+        built-in `resources/agents/<id>.md` unless a user or project scope
+        overrides it (no room scope: `resolve-prompt` passes no room root).
 
    The prompt deliberately does NOT live in an unmanaged file: agents mutate dvergr
    through controlled surfaces, not by scribbling markdown outside the substrate.

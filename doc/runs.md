@@ -180,7 +180,9 @@ Some neighbouring pieces exist beside the Run row rather than in it: each Run
 has its own conserved wallet (`dvergr.resource/run-wallet-id`), a stopped Run can
 be resumed from its savepoint ([run-resume.md](run-resume.md)), and the sandbox
 effect boundary keeps receipts and can answer effects from a recording
-([effects.md](effects.md); its receipts are held in memory, not on the Run).
-Not built: durable effect receipts linked to a Run, retrying a failed Run (a new
+([effects.md](effects.md)). An ordinary Run's receipts are held in memory; an
+evaluated Attempt stores its world's receipts as an effect-log artifact linked
+from the Attempt (`dvergr.agent.evaluation`). Not built: a durable receipt log
+for every Run, retrying a failed Run (a new
 trigger or a resume starts a new Run), and replaying a Run's external effects.
 These can extend the stable Run identity without replacing it.
