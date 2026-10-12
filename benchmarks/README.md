@@ -2,17 +2,20 @@
 
 Benchmarks for dvergr's evaluation path.
 
-- **Public benchmarks**, each with its section in
-  [doc/benchmarks.md](../doc/benchmarks.md):
+- **Public benchmarks**, each with a page in [doc/](doc/) (the catalog and
+  the provider contract: [doc/benchmarks.md](../doc/benchmarks.md)):
   - **tau2** (retail, banking, airline, telecom) and **BFCL** v4 (the Python
     single-turn categories), transcribed and checked for equivalence with
-    upstream's own code;
+    upstream's own code ([doc/tau2.md](doc/tau2.md), [doc/bfcl.md](doc/bfcl.md));
   - **AutomationBench** (`automationbench`): upstream's Python tools and rubric
-    behind a sidecar process;
+    behind a sidecar process ([doc/automationbench.md](doc/automationbench.md));
   - **BIRD** (`bird`): text-to-SQL, SQL on SQLite and on Datahike
-    (pg-datahike), and Datalog;
+    (pg-datahike), and Datalog ([doc/bird.md](doc/bird.md));
   - **SpreadsheetBench** (`spreadsheetbench`): the Verified 400 tasks, graded on
-    rechentafel over the tasks a zero-token oracle certifies.
+    rechentafel over the tasks a zero-token oracle certifies
+    ([doc/spreadsheetbench.md](doc/spreadsheetbench.md)).
+- **Wiki** (`dvergr.catalog.wiki`, in `dvergr` itself): a catalog workflow
+  calibrated rather than transcribed ([doc/wiki.md](doc/wiki.md)).
 - **Bank booking** (`bankbooking`): writes the bank-booking case pack
   (`examples/workflows/bank-booking`, DATEV via Kontor), a room workflow run with
   `dvergr.catalog.room-run` (doc/room-workflows.md).
@@ -25,9 +28,10 @@ Benchmarks for dvergr's evaluation path.
 This is its own artefact, `org.replikativ/dvergr-benchmarks`. The `dvergr` jar
 does not contain it. What stays in `dvergr` is what a benchmark is built
 *with*: `dvergr.agent.evaluation`, `environment`, `experiment`,
-`experiment.runner`, `verifiers` (a registry the providers register their
-capabilities in; nothing in `src/` reads it back yet, the providers pass the
-capabilities to `experiment/run` themselves), `roster`. A benchmark of your own is a third
+`experiment.runner`, `verifiers` (a registry for capabilities by reference; the
+tau2, BFCL, BIRD and AutomationBench providers have a `register!` for it that
+nothing calls, and nothing in `src/` reads it: the providers hand the
+capabilities to the runner themselves), `roster`. A benchmark of your own is a third
 provider next to these, in your repo (the provider contract:
 doc/benchmarks.md, "What a benchmark brings").
 
@@ -37,6 +41,7 @@ doc/benchmarks.md, "What a benchmark brings").
 | `resources/` | tau2 tool schemas emitted by upstream; the pinned source snapshots of the coding fixtures |
 | `test/` | the equivalence digests and the provider tests; run with the suite (`clojure -M:test`) |
 | `dev/` | the Python oracles that run upstream's code; needed only to regenerate digests |
+| `doc/` | one page per benchmark: protocol, equivalence or calibration, upstream faults, candidates, results, what is not done |
 | `reference/` | standalone scripts that run BIRD and SpreadsheetBench as their authors do, for the same cases a Dvergr experiment ran, and pair the two ([reference/README.md](reference/README.md)); on no classpath |
 
 Use:

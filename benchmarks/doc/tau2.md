@@ -1,0 +1,684 @@
+# tau2-bench
+
+The four tau2-bench domains Dvergr transcribes natively (retail, banking_knowledge with `bm25`
+retrieval, airline, telecom): their namespaces, protocol notes, equivalence to upstream,
+baselines, the certified-experiment path and what is not done. Part of the
+[benchmark catalog](../../doc/benchmarks.md); how to run an experiment and read its report:
+[doc/running-benchmarks.md](../../doc/running-benchmarks.md).
+
+## tau2-bench (retail)
+
+Upstream: `sierra-research/tau2-bench` at the revision pinned in
+`dvergr.benchmarks.tau2.core/upstream`. Data is read from a checkout at
+`../tau2-bench`, and every file is verified against its pinned SHA-256.
+
+| Namespace | Role |
+| --- | --- |
+| `dvergr.benchmarks.pyjson` | Python `json.dumps`, float `repr`, and `round`, which DB hashing and tool output need to match exactly |
+| `dvergr.benchmarks.tau2.retail` | Pure retail tools: `(respond db name args) -> {:db :content :error}` |
+| `dvergr.benchmarks.tau2.core` | Data loading, upstream prompts, the half-duplex episode protocol, grading |
+| `dvergr.benchmarks.live` | Generate functions over Dvergr providers (Claude Code, Anthropic, OpenAI, …) |
+| `dvergr.benchmarks.tau2.runner` | Headless batch runs, resumable EDN episode logs, pass^k |
+| `dvergr.benchmarks.tau2.equivalence` | Differential replay against the Python oracle, plus a seeded fuzz corpus |
+
+Run from the REPL:
+
+```clojure
+(require '[dvergr.benchmarks.tau2.core :as t2]
+         '[dvergr.benchmarks.tau2.runner :as tr])
+(def dom (t2/load-domain "retail"))
+(tr/run! dom {:split "test" :trials 4 :parallelism 3
+              :agent {:model "claude-code-sonnet"}
+              :user {:model "claude-code-sonnet"}
+              :judge {:model "claude-code-sonnet"}})
+;; => {:dir ".dvergr/benchmarks/tau2/<run>" :header {...}
+;;     :metrics {:avg-reward .. :pass-hat-k {1 .. 4 ..} ...}}
+```
+
+Each episode is appended to `<dir>/episodes.edn` as it finishes. An entry
+holds the full transcript, termination reason, grade breakdown, usage, and
+duration. Passing the same `:dir` again resumes the run. Infrastructure
+failures are recorded under `:failure` and excluded from metrics, as upstream
+does, and never scored as model failures.
+
+### What is comparable
+
+The run header records the upstream revision, split, trials, and the agent,
+user-simulator, and judge models. Upstream results use `gpt-4.1` at
+temperature 0 as both the user simulator and the NL-assertion judge. A
+number produced with a different user or judge model is a Dvergr-internal
+measurement, not a leaderboard entry. Use the upstream `train` split (74
+tasks) for tuning and self-optimization. Report on `test` (40 tasks), which
+tuning must never see. Nothing enforces this: `tx/run!` defaults to `:split "base"`
+(train and test together), so pass `:split "test"` for a reported number. BFCL has no
+split.
+
+### Protocol notes
+
+- The agent opens with `"Hi! How can I help you today?"`. Either side ends
+  the episode with `###STOP###`; the user can also end it with
+  `###TRANSFER###` or `###OUT-OF-SCOPE###`.
+- Upstream's default is `enforce_communication_protocol = False`. A message
+  with both text and tool calls goes to the environment, and the user never
+  sees its text. An empty message is an agent error. Enable the strict rule
+  with `:enforce-protocol? true`.
+- Limits are 200 steps and 10 tool errors. Any termination other than an
+  agent or user stop scores 0.
+- The reward is the product over the task's `reward_basis`: DB hash against
+  the replayed gold actions, communicate-info substring checks, and
+  LLM-judged NL assertions. The predicted DB is the episode's final value, not
+  a replay of its calls, which is equivalent because tools are deterministic.
+
+### Baselines
+
+| Date | Agent | User sim / judge | Split | Trials | pass^1 | Notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2026-09-18 | Sonnet 5 via Claude Code (`claude-code-sonnet`) | same | test (40) | 1 | 0.80 | Internal only: not a leaderboard setting |
+| 2026-09-18 | reference loop, Sonnet 5 via Claude Code | Opus 5 via Claude Code | test (40) | 1 | 0.925 | Room path (`retail-cmp-A`) |
+| 2026-09-18 | Dvergr `llm-agent`, JSON tools, Sonnet 5 | Opus 5 | test (40) | 1 | 0.925 | Room path; ~113k agent input tokens per episode |
+| 2026-09-18 | Dvergr `llm-agent`, REPL, Sonnet 5 | Opus 5 | test (40) | 1 | 0.900 | Room path; ~80k agent input tokens per episode (−30%) |
+
+In `retail-cmp-A` all three candidates fail tasks 27 and 38 (DB) and 68 (NL
+assertion); the REPL candidate also fails task 64. Every one of the 120
+episodes passes `verify-world` and `verify-episode`. One trial cannot rank
+the candidates. The REPL candidate needs about 30% fewer agent input tokens,
+because it composes several tool calls per `clojure_eval` (263 evaluations
+for 366 domain calls).
+
+`retail-cmp-A` predates the host-context note (below): the CLI's injected
+operator email reached the candidates, which looked it up with
+`find_user_id_by_email` (or offered it to the customer) in 11/40 REPL, 3/40
+JSON-tools and 3/40 reference episodes. None of these are failed tasks, so
+the rewards stand, but the REPL candidate's step, error and token counts are
+inflated.
+
+### Claude Code as the model backend
+
+Claude Code (`claude -p`, billed to a Pro/Max subscription) injects host
+context into every call: the signed-in account's email and the wall-clock
+date. No CLI flag, setting or Agent SDK option removes it (Claude Code
+2.1.277; only `ANTHROPIC_UNIX_SOCKET` skips the email). Experiments that use
+Claude Code models therefore:
+
+- can run the CLI isolated with `:claude-env (cc/token-env dir token)`: an
+  empty `CLAUDE_CONFIG_DIR` (no stored account profile, so no email to
+  inject) plus a long-lived inference token from `claude setup-token`, which
+  never refreshes and cannot disturb the interactive login. Stripping the
+  email from a config directory that shares the login's credentials is not
+  safe: the CLI re-fetches the profile every 24 h and a token refresh from a
+  second config directory can rotate the shared refresh token. Verified
+  2026-09-19: with the token and an empty config directory the model sees no
+  email (the same probe on the normal login lists it), the CLI stores no
+  account profile, usage reports still arrive, and the REPL probe that used
+  the email in 4/6 calls without a note used it in 0/6. Only the date remains;
+  the note covers it;
+- append `tx/host-context-note` to every system prompt (agent, user
+  simulator, judge), telling the model that account details and dates outside
+  its system prompt belong to the harness operator (`:host-context-note`
+  overrides it, `false` disables it). The note is a fallback, not a fix:
+  in single-call probes on task 42's opening the JSON-tools prompt stopped
+  using the email (3/4 without the note, 0/4 with it), but the REPL prompt
+  still used it in 2/6 calls;
+- pin the CLI with `:claude-cli`, a copied versioned binary, e.g.
+  `.dvergr/tools/claude-cli/claude-2.1.277` (the updater may prune
+  `~/.local/share/claude/versions/*`, and `--bare`, which ignores
+  subscription login, is announced as a future default for `-p`);
+- record `{:claude-cli version :host-context-note-id id}` under the
+  ExperimentDef's `:host` metadata, so changing either starts fresh cells;
+- read the CLI's `rate_limit_event`s (`cc/rate-limit-status`) and pause
+  before each cell while a usage window is at least
+  `:usage-pause-threshold` (default 0.97) utilized. A cell that fails
+  because the subscription rejected a call keeps its `:failed` Attempt and
+  is re-run after the reset, at most `:usage-retries` (3) times. An error
+  result from the CLI is now an error, never a model reply.
+
+```clojure
+(def claude-env (cc/token-env ".dvergr/benchmarks/claude-config"
+                              (slurp (str (System/getProperty "user.home")
+                                          "/.dvergr/secrets/claude-oauth-token"))))
+(tx/run! {... :claude-cli ".dvergr/tools/claude-cli/claude-2.1.277"
+          :claude-env claude-env})
+```
+
+Anthropic's terms allow a subscription through the unmodified CLI for one's
+own use; products built for other users must use API keys.
+
+Failure classes in the first (host-runner) run were:
+
+- incomplete multi-request (tasks 71, 97);
+- ordering against the one-return-or-exchange policy (27);
+- wrong variant choice (60);
+- no write at all (39);
+- a cancel reason the scenario never specifies (38);
+- an unstated order total, failed by the judge (68);
+- one tool call emitted without `<tool_use>` tags (90). This was a
+  Claude Code adapter gap, since fixed.
+
+### Judge re-grading (replay)
+
+Recorded episodes can be re-graded without re-running them: only the judge
+is called. `retail-cmp-A`'s 33 episodes with NL assertions (45 assertions),
+re-judged 2026-09-19, compared with the recorded Opus verdicts:
+
+| Judge | Assertions agreeing | Episode verdicts agreeing |
+| --- | --- | --- |
+| Opus 5, second pass | 42/45 | 30/33 |
+| Sonnet 5 | 43/45 | 31/33 |
+| Haiku 4.5 | 42/45 | 30/33 |
+
+Every disagreement is on a recorded "not met" (Opus said unmet, the other
+pass said met), and all but one are task 68 ("Agent should tell the user the
+order total is $829.43"). In all three candidates' episodes the agent stated
+$829.43 among three order totals but, lacking order dates, never identified
+it as the most recent order's. The literal reading of the assertion is met,
+its intent is not, and judges (Opus included) split on it. On unambiguous
+assertions every judge agreed. So judge variance is set by assertion
+ambiguity, not by judge size: a cheaper judge is as consistent with the
+recorded Opus verdicts as Opus itself on this set. The set is small
+(4 failing episodes), so treat NL-assertion outcomes on ambiguous tasks as
+noise when ranking candidates.
+
+### Candidates
+
+A candidate is whatever answers the simulated user. Grading, protocol and
+worlds are identical across candidates.
+
+| Candidate | Agent spec | What is under test |
+| --- | --- | --- |
+| Reference | `{:model m}` | tau2's `LLMAgent`: one model step per protocol step (`live/model-generate`) |
+| Dvergr loop | `{:model m :harness :dvergr :action-space :tools}` | Dvergr's own agent turn (`chat.agent/run-agent-turn!`) inside one working chat context per episode, with the domain tools as JSON tools |
+| Dvergr REPL | `{:model m :harness :dvergr :action-space :repl :repl-guidance g}` | The same loop with one `clojure_eval` tool. The domain tools are documented SCI functions `tau2/<tool>` returning upstream's strings, plus `tau2/parse` and `tau2/shape` |
+
+The REPL candidate gets the same information as the JSON-tools candidate: its
+prompt lists every tool as a Clojure call with its full description and
+arguments (7.9k characters against 11.8k of JSON schema), and
+`(clojure.repl/doc tau2/<tool>)` / `(sandbox/doc 'tau2)` show the same docs at
+runtime. Before 2026-09-19 it saw only tool names. The REPL candidate's prompt
+ends with action-space guidance (`episode/repl-guidance`: `:shape`, the default;
+`:compute`; `:inspect`), chosen by the AgentDef's `:conversation/repl-guidance`.
+`candidate-roster` (so `tx/run!`) and the decision-point probes (`tau2.probe`)
+set it from a spec's `:repl-guidance`, and it enters the system prompt whose
+sha256 the AgentDef carries, so two specs that differ only in `:repl-guidance`
+are two candidates. Before 2026-10-12 `candidate-roster` dropped it: every REPL
+candidate of an experiment got `:shape`. `tau2/shape` exists because REPL agents computed over data they had
+not looked at: product `variants` are a map keyed by item id, and
+`(filter #(get % "available") variants)` over its entries counted nothing.
+
+### Result types (malli)
+
+`dvergr.benchmarks.tau2.schemas` holds curated malli types for tool results
+(retail: order, user, product, variant, payment method, ...), drafted with
+`malli.provider` from every result of the gold trajectories and a seeded fuzz
+corpus and then curated (id-keyed maps as `:map-of` with a description,
+payment methods as a union, enums and nullable fields from the data). The
+schema test validates every corpus result against them. The REPL candidate
+sees each tool's result type in its doc and prompt, and has `(tau2/types)`
+and `(tau2/check type x)` at runtime.
+
+The full type section is deliberately NOT in the default prompt. Interleaved
+probes on task 2 (count available T-shirts): `:shape` 15/16, `:typed` (same
+prompt plus all type definitions) 8/16, p = 0.007. With the types in front of
+them agents trusted the schema, went straight to `(count variants)` and never
+looked at the records whose `available` flags decide the answer. Types say
+what a value's structure is, not which fields matter.
+
+Probe samples run in one parallel batch are correlated (the same variant
+went 2/8 and 8/8 in consecutive batches), so compare variants interleaved
+within the same rounds.
+
+### Checkpoints and branches (copy-on-write)
+
+An episode's whole live state is forkable: the tau2 world, the graded log
+and step/error counters, the customer's history, the reference agent's
+history and the Dvergr candidate's working context (chat history and SCI
+REPL heap) all live in the episode Room's execution context
+(`episode/CtxAtom` cells).
+
+```clojure
+(let [{cp :checkpoint} (ep/run! (assoc opts :checkpoint-at 3))]   ; pause before the 3rd customer message
+  (try
+    (mapv (fn [_] (ep/branch! cp)) (range 8))                       ; 8 certified continuations
+    (finally (ep/release-checkpoint! cp))))
+```
+
+- `run!` with `:checkpoint-at k` stops when the customer has produced its
+  k-th message and holds it back: the candidate is idle, so the Room is a
+  clean fork point. Nothing is graded or certified; the Room stays open.
+- `branch!` forks the checkpoint Room's execution context (`:mode :frozen`,
+  O(1) copy-on-write) into a new episode Room on the experiment store,
+  projects the candidate's working context into it (`room-context/fork-ctx!`),
+  rebinds the `tau2/*` tools to the branch's world, delivers the held
+  message and runs to the end. Each branch is an ordinary certified Attempt
+  whose metrics and evidence carry `{:branch {:checkpoint-room :at}}`; its
+  trajectory starts with the checkpoint's log. Branches never see each other
+  and never change the checkpoint (`tau2_lab_test`: gold vs idle
+  continuations 1.0 / 0.0 from one checkpoint; a REPL definition made before
+  the checkpoint is inherited, a redefinition in one branch is invisible to
+  the others).
+- `opts` may vary the customer (`:user`), the judge and, for the reference
+  harness, the agent's generate fn; the Dvergr candidate keeps the
+  checkpoint's working context (its prompt and model are fixed there).
+
+Limits: checkpoints are taken live (a certified log can only be replayed
+into a probe, since it does not contain the candidate's REPL heap); forks
+happen only between model steps.
+
+### Decision-point probes
+
+`dvergr.benchmarks.tau2.probe` re-samples one candidate turn from a recorded
+episode: the world is rebuilt by replaying the certified effects, the
+candidate's history is the recorded dialogue with earlier tool traffic in its
+own action space, and only the answer to one customer message runs, `n` times
+in parallel. A probe costs one agent turn instead of an episode (seconds,
+~0.01% of a Max weekly window), so prompt and harness changes are checked at
+the decision points where candidates went wrong before a full run confirms
+them. Probes are diagnostics, not certified results.
+
+```clojure
+(pr/probe! dom task (:trajectory evidence) cut
+           {:action-space :repl :repl-guidance :shape :model "claude-code-sonnet"} 6)
+```
+
+Task 2 (count available T-shirts), 2026-09-19: JSON tools 4/4; REPL with
+names-only prompt failed in both full episodes; REPL with signatures
+`:compute` 6/6 and `:shape` 6/6, `:shape` with 3.8 evaluations per turn
+against 5.3.
+
+`dvergr.benchmarks.tau2.harness` binds each harness turn to the episode's
+world value. Every tool call, including calls made inside `clojure_eval`, is
+recorded as a tau2 tool-call message, so DB and ACTION grading and step/error
+accounting are unchanged. Harness candidates change the orchestration, so
+their results would be tau2 "custom" submissions.
+
+First comparison (2026-09-18) on retail train tasks 0–8, 1 trial, Sonnet 5 via
+Claude Code as agent, user and judge: reference 8/8, Dvergr loop 8/8,
+Dvergr REPL 6/8. The REPL failures were a correct DB with an unfiltered count
+of unavailable variants (task 3, judged) and a wrong exchange variant (task 6).
+At this sample size the candidates are indistinguishable; the comparison
+proves the plumbing, not a ranking.
+
+### Certified experiments
+
+Experiments run on Dvergr's generic evaluation path
+(`doc/evaluation-model.md`): every cell is one
+`dvergr.agent.evaluation/evaluate`, folded by `dvergr.agent.experiment/run`.
+tau2 brings only what is its own (`dvergr.benchmarks.tau2.provider`):
+
+- a **world setup**: the task's initial world, installed in the Run's forked
+  world;
+- a **protocol**: the conversation with the simulated customer, hosted by the
+  Run inside that world;
+- a **verifier**: the grader behind the evaluator boundary. The trusted
+  observer reads the final world; the verifier sees portable evidence.
+
+Their references carry the upstream revision and the simulator and judge
+models, so those are part of every EnvironmentDef's content id. The forked
+world is discarded after certification, so the certified evidence is the
+record: the graded log, the candidate's own transcript (REPL code and tool
+results), its per-turn Runs and, for a failed Run, what failed. Every Attempt
+records its verifier's trust tier (`:verifier-trust`) and its experiment cell.
+
+Each experiment directory is a dvergr home whose experiment Room (one per
+ExperimentDef) keeps a certified Attempt per cell, and a Scorecard once every cell completed (an
+infrastructure fault is not a verdict: `runner/run!` re-runs faulted or errored cells
+within the same call, `:fault-retries` times, default 1, and re-running the same
+home resumes and re-runs exactly the cells still without a verdict made with the current
+inputs, see "Resume and inputs ids"). The result's
+`:report` is the room's report (`experiment_report`), except when a preflight stops it
+(`:stopped :over-budget`). A directory of the layout before homes (`store/` and
+`artifacts/`) is refused.
+
+Run it in a dedicated JVM, because the experiment directory is the process's
+home for the call (`runner/open-home!`):
+
+```clojure
+(require '[dvergr.benchmarks.tau2.core :as t2]
+         '[dvergr.benchmarks.tau2.experiment :as tx]
+         '[dvergr.benchmarks.tau2.inspect :as insp]
+         '[dvergr.agent.experiment.runner :as runner])
+(def dom (t2/load-domain "retail"))
+(tx/run! {:dir "runs/retail-cmp" :domain dom :split "base"
+          :repetitions 4 :parallelism 3
+          :candidates [{:id :reference :harness :reference :model "claude-code-sonnet"}
+                       {:id :dvergr-tools :harness :dvergr :action-space :tools :model "claude-code-sonnet"}
+                       {:id :dvergr-repl :harness :dvergr :action-space :repl :model "claude-code-sonnet"}]
+          :user {:model "claude-code-opus"} :judge {:model "claude-code-opus"}})
+;; Re-running the same call resumes: completed cells are skipped (while their inputs hold).
+
+(def xs (runner/open-experiment "runs/retail-cmp")) ; the home, its room
+(insp/summary xs (:room-id xs))                   ; reward, pass^k, failures
+(def e (insp/episode xs (:room-id xs) attempt-id))
+(insp/print-transcript e)                        ; dialogue, REPL code, effects
+(insp/verify-world dom task e)                   ; replay reproduces the certified hash
+(insp/verify-episode e)                          ; Room-path records only
+(runner/close-experiment xs)
+```
+
+The host runner (`dvergr.benchmarks.tau2.runner/run!`) remains available for
+quick batches outside the experiment path (no certified Attempts or Scorecard);
+`tx/run!` is the recorded path.
+
+## tau2-bench (banking_knowledge, `bm25` retrieval)
+
+This is τ³'s knowledge domain. It has 97 tasks over a bank database, a
+698-document knowledge base, and dual control: the simulated user has tools
+too. The leaderboard requires reporting the retrieval configuration. Dvergr
+transcribes `bm25`, which is sparse `KB_search` over `rank_bm25.BM25Okapi`
+and needs no embedding API.
+
+| Namespace | Role |
+| --- | --- |
+| `dvergr.benchmarks.python` | Python 3.12 semantics that tool outputs expose: `repr`/`str`, `format(x, '.2f')`, `json.loads` with CPython's error messages, `json.dumps(indent=2)`, `str.title`, `float()`/`int()`, and comparisons that raise `TypeError` |
+| `dvergr.benchmarks.tau2.banking.db` | The TransactionalDB value, `db_query`, deterministic ids, validation helpers, Python keyword binding, and the tool-definition format |
+| `dvergr.benchmarks.tau2.banking` | BM25, the 15 agent tools, the unlock/give/call discoverable-tool mechanics, user tools, and the environment dispatcher |
+| `dvergr.benchmarks.tau2.banking.tools-{a,b,c}` | The 43 agent-discoverable tools (plus the upstream example tool) |
+
+A banking world is `{:db :agent-unlocked :user-given :allowlist}`. Only `:db`
+is graded; unlock and give state is behavioral, like upstream's in-memory
+toolkit state. `(t2/load-domain "banking_knowledge")` works with the same
+episode driver and runner as retail. The driver runs both sides: user tool
+calls execute with requestor `:user`, and results go back to the simulated
+user only. Grading adds tau2's ACTION component. Note that upstream compares
+only the argument keys of the *predicted* call unless `compare_args` is set;
+the port does the same.
+
+Faithfulness choices:
+
+- **Knowledge-base document order.** Upstream takes it from `glob()`, which
+  depends on the filesystem, and it breaks BM25 score ties. The order is
+  pinned from the oracle in `benchmarks/resources/benchmarks/tau2/banking-tools.json`.
+- **Task source.** Tasks load from `tasks/task_*.json`, as upstream's
+  `get_tasks` does. The combined `tasks.json` next to them is stale upstream:
+  13 tasks differ.
+- **Search timing.** `KB_search` ends with a wall-clock timing line upstream.
+  The port prints zeros so worlds stay pure functions of their inputs, and
+  equivalence masks the digits.
+- **Other upstream quirks, reproduced deliberately:**
+  - numbers in discoverable-tool JSON are parsed as floats (`parse_int=float`);
+  - discoverable tools can be called directly by name, without unlocking;
+  - `list_discoverable_*_tools` tests for a message that is never produced;
+  - calls that mutate and then raise keep their partial writes;
+  - a savings-account early-closure fee never triggers, because the code
+    checks `savings` but the data says `saving`;
+  - `str.upper()` status checks;
+  - JSON-injection through f-string query constraints.
+
+  The transcription comments name each one.
+
+Verified on 2026-09-18 against upstream `b7ea907`, with 0 mismatches:
+
+| Check | Calls |
+| --- | --- |
+| Gold actions of all 97 tasks (agent and user requestors) | 955 |
+| Seeded core corpus: `KB_search`, core tools, the unlock/give/call mechanics, user tools, and malformed or wrongly-typed arguments | 3315 |
+| All 44 discoverable agent tools called directly (int/float/str/bool spellings, every error branch, dependent chains, injected fixture records) | 1661 |
+| The same calls through `unlock` + `call_discoverable_agent_tool` (float-parsed JSON) | 3316 |
+| Agent prompt, 97 user-simulator prompts, per-task user tool sets, tool signatures, mutation flags | identical |
+| Gold agent and user through the dual-control episode protocol | 97/97 reward 1.0 |
+
+`benchmarks/test/dvergr/benchmarks/tau2_banking_test.clj` pins all of this as digests.
+The directly-called corpus is vendored as `banking_corpus.json`, and its
+generators live in `benchmarks/dev/tau2/banking/`.
+
+## tau2-bench (airline)
+
+This domain has 50 tasks over a flight database: 300 flights with per-date
+status, 500 users, and 2000 reservations. It has 14 agent tools and no user
+tools. Every task's `reward_basis` is DB plus COMMUNICATE.
+
+| Namespace | Role |
+| --- | --- |
+| `dvergr.benchmarks.tau2.airline` | FlightDB normalization, the 14 tools, `respond`, and `load-airline`, which verifies the data files against pinned digests |
+| `dvergr.benchmarks.tau2.airline.pydantic` | The lax-mode pydantic 2.13 coercions and the exact `ValidationError` text the tools expose, including `input_value` truncation |
+| `dvergr.benchmarks.tau2.airline.corpus` | The seeded differential corpus: random calls plus hand-shaped scenarios |
+
+Tool schemas are vendored from the oracle as
+`benchmarks/resources/benchmarks/tau2/airline-tools.json`. The oracle is
+`benchmarks/dev/tau2/airline/oracle_airline.py`. It drives the real upstream
+`Environment.get_response` and can record a DB hash after every call.
+
+The port reproduces these upstream quirks deliberately:
+
+- **Fixed values.** The current time is fixed at `2024-05-15T15:00:00`.
+  Reservation ids are `HATHAT`/`HATHAU`/`HATHAV`, and a fourth booking fails.
+  Certificate ids are `certificate_3221322..24`.
+- **Validation only where upstream builds a model.** Arguments are checked
+  only when upstream constructs a pydantic model. Elsewhere, raw values go
+  through Python arithmetic and are stored as given:
+  - `update_reservation_baggages` stores `"5"` or `1.5`;
+  - `update_reservation_passengers` stores a string or a mixed list whose
+    length matches;
+  - `50 * "1"` in `book_reservation` raises `int += str`.
+- **Seats.** Cancelling releases no seats, and changing flights books none.
+- **Unknown cabins.** An unknown cabin fails only with a `KeyError` on a new
+  leg's seat lookup. With an empty flight list, it is stored.
+- **Unpadded next-day date.** `search_onestop_flight` builds the next day
+  as `2024-05-{day+1}` without zero padding.
+- **Partial effects.** A repeated certificate in `book_reservation` passes
+  the balance check once per entry, then raises `KeyError` after the earlier
+  gift-card and certificate deductions have been applied. A fractional
+  baggage charge debits the gift card before `Payment(amount=int)` rejects
+  it. Both partial effects are kept.
+
+Verified on 2026-09-19 against upstream `b7ea907` (pydantic 2.13.5), with 0
+mismatches in tool content, error flags, and final DB hashes:
+
+| Check | Sequences / calls |
+| --- | --- |
+| Initial DB hash | identical |
+| Gold actions of all 50 tasks | 50 / 142 |
+| Seeded corpus (seed 11): bookings with split certificate, gift-card, and credit-card payments, changes, cancellations, and certificates; 2261 error outputs covering validation text, TypeErrors, KeyErrors, unhashable ids, argument errors, and user-requestor calls | 1200 / 5888 |
+| Earlier development corpora (seeds 1 and 2, not pinned) | 700 / 3394 |
+| Agent prompt, 50 user-simulator prompts, tool schemas, mutation flags | identical |
+| Gold agent through the episode protocol | 50/50 reward 1.0 |
+
+`benchmarks/test/dvergr/benchmarks/tau2_airline_test.clj` pins all of this as digests
+in `airline_oracle_digests.edn`. The corpus is regenerated from its seed, so
+no corpus file is vendored. Environment replay of the pinned corpus takes
+about 8.5 minutes in Python and about 60 s in Clojure. The Clojure time is
+dominated by hashing the 7 MB database once per sequence.
+
+## tau2-bench (telecom)
+
+Telecom is a technical-support domain with **dual control**: the agent works
+on the carrier's database (customers, lines, plans, bills), and the simulated
+user operates their own phone (airplane mode, SIM, mobile data, roaming, APN,
+network mode, VPN, Wi-Fi calling, app permissions, payments). Tasks are
+graded almost entirely by **environment assertions** on the final state,
+e.g. "mobile data works and the speed test reports Excellent".
+
+| Namespace | Role |
+| --- | --- |
+| `dvergr.benchmarks.tau2.telecom` | Environment: dispatch (`respond`), `sync-tools`, initialization actions, env assertions, world hash, `load-telecom` |
+| `dvergr.benchmarks.tau2.telecom.db` | TOML subset reader, the pydantic models as ordered maps, both hashes |
+| `dvergr.benchmarks.tau2.telecom.agent` | The 13 agent tools of `TelecomTools`, plus initialization functions and assertions |
+| `dvergr.benchmarks.tau2.telecom.device` | The 30 user tools of `TelecomUserTools` (the phone simulation), the `APNSettings` validation, initialization functions and assertions |
+| `dvergr.benchmarks.tau2.telecom.corpus` | Gold, fuzz, flow and grading corpora, Clojure replay, digests |
+
+A telecom world is `{:db :user :vpn-performance :bill-seq}`. `:db` is the
+agent's TelecomDB, `:user` the TelecomUserDB (`device` plus `surroundings`).
+Upstream grades both databases, so `world-hash` is `agent-hash|user-hash`.
+`(tc/load-domain)` returns a domain map with the same keys as
+`load-banking`, plus `:env-assertion-checks` and `:settle`.
+
+### Upstream configuration, read from the code
+
+- **Environment**: the registry's `"telecom"` domain is
+  `get_environment(policy_type="manual")`, not solo. The `"telecom-workflow"`
+  variant (tech_support_workflow.md) and solo mode (main_policy_solo.md) are
+  not ported.
+- **Agent policy**: `"<main_policy>\n" + main_policy.md + "\n</main_policy>\n<tech_support_policy>\n" + tech_support_manual.md + "\n</tech_support_policy>"`.
+  The tech-support manual is part of the agent's system prompt.
+- **Tasks**: `get_tasks` loads `tasks.json`. It is byte-identical to
+  `tasks_full.json` (2285 tasks). `tasks_small.json` is no longer used. The
+  default split is `base` (`--task-split-name` defaults to `"base"`): 114
+  tasks, returned in `tasks.json` order. `train` (74) + `test` (40) = `base`.
+  `small` (20) is disjoint from `base`. `full` is all 2285.
+- **User simulator**: every task gets all 30 user tools (`task.user_tools` is
+  never set), so the user simulator uses `simulation_guidelines_tools.md`.
+  40 of the 114 base tasks have a persona string (`[PERSONA:Easy|Hard]`).
+- **Initial state**: no task has initialization data or message history.
+  Every task has initialization actions (`set_user_info`, `turn_airplane_mode_on`,
+  `break_apn_settings`, `set_data_usage`, `suspend_line_for_overdue_bill`, …),
+  replayed by `set_state`. Each action is followed by `sync_tools`, and one
+  more sync runs at the end.
+- **Reward basis**: `ENV_ASSERTION` for 94 base tasks, and `ENV_ASSERTION` +
+  `ACTION` for 20. No telecom task uses DB, COMMUNICATE or NL_ASSERTION.
+
+### Protocol notes
+
+- **Sync.** `Environment.get_response` runs `TelecomEnvironment.sync_tools`
+  after every successful tool call, from either side. The orchestrator also
+  runs it after every step. Sync copies the agent DB's state for the user's
+  line onto the phone: `line_active`, `roaming_allowed`, and
+  `mobile_data_usage_exceeded` (data used ≥ plan limit + refueled). It also
+  settles payments: a paid request marks its bill `Paid`, then the first bill
+  awaiting payment becomes the new request. `respond` does the same.
+  A sync that raises (a phone number with no line) turns a successful call
+  into an error but keeps the call's effects, as upstream does.
+- **Grading.** Upstream rebuilds the predicted environment by replaying the
+  trajectory's mutating calls (`set_state`), ends with a sync, and runs each
+  assertion followed by a sync. The port grades the episode's final world
+  after one `settle` (a sync; syncing is idempotent). The two agree on every
+  trajectory checked (see below).
+- **ACTION** tasks expect `transfer_to_human_agents` with `compare_args: []`,
+  so only the tool name is matched. `core/action-checks` already implements this.
+- **DB is not usable for telecom.** Upstream's gold environment replays the
+  gold actions with `make_tool_call`, which does not sync, so its user DB
+  never matches a live one. On 71 of the 114 base tasks the DB check fails
+  even for the gold trajectory. It is not in any reward basis, so this
+  changes no score. `core/grade` still computes `:db-match`; ignore it here.
+
+### Deliberate deviations (upstream nondeterminism)
+
+- **Draft-bill ids.** `_apply_one_time_charge` names a new draft bill
+  `B{uuid4().hex[:8]}`, which is random. The port uses a per-world counter
+  (`B00000001`, …). The oracle pins `uuid4` to the same counter. Upstream,
+  any `refuel_data` for a customer without a draft bill therefore makes the
+  DB hash irreproducible. Only C1001 has a draft bill, and the gold
+  trajectories only touch C1001.
+- **Shared VPN details.** `TelecomUserTools.default_vpn_details` is a class
+  attribute. `connect_vpn` assigns that object to the device, and `break_vpn`
+  mutates it in place (server performance POOR). Within one episode this
+  means every later `connect_vpn` gets a POOR server; the port carries it as
+  `:vpn-performance`. Upstream the object is also shared across the whole
+  process: after any task ran `break_vpn`, a later task in the same process
+  that connects a VPN gets a slow connection (0.1× speed), which can fail
+  `assert_internet_speed`. The port models a fresh process per episode. The
+  oracle resets the attribute before every sequence.
+
+### Upstream quirks reproduced
+
+The transcription comments name each one.
+
+- Tool arguments are not validated (tools are plain methods), so errors are
+  Python's own: `'int' object has no attribute 'startswith'`,
+  `'<=' not supported between instances of 'str' and 'int'`,
+  `unhashable type: 'list'`, `slice indices must be integers or None …`, and
+  keyword-binding `TypeError`s. That includes argument names that collide with
+  `Environment.make_tool_call`'s own parameters (`requestor`, `tool_name`, `self`).
+- `set_network_mode_preference` stores a non-string mode unvalidated, runs a
+  network search (falling back to 4G), then fails on `.value`. The junk value
+  stays on the phone. `mode=None` returns "Failed to set …" but still
+  changes the preference and searches.
+- `set_apn_settings` validates dicts with pydantic 2.13. The ValidationError
+  text is reproduced byte for byte: enum, bool parsing, int-from-float, extra
+  keys, and 50-character repr truncation. Non-dict arguments are stored
+  unvalidated, and every later APN access raises `AttributeError` until a
+  valid dict replaces them, including a partial network search.
+- Dict tool results go through `Environment.to_json_str._process`, which turns
+  numbers into strings: `get_data_usage` returns `"data_used_gb": "8.7"`,
+  and `refuel_data` returns `"charge": "4.0"`. Model results keep real floats.
+  `datetime` fields render as `2025-01-20 14:30:00` (`default=str`).
+- `refuel_data` does not check the line status (the check is commented out
+  upstream). It echoes `gb_amount` with `str()` (`2 GB`, `True GB`).
+- `check_vpn_status` prints the details dict with Python's enum repr,
+  `<PerformanceLevel.EXCELLENT: 'excellent'>`.
+
+### Verified
+
+Verified 2026-09-19 against upstream `b7ea907` (Python 3.12.2,
+pydantic 2.13.5). Every check below has 0 mismatches.
+
+| Check | Size |
+| --- | --- |
+| Initial agent DB and user DB (full dumps and both hashes) | identical |
+| Gold actions (agent and user) + env assertions, **all 2285 tasks**, run from each task's initialization actions | 2285 sequences, 13,215 calls, 3,674 assertions (base: 114 / 516 calls, 393 of them by the user / 209 assertions) |
+| Seeded fuzz (seed 11): default state, any of the 2285 task states, or random stacks of initialization functions; both toolkits; wrongly typed, missing, extra and colliding arguments; wrong-requestor and unknown tools; assertions with `assert_value` true/false | 1500 sequences, 11,196 calls, 1,114 initialization calls, 3,068 assertions |
+| Seeded flows (seed 23): payment request → pay → sync → resume; junk APN → reset/reboot/MMS; PIN/PUK locks and unseated SIM; data exhaustion, refuel and new draft bills; broken VPN reconnects | 600 sequences, 5,863 calls, 726 initialization calls, 868 assertions |
+| Agent system prompt, greeting, 2285 user-simulator prompts, per-task user tool sets, tool schemas, parameters, mutation flags | identical |
+| Grading vs upstream `EnvironmentEvaluator` + `ActionEvaluator` on perturbed base trajectories (gold, drop-first, drop-last, reversed, gold+noise, noise) | 684 trajectories, same reward (305 × 1.0, 379 × 0.0) |
+| Upstream's own grade of the base gold trajectories | 114/114 reward 1.0 |
+| Gold agent + user through `core/run-episode` + `core/grade` | 114/114 reward 1.0; an agent that stops immediately scores 0.0 on all 114 |
+
+The replays compare tool content, error flags, both database hashes,
+initialization-call results and assertion results. Digests are pinned in
+`benchmarks/test/dvergr/benchmarks/tau2/telecom_oracle_digests.edn`, and
+`benchmarks/test/dvergr/benchmarks/tau2_telecom_test.clj` rechecks all of it without
+Python (6 tests, 567 assertions, about 80 s including JVM start). The corpora
+are regenerated from their seeds by `telecom.corpus`, and the tool schemas are
+vendored in `benchmarks/resources/benchmarks/tau2/telecom-tools.json`.
+
+Oracle: `benchmarks/dev/tau2/telecom/oracle_telecom.py`
+(`replay | schema | prompts | gold-eval | grade`), run in the checkout with
+`uv run --no-sync python …`.
+
+### Not done / unverified
+
+- Solo mode, the workflow policy variant and the voice task set.
+- Malli result types and REPL-candidate docs (`schemas.clj`) for telecom.
+- Live episodes with a model.
+- A second draft bill in one sequence (id `B00000002`) is never reached.
+  Junk values written by initialization functions (e.g. a non-numeric
+  `set_data_usage`) are not exercised; tasks never produce them.
+
+## Equivalence method
+
+`benchmarks/dev/tau2/oracle.py` is the only Python involved, and it runs
+against the upstream checkout (`uv run python …`), never inside Dvergr. It
+exports:
+
+- `replay`: tool content, error flag, and final DB hash for any call sequence;
+- `schema`: tool schemas (vendored as `benchmarks/resources/benchmarks/tau2/retail-tools.json`);
+- `prompts`: exact agent and user-simulator system prompts for every task;
+- `judge-prompts`: the exact NL-judge request, captured by stubbing upstream's
+  `generate`.
+
+Verified on 2026-09-18 against upstream `b7ea907`:
+
+| Check | Result |
+| --- | --- |
+| Initial DB hash | identical |
+| 114 gold action sequences (550 calls) | byte-identical outputs and final hashes |
+| 1500 seeded fuzz sequences (6770 calls: error paths, partial effects, argument errors, `calculate`) | identical after one fix: pydantic coerces `OrderPayment(amount=abs(0))` to `0.0` |
+| 114 user-simulator prompts, agent prompt, greeting | identical |
+| NL-judge prompts (including Python `repr` quoting) | identical |
+| Gold-replay agent through the full episode protocol | 114/114 reward 1.0 |
+
+Upstream quirks are reproduced on purpose, because grading hashes the final
+state. For example, `modify_pending_order_items` gives every modified item the
+last requested variant's price and options, and a failing tool call can leave
+the partial writes that happened before the failure.
+
+`benchmarks/test/dvergr/benchmarks/tau2_test.clj` pins the oracle results as per-sequence
+digests (`retail_oracle_digests.edn`), so CI rechecks equivalence without
+Python whenever the checkout is present.
+
+Environment replay cost for the fuzz corpus: Python takes 283 s, because it
+reloads and re-validates the mutable DB per sequence. Clojure takes 0.43 s,
+because every sequence starts from the same immutable value. This measures
+environment execution only; model latency dominates live episodes.
+
+## Next steps
+
+Done since this list was first written: the telecom domain is ported and
+verified (above), and fork-at-turn exists (`:checkpoint-at` and `branch!` in
+`dvergr.benchmarks.tau2.episode`, see *Checkpoints and branches*).
+
+1. Measure the candidates properly: 4 trials on `test`, and a user simulator
+   that differs from the agent model. Then tune the REPL candidate's prompt and
+   affordances on `train` only.
+2. Use branches for counterfactual rollouts and cheap pass^k/GRPO-style groups
+   from one shared prefix; checkpoints and branches still use the Room path.
+3. Banking's other retrieval configurations (`grep_only`, `full_kb`,
+   `golden_retrieval`) need no embeddings and reuse the same tools.
