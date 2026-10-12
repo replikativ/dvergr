@@ -65,16 +65,27 @@
     :world {:isolation :room}
     :metadata {:benchmark :tau2 :initial-db-hash (:initial-db-hash domain)}}))
 
+(def ^:private known-repl-guidance
+  "The `:repl-guidance` values `episode/agent-system-prompt` accepts."
+  (conj (set (keys episode/repl-guidance)) :typed))
+
 (defn candidate-roster
-  "AgentDefs for candidate specs `{:id :harness :action-space :model :provider
-   :max-model-steps :budget-dollars}`. With `domain`, each AgentDef carries the
-   sha256 of the system prompt it will run with, so a prompt change is a new
-   candidate (never resumed into old cells)."
+  "AgentDefs for candidate specs `{:id :harness :action-space :repl-guidance
+   :model :provider :max-model-steps :budget-dollars}`. `:repl-guidance` (a key
+   of `episode/repl-guidance` or `:typed`; the episode's default is `:shape`)
+   selects the REPL action-space guidance and is part of the AgentDef, so
+   specs that differ only in it are distinct candidates. With `domain`, each
+   AgentDef carries the sha256 of the system prompt it will run with, so a
+   prompt change is a new candidate (never resumed into old cells)."
   ([specs] (candidate-roster specs nil))
   ([specs domain]
    (reduce (fn [team {:keys [id harness action-space model provider max-model-steps budget-dollars
                              repl-guidance]
                       :or {harness :dvergr action-space :tools max-model-steps 100 budget-dollars 5.0}}]
+             (when (and repl-guidance (not (contains? known-repl-guidance repl-guidance)))
+               (throw (ex-info "Unknown :repl-guidance"
+                               {:type ::unknown-repl-guidance :repl-guidance repl-guidance
+                                :known known-repl-guidance})))
              (let [model-id (registry/resolve-alias model)]
                (roster/make-agent
                 team
@@ -85,7 +96,8 @@
                                 :model model-id}
                  :program {:kind :llm :max-model-steps max-model-steps :budget-dollars budget-dollars}
                  :metadata (let [m (cond-> {:conversation/harness harness}
-                                     (= :dvergr harness) (assoc :conversation/action-space action-space))]
+                                     (= :dvergr harness) (assoc :conversation/action-space action-space)
+                                     repl-guidance (assoc :conversation/repl-guidance repl-guidance))]
                              (cond-> m
                                domain (assoc :conversation/system-prompt-sha256
                                              (pj/sha256-hex (episode/agent-system-prompt
