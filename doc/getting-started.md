@@ -4,6 +4,17 @@ This guide walks you through your first dvergr session: a room with one
 LLM agent, then a multi-room scenario, then a substrate-isolated
 proposal. No prior dvergr experience assumed.
 
+## Prerequisites
+
+- A JDK, 22 or newer (CI builds on `cimg/openjdk:22.0`).
+- The [Clojure CLI](https://clojure.org/guides/install_clojure) and git.
+- A model: an API key (Anthropic, OpenAI, Fireworks) or a logged-in subscription CLI
+  (`claude` for Claude Code, `codex` for a ChatGPT subscription); see
+  [provider-setup.md](provider-setup.md).
+- Optional: [babashka](https://babashka.org) (`bb`) for the MCP relay `bin/dvergr-mcp`
+  ([mcp.md](mcp.md)); bubblewrap for real programs in the room shell
+  ([tools-and-sandbox.md](tools-and-sandbox.md)).
+
 ## Dependencies
 
 Add dvergr to your `deps.edn`:
@@ -82,7 +93,7 @@ Try:
 - **Ctrl-C** — quit
 
 Rooms, their history, and knowledge **persist automatically** in Datahike under
-the state root (`$DVERGR_HOME`, default `./.dvergr/`). There is no save/resume flag — restart `clojure -M:cli` and your
+the state root (`$DVERGR_HOME`, default `./.dvergr/`; what is in it: [homes.md](homes.md)). There is no save/resume flag — restart `clojure -M:cli` and your
 rooms rehydrate from the store.
 
 See [cli.md](cli.md) for the full reference.

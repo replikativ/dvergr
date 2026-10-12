@@ -1,17 +1,16 @@
 # Running benchmarks
 
 How to run a benchmark or a case pack, what the numbers in its report mean,
-and what an experiment guarantees. `doc/benchmarks.md` describes each
-benchmark; `doc/room-workflows.md` the bundle format.
+and what an experiment guarantees. `doc/benchmarks.md` lists the benchmarks,
+`benchmarks/doc/` describes each one, and `doc/room-workflows.md` the bundle format.
 
 ## Run one
 
 Every benchmark has an `experiment/run!` in `benchmarks/` (on the classpath
 with `-M:benchmarks`, included in `:dev` and `:test`). Its `:dir` is a dvergr
-**home**: the system DB and the stores of the rooms registered there, nothing
-else, besides its `home.edn`. `run!` opens it with a headless daemon (no
-Telegram, web or MCP listener, no agents, the home's schedules suspended, no
-storage GC; `runner/open-home!`), keeps the experiment in a room of it, runs it
+**home** ([homes.md](homes.md)): `run!` opens it with a headless daemon (no
+Telegram, web or MCP listener, no agents, schedules suspended, no storage GC;
+`runner/open-home!`), keeps the experiment in a room of it, runs it
 (`runner/run-in`) and closes the home again, whatever happens. The home is the
 process's for the call, so run it in its own JVM; in a process that runs a
 daemon, pass `:daemon` (and an `:experiment-id`) and it runs in that daemon's

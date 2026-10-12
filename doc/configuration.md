@@ -11,7 +11,7 @@ that both depend on dvergr stay fully isolated.
 |-------|----------|-----------|----------|
 | **Built-in defaults** | dvergr's classpath: `resources/agents/*.md`, `resources/models.edn`, `resources/phases/*.edn`, `resources/skills/*.md` | fallback | dvergr (the library) |
 | **Project config** | `./config.local.edn` (+ project skills) | seed + override | your project |
-| **Runtime state** | `./.dvergr/` (Datahike — chat, actors, **agent prompts**; Geschichte room workspaces; index) | **authoritative once seeded** | the running system / UIs |
+| **Runtime state** | `./.dvergr/`, the home ([homes.md](homes.md)): the system DB (actors, **agent prompts**, the room registry) and each room's stores (messages, KB, Geschichte workspace) | **authoritative once seeded** | the running system / UIs |
 
 Rule of thumb: the **file** is a *seed*; once the system boots, the **Datahike
 store under `.dvergr/`** is the source of truth. Editing an agent in the TUI/web
@@ -30,18 +30,10 @@ placeholder (contains `YOUR_`, as in the example) counts as unset, so the env va
 is used.
 
 ### State root — `dvergr.substrate.paths`
-Priority: `(paths/set-home! …)` → `$DVERGR_HOME` → `./.dvergr`. Layout:
-
-```
-.dvergr/
-  db/            Datahike file store (chat + KB + code + actors + agent prompts)  ← authoritative
-  system-db/     registry of parties / systems / rooms / grants
-  systems/       per-system stores (each room's KB/repo scope)
-  workspace/     the agent code workspace (sandbox load root, cloned from the sandbox stdlib)
-  transcripts/   intake transcript cache
-  dvergr.log     daemon/substrate log
-.nrepl-port      written at repo root for client discovery
-```
+Priority: `(paths/set-home! …)` → `$DVERGR_HOME` → `./.dvergr`. The state root is a dvergr
+**home**: the system DB, every room's stores under `systems/`, `home.edn`, the log, the MCP
+token. [homes.md](homes.md) has the layout as built, moved vs copied homes, experiment homes
+and storage GC. The `.nrepl-port` of a REPL is written at the project root, not in the home.
 
 ## `config.local.edn` schema (all keys optional)
 
@@ -65,7 +57,7 @@ Priority: `(paths/set-home! …)` → `$DVERGR_HOME` → `./.dvergr`. Layout:
  :mail          {:account-id {:email "…" :imap {…} :smtp {…} :data-path "…"}}
 
  ;; Sandbox credential injection — an agent uses an API key it never sees.
- ;; See doc/boundary-secret-injection.md for the full :secrets/:sandbox-env schema.
+ ;; See doc/effects.md ("Secrets at the boundary") for the full :secrets/:sandbox-env schema.
  :secrets       [{:name "BRAVE_API_KEY" :env "BRAVE_API_KEY"
                   :allowed-domains ["https://api.search.brave.com"]
                   :allowed-locations [:header :query] :header-names ["X-Subscription-Token"]}]
@@ -118,14 +110,66 @@ Two independent pieces, both project-overridable:
    `dvergr.agent.persona`, falling back to the built-in `resources/agents/<id>.md`.
    `update_agent_profile`, the agent-config UI, and `dvergr.agent.ops/update-agent!` all write the
    row; dvergr's own resources are never mutated. `(persona/source id)` reports
-   `:db` / `:builtin` / `:none`. Because the prompt lives in Datahike it is
-   value-semantic (forks with the actor row) and versioned with the rest of the DB —
-   see `doc/state-model.md`.
+   `:db` / `:builtin` / `:none`. The prompt lives in the actor row of the
+   system DB, which is shared by every room and not forked — see
+   [worlds-and-forks.md](worlds-and-forks.md#shared-durable-the-system-db).
 
 So a host project customises agents by: declaring them under `:agents` in its
 `config.local.edn` (seed), shipping defaults as `resources/agents/<id>.md` on its
 classpath, and/or editing the prompt at runtime through the API/UI (persists to the
 DB) — without forking dvergr.
+
+## Skills and agent definitions
+
+Skills (instructions an agent pulls in for a kind of task) and agent identities (a persona
+with its model, tools and rooms) are both **definition files**: markdown with a frontmatter
+block, loaded by `dvergr.discourse.definitions`. `kind: agent` makes the body a system prompt,
+`kind: skill` a skill template.
+
+```markdown
+---
+kind: agent
+name: researcher
+description: Finds and cites sources
+provider: fireworks
+model: accounts/fireworks/models/minimax-m3
+tools: [clojure_eval, knowledge_search]
+provides: [:research]
+rooms: ["*"]
+autostart: true
+vetted: true
+---
+You are a careful researcher. …
+```
+
+Skill frontmatter adds `requires_tools` and `requires_env` (what an agent must have for the
+skill to apply). List values are `[a, b]` or indented `  - item` lines; `provides` becomes
+keywords. An agent's `provides` are its capability tags (routing) and skills; `rooms: ["*"]`
+joins every room.
+
+**Scope chain.** Each kind (`agents/`, `skills/`) is read from four places; a later one
+overrides an earlier one by `name`:
+
+1. built-in: `resources/agents/`, `resources/skills/` on the classpath (dvergr's own, or your
+   project's resources);
+2. user: `~/.dvergr/<kind>/`;
+3. project: `./.dvergr/<kind>/` (relative to the process's working directory, not
+   `$DVERGR_HOME`);
+4. room: `<kind>/` in a room's workspace, which an agent can write from the sandbox.
+
+**Vetting.** A definition takes effect only with `vetted: true`. An unvetted skill can be listed
+and read but is not offered in agent prompts (`dvergr.orchestration.skills/eligible?`; also
+`disabled: true`, a missing `requires_tools` tool or a missing `requires_env` variable keep it
+out); the externally lifted skills under `resources/skills/lifted/` are unvetted. Agents
+author skills into their own room from the sandbox with `dvergr.skills/author!` and `lift!`
+(written `vetted: false`); `dvergr.skills/promote!` marks a room skill vetted and stamps
+`vetted_by`/`vetted_at`.
+
+**Autostart.** At start the daemon creates every agent whose definition (built-in, user or
+project scope) has `autostart: true` and `vetted: true`, unless config `:agents` declares it or
+the system DB already has its row; from then on the row is authoritative, as for configured
+agents. A headless daemon (doc/homes.md) autostarts none. So config `:agents` is optional: a
+vetted agent file is enough.
 
 ## Quick start (host project)
 

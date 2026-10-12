@@ -17,12 +17,14 @@ The mechanism notebooks **import** the runnable scenarios from
 
 | Notebook | Shows | Imports |
 |----------|-------|---------|
-| `getting_started.clj`   | rooms, participants, `post!`, tagged routing — from zero | — |
-| `humans_and_agents.clj` | humans as participants, background tasks, propose → accept/reject | `examples/humans_and_agents.clj` |
-| `auditor.clj`           | capability-tag subscriptions beyond the inbox | `examples/scenario_auditor.clj` |
-| `escalation.clj`        | budget escalation via tagged messages + bus-level policy | `examples/scenario_manager_escalation.clj` |
-| `streaming.clj`         | per-consumer buffer/SLA policy on a token stream | `examples/scenario_streaming_partial.clj` |
-| `llm_agent.clj`         | drive a real model with tools (`llm-agent` + `ask`) — key-gated | — |
+| `index.clj`             | the book's landing page: what dvergr is, the reading order | — |
+| `getting_started.clj`   | rooms, participants, `post!`, tagged routing, capability subscriptions, the fork-and-merge proposal — from zero | — |
+| `programming_model.clj` | the compositional kernel: tag routing, capability subscriptions beyond the inbox, budget escalation as a posted tag, per-consumer buffer policy on a token stream | `examples/scenario_auditor.clj`, `examples/scenario_manager_escalation.clj`, `examples/scenario_streaming_partial.clj` |
+| `humans_and_agents.clj` | humans as participants, background tasks, propose → accept/reject on substrate forks | `examples/humans_and_agents.clj` |
+| `agents_and_tools.clj`  | a real LLM agent with the `clojure_eval` sandbox as a tool (`llm-agent` + `ask`); shown as code with a captured reply, not run at render time | — |
+
+`render.clj` builds the book (in the order of its `notebooks` vector);
+`support.clj` holds the shared `settle` helper.
 
 ## Build
 
@@ -31,10 +33,10 @@ clj -M:clay -m notebooks.render
 ```
 
 Renders the book headlessly to `docs/` (needs the `quarto` CLI on `PATH`). Give
-it a generous timeout — the demos `Thread/sleep` to let async routing settle, and
-`llm_agent` makes a live model call **only** if a provider key
-(`FIREWORKS_API_KEY` / `ANTHROPIC_API_KEY`, or `claude` on `PATH`) is present;
-otherwise it renders an explanatory note so the book builds in CI without a key.
+it a generous timeout — the demos `Thread/sleep` (`support/settle`) to let async
+routing settle. No notebook calls a model at render time, so the book builds in
+CI without a provider key: `agents_and_tools` shows its code and a captured
+example reply.
 
 ## Output
 
