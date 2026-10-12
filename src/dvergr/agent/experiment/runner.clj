@@ -6,14 +6,21 @@
    AutomationBench and SpreadsheetBench; a user's own benchmark is one more:
    doc/benchmarks.md). This namespace brings the
    rest: the experiment's home, the experiment Room, Claude Code
-   settings for the run, waiting out subscription usage windows, resume, and
-   the Scorecard. Every cell (candidate x environment x repetition) is one
+   settings for the run, the subscription allowance (no new cell once a
+   window is 80 % used, `default-allowance`) and Claude Code's wait for its
+   usage window (`:usage-pause-threshold`, 0.97), resume, and the Scorecard. Every cell (candidate x environment x repetition) is one
    `dvergr.agent.evaluation/evaluate` through `dvergr.agent.experiment/run`.
 
    `:dir` is a dvergr home (`open-home!`): its system DB and the stores of its
    rooms. The experiment is kept in a room of that home, one per ExperimentDef
    (`experiment-slug`): its Runs, Attempts (their exact payloads as blobs of
    the room's Datahike store) and Scorecard, as any daemon room keeps them.
+   `run-in` takes the room from its caller instead: `catalog_benchmark`
+   keeps an experiment in its `room` (default the new fixture room) under
+   its `experiment` name, and
+   `room-run` in the room <bundle name>, so there every version of the
+   experiment (a changed bundle or model list is a new ExperimentDef) is kept
+   in one room.
    The report is read from there (the `experiment/report` op). Re-running
    with the same home resumes: cells with a verdict made with the inputs
    their candidate would be presented with now are kept (`experiment/run`:

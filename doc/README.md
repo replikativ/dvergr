@@ -42,6 +42,7 @@ New to dvergr? Start with **[Getting Started](getting-started.md)**.
 - **[Workflows defined in a room](room-workflows.md)** — a room's own benchmark: bundles, checkers, calibration, case packs from your own history, `room-run`
 - **[Benchmarks](benchmarks.md)** — the providers (tau2-bench's four domains, BFCL, AutomationBench, BIRD, SpreadsheetBench, the wiki and room workflows), equivalence, results
 - **[Running benchmarks](running-benchmarks.md)** — how to run one, what its report means, resume, faults, cost at list price, held-out discipline
+- **[Reference setups](../benchmarks/reference/README.md)** — BIRD and SpreadsheetBench as their authors run them, on the cases a Dvergr experiment ran, and how to pair the two
 - **[Evaluation model](evaluation-model.md)** — Attempts, Evaluators, Experiments, Scorecards
 - **[Practical agent evaluation](practical-agent-evaluation.md)** — frozen-web discovery, citation verification, market evidence
 - **[Coding benchmarks](coding-benchmarks.md)** — coding repair in the SCI workspace

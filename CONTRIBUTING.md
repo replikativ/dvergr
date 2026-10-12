@@ -17,7 +17,9 @@ new namespace belongs at the lowest layer that satisfies its dependencies.
 - **L3 — discourse**: `discourse` core (Room/Participant/Message, fork/merge,
   algebra), `bus`/`peer-bus`/`room.registry`/`room.store`, `rooms`, adapters.
 - **L4 — tools + sandbox**: tool registry/executor, SCI sandbox, code-edit utils,
-  ~30 intake data sources, channels, git worktrees.
+  channels, git worktree management. The intake data sources live in the
+  [dvergr-sandbox](https://github.com/replikativ/dvergr-sandbox) repo cloned into
+  each room's workspace; only `intake/bash` and `intake/mail` are in-tree.
 - **L5 — agent execution**: the turn loop (`chat.agent`), compaction, the model
   abstraction + provider impls, the LLM-backed participant factory, process.
 - **L6 — orchestration**: the `daemon`, sessions, scheduler, actors,
@@ -45,6 +47,11 @@ clj -M:test                       # full suite
 clj -M:test --focus my.ns         # one namespace
 ```
 
+CI runs the full suite on every push, split over three containers, each on its
+share of the namespaces (`.circleci/config.yml`, `dvergr.test-split`), and checks
+formatting with `clojure -M:format`. [doc/testing.md](doc/testing.md) shows how to
+run one container's share locally and how to write waits that hold.
+
 For co-development, add the `:local` alias so sibling checkouts (`../spindel`,
 `../datahike`, `../yggdrasil`, …) override the published deps: `clj -M:local:test`.
 
@@ -62,7 +69,10 @@ clj -M:local:dev:repl             # nREPL + CIDER middleware
 ```
 
 Other handy aliases (see `deps.edn`): `:cli` (start daemon + TUI),
-`:mcp-server`, `:build` (jar / uberjar / install / deploy).
+`:build` (jar / uberjar / install / deploy), and `:mcp-server`
+(`dvergr.mcp.server/-main`: an MCP server without a daemon, so its tools only
+answer that no daemon runs; MCP clients use `bin/dvergr-mcp`, see
+[doc/mcp.md](doc/mcp.md)).
 
 ## Using dvergr as a library
 
@@ -86,17 +96,18 @@ those is an upstream task tracked separately.
 
 ## Commits & PRs
 
-We use **conventional commits** scoped to a subsystem:
+A commit's summary line says what is true after it, as a plain sentence,
+often after the area it concerns and a colon; no type prefixes:
 
 ```
-feat(web): spec-derived JSON HTTP API (reitit + malli + swagger)
-fix(adapters): Telegram full-room mirror + async egress
-refactor(ops): malli as the single args-schema source
-docs: trim doc/ to user-facing pages
+Resume keeps a cell only while its inputs hold
+Report: paired comparisons with the exact McNemar test
+Web: Host, Origin and CSRF checks; state changes are POSTs
+A home can be moved: store ids are kept beside the stores; a copied home is refused
 ```
 
-Common types: `feat`, `fix`, `refactor`, `docs`, `chore`, `deps`, `test`.
-Keep the summary line tight and imperative; branch off `main` and open a PR.
-Run the suite before pushing.
+The body explains why, in prose. Format with `clojure -M:ffix` before
+committing (CI fails on unformatted code). Branch off `main` and open a PR; CI
+runs the suite, so run the namespaces you touched locally (`--focus`).
 
 Welcome aboard!

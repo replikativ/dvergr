@@ -424,10 +424,18 @@ environment but cannot certify its own reward.
 When the Room has a store, trusted certification persists an immutable Attempt
 before the world can become reviewable or be discarded. The typed Datahike row
 indexes Run, environment, verifier, provider/model, status, timing, reward,
-checks, prompt/program/interpreter provenance, and evidence references. The
-exact EnvironmentDef, AgentDef, receipt, and portable evidence live together in
-Dvergr's immutable blob CAS; the row holds the content reference rather than an
-opaque EDN/JSON column. SCI can query this projection but its Datahike surface
+checks, prompt/program/interpreter provenance, the inputs id, and evidence
+references. The inputs id (`:attempt/inputs-id`, from the receipt's metrics) is
+the content id of what the Run resolved when it started (`program/run-inputs`):
+for an LLM Run the assembled system prompt's id, the tools offered and the
+resolved model; for a protocol Run its ref, the resolved model and what the
+protocol declares with `make-protocol`'s `:inputs`; none for a deterministic
+program. An experiment resume keeps a cell only while it matches. The exact
+EnvironmentDef, AgentDef, receipt, and portable evidence live together as an
+immutable blob in the room's own Datahike store (`artifact/datahike-store`),
+tracked by its GC; the row holds the content reference rather than an opaque
+EDN/JSON column. Older string references are still read from the legacy global
+blob CAS. SCI can query this projection but its Datahike surface
 rejects writes or retractions in the `:attempt/*` and `:attempt.check/*`
 namespaces. A Hasch identity detects content mutation; it does not authenticate
 an external writer, so cross-process imports require a trusted manifest or

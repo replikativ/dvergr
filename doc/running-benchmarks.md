@@ -9,8 +9,9 @@ benchmark; `doc/room-workflows.md` the bundle format.
 Every benchmark has an `experiment/run!` in `benchmarks/` (on the classpath
 with `-M:benchmarks`, included in `:dev` and `:test`). Its `:dir` is a dvergr
 **home**: the system DB and the stores of the rooms registered there, nothing
-else. `run!` opens it with a headless daemon (no Telegram, web or MCP
-listener; `runner/open-home!`), keeps the experiment in a room of it, runs it
+else, besides its `home.edn`. `run!` opens it with a headless daemon (no
+Telegram, web or MCP listener, no agents, the home's schedules suspended, no
+storage GC; `runner/open-home!`), keeps the experiment in a room of it, runs it
 (`runner/run-in`) and closes the home again, whatever happens. The home is the
 process's for the call, so run it in its own JVM; in a process that runs a
 daemon, pass `:daemon` (and an `:experiment-id`) and it runs in that daemon's
@@ -34,13 +35,15 @@ clojure -M -m dvergr.catalog.room-run examples/workflows/bank-booking \
   --models codex-subscription-luna,claude-code-haiku --cases 30 --home runs/bank-booking
 ```
 
-`room-run` does what an MCP client does: it opens the home (default
+`room-run` calls the ops an MCP client calls, in process (`dvergr.ops/invoke`
+on the home's daemon, no MCP transport): it opens the home (default
 `$DVERGR_HOME/workflow-runs/<bundle name>` when `DVERGR_HOME` is set, else
 `workflow-runs/<bundle name>` in the working directory; a home of its own, since a
 daemon may have `DVERGR_HOME` itself open), creates the room `bank-booking` there, writes
 the bundle into its workspace with `room_write`, runs `catalog_benchmark` into
-that room and prints the report from `experiment_report` (or writes it to
-`--report FILE`). stdout has progress lines (cells done of the total) and the report; the
+that room, polls `job_status` until the job is over and settled, and prints the report from
+`experiment_report` (or writes it to `--report FILE`). stdout has progress lines (the job
+status's `progress`: cells done of the total, faults, phase) and the report; the
 log goes to `<home>/dvergr.log`. The exit code is 1 when cells did not finish. Inside a
 daemon, use the `catalog_benchmark` MCP tool (the `bench` profile) or
 `runner/run-in`.
@@ -69,20 +72,35 @@ then discarded. What lives in the fork differs:
 
 ## Resume, identity and faults
 
-- Running again on the same home resumes: cells with a verdict are kept,
-  the rest run. Each ExperimentDef is kept in a room of its own
-  (`runner/experiment-slug`: its readable id and the start of its content
-  id), so a changed experiment never resumes into another's room. A
-  directory of the layout before homes (`artifacts/` beside `store/`) is
-  refused, not read.
+- Running again on the same home resumes: cells with a verdict made with
+  the current inputs (below) are kept, the rest run. A directory of the
+  layout before homes (`artifacts/` beside `store/`) is refused, not read.
+- Where an experiment is kept depends on the path. `run!` keeps each
+  ExperimentDef in a room of its own (`runner/experiment-slug`: its readable
+  id and the start of its content id), so a changed experiment never resumes
+  into another's room. `room-run` keeps every version in the room `<bundle
+  name>` as the experiment `<bundle name>`, and `catalog_benchmark` in its
+  `room` under its `experiment` name; a changed bundle or model list there is
+  a new ExperimentDef in the same room, and its cells start afresh.
 - A cell that faults (the path to the model failed: transport, provider
   limits, a sidecar) has no verdict and runs again, once more within the same
   run by default (`:fault-retries`, default 1), and on every resume. A model
   that answers wrongly, or not at all, gets a verdict: that is a result.
-- An experiment's identity covers its environments, candidates, the
+- An ExperimentDef's identity covers its environments, candidates, the
   providers' prompt and grader versions, and the versions of the libraries
   it runs on (spindel, datahike, pg-datahike, rechentafel, kontor). Changing
   any of them starts a new experiment instead of mixing two in one Scorecard.
+- What a Run resolves only when it starts is not in the ExperimentDef: the
+  assembled system prompt (the sandbox pointer, skills, the workspace's
+  AGENTS.md), the tools offered, and the model an alias names. Each Attempt
+  records these as its inputs id (`program/run-inputs`); a benchmark protocol
+  adds what it declares as its `:inputs` (its own prompt and tool schemas).
+  Before any cell starts, the run computes the inputs id each candidate would
+  get now and keeps a cell only when its Attempt recorded exactly that. The
+  others run again; their old Attempts stay in the store and count in no
+  Scorecard, and `run!`'s result counts them as `:stale-cells`. Attempts
+  from before inputs ids count as stale for LLM and protocol candidates, so
+  such an experiment re-runs their cells once.
 - A Scorecard exists only when every cell has a verdict; until then the
   report says how many cells did not finish.
 
@@ -103,6 +121,9 @@ The report is the experiment room's, rendered from its store by the
   verdict for (see below).
 - **Where answers fail**: how often each check failed.
 - **Cases**: for a case pack, which cases could grade an answer.
+- **Inputs changed** (only when it applies): how many cells ran again, or
+  await a re-run, because their candidate's inputs changed, and how many
+  earlier Attempts are superseded.
 
 Costs are at the models' **list prices**, whether or not a subscription paid
 for them: a subscription model names the API model its tokens are worth
@@ -151,9 +172,14 @@ comparisons** table does this for you:
   tool protocol: only the calls a response opens with run (later ones were
   written without seeing a result), arguments are typed by the tool's
   schema.
-- **Subscriptions** are metered by their usage windows: the runner stops
-  admitting cells at 80 % of a window (`:usage-pause-threshold`) and resumes
-  after the reset. The Claude subscription is shared with interactive use.
+- **Subscriptions** are metered by their usage windows. The runner starts
+  no new cell once a window is 80 % used or the experiment has taken ten
+  points of it since it started (`:allowance`, default `{:share 0.10
+  :pause-at 0.80}`; `nil` for no bound): the result carries `:refused`, and
+  running again after the reset resumes the rest. Separately, an experiment
+  with a Claude Code candidate waits before each pass while a window is at
+  least `:usage-pause-threshold` used (default 0.97). The Claude subscription
+  is shared with interactive use.
 
 ## Tuning and reporting
 
@@ -170,5 +196,5 @@ comparisons** table does this for you:
   the call); inside a daemon, `run!` takes `:daemon`.
 - At `:parallelism` 8 a scripted experiment spends about 0.35 s per cell in
   the harness: every cell writes to the experiment's one store (datahike's
-  single writer), and a cell's admission (forking its world, the Run's
-  durable start) still runs on the experiment's drain.
+  single writer). A cell's admission (forking its world, the Run's durable
+  start) runs off the experiment's drain (spindel `blocking`).

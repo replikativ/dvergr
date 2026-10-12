@@ -2,7 +2,7 @@
   "BFCL experiments as certified Dvergr experiments
    (`dvergr.agent.experiment.runner`).
 
-     (run! {:dir \".dvergr/benchmarks/bfcl-smoke\"
+     (run! {:dir \"runs/bfcl-smoke\"
             :categories [\"simple_python\" \"parallel\" \"irrelevance\"]
             :sample 5
             :candidates [{:id :sonnet :model \"claude-code-sonnet\"}]})

@@ -1,7 +1,7 @@
 (ns dvergr.benchmarks.bfcl.inspect
   "Read a BFCL experiment directory.
 
-     (def xs (open \".dvergr/benchmarks/bfcl-luna\"))
+     (def xs (open \"runs/bfcl-luna\"))
      (report xs)      ; per candidate: accuracy by category, why it loses
      (failures xs :luna-repl)
      (close xs)"

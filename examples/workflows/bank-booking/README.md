@@ -6,7 +6,7 @@ is the demo of a **case pack built from a firm's own history**:
 
 1. a year of a synthetic Mandant's bank bookings (Musterfirma GmbH, 264 lines, about 30
    vendors and customers) is written as a DATEV EXTF Buchungsstapel with Kontor's codec,
-   as DATEV exports it (`../../data/bank-booking-buchungsstapel.csv`);
+   as DATEV exports it (not in the repository: `write-example!` below writes it);
 2. Kontor's importer (`kontor.import-datev.buchungsstapel`) reads it back, the path a
    real export takes;
 3. `dvergr.catalog.casepack` certifies the cases and writes this bundle.
@@ -21,8 +21,12 @@ that firm's conventions. Each case is the bank's date, amount and text (`/docs/c
 the chart and tax keys the firm uses (`/docs/kontenrahmen.txt`); the answer is
 `{"gegenkonto" "6805" "bu" "9"}`, graded per field.
 
-Regenerate with `(dvergr.benchmarks.bankbooking/write-example! "examples/workflows/bank-booking" "examples/data/bank-booking-buchungsstapel.csv")`
-(benchmarks alias). Benchmark a sample:
+Regenerate the export and the bundle with `(dvergr.benchmarks.bankbooking/write-example!
+"examples/workflows/bank-booking" "examples/data/bank-booking-buchungsstapel.csv")` (the
+`:benchmarks` alias, included in `:dev`). The bookings are deterministic for their seed
+(default 20261001). The export goes to the
+second path, in ISO-8859-1 as DATEV writes it; it is not checked in (`data/` is
+git-ignored), so run this once to look at it or to import it into Kontor. Benchmark a sample:
 
     clojure -M -m dvergr.catalog.room-run examples/workflows/bank-booking \
       --models codex-subscription-luna,claude-code-haiku --cases 30 --home runs/bank-booking

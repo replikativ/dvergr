@@ -1,7 +1,7 @@
 # Resuming Runs from savepoints
 
 Status: **implemented** (2026-09-27), as below; see *As built* for where it differs from the proposal. Builds on spindel savepoints (spindel#56:
-`effects.savepoint`, `savepoint.portable`, shipped in 0.1.53; dvergr pins spindel in deps.edn, 0.1.97 at the time of writing) and on the
+`effects.savepoint`, `savepoint.portable`, shipped in 0.1.53; deps.edn has the spindel version dvergr pins) and on the
 effect logs with idempotency classes (doc/effects.md).
 
 ## Before this work
@@ -87,6 +87,11 @@ stays what it is for: reproducing an Attempt and freezing a benchmark.
   leaves the old Run with its wallet, resumable again; a successor that failed before it
   executed (admission, allocation or spawn) does not count as a resume. `run_detail` shows
   `resumable-from-step` and `resumed-by`.
+- **Inputs.** The resumed Run continues the stopped Run's conversation, system prompt
+  included, and records that prompt, the one it is sent, in its inputs id
+  (`program/run-inputs`: prompt id, offered tools, resolved model), not the prompt a fresh
+  Run would assemble now. An experiment resume compares this id with the one its candidate
+  would get now (doc/benchmarks.md, "Resume and inputs ids").
 - **Through spindel.** The world is a Run world of the room forked at the recorded
   snapshots (so registry, settlement and review are as for any Run), and
   `savepoint.portable/hydrate-into!` (spindel 0.1.67+) makes it the savepoint's continuation

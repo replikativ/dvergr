@@ -4,9 +4,12 @@ A **Run** is one causally bounded execution by an actor in a Room. It is the
 durable answer to: what started, what exact message caused it, who performed it,
 what output/activity belongs to it, and how it ended?
 
-The first implemented Run kind is `:agent-turn`. One such Run spans every model
-round, tool call, same-thread steer, and model switch needed to handle one
-trigger. A Run is not a Room, Thread, actor identity, model request, UI spinner,
+The Run kind this page describes is `:agent-turn` (the default of
+`run/start!`). One such Run spans every model round, tool call, same-thread
+steer, and model switch needed to handle one trigger. Other subsystems admit
+Runs of their own kinds: a hired agent task is `:agent-task`
+(`dvergr.agent.program`), and a job is a `:workflow` or `:experiment` Run of its
+room (`dvergr.jobs`). A Run is not a Room, Thread, actor identity, model request, UI spinner,
 or private copy of the transcript.
 
 ```text
@@ -59,20 +62,58 @@ Durable statuses currently are:
 | `:running` | The execution was admitted and may have a live handle. |
 | `:waiting` | It stopped at a resumable product boundary, currently budget exhaustion. |
 | `:completed` | It ended successfully, with or without a visible reply. |
-| `:failed` | The turn failed or produced no usable output. |
+| `:failed` | The turn threw, its reply could not be posted, or its process stopped while it ran. |
 | `:cancelled` | The executor acknowledged cancellation. |
+
+A terminal or waiting row may carry `:run/reason` (and `:run/error` for a
+failure). The reasons an `:agent-turn` Run ends with (`dvergr.discourse.llm`,
+`dvergr.agent.run`):
+
+| Status | `:run/reason` | When |
+|---|---|---|
+| `:completed` | none | The reply was posted, or the turn ended without one. |
+| `:completed` | `:silent` | The reply opted for silence (`[SKIP]`, `[NO_REPLY]`, blank; `dvergr.discourse.enrichment/with-silence`). |
+| `:completed` | `:withheld` | A wrapper dropped the reply without giving a reason. |
+| `:completed` | another keyword | A wrapper dropped the reply and named its own reason (`withhold-reply!`). |
+| `:waiting` | `:budget-exhausted`, `:attention-suspended` | The turn stopped at a resumable boundary. |
+| `:failed` | `:error` | The turn or its handler threw. |
+| `:failed` | `:reply-emission-failed` | Posting the reply failed. |
+| `:failed` | `:orphaned` | The process stopped while the Run was running (see below). |
+| `:cancelled` | `:cancel-requested` | The turn was cancelled (`cancel-run!`, `cancel-room-turn!`). |
+| `:cancelled` | `:participant-left` | The agent left the room mid-turn. |
 
 `:cancelling` exists only in the live snapshot between request and
 acknowledgement. A durable `:running` row after process loss means unfinished,
-not proof that work is still live; reconciliation is a later feature.
+not that work is still live: when the daemon loads its durable Rooms again,
+before a Room admits work, `run/reconcile-orphaned-runs!` fails every `:running` Run no live
+execution owns, with reason `:orphaned`. `:waiting` Runs are left as they are.
 Targeted cancellation uses a private per-Run token. It does not cancel or poison
 the actor's reusable ChatContext, so a later Run by the same actor can proceed.
 
 `:waiting` currently means this execution stopped at a resumable product
 boundary; it is no longer live and therefore does not appear in `active-runs`.
-A later message starts a new Run rather than resuming a parked continuation.
-When durable continuations exist, we can refine this state without changing Run
-identity or correlation.
+A later message starts a new Run. A stopped Run with a savepoint can be resumed
+on request (`program/resume!`, the `run_resume` op): the resume is a new Run
+whose cause is the old one; [run-resume.md](run-resume.md) describes it.
+
+## How a turn ends
+
+The handler of an LLM agent owns its turn's Run, but its reply passes through
+wrappers it does not know (silence filters, reply gating). So the Run is
+finished through a *reply obligation* (`dvergr.discourse`):
+
+- `reply-obligation!` registers one for the running handler, with callbacks for
+  a posted reply (`:on-emitted`), a failed post (`:on-failed`) and a dropped
+  reply (`:on-dropped`, with a reason);
+- `carry-obligation` marks the reply that settles it;
+- `withhold-reply!` is what a wrapper calls when it drops a reply, so its reason
+  (e.g. `:silent`) reaches the Run;
+- `release-obligation!` takes it back when the handler finishes the Run itself.
+
+The participant settles every obligation exactly once. One still open when the
+handler ends is settled as `:withheld`, as `:handler-failed` when the handler
+threw, and as `:abandoned` when the participant left; the table above shows the
+Run status each becomes.
 
 ## REPL use
 

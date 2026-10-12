@@ -10,10 +10,10 @@ Add dvergr to your `deps.edn`:
 
 ```clojure
 {:deps {org.clojure/clojure  {:mvn/version "1.12.0"}
-        org.replikativ/dvergr {:git/url "https://github.com/replikativ/dvergr"
-                                :git/sha "<sha>"}}}
+        org.replikativ/dvergr {:mvn/version "<version>"}}}
 ```
 
+The current version is on [Clojars](https://clojars.org/org.replikativ/dvergr).
 dvergr pulls in spindel, datahike, yggdrasil, SCI, and a small set of
 provider libraries automatically.
 
@@ -69,19 +69,20 @@ The fastest way to feel dvergr is the TUI chat client:
 clojure -M:cli
 ```
 
-You'll see a sidebar with one room (`scratch`) and a chat pane. Type
-a message, press **Enter**. The footer shows the budget used, the
-last turn's elapsed time + token counts, and the current generation
-status.
+You'll see the tree of rooms, agents and forks. Select a room and press
+**Enter** to open it, type a message and press **Enter** to send it. The
+room's header shows the budget used, the last turn's elapsed time + token
+counts, and the current generation status.
 
 Try:
 
-- **Ctrl-N** — create a fresh room (`room-2`)
-- **Tab** — cycle the active room
-- **q** or **Ctrl-C** — quit
+- **n** (in the tree) — create a room (it asks for a slug)
+- **Esc** — cancel a running turn, or go back to the tree
+- **Tab** — switch between the tree and the process list
+- **Ctrl-C** — quit
 
 Rooms, their history, and knowledge **persist automatically** in Datahike under
-`./.dvergr/`. There is no save/resume flag — restart `clojure -M:cli` and your
+the state root (`$DVERGR_HOME`, default `./.dvergr/`). There is no save/resume flag — restart `clojure -M:cli` and your
 rooms rehydrate from the store.
 
 See [cli.md](cli.md) for the full reference.
@@ -123,12 +124,17 @@ inbox, the audit log, anyone else listening) wake up:
 ```clojure
 (d/post! room (d/message :you :coder "What is 2 + 2?"))
 
-;; The reply lands asynchronously. Sleep a few seconds then read the log:
-(Thread/sleep 8000)
+;; The reply lands asynchronously; the room's log has it once it is there:
 (mapv (juxt :from :content) (d/log room))
-;; =>
-;; [[:you   "What is 2 + 2?"]
-;;  [:coder "4."]]
+```
+
+To wait for the reply instead, `d/ask` posts a message and returns a Spin of
+the answer; deref it at the REPL:
+
+```clojure
+(binding [ec/*execution-context* (:ctx room)]
+  (:content @(d/ask room :coder {:content "What is 2 + 2?"})))
+;; => "4."
 ```
 
 ### Step 4 — subscribe by capability tag
@@ -216,8 +222,6 @@ accept, the registered systems settle through the canonical fork handle.
   distributive law λ
 - **[CLI Reference](cli.md)** — `dvergr-cli` full keys + persistence +
   provider config
-- **[Programming Model](programming-model.md)** — the primitives,
-  bialgebra, ToM probes, and substrate forks
 - **[Examples](../examples/)** — runnable scenarios: manager
   escalation, streaming SLAs, auditor, humans + agents
 
@@ -244,6 +248,3 @@ registered `:codex-subscription-cli` compatibility provider instead.
 **"namespace 'dvergr.X' not found"** — check `(:provider config)`
 matches a registered provider. List models with
 `(dvergr.model.registry/list-models)`.
-
-**Streaming tokens drop** — this was a bug in `spindel.pubsub.pub`
-fixed in spindel 0.1.12. Upgrade.

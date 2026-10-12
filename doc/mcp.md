@@ -22,7 +22,7 @@ loopback TCP port (default `127.0.0.1:17888`). Its files live under the state ro
   relay another `--port` for another home (one daemon per home, one port per daemon);
 - when the daemon restarts, it reconnects, replays the handshake and sends
   `tools/list_changed`; a call in flight gets an error result saying the connection dropped;
-- it never starts a second daemon on a state root whose daemon (`.dvergr/daemon.pid`) runs
+- it never starts a second daemon on a state root whose daemon (`$DVERGR_HOME/daemon.pid`) runs
   without MCP; restart that one with `--mcp`, or set `:mcp` in its config.
 
 Claude Code (`.mcp.json` or `claude mcp add`):
@@ -43,9 +43,10 @@ tool_timeout_sec = 300
 ```
 
 Options (flags or environment): `--profile` / `DVERGR_MCP_PROFILE`, `--toolsets a,b` /
-`DVERGR_MCP_TOOLSETS`, `--port` / `DVERGR_MCP_PORT`, `--dir` / `DVERGR_DIR` (the checkout the
-daemon starts in), `DVERGR_HOME` (state root), `DVERGR_MCP_START` (the start command),
-`--no-start`, `--wait-s`.
+`DVERGR_MCP_TOOLSETS`, `--room` / `DVERGR_MCP_ROOM` and `--tools a,b` / `DVERGR_MCP_TOOLS`
+(below), `--port` / `DVERGR_MCP_PORT`, `--host` (default `127.0.0.1`), `--dir` / `DVERGR_DIR`
+(the checkout the daemon starts in), `DVERGR_HOME` (state root), `DVERGR_MCP_START` (the start
+command), `--no-start`, `--wait-s` (default 120).
 
 To run the daemon yourself: `clojure -M:cli --no-tui --mcp [--mcp-port 17888]`, or
 `:mcp {:port 17888 :profile "offload"}` in the config file. The daemon inherits its
@@ -67,12 +68,12 @@ paths are not the same measurement.
 
 **Over HTTP, without the relay.** Give the daemon `:mcp {:port 17888 :http {:port 17889}}` and
 it also serves Streamable HTTP at `http://127.0.0.1:17889/mcp` (loopback only). Requests need
-the bearer token the daemon writes to `.dvergr/mcp/http-token` (mode 0600) on its first start.
+the bearer token the daemon writes to `$DVERGR_HOME/mcp/http-token` (mode 0600) on its first start.
 Claude Code:
 
 ```sh
 claude mcp add --transport http dvergr http://127.0.0.1:17889/mcp \
-  --header "Authorization: Bearer $(cat .dvergr/mcp/http-token)"
+  --header "Authorization: Bearer $(cat "$DVERGR_HOME/mcp/http-token")"
 ```
 
 or in `.mcp.json`:
@@ -116,11 +117,11 @@ neither listed nor callable.
 | `wallets` | `room_wallet`, `models_list` |
 | `repl` | `clojure_eval` in the room's SCI sandbox |
 | `describe` | `repl_describe`: the REPL's API (dvergr namespaces, functions, signatures, docs), filtered by a query |
-| `agents` | agent administration, `room_invite` |
+| `agents` | agent administration (`agent_create`/`agent_update` take `tools`, below), `room_invite` |
 | `system` | statistics |
-| `admin` | archived rooms: `room_unarchive` brings one back, `room_purge` removes it and its stores for good (admin profile only) |
-| `code` | files, search, shell, tasks: for hosts without their own (off by default) |
-| `extra` | tools registered at runtime (channels) |
+| `admin` | `room_unarchive` brings an archived room back, `room_purge` removes it and its stores for good, `catalog_promote`, `run_resume` (admin profile only) |
+| `code` | every `dvergr.tools` registry tool but `clojure_eval` and `repl_describe`: files, search, shell, tasks, and the `schedule_*` and `mail_*` tools the daemon registers at start; for hosts without their own (off by default). The list follows the registry (`tools/list_changed`) |
+| `extra` | tools registered at runtime that are neither ops nor registry tools (channels) |
 
 **REPL-first (`--profile code`).** Two tools: `clojure_eval`, whose `dvergr.ops` namespace
 calls every op of the listed toolsets (see below), and `repl_describe` to discover the API
@@ -142,12 +143,21 @@ around 40, and every definition costs context in every session.
   destructive, so e.g. Codex asks before calling them.
 - **Results** are JSON text plus the same value as `structuredContent`; text beyond 60k
   characters is cut with a note (Claude Code caps a result at 25k tokens).
+- **A failure is an error.** An op that refuses or fails throws, and MCP returns it as a tool
+  error (`isError: true`) with its message, never as a success-shaped result. The JSON API
+  answers with the op's status: 400 for a request the caller can fix (an agent with a blank
+  id, a bad field value), 404 for an unknown room or agent, 409 for a taken agent id or a
+  write that met a concurrent change, 500 otherwise. `agent_delete` is idempotent: it answers
+  `{deleted: id}` whether or not the agent existed.
 - **Schemas** are flat and closed (`additionalProperties: false`, no `oneOf`/`anyOf`/`$ref`) and
   names match `^[a-z][a-z0-9_]{0,39}$`, so strict model APIs accept them; `server_test` checks
   every tool.
 - **Long work is a job.** `workflow_start` returns a job at once; `job_status {job, wait-ms}`
   answers when it finishes or after at most 25 s (below every common client timeout), and
-  `job_cancel` stops it. A job is a durable Run of its room, and the attempts it starts are its
+  `job_cancel` stops it. A benchmark job's status carries `progress` (`cells-done`,
+  `cells-total`, `faults`, and `phase`: `running`, `settling` while its fixture room is
+  archived after the last cell, `done`) and `settled`; poll until `status` is no longer
+  `running` and `settled` is not `false`, as `room-run` does. A job is a durable Run of its room, and the attempts it starts are its
   child Runs, so a client can restart and poll again (`job_list`), and a job outlives the
   daemon: after a restart it reads as it finished, or `failed` with reason `orphaned` if the
   daemon stopped while it ran. A workflow runs up to `parallelism` attempts at once (default 4).
@@ -166,11 +176,16 @@ around 40, and every definition costs context in every session.
   (.xlsx, PDF), at most 24 KiB per call (`offset`, `next-offset` for the rest), and `room_write
   {room, files, message}` writes a batch as one commit of the room's repository: `files` maps a
   path to `{"text": …}`, `{"base64": …}` or `null` (remove it), and only those paths are
-  committed. It is all or nothing: a refused or failed write undoes the batch, and a path another
-  writer changed meanwhile fails it rather than committing their bytes. It refuses while the
-  workspace has staged changes; symbolic links are neither read nor written through. Paths stay
-  in the workspace (no `..`, nothing under `.git`); a read-only world refuses the write and
-  receipts the refusal. There is no Git API:
+  committed; writing what is already there commits nothing (`commit` is null). At most 200
+  paths and 16 MiB per call, 8 MiB per file. It is all or nothing, with one exception: a refused
+  or failed write undoes the batch's own changes, and a path another writer changed meanwhile
+  fails it rather than committing their bytes; but a path changed by someone else between the
+  write and the undo is left as they made it, and the error names it (`conflicted`). There is
+  no client-side compare-and-write argument: each write compares against the batch's own
+  snapshot. It refuses while the workspace has staged changes; symbolic links are neither read
+  nor written through. Paths stay in the workspace (no `..`, nothing under `.git`, no path the
+  sandbox's sensitive-path policy refuses); a read-only world refuses the write and receipts
+  the refusal. There is no Git API:
   history is the room's (`room_fork`, `room_diff`, `room_review`, `room_merge`, `room_export`).
   Files are also resources, `room://{room}/files/{+path}` (a file whole up to 4 MiB, a directory as
   JSON).
@@ -199,14 +214,32 @@ around 40, and every definition costs context in every session.
   room_files        {room: "books", path: "/workflows/invoice-coding"}     # the bundle it wrote
   room_read         {room: "books", path: "/workflows/invoice-coding/certification.edn"}
   catalog_calibrate {room: "books", name: "invoice-coding"}
-  catalog_benchmark {workflow: "books/invoice-coding", models: ["…", "…"], room: "books"}
-  job_status        {job: <id>, wait-ms: 25000}                         # until completed
-  scorecard_list    {room: "books"}  →  scorecard_detail {room: "books", id: <id>}
+  catalog_benchmark {workflow: "books/invoice-coding", models: ["…", "…"], room: "books",
+                     experiment: "invoice-coding", cases: 30}
+  job_status        {job: <id>, wait-ms: 25000}                         # until settled
+  experiment_report {room: "books", experiment: <the job's experiment>}
   ```
 - **A benchmark can report into your room.** `catalog_benchmark {workflow, models, room}` (the
   `bench` profile) still
   runs every cell in a world forked from a new fixture room, but keeps the job, its Attempts and
   the Scorecard in `room`, where its dashboards (and `experiment_progress {room}`) show them.
+  `experiment` names the experiment: benchmarking again with the same name, workflow and
+  models into the same `room` resumes it (cells with a verdict made with the current inputs
+  are kept, the others run again). Without `room` each call keeps its results in its own new
+  fixture room, and without `experiment` each call is a new experiment, so neither resumes.
+  `cases` takes a dataset's first N cases of a fixed shuffle, `case-ids` names them instead.
+- **Reports.** `experiment_report {room, experiment?, scorecard?, baseline?}` renders a room's
+  experiment report as Markdown from its store. Its `experiment` is the ExperimentDef content
+  id, the `experiment` a `catalog_benchmark` job returns, not the name you passed it; without
+  it, the room's newest Scorecard made with the candidates' current inputs. The report's
+  paired comparisons (exact McNemar on the cases where two candidates differ, Holm-adjusted)
+  are also in its result as `paired`. `scorecard_detail {room, id, baseline?}` returns one
+  Scorecard as data: the leaderboard, every cell, the pass rate per check, `comparison`
+  (each candidate against `baseline`, default the top of the leaderboard) and `paired` (every
+  pair, or each against `baseline` when given).
+- **Agents.** `agent_create` and `agent_update` take `tools`, a list of tool names (`[]` for
+  none); an agent given `tools` gets exactly those, one without them gets the tools its tags
+  choose.
 - **Money is in the result.** A workflow result has each attempt's spend, the per-model table
   (cost per completed attempt) and the room's wallet afterwards.
 - **A query cannot reach the host.** Datahike queries and transactions from the sandbox

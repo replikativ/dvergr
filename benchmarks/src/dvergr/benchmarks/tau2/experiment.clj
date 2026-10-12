@@ -1,15 +1,17 @@
 (ns dvergr.benchmarks.tau2.experiment
   "tau2 experiments as certified Dvergr experiments.
 
-   Every cell (candidate x task x repetition) is a certified conversational
-   episode (`dvergr.benchmarks.tau2.episode`); cells run on bounded host
-   threads. The experiment directory is a dvergr home: the experiment Room
+   Every cell (candidate x task x repetition) is one evaluation through
+   `dvergr.agent.experiment/run` with tau2's capabilities
+   (`dvergr.benchmarks.tau2.provider`), in a forked world discarded after
+   certification. The experiment directory is a dvergr home: the experiment Room
    (episode Rooms, Runs, messages, Attempts, Scorecard) is a room of it, in
    that room's Datahike store (`dvergr.agent.experiment.runner/run!`).
-   Re-running with the same home resumes: cells with a verdict are kept.
-   When every cell has an Attempt the Scorecard is persisted.
+   Re-running with the same home resumes: cells with a verdict made with the
+   current inputs are kept. When every cell has a verdict the Scorecard is
+   persisted.
 
-     (run! {:dir \".dvergr/benchmarks/retail-cmp\" :domain dom
+     (run! {:dir \"runs/retail-cmp\" :domain dom
             :task-ids [\"0\" \"1\"] :repetitions 2 :parallelism 3
             :candidates [{:id :reference :harness :reference :model \"claude-code-sonnet\"}
                          {:id :dvergr-repl :harness :dvergr :action-space :repl
@@ -96,8 +98,9 @@
   runner/host-context-note)
 
 (defn run!
-  "Run (or resume) an experiment. Returns `{:dir :experiment-room :experiment
-   :results :failed-cells :scorecard}`.
+  "Run (or resume) an experiment. Returns `runner/run!`'s result (`:dir :room
+   :experiment-room :experiment :results :failed-cells :stale-cells :scorecard
+   :report`, …).
 
    Every cell is one `dvergr.agent.evaluation/evaluate` through
    `dvergr.agent.experiment/run`, with tau2's capabilities from

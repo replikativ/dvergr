@@ -1,7 +1,7 @@
 (ns dvergr.benchmarks.tau2.inspect
   "Read-only inspection of a recorded tau2 experiment store.
 
-     (def xs (runner/open-experiment \".dvergr/benchmarks/<experiment>\")) ; its home
+     (def xs (runner/open-experiment \"runs/<experiment>\")) ; its home
      (summary xs (:room-id xs))                    ; per candidate: reward, pass^k
      (attempts xs (:room-id xs))                   ; certified Attempts
      (def e (episode xs (:room-id xs) attempt-id))

@@ -24,12 +24,12 @@ clojure -M:cli --no-tui --web
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `-p`, `--port PORT` | `7888` | nREPL port (written to `.nrepl-port` for editor/`clj-nrepl-eval` auto-discovery) |
-| `--nrepl-port-file PATH` | `.nrepl-port` | where to write the nREPL port |
+| `--nrepl-port-file PATH` | `.nrepl-port` | where to write the nREPL port (parent directories are created; a file that cannot be written stops the start with exit code 1) |
 | `--no-tui` | — | run without the TUI (daemon + nREPL only) |
 | `--web` | — | also start the web dashboard |
 | `--web-port PORT` | `17880` | web dashboard port (with `--web`) |
 | `--web-bind IP` | `127.0.0.1` | web bind address — the UI/API are unauthenticated, so default is loopback. Loopback does not keep out the pages your browser shows, so the server also checks the Host header (DNS rebinding), the Origin of every state-changing request and a per-session CSRF token; a reverse proxy's name and origin go in `:http {:allowed-hosts […] :allowed-origins […]}` |
-| `--mcp` | — | also serve MCP on loopback TCP (clients connect through `bin/dvergr-mcp`; [mcp.md](mcp.md)) |
+| `--mcp` | — | also serve MCP on loopback TCP (clients connect through `bin/dvergr-mcp`; [mcp.md](mcp.md)). The daemon names its state root in `server/discover`'s `_meta` (`dvergr/home`), and the relay refuses a daemon of another state root |
 | `--mcp-port PORT` | `17888` | MCP port (with `--mcp`) |
 | `-h`, `--help` | — | show usage |
 
@@ -40,43 +40,45 @@ Fireworks → OpenAI → native Codex subscription → isolated Codex CLI → th
 `claude` CLI). See [provider-setup.md](provider-setup.md) and
 [configuration.md](configuration.md).
 
-## Layout
+## Views
 
-```
-┌─ rooms ─────────┬─ dvergr · room: scratch · $0.12 / $1.00 · last 8.3s 245tok $0.0012 · ● generating ─┐
-│ rooms           │                                                                                    │
-│ ────────────    │  you  > Refactor src/app.clj                                                       │
-│ ▸ scratch       │  coder> I'll start by reading the file.                                            │
-│   plan          │         [tool: read_file src/app.clj]                                              │
-│   triage        │         ...                                                                        │
-│                 │                                                                                    │
-│ Ctrl-N: new     │ > _                                                                                │
-└─────────────────┴────────────────────────────────────────────────────────────────────────────────────┘
-                      Enter: send · Ctrl-N: new room · Tab: cycle · Esc: cancel · Ctrl-C/q: quit
-```
+The TUI has a few views; **Tab** switches between the tree and the process list,
+and leaves a room for the tree.
 
-- **Sidebar** (left): rooms list, active room marked `▸`
-- **Header**: room name, live budget, last-turn elapsed/tokens/cost, in-flight tool, generation status
-- **Body**: scrolling messages — your turns prefixed `you  > `, the agent's `coder> `; an in-progress reply streams into a draft line until the turn finishes
-- **Footer**: input prompt + key hints
+- **Tree** (`Rooms · Agents · Forks`): rooms, their forks and the agents. Keys not
+  listed below go to the tree component (moving the selection), **Enter** opens a
+  room (or an agent's config), and single keys act on the selection.
+- **Room**: the room's messages with an input line; a reply streams in as it is
+  written. Typing `/` opens the command menu (↑/↓ select, Tab or Enter complete).
+- **Processes**: the running processes of the chat, with abort / continue / extend.
+- **Agent config**: an agent's fields, edited in place.
 
 ## Keys
 
-| Key | Action |
-|---|---|
-| **Enter** | Send the input line to the active room's agent |
-| **Ctrl-N** | Create a new room and switch to it |
-| **Tab** | Cycle the active room |
-| **Esc** | Cancel the current turn (interrupts the agent's generation) |
-| **Ctrl-R** | Voice input — press to start recording, again to stop; transcribes and posts as a `🎤` message ([setup](media.md#recording-repl--tui)) |
-| **Ctrl-T** / **Ctrl-E** | Toggle the trace view / per-agent context bars |
-| **Ctrl-C** / **q** (input empty) | Quit |
-| **Backspace** / printable chars | Edit input |
+| Key | Where | Action |
+|---|---|---|
+| **Ctrl-C** | anywhere | Quit |
+| **Tab** | anywhere | Switch view: tree ↔ processes; from a room, back to the tree |
+| **Ctrl-O** | anywhere | Toggle mouse reporting (on: wheel scrolls; off: the terminal selects and copies text) |
+| **Enter** | tree | Open the selected room, or the selected agent's config |
+| **n** / **a** | tree | New room (asks for a slug) / new agent (asks for an id); Esc cancels the prompt |
+| **c** | tree | Chat with the selected agent |
+| **f** | tree | Fork the selected room (`:ctx` isolation) |
+| **m** / **x** | tree | Merge the selected fork into its parent / discard it (asks y / n) |
+| **d** | tree | Archive the selected room |
+| **Enter** | room | Send the input line (a `/command` runs instead) |
+| **Esc** | room | Cancel the running turn; when none runs, back to the tree |
+| **PageUp** / **PageDown**, wheel | room | Scroll |
+| **Ctrl-R** | room | Voice input — press to start recording, again to stop; transcribes and posts as a `🎤` message ([setup](media.md#recording-repl--tui)) |
+| **Ctrl-T** / **Ctrl-E** | room | Toggle the trace view / per-agent context bars |
+| **j** / **k**, **e** or **Enter**, **p**, **c**, **x**, **Esc** | agent config | Move, edit a field, edit the prompt in `$EDITOR`, chat, delete (asks y / n), back |
+| **j** / **k**, **a** / **c** / **e** | processes | Move; abort, continue, or extend the focused process by $0.10 |
 
 ## Persistence
 
 Rooms, their message history, knowledge, and per-agent budget **persist
-automatically** in Datahike under `./.dvergr/` (the daemon owns the stores). There
+automatically** in Datahike under the state root (`$DVERGR_HOME`, default `./.dvergr`;
+the daemon owns the stores). There
 is no save/resume step — restart `clojure -M:cli` and your rooms rehydrate from the
 registry + stores, the agent continuing with full conversational state. Forks made
 with `:isolation :ctx` carry their own branched stores until merged or discarded.
@@ -109,14 +111,12 @@ to the same bus channels.
 ## Troubleshooting
 
 **Agent doesn't reply** — make sure a provider is configured (a key in env or
-`config.local.edn`). Reply errors print to stderr; the daemon log is `.dvergr/dvergr.log`.
+`config.local.edn`). Reply errors print to stderr; the daemon log is `dvergr.log` in the state root
+(`$DVERGR_HOME`, default `./.dvergr`).
 List registered models with `(dvergr.model.registry/list-models)` over the nREPL.
 
 **Garbled output / Unicode issues** — the terminal needs UTF-8 + 256-color. The TUI
 uses JLine; in an unusual terminal set `TERM=xterm-256color`.
-
-**Tab doesn't cycle rooms** — some terminals map Tab to focus-change; Ctrl-Tab is
-also wired.
 
 ## See also
 
