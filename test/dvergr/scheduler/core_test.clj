@@ -1,8 +1,11 @@
 (ns dvergr.scheduler.core-test
   "Tests for the room-scoped schedule CRUD (RF5). Schedules live in the room's
    own datahike store; firing is covered by dvergr.rooms.scheduler-test."
-  (:require [clojure.test :refer [deftest is testing use-fixtures]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as dh]
+            [dvergr.sandbox :as sandbox]
+            [dvergr.sandbox.ns.agent :as agent-ns]
             [dvergr.chat.schema :as cschema]
             [dvergr.scheduler.schema :as sched-schema]
             [dvergr.scheduler.core :as scheduler]
@@ -13,7 +16,8 @@
             [dvergr.room.store.datahike :as store-dh]
             [dvergr.tools :as tools]
             [org.replikativ.spindel.engine.core :as ec]
-            [org.replikativ.spindel.engine.context :as ectx]))
+            [org.replikativ.spindel.engine.context :as ectx]
+            [sci.core :as sci]))
 
 (def ^:dynamic *room* nil)
 (def ^:dynamic *cleanup* nil)
@@ -131,3 +135,22 @@
     (is (some? (tools/get-tool "schedule_create")))
     (is (some? (tools/get-tool "schedule_list")))
     (is (some? (tools/get-tool "schedule_cancel")))))
+
+(deftest the-sandbox-prompts-scheduler-calls-run
+  (testing "every `(dvergr.scheduler/…)` call the sandbox system prompt shows
+            creates a schedule in the room as written"
+    (let [forms (->> (re-seq #"`(\(dvergr\.scheduler/[^`]+)`" sandbox/sandbox-prompt-pointer)
+                     (map second)
+                     ;; the CODE-task example names the agent as `<you>`
+                     (map #(str/replace % "<you>" ":agent")))]
+      (is (= #{"every" "at" "create"}
+             (set (map #(second (re-find #"^\(dvergr\.scheduler/(\S+)" %)) forms))))
+      (with-redefs [scheduler/current-room (constantly *room*)]
+        (let [ctx (doto (sci/init {}) (agent-ns/add-scheduler-ns!))]
+          (doseq [form forms]
+            (is (uuid? (sci/eval-string* ctx form)) form))
+          (is (= (count forms) (count (scheduler/list-schedules *room*))))
+          (testing "a one-shot `at` needs a date: a bare time is refused"
+            (is (thrown? Exception
+                         (sci/eval-string*
+                          ctx "(dvergr.scheduler/at \"09:00\" :agent \"task\")")))))))))
