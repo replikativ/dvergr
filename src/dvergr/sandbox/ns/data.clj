@@ -300,7 +300,7 @@
    for `:world-policy :fork`: each particle then executes in a frozen
    canonical Yggdrasil world and only its immutable result projection
    survives; particle worlds are discarded before the inference Spin
-   completes. Forks cost far more (a fork per particle).
+   completes. A fork per particle costs about three times as much.
 
    Namespaces added:
    - dist/   — foerster distributions: normal, uniform, exponential, gamma
@@ -440,7 +440,7 @@
   ;; Inference runners — these take/return Spins and compose with await in Spin
   ;; bodies. Fresh worlds by default: they cannot reach the ambient room (a
   ;; capability call fails there, see dvergr.runtime.ctx/selected-context),
-  ;; and a fork per particle costs a few hundred times as much. A model that
+  ;; and a fork per particle costs about three times as much. A model that
   ;; needs room state asks for :world-policy :fork.
   (let [smc*        @(resolve 'org.replikativ.foerster.core/smc-infer)
         importance* @(resolve 'org.replikativ.foerster.core/importance-sampling)

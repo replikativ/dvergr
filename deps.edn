@@ -90,7 +90,7 @@
         ;; stayed :running); child awaits, inline child completion and a
         ;; directly cancelled race no longer strand or double-run their
         ;; continuations (#118).
-        org.replikativ/spindel     {:mvn/version "0.1.111"}
+        org.replikativ/spindel     {:mvn/version "0.1.112"}
         ;; probabilistic inference in forkable worlds, split out of spindel:
         ;; the sandbox's infer/ and dist/ namespaces (foerster.core, .dist).
         ;; 0.1.45: savepoint inference throughout, resample-move, tempering,
