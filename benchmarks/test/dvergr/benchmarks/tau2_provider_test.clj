@@ -205,3 +205,24 @@
               (is (empty? (run/active-runs (:id room))))
               (is (some? result)))))
         (finally (d/close-room! room))))))
+
+(deftest repl-guidance-is-part-of-the-candidate
+  ;; Specs that differ only in :repl-guidance are distinct AgentDefs (and,
+  ;; with a domain, carry distinct system-prompt hashes).
+  (let [spec {:harness :dvergr :action-space :repl :model "claude-code-sonnet"}
+        meta-of (fn [team id] (:agent/metadata (roster/agent team id)))
+        team (tx/candidate-roster [(assoc spec :id :a :repl-guidance :compute)
+                                   (assoc spec :id :b :repl-guidance :inspect)
+                                   (assoc spec :id :c)])]
+    (is (= :compute (:conversation/repl-guidance (meta-of team :a))))
+    (is (= :inspect (:conversation/repl-guidance (meta-of team :b))))
+    (is (not (contains? (meta-of team :c) :conversation/repl-guidance)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unknown :repl-guidance"
+                          (tx/candidate-roster [(assoc spec :id :x :repl-guidance :nope)])))
+    (when checkout?
+      (let [dom (t2/load-domain "retail")
+            team (tx/candidate-roster [(assoc spec :id :a :repl-guidance :compute)
+                                       (assoc spec :id :b :repl-guidance :inspect)]
+                                      dom)]
+        (is (not= (:conversation/system-prompt-sha256 (meta-of team :a))
+                  (:conversation/system-prompt-sha256 (meta-of team :b))))))))

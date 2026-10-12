@@ -217,7 +217,7 @@ around 40, and every definition costs context in every session.
   room_read         {room: "books", path: "/workflows/invoice-coding/certification.edn"}
   catalog_calibrate {room: "books", name: "invoice-coding"}
   catalog_benchmark {workflow: "books/invoice-coding", models: ["…", "…"], room: "books",
-                     experiment: "invoice-coding", cases: 30}
+                     name: "invoice-coding", cases: 30}
   job_status        {job: <id>, wait-ms: 25000}                         # until settled
   experiment_report {room: "books", experiment: <the job's experiment>}
   ```
@@ -225,10 +225,10 @@ around 40, and every definition costs context in every session.
   `bench` profile) still
   runs every cell in a world forked from a new fixture room, but keeps the job, its Attempts and
   the Scorecard in `room`, where its dashboards (and `experiment_progress {room}`) show them.
-  `experiment` names the experiment: benchmarking again with the same name, workflow and
-  models into the same `room` resumes it (cells with a verdict made with the current inputs
-  are kept, the others run again). Without `room` each call keeps its results in its own new
-  fixture room, and without `experiment` each call is a new experiment, so neither resumes.
+  `name` names the experiment (`experiment` is its deprecated alias): benchmarking again with
+  the same name, workflow and models into the same `room` resumes it (cells with a verdict made
+  with the current inputs are kept, the others run again). Without `room` each call keeps its results in its own new
+  fixture room, and without `name` each call is a new experiment, so neither resumes.
   `cases` takes a dataset's first N cases of a fixed shuffle, `case-ids` names them instead.
 - **Reports.** `experiment_report {room, experiment?, scorecard?, baseline?}` renders a room's
   experiment report as Markdown from its store. Its `experiment` is the ExperimentDef content
