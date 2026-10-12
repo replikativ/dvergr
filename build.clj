@@ -1,10 +1,9 @@
 (ns build
   "Build script for dvergr — both a library jar (for Clojars / git-dep
-   consumers) and a runnable MCP-server uberjar.
+   consumers) and the runnable standalone harness uberjar.
 
    Usage:
      clj -T:build jar        # Library jar + pom  (org.replikativ/dvergr)
-     clj -T:build uber       # Runnable MCP-server uberjar (main dvergr.mcp.server)
      clj -T:build harness    # Standalone harness uberjar — daemon + nREPL + TUI +
                              #   web + Telegram (main dvergr.cli.main, :cli deps)
      clj -T:build install    # Install the library jar to ~/.m2
@@ -25,7 +24,6 @@
 (def class-dir "target/classes")
 (def basis (delay (b/create-basis {:project "deps.edn"})))
 (def jar-file (format "target/%s-%s.jar" (name lib) version))
-(def uber-file (format "target/%s-%s-standalone.jar" (name lib) version))
 ;; The standalone harness includes the :cli alias (src-clients/ — the TUI + CLI
 ;; entry — plus the web + mail + nREPL deps).
 (def harness-basis (delay (b/create-basis {:project "deps.edn" :aliases [:cli]})))
@@ -66,21 +64,6 @@
   (b/copy-dir {:src-dirs ["src" "resources"] :target-dir class-dir})
   (b/jar {:class-dir class-dir :jar-file jar-file})
   (println (str "JAR: " jar-file " (version " version ")")))
-
-(defn uber
-  "Build the runnable MCP-server uberjar (main = dvergr.mcp.server)."
-  [_]
-  (clean nil)
-  (b/copy-dir {:src-dirs ["src" "resources"] :target-dir class-dir})
-  (b/compile-clj {:basis @basis
-                  :src-dirs ["src"]
-                  :class-dir class-dir
-                  :ns-compile '[dvergr.mcp.server]})
-  (b/uber {:class-dir class-dir
-           :uber-file uber-file
-           :basis @basis
-           :main 'dvergr.mcp.server})
-  (println (str "Uberjar: " uber-file " (version " version ")")))
 
 (defn harness
   "Build the standalone harness uberjar: one runnable jar that boots the daemon +

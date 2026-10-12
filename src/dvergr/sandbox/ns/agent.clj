@@ -737,7 +737,7 @@
            experiment   [([spec]) "Create a portable full-factorial ExperimentDef. Requires a DatasetDef and a non-empty vector of AgentDefs; repetitions default to one. Candidates bind exact AgentDef content. Concurrency and admission ceilings remain host policy."]
            experiment-ref [([experiment]) "Return the stable logical/version/content reference for one exact ExperimentDef. Running and trusted scoring remain host-owned capabilities."]
            room-id      [([]) "Return the live identity of the current Room/world. In an isolated fork this is the child Room, not its parent."]
-           hire!        [([roster agent-ref opts]) "Durably start one owned AgentDef in the current Room: (hire! team :a {:task value :resources {\"microUSD\" 1000}}). Returns a RunHandle. The current Run remains responsible for the child even if the handle is ignored. opts: :task (required); :from (a keyword sender); :settlement (:automatic, :review or :discard); :resources, a MAP of resource coordinate → positive amount (e.g. {\"microUSD\" 1000}) split from the current Run/Room's conserved balance; :limits {:max-model-steps n :budget-dollars x}, which can only TIGHTEN the agent's own limits for this Run; :parent-run, the parent Run's uuid (defaults to the current Run and, when one is ambient, must equal it). Unknown keys are rejected."]
+           hire!        [([roster agent-ref opts]) "Durably start one owned AgentDef in the current Room: (dvergr.agent/hire! team :a {:task value :resources {\"microUSD\" 1000}}). Returns a RunHandle. The current Run remains responsible for the child even if the handle is ignored. opts: :task (required); :from (a keyword sender); :settlement (:automatic, :review or :discard); :resources, a MAP of resource coordinate → positive amount (e.g. {\"microUSD\" 1000}) split from the current Run/Room's conserved balance; :limits {:max-model-steps n :budget-dollars x}, which can only TIGHTEN the agent's own limits for this Run; :parent-run, the parent Run's uuid (defaults to the current Run and, when one is ambient, must equal it). Unknown keys are rejected."]
            run-experiment! [([roster experiment] [roster experiment opts]) "Run an ExperimentDef as a sub-experiment of the current Run: a job Run (its child) whose cells are attempts in worlds forked from the current Room/world, scored only by verifiers this host offers (see `offered`), certified with this Run's records. Candidates are held to the same program ceiling as `hire!`. Returns a Spin resolving to {:job uuid :status :completed|:failed|:cancelled :scorecard ScorecardDef (when completed) :error string}. Cancelling the current Run cancels it. opts: :parallelism (default 1)."]
            offered      [([]) "The verifier and world-setup refs this host offers to experiments: {:evaluators [ref ...] :world-setups [ref ...]}."]
            observe      [([handle-or-run-id]) "Read the current Room's durable Run projection for a RunHandle or UUID."]
@@ -812,15 +812,14 @@
                              'by-tag  [:=> [:cat :keyword] [:vector OnlineAgent]]})))))
 
 (defn add-skills-ns!
-  "Expose the skill registry + dispatch as 'skills namespace in SCI.
+  "Expose the skill registry + dispatch as the `dvergr.skills` namespace in SCI.
 
    Usage:
-     (require '[skills])
-     (skills/all)                        ; every skill on disk
-     (skills/find :research)             ; skill maps providing :research
-     (skills/providers :research)        ; actor-ids that declare :research
-     (skills/rank :research)             ; ranked online providers
-     (skills/dispatch :research)         ; the single best provider (actor map or nil)"
+     (dvergr.skills/all)                 ; every skill on disk
+     (dvergr.skills/find :research)      ; skill maps providing :research
+     (dvergr.skills/providers :research) ; actor-ids that declare :research
+     (dvergr.skills/rank :research)      ; ranked online providers
+     (dvergr.skills/dispatch :research)  ; the single best provider (actor map or nil)"
   [sci-ctx conn & [effects]]
   (load/require! 'dvergr.orchestration.skills)
   (let [load-all*   @(ns-resolve 'dvergr.orchestration.skills 'load-all)
@@ -1243,7 +1242,7 @@
          '{every    [([period agent-id task]
                       [period at agent-id task]
                       [period day-of-week at agent-id task])
-                     "Recurring schedule in THIS room. `period` is :day/:week/…, `at` is \"HH:MM\" wall-clock, `day-of-week` a keyword like :monday. e.g. (every :day \"09:00\" :huginn \"Morning sweep\")."]
+                     "Recurring schedule in THIS room. `period` is :day/:week/…, `at` is \"HH:MM\" wall-clock, `day-of-week` a keyword like :monday. e.g. (dvergr.scheduler/every :day \"09:00\" :huginn \"Morning sweep\")."]
            at       [([iso-datetime agent-id task])
                      "One-shot at a FULL ISO datetime — \"2026-04-01T09:00\", not \"09:00\". For a daily wall-clock time use `every` instead."]
            interval [([ms agent-id task])

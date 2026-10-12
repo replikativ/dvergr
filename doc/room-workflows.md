@@ -132,13 +132,13 @@ list price of the API model a subscription model corresponds to (its registry en
 
 **In a daemon**, `catalog_benchmark` runs the experiment in a room (`runner/run-in`) as a
 job (budget per attempt: $0.50 unless given; `cases` takes the first N cases, as above).
-With `experiment` (a name) the experiment keeps its identity: benchmarking again with the
+With `name` (`experiment` is its deprecated alias) the experiment keeps its identity: benchmarking again with the
 same name, workflow and models into the same `room` resumes it (cells with a verdict made with
 the current inputs are kept). Without `room` the results stay in the new fixture room, and
-without `experiment` every call is a new experiment, so neither resumes. `case-ids` names the
+without `name` every call is a new experiment, so neither resumes. `case-ids` names the
 cases instead of `cases`; `params` and `prompt` override the workflow's task parameters and the
 candidates' system prompt. `experiment_report {room, experiment?}` renders the report from the
-room's store. Its `experiment` is not the name: it is the ExperimentDef content id, which the
+room's store. Its `experiment` is not the `name`: it is the ExperimentDef content id, which the
 job returns as `experiment` (beside its `scorecard` once completed).
 
 A bundle with `:fetched true` in `workflow.edn` records its Attempts' effects (`:world
@@ -274,7 +274,7 @@ checkout and no agent in the room. The whole flow:
    (`certification.edn` says which cases were kept and why the others were not).
 4. `catalog_calibrate {room: "books", name: "invoice-coding"}`
 5. `catalog_benchmark {workflow: "books/invoice-coding", models: [...], room: "books",
-   experiment: "invoice-coding"}`, then `job_status` until it is over and `settled`.
+   name: "invoice-coding"}`, then `job_status` until it is over and `settled`.
    Each `job_status` waits up to 25 s and shows `progress` (cells done of the total, faults,
    the phase).
 6. `scorecard_list {room: "books"}` and `scorecard_detail {room: "books", id}`.

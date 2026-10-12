@@ -105,6 +105,22 @@
    :knowledge-worker minimal-readonly-tools   ; read + shell + clojure_eval (inspect + program, no mutation)
    :readonly         minimal-readonly-tools})
 
+(def ^:private self-registering-namespaces
+  "Namespaces that register tools when they load and that an agent's sandbox
+   loads as it is built (`dvergr.sandbox.ns.kb` loads `llm_call`, the intake
+   namespace loads the mail tools). Resolving tool names loads them first, so
+   what a name resolves to never depends on whether a sandbox happened to be
+   built before: an LLM Run resolves its tools after building its sandbox,
+   the prediction of its inputs before."
+  '[dvergr.tools.llm-call dvergr.intake.mail])
+
+(defn- ensure-self-registered! []
+  (doseq [n self-registering-namespaces]
+    ;; optional, as where the sandbox loads them: one that cannot load
+    ;; registers nothing either way
+    (try ((requiring-resolve 'dvergr.substrate.load/require!) n)
+         (catch Throwable _ nil))))
+
 (defn normalize-tools
   "Normalize a tools spec to the name→tool-def map `tool-definitions` expects.
    Accepts:
@@ -123,6 +139,7 @@
     (map? tools) tools
     (or (set? tools) (sequential? tools))
     (let [name-strs (map #(if (keyword? %) (str/replace (name %) "-" "_") (str %)) tools)]
+      (ensure-self-registered!)
       (select-keys @registry name-strs))
     :else tools))
 

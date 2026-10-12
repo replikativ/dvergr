@@ -152,7 +152,7 @@
   "Build the `## Skills` block appended to an agent's system prompt. Progressive
    disclosure: inject only a BRIEF index (name — description) so the prompt stays
    small as the library grows; the agent reads the full instructions on demand
-   with `(skills/read \"<name>\")`. Skills with `always: true` inject their full
+   with `(dvergr.skills/read \"<name>\")`. Skills with `always: true` inject their full
    body (for short, always-on skills). Returns nil if empty."
   [skills]
   (when (seq skills)
@@ -160,7 +160,7 @@
           brief  (remove :always skills)]
       (str "\n\n---\n\n## Skills\n\n"
            "You have skills available. Each is a short instruction set; read the "
-           "FULL text before using one with `(skills/read \"<name>\")` in "
+           "FULL text before using one with `(dvergr.skills/read \"<name>\")` in "
            "clojure_eval.\n\n"
            (str/join "\n"
                      (for [s brief]

@@ -80,7 +80,7 @@ then discarded. What lives in the fork differs:
   id and the start of its content id), so a changed experiment never resumes
   into another's room. `room-run` keeps every version in the room `<bundle
   name>` as the experiment `<bundle name>`, and `catalog_benchmark` in its
-  `room` under its `experiment` name; a changed bundle or model list there is
+  `room` under its `name`; a changed bundle or model list there is
   a new ExperimentDef in the same room, and its cells start afresh.
 - A cell that faults (the path to the model failed: transport, provider
   limits, a sidecar) has no verdict and runs again, once more within the same

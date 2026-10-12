@@ -26,7 +26,7 @@ Share target pages with the integration.
 ## Usage
 
 ```clojure
-(require '[http] '[env])
+(require '[babashka.http-client :as http] '[cheshire.core :as json] '[env])
 
 (def notion-key (env/get "NOTION_API_KEY"))
 
@@ -38,7 +38,7 @@ Share target pages with the integration.
                           "Notion-Version" "2022-06-28"
                           "Content-Type" "application/json"}
                 :json body})]
-    (:body resp)))
+    (json/parse-string (:body resp) true)))
 
 ;; Search pages
 (notion-api :post "/search"

@@ -75,10 +75,9 @@ A provider is a namespace (`dvergr.benchmarks.<name>.provider`) with:
    (driver, judge) are in the capability references, hence in its content id.
 4. **A candidate roster**: AgentDefs; what varies (model, action space, prompt
    digest) is in the AgentDef so that a change is a new candidate, never
-   resumed into old cells (tau2's `:repl-guidance` is not, see its
-   Candidates section). What a protocol assembles at Run start from code
-   rather than from the AgentDef (a system prompt template, tool schemas) it
-   declares as `:inputs`, so that a change re-runs the cells made before it
+   resumed into old cells (tau2's `:repl-guidance` included). What a protocol
+   assembles at Run start from code rather than from the AgentDef (a system
+   prompt template, tool schemas) it declares as `:inputs`, so that a change re-runs the cells made before it
    (see "Resume and inputs ids").
 5. **An equivalence proof** when the benchmark is a transcription (below), and
    a scripted candidate that replays gold answers, so the whole path is tested
@@ -1185,11 +1184,11 @@ arguments (7.9k characters against 11.8k of JSON schema), and
 runtime. Before 2026-09-19 it saw only tool names. The REPL candidate's prompt
 ends with action-space guidance (`episode/repl-guidance`: `:shape`, the default;
 `:compute`; `:inspect`), chosen by the AgentDef's `:conversation/repl-guidance`.
-The decision-point probes (`tau2.probe`) set it from a spec's `:repl-guidance`;
-`tx/run!` does not: `candidate-roster` takes `:repl-guidance` from the spec but
-puts it neither into the AgentDef nor into the system prompt whose sha256 the
-AgentDef carries, so every REPL candidate of an experiment gets `:shape`, and two
-specs that differ only in `:repl-guidance` are the same candidate. `tau2/shape` exists because REPL agents computed over data they had
+`candidate-roster` (so `tx/run!`) and the decision-point probes (`tau2.probe`)
+set it from a spec's `:repl-guidance`, and it enters the system prompt whose
+sha256 the AgentDef carries, so two specs that differ only in `:repl-guidance`
+are two candidates. Before 2026-10-12 `candidate-roster` dropped it: every REPL
+candidate of an experiment got `:shape`. `tau2/shape` exists because REPL agents computed over data they had
 not looked at: product `variants` are a map keyed by item id, and
 `(filter #(get % "available") variants)` over its entries counted nothing.
 

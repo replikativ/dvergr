@@ -11,7 +11,7 @@ source: dvergr
 ---
 Explain **$ARGUMENTS** in depth.
 
-- If it's a file or namespace, read it first with `clojure_eval` (`(bash/run "cat …")` or `(fs/read "…")`), then explain what it does, how it fits the wider system, and any gotchas.
+- If it's a file or namespace, read it first with `clojure_eval` (`(slurp "…")` or `(babashka.process/shell "cat …")`), then explain what it does, how it fits the wider system, and any gotchas.
 - If it's a concept, explain it concretely with reference to where it shows up in this codebase.
 
 Be precise and cite `file:line` where useful.

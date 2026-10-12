@@ -23,8 +23,9 @@ an `:external` actor so other agents can dispatch to its tools.
 1. Probe the MCP endpoint for its tool list (`tools/list` over HTTP).
 2. Map each MCP tool to a `:provides` tag (often the tool name
    becomes a kebab-case keyword).
-3. `(dvergr.actors/spawn-agent! {:id <kw> :kind :external ...})`
-   — set `:actor/config` to `{:transport :mcp :url <url> :auth ...}`.
+3. `(dvergr.actors/spawn-agent! {:id :github-mcp :skills #{:github} :config {:transport :mcp :url "https://example.org/mcp"}})`
+   — the sandbox records it as an `:agent` actor (it cannot create
+   `:external` ones yet), with the endpoint in its `:config`.
 4. Tell the user which skills the new actor now provides.
 
 ## Caveats

@@ -264,9 +264,6 @@
                        org.replikativ/spindel-tui {:local/root "../spindel-tui"}
                        org.replikativ/muschel     {:local/root "../muschel"}}}
 
-  ;; MCP server for exposing dvergr capabilities to MCP-capable clients
-  :mcp-server {:main-opts ["-m" "dvergr.mcp.server"]}
-
   ;; CLI: the user-facing entry. Starts daemon + nREPL + TUI.
   ;; Equivalent to running dvergr.cli.main/-main directly (see that ns
   ;; for flags: -p/--port, --no-tui, --help). Headless mode is
@@ -303,9 +300,8 @@
            :main-opts  ["-m" "cljfmt.main" "fix" "src" "src-clients" "test" "examples"
                         "benchmarks/src" "benchmarks/test"]}
 
-  ;; Build tooling: library jar, MCP uberjar, install, clojars deploy.
+  ;; Build tooling: library jar, harness uberjar, install, clojars deploy.
   ;;   clj -T:build jar       — library jar + pom (org.replikativ/dvergr)
-  ;;   clj -T:build uber      — runnable MCP-server uberjar
   ;;   clj -T:build install   — install the library jar to ~/.m2
   ;;   clj -T:build deploy    — deploy to Clojars (needs CLOJARS_USERNAME/PASSWORD)
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.5"}

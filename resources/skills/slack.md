@@ -26,17 +26,18 @@ Get a token: https://api.slack.com/apps → Create App → Bot Token Scopes: `ch
 ## Usage
 
 ```clojure
-(require '[http] '[env])
+(require '[babashka.http-client :as http] '[cheshire.core :as json] '[env])
 
 (def slack-token (env/get "SLACK_TOKEN"))
 
 (defn slack-api [method params]
   (let [resp (http/post (str "https://slack.com/api/" method)
                {:headers {"Authorization" (str "Bearer " slack-token)}
-                :json params})]
-    (if (:ok (:body resp))
-      (:body resp)
-      (throw (ex-info (str "Slack error: " (:error (:body resp))) (:body resp))))))
+                :json params})
+        body (json/parse-string (:body resp) true)]
+    (if (:ok body)
+      body
+      (throw (ex-info (str "Slack error: " (:error body)) body)))))
 
 ;; Post a message
 (slack-api "chat.postMessage"

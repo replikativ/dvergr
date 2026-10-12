@@ -10,7 +10,6 @@
    loading source here does not widen it."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
-            [dvergr.substrate.paths :as paths]
             [muschel.fs :as mfs]))
 
 (def ^:dynamic *workspace-dir*
@@ -43,10 +42,16 @@
 (defn workspace-root
   "The primary workspace root. Geschichte workspaces return a virtual root
   descriptor; explicit test overrides and the transitional fallback remain
-  physical paths. Never nil — see `room-workspace-root` for the room-only view."
+  physical paths. Never nil — see `room-workspace-root` for the room-only view.
+
+  The fallback is the shared `.dvergr/workspace`, seeded first
+  (`dvergr.substrate.git/safe-workspace-root`, a no-op once it is): what it
+  holds (AGENTS.md, skills) must not depend on whether a sandbox happened to
+  seed it before. An Attempt's system prompt reads it, and so does the
+  prediction of that prompt made before the Attempt's sandbox exists."
   []
   (or (room-workspace-root)
-      (io/file (paths/workspace-dir))))
+      (io/file ((requiring-resolve 'dvergr.substrate.git/safe-workspace-root)))))
 
 (def ^:dynamic *workspace-roots*
   "Ordered override list of roots the load-fn searches — a room's own repo first,

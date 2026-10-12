@@ -185,7 +185,7 @@
         (let [c (ops/invoke daemon :catalog/calibrate {:room name :name name})]
           (verify! b (:bundle c))
           {:home (str home) :room name :calibration c})
-        (let [args (cond-> {:workflow (str name "/" name) :models (vec models) :room name :experiment name
+        (let [args (cond-> {:workflow (str name "/" name) :models (vec models) :room name :name name
                             :repetitions (or repetitions 1)}
                      budget-dollars (assoc :budget-dollars (double budget-dollars))
                      timeout-ms (assoc :timeout-ms timeout-ms)

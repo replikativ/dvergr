@@ -20,16 +20,18 @@ which chats, which models, and which tools.
 
 ## Tactics
 
-1. Query the `:account/*` schema via Datalog:
+1. Query the `:ledger/*` entries via Datalog:
    ```clojure
-   (d/q '[:find ?type (sum ?amount)
-          :where [?e :account/type ?type]
-                 [?e :account/amount ?amount]]
+   (require '[datahike.api :as d])
+   (d/q '[:find ?model (sum ?cost)
+          :with ?e
+          :where [?e :ledger/cost-microdollars ?cost]
+                 [?e :ledger/model ?model]]
         @dvergr.room/*room*)   ; the cost ledger lives in your room's store
    ```
-2. For per-chat breakdown, group by `:account/chat`.
-3. For per-model breakdown, look at `:account/metadata` (often
-   has `:model`).
+2. For per-chat breakdown, group by `:ledger/context`.
+3. For per-resource breakdown (input/output tokens, web searches), group
+   by `:ledger/resource`.
 4. Return a small table and one observation (e.g. "75% of today's
    spend is one runaway research session").
 

@@ -25,7 +25,7 @@ Get a key: Linear Settings → API → Personal API Keys
 ## Usage
 
 ```clojure
-(require '[http] '[env])
+(require '[babashka.http-client :as http] '[cheshire.core :as json] '[env])
 
 (def linear-key (env/get "LINEAR_API_KEY"))
 
@@ -34,7 +34,7 @@ Get a key: Linear Settings → API → Personal API Keys
                {:headers {"Authorization" linear-key
                           "Content-Type" "application/json"}
                 :json {:query query :variables (or variables {})}})]
-    (get-in (:body resp) [:data])))
+    (:data (json/parse-string (:body resp) true))))
 
 ;; List my issues
 (linear-gql "{ viewer { assignedIssues(first: 10) { nodes { title state { name } priority } } } }")
