@@ -611,6 +611,7 @@
   "`agent` with its policy's model alias resolved: the model its Run calls
    throughout, whatever the alias names later."
   [agent]
+  (registry/ensure-models-loaded!)
   (cond-> agent
     (get-in agent [:agent/model-policy :model])
     (update-in [:agent/model-policy :model] registry/resolve-alias)))
@@ -640,6 +641,8 @@
    registry default), or nil when it does not compact."
   [agent model-spec]
   (let [{:keys [auto-compact? compaction-model] :or {auto-compact? true}} (:agent/program agent)]
+    ;; the registry default comes from models.edn: loaded first, whoever asks
+    (registry/ensure-models-loaded!)
     (when auto-compact?
       {:model (registry/resolve-alias (or compaction-model
                                           (registry/get-default :compaction-model)
@@ -881,6 +884,8 @@
                     ;; every model step calls the model the inputs id names:
                     ;; an alias re-registered mid-Run does not move it
                     model-spec (let [spec (resolve-model-spec agent)]
+                                 ;; aliases come from models.edn too
+                                 (registry/ensure-models-loaded!)
                                  (cond-> spec
                                    (:model spec) (update :model registry/resolve-alias)))
                     instructions (llm-instructions agent tool-map)
