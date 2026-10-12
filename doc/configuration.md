@@ -51,7 +51,8 @@ Priority: `(paths/set-home! …)` → `$DVERGR_HOME` → `./.dvergr`. Layout:
                 :model    "accounts/fireworks/models/minimax-m3"
                 :tags     #{:secretary}
                 :description "Primary interface — chat and task routing"
-                :profile  "var"}}   ; optional; defaults to the agent id → resources/agents/<id>.md
+                :profile  "var"     ; optional; defaults to the agent id → resources/agents/<id>.md
+                :sandbox  #{:foerster/inference}}}  ; optional sandbox extensions (dvergr.sandbox.extensions)
  :default-agent :var
 
  ;; Channels (secrets fall back to env). See doc/channels.md.

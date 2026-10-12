@@ -3,12 +3,19 @@
    and only them; runs record what they resolved to."
   (:require [clojure.test :refer [deftest is testing]]
             [dvergr.agent.evaluation :as evaluation]
+            [dvergr.agent.room-context :as room-context]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.turn :as turn]
             [dvergr.chat.context :as chat-context]
+            [dvergr.discourse :as d]
+            [dvergr.discourse.llm :as llm]
+            [dvergr.orchestration.daemon :as daemon]
+            [dvergr.room.store.memory :as mem]
             [dvergr.sandbox :as sandbox]
             [dvergr.sandbox.extensions :as extensions]
-            [org.replikativ.spindel.engine.context :as context]))
+            [org.replikativ.spindel.core :as sp]
+            [org.replikativ.spindel.engine.context :as context]
+            [org.replikativ.spindel.engine.core :as ec]))
 
 (deftest the-registry-checks-what-it-is-given
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"qualified keyword"
@@ -157,3 +164,69 @@
         (chat-context/close-chat! cctx)
         (Thread/sleep 3000)
         (is (zero? (busy-chain-threads)) "releasing the interpreter cancelled it")))))
+
+(defn- has-infer? [cctx execution-ctx]
+  (:value (sandbox/eval-code (chat-context/sci-context-in cctx execution-ctx)
+                             "(some? (find-ns 'infer))"
+                             :execution-context execution-ctx :timeout-ms 30000)))
+
+(deftest room-agents-name-extensions
+  (testing "an agent's config names them; an unknown one fails its creation"
+    (is (= #{:foerster/inference}
+           (:sandbox (daemon/resolve-safe-config {:id :analyst :sandbox [:foerster/inference]}))))
+    (is (not (contains? (daemon/resolve-safe-config {:id :analyst}) :sandbox)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unknown sandbox extension"
+                          (daemon/resolve-safe-config {:id :analyst :sandbox #{:test/never-registered}})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unknown sandbox extension"
+                          (llm/llm-agent {:id :analyst :spec {} :sandbox #{:test/never-registered}})))))
+
+(deftest a-room-working-context-installs-the-agents-extensions
+  (let [parent-ctx (context/create-execution-context)
+        child-ctx (atom nil)
+        parent (d/make-room {:id :ext-parent :ctx parent-ctx :store (mem/make)})]
+    (try
+      (let [with (room-context/ensure-ctx! parent :analyst {:budget-dollars 1.0 :sandbox #{:foerster/inference}})
+            without (room-context/ensure-ctx! parent :plain {:budget-dollars 1.0})]
+        (is (true? (has-infer? with parent-ctx)))
+        (is (false? (has-infer? without parent-ctx)))
+        (testing "a context built without them (a scheduled task before the agent joined) gets them later"
+          (let [upgraded (room-context/ensure-ctx! parent :plain {:sandbox #{:foerster/inference}})]
+            (is (true? (has-infer? upgraded parent-ctx)))
+            (is (identical? upgraded (room-context/ensure-ctx! parent :plain {:sandbox #{:foerster/inference}})))
+            (is (identical? upgraded (room-context/ensure-ctx! parent :plain {})))))
+        (testing "a fork of the room keeps them"
+          (let [c (reset! child-ctx (context/fork-context parent-ctx :mode :frozen))
+                child (d/make-room {:id :ext-child :ctx c :store (mem/make)})
+                projected (room-context/fork-ctx! parent child :analyst)]
+            (is (some? projected))
+            (is (true? (has-infer? projected c))))))
+      (finally
+        (room-context/drop-ctx! :ext-child :analyst)
+        (room-context/drop-ctx! :ext-parent :analyst)
+        (room-context/drop-ctx! :ext-parent :plain)
+        (some-> @child-ctx context/close-context!)
+        (context/close-context! parent-ctx)))))
+
+(deftest a-room-joined-agent-has-its-extensions
+  (let [room (d/room :ext-joined)
+        seen (promise)]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (d/join room (llm/llm-agent
+                      {:id :analyst
+                       :spec {:provider :mock :model "mock"}
+                       :sandbox #{:foerster/inference}
+                       :run-turn-fn (fn [cctx _]
+                                      (deliver seen (has-infer? cctx (:ctx room)))
+                                      (chat-context/add-message! cctx {:role :assistant :content "ok"})
+                                      :complete)})))
+      (let [p (promise)]
+        (binding [ec/*execution-context* (:ctx room)]
+          (sp/spawn! (sp/spin (deliver p (sp/await (d/ask room :analyst {:content "hi"}))))))
+        (is (= "ok" (:content (deref p 60000 ::timeout))))
+        (is (true? (deref seen 1000 ::timeout)))
+        (is (= #{:foerster/inference} (:sandbox (get @(:participants room) :analyst)))
+            "the Participant names them for room code outside a turn (scheduled tasks)"))
+      (finally
+        (room-context/drop-ctx! :ext-joined :analyst)
+        (d/close-room! room)))))

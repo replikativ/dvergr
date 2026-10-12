@@ -71,7 +71,11 @@
   (future
     (let [outcome
           (try
-            (let [cctx (room-context/ensure-ctx! room aid {})
+            (let [cctx (room-context/ensure-ctx!
+                        room aid
+                        ;; the agent's own extensions (a context built before
+                        ;; the agent joined gets them on its first turn)
+                        {:sandbox (:sandbox (get @(:participants room) aid))})
                   {:keys [success value error]}
                   (sandbox/eval-code
                    (chat-context/sci-context-in cctx (:ctx room)) (:schedule/code s)

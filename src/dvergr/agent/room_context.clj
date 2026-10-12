@@ -25,6 +25,7 @@
             [dvergr.chat.schema :as schema]
             [dvergr.room.registry :as rreg]
             [dvergr.room.store :as rstore]
+            [dvergr.sandbox.extensions :as extensions]
             [dvergr.chat.accounting :as acct]
             [dvergr.system.db :as sdb]
             [dvergr.system.rooms :as srooms]
@@ -250,13 +251,34 @@
                             legacy-history?)))
           messages)))
 
+(defn- with-extensions!
+  "The cached working context of `k` with the extensions `sandbox` too:
+   whichever caller built it first (a turn, or a scheduled task before the
+   agent joined), the agent's extensions end up installed. Under the Room
+   monitor."
+  [k {:keys [chat-ctx sandbox-opts execution-ctx] :as entry} sandbox]
+  (let [have (set (:sandbox-extensions chat-ctx))
+        want (into have sandbox)]
+    (if (= have want)
+      chat-ctx
+      (let [cctx (assoc chat-ctx :sandbox-extensions want)]
+        ;; recorded before installing: an installation that fails part way is
+        ;; still released with the context (releasing what never installed is
+        ;; a no-op)
+        (swap! room-agent-ctxs assoc k
+               (assoc entry :chat-ctx cctx
+                      :sandbox-opts (assoc sandbox-opts :sandbox-extensions want)))
+        (extensions/install! (chat-ctx/sci-context-in cctx execution-ctx) execution-ctx want)
+        cctx))))
+
 (defn ensure-ctx!
   "Get-or-create the long-lived working chat-ctx for `agent-id` in `room`.
 
    On first call, create the ctx with a stable chat-id and seed its durable
    attention projection from the Room store. Subsequent calls return the
-   cached ctx; live facts enter only through explicit interpreter admission."
-  [room agent-id {:keys [system-prompt budget-dollars limit]}]
+   cached ctx; live facts enter only through explicit interpreter admission.
+   `:sandbox` names the agent's sandbox extensions (`dvergr.sandbox.extensions`)."
+  [room agent-id {:keys [system-prompt budget-dollars limit sandbox]}]
   (let [room-id (:id room)
         k       [room-id agent-id]]
     ;; Room forking and unregister hold the same monitor. Cache reads belong
@@ -268,7 +290,8 @@
                                   {:type ::closed-room
                                    :room-id room-id
                                    :room/incarnation (:incarnation room)})))]
-          (or (:chat-ctx (get @room-agent-ctxs k))
+          (or (when-let [entry (get @room-agent-ctxs k)]
+                (with-extensions! k entry sandbox))
               (let [;; The room's system-db UUID — the key the system resolvers
                 ;; (room-kb-conn / room-kbs / room-msgs) want; distinct from the
                 ;; in-memory keyword `room-id`. Threads to the sandbox so `dvergr.room`
@@ -308,7 +331,10 @@
                         ;; writer for this conversation; the agent's own turn messages
                         ;; stay signal-only (no redundant datahike write). Token
                      ;; accounting still persists.
-                     :durable?       false}
+                     :durable?       false
+                     ;; the agent's sandbox extensions; a fork inherits them
+                     ;; with these opts (`fork-ctx!`)
+                     :sandbox-extensions sandbox}
                     messages (hydration-messages! room agent-id limit)
                     cctx (turn/new-working-ctx sandbox-opts)
                     bound-sandbox-opts (assoc sandbox-opts

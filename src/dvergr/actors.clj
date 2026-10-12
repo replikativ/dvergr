@@ -302,7 +302,7 @@
    :skills      (set (or (:skills agent-config) (:tags agent-config) #{}))
    :config      (-> agent-config
                     (select-keys [:provider :model :budget-dollars
-                                  :rooms :tools :description]))
+                                  :rooms :tools :sandbox :description]))
    :external-refs (or (:external-refs agent-config) {})
    :status      :online})
 

@@ -237,6 +237,26 @@
             "a room join reads the stored :tools")
         (finally (daemon/stop-agent! d :tools-op))))))
 
+(deftest an-agents-sandbox-extensions-outlive-its-creation
+  (testing "create-agent! hands :sandbox to the agent and the actor row keeps it for later joins"
+    (let [d *shared-daemon*
+          captured (atom nil)
+          orig llm/llm-agent]
+      (try
+        (with-redefs [llm/llm-agent (fn [o] (when (= :ext-agent (:id o)) (reset! captured o)) (orig o))]
+          (daemon/create-agent! d {:id :ext-agent :provider :fireworks :model "t"
+                                   :sandbox [:foerster/inference]}))
+        (is (= #{:foerster/inference} (:sandbox @captured)))
+        (is (= #{:foerster/inference}
+               (:sandbox (daemon/resolve-safe-config (daemon/agent-join-config d :ext-agent))))
+            "a later join reads the stored :sandbox")
+        (finally (daemon/stop-agent! d :ext-agent)))))
+  (testing "a row written before agents had :sandbox keeps the declared one"
+    (actors/ensure-agent! (sdb/get-conn) :ext-old {:provider :fireworks :model "t"})
+    (let [d (assoc-in *shared-daemon* [:config :agents :ext-old] {:sandbox #{:foerster/inference}})]
+      (is (= #{:foerster/inference} (:sandbox (daemon/agent-join-config d :ext-old))))
+      (is (nil? (:sandbox (daemon/agent-join-config *shared-daemon* :ext-old)))))))
+
 (deftest test-daemon-stop-agent
   (testing "stop-agent! removes one agent from a running daemon"
     (let [d *shared-daemon*]

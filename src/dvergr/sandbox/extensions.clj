@@ -59,6 +59,16 @@
 (defn- realized-basis [basis]
   (into {} (map (fn [[k v]] [k (if (delay? v) @v v)])) basis))
 
+(defn checked-ids
+  "`ids` as a set of registered extension ids; throws for anything else, so
+   an agent naming an unknown extension fails where it is configured."
+  [ids]
+  (when-not (and (coll? ids) (not (map? ids)) (every? keyword? ids))
+    (throw (ex-info "A sandbox is a collection of extension keywords"
+                    {:type ::invalid-sandbox :sandbox ids})))
+  (run! lookup ids)
+  (set ids))
+
 (defn refs
   "[{:extension/id :extension/version :extension/basis} …] of `ids`, sorted;
    throws for an unknown one."
