@@ -607,6 +607,14 @@
        (sort-by :name)
        vec))
 
+(defn- pin-model
+  "`agent` with its policy's model alias resolved: the model its Run calls
+   throughout, whatever the alias names later."
+  [agent]
+  (cond-> agent
+    (get-in agent [:agent/model-policy :model])
+    (update-in [:agent/model-policy :model] registry/resolve-alias)))
+
 (defn- llm-inputs
   "The `run-inputs` of an LLM Run that starts with `instructions`, offers
    `tool-map` and calls the model `model-spec`."
@@ -635,16 +643,17 @@
   ([agent protocol]
    (cond
      protocol
-     (cond-> {:inputs/kind :protocol
-              :protocol (:ref protocol)
-              :model (model-inputs (:agent/model-policy agent))}
-       (:inputs protocol)
-       (assoc :protocol-inputs
-              (let [inputs ((:inputs protocol) agent)]
-                (when-not (roster/data-value? inputs)
-                  (throw (ex-info "Protocol :inputs must return portable data"
-                                  {:type ::non-portable-protocol-inputs :protocol (:ref protocol)})))
-                inputs)))
+     (let [agent (pin-model agent)]
+       (cond-> {:inputs/kind :protocol
+                :protocol (:ref protocol)
+                :model (model-inputs (:agent/model-policy agent))}
+         (:inputs protocol)
+         (assoc :protocol-inputs
+                (let [inputs ((:inputs protocol) agent)]
+                  (when-not (roster/data-value? inputs)
+                    (throw (ex-info "Protocol :inputs must return portable data"
+                                    {:type ::non-portable-protocol-inputs :protocol (:ref protocol)})))
+                  inputs))))
 
      (= :llm (get-in agent [:agent/program :kind]))
      (let [tool-map (tools/normalize-tools (or (:agent/tools agent) #{}))]
@@ -871,7 +880,11 @@
                 {:chat-ctx chat-ctx
                  :tool-map tool-map
                  :tool-ctx tool-ctx
-                 :model-spec model-spec})))
+                 ;; every model step calls the model the inputs id names:
+                 ;; an alias re-registered mid-Run does not move it
+                 :model-spec (cond-> model-spec
+                               (get-in inputs [:model :model])
+                               (assoc :model (get-in inputs [:model :model])))})))
            initialized (sp/await (worker-result-spin init-worker))]
        (when (or (= ::worker-cancelled initialized)
                  (run/cancel-requested? run-id))
@@ -1041,24 +1054,25 @@
          call (start-worker!
                supervisor
                (fn []
+                 (let [;; the model the inputs id names, resolved once
+                       pinned (pin-model (dissoc agent ::limits ::protocol))]
                  ;; what the protocol presents, as `run-inputs` predicts it
-                 (update-llm-metrics!
-                  supervisor
-                  (constantly {:inputs-id (inputs-id (run-inputs (dissoc agent ::limits ::protocol)
-                                                                 protocol))}))
-                 (let [scope (some-> (resource/model-scope control-room run-id)
-                                     (assoc :cancel? #(run/cancel-requested? run-id)))]
-                   (binding [resource/*model-scope* scope
-                             chat-agent/*turn-failure* failure]
-                     ((:run protocol)
-                      {:control-room control-room
-                       :room work-room
-                       :run/id run-id
-                       :agent (dissoc agent ::limits ::protocol)
-                       :task task
-                       :limits (::limits agent)
-                       :model-scope scope
-                       :cancelled? (fn [] (run/cancel-requested? run-id))})))))
+                   (update-llm-metrics!
+                    supervisor
+                    (constantly {:inputs-id (inputs-id (run-inputs pinned protocol))}))
+                   (let [scope (some-> (resource/model-scope control-room run-id)
+                                       (assoc :cancel? #(run/cancel-requested? run-id)))]
+                     (binding [resource/*model-scope* scope
+                               chat-agent/*turn-failure* failure]
+                       ((:run protocol)
+                        {:control-room control-room
+                         :room work-room
+                         :run/id run-id
+                         :agent pinned
+                         :task task
+                         :limits (::limits agent)
+                         :model-scope scope
+                         :cancelled? (fn [] (run/cancel-requested? run-id))}))))))
          outcome (sp/await (worker-result-spin call))]
      (cond
        (or (= ::worker-cancelled outcome)

@@ -590,6 +590,10 @@
     {:protocol
      (evaluation/make-protocol
       {:id :bird/query-submit :version version :basis basis :limit-keys #{:max-turns}
+       ;; what the candidate is presented with beyond its question: a resume
+       ;; re-runs cells made with another system prompt or tool schema
+       :inputs (fn [agent] {:system-prompt (system-prompt (engine-of agent) (nested-of agent))
+                            :tools tools})
        :run (fn [{:keys [agent environment cancelled? model-scope]}]
               (let [question (question-of by-id environment)]
                 (episode! {:question question :engine (engine-of agent) :nested? (nested-of agent)

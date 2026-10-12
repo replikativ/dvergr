@@ -289,3 +289,18 @@
         "Attempts from before inputs ids are superseded once one has them")
     (is (= #{1 2} (current [(attempt 2 nil 20 :completed) (attempt 1 nil 10 :completed)]))
         "a deterministic candidate's (or an old experiment's) all count")))
+
+(deftest a-run-calls-the-model-its-inputs-id-names
+  (with-room :inputs-pinned
+    (fn [room]
+      (let [{:keys [team definition]} (fixture)
+            models (atom [])]
+        (with-redefs [providers/ensure-initialized! (constantly nil)
+                      chat-agent/messages->api-format (fn [messages _ _] messages)
+                      model-chat/chat (fn [messages opts]
+                                        (swap! models conj (:model opts))
+                                        {:content (or (task-of messages) "no task") :tool-calls nil
+                                         :usage {:input-tokens 1 :output-tokens 1} :stop-reason :end-turn})]
+          (run! room team definition)
+          (is (= #{"inputs-test-model-a" "inputs-test-plain"} (set @models))
+              "the alias is resolved once, when the Run assembles its inputs"))))))

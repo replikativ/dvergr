@@ -67,6 +67,9 @@
      (evaluation/make-protocol
       {:id :tau2/conversation :version version :basis (basis domain user)
        :limit-keys #{:max-steps :max-errors}
+       ;; the system prompt the candidate runs with: a resume re-runs cells
+       ;; made with another
+       :inputs (fn [agent] {:system-prompt (episode/agent-system-prompt domain agent)})
        :run (fn [{:keys [room agent environment cancelled? model-scope]}]
               (let [task (task-of domain environment)
                     limits (merge {:max-steps 200 :max-errors 10}
