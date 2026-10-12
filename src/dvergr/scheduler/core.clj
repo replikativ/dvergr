@@ -19,6 +19,7 @@
             [dvergr.runtime.ctx :as rctx]
             [dvergr.room.registry :as rreg]
             [dvergr.scheduler.cron :as cron]
+            [dvergr.scheduler.schema :as schema]
             [org.replikativ.spindel.engine.core :as rtc])
   (:import [java.util Date]))
 
@@ -74,7 +75,19 @@
                       (when code {:schedule/code code})
                       (when description {:schedule/description description})
                       (cron/spec->attrs spec now))]
-      (d/transact conn [row])
+      ;; a room provisioned before `:schedule/second` existed lacks it;
+      ;; installing a schema attribute is an idempotent upsert
+      (when (and (:schedule/second row)
+                 (not (contains? (d/schema @conn) :schedule/second)))
+        (d/transact conn [(schema/attribute :schedule/second)]))
+      (d/transact conn
+                  (cond-> [row]
+                    ;; re-created under the same id without seconds: the
+                    ;; stored ones must not outlive the rule they belonged to
+                    (not (:schedule/second row))
+                    (into (when-let [old (when (contains? (d/schema @conn) :schedule/second)
+                                           (:schedule/second (d/entity @conn [:schedule/id id])))]
+                            [[:db/retract [:schedule/id id] :schedule/second old]]))))
       id)))
 
 (defn cancel-schedule!
@@ -100,7 +113,7 @@
            :description (:schedule/description e)}
     (:schedule/interval-ms e)  (assoc :interval-ms (:schedule/interval-ms e))
     (:schedule/every e)        (assoc :every (:schedule/every e))
-    (:schedule/time-of-day e)  (assoc :at (cron/mins->hhmm (:schedule/time-of-day e)))
+    (:schedule/time-of-day e)  (assoc :at (cron/entity-at e))
     (:schedule/weekday e)      (assoc :on (:schedule/weekday e))
     (:schedule/day-of-month e) (assoc :on-day (:schedule/day-of-month e))))
 

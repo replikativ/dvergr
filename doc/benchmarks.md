@@ -123,9 +123,11 @@ run's parallelism and subscription window points (the points the pilot moved per
 pilot that moved no whole point counts as one, an upper bound). When the conservative
 estimate exceeds the budget the run stops with the estimate (`:stopped :over-budget`);
 running again with a larger budget resumes from the pilot. A candidate with cells left
-whose pilot left no Attempt (its pilot cells faulted or were refused) has no measured cost:
-the estimate lists it under `:unpiloted` and the gate refuses (`:over {:unpiloted …}`)
-rather than pass on the other candidates' bills; running again pilots it. This is the experiment predicting
+whose pilot left no Attempt with a verdict (its pilot cells faulted or were refused) has no
+measured cost: the estimate lists it under `:unpiloted` and the gate refuses (`:over
+{:unpiloted …}`) rather than pass on the other candidates' bills; running again pilots it. A
+faulted pilot cell (a provider outage) is never extrapolated, since it stopped wherever the
+fault struck; what it spent is reported under `:faulted`. This is the experiment predicting
 its own resource use before committing to it; the measurements it keeps are what later
 predictions, and tuning on pilots before a full run, build on.
 

@@ -6,6 +6,7 @@
             [dvergr.chat.schema :as cschema]
             [dvergr.scheduler.schema :as sched-schema]
             [dvergr.scheduler.core :as scheduler]
+            [dvergr.scheduler.cron :as cron]
             [dvergr.rooms.scheduler :as rsched]
             [dvergr.rooms.messages :as rmsg]
             [dvergr.discourse :as d]
@@ -62,6 +63,41 @@
       (is (= :recurring (:kind s)))
       (is (= :day (:every s)))
       (is (= "09:00" (:at s))))))
+
+(deftest hourly-seconds-survive-the-store
+  (let [id (scheduler/create-schedule! *room*
+                                       {:agent-id :a :task "hourly"
+                                        :schedule {:every :hour :at "00:15:30" :tz "UTC"}})
+        conn (get-in *room* [:store :conn])
+        e (dh/pull @conn '[*] [:schedule/id id])
+        fired (java.util.Date/from (java.time.Instant/parse "2026-10-10T12:15:30Z"))]
+    (is (= "00:15:30" (:at (first (scheduler/list-schedules *room*)))))
+    (is (= (java.time.Instant/parse "2026-10-10T13:15:30Z")
+           (.toInstant (cron/compute-next-fire (assoc e :schedule/last-run fired) fired)))
+        "the stored rule fires at :15:30, not :15:00")
+    (testing "re-created under the same id without seconds, it loses them"
+      (scheduler/create-schedule! *room* {:id id :agent-id :a :task "hourly"
+                                          :schedule {:every :hour :at "00:15" :tz "UTC"}})
+      (let [e (dh/pull @conn '[*] [:schedule/id id])]
+        (is (nil? (:schedule/second e)))
+        (is (= "00:15" (:at (first (scheduler/list-schedules *room*)))))))))
+
+(deftest a-room-without-the-seconds-attribute-installs-it
+  (let [cfg {:store {:backend :memory :id (random-uuid)} :schema-flexibility :write}
+        _ (dh/create-database cfg)
+        conn (dh/connect cfg)]
+    (try
+      (dh/transact conn cschema/full-schema)
+      (dh/transact conn (vec (remove #(= :schedule/second (:db/ident %)) sched-schema/schema)))
+      (let [room (d/make-room {:id :sched-legacy :slug "sched-legacy" :ctx ec/*execution-context*
+                               :store (store-dh/make conn)})
+            id (scheduler/create-schedule! room {:agent-id :a :task "t"
+                                                 :schedule {:every :hour :at "00:15:30"}})]
+        (is (= 30 (:schedule/second (dh/pull @conn '[:schedule/second] [:schedule/id id])))))
+      (finally
+        (rsched/stop-room-scheduler! :sched-legacy)
+        (rmsg/drop-room! :sched-legacy)
+        (dh/release conn) (dh/delete-database cfg)))))
 
 (deftest cancel-deactivates
   (testing "cancel flips active? false → drops from the active list"

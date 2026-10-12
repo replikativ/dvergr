@@ -154,6 +154,23 @@
   (let [[h m] (clojure.string/split s #":")]
     (+ (* 60 (Integer/parseInt h)) (Integer/parseInt m))))
 
+(defn hhmmss->second
+  "The seconds of \"HH:MM:SS\" (0 for \"HH:MM\"): stored beside the minutes
+   (`:schedule/second`), so a stored `:at` keeps them."
+  [s]
+  (let [[_ _ sec] (clojure.string/split s #":")]
+    (if sec (Integer/parseInt sec) 0)))
+
+(defn entity-at
+  "The `:at` time string of a stored schedule entity `e`, or nil: \"HH:MM\",
+   or \"HH:MM:SS\" when it carries seconds."
+  [e]
+  (when-let [m (:schedule/time-of-day e)]
+    (let [sec (:schedule/second e)]
+      (if (and sec (pos? sec))
+        (format "%s:%02d" (mins->hhmm m) sec)
+        (mins->hhmm m)))))
+
 (defn entity->spec
   "Map a transparent `:schedule/*` entity to the spec map `next-fire-time`
    understands. (:once is handled directly via :schedule/next-fire, not here.)"
@@ -161,7 +178,7 @@
   (case (:schedule/kind e)
     :interval {:every-ms (:schedule/interval-ms e)}
     :recurring (cond-> {:every (:schedule/every e)}
-                 (:schedule/time-of-day e)  (assoc :at (mins->hhmm (:schedule/time-of-day e)))
+                 (:schedule/time-of-day e)  (assoc :at (entity-at e))
                  (:schedule/weekday e)      (assoc :on (:schedule/weekday e))
                  (:schedule/day-of-month e) (assoc :on-day (:schedule/day-of-month e))
                  (:schedule/tz e)           (assoc :tz (:schedule/tz e)))
@@ -268,6 +285,10 @@
                :schedule/every (:every spec)
                :schedule/next-fire (java.util.Date/from (next-fire-time spec from-inst))}
         (:at spec)     (assoc :schedule/time-of-day (hhmm->mins (:at spec)))
+        ;; only when it has seconds: rooms provisioned before the attribute
+        ;; existed install it with their first such schedule (scheduler.core)
+        (and (:at spec) (pos? (hhmmss->second (:at spec))))
+        (assoc :schedule/second (long (hhmmss->second (:at spec))))
         (:on spec)     (assoc :schedule/weekday (:on spec))
         (:on-day spec) (assoc :schedule/day-of-month (long (:on-day spec)))
         (:tz spec)     (assoc :schedule/tz (:tz spec)))
