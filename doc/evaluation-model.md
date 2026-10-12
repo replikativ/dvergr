@@ -165,10 +165,15 @@ lists the tiers among its Attempts. Agent-authored verifiers
 outside the room-workflow checkers are not built either.
 
 The checks are split in two. `observe` runs on the host with the live world
-and may do IO: a room workflow's observer asks its judge model, and its
-`capture` reads the world's files. `verify` is a function of the
-EnvironmentDef and the portable evidence `observe` returned, so a verdict
-can be re-derived from the stored evidence. A score means what its
+and may do IO: a room workflow's observer asks its judge model and keeps the
+answers in the evidence (`:judgements`), and its `capture` reads the world's
+files. `verify` is a function of the EnvironmentDef and the portable evidence
+`observe` returned, so such a verdict can be re-derived from the stored
+evidence. One exception: tau2's verifier asks a live judge model for a task's
+natural-language assertions (`nl-assertion-checks` in
+`dvergr.benchmarks.tau2.core`, called from the provider's verify), so
+re-verifying those tasks makes a model call and may answer differently; the
+judge's answers are not yet kept as evidence. A score means what its
 verifier's identity says, not what its reporter claims.
 
 A verifier may offer a **partial** form, called at checkpoints, returning
@@ -287,8 +292,10 @@ arena commands debit their own units (`dvergr.agent.arenas.renewal`).
 
 What is not debited in microdollars: the model calls inside a protocol Run
 (a tau2 conversation's, the candidate's and the customer's alike) and a room
-workflow judge's. A protocol's observer records them as the Attempt's
-`:spend` on its receipt; they are not taken from a wallet. And nested paid
+workflow judge's. A protocol's observer records its calls as the Attempt's
+`:spend` on its receipt, but they are not taken from a wallet; a room
+workflow judge's usage is not recorded at all (`model-judge` in
+`dvergr.catalog.room` keeps only the answer text). And nested paid
 work stays closed (`:provider-effects? false` in `child-program-authority`)
 until debits are effectively once.
 

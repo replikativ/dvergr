@@ -9,8 +9,9 @@ TUI key, or the agent itself looking at its own running processes.
 This file is the design contract for `dvergr.agent.process`. The
 implementation lives at `src/dvergr/agent/process.clj`.
 
-Status: built for `clojure_eval` (each eval is a process, soft checkpoint
-after 30 s), for budget exhaustion (a tracked process that waits for a
+Status: built for `clojure_eval` (each eval is a process that can be
+listed and aborted; its body never calls `checkpoint!`, so the 30 s grace
+is unused), for budget exhaustion (a tracked process that waits for a
 decision while the turn ends), in the TUI's Processes view and in the
 sandbox's `processes` namespace. Two effect ops are built
 (`:extend-budget`, `:inject-message`). Not built: model, temperature and
@@ -173,7 +174,7 @@ chat-ctx goes. The TUI shows a terminated process for 30 s, then hides it.
 | | Slice | Status |
 |---|---|---|
 | **1** | Core ns + record + checkpoint! + directive! + effect multimethod | built (`src/dvergr/agent/process.clj`; the registry in ctx state, not a `:processes-signal`) |
-| **2** | Wire `clojure_eval` to use `->process` | built (`dvergr.tools`, grace 30 s; an abort reaches `sandbox/eval-code` through its `:cancel?`) |
+| **2** | Wire `clojure_eval` to use `->process` | built (`dvergr.tools`; the 30 s grace only bounds a `checkpoint!`, which the eval body does not call; an abort reaches `sandbox/eval-code` through its `:cancel?`) |
 | **3** | Wrap the LLM turn in `->process`; Esc → `directive! :abort` | not built. Esc in the TUI cancels the room's turn through its Run (`daemon/cancel-room-turn!`). Budget exhaustion registers a tracked process (`budget-exhausted!`) that waits for a decision while the turn ends; it never blocks the drain |
 | **4** | Processes view in TUI + key bindings | built (`dvergr.tui.app`) |
 | **5** | SCI exposure of `(processes/list :directive! :snapshot)` + Vár prompt | built (`dvergr.sandbox.ns.io/add-process-ns!`, `resources/agents/var.md`) |

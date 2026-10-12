@@ -5,7 +5,9 @@
      1. the actor row's `:actor/system-prompt` (Datahike, AUTHORITATIVE) — managed
         only through the API (`dvergr.agent.ops`, the web/TUI config, the REPL),
         so it is value-semantic (forks with the row) and versioned.
-     2. `resources/agents/<id>.md` — dvergr's built-in default (classpath, read-only).
+     2. the `agents/<id>` definition's body (`dvergr.discourse.definitions`): the
+        built-in `resources/agents/<id>.md` unless a user, project or room
+        scope overrides it.
 
    The prompt deliberately does NOT live in an unmanaged file: agents mutate dvergr
    through controlled surfaces, not by scribbling markdown outside the substrate.
@@ -14,8 +16,8 @@
 
    The single home for persona loading — `daemon/load-agent-prompt` and the tools
    layer both delegate here. The DB lookup needs no execution context (the
-   system-db resolves without one); with no system-db, only the built-in
-   resource is consulted."
+   system-db resolves without one); with no system-db, only the definition
+   is consulted."
   (:require [clojure.java.io :as io]
             [dvergr.actors :as actors]
             [dvergr.discourse.definitions :as defs]

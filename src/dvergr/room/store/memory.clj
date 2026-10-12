@@ -1,6 +1,7 @@
 (ns dvergr.room.store.memory
-  "In-memory PRoomStore — atom-backed. Used by tests; no production path
-   constructs one."
+  "In-memory PRoomStore — atom-backed. Used by tests and by tau2's
+   harness and probe (`dvergr.benchmarks.tau2.harness`, `.probe`); daemon rooms
+   never use one."
   (:require [dvergr.agent.attempt :as attempt]
             [dvergr.room.store :as store]))
 

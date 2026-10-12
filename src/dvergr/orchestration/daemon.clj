@@ -117,7 +117,8 @@
 ;; that picks a set) leaves out. An agent's explicit :tools, or a tag's set,
 ;; decide instead: the :secretary set (`chat-tools`) includes `shell`.
 ;;
-;; shell         — direct OS execution through the agent's bash session
+;; shell         — the agent's muschel shell session (Clojure builtins over the
+;;                 workspace; native binaries only from a configured allowlist)
 ;; run_tests     — clojure.test over the sandbox session's namespaces; agents
 ;;                 can do the same through clojure_eval
 ;; telegram_*    — the bot must not self-reference its own channel;

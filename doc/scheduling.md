@@ -70,12 +70,14 @@ than silently producing the wrong cadence (a silent drop is how `{:every :hour
 ## Minute ticks
 
 The daemon clock (`dvergr.runtime.clock`) is one signal holding the current minute,
-truncated to `:00` seconds, and every room's scheduler re-runs when it changes. A
-tick fires each schedule whose `:schedule/next-fire` is at or before that minute.
-So a schedule fires at the first minute boundary at or after its fire time: an
-`:at` with seconds (stored as `:schedule/second`, so the computed fire
-times keep it) fires at the next minute's tick, and an interval shorter than a
-minute fires at most once a minute.
+truncated to `:00` seconds, and every room's scheduler re-runs when it changes. The
+heartbeat sleeps 60 s between updates, so a tick lands up to a minute after the
+boundary it names, not on it. A tick fires each schedule whose
+`:schedule/next-fire` is at or before that minute. So a schedule fires on the first
+tick whose minute is at or after its fire time: an `:at` with seconds (stored as
+`:schedule/second`, so the computed fire times keep it) fires at the next
+minute's tick, and an interval shorter than a minute fires at most once a
+minute.
 
 ## From tools and MCP
 
