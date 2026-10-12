@@ -5,8 +5,9 @@
    the capability that scores it is host code. Agent code can build an
    Environment and an Experiment as data, but cannot hand the host a scoring
    function: an experiment an agent starts is scored only by what is
-   registered here (the catalog workflows' checkers, the workflow completion
-   check), and one naming anything else is refused before any Run starts."
+   registered here (the wiki benchmark sets' checkers and fixtures,
+   `dvergr.catalog`; the workflow completion check, `dvergr.agent.workflow`),
+   and one naming anything else is refused before any Run starts."
   (:require [dvergr.agent.evaluation :as evaluation]))
 
 (defonce ^:private registry (atom {:evaluators {} :world-setups {}}))

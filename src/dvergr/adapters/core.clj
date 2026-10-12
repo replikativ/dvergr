@@ -6,29 +6,26 @@
    users**. The adapter maps:
 
      venue (chat-id) → one discourse Room (the persisted transcript)
-     remote user     → a durable actor + a Participant joined lazily on
-                       their first message, whose `on-message` is the
-                       egress (send back to the venue's chat-id)
+     remote user     → a durable actor (the `:from` of their messages)
 
    Inbound:  medium event → post into the venue's Room AS the user-actor,
              addressed to the room's routed agent.
-   Outbound: an agent reply `:to` a user-actor routes through the Bus to
-             that user's egress Participant → sent back to the venue.
+   Outbound: the room mirror (`mirror-room!`, started on the venue's first
+             inbound message) sends every conversational message of the
+             room back to the venue, except the venue's own inbound.
 
-   This is the Participant-on-Bus model end to end: no response-sinks, no
-   `:_system` fan-out. A DM is just the single-remote-user case; a group
-   has several user-participants sharing one venue chat-id, and an agent
-   addressing one of them sends exactly once.
+   No response-sinks, no `:_system` fan-out. A DM is just the
+   single-remote-user case; a group has several user-actors sharing one
+   venue chat-id, and each message leaves once through the mirror.
 
    ## Thin vs rich adapters (the same shape at different distances)
 
    The render half comes in flavors distinguished by whether a `:send-fn`
    is supplied:
 
-     - **thin** (Telegram, Slack…): supply `:send-fn`. Each remote user gets
-       an egress Participant whose on-message sends agent replies back out
-       over the channel.
-     - **rich** (TUI, web, simmis): omit `:send-fn`. No egress Participant —
+     - **thin** (Telegram, Slack…): supply `:send-fn`. The room is mirrored
+       out to the venue over the channel.
+     - **rich** (TUI, web, simmis): omit `:send-fn`. No mirror —
        the frontend renders by OBSERVING room state (in-process: subscribe to
        the room bus; remote/simmis: replicate the per-room datahike via
        konserve-sync). Agent replies live in the room; the frontend shows
@@ -55,17 +52,17 @@
                       user (upsert the durable row, return its id)
    Optional:
      :send-fn       — (fn [chat-id text]) sends text out to a venue. Supply for
-                      a THIN adapter (Telegram): each user gets an egress
-                      Participant. OMIT for a RICH adapter (TUI/web/simmis):
-                      no egress is joined; the frontend renders by observing
-                      room state.
+                      a THIN adapter (Telegram): the room is mirrored out to
+                      the venue. OMIT for a RICH adapter (TUI/web/simmis):
+                      no mirror; the frontend renders by observing room
+                      state.
      :default-agent — keyword the inbound message is FORCED to address (a thin
                       adapter routing to a specific agent). Omit to address the
                       room's agent via `dvergr.discourse/room-target` (the
                       default — what rich adapters want).
      :speaker-name  — (fn [actor-id]) → display label for an outbound message's
                       sender. Through a single bot every actor's reply looks
-                      identical, so the egress prefixes `[<name>] ` (multiple
+                      identical, so the mirror prefixes `[<name>] ` (multiple
                       agents in a group, or distinguishing the agent from the
                       human). Defaults to the actor-id's name."
   [{:keys [ctx send-fn ensure-room ensure-actor default-agent speaker-name]}]
@@ -99,9 +96,10 @@
 
 (defn egress-participant
   "A Participant standing in for a remote user in their venue's room. Its
-   `on-message` is the outbound edge: any message routed to this user
+   `on-message` is an outbound edge: any message routed to this user
    (an agent reply addressed `:to` them) is sent to the venue's chat-id.
-   Emits no reply of its own."
+   Emits no reply of its own. `inbound!` does not join it: the outbound path
+   is `mirror-room!`, which also sees replies addressed to others."
   [adapter chat-id actor-id]
   (d/participant
    {:id  actor-id
@@ -187,9 +185,9 @@
 
    1. upsert the remote user's actor (→ actor-id)
    2. ensure the venue's Room exists (+ routed agent joined)
-   3. lazily join the user's egress Participant
+   3. for a thin adapter, start the room mirror (once per room)
    4. post the message into the room AS the user-actor, addressed to the
-      routed agent — the agent's reply will route back through the egress.
+      routed agent — the agent's reply reaches the venue through the mirror.
 
    Returns the actor-id, or nil if the event was empty/unroutable."
   [adapter {:keys [chat-id user text attachment]}]

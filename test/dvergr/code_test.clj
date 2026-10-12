@@ -1,6 +1,6 @@
 (ns dvergr.code-test
   "Tests for the Clojure → categorical-data mapping: the strict round-trip iso
-   and the derived var/ref index (doc/programmatic-knowledge.md §7b)."
+   and the derived var/ref index."
   (:require [clojure.test :refer [deftest is testing]]
             [dvergr.code :as code]
             [sci.core :as sci]))

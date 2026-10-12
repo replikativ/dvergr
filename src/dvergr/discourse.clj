@@ -271,8 +271,8 @@
      :parent-id — parent room id keyword (default: nil)
      :ctx       — spindel ExecutionContext (default: create fresh)
      :store     — optional PRoomStore for durability. When provided,
-                  every Message that flows through the room's bus is
-                  mirrored to the store; consumers reading via
+                  every Message posted on the room's bus is appended
+                  to the store inside `post!`; consumers reading via
                   `room/messages` get the persisted log instead of
                   the in-memory bus log.
      :meta      — arbitrary metadata map (telegram-chat-id, room
@@ -647,7 +647,7 @@
    so a fork persists under the ROOT of its fork chain — stored in the room's
    meta as `:conversation-id`. Messages are thus one logical conversation that a
    fork's datahike branch isolates, and `merge-fork!` collapses natively
-   (no out-of-band `append-log!`). See doc/unified-fork-conversation.md."
+   (no out-of-band `append-log!`)."
   [room]
   (rstore/conversation-id room))
 
@@ -1236,7 +1236,8 @@
 
    `:ctx` — create the canonical `spindel.yggdrasil/ForkHandle`, which forks
    the execution context and automatically branches all registered yggdrasil
-   systems (datahike, git worktrees, btrfs subvolumes, ZFS datasets, …). The fork
+   systems (in a dvergr room: its Datahike stores and its Geschichte
+   workspace; yggdrasil also has git, btrfs and ZFS adapters). The fork
    becomes substrate-isolated: an agent's writes to its chat-ctx
    datahike, KB writes, file edits, etc. happen on branched copies
    and are only visible inside the fork until `merge-room` merges them back via
@@ -1288,7 +1289,7 @@
          ;; CONVERSATION id (root of the fork chain) — so a fork's messages are
          ;; the same logical conversation on a datahike branch, and
          ;; merge-fork! collapses them natively (no append-log!). It writes
-         ;; no separate :chat entity. (doc/unified-fork-conversation.md)
+         ;; no separate :chat entity.
                conv-id    (conversation-id room)
          ;; RF5: the fork's store wraps the PARENT room's OWN messages conn under
          ;; the fork ctx (branched), so fork messages ride the per-room store's
@@ -2129,14 +2130,15 @@
       point) to the parent's log.
    2. If the fork's ctx was forked (`:isolation :ctx`), settle its canonical
       ForkHandle by merging all branched Yggdrasil systems into the parent —
-      datahike branches collapse, git branches fast-forward or three-way merge.
+      each system by its own merge semantics (datahike branches collapse;
+      the Geschichte workspace merges through its yggdrasil adapter).
    3. Deregister the fork's participants.
 
    Concurrent sibling forks UNION (identity-keyed datahike merge); a genuine
    field clash (same entity+attr changed differently on both sides) is a 3-way
    CONFLICT that `merge-fork!` refuses by default. Pass `{:merge-opts
    {:force true}}` (the agent reconciler does, after resolving) to force past it.
-   (doc/unified-fork-conversation.md, dvergr.rooms.forks/reconcile-merge!.)"
+   (See `dvergr.rooms.forks/reconcile-merge!`.)"
   ([parent fork] (merge-room parent fork {}))
   ([parent fork {:keys [merge-opts]}]
    (assert-settlement-released! fork :merge)
@@ -2157,7 +2159,7 @@
    ;; a message store with no extra systems. A `:store` fork's datahike *message*
    ;; branch also collapses here (bringing its messages into the parent's
    ;; conversation under the shared :chat/id); its deferred data-DB grants commit on
-   ;; accept via :on-merge (store forks only). (doc/unified-fork-conversation.md)
+   ;; accept via :on-merge (store forks only).
        (when-let [handle (fork-handle fork)]
          (try
            (let [pending (when (:store fork)

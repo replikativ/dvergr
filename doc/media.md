@@ -80,7 +80,7 @@ overridable with `DVERGR_VISION_MODEL` — see
 
 Returns free text: a detailed description with any visible text transcribed
 verbatim. In the sandbox the path is read through the chat-ctx's muschel FS, so
-worktree files and mounted drives (e.g. `/drive`) both work — bytes never enter
+workspace files and mounted drives (e.g. `/drive`) both work — bytes never enter
 the SCI sandbox, only the extracted text comes back.
 
 ### `vision/extract` — structured data (invoices, receipts → JSON)

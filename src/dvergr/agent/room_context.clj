@@ -6,7 +6,7 @@
    the durable source of facts; explicit attention decisions project which of
    those facts enter this participant's model input.
 
-   ## Consistency model (see doc/per-room-chat-ctx.md)
+   ## Consistency model
 
    - The active discourse interpreter is the sole live admission point. There
      is deliberately no eager bus fold: observing a Room fact must not make an
@@ -143,9 +143,10 @@
 (defn raise-budget!
   "Set the live budget :total on every cached agent ctx of `room-id` to
    `dollars`. The embedder calls this when its room-budget setting
-   changes, so an agent paused at a budget checkpoint resolves
-   :extended and continues instead of wrapping up. Returns the number
-   of ctxs updated."
+   changes. An agent whose turn ended on its budget
+   (`dvergr.agent.process/budget-exhausted!`) is not resumed by it: the
+   next message starts a turn under the new total. Returns the number of
+   ctxs updated."
   [room-id dollars]
   (let [micro (long (* (double dollars)
                        acct/MICRODOLLARS-PER-DOLLAR))]

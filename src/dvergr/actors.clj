@@ -23,7 +23,7 @@
      (a/lookup conn :scribe)
      (a/list-actors conn)
      (a/list-actors conn :kind :agent :status :online)
-     (a/online? :scribe)              ; consults the runtime registry
+     (a/online? :scribe)              ; joined to a registered room?
      (a/dismiss! conn :scribe)        ; flags status :retired (keeps the row)"
   (:require [clojure.edn :as edn]
             [datahike.api :as dh]

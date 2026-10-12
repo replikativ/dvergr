@@ -1,12 +1,12 @@
 (ns dvergr.rooms.forks
   "Shared fork-management operations the TUI and web both call — describe a
    fork vs its parent, merge a fork back, or discard it. Thin wrappers over
-   `dvergr.discourse` + `dvergr.substrate.git` so the two surfaces behave
+   `dvergr.discourse` + `dvergr.substrate.geschichte` so the two surfaces behave
    identically. Call with the daemon execution context bound.
 
    Two kinds of fork (see `dvergr.discourse/fork-room`):
-   - `:isolation :ctx` — its own forked context with real git/datahike
-     branches; merging actually collapses those branches into the parent.
+   - `:isolation :ctx` — its own forked context with real Datahike and
+     Geschichte workspace branches; merging actually collapses those branches into the parent.
    - `:isolation :none` — shares the parent context; \"merge\" is just a
      conversation-log append, and there is no git history to browse."
   (:require [dvergr.room.registry :as rreg]
@@ -146,8 +146,8 @@
   (boolean (some-> fork :ctx :parent-ctx)))
 
 (defn fork!
-  "Fork `room` into an isolated `:ctx` branch — its own git worktree + datahike
-   branch — so the fork can later be merged (`reconcile-merge!`) or discarded
+  "Fork `room` into an isolated `:ctx` branch — its own Geschichte workspace
+   branch + Datahike branches — so the fork can later be merged (`reconcile-merge!`) or discarded
    (`discard!`). The canonical fork op both the TUI (`f`) and web (`/fork`) call.
    Returns the new fork Room. Call with the daemon execution context bound."
   [room]
@@ -339,9 +339,10 @@
   (commit-workspace! fork (str "Work of fork " (name (:id fork)))))
 
 (defn state-token
-  "A content hash of `fork`'s state: its mergeable systems' snapshot ids (git
-   commit, datahike commit, …). It changes whenever the fork does, so a merge
-   can be pinned to the state that was reviewed (`merge-reviewed!`). nil for
+  "A content hash of `fork`'s state: its mergeable systems' snapshot ids
+   (workspace commit, datahike commit, …). It changes whenever the fork does,
+   so a merge can be pinned to the state that was reviewed (the `room_merge`
+   op's `expect-state`, `dvergr.ops` `:room/merge`). nil for
    non-`:ctx` forks."
   [fork]
   (when (ctx-fork? fork)

@@ -1,9 +1,12 @@
 # Forks, worlds, and settlement
 
-Status: proposed cross-project contract. This document maps the existing
-Yggdrasil, Spindel, Dvergr, and Simmis abstractions before their APIs are
-consolidated. Names marked *provisional* describe semantics, not necessarily the
-next public function names.
+Status: the cross-project contract, built on the Dvergr side through step 7 of
+*Migration sequence* below: `fork-room` forks through `ygg/fork!` and keeps the
+handle, Run worlds (`dvergr.agent.world`) hold Run policy over it, and review
+and settlement go through that handle. Steps 3 and 8 are partial and 9-10 are
+not built; the Simmis governance layer (Proposal/ForkSet) is not part of this
+repository. Names marked *provisional* describe semantics, not necessarily
+public function names.
 
 ## Objective
 
@@ -87,17 +90,27 @@ A **Run** is the durable identity of one causally bounded execution. It is not a
 fork. A Run may execute in a private world fork, share an ambient world, or
 produce no substrate changes.
 
-A **RunWorld** is a Run's lease and policy over one world fork:
+A **RunWorld** is a Run's lease and policy over one world fork. As built
+(`dvergr.agent.world`):
 
 ```clojure
-{:run/id             run-id
- :fork/handle        live-fork-handle
- :room/view          work-room
- :settlement/policy  :automatic|:review|:discard}
+(defrecord RunWorld [id parent work policy settlement])
+;; id          the work Room's id
+;; parent      the Room it forks
+;; work        the work Room, opened by `d/fork-room` with :isolation :ctx
+;; policy      :automatic | :review | :discard | :deferred
+;; settlement  an atom caching the one settlement decision
 ```
 
-Its fork identity, parent, child context, and live settlement capability come
-from the canonical Spindel handle and are not recreated in Dvergr.
+The Run's id is in the work Room's meta (`:run-id`, beside `:run-world?`,
+`:record-room-id` and `:settlement-policy`) and in its context state
+(`[:dvergr/run-id]`, for the resource authority). Its fork identity, parent,
+child context, and live settlement capability come from the canonical handle
+`ygg/fork!` returned, which the work Room keeps (`fork-handle` in
+`dvergr.discourse`), and are not recreated in Dvergr. `settle!` decides
+once: failure or cancellation discards; `:deferred` holds the world until the
+host releases it; `:waiting` and `:review` retain it; `:discard` drops it;
+otherwise it merges, and a failed merge is retained for review.
 
 ### Simmis: governance
 

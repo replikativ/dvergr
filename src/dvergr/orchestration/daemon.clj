@@ -113,16 +113,16 @@
 ;; Safety
 ;; ============================================================================
 
-;; Tools excluded from daemon agents regardless of config.
+;; Tools the default set (`safe-tools`, for an agent with no :tools and no tag
+;; that picks a set) leaves out. An agent's explicit :tools, or a tag's set,
+;; decide instead: the :secretary set (`chat-tools`) includes `shell`.
 ;;
-;; shell         — direct OS execution; full system access
-;; run_tests     — Kaocha runs on the JVM, not sandboxed; daemon agents should
-;;                 write/run tests via clojure_eval + clojure.test inside SCI
+;; shell         — the agent's muschel shell session (Clojure builtins over the
+;;                 workspace; native binaries only from a configured allowlist)
+;; run_tests     — clojure.test over the sandbox session's namespaces; agents
+;;                 can do the same through clojure_eval
 ;; telegram_*    — the bot must not self-reference its own channel;
-;;                 all outbound messaging is handled by the daemon's response sinks
-;;
-;; Agents needing native test execution must be started manually outside the daemon
-;; with :isolation :native — never from an untrusted channel like Telegram.
+;;                 outbound messages go through the room's channel mirror
 (def ^:private excluded-from-daemon
   #{"shell" "run_tests"
     "telegram_send" "telegram_poll" "telegram_updates" "telegram_chat_info"})
@@ -136,25 +136,24 @@
 ;; ============================================================================
 ;; Shared Execution Context
 ;;
-;; Each daemon owns one spindel execution context with git + datahike systems
-;; registered for forkable agent worktrees and persistent chat DB. Moved here
-;; from the deleted dvergr.agent.process; the daemon is the only caller.
+;; Each daemon owns one spindel execution context and its peer-bus. The daemon
+;; registers no workspace on it (`:with-git? false`): rooms carry their own
+;; Geschichte workspaces and stores. The daemon is the only caller.
 ;; ============================================================================
 
 (defn create-shared-context
-  "Create a shared execution context with optional Geschichte + Datahike
-   systems registered for fork-isolated agent work and persistent chat data.
+  "Create a shared execution context, optionally with the fallback Geschichte
+   workspace system registered, and the daemon peer-bus.
 
    Options:
      :with-git?       — register the Geschichte workspace system (legacy option
                         name retained for callers)
                         (default true)
-     :with-datahike?  — register Datahike system for the chat DB
-                        (default true)
+     :with-datahike?  — no-op, kept for callers (there is no shared chat DB)
      :repo-path       — Geschichte Datahike store path
      :worktrees-dir   — ignored legacy option; virtual workspaces are Datahike
                         branches and have no worktree directory
-     :db-path         — datahike file-store path (default .dvergr/db)"
+     :db-path         — no-op, kept for callers"
   [& {:keys [with-git? with-datahike? repo-path worktrees-dir db-path]
       :or {with-git?      true
            with-datahike? true
@@ -191,8 +190,9 @@
 ;; ============================================================================
 
 (defn- load-agent-prompt
-  "Persona markdown for `profile-name` — project-local `.dvergr/agents/<name>.md`
-   if present, else the built-in `resources/agents/<name>.md`. nil if neither.
+  "Persona prompt for `profile-name` — the actor row's stored prompt if set,
+   else the agent definition's body (built-in `resources/agents/<name>.md`
+   unless a scope overrides it). nil if neither.
    (Resolution lives in `dvergr.agent.persona`.)"
   [profile-name]
   (persona/resolve-prompt profile-name))
@@ -212,9 +212,10 @@
 
 (defn- chat-tools
   "Return tool map for chat mode: SCI-first. `clojure_eval` is the ONE universal
-   capability — bash (`bash/run`), the whole intake.* surface (web/hn/yt/tweet/
-   reddit/…), `llm/call`, `kb/*`, `calendar/*`, `agents/*`, fork/
-   propose primitives are all just functions in the sandbox, not separate tools.
+   capability — the shell (`dvergr.shell/run`), the `dvergr.intake.*` sources
+   (web search/fetch, HN, YouTube, …), `llm/*`, the room's KB (`dvergr.room/kb-*`),
+   `scheduler/*`, `dvergr.agents/*` are all just functions in the sandbox, not
+   separate tools.
    Composing Clojure beats a one-shot tool: the agent can chain and transform
    results in the same eval, keeping state in its REPL.
 
@@ -234,7 +235,8 @@
 (defn- huginn-tools
   "Return tool map for Huginn (code-first intake monitor).
    Huginn uses clojure_eval + intake SCI namespaces for research
-   (intake.web/search, intake.web/fetch, intake.hn/search, …),
+   (`dvergr.intake.web-search/search`, `dvergr.intake.web-fetch/fetch-page`,
+   `dvergr.intake.hn/search-stories`, … from the room's sandbox repo),
    knowledge tools for storage, llm_call for summarization, and
    mail tools for inbox."
   []
@@ -456,8 +458,7 @@
 (defn stop-agent!
   "Leave the participant from every room it joined, dropping its presence
    (presence == room membership). The participant's spin and any driver
-   pumps continue running on the shared executor — discourse has no
-   per-spin cancel today — but no further messages are routed to it. The
+   pumps are cancelled and its subscriptions closed (`d/leave`). The
    durable actor row is left intact (use actors/dismiss! to retire it)."
   [daemon agent-id]
   (binding [rtc/*execution-context* (:execution-ctx daemon)]
@@ -794,8 +795,8 @@
          (tel/log! {:level :info :id :daemon/mail-intake-unavailable}
                    "mail intake unavailable (clojure-mail not on classpath)")))
   ;; Register the agent-facing schedule_* tools (schedule_create/list/cancel).
-  ;; The scheduler BACKEND is wired below (install-schema! + restore-schedules!);
-  ;; requiring this ns registers the tools so an agent can set up its own
+  ;; Schedules are rows in each room's store, fired by the room's scheduler
+  ;; spin (see below); requiring this ns registers the tools so an agent can set up its own
   ;; recurring tasks — agents opt in by listing them in their :tools.
   (require 'dvergr.scheduler.tools)
   ;; Load the model registry from models.edn (the configured Fireworks set +
@@ -810,8 +811,7 @@
   ;; A moved home's registry still names the old home's stores: point it here.
   (sdb/rehome-scopes!)
 
-  ;; Create execution context, daemon-wide discourse room, and the
-  ;; :_system receiver that drains all agent replies into the sink fan-out.
+  ;; Create the execution context and the daemon-wide discourse room.
   ;; RF5 (Option B): the daemon root does NOT register the legacy `.dvergr/workspace`
   ;; git system. Its agents run in ROOMS, each of which carries its OWN per-room repo
   ;; (RF5 S2); a root workspace-git was a pre-RF5 vestige that bled into every room
@@ -1009,7 +1009,7 @@
                     default-agent-id (or (:default-agent config) :var)
                     ;; Telegram medium adapter (dvergr.channels.telegram) —
                     ;; inbound posts into per-chat Rooms as the sender's
-                    ;; user-actor; outbound via the user's egress Participant.
+                    ;; user-actor; outbound via the room mirror (below).
                     ;; The daemon-side capabilities are injected as `caps`.
                     caps    (telegram-caps daemon token default-agent-id
                                            (:tool-commands? tg-config))
@@ -1122,9 +1122,7 @@
   (stop-gc-loop!)
 
   ;; Leave all registered participants from the discourse room and
-  ;; unregister them. Driver pumps + participant spins remain on the
-  ;; executor (discourse has no per-spin cancel today) but no further
-  ;; messages are routed to them. Reserved `_`-prefixed ids (e.g. the
+  ;; unregister them (`d/leave` cancels their spins and pumps). Reserved `_`-prefixed ids (e.g. the
   ;; `:_activity` lane) are not agents — skip them.
   (binding [rtc/*execution-context* (:execution-ctx daemon)]
     (doseq [agent-id (->> (some-> (:discourse-room daemon) :participants deref keys)

@@ -101,19 +101,11 @@
 
 (defn make-agent-turn
   "Return `{:turn (fn [{:keys [world history message]}] -> {:world :reply :messages :usage})
-            ;; Dvergr's own view of the episode: the system prompt as sent, every
-     ;; model message with its tool uses (e.g. the clojure_eval code), and
-     ;; every tool result, in chat order.
-     :transcript (fn []
-                   (mapv (fn [m]
-                           (let [m (into {} (remove (fn [[k _]] (= :db/id k))) m)]
-                             (cond-> m
-                               (:message/tool-uses m)
-                               (update :message/tool-uses
-                                       (fn [tus] (mapv #(into {} (remove (fn [[k _]] (= :db/id k))) %)
-                                                       tus))))))
-                         (chat-context/get-messages chat-ctx)))
-     :close (fn [])}` for one episode.
+            :transcript (fn [] -> messages)
+            :close (fn [])}` for one episode. `:transcript` is Dvergr's own
+   view of the episode: the system prompt as sent, every model message with
+   its tool uses (e.g. the clojure_eval code), and every tool result, in chat
+   order (without `:db/id`s).
 
    `spec` is `{:model id :provider kw? :action-space :tools|:repl
    :max-model-steps n :budget-dollars n}`."

@@ -50,7 +50,7 @@
                         (:status data))))))
 
 (defn- parse-retry-after
-  "Parse Retry-After header (seconds or HTTP date)."
+  "Parse a Retry-After header: seconds; anything else (an HTTP date) → 5000 ms."
   [value]
   (when value
     (try
@@ -59,7 +59,8 @@
         5000))))
 
 (defn- calculate-backoff
-  "Calculate exponential backoff delay with jitter."
+  "Calculate exponential backoff delay with jitter. A `response`'s Retry-After
+   would take precedence, but both callers pass nil, so it is never honoured."
   [attempt response]
   (let [retry-after (some-> response :headers (get "retry-after") parse-retry-after)
         base-delay (* (:base-delay-ms retry-config) (Math/pow 2 attempt))

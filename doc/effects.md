@@ -1,15 +1,16 @@
 # Effects: one boundary between sandbox code and the world
 
 Status: **implemented** (`dvergr.effects`; the design was agreed 2026-09-27, decisions at
-the end). Built in steps, each noted where it lands; grants (eacl) are still open.
+the end). Built in steps, each noted where it lands; grants (eacl) and the `:preflight` mode
+are not built.
 
 ## Why
 
 Code in a room's sandbox (an agent's, or an MCP client's `clojure_eval`) reaches the world
 through the capabilities dvergr injects: files, HTTP, databases, rooms, models, mail,
-schedules, processes. Today each capability guards and records itself, or does not. One
-boundary through which every effect passes gives, as ordinary handlers instead of per-feature
-code:
+schedules, processes. Before the boundary, each capability guarded and recorded itself, or
+did not (the inventory below is that state). One boundary through which every effect passes
+gives, as ordinary handlers instead of per-feature code:
 
 - **authority**: the same answer to "may this subject do this to that object" everywhere,
   shared with simmis (`is.simm.model.access/can?`, eacl behind it later);
@@ -23,7 +24,7 @@ code:
   robustness;
 - **preflight**: record what code would do, without doing it, for approval.
 
-## What exists (inventory, 2026-09-27)
+## What existed before the boundary (inventory, 2026-09-27)
 
 Guards: HTTP domain policy (`dvergr.sandbox.ns.io/make-domain-policy`), SSRF guard, secret
 substitution and scrubbing, the sensitive-path policy and path clamps, muschel shell permits,
@@ -43,8 +44,8 @@ registry tools pass `dvergr.tools/execute`, which already has an allowlist and a
 
 ## Hardening first (independent of the boundary)
 
-The inventory found holes that are bugs today. They are fixed before the boundary, in their
-own PR, each with a test that fails first. **Fixed** (`test/dvergr/sandbox/hardening_test.clj`):
+The inventory found holes that were bugs at the time. They were fixed before the boundary, in
+their own PR, each with a test that fails first. **Fixed** (`test/dvergr/sandbox/hardening_test.clj`):
 1, 2, 3, 4, 6, 7, 8; 5 is the boundary's receipt stream (below).
 
 For 7 and 8 the working context carries the acting identity (`:agent-id`, from the agent the
@@ -141,14 +142,14 @@ real continuations, without changing capabilities.
 
 **Configuration is data and composes algebraically.** A world's handlers live in its binding
 (`:effects {:handlers [[:admit #{:read :network}] [:read-only]]}`), set by the runtime and
-unreachable from code; they fork with the world. A refusing handler is a filter `admit S`
-(`read-only` is `admit #{:read}`); filters compose by intersection, so they commute, are
-idempotent, and admitting every class is the identity. `normalize` gives the canonical stack:
-receipts, one filter, then answering handlers in the order given, then the world. `compose`
-concatenates and normalizes; it is associative with `[]` as identity. A rebind or fork
-composes its handlers onto the world's, so authority narrows and never widens (attenuation,
-as in simmis's delegation). These laws are test.check properties
-(`test/dvergr/effects_test.clj`).
+unreachable from code; the configuration forks with the world (but see the state of answering
+handlers below). A refusing handler is a filter `admit S` (`read-only` is `admit #{:read}`);
+filters compose by intersection, so they commute, are idempotent, and admitting every class is
+the identity. `normalize` gives the canonical stack: receipts, one filter, then answering
+handlers in the order given, then the world. `compose` concatenates and normalizes; it is
+associative with `[]` as identity. A rebind or fork composes its handlers onto the world's, so
+authority narrows and never widens (attenuation, as in simmis's delegation). These laws are
+test.check properties (`test/dvergr/effects_test.clj`).
 
 **Landed** (step 2): the vocabulary, `perform!`, receipts (reads by digest; subject = the
 acting identity), the filter (admission and `read-only`), receipts kept on the working
@@ -171,8 +172,17 @@ gate of its capability rather than per call site.
   classification, or one whose function returns no effect, runs as `:tool/call`, assumed to
   write and reach out; a test fails on any registered tool without one.
 - **Workspace files**: `dvergr.tools/workspace-write!` is the one gate for `write_file`,
-  `edit_file` and `clojure_edit` (an `:fs/write` with its size, as a sandbox `spit`); a caller
-  without a chat passes its own boundary as `:effect-boundary`.
+  `edit_file` and `clojure_edit` (an `:fs/write` with its size, as a sandbox `spit`), and
+  `workspace-delete!` (an `:fs/delete`) for removals; a caller without a chat passes its own
+  boundary as `:effect-boundary`. With `:expect` (a content id, or nil for no file) either is a
+  compare-and-write, checked in the same transaction, that throws when the file changed.
+- **Room files from outside the room**: `room_write` (MCP and the JSON API,
+  `dvergr.rooms.files/write!`) is a `:git/commit` effect, decided before anything is written,
+  under the room world's handlers (`files/host-boundary`). Inside it each path passes
+  `workspace-write!` or `workspace-delete!` with `:expect` set to what the batch's snapshot saw,
+  so a file changed underneath fails the batch. On failure the batch's own changes are undone;
+  a path another writer changed meanwhile is left as they made it and named in the error's
+  `:conflicted`.
 - **Databases**: the tools' transacts (`task_create`, `task_update`, `knowledge_add`) are
   `:db/transact`, as the sandbox's `datahike.api/transact` is.
 - **The global registry**: actor rows and a prompt (`dvergr.actors/*`, `update_agent_profile`)
@@ -206,31 +216,40 @@ Actions as in simmis, weakest first: `:read`, `:write` (including writing a fork
 beneath it (forks and nested rooms, transitively), discard or delete what is beneath its room
 (never the room itself), and read and write rooms it takes part in; anything else is denied
 until grants exist. Re-parenting needs `:admin` on the room moved, so it cannot be used to gain
-authority. The authority filter is a **predicate filter**: it composes by conjunction (once is
-enough) and sits after the class filter; the runtime adds it for every agent subject, so no
-configuration removes it; MCP connections and the host keep their reach. Laws (the action
-ladder, monotonicity in relations, authority carrying down the tree) are test.check
-properties (`test/dvergr/authority_test.clj`).
+authority. Nothing refuses a re-parent that makes a cycle, though: `set-parent!` writes the
+parent as given, and the ancestor walk behind `can?` (`authority/ancestors-of`) has no cycle
+guard, so a cyclic parent chain can make an authority decision loop (an open bug). The
+authority filter is a **predicate filter**: it composes by conjunction (once is enough) and
+sits after the class filter; the runtime adds it for every agent subject, so no configuration
+removes it; MCP connections and the host keep their reach. Laws (the action ladder,
+monotonicity in relations, authority carrying down the tree) are test.check properties
+(`test/dvergr/authority_test.clj`).
 
 An agent that creates a room keeps it by taking part in it (`:agents`) or nesting it
 (`:parent-id`) under its own.
 
 **Record, replay, faults** (steps 4 and 5): answering handlers. Their configuration is data
 (`[:replay {:id …}]`); the state they need (a recording, a replay cursor, fault counters) is
-host-side, created before the run (`recording!`, `replay!`, `faults!`) and unreachable from
-code. `[:record]` appends each effect's key (operation, resource, optional finer `:key`) and
-its result or error; `[:replay]` answers each effect with the next recorded entry for its key
-and never reaches the world, reporting divergence when asked for something unrecorded;
-`[:faults]` fails a `rate` of the effects in scope with a fault drawn from `kinds` (`:error`,
-`:timeout`, and for HTTP a 429 or 503 answer of the operation's shape), as a function of
-`(seed, key, occurrence)`. Answering handlers do not commute (a recording outside faults
-records them; inside, only what reached the world). Laws as properties: replay reproduces a
-recording without the world; rate 0 is the identity; the same seed gives the same faults.
+host-side, created before the run (`recording!`, `replay!`, `faults!`, `quota!`) and
+unreachable from code. That state lives in one process-wide map keyed by the handler's id
+(`effects/states`), not in the world: a fork that inherits `[:record {:id …}]` appends to the
+same recording, advances the same replay cursor, and counts toward the same fault occurrences
+and the same quota as its parent. Only a fork given handlers with a new id has its own.
+`[:record]` appends each effect's key (operation, resource, optional finer `:key`) and its
+result or error; `[:replay]` answers each effect with the next recorded entry for its key and
+never reaches the world, reporting divergence when asked for something unrecorded; `[:faults]`
+fails a `rate` of the effects in scope with a fault drawn from `kinds` (`:error`, `:timeout`,
+and for HTTP a 429 or 503 answer of the operation's shape), as a function of `(seed, key,
+occurrence)`. Answering handlers do not commute (a recording outside faults records them;
+inside, only what reached the world). Laws as properties: replay reproduces a recording without
+the world; rate 0 is the identity; the same seed gives the same faults.
 
-**World configuration**: a world (a Room's execution context) holds handlers every sandbox
-in it runs under, outside each capability's own (`install-world!`, `world-handlers`); forks
-inherit them and may add their own without touching the parent. An EnvironmentDef's
-`:world :effects` installs them in each Attempt's isolated world (doc/benchmarks.md).
+**World configuration**: a world (a Room's execution context) holds handlers every sandbox in
+it runs under, outside each capability's own (`install-world!`, `world-handlers`). The
+configuration is context state, so forks inherit it and may compose their own onto it without
+changing the parent's configuration; the host-side state of an inherited answering handler is
+shared, as above. An EnvironmentDef's `:world :effects` installs them in each Attempt's
+isolated world (doc/benchmarks.md).
 
 **Quotas**: `[:quota {:id …}]` (host state from `quota!`) counts the `:bytes` of every write
 effect (file writes carry their size, database transactions their printed size) and refuses
@@ -261,7 +280,7 @@ preflight.
 
 | Goal | Mode / handler | Notes |
 |---|---|---|
-| Read-only eval | `:read-only` | honest because every effect passes the boundary; pure computation still runs |
+| Read-only eval | `:read-only` | honest because every writer passes the boundary; pure computation still runs |
 | Permissions shared with simmis | authority | the `can?` seam first, eacl later |
 | Metering | resources | eval CPU/wall and model tokens as ledger resources, recorded not charged |
 | Reproducible Attempts | `:replay` | an Attempt's log replays it; divergence is reported |

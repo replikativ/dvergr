@@ -27,18 +27,19 @@
        same FS — `wc -l < /etc/passwd` is refused.
      - Glob expansion (`*.txt`) walks the FS, never real disk.
      - The builtin host's `:fallback-allowlist` controls which
-       system binaries can be invoked at all. Default is `git` +
-       `gh` for the common dev workflow. Anything not in builtins
-       or the allowlist refuses with exit 126.
+       system binaries can be invoked at all. The default is empty
+       (`default-fallback-allowlist`); over a Geschichte workspace `git`
+       is a muschel builtin on the workspace's repository. Anything not
+       in builtins or the allowlist refuses with exit 126.
 
    ## Substrate-fork interaction
 
    The session lives in the chat-ctx's spindel execution context.
    When dvergr.discourse/fork-room with :isolation :ctx forks the
    chat-ctx, the muschel session's env-atom is CoW-forked alongside
-   — a worker's `cd` doesn't leak to the parent. Filesystem effects
-   of the commands themselves still need a git-worktree workspace
-   to be truly contained (PR #8 — yggdrasil git-worktree wiring)."
+   — a worker's `cd` doesn't leak to the parent. The commands' file
+   effects land in the room's Geschichte workspace, a virtual
+   filesystem the fork branches with the rest of the room."
   (:require [clojure.string :as str]
             [dvergr.substrate.git :as dgit]
             [dvergr.substrate.geschichte :as geschichte]
@@ -368,10 +369,10 @@
   a virtual workspace descriptor and exposes no physical path.
 
    `:mount-at \"/\"` makes the workspace dir ITSELF the sandbox root (so sandbox
-   `/` ↔ the worktree), rather than muschel's default `/home/agent` + `/tmp`
-   mount layout — i.e. the agent's whole filesystem IS the git worktree. The
-   host translates sandbox paths → real disk at the OS-spawn boundary
-   (`fs/physical-path`), so git/ls still run in the real worktree.
+   `/` ↔ the workspace), rather than muschel's default `/home/agent` + `/tmp`
+   mount layout — i.e. the agent's whole filesystem IS the workspace. For a
+   string `:workspace` (a disk directory) the host translates sandbox paths →
+   real disk at the OS-spawn boundary (`fs/physical-path`).
 
    Options:
      :workspace          (default: `default-workspace`)

@@ -217,11 +217,12 @@
 
      builtin → user (~/.dvergr/<kind>) → project (./.dvergr/<kind>) → room
 
-   The optional `room-dir` is a room's sandbox-repo working path; when given and
+   The optional `room-dir` is a room's sandbox-repo root (a path or the room's
+   workspace); when given and
    `<room-dir>/<kind>/` exists, it is the highest-precedence (`:room`) layer —
    so a room can override or add its own definitions. `definitions` stays
-   decoupled from rooms: the caller resolves the path (e.g. via
-   `dvergr.substrate.git/current-worktree-path`).
+   decoupled from rooms: the caller resolves it (e.g. via
+   `dvergr.sandbox.workspace/workspace-root`, as `dvergr.agent.prompt` does).
 
    Each value includes the parsed frontmatter plus `:name :file :path :scope`
    and `:content` (the body)."

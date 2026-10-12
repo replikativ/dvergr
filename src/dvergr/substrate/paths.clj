@@ -1,10 +1,11 @@
 (ns dvergr.substrate.paths
   "Single project-local root for dvergr's on-disk state: `.dvergr/`.
 
-   Everything dvergr writes at runtime — the chat/KB/code Datahike store, git
-   fork worktrees, the Lucene search index, intake transcripts,
-   the log file — lives under one directory so it's obvious, easy to .gitignore,
-   and trivial to reset (`rm -rf .dvergr`).
+   Everything dvergr writes at runtime — the system-db, the per-room stores
+   under `systems/`, the fallback Geschichte workspace store, the sandbox
+   workspace clone, blobs, mail, the MCP token, the log file — lives under one
+   directory so it's obvious, easy to .gitignore, and trivial to reset
+   (`rm -rf .dvergr`).
 
    Resolution priority for the root (see `home`):
      1. an explicit `(set-home! \"…\")` from Clojure
@@ -56,8 +57,8 @@
 ;; must use `path`, NOT `dir` — datahike/konserve create their own store dir and
 ;; throw "File store already exists" if it's pre-created. Only CONTAINER dirs
 ;; (whose real store/file is a child) may be pre-created with `dir`.
-(defn db-dir           "Chat/KB/code Datahike file store (datahike makes it)." [] (path "db"))
-(defn worktrees-dir    "Git worktrees container (git makes <branch> under it)." [] (dir "worktrees"))
+(defn db-dir           "Legacy single chat-store path; no caller (rooms have their own stores under `systems/`)." [] (path "db"))
+(defn worktrees-dir    "Native git worktrees container, for `dvergr.substrate.git/create-git-system` only (room workspaces are Geschichte, with no directory)." [] (dir "worktrees"))
 (defn workspace-dir    "Agent code workspace — a dedicated git repo, the SCI sandbox's load root." [] (dir "workspace"))
 (defn workspace-store  "Fallback Geschichte repository store (Datahike creates it)." [] (path "geschichte-workspace"))
 (defn system-db-dir    "System DB store: registry of parties/systems/rooms/grants (datahike makes it)." [] (path "system-db"))

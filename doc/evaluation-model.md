@@ -1,16 +1,20 @@
 # The evaluation model: attempts as a first-class verb
 
-Status: design, agreed direction (2026-09-20), partly built; see *Order of
-work* for what exists. It follows a systematic map of the current harness; every
-claim about existing code names its namespace.
+Status: step 1 of *Order of work* is built (2026-09-20): every benchmark
+provider and every room workflow is scored through `evaluate`. Of step 2,
+model spend is debited from Run wallets and a sandbox can run an experiment
+against the verifiers its host offers; the rest of steps 2-4 is not built.
+Every claim about existing code names its namespace.
 
 ## Why
 
 Dvergr is a recursively self-programmable harness: an agent can hire agents
 into forked worlds, which can hire further. Evaluation should be the same
 kind of thing: something an agent does, at any depth, in a further nested
-world. Today it is not. The generic machinery exists but only host code can
-drive it, and the one real benchmark (tau2) goes around it.
+world. It is partly that: the generic machinery scores every benchmark, and
+an agent can start an experiment (`dvergr.agent/run-experiment!` in the
+sandbox), but only against verifiers the host offers, and inside a paid
+LLM Run only over `:echo`/`:scripted` candidates.
 
 The goal is one verb, `attempt!`, from which tests, benchmarks, retries,
 search and training data all follow, plus a small contract for what a
@@ -34,7 +38,7 @@ Three layers, each built on the one below.
    `dvergr.agent.experiment/run` folds it over dataset x candidates into a
    **Scorecard**.
 
-Definitions are already portable, content-addressed values an agent can
+Definitions are portable, content-addressed values an agent can
 author in its sandbox: `EnvironmentDef`, `DatasetDef`, `ExperimentDef`
 (`dvergr.agent/environment`, `dataset`, `experiment` in SCI). An
 EnvironmentDef *names* its verifier (`{:verifier/id :version :basis}`) and
@@ -46,7 +50,7 @@ record unreachable from SCI, and a governed Datahike writer
 (`dvergr.agent.attempt.governance`) that rejects unauthorized creation and
 any mutation of Attempts and Scorecards.
 
-So `evaluate` already is about 90% of `attempt!`.
+So `evaluate` is most of `attempt!`.
 
 ### Two planes
 
@@ -62,29 +66,23 @@ One separation in the existing code makes the rest compositional.
 
 Discarding a world discards its side effects and keeps the evidence.
 
-## What is wrong today
+## What was wrong, and what still blocks
 
-**tau2 bypasses the generic path** (`dvergr.benchmarks.tau2.*`,
-`dvergr.agent.conversation`):
+Until step 1 (2026-09-20), tau2 went around this path: its episodes ran in
+plain child Rooms rather than forks, its grader was called inline with no
+evaluator boundary, and it re-implemented the job matrix and resume. tau2
+now runs as a provider (`dvergr.benchmarks.tau2.provider`: world setup,
+conversation protocol, grader as Evaluator), and `experiment/run` resumes.
+Only checkpoints and branches (`episode/run!`, `branch!`) still use the
+Room path (`dvergr.agent.conversation`).
 
-- Episodes run in plain child Rooms, not forks: no RunWorld, no settlement
-  axis, no locked world.
-- The grader is called inline, in the same code that builds the evidence
-  and the receipt. There is no evaluator boundary, so the trust model above
-  does not hold for tau2 scores.
-- Its EnvironmentDefs are structurally rejected by `evaluate`
-  (`:world {:isolation :room}`, limits `:max-steps`/`:max-errors`).
-- It re-implements the job matrix, parallelism and Scorecard assembly of
-  `experiment/run`. It adds **resume**, which the generic runner lacks.
-- Snapshot and branch is bespoke to tau2 (`episode/branch!`).
-
-**Invariants that block the agreed direction:**
+**Invariants that block the rest of the direction:**
 
 | Wanted | Blocked by |
 |---|---|
 | Function candidates | A candidate must be an AgentDef; programs are only `:echo :scripted :llm`; `make-attempt` cross-checks agent version and program kind |
-| Agent-authored verifiers | `Evaluator` is a host record matched by exact ref; trust is binary; no registry in `src/` (only `dev/`) |
-| Nested evaluation | SCI `hire!` forbids `:deferred`; children are limited to `:echo`/`:scripted` with provider effects off; `persist!` is unreachable from SCI; `experiment/run` forces `:discard` |
+| Agent-authored verifiers | `Evaluator` is a host record matched by exact ref (`dvergr.agent.evaluation/make-evaluator`); the sandbox can only name a verifier its host offers (`dvergr.agent.evaluators`) |
+| Nested evaluation | SCI `hire!` forbids `:deferred`; children and the candidates of a sandbox experiment are limited to `:echo`/`:scripted` with provider effects off (`child-program-authority` in `dvergr.agent.program`); `experiment/run` requires `:discard` |
 | Branch any Run | A world can only be branched when nothing runs in it; `RunHandle` rejects cross-fork use; the Run registry is process-local; RunWorlds fork with `:forkable-components #{}` |
 
 Two unrelated things share a name: `dvergr.agent.episode` (a read-only join
@@ -136,25 +134,47 @@ agent iterate on its own code before it spends tokens.
 
 ### Verifiers and trust
 
-Verifiers move into a registry in `src/`, keyed by the verifier ref. Every
-Attempt records its verifier's identity and a trust tier:
+As built, the trust tier is a field of the `Evaluator` record
+(`dvergr.agent.evaluation`, `trust-tiers`), set by the host code that
+constructs it (`make-evaluator :tier`, default `:trusted`), and every receipt
+records it as `:verifier-trust` in its metrics:
 
-- **trusted**: host registry (tau2's grader).
-- **room**: authored in this Room and vetted, through the same gate skills
-  already use.
-- **ad-hoc**: authored and unvetted. Usable for an agent's own iteration;
-  never aggregated into a Scorecard a parent reads as authoritative.
+- **trusted**: host code (the benchmark providers' graders, tau2's among
+  them).
+- **room**: a room workflow's checker whose bundle the host promoted after
+  calibration (`dvergr.catalog.room/promote!`, `catalog_promote`).
+- **ad-hoc**: an unpromoted bundle's checker. Usable for an agent's own
+  iteration.
 
 Every Attempt is stored, in every tier: trust is a field on the record, not
-a storage decision. The host assigns the tier by resolving the verifier in
-the registry, so an agent cannot claim a higher one. Policy applies when
-aggregating: a Scorecard requires a minimum tier (one more check in
-`validate-scorecard-attempts`, which already re-verifies every entry).
-Nothing is ephemeral, so anything can be forked or re-verified later.
+a storage decision. An agent cannot claim a higher tier, because only host
+code constructs an Evaluator and agent code can only name one by ref. There
+are two host registries. `dvergr.agent.evaluators` holds what the
+sandbox's `run-experiment!` may use (the wiki benchmark and the workflow
+completion check). `dvergr.agent.verifiers` is a second registry with a
+`register!` in the tau2, BFCL, BIRD and AutomationBench providers, but no
+code path calls them and only the registry's own test reads it: the shared
+runner (`dvergr.agent.experiment.runner`) builds the capability maps
+`experiment/run` takes from the provider's `{:world-setup :protocol
+:evaluator}` directly.
 
-In every tier a verifier is content-addressed, pure, and runs with no IO in
-a fork, so any verdict can be re-derived. A score means what its verifier's
-identity says, not what its reporter claims.
+Not built: a minimum tier for Scorecards (one more check in
+`validate-scorecard-attempts`, which already re-verifies every entry);
+today a Scorecard aggregates Attempts of any tier, and `scorecard_detail`
+lists the tiers among its Attempts. Agent-authored verifiers
+outside the room-workflow checkers are not built either.
+
+The checks are split in two. `observe` runs on the host with the live world
+and may do IO: a room workflow's observer asks its judge model and keeps the
+answers in the evidence (`:judgements`), and its `capture` reads the world's
+files. `verify` is a function of the EnvironmentDef and the portable evidence
+`observe` returned, so such a verdict can be re-derived from the stored
+evidence. One exception: tau2's verifier asks a live judge model for a task's
+natural-language assertions (`nl-assertion-checks` in
+`dvergr.benchmarks.tau2.core`, called from the provider's verify), so
+re-verifying those tasks makes a model call and may answer differently; the
+judge's answers are not yet kept as evidence. A score means what its
+verifier's identity says, not what its reporter claims.
 
 A verifier may offer a **partial** form, called at checkpoints, returning
 reward components so far. It is optional; without it a benchmark has
@@ -165,22 +185,24 @@ terminal rewards only (see Caveats).
 Four things. The rest is shared.
 
 1. **World setup**: the initial world (tau2's store, the customer's phone).
-2. **Protocol and driver**. Today an `:llm` program is one task, one answer:
-   the Run completes on the model's first text reply
-   (`program/execute-llm-program`). An EnvironmentDef therefore names a
-   protocol:
-   - `:task` (default): today's behaviour.
-   - `:conversation`: the hired Run *is the episode*. It joins the candidate
-     and a trusted **driver** in the work world, runs the turn loop under the
-     environment's limits and stop conditions, and ends when the driver says
-     so. Each candidate reply is an `:agent-turn` Run, a structural child of
-     the episode Run.
+2. **Protocol and driver**. By default an `:llm` program is one task, one
+   answer: the Run completes on the model's first text reply
+   (`program/execute-llm-program`). An EnvironmentDef may instead name a
+   protocol by exact ref in its world (`{:protocol/id :protocol/version
+   :protocol/basis}`); the host resolves it to a `Protocol` capability
+   (`evaluation/make-protocol`) whose `run` hosts the whole interaction in
+   the Run's work world, under the Run's supervisor, and returns the Run's
+   value. Each provider brings its own: tau2's `:tau2/conversation` joins the
+   candidate and a trusted **driver** (the simulated customer with its own
+   tools and private scenario) and runs the turn loop under `:max-steps` and
+   `:max-errors`; BFCL, BIRD, SpreadsheetBench and AutomationBench have
+   theirs. A protocol's `inputs` says what it presents to the candidate
+   beyond the AgentDef (tau2: the system prompt), which enters the Attempt's
+   inputs id.
 
-   The conversation protocol is generic; tau2 supplies only its driver, the
-   simulated customer with its own tools and private scenario. The
-   alternative, exposing the customer as a tool inside one ordinary Run, was
-   rejected: customer messages would reach the model as tool results rather
-   than user turns, which is a different benchmark from upstream's.
+   Exposing the customer as a tool inside one ordinary Run was rejected:
+   customer messages would reach the model as tool results rather than user
+   turns, which is a different benchmark from upstream's.
 3. **Verifier**, terminal and optionally partial.
 4. **Private data**: what the candidate must never see (gold actions). The
    interpreter projects tasks through this boundary, so the same mechanism
@@ -253,21 +275,31 @@ separate the two. More cases, or harder ones, may.
 
 ### Accounting
 
-Today two accounting systems are not connected:
+Model spend reaches the conserved ledger (`dvergr.resource`, Kontor) when a
+Run is allocated microdollars: the LLM program binds the Run's wallet
+(`resource/*spend-wallet*`, `dvergr.agent.program`) around its model steps,
+and every model call's cost is debited from it with `consume!`
+(`charge-spend!`, called from `dvergr.chat.context`). An empty wallet ends
+the Run's budget; a resumed Run spends what the stopped one left. Model
+dispatches can also be admitted one by one (`admit-model-dispatch!`), and
+arena commands debit their own units (`dvergr.agent.arenas.renewal`).
 
-| | Conserved ledger (`dvergr.resource`, Kontor) | Chat budget (`budget-signal`) |
+| | Conserved ledger | Chat budget (`budget-signal`) |
 |---|---|---|
 | Lives in | control Room store; never forked | the working context; forks with the world |
-| Tracks | authority to spend: a grant at hire, the remainder returned | actual spend: tokens x price; stops the Run on budget |
-| Gap | `consume!` has no callers: spend is never debited | not conserved, not tied to a wallet |
+| Tracks | a grant at hire, model spend debited per call, the remainder returned | tokens x price; stops the Run on budget |
+| Gap | each debit has a fresh random id (`UUID/randomUUID`), so a retried call is not charged effectively once | not conserved; only capped by the wallet when one is bound |
 
-This is why nested paid work is closed (`:provider-effects? false` in
-`child-program-authority`: "until provider usage and Kontor receipts form
-one atomic path"). The prerequisite for nested attempts is therefore to
-debit model spend from the Run's wallet with `consume!`, under a stable id
-so a retried effect cannot charge twice.
+What is not debited in microdollars: the model calls inside a protocol Run
+(a tau2 conversation's, the candidate's and the customer's alike) and a room
+workflow judge's. A protocol's observer records its calls as the Attempt's
+`:spend` on its receipt, but they are not taken from a wallet; a room
+workflow judge's usage is not recorded at all (`model-judge` in
+`dvergr.catalog.room` keeps only the answer text). And nested paid
+work stays closed (`:provider-effects? false` in `child-program-authority`)
+until debits are effectively once.
 
-With that, an attempt is funded as follows. The caller grants an **attempt
+Not built: attempt wallets. The plan: an attempt is funded as follows. The caller grants an **attempt
 wallet**; the attempt sub-grants to each paid role, each an ordinary Run with
 its own wallet: the **candidate**, the **driver**, the **judge**. Per-role
 limits come from the EnvironmentDef; unused amounts return upward as today;
@@ -338,8 +370,9 @@ has most of the first half.
 Refactor first. Each step keeps the suite green.
 
 1. **Fold tau2 into `evaluate`.** DONE (2026-09-20), except the last item.
-   - Verifier registry with trust tiers in `src/` (`dvergr.agent.verifiers`);
-     the tier is recorded on every receipt.
+   - Trust tiers on the Evaluator (`make-evaluator :tier`), recorded on
+     every receipt (`dvergr.agent.verifiers`, the registry this step added,
+     is unused outside its tests).
    - Environment protocols (`evaluation/make-protocol`): a Run hosts a
      trusted interaction in its world, under its own supervisor.
    - `experiment/run`: protocols, each Attempt's cell identity, `:resume?`,
@@ -357,12 +390,15 @@ Refactor first. Each step keeps the suite green.
      alive. They move with step 3. The tau2 episode namespace is not renamed
      yet.
 2. **Widen the primitive.** First the prerequisite: debit model spend from
-   Run wallets (`consume!`, effectively once), then attempt wallets with
+   Run wallets (`consume!`; built, but not yet effectively once), then attempt wallets with
    per-role sub-grants; this is also what lets `:provider-effects?` open for
    delegation generally. Then `:fn` candidates; agent-authored verifiers in
    the `:room` and `:ad-hoc` tiers; a minimum tier for Scorecards;
    `attempt!`, `evaluate!` and reading the subtree's Attempts in the sandbox,
-   with the attenuation `hire!` already applies.
+   with the attenuation `hire!` already applies. Built so far: the sandbox's
+   `run-experiment!` (`dvergr.sandbox.ns.agent`) runs an experiment as a job
+   under the calling Run, against host-offered verifiers; inside a paid LLM
+   Run its candidates are limited to `:echo` and `:scripted`.
 3. **Run-level snapshot and branch** in `dvergr.agent.world`, replacing
    tau2's. The seam exists: `hire-prepared-in!` already separates the control
    Room from the world parent, so a branch is an evaluation whose world

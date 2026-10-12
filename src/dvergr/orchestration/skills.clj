@@ -29,9 +29,9 @@
        3. tiebreak by :created-at (older wins — established providers
           are preferred over fresh spawns)
 
-   Phase C exposes the dispatch surface to SCI as the 'skills namespace
-   and refactors the daemon's inline `load-skills`/`inject-skills` to
-   live here."
+   The sandbox exposes the lookup and dispatch surface as `dvergr.skills`;
+   `inject-skills` is what `dvergr.agent.prompt` calls when it assembles a
+   system prompt."
   (:require [clojure.set]
             [clojure.string :as str]
             [dvergr.actors :as actors]

@@ -11,7 +11,7 @@ that both depend on dvergr stay fully isolated.
 |-------|----------|-----------|----------|
 | **Built-in defaults** | dvergr's classpath: `resources/agents/*.md`, `resources/models.edn`, `resources/phases/*.edn`, `resources/skills/*.md` | fallback | dvergr (the library) |
 | **Project config** | `./config.local.edn` (+ project skills) | seed + override | your project |
-| **Runtime state** | `./.dvergr/` (Datahike — chat, actors, **agent prompts**; worktrees; index) | **authoritative once seeded** | the running system / UIs |
+| **Runtime state** | `./.dvergr/` (Datahike — chat, actors, **agent prompts**; Geschichte room workspaces; index) | **authoritative once seeded** | the running system / UIs |
 
 Rule of thumb: the **file** is a *seed*; once the system boots, the **Datahike
 store under `.dvergr/`** is the source of truth. Editing an agent in the TUI/web
@@ -37,7 +37,6 @@ Priority: `(paths/set-home! …)` → `$DVERGR_HOME` → `./.dvergr`. Layout:
   db/            Datahike file store (chat + KB + code + actors + agent prompts)  ← authoritative
   system-db/     registry of parties / systems / rooms / grants
   systems/       per-system stores (each room's KB/repo scope)
-  worktrees/     git worktrees for :ctx room forks
   workspace/     the agent code workspace (sandbox load root, cloned from the sandbox stdlib)
   transcripts/   intake transcript cache
   dvergr.log     daemon/substrate log

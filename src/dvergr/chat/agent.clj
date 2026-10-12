@@ -221,6 +221,7 @@
    Returns:
    - :continue if more turns needed (tool calls made)
    - :complete if agent is done (no tool calls)
+   - :cancelled if the turn was cancelled
    - :error if something failed"
   [chat-ctx {:keys [provider model tools tool-ctx on-text auto-compact? compaction-model turn-number cancel?
                     system-suffix on-reply run-id model-opts]

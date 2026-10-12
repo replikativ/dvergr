@@ -1,6 +1,6 @@
 # One algebra for worlds, savepoints and budgets
 
-Status: **in progress** (2026-09-27; agreed in direction: "unify our stack and FRP algebra"). Done: steps 1 (spindel#74, released in 0.1.67), 2 (#195), 3 (resume through `hydrate-into!`), 4 (#196). Step 5 is a renaming without a new guarantee and step 6 is deferred until inference runs over Attempts (below).
+Status: steps 1-4 are built (spindel#74, released in 0.1.67; #195; resume through `hydrate-into!`; #196), with one difference from the plan: turn savepoints do not escrow, and a resume grants the stopped Run's remainder straight from its wallet (step 2). Step 5 was assessed and not done (a renaming without a new guarantee); step 6 is deferred until inference runs over Attempts (below). The map's "dvergr today" column describes the code before these steps.
 
 dvergr grew its own versions of things spindel now provides: Run worlds beside spindel's
 savepoint worlds, a resource ledger beside spindel's resource authority, a resume path beside
@@ -34,20 +34,25 @@ states (and tests) hold for dvergr too.
    mapping a world to the Run that owns it (`:run-id` in the Room's meta): `grant!` =
    allocate from the parent Run's wallet, `return!` = return the remainder, `escrow!` = move
    the remainder into an escrow account named by the savepoint id, `claim!` = move it into
-   the claiming Run's wallet, once. Run worlds' savepoint sessions carry it; turn savepoints
-   persist with `{:escrow? true}`.
+   the claiming Run's wallet, once. Run worlds' savepoint sessions carry it
+   (`program.clj`, `savepoint/open!` with `:authority`). As built, turn savepoints persist
+   without an escrow (`portable/persist`), and `resume!` grants the stopped Run's remainder
+   from its wallet to the new Run's (`:resources-from`); escrow is for a planned handoff
+   across a process boundary (doc/run-resume.md).
 3. **Resume through the law (done, spindel 0.1.70):** `resume!` opens a Run world forked at
    the savepoint's snapshots (dvergr owns the handle and settles it), and
    `portable/hydrate-into!` makes that world the savepoint's continuation: seed and sequence,
    bookkeeping cleared, pinned components repinned, and `continue-llm-run` started as the
    session's computation, before the Run's first step. The Run's supervisor drives the loop
    from the recorded step; the continuation resolves with the resumed Run's result, so the
-   session's end is the Run's end. The budget moves as step 2 says.
+   session's end is the Run's end. The budget moves by the grant step 2 describes.
 4. **Model budget in the ledger (done):** a Run allocated microdollars pays its model spend
    from its wallet: `account-usage!` charges each cost through `resource/*spend-wallet*`
    (bound by the LLM loop; unlike `*model-scope*` it restricts no provider), a cost beyond
    what is left takes the rest and exhausts the budget, and the Run's budget is at most its
-   wallet. Model spend is thereby conserved, escrowed and resumed with everything else. A
+   wallet. Model spend is thereby conserved and resumed with everything else. Each debit
+   has a fresh id (`resource/charge-spend!`), so a retried call is not charged effectively
+   once. A
    resumed Run without a wallet starts with its budget minus what the stopped Run's chat
    spent, not a fresh one.
 5. **One handler table (assessed, not done):** dvergr's effect configuration and spindel's

@@ -108,10 +108,6 @@
        first))
 
 ;; ============================================================================
-;; Wrap-up prompt for budget-checkpoint :wrap-up resolution
-;; ============================================================================
-
-;; ============================================================================
 ;; Public API
 ;; ============================================================================
 
@@ -328,14 +324,11 @@
                 (when-let [sp (:system-prompt spec)]
                   (cc/add-message! c {:role :system :content sp}))
                 c)))
-        ;; Grace window for the manager to extend the budget after exhaustion.
         compaction-strategy (:strategy compaction :sync-before-turn)
         ;; In race mode, disable run-turn-fn's internal sync compaction — we
         ;; drive it from the agent's spin-race below.
         race-compaction?    (= :race-with-turn compaction-strategy)]
     (let [;; Mutable state controlled by directives (message-channel).
-          ;; The budget-checkpoint above is a SEPARATE channel via
-          ;; dvergr.agent.process — both paths can fire; first to act wins.
           cancelled?   (atom false)             ; flip on :directive/cancel
           spec-atom    (atom spec)              ; swap on :directive/switch-model
           ;; Race-arm state: at most one in-flight compaction handle.
@@ -361,10 +354,7 @@
                  (case (:type msg)
 
                ;; --- directive: extend the dollar budget ---
-               ;; Bumps :total on the chat-ctx budget signal. The
-               ;; budget-checkpoint! path is the preferred way to do
-               ;; this (via Processes pane + processes/directive!),
-               ;; but message-channel still works.
+               ;; Bumps :total on the chat-ctx budget signal.
                    :directive/raise-budget
                    (do (apply-raise-budget! chat-ctx msg) nil)
 

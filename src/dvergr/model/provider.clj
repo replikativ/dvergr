@@ -159,7 +159,8 @@
    - How tool results are formatted in the message history
    - Provider-specific quirks (e.g., Kimi K2 tool ID rewriting)
 
-   When not implemented, falls back to Anthropic-style formatting in agent.clj."
+   There is no fallback: `dvergr.chat.agent` throws for a provider that does
+   not implement it."
 
   (format-messages [this messages model]
     "Convert chat context messages to API message format.

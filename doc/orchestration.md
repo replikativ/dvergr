@@ -1,8 +1,12 @@
 # Recursive work orchestration
 
-Status: accepted design contract, implemented incrementally. This document fixes
-the vocabulary, ownership, and interoperability boundaries for the implementation
-work; a staged API described below may not exist yet.
+Status: partly built, partly superseded. Stage 2 is built (Runs for agent turns,
+[runs.md](runs.md)); of Stage 1, typed thread roots (`:message/thread-root-id`) and
+attention decisions (`dvergr.discourse.attention`) exist. The provider-neutral task protocol and Stage 3's
+`delegate!`/`message!`/`follow-up!` API were never built and are superseded by
+`hire!` (see the banner under *Provider-neutral task protocol*); Stages 4-6 are not
+built. The vocabulary, ownership and interoperability boundaries below still
+describe the code where it exists.
 
 ## Objective
 
@@ -492,6 +496,10 @@ Implemented for `:agent-turn` Runs; see [runs.md](runs.md):
 
 ### Stage 3: durable delegated tasks
 
+> **Superseded.** Not built as written: delegation is `hire!`, which already gives a
+> durable Run with parent lineage, a forked world with a settlement policy, conserved
+> resources and cancellation. Items 1-4 below are the original plan.
+
 1. Define task identity, parent/root lineage, objective, assignee, status, context
    frontier, and workspace policy as typed attributes.
 2. Implement normalized events and pure task projection.
@@ -503,8 +511,8 @@ The provider-free functional-programming precursor is implemented now: immutable
 AgentDefs/Rosters compose in room SCI, and `hire!` starts a Run-backed Spindel
 computation whose effects execute in an isolated Run world. Automatic settlement
 is the common path; review retains the world as a normal inspectable fork. See
-[agent-programs.md](agent-programs.md). Its `:roster/scope` is data only until
-this stage supplies enforceable attenuation/accounting.
+[agent-programs.md](agent-programs.md). Its `:roster/scope` is stored on the
+Roster but nothing reads it; resources move through `hire!`'s `:resources`.
 
 ### Stage 4: recursive workrooms
 

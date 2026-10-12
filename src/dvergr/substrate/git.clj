@@ -1,8 +1,13 @@
 (ns dvergr.substrate.git
-  "Git worktree integration for session isolation.
+  "Native git worktree integration (yggdrasil's git adapter).
 
-   Each session gets its own git worktree with an isolated working directory.
-   Sessions can be nested via branch-from-branch pattern."
+   Room workspaces are Geschichte (`dvergr.substrate.geschichte`), not native
+   worktrees, and no production path registers a git system here; what dvergr
+   still uses is `safe-workspace-root` (the isolated `.dvergr/workspace`
+   clone, the fallback when no room workspace is in scope) and
+   `current-worktree-path` (nil without a registered git system). The session
+   worktree fns (one worktree per session, nested branch-from-branch) remain
+   for a host that registers one."
   (:require [yggdrasil.adapters.git :as git-adapter]
             [yggdrasil.protocols :as p]
             [org.replikativ.spindel.engine.core :as ec]

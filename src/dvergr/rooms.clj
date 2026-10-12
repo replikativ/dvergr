@@ -11,7 +11,7 @@
    Usage:
      (hydrate-registry! ctx)             ; one-shot at daemon startup
      (create-room! {:title \"General\" :slug \"general\" :type :internal})
-     (post-to-slug! \"general\" {:content \"hello\" :role :user})"
+     ;; then post through the Room: (dvergr.discourse/post! room msg)"
   (:require [datahike.api :as dh]
             [dvergr.chat.schema :as schema]
             [dvergr.substrate.config :as config]
@@ -261,10 +261,9 @@
    per-room conn + conversation chat-id are resolved here; requires a bound
    execution context. No-op (nil) if the room isn't provisioned.
 
-   New code should prefer `(dvergr.discourse/post! room …)` (bus-routed, so the
-   persistence listener writes it AND agents react). This direct path serves the
-   system-notification callsites (calendar dispatcher, Telegram reply mirror)
-   that only need the message in the room log.
+   New code should prefer `(dvergr.discourse/post! room …)` (bus-routed: it
+   appends durably AND agents react). This direct path writes only the room
+   log, and nothing in dvergr calls it.
 
    Opts: :content :role(:user) :source-user :source-username :source-user-id."
   [slug {:keys [content role source-user source-username source-user-id]}]

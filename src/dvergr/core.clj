@@ -10,6 +10,10 @@
      (d/join room (d/llm-agent {:id :coder :spec spec}))
      (d/post! room (d/message :you :coder \"hello\"))
 
+   Durable Runs (an LLM agent's turns, tasks, jobs) are re-exported too:
+   `runs`, `run` (`(run room run-id)` loads a stored one), `active-runs`,
+   `watch-runs!`, `unwatch-runs!`, `cancel-run!` (`dvergr.agent.run`).
+
    For deeper APIs reach into the underlying namespaces directly:
 
      dvergr.discourse                — Room + participant + ask/fan-out/race
@@ -17,7 +21,8 @@
      dvergr.discourse.generation     — GenerationHandle + adapters
      dvergr.runtime.bus                      — pub/sub routing kernel
      dvergr.participant.context      — ParticipantContext
-     dvergr.discourse.personas                 — researcher, coder, reviewer"
+     dvergr.discourse.personas       — researcher, coder, reviewer
+     dvergr.agent.run                — the Run lifecycle"
   (:require [dvergr.discourse]
             [dvergr.discourse.llm]
             [dvergr.discourse.generation]
@@ -107,6 +112,8 @@
 (def bus-subscribe!          @#'dvergr.runtime.bus/subscribe!)
 (def bus-unsubscribe!        @#'dvergr.runtime.bus/unsubscribe!)
 (def bus-log                 @#'dvergr.runtime.bus/log)
+;; The root value of `*default-buffers*` when this ns loaded: a `binding` or a
+;; later root change does not show here.
 (def default-buffers         @#'dvergr.runtime.bus/*default-buffers*)
 
 ;; ============================================================================

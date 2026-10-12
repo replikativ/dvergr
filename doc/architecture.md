@@ -1,7 +1,7 @@
 # Dvergr Architecture Map
 
 > A map of the codebase: the layer model, the subsystem dependency graph, the
-> inbound message flow, and a per-namespace-family table (~112 namespaces under
+> inbound message flow, and a per-namespace-family table (the namespaces under
 > `src/` + `src-clients/`). The exhaustive per-file table was retired in favour of
 > the family table below — it stays accurate across refactors.
 
@@ -11,13 +11,15 @@ Dvergr is a Clojure AI-agent harness organized as an 8-layer stack (L0–L7) ove
 copy-on-write substrate and a reactive (FRP) runtime. The architecture has
 converged on **Rooms + Participants on a Bus** as the single discourse model, with
 **medium adapters** (`dvergr.adapters.core`) bridging external chat media (Telegram)
-into rooms as remote-user actors. A room is a self-contained project (its own git
-workspace + Datahike message/knowledge stores); a thin global **system-db**
+into rooms as remote-user actors. A room is a self-contained project (its own Geschichte
+workspace, a git repository kept as a Datahike branch with a muschel virtual
+filesystem, + Datahike message/knowledge stores); a thin global **system-db**
 (`dvergr.system.db`) is only the registry that keeps the set of rooms/agents together.
 
 **Layer summary:**
-- **L0 — CoW substrate / persistence**: config loading (`substrate/config`), git
-  worktree CoW (`substrate/git`), state-root paths (`substrate/paths`), logging
+- **L0 — CoW substrate / persistence**: config loading (`substrate/config`), the
+  Geschichte room workspaces (`substrate/geschichte`; forking a room branches
+  them), state-root paths (`substrate/paths`), logging
   (`substrate/log`), the katzen-bound knowledge schema (`kb/schema`), exact-text +
   semantic code parsing (`code`), and per-domain Datahike schema (`scheduler/schema`).
 - **L1 — reactive runtime primitives**: spindel ExecutionContext/FRP (external), the
@@ -36,8 +38,8 @@ workspace + Datahike message/knowledge stores); a thin global **system-db**
   per-room reactive scheduler (`rooms/scheduler`), and the transport-agnostic `adapters/core`.
 - **L4 — tools + sandbox**: the `tools` registry/executor, the SCI sandbox (`sandbox` +
   `sandbox/ns/*` injectors + `sandbox/workspace` load-root + gated `sandbox/deps`),
-  structural/analyzer code-edit utilities, the channels framework, and git worktree
-  management. **The read-only intake data sources are no longer in dvergr's source** —
+  structural/analyzer code-edit utilities, the channels framework, and the room
+  workspace's file operations. **The read-only intake data sources are no longer in dvergr's source** —
   they live as agent-editable Clojure in the
   [dvergr-sandbox](https://github.com/replikativ/dvergr-sandbox) stdlib repo, cloned into
   each room's workspace; only `intake/bash` (the muschel shell) and `intake/mail` remain
@@ -48,22 +50,29 @@ workspace + Datahike message/knowledge stores); a thin global **system-db**
   LLM-backed participant factory (`discourse/llm`), the shared turn mechanics
   (`agent/turn`), the system-prompt assembler (`agent/prompt`), and process
   checkpoint/resume (`agent/process`).
-- **L6 — orchestration**: the `daemon` (still a large monolith — turn loop + session
-  handling + Telegram adapter + evaluator inlined), the `scheduler`, actors + transport,
+- **L6 — orchestration**: the `daemon` (boot and shutdown, agent lifecycle and
+  room joining, the Telegram, MCP and web wiring, the store GC loop), the `scheduler`, actors + transport,
   skills + the unified `definitions` loader, tasks, stats, personas, the
   central `ops` spec, and the Telegram channel.
 - **L7 — clients**: the `core` facade, MCP server/json-rpc, the nREPL `client`, the CLI
   entry point, the TUI app, and the web dashboard/API.
 
-**Key cross-cutting threads.** Spindel's ExecutionContext is the spine: rooms,
-schedules, the peer-bus, and stats all live as ctx-local state under `[:dvergr/*]`
-paths. Canonical Spindel world forks over registered Yggdrasil systems underpin the
-fork/review/merge lifecycle (`rooms/forks` + the `spawn_agent`/`propose_change` tools).
+**Key cross-cutting threads.** Spindel's ExecutionContext is the spine: the
+peer-bus (`[:dvergr/peer-bus]`) and the stats cache (`[:dvergr/stats]`) live as
+ctx-local state. Schedules do not: they are `:schedule/*` rows in each room's own
+messages store, so they fork and merge with the room (`rooms/scheduler`). Canonical
+Spindel world forks over registered Yggdrasil systems underpin the
+fork/review/merge lifecycle (`rooms/forks` and the `room_fork`, `room_diff`,
+`room_review`, `room_merge` and `room_discard` ops; `hire!` forks for subagents,
+and the `spawn_agent`/`propose_change` tools are adapters over it).
+
+The daemon (`orchestration/daemon`, about 1300 lines) holds no turn loop and no
+evaluator: turns run in `chat/agent` and `discourse/llm`, Telegram traffic goes
+through `adapters/core` (the daemon only builds the adapter's capability map), and
+evaluation lives in `agent/evaluation` and `agent/experiment`.
 
 The largest remaining structural debt:
 
-- the `daemon` monolith (inlined turn loop + session handling + Telegram adapter + evaluator);
-- `channels/telegram`, still partly on the old dispatch path rather than `adapters/core`;
 - residual `:status :online` presence assumptions in `skills`/`stats` that pre-date the
   resolved "presence = room membership" model.
 
@@ -76,11 +85,11 @@ graph TD
   L7["L7 Clients: core / mcp / client / cli / tui / web"]
   L6["L6 Orchestration: daemon / scheduler / actors / skills / definitions / tasks / personas / ops"]
   L5["L5 Agent Execution: chat.agent / compaction / model.* / discourse.llm / agent.turn / agent.process"]
-  L4["L4 Tools and Sandbox: tools / sandbox.* / workspace / channels / git (intakes live in the sandbox repo)"]
+  L4["L4 Tools and Sandbox: tools / sandbox.* / workspace / channels (intakes live in the sandbox repo)"]
   L3["L3 Discourse + Rooms: discourse / rooms / registry / adapters / system.rooms"]
   L2["L2 Per-room State: chat.context / chat.schema / accounting / room.store / system.db"]
   L1["L1 Reactive Runtime: spindel FRP / bus / clock / ctx / cron"]
-  L0["L0 CoW Substrate: datahike / git / config / paths / code / kb.schema"]
+  L0["L0 CoW Substrate: datahike / geschichte / config / paths / code / kb.schema"]
   L7 --> L6 --> L5 --> L4 --> L3 --> L2 --> L1 --> L0
 ```
 
@@ -207,7 +216,7 @@ graph TD
 
 | family | layer | role |
 |--------|-------|------|
-| `substrate/{config,git,log,paths}` | L0 | EDN config load/cache; git worktree CoW; structured logging; `.dvergr/` state-root resolution |
+| `substrate/{config,geschichte,git,log,paths}` | L0 | EDN config load/cache; Geschichte room workspaces (a Datahike branch + a muschel filesystem); native git helpers (the sandbox stdlib clone, the safe fallback workspace); structured logging; `.dvergr/` state-root resolution |
 | `code` + `code/index` | L0/L2 | Clojure source parse/diff + in-memory katzen ACSet code index |
 | `kb/schema` | L0 | Knowledge-base schema (katzen canonical → Datahike idents) |
 | `scheduler/{schema,cron,core,tools}` | L0–L6 | persistent-schedule schema; pure cron math; spindel-native scheduler; agent schedule tools |
@@ -235,7 +244,7 @@ graph TD
 | `agent/{evaluation,environment,experiment,experiment/*,verifiers,evaluators,attempt,spend,trajectory,conversation,episode}` | L5/L6 | the evaluation path (doc/evaluation-model.md): Attempts, EnvironmentDefs, experiments and their runner, preflight and statistics, verifier trust tiers, spend, trajectory export, certified conversations |
 | `catalog` + `catalog/{wiki,wiki_gen,room,room_run,casepack,report,workspace}` | L6 | catalog workflows (the wiki family) and room workflows (doc/room-workflows.md): bundles, case packs, `room-run` (a client of the room path), the report |
 | `jobs`, `artifact`, `activity` | L6 | long operations as durable Runs; content-addressed portable values; durable observations on room messages |
-| `orchestration/{daemon,skills,tasks,stats}` | L6 | the runtime daemon (lifecycle/registry/turn loop/sessions/Telegram); skill registry; task ledger; stats cache |
+| `orchestration/{daemon,skills,tasks,stats}` | L6 | the runtime daemon (boot/shutdown, agent lifecycle, channel/MCP/web wiring, GC loop); skill registry; task ledger; stats cache |
 | `actors` + `actors/transport` | L6 | durable actor identity table; PActorTransport impls |
 | `ops` | L6 | central operations spec — one data map; web/MCP/Telegram surfaces derived (datahike-spec pattern) |
 | `security/allowlist` | L6 | Telegram user allowlist access control |

@@ -24,10 +24,13 @@ returns `{:type :success/:error :content "..." :metadata {...}}`.
 - **Files & code edits** — `read_file`, `write_file`, `edit_file` (exact-string, must be
   unique), `glob`, `grep`, `clojure_edit` (structural form replace/insert), `code_query`
   (queries a katzen ACSet index built from the Clojure you write this session),
-  `clj_kondo` (lint), `run_tests` (Kaocha, runs in the agent's worktree).
+  `clj_kondo` (lint), `run_tests` (clojure.test over the namespaces defined or loaded in
+  the agent's SCI session; not Kaocha: it runs no test file from disk until the agent
+  loads it).
 - **Code eval / shell** — `clojure_eval` (the main one — see below) and `shell` (a
   muschel-jailed bash via `dvergr.intake.bash/run`; read-only commands auto-allowed,
-  destructive ones like `sudo`/`rm -rf` auto-denied, output capped at 8000 chars/stream).
+  destructive ones like `sudo`/`rm -rf` auto-denied, output capped at 30000 chars per
+  stream; `dvergr.intake.bash/run`'s own default is 8000).
 - **Knowledge graph** — `knowledge_search` (fulltext over the room's native Datahike
   `:scriptum` secondary index) and `knowledge_add` (the `[[Entity]]` graph).
 - **Tasks** — `task_create`, `task_list`, `task_update` (Datahike-backed `:task/*`).
@@ -36,8 +39,13 @@ returns `{:type :success/:error :content "..." :metadata {...}}`.
   review), `update_agent_profile` (rewrites an agent's system prompt → actor row),
   `budget` (remaining μ$ / cost estimate).
 - **Registered beside `dvergr.tools`** — `llm_call` (a cheap one-shot LLM call,
-  `dvergr.tools.llm-call`), `request_dependency` and `request_plan_review` (ask a human
-  to approve a library or a plan, `dvergr.tools.approval`).
+  `dvergr.tools.llm-call`); `schedule_create`, `schedule_list`, `schedule_cancel` (the
+  current room's schedules, `dvergr.scheduler.tools`, which the daemon requires at start;
+  see [scheduling.md](scheduling.md)); and `mail_inbox`, `mail_search`, `mail_read`,
+  `mail_sync` (`dvergr.intake.mail`, which the daemon requires at start when clojure-mail
+  is on the classpath). An agent gets them by listing them in its `:tools`. Registry tools
+  are also served over MCP: `clojure_eval` in the `repl` toolset, these and most others in
+  `code` ([mcp.md](mcp.md)).
 - **Data sources (intake)** — the `dvergr.intake.*` modules: HN, Lobsters, Bluesky,
   Mastodon, dev.to, web fetch/search, YouTube transcripts, Twitter, GitHub, RSS, Zulip,
   plus company/market intel (SEC EDGAR, Companies House, Finnhub, GLEIF, Wikidata,
@@ -75,9 +83,8 @@ cancellable.
   - `babashka.fs` (path-clamped to the workspace; content I/O is `slurp`/`spit`),
     `babashka.http-client` (domain-gated), `babashka.process` (`shell`/`sh`, muschel-backed
     and jailed), `cheshire.core`, `clojure.data.xml` (XXE-safe), `datahike.api` (the real
-    API on any conn), `dvergr.codec` (base64, url, html helpers).
-  - `dh` — datahike `q`/`pull`/`pull-many`/`entity`/`datoms`/`schema`/`db` against the
-    room's DB, and `dh/search` (fulltext over the scriptum secondary index).
+    API on any conn, e.g. `dvergr.room/*kb*`; the agent aliases it `d` itself),
+    `dvergr.codec` (base64, url, html helpers).
   - `dvergr.intake.*` — read-only external SOURCE files in the room repo (cloned from
     the [dvergr-sandbox](https://github.com/replikativ/dvergr-sandbox) stdlib);
     `require` + extend them. e.g. `dvergr.intake.hn`,
@@ -103,13 +110,14 @@ cancellable.
     `processes` (list and steer your own long-running work).
   - `spindel.comb` / `spindel.sig` / `spindel.work` / `sync` — reactive primitives;
     `spin`/`await`/`track` when the session is backed by a spindel execution context.
-  - `infer` / `dist` — probabilistic inference (foerster).
   - `sandbox` — runtime self-reflection: `(sandbox/overview)` lists every injected
-    namespace with purpose + example + fns; `(sandbox/doc 'dh)` zooms into one.
+    namespace with purpose + example + fns; `(sandbox/doc 'datahike.api)` zooms into one.
 
 ### Safety boundaries
 
-- **Denied**: `eval`, `load-file`, `load-string` (and their `clojure.core/*` forms).
+- **Denied**: `eval` and `load-file` (and their `clojure.core/*` forms). `load-string`
+  and `require` are allowed: they evaluate in the sandbox, `require` resolves source from
+  the session's workspace only, and loaded code still sees only the curated classes.
 - **No raw file/shell/network.** I/O only goes through the gated namespaces:
   `babashka.fs`/`git` are path-safe (clamped to the workspace); `babashka.process` is the
   muschel jail (workspace rooted at `/`, relative paths only, destructive ops blocked);
@@ -151,14 +159,34 @@ boundary. One jailed program runs at a time per workspace.
 
 ## Room-scoping & fork isolation
 
-Tool I/O is anchored to the surrounding room's workspace, not the daemon root. Tool
-`:cwd` defaults to the **current yggdrasil git system's worktree** for the bound
-execution context, so when a room is forked (`:isolation :ctx`), `read_file`/`write_file`/
-`run_tests`/`bash` all see the fork's worktree automatically. Likewise `dh` writes go to
-the **fork-local** Datahike conn — nothing reaches the parent until the fork is merged.
-`spawn_agent` and `propose_change` construct ordinary AgentDefs and call the same
-Run-backed `hire!` exposed in SCI. Their tool I/O therefore resolves in the child
-world automatically. See `doc/state-model.md` for the full value-semantics picture.
+Tool I/O is anchored to the surrounding room's workspace, not the daemon root. When no
+`:cwd` is given, a tool context takes the **Geschichte workspace of the bound execution
+context** (`dvergr.substrate.geschichte/current-workspace`) and serves it as the tools'
+filesystem, rooted at `/`. A forked room (`:isolation :ctx`) has its own workspace branch,
+so `read_file`/`write_file`/`shell` see the fork's files automatically. Likewise
+`dvergr.room/*room*` and `*kb*` are the **fork's** Datahike conns: nothing reaches the
+parent until the fork is merged. `spawn_agent` and `propose_change` construct ordinary
+AgentDefs and call the same Run-backed `hire!` exposed in SCI. Their tool I/O therefore
+resolves in the child world automatically. See `doc/state-model.md` for the full
+value-semantics picture.
+
+Clients outside the room reach the same workspace through the same gates. The MCP and
+JSON API ops `room_files`, `room_read` and `room_write` (`dvergr.rooms.files`, see
+[mcp.md](mcp.md)) read the room's Geschichte repository, and a `room_write` batch is a
+`:git/commit` effect whose writes and removals pass `workspace-write!` and
+`workspace-delete!` under the room world's handlers (`files/host-boundary`), so the
+world's read-only mode, quota and receipts decide them as they decide an agent's
+`write_file` ([effects.md](effects.md)).
+
+## Tools and an Attempt's inputs
+
+What a model is offered is part of what an experiment compares. An LLM Run records an
+inputs id (`:attempt/inputs-id`, the content id of `dvergr.agent.program/run-inputs`) that
+covers the assembled system prompt and each offered tool's name, description and input
+schema, as well as the resolved model. On resume an experiment keeps a cell only while
+its candidate's inputs id is the same, so editing the `:description` or `:parameters` of
+a tool a candidate is offered, or the sandbox prompt, re-runs that candidate's cells (see
+"Resume and inputs ids" in [benchmarks.md](benchmarks.md)).
 
 ## The `/drive` mount
 

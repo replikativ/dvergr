@@ -2,11 +2,16 @@
   "Process-local registry of trusted evaluation capabilities.
 
    An EnvironmentDef names its verifier and world setup by exact reference
-   and never contains them. This registry is where a host resolves those
-   references: benchmark providers register their `Evaluator`,
-   `WorldSetup` and `Protocol` capabilities here, and `evaluators`,
-   `world-setups` and `protocols` return the capability maps
-   `dvergr.agent.experiment/run` takes.
+   and never contains them. This registry can hold `Evaluator`, `WorldSetup`
+   and `Protocol` capabilities by reference, and `evaluators`, `world-setups`
+   and `protocols` return them in the shape `dvergr.agent.experiment/run`
+   takes. No production path reads it: the BFCL, BIRD and AutomationBench
+   providers have a `register!` that writes here, but nothing calls it; the
+   benchmark runner is handed the capabilities directly
+   (`dvergr.agent.experiment.runner/run-in` `:capabilities`); a verifier's
+   trust tier is the Evaluator's own (`dvergr.agent.evaluation/make-evaluator`
+   `:tier`). Experiments an agent starts resolve refs through
+   `dvergr.agent.evaluators` instead.
 
    Capabilities are host functions, so the registry is process-local and is
    never exposed to SCI. Registering is idempotent for the same capability

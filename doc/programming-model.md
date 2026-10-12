@@ -49,8 +49,11 @@ constructing specialized teams and parallel workflows for themselves without a
 hidden mutable roster.
 
 See [Agent programs in the room REPL](agent-programs.md) for the API, a
-provider-free runnable example, and the state/fork contract. The native LLM/tool
-interpreter is deliberately a follow-up on the same boundary.
+provider-free runnable example, and the state/fork contract. Besides the
+deterministic `:echo` and `:scripted` programs, `hire!` runs the `:llm` program
+kind, a bounded Dvergr-native model/tool loop, on the same boundary. Code running
+inside a paid `:llm` Run may itself hire only `:echo` and `:scripted` children
+(`child-program-authority` in `dvergr.agent.program`).
 
 ## The Room + Bus
 
@@ -91,9 +94,8 @@ Per-namespace defaults in `dvergr.runtime.bus/*default-buffers*`:
 Each line is a programming-model commitment. Two strong opinions:
 
 **Escalations cannot be silently dropped.** An agent posting
-`:escalation/budget` *can* assume some handler will answer (or the bus
-health monitor will surface a stuck queue). Forces explicit
-escalation chains.
+`:escalation/budget` *can* assume some handler will answer. Nothing
+watches for a stuck queue, so this forces explicit escalation chains.
 
 **Streaming defaults to fixed-buffer.** Tokens are discrete data;
 losing them loses information. UI consumers that only want "current
@@ -290,7 +292,7 @@ the compacted state. Saves ~2-3s on the boundary turn.
 ## Substrate forks (yggdrasil)
 
 `fork-room {:isolation :ctx}` branches every yggdrasil system in the
-parent ctx — datahike connection, git worktree, KB conn, etc. The worker inside
+parent ctx — the room's Datahike stores, its Geschichte workspace, the KB, etc. The worker inside
 the fork sees a forked DB; `merge-room` settles each registered system through
 the canonical recoverable settlement boundary.
 
