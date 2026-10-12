@@ -2,7 +2,7 @@
 
 Status: deterministic and native LLM/tool interpreters, conserved resource
 delegation, model-spend debiting from a Run's microdollar wallet, and resume
-from turn savepoints (doc/run-resume.md) are implemented. Simulation and
+from turn savepoints (doc/runs.md, "Resuming a Run") are implemented. Simulation and
 replay interpreters are not built.
 
 Dvergr agents can construct specialized workers and compose their executions

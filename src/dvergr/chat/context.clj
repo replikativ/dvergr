@@ -185,8 +185,9 @@
 
     ;; Persist to datahike (durable) — UNLESS this ctx delegates durability to
     ;; the room store (`:durable? false`, set by dvergr.agent.room-context).
-    ;; In the room model the bus→store listener is the single durable writer for
-    ;; the conversation; re-writing message entities under the chat-id would be a
+    ;; In the room model the room's bus persists each message inside `post!`
+    ;; (its `:durable-append!` hook), the single durable writer for the
+    ;; conversation; re-writing message entities under the chat-id would be a
     ;; redundant second write. Provider usage is accounted separately; the
     ;; budget is reconstructed from that ledger on restore.
     (when-let [conn (:db-conn chat-ctx)]

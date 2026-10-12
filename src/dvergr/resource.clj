@@ -171,7 +171,7 @@
 (def ^:dynamic *spend-wallet*
   "The Run whose conserved microUSD wallet pays for model calls made here:
    `{:room :run-id}`, bound by the LLM program around its model steps when the
-   Run was allocated microdollars (doc/unified-worlds.md, step 4). Unlike
+   Run was allocated microdollars (doc/worlds-and-forks.md, Worlds, savepoints and budgets). Unlike
    `*model-scope*` it restricts no provider: it only moves spend onto the
    ledger."
   nil)

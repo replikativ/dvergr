@@ -8,7 +8,7 @@
 
    An `:llm` Run saves a turn savepoint as it goes; `resume!` continues a
    stopped Run from its latest one as a new Run caused by it
-   (doc/run-resume.md). `run-inputs`/`inputs-id` say what a Run presents to its
+   (doc/runs.md, Resuming a Run). `run-inputs`/`inputs-id` say what a Run presents to its
    candidate when it starts (assembled prompt, tools, resolved model), which an
    experiment's resume compares per cell."
   (:require [dvergr.agent.roster :as roster]
@@ -772,7 +772,7 @@
          (assoc :room room))}))
 
 ;; ---------------------------------------------------------------------------
-;; Turn savepoints (doc/run-resume.md)
+;; Turn savepoints (doc/runs.md, Resuming a Run)
 ;; ---------------------------------------------------------------------------
 
 (defonce ^:private resuming
@@ -863,7 +863,7 @@
         budget-dollars (min (double budget-dollars)
                             (double (or (:budget-dollars limits)
                                         budget-dollars)))
-        ;; the one ledger (doc/unified-worlds.md, step 4): a Run allocated
+        ;; the one ledger (doc/worlds-and-forks.md, Worlds, savepoints and budgets): a Run allocated
         ;; microdollars spends its wallet, and a resumed Run what the stopped one
         ;; left, not a fresh budget
         spend-wallet (resource/spend-wallet control-room run-id)
@@ -1940,7 +1940,7 @@
 
 (defn resume!
   "Continue Run `run-id` of `control-room` from its latest turn savepoint
-   (doc/run-resume.md): a new Run, caused by it, whose world is a fork of
+   (doc/runs.md, Resuming a Run): a new Run, caused by it, whose world is a fork of
    `world-parent` at the systems' recorded snapshots, whose conversation
    starts as the old Run's did at the savepoint and whose steps count on from
    it. The old Run must be terminal (a Run whose process stopped is failed on

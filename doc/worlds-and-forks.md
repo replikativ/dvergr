@@ -1,12 +1,199 @@
-# Forks, worlds, and settlement
+# Worlds, forks and state
 
-Status: the cross-project contract, built on the Dvergr side through step 7 of
-*Migration sequence* below: `fork-room` forks through `ygg/fork!` and keeps the
-handle, Run worlds (`dvergr.agent.world`) hold Run policy over it, and review
-and settlement go through that handle. Steps 3 and 8 are partial and 9-10 are
-not built; the Simmis governance layer (Proposal/ForkSet) is not part of this
-repository. Names marked *provisional* describe semantics, not necessarily
-public function names.
+Status: built. This page is where every kind of state lives and whether it forks
+(first part), the fork contract shared by Yggdrasil, Spindel, Dvergr and Simmis
+(second part), and how Run worlds, savepoints and budgets are instances of the
+spindel primitives (third part). The on-disk layout of a home, moved and copied
+homes, and the headless daemon are in [homes.md](homes.md). Design history: the
+use cases and migration sequence of the fork contract
+([design/fork-and-world-migration.md](design/fork-and-world-migration.md)) and
+the plan that unified worlds, savepoints and budgets
+([design/unified-worlds.md](design/unified-worlds.md)). Names marked
+*provisional* describe semantics, not necessarily public function names.
+
+## Where state lives
+
+A fork copies what is in an execution context (copy-on-write) and branches the
+Yggdrasil systems registered in it; everything else is shared or rebuilt. So
+each kind of state is in one of four places (`dvergr.runtime.ctx` describes the
+same split from the code's side).
+
+### Forkable: a room's own context and systems
+
+Each room runs on its **own execution context**, a fork of the daemon's root
+with `:systems :none` that registers only that room's systems
+(`dvergr.system.rooms`, `fork-room-ctx`). Forking the room with `:isolation
+:ctx` creates one canonical Spindel `ForkHandle`, which copy-on-write copies
+the context **and** branches those systems as a unit; settling that handle
+merges or discards it. A room's systems:
+
+- **messages store** (`:msgs`, a Datahike DB of its own): the conversation,
+  the room's Runs, certified Attempt indexes and the blobs of their payloads,
+  and the room's resource governance (Kontor wallets). Its fulltext
+  index is a native Datahike `:scriptum` secondary index whose files are a
+  `-ft` sibling of the store directory (`dvergr.search.secondary`).
+- **knowledge base** (`:kb`, Datahike): `:entity/*`, with its own `-ft`
+  fulltext index.
+- **repository** (`:repo`): a Geschichte workspace, a Datahike branch with a
+  muschel virtual filesystem, not a native checkout. The agent's file edits
+  land here.
+- optionally a Kontor **business book** (`:book`, settles by replay) and the
+  **data DBs** an agent created (`:data`).
+- **in-context signals**: per-chat messages/budget/status signals, the room's
+  Yggdrasil composite, proposal handles, shell sessions.
+
+A room may also attach another room's KB or repository (a `:grant` in the
+system DB, `:read` or `:read-write`); the live attachment is a registration in
+the room's composite.
+
+### Shared, durable: the system DB
+
+One Datahike DB per home (`dvergr.system.db`), not per room and not forked:
+parties (humans and agents, `:party/*`, with their actor rows), the registry
+of rooms (`:room/*`), of systems and their store scopes (`:system/*`),
+assignments and grants. The daemon rehydrates the room registry and every
+room's context from it at boot (`dvergr.rooms/hydrate-registry!`,
+`dvergr.system.rooms/hydrate-rooms!`). A `:ctx` fork that creates a data DB defers its system-DB
+grant (reconciled on merge, dropped on discard), so a fork's DB does not
+resurrect on restart.
+
+### Shared, reactive: the root context
+
+The live room registry (`[:dvergr/rooms]`), the rooms tree and the peer bus
+live in the **root** context and are read by every frontend; writes to them
+climb to the root whatever context is bound (`dvergr.runtime.ctx`'s `shared-*`
+ops), so a fork never gets a private copy the UI cannot see.
+
+### Files, and transient daemon state
+
+The bytes of all those stores, the sandbox workspace clone, blobs, mail, the
+MCP token and the log live in the home directory ([homes.md](homes.md)); a
+store's *content* forks, its directory is just where the bytes land.
+
+In memory only, rebuilt on restart and never forked: the `Daemon` record
+(`config`, `execution-ctx`, `discourse-room`, `telegram-ch`, `http-server`,
+`status`; `dvergr.orchestration.daemon`), `current-daemon`, the live Run
+registry (the turn API in `dvergr.agent.turn` is a projection over it), the
+map of room contexts, live participants and spins, and the stats/diff caches.
+All of it is a projection of the durable state: agents and rooms rehydrate
+from actor rows and the registry, budgets from the ledger, Geschichte
+workspaces re-open. Losing it loses nothing durable.
+
+## The chat-state `ChatContext` (per `[room, agent]`)
+
+The working state an agent reasons with is one cached `ChatContext` per
+room-agent pair (`dvergr.agent.room-context/ensure-ctx!`), a fold of the
+forkable state:
+
+- `messages-signal`: deltaable vector of the conversation (in-memory projection)
+- `budget-signal`: `{:total :used :by-type}` token accounting
+- `status-signal`: `:active` / `:paused` / `:completed`
+- `db-conn`: the Datahike connection it persists to (in a fork: the branched one)
+- `sci-component`: a stable Spindel component reference selecting the agent's
+  **SCI sandbox** (`clojure_eval` world) in the current execution context
+
+An agent's ChatContext in a room is **`:durable? false`**: its messages stay
+signals. The room's bus persists every message itself, inside `post!` and
+before the message is visible anywhere (`dvergr.room.store`, its
+`:durable-append!` hook; a store failure fails the post). So the durable chat
+state **is** the room's messages store; the `ChatContext` is its reactive fold
+plus the per-session sandbox.
+
+`ChatContext` exposes no raw `:sci-ctx` field. Embedders call
+`dvergr.chat.context/sci-context-in` with the intended execution context, or
+`sci-context` while that context is bound. `:sci-component` is an opaque
+stable reference and must not be passed to SCI directly. Tool contexts still
+use `:sci-ctx`; supply the interpreter returned by one of those resolvers.
+
+## What a `:isolation :ctx` fork forks
+
+`dvergr.discourse/fork-room` calls `spindel.yggdrasil/fork!`, retains its
+process-local `ForkHandle`, and branches every registered system of the room as
+a unit:
+
+- **the messages store** → branched: messages, Runs, Attempt indexes, all
+  isolated until merge. The fork's own store wraps the branched
+  connection under the parent's conversation id, so the fork's messages are
+  the same logical conversation on a Datahike branch and a merge collapses
+  them natively. Exact Attempt payloads are immutable blobs in the room's own
+  Datahike store (`dvergr.artifact/datahike-store`, tracked by its GC); only a
+  branch's typed reference makes one part of that world. Older string
+  references are read from the legacy global blob CAS.
+- **the KB** → branched.
+- **the Geschichte workspace** → a branch of the room's repository; the
+  agent's file edits are isolated.
+- **muschel shell session** → its env-atom is CoW-forked alongside, so a
+  worker's `cd` / shell state can't leak to the parent.
+- **per-agent SCI sandbox** → the SCI interpreter is a Spindel world
+  component. Forking the execution context forks its heap (vars, atoms,
+  bindings, and continuations) from the effective parent state. The child
+  reuses the stable `ChatContext` identity while resolving an independent
+  interpreter; `(def x …)` in one fork is invisible to its parent and
+  siblings. Discard unregisters the child realization rather than merging
+  transient interpreter state.
+
+Resources are the exception: resource facts live in the control Room's store,
+and a work-world fork never copies or settles that authority. A child receives
+resources only through one governed Kontor transfer from its parent's wallet
+(`dvergr.resource`).
+
+Injected host capabilities follow a stricter rule than ordinary SCI values.
+They never close over a Room, Datahike connection, Geschichte workspace, or
+filesystem. Each interpreter component owns a stable capability identity whose
+serializable binding lives in the Spindel execution context. A copied function
+therefore resolves that identity in the currently selected descendant world at
+call time. This is why a helper defined *before* a fork cannot write back into
+its parent even though the helper's SCI function value itself was inherited.
+Namespace refresh after projection exposes new APIs; it is not the isolation
+mechanism.
+
+The fork's conversation is **seeded from the branched store**, so the agent
+sees inherited (pre-fork) messages *plus* its own, exactly what the UI shows.
+`merge-room` and `discard` settle that same handle exactly once. A fork is thus
+a fully **substrate-isolated world** you can review (`diff`) before adopting or
+discarding. The live handle is process-local; `dvergr.discourse/fork-descriptor`
+is the portable projection used by Runs, proposals, UIs, and audit state.
+
+## Personas and agent config: managed, not files
+
+An agent's model/provider/skills/budget/description live in its **actor row**
+in the system DB, and so does the system prompt (`:actor/system-prompt`),
+edited only through the API (`dvergr.agent.ops/update-agent!`, the web
+textarea, the REPL). Agents mutate dvergr through controlled surfaces (the
+REPL, the git-backed shell, the API), not by writing unmanaged files outside
+the substrate; one row is the single source of truth for an agent's settings.
+
+The built-in `resources/agents/<id>.md` files remain read-only seeds and
+defaults on the classpath. `dvergr.agent.persona/resolve-prompt` reads the
+actor row first, falling back to the built-in definition's body.
+
+Editing surfaces: the web config textarea and `ops/update-agent!`/the REPL
+write the row directly; the TUI's agent-config view offers `p` to edit the
+prompt in `$EDITOR` (dumped to a throwaway tmpfile, saved back to the DB) via
+spindel-tui's `:with-suspended`. The tmpfile is transient editing scratch,
+never state.
+
+## As a library
+
+No client/server boilerplate; the host owns its state root and config:
+
+- **State root** (a dvergr *home*): `paths/set-home!` / `DVERGR_HOME` /
+  `./.dvergr`. One home per process; a moved home is adopted, a copied one
+  refused; to try something on a home's data, fork a room instead
+  ([homes.md](homes.md)).
+- **Config**: `config.local.edn` (or `$DVERGR_CONFIG`), loaded once by
+  `dvergr.substrate.config/load-config`; it is a **seed**: after first boot
+  the actor rows are authoritative.
+- **Boot**: `(config/load-config)` → `(daemon/start! (config/daemon-config))`.
+- **APIs**: `dvergr.core` (room/participant/ask/fork facade) and
+  `dvergr.clients.client`, the REPL surface over a running (or booted-lite)
+  daemon (`c/start!`; `c/room`/`c/spawn` for a Room handle; `c/fork`/`c/merge!`).
+
+The host owns the home directory, `config.local.edn`, and any agent overrides;
+the library owns the rest, and all durable meaning is in forkable stores and
+the system DB.
+
+# The fork contract
 
 ## Objective
 
@@ -202,72 +389,53 @@ provide.
 
 ## Fork policy
 
-World creation needs an explicit policy surface:
+What a world fork receives is decided where it is created. `ygg/fork!` (spindel) takes:
 
 ```clojure
-{:purpose :run|:workroom|:particle|:proposal|:experiment
- :systems :all|:none|#{system-id ...}
- :mode :overlay|:snapshot
- :rights {system-id :write}
- :effects :live|:record|:stub
- :settlement :automatic|:review|:discard}
+{:purpose   :run | :workroom | :room | :particle | :proposal | ...  ; descriptor tag
+ :owner     owner-id                     ; initial affine settlement owner
+ :systems   :all | :none | #{system-id ...}   ; systems visible and branched
+ :mode      :following | :frozen         ; overlay relation to the parent
+ :snapshots {system-id snapshot-id}      ; pin systems at fixed values
+ :rights    {system-id :write}}          ; explicit grants
 ```
 
-The default for a normal isolated Dvergr Run can remain all systems granted to
-the Room. Simulations and inference should default to no live external effects
-unless explicitly granted. Eventually Kontor allocations determine both
-resource rights and the maximum fork policy a child may receive.
+Dvergr adds the rest on its own layers: a Run world's settlement policy
+(`:automatic`, `:review`, `:discard`, `:deferred`, on the RunWorld), the effect
+policy of the world (handlers in world state, [effects.md](effects.md)), and its
+resources (a governed transfer from the parent's wallet, below). A room's own
+context is a fork with `:systems :none` that registers only that room's systems;
+a Run world is a `:purpose :run` fork of it, with all of them.
 
-Today Spindel accepts only the enforceable `:write` right. It rejects `:read` and
-`:fork` instead of placing an unenforced label in the descriptor. Those rights
+Spindel accepts only the enforceable `:write` right. It rejects `:read` and
+`:fork` instead of placing an unenforced label in the descriptor; those rights
 belong here once the substrate and SCI capability boundary can enforce them.
+Simulations and inference should default to no live external effects unless
+explicitly granted; eventually Kontor allocations should bound the fork policy
+a child may receive.
 
-## Representative use cases
+Inference worlds follow this. The sandbox's `infer/smc-infer`,
+`infer/importance-sampling` and `infer/kernel-infer` (foerster's inference on
+Spindel worlds) run in fresh worlds by default (`:world-policy :fresh`): a fresh
+world has no room state, and a stable handle called from an inference world
+outside its owner's lineage throws (`dvergr.runtime.ctx/selected-context`). A
+model that needs room state passes `{:world-policy :fork}`: each particle and
+resampling descendant then owns a frozen canonical Yggdrasil fork, discarded
+once the particle results are captured ([agent-programs.md](agent-programs.md)).
 
-### Coding Run from the REPL
+## Adoption: handing a fork to a durable owner
 
-1. Open one Spindel world fork from the Room.
-2. Execute SCI/model/tool work against fork-resolved Geschichte and Datahike.
-3. Run trusted checks in the same world.
-4. Return the computed result through the Run.
-5. Merge, retain for review, or discard after physical quiescence.
-
-Needs: canonical handle migration and recoverable settlement. The core path
-otherwise exists.
-
-### Recursive team
-
-A lead Run works in world `A`. Hiring a researcher creates `B = fork(A)`; that
-researcher may create `C = fork(B)`. Accepted `C` work merges into `B`, and
-accepted `B` work merges into `A`. Trunk is never an implicit target.
-
-The canonical nested ownership path now exists: SCI `dvergr.agent/hire!` (host:
-`dvergr.agent.program/hire!`) and the
-`spawn_agent` / `propose_change` tool adapters all use Run worlds. Recursive
-`hire-in!` keeps durable facts in the root control Room while forking and settling
-against the immediate work-world parent. Paid recursive LLM delegation remains
-attenuated until measured provider usage is debited from the already-supported
-conserved Run resource vectors. Owned child Runs delay parent settlement and
-resource return even when their handles are ignored; ambient/detached work must
-eventually receive a distinct durable owner rather than arise by accident.
-
-### Simmis proposal
-
-A standalone Run completes in review mode. Promotion transfers its open fork to
-a durable ForkSet and persists the descriptor as a GC root. The Run becomes a
-contributor and loses settlement authority. Review may survive restart and
-settles the adopted world as one affine unit.
-
-The live bridge is `dvergr.rooms.forks/adopt!`. Its `:prepare!` callback must
-persist the prospective descriptor/owner before Spindel transfers authority.
-Successful transfer detaches the transient Room and returns the adopter's sole
-process-local `ForkHandle`; preparation failure leaves the review world open.
+A Run that completes in review mode keeps its world open. Promotion hands that
+open fork to a durable owner (a Simmis ForkSet, a long-lived child Room) through
+`dvergr.rooms.forks/adopt!`. Its `:prepare!` callback must persist the
+prospective descriptor and owner before Spindel transfers authority. A
+successful transfer detaches the transient Room and returns the adopter's sole
+process-local `ForkHandle`; a preparation failure leaves the review world open.
 If the affine CAS loses a race after preparation, the required `:abort!`
-compensates the prepared durable row. The handle is never persisted.
-The prepared descriptor includes `:dvergr/room-id`,
-`:dvergr/parent-room-id`, and (for a nested isolated world)
-`:dvergr/parent-fork-id`. The durable owner must retain that ancestry until the
-child settles; Dvergr's shared topology is its immediate in-process projection.
+compensates the prepared durable row. The handle is never persisted. The
+prepared descriptor includes `:dvergr/room-id`, `:dvergr/parent-room-id`, and
+(for a nested isolated world) `:dvergr/parent-fork-id`; the durable owner must
+retain that ancestry until the child settles.
 
 Adoption starts as whole-world authority. `partition-adoption!` can then consume
 that aggregate handle into an exhaustive tree of disjoint system capabilities.
@@ -276,111 +444,26 @@ only after every leaf is terminal and the supplied tree proves that no partition
 was omitted. A durable adopter prepares the intended plan before partitioning
 and commits the exact child descriptors afterward. If that commit fails, the
 API returns the error together with all live child handles so recovery cannot
-silently lose authority. No proposal layer may accept or dismiss systems by
-mutating raw branches outside this capability tree.
+silently lose authority (`retry-partition-commit!`). No proposal layer may
+accept or dismiss systems by mutating raw branches outside this capability tree.
 
 Each durable leaf decision goes through `settle-adoption!`: governance prepares
 the intent, Spindel consumes the affine capability, and governance commits the
 terminal descriptor as Spindel's single-execution post-commit callback. A
 failed durable commit leaves terminal authority and its receipt available to
 `retry-settlement-commit!`; it never recreates an actionable review. Structural
-release rejects failed partition persistence, duplicate/substituted handles,
+release rejects failed partition persistence, duplicate or substituted handles,
 and any durable leaf whose terminal commit is incomplete. Commit callbacks see
-only portable operation/descriptor data—never execution contexts or live
+only portable operation/descriptor data, never execution contexts or live
 systems from Spindel's internal settlement payload. Failed compensation is
 returned as explicit recovery state with the durable receipt still attached;
-`retry-settlement-abort!` repairs that durable intent before the still-open
-capability can receive a new decision.
+`dvergr.discourse/retry-settlement-abort!` repairs that durable intent before
+the still-open capability can receive a new decision.
 
-Simmis still needs to supply the durable half: store the descriptor as a GC
-root, index its systems into the existing ForkSet, and journal per-system
-settlement. After restart it reopens the named Datahike/Geschichte branches
-under that durable ownership claim; it does not deserialize the old Spindel
-reactive context.
-
-### Multi-agent campaign
-
-Several Runs contribute independent forks. The Proposal may retain each
-contribution for per-agent/per-scope decisions, or construct an additional
-integration world and merge selected contributions into it. The integration
-world is another canonical fork, not a special proposal branch implementation.
-
-Needs: multiple adopted descriptors and explicit contribution edges. ForkSet
-already supplies most governance semantics.
-
-### Thought experiment
-
-Fork a snapshot of selected state, substitute recorded/stubbed effects, execute
-a hypothetical conversation or program, return an explicit result, and discard
-the world. It creates no Proposal unless deliberately promoted.
-
-Needs: selected systems/effect policy. Message-only discourse branching remains
-available as a cheaper operation when no state isolation is required.
-
-### SMC particles
-
-Create `N` snapshot world forks at a checkpoint. Each particle receives an
-independent reactive state and an explicit external-system/effect policy.
-Observe evidence, resample descriptors/contexts, and discard unselected
-particles. Only an explicitly selected particle can be promoted or merged.
-
-Spindel's inference coordinator now accepts `:world-policy :fork`: initial and
-resampled particles are frozen canonical Yggdrasil forks, and the complete
-speculative tree is discarded after immutable particle results have been
-captured. Dvergr's SCI `infer/smc-infer`, `infer/importance-sampling`, and
-`infer/kernel-infer` wrappers run in fresh worlds unless a model asks for that
-policy: a fresh world cannot reach room state, since a stable handle called
-from an inference world outside its owner's lineage throws
-(`dvergr.runtime.ctx/selected-context`). `infer/values`,
-`infer/log-weights`, `infer/ess`, and `infer/worlds` project results and portable
-world descriptors without exposing live settlement handles.
-
-This solves isolation and affine cleanup for one inference population. It does
-not promote a posterior particle automatically: promotion remains an explicit
-Run/proposal operation, and PGAS ancestor scoring is rejected for canonical
-worlds until retained-world ancestry has a sound ownership contract.
-
-### MCTS
-
-Each tree edge forks its node world, applies an action, runs or simulates effects,
-and accumulates reward/evidence. Pruning consumes and discards the corresponding
-handles. Transpositions may share immutable snapshots but never writable
-capabilities.
-
-Needs: cheap nested handles, deterministic seeds/virtual time, selective/stubbed
-effects, resource accounting, and aggressive lifecycle/GC. No new fork algebra
-is required.
-
-### Continuous reactive cooperation
-
-Long-lived agents observe and communicate in one Room without creating a Run or
-fork for every message. Runs identify bounded computations when useful; Room
-signals and speech acts remain the continuous FRP substrate.
-
-Needs: no additional fork primitive. Attention and steering policies compose
-above the world model.
-
-### Self-programming and verified training
-
-An agent constructs an immutable Roster/workflow, stores durable program or
-skill changes in forked Geschichte/Datahike, executes it in a controlled world,
-and receives a trusted verifier result plus Kontor resource receipts. The world
-and verifier basis make the environment replayable; reward is not inferred from
-model prose.
-
-Needs: versioned environment descriptors, fork basis, resource allocation and
-effect receipts. SCI Vars/atoms may later become more deeply forkable, but
-durable definitions should remain in owned substrates rather than depend on
-serializing live evaluator internals.
-
-### Long-lived child Room
-
-A child Room that needs independent policy and substrate adopts/detaches a world
-fork as its durable root. It is no longer an unsettled speculative fork. On
-restart, it rehydrates from its descriptor and authoritative Room facts.
-
-Needs: adoption and descriptor-based hydration. The current per-Room context
-provisioning is a partial implementation without the unified lifecycle.
+The durable half belongs to the adopter and is not in this repository: store the
+descriptor as a GC root, index its systems, journal per-system settlement, and
+after a restart reopen the named Datahike/Geschichte branches under that
+ownership claim (never deserialize the old Spindel reactive context).
 
 ## Laws and characterization tests
 
@@ -409,28 +492,22 @@ it:
 12. **Projection identity:** Room, Run, Proposal, UI, and audit projections refer
     to the same fork ID/descriptor rather than minting parallel fork identities.
 
-## Migration sequence
+# Worlds, savepoints and budgets
 
-1. **Done in this pass:** stabilize this vocabulary and its core laws as
-   characterization tests in Spindel.
-2. **Done in this pass:** enrich `ForkHandle` with a portable descriptor and single-settlement/transfer
-   boundary, reusing the distributed descriptor schema.
-3. **Partial:** selected-system and snapshot-world policies exist; repair
-   inference particle isolation next.
-4. **Done in this pass:** change Dvergr `fork-room` to call `ygg/fork!` and retain
-   its handle.
-5. **Done in this pass:** keep `RunWorld` as Run policy plus the canonical
-   handle/Room view (its small atom caches the policy decision, not substrate
-   state).
-6. **Done in this pass:** route `dvergr.rooms.forks` review and settlement through
-   that handle.
-7. **Done:** removed `dvergr.agent.subagent/hire!`, `dvergr.room/hire`,
-   `dvergr.discourse/hire`, and the independent `chat.context/fork-sub-chat`
-   hierarchy. All bounded delegation and executable branching is Run-backed;
-   conversational branches remain message/thread projections.
-8. **Partial:** Dvergr now exposes durability-first affine adoption. Implement
-   the Simmis GC root, whole-world ForkSet projection, and recoverable settlement
-   journal. Add affine world partitioning before exposing per-scope settlement.
-9. Replace boot-time blanket orphan cleanup with descriptor/owner-aware GC.
-10. Build SMC, MCTS, resource-aware campaigns, and training environments on the
-    same world policy.
+dvergr's Run worlds, budgets, resume and Attempt worlds are instances of the
+spindel primitives, so the laws spindel states (and tests) hold for them too.
+How each maps, as built:
+
+| dvergr | spindel primitive | as built |
+|---|---|---|
+| Run world: `dvergr.agent.world/open!` → `d/fork-room` → a `ygg/fork!` handle the work Room owns and settles (merge, review, discard) | a world fork (`ForkHandle`) | the Room keeps the canonical handle; RunWorld adds only Run policy |
+| Run budget: `dvergr.resource` wallets (Kontor), conserved transfers keyed by Run | `PResourceAuthority`: `grant!` on fork, `return!` on discard, `escrow!`/`claim!` across a process boundary | `dvergr.resource.authority/authority` is a `PResourceAuthority` over the ledger, mapping a world to the Run that owns it (`:run-id` in the Room's meta); Run worlds' savepoint sessions carry it |
+| model spend of a Run | a resource in the authority | a Run allocated microdollars pays its model spend from its wallet: `chat.context/account-usage!` charges each cost through `resource/*spend-wallet*` (bound by the LLM loop; unlike `*model-scope*` it restricts no provider); a cost beyond what is left takes the rest and exhausts the budget, and the Run's budget is at most its wallet. Each debit has a fresh id (`resource/charge-spend!`), so a retried call is not charged effectively once |
+| turn savepoints (`:conversation/turn`, persisted on the Run) | `savepoint`, `savepoint.portable/persist` | persisted without an escrow |
+| `program/resume!`: a new Run in a Run world forked at the savepoint's snapshots | `portable/hydrate-into!` | dvergr forks the world and keeps the handle; `hydrate-into!` makes it the savepoint's continuation (seed and sequence, bookkeeping cleared, pinned components repinned, `continue-llm-run` started as the session's computation before the Run's first step); the supervisor drives the loop from the recorded step, and the session ends with the Run. The stopped Run's remainder is granted from its wallet to the new Run's (`:resources-from`); escrow is for a planned handoff across a process boundary ([runs.md](runs.md)). A resumed Run without a wallet starts with its budget minus what the stopped Run's chat spent |
+| effect handler configuration in world state (`[:dvergr/effects :handlers]`, inherited by forks, composed) | savepoint handler tables in world state (`[:savepoint/handlers]`, inherited by forks, replaceable) | two tables: dvergr's holds portable effect specs with a composition algebra, spindel's maps savepoint sites to functions; one convention would rename keys and add no guarantee |
+| Attempt worlds: one forked world per cell, discarded after scoring | a `world-scope` over the experiment's worlds | not a scope: each cell's Run pays from a wallet of its candidate's budget (the preflight reports the cells × per-Run cap), cells settle `:discard` after certification and cleanup groups join the teardown. A scope pays once an algorithm runs over Attempts (SMC, MCTS: resampling agent runs, branching at savepoints) |
+
+SCI effects stay tail-resumptive handlers ([effects.md](effects.md)): SCI code
+is not CPS-transformed, so its effects cannot be spindel effects. The effect
+*mechanism* in the sandbox stays dvergr's.

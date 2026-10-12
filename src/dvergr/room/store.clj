@@ -357,7 +357,7 @@
     :run/settlement-status :run/settlement-reason
     :run/roster :run/agent-version :run/program-kind
     :run/interpreter-version :run/agent-def-hash :run/chat-id
-    ;; resuming (doc/run-resume.md): the latest portable savepoint, as EDN,
+    ;; resuming (doc/runs.md, Resuming a Run): the latest portable savepoint, as EDN,
     ;; and the Run that continued from it
     :run/savepoint :run/resumed-by})
 

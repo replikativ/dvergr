@@ -188,7 +188,7 @@
      :created-at     (:run/created-at r)
      :started-at     (:run/started-at r)
      :ended-at       (:run/ended-at r)
-     ;; resuming (doc/run-resume.md): the step its latest savepoint follows,
+     ;; resuming (doc/runs.md, Resuming a Run): the step its latest savepoint follows,
      ;; and the Run that continued it
      :resumable-from-step (some-> (run/savepoint r) :savepoint/payload :step)
      :resumed-by     (some-> (:run/resumed-by r) str)}))

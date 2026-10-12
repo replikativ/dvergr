@@ -438,7 +438,7 @@ The UI may say “three agents implemented token refresh” while still displayi
 
 ## State placement and fork safety
 
-Follow `doc/state-model.md`:
+Follow [worlds-and-forks.md](../worlds-and-forks.md#where-state-lives):
 
 - Durable task, event, thread, artifact, and summary facts belong in the room's
   forkable Datahike/Geschichte/Yggdrasil state.

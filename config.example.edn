@@ -77,7 +77,7 @@
  ;;                     :model "codex-subscription-cli"}}
 
  ;; ============================================================
- ;; Secrets — boundary key injection (doc/boundary-secret-injection.md)
+ ;; Secrets — boundary key injection (doc/effects.md, section Secrets at the boundary)
  ;; An agent USES an API key without ever SEEING it: in the sandbox `(env/get
  ;; "BRAVE_API_KEY")` returns an opaque placeholder, and the gated `http`
  ;; primitive swaps in the REAL value (from the host env var named by `:env`)

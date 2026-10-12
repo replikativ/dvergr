@@ -87,7 +87,7 @@
                         {:url url :allowed allowed-domains}))))))
 
 ;; ===========================================================================
-;; Boundary secret injection (doc/boundary-secret-injection.md)
+;; Boundary secret injection (doc/effects.md, section Secrets at the boundary)
 ;;
 ;; An agent USES an API key without ever SEEING it: `env/get` returns an opaque
 ;; PLACEHOLDER; the gated HTTP egress (`do-request`) substitutes the real value
@@ -826,7 +826,7 @@
 
    A key configured as a secret (config `:secrets`) resolves to an opaque placeholder
    that the HTTP primitive substitutes for the real value only at egress to its bound
-   domain (doc/boundary-secret-injection.md); any other granted key is a real value
+   domain (doc/effects.md, section Secrets at the boundary); any other granted key is a real value
    the agent can read, so grant narrowly.
 
    Usage in SCI:

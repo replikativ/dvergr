@@ -17,7 +17,7 @@
 ;; kernel. A message's `:type` is its *illocutionary force* — what the utterance
 ;; does — and participants **subscribe by the kinds of speech act they answer**
 ;; rather than by hardcoded sender→receiver wiring. (See
-;; [discourse-theory.md](../../doc/discourse-theory.md) for that framing.)
+;; [programming-model.md, Why discourse](../../doc/programming-model.md#why-discourse) for that framing.)
 ;;
 ;; This notebook shows three faces of that one idea — each runs live, with no
 ;; model. Every block binds the room's execution context with `with-room`.
@@ -175,4 +175,4 @@
 ;; The deeper algebra — `ask` / `fan-out` / `race` / `quorum` / `pipeline` and
 ;; the theory-of-mind `simulate-reply` — is in
 ;; [programming-model.md](../../doc/programming-model.md) and
-;; [discourse-theory.md](../../doc/discourse-theory.md).
+;; [programming-model.md, Why discourse](../../doc/programming-model.md#why-discourse).
