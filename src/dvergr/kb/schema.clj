@@ -2,8 +2,7 @@
   "The knowledge base as a katzen ACSet — BOUND from the canonical
    `katzen.schema.knowledge`. dvergr no longer defines a KB schema of its own;
    it maps the abstract canonical names onto its datahike idents (`:entity/*`,
-   `:link/*`) via `katzen.acset/rename-schema`. Single source of truth = katzen
-   (doc/katzen-knowledge-and-code.md, P2).
+   `:link/*`) via `katzen.acset/rename-schema`. Single source of truth = katzen.
 
    `as-acset` wraps an app-managed knowledge-schema conn: install missing schema
    idents (incl. the `:katzen/ob` marker — existing columns are left as the app

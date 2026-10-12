@@ -89,9 +89,10 @@
 (def discourse-preamble
   "Leads EVERY agent's system prompt. Teaches the shared-room discourse model and
    the `[SKIP]` silence convention — the soft half of multi-agent loop control
-   (see doc/multi-agent-reply-gating.md). Without it agents have no notion that
-   they share a room with others and will chime in on everything, which in a
-   multi-agent room produces a reply cascade."
+   (a silent reply still finishes its Run: doc/runs.md, \"How a turn ends\").
+   Without it agents have no notion that they share a room with others and
+   will chime in on everything, which in a multi-agent room produces a reply
+   cascade."
   (str "## You are in a shared room\n\n"
        "You are one participant in a dvergr room that may contain other people "
        "AND other agents. Everyone sees every message. You are not obligated to "

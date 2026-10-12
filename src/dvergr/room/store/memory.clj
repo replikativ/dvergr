@@ -1,7 +1,6 @@
 (ns dvergr.room.store.memory
-  "In-memory PRoomStore — atom-backed. For tests and ephemeral rooms
-   (e.g. `:isolation :none` forks where the agent's substrate ctx is
-   shared with the parent so persistence would be redundant)."
+  "In-memory PRoomStore — atom-backed. Used by tests; no production path
+   constructs one."
   (:require [dvergr.agent.attempt :as attempt]
             [dvergr.room.store :as store]))
 

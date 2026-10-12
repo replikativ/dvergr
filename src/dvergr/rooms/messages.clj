@@ -115,7 +115,7 @@
           ;; conversation :chat/id, so a fork already returns inherited (pre-fork)
           ;; + its own messages in order. For a fork we drop a `:divider?` marker
           ;; after the inherited prefix (the messages the parent also has) so every
-          ;; frontend can render the fork boundary. (doc/unified-fork-conversation.md)
+          ;; frontend can render the fork boundary.
           (let [fork?  (some-> room :meta deref :forked-from)
                 parent (when (and fork? (:parent-id room)) (rreg/lookup (:parent-id room)))
                 pids   (when parent (set (map :id (d/messages parent {:limit 200}))))

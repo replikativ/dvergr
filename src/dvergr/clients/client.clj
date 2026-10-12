@@ -239,12 +239,13 @@
 ;; ============================================================================
 
 (defn fork
-  "Fork `room` into a fresh git worktree + DB branch (CoW). Returns the fork Room."
+  "Fork `room` into a Geschichte workspace branch + Datahike branches (CoW).
+   Returns the fork Room."
   ([room] (fork room {:isolation :ctx}))
   ([room opts] (in-room room (d/fork-room room opts))))
 
 (defn diff
-  "The git diff this fork has accumulated over its parent — {:branch :parent-branch
+  "The workspace diff this fork has accumulated over its parent — {:branch :parent-branch
    :commits :stat}."
   [fork]
   ((requiring-resolve 'dvergr.substrate.geschichte/diff-since-fork) (:ctx fork)))
@@ -259,7 +260,7 @@
         :merged))))
 
 (defn discard!
-  "Drop the fork's worktree without merging."
+  "Drop the fork and its branches without merging."
   [fork]
   (with-ctx (fn [_ ctx _] (binding [rtc/*execution-context* ctx] (d/discard fork)) :discarded)))
 

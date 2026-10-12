@@ -1,9 +1,13 @@
 (ns dvergr.ops
   "Central operations specification — ONE data map of dvergr's surface operations
-   (rooms, agents, forks), from which the bindings are DERIVED rather than
-   hand-rolled. Modeled on `datahike.api.specification`: the spec is data, and
-   `spec->…` projections render it onto a binding (MCP today; the TUI/web/Telegram
-   field-specs, command grammars, and form-parsers over time).
+   (rooms and their files, forks, agents, Runs and Attempts, workflows, the
+   catalog, experiments and Scorecards, jobs, models), from which the bindings
+   are DERIVED rather than hand-rolled. Modeled on `datahike.api.specification`:
+   the spec is data, and projections render it onto a binding: the MCP tools
+   (`dvergr.mcp.surface`), the JSON API (`dvergr.web.api`) and the web action
+   routes (`dvergr.web.ops`), the Telegram commands
+   (`dvergr.channels.telegram-commands`) and the MCP REPL's `dvergr.ops`
+   namespace (`dvergr.mcp.repl`); the TUI calls ops too.
 
    Each entry is `{:doc :kind :schema :impl}`:
      :kind   — :read (a resource — what a UI renders) or :write (a mutation/tool)

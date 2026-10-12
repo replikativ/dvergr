@@ -1,9 +1,9 @@
 # Agent programs in the room REPL
 
-Status: deterministic and native LLM/tool interpreters plus conserved resource
-delegation are implemented. The data model and Run boundary are intentional;
-simulation, replay, provider-usage debiting, and durable continuation are later
-interpreters over the same contract.
+Status: deterministic and native LLM/tool interpreters, conserved resource
+delegation, model-spend debiting from a Run's microdollar wallet, and resume
+from turn savepoints (doc/run-resume.md) are implemented. Simulation and
+replay interpreters are not built.
 
 Dvergr agents can construct specialized workers and compose their executions
 from the SCI REPL. The initial surface separates four concepts:
@@ -287,10 +287,14 @@ supported. Runs without this coordinate retain their previous behavior.
 
 This counts gateway admissions, not transport-internal reconnects, tokens,
 elapsed time, heap, or provider charges. It is not an equal-token team budget.
-`"microUSD"` is still not automatically debited for model usage, and a zero-priced
-subscription does not consume a dollar ceiling. Token reservation, unknown-usage
-reconciliation and agent-spawned paid LLM children remain follow-up work; the
-existing paid-child restriction is unchanged. No new turn-based programming
+Model spend in `"microUSD"` is a separate debit: when a Run's allocation carries
+microdollars, the LLM program binds that wallet (`resource/*spend-wallet*`) and
+each model call's priced cost is consumed from it after the call
+(`resource/charge-spend!`); an empty wallet ends the Run's budget. Each such
+debit has a fresh id, so it is not effectively once, and a zero-priced
+subscription consumes nothing. Token reservation, unknown-usage reconciliation
+and agent-spawned paid LLM children remain follow-up work; the existing
+paid-child restriction is unchanged. No new turn-based programming
 semantics or fork-local spending counter is introduced.
 
 ## Execution and world settlement
@@ -320,9 +324,9 @@ the SCI `hire!` closure and model-tool adapters resolve them automatically.
 
 An LLM-created sandbox can still build and revise arbitrary immutable rosters,
 but its `hire!` authority currently accepts only provider-free `:echo` and
-`:scripted` children. Generic resource vectors can already split recursively;
-paid recursive LLM work remains closed until measured provider usage is debited
-from that wallet. A top-level Room REPL has no such program-kind ceiling.
+`:scripted` children. Generic resource vectors can already split recursively,
+and model spend is debited from the wallet, but not effectively once (each debit
+has a fresh id); paid recursive LLM work stays closed until it is. A top-level Room REPL has no such program-kind ceiling.
 
 The `spawn_agent` and `propose_change` model tools are convenience adapters over
 this same boundary. They construct a portable one-agent Roster, call `hire!`,
@@ -643,8 +647,8 @@ SCI, and joins their result Spins. Its trusted verifier checks the canonical
 Kontor allocation and return receipts for every wallet edge, durable child
 parentage and settlement, empty terminal Run wallets, the restored Room balance,
 and global quiescence. In the 2026-08-30 Codex Sol probe it passed all checks in
-three model exchanges. This evaluates affine delegation and return; it does not
-pretend the provider call itself has been debited yet.
+three model exchanges. This evaluates affine delegation and return; the probe
+predates model-spend debiting (#196, 2026-09-27) and does not exercise it.
 
 The self-programming environment asks the root model to construct two cheap
 simulated particles plus an independent verifier specification, join all three

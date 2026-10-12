@@ -1,15 +1,12 @@
 (ns dvergr.chat.schema
-  "Chat schema for cognitive agent group chats.
+  "The Datahike schema of a room's stores and of the system-db, with helpers.
 
-   Adapted from simmis schema with agent-specific extensions:
-   - Budget tracking for resource accounting
-   - Participant permissions for tiered agents
-   - Message importance for context compaction
-
-   Architecture:
-   - Each chat maps to a SpindelContext (for reactive state)
-   - Each chat has its own datahike (for durable storage)
-   - Messages are synced: spindel signal ↔ datahike"
+   Despite the name it covers more than chats: chats and messages, tool calls,
+   knowledge, tasks, Runs, Attempts, Scorecards, attention facts, the ledger,
+   budgets, pricing, rooms, actors and assignments (`full-schema` is the
+   union). A room's messages store holds its conversation; messages become
+   durable as `post!` appends them (`dvergr.room.store`), and a chat-ctx's
+   messages signal is a projection of that log."
   (:require [datahike.api :as d]
             [taoensso.telemere :as tel]
             [dvergr.kb.schema :as kb]

@@ -162,12 +162,14 @@
 (defn- resolve-default-cwd
   "Working directory for tool calls when none is supplied. Priority:
 
-     1. yggdrasil's registered git system's current worktree path
-        — when called inside a forked execution context, this is the
-        fork's worktree, so per-fork tool calls are anchored to it.
-     2. JVM cwd as a last-resort fallback.
+     1. \"/\" of the room's Geschichte workspace (`geschichte/current-workspace`
+        in the bound execution context; in a fork, the fork's branch), so
+        per-fork tool calls are anchored to it.
+     2. a registered native git system's working path, if any.
+     3. the isolated `.dvergr/workspace` clone (`git/safe-workspace-root`),
+        never the host JVM cwd.
 
-   Failures (no ctx bound, no git system) fall through silently."
+   Failures (no ctx bound, no workspace) fall through silently."
   []
   (or (when (resolve-default-workspace) "/")
       (try
@@ -181,10 +183,10 @@
   "Create an execution context for tool calls.
 
    Options:
-   - :cwd           - Working directory. If omitted, defaults to the
-                      current yggdrasil git system's worktree (per the
-                      bound execution context — picks up fork worktrees
-                      automatically), else JVM cwd.
+   - :cwd           - Working directory. If omitted: \"/\" of the given
+                      :filesystem, or of the bound context's Geschichte
+                      workspace (a fork's branch in a fork), else
+                      `resolve-default-cwd`.
    - :sci-ctx       - SCI context for sandboxed eval
    - :db-conn       - Datahike connection for queries
    - :chat-ctx      - ChatContext for budget tracking
@@ -956,8 +958,8 @@
                 ;; process. The agent / user can issue
                 ;;   (directive! cctx pid {:type :abort})
                 ;; and the existing sandbox cancel-poller catches it.
-                ;; Soft-checkpoint after 30s so a manager can choose
-                ;; "keep going" or "stop" on long evals.
+                ;; (`:grace-ms` only bounds `proc/checkpoint!`, which this
+                ;; body does not call.)
                (and sci-ctx chat-ctx)
                (let [result-p (promise)
                      desc     (str "clojure_eval: "

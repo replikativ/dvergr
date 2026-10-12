@@ -1,8 +1,7 @@
 (ns dvergr.code.index
-  "The in-memory CODE index as a katzen ACSet (interface-level L2,
-   doc/katzen-knowledge-and-code.md).
+  "The in-memory CODE index as a katzen ACSet (interface-level L2).
 
-   The git-worktree text is ground truth; THIS is a derived projection over
+   The source text is ground truth; THIS is a derived projection over
    `katzen.schema.clojure-code` — `Namespace`s and `Def`s keyed by the shared
    `:def/qname` Identity URI, with their relationships (`:def/ns`, `:def/refs`,
    `:def/method-of`, `:def/implements`) and interface facts (`:def/kind`,

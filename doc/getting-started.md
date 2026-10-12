@@ -181,7 +181,7 @@ inspect the result, then **merge** or **discard** through its affine handle.
 
 ```clojure
 ;; Fork the room. :ctx creates one Spindel ForkHandle over the execution
-;; context + registered git/datahike systems, so the worker's side effects are
+;; context + registered Geschichte/datahike systems, so the worker's side effects are
 ;; held in isolation until you decide.
 (def fork (d/fork-room room {:isolation :ctx}))
 
@@ -194,10 +194,10 @@ inspect the result, then **merge** or **discard** through its affine handle.
   (d/join fork (d/coder {:id :coder}))
   (d/post! fork (d/message :you :coder "Add input validation to src/app.clj")))
 
-;; The worker ran in the branched worktree + datahike. Inspect the fork's log,
-;; its worktree, its tests…
+;; The worker ran in the branched Geschichte workspace + datahike. Inspect the
+;; fork's log, its workspace files, its tests…
 
-;; Accept — settle the fork's git + datahike world into the parent:
+;; Accept — settle the fork's Geschichte + datahike world into the parent:
 (d/merge-room room fork)
 
 ;; …or discard — drop the branches, nothing leaks into the parent:

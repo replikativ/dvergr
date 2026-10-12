@@ -13,7 +13,10 @@ follows.
 - **Participant** — anything that sends and receives messages: an LLM agent, a
   human at a TUI/web client, or an egress adapter mirroring a room into Telegram.
   A participant is a long-lived reactive process with an `on-message` handler
-  that returns a reply (or nil for silence).
+  that returns a reply (or nil for silence). An LLM agent's Run still
+  completes when it stays silent: with no reason for nil, `:silent` for a
+  `[SKIP]` or blank reply, `:withheld` for a reply a wrapper drops
+  ([runs.md](runs.md#how-a-turn-ends)).
 - **Bus** — the pub/sub substrate. Posting a message fans it out to every
   matching subscriber and appends it to the room's log. Participants never call
   each other directly; they only post to, and subscribe on, the bus.
@@ -99,10 +102,11 @@ A room can be **forked** copy-on-write for hypothetical or risky work:
 
 - `fork-room` clones the participants into a sibling room seeded with the
   parent's history. With `:isolation :ctx`, it also forks the execution
-  context — branching the Datahike DB, git worktrees, and other substrate — so
+  context — branching the room's Datahike stores, its Geschichte workspace, and
+  other substrate — so
   the fork's side effects stay isolated until you decide their fate.
 - `merge-room` settles the fork's registered systems into the parent through a
-  prechecked, journalable boundary (Datahike and git retain their native merge semantics).
+  prechecked, journalable boundary (Datahike and Geschichte keep their native merge semantics).
 - `discard` throws the fork away, deleting its branches; the parent is untouched.
 
 This is the backbone of the proposal/review lifecycle (an agent works in a fork,

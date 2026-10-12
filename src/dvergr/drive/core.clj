@@ -143,9 +143,9 @@
     node))
 
 (defn link-blob!
-  "Upsert a file node pointing at an EXISTING CAS blob — the browser upload
-   path: bytes go to the blob store first, then the node transact references
-   the hash (no double transfer)."
+  "Upsert a file node pointing at an EXISTING CAS blob: bytes go to the blob
+   store first, then the node transact references the hash (no double
+   transfer). Nothing in dvergr calls it yet."
   [conn parent-id name blob-id mime size source]
   (let [existing (child-by-name @conn parent-id name)
         id (or (:fs.node/id existing) (random-uuid))

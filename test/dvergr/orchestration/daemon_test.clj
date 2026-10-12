@@ -2,8 +2,8 @@
   "Integration tests for the daemon with mock agents.
 
    Most tests share one daemon (`*shared-daemon*`) — each `daemon/start!`
-   does heavy I/O (Datahike connect, Lucene init, ygg system registration,
-   calendar schema install) that takes ~3-5s and dominates the suite.
+   does heavy I/O (system-db and room stores, Geschichte workspaces, room
+   subsystems) that takes ~3-5s and dominates the suite.
    Tests that specifically exercise start/stop lifecycle keep their own
    per-test daemon."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]

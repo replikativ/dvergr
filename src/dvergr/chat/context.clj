@@ -3,18 +3,12 @@
 
    Each chat is backed by:
    1. SpindelContext - for reactive state (messages, budget)
-   2. Datahike - for durable persistence (uses Yggdrasil-registered db if available)
+   2. Datahike - for durable persistence: the `:db-conn` passed in (on the
+      room path, the room's own store), else a local DB of its own
    3. SCI context - for sandboxed agent computation
 
    Budget tracking uses microdollars (μ$) as the numéraire:
-   1 USD = 1,000,000 μ$
-
-   Yggdrasil Integration:
-   When a DatahikeSystem is registered in the execution context (via agents/core),
-   ChatContext will use that connection instead of creating its own. This enables:
-   - File-based persistence (survives REPL crashes)
-   - Automatic forking when agents use with-fork
-   - Branch-based isolation for agent work"
+   1 USD = 1,000,000 μ$"
   (:require [org.replikativ.spindel.engine.core :as rtc]
             [org.replikativ.spindel.yggdrasil :as ygg]
             [org.replikativ.spindel.engine.context :as ctx]
@@ -296,16 +290,13 @@
        :title - Chat title
        :budget-dollars - Budget in dollars (default $1.00)
        :budget - Legacy: budget in microdollars
-       :db-path - Path for datahike (default in-memory, or uses Yggdrasil db if registered)
+       :db-conn - Datahike connection to use (the room path passes the room's
+                  own store); without it a local DB is created
+       :db-path - Path for that local DB (default in-memory)
        :with-sci? - Register a fork-selected SCI world component (default true)
 
-   Yggdrasil Integration:
-     If a DatahikeSystem is registered in the current execution context
-     (via agents/create-shared-context), that connection will be used instead
-     of creating a new one. This enables:
-     - Persistent file-based storage
-     - Automatic branching when agents fork
-     - Database inspection after agent runs
+   There is no shared chat DB to fall back to: without :db-conn the chat-ctx
+   gets a database of its own.
 
    Spindel-ctx selection (priority):
      1. Explicit `:execution-context` opt
@@ -318,7 +309,7 @@
    The dynamic-bind path is what makes the room (not the chat-ctx)
    the unit of work isolation: when a room is forked via
    `d/fork-room :isolation :ctx`, yggdrasil's registered systems
-   (git worktree, datahike branch) live on the fork's ctx. The
+   (Geschichte workspace, Datahike branches) live on the fork's ctx. The
    ChatContext retains a stable SCI component ref; callers resolve its
    interpreter through `sci-context-in`, so a fork selects a fork-local heap
    without reconstructing the interpreter."

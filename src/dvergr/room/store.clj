@@ -2,23 +2,24 @@
   "PRoomStore — pluggable durability for a Room.
 
    Every Room (`dvergr.discourse.Room`) optionally carries a
-   `:store`. When non-nil, the Room spawns an internal listener at
-   construction that mirrors every message-shaped event on its bus
-   to the store via `-store-message!`. Consumers of Rooms never call
+   `:store`. When non-nil, the Room's bus persists every
+   message-shaped event to the store via `-store-message!` inside
+   `post!` (its `:durable-append!` hook), before the message is
+   visible anywhere; a store failure fails the post. Consumers of Rooms never call
    the store directly — they post via `discourse/post!` and read via
    `room/messages` (which routes to the store when present, the bus
    log otherwise).
 
    The store also persists room *metadata* (title, parent, agent-ids,
-   etc.) so the daemon can re-hydrate the registry on startup.
+   etc.); the daemon re-hydrates the registry from the system-db
+   (`dvergr.rooms/hydrate-registry!`), not from here.
 
    Two impls ship:
-     - dvergr.room.store.memory     — atom-backed; for tests and
-                                       ephemeral rooms (e.g. forks)
-     - dvergr.room.store.datahike   — wraps the existing
-                                       `:chat/*` / `:message/*` /
-                                       `:room/*` schema, same data
-                                       as today's `dvergr.rooms`."
+     - dvergr.room.store.memory     — atom-backed; used by tests
+     - dvergr.room.store.datahike   — the room's own messages store
+                                       (`:chat/*` / `:message/*` /
+                                       `:room/*` schema); a `:ctx`
+                                       fork gets a branched one"
   (:require [clojure.edn :as edn]
             [clojure.string :as str]))
 

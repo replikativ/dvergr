@@ -30,8 +30,9 @@
   ^java.util.Date []
   (java.util.Date. (* 60000 (quot (System/currentTimeMillis) 60000))))
 
-;; {:signal SignalRef :running? bool}. The signal survives stop!/start! so a
-;; same-process restart reuses it (trackers keep their reference).
+;; {:signal SignalRef :running? bool}. The SignalRef survives stop!/start!, but
+;; its value lives in the root ctx it is read on: a new daemon root reads the
+;; value it was created with until its heartbeat's first tick.
 (defonce ^:private clock-state (atom {:signal nil :running? false}))
 
 (defn clock-signal

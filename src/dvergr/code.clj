@@ -1,6 +1,5 @@
 (ns dvergr.code
   "The Clojure → categorical-data mapping (programmatic knowledge, L0/L1).
-   See doc/programmatic-knowledge.md §7b.
 
    A source file ⟷ an ORDERED sequence of blocks (top-level forms + trivia),
    each carrying its EXACT source via rewrite-clj — a *strict* round-trip iso
@@ -287,7 +286,7 @@
 ;; L2 — structured per-definition diff (keep the datahike projection in sync
 ;;       with the text, efficiently)
 ;;
-;; The git worktree text is AUTHORITATIVE. The structured representation is a
+;; The source text is AUTHORITATIVE. The structured representation is a
 ;; per-definition projection of it: {var-name → form source (+ refs)}, the key
 ;; being the DEFINED VAR SYMBOL — a stable content identity, never an allocated
 ;; datahike eid. When the text changes we want to transact ONLY the defs that

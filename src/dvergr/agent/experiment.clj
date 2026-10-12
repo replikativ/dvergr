@@ -831,8 +831,9 @@
 
    `evaluators` is a host-owned map from exact verifier refs to Evaluator
    capabilities. All candidates, evaluators, environment policies, and host
-   admission ceilings are preflighted before the Spin can admit a Run. Jobs and
-   evaluation Spins are realized one bounded batch at a time. Options include
+   admission ceilings are preflighted before the Spin can admit a Run. Cells
+   are constructed one at a time as the admission controller (`run-admitted`,
+   at most `:parallelism` running) admits them. Options include
    ordinary evaluation `:from`/`:parent-run`/`:world-parent` plus host-owned `:parallelism`,
    `:max-parallelism`, `:max-attempts`, an optional process-local
    `:cleanup-group`, an exact `:world-setups` capability map for environments
@@ -862,7 +863,8 @@
    exactly the inputs computed for it.
 
    With `:complete-only? true` no Scorecard is persisted while any cell's
-   Attempt is not `:completed` (an infrastructure fault is not a verdict);
+   Attempt has no verdict (`verdict?`: an infrastructure fault is not one, a
+   model-caused failure is);
    the result carries `:incomplete {:cells n}` instead, and a resumed run
    re-runs exactly those cells.
 

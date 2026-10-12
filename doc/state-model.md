@@ -15,7 +15,8 @@ branches the workspace as a unit; settling that handle merges or discards it.
 - **The chat Datahike DB** (one DB, system `"dvergr-chat-db"`): messages, rooms
   (`:chat/*`), **actors/agents** (`:actor/*`), tool-uses, **ledger** (budget),
   **knowledge** (`:entity/*`), code, tasks, proposals. Branches on fork.
-- **Git worktrees**: the agent's file edits; branch on fork.
+- **Geschichte workspace**: the room's git repository, kept as a Datahike branch
+  with a muschel virtual filesystem; the agent's file edits; branches on fork.
 - **In-context signals**: per-chat messages/budget/status signals, the live room
   registry (`[:dvergr/rooms]`), processes, etc. CoW-copied with the context.
 
@@ -38,7 +39,7 @@ The `Daemon` record fields (`config`, `execution-ctx`, `discourse-room`,
 registry (now in `dvergr.agent.turn`), live participants/spins, and the stats/diff
 caches. **All a projection of Tiers 1–2** —
 agents/rooms rehydrate from Datahike actor rows + the registry, budget from the
-ledger, worktrees re-open. This is the "fine to be stateful" part: losing it loses
+ledger, Geschichte workspaces re-open. This is the "fine to be stateful" part: losing it loses
 nothing durable.
 
 ## The chat-state `ChatContext` (per `[room, agent]`)
@@ -70,7 +71,8 @@ plus the per-session sandbox.
   reference makes one part of that world. Older string references are read
   from the legacy global blob CAS. *This is the whole semantic chat state, forked
   through yggdrasil.*
-- **git worktree** → a fresh worktree; the agent's file edits are isolated.
+- **Geschichte workspace** → a branch of the room's repository; the agent's file
+  edits are isolated.
 - **muschel shell session** → its env-atom is CoW-forked alongside, so a worker's
   `cd` / shell state can't leak to the parent.
 - **per-agent SCI sandbox** → the SCI interpreter is a Spindel world component.

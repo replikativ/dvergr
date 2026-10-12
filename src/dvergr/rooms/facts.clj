@@ -72,8 +72,10 @@
 (defn watch!
   "Call `(f)` after durable changes of `room`, at most every `min-interval-ms`
    (a change inside the interval is reported at its end, so the last one is
-   never lost). For consumers outside spins: MCP notifications, relays. `key`
-   is idempotent; `unwatch!` stops it."
+   never lost). For consumers outside spins: MCP notifications, relays.
+   `unwatch!` with `key` stops it. Watching again under a `key` that is still
+   watched starts a second watcher and leaves the first running (only the new
+   one can be unwatched): unwatch first."
   [room key f & {:keys [min-interval-ms] :or {min-interval-ms 250}}]
   (when-let [signal (facts-signal room)]
     (let [running? (atom true)

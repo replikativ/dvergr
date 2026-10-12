@@ -12,10 +12,12 @@
      - `:participant-id`  — stable id, matches the discourse Participant.
      - `:role`            — :llm | :human | :hybrid | :scripted.
      - `:ctx`             — the participant's private spindel execution
-                            context (own signals, atoms, drain). Forked
-                            uniformly by `dvergr.discourse/fork-room
-                            {:isolation :ctx}` regardless of role. Same
-                            name as `Room.ctx`.
+                            context (own signals, atoms, drain): the
+                            one passed in, or a fresh root
+                            (`create-human-context`), or the chat-ctx's
+                            (`create-llm-context`). `dvergr.discourse/
+                            fork-room {:isolation :ctx}` forks the Room's
+                            ctx, not this one. Same name as `Room.ctx`.
      - `:memory-signal`   — Deltaable vector of memory entries. For an
                             LLM agent these are chat messages; for a
                             human they're saved notes / received items;

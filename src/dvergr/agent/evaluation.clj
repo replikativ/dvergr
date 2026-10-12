@@ -594,10 +594,16 @@
   "Return a Spin which evaluates one AgentDef in one EnvironmentDef.
 
    The Run is the causal execution identity and its ordinary RunWorld is the
-   isolated scenario. Environment `:world` may specify `:settlement` and a
-   conserved `:resources` vector; `:limits` may specify `:timeout-ms` and
-   `:cancel-timeout-ms`. A timeout requests targeted Run cancellation and no
-   receipt is certified until the Run has physically quiesced.
+   isolated scenario. Environment `:world` may specify `:isolation`,
+   `:settlement`, a conserved `:resources` vector, a `:setup` reference (with
+   a matching `:world-setup` capability), a `:protocol` reference (with a
+   matching `:protocol` capability) and `:effects` (the world's effect
+   handlers: faults, record, read-only, admission, host lists, quota).
+   `:limits` may specify `:timeout-ms`, `:cancel-timeout-ms`, `:on-timeout`
+   (`:fault`, the default, or `:verdict`), for an `:llm` program
+   `:max-model-steps` and `:budget-dollars`, and the limit keys a protocol
+   declares. A timeout requests targeted Run cancellation and no receipt is
+   certified until the Run has physically quiesced.
 
    Options may provide `:from` and structural `:parent-run`. `:world-parent`
    (default `room`) is the Room the attempt's world forks: a world inside

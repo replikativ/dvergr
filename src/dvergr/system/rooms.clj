@@ -2,16 +2,16 @@
   "Rooms as projects — provisioning + resolvers over the `dvergr.system.db`
    registry.
 
-   A room's own KB (datahike) and repo (git) are registered as **yggdrasil
-   systems** in the execution context's composite, so they fork + merge with the
-   room (the same mechanism the chat DB uses) and resolve **fork-aware** via
+   A room's own KB (datahike) and repo (a Geschichte workspace) are registered as **yggdrasil
+   systems** in the room's execution context composite, so they fork + merge
+   with the room (as its messages store does) and resolve **fork-aware** via
    `ygg/system`. The registry (`dvergr.system.db`) records *which* systems a room
    owns/attaches and with what permission; this namespace turns that into the
    concrete, ctx-resolved stores the sandbox/tools use:
 
    - `room-kb-conn`     — a room's OWN writable KB conn (for `knowledge_add`).
    - `room-kb-conns`    — all KBs a room may read (own + attached).
-   - `room-load-roots`  — ordered repo worktrees for the SCI load-fn.
+   - `room-load-roots`  — ordered repo roots for the SCI load-fn.
    - `room-mount-spec`  — muschel composite-fs mount data.
 
    Resolvers require a bound execution context (always true in a turn; tests bind

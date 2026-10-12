@@ -13,8 +13,8 @@
                             → :ignored
 
    :completed and :ignored set :task/completed-at. :ignored is set by
-   the dispatcher (or a cleanup job) when too much time passes; humans
-   themselves use :complete or :decline.
+   with `ignore!` (e.g. when too much time passes); a human's answer is
+   `accept!` then `complete!`. There is no decline.
 
    The task is the durable handle; the actual content lives both here
    (as :task/content) AND as a posted message in the room (so it

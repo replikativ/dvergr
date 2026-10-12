@@ -3,9 +3,8 @@
    - Agent addressing (parse-agent-command)
    - Markdown agent profiles (load-agent-prompt)
    - Agent list formatting (format-agent-list)
-   - Daemon dispatch routing
-   - spawn_agent tool
-   - Nested agent execution (integration, requires FIREWORKS_API_KEY)"
+   - spawn_agent and propose_change tools registered
+   - the daemon's persona prompt at agent creation"
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [clojure.string :as str]
             [dvergr.orchestration.daemon :as daemon]

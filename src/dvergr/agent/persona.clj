@@ -13,8 +13,9 @@
    classpath, or sets prompts at runtime via the API (which persists to the DB).
 
    The single home for persona loading — `daemon/load-agent-prompt` and the tools
-   layer both delegate here. ctx-bound: the DB lookup needs a bound execution
-   context; with none, only the built-in resource is consulted."
+   layer both delegate here. The DB lookup needs no execution context (the
+   system-db resolves without one); with no system-db, only the built-in
+   resource is consulted."
   (:require [clojure.java.io :as io]
             [dvergr.actors :as actors]
             [dvergr.discourse.definitions :as defs]
@@ -25,7 +26,7 @@
 (defn- chat-conn [] (sdb/get-conn))
 
 (defn- db-prompt
-  "The actor row's stored system prompt for `id`, or nil (also nil with no ctx)."
+  "The actor row's stored system prompt for `id`, or nil."
   [id]
   (when-let [conn (chat-conn)]
     (some-> (actors/lookup conn id) :system-prompt not-empty)))

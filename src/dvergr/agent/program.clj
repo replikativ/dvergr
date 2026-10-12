@@ -4,7 +4,13 @@
    Roster construction is pure; `hire!` is the effect boundary that admits a
    durable Run, posts its precise task trigger, and starts a Spindel Spin.
    Workflow results live in the fork-aware execution graph, while Room messages
-   and Run lifecycle remain the durable source of truth."
+   and Run lifecycle remain the durable source of truth.
+
+   An `:llm` Run saves a turn savepoint as it goes; `resume!` continues a
+   stopped Run from its latest one as a new Run caused by it
+   (doc/run-resume.md). `run-inputs`/`inputs-id` say what a Run presents to its
+   candidate when it starts (assembled prompt, tools, resolved model), which an
+   experiment's resume compares per cell."
   (:require [dvergr.agent.roster :as roster]
             [dvergr.agent.prompt :as prompt]
             [dvergr.agent.room-context :as room-context]
@@ -75,9 +81,11 @@
    cannot bypass delegation attenuation by choosing a different interface."
   [run-id supervisor]
   {:program-kinds #{:echo :scripted}
-   ;; Conserved vectors can now be split recursively, but model calls are not
-   ;; yet debited from the Run wallet. Keep paid recursive effects closed until
-   ;; provider usage and Kontor receipts form one atomic/effectively-once path.
+   ;; Conserved vectors split recursively, and model calls are debited from the
+   ;; Run wallet (`resource/*spend-wallet*`, `charge-spend!`), but each debit
+   ;; has a fresh random id, so a retried debit is a second one. Keep paid
+   ;; recursive effects closed until provider usage and Kontor receipts form
+   ;; one atomic/effectively-once path.
    :provider-effects? false
    :parent-run run-id
    ;; Process-local structured ownership. The sandbox may construct immutable
@@ -719,9 +727,10 @@
                    :room-id system-id
                    :room-runtime-id (:id work-room)
                    :room-incarnation (:incarnation work-room)
-                   ;; Generic resource vectors split recursively, but paid model
-                   ;; usage is not debited yet. Permit only provider-free child
-                   ;; programs until that receipt path exists.
+                   ;; Paid model usage is debited, but not effectively once
+                   ;; (see `child-program-authority`). Permit only
+                   ;; provider-free child programs until that receipt path
+                   ;; exists.
                    :agent-program-ceiling (child-program-authority run-id supervisor)})]
     {:chat-ctx chat-ctx
      :owned-db? (nil? trace-db)}))
@@ -2025,8 +2034,8 @@
    - `:resources`  positive conserved vector split from the parent Run/Room
    - `:limits`     restrictive LLM `:max-model-steps` / `:budget-dollars`
    Built-in program kinds are deterministic `:scripted` / `:echo` and the
-   bounded Dvergr-native `:llm` model/tool loop. Simulation and replay
-   interpreters implement the same boundary."
+   bounded Dvergr-native `:llm` model/tool loop. (No simulation or replay
+   interpreter exists; one would implement the same boundary.)"
   [control-room world-parent roster agent-ref opts]
   (hire-prepared-in! control-room world-parent roster agent-ref opts nil))
 

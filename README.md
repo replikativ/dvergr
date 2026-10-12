@@ -29,7 +29,7 @@ reactive runtime), [Datahike](https://github.com/replikativ/datahike)
 - 🏷️ **Tagged routing** — agents escalate `:escalation/budget`, policy-bots
   subscribe by capability tag; neither hardcodes the other
 - 🌿 **Substrate forks** — a "what would the coder write?" probe runs on a
-  branched git worktree + datahike, then settles through one affine world handle
+  branched Geschichte workspace + datahike, then settles through one affine world handle
 - 🧩 **Compositional kernel** — five primitives (tagged message, capability sub,
   dynamic subscribe, fork-room, GenerationHandle) cover the whole programming surface
 

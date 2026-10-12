@@ -1,13 +1,22 @@
 # Process model — deliberable long-running work
 
 A process (the record `dvergr.agent.process.Proc`, named so it does not collide with
-`java.lang.Process`) wraps a spin so long-running work (a sandbox
+`java.lang.Process`) wraps a body so long-running work (a sandbox
 eval, an LLM turn, a delegated /task) can be **paused at checkpoints,
 inspected, redirected, and resumed** by a manager — the user pressing a
 TUI key, or the agent itself looking at its own running processes.
 
 This file is the design contract for `dvergr.agent.process`. The
 implementation lives at `src/dvergr/agent/process.clj`.
+
+Status: built for `clojure_eval` (each eval is a process, soft checkpoint
+after 30 s), for budget exhaustion (a tracked process that waits for a
+decision while the turn ends), in the TUI's Processes view and in the
+sandbox's `processes` namespace. Two effect ops are built
+(`:extend-budget`, `:inject-message`). Not built: model, temperature and
+tool-cap effects, wrapping the LLM turn in a process, and trimming
+terminated processes from the registry. The sections below say which is
+which.
 
 ## Why this exists
 
@@ -26,14 +35,15 @@ plus a directive surface.
 
 ## Vocabulary
 
-- **Process** — a spin registered with a chat-ctx, with a status
-  signal, a progress signal, and a directive deferred.
+- **Process** — a body registered with a chat-ctx (run on a future by
+  `->process`, or owned elsewhere and only tracked by `register!`), with a
+  status signal, a progress signal, and a first-wins directive slot.
 - **Checkpoint** — a call inside the process body that snapshots state
-  and awaits a directive. The spin parks here.
+  and awaits a directive. The body's thread waits here.
 - **Directive** — a manager-issued instruction (data) that determines
   whether the process resumes, aborts, or runs effects first.
 - **Effect** — a side-effect on chat-ctx (extend budget, inject a
-  message, swap a model) applied before the process resumes.
+  message) applied before the process resumes.
 
 ## Two directive types, effects as data
 
@@ -45,21 +55,22 @@ plus a directive surface.
 {:type :abort :reason "user pressed esc"}
 ```
 
-The spin doesn't know about effect types. `directive!` runs the
-effects against chat-ctx *before* delivering the directive-deferred.
+The body doesn't know about effect types. `directive!` runs the
+effects against chat-ctx *before* delivering the directive (a latch the body waits on).
 By the time `checkpoint!` returns, the world (chat-ctx signals,
-messages, accounting ledger) is already in the new state; the spin
+messages, accounting ledger) is already in the new state; the body
 observes the diff on its next iteration.
 
-### Effect ops shipped in v1
+### Effect ops
 
 | Op | Implementation | Use |
 |---|---|---|
-| `:extend-budget` `{:dollars N}` | `swap!` on `:budget-signal` | "Keep going, here's more money" |
+| `:extend-budget` `{:dollars N}` | `swap!` on the chat-ctx's `:budget-signal` | "Keep going, here's more money" |
 | `:inject-message` `{:role :content}` | `chat-ctx/add-message!` | "Refocus on …" |
-| `:swap-model` `{:model id}` | mutates current opts (per-process atom) | Escalate or downshift mid-turn |
-| `:set-temperature` `{:temp f}` | same | Reduce randomness |
-| `:set-tool-cap` `{:n}` | per-process signal | "No more than N more tool calls" |
+
+Not built: `:swap-model`, `:set-temperature` and `:set-tool-cap`. The
+`:swap-model` and `:set-temperature` sugar types below still desugar to
+those ops, which then land on the `:default` method and are skipped.
 
 `run-effect!` is a multimethod (`[chat-ctx op]`). Unknown ops are
 logged + skipped — never crash the process.
@@ -70,10 +81,10 @@ For ergonomic manager-side use, sugar shorthands desugar to
 `:continue` + a single-effect bundle:
 
 ```clojure
-(directive! pid {:type :extend-budget :dollars 0.5})
+(directive! chat-ctx pid {:type :extend-budget :dollars 0.5})
 ;; ≡ {:type :continue :effects [{:op :extend-budget :dollars 0.5}]}
 
-(directive! pid {:type :refocus :hint "look at cache hits"})
+(directive! chat-ctx pid {:type :refocus :hint "look at cache hits"})
 ;; ≡ {:type :continue :effects [{:op :inject-message :role :system :content "..."}]}
 ```
 
@@ -85,20 +96,26 @@ Power users compose multi-effect directives directly.
   checkpoint, `checkpoint!` returns `{:type :continue :effects-applied []}`.
   The process keeps going. Matches how a human assistant works.
 - **`:grace-ms 5000`** is the default. Per-process configurable.
-- **First-wins** on the directive deferred: subsequent `directive!`
+- **First-wins** on the directive: subsequent `directive!`
   calls are no-ops; the manager can detect rejection from the return
   value and re-issue if needed.
 
 ## Visibility
 
-The chat-ctx grows a `:processes-signal` — `{process-id → snapshot}`.
+The registry is a map `{process-id → Proc}` in the chat-ctx's execution
+context state, under `[:dvergr/processes]`; `list-processes` returns a
+vector of snapshots.
 
-- **TUI** reads it for the Processes pane.
-- **SCI sandbox** exposes `(processes/list)`, `(processes/snapshot pid)`,
-  `(processes/directive! pid dir)` so Vár can see and direct her own
-  running processes from `clojure_eval`.
-- **Vár's prompt** grows: "Check `(processes/list)` between turns; if a
-  tool call is stuck, issue `:abort`."
+- **TUI**: the Processes view (cycled to from the tree view) lists the
+  running and awaiting processes of the selected chat; `a` aborts the
+  focused one, `c` continues it, `e` extends its budget by $0.10.
+- **SCI sandbox**: `(processes/list)`, `(processes/snapshot pid)`,
+  `(processes/directive! pid dir)` (`ns-io/add-process-ns!`, installed with
+  each chat's sandbox), so an agent can see and direct its own running processes from
+  `clojure_eval`. A directive that extends a budget is refused there: a
+  budget is extended by whoever gave it.
+- **Vár's prompt** (`resources/agents/var.md`) tells her about
+  `(processes/list)`.
 
 ## Lifecycle states
 
@@ -116,8 +133,9 @@ The chat-ctx grows a `:processes-signal` — `{process-id → snapshot}`.
             :running ──── body returns ──► :completed
 ```
 
-`:completed` and `:aborted` are terminal. Process stays in the
-registry briefly (~5min) for inspection, then GC'd.
+`:completed` and `:aborted` are terminal. Nothing removes a terminated
+process from the registry (not built: the trim); it stays until its
+chat-ctx goes. The TUI shows a terminated process for 30 s, then hides it.
 
 ## API
 
@@ -129,8 +147,11 @@ registry briefly (~5min) for inspection, then GC'd.
             :grace-ms 5000               ;; optional
             :on-complete (fn [result])   ;; optional
             :on-abort (fn [reason])}     ;; optional
-           (spin (… body using checkpoint! …)))
+           (fn [] … body using checkpoint! …))   ;; 0-arity fn, run on a future
 ;; → Process
+
+;; Tracking only: no body thread; the work owner polls (aborted? proc)
+(register! chat-ctx {:description "…"})
 
 ;; Inside the process body
 (checkpoint! {:state {:elapsed-ms 30000 :budget-used 4000}
@@ -141,20 +162,21 @@ registry briefly (~5min) for inspection, then GC'd.
 ;; Manager-side
 (directive! chat-ctx process-id {:type :continue
                                   :effects [...]})
-;; → :delivered | :already-decided
+;; → :delivered | :already-decided | :no-such-process
 
 (snapshot process)             ;; latest progress-signal value
-(list-processes chat-ctx)      ;; map of id → snapshot
+(list-processes chat-ctx)      ;; vector of snapshots
 ```
 
 ## Implementation tiers
 
-| | Slice | Touches |
+| | Slice | Status |
 |---|---|---|
-| **1** | Core ns + record + checkpoint! + directive! + effect multimethod | `src/dvergr/agent/process.clj`, chat-ctx `:processes-signal` |
-| **2** | Wire `clojure_eval` to use `->process` | `dvergr.tools/clojure_eval`, `sandbox/eval-code` |
-| **3** | Wrap daemon turn loop in `->process`; converge Esc → `directive! :abort` | the LLM turn (`dvergr.discourse.llm`) + TUI key handler |
-| **4** | Processes pane in TUI + key bindings | `dvergr.tui.app` |
-| **5** | SCI exposure of `(processes/list :directive! :snapshot)` + Vár prompt | `dvergr.sandbox`, `resources/agents/var.md` |
+| **1** | Core ns + record + checkpoint! + directive! + effect multimethod | built (`src/dvergr/agent/process.clj`; the registry in ctx state, not a `:processes-signal`) |
+| **2** | Wire `clojure_eval` to use `->process` | built (`dvergr.tools`, grace 30 s; an abort reaches `sandbox/eval-code` through its `:cancel?`) |
+| **3** | Wrap the LLM turn in `->process`; Esc → `directive! :abort` | not built. Esc in the TUI cancels the room's turn through its Run (`daemon/cancel-room-turn!`). Budget exhaustion registers a tracked process (`budget-exhausted!`) that waits for a decision while the turn ends; it never blocks the drain |
+| **4** | Processes view in TUI + key bindings | built (`dvergr.tui.app`) |
+| **5** | SCI exposure of `(processes/list :directive! :snapshot)` + Vár prompt | built (`dvergr.sandbox.ns.io/add-process-ns!`, `resources/agents/var.md`) |
 
-Tier 1 ships the primitive; everything else is consumers.
+`checkpoint!` blocks the future thread that runs the process body; parking
+the body as a spin without holding a thread is not built.

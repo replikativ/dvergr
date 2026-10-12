@@ -8,8 +8,9 @@ The Run kind this page describes is `:agent-turn` (the default of
 `run/start!`). One such Run spans every model round, tool call, same-thread
 steer, and model switch needed to handle one trigger. Other subsystems admit
 Runs of their own kinds: a hired agent task is `:agent-task`
-(`dvergr.agent.program`), and a job is a `:workflow` or `:experiment` Run of its
-room (`dvergr.jobs`). A Run is not a Room, Thread, actor identity, model request, UI spinner,
+(`dvergr.agent.program`), a job is a `:workflow` or `:experiment` Run of its
+room (`dvergr.jobs`), and a conversation episode is an `:episode` Run of its
+experiment room (`dvergr.agent.conversation`). A Run is not a Room, Thread, actor identity, model request, UI spinner,
 or private copy of the transcript.
 
 ```text
@@ -175,6 +176,11 @@ history. Join `:message/run-id` to `:run/id` for raw activity/output, and join
 `:run/trigger` to `:message/id` for Thread membership. Do not infer ownership
 from timestamps or assume the final reply is the completion record.
 
-This slice intentionally does not yet define generic effect receipts, approvals,
-retry semantics, resource scopes, replay, or arbitrary SCI ProgramRefs. Those can
-extend the stable Run identity without replacing it.
+Some neighbouring pieces exist beside the Run row rather than in it: each Run
+has its own conserved wallet (`dvergr.resource/run-wallet-id`), a stopped Run can
+be resumed from its savepoint ([run-resume.md](run-resume.md)), and the sandbox
+effect boundary keeps receipts and can answer effects from a recording
+([effects.md](effects.md); its receipts are held in memory, not on the Run).
+Not built: durable effect receipts linked to a Run, retrying a failed Run (a new
+trigger or a resume starts a new Run), and replaying a Run's external effects.
+These can extend the stable Run identity without replacing it.

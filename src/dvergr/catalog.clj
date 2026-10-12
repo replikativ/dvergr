@@ -99,7 +99,7 @@
                                              (when benchmark? "-bench")))}))
 
 ;; The benchmark sets' checkers and fixtures, offered to experiments agents
-;; start (`dvergr.agent/run-experiment!`): scored against the gold facts.
+;; start (the sandbox's `dvergr.agent/run-experiment!`): scored against the gold facts.
 (evaluators/register-evaluator! (wiki/evaluator (assoc wiki/params :gold (wiki/gold))))
 (evaluators/register-evaluator! (wiki/evaluator-v2 (assoc wiki/params :gold (wiki/gold-v2))))
 (evaluators/register-world-setup! (wiki/world-setup (wiki/fixtures)))

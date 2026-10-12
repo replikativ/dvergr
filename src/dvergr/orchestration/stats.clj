@@ -31,8 +31,7 @@
 ;; ============================================================================
 
 ;; RF5 S4: stats no longer hold a single chat-db conn — cost lives per-room and
-;; queries fan out over the registry. `init!` is kept as a no-op for the daemon
-;; call site until that boot block is cleaned up.
+;; queries fan out over the registry.
 
 ;; The per-agent stats cache lives on the current spindel execution-context
 ;; under [:dvergr/stats agent-id]. That way a test/sidecar ctx gets its own

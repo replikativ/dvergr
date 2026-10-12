@@ -4,7 +4,8 @@
 
    A command is DATA + a run fn, so the same registry serves four sources:
 
-     :builtin  — shipped handlers (/fork /worktree /model /plan /help /skill)
+     :builtin  — shipped handlers (/help /commands /model /fork /worktree
+                 /invite /plan /build /sandbox)
      :prompt   — a markdown template (frontmatter `kind: prompt`); `/name args`
                  expands $1/$ARGUMENTS/$(clojure) and is posted as a USER message
                  (triggers a turn). The opencode/pi prompt-template pattern.
@@ -192,8 +193,9 @@
     (->> (vals by-name) (sort-by :name) vec)))
 
 (defn lookup
-  "Resolve a parsed input's command. `/skill:linear` resolves the `skill`
-   built-in (suffix carried in ctx); otherwise an exact name match."
+  "Resolve a parsed input's command. `/skill:linear` resolves the skill
+   command `skill:linear` (there is no bare `/skill`); otherwise an exact name
+   match."
   [{:keys [name suffix]} ctx]
   (let [cmds (into {} (map (juxt :name identity) (all-commands ctx)))]
     (cond
@@ -315,7 +317,7 @@
 
 (defn- do-fork!
   "Fork the current room with `:isolation :ctx` — a real branch: the fork gets
-   its OWN forked execution context (git worktree + Datahike branch) seeded with
+   its OWN forked execution context (Geschichte workspace + Datahike branches) seeded with
    the parent's history, so speculative work is isolated and can later be MERGED
    back into the parent (or discarded). The fork is registered in the parent ctx
    so the tree shows it; navigate in, work, then merge/discard from the tree."
@@ -345,7 +347,7 @@
          (when notify!
            (notify! (str "Worktree-isolated forks run in a separate execution "
                          "context the UI can't display yet — use /fork for a "
-                         "conversational fork. (Tracked in doc/command-systems.md.)")))
+                         "conversational fork.")))
          {:handled? true :no-turn? true})})
 
 (register!

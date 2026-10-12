@@ -242,9 +242,10 @@
    store, resumable; `:parent-run` makes every cell's Run its child. With
    `:world-parent`, the cells fork that room instead while `room` keeps the
    records (a benchmark set's fixture room, reported in the caller's room).
-   Evaluates in the forked room's own context, whoever calls: a
-   daemon room's context is a fork of the daemon's, and an evaluation in the
-   latter loses its Run's wakeups. `capabilities` is
+   Evaluates in the context of the room the cells fork (`:world-parent`, else
+   `room`), whoever calls; each cell's own fork context is chosen inside
+   `experiment/run`. A daemon room's context is a fork of the daemon's, and an
+   evaluation in the latter loses its Run's wakeups. `capabilities` is
    `{:world-setup :protocol :evaluator}` (setup and protocol when named)."
   [room {:keys [capabilities team experiment parallelism cleanup-group benchmark parent-run
                 world-parent admit]

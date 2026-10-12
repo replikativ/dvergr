@@ -8,8 +8,13 @@
    - paired comparisons: each pair of candidates (or each against a
      baseline) on the cases both have a verdict for, the cases where they
      disagree, the exact McNemar p and a verdict;
+   - resources: per candidate, input and output tokens per attempt, the
+     cached share of the input, median, p90, summed and wall-clock time,
+     and the total cost;
    - where candidates fail: per check, how often it failed;
-   - which cases could not grade an answer, and why (certification).
+   - which cases could not grade an answer, and why (certification);
+   - when cells ran again because their inputs changed, a note saying how
+     many (`inputs-note`).
 
    As Markdown, to read or to publish. `room-report` renders it from what an
    experiment Room stores (its Scorecard and certified Attempts): the

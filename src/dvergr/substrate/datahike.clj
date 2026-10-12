@@ -5,8 +5,7 @@
 
    This is the seam shared with product layers (simmis): every per-room /
    per-KB / system store is opened through the same call, so schema +
-   branching stay uniform across all of them (see simmis
-   doc/using-dvergr-databases.md §5, which proposed it). dvergr's own
+   branching stay uniform across all of them. dvergr's own
    call sites (`dvergr.system.rooms`, `dvergr.system.mail`) route through
    it too — the helper IS the documented provisioning idiom, not a wrapper
    beside it."

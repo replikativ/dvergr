@@ -233,7 +233,8 @@
                 ;; Off the poll thread: media messages block on file download
                 ;; + transcription (minutes worst-case), and one slow message
                 ;; must not stall inbound delivery for every other chat.
-                ;; Room-level ordering is preserved by the bus fold.
+                ;; One future per message: messages of one chat are not
+                ;; ordered among themselves on the way into the room.
                 (future
                   (try
                     (on-msg msg)
@@ -567,8 +568,9 @@
       "No agents registered.")))
 
 (defn make-daemon-adapter
-  "Build the Telegram medium adapter from the daemon-injected `caps`. Thin:
-   each remote user gets an egress Participant (it's a `:send-fn` adapter)."
+  "Build the Telegram medium adapter from the daemon-injected `caps`. Thin
+   (a `:send-fn` adapter): each Telegram room is mirrored back to its chat
+   (`adapters/mirror-room!`)."
   [{:keys [ctx default-agent send-fn ensure-room ensure-actor speaker-name]}]
   (adapters/make-adapter
    {:ctx           ctx

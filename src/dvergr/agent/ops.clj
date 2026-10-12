@@ -5,16 +5,20 @@
    An agent is two coupled things:
      1. a durable **actor row** (`dvergr.actors`, datahike-authoritative) that
         carries identity + the model/provider/skills/budget config, and
-     2. a **persona prompt** (`dvergr.agent.persona`, a project-local markdown
-        file under `.dvergr/agents/<id>.md`, built-in resource as fallback).
+     2. a **persona prompt** (`dvergr.agent.persona`: the row's
+        `:actor/system-prompt`, with the built-in `resources/agents/<id>.md`
+        as fallback).
 
    These ops keep both in sync so a UI edit is a single call. The actor row is
    the source of truth (see [[fork-isolation-arc]] config foundation); the
    daemon's join path reads it (see `dvergr.orchestration.daemon/agent-join-config`),
    so edits take effect on the next room join without a restart.
 
-   ctx-bound: every fn resolves the chat-db conn from the bound
-   `*execution-context*` and returns nil when there is none."
+   No execution context is needed: actor rows live in the system-db
+   (`dvergr.system.db`), which resolves without one. These fns answer nil for
+   an unknown or taken id; the op layer (`dvergr.ops`, with `dvergr.agent.fields/
+   normalize`) turns that, and bad field values, into errors with a status
+   (400/404/409)."
   (:require [clojure.string :as str]
             [datahike.api :as dh]
             [dvergr.actors :as actors]
@@ -82,7 +86,7 @@
 (defn create-agent!
   "Create a new :agent actor row (+ optional persona prompt). `id` may be a
    keyword or string. Returns the new agent view (`get-agent`), or nil if the
-   id already exists / there's no ctx.
+   id already exists or there is no system-db.
 
    Accepts the UI-level field map: :id :name :model :provider :tags :tools
    :description :budget-dollars :rooms :prompt."
