@@ -210,3 +210,25 @@
       (finally
         (kontor-governance/ungovern! conn)
         (d/close-room! room)))))
+
+(deftest a-charge-takes-what-another-writer-left
+  (let [[room conn] (ledger-room)
+        wallet (kontor/account-ref (resource/room-wallet-id :authority-room))
+        transfer kontor/transfer!
+        raced (atom false)]
+    (try
+      (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 100M}})
+      ;; between the charge's read and its debit, a grant elsewhere takes 60
+      (with-redefs [kontor/transfer!
+                    (fn [st spec]
+                      (when (and (= :consume (:kind spec)) (compare-and-set! raced false true))
+                        (transfer st {:id (random-uuid) :kind :consume :source wallet
+                                      :destination kontor/sink-account
+                                      :resources {resource/microdollars 60M}}))
+                      (transfer st spec))]
+        (binding [resource/*spend-wallet* (resource/spending (resource/room-spend-wallet room) [:race])]
+          (is (= 40M (:charged (resource/charge-spend! 80))) "the provider was paid: the rest is taken")))
+      (is (zero? (get (resource/balance room) resource/microdollars 0M)) "the wallet is empty, not overdrawn")
+      (finally
+        (kontor-governance/ungovern! conn)
+        (d/close-room! room)))))

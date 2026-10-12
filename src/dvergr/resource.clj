@@ -233,8 +233,9 @@
 (defn charge-spend!
   "Consume `cost` microdollars of model spend from the bound spend wallet.
    The provider was already paid, so the ledger cannot refuse it: a cost
-   beyond what is left takes the rest; charges to one wallet are serialized
-   (the rest is read, then taken). The debit's id is the next one of the
+   beyond what is left takes the rest; charges to one wallet are serialized,
+   and a debit refused because another writer took from the wallet meanwhile
+   takes the new rest. The debit's id is the next one of the
    binding's charge scope (`spending`): when that debit was already made (the
    scope charged again, a retried step), it is not made twice. Returns
    `{:charged n :exhausted? bool}`, or nil when no wallet is bound or there is
@@ -248,17 +249,30 @@
           (if-let [done (store/-resource-receipt (resource-store! room) id)]
             {:charged (get-in done [:resources microdollars] 0M)
              :exhausted? (<= (wallet-left payer) 0M)}
-            (let [left (wallet-left payer)
-                  amount (min (bigdec cost) left)]
-              (when (pos? amount)
-                (store/-transfer-resources!
-                 (resource-store! room)
-                 {:id id
-                  :kind :consume
-                  :source (kontor/account-ref wallet)
-                  :destination kontor/sink-account
-                  :resources {microdollars amount}}))
-              {:charged amount :exhausted? (<= left (bigdec cost))})))))))
+            ;; Other writers (a grant to a new Run, a fork's escrow) may take
+            ;; from the wallet between the read and the debit; the ledger then
+            ;; refuses the debit. The provider was paid: read the rest again
+            ;; and take that.
+            (loop [tries 0]
+              (let [left (wallet-left payer)
+                    amount (min (bigdec cost) left)
+                    outcome (try
+                              (when (pos? amount)
+                                (store/-transfer-resources!
+                                 (resource-store! room)
+                                 {:id id
+                                  :kind :consume
+                                  :source (kontor/account-ref wallet)
+                                  :destination kontor/sink-account
+                                  :resources {microdollars amount}}))
+                              {:charged amount :exhausted? (<= left (bigdec cost))}
+                              (catch clojure.lang.ExceptionInfo e e))]
+                (cond
+                  (map? outcome) outcome
+                  (store/-resource-receipt (resource-store! room) id)
+                  {:charged amount :exhausted? (<= left (bigdec cost))}
+                  (and (< tries 8) (< (wallet-left payer) amount)) (recur (inc tries))
+                  :else (throw outcome))))))))))
 
 (defn charge-usage!
   "Record one model call's provider `usage` under `model` in the bound
