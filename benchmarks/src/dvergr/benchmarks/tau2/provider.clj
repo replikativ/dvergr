@@ -9,7 +9,8 @@
      protocol      the conversation with the simulated customer (the driver),
                    hosted by the Run inside that world
      verifier      tau2's grader, behind the evaluator boundary: the observer
-                   reads the final world, the verifier sees portable evidence
+                   reads the final world and asks the judge, the verifier sees
+                   portable evidence (the judge's answers among it)
      private data  gold actions and assertions never leave this namespace's
                    closures; candidates see the policy, the tools and the
                    customer
@@ -32,8 +33,12 @@
    the room's `[customer · HH:mm]` prefix (the wall clock leaked into a
    frozen-clock world; reference candidates got the raw text). 3: a durable
    room store keeps that metadata (`:plain?`); under 2 it refused every
-   customer message, so episodes in a durable room lost the customer's turns."
-  3)
+   customer message, so episodes in a durable room lost the customer's turns.
+   4: the judge's answers on a task's natural-language assertions are asked
+   when the Attempt is observed and kept in its evidence (`:nl-assertions`);
+   verify grades from the evidence alone, so a certified Attempt re-verifies
+   without a model call (under 3 verify asked the judge live)."
+  4)
 
 (defn- task-of [domain definition]
   (let [task-id (get-in definition [:environment/task :task-id])]
@@ -110,6 +115,15 @@
                         ;; infrastructure fault, never a model verdict.
                         termination (or (:termination outcome) :infrastructure-error)]
                     {:result {:termination termination}
+                     ;; the judge's answers, asked once here: verify grades
+                     ;; from them, so re-verifying makes no model call
+                     :nl-assertions (when (and (#{:agent-stop :user-stop} termination)
+                                               (some #{"NL_ASSERTION"}
+                                                     (get-in task ["evaluation_criteria" "reward_basis"])))
+                                      (if judge-gen
+                                        (t2/nl-assertion-checks task (episode/trajectory (vec log)) judge-gen)
+                                        (throw (ex-info "Task requires an NL assertion judge"
+                                                        {:type ::t2/judge-required :task (get task "id")}))))
                      :failure (when-not (= :completed (:run/status result))
                                 {:status (:run/status result)
                                  :reason (:run/reason durable)
@@ -122,13 +136,13 @@
                      :facts (when (and world (#{:agent-stop :user-stop} termination))
                               (t2/world-facts domain task {:world world}))
                      :prompts {:user-system-sha256 (pj/sha256-hex (t2/user-system-prompt domain task))}}))
-       :verify (fn [definition {:keys [trajectory facts] :as evidence}]
+       :verify (fn [definition {:keys [trajectory facts nl-assertions] :as evidence}]
                  (let [task (task-of domain definition)
                        termination (get-in evidence [:result :termination])
                        grade (t2/grade-facts task
                                              {:messages (episode/trajectory trajectory)
                                               :termination termination}
-                                             facts {:judge judge-gen})]
+                                             facts {:nl-assertions nl-assertions})]
                    {:reward (double (:reward grade))
                     :checks (merge {:terminated-normally (contains? #{:agent-stop :user-stop} termination)}
                                    (into {} (map (fn [[k v]] [k (= 1.0 (double v))]))

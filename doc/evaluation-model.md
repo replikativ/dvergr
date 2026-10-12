@@ -169,11 +169,12 @@ and may do IO: a room workflow's observer asks its judge model and keeps the
 answers in the evidence (`:judgements`), and its `capture` reads the world's
 files. `verify` is a function of the EnvironmentDef and the portable evidence
 `observe` returned, so such a verdict can be re-derived from the stored
-evidence. One exception: tau2's verifier asks a live judge model for a task's
+evidence. tau2's observer, too, asks its judge model for a task's
 natural-language assertions (`nl-assertion-checks` in
-`dvergr.benchmarks.tau2.core`, called from the provider's verify), so
-re-verifying those tasks makes a model call and may answer differently; the
-judge's answers are not yet kept as evidence. A score means what its
+`dvergr.benchmarks.tau2.core`) and keeps the answers in the evidence
+(`:nl-assertions`); its verify grades from them, so a certified tau2 Attempt
+re-verifies without a model call (grader version 4; Attempts of version 3
+asked the judge in verify and do not mix with them). A score means what its
 verifier's identity says, not what its reporter claims.
 
 A verifier may offer a **partial** form, called at checkpoints, returning
