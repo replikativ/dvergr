@@ -16,7 +16,7 @@
    evidence Runs/messages to share the Attempt's Room); the episode Room is
    referenced as plain data and re-verified by inspection. Blocking work
    (model calls, grading, certification, Room teardown) belongs on host
-   threads, never on the Spindel drain. See doc/conversation-evaluation.md."
+   threads, never on the Spindel drain. See doc/design/conversation-evaluation.md."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [datahike.api :as dh]

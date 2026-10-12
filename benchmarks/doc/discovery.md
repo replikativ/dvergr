@@ -107,7 +107,7 @@ reported as deficient model reasoning.
 
 ### Evidence from unsuccessful coding attempts
 
-See [Coding benchmarks](coding-benchmarks.md) for the reusable Spindel
+See [Coding benchmarks](coding.md) for the reusable Spindel
 permutation repair fixture and its REPL entry point.
 
 A failed or cancelled Run discards its work world after supervised execution

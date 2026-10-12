@@ -3,7 +3,7 @@
 Dvergr is a Clojure agent harness built on the spindel FRP runtime: rooms, agents and their Runs are
 reactive processes, each attempt runs in a forked world, and benchmarks are experiments over
 certified Attempts. README.md is the product overview; `doc/` holds the design
-(`doc/architecture.md`, `doc/programming-model.md`, `doc/fork-and-world-model.md`,
+(`doc/architecture.md`, `doc/programming-model.md`, `doc/worlds-and-forks.md`,
 `doc/evaluation-model.md`, `doc/benchmarks.md`, `doc/room-workflows.md`).
 
 ## Never use :reload-all

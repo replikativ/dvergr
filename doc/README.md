@@ -17,10 +17,10 @@ New to dvergr? Start with **[Getting Started](getting-started.md)**.
 
 - **[Rooms & Agents](rooms-and-agents.md)** — the core model: Rooms + Participants on a Bus, addressing (DM vs broadcast), forks
 - **[Programming Model](programming-model.md)** — the compositional kernel: tagged messages, capability routing, dynamic subscriptions, escalation
-- **[Recursive work orchestration](orchestration.md)** — Rooms, threads, tasks, executions, recursive Workrooms, and provider-neutral collaboration
+- **[Recursive work orchestration](design/orchestration.md)** — Rooms, threads, tasks, executions, recursive Workrooms, and provider-neutral collaboration
 - **[Runs](runs.md)** — durable execution identity, lifecycle subscription, correlation, and targeted cancellation
 - **[Agent programs](agent-programs.md)** — immutable specialized-agent rosters, Run-backed hiring, Spindel composition, and fork-safe state placement
-- **[Forks, worlds, and settlement](fork-and-world-model.md)** — the cross-project Yggdrasil/Spindel/Dvergr/Simmis fork contract, ownership laws, and use-case coverage
+- **[Forks, worlds, and settlement](worlds-and-forks.md)** — the cross-project Yggdrasil/Spindel/Dvergr/Simmis fork contract, ownership laws, and use-case coverage
 - **[Discourse Theory](discourse-theory.md)** — why "discourse": speech acts, theory of mind, and the Rational-Speech-Acts/FRP lineage (short, optional)
 - **[Architecture](architecture.md)** — the L0–L7 layer map, subsystem graph, inbound message flow, per-file table
 - **[State Model](state-model.md)** — the three-tier copy-on-write state + workspace model
@@ -44,9 +44,9 @@ New to dvergr? Start with **[Getting Started](getting-started.md)**.
 - **[Running benchmarks](running-benchmarks.md)** — how to run one, what its report means, resume, faults, cost at list price, held-out discipline
 - **[Reference setups](../benchmarks/reference/README.md)** — BIRD and SpreadsheetBench as their authors run them, on the cases a Dvergr experiment ran, and how to pair the two
 - **[Evaluation model](evaluation-model.md)** — Attempts, Evaluators, Experiments, Scorecards
-- **[Practical agent evaluation](practical-agent-evaluation.md)** — frozen-web discovery, citation verification, market evidence
-- **[Coding benchmarks](coding-benchmarks.md)** — coding repair in the SCI workspace
-- **[Conversation evaluation](conversation-evaluation.md)** — certified conversational episodes
+- **[Practical agent evaluation](../benchmarks/doc/discovery.md)** — frozen-web discovery, citation verification, market evidence
+- **[Coding benchmarks](../benchmarks/doc/coding.md)** — coding repair in the SCI workspace
+- **[Conversation evaluation](design/conversation-evaluation.md)** — certified conversational episodes
 
 ## 🤝 Contributing
 

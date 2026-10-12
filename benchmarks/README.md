@@ -17,10 +17,10 @@ Benchmarks for dvergr's evaluation path.
   (`examples/workflows/bank-booking`, DATEV via Kontor), a room workflow run with
   `dvergr.catalog.room-run` (doc/room-workflows.md).
 - **Dvergr's own fixtures**: coding repair (`permutation`, `rss`, on
-  `coding-workspace`): [doc/coding-benchmarks.md](../doc/coding-benchmarks.md);
+  `coding-workspace`): [doc/coding.md](doc/coding.md);
   frozen-web discovery, citation verification and market evidence
   (`discovery`, `discovery-citations`, `frozen-web`, `market-evidence`):
-  [doc/practical-agent-evaluation.md](../doc/practical-agent-evaluation.md).
+  [doc/discovery.md](doc/discovery.md).
 
 This is its own artefact, `org.replikativ/dvergr-benchmarks`. The `dvergr` jar
 does not contain it. What stays in `dvergr` is what a benchmark is built
