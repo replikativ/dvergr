@@ -19,6 +19,7 @@
             [dvergr.chat.accounting :as acct]
             [dvergr.chat.persist :as persist]
             [dvergr.sandbox :as sandbox]
+            [dvergr.sandbox.extensions :as extensions]
             [taoensso.telemere :as tel]
             [datahike.api :as dh]))
 
@@ -459,6 +460,8 @@
    room caches use it when a child world is discarded."
   [chat-ctx execution-context]
   (try
+    (when-let [ids (seq (:sandbox-extensions chat-ctx))]
+      (extensions/release! (sci-context-in chat-ctx execution-context) ids))
     (sandbox/release-agent-resources! execution-context (:capability-id chat-ctx))
     (finally
       ;; Disposable-resource cleanup is best-effort with respect to component

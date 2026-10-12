@@ -720,25 +720,28 @@ branch-correct Room store while the affine world-settlement gate is held.
 `episode/export` is only a read projection joining that Attempt to current Run
 facts; it introduces no lifecycle, clock, mutable cell, or settlement authority.
 
-Probabilistic programs use the same placement rule. In SCI, Dvergr defaults
-`infer/smc-infer`, `infer/importance-sampling`, and `infer/kernel-infer` to
-`:world-policy :fork` (the inference is foerster's, run on Spindel worlds). Each particle and resampling descendant owns a
-canonical Yggdrasil fork. Before a result crosses into SCI, Dvergr removes the
+Probabilistic programs (foerster's inference, run on Spindel worlds) run in
+fresh worlds by default (`:world-policy :fresh`). A fresh world has no room
+state: a model there that calls a sandbox capability fails instead of acting on
+the room. A model that needs room state passes `{:world-policy :fork}`; then
+each particle and resampling descendant owns a canonical Yggdrasil fork, at
+the cost of a fork per particle. Before a result crosses into SCI, Dvergr removes the
 execution contexts and exposes only portable results, weights, statistics, and
 world descriptors. `infer/predict` likewise receives values rather than native
 contexts. For example:
 
 ```clojure
 (spin
-  (let [posterior (await (infer/smc-infer (scenario-model) 64))]
+  (let [posterior (await (infer/smc-infer (scenario-model) 64 {:world-policy :fork}))]
     {:values  (infer/values posterior)
      :weights (infer/log-weights posterior)
      :ess     (infer/ess posterior)
      :worlds  (infer/worlds posterior)}))
 ```
 
-Pass `{:world-policy :fresh}` only when the model is proven not to touch Room,
-Datahike, repository, accounting, or other registered world state. Inference
+An AgentDef with `:sandbox #{:foerster/inference}` also gets foerster's sandbox
+namespaces (`infer/run`, background jobs with `infer/start`, `model/` blocks,
+`opt/`, `diag/`, `lp/`; see `dvergr.sandbox.extensions`). Inference
 does not introduce an `AgentParticle` entity and does not turn every sample into
 a Run. A Run remains the durable identity of an application-level computation;
 particles are its internal execution placements unless the program explicitly

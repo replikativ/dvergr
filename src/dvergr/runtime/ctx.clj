@@ -53,11 +53,24 @@
 
    This is the ambient-world rule for stable handles: child execution may
    refine an owner into its fork, while parent/sibling execution cannot pull a
-   child-owned value out of its world."
+   child-owned value out of its world.
+
+   One bound world neither: a savepoint world outside the owner's lineage — a
+   model running in a fresh inference world (foerster `:world-policy
+   :fresh`, every Markov chain). Retaining the owner there would let a
+   speculative particle act on the real room, so it throws instead; a model
+   that needs room state runs with `:world-policy :fork`, whose particles are
+   descendants."
   [owner]
   (let [bound (when (ec/execution-context-bound?)
                 (ec/current-execution-context))]
-    (if (descendant-context? bound owner) bound owner)))
+    (cond
+      (descendant-context? bound owner) bound
+      (and bound (some? (rtp/get-state bound [:savepoint/session])))
+      (throw (ex-info (str "A model in a fresh inference world cannot reach room state; "
+                           "run it with {:world-policy :fork}")
+                      {:type ::isolated-inference-world}))
+      :else owner)))
 
 (def ^:private sandbox-bindings-path
   "Fork-local bindings used by stable SCI host capabilities.  The binding key

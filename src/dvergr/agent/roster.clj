@@ -40,6 +40,7 @@
    :prompt :agent/prompt
    :program :agent/program
    :tools :agent/tools
+   :sandbox :agent/sandbox
    :model-policy :agent/model-policy
    :metadata :agent/metadata})
 
@@ -104,6 +105,11 @@
                   (:agent/tools spec)
                   (assoc :agent/tools (keyword-set! "AgentDef :tools"
                                                     (:agent/tools spec)))
+
+                  ;; sandbox extensions, by name (dvergr.sandbox.extensions)
+                  (:agent/sandbox spec)
+                  (assoc :agent/sandbox (keyword-set! "AgentDef :sandbox"
+                                                      (:agent/sandbox spec)))
 
                   (:agent/model-policy spec)
                   (assoc :agent/model-policy (:agent/model-policy spec))

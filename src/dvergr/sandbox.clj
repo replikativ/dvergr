@@ -13,6 +13,7 @@
             [clojure.string :as str]
             [datahike.api :as dh]
             [org.replikativ.spindel.engine.core :as rtc]
+            [org.replikativ.spindel.spin.core :as spin-core]
             [org.replikativ.spindel.engine.component :as component]
             [org.replikativ.spindel.sci.world :as sci-world]
             [org.replikativ.spindel.yggdrasil :as ygg]
@@ -117,6 +118,40 @@
             (repeat true))}
    'java.util.Date java.util.Date})
 
+(def ^:dynamic ^:private *awaited*
+  "The spins an evaluation blocked on with `deref` (an atom), or nil outside
+   `eval-code*`'s timeout path."
+  nil)
+
+(defn- waiting-on
+  "Call `f`, with `x` in `*awaited*` while `f` blocks on it: a deref that
+   returns (a cached spin, a timed deref that gave up) leaves no trace, one
+   that is interrupted stays recorded."
+  [x f]
+  (if (and *awaited* (instance? org.replikativ.spindel.spin.core.Spin x))
+    (let [entry (Object.)]
+      (swap! *awaited* assoc entry x)
+      (let [v (f)]
+        (swap! *awaited* dissoc entry)
+        v))
+    (f)))
+
+(defn- sandbox-deref
+  "`clojure.core/deref` for the sandbox: a Spin it is blocked on when the
+   evaluation times out or is cancelled is cancelled too, so the computation
+   it was waiting for stops with the evaluation, not only its thread."
+  ([x] (waiting-on x #(deref x)))
+  ([x timeout-ms timeout-val] (waiting-on x #(deref x timeout-ms timeout-val))))
+
+(defn- cancel-awaited!
+  "Cancel the spins an interrupted evaluation was waiting for, in its world:
+   their computations (an inference's chains, say) stop with them."
+  [awaited execution-ctx]
+  (when execution-ctx
+    (binding [rtc/*execution-context* execution-ctx]
+      (doseq [s (vals @awaited)]
+        (try (spin-core/cancel-spin! s) (catch Throwable _ nil))))))
+
 (def ^:private core-extras
   "clojure.core 1.11/1.12 additions SCI's default set lacks. Copied from the REAL
    vars (docs + arglists intact) via `sci/copy-var` — the babashka approach (see
@@ -142,7 +177,10 @@
    'tap>           (sci/copy-var tap> clojure-core-ns)
    ;; add-tap/remove-tap are withheld: the tap set is JVM-global, so a sandbox
    ;; fn registered there would see every other sandbox's (and the host's) taps.
-   'Throwable->map (sci/copy-var Throwable->map clojure-core-ns)})
+   'Throwable->map (sci/copy-var Throwable->map clojure-core-ns)
+   'deref          (sci/new-var 'deref sandbox-deref
+                                (assoc (select-keys (meta #'clojure.core/deref) [:doc :arglists])
+                                       :ns clojure-core-ns))})
 
 ;; ---------------------------------------------------------------------------
 ;; Resource Limits
@@ -503,37 +541,40 @@
           stderr      (StringWriter.)
           cancel-poll-stop (atom false)
           cancel-fired (atom false)
+          awaited     (atom {})
+          eval-ctx    rtc/*execution-context*
           eval-future (future
-                        (metered
-                         (fn []
+                        (binding [*awaited* awaited]
+                          (metered
+                           (fn []
                         ;; Watchdog starts here on the eval thread
-                           (let [{:keys [cancel! fired?]} (make-timeout timeout-ms)
-                                 eval-thread (Thread/currentThread)
-                                 _ (when cancel?
-                                     (let [t (Thread.
-                                              #(loop []
-                                                 (when-not @cancel-poll-stop
-                                                   (if (try (cancel?) (catch Throwable _ false))
+                             (let [{:keys [cancel! fired?]} (make-timeout timeout-ms)
+                                   eval-thread (Thread/currentThread)
+                                   _ (when cancel?
+                                       (let [t (Thread.
+                                                #(loop []
+                                                   (when-not @cancel-poll-stop
+                                                     (if (try (cancel?) (catch Throwable _ false))
                                                    ;; Mirror watchdog semantics:
                                                    ;; mark fired and interrupt the
                                                    ;; eval thread so SCI's
                                                    ;; interrupt-fn / responsive IO
                                                    ;; sees it and unwinds the
                                                    ;; computation cleanly.
-                                                     (do (reset! cancel-fired true)
-                                                         (.interrupt eval-thread))
-                                                     (do (Thread/sleep 100) (recur))))))]
-                                       (.setDaemon t true)
-                                       (.setName t "dvergr-eval-cancel-poll")
-                                       (.start t)))]
-                             (try
-                               (sci-ctx-store/with-ctx sci-ctx
-                                 (sci/binding [sci/out stdout sci/err stderr]
-                                   (let [result (sci/eval-string* sci-ctx code)
-                                         result (if realize? (pr-str result) result)]
-                                     {:value result :stdout (str stdout) :stderr (str stderr)
-                                      :success true})))
-                               (catch Throwable e
+                                                       (do (reset! cancel-fired true)
+                                                           (.interrupt eval-thread))
+                                                       (do (Thread/sleep 100) (recur))))))]
+                                         (.setDaemon t true)
+                                         (.setName t "dvergr-eval-cancel-poll")
+                                         (.start t)))]
+                               (try
+                                 (sci-ctx-store/with-ctx sci-ctx
+                                   (sci/binding [sci/out stdout sci/err stderr]
+                                     (let [result (sci/eval-string* sci-ctx code)
+                                           result (if realize? (pr-str result) result)]
+                                       {:value result :stdout (str stdout) :stderr (str stderr)
+                                        :success true})))
+                                 (catch Throwable e
                               ;; Catch Throwable so JVM Errors (StackOverflowError,
                               ;; OutOfMemoryError) also produce a structured result
                               ;; rather than crashing the future unhandled.
@@ -549,44 +590,48 @@
                               ;; would surface to the agent as e.g. "sleep
                               ;; interrupted / InterruptedException" and the
                               ;; agent has to GUESS it was a timeout.
-                                 (cond
-                                   @cancel-fired
-                                   {:error   {:message "Evaluation cancelled by user"
-                                              :type    "CancellationException"
-                                              :data    {:cause :user-cancel}}
-                                    :stdout  (str stdout)
-                                    :stderr  (str stderr)
-                                    :success false}
+                                   (cond
+                                     @cancel-fired
+                                     {:error   {:message "Evaluation cancelled by user"
+                                                :type    "CancellationException"
+                                                :data    {:cause :user-cancel}}
+                                      :stdout  (str stdout)
+                                      :stderr  (str stderr)
+                                      :success false}
 
-                                   (fired?)
-                                   {:error   {:message (str "Timed out after " timeout-ms "ms"
-                                                            " — your code likely got stuck"
-                                                            " (a (spin …) that never resolved,"
-                                                            " an infinite loop, or oversized"
-                                                            " inference). Try fewer particles,"
-                                                            " bound your loops, or check for"
-                                                            " hung @spin / await.")
-                                              :type    "TimeoutException"
-                                              :data    {:timeout-ms timeout-ms
-                                                        :cause :watchdog-interrupt}}
-                                    :stdout  (str stdout)
-                                    :stderr  (str stderr)
-                                    :success false}
+                                     (fired?)
+                                     {:error   {:message (str "Timed out after " timeout-ms "ms"
+                                                              " — your code likely got stuck"
+                                                              " (a (spin …) that never resolved,"
+                                                              " an infinite loop, or oversized"
+                                                              " inference). Try fewer particles,"
+                                                              " bound your loops, or check for"
+                                                              " hung @spin / await.")
+                                                :type    "TimeoutException"
+                                                :data    {:timeout-ms timeout-ms
+                                                          :cause :watchdog-interrupt}}
+                                      :stdout  (str stdout)
+                                      :stderr  (str stderr)
+                                      :success false}
 
-                                   :else
-                                   {:error {:message (.getMessage e)
-                                            :type     (str (class e))
-                                            :data     (when (instance? clojure.lang.ExceptionInfo e)
-                                                        (ex-data e))
-                                            :stacktrace (when (instance? Exception e)
-                                                          (sci/stacktrace e))}
-                                    :stdout (str stdout)
-                                    :stderr (str stderr)
-                                    :success false}))
-                               (finally
+                                     :else
+                                     {:error {:message (.getMessage e)
+                                              :type     (str (class e))
+                                              :data     (when (instance? clojure.lang.ExceptionInfo e)
+                                                          (ex-data e))
+                                              :stacktrace (when (instance? Exception e)
+                                                            (sci/stacktrace e))}
+                                      :stdout (str stdout)
+                                      :stderr (str stderr)
+                                      :success false}))
+                                 (finally
                               ;; Always cancel the watchdog when eval finishes
-                                 (cancel!)
-                                 (reset! cancel-poll-stop true)))))))]
+                                   (cancel!)
+                                   (reset! cancel-poll-stop true)
+                                 ;; interrupted (even if the code caught it):
+                                 ;; stop what the eval was still blocked on
+                                   (when (or @cancel-fired (fired?))
+                                     (cancel-awaited! awaited eval-ctx)))))))))]
       ;; Outer fence: poll the eval-future short-interval, so we ALSO
       ;; honour user cancel even when the inner SCI interrupt-fn isn't
       ;; reachable (spindel-backed SCI doesn't expose it for every
@@ -602,8 +647,10 @@
                   (not= r ::pending)              r
                   (and cancel? (cancel?))         (do (reset! cancel-poll-stop true)
                                                       (future-cancel eval-future)
+                                                      (cancel-awaited! awaited eval-ctx)
                                                       ::cancelled)
-                  (> (System/currentTimeMillis) outer-deadline) ::timed-out
+                  (> (System/currentTimeMillis) outer-deadline) (do (cancel-awaited! awaited eval-ctx)
+                                                                    ::timed-out)
                   :else (recur))))]
         (case result
           ::cancelled
