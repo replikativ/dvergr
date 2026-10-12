@@ -291,14 +291,19 @@ arena commands debit their own units (`dvergr.agent.arenas.renewal`).
 | Tracks | a grant at hire, model spend debited per call, the remainder returned | tokens x price; stops the Run on budget |
 | Idempotence | each debit's id is derived from its charge scope (the Run and model step) and its ordinal there, so a retried step debits once | not conserved; only capped by the wallet when one is bound |
 
-What is not debited in microdollars: the model calls inside a protocol Run
-(a tau2 conversation's, the candidate's and the customer's alike) and a room
-workflow judge's. A protocol's observer records its calls as the Attempt's
-`:spend` on its receipt, but they are not taken from a wallet; a room
-workflow judge's usage is not recorded at all (`model-judge` in
-`dvergr.catalog.room` keeps only the answer text). And nested paid
-work stays closed (`:provider-effects? false` in `child-program-authority`)
-until debits are effectively once.
+A protocol Run's model calls (a tau2 conversation's, the candidate's and the
+customer's alike) are debited from the Run's wallet too, in the charge scope
+`[:protocol run-id]`: the protocol worker binds the wallet, and
+`dvergr.benchmarks.live/scoped` carries the binding to the threads its
+participants call models on. A protocol's observer still reports those calls
+as the Attempt's `:spend` on its receipt. The model calls an Attempt's
+observation makes, a judge's (a room workflow's `model-judge` in
+`dvergr.catalog.room`, tau2's NL-assertion judge), are paid by the wallet the
+candidate's Run was granted from, its parent Run's or else the control Room's,
+never by the candidate's own (scope `[:observe run-id]`). A wallet is charged
+only when it holds microdollars. Nested paid work stays closed
+(`:provider-effects? false` in `child-program-authority`): a provider's answer
+and its debit are still two writes.
 
 Not built: attempt wallets. The plan: an attempt is funded as follows. The caller grants an **attempt
 wallet**; the attempt sub-grants to each paid role, each an ordinary Run with
@@ -311,8 +316,9 @@ the receipt's `:resources` reports spend per role.
 - The environment's own cost is visible separately.
 - The total is bounded by the caller's grant, so recursion cannot overspend.
 
-(tau2 today budgets only the candidate; the customer's and the judge's usage
-is logged but unbounded.)
+(tau2 today budgets only the candidate's chat; with a Run wallet, the
+customer's calls come out of that same wallet and the judge's out of the
+caller's.)
 
 ### One log
 

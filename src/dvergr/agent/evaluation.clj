@@ -14,6 +14,7 @@
             [dvergr.agent.program :as program]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.spend :as spend]
+            [dvergr.resource :as resource]
             [dvergr.room.registry :as registry]
             [dvergr.rooms.forks :as forks]
             [hasch.core :as hasch]
@@ -198,8 +199,11 @@
    facts (`:result :durable :room :world/room :run-id :environment :agent`
    and the setup and execution evidence) and returns portable evidence; a
    `:spend` it returns (`dvergr.agent.spend`) is the Attempt's bill on the
-   receipt, else the Run's own metrics are. `verify` receives the EnvironmentDef
-   plus that evidence and returns `{:checks {keyword boolean} :reward number}`,
+   receipt, else the Run's own metrics are. Model calls `observe` makes (a
+   judge's, charged with `resource/charge-usage!`) are paid by the wallet the
+   Run was granted from: the experiment's cost, not the candidate's.
+   `verify` receives the EnvironmentDef plus that evidence and returns
+   `{:checks {keyword boolean} :reward number}`,
    and optionally `:metrics`, a portable map of what it measured (the receipt
    records it under `:metrics :verification`).
    Optional `capture` receives `{:room control-room :world/room work-room
@@ -527,21 +531,36 @@
              :once (count (filter #(= :once (:idempotency %)) receipts))}
       log (assoc :log (str log)))))
 
+(defn- observation-payer
+  "Who pays for the model calls an Attempt's observation makes (a judge): the
+   wallet the candidate's Run was granted from, its parent Run's or else the
+   control Room's, when it holds microdollars. Judging is the experiment's
+   cost, never the candidate's: the candidate's wallet is not charged (and was
+   returned when its Run ended)."
+  [room durable]
+  (if-let [parent (:run/parent durable)]
+    (resource/spend-wallet room parent)
+    (resource/room-spend-wallet room)))
+
 (defn- certification-candidate
   [{:keys [room world-room setup-evidence execution-evidence definition evaluator agent run-id
            result durable started-at started-nanos timeout? extra-metrics effect-receipts]}]
-  (let [evidence ((:observe evaluator)
-                  {:room room
-                   :agent agent
-                   :world/room world-room
-                   :setup/evidence setup-evidence
-                   :execution/evidence execution-evidence
-                   :environment definition
-                   :run-id run-id
-                   :result result
-                   :durable durable
-                   :default (default-evidence {:result result
-                                               :durable durable})})
+  (let [;; the observation's model calls (a judge's), in their own charge
+        ;; scope: observing this Run again does not charge them twice
+        judging (resource/spending (observation-payer room durable) [:observe run-id])
+        evidence (binding [resource/*spend-wallet* judging]
+                   ((:observe evaluator)
+                    {:room room
+                     :agent agent
+                     :world/room world-room
+                     :setup/evidence setup-evidence
+                     :execution/evidence execution-evidence
+                     :environment definition
+                     :run-id run-id
+                     :result result
+                     :durable durable
+                     :default (default-evidence {:result result
+                                                 :durable durable})}))
         _ (when-not (and (map? evidence) (roster/data-value? evidence))
             (throw (ex-info "Evaluator evidence must be a portable map"
                             {:type ::invalid-evidence :evidence evidence})))

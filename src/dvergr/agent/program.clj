@@ -1101,7 +1101,10 @@
    allocated no `model-dispatches`), so they spend the Run's admissions. The
    binding is the worker thread's; a protocol whose model calls happen on
    other threads (Room participants, futures) gets the scope as `:model-scope`
-   and binds it there.
+   and binds it there. Their cost is the Run's too: with a microdollar
+   wallet, `resource/*spend-wallet*` is bound to it (charge scope `[:protocol
+   run-id]`), and a protocol carries that binding to its other threads as
+   `dvergr.benchmarks.live/scoped` does.
 
    A model turn the protocol runs on the worker thread (`chat.agent`'s
    `run-agent-turn!`) that fails for `:infrastructure` (transport, provider
@@ -1127,6 +1130,13 @@
                    (let [scope (some-> (resource/model-scope control-room run-id)
                                        (assoc :cancel? #(run/cancel-requested? run-id)))]
                      (binding [resource/*model-scope* scope
+                               ;; the protocol's model calls, the candidate's
+                               ;; and its driver's, are paid from the Run's
+                               ;; wallet (`live/scoped` carries this binding
+                               ;; to the threads they run on)
+                               resource/*spend-wallet*
+                               (some-> (resource/spend-wallet control-room run-id)
+                                       (resource/spending [:protocol run-id]))
                                chat-agent/*turn-failure* failure]
                        (with-model-entry-checked supervisor run-id [(:model inputs)]
                          [(:agent/model-policy pinned)]

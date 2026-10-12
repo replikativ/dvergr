@@ -413,6 +413,7 @@
                         (do (end! episode :max-model-steps) :error)
                         (let [failure (volatile! nil)
                               outcome (binding [resource/*model-scope* (:model-scope episode)
+                                                resource/*spend-wallet* (:spend-wallet episode)
                                                 chat-agent/*turn-failure* failure]
                                         (chat-agent/run-agent-turn! chat-ctx (dissoc opts :system-suffix)))]
                           ;; the path to the model failing (transport, provider
@@ -779,7 +780,10 @@
     :or {limits {:max-steps 200 :max-errors 10} timeout-ms (* 30 60 1000)
          cancelled? (constantly false)}}]
   (let [room-id (:id room)
-        episode (assoc (new-episode domain task limits room nil) :model-scope model-scope)
+        ;; the protocol worker's spend binding, for the candidate's turns on
+        ;; its participant thread
+        episode (assoc (new-episode domain task limits room nil)
+                       :model-scope model-scope :spend-wallet resource/*spend-wallet*)
         _ (reset! (:state episode) {:seq 0 :steps 0 :errors 0 :log [] :usage {}})
         _ (watch-candidate-runs! episode)
         candidate* (volatile! nil)]

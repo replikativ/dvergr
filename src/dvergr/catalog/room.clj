@@ -31,6 +31,7 @@
             [dvergr.catalog.workspace :as ws]
             [dvergr.effects :as effects]
             [dvergr.io.frozen-web :as frozen-web]
+            [dvergr.resource :as resource]
             [dvergr.sandbox.ns.io :as sandbox-io]
             [org.replikativ.spindel.engine.core :as ec]
             [dvergr.sandbox :as sandbox]
@@ -396,15 +397,19 @@
         (take 40 pages)))
 
 (defn- model-judge
-  "Ask `model` one judge question: its answer as text (at most 500 characters)."
+  "Ask `model` one judge question: its answer as text (at most 500 characters).
+   Its usage is charged to the bound spend wallet (`resource/charge-usage!`):
+   the evaluation binds the payer of the Attempt's observation."
   [model]
   (fn [prompt]
-    (let [{:keys [text error]} ((requiring-resolve 'dvergr.tools.llm-call/cheap-llm-call)
-                                "Answer the question exactly as it asks, briefly." prompt
-                                {:model model :max-tokens 200})]
+    (let [{:keys [text error usage] :as answer}
+          ((requiring-resolve 'dvergr.tools.llm-call/cheap-llm-call)
+           "Answer the question exactly as it asks, briefly." prompt
+           {:model model :max-tokens 200})]
       (if error
         (throw (ex-info (str "The judge failed: " error) {:type ::judge-failed}))
-        (let [t (str/trim (str text))] (subs t 0 (min (count t) 500)))))))
+        (do (resource/charge-usage! (:model answer) usage)
+            (let [t (str/trim (str text))] (subs t 0 (min (count t) 500))))))))
 
 (defn evaluator
   "The bundle's checker as an Evaluator: it captures the files under the
