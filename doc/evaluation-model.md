@@ -169,11 +169,12 @@ and may do IO: a room workflow's observer asks its judge model and keeps the
 answers in the evidence (`:judgements`), and its `capture` reads the world's
 files. `verify` is a function of the EnvironmentDef and the portable evidence
 `observe` returned, so such a verdict can be re-derived from the stored
-evidence. One exception: tau2's verifier asks a live judge model for a task's
+evidence. tau2's observer, too, asks its judge model for a task's
 natural-language assertions (`nl-assertion-checks` in
-`dvergr.benchmarks.tau2.core`, called from the provider's verify), so
-re-verifying those tasks makes a model call and may answer differently; the
-judge's answers are not yet kept as evidence. A score means what its
+`dvergr.benchmarks.tau2.core`) and keeps the answers in the evidence
+(`:nl-assertions`); its verify grades from them, so a certified tau2 Attempt
+re-verifies without a model call (grader version 4; Attempts of version 3
+asked the judge in verify and do not mix with them). A score means what its
 verifier's identity says, not what its reporter claims.
 
 A verifier may offer a **partial** form, called at checkpoints, returning
@@ -280,7 +281,8 @@ Run is allocated microdollars: the LLM program binds the Run's wallet
 (`resource/*spend-wallet*`, `dvergr.agent.program`) around its model steps,
 and every model call's cost is debited from it with `consume!`
 (`charge-spend!`, called from `dvergr.chat.context`). An empty wallet ends
-the Run's budget; a resumed Run spends what the stopped one left. Model
+the Run's budget; a resumed Run spends what the stopped one left (a new Run,
+so new debit ids; what the stopped Run paid stays paid). Model
 dispatches can also be admitted one by one (`admit-model-dispatch!`), and
 arena commands debit their own units (`dvergr.agent.arenas.renewal`).
 
@@ -288,16 +290,25 @@ arena commands debit their own units (`dvergr.agent.arenas.renewal`).
 |---|---|---|
 | Lives in | control Room store; never forked | the working context; forks with the world |
 | Tracks | a grant at hire, model spend debited per call, the remainder returned | tokens x price; stops the Run on budget |
-| Gap | each debit has a fresh random id (`UUID/randomUUID`), so a retried call is not charged effectively once | not conserved; only capped by the wallet when one is bound |
+| Idempotence | each debit's id is derived from its charge scope (the Run and model step) and its ordinal there, so a retried step debits once | not conserved; only capped by the wallet when one is bound |
 
-What is not debited in microdollars: the model calls inside a protocol Run
-(a tau2 conversation's, the candidate's and the customer's alike) and a room
-workflow judge's. A protocol's observer records its calls as the Attempt's
-`:spend` on its receipt, but they are not taken from a wallet; a room
-workflow judge's usage is not recorded at all (`model-judge` in
-`dvergr.catalog.room` keeps only the answer text). And nested paid
-work stays closed (`:provider-effects? false` in `child-program-authority`)
-until debits are effectively once.
+A protocol Run's model calls (a tau2 conversation's, the candidate's and the
+customer's alike) are debited from the Run's wallet too, in the charge scope
+`[:protocol run-id]`: the protocol worker binds the wallet, and
+`dvergr.benchmarks.live/scoped` carries the binding to the threads its
+participants call models on. A protocol's observer still reports those calls
+as the Attempt's `:spend` on its receipt. The model calls an Attempt's
+observation makes, a judge's (a room workflow's `model-judge` in
+`dvergr.catalog.room`, tau2's NL-assertion judge), are paid by the wallet the
+candidate's Run was granted from, its parent Run's or else the control Room's,
+never by the candidate's own (scope `[:observe run-id]`). A wallet is charged
+only when it holds microdollars. Those calls are recorded, wallet or not, as
+`:judge-spend` in the receipt's metrics, apart from `:spend`: `report.md`
+lists them in a Judge table (list price and billed), `scorecard_detail` as
+`judge-spend` on each leaderboard row, and no candidate's cost per attempt or
+per pass includes them. Nested paid work stays closed
+(`:provider-effects? false` in `child-program-authority`): a provider's answer
+and its debit are still two writes.
 
 Not built: attempt wallets. The plan: an attempt is funded as follows. The caller grants an **attempt
 wallet**; the attempt sub-grants to each paid role, each an ordinary Run with
@@ -310,8 +321,9 @@ the receipt's `:resources` reports spend per role.
 - The environment's own cost is visible separately.
 - The total is bounded by the caller's grant, so recursion cannot overspend.
 
-(tau2 today budgets only the candidate; the customer's and the judge's usage
-is logged but unbounded.)
+(tau2 today budgets only the candidate's chat; with a Run wallet, the
+customer's calls come out of that same wallet and the judge's out of the
+caller's.)
 
 ### One log
 
@@ -390,7 +402,7 @@ Refactor first. Each step keeps the suite green.
      alive. They move with step 3. The tau2 episode namespace is not renamed
      yet.
 2. **Widen the primitive.** First the prerequisite: debit model spend from
-   Run wallets (`consume!`; built, but not yet effectively once), then attempt wallets with
+   Run wallets (`consume!`; built, a debit once per charge), then attempt wallets with
    per-role sub-grants; this is also what lets `:provider-effects?` open for
    delegation generally. Then `:fn` candidates; agent-authored verifiers in
    the `:room` and `:ad-hoc` tiers; a minimum tier for Scorecards;

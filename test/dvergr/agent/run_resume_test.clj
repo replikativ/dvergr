@@ -253,3 +253,48 @@
       (finally
         (kontor-governance/ungovern! conn)
         (d/close-room! room)))))
+
+(deftest a-resumed-run-is-not-charged-again-for-what-was-spent
+  (let [[room conn] (resource-room :resume-spend-room)
+        seen (atom nil)
+        ;; a budget above the wallet: the wallet is what bounds the Run
+        team (roster/make-agent
+              (roster/make-roster {:id :resume-spend-team})
+              {:id :worker
+               :tools #{:clojure_eval}
+               :model-policy {:provider :codex-subscription :model "codex-subscription-sol"}
+               :program {:kind :llm :max-model-steps 6 :auto-compact? false :budget-dollars 5.0}})]
+    (try
+      (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 10000000M}})
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [first-run
+              ;; step 0 spends $0.25 from the wallet, then the process stops
+              (with-redefs [providers/ensure-initialized! (constantly nil)
+                            program/return-unused-resources! (fn [& _] nil)
+                            dvergr.chat.accounting/calculate-cost (fn [_type amount & _] amount)
+                            chat-agent/run-agent-turn!
+                            (fn [chat-ctx opts]
+                              (if (zero? (:turn-number opts))
+                                (do (chat-context/account-usage! chat-ctx :output-tokens 250000)
+                                    (tool-step! chat-ctx 0))
+                                (throw (ex-info "the process stopped" {}))))]
+                (let [h (program/hire! room team :worker
+                                       {:task "calculate"
+                                        :resources {resource/microdollars 4000000M}})]
+                  @h
+                  (program/run-id h)))]
+          (is (= 3750000M (resource/wallet-microdollars room first-run)) "step 0 was paid once")
+          (with-redefs [providers/ensure-initialized! (constantly nil)
+                        chat-agent/run-agent-turn!
+                        (fn [chat-ctx _opts]
+                          (reset! seen (:total (chat-context/get-budget chat-ctx)))
+                          (chat-context/add-message! chat-ctx {:role :assistant :content "The result is 2."})
+                          :complete)]
+            (is (= :completed (:run/status @(program/resume! room room first-run)))))
+          (is (= 3750000 @seen)
+              "the resumed Run's budget is what the wallet left: the stopped Run's spend is not taken off it again")
+          (is (= {resource/microdollars 9750000M} (resource/balance room))
+              "the Room paid the $0.25 once, and got the rest back")))
+      (finally
+        (kontor-governance/ungovern! conn)
+        (d/close-room! room)))))

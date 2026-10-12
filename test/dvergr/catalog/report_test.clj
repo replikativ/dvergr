@@ -51,6 +51,24 @@
                  (report/rows {:scorecard {:scorecard/entries [(entry 1 2862) (entry 2 1138)]} :receipts []}))]
     (is (= 2000 (:notional-per-attempt (rs :fireworks))))))
 
+(deftest a-judge-s-cost-is-the-experiment-s-not-the-candidate-s
+  (let [judged (update result :receipts
+                       (fn [rs] (mapv #(cond-> %
+                                         (= "a" (subs (name (:attempt/id %)) 0 1))
+                                         (assoc-in [:attempt/metrics :judge-spend]
+                                                   {:microdollars 0 :notional-microdollars 500}))
+                                      rs)))
+        rs (into {} (map (juxt :candidate identity)) (report/rows judged))
+        md (report/markdown {:title "t" :result judged})]
+    (is (= 2000 (:notional-per-attempt (rs :luna))) "the candidate's cost leaves the judge out")
+    (is (= [2000 0] ((juxt :judge-notional-total :judge-billed-total) (rs :luna))))
+    (is (nil? (:judge-notional-total (rs :haiku))) "no judge recorded: none shown")
+    (is (str/includes? md "### Judge"))
+    (is (str/includes? md "| luna | $0.0020 | $0.0000 | $0.0005 |"))
+    (is (str/includes? md "| **judge, all** | $0.0020 | $0.0000 | |"))
+    (is (not (str/includes? (report/markdown {:title "t" :result result}) "### Judge"))
+        "a report without a judge has no judge section")))
+
 (defn- cell-entries
   "Scorecard entries of `candidate`, one case per character of `s` (1 a pass,
    0 a fail), `reps` repetitions each passing alike."

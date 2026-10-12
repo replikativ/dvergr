@@ -12,6 +12,7 @@
    candidate when it starts (assembled prompt, tools, resolved model), which an
    experiment's resume compares per cell."
   (:require [dvergr.agent.roster :as roster]
+            [dvergr.sandbox.extensions :as extensions]
             [dvergr.agent.prompt :as prompt]
             [dvergr.agent.room-context :as room-context]
             [dvergr.agent.run :as run]
@@ -82,10 +83,11 @@
   [run-id supervisor]
   {:program-kinds #{:echo :scripted}
    ;; Conserved vectors split recursively, and model calls are debited from the
-   ;; Run wallet (`resource/*spend-wallet*`, `charge-spend!`), but each debit
-   ;; has a fresh random id, so a retried debit is a second one. Keep paid
-   ;; recursive effects closed until provider usage and Kontor receipts form
-   ;; one atomic/effectively-once path.
+   ;; Run wallet (`resource/*spend-wallet*`, `charge-spend!`) under ids of
+   ;; their charge scope, so a retried step debits once. Provider usage and
+   ;; the Kontor receipt are still two writes (a crash between the provider's
+   ;; answer and the debit loses the debit), so paid recursive effects stay
+   ;; closed until per-role attempt wallets bound them.
    :provider-effects? false
    :parent-run run-id
    ;; Process-local structured ownership. The sandbox may construct immutable
@@ -659,14 +661,18 @@
 
 (defn- llm-inputs
   "The `run-inputs` of an LLM Run that starts with `instructions`, offers
-   `tool-map`, calls the model `model-spec` and compacts with `compaction`
-   (a model spec, or nil)."
-  [instructions tool-map model-spec compaction]
+   `tool-map`, calls the model `model-spec`, compacts with `compaction` (a
+   model spec, or nil) and installs the sandbox extensions `sandbox` (the
+   AgentDef's `:sandbox` ids): what they resolve to in this process's
+   registry (`extensions/refs`), since a changed extension changes what the
+   candidate can call while its name, in the AgentDef, stays the same."
+  [instructions tool-map model-spec compaction sandbox]
   (cond-> {:inputs/kind :llm
            :prompt-id (prompt-id instructions)
            :tools (tool-inputs tool-map)
            :model (model-inputs model-spec)}
-    compaction (assoc :compaction (model-inputs compaction))))
+    compaction (assoc :compaction (model-inputs compaction))
+    (seq sandbox) (assoc :sandbox (extensions/refs sandbox))))
 
 (defn run-inputs
   "What a Run of `agent` will present to its candidate when it starts now,
@@ -674,7 +680,9 @@
    AgentDef or the EnvironmentDef, so not in an ExperimentDef's identity.
 
    - An LLM program: the assembled system prompt (by its `prompt-id`), the
-     tools offered (`tool-inputs`) and the resolved model (`model-inputs`).
+     tools offered (`tool-inputs`), the resolved model (`model-inputs`) and,
+     when its AgentDef names sandbox extensions, what they resolve to in the
+     process's extension registry (`extensions/refs`), which the Run installs.
    - A protocol (`protocol`, the environment's): its ref, the resolved model
      of the AgentDef's policy, and what the protocol's own `:inputs` says
      (`dvergr.agent.evaluation/make-protocol`).
@@ -702,7 +710,8 @@
      (= :llm (get-in agent [:agent/program :kind]))
      (let [tool-map (tools/normalize-tools (or (:agent/tools agent) #{}))]
        (let [spec (resolve-model-spec agent)]
-         (llm-inputs (llm-instructions agent tool-map) tool-map spec (compaction-spec agent spec))))
+         (llm-inputs (llm-instructions agent tool-map) tool-map spec (compaction-spec agent spec)
+                     (:agent/sandbox agent))))
 
      :else nil)))
 
@@ -731,10 +740,10 @@
                    :room-id system-id
                    :room-runtime-id (:id work-room)
                    :room-incarnation (:incarnation work-room)
-                   ;; Paid model usage is debited, but not effectively once
-                   ;; (see `child-program-authority`). Permit only
-                   ;; provider-free child programs until that receipt path
-                   ;; exists.
+                   ;; Paid model usage is debited once per charge, but the
+                   ;; provider's answer and its debit are two writes (see
+                   ;; `child-program-authority`). Permit only provider-free
+                   ;; child programs until attempt wallets bound them.
                    :agent-program-ceiling (child-program-authority run-id supervisor)})]
     {:chat-ctx chat-ctx
      :owned-db? (nil? trace-db)}))
@@ -866,12 +875,15 @@
         ;; the one ledger (doc/worlds-and-forks.md, Worlds, savepoints and budgets): a Run allocated
         ;; microdollars spends its wallet, and a resumed Run what the stopped one
         ;; left, not a fresh budget
+        ;; A resumed Run's wallet holds what the stopped one left, so its
+        ;; budget is the configured one less the stopped Run's spend, capped by
+        ;; that wallet: the spend is subtracted once, not from the wallet again.
         spend-wallet (resource/spend-wallet control-room run-id)
         budget-dollars (cond-> budget-dollars
-                         spend-wallet
-                         (min (/ (double (resource/wallet-microdollars control-room run-id)) 1e6))
                          (::resume agent)
-                         (-> (- (/ (double (or (get-in agent [::resume :spent]) 0)) 1e6)) (max 0.0)))
+                         (-> (- (/ (double (or (get-in agent [::resume :spent]) 0)) 1e6)) (max 0.0))
+                         spend-wallet
+                         (min (/ (double (resource/wallet-microdollars control-room run-id)) 1e6)))
         effective-limits {:max-model-steps max-model-steps
                           :budget-dollars budget-dollars}]
     (sp/spin
@@ -911,7 +923,7 @@
                     ;; what the model is presented with: the system prompt it
                     ;; is sent (a resumed Run's is the one it started with)
                     compaction (compaction-spec agent model-spec)
-                    inputs (llm-inputs sent tool-map model-spec compaction)]
+                    inputs (llm-inputs sent tool-map model-spec compaction (:agent/sandbox agent))]
                 (update-llm-metrics!
                  supervisor
                  (constantly
@@ -957,7 +969,12 @@
                   supervisor
                   (fn []
                     (binding [chat-agent/*turn-failure* failure
-                              resource/*spend-wallet* spend-wallet
+                              ;; the step is the charge scope: its debits have
+                              ;; ids of this Run and step, so charging the step
+                              ;; again does not charge it twice
+                              resource/*spend-wallet*
+                              (some-> spend-wallet
+                                      (resource/spending [:llm-step run-id model-step]))
                               resource/*model-scope*
                               (some-> (resource/model-scope control-room run-id)
                                       (assoc :cancel? #(run/cancel-requested? run-id)))]
@@ -1092,7 +1109,10 @@
    allocated no `model-dispatches`), so they spend the Run's admissions. The
    binding is the worker thread's; a protocol whose model calls happen on
    other threads (Room participants, futures) gets the scope as `:model-scope`
-   and binds it there.
+   and binds it there. Their cost is the Run's too: with a microdollar
+   wallet, `resource/*spend-wallet*` is bound to it (charge scope `[:protocol
+   run-id]`), and a protocol carries that binding to its other threads as
+   `dvergr.benchmarks.live/scoped` does.
 
    A model turn the protocol runs on the worker thread (`chat.agent`'s
    `run-agent-turn!`) that fails for `:infrastructure` (transport, provider
@@ -1118,6 +1138,13 @@
                    (let [scope (some-> (resource/model-scope control-room run-id)
                                        (assoc :cancel? #(run/cancel-requested? run-id)))]
                      (binding [resource/*model-scope* scope
+                               ;; the protocol's model calls, the candidate's
+                               ;; and its driver's, are paid from the Run's
+                               ;; wallet (`live/scoped` carries this binding
+                               ;; to the threads they run on)
+                               resource/*spend-wallet*
+                               (some-> (resource/spend-wallet control-room run-id)
+                                       (resource/spending [:protocol run-id]))
                                chat-agent/*turn-failure* failure]
                        (with-model-entry-checked supervisor run-id [(:model inputs)]
                          [(:agent/model-policy pinned)]

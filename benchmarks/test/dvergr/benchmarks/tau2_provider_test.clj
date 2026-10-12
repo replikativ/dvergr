@@ -95,6 +95,50 @@
               (is (empty? (run/active-runs (:id room)))))))
         (finally (d/close-room! room))))))
 
+(deftest the-judge-s-answers-are-evidence
+  (if-not checkout?
+    (support/skip! "the-judge-s-answers-are-evidence: no ../tau2-bench checkout")
+    (let [dom (t2/load-domain "retail")
+          task (get-in dom [:tasks "108"])
+          {:keys [agent-generate user-fn-for]} (gold-pair)
+          asked (atom 0)
+          verdict (atom true)
+          judge (fn [{:keys [messages]}]
+                  (swap! asked inc)
+                  (is (str/includes? (:content (first messages)) "expectedOutcomes"))
+                  {:content (str "{\"results\": ["
+                                 (str/join ", " (for [a (get-in task ["evaluation_criteria" "nl_assertions"])]
+                                                  (str "{\"expectedOutcome\": " (pr-str a)
+                                                       ", \"reasoning\": \"seen\", \"metExpectation\": " @verdict "}")))
+                                 "]}")})
+          caps (provider/capabilities dom {:user-fn (user-fn-for task)
+                                           :agent-generate agent-generate
+                                           :judge-fn judge})
+          env (provider/environment-def dom "108" caps {:timeout-ms 60000})
+          room (d/make-room {:id :tau2/provider-judge :store (memory/make)})]
+      (is (some #{"NL_ASSERTION"} (get-in task ["evaluation_criteria" "reward_basis"])))
+      (try
+        (binding [ec/*execution-context* (:ctx room)]
+          (let [result @(evaluation/evaluate room (team) :gold env (:evaluator caps)
+                                             {:world-setup (:world-setup caps)
+                                              :protocol (:protocol caps)})
+                receipt (:attempt-receipt result)
+                evidence (:attempt/evidence (first (attempts/attempts room {:limit 10})))]
+            (is (= 1.0 (:attempt/reward receipt)))
+            (is (true? (get-in receipt [:attempt/checks :nl-assertion])))
+            (is (= 1 @asked) "the judge was asked once, when the Attempt was observed")
+            (testing "its answers are kept in the evidence"
+              (is (= [{:assertion (first (get-in task ["evaluation_criteria" "nl_assertions"]))
+                       :met true :justification "seen"}]
+                     (:nl-assertions evidence))))
+            (testing "the certified Attempt re-verifies from its evidence alone"
+              (reset! verdict false)
+              (let [again ((:verify (:evaluator caps)) env evidence)]
+                (is (= 1 @asked) "no model call")
+                (is (= (:attempt/reward receipt) (:reward again)))
+                (is (= (:attempt/checks receipt) (:checks again)))))))
+        (finally (d/close-room! room))))))
+
 (deftest telecom-experiment-resumes
   (if-not checkout?
     (support/skip! "telecom-experiment-resumes: no ../tau2-bench checkout")

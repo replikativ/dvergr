@@ -128,6 +128,9 @@ Costs are at the models' **list prices**, whether or not a subscription paid
 for them: a subscription model names the API model its tokens are worth
 (`:list-price-of` in the registry). Cached input is billed at the cache rate.
 The console of `room-run` prints both what was billed and the list price.
+When a judge model graded the attempts, a **Judge** table under Resources
+shows what judging each candidate cost (list price and billed): the
+experiment's cost, in none of the candidates' costs.
 
 To compare two candidates, compare them on the same cases (paired): the
 experiment runs every candidate on every case, and a paired test (McNemar on

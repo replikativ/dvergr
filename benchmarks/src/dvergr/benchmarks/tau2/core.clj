@@ -462,9 +462,11 @@
 
 (defn grade-facts
   "tau2 `evaluate_simulation` with EvaluationType.ALL from an episode's
-   messages and its `world-facts`. `judge` may be nil when no task in scope
+   messages and its `world-facts`. A task graded on NL assertions takes the
+   judge's recorded answers (`:nl-assertions`, as `nl-assertion-checks`
+   returns them), else asks `judge`; either may be nil when no task in scope
    needs NL assertions."
-  [task {:keys [messages termination]} {:keys [db-match env-assertion-checks]} {:keys [judge]}]
+  [task {:keys [messages termination]} {:keys [db-match env-assertion-checks]} {:keys [judge nl-assertions]}]
   (if-not (#{:agent-stop :user-stop} termination)
     {:reward 0.0 :termination termination
      :note "Simulation terminated prematurely"}
@@ -472,11 +474,12 @@
           comm (communicate-checks task messages)
           actions (action-checks task messages)
           nl (when (contains? basis "NL_ASSERTION")
-               (if judge
-                 (nl-assertion-checks task messages judge)
-                 (throw (ex-info "Task requires an NL assertion judge"
-                                 {:type ::judge-required
-                                  :task (get task "id")}))))
+               (cond
+                 (some? nl-assertions) (vec nl-assertions)
+                 judge (nl-assertion-checks task messages judge)
+                 :else (throw (ex-info "Task requires an NL assertion judge"
+                                       {:type ::judge-required
+                                        :task (get task "id")}))))
           env env-assertion-checks
           components (cond-> {}
                        (contains? basis "DB") (assoc :db (if db-match 1.0 0.0))

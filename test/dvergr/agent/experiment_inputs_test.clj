@@ -19,6 +19,7 @@
             [dvergr.model.registry :as registry]
             [dvergr.room.store.memory :as memory]
             [dvergr.sandbox]
+            [dvergr.sandbox.extensions :as extensions]
             [dvergr.substrate.git]
             [dvergr.substrate.paths :as paths]
             [dvergr.tools]
@@ -210,6 +211,47 @@
             (is (= 3 stale-cells) "the alias names another model now")
             (is (= 3 @calls))
             (is (= 6 (count (:scorecard/entries scorecard))))))))))
+
+(deftest a-changed-sandbox-extension-re-runs-its-cells
+  ;; the AgentDef names the extension; what it resolves to (its version and
+  ;; basis, e.g. a library's version) is an input of the Run
+  (let [ext :inputs-test/extension
+        register! (fn [basis] (extensions/register! ext {:version 1 :basis basis
+                                                         :install (fn [_ _] nil)}))]
+    (with-room :inputs-extension-changed
+      (fn [room]
+        (register! {:lib "1.0"})
+        (let [{:keys [team definition]} (fixture)
+              team (roster/make-agent team {:id :extended :tools #{:clojure_eval} :sandbox #{ext}
+                                            :model-policy {:provider :test :model "inputs-test-plain"}
+                                            :program {:kind :llm :max-model-steps 2 :budget-dollars 1.0
+                                                      :auto-compact? false}})
+              definition (experiment/make-experiment
+                          {:id :inputs-test/extended
+                           :dataset (:experiment/dataset definition)
+                           :candidates [(roster/agent team :extended) (roster/agent team :plain)]})
+              calls (atom 0)]
+          (with-model calls
+            (let [first-pass (run! room team definition)
+                  predicted (binding [ec/*execution-context* (:ctx room)]
+                              (program/run-inputs (roster/agent team :extended)))]
+              (is (zero? (:stale-cells first-pass)))
+              (is (= [{:extension/id ext :extension/version 1 :extension/basis {:lib "1.0"}}]
+                     (:sandbox predicted)))
+              (is (= #{(program/inputs-id predicted)} (inputs-ids (:attempts first-pass) :extended))
+                  "the Run records the inputs the prediction computes, from the same registry"))
+            (testing "unchanged extension refs keep every cell"
+              (reset! calls 0)
+              (let [{:keys [stale-cells]} (run! room team definition)]
+                (is (zero? stale-cells))
+                (is (zero? @calls))))
+            (testing "a changed extension ref makes its candidate's kept cells stale"
+              (register! {:lib "2.0"})
+              (reset! calls 0)
+              (let [{:keys [stale-cells scorecard]} (run! room team definition)]
+                (is (= 3 stale-cells) "only the candidate whose extension changed")
+                (is (= 3 @calls))
+                (is (= 6 (count (:scorecard/entries scorecard))))))))))))
 
 (deftest attempts-without-an-inputs-id-are-stale
   (testing "an LLM candidate's Attempts from before inputs ids run again"

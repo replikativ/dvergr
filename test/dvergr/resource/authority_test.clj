@@ -158,7 +158,77 @@
               result (binding [ec/*execution-context* (:ctx room)] @handle)]
           (is (= [600000M 0M] @wallets) "each model call is paid from the wallet; the overrun takes the rest")
           (is (= :waiting (:run/status result)) "an empty wallet is an exhausted budget")
+          (is (= 1100000 (get-in result [:run/metrics :usage :used]))
+              "the budget records what the calls cost, not the budget it ended")
           (is (= {resource/microdollars 9000000M} (resource/balance room)) "$1 spent on models, nothing created or lost")))
+      (finally
+        (kontor-governance/ungovern! conn)
+        (d/close-room! room)))))
+
+(deftest a-charge-scope-debits-each-charge-once
+  (let [[room conn] (ledger-room)
+        left #(get (resource/balance room) resource/microdollars 0M)]
+    (try
+      (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 1000M}})
+      (let [payer (resource/room-spend-wallet room)
+            step! (fn [scope costs]
+                    (binding [resource/*spend-wallet* (resource/spending payer scope)]
+                      (mapv resource/charge-spend! costs)))]
+        (is payer "a Room wallet holding microdollars pays")
+        (testing "two calls in one scope are two debits"
+          (step! [:llm-step :r 0] [100 50])
+          (is (= 850M (left))))
+        (testing "charging the same scope again (a retried step) debits nothing more"
+          (is (= [{:charged 100M :exhausted? false} {:charged 50M :exhausted? false}]
+                 (step! [:llm-step :r 0] [100 50])))
+          (is (= 850M (left))))
+        (testing "a further call in the retried step is a new debit"
+          (step! [:llm-step :r 0] [100 50 25])
+          (is (= 825M (left))))
+        (testing "another step is another scope"
+          (step! [:llm-step :r 1] [100])
+          (is (= 725M (left))))
+        (testing "provider usage is priced, recorded and charged"
+          (let [s (resource/spending payer [:judge :r])]
+            (with-redefs [dvergr.chat.accounting/get-model-pricing (fn [_] {:input 1 :output 2})]
+              (binding [resource/*spend-wallet* s]
+                (resource/charge-usage! "m" {:input-tokens 10 :output-tokens 5})))
+            (is (= [{:model "m" :usage {:input-tokens 10 :output-tokens 5}}] @(:calls s)))
+            (is (= 705M (left)))))
+        (testing "concurrent charges to one wallet take what is left, not fail"
+          (let [n (left)
+                charge! #(future (binding [resource/*spend-wallet*
+                                           (resource/spending payer [:parallel (random-uuid)])]
+                                   (resource/charge-spend! (* 2 (quot (long n) 3)))))
+                results (mapv deref (doall (repeatedly 2 charge!)))]
+            (is (= 0M (left)))
+            (is (= n (reduce + (map :charged results))))))
+        (testing "without a payer, nothing is charged"
+          (binding [resource/*spend-wallet* (resource/spending nil [:x])]
+            (is (nil? (resource/charge-spend! 100))))
+          (is (= 0M (left)))))
+      (finally
+        (kontor-governance/ungovern! conn)
+        (d/close-room! room)))))
+
+(deftest a-charge-takes-what-another-writer-left
+  (let [[room conn] (ledger-room)
+        wallet (kontor/account-ref (resource/room-wallet-id :authority-room))
+        transfer kontor/transfer!
+        raced (atom false)]
+    (try
+      (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 100M}})
+      ;; between the charge's read and its debit, a grant elsewhere takes 60
+      (with-redefs [kontor/transfer!
+                    (fn [st spec]
+                      (when (and (= :consume (:kind spec)) (compare-and-set! raced false true))
+                        (transfer st {:id (random-uuid) :kind :consume :source wallet
+                                      :destination kontor/sink-account
+                                      :resources {resource/microdollars 60M}}))
+                      (transfer st spec))]
+        (binding [resource/*spend-wallet* (resource/spending (resource/room-spend-wallet room) [:race])]
+          (is (= 40M (:charged (resource/charge-spend! 80))) "the provider was paid: the rest is taken")))
+      (is (zero? (get (resource/balance room) resource/microdollars 0M)) "the wallet is empty, not overdrawn")
       (finally
         (kontor-governance/ungovern! conn)
         (d/close-room! room)))))

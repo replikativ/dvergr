@@ -169,11 +169,12 @@
         {:room room :run-id run-id}))))
 
 (def ^:dynamic *spend-wallet*
-  "The Run whose conserved microUSD wallet pays for model calls made here:
-   `{:room :run-id}`, bound by the LLM program around its model steps when the
-   Run was allocated microdollars (doc/worlds-and-forks.md, Worlds, savepoints and budgets). Unlike
-   `*model-scope*` it restricts no provider: it only moves spend onto the
-   ledger."
+  "Where model spend made here goes: a `spending` value, bound around the
+   model calls of one charge scope (an LLM Run's model step, a protocol Run,
+   an Attempt's observation). Its `:payer` is the conserved microUSD wallet
+   that pays (`{:room :wallet}`, nil to only record); unlike `*model-scope*`
+   it restricts no provider: it only moves spend onto the ledger
+   (doc/worlds-and-forks.md, Worlds, savepoints and budgets)."
   nil)
 
 (defn spend-wallet
@@ -183,34 +184,115 @@
   (when (satisfies? store/PResourceStore (:store room))
     (let [allocation (store/-resource-receipt (:store room) (allocation-id run-id))]
       (when (contains? (:resources allocation) microdollars)
-        {:room room :run-id run-id}))))
+        {:room room :run-id run-id :wallet (run-wallet-id run-id)}))))
+
+(defn room-spend-wallet
+  "The Room root wallet of `room` as a spend wallet: when it holds
+   microdollars."
+  [room]
+  (when (satisfies? store/PResourceStore (:store room))
+    (let [wallet (room-wallet-id (:id room))]
+      (when (contains? (try (balance room (kontor/account-ref wallet))
+                            (catch clojure.lang.ExceptionInfo _ {}))
+                       microdollars)
+        {:room room :wallet wallet}))))
+
+(defn spending
+  "A `*spend-wallet*` value: model spend in charge scope `scope` (portable
+   data naming what is charged, e.g. `[:llm-step run-id 3]`) paid by `payer`
+   (a `spend-wallet`, or nil to only record). Each debit's id is derived from
+   `scope` and the debit's ordinal within it, so the same scope charged again
+   (a retried step) debits once, and each further charge in it is a new
+   debit. `:calls` records the provider usage `charge-usage!` was given."
+  [payer scope]
+  {:payer payer :scope scope :debits (atom 0) :calls (atom [])})
+
+(defn spend-debit-id
+  "The debit id of the `n`th charge (from 1) in charge scope `scope`."
+  [scope n]
+  (stable-id (pr-str [:dvergr/resource-spend scope n])))
+
+(defn- wallet-left [{:keys [room wallet]}]
+  (get (balance room (kontor/account-ref wallet)) microdollars 0M))
 
 (defn wallet-microdollars
   "What is left in `run-id`'s wallet, in microdollars."
   [room run-id]
   (get (run-balance room run-id) microdollars 0M))
 
+(defonce ^:private wallet-locks
+  ;; wallet uuid -> monitor: a capped debit reads what is left and then
+  ;; transfers, so charges to one wallet (parallel observations sharing the
+  ;; Room's or a parent's) are serialized within the process
+  (atom {}))
+
+(defn- wallet-lock [wallet]
+  (or (get @wallet-locks wallet)
+      (get (swap! wallet-locks #(if (contains? % wallet) % (assoc % wallet (Object.)))) wallet)))
+
 (defn charge-spend!
   "Consume `cost` microdollars of model spend from the bound spend wallet.
    The provider was already paid, so the ledger cannot refuse it: a cost
-   beyond what is left takes the rest. Returns `{:charged n :exhausted?
-   bool}`, or nil when no wallet is bound or there is nothing to charge."
+   beyond what is left takes the rest; charges to one wallet are serialized,
+   and a debit refused because another writer took from the wallet meanwhile
+   takes the new rest. The debit's id is the next one of the
+   binding's charge scope (`spending`): when that debit was already made (the
+   scope charged again, a retried step), it is not made twice. Returns
+   `{:charged n :exhausted? bool}`, or nil when no wallet is bound or there is
+   nothing to charge."
   [cost]
-  (when-let [{:keys [room run-id]} *spend-wallet*]
-    (when (pos? cost)
-      (let [left (wallet-microdollars room run-id)
-            amount (min (bigdec cost) left)]
-        (when (pos? amount)
-          (consume! room run-id {:id (UUID/randomUUID)
-                                 :resources {microdollars amount}
-                                 :effective-date (java.util.Date.)}))
-        {:charged amount :exhausted? (<= left (bigdec cost))}))))
+  (when-let [{:keys [payer scope debits]} *spend-wallet*]
+    (when (and payer (pos? cost))
+      (let [{:keys [room wallet]} payer
+            id (spend-debit-id scope (swap! debits inc))]
+        (locking (wallet-lock wallet)
+          (if-let [done (store/-resource-receipt (resource-store! room) id)]
+            {:charged (get-in done [:resources microdollars] 0M)
+             :exhausted? (<= (wallet-left payer) 0M)}
+            ;; Other writers (a grant to a new Run, a fork's escrow) may take
+            ;; from the wallet between the read and the debit; the ledger then
+            ;; refuses the debit. The provider was paid: read the rest again
+            ;; and take that.
+            (loop [tries 0]
+              (let [left (wallet-left payer)
+                    amount (min (bigdec cost) left)
+                    outcome (try
+                              (when (pos? amount)
+                                (store/-transfer-resources!
+                                 (resource-store! room)
+                                 {:id id
+                                  :kind :consume
+                                  :source (kontor/account-ref wallet)
+                                  :destination kontor/sink-account
+                                  :resources {microdollars amount}}))
+                              {:charged amount :exhausted? (<= left (bigdec cost))}
+                              (catch clojure.lang.ExceptionInfo e e))]
+                (cond
+                  (map? outcome) outcome
+                  (store/-resource-receipt (resource-store! room) id)
+                  {:charged amount :exhausted? (<= left (bigdec cost))}
+                  (and (< tries 8) (< (wallet-left payer) amount)) (recur (inc tries))
+                  :else (throw outcome))))))))))
+
+(defn charge-usage!
+  "Record one model call's provider `usage` under `model` in the bound
+   `spending` and charge what it cost at the registry's price
+   (`dvergr.agent.spend/of-usage`) to its payer: for model calls made outside
+   a chat context (a protocol's driver or reference candidate, a judge).
+   A chat context's turns are charged by `chat.context/account-usage!`."
+  [model usage]
+  (when-let [{:keys [calls]} *spend-wallet*]
+    (when (map? usage)
+      (swap! calls conj {:model model :usage usage})
+      (charge-spend! (:microdollars ((requiring-resolve 'dvergr.agent.spend/of-usage) model usage) 0)))))
 
 (defn admit-model-dispatch!
   "Spend one admission immediately before native model egress. No read/check/
    write race: Kontor validates the debit atomically. Rejected admission never
    reaches the provider. An admitted failed/ambiguous dispatch is not refunded.
-   Each gateway retry has a new identity, not a replay of the previous effect."
+   Each gateway retry has a new identity, not a replay of the previous effect:
+   an admission pays for an egress, not for a result, so unlike a spend debit
+   (`charge-spend!`) its id is fresh on purpose."
   []
   (when-let [{:keys [room run-id cancel?]} *model-scope*]
     (when (or (.isInterrupted (Thread/currentThread)) (and cancel? (cancel?)))

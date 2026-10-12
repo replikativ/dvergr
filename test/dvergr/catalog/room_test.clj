@@ -3,6 +3,7 @@
    checker run in SCI with no effects, and benchmarked like a catalog
    workflow, the checker's verdict on every Attempt with its `:ad-hoc` tier."
   (:require [dvergr.agent.experiment.runner]
+            [dvergr.tools.llm-call]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
@@ -15,6 +16,7 @@
             [dvergr.chat.agent :as chat-agent]
             [dvergr.model.chat :as model-chat]
             [dvergr.model.providers :as providers]
+            [dvergr.resource :as resource]
             [dvergr.substrate.paths :as paths]
             [dvergr.system.db :as sdb]))
 
@@ -296,6 +298,26 @@
       (is (empty? @asked)))
     (testing "the judge model is part of the verifier's basis"
       (is (= "claude-code-haiku" (get-in (evaluation/evaluator-ref ev) [:verifier/basis :judge]))))))
+
+(deftest a-model-judge-s-usage-is-charged-to-the-observation
+  ;; without `:judge-fn`, the judge is the workflow's model (here stubbed):
+  ;; its usage goes to the spend the evaluation binds around `observe`
+  (let [fs {"workflow.edn" (pr-str {:title "Finds" :task "List finds." :capture ["/out"]
+                                    :judge {:model "claude-haiku-4-5" :max-requests 2}})
+            "checker.clj" "(ns j)
+                           (defn judge-requests [_] [{:id \"a\" :prompt \"Relevant?\"}])
+                           (defn check [{:keys [judgements]}]
+                             {:checks {:judged? (= \"Yes.\" (get judgements \"a\"))} :reward 1.0})"
+            "fixtures/README.md" "x"}
+        ev (room-wf/evaluator (room-wf/bundle "finds" fs) {})
+        spending (resource/spending nil [:observe :r])]
+    (with-redefs [dvergr.tools.llm-call/cheap-llm-call
+                  (fn [_ _ {:keys [model]}] {:text "Yes." :model model :usage {:input-tokens 30 :output-tokens 2}})]
+      (let [evidence (binding [resource/*spend-wallet* spending]
+                       ((:observe ev) {:default {} :result {:run/status :completed}
+                                       :execution/evidence {:files {}}}))]
+        (is (= {"a" "Yes."} (:judgements evidence)))
+        (is (= [{:model "claude-haiku-4-5" :usage {:input-tokens 30 :output-tokens 2}}] @(:calls spending)))))))
 
 (deftest a-task-s-answer-sources-stay-out-of-reach
   (let [b (room-wf/bundle "blocked" (assoc files "workflow.edn"

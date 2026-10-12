@@ -135,7 +135,9 @@
         {:keys [exhausted?]} ((requiring-resolve 'dvergr.resource/charge-spend!) cost)
         _ (when exhausted?
             (binding [rtc/*execution-context* (selected-execution-context chat-ctx)]
-              (swap! (:budget-signal chat-ctx) (fn [b] (assoc b :used (max (:used b) (:total b)))))))]
+              ;; the budget ends at what was used: `:used` stays the spend
+              ;; (receipts and reports read it), the total comes down to it
+              (swap! (:budget-signal chat-ctx) (fn [b] (assoc b :total (min (:total b) (:used b)))))))]
 
     ;; Persist via THE ledger writer (acct/record-usage!): the ledger row +
     ;; the :chat/budget-used rollup land in one atomic transact there. This

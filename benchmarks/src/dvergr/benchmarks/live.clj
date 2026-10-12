@@ -33,11 +33,16 @@
   "`generate` under a Run's model scope (the `:model-scope` a protocol is
    given): its calls spend the Run's dispatch admissions wherever they happen.
    A protocol's driver and reference candidate run on Room participant threads,
-   where the protocol worker's own binding does not reach. nil scope: as is."
+   where the protocol worker's own binding does not reach. The spend binding
+   of the calling thread (`resource/*spend-wallet*`, the Run's wallet) goes
+   along too, so their cost is the Run's. Neither bound: as is."
   [generate scope]
-  (if scope
-    (fn [request] (binding [resource/*model-scope* scope] (generate request)))
-    generate))
+  (let [spend resource/*spend-wallet*]
+    (if (or scope spend)
+      (fn [request] (binding [resource/*model-scope* scope
+                              resource/*spend-wallet* spend]
+                      (generate request)))
+      generate)))
 
 (defn model-generate
   "Return a generate fn backed by `dvergr.model.chat/chat`.
@@ -61,6 +66,8 @@
                                   temperature (assoc :temperature temperature)
                                   max-tokens (assoc :max-tokens max-tokens)
                                   effort (assoc :effort effort)))]
+        ;; paid from the bound spend wallet: the Run's, or the judge's payer
+        (resource/charge-usage! model-id (:usage response))
         {:content (:content response)
          :tool-calls (mapv (fn [{:keys [id name input]}]
                              {:id (or id (str "call_" (swap! counter inc)))
