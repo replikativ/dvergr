@@ -23,7 +23,8 @@ video transcript, a long-form chat log, or a local file.
 
 1. If the input is a URL, fetch via `(dvergr.intake.web-fetch/fetch-page url)`
    (after `(require '[dvergr.intake.web-fetch])`).
-2. If it's a YouTube link, prefer `(dvergr.intake.youtube/get-transcript url)`.
+2. If it's a YouTube link, prefer `(dvergr.intake.youtube/get-transcript url)`
+   (after `(require '[dvergr.intake.youtube])`).
 3. For a long transcript, call `(llm/call prompt text)` with a focused
    prompt: "summarize for an engineer who wants the key claims and any
    counter-arguments, no filler".
