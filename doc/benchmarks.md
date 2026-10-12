@@ -72,7 +72,10 @@ A provider is a namespace (`dvergr.benchmarks.<name>.provider`) with:
    (driver, judge) are in the capability references, hence in its content id.
 4. **A candidate roster**: AgentDefs; what varies (model, action space, prompt
    digest) is in the AgentDef so that a change is a new candidate, never
-   resumed into old cells.
+   resumed into old cells. What a protocol assembles at Run start from code
+   rather than from the AgentDef (a system prompt template, tool schemas) it
+   declares as `:inputs`, so that a change re-runs the cells made before it
+   (see "Resume and inputs ids").
 5. **An equivalence proof** when the benchmark is a transcription (below), and
    a scripted candidate that replays gold answers, so the whole path is tested
    end to end without a model.
@@ -100,6 +103,47 @@ ExperimentDef, Claude Code settings for the run, waiting out subscription usage 
 resume, the Scorecard, and the report (`experiment_report`, the result's `:report`). A
 provider's `experiment/run!` is a call to it; with `:daemon` instead of `:dir` it runs in a
 running daemon's home (`runner/run-in` underneath, as `catalog_benchmark`).
+
+**Resume and inputs ids.** The ExperimentDef's content id (dataset, candidate AgentDefs, metadata
+with provider, grader and library versions) names what is fixed before anything runs. A Run
+also resolves inputs only when it starts, and those reach the candidate without being in the
+ExperimentDef. Each Attempt records them as its inputs id (`:attempt/inputs-id`, beside
+`:attempt/prompt-id`), the content id of `dvergr.agent.program/run-inputs`:
+
+| Candidate | In the inputs id |
+|---|---|
+| LLM program | the assembled system prompt (its prompt id: harness preamble, the agent's prompt, the skills eligible in the world's workspace, the tool-use guideline, the sandbox pointer, the workspace's AGENTS.md); the tools offered, each one's name, description and input schema (a Claude Code candidate is offered the same tools over MCP); the model: its alias resolved, provider, API type and quirks (sampling defaults) |
+| Protocol | the protocol's ref, the resolved model of the AgentDef's policy, and what the protocol's own `:inputs` (`evaluation/make-protocol`) says it assembles |
+| `:echo`, `:scripted` | nothing (nil): a deterministic program resolves nothing |
+
+Not in it, because they are already in the ExperimentDef or do not change what the candidate is
+presented with: the task (an answer contract appended to a case pack's task is part of the
+EnvironmentDef), budgets and limits (the AgentDef, the EnvironmentDef), the Claude Code CLI
+version and host note (the metadata), prices and context sizes (they change what a call costs,
+and models.dev refreshes them), the date note and planning-mode guideline (a room
+participant's turns get them, a Run's model steps do not), and the files of the
+experiment room's repository other than AGENTS.md and its skills (world state, seeded once when
+the room is made; Attempts discard their forks).
+
+Running again works like a spin's B-gate, which re-runs a spin iff its captured environment
+changed: before any cell starts, `experiment/run` computes the inputs id each candidate would get
+now, without a model call (the prompt is assembled in the world the cells fork, not sent). A
+cell with a verdict is kept only when its Attempt recorded that id; the others run again
+(`:stale-cells` in the result). The old Attempts stay in the store and count in no Scorecard.
+The report and `experiment_progress` read the store alone, so they take a candidate's current
+inputs to be those of its most recently certified Attempt: they count only cells made with them,
+pass over a Scorecard whose cells ran again with other inputs, and state how many cells ran again,
+how many await a re-run, and how many Attempts are superseded. A preflight's pilot, the
+Scorecard, the frontier and the paired comparisons use that same set. A Run whose recorded
+inputs differ from the prediction (a world setup that rewrites the workspace's skills or
+AGENTS.md) is logged (`:dvergr.agent.experiment/inputs-not-predicted`): such a cell runs again on
+every resume, which wastes tokens but never mixes inputs.
+
+Attempts certified before inputs ids were recorded have none. A deterministic candidate's are
+kept (its inputs id is nil too); an LLM or protocol candidate's are stale, since nothing says what
+it was presented with, so resuming such an experiment re-runs its cells once. That costs one more
+run of every interrupted experiment resumed after the upgrade (a finished one only when run again;
+its report reads as before), and it never folds two prompt texts into one Scorecard.
 
 **Subscription allowance.** A subscription (Codex, Claude Code) has no bill, but it is the
 user's own quota. `dvergr.model.subscription` meters it from what the provider reports with
@@ -1238,7 +1282,8 @@ Each experiment directory is a dvergr home whose experiment Room (one per
 ExperimentDef) keeps a certified Attempt per cell, and a Scorecard once every cell completed (an
 infrastructure fault is not a verdict: `runner/run!` re-runs faulted or errored cells
 within the same call, `:fault-retries` times, default 1, and re-running the same
-home resumes and re-runs exactly the cells still without a verdict). The result's
+home resumes and re-runs exactly the cells still without a verdict made with the current
+inputs, see "Resume and inputs ids"). The result's
 `:report` is the room's report (`experiment_report`), except when a preflight stops it
 (`:stopped :over-budget`). A directory of the layout before homes (`store/` and
 `artifacts/`) is refused.
@@ -1258,7 +1303,7 @@ home for the call (`runner/open-home!`):
                        {:id :dvergr-tools :harness :dvergr :action-space :tools :model "claude-code-sonnet"}
                        {:id :dvergr-repl :harness :dvergr :action-space :repl :model "claude-code-sonnet"}]
           :user {:model "claude-code-opus"} :judge {:model "claude-code-opus"}})
-;; Re-running the same call resumes: completed cells are skipped.
+;; Re-running the same call resumes: completed cells are skipped (while their inputs hold).
 
 (def xs (runner/open-experiment ".dvergr/benchmarks/retail-cmp")) ; the home, its room
 (insp/summary xs (:room-id xs))                   ; reward, pass^k, failures

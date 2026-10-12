@@ -850,6 +850,12 @@
     :db/cardinality :db.cardinality/one
     :db/index true}
 
+   {:db/ident :attempt/inputs-id
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/index true
+    :db/doc "What the Attempt's candidate was presented with beyond its AgentDef and EnvironmentDef (system prompt, tools, resolved model), as a content id; a resume keeps the Attempt only while its cell would get the same"}
+
    {:db/ident :attempt/model-resolution
     :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/one}

@@ -722,11 +722,12 @@
           (is (= :completed (:run/status result)))
           (is (= "The result is 2." (:run/value result)))
           (is (uuid? (get-in result [:run/metrics :prompt-id])))
+          (is (uuid? (get-in result [:run/metrics :inputs-id])))
           (is (= {:provider :codex-subscription
                   :model "codex-subscription-sol"
                   :model-steps 2
                   :usage {:used 0 :by-type {}}}
-                 (dissoc (:run/metrics result) :prompt-id)))
+                 (dissoc (:run/metrics result) :prompt-id :inputs-id)))
           (is (= :completed (:run/status durable)))
           (is (uuid? (:run/chat-id durable)))
           (is (= 2 (count @calls)))
@@ -1128,7 +1129,7 @@
                       :model "stub"
                       :usage {:used 0 :by-type {}}}
                      (dissoc (:run/metrics result)
-                             :prompt-id :model-steps)))
+                             :prompt-id :inputs-id :model-steps)))
               (is (<= 1 (get-in result [:run/metrics :model-steps]) 2)
                   "cancellation may win before or after the worker acknowledges step two")
               (is (uuid? (get-in result [:run/metrics :prompt-id])))))))

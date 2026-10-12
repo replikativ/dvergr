@@ -8,6 +8,7 @@
   (:require [dvergr.agent.attempt :as attempt]
             [dvergr.agent.environment :as environment]
             [dvergr.agent.evaluation :as evaluation]
+            [dvergr.agent.program :as program]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.spend :as spend]
             [dvergr.room.store :as store]
@@ -17,7 +18,8 @@
             [org.replikativ.spindel.spin.core :as spin-core]
             [org.replikativ.spindel.spin.combinators :as comb]
             [org.replikativ.spindel.spin.sync :as sync]
-            [org.replikativ.spindel.work :as work]))
+            [org.replikativ.spindel.work :as work]
+            [taoensso.telemere :as tel]))
 
 (defn- invalid! [message type data]
   (throw (ex-info message (assoc data :type type))))
@@ -300,6 +302,14 @@
         (and (#{:failed :cancelled} (:attempt/status r))
              (= :model (get-in r [:attempt/metrics :failure :kind]))))))
 
+(defn inputs-id
+  "The inputs id an Attempt recorded (`dvergr.agent.program/run-inputs`):
+   what its candidate was presented beyond the ExperimentDef. Nil for an
+   Attempt of a deterministic program, and for one certified before inputs
+   ids were recorded."
+  [attempt]
+  (get-in attempt [:attempt/receipt :attempt/metrics :inputs-id]))
+
 (defn- result-spin
   "One cell. With `contain?` (complete-only experiments) a cell whose
    evaluation fails to certify becomes an `:error` result, so the other cells
@@ -309,7 +319,7 @@
    about to start: a refused cell does not run and
    becomes a `:refused` result (a governor's decision, e.g. a subscription
    allowance; resuming runs it later)."
-  [room team evaluators capabilities opts experiment job on-result contain? admit]
+  [room team evaluators capabilities opts experiment job on-result contain? admit predicted]
   (let [definition (:environment job)
         candidate (:candidate job)]
     (sp/spin
@@ -328,29 +338,131 @@
                           {:experiment/job (experiment-job job)
                            :error (or (ex-message t) (str t))}
                           (throw t))))]
+         ;; The Run records what it presented; a resume keeps the cell only
+         ;; when that is what it predicts. A difference (a world setup that
+         ;; changes the workspace the prompt reads) re-runs it every time.
+         (when-let [a (:attempt result)]
+           (when (and (not= ::unpredicted predicted) (not= predicted (inputs-id a)))
+             (tel/log! {:level :warn :id ::inputs-not-predicted
+                        :data {:experiment (:experiment/content-id experiment)
+                               :candidate (:candidate/id candidate)
+                               :environment (:environment/content-id definition)
+                               :predicted predicted :recorded (inputs-id a)}}
+                       "A cell's Run recorded other inputs than predicted: a resume runs it again")))
          (when on-result
            (try (on-result result) (catch Throwable _ nil)))
          result)))))
 
-(defn- completed-cells
-  "`{[candidate-id environment-content-id repetition] Attempt}` for the
-   completed Attempts this exact ExperimentDef already has in `room`."
-  [room experiment]
+(defn- attempt-cell
+  "`[candidate-id environment-content-id repetition]` of an experiment
+   Attempt."
+  [a]
+  (let [r (:attempt/receipt a)
+        m (:attempt/metrics r)]
+    [(:experiment-candidate m)
+     (get-in r [:attempt/environment :environment/content-id])
+     (:experiment-repetition m)]))
+
+(defn- experiment-attempts
+  "The certified Attempts of ExperimentDef `content-id` in `room`, newest
+   first."
+  [room content-id]
   (let [room-store (:store room)]
     (if-not (satisfies? store/PAttemptStore room-store)
-      {}
-      (into {}
-            (keep (fn [a]
-                    (let [r (:attempt/receipt a)
-                          m (:attempt/metrics r)]
-                      (when (and (verdict? a)
-                                 (= (:experiment/content-id experiment)
-                                    (:experiment-content-id m)))
-                        [[(:experiment-candidate m)
-                          (get-in r [:attempt/environment :environment/content-id])
-                          (:experiment-repetition m)]
-                         a]))))
-            (store/-list-attempts room-store (store/conversation-id room) {:limit 1000000})))))
+      []
+      (filterv #(= content-id (get-in % [:attempt/receipt :attempt/metrics :experiment-content-id]))
+               (store/-list-attempts room-store (store/conversation-id room) {:limit 1000000})))))
+
+(defn- current-inputs-ids
+  "`{[candidate-id environment-content-id] inputs-id}`: the inputs id each
+   cell's candidate would be presented with if it started now
+   (`program/run-inputs`, in the bound context: the world the cells fork),
+   computed once per candidate and protocol. Tokens are not spent: the
+   system prompt is assembled, not sent."
+  [team experiment protocols]
+  (let [by (memoize (fn [candidate protocol]
+                      (program/inputs-id
+                       (program/run-inputs (exact-agent! team candidate) protocol))))]
+    (into {}
+          (for [candidate (:experiment/candidates experiment)
+                definition (get-in experiment [:experiment/dataset :dataset/environments])]
+            [[(:candidate/id candidate) (:environment/content-id definition)]
+             (by candidate (protocol! protocols definition))]))))
+
+(defn- completed-cells
+  "What this exact ExperimentDef already has in `room`, for a resume:
+   `:done`, `{[candidate-id environment-content-id repetition] Attempt}` of
+   the Attempts with a verdict whose inputs id is the one their cell would
+   get now (`current`, as `current-inputs-ids` gives it; the newest such
+   Attempt of a cell), and `:stale`, the cells with a verdict made with other
+   inputs only: they run again. An Attempt certified before inputs ids were
+   recorded has none, so it is stale unless its cell's current inputs id is
+   nil too (a deterministic program)."
+  [room experiment current]
+  (let [verdicts (filter verdict? (experiment-attempts room (:experiment/content-id experiment)))
+        valid? (fn [a] (let [[c e] (attempt-cell a)]
+                         (= (get current [c e]) (inputs-id a))))
+        ;; newest first: the first Attempt of a cell is its newest
+        done (reduce (fn [m a] (let [k (attempt-cell a)]
+                                 (if (contains? m k) m (assoc m k a))))
+                     {} (filter valid? verdicts))]
+    {:done done
+     :stale (into #{} (comp (remove valid?) (map attempt-cell) (remove done)) verdicts)}))
+
+(defn current-attempts
+  "The Attempts of `attempts` (of one ExperimentDef) made with the inputs
+   their candidate has now, as the store alone can tell: a candidate's
+   current inputs id (per environment protocol, which is part of it) is the
+   one its most recently certified Attempt recorded. The runner certifies a
+   cell only with the inputs it computes for it at the start, so once a
+   resumed run has certified one of a candidate's cells this is exactly its
+   current set; until then the previous inputs still count as current (a
+   resume replaces them)."
+  [attempts]
+  (let [k (fn [a] [(first (attempt-cell a)) (get-in a [:attempt/environment :environment/world :protocol])])
+        newest (reduce (fn [m a]
+                         (let [t (or (:attempt/certified-at a) 0)]
+                           (if (and (contains? m (k a)) (>= (first (get m (k a))) t))
+                             m
+                             (assoc m (k a) [t (inputs-id a)]))))
+                       {} attempts)]
+    (filterv #(= (second (get newest (k %))) (inputs-id %)) attempts)))
+
+(defn inputs-changes
+  "How the inputs of one ExperimentDef's `attempts` changed over its runs:
+   `:rerun`, the cells with a verdict made with the current inputs
+   (`current-attempts`) that also have one made with other inputs (run again
+   because what their candidate saw changed); `:awaiting`, the cells whose
+   verdicts were all made with other inputs (a resume runs them again);
+   `:superseded`, the Attempts with a verdict not made with the current
+   inputs. Superseded Attempts stay in the store and count in no Scorecard."
+  [attempts]
+  (let [verdicts (filter verdict? attempts)
+        ;; a fault made with new inputs makes them current too
+        current (set (filter verdict? (current-attempts attempts)))
+        current-cells (into #{} (map attempt-cell) current)
+        stale (remove current verdicts)
+        stale-cells (into #{} (map attempt-cell) stale)]
+    {:rerun (count (filter current-cells stale-cells))
+     :awaiting (count (remove current-cells stale-cells))
+     :superseded (count stale)}))
+
+(defn inputs-of
+  "What the store says of the inputs of ExperimentDef `content-id` in
+   `room`: `inputs-changes` of its Attempts, and `:current`, the ids of its
+   Attempts made with their candidate's current inputs (`current-attempts`)."
+  [room content-id]
+  (let [xs (experiment-attempts room content-id)]
+    (assoc (inputs-changes xs)
+           :current (into #{} (map :attempt/id) (current-attempts xs)))))
+
+(defn scorecard-current?
+  "Whether every entry of `scorecard` is an Attempt made with its
+   candidate's current inputs: one of the ids `current` (`inputs-of`'s, of
+   its ExperimentDef). A Scorecard whose cells were since run again with
+   other inputs is superseded."
+  [scorecard current]
+  (every? #(contains? current (:attempt/id %)) (:scorecard/entries scorecard)))
 
 (defn run-batches
   "A Spin yielding the values of `spins` in order, running at most
@@ -711,10 +823,18 @@
    Experiment batches initially require discard settlement; retained partial
    experiments need durable execution identity and recovery first.
 
-   With `:resume? true`, cells that already have a completed Attempt of this
-   exact ExperimentDef in `room` are not run again; their Attempts enter the
-   Scorecard. Every Attempt records its cell in its receipt metrics, so an
-   interrupted experiment continues where it stopped.
+   With `:resume? true`, cells that already have an Attempt with a verdict of
+   this exact ExperimentDef in `room`, made with the inputs the cell's
+   candidate would be presented with now, are not run again; their Attempts
+   enter the Scorecard. Every Attempt records its cell and its inputs id
+   (`dvergr.agent.program/run-inputs`: the assembled system prompt, the tools
+   offered, the resolved model; a protocol's ref, model and `:inputs`) in its
+   receipt metrics, so an interrupted experiment continues where it stopped,
+   and a cell made with other inputs (a changed prompt text, tool schema or
+   model alias; or an Attempt from before inputs ids were recorded) runs
+   again, as a B-gate re-runs a spin whose captured environment changed. The
+   old Attempts stay in the store and enter no Scorecard; the result's
+   `:stale-cells` counts the cells that run again for this reason.
 
    With `:complete-only? true` no Scorecard is persisted while any cell's
    Attempt is not `:completed` (an infrastructure fault is not a verdict);
@@ -793,7 +913,14 @@
               definition (evaluator! evaluators definition)
               (cell-evaluation-opts capabilities base-evaluation-opts
                                     definition)))
-         done (if resume? (completed-cells room experiment) {})
+         ;; what each cell's candidate would be presented with now: a kept
+         ;; cell must have been made with exactly that
+         current (when resume? (current-inputs-ids team experiment protocols))
+         {:keys [done stale]} (if resume? (completed-cells room experiment current) {:done {} :stale #{}})
+         _ (when (seq stale)
+             (tel/log! {:level :info :id ::inputs-changed
+                        :data {:experiment (:experiment/content-id experiment) :cells (count stale)}}
+                       "Cells made with other inputs run again"))
          cell-key (fn [job] [(get-in job [:candidate :candidate/id])
                              (get-in job [:environment :environment/content-id])
                              (:repetition job)])
@@ -808,7 +935,10 @@
          cell-fns (map (fn [job]
                          #(result-spin room team evaluators capabilities
                                        base-evaluation-opts experiment job on-result
-                                       (boolean complete-only?) admit))
+                                       (boolean complete-only?) admit
+                                       (get current [(get-in job [:candidate :candidate/id])
+                                                     (get-in job [:environment :environment/content-id])]
+                                            ::unpredicted)))
                        (remove #(contains? done (cell-key %)) all-jobs))]
      (sp/spin
       (let [results (into (vec resumed)
@@ -841,6 +971,8 @@
            :execution {:parallelism parallelism
                        :attempt-count attempt-count
                        :cleanup-group cleanup-group}
+           ;; cells whose verdicts were made with other inputs: run again
+           :stale-cells (count stale)
            :results results
            :refused (first (map :refused refused))
            :attempts (mapv :attempt results)
@@ -865,10 +997,14 @@
   "What the experiments in `room` have done so far, from its store alone:
    for each ExperimentDef (by content id) and candidate, the certified cells,
    verdicts (completed, or failed by the model itself), faults (failures of
-   the path to the model, re-run on resume), mean reward over verdicts, spend
-   and failure causes; and the Room's Runs still running. The facts are the
-   Attempts and Runs the experiment certified and started, so this is the same
-   view while it runs, after it stops, and from any process holding the store."
+   the path to the model, re-run on resume), mean reward over verdicts and
+   failure causes, all of the Attempts made with the candidate's current
+   inputs (`current-attempts`); spend, of every Attempt; `:inputs`, how its
+   inputs changed (`inputs-changes`: cells re-run, cells awaiting a re-run,
+   superseded Attempts); and the Room's Runs still running. The facts are
+   the Attempts and Runs the experiment certified and started, so this is the
+   same view while it runs, after it stops, and from any process holding the
+   store."
   [room]
   (let [room-store (:store room)
         attempts (if (satisfies? store/PAttemptStore room-store)
@@ -883,12 +1019,21 @@
      (->> mine
           (group-by #(get-in % [:attempt/receipt :attempt/metrics :experiment-content-id]))
           (mapv (fn [[content-id xs]]
-                  {:experiment/content-id content-id
-                   :candidates
-                   (->> xs
-                        (group-by #(get-in % [:attempt/receipt :attempt/metrics :experiment-candidate]))
-                        (mapv (fn [[c ys]] (assoc (candidate-progress ys) :candidate/id c)))
-                        (sort-by (comp str :candidate/id))
-                        vec)})))
+                  (let [spent (into {} (map (fn [[c ys]]
+                                              [c (reduce + 0 (keep #(get-in % [:attempt/receipt :attempt/metrics
+                                                                               :spend :microdollars])
+                                                                   ys))]))
+                                    (group-by #(get-in % [:attempt/receipt :attempt/metrics :experiment-candidate]) xs))]
+                    {:experiment/content-id content-id
+                     :inputs (inputs-changes xs)
+                     :candidates
+                     (->> (current-attempts xs)
+                          (group-by #(get-in % [:attempt/receipt :attempt/metrics :experiment-candidate]))
+                          (mapv (fn [[c ys]] (assoc (candidate-progress ys)
+                                                    :candidate/id c
+                                                    ;; what was spent, superseded Attempts too
+                                                    :microdollars (get spent c 0))))
+                          (sort-by (comp str :candidate/id))
+                          vec)}))))
      :running (mapv #(select-keys % [:run/id :run/actor :run/started-at]) running)
      :microdollars (reduce + 0 (keep #(get-in % [:attempt/receipt :attempt/metrics :spend :microdollars]) mine))}))

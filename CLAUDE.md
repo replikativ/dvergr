@@ -81,8 +81,14 @@ shared with interactive use: the runner stops admitting cells at 80 % (`:usage-p
   `room-run` is a client of the MCP path: `room_write` the bundle, `catalog_benchmark`, `job_status`.
 - The experiment's room is one per ExperimentDef (`runner/experiment-slug`): running again on the
   same home resumes in it: cells with a verdict are kept, faulted cells re-run (and once more
-  within the same run, `:fault-retries`). A prompt or grader version bump is a new ExperimentDef,
-  hence a new room, so no resume mixes versions. An old-layout dir (`artifacts/`) is refused.
+  within the same run, `:fault-retries`). A provider prompt or grader version bump is a new
+  ExperimentDef, hence a new room. What a Run resolves only when it starts (the assembled system
+  prompt, e.g. the sandbox pointer; the tools offered; the model an alias names) is not in the
+  ExperimentDef: each Attempt records it as its inputs id (`program/run-inputs`), and a resume
+  keeps a cell only while its candidate would get the same inputs now; the others re-run, their
+  old Attempts stay in the store but count in no Scorecard (the report says how many re-ran).
+  Attempts from before inputs ids (LLM and protocol candidates) count as stale and re-run once.
+  An old-layout dir (`artifacts/`) is refused.
 - The report is the room's, read through the `experiment_report` op (`runner/report dir`, the
   result's `:report`, `room-run` prints it or writes `--report FILE`): frontier with 95 %
   intervals, failed checks, tokens (input incl. cached, output), median/p90/summed/wall time,

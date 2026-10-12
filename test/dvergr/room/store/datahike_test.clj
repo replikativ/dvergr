@@ -294,6 +294,7 @@
         room-id :datahike-attempt-cell
         [cell plain] [(random-uuid) (random-uuid)]
         experiment-id (random-uuid)
+        inputs-id (random-uuid)
         agent (-> (roster/make-roster)
                   (roster/make-agent {:id :candidate :program {:kind :echo}})
                   (roster/agent :candidate))
@@ -312,7 +313,8 @@
                                    {:spend {:microdollars 1234 :priced? true :notional-microdollars 5678}
                                     :experiment-content-id experiment-id
                                     :experiment-candidate :candidate
-                                    :experiment-repetition 0})]
+                                    :experiment-repetition 0
+                                    :inputs-id inputs-id})]
       (store/-store-attempt! st room-id value)
       (is (= value (store/-load-attempt st room-id cell))))
     (store/-store-attempt! st room-id (certified-attempt plain agent))
@@ -328,7 +330,11 @@
                    [?a :attempt/experiment-content-id ?exp]
                    [?a :attempt/experiment-candidate ?candidate]
                    [?a :attempt/run ?r]
-                   [?r :run/id ?run-id]] @conn)))))
+                   [?r :run/id ?run-id]] @conn)))
+    (is (= #{[cell inputs-id]}
+           (dh/q '[:find ?run-id ?inputs
+                   :where [?a :attempt/inputs-id ?inputs] [?a :attempt/run ?r] [?r :run/id ?run-id]] @conn))
+        "what the candidate was presented with is typed")))
 
 (deftest legacy-artifact-injection-and-domain-readers-remain-compatible
   (let [[conn _] (mem-store)

@@ -34,7 +34,7 @@
    (`:verifier-trust` in its metrics), so a reward is never read without it."
   [:trusted :room :ad-hoc])
 (defrecord WorldSetup [ref prepare])
-(defrecord Protocol [ref run limit-keys])
+(defrecord Protocol [ref run limit-keys inputs])
 
 (defonce ^:private pending-tasks (atom {}))
 
@@ -285,8 +285,16 @@
    :task :limits :cancelled? (fn [])}`. It must leave the work Room quiescent
    (no participants, no live Runs) and return the Run's portable value.
    `limit-keys` names the environment limits this protocol interprets, beyond
-   the evaluator's own. The capability is never portable or exposed to SCI."
-  [{:keys [id version basis run limit-keys]
+   the evaluator's own.
+
+   `inputs` (optional, `(fn [agent])` → portable data) says what the protocol
+   resolves at Run start and presents to the candidate `agent`, beyond its
+   ref, the AgentDef and the EnvironmentDef: e.g. the system prompt it
+   assembles, or the tool schemas it offers. It enters the Attempt's inputs
+   id (`dvergr.agent.program/run-inputs`), so a resume re-runs cells made
+   when it said something else. The capability is never portable or exposed
+   to SCI."
+  [{:keys [id version basis run limit-keys inputs]
     :or {version 1 limit-keys #{}}}]
   (when-not (keyword? id)
     (throw (ex-info "Protocol :id must be a keyword"
@@ -303,9 +311,12 @@
   (when-not (and (set? limit-keys) (every? keyword? limit-keys))
     (throw (ex-info "Protocol :limit-keys must be a set of keywords"
                     {:type ::invalid-protocol-limit-keys :limit-keys limit-keys})))
+  (when-not (or (nil? inputs) (fn? inputs))
+    (throw (ex-info "Protocol :inputs must be a function"
+                    {:type ::invalid-protocol-inputs})))
   (->Protocol (cond-> {:protocol/id id :protocol/version version}
                 (some? basis) (assoc :protocol/basis basis))
-              run limit-keys))
+              run limit-keys inputs))
 
 (defn protocol-ref
   "Return the portable exact reference named by a Protocol capability."

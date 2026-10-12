@@ -15,6 +15,7 @@
             [dvergr.chat.context :as chat-context]
             [dvergr.discourse :as d]
             [dvergr.model.providers :as providers]
+            [dvergr.model.registry :as registry]
             [dvergr.resource :as resource]
             [dvergr.room.store :as room-store]
             [dvergr.system.rooms :as system-rooms]
@@ -556,6 +557,107 @@
                       {:type ::no-provider
                        :agent/id (:agent/id agent)}))))
 
+(def ^:private llm-base-prompt
+  (str "You are a model inside the Dvergr harness. Dvergr owns "
+       "tools and the sandbox. Call only tools explicitly supplied "
+       "in this request; when none are supplied, answer directly. "
+       "Never request shell, grep, file, web, or other native "
+       "Codex tools unless Dvergr explicitly supplied that exact tool."))
+
+(defn llm-instructions
+  "The system prompt an LLM Run of `agent` starts with, assembled the way the
+   Run assembles it (`prompt/assemble-system-prompt`) for its `tool-map`: the
+   harness preamble, the agent's own prompt, skills, the tool-use guideline,
+   the sandbox pointer and the workspace guide of the bound context's
+   workspace. Reads that workspace (skills, AGENTS.md), so blocking work."
+  [agent tool-map]
+  (prompt/assemble-system-prompt
+   (str llm-base-prompt
+        (when-let [agent-prompt (:agent/prompt agent)]
+          (str "\n\n" agent-prompt)))
+   {:tools tool-map :isolation :sci :profile :workflow}))
+
+(defn prompt-id
+  "The content id of system prompt `instructions` (`:attempt/prompt-id`)."
+  [instructions]
+  (hasch/uuid [:dvergr/llm-system-prompt instructions]))
+
+(defn- model-inputs
+  "What the Run's model is, resolved now: the alias resolved to its registry
+   id, the provider, and the registry entry's API type and quirks (its
+   sampling defaults). Prices and context sizes are not in it: they change
+   what a call costs (models.dev refreshes them), not what the model is
+   asked."
+  [{:keys [provider model]}]
+  (registry/ensure-models-loaded!)
+  (let [id (when model (registry/resolve-alias model))
+        definition (when id (registry/get-model id))]
+    {:provider (or provider (:provider definition))
+     :model id
+     :api-type (:api-type definition)
+     :quirks (:quirks definition)}))
+
+(defn- tool-inputs
+  "The tools a model is offered, as it is offered them: each one's name,
+   description and input schema, in name order."
+  [tool-map]
+  (->> (vals tool-map)
+       (map (fn [{:keys [name description parameters]}]
+              {:name name :description description :parameters parameters}))
+       (sort-by :name)
+       vec))
+
+(defn- llm-inputs
+  "The `run-inputs` of an LLM Run that starts with `instructions`, offers
+   `tool-map` and calls the model `model-spec`."
+  [instructions tool-map model-spec]
+  {:inputs/kind :llm
+   :prompt-id (prompt-id instructions)
+   :tools (tool-inputs tool-map)
+   :model (model-inputs model-spec)})
+
+(defn run-inputs
+  "What a Run of `agent` will present to its candidate when it starts now,
+   as portable data: the inputs resolved at Run start that are not in the
+   AgentDef or the EnvironmentDef, so not in an ExperimentDef's identity.
+
+   - An LLM program: the assembled system prompt (by its `prompt-id`), the
+     tools offered (`tool-inputs`) and the resolved model (`model-inputs`).
+   - A protocol (`protocol`, the environment's): its ref, the resolved model
+     of the AgentDef's policy, and what the protocol's own `:inputs` says
+     (`dvergr.agent.evaluation/make-protocol`).
+   - Any other program: nil. A deterministic program (`:echo`, `:scripted`)
+     resolves nothing at Run start: everything it does is in its AgentDef.
+
+   The LLM case reads the bound context's workspace, as the Run reads its
+   world's (`llm-instructions`). `inputs-id` is its content id."
+  ([agent] (run-inputs agent nil))
+  ([agent protocol]
+   (cond
+     protocol
+     (cond-> {:inputs/kind :protocol
+              :protocol (:ref protocol)
+              :model (model-inputs (:agent/model-policy agent))}
+       (:inputs protocol)
+       (assoc :protocol-inputs
+              (let [inputs ((:inputs protocol) agent)]
+                (when-not (roster/data-value? inputs)
+                  (throw (ex-info "Protocol :inputs must return portable data"
+                                  {:type ::non-portable-protocol-inputs :protocol (:ref protocol)})))
+                inputs)))
+
+     (= :llm (get-in agent [:agent/program :kind]))
+     (let [tool-map (tools/normalize-tools (or (:agent/tools agent) #{}))]
+       (llm-inputs (llm-instructions agent tool-map) tool-map (resolve-model-spec agent)))
+
+     :else nil)))
+
+(defn inputs-id
+  "The content id of `run-inputs` (`:attempt/inputs-id`); nil for nil (a
+   deterministic program, which resolves nothing at Run start)."
+  [inputs]
+  (when (some? inputs) (hasch/uuid [:dvergr/run-inputs inputs])))
+
 (defn- new-llm-context
   [control-room work-room run-id agent budget-dollars chat-id supervisor]
   (let [system-id (room-context/room-system-id work-room)
@@ -734,21 +836,16 @@
                     (llm-tool-context control-room work-room chat-ctx agent run-id
                                       supervisor)
                     model-spec (resolve-model-spec agent)
-                    instructions
-                    (prompt/assemble-system-prompt
-                     (str "You are a model inside the Dvergr harness. Dvergr owns "
-                          "tools and the sandbox. Call only tools explicitly supplied "
-                          "in this request; when none are supplied, answer directly. "
-                          "Never request shell, grep, file, web, or other native "
-                          "Codex tools unless Dvergr explicitly supplied that exact tool."
-                          (when-let [agent-prompt (:agent/prompt agent)]
-                            (str "\n\n" agent-prompt)))
-                     {:tools tool-map :isolation :sci :profile :workflow})]
+                    instructions (llm-instructions agent tool-map)
+                    inputs (llm-inputs instructions tool-map model-spec)]
                 (update-llm-metrics!
                  supervisor
                  (constantly
                   (cond->
-                   {:prompt-id (hasch/uuid [:dvergr/llm-system-prompt instructions])
+                   {:prompt-id (:prompt-id inputs)
+                    ;; what this Run presented to its model, as `run-inputs`
+                    ;; predicts it: what a resume compares
+                    :inputs-id (inputs-id inputs)
                     :provider (:provider model-spec)
                     :model (:model model-spec)
                     :model-steps 0
@@ -935,6 +1032,11 @@
          call (start-worker!
                supervisor
                (fn []
+                 ;; what the protocol presents, as `run-inputs` predicts it
+                 (update-llm-metrics!
+                  supervisor
+                  (constantly {:inputs-id (inputs-id (run-inputs (dissoc agent ::limits ::protocol)
+                                                                 protocol))}))
                  (let [scope (some-> (resource/model-scope control-room run-id)
                                      (assoc :cancel? #(run/cancel-requested? run-id)))]
                    (binding [resource/*model-scope* scope
