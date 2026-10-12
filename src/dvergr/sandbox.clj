@@ -1015,7 +1015,7 @@
        "(your code), knowledge base, and schedules. Read/write code with `fs`/`git`/"
        "shell (changes live in the room's repo); recall/save facts with the "
        "knowledge tools; automate recurring work with `dvergr.scheduler` "
-       "(`(dvergr.scheduler/interval ms :agent \"task\")`, `(dvergr.scheduler/at \"09:00\" …)`). "
+       "(`(dvergr.scheduler/every :day \"09:00\" :agent \"task\")`, `(dvergr.scheduler/at \"2026-11-01T09:00\" :agent \"task\")`). "
        "For a substantial or risky change, FORK first: `(dvergr.room/fork! room)` "
        "gives an isolated branch (own git + DB) you can experiment in freely; when "
        "it's good `(dvergr.room/merge! parent fork)` collapses your work back (the "
