@@ -410,10 +410,12 @@
   ;; load, which building a sandbox does: resolving a name loads them first.
   ;; A cold process is simulated: the tool is not registered until its
   ;; namespace is (re)required.
-  (let [saved (get @dvergr.tools/registry "llm_call")
+  (let [_ (require 'dvergr.tools.llm-call)
+        saved (get @dvergr.tools/registry "llm_call")
         required (atom [])
         require! dvergr.substrate.load/require!]
     (try
+      (is (some? saved))
       (swap! dvergr.tools/registry dissoc "llm_call")
       (with-redefs [dvergr.substrate.load/require!
                     (fn [& args]
@@ -421,7 +423,7 @@
                       (when (some #{'dvergr.tools.llm-call} args)
                         (swap! dvergr.tools/registry assoc "llm_call" saved))
                       (apply require! args))]
-        (is (= #{"llm_call"} (set (keys (dvergr.tools/normalize-tools #{:llm_call})))))
+        (is (= {"llm_call" saved} (dvergr.tools/normalize-tools #{:llm_call})))
         (is (= #{'dvergr.tools.llm-call 'dvergr.intake.mail} (set @required))))
       (finally (swap! dvergr.tools/registry assoc "llm_call" saved)))))
 
@@ -436,10 +438,19 @@
       (reset! loaded? false)
       (with-redefs [registry/load-models-resource! (fn [] (deliver started true) @release (load!))]
         (let [first-caller (future (registry/ensure-models-loaded!) :done)
-              _ (deref started 5000 nil)
-              second-caller (future (registry/ensure-models-loaded!) @loaded?)]
-          (Thread/sleep 200)
-          (is (not (realized? second-caller)) "the second caller waits for the load")
+              _ (is (deref started 5000 nil) "the first caller is loading")
+              second-thread (promise)
+              second-caller (future (deliver second-thread (Thread/currentThread))
+                                    (registry/ensure-models-loaded!) @loaded?)
+              ^Thread t (deref second-thread 5000 nil)
+              ;; until it has returned or blocks on the load
+              blocked? (loop [n 0]
+                         (cond (realized? second-caller) false
+                               (= Thread$State/BLOCKED (.getState t)) true
+                               (< n 500) (do (Thread/sleep 10) (recur (inc n)))
+                               :else false))]
+          (is blocked? "the second caller waits for the load")
+          (is (not (realized? second-caller)))
           (deliver release true)
           (is (= :done (deref first-caller 5000 nil)))
           (is (true? (deref second-caller 5000 nil)) "and returns once it is complete")))
