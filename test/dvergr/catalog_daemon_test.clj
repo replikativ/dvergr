@@ -331,6 +331,20 @@
       (is (:promoted? (ops/invoke *daemon* :catalog/promote {:room "marketing" :name "competitors"})))
       (is (= "room" (:verifier (first (filter #(= "marketing/competitors" (:id %))
                                               (ops/invoke *daemon* :catalog/list {:room "marketing"})))))))
+    (testing "catalog_benchmark's `name`, and `experiment` as its deprecated alias"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"lowercase letters"
+                            (ops/invoke *daemon* :catalog/benchmark
+                                        {:workflow "marketing/competitors" :models ["claude-haiku-4-5"]
+                                         :name "Not A Name"})))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"lowercase letters"
+                            (ops/invoke *daemon* :catalog/benchmark
+                                        {:workflow "marketing/competitors" :models ["claude-haiku-4-5"]
+                                         :experiment "Not A Name"}))
+          "the alias is still read")
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"deprecated alias"
+                            (ops/invoke *daemon* :catalog/benchmark
+                                        {:workflow "marketing/competitors" :models ["claude-haiku-4-5"]
+                                         :name "one" :experiment "two"}))))
     (testing "catalog_benchmark runs it as \"<room>/<name>\""
       (let [calls (atom 0)]
         (with-redefs [providers/ensure-initialized! (constantly nil)

@@ -1182,7 +1182,8 @@
               "checker, folded into a Scorecard with the bill. With `room`, the job, its Attempts "
               "and the Scorecard are kept in that room (its dashboards show them) while the "
               "attempts still fork the new fixture room. Returns a job; experiment_progress "
-              "{room} shows every certified cell while it runs.")
+              "{room} shows every certified cell while it runs. `name` names the experiment so a "
+              "later call resumes it (`experiment` is its deprecated alias).")
     :kind :write
     :schema [:map
              [:workflow [:string {:description "catalog workflow id, e.g. wiki/v2"}]]
@@ -1194,7 +1195,8 @@
              [:noise {:optional true} [:int {:min 0 :max 4 :description "kinds of noise in generated documents: 1 scan artefacts, 2 and an erratum, 3 and short names, 4 and retyped documents (wiki/v3; default 0)"}]]
              [:split {:optional true} [:enum {:description "dev (public, the default), test (held out: the host's key) or real (real corpora)"} "dev" "test" "real"]]
              [:repetitions {:optional true} [:int {:min 1 :max 10 :description "attempts per model (default 1)"}]]
-             [:experiment {:optional true} [:string {:description "a name for the experiment, kept: benchmarking again with the same name, workflow and models into the same room resumes it (cells with a verdict made with the current inputs are kept, the others run again); default a new one. The job returns the ExperimentDef content id as `experiment`: that id, not this name, is what experiment_report takes"}]]
+             [:name {:optional true} [:string {:description "a name for the experiment, kept: benchmarking again with the same name, workflow and models into the same room resumes it (cells with a verdict made with the current inputs are kept, the others run again); default a new one. The job returns the ExperimentDef content id as `experiment`: that id, not this name, is what experiment_report takes"}]]
+             [:experiment {:optional true} [:string {:description "deprecated: the old key for `name`, still accepted"}]]
              [:cases {:optional true} [:int {:min 1 :description "a dataset workflow's first N cases of a fixed shuffle (default all)"}]]
              [:case-ids {:optional true} [:vector {:description "instead of cases: the ids of the cases to run"} :string]]
              [:parallelism {:optional true} [:int {:min 1 :max 16 :description "attempts at a time (default 1)"}]]
@@ -1217,9 +1219,14 @@
                   control (when room
                             (or (resolve-room daemon room)
                                 (throw (ex-info (str "No room " room) {:type ::no-room :room room}))))
-                  _ (when (and (:experiment args) (not (re-matches #"[a-z0-9][a-z0-9-]{0,63}" (:experiment args))))
-                      (op-error! (str "An experiment name is lowercase letters, digits and dashes: " (:experiment args))
-                                 ::invalid-experiment 400 {:experiment (:experiment args)}))
+                  ;; `experiment` is the deprecated key for `name`
+                  _ (when (and (:name args) (:experiment args) (not= (:name args) (:experiment args)))
+                      (op-error! "Give the experiment's name once, as `name` (`experiment` is its deprecated alias)"
+                                 ::invalid-experiment 400 {:name (:name args) :experiment (:experiment args)}))
+                  exp-name (or (:name args) (:experiment args))
+                  _ (when (and exp-name (not (re-matches #"[a-z0-9][a-z0-9-]{0,63}" exp-name)))
+                      (op-error! (str "An experiment name is lowercase letters, digits and dashes: " exp-name)
+                                 ::invalid-experiment 400 {:name exp-name}))
                   plan (plan-fn (cond-> (cond-> (select-keys args [:models :budget-dollars :timeout-ms :cases :params :prompt])
                                           (:case-ids args) (assoc :cases (vec (:case-ids args))))
                                   (:environments args) (assoc :n (:environments args))
@@ -1231,7 +1238,7 @@
                   r (in-ctx daemon
                             (rooms/create-room! {:title (str (:title wf) " (benchmark)") :slug slug})
                             (rreg/lookup (keyword slug)))
-                  exp (runner/experiment-def (assoc plan :id (keyword (or (:experiment args) slug))
+                  exp (runner/experiment-def (assoc plan :id (keyword (or exp-name slug))
                                                     :repetitions (or repetitions 1)
                                                     ;; the host's versions: a resume never mixes two
                                                     :metadata (merge (:metadata plan) (runner/runtime-identity models))))
