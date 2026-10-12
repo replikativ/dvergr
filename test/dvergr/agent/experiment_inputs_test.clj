@@ -2,7 +2,8 @@
   "Resume keeps a cell only while its candidate would be presented with the
    same inputs: the assembled system prompt, the tools offered, the resolved
    model (`program/run-inputs`)."
-  (:require [clojure.string :as str]
+  (:require [clojure.java.shell]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [dvergr.agent.environment :as environment-def]
             [dvergr.agent.evaluation :as evaluation]
@@ -18,7 +19,9 @@
             [dvergr.model.registry :as registry]
             [dvergr.room.store.memory :as memory]
             [dvergr.sandbox]
+            [dvergr.substrate.git]
             [dvergr.substrate.paths :as paths]
+            [dvergr.tools]
             [org.replikativ.spindel.engine.core :as ec]))
 
 (def ^:private evaluator
@@ -355,22 +358,54 @@
         (is (not= a (id)) "another default compaction model is other inputs"))
       (finally (swap! registry/defaults assoc :compaction-model before)))))
 
+(defn- seed-repo
+  "A local git repository to seed workspaces from, its AGENTS.md saying
+   `marker`."
+  [marker]
+  (let [dir (str (System/getProperty "java.io.tmpdir") "/dvergr-inputs-seed-" (random-uuid))
+        sh (fn [& args] (let [r (apply clojure.java.shell/sh (concat args [:dir dir]))]
+                          (when-not (zero? (:exit r)) (throw (ex-info "git failed" r)))))]
+    (.mkdirs (java.io.File. dir))
+    (spit (str dir "/AGENTS.md") (str "# Workspace\n\n" marker "\n"))
+    (sh "git" "init" "-q" "-b" "main")
+    (sh "git" "add" "-A")
+    (sh "git" "-c" "user.email=t@dvergr" "-c" "user.name=t" "commit" "-q" "-m" "seed")
+    dir))
+
 (deftest the-prediction-reads-the-workspace-the-run-seeds
   ;; A room without a repository of its own reads the shared
   ;; .dvergr/workspace, which the first sandbox seeds. The prediction runs
   ;; before any sandbox exists: it must read the seeded workspace too, or a
   ;; fresh home's first run disagrees with every Run it predicts.
   (let [prev (paths/home)
-        home (str (System/getProperty "java.io.tmpdir") "/dvergr-inputs-home-" (random-uuid))]
+        home (str (System/getProperty "java.io.tmpdir") "/dvergr-inputs-home-" (random-uuid))
+        marker (str "inputs-seed-marker-" (random-uuid))
+        seed (seed-repo marker)
+        prompts (atom [])
+        instructions program/llm-instructions]
     (try
       (paths/set-home! home)
       (is (not (.exists (java.io.File. (str (paths/workspace-dir) "/.git")))) "a fresh home: not seeded yet")
-      (with-room :inputs-fresh-workspace
-        (fn [room]
-          (let [{:keys [team definition]} (fixture)
-                calls (atom 0)]
-            (with-model calls
-              (let [{:keys [results scorecard]} (run! room team definition)]
-                (is (not-any? :unpredicted? results))
-                (is (= 6 (count (:scorecard/entries scorecard)))))))))
+      (with-redefs [dvergr.substrate.git/sandbox-repo (constantly seed)
+                    program/llm-instructions (fn [agent tool-map]
+                                               (let [p (instructions agent tool-map)]
+                                                 (when (contains? tool-map "clojure_eval") (swap! prompts conj p))
+                                                 p))]
+        (with-room :inputs-fresh-workspace
+          (fn [room]
+            (let [{:keys [team definition]} (fixture)
+                  calls (atom 0)]
+              (with-model calls
+                (let [{:keys [results scorecard]} (run! room team definition)]
+                  (is (str/includes? (first @prompts) marker)
+                      "the prediction, made before any sandbox, read the seeded AGENTS.md")
+                  (is (= 4 (count @prompts)) "the prediction and the sandboxed candidate's three Runs")
+                  (is (apply = @prompts))
+                  (is (not-any? :unpredicted? results))
+                  (is (= 6 (count (:scorecard/entries scorecard))))))))))
       (finally (paths/set-home! prev)))))
+
+(deftest a-tool-a-sandbox-registers-resolves-before-any-sandbox
+  ;; `llm_call` registers itself when its namespace loads, which building a
+  ;; sandbox does; resolving the name loads it first
+  (is (contains? (dvergr.tools/normalize-tools #{:llm_call}) "llm_call")))
