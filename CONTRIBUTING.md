@@ -69,10 +69,7 @@ clj -M:local:dev:repl             # nREPL + CIDER middleware
 ```
 
 Other handy aliases (see `deps.edn`): `:cli` (start daemon + TUI),
-`:build` (jar / uberjar / install / deploy), and `:mcp-server`
-(`dvergr.mcp.server/-main`: an MCP server without a daemon, so its tools only
-answer that no daemon runs; MCP clients use `bin/dvergr-mcp`, see
-[doc/mcp.md](doc/mcp.md)).
+`:build` (jar / uberjar / install / deploy).
 
 ## Using dvergr as a library
 

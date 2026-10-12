@@ -5,8 +5,8 @@
    - TCP on loopback (newline-delimited JSON-RPC), started by the daemon
      (`:mcp` config or `--mcp`). Clients reach it through `bin/dvergr-mcp`, a
      stdio relay that starts and reconnects to the daemon (see doc/mcp.md).
-   - stdio in this process (`--stdio`): tools answer only when a daemon runs
-     in the same JVM.
+   - stdio in this process (`run-stdio`): tools answer only when a daemon
+     runs in the same JVM.
 
    Which tools a connection sees (profiles, toolsets), their annotations and
    the result encoding are `dvergr.mcp.surface`.
@@ -15,13 +15,7 @@
      (require '[dvergr.mcp.server :as mcp])
      (mcp/start! {:port 17888})   ; start TCP server
      ;; ... develop, modify tool handlers, they're live ...
-     (mcp/stop!)                  ; stop TCP server
-
-   Standalone (`-main`: the `:mcp-server` alias, the `clj -T:build uber`
-   jar): it serves `--stdio` or TCP (`--port`, default 17888) but starts no
-   daemon, so every tool answers \"No dvergr daemon is running in this
-   process.\" The daemon is `clojure -M:cli --mcp`, or `bin/dvergr-mcp`
-   starts one."
+     (mcp/stop!)                  ; stop TCP server"
   (:require [clojure.string :as str]
             [dvergr.mcp.json-rpc :as json-rpc]
             [dvergr.mcp.repl :as repl]
@@ -34,8 +28,7 @@
             [org.replikativ.spindel.engine.core :as ec]
             [jsonista.core :as json])
   (:import (java.net ServerSocket Socket)
-           (java.io BufferedReader InputStreamReader BufferedWriter OutputStreamWriter))
-  (:gen-class))
+           (java.io BufferedReader InputStreamReader BufferedWriter OutputStreamWriter)))
 
 ;; ============================================================================
 ;; JSON mappers
@@ -801,7 +794,7 @@
     {:running false}))
 
 ;; ============================================================================
-;; Stdio transport (for uberjar / subprocess mode)
+;; Stdio transport (in this process)
 ;; ============================================================================
 
 (defn run-stdio
@@ -813,30 +806,3 @@
         writer (BufferedWriter. (OutputStreamWriter. System/out))]
     (handle-connection reader writer "stdio"
                        (surface/selection {:profile profile :toolsets toolsets}))))
-
-;; ============================================================================
-;; Entry point
-;; ============================================================================
-
-(defn -main
-  "Entry point. Default: TCP on 127.0.0.1:17888. Use --stdio for subprocess mode,
-   --port <n> for the TCP port, --bind <addr> to change the bind address (pass
-   0.0.0.0 to expose on the network), --profile / --toolsets for the default
-   tool selection."
-  [& args]
-  (let [args-set (set args)
-        opt (fn [flag] (second (drop-while #(not= % flag) args)))]
-    (cond
-      (args-set "--stdio")
-      (run-stdio :profile (opt "--profile") :toolsets (opt "--toolsets"))
-
-      :else
-      (let [port (if-let [p (opt "--port")]
-                   (Integer/parseInt p)
-                   (if-let [p (some #(when (re-matches #"\d+" %) %) args)]
-                     (Integer/parseInt p)
-                     17888))
-            bind (or (opt "--bind") "127.0.0.1")]
-        (start! :port port :bind bind :profile (opt "--profile") :toolsets (opt "--toolsets"))
-        ;; Keep main thread alive
-        (.join ^Thread (:accept-thread @server-state))))))
