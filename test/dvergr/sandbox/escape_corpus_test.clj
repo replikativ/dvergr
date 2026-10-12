@@ -25,6 +25,8 @@
   (:require [clojure.string :as str]
             [clojure.repl.deps]
             [clojure.test :refer [deftest is testing]]
+            [dvergr.discourse :as d]
+            [dvergr.room.store.memory :as mem]
             [dvergr.sandbox :as sandbox]
             [dvergr.sandbox.deps :as deps]
             [org.replikativ.spindel.engine.core :as rtc]
@@ -57,6 +59,29 @@
 ;; ===========================================================================
 ;; GROUP 1 — green guards: closed holes + the capability kept intact
 ;; ===========================================================================
+
+(deftest room-ops-hand-out-data-not-live-rooms
+  ;; `dvergr.room/get` (list, children, fork!, forks, root, …) returned the live
+  ;; Room record: code replaced a room's participants (`reset!` on its atom),
+  ;; edited its meta and held its execution context, store and bus — for every
+  ;; room `list` showed. CONFIRMED-OPEN before the ops returned data views.
+  (with-sandbox
+    (fn [sci-ctx ec]
+      (let [room (binding [rtc/*execution-context* ec]
+                   (d/make-room {:id :escape-room :ctx ec :store (mem/make)}))]
+        (try
+          (testing "a room is plain data"
+            (is (= {:ok {:id :escape-room :slug "escape-room" :title "escape-room" :parent-id nil :fork? false}}
+                   (eval-in sci-ctx ec "(dvergr.room/get :escape-room)")))
+            (is (= {:ok true}
+                   (eval-in sci-ctx ec "(every? #(not-any? % [:participants :meta :ctx :store :bus :fork-handle]) (dvergr.room/list))"))))
+          (testing "its atoms are out of reach"
+            (eval-in sci-ctx ec "(let [r (dvergr.room/get :escape-room)] (reset! (:participants r) {:intruder 1}))")
+            (eval-in sci-ctx ec "(dvergr.room/list :where (fn [r] (when-let [p (:participants r)] (reset! p {:intruder 1})) true))")
+            (is (not (contains? @(:participants room) :intruder))))
+          (testing "the view still addresses the room"
+            (is (= {:ok []} (eval-in sci-ctx ec "(dvergr.room/participants (dvergr.room/get :escape-room))"))))
+          (finally (d/close-room! room)))))))
 
 (deftest sensitive-path-policy-covers-every-branch
   ;; The pattern was wrapped across three lines; a Clojure regex literal is not

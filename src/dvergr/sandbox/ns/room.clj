@@ -46,10 +46,11 @@
   [:or :string :keyword [:map [:id :keyword]]])
 
 (def ^:private Room
-  "A live `dvergr.discourse/Room` record (open map; also carries the bus,
-   participants atom, execution ctx, store and meta atom)."
+  "What the Room ops return for a room: plain data, never the live record.
+   It is also a RoomRef."
   [:map [:id :keyword] [:slug :string] [:title [:maybe :string]]
-   [:parent-id [:maybe :keyword]]])
+   [:parent-id [:maybe :keyword]] [:fork? :boolean]
+   [:forked-from {:optional true} :any]])
 
 (def ^:private AgentId [:or :keyword :string])
 

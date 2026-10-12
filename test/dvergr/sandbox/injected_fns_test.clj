@@ -40,8 +40,11 @@
         forks  (atom [])]
     (try
       (testing "fork! with no opts is ISOLATED: its own ctx, writes stay in it"
-        (let [fork (fork! parent)]
+        (let [view (fork! parent)
+              fork (binding [ec/*execution-context* (:ctx parent)] (rreg/lookup (:id view)))]
           (swap! forks conj fork)
+          (is (= {:id (:id fork) :fork? true} (select-keys view [:id :fork?]))
+              "a fork comes back as data")
           (is (some? fork))
           (is (not (identical? (:ctx fork) (:ctx parent))))
           (binding [ec/*execution-context* (:ctx fork)]
@@ -54,15 +57,21 @@
           (testing "participants and discard! accept a slug"
             (is (vector? (('participants ops) (:slug fork))))
             (is (= (:id fork) (:id (('discard! ops) (:slug fork)))))
+            (is (= (:id fork) (:id (('discard! ops) view))) "a second discard! answers as the first")
+            (is (= (:id fork) (:id (('discard! ops) (:slug fork)))) "by slug too")
+            (is (re-find #"already settled: discarded" (:error (('merge! ops) (:slug parent) view)))
+                "a discarded fork does not merge")
             (is (nil? (binding [ec/*execution-context* (:ctx parent)]
                         (rreg/lookup (:id fork))))
                 "discarded fork left the registry"))))
       (testing "explicit opts still win"
-        (let [shared (fork! parent {:isolation :none})]
+        (let [shared (binding [ec/*execution-context* (:ctx parent)]
+                       (rreg/lookup (:id (fork! parent {:isolation :none}))))]
           (swap! forks conj shared)
           (is (identical? (:ctx shared) (:ctx parent)))))
       (testing "merge! accepts refs"
-        (let [fork (fork! parent)]
+        (let [fork (binding [ec/*execution-context* (:ctx parent)]
+                     (rreg/lookup (:id (fork! parent))))]
           (swap! forks conj fork)
           (is (= (:id parent)
                  (:id (('merge! ops) (:slug parent) (:slug fork))))

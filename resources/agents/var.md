@@ -135,8 +135,8 @@ the code.
 ;; forks of any room. ONE unified surface for both. The user sees
 ;; them as the tree-of-rooms in the TUI and at /dashboard on the web.
 (require '[room])
-(dvergr.room/list)                                ; every Room: persistent + forks
-(dvergr.room/get "boardroom")                     ; lookup by slug — returns the Room
+(dvergr.room/list)                                ; every room (as data): persistent + forks
+(dvergr.room/get "boardroom")                     ; lookup by slug — {:id :slug :title :parent-id :fork?}
 (dvergr.room/create! {:slug "deep-dive"           ; new persistent room
                :title "Project deep-dive"
                :type :internal
@@ -160,7 +160,7 @@ the code.
 (def f (dvergr.room/fork! "boardroom" {:isolation :ctx})) ; substrate-isolated
 (dvergr.room/merge! (dvergr.room/get "boardroom") f)     ; promote fork's changes
 (dvergr.room/discard! f)                          ; throw fork away
-(dvergr.room/forks)                               ; live forks (Rooms)
+(dvergr.room/forks)                               ; live forks (as data)
 
 ;; Compose. Pull a list of HN stories, fetch each, summarise — one eval,
 ;; not eight tool calls.
