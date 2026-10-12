@@ -338,20 +338,26 @@
                           {:experiment/job (experiment-job job)
                            :error (or (ex-message t) (str t))}
                           (throw t))))]
-         ;; The Run records what it presented; a resume keeps the cell only
-         ;; when that is what it predicts. A difference (a world setup that
-         ;; changes the workspace the prompt reads) re-runs it every time.
-         (when-let [a (:attempt result)]
-           (when (and (not= ::unpredicted predicted) (not= predicted (inputs-id a)))
+         ;; The Run records what it presented; a resume keeps a cell only
+         ;; when that is what it predicts, and a Scorecard takes a cell only
+         ;; then too, so kept and new cells never differ in their inputs. A
+         ;; difference (a world setup that rewrites the workspace's skills or
+         ;; AGENTS.md, which the prompt reads) leaves the cell without a
+         ;; usable verdict.
+         (let [a (:attempt result)
+               result (cond-> result
+                        (and a (not= ::unpredicted predicted) (not= predicted (inputs-id a)))
+                        (assoc :unpredicted? true))]
+           (when (:unpredicted? result)
              (tel/log! {:level :warn :id ::inputs-not-predicted
                         :data {:experiment (:experiment/content-id experiment)
                                :candidate (:candidate/id candidate)
                                :environment (:environment/content-id definition)
                                :predicted predicted :recorded (inputs-id a)}}
-                       "A cell's Run recorded other inputs than predicted: a resume runs it again")))
-         (when on-result
-           (try (on-result result) (catch Throwable _ nil)))
-         result)))))
+                       "A cell's Run recorded other inputs than predicted: it enters no Scorecard"))
+           (when on-result
+             (try (on-result result) (catch Throwable _ nil)))
+           result))))))
 
 (defn- attempt-cell
   "`[candidate-id environment-content-id repetition]` of an experiment
@@ -417,14 +423,20 @@
    cell only with the inputs it computes for it at the start, so once a
    resumed run has certified one of a candidate's cells this is exactly its
    current set; until then the previous inputs still count as current (a
-   resume replaces them)."
+   resume replaces them). An Attempt without an inputs id (one from before
+   they were recorded, or a Run that faulted before it assembled its inputs)
+   says nothing about the current inputs: the newest Attempt with one
+   decides, and only a candidate none of whose Attempts has one (a
+   deterministic program, or an experiment from before) has nil."
   [attempts]
   (let [k (fn [a] [(first (attempt-cell a)) (get-in a [:attempt/environment :environment/world :protocol])])
         newest (reduce (fn [m a]
-                         (let [t (or (:attempt/certified-at a) 0)]
-                           (if (and (contains? m (k a)) (>= (first (get m (k a))) t))
+                         (let [t (or (:attempt/certified-at a) 0)
+                               ;; an Attempt with an inputs id outranks one without
+                               rank [(if (inputs-id a) 1 0) t]]
+                           (if (and (contains? m (k a)) (>= (compare (first (get m (k a))) rank) 0))
                              m
-                             (assoc m (k a) [t (inputs-id a)]))))
+                             (assoc m (k a) [rank (inputs-id a)]))))
                        {} attempts)]
     (filterv #(= (second (get newest (k %))) (inputs-id %)) attempts)))
 
@@ -952,8 +964,12 @@
           (throw (ex-info (str "Experiment cell failed: " (:error (first errors)))
                           {:type ::cell-failed :errors (mapv #(select-keys % [:experiment/job :error]) errors)})))
         (let [unfinished (count (remove #(and (:attempt %) (verdict? (:attempt %))) results))
-              scorecard (if (and (or complete-only? (seq refused)) (pos? unfinished))
-                          {:incomplete {:cells unfinished
+              ;; verdicts made with other inputs than their cell's predicted
+              unpredicted (count (filter #(and (:unpredicted? %) (verdict? (:attempt %))) results))
+              scorecard (if (or (and (or complete-only? (seq refused)) (pos? unfinished))
+                                (pos? unpredicted))
+                          {:incomplete {:cells (+ unfinished unpredicted)
+                                        :unpredicted unpredicted
                                         :refused (count refused)
                                         :errors (mapv (fn [{:keys [error] job :experiment/job}]
                                                         {:candidate (get-in job [:candidate/id])

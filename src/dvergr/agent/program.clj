@@ -837,7 +837,18 @@
                                       supervisor)
                     model-spec (resolve-model-spec agent)
                     instructions (llm-instructions agent tool-map)
-                    inputs (llm-inputs instructions tool-map model-spec)]
+                    ;; resuming: the conversation so far is the stopped Run's,
+                    ;; system prompt included
+                    resumed (when-let [{from-chat :chat} (::resume agent)]
+                              (chat-context/load-messages (some-> control-room :store :conn) from-chat))
+                    sent (if (::resume agent)
+                           (some (fn [m] (when (= :system (or (:message/role m) (:role m)))
+                                           (or (:message/content m) (:content m))))
+                                 resumed)
+                           instructions)
+                    ;; what the model is presented with: the system prompt it
+                    ;; is sent (a resumed Run's is the one it started with)
+                    inputs (llm-inputs sent tool-map model-spec)]
                 (update-llm-metrics!
                  supervisor
                  (constantly
@@ -851,10 +862,8 @@
                     :model-steps 0
                     :usage {}}
                     (seq limits) (assoc :limits effective-limits))))
-                (if-let [{from-chat :chat} (::resume agent)]
-                  ;; resuming: the conversation so far is the resumed Run's
-                  (chat-context/replace-messages!
-                   chat-ctx (chat-context/load-messages (some-> control-room :store :conn) from-chat))
+                (if (::resume agent)
+                  (chat-context/replace-messages! chat-ctx resumed)
                   (do (chat-context/add-message!
                        chat-ctx {:role :system :content instructions})
                       (chat-context/add-message!

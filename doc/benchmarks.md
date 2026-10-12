@@ -136,8 +136,11 @@ pass over a Scorecard whose cells ran again with other inputs, and state how man
 how many await a re-run, and how many Attempts are superseded. A preflight's pilot, the
 Scorecard, the frontier and the paired comparisons use that same set. A Run whose recorded
 inputs differ from the prediction (a world setup that rewrites the workspace's skills or
-AGENTS.md) is logged (`:dvergr.agent.experiment/inputs-not-predicted`): such a cell runs again on
-every resume, which wastes tokens but never mixes inputs.
+AGENTS.md) is logged (`:dvergr.agent.experiment/inputs-not-predicted`), and no Scorecard takes
+it: the result stays incomplete (`:incomplete {:unpredicted n}`, also stated in `run!`'s report)
+and a resume runs it again. Every cell of a Scorecard was thus made with exactly the inputs
+computed for it, whether it was kept or just ran. A Run resumed from a turn savepoint records
+the system prompt it continues with, the stopped Run's.
 
 Attempts certified before inputs ids were recorded have none. A deterministic candidate's are
 kept (its inputs id is nil too); an LLM or protocol candidate's are stale, since nothing says what

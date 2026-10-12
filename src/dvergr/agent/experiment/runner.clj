@@ -544,16 +544,23 @@
              :scorecard (:scorecard result)
              ;; the report is the room's, read through the op every binding
              ;; uses (experiment_report): nothing beside the stores
-             :report (:markdown
-                      (try (op daemon :experiment/report
-                               (cond-> {:room slug :title title
-                                        :experiment (str (:experiment/content-id experiment-def))}
-                                 (:scorecard/content-id (:scorecard result))
-                                 (assoc :scorecard (str (:scorecard/content-id (:scorecard result))))))
-                           (catch Throwable e
-                             (tel/log! {:level :warn :id :experiment/report-failed
-                                        :data {:room slug :error (ex-message e)}})
-                             nil)))})))
+             :report (some->
+                      (:markdown
+                       (try (op daemon :experiment/report
+                                (cond-> {:room slug :title title
+                                         :experiment (str (:experiment/content-id experiment-def))}
+                                  (:scorecard/content-id (:scorecard result))
+                                  (assoc :scorecard (str (:scorecard/content-id (:scorecard result))))))
+                            (catch Throwable e
+                              (tel/log! {:level :warn :id :experiment/report-failed
+                                         :data {:room slug :error (ex-message e)}})
+                              nil)))
+                      (str (let [n (get-in result [:scorecard :incomplete :unpredicted] 0)]
+                             (when (pos? n)
+                               (str "\n**Unpredicted inputs:** " n " cell" (when (not= 1 n) "s")
+                                    " ran with other inputs than computed before they started (a world setup "
+                                    "that rewrites the workspace's skills or AGENTS.md?), so no Scorecard "
+                                    "takes them, and a resume runs them again.\n")))))})))
       (finally
         (try (evaluation/await-cleanups-for! room cleanup-group) (catch Throwable _ nil))))))
 

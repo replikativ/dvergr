@@ -251,3 +251,40 @@
     (is (= (id (protocol "a")) (id (protocol "a"))))
     (is (not= (id (protocol "a")) (id (protocol "b"))))
     (is (not= (id (protocol "a")) (id nil)) "a protocol Run is not the LLM program")))
+
+(deftest a-run-with-other-inputs-than-predicted-enters-no-scorecard
+  (with-room :inputs-unpredicted
+    (fn [room]
+      (let [{:keys [team definition]} (fixture)
+            calls (atom 0)
+            pointer @#'dvergr.sandbox/sandbox-prompt-pointer]
+        (with-model calls
+          (try
+            (binding [ec/*execution-context* (:ctx room)]
+              (let [spin (experiment/run room team definition evaluators {:resume? true :complete-only? true})
+                    ;; predicted; now the prompt the Runs assemble differs
+                    _ (alter-var-root #'dvergr.sandbox/sandbox-prompt-pointer (constantly (str pointer " (changed)")))
+                    {:keys [scorecard results]} @spin]
+                (is (= 6 @calls))
+                (is (= 3 (count (filter :unpredicted? results))) "the sandboxed candidate's cells")
+                (is (= {:cells 3 :unpredicted 3} (select-keys (:incomplete scorecard) [:cells :unpredicted]))
+                    "no Scorecard takes a cell made with other inputs than its cell's")))
+            (finally
+              (alter-var-root #'dvergr.sandbox/sandbox-prompt-pointer (constantly pointer)))))))))
+
+(deftest an-attempt-without-inputs-says-nothing-about-the-current-ones
+  (let [attempt (fn [id inputs t status]
+                  {:attempt/id id :attempt/certified-at t
+                   :attempt/environment {:environment/content-id :e :environment/world {}}
+                   :attempt/receipt {:attempt/status status
+                                     :attempt/environment {:environment/content-id :e}
+                                     :attempt/metrics (cond-> {:experiment-candidate :c :experiment-repetition 0}
+                                                        inputs (assoc :inputs-id inputs))}})
+        current (fn [xs] (set (map :attempt/id (experiment/current-attempts xs))))]
+    (is (= #{1} (current [(attempt 2 nil 20 :failed) (attempt 1 :a 10 :completed)]))
+        "a Run that faulted before it assembled its inputs does not make them nil")
+    (is (= #{2} (current [(attempt 2 :b 20 :completed) (attempt 1 :a 10 :completed)])))
+    (is (= #{2} (current [(attempt 2 :b 20 :completed) (attempt 1 nil 10 :completed)]))
+        "Attempts from before inputs ids are superseded once one has them")
+    (is (= #{1 2} (current [(attempt 2 nil 20 :completed) (attempt 1 nil 10 :completed)]))
+        "a deterministic candidate's (or an old experiment's) all count")))
