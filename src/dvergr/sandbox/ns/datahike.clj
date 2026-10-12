@@ -1,7 +1,7 @@
 (ns dvergr.sandbox.ns.datahike
   "A faithful mirror of the datahike API for the agent sandbox — mounted in SCI as
-   both `datahike.api` and the short alias `d`. Ordinary datahike code the agent
-   already knows works verbatim:
+   `datahike.api`. Ordinary datahike code the agent already knows works verbatim
+   once it aliases the namespace, `(require '[datahike.api :as d])`:
 
      (d/q '[:find ?t :where [?e :entity/title ?t]] @dvergr.room/*kb*)
      (d/transact dvergr.room/*kb* [{:entity/title \"Note\"}])
@@ -166,7 +166,7 @@
   (binding [resolve/*symbol-resolver* resolve/safe-symbol-resolver] (f)))
 
 (defn add-datahike-ns!
-  "Mount the faithful datahike API under `datahike.api` and `d`, with lifecycle fns
+  "Mount the faithful datahike API under `datahike.api`, with lifecycle fns
    guarded to room `room-id` (resolved fork-aware under `ctx`)."
   [sci-ctx room-id ctx & [binding-resolver binding-swap! effects]]
   (let [data      (into {} (keep (fn [sym]

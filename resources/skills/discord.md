@@ -25,7 +25,7 @@ Create a bot: https://discord.com/developers/applications â†’ New Application â†
 ## Usage
 
 ```clojure
-(require '[http] '[env])
+(require '[babashka.http-client :as http] '[cheshire.core :as json] '[env])
 
 (def discord-token (env/get "DISCORD_BOT_TOKEN"))
 
@@ -36,7 +36,7 @@ Create a bot: https://discord.com/developers/applications â†’ New Application â†
                 :headers {"Authorization" (str "Bot " discord-token)
                           "Content-Type" "application/json"}
                 :json body})]
-    (:body resp)))
+    (json/parse-string (:body resp) true)))
 
 ;; Send a message
 (discord-api :post "/channels/CHANNEL_ID/messages"

@@ -812,15 +812,14 @@
                              'by-tag  [:=> [:cat :keyword] [:vector OnlineAgent]]})))))
 
 (defn add-skills-ns!
-  "Expose the skill registry + dispatch as 'skills namespace in SCI.
+  "Expose the skill registry + dispatch as the `dvergr.skills` namespace in SCI.
 
    Usage:
-     (require '[skills])
-     (skills/all)                        ; every skill on disk
-     (skills/find :research)             ; skill maps providing :research
-     (skills/providers :research)        ; actor-ids that declare :research
-     (skills/rank :research)             ; ranked online providers
-     (skills/dispatch :research)         ; the single best provider (actor map or nil)"
+     (dvergr.skills/all)                 ; every skill on disk
+     (dvergr.skills/find :research)      ; skill maps providing :research
+     (dvergr.skills/providers :research) ; actor-ids that declare :research
+     (dvergr.skills/rank :research)      ; ranked online providers
+     (dvergr.skills/dispatch :research)  ; the single best provider (actor map or nil)"
   [sci-ctx conn & [effects]]
   (load/require! 'dvergr.orchestration.skills)
   (let [load-all*   @(ns-resolve 'dvergr.orchestration.skills 'load-all)

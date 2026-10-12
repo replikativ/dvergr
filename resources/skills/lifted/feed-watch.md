@@ -24,9 +24,9 @@ podcasts that publish to RSS.
 1. The user names the topic and (optionally) a feed list.
 2. Persist the watch via `(dvergr.scheduler/interval <interval-ms> ...)` so it
    keeps running between conversations.
-3. Each tick: `(intake.web/fetch feed-url)`, parse with
-   `clojure.xml`, filter items newer than last-seen, score by topic
-   match.
+3. Each tick: `(dvergr.intake.rss/fetch-feed feed-url)` (after
+   `(require '[dvergr.intake.rss])`; it parses RSS and Atom), filter
+   items newer than last-seen, score by topic match.
 4. Post a digest to the room when matches accumulate; otherwise
    stay silent.
 
