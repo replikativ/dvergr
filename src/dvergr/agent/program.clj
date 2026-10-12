@@ -12,6 +12,7 @@
    candidate when it starts (assembled prompt, tools, resolved model), which an
    experiment's resume compares per cell."
   (:require [dvergr.agent.roster :as roster]
+            [dvergr.sandbox.extensions :as extensions]
             [dvergr.agent.prompt :as prompt]
             [dvergr.agent.room-context :as room-context]
             [dvergr.agent.run :as run]
@@ -660,14 +661,18 @@
 
 (defn- llm-inputs
   "The `run-inputs` of an LLM Run that starts with `instructions`, offers
-   `tool-map`, calls the model `model-spec` and compacts with `compaction`
-   (a model spec, or nil)."
-  [instructions tool-map model-spec compaction]
+   `tool-map`, calls the model `model-spec`, compacts with `compaction` (a
+   model spec, or nil) and installs the sandbox extensions `sandbox` (the
+   AgentDef's `:sandbox` ids): what they resolve to in this process's
+   registry (`extensions/refs`), since a changed extension changes what the
+   candidate can call while its name, in the AgentDef, stays the same."
+  [instructions tool-map model-spec compaction sandbox]
   (cond-> {:inputs/kind :llm
            :prompt-id (prompt-id instructions)
            :tools (tool-inputs tool-map)
            :model (model-inputs model-spec)}
-    compaction (assoc :compaction (model-inputs compaction))))
+    compaction (assoc :compaction (model-inputs compaction))
+    (seq sandbox) (assoc :sandbox (extensions/refs sandbox))))
 
 (defn run-inputs
   "What a Run of `agent` will present to its candidate when it starts now,
@@ -675,7 +680,9 @@
    AgentDef or the EnvironmentDef, so not in an ExperimentDef's identity.
 
    - An LLM program: the assembled system prompt (by its `prompt-id`), the
-     tools offered (`tool-inputs`) and the resolved model (`model-inputs`).
+     tools offered (`tool-inputs`), the resolved model (`model-inputs`) and,
+     when its AgentDef names sandbox extensions, what they resolve to in the
+     process's extension registry (`extensions/refs`), which the Run installs.
    - A protocol (`protocol`, the environment's): its ref, the resolved model
      of the AgentDef's policy, and what the protocol's own `:inputs` says
      (`dvergr.agent.evaluation/make-protocol`).
@@ -703,7 +710,8 @@
      (= :llm (get-in agent [:agent/program :kind]))
      (let [tool-map (tools/normalize-tools (or (:agent/tools agent) #{}))]
        (let [spec (resolve-model-spec agent)]
-         (llm-inputs (llm-instructions agent tool-map) tool-map spec (compaction-spec agent spec))))
+         (llm-inputs (llm-instructions agent tool-map) tool-map spec (compaction-spec agent spec)
+                     (:agent/sandbox agent))))
 
      :else nil)))
 
@@ -915,7 +923,7 @@
                     ;; what the model is presented with: the system prompt it
                     ;; is sent (a resumed Run's is the one it started with)
                     compaction (compaction-spec agent model-spec)
-                    inputs (llm-inputs sent tool-map model-spec compaction)]
+                    inputs (llm-inputs sent tool-map model-spec compaction (:agent/sandbox agent))]
                 (update-llm-metrics!
                  supervisor
                  (constantly
