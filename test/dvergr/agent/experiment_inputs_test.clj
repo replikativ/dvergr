@@ -406,6 +406,41 @@
       (finally (paths/set-home! prev)))))
 
 (deftest a-tool-a-sandbox-registers-resolves-before-any-sandbox
-  ;; `llm_call` registers itself when its namespace loads, which building a
-  ;; sandbox does; resolving the name loads it first
-  (is (contains? (dvergr.tools/normalize-tools #{:llm_call}) "llm_call")))
+  ;; `llm_call` and the mail tools register themselves when their namespaces
+  ;; load, which building a sandbox does: resolving a name loads them first.
+  ;; A cold process is simulated: the tool is not registered until its
+  ;; namespace is (re)required.
+  (let [saved (get @dvergr.tools/registry "llm_call")
+        required (atom [])
+        require! dvergr.substrate.load/require!]
+    (try
+      (swap! dvergr.tools/registry dissoc "llm_call")
+      (with-redefs [dvergr.substrate.load/require!
+                    (fn [& args]
+                      (swap! required into (filter symbol? args))
+                      (when (some #{'dvergr.tools.llm-call} args)
+                        (swap! dvergr.tools/registry assoc "llm_call" saved))
+                      (apply require! args))]
+        (is (= #{"llm_call"} (set (keys (dvergr.tools/normalize-tools #{:llm_call})))))
+        (is (= #{'dvergr.tools.llm-call 'dvergr.intake.mail} (set @required))))
+      (finally (swap! dvergr.tools/registry assoc "llm_call" saved)))))
+
+(deftest a-cold-model-registry-is-read-only-once-loaded
+  ;; a caller that arrives while models.edn loads waits for the whole load
+  (let [loaded? @#'registry/models-loaded?
+        before @loaded?
+        started (promise)
+        release (promise)
+        load! @#'registry/load-models-resource!]
+    (try
+      (reset! loaded? false)
+      (with-redefs [registry/load-models-resource! (fn [] (deliver started true) @release (load!))]
+        (let [first-caller (future (registry/ensure-models-loaded!) :done)
+              _ (deref started 5000 nil)
+              second-caller (future (registry/ensure-models-loaded!) @loaded?)]
+          (Thread/sleep 200)
+          (is (not (realized? second-caller)) "the second caller waits for the load")
+          (deliver release true)
+          (is (= :done (deref first-caller 5000 nil)))
+          (is (true? (deref second-caller 5000 nil)) "and returns once it is complete")))
+      (finally (reset! loaded? (or before @loaded?))))))

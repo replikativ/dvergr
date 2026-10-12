@@ -631,17 +631,25 @@
         (load-models-from-edn (.getPath f))))))
 
 (defonce ^:private models-loaded? (atom false))
+(defonce ^:private models-lock (Object.))
 
 (defn ensure-models-loaded!
   "Idempotently load models.edn into the registry. The model dropdowns (web +
    TUI) and pricing read from the registry, which otherwise holds only the
    built-in `default-models` — so without this the UI would offer the wrong
    models (the Anthropic defaults) rather than the configured Fireworks set.
-   Cheap + safe to call on every dropdown render."
+   Cheap + safe to call on every dropdown render. A caller returns only once
+   the models, aliases and defaults are all in (a concurrent first caller
+   waits for the load): an experiment's prediction of a Run's inputs and the
+   Run itself must read the same registry. A load that fails is tried again
+   by the next caller."
   []
-  (when (compare-and-set! models-loaded? false true)
-    (try (load-models-resource!)
-         (catch Throwable _ (reset! models-loaded? false)))))
+  (when-not @models-loaded?
+    (locking models-lock
+      (when-not @models-loaded?
+        (try (load-models-resource!)
+             (reset! models-loaded? true)
+             (catch Throwable _ nil))))))
 
 (defn reset-to-defaults!
   "Reset the registry to default models only."
