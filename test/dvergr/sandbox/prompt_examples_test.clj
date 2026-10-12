@@ -288,60 +288,40 @@
       (map second (rest s))
       [(second s)])))
 
-(defn- children
-  "A schema form's children, without its properties map."
-  [form]
-  (let [cs (rest form)] (if (map? (first cs)) (rest cs) cs)))
+(def ^:private regex-types #{:cat :catn :alt :altn :? :* :+ :repeat})
 
-(defn- expansions
-  "The positional schemas a sequence (regex) schema `form` can match, as
-   vectors of at most `n` element schemas: `[:cat :string [:? :map]]` is
-   `[[:string] [:string :map]]`."
-  [form n]
-  (letfn [(seqs [forms]
-            (reduce (fn [acc f]
-                      (for [a acc b (expansions f (- n (count a)))
-                            :when (<= (+ (count a) (count b)) n)]
-                        (into a b)))
-                    [[]] forms))
-          (star [f lo hi]
-            (loop [k 0 acc #{[]} out (if (zero? lo) #{[]} #{})]
-              (if (or (>= k hi) (empty? acc))
-                out
-                (let [acc (set (for [a acc b (expansions f (- n (count a)))
-                                     :when (and (seq b) (<= (+ (count a) (count b)) n))]
-                                 (into a b)))
-                      k (inc k)]
-                  (recur k acc (cond-> out (>= k lo) (into acc)))))))]
-    (let [op (when (vector? form) (first form))]
-      (case op
-        (:cat) (seqs (children form))
-        (:catn) (seqs (map second (children form)))
-        (:alt) (mapcat #(expansions % n) (children form))
-        (:altn) (mapcat #(expansions (second %) n) (children form))
-        (:?) (cons [] (expansions (first (children form)) n))
-        (:*) (star (first (children form)) 0 n)
-        (:+) (star (first (children form)) 1 n)
-        (:repeat) (let [{:keys [min max] :or {min 0 max n}} (second form)]
-                    (star (last form) min (clojure.core/min max n)))
-        (if (pos? n) [[form]] [])))))
+(defn- unknown? [x] (= ::unknown x))
+
+(defn- relaxed
+  "`schema` that also accepts ::unknown wherever it takes a value (not a
+   sequence position), so code arguments can be validated around."
+  [schema]
+  (m/walk schema
+          (m/schema-walker
+           (fn [s]
+             (if (regex-types (m/type s))
+               s
+               (m/schema [:or [:fn unknown?] s]))))))
+
+(defn- as-value
+  "Argument form `x` as the value it evaluates to, with every part only known
+   at run time (a symbol, a call) as ::unknown: `{:task task}` is
+   `{:task ::unknown}`, `'[:find ?e]` is `[:find ?e]`."
+  [x]
+  (cond
+    (and (seq? x) (= 'quote (first x))) (second x)
+    (or (symbol? x) (seq? x)) ::unknown
+    (map? x) (into {} (map (fn [[k v]] [(as-value k) (as-value v)])) x)
+    (vector? x) (mapv as-value x)
+    (set? x) (set (map as-value x))
+    :else x))
 
 (defn- input-ok?
-  "Can arguments `args` (literal ones as given, symbols unknown) satisfy the
-   input schema `input`? Some way of matching `args` to the schema's positions
-   must accept every literal argument at its position; with every argument
-   literal, the schema itself decides."
+  "Can arguments `args` satisfy the input schema `input`? Every argument part
+   known from the text (literals, map keys and values, vector elements) is
+   checked where the schema puts it; parts known only at run time pass."
   [input args]
-  (let [n (count args)
-        lits (map literal? args)]
-    (if (every? true? lits)
-      (m/validate input (vec args))
-      (boolean
-       (some (fn [positions]
-               (and (= n (count positions))
-                    (every? (fn [[s a lit?]] (or (not lit?) (m/validate s a)))
-                            (map vector positions args lits))))
-             (expansions (m/form input) n))))))
+  (m/validate (relaxed input) (mapv as-value args)))
 
 (defn- referred-name
   "The qualified name of the injected fn `user` refers as `sym`, or nil."
@@ -389,10 +369,12 @@
    read, requires that throw, names that do not resolve, calls that would not
    run. With `prose?` (a docstring, where parentheses also hold prose such as
    `(done/found)`), only qualified names whose namespace is a sandbox one or
-   dotted are checked. The requires a text makes are undone afterwards, so
+   dotted, and unqualified calls to a fn of the doc's own `home-ns`, are
+   checked. The requires a text makes are undone afterwards, so
    one text's aliases never make another's examples pass."
-  [sci-ctx text & {:keys [prose?]}]
-  (let [user (get-in @(:env sci-ctx) [:namespaces 'user])]
+  [sci-ctx text & {:keys [prose? home-ns]}]
+  (let [user (get-in @(:env sci-ctx) [:namespaces 'user])
+        home-names (set (filter symbol? (keys (get-in @(:env sci-ctx) [:namespaces home-ns]))))]
     (try
       (let [forms (forms-in text)
             registered (ns-malli/fn-schemas)
@@ -419,13 +401,15 @@
                               (str sym " does not resolve")))]
                 :when why]
             why)
-          (when-not prose?
-            (for [head (distinct (keep #(let [h (first %)] (when (simple-symbol? h) h))
-                                       (mapcat calls forms)))
-                  :when (not (or (placeholder? head) (bound head) (special-forms head)
-                                 (interop? head) (str/starts-with? (name head) "%")))
-                  :when (not (resolves? sci-ctx head))]
-              (str head " does not resolve")))
+          (for [head (distinct (keep #(let [h (first %)] (when (simple-symbol? h) h))
+                                     (mapcat calls forms)))
+                ;; in prose only a name the doc's own namespace has: a call
+                ;; written unqualified there does not resolve in `user`
+                :when (or (not prose?) (contains? home-names head))
+                :when (not (or (placeholder? head) (bound head) (special-forms head)
+                               (interop? head) (str/starts-with? (name head) "%")))
+                :when (not (resolves? sci-ctx head))]
+            (str head " does not resolve: qualify it or show its require"))
           (keep #(call-problem sci-ctx registered %) (distinct (mapcat calls forms))))))
       (finally
         (swap! (:env sci-ctx) assoc-in [:namespaces 'user] user)))))
@@ -454,6 +438,30 @@
         :when d]
     [(str ns-sym "/" sym) d]))
 
+(deftest the-check-catches-calls-that-would-throw
+  (with-agent-sandbox
+    (fn [sci-ctx]
+      (testing "each of these is reported"
+        (doseq [bad ["`(search/find \"x\")`"
+                     "`(dvergr.room/post! \"research\" \"found a lead\")`"
+                     "`(dvergr.room/post! room \"found a lead\")`"
+                     "`(dvergr.skills/find \"draft a brief\")`"
+                     "`(dvergr.tasks/complete! id)`"
+                     "`(d/q '[:find ?e :where [?e :a]] db)`"
+                     "`(require '[http])`"
+                     "`(babashka.http-client/get)`"
+                     "`(llm/summarize text {:max-tokens \"300\"})`"
+                     "`(dvergr.room/messages r :limit \"x\")`"
+                     "`(dvergr.agent/hire! team :a {:task task :resources [\"microUSD\" 1000]})`"
+                     "`(let [x (missing-fn)] x)`"
+                     "`(require '[dvergr.tasks :refer [complete!]]) (complete! id)`"
+                     "`(dvergr.intake.hn/search-stories \"x\")`"
+                     "`(dvergr.actors/spawn-agent! {:id <kw> :kind :external ...})`"
+                     "Use `(dvergr.tasks/complete! id)` here."]]
+          (is (seq (problems sci-ctx bad)) bad)))
+      (testing "an unqualified call in a docstring is checked against its own namespace"
+        (is (seq (problems sci-ctx "`(complete! id)`" :prose? true :home-ns 'dvergr.tasks)))))))
+
 (deftest the-sandbox-prompt-shows-calls-that-run
   (with-agent-sandbox
     (fn [sci-ctx]
@@ -476,7 +484,9 @@
         (doseq [[n d] (docstrings sci-ctx)]
           ;; its backticked code strictly, its bare calls as prose
           (is (empty? (problems sci-ctx d)) n)
-          (is (empty? (problems sci-ctx (str "`" (str/replace d "`" "") "`") :prose? true)) n))))))
+          (is (empty? (problems sci-ctx (str "`" (str/replace d "`" "") "`") :prose? true
+                                :home-ns (symbol (first (str/split n #"/")))))
+              n))))))
 
 (deftest the-guides-run-examples-run-in-a-room
   (testing "the `dvergr.agent` race and the `spindel.work` example evaluate as shown"
