@@ -201,7 +201,8 @@
    `:spend` it returns (`dvergr.agent.spend`) is the Attempt's bill on the
    receipt, else the Run's own metrics are. Model calls `observe` makes (a
    judge's, charged with `resource/charge-usage!`) are paid by the wallet the
-   Run was granted from: the experiment's cost, not the candidate's.
+   Run was granted from and recorded apart, as `:judge-spend` in the
+   receipt's metrics: the experiment's cost, not the candidate's.
    `verify` receives the EnvironmentDef plus that evidence and returns
    `{:checks {keyword boolean} :reward number}`,
    and optionally `:metrics`, a portable map of what it measured (the receipt
@@ -574,6 +575,10 @@
         ;; puts its provider's usage, folded by `spend`, under :spend.
         attempt-spend (or (:spend evidence)
                           (spend/of-metrics (:run/metrics result)))
+        ;; what judging the Attempt cost (the observation's model calls), kept
+        ;; apart: it is the experiment's cost, not the candidate's
+        judge-spend (when-let [calls (seq @(:calls judging))]
+                      (spend/total (map (fn [{:keys [model usage]}] (spend/of-usage model usage)) calls)))
         elapsed-ms (long (/ (- (System/nanoTime) started-nanos) 1000000))
         receipt
         (environment/make-attempt-receipt
@@ -590,6 +595,7 @@
                                           :timed-out? timeout?
                                           :verifier-trust (:tier evaluator)
                                           :spend attempt-spend)
+                             judge-spend (assoc :judge-spend judge-spend)
                              ;; what the verifier measured beside its checks
                              ;; (which cells mismatched, how many compared)
                              (seq verification) (assoc :verification verification)

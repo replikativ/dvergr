@@ -82,7 +82,12 @@
                      (kontor/account-ref (:source r)))))
             (is (= (kontor/account-ref (resource/run-wallet-id run-id))
                    (kontor/account-ref (:source (receipt [:protocol run-id]))))))
-          (is (= 99400M (usd room)) "three calls paid once each, the rest returned")))
+          (is (= 99400M (usd room)) "three calls paid once each, the rest returned")
+          (testing "the judge's spend is recorded on the receipt, apart from the Attempt's"
+            (let [metrics (get-in result [:attempt-receipt :attempt/metrics])]
+              (is (= 200 (get-in metrics [:judge-spend :microdollars])))
+              (is (= {:input 100 :output 50} (get-in metrics [:judge-spend :tokens])))
+              (is (not= 200 (get-in metrics [:spend :microdollars])))))))
       (finally
         (kontor-governance/ungovern! conn)
         (d/close-room! room)))))

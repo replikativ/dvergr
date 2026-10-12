@@ -301,7 +301,11 @@ observation makes, a judge's (a room workflow's `model-judge` in
 `dvergr.catalog.room`, tau2's NL-assertion judge), are paid by the wallet the
 candidate's Run was granted from, its parent Run's or else the control Room's,
 never by the candidate's own (scope `[:observe run-id]`). A wallet is charged
-only when it holds microdollars. Nested paid work stays closed
+only when it holds microdollars. Those calls are recorded, wallet or not, as
+`:judge-spend` in the receipt's metrics, apart from `:spend`: `report.md`
+lists them in a Judge table (list price and billed), `scorecard_detail` as
+`judge-spend` on each leaderboard row, and no candidate's cost per attempt or
+per pass includes them. Nested paid work stays closed
 (`:provider-effects? false` in `child-program-authority`): a provider's answer
 and its debit are still two writes.
 

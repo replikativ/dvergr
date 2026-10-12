@@ -218,10 +218,26 @@
                :checks       (:attempt/checks receipt)
                :verifier-trust (some-> (:verifier-trust metrics) name)
                :spend        (spend-data (:spend metrics))
-               :metrics      (dissoc metrics :spend)
+               ;; judging the Attempt: the experiment's cost, not in :spend
+               :judge-spend  (spend-data (:judge-spend metrics))
+               :metrics      (dissoc metrics :spend :judge-spend)
                :certified-at (:attempt/certified-at a)}
         full? (assoc :evidence (:attempt/evidence a)
                      :result (:attempt/result receipt))))))
+
+(defn- judge-spends
+  "`rows` (leaderboard rows) with `:judge-spend`, what judging each
+   candidate's Attempts among `entries` cost, where a judge recorded any."
+  [entries load-attempt rows]
+  (let [by-candidate (update-vals (group-by (comp kw->str :candidate/id) entries)
+                                  (fn [es] (keep #(some-> (load-attempt (:attempt/id %))
+                                                          :attempt/receipt :attempt/metrics :judge-spend)
+                                                 es)))]
+    (mapv (fn [row]
+            (if-let [spends (seq (get by-candidate (:candidate row)))]
+              (assoc row :judge-spend (spend-data (spend/total spends)))
+              row))
+          rows)))
 
 (defn- check-rates
   "Per candidate, the share of its Attempts that passed each check:
@@ -290,7 +306,9 @@
    then by cost per pass, with 95% intervals for the pass rate (Jeffreys) and
    the mean reward (`dvergr.agent.experiment.stats`). With `:full?`, also
    every cell, and with `:load-attempt` (id → certified Attempt) the pass rate
-   of every check per candidate; with `:compare?`, every candidate against
+   of every check per candidate and, where a judge model graded, what judging
+   its Attempts cost (`:judge-spend` on its row, apart from its `:spend`);
+   with `:compare?`, every candidate against
    `:baseline` (`comparison`) and the paired comparisons
    (`dvergr.catalog.report/paired`: exact McNemar per pair)."
   [sc & [{:keys [full? load-attempt compare? baseline]}]]
@@ -329,6 +347,9 @@
                                 :repetitions (:experiment/repetitions exp)}
                :leaderboard    rows
                :cells          (count (:scorecard/entries sc))}
+        ;; what judging each candidate's Attempts cost, beside (never in) its
+        ;; :spend and cost per pass: the experiment's cost
+        load-attempt (update :leaderboard (partial judge-spends (:scorecard/entries sc) load-attempt))
         load-attempt (assoc :check-rates (check-rates (:scorecard/entries sc) load-attempt)
                             ;; who vouches for the rewards: every tier among its Attempts
                             :verifier-trust (vec (distinct (keep #(some-> (load-attempt (:attempt/id %))
@@ -946,7 +967,9 @@
    :scorecard/detail
    {:doc (str "One Scorecard with every cell (candidate x environment x repetition: reward, pass, spend), each "
               "candidate's pass rate per check, and every candidate against a baseline: probability of a "
-              "higher / no-worse pass rate, paired reward difference, cost per pass saved. `paired`: the "
+              "higher / no-worse pass rate, paired reward difference, cost per pass saved. Where a judge model "
+              "graded, each leaderboard row's `judge-spend` is what judging that candidate cost: the experiment's "
+              "cost, in none of its `spend` or cost per pass. `paired`: the "
               "paired comparisons (each against `baseline`, else every pair, beyond five candidates each against the best): on the cases both have a verdict "
               "for, both passed / A only / B only / both failed, the exact McNemar p, Holm-adjusted, and a verdict.")
     :kind :read

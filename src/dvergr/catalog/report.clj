@@ -10,7 +10,8 @@
      disagree, the exact McNemar p and a verdict;
    - resources: per candidate, input and output tokens per attempt, the
      cached share of the input, median, p90, summed and wall-clock time,
-     and the total cost;
+     and the total cost; and when a judge model graded, the judge's cost
+     (list price and billed) apart, as the experiment's;
    - where candidates fail: per check, how often it failed;
    - which cases could not grade an answer, and why (certification);
    - when cells ran again because their inputs changed, a note saying how
@@ -38,7 +39,10 @@
 (defn rows
   "Per candidate: `{:candidate :n :passes :pass-rate :pass-interval :reward
    :reward-interval :notional-per-attempt :notional-per-pass :tokens-per-attempt
-   :median-seconds :failed-checks {check n}}` from a run result."
+   :median-seconds :failed-checks {check n} :judge-notional-total
+   :judge-billed-total}` from a run result. The judge totals (nil when no
+   receipt records a judge) are what judging the candidate's attempts cost:
+   in none of its own costs."
   [{:keys [scorecard receipts]}]
   (let [receipt-by-id (into {} (map (juxt :attempt/id identity)) receipts)]
     (vec
@@ -55,7 +59,11 @@
                  spans (keep (fn [r] (when-let [t0 (:attempt/started-at r)]
                                        [t0 (+ t0 (or (:attempt/elapsed-ms r) 0))]))
                              receipts)
-                 failed (frequencies (mapcat (fn [r] (keep (fn [[k v]] (when (false? v) k)) (:attempt/checks r))) receipts))]]
+                 failed (frequencies (mapcat (fn [r] (keep (fn [[k v]] (when (false? v) k)) (:attempt/checks r))) receipts))
+                 ;; judging the candidate's attempts: the experiment's cost,
+                 ;; never in the candidate's own
+                 judge (spend/total (keep #(get-in % [:attempt/metrics :judge-spend]) receipts))
+                 judged? (some #(get-in % [:attempt/metrics :judge-spend]) receipts)]]
        {:candidate cid :n n :passes passes
         :pass-rate (when (pos? n) (/ passes (double n)))
         :pass-interval (xstats/pass-rate-interval passes n)
@@ -76,7 +84,9 @@
         ;; first start to last end: with parallel cells less than the sum
         :wall-seconds (when (seq spans)
                         (/ (- (reduce max (map second spans)) (reduce min (map first spans))) 1000.0))
-        :failed-checks (into (sorted-map) failed)}))))
+        :failed-checks (into (sorted-map) failed)
+        :judge-notional-total (when judged? (spend/notional-microdollars judge))
+        :judge-billed-total (when judged? (:microdollars judge 0))}))))
 
 ;; ---------------------------------------------------------------------------
 ;; Paired comparisons
@@ -197,6 +207,27 @@
        "\n\"No detectable difference\" is not \"equal\": more cases, or cases where the candidates differ, can still "
        "separate them.\n"))))
 
+(defn- judge-markdown
+  "The judge's cost, when a judge model graded the attempts: per candidate
+   whose attempts it judged, at list price and as billed. It is the
+   experiment's cost, so no candidate's cost above includes it."
+  [rs]
+  (when (some :judge-notional-total rs)
+    (let [total #(reduce + 0 (keep % rs))]
+      (str "\n### Judge\n\n"
+           "What the judge model's calls cost, grading each candidate's attempts. Judging is the experiment's "
+           "cost: it is in no candidate's cost per attempt, per pass or total above.\n\n"
+           "| Candidate judged | Judge cost (list price) | Judge cost (billed) | Per attempt (list price) |\n"
+           "|---|---:|---:|---:|\n"
+           (str/join
+            (for [{:keys [candidate n judge-notional-total judge-billed-total]} rs
+                  :when judge-notional-total]
+              (format "| %s | %s | %s | %s |\n" (name candidate)
+                      (money judge-notional-total) (money judge-billed-total)
+                      (if (pos? n) (money (/ judge-notional-total n)) "–"))))
+           (format "| **judge, all** | %s | %s | |\n"
+                   (money (total :judge-notional-total)) (money (total :judge-billed-total)))))))
+
 (defn markdown
   "The pilot report: `title`, the run `result`, and optionally the bundle's
    `certification` (`dvergr.catalog.casepack`), a `note`, a `baseline`
@@ -244,6 +275,7 @@
      "Cached input is the share of input tokens read from the provider's cache (– where it was not recorded).\n"
      "\nCosts are at the models' list prices (what the same tokens cost through the API), whether or not "
      "a subscription paid for them.\n"
+     (judge-markdown rs)
      (when (seq checks)
        (str "\n## Where answers fail\n\n"
             "How often each check failed, of all attempts.\n\n"
