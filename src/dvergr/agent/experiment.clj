@@ -346,7 +346,7 @@
          ;; usable verdict.
          (let [a (:attempt result)
                result (cond-> result
-                        (and a (not= ::unpredicted predicted) (not= predicted (inputs-id a)))
+                        (and a (not= predicted (inputs-id a)))
                         (assoc :unpredicted? true))]
            (when (:unpredicted? result)
              (tel/log! {:level :warn :id ::inputs-not-predicted
@@ -846,7 +846,11 @@
    model alias; or an Attempt from before inputs ids were recorded) runs
    again, as a B-gate re-runs a spin whose captured environment changed. The
    old Attempts stay in the store and enter no Scorecard; the result's
-   `:stale-cells` counts the cells that run again for this reason.
+   `:stale-cells` counts the cells that run again for this reason. Resumed
+   or not, a cell whose Run records other inputs than computed for it
+   before the cells start is `:unpredicted?` and no Scorecard is persisted
+   (`:incomplete {:unpredicted n}`): every cell of a Scorecard was made with
+   exactly the inputs computed for it.
 
    With `:complete-only? true` no Scorecard is persisted while any cell's
    Attempt is not `:completed` (an infrastructure fault is not a verdict);
@@ -926,8 +930,8 @@
               (cell-evaluation-opts capabilities base-evaluation-opts
                                     definition)))
          ;; what each cell's candidate would be presented with now: a kept
-         ;; cell must have been made with exactly that
-         current (when resume? (current-inputs-ids team experiment protocols))
+         ;; cell must have been made with exactly that, and so must a new one
+         current (current-inputs-ids team experiment protocols)
          {:keys [done stale]} (if resume? (completed-cells room experiment current) {:done {} :stale #{}})
          _ (when (seq stale)
              (tel/log! {:level :info :id ::inputs-changed
@@ -949,8 +953,7 @@
                                        base-evaluation-opts experiment job on-result
                                        (boolean complete-only?) admit
                                        (get current [(get-in job [:candidate :candidate/id])
-                                                     (get-in job [:environment :environment/content-id])]
-                                            ::unpredicted)))
+                                                     (get-in job [:environment :environment/content-id])])))
                        (remove #(contains? done (cell-key %)) all-jobs))]
      (sp/spin
       (let [results (into (vec resumed)
@@ -964,11 +967,13 @@
           (throw (ex-info (str "Experiment cell failed: " (:error (first errors)))
                           {:type ::cell-failed :errors (mapv #(select-keys % [:experiment/job :error]) errors)})))
         (let [unfinished (count (remove #(and (:attempt %) (verdict? (:attempt %))) results))
-              ;; verdicts made with other inputs than their cell's predicted
-              unpredicted (count (filter #(and (:unpredicted? %) (verdict? (:attempt %))) results))
+              ;; Attempts made with other inputs than their cell's predicted
+              unpredicted (count (filter :unpredicted? results))
               scorecard (if (or (and (or complete-only? (seq refused)) (pos? unfinished))
                                 (pos? unpredicted))
-                          {:incomplete {:cells (+ unfinished unpredicted)
+                          {:incomplete {:cells (count (filter #(or (:unpredicted? %)
+                                                                   (not (and (:attempt %) (verdict? (:attempt %)))))
+                                                              results))
                                         :unpredicted unpredicted
                                         :refused (count refused)
                                         :errors (mapv (fn [{:keys [error] job :experiment/job}]

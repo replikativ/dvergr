@@ -261,7 +261,8 @@
         (with-model calls
           (try
             (binding [ec/*execution-context* (:ctx room)]
-              (let [spin (experiment/run room team definition evaluators {:resume? true :complete-only? true})
+              ;; not a resume: the prediction holds every cell all the same
+              (let [spin (experiment/run room team definition evaluators {:complete-only? true})
                     ;; predicted; now the prompt the Runs assemble differs
                     _ (alter-var-root #'dvergr.sandbox/sandbox-prompt-pointer (constantly (str pointer " (changed)")))
                     {:keys [scorecard results]} @spin]

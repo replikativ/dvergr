@@ -109,8 +109,17 @@
         attempts (keep :attempt (:results r))
         pilot? (fn [a] (contains? pilot [(get-in a [:attempt/receipt :attempt/metrics :experiment-candidate])
                                          (get-in a [:attempt/receipt :attempt/environment :environment/content-id])]))
-        done (frequencies (map #(get-in % [:attempt/receipt :attempt/metrics :experiment-candidate])
-                               (filter experiment/verdict? attempts)))
+        ;; a cell made with other inputs than predicted is no Scorecard's: it
+        ;; runs again, and measures nothing (its spend is kept, as a fault's)
+        done (frequencies (keep (fn [{:keys [attempt unpredicted?]}]
+                                  (when (and attempt (not unpredicted?) (experiment/verdict? attempt))
+                                    (get-in attempt [:attempt/receipt :attempt/metrics :experiment-candidate])))
+                                (:results r)))
+        pilot-receipts (vec (keep (fn [{:keys [attempt unpredicted?]}]
+                                    (when (and attempt (pilot? attempt))
+                                      (cond-> (:attempt/receipt attempt)
+                                        unpredicted? (assoc :unpredicted? true))))
+                                  (:results r)))
         per-candidate (* (count (get-in experiment [:experiment/dataset :dataset/environments]))
                          (:experiment/repetitions experiment))
         remaining (into {} (map (fn [c] [(:candidate/id c) (- per-candidate (get done (:candidate/id c) 0))]))
@@ -120,7 +129,7 @@
                                                          [:agent/program :budget-dollars])]
                                       [(:candidate/id c) (* 1e6 (double d))])))
                    (:experiment/candidates experiment))
-        est (preflight/estimate {:pilot-receipts (mapv :attempt/receipt (filter pilot? attempts))
+        est (preflight/estimate {:pilot-receipts pilot-receipts
                                  :remaining remaining :parallelism parallelism :cell-caps caps
                                  ;; the most drained window decides: rate of its provider
                                  :calibration (some->> (seq (keep subscription/points-per-token metered))
