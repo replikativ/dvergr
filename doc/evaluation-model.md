@@ -343,7 +343,12 @@ Refactor first. Each step keeps the suite green.
    - Environment protocols (`evaluation/make-protocol`): a Run hosts a
      trusted interaction in its world, under its own supervisor.
    - `experiment/run`: protocols, each Attempt's cell identity, `:resume?`,
-     `:complete-only?`.
+     `:complete-only?`. A resume keeps a cell only while its Attempt's inputs
+     id (`program/run-inputs`: what the Run resolved at its start and
+     presented to the candidate, the assembled system prompt, the tools
+     offered, the resolved model, a protocol's `:inputs`) equals the one the
+     cell would get now; stale cells re-run and their Attempts count in no
+     Scorecard (doc/benchmarks.md, "Resume and inputs ids").
    - `dvergr.benchmarks.tau2.provider`: world setup, conversation protocol,
      grader as Evaluator. `tx/run!` is `experiment/run`; the host runner
      (`tau2.runner/run!`) remains for unrecorded batches only. All four domains and all three candidates verified on it.

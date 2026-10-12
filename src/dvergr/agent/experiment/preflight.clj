@@ -40,9 +40,12 @@
   (:require [dvergr.agent.experiment :as experiment]))
 
 (defn- measured?
-  "Whether a pilot Attempt `receipt` measures its cell: it has a verdict."
+  "Whether a pilot Attempt `receipt` measures its cell: it has a verdict,
+   made with the inputs predicted for its cell (the runner marks one made
+   with others `:unpredicted?`: it runs again, like a fault)."
   [receipt]
-  (experiment/verdict? {:attempt/receipt receipt}))
+  (and (not (:unpredicted? receipt))
+       (experiment/verdict? {:attempt/receipt receipt})))
 
 (defn stratum
   "The default stratum of an environment ref: its id's namespace

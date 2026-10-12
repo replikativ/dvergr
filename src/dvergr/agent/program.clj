@@ -15,6 +15,7 @@
             [dvergr.chat.context :as chat-context]
             [dvergr.discourse :as d]
             [dvergr.model.providers :as providers]
+            [dvergr.model.registry :as registry]
             [dvergr.resource :as resource]
             [dvergr.room.store :as room-store]
             [dvergr.system.rooms :as system-rooms]
@@ -556,6 +557,150 @@
                       {:type ::no-provider
                        :agent/id (:agent/id agent)}))))
 
+(def ^:private llm-base-prompt
+  (str "You are a model inside the Dvergr harness. Dvergr owns "
+       "tools and the sandbox. Call only tools explicitly supplied "
+       "in this request; when none are supplied, answer directly. "
+       "Never request shell, grep, file, web, or other native "
+       "Codex tools unless Dvergr explicitly supplied that exact tool."))
+
+(defn llm-instructions
+  "The system prompt an LLM Run of `agent` starts with, assembled the way the
+   Run assembles it (`prompt/assemble-system-prompt`) for its `tool-map`: the
+   harness preamble, the agent's own prompt, skills, the tool-use guideline,
+   the sandbox pointer and the workspace guide of the bound context's
+   workspace. Reads that workspace (skills, AGENTS.md), so blocking work."
+  [agent tool-map]
+  (prompt/assemble-system-prompt
+   (str llm-base-prompt
+        (when-let [agent-prompt (:agent/prompt agent)]
+          (str "\n\n" agent-prompt)))
+   {:tools tool-map :isolation :sci :profile :workflow}))
+
+(defn prompt-id
+  "The content id of system prompt `instructions` (`:attempt/prompt-id`)."
+  [instructions]
+  (hasch/uuid [:dvergr/llm-system-prompt instructions]))
+
+(defn- model-inputs
+  "What the Run's model is, resolved now: the alias resolved to its registry
+   id, the provider, and the registry entry that shapes every request (API
+   type, quirks such as sampling defaults, output limit, context size,
+   capabilities, instruction role, reasoning efforts). Its prices and display
+   names are not in it: they change what a call costs or is called, not what
+   the model is asked. A models.dev refresh that changes a limit changes it."
+  [{:keys [provider model]}]
+  (registry/ensure-models-loaded!)
+  (let [id (when model (registry/resolve-alias model))
+        definition (when id (registry/get-model id))]
+    (merge (dissoc definition :id :name :pricing :list-price-of)
+           {:provider (or provider (:provider definition))
+            :model id})))
+
+(defn- tool-inputs
+  "The tools a model is offered, as it is offered them: each one's name,
+   description and input schema, in name order."
+  [tool-map]
+  (->> (vals tool-map)
+       (map (fn [{:keys [name description parameters]}]
+              {:name name :description description :parameters parameters}))
+       (sort-by :name)
+       vec))
+
+(defn- pin-model
+  "`agent` with its policy's model alias resolved: the model its Run calls
+   throughout, whatever the alias names later."
+  [agent]
+  (cond-> agent
+    (get-in agent [:agent/model-policy :model])
+    (update-in [:agent/model-policy :model] registry/resolve-alias)))
+
+(defn- model-entry-changed!
+  "When the registry entries of the models a Run calls (`specs`, nil for one
+   it does not call) are no longer the ones its inputs id was computed from
+   (`before`, their `model-inputs` then), the Run drops its inputs id and
+   says so (`:inputs-drifted?`): its model calls were not all shaped alike,
+   so no single id says what it was presented with, and it enters no
+   Scorecard (a resume runs its cell again)."
+  [supervisor run-id before specs]
+  (when (not= before (mapv #(some-> % model-inputs) specs))
+    (tel/log! {:level :warn :id ::model-entry-changed :data {:run/id run-id :models (mapv :model specs)}}
+              "A model's registry entry changed during the Run: it records no inputs id")
+    (update-llm-metrics! supervisor #(-> % (dissoc :inputs-id) (assoc :inputs-drifted? true)))))
+
+(defmacro ^:private with-model-entry-checked
+  "`body` (one or more model calls), then `model-entry-changed!`."
+  [supervisor run-id before specs & body]
+  `(try ~@body
+        (finally (model-entry-changed! ~supervisor ~run-id ~before ~specs))))
+
+(defn- compaction-spec
+  "The model an LLM Run of `agent` compacts its conversation with, resolved,
+   as `chat.agent/run-agent-turn!` picks it (`:compaction-model`, else the
+   registry default), or nil when it does not compact."
+  [agent model-spec]
+  (let [{:keys [auto-compact? compaction-model] :or {auto-compact? true}} (:agent/program agent)]
+    (when auto-compact?
+      {:model (registry/resolve-alias (or compaction-model
+                                          (registry/get-default :compaction-model)
+                                          "accounts/fireworks/models/minimax-m2p7"))
+       :provider (or (:provider model-spec) :fireworks)})))
+
+(defn- llm-inputs
+  "The `run-inputs` of an LLM Run that starts with `instructions`, offers
+   `tool-map`, calls the model `model-spec` and compacts with `compaction`
+   (a model spec, or nil)."
+  [instructions tool-map model-spec compaction]
+  (cond-> {:inputs/kind :llm
+           :prompt-id (prompt-id instructions)
+           :tools (tool-inputs tool-map)
+           :model (model-inputs model-spec)}
+    compaction (assoc :compaction (model-inputs compaction))))
+
+(defn run-inputs
+  "What a Run of `agent` will present to its candidate when it starts now,
+   as portable data: the inputs resolved at Run start that are not in the
+   AgentDef or the EnvironmentDef, so not in an ExperimentDef's identity.
+
+   - An LLM program: the assembled system prompt (by its `prompt-id`), the
+     tools offered (`tool-inputs`) and the resolved model (`model-inputs`).
+   - A protocol (`protocol`, the environment's): its ref, the resolved model
+     of the AgentDef's policy, and what the protocol's own `:inputs` says
+     (`dvergr.agent.evaluation/make-protocol`).
+   - Any other program: nil. A deterministic program (`:echo`, `:scripted`)
+     resolves nothing at Run start: everything it does is in its AgentDef.
+
+   The LLM case reads the bound context's workspace, as the Run reads its
+   world's (`llm-instructions`). `inputs-id` is its content id."
+  ([agent] (run-inputs agent nil))
+  ([agent protocol]
+   (cond
+     protocol
+     (let [agent (pin-model agent)]
+       (cond-> {:inputs/kind :protocol
+                :protocol (:ref protocol)
+                :model (model-inputs (:agent/model-policy agent))}
+         (:inputs protocol)
+         (assoc :protocol-inputs
+                (let [inputs ((:inputs protocol) agent)]
+                  (when-not (roster/data-value? inputs)
+                    (throw (ex-info "Protocol :inputs must return portable data"
+                                    {:type ::non-portable-protocol-inputs :protocol (:ref protocol)})))
+                  inputs))))
+
+     (= :llm (get-in agent [:agent/program :kind]))
+     (let [tool-map (tools/normalize-tools (or (:agent/tools agent) #{}))]
+       (let [spec (resolve-model-spec agent)]
+         (llm-inputs (llm-instructions agent tool-map) tool-map spec (compaction-spec agent spec))))
+
+     :else nil)))
+
+(defn inputs-id
+  "The content id of `run-inputs` (`:attempt/inputs-id`); nil for nil (a
+   deterministic program, which resolves nothing at Run start)."
+  [inputs]
+  (when (some? inputs) (hasch/uuid [:dvergr/run-inputs inputs])))
+
 (defn- new-llm-context
   [control-room work-room run-id agent budget-dollars chat-id supervisor]
   (let [system-id (room-context/room-system-id work-room)
@@ -696,7 +841,7 @@
    runs under a supervised worker; this Spin retains orchestration, activity
    correlation, cleanup, and cancellation in the Room's execution graph."
   [control-room work-room run-id chat-id agent task trigger supervisor limits]
-  (let [{:keys [max-model-steps budget-dollars auto-compact? compaction-model]
+  (let [{:keys [max-model-steps budget-dollars auto-compact?]
          :or {max-model-steps default-max-model-steps
               budget-dollars 1.0
               auto-compact? true}} (:agent/program agent)
@@ -733,31 +878,40 @@
                     {:keys [tool-map tool-ctx]}
                     (llm-tool-context control-room work-room chat-ctx agent run-id
                                       supervisor)
-                    model-spec (resolve-model-spec agent)
-                    instructions
-                    (prompt/assemble-system-prompt
-                     (str "You are a model inside the Dvergr harness. Dvergr owns "
-                          "tools and the sandbox. Call only tools explicitly supplied "
-                          "in this request; when none are supplied, answer directly. "
-                          "Never request shell, grep, file, web, or other native "
-                          "Codex tools unless Dvergr explicitly supplied that exact tool."
-                          (when-let [agent-prompt (:agent/prompt agent)]
-                            (str "\n\n" agent-prompt)))
-                     {:tools tool-map :isolation :sci :profile :workflow})]
+                    ;; every model step calls the model the inputs id names:
+                    ;; an alias re-registered mid-Run does not move it
+                    model-spec (let [spec (resolve-model-spec agent)]
+                                 (cond-> spec
+                                   (:model spec) (update :model registry/resolve-alias)))
+                    instructions (llm-instructions agent tool-map)
+                    ;; resuming: the conversation so far is the stopped Run's,
+                    ;; system prompt included
+                    resumed (when-let [{from-chat :chat} (::resume agent)]
+                              (chat-context/load-messages (some-> control-room :store :conn) from-chat))
+                    sent (if (::resume agent)
+                           (some (fn [m] (when (= :system (or (:message/role m) (:role m)))
+                                           (or (:message/content m) (:content m))))
+                                 resumed)
+                           instructions)
+                    ;; what the model is presented with: the system prompt it
+                    ;; is sent (a resumed Run's is the one it started with)
+                    compaction (compaction-spec agent model-spec)
+                    inputs (llm-inputs sent tool-map model-spec compaction)]
                 (update-llm-metrics!
                  supervisor
                  (constantly
                   (cond->
-                   {:prompt-id (hasch/uuid [:dvergr/llm-system-prompt instructions])
+                   {:prompt-id (:prompt-id inputs)
+                    ;; what this Run presented to its model, as `run-inputs`
+                    ;; predicts it: what a resume compares
+                    :inputs-id (inputs-id inputs)
                     :provider (:provider model-spec)
                     :model (:model model-spec)
                     :model-steps 0
                     :usage {}}
                     (seq limits) (assoc :limits effective-limits))))
-                (if-let [{from-chat :chat} (::resume agent)]
-                  ;; resuming: the conversation so far is the resumed Run's
-                  (chat-context/replace-messages!
-                   chat-ctx (chat-context/load-messages (some-> control-room :store :conn) from-chat))
+                (if (::resume agent)
+                  (chat-context/replace-messages! chat-ctx resumed)
                   (do (chat-context/add-message!
                        chat-ctx {:role :system :content instructions})
                       (chat-context/add-message!
@@ -765,6 +919,8 @@
                 {:chat-ctx chat-ctx
                  :tool-map tool-map
                  :tool-ctx tool-ctx
+                 :compaction compaction
+                 :model-inputs [(:model inputs) (:compaction inputs)]
                  :model-spec model-spec})))
            initialized (sp/await (worker-result-spin init-worker))]
        (when (or (= ::worker-cancelled initialized)
@@ -775,7 +931,7 @@
                          {:type ::runtime-initialization-failed
                           :agent/id (:agent/id agent)}
                          (::worker-error initialized))))
-       (let [{:keys [chat-ctx tool-map tool-ctx model-spec]} initialized
+       (let [{:keys [chat-ctx tool-map tool-ctx model-spec model-inputs compaction]} initialized
              posted (ratom/create-atom 0)]
          (loop [model-step (if-let [{:keys [step]} (::resume agent)] (inc step) 0)]
            (when (run/cancel-requested? run-id)
@@ -790,29 +946,31 @@
                               resource/*model-scope*
                               (some-> (resource/model-scope control-room run-id)
                                       (assoc :cancel? #(run/cancel-requested? run-id)))]
-                      (chat-agent/run-agent-turn!
-                       chat-ctx
-                       {:provider (:provider model-spec)
-                        :model (:model model-spec)
+                      (with-model-entry-checked supervisor run-id model-inputs [model-spec compaction]
+                        (chat-agent/run-agent-turn!
+                         chat-ctx
+                         {:provider (:provider model-spec)
+                          :model (:model model-spec)
                         ;; The SAME normalized map defines both the model schema
                         ;; and execute-side authority. Empty means no tools.
-                        :tools tool-map
-                        :tool-ctx tool-ctx
-                        :cancel? (turn/cancel?-fn
-                                  chat-ctx (:ctx work-room)
-                                  (fn [] (run/cancel-requested? run-id)))
-                        :auto-compact? auto-compact?
-                        :compaction-model compaction-model
+                          :tools tool-map
+                          :tool-ctx tool-ctx
+                          :cancel? (turn/cancel?-fn
+                                    chat-ctx (:ctx work-room)
+                                    (fn [] (run/cancel-requested? run-id)))
+                          :auto-compact? auto-compact?
+                          ;; the one its inputs id names
+                          :compaction-model (:model compaction)
                       ;; The existing single-exchange core still calls this
                       ;; trace field `turn-number`; semantically it is a model
                       ;; integration step, not a conversational turn.
-                        :turn-number model-step
-                        :run-id run-id
+                          :turn-number model-step
+                          :run-id run-id
                         ;; The world this Run works in, for an adapter whose
                         ;; model is an external agent (claude -p): it invokes
                         ;; that agent INTO this room over MCP.
-                        :model-opts {:room-id (let [id (:id work-room)]
-                                                (if (keyword? id) (subs (str id) 1) (str id)))}}))))
+                          :model-opts {:room-id (let [id (:id work-room)]
+                                                  (if (keyword? id) (subs (str id) 1) (str id)))}})))))
                  outcome (sp/await (worker-result-spin call))
                  budget (chat-context/get-budget chat-ctx)]
              (update-llm-metrics!
@@ -935,19 +1093,28 @@
          call (start-worker!
                supervisor
                (fn []
-                 (let [scope (some-> (resource/model-scope control-room run-id)
-                                     (assoc :cancel? #(run/cancel-requested? run-id)))]
-                   (binding [resource/*model-scope* scope
-                             chat-agent/*turn-failure* failure]
-                     ((:run protocol)
-                      {:control-room control-room
-                       :room work-room
-                       :run/id run-id
-                       :agent (dissoc agent ::limits ::protocol)
-                       :task task
-                       :limits (::limits agent)
-                       :model-scope scope
-                       :cancelled? (fn [] (run/cancel-requested? run-id))})))))
+                 (let [;; the model the inputs id names, resolved once
+                       pinned (pin-model (dissoc agent ::limits ::protocol))
+                       inputs (run-inputs pinned protocol)]
+                   ;; what the protocol presents, as `run-inputs` predicts it
+                   (update-llm-metrics!
+                    supervisor
+                    (constantly {:inputs-id (inputs-id inputs)}))
+                   (let [scope (some-> (resource/model-scope control-room run-id)
+                                       (assoc :cancel? #(run/cancel-requested? run-id)))]
+                     (binding [resource/*model-scope* scope
+                               chat-agent/*turn-failure* failure]
+                       (with-model-entry-checked supervisor run-id [(:model inputs)]
+                         [(:agent/model-policy pinned)]
+                         ((:run protocol)
+                          {:control-room control-room
+                           :room work-room
+                           :run/id run-id
+                           :agent pinned
+                           :task task
+                           :limits (::limits agent)
+                           :model-scope scope
+                           :cancelled? (fn [] (run/cancel-requested? run-id))})))))))
          outcome (sp/await (worker-result-spin call))]
      (cond
        (or (= ::worker-cancelled outcome)

@@ -310,6 +310,9 @@
     {:protocol
      (evaluation/make-protocol
       {:id :spreadsheetbench/read-write-submit :version version :basis basis :limit-keys #{:max-turns}
+       ;; what the candidate is presented with beyond its task: a resume
+       ;; re-runs cells made with another system prompt or tool schema
+       :inputs (fn [_agent] {:system-prompt system-prompt :tools tools})
        :run (fn [{:keys [agent environment cancelled? model-scope]}]
               (let [task (task-of by-id environment)
                     opts {:max-turns (get-in environment [:environment/limits :max-turns] 30)

@@ -93,6 +93,13 @@
    (evaluation/make-protocol
     {:id :bfcl/single-turn :version version :basis (basis)
      :limit-keys #{}
+     ;; what a Dvergr-harness candidate is told about its action space (the
+     ;; request and its tools are the task's): a resume re-runs cells made
+     ;; with another wording
+     :inputs (fn [agent]
+               (let [{kind :bfcl/harness repl-guidance :bfcl/repl-guidance} (:agent/metadata agent)]
+                 (when (= :dvergr kind)
+                   {:repl-guidance (get harness/repl-guidance (or repl-guidance :neutral))})))
      :run (fn [{:keys [room agent environment]}]
             (let [task (task-of tasks environment)
                   {:bfcl/keys [harness action-space repl-guidance parallel-tool-calls]}

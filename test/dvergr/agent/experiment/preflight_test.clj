@@ -126,3 +126,12 @@
         "the mean of the verdict cells only: a zero-cost fault would pull it down")
     (is (< (Math/abs (- 3000000.0 (get-in est [:candidates :c :list-microdollars :worst-seen]))) 1e-6))
     (is (= 1 (get-in est [:candidates :c :faulted :cells])))))
+
+(deftest unpredicted-pilot-cells-measure-nothing
+  ;; made with other inputs than predicted: no Scorecard's, so run again
+  (let [est (preflight/estimate {:pilot-receipts [(receipt :c 0.10 1000 1000)
+                                                  (assoc (receipt :c 0.90 9000 9000) :unpredicted? true)]
+                                 :remaining {:c 10}})]
+    (is (= 1 (get-in est [:candidates :c :pilot-cells])))
+    (is (< (Math/abs (- 1000000.0 (get-in est [:candidates :c :list-microdollars :expected]))) 1e-6))
+    (is (= 1 (get-in est [:candidates :c :faulted :cells])) "its spend is kept, as a fault's")))

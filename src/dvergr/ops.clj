@@ -617,7 +617,10 @@
    :experiment/progress
    {:doc (str "What the experiments in a room have done so far, from its store: per experiment and "
               "candidate the certified cells, verdicts, faults, mean reward, spend and failure causes, "
-              "and the Runs still running. The same while it runs and after.")
+              "and the Runs still running. The same while it runs and after. Cells count with the "
+              "inputs their candidate has now (system prompt, tools, resolved model): `inputs` says "
+              "how many cells ran again because they changed, how many await a re-run, and how many "
+              "earlier Attempts are superseded.")
     :kind :read
     :schema [:map [:room Room]]
     :impl (fn [daemon {:keys [room]}]
@@ -629,7 +632,10 @@
               "passed (95% interval), mean reward, cost per attempt and per pass at list price, tokens "
               "and time; which checks fail; for a case pack, which cases could not grade an answer. "
               "From the room's store: the Scorecard `scorecard`, else the newest of the ExperimentDef "
-              "`experiment`, else the room's newest; without a Scorecard, what it has certified so far. "
+              "`experiment`, else the room's newest made with the candidates' current inputs (a "
+              "Scorecard whose cells ran again because their system prompt, tools or resolved model "
+              "changed is superseded); without one, what it has certified so far, and `inputs`: how "
+              "many cells ran again or await a re-run for that reason. "
               "Paired comparisons: every pair of candidates (or each against `baseline`; beyond five "
               "candidates each against the best) on the cases both have a verdict for, with the exact "
               "McNemar p (Holm-adjusted) and a verdict; also as data in `paired`.")
@@ -1188,7 +1194,7 @@
              [:noise {:optional true} [:int {:min 0 :max 4 :description "kinds of noise in generated documents: 1 scan artefacts, 2 and an erratum, 3 and short names, 4 and retyped documents (wiki/v3; default 0)"}]]
              [:split {:optional true} [:enum {:description "dev (public, the default), test (held out: the host's key) or real (real corpora)"} "dev" "test" "real"]]
              [:repetitions {:optional true} [:int {:min 1 :max 10 :description "attempts per model (default 1)"}]]
-             [:experiment {:optional true} [:string {:description "a name for the experiment, kept: benchmarking again with the same name, workflow and models into the same room resumes it (cells with a verdict are kept, faulted ones run again); default a new one"}]]
+             [:experiment {:optional true} [:string {:description "a name for the experiment, kept: benchmarking again with the same name, workflow and models into the same room resumes it (cells with a verdict made with the current inputs are kept, the others run again); default a new one"}]]
              [:cases {:optional true} [:int {:min 1 :description "a dataset workflow's first N cases of a fixed shuffle (default all)"}]]
              [:case-ids {:optional true} [:vector {:description "instead of cases: the ids of the cases to run"} :string]]
              [:parallelism {:optional true} [:int {:min 1 :max 16 :description "attempts at a time (default 1)"}]]

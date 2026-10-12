@@ -15,8 +15,11 @@
    (`experiment-slug`): its Runs, Attempts (their exact payloads as blobs of
    the room's Datahike store) and Scorecard, as any daemon room keeps them.
    The report is read from there (the `experiment/report` op). Re-running
-   with the same home resumes: cells with a verdict are kept, faulted ones
-   run again, and a Scorecard is persisted only when every cell has one.
+   with the same home resumes: cells with a verdict made with the inputs
+   their candidate would be presented with now are kept (`experiment/run`:
+   the assembled system prompt, tools, resolved model), the others and the
+   faulted ones run again, and a Scorecard is persisted only when every
+   cell has one.
 
    Claude Code models (subscription via `claude -p`): the CLI can be pinned
    with `:claude-cli`, `:claude-env` adds CLI environment entries (see
@@ -106,8 +109,17 @@
         attempts (keep :attempt (:results r))
         pilot? (fn [a] (contains? pilot [(get-in a [:attempt/receipt :attempt/metrics :experiment-candidate])
                                          (get-in a [:attempt/receipt :attempt/environment :environment/content-id])]))
-        done (frequencies (map #(get-in % [:attempt/receipt :attempt/metrics :experiment-candidate])
-                               (filter experiment/verdict? attempts)))
+        ;; a cell made with other inputs than predicted is no Scorecard's: it
+        ;; runs again, and measures nothing (its spend is kept, as a fault's)
+        done (frequencies (keep (fn [{:keys [attempt unpredicted?]}]
+                                  (when (and attempt (not unpredicted?) (experiment/verdict? attempt))
+                                    (get-in attempt [:attempt/receipt :attempt/metrics :experiment-candidate])))
+                                (:results r)))
+        pilot-receipts (vec (keep (fn [{:keys [attempt unpredicted?]}]
+                                    (when (and attempt (pilot? attempt))
+                                      (cond-> (:attempt/receipt attempt)
+                                        unpredicted? (assoc :unpredicted? true))))
+                                  (:results r)))
         per-candidate (* (count (get-in experiment [:experiment/dataset :dataset/environments]))
                          (:experiment/repetitions experiment))
         remaining (into {} (map (fn [c] [(:candidate/id c) (- per-candidate (get done (:candidate/id c) 0))]))
@@ -117,7 +129,7 @@
                                                          [:agent/program :budget-dollars])]
                                       [(:candidate/id c) (* 1e6 (double d))])))
                    (:experiment/candidates experiment))
-        est (preflight/estimate {:pilot-receipts (mapv :attempt/receipt (filter pilot? attempts))
+        est (preflight/estimate {:pilot-receipts pilot-receipts
                                  :remaining remaining :parallelism parallelism :cell-caps caps
                                  ;; the most drained window decides: rate of its provider
                                  :calibration (some->> (seq (keep subscription/points-per-token metered))
@@ -346,9 +358,12 @@
 
 (defn experiment-slug
   "The slug of the room an ExperimentDef is kept in: its readable id (cut to
-   40 characters) and the start of its content id. A change of prompt, grader,
-   candidates or library versions is a new ExperimentDef, so a new room:
-   nothing resumes into another version's cells."
+   40 characters) and the start of its content id. A change of provider
+   prompt or grader version, candidates or library versions is a new
+   ExperimentDef, so a new room: nothing resumes into another version's
+   cells. What a Run resolves only when it starts (the assembled system
+   prompt, the tools, the model an alias names) changes no room: its cells
+   re-run in this one (`experiment/run`, inputs ids)."
   [experiment]
   (let [id (:experiment/id experiment)
         readable (slug-part (str (namespace id) "-" (name id)))
@@ -473,6 +488,9 @@
         ;; Detached evaluation cleanup of this operation is joined before the
         ;; call returns.
         cleanup-group (evaluation/cleanup-group)
+        ;; the cells made with other inputs when this call started (its
+        ;; first run, the pilot's when there is one): they run again
+        stale-cells (atom nil)
         run-once (fn run-once
                    ([] (run-once admit))
                    ([admit]
@@ -482,7 +500,9 @@
                     (let [spin (run-in room {:capabilities capabilities :team team :admit admit
                                              :experiment experiment-def :parallelism parallelism
                                              :cleanup-group cleanup-group :benchmark benchmark})]
-                      (binding [ec/*execution-context* (:ctx room)] @spin))))]
+                      (let [r (binding [ec/*execution-context* (:ctx room)] @spin)]
+                        (compare-and-set! stale-cells nil (:stale-cells r 0))
+                        r))))]
     (try
       (let [estimate (when-let [pf (:preflight opts)]
                        (run-preflight! {:preflight pf :experiment experiment-def :team team :metered metered
@@ -492,6 +512,7 @@
         ;; (or none) resumes from them
           (do (record-calibration! metered started-ms (:attempts (meta estimate)))
               {:dir dir :room slug :experiment-room room-id :experiment experiment-def
+               :stale-cells (or @stale-cells 0)
                :preflight estimate :stopped :over-budget})
           (let [result (loop [n 0]
                          (let [r (run-once)]
@@ -513,6 +534,9 @@
                 _ (record-calibration! metered started-ms ran)]
             {:dir dir :room slug :experiment-room room-id :experiment experiment-def
              :results (count (:results result)) :failed-cells failed-cells
+             ;; cells kept from an earlier run but made with other inputs
+             ;; (prompt text, tools, resolved model): run again
+             :stale-cells (or @stale-cells 0)
              ;; the receipts of the Attempts this invocation has (a report's
              ;; checks and times), by Attempt id
              :receipts (mapv (fn [a] (assoc (:attempt/receipt a) :attempt/id (:attempt/id a)))
@@ -529,16 +553,23 @@
              :scorecard (:scorecard result)
              ;; the report is the room's, read through the op every binding
              ;; uses (experiment_report): nothing beside the stores
-             :report (:markdown
-                      (try (op daemon :experiment/report
-                               (cond-> {:room slug :title title
-                                        :experiment (str (:experiment/content-id experiment-def))}
-                                 (:scorecard/content-id (:scorecard result))
-                                 (assoc :scorecard (str (:scorecard/content-id (:scorecard result))))))
-                           (catch Throwable e
-                             (tel/log! {:level :warn :id :experiment/report-failed
-                                        :data {:room slug :error (ex-message e)}})
-                             nil)))})))
+             :report (some->
+                      (:markdown
+                       (try (op daemon :experiment/report
+                                (cond-> {:room slug :title title
+                                         :experiment (str (:experiment/content-id experiment-def))}
+                                  (:scorecard/content-id (:scorecard result))
+                                  (assoc :scorecard (str (:scorecard/content-id (:scorecard result))))))
+                            (catch Throwable e
+                              (tel/log! {:level :warn :id :experiment/report-failed
+                                         :data {:room slug :error (ex-message e)}})
+                              nil)))
+                      (str (let [n (get-in result [:scorecard :incomplete :unpredicted] 0)]
+                             (when (pos? n)
+                               (str "\n**Unpredicted inputs:** " n " cell" (when (not= 1 n) "s")
+                                    " ran with other inputs than computed before they started (a world setup "
+                                    "that rewrites the workspace's skills or AGENTS.md?), so no Scorecard "
+                                    "takes them, and a resume runs them again.\n")))))})))
       (finally
         (try (evaluation/await-cleanups-for! room cleanup-group) (catch Throwable _ nil))))))
 
@@ -552,9 +583,10 @@
 
 (defn run!
   "Run (or resume) an experiment. Returns `{:dir :room :experiment-room
-   :experiment :results :failed-cells :scorecard :receipts :refused :preflight
-   :subscription :report}` (`:room` is the slug of the room that keeps it,
-   `:results` the number of cell results, `:receipts` the Attempts' receipts,
+   :experiment :results :failed-cells :stale-cells :scorecard :receipts :refused
+   :preflight :subscription :report}` (`:room` is the slug of the room that
+   keeps it, `:results` the number of cell results, `:stale-cells` the cells
+   an earlier run made with other inputs, which ran again, `:receipts` the Attempts' receipts,
    `:report` the `experiment/report` Markdown). A preflight stop returns
    `{:dir :room :experiment-room :experiment :preflight :stopped :over-budget}`.
 

@@ -281,7 +281,7 @@
         cs (mapcat :candidates xs)]
     (str "**Incomplete:** there is no Scorecard yet: " (reduce + 0 (map :verdicts cs)) " cells have a verdict and "
          (reduce + 0 (map :faults cs)) " faulted. Running the experiment again resumes it: cells with a "
-         "verdict are kept, faulted ones run again."
+         "verdict made with the current inputs are kept, the others run again."
          (when (seq cs)
            (str "\n\n| Candidate | Verdicts | Faults | Mean reward |\n|---|---:|---:|---:|\n"
                 (str/join (for [{:keys [verdicts faults reward-mean] cid :candidate/id} cs]
@@ -302,37 +302,78 @@
         ids (set (keep of-exp attempts))
         exp-id (if experiment-content-id
                  (some #(when (= (str experiment-content-id) (str %)) %) ids)
-                 (when (= 1 (count ids)) (first ids)))]
+                 (when (= 1 (count ids)) (first ids)))
+        ;; only what was made with the candidates' current inputs, as in a
+        ;; Scorecard
+        attempts (experiment/current-attempts (filter #(= exp-id (of-exp %)) attempts))]
     (when exp-id
       (paired-cells
        (for [a attempts
-             :when (= exp-id (of-exp a))
              :let [r (:attempt/receipt a) m (:attempt/metrics r)]]
          {:candidate/id (:experiment-candidate m)
           :environment {:environment/content-id (get-in r [:attempt/environment :environment/content-id])}
           :repetition (:experiment-repetition m)
           :attempt/id (:attempt/id a)
           :passed? (experiment/passed? r)})
-       (for [a attempts :when (= exp-id (of-exp a))]
+       (for [a attempts]
          (assoc (:attempt/receipt a) :attempt/id (:attempt/id a)))))))
+
+(defn inputs-note
+  "What the report says of cells run again because their inputs changed
+   (`experiment/inputs-changes`), or nil when none did."
+  [{:keys [rerun awaiting superseded]} superseded-scorecard?]
+  (when (or (pos? (or rerun 0)) (pos? (or awaiting 0)) superseded-scorecard?)
+    (str "**Inputs changed:** "
+         (when (pos? (or rerun 0))
+           (str rerun " cell" (when (not= 1 rerun) "s") " ran again because what the candidate was presented "
+                "with changed (its assembled system prompt, the tools offered, or the resolved model). "))
+         (when (pos? (or awaiting 0))
+           (str awaiting " cell" (when (not= 1 awaiting) "s") " made with earlier inputs "
+                (if (= 1 awaiting) "awaits" "await") " a re-run (running the experiment again does it). "))
+         (when superseded-scorecard?
+           "The Scorecard shown was made with inputs since superseded. ")
+         (when (pos? (or superseded 0))
+           (str "The " superseded " earlier Attempt" (when (not= 1 superseded) "s") " stay in the store and "
+                "count in no Scorecard, frontier or comparison here."))
+         "\n\n")))
 
 (defn room-report
   "The report of an experiment kept in `room`, from its store: the Scorecard
    `scorecard` (a content id), else the newest one of the ExperimentDef
-   `experiment` (a content id), else the room's newest. Its Attempts' receipts
-   are loaded from the store, and a room-workflow bundle's certification from
-   the room's workspace. Without a Scorecard, what the experiment has
-   certified so far. With `baseline` (a candidate id), the paired
-   comparisons are every candidate against it. Returns `{:scorecard
-   :experiment :complete :markdown :paired}`: `:paired` is the paired
-   comparisons as data (`paired`), over the Attempts certified so far while
-   there is no Scorecard."
+   `experiment` (a content id), else the room's newest; unless named, only a
+   Scorecard made with its candidates' current inputs
+   (`experiment/scorecard-current?`): one whose cells ran again because their
+   system prompt, tools or resolved model changed is superseded. Its Attempts'
+   receipts are loaded from the store, and a room-workflow bundle's
+   certification from the room's workspace. Without a Scorecard, what the
+   experiment has certified so far with the current inputs. With `baseline`
+   (a candidate id), the paired comparisons are every candidate against it.
+   Returns `{:scorecard :experiment :complete :markdown :paired :inputs}`:
+   `:paired` is the paired comparisons as data (`paired`), over the Attempts
+   certified so far while there is no Scorecard; `:inputs` is
+   `experiment/inputs-changes` of the experiment (cells re-run, awaiting a
+   re-run, superseded Attempts), also stated in the Markdown when any."
   [room {:keys [scorecard experiment title baseline]}]
-  (let [sc (if scorecard
+  (let [inputs-of (memoize #(experiment/inputs-of room %))
+        current? (fn [sc] (experiment/scorecard-current?
+                           sc (:current (inputs-of (get-in sc [:scorecard/experiment :experiment/content-id])))))
+        ;; unless one is named, the newest Scorecard made with the current
+        ;; inputs: one whose cells ran again with other inputs is superseded
+        sc (if scorecard
              (experiment/scorecard room scorecard)
-             (first (experiment/scorecards room (cond-> {:limit 1}
-                                                  experiment (assoc :experiment-content-id experiment)))))
+             (some #(when (current? %) %)
+                   (experiment/scorecards room (cond-> {:limit 1000}
+                                                 experiment (assoc :experiment-content-id experiment)))))
         exp (:scorecard/experiment sc)
+        ;; without a Scorecard or a named one: the room's only ExperimentDef
+        exp-id (or (:experiment/content-id exp) experiment
+                   (let [st (:store room)
+                         ids (when (satisfies? store/PAttemptStore st)
+                               (into #{} (keep #(get-in % [:attempt/receipt :attempt/metrics :experiment-content-id]))
+                                     (store/-list-attempts st (store/conversation-id room) {:limit 1000000})))]
+                     (when (= 1 (count ids)) (first ids))))
+        inputs (when exp-id (inputs-of exp-id))
+        inputs-text (when inputs (inputs-note inputs (boolean (and sc (not (current? sc))))))
         st (:store room)
         cid (store/conversation-id room)
         receipts (vec (keep (fn [{:attempt/keys [id]}]
@@ -348,6 +389,8 @@
      :experiment (some-> (or (:experiment/content-id exp) experiment) str)
      :complete (some? sc)
      :paired comparisons
+     :inputs (some-> inputs (dissoc :current))
      :markdown (markdown (cond-> {:title title :result {:scorecard sc :receipts receipts} :paired comparisons}
                            sc (assoc :certification (bundle-certification room exp))
-                           (nil? sc) (assoc :note (progress-note room experiment))))}))
+                           (and sc inputs-text) (assoc :note (str/trimr inputs-text))
+                           (nil? sc) (assoc :note (str inputs-text (progress-note room experiment)))))}))

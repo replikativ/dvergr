@@ -14,6 +14,7 @@
             [dvergr.discourse :as d]
             [dvergr.model.providers :as providers]
             [dvergr.resource :as resource]
+            [dvergr.sandbox]
             [dvergr.room.store :as room-store]
             [dvergr.room.store.datahike :as datahike-store]
             [kontor.governance :as kontor-governance]
@@ -47,6 +48,7 @@
   (let [room (durable-room :resume-room)
         seen (atom [])
         continued (atom [])
+        first-metrics (atom nil)
         continue-llm-run program/continue-llm-run]
     (try
       (binding [ec/*execution-context* (:ctx room)]
@@ -62,7 +64,7 @@
                                     (tool-step! chat-ctx 0))
                                 (throw (ex-info "the process stopped" {}))))]
                 (let [h (program/hire! room team :worker {:task "calculate"})]
-                  @h
+                  (reset! first-metrics (:run/metrics @h))
                   (program/run-id h)))
               old (run/run room first-run)
               data (run/savepoint old)]
@@ -75,6 +77,8 @@
           (testing "resuming: a new Run, caused by the old, continuing at step 1 with its conversation"
             (let [second-run
                   (with-redefs [providers/ensure-initialized! (constantly nil)
+                                ;; the harness prompt changed since the Run stopped
+                                dvergr.sandbox/sandbox-prompt-pointer "a newer sandbox prompt"
                                 ;; spindel's hydrate-into! starts the named continuation
                                 program/continue-llm-run
                                 (fn [run-id step value]
@@ -91,6 +95,9 @@
                           result @h]
                       (is (= :completed (:run/status result)))
                       (is (= "The result is 2." (:run/value result)))
+                      (is (= (select-keys @first-metrics [:prompt-id :inputs-id])
+                             (select-keys (:run/metrics result) [:prompt-id :inputs-id]))
+                          "it records the system prompt it continues with, the stopped Run's")
                       (program/run-id h)))]
               (is (= [1] (mapv :step @seen)) "the steps count on from the savepoint")
               (is (= 750000 (:budget (first @seen)))

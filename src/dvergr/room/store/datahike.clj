@@ -421,6 +421,7 @@
     :attempt/evidence-content-id :attempt/settlement-intent
     :attempt/microdollars :attempt/notional-microdollars
     :attempt/experiment-content-id :attempt/experiment-candidate
+    :attempt/inputs-id
     {:attempt/run [:run/id]}
     {:attempt/evidence-runs [:run/id]}
     {:attempt/evidence-messages [:message/id]}
@@ -526,6 +527,7 @@
                       :attempt.check/passed? passed?})
                    (:attempt/checks receipt))}
       (:prompt-id metrics) (assoc :attempt/prompt-id (:prompt-id metrics))
+      (:inputs-id metrics) (assoc :attempt/inputs-id (:inputs-id metrics))
       (:model-resolution metrics)
       (assoc :attempt/model-resolution (:model-resolution metrics))
       (:model-steps metrics) (assoc :attempt/model-steps (long (:model-steps metrics)))
@@ -610,7 +612,8 @@
                                      {:attempt/microdollars (get-in metrics [:spend :microdollars])
                                       :attempt/notional-microdollars (get-in metrics [:spend :notional-microdollars])
                                       :attempt/experiment-content-id (:experiment-content-id metrics)
-                                      :attempt/experiment-candidate (:experiment-candidate metrics)}
+                                      :attempt/experiment-candidate (:experiment-candidate metrics)
+                                      :attempt/inputs-id (:inputs-id metrics)}
                                      (keys entity)))]
           (when-not (= expected (get actual k))
             (throw (ex-info "Attempt typed projection differs from exact payload"
