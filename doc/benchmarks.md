@@ -112,7 +112,7 @@ ExperimentDef. Each Attempt records them as its inputs id (`:attempt/inputs-id`,
 
 | Candidate | In the inputs id |
 |---|---|
-| LLM program | the assembled system prompt (its prompt id: harness preamble, the agent's prompt, the skills eligible in the world's workspace, the tool-use guideline, the sandbox pointer, the workspace's AGENTS.md); the tools offered, each one's name, description and input schema (a Claude Code candidate is offered the same tools over MCP); the model: its alias resolved, provider, and the registry entry that shapes each request (API type, quirks such as sampling defaults, output limit, context size, capabilities, instruction role, reasoning efforts) |
+| LLM program | the assembled system prompt (its prompt id: harness preamble, the agent's prompt, the skills eligible in the world's workspace, the tool-use guideline, the sandbox pointer, the workspace's AGENTS.md); the tools offered, each one's name, description and input schema (a Claude Code candidate is offered the same tools over MCP); the model: its alias resolved, provider, and the registry entry that shapes each request (API type, quirks such as sampling defaults, output limit, context size, capabilities, instruction role, reasoning efforts), and the compaction model likewise when the program compacts; the Run calls those models throughout, and one whose registry entry changes while it runs records no inputs id (`:inputs-drifted?`) |
 | Protocol | the protocol's ref, the resolved model of the AgentDef's policy, and what the protocol's own `:inputs` (`evaluation/make-protocol`) says it assembles |
 | `:echo`, `:scripted` | nothing (nil): a deterministic program resolves nothing |
 

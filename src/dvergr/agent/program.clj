@@ -616,31 +616,46 @@
     (update-in [:agent/model-policy :model] registry/resolve-alias)))
 
 (defn- model-entry-changed!
-  "When the registry entry of the model a Run calls is no longer the one its
-   inputs id was computed from (`model-inputs` then, `before`), the Run drops
-   its inputs id and says so (`:inputs-drifted?`): its model calls were not all shaped alike, so no single id
-   says what it was presented with, and it enters no Scorecard (a resume runs
-   its cell again)."
-  [supervisor run-id before model-spec]
-  (when (and before (not= before (model-inputs model-spec)))
-    (tel/log! {:level :warn :id ::model-entry-changed :data {:run/id run-id :model (:model model-spec)}}
-              "The model's registry entry changed during the Run: it records no inputs id")
+  "When the registry entries of the models a Run calls (`specs`, nil for one
+   it does not call) are no longer the ones its inputs id was computed from
+   (`before`, their `model-inputs` then), the Run drops its inputs id and
+   says so (`:inputs-drifted?`): its model calls were not all shaped alike,
+   so no single id says what it was presented with, and it enters no
+   Scorecard (a resume runs its cell again)."
+  [supervisor run-id before specs]
+  (when (not= before (mapv #(some-> % model-inputs) specs))
+    (tel/log! {:level :warn :id ::model-entry-changed :data {:run/id run-id :models (mapv :model specs)}}
+              "A model's registry entry changed during the Run: it records no inputs id")
     (update-llm-metrics! supervisor #(-> % (dissoc :inputs-id) (assoc :inputs-drifted? true)))))
 
 (defmacro ^:private with-model-entry-checked
   "`body` (one or more model calls), then `model-entry-changed!`."
-  [supervisor run-id before model-spec & body]
+  [supervisor run-id before specs & body]
   `(try ~@body
-        (finally (model-entry-changed! ~supervisor ~run-id ~before ~model-spec))))
+        (finally (model-entry-changed! ~supervisor ~run-id ~before ~specs))))
+
+(defn- compaction-spec
+  "The model an LLM Run of `agent` compacts its conversation with, resolved,
+   as `chat.agent/run-agent-turn!` picks it (`:compaction-model`, else the
+   registry default), or nil when it does not compact."
+  [agent model-spec]
+  (let [{:keys [auto-compact? compaction-model] :or {auto-compact? true}} (:agent/program agent)]
+    (when auto-compact?
+      {:model (registry/resolve-alias (or compaction-model
+                                          (registry/get-default :compaction-model)
+                                          "accounts/fireworks/models/minimax-m2p7"))
+       :provider (or (:provider model-spec) :fireworks)})))
 
 (defn- llm-inputs
   "The `run-inputs` of an LLM Run that starts with `instructions`, offers
-   `tool-map` and calls the model `model-spec`."
-  [instructions tool-map model-spec]
-  {:inputs/kind :llm
-   :prompt-id (prompt-id instructions)
-   :tools (tool-inputs tool-map)
-   :model (model-inputs model-spec)})
+   `tool-map`, calls the model `model-spec` and compacts with `compaction`
+   (a model spec, or nil)."
+  [instructions tool-map model-spec compaction]
+  (cond-> {:inputs/kind :llm
+           :prompt-id (prompt-id instructions)
+           :tools (tool-inputs tool-map)
+           :model (model-inputs model-spec)}
+    compaction (assoc :compaction (model-inputs compaction))))
 
 (defn run-inputs
   "What a Run of `agent` will present to its candidate when it starts now,
@@ -675,7 +690,8 @@
 
      (= :llm (get-in agent [:agent/program :kind]))
      (let [tool-map (tools/normalize-tools (or (:agent/tools agent) #{}))]
-       (llm-inputs (llm-instructions agent tool-map) tool-map (resolve-model-spec agent)))
+       (let [spec (resolve-model-spec agent)]
+         (llm-inputs (llm-instructions agent tool-map) tool-map spec (compaction-spec agent spec))))
 
      :else nil)))
 
@@ -825,7 +841,7 @@
    runs under a supervised worker; this Spin retains orchestration, activity
    correlation, cleanup, and cancellation in the Room's execution graph."
   [control-room work-room run-id chat-id agent task trigger supervisor limits]
-  (let [{:keys [max-model-steps budget-dollars auto-compact? compaction-model]
+  (let [{:keys [max-model-steps budget-dollars auto-compact?]
          :or {max-model-steps default-max-model-steps
               budget-dollars 1.0
               auto-compact? true}} (:agent/program agent)
@@ -879,7 +895,8 @@
                            instructions)
                     ;; what the model is presented with: the system prompt it
                     ;; is sent (a resumed Run's is the one it started with)
-                    inputs (llm-inputs sent tool-map model-spec)]
+                    compaction (compaction-spec agent model-spec)
+                    inputs (llm-inputs sent tool-map model-spec compaction)]
                 (update-llm-metrics!
                  supervisor
                  (constantly
@@ -902,7 +919,8 @@
                 {:chat-ctx chat-ctx
                  :tool-map tool-map
                  :tool-ctx tool-ctx
-                 :model-inputs (:model inputs)
+                 :compaction compaction
+                 :model-inputs [(:model inputs) (:compaction inputs)]
                  :model-spec model-spec})))
            initialized (sp/await (worker-result-spin init-worker))]
        (when (or (= ::worker-cancelled initialized)
@@ -913,7 +931,7 @@
                          {:type ::runtime-initialization-failed
                           :agent/id (:agent/id agent)}
                          (::worker-error initialized))))
-       (let [{:keys [chat-ctx tool-map tool-ctx model-spec model-inputs]} initialized
+       (let [{:keys [chat-ctx tool-map tool-ctx model-spec model-inputs compaction]} initialized
              posted (ratom/create-atom 0)]
          (loop [model-step (if-let [{:keys [step]} (::resume agent)] (inc step) 0)]
            (when (run/cancel-requested? run-id)
@@ -928,7 +946,7 @@
                               resource/*model-scope*
                               (some-> (resource/model-scope control-room run-id)
                                       (assoc :cancel? #(run/cancel-requested? run-id)))]
-                      (with-model-entry-checked supervisor run-id model-inputs model-spec
+                      (with-model-entry-checked supervisor run-id model-inputs [model-spec compaction]
                         (chat-agent/run-agent-turn!
                          chat-ctx
                          {:provider (:provider model-spec)
@@ -941,7 +959,8 @@
                                     chat-ctx (:ctx work-room)
                                     (fn [] (run/cancel-requested? run-id)))
                           :auto-compact? auto-compact?
-                          :compaction-model compaction-model
+                          ;; the one its inputs id names
+                          :compaction-model (:model compaction)
                       ;; The existing single-exchange core still calls this
                       ;; trace field `turn-number`; semantically it is a model
                       ;; integration step, not a conversational turn.
@@ -1085,8 +1104,8 @@
                                        (assoc :cancel? #(run/cancel-requested? run-id)))]
                      (binding [resource/*model-scope* scope
                                chat-agent/*turn-failure* failure]
-                       (with-model-entry-checked supervisor run-id (:model inputs)
-                         (:agent/model-policy pinned)
+                       (with-model-entry-checked supervisor run-id [(:model inputs)]
+                         [(:agent/model-policy pinned)]
                          ((:run protocol)
                           {:control-room control-room
                            :room work-room

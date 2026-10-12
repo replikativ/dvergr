@@ -335,3 +335,18 @@
                 (is (= #{:plain} cs) "the store's views score none of its cells"))))
           (finally
             (if before (swap! registry/registry assoc id before) (swap! registry/registry dissoc id))))))))
+
+(deftest the-compaction-model-is-an-input
+  (let [agent (-> (roster/make-roster {:id :inputs-test/compacting})
+                  (roster/make-agent {:id :c :model-policy {:provider :test :model "inputs-test-plain"}
+                                      :program {:kind :llm}})
+                  (roster/agent :c))
+        before (get @registry/defaults :compaction-model)
+        id #(with-redefs [providers/ensure-initialized! (constantly nil)]
+              (program/inputs-id (program/run-inputs agent)))]
+    (try
+      (swap! registry/defaults assoc :compaction-model "inputs-test-compactor-a")
+      (let [a (id)]
+        (swap! registry/defaults assoc :compaction-model "inputs-test-compactor-b")
+        (is (not= a (id)) "another default compaction model is other inputs"))
+      (finally (swap! registry/defaults assoc :compaction-model before)))))
