@@ -943,11 +943,11 @@
    {:doc (str "One Scorecard with every cell (candidate x environment x repetition: reward, pass, spend), each "
               "candidate's pass rate per check, and every candidate against a baseline: probability of a "
               "higher / no-worse pass rate, paired reward difference, cost per pass saved. `paired`: the "
-              "paired comparisons (every pair, or each against `baseline`): on the cases both have a verdict "
+              "paired comparisons (each against `baseline`, else every pair, beyond five candidates each against the best): on the cases both have a verdict "
               "for, both passed / A only / B only / both failed, the exact McNemar p, Holm-adjusted, and a verdict.")
     :kind :read
     :schema [:map [:room Room] [:id [:string {:description "scorecard content id"}]]
-             [:baseline {:optional true} [:string {:description "candidate to compare the others against (default: the top of the leaderboard for `comparison`; every pair for `paired`)"}]]]
+             [:baseline {:optional true} [:string {:description "candidate to compare the others against (default: the top of the leaderboard for `comparison`; for `paired` every pair, beyond five candidates each against the best)"}]]]
     :impl (fn [daemon {:keys [room id baseline]}]
             (when-let [r (resolve-room daemon room)]
               (in-ctx daemon

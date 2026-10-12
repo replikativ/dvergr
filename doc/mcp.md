@@ -68,12 +68,13 @@ paths are not the same measurement.
 
 **Over HTTP, without the relay.** Give the daemon `:mcp {:port 17888 :http {:port 17889}}` and
 it also serves Streamable HTTP at `http://127.0.0.1:17889/mcp` (loopback only). Requests need
-the bearer token the daemon writes to `$DVERGR_HOME/mcp/http-token` (mode 0600) on its first start.
+the bearer token the daemon writes to `mcp/http-token` in its state root (`$DVERGR_HOME`, default
+`.dvergr` in the directory it started in; mode 0600) on its first start.
 Claude Code:
 
 ```sh
 claude mcp add --transport http dvergr http://127.0.0.1:17889/mcp \
-  --header "Authorization: Bearer $(cat "$DVERGR_HOME/mcp/http-token")"
+  --header "Authorization: Bearer $(cat "${DVERGR_HOME:-.dvergr}/mcp/http-token")"
 ```
 
 or in `.mcp.json`:
@@ -144,11 +145,12 @@ around 40, and every definition costs context in every session.
 - **Results** are JSON text plus the same value as `structuredContent`; text beyond 60k
   characters is cut with a note (Claude Code caps a result at 25k tokens).
 - **A failure is an error.** An op that refuses or fails throws, and MCP returns it as a tool
-  error (`isError: true`) with its message, never as a success-shaped result. The JSON API
-  answers with the op's status: 400 for a request the caller can fix (an agent with a blank
-  id, a bad field value), 404 for an unknown room or agent, 409 for a taken agent id or a
-  write that met a concurrent change, 500 otherwise. `agent_delete` is idempotent: it answers
-  `{deleted: id}` whether or not the agent existed.
+  error (`isError: true`) with its message. The JSON API answers with the status the op gave
+  it: 400 for a request the caller can fix (an agent with a blank id, a bad field value), 404
+  for an unknown agent, or an unknown room in the agent, room file and `experiment_report`
+  ops, 409 for a taken agent id or a write that met a concurrent change; a failure without a
+  status is 500. Not every op checks its room: several reads answer null for an unknown one.
+  `agent_delete` is idempotent: it answers `{deleted: id}` whether or not the agent existed.
 - **Schemas** are flat and closed (`additionalProperties: false`, no `oneOf`/`anyOf`/`$ref`) and
   names match `^[a-z][a-z0-9_]{0,39}$`, so strict model APIs accept them; `server_test` checks
   every tool.
@@ -235,8 +237,9 @@ around 40, and every definition costs context in every session.
   paired comparisons (exact McNemar on the cases where two candidates differ, Holm-adjusted)
   are also in its result as `paired`. `scorecard_detail {room, id, baseline?}` returns one
   Scorecard as data: the leaderboard, every cell, the pass rate per check, `comparison`
-  (each candidate against `baseline`, default the top of the leaderboard) and `paired` (every
-  pair, or each against `baseline` when given).
+  (each candidate against `baseline`, default the top of the leaderboard) and `paired` (each
+  against `baseline` when given; else every pair, beyond five candidates each against the
+  best).
 - **Agents.** `agent_create` and `agent_update` take `tools`, a list of tool names (`[]` for
   none); an agent given `tools` gets exactly those, one without them gets the tools its tags
   choose.

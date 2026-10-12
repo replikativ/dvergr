@@ -64,7 +64,8 @@ and leaves a room for the tree.
 | **n** / **a** | tree | New room (asks for a slug) / new agent (asks for an id); Esc cancels the prompt |
 | **c** | tree | Chat with the selected agent |
 | **f** | tree | Fork the selected room (`:ctx` isolation) |
-| **m** / **x** | tree | Merge the selected fork into its parent / discard it (asks y / n) |
+| **m** | tree | Merge the selected fork into its parent: a `:ctx` fork at once (conflicting fields reconciled by an agent), a conversational fork after y / n |
+| **x** | tree | Discard the selected fork (asks y / n) |
 | **d** | tree | Archive the selected room |
 | **Enter** | room | Send the input line (a `/command` runs instead) |
 | **Esc** | room | Cancel the running turn; when none runs, back to the tree |
