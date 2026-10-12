@@ -25,7 +25,9 @@ Benchmarks for dvergr's evaluation path.
 This is its own artefact, `org.replikativ/dvergr-benchmarks`. The `dvergr` jar
 does not contain it. What stays in `dvergr` is what a benchmark is built
 *with*: `dvergr.agent.evaluation`, `environment`, `experiment`,
-`experiment.runner`, `verifiers`, `roster`. A benchmark of your own is a third
+`experiment.runner`, `verifiers` (a registry the providers register their
+capabilities in; nothing in `src/` reads it back yet, the providers pass the
+capabilities to `experiment/run` themselves), `roster`. A benchmark of your own is a third
 provider next to these, in your repo (the provider contract:
 doc/benchmarks.md, "What a benchmark brings").
 
@@ -35,6 +37,7 @@ doc/benchmarks.md, "What a benchmark brings").
 | `resources/` | tau2 tool schemas emitted by upstream; the pinned source snapshots of the coding fixtures |
 | `test/` | the equivalence digests and the provider tests; run with the suite (`clojure -M:test`) |
 | `dev/` | the Python oracles that run upstream's code; needed only to regenerate digests |
+| `reference/` | standalone scripts that run BIRD and SpreadsheetBench as their authors do, for the same cases a Dvergr experiment ran, and pair the two ([reference/README.md](reference/README.md)); on no classpath |
 
 Use:
 
@@ -59,7 +62,7 @@ Task data is not vendored. Tests that need it report as pending without it.
 | AutomationBench | `AUTOMATIONBENCH_ROOT`, default `~/.cache/dvergr-bench/automationbench`: `git clone https://github.com/zapier/AutomationBench`, check out `4a8e1061254004d9dac807054eed33fad7d1ff14`, then `uv sync && uv pip install --python .venv/bin/python time-machine` in it |
 | BIRD | `BIRD_ROOT`, default `~/.cache/dvergr-bench/bird/dev_20240627`: BIRD's `dev.zip` (https://bird-bench.github.io) unpacked, with `dev_databases.zip` unpacked in it |
 | SpreadsheetBench | `SPREADSHEETBENCH_ROOT`, default `~/.cache/dvergr-bench/spreadsheetbench/data/spreadsheetbench_verified_400`; experiments also need the oracle's certification at `~/.cache/dvergr-bench/spreadsheetbench/oracle-verified-400.edn`, written once with `(spit (spreadsheetbench.experiment/oracle-file) (pr-str (spreadsheetbench.oracle/report)))` |
-| Bank booking | none: the bundle and its DATEV export are in `examples/` |
+| Bank booking | none: the bundle is in `examples/workflows/bank-booking/`; its DATEV export is not checked in, and `bankbooking/write-example!` writes it (that bundle's README) |
 
 How to run one (aliases, credentials, a dedicated JVM, reading the report):
 [doc/running-benchmarks.md](../doc/running-benchmarks.md). Licences of the

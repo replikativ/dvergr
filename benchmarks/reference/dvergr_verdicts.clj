@@ -3,6 +3,10 @@
 ;; given to `run!`) and keeps, per case, the latest verdict of CANDIDATE; a case passes when
 ;; its reward is 1.0. The case id is the last part of the environment id
 ;; (:bird.<db>/q-<question-id>, :spreadsheetbench/t-<task-id>).
+;; It does not compare inputs ids (`:attempt/inputs-id`): when the candidate's system prompt,
+;; tools or resolved model changed and not every cell has run again, the latest Attempt of a
+;; case can be one made with the old inputs, which the experiment's Scorecard leaves out.
+;; Pair an experiment whose report has a Scorecard (no cells awaiting a re-run).
 ;;
 ;; Run from the repository root, in a JVM of its own (it opens the home):
 ;;   clojure -J-Xmx2g -M:benchmarks benchmarks/reference/dvergr_verdicts.clj DIR CANDIDATE OUT.json [ROOM]

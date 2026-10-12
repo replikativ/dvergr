@@ -2,7 +2,7 @@
   "AutomationBench experiments as certified Dvergr experiments
    (`dvergr.agent.experiment.runner`).
 
-     (run! {:dir \".dvergr/benchmarks/automationbench-smoke\"
+     (run! {:dir \"runs/automationbench-smoke\"
             :domains [\"sales\" \"finance\"] :sample 3
             :candidates [{:id :luna :model \"codex-subscription-luna\"}]})
 

@@ -183,6 +183,11 @@ the comparison raises on it for every answer.
 
 ## Paired tests (McNemar)
 
+Two candidates of one Dvergr experiment need none of these scripts: the experiment's report
+(`experiment_report`, `runner/report`) has a **Paired comparisons** table with the same
+exact McNemar test (Holm-adjusted across pairs; doc/running-benchmarks.md). The scripts are
+for pairing a Dvergr run with a run outside Dvergr, such as the reference setups here.
+
 Every comparison in the post is paired: two candidates on the same cases. For two verdict
 files, `mcnemar.py` counts b (A right, B wrong) and c (the reverse) and reports the exact
 two-sided binomial test of b against Binomial(b + c, 1/2):

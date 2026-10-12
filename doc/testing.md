@@ -5,6 +5,10 @@ The suite is one kaocha suite, `:unit` (tests.edn), over `test/` (dvergr) and
 provider calls) and `^:security-open` tests (sandbox escapes still open) are
 skipped by default.
 
+The MCP relay (`bin/dvergr-mcp`) is a babashka script, and its tests in
+`dvergr.mcp.smoke-test` skip (with a note) when `bb` is not on `PATH`; CI
+installs babashka 1.12.200 so they run there. Install `bb` to run them locally.
+
 ## Running tests locally
 
 ```bash

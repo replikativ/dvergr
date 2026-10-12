@@ -31,18 +31,21 @@ call.
 ## Layout
 
 ```
-dvergr.core              public facade (rooms, discourse, personas, proposals)
+dvergr.core              public facade (rooms, discourse, personas, Runs)
 dvergr.chat.agent        agent turn loop; dvergr.chat.context per-chat state
 dvergr.model.*           providers (api/{anthropic,openai,codex_subscription,claude_code}), gateway, registry
-dvergr.tools             tool registry + effects boundary (dvergr.agent.effects)
+dvergr.tools             tool registry; the effect boundary is dvergr.effects
 dvergr.agent.program     Runs: hire, supervisor, workers (blocking work off the engine)
 dvergr.agent.{evaluation,experiment,world,attempt,spend}   evaluation path
 dvergr.agent.experiment.runner   run!/run-in/open-home!: experiments in a home's rooms, resume
-dvergr.catalog.*         room workflows, case packs, wiki benchmark, report
+dvergr.catalog.*         room workflows, case packs (casepack-cli), room-run, wiki benchmark, report
 dvergr.mcp.*             MCP server (profiles; the `bench` profile has the catalog tools)
-benchmarks/              tau2, BFCL, BIRD, SpreadsheetBench, AutomationBench, CUAD, bank booking:
+benchmarks/              tau2, BFCL, BIRD, SpreadsheetBench, AutomationBench, bank booking:
                          a separate artefact (org.replikativ/dvergr-benchmarks), on the
-                         classpath with -A:benchmarks (included in :dev and :test)
+                         classpath with -A:benchmarks (included in :dev and :test);
+                         benchmarks/reference/ runs BIRD and SpreadsheetBench as their
+                         authors do (scripts, on no classpath)
+examples/workflows/      room workflow bundles: bank-booking, competitors, contract-review (CUAD)
 ```
 
 Tests: `clojure -M:test` (kaocha, both artefacts); one namespace with `--focus <ns>`. CI runs the
@@ -60,41 +63,61 @@ quirks; `resources/models.edn` adds Fireworks models, and `(registry/refresh-fro
   `codex-subscription-luna`, `codex-subscription-sol` (Codex, GPT-5.6), `codex-subscription-luna-6`,
   `codex-subscription-sol-6.1`, `codex-subscription-astra-6` (Codex, GPT-6/6.1), `claude-code-haiku`,
   `claude-code-sonnet`, `claude-code-opus` (Claude Code CLI).
-- Fireworks: `accounts/fireworks/models/minimax-m3` (default), `glm-5p3-flash`,
+- Fireworks: `accounts/fireworks/models/minimax-m3`, `glm-5p3-flash`,
   `deepseek-v4p1-flash`, `glm-5p3`, `kimi-k3`. Key: `OPENAI_API_KEY` +
-  `OPENAI_BASE_URL=https://api.fireworks.ai/inference/v1`, or `FIREWORKS_API_KEY`.
+  `OPENAI_BASE_URL=https://api.fireworks.ai/inference/v1`, or `FIREWORKS_API_KEY`. An agent
+  that pins no model and gets Fireworks as its provider runs `minimax-m2p7`
+  (`providers/default-spec`); the registry's `:compaction-model` default and the `minimax`
+  alias are `minimax-m3`.
 - API: `claude-sonnet-4-6`, `claude-opus-4-7`, `claude-haiku-4-5`, `gpt-5.6-*`.
 
 Claude Code CLI candidates call tools natively over MCP when they work in a room (room workflows;
 `room/experiment!` starts a headless daemon for them) and through a text tool protocol otherwise
 (protocol benchmarks such as BIRD and SpreadsheetBench). The Claude subscription's 7-day window is
-shared with interactive use: the runner stops admitting cells at 80 % (`:usage-pause-threshold`).
+shared with interactive use: the runner starts no new cell once a subscription window is 80 %
+used or the experiment has taken ten points of it (`:allowance`, default `{:share 0.10 :pause-at
+0.80}`; the result carries `:refused` and running again resumes). Separately, before each pass a
+Claude Code experiment waits while a window is at least `:usage-pause-threshold` (0.97) used.
 
 ## Running benchmarks
 
 - Each benchmark has `dvergr.benchmarks.<name>.experiment/run!`, or a room workflow
   (`clojure -M -m dvergr.catalog.room-run <bundle-dir> --models … --cases N --home DIR`). Both
-  keep the experiment in a room of a dvergr **home** (`:dir` / `--home`: system DB + the rooms'
-  stores, nothing else). `run!` is `runner/open-home!` (a headless daemon on that home, the
-  process's for the call) + `runner/run-in` + `runner/close-home!`: run it in its own JVM; in a
-  process with a daemon pass `:daemon` (and `:experiment-id`) and it uses that daemon's home.
-  `room-run` is a client of the MCP path: `room_write` the bundle, `catalog_benchmark`, `job_status`.
-- The experiment's room is one per ExperimentDef (`runner/experiment-slug`): running again on the
-  same home resumes in it: cells with a verdict are kept, faulted cells re-run (and once more
-  within the same run, `:fault-retries`). A provider prompt or grader version bump is a new
-  ExperimentDef, hence a new room. What a Run resolves only when it starts (the assembled system
-  prompt, e.g. the sandbox pointer; the tools offered; the model an alias names) is not in the
-  ExperimentDef: each Attempt records it as its inputs id (`program/run-inputs`), and a resume
-  keeps a cell only while its candidate would get the same inputs now; the others re-run, their
-  old Attempts stay in the store but count in no Scorecard (the report says how many re-ran).
-  Attempts from before inputs ids (LLM and protocol candidates) count as stale and re-run once.
-  An old-layout dir (`artifacts/`) is refused.
+  keep the experiment in a room of a dvergr **home** (`:dir` / `--home`): the system DB, the
+  rooms' stores and `home.edn` (room-run adds its log, `dvergr.log`). `run!` is
+  `runner/open-home!` (a headless daemon on that home, the process's for the call: no Telegram,
+  web or MCP listener, no agents, schedules suspended, no storage GC) + `runner/run-in` +
+  `runner/close-home!`: run it in its own JVM; in a process with a daemon pass `:daemon` (and
+  `:experiment-id`) and it uses that daemon's home. A moved home is adopted, a copied one
+  refused (`system.home/claim!`), and an old-layout dir (`artifacts/`) is refused.
+- `room-run` calls in process the ops an MCP client calls (`ops/invoke` on the home's daemon,
+  no MCP transport): `room_create` (once), `room_write` the bundle, `catalog_benchmark`, `job_status`
+  until settled, `experiment_report`.
+- Which room an experiment lives in depends on the path. `run!` keeps each ExperimentDef in a
+  room of its own (`runner/experiment-slug`: readable id + the start of its content id), so a
+  provider prompt or grader version bump is a new room. `room-run` keeps every version in the
+  one room `<bundle name>`, as the experiment named `<bundle name>`; `catalog_benchmark` keeps it
+  in its `room` (default: the new fixture room) under its `experiment` name (default: a fresh
+  one). A changed bundle or model list is a new ExperimentDef in that same room. The
+  `experiment` argument is a name in `catalog_benchmark`, but the ExperimentDef content id
+  (what `catalog_benchmark` returns as `experiment`) in `experiment_report`.
+- Running again on the same home (same experiment) resumes: cells with a verdict are kept,
+  faulted cells re-run (and once more within the same run, `:fault-retries`). What a Run
+  resolves only when it starts (the assembled system prompt, e.g. the sandbox pointer; the tools
+  offered; the model an alias names) is not in the ExperimentDef: each Attempt records it as its
+  inputs id (`program/run-inputs`), and a resume keeps a cell only while its candidate would
+  get the same inputs now; the others re-run, their old Attempts stay in the store but count in
+  no Scorecard (the report says how many re-ran). Attempts from before inputs ids (LLM and
+  protocol candidates) count as stale and re-run once.
 - The report is the room's, read through the `experiment_report` op (`runner/report dir`, the
   result's `:report`, `room-run` prints it or writes `--report FILE`): frontier with 95 %
-  intervals, failed checks, tokens (input incl. cached, output), median/p90/summed/wall time,
-  list-price cost. `runner/progress dir` and `runner/open-experiment` read a home back.
+  intervals, resources (tokens: input incl. cached, output; median/p90/summed/wall time;
+  list-price cost), paired comparisons, failed checks. `runner/progress dir` and
+  `runner/open-experiment` read a home back.
 - Tune on the `:dev` split, report on `:eval`, and confirm a tuned change on questions not used
-  for tuning. Compare candidates paired (same cases).
+  for tuning. To compare candidates, read the report's Paired comparisons (exact McNemar on the
+  cases where two candidates differ, Holm-adjusted; `baseline` picks the one to compare
+  against); `doc/running-benchmarks.md` explains the table.
 - One experiment JVM at a time on this machine, with an `-Xmx` cap.
 
 ## Spindel (the FRP runtime)
@@ -119,8 +142,10 @@ Rules:
    REPL/test/host boundary.
 2. **Never block inside a spin body.** Await continuations and deferred deliveries resume inline on
    the context's single drain thread, so blocking I/O there stalls every spin of the context. Run
-   blocking work on embedder threads that talk back only through `sp/deliver!`: in dvergr,
-   `program/start-worker!` (supervised); in spindel, `org.replikativ.spindel.blocking/blocking`.
+   blocking work on embedder threads that talk back only through `sp/deliver!`, or wrap it in
+   `org.replikativ.spindel.blocking/blocking` (a Spin of `(f)` run on a worker thread; await
+   it), as dvergr's evaluation and Run code does. A Run's own native work goes through the
+   supervised workers of `dvergr.agent.program` (`start-worker!`, private to that namespace).
    Engine threads are never interrupt targets; cancel through the engine (`cancel-spin!`, `race`,
    `timeout`).
 3. **Bind `*execution-context*`** where spins are created; evaluate a room's work in the room's

@@ -71,14 +71,21 @@
                           nesting. Defaults to the global room (boardroom)
                           unless the room being created IS the global room.
                           Pass false to opt out.
-     :ctx              - Execution context for the discourse Room
-                          (default: current bound ctx)
+     :ctx              - Execution context the room is provisioned in
+                          (default: current bound ctx); the discourse Room
+                          itself runs on the room's own ctx from
+                          provisioning, never on this one
      :repo-source      - Local checkout or Git URL the room's repository is
                           cloned from (default: the sandbox stdlib);
                           :repo-branch picks a local checkout's branch
 
    Returns the room-id (slug keyword) of the created room. Callers who need the
-   discourse Room can look it up via `(dvergr.room.registry/lookup room-id)`."
+   discourse Room can look it up via `(dvergr.room.registry/lookup room-id)`.
+
+   Throws when there is no execution context (none given, none bound), when
+   provisioning fails (e.g. the repository cannot be cloned), or when the
+   provisioned room has no execution context or messages store: a room that
+   cannot be provisioned is never returned half made."
   [{:keys [title slug type telegram-chat-id agent-ids parent-id ctx repo-source repo-branch]
     :or   {parent-id :default}}]
   (let [ctx (or ctx (try (ec/current-execution-context) (catch Throwable _ nil)))

@@ -13,8 +13,11 @@
    headless daemon, creates the room <bundle name> there (once), writes the
    bundle into its workspace as workflows/<bundle name>/ (`room_write`), and
    runs `catalog_benchmark` into that room as the experiment <bundle name>.
-   Running again resumes it: cells with a verdict are kept, faulted ones run
-   again. The Scorecard is printed (billed and list-price cost) and the
+   Running again resumes it: cells with a verdict made with the current
+   inputs (system prompt, tools, resolved model) are kept, the others and
+   the faulted ones run again; a changed bundle or model list is a new
+   experiment in the same room. The ops are called in process
+   (`dvergr.ops/invoke` on the home's daemon), not over an MCP transport. The Scorecard is printed (billed and list-price cost) and the
    report (`experiment_report`) printed to stdout, or written to `--report
    FILE`; the exit code is 1 when cells did not finish. stdout has progress
    lines and the report; the log goes to <home>/dvergr.log. Nothing is

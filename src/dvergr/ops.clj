@@ -943,11 +943,11 @@
    {:doc (str "One Scorecard with every cell (candidate x environment x repetition: reward, pass, spend), each "
               "candidate's pass rate per check, and every candidate against a baseline: probability of a "
               "higher / no-worse pass rate, paired reward difference, cost per pass saved. `paired`: the "
-              "paired comparisons (every pair, or each against `baseline`): on the cases both have a verdict "
+              "paired comparisons (each against `baseline`, else every pair, beyond five candidates each against the best): on the cases both have a verdict "
               "for, both passed / A only / B only / both failed, the exact McNemar p, Holm-adjusted, and a verdict.")
     :kind :read
     :schema [:map [:room Room] [:id [:string {:description "scorecard content id"}]]
-             [:baseline {:optional true} [:string {:description "candidate to compare the others against (default: the top of the leaderboard)"}]]]
+             [:baseline {:optional true} [:string {:description "candidate to compare the others against (default: the top of the leaderboard for `comparison`; for `paired` every pair, beyond five candidates each against the best)"}]]]
     :impl (fn [daemon {:keys [room id baseline]}]
             (when-let [r (resolve-room daemon room)]
               (in-ctx daemon
@@ -1187,14 +1187,14 @@
     :schema [:map
              [:workflow [:string {:description "catalog workflow id, e.g. wiki/v2"}]]
              [:models [:vector {:description "model ids or aliases"} :string]]
-             [:room {:optional true} [:string {:description "room id or slug that keeps the results (default: the new fixture room)"}]]
+             [:room {:optional true} [:string {:description "room id or slug that keeps the results (default: the new fixture room, so nothing resumes)"}]]
              [:environments {:optional true} [:int {:min 1 :max 50 :description "generated worlds, for workflows that generate them (wiki/v3; default 6)"}]]
              [:scale {:optional true} [:int {:min 1 :max 10 :description "documents per generated world, as a multiple (wiki/v3; default 1 = twelve documents)"}]]
              [:prose {:optional true} [:int {:min 0 :max 20 :description "paragraphs of routine text per generated document (wiki/v3; default 0)"}]]
              [:noise {:optional true} [:int {:min 0 :max 4 :description "kinds of noise in generated documents: 1 scan artefacts, 2 and an erratum, 3 and short names, 4 and retyped documents (wiki/v3; default 0)"}]]
              [:split {:optional true} [:enum {:description "dev (public, the default), test (held out: the host's key) or real (real corpora)"} "dev" "test" "real"]]
              [:repetitions {:optional true} [:int {:min 1 :max 10 :description "attempts per model (default 1)"}]]
-             [:experiment {:optional true} [:string {:description "a name for the experiment, kept: benchmarking again with the same name, workflow and models into the same room resumes it (cells with a verdict made with the current inputs are kept, the others run again); default a new one"}]]
+             [:experiment {:optional true} [:string {:description "a name for the experiment, kept: benchmarking again with the same name, workflow and models into the same room resumes it (cells with a verdict made with the current inputs are kept, the others run again); default a new one. The job returns the ExperimentDef content id as `experiment`: that id, not this name, is what experiment_report takes"}]]
              [:cases {:optional true} [:int {:min 1 :description "a dataset workflow's first N cases of a fixed shuffle (default all)"}]]
              [:case-ids {:optional true} [:vector {:description "instead of cases: the ids of the cases to run"} :string]]
              [:parallelism {:optional true} [:int {:min 1 :max 16 :description "attempts at a time (default 1)"}]]
@@ -1326,10 +1326,13 @@
    {:doc (str "Write files into a room's workspace as ONE commit of its repository: `files` maps a path "
               "(e.g. data/cases.csv) to {text} (UTF-8) or {base64} (binary, e.g. .xlsx), or to null to "
               "remove the file. Only these paths are committed; writing what is already there commits "
-              "nothing (commit null). Paths stay in the workspace: no '..', nothing under .git. At most "
+              "nothing (commit null). Paths stay in the workspace: no '..', nothing under .git, no "
+              "sensitive file (the sandbox's sensitive-path policy). At most "
               room-files/max-batch-files " paths and " (quot room-files/max-batch-bytes (* 1024 1024)) " MiB per call, "
               (quot room-files/max-file-bytes (* 1024 1024)) " MiB per file. It is all or nothing: a "
-              "refused or failed write undoes the batch. Refused while the workspace has staged "
+              "refused or failed write undoes the batch's changes and commits nothing; a path another "
+              "writer changed since the batch wrote it is left as they made it and named in the error "
+              "(conflicted). Refused while the workspace has staged "
               "changes, and for a path that is a symbolic link. A read-only world refuses it. "
               "History is the room's: room_fork to try changes, room_diff/room_merge to adopt them.")
     :kind :write
@@ -1385,7 +1388,9 @@
               (in-ctx daemon (forks/discard! r) {:discarded (id->str (:id r))})))}
 
    :agent/create
-   {:doc "Create an agent (provision a durable row + bring it online)."
+   {:doc (str "Create an agent (provision a durable row + bring it online). `tools`: the agent's tool "
+              "names ([] for none); without it, its tags choose. Errors: a blank id or a bad field "
+              "value (400), an id already taken (409).")
     :kind :write
     :schema (fields/create-schema)
     :impl (fn [daemon {:keys [id] :as args}]
@@ -1406,7 +1411,9 @@
                         {:created id}))))}
 
    :agent/update
-   {:doc "Update an agent's config (partial patch: model/provider/tags/prompt/…)."
+   {:doc (str "Update an agent's config (partial patch: model/provider/tags/prompt/…, and `tools`: "
+              "the agent's tool names, [] for none). Errors: a bad field value (400), an unknown "
+              "agent (404).")
     :kind :write
     :schema [:map [:id AgentId] [:patch (fields/update-schema)]]
     :impl (fn [daemon {:keys [id patch]}]
@@ -1442,7 +1449,8 @@
                         {:invited agent :room (id->str (:id r))}))))}
 
    :agent/delete
-   {:doc "Delete an agent — stop the live participant, then retract its row + persona."
+   {:doc (str "Delete an agent — stop the live participant, then retract its row + persona. "
+              "Idempotent: an unknown id answers {deleted id} too.")
     :kind :write
     :schema [:map [:id AgentId]]
     :impl (fn [daemon {:keys [id]}]

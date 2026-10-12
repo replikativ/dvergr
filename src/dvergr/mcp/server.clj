@@ -17,9 +17,11 @@
      ;; ... develop, modify tool handlers, they're live ...
      (mcp/stop!)                  ; stop TCP server
 
-   Standalone:
-     java -jar dvergr-mcp.jar --stdio          # stdio mode
-     java -jar dvergr-mcp.jar --port 17888     # TCP mode"
+   Standalone (`-main`: the `:mcp-server` alias, the `clj -T:build uber`
+   jar): it serves `--stdio` or TCP (`--port`, default 17888) but starts no
+   daemon, so every tool answers \"No dvergr daemon is running in this
+   process.\" The daemon is `clojure -M:cli --mcp`, or `bin/dvergr-mcp`
+   starts one."
   (:require [clojure.string :as str]
             [dvergr.mcp.json-rpc :as json-rpc]
             [dvergr.mcp.repl :as repl]
@@ -53,8 +55,9 @@
 ;;
 ;; The MCP surface is a projection of `dvergr.ops` (rooms/agents/forks) — no
 ;; parallel agent registry, no unsandboxed eval. A new op added to the spec
-;; appears here automatically, named identically across every binding. (Coding
-;; tools — the `dvergr.tools` registry, sandboxed — are a follow-up.)
+;; appears here automatically, named identically across every binding. The
+;; coding tools (the `dvergr.tools` registry, sandboxed) are served beside them
+;; and kept in step with the registry (`sync-registry-tools!`).
 
 ;; Kept so the daemon can wire a db conn if it wants; ops resolves its own.
 (defonce server-db-conn (atom nil))

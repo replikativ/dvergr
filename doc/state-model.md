@@ -65,8 +65,10 @@ plus the per-session sandbox.
 
 - **Datahike `dvergr-chat-db`** → branched — messages, Runs, certified Attempt
   indexes, KB, ledger, proposals, all isolated until merge. Exact Attempt
-  payloads use the immutable global blob CAS; only a branch's typed reference
-  makes one part of that world. *This is the whole semantic chat state, forked
+  payloads are immutable blobs in the room's own Datahike store
+  (`artifact/datahike-store`, tracked by its GC); only a branch's typed
+  reference makes one part of that world. Older string references are read
+  from the legacy global blob CAS. *This is the whole semantic chat state, forked
   through yggdrasil.*
 - **git worktree** → a fresh worktree; the agent's file edits are isolated.
 - **muschel shell session** → its env-atom is CoW-forked alongside, so a worker's
@@ -137,6 +139,19 @@ No client/server boilerplate; the host owns its state root and config:
 - **APIs**: `dvergr.core` (room/participant/ask/fork facade) and
   `dvergr.clients.client` — the nREPL client (`c/start!` to attach or boot a lite
   daemon; `c/room`/`c/spawn` for a Room handle; `c/fork`/`c/merge!`).
+
+**Homes.** A state root is a dvergr *home*. `home.edn` in it holds the home's id
+and the path it was last opened at (`dvergr.system.home/claim!`): a home opened
+at another path whose original place no longer holds it was moved, and is
+adopted; one whose original is still there with the same id is a copy, and is
+refused. To try something on a home's data without changing it, fork a room
+instead. An experiment opens a home of its own with `runner/open-home!` (or
+`with-home`, closed by `close-home!`): a headless daemon with no Telegram, web
+or MCP listener (a Claude Code candidate gets a loopback MCP server on an
+ephemeral port), no agents, schedules suspended and no storage GC. A process has
+one home at a time, and `open-home!` refuses to run in a process that already
+runs a daemon. A directory of the experiment layout before homes (`artifacts/`)
+is refused.
 
 The host owns `.dvergr/`, `config.local.edn`, and any agent overrides; the library
 owns the rest, and all durable meaning is in the forkable Datahike DB — the property

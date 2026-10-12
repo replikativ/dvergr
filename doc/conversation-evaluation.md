@@ -1,6 +1,6 @@
 # Certified conversational episodes
 
-Status: implemented 2026-09-18. The design and its binding revisions were reviewed against the code, and the implementation was reviewed independently. Scope: run tau2-style benchmarks, and in
+Status: implemented 2026-09-18 as the Room path described here. tau2 experiments (`tx/run!`) have since moved to the generic provider path (`dvergr.benchmarks.tau2.provider`, doc/benchmarks.md "Certified experiments"); the episode Room path remains for `episode/run!`, `branch!` and the probes. The design and its binding revisions were reviewed against the code, and the implementation was reviewed independently. Scope: run tau2-style benchmarks, and in
 general any multi-turn environment with a simulated counterpart, *inside*
 Dvergr's programming model, so every episode is recorded durably, certified,
 and inspectable.
@@ -179,16 +179,18 @@ contradicts the frozen world clock (banking is fixed at 2025-11-14). So:
 
 ### Recording and inspection
 
-- **Store.** Each experiment writes to
-  `.dvergr/benchmarks/<experiment>/store` (datahike on the filesystem, plus
-  the blob CAS for large Attempt and Scorecard values). An EDN summary
-  alongside it is optional and only for grep.
-- **`inspect` API.**
-  - `(scorecards store)` and `(attempts store {:environment-id ..})`;
-  - `(episode store attempt-id)`, which returns messages, activities,
-    effects, runs and grading;
-  - `(replay-world store attempt-id)` and `(diff-against-gold ...)`;
-  - `(pass-hat-k attempts k)`.
+- **Store.** An experiment is a room of its home (the `:dir` of `run!`,
+  `runner/open-home!`): Attempts, Runs and Scorecards are in that room's
+  Datahike store, their exact payloads as blobs of the same store.
+- **`inspect` API** (`dvergr.benchmarks.tau2.inspect`, on what
+  `runner/open-experiment` returns):
+  - `(summary xs room-id)` (reward and pass^k per candidate),
+    `(attempts xs room-id)` and `(scorecards xs room-id)`;
+  - `(episode xs room-id attempt-id)`, which returns messages, activities,
+    effects, runs and grading, and `(print-transcript e)`;
+  - `(verify-world domain task e)` (replay the effects, compare the
+    certified world hash) and `(verify-episode e)`;
+  - `pass-hat-k` is `dvergr.benchmarks.tau2.runner/pass-hat-k`.
 - **Other readers.** Simmis can open the same store and render the episode
   Rooms with its existing run views.
 
@@ -247,9 +249,10 @@ An explicit `:episode` Run can own a certified Attempt, and nothing needs
    on host threads. Participants do blocking model calls through
    `generation/future-handle` and never block the Spindel drain.
 9. **Faults still get Attempts.** An episode that ends in an infrastructure
-   fault is certified with status `:failed` and reward 0. The failure class is
-   recorded, and inspection and metrics filter it out, so a Scorecard can
-   always be built from one Attempt per cell.
+   fault is certified with status `:failed` and reward 0, and the failure
+   class is recorded. Such an Attempt is no verdict: the cell runs again, and
+   no Scorecard is made until every cell has a verdict (the provider fault
+   test below).
 10. **Fork-at-turn needs more than the context fork.** It needs a `:frozen`
     fork (the default `:following` mode reads the parent's live values) and a
     store that follows the fork (unprovisioned Room forks get none). It
@@ -261,9 +264,9 @@ An explicit `:episode` Run can own a certified Attempt, and nothing needs
 
 | Namespace | Role |
 | --- | --- |
-| `dvergr.agent.conversation` | Generic pieces. It owns the experiment store (a file-backed Datahike database plus a file artifact store), home isolation, episode Run admission and finish, effect rows, and certification. |
+| `dvergr.agent.conversation` | Generic pieces. It owns episode Run admission and finish, effect rows, and certification, and `open-store!`, a standalone file-backed Datahike episode store (payloads as blobs in it) for tests and the lab path; experiments keep their store in a room of the home (`runner/open-home!`). |
 | `dvergr.benchmarks.tau2.episode` | One episode. It keeps the world in the episode Room's context and runs the effect interpreter with its bounds. It builds the candidates (the production `llm-agent` with `:tools` or `:repl`, or the tau2 reference loop), the customer participant and a Run watcher, and it does host orchestration and fault certification. |
-| `dvergr.benchmarks.tau2.experiment` | Experiments. It builds content-addressed Environment, Dataset and Experiment defs and runs cells on bounded host threads. Resume is keyed by the ExperimentDef content id. It only writes a Scorecard for a fault-free, complete experiment. |
+| `dvergr.benchmarks.tau2.experiment` | Experiments. It builds the candidate roster and runs the cells through `runner/run!` and `experiment/run` with the capabilities of `dvergr.benchmarks.tau2.provider`, each cell in a forked world. Resume keeps a cell made with the current inputs (doc/benchmarks.md "Resume and inputs ids"). A Scorecard is persisted only when every cell has a verdict. |
 | `dvergr.benchmarks.tau2.inspect` | Read-only views: summary and pass^k, Attempts, episode reconstruction, a printed transcript, `verify-world` (replay → certified hash), and `verify-episode` (the graded log against Room rows). |
 
 **The implementation review** found these defects, all fixed:
@@ -305,8 +308,6 @@ Remaining known gaps:
 
 - Fork-at-turn and grouped rollouts. The design enables them, since the
   world and dialogue live in a forkable Room, but they come later.
-- Resuming a partially run experiment. Attempts survive; the Scorecard
-  requires completion, as today.
 - Token-level logprobs.
 - Changes to `program.clj` or `evaluation/evaluate`.
 

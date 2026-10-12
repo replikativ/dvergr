@@ -105,7 +105,8 @@ clojure -M -m dvergr.catalog.room-run path/to/competitors --check
 clojure -M -m dvergr.catalog.room-run path/to/competitors --models claude-haiku-4-5,codex-subscription-luna --repetitions 2 --home runs/competitors
 ```
 
-`room-run` is a client of the room path, the one an MCP client takes. It opens the dvergr
+`room-run` is a client of the room path, the one an MCP client takes: it calls the same ops in
+process (`dvergr.ops/invoke` on the home's daemon, no MCP transport). It opens the dvergr
 home `--home` (default `$DVERGR_HOME/workflow-runs/<bundle name>` when `DVERGR_HOME` is set,
 else `workflow-runs/<bundle name>` in the working directory) with a headless daemon, creates the room
 `<bundle name>` there once, writes the bundle into its workspace as `workflows/<bundle name>/`
@@ -113,7 +114,9 @@ with `room_write` (and removes what the bundle no longer has), and runs `catalog
 into that room as the experiment `<bundle name>`; `--check` runs `catalog_calibrate` instead.
 Everything it keeps is in the home's stores: the bundle in the room's repository, the Runs,
 Attempts and Scorecard in the room's Datahike store. Running it again resumes, keeping cells
-that have a verdict; cells that faulted run once more within the run. `--cases N` takes the
+that have a verdict made with the current inputs (the assembled system prompt, the tools, the
+resolved model: doc/running-benchmarks.md); cells that faulted run once more within the run. A
+changed bundle or model list is a new experiment in the same room, so its cells run afresh. `--cases N` takes the
 first N cases of a dataset in a fixed shuffle (seed 20261001), so the same N gives the same
 cases every time. It prints each candidate's reward and two costs, then the report from
 `experiment_report` (to stdout, or to `--report FILE` when given), and exits 1 when cells did
@@ -130,9 +133,13 @@ list price of the API model a subscription model corresponds to (its registry en
 **In a daemon**, `catalog_benchmark` runs the experiment in a room (`runner/run-in`) as a
 job (budget per attempt: $0.50 unless given; `cases` takes the first N cases, as above).
 With `experiment` (a name) the experiment keeps its identity: benchmarking again with the
-same name, workflow and models into the same `room` resumes it. `experiment_report {room,
-experiment?}` renders the report from the room's store; the job's result names its
-`experiment` and `scorecard`.
+same name, workflow and models into the same `room` resumes it (cells with a verdict made with
+the current inputs are kept). Without `room` the results stay in the new fixture room, and
+without `experiment` every call is a new experiment, so neither resumes. `case-ids` names the
+cases instead of `cases`; `params` and `prompt` override the workflow's task parameters and the
+candidates' system prompt. `experiment_report {room, experiment?}` renders the report from the
+room's store. Its `experiment` is not the name: it is the ExperimentDef content id, which the
+job returns as `experiment` (beside its `scorecard` once completed).
 
 A bundle with `:fetched true` in `workflow.edn` records its Attempts' effects (`:world
 :effects {:record true}`), and its checker is given `:fetched {url body}`: the successful GET
@@ -207,7 +214,8 @@ benchmarked against the outcomes those cases actually had. Most organisations ha
 already: invoices with the account they were booked to, tickets with the team that solved
 them, applications with the decision.
 
-- **The table** is CSV (`,` or `;`, quotes, a byte-order mark, as Excel and DATEV write it),
+- **The table** is CSV (`,`, `;` or tab, whichever the header line has most; quotes, a
+  byte-order mark, as Excel and DATEV write it),
   JSON lines or EDN. `spec` names its columns: `id`, `inputs` (written to the case's
   `/docs/case.edn`), `attachments` (text files beside the table, copied to `/docs/`),
   `expected {column {:rule …}}`, and optionally `title`, `task` (else one is written from the
@@ -265,13 +273,15 @@ checkout and no agent in the room. The whole flow:
    writes the bundle to `/workflows/invoice-coding/`; `room_files` and `room_read` show it
    (`certification.edn` says which cases were kept and why the others were not).
 4. `catalog_calibrate {room: "books", name: "invoice-coding"}`
-5. `catalog_benchmark {workflow: "books/invoice-coding", models: [...], room: "books"}`, then
-   `job_status` until it completes.
-   Each `job_status` waits up to 25 s and shows `progress` (cells done of the total).
+5. `catalog_benchmark {workflow: "books/invoice-coding", models: [...], room: "books",
+   experiment: "invoice-coding"}`, then `job_status` until it is over and `settled`.
+   Each `job_status` waits up to 25 s and shows `progress` (cells done of the total, faults,
+   the phase).
 6. `scorecard_list {room: "books"}` and `scorecard_detail {room: "books", id}`.
-7. `experiment_report {room: "books", experiment}` (the `experiment` id `catalog_benchmark`
-   returned): the report as Markdown, with the frontier, the failing checks and the cases
-   that could not grade.
+7. `experiment_report {room: "books", experiment}` (the `experiment` content id
+   `catalog_benchmark` returned, not the name given): the report as Markdown, with the
+   frontier, the resources, the paired comparisons of the candidates (`baseline` to compare
+   each against one), the failing checks and the cases that could not grade.
 
 To change the table, `room_write` it again and rerun `catalog_cases`; the room's history keeps
 every version.

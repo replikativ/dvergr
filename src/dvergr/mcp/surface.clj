@@ -66,7 +66,7 @@
    :attempts "Run a task N times per model on forks, as a job; Attempts, Scorecards"
    :runs     "The blocking workflow_attempt, and Runs (lower level)"
    :catalog  "Workflows with their own checker and benchmark set"
-   :bench    "Benchmark models on a workflow's benchmark set; experiment progress"
+   :bench    "Benchmark models on a workflow's benchmark set; experiment progress and reports"
    :wallets  "Budgets and model prices"
    :repl     "The room's Clojure REPL (SCI sandbox) with dvergr's programming model"
    :describe "repl_describe: the REPL's API (dvergr namespaces, functions, docs), for REPL-first clients"

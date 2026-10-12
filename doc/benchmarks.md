@@ -15,7 +15,8 @@ The providers are not part of the `dvergr` jar. They live in
 suite, `clojure -M:test`, includes them). `dvergr` itself keeps what a
 benchmark is built with, so that a benchmark of your own is one more provider
 in your own repo: `dvergr.agent.evaluation`, `environment`, `experiment`,
-`experiment.runner`, `verifiers`, `roster`.
+`experiment.runner`, `verifiers` (a registry the providers register their
+capabilities in; nothing in `src/` reads it back yet), `roster`.
 
 | Tier | Meaning | Status |
 | --- | --- | --- |
@@ -72,7 +73,8 @@ A provider is a namespace (`dvergr.benchmarks.<name>.provider`) with:
    (driver, judge) are in the capability references, hence in its content id.
 4. **A candidate roster**: AgentDefs; what varies (model, action space, prompt
    digest) is in the AgentDef so that a change is a new candidate, never
-   resumed into old cells. What a protocol assembles at Run start from code
+   resumed into old cells (tau2's `:repl-guidance` is not, see its
+   Candidates section). What a protocol assembles at Run start from code
    rather than from the AgentDef (a system prompt template, tool schemas) it
    declares as `:inputs`, so that a change re-runs the cells made before it
    (see "Resume and inputs ids").
@@ -411,7 +413,13 @@ Next for the wiki benchmark:
   interval; and the cost per pass saved and the cost ratio. The question a pilot
   asks: "is the model at a tenth of the price good enough here?" With 3 of 4 passes
   against 4 of 4, the answer is "probably worse (P higher = 0.16, P no worse by 5
-  points = 0.24): run more worlds", not a ranking.
+  points = 0.24): run more worlds", not a ranking. `scorecard_detail` and
+  `experiment_report` also return the paired comparisons (`paired`: exact McNemar
+  on the cases where two candidates differ, Holm-adjusted; see
+  running-benchmarks.md). For `paired`, `baseline` names the candidate every
+  other one is paired with; without it every pair is compared (beyond five
+  candidates, each against the best). The leaderboard-top default above is the
+  `comparison`'s only.
 - **Cost at list price.** A subscription model (Claude Code, Codex) costs nothing
   per call, which says nothing about what the work is worth. Its registry entry
   names the API model its tokens correspond to (`:list-price-of`: claude-code-haiku
@@ -423,8 +431,7 @@ Next for the wiki benchmark:
   a paid run. Spends recorded before fold exactly as they did (stored Scorecards
   still validate).
 
-Open: an LLM judge tier for prose faithfulness; attempts run one after another (a
-Datahike writer race on concurrent Runs in one durable room).
+Open: an LLM judge tier for prose faithfulness.
 
 ## Competitor discovery (a room workflow)
 
@@ -616,7 +623,7 @@ Setup: `benchmarks/resources/benchmarks/automationbench/README.md`. Run:
 
 ```clojure
 (require '[dvergr.benchmarks.automationbench.experiment :as abx])
-(abx/run! {:dir ".dvergr/benchmarks/ab-smoke" :domains abx/public-domains :sample 1
+(abx/run! {:dir "runs/ab-smoke" :domains abx/public-domains :sample 1
            :candidates [{:id :luna :model "codex-subscription-luna"}]})
 ```
 
@@ -628,6 +635,12 @@ execution accuracy runs it and compares its SET of result rows with the gold SQL
 (Python equality: 1 = 1.0). The question here is whether Datahike, the store dvergr is built
 on, is competitive as the database under such work, with SQL (through pg-datahike) and with
 Datalog.
+
+**Reference setup.** [`benchmarks/reference/`](../benchmarks/reference/README.md) runs BIRD's
+own one-prompt harness on 100 `:eval` questions a Dvergr experiment ran, graded by upstream's
+code: GPT-5.6 Luna 51 of 100 with BIRD's prompt, 61 with one line about returning only the
+asked-for columns, against 65 in Dvergr's SQLite workflow (paired: 3 and 7 questions one way
+and the other, p = 0.34; the plain prompt against it 1 and 15, p = 0.0005).
 
 - **Data:** every SQLite table is loaded into Datahike as attributes `:table/column` with
   pg-datahike's row marker (`bird.load`), so the same data answers SQL and `d/q`.
@@ -758,6 +771,12 @@ Verified set `verified_400`: 400 tasks from Excel forums, one test case each;
 `dvergr.benchmarks.spreadsheetbench.*`). A task is an instruction, an input workbook and an
 answer position; upstream grades the cells of the answer range against a gold workbook.
 
+**Reference setup.** [`benchmarks/reference/`](../benchmarks/reference/README.md) runs
+upstream's single-round and multi-round (`row_react_exec`) harnesses on 59 `:eval` tasks a
+Dvergr experiment ran: GPT-5.6 Luna 14 and 18 graded as shipped, 34 and 41 after LibreOffice
+recalculation, against 51 on Dvergr's harness and checker (paired, multi-round recalculated
+against Dvergr: 5 and 15 tasks, p = 0.041).
+
 - **Grading** (`spreadsheetbench.core`): upstream's `compare_workbooks` (evaluation.py),
   ported: answer ranges column-major, numbers and booleans rounded to 2 places as Python's
   `round` does, dates to a day serial, times to `HH:MM`, nil and `""` equal; the truth is the
@@ -832,7 +851,7 @@ parameter). Irrelevance tasks expect no call, relevance tasks at least one.
 
 ```clojure
 (require '[dvergr.benchmarks.bfcl.experiment :as bx])
-(bx/run! {:dir ".dvergr/benchmarks/bfcl-smoke"
+(bx/run! {:dir "runs/bfcl-smoke"
           :categories ["simple_python" "parallel" "irrelevance"] :sample 5
           :candidates [{:id :sonnet :model "claude-code-sonnet"}]})
 ```
@@ -964,8 +983,9 @@ expect a call; it is kept as a measured negative. With `:neutral` the REPL
 candidate is where the JSON candidate is on relevance and irrelevance. At eight
 tasks per category these are directions, not scores.
 
-`bfcl.inspect` reads an experiment directory: `report`, `failures`,
-`print-report`.
+`bfcl.inspect` reads an experiment home: `open` opens it (a headless daemon on
+the home, so in a JVM of its own), then `report`, `failures` and
+`print-report`, then `close`.
 
 ### Not done
 
@@ -1160,10 +1180,14 @@ The REPL candidate gets the same information as the JSON-tools candidate: its
 prompt lists every tool as a Clojure call with its full description and
 arguments (7.9k characters against 11.8k of JSON schema), and
 `(clojure.repl/doc tau2/<tool>)` / `(sandbox/doc 'tau2)` show the same docs at
-runtime. Before 2026-09-19 it saw only tool names. `:repl-guidance` selects the
-action-space guidance (`:shape`, the default; `:compute`; `:inspect`); each
-variant is a distinct candidate because AgentDefs carry their system prompt's
-sha256. `tau2/shape` exists because REPL agents computed over data they had
+runtime. Before 2026-09-19 it saw only tool names. The REPL candidate's prompt
+ends with action-space guidance (`episode/repl-guidance`: `:shape`, the default;
+`:compute`; `:inspect`), chosen by the AgentDef's `:conversation/repl-guidance`.
+The decision-point probes (`tau2.probe`) set it from a spec's `:repl-guidance`;
+`tx/run!` does not: `candidate-roster` takes `:repl-guidance` from the spec but
+puts it neither into the AgentDef nor into the system prompt whose sha256 the
+AgentDef carries, so every REPL candidate of an experiment gets `:shape`, and two
+specs that differ only in `:repl-guidance` are the same candidate. `tau2/shape` exists because REPL agents computed over data they had
 not looked at: product `variants` are a map keyed by item id, and
 `(filter #(get % "available") variants)` over its entries counted nothing.
 
@@ -1300,7 +1324,7 @@ home for the call (`runner/open-home!`):
          '[dvergr.benchmarks.tau2.inspect :as insp]
          '[dvergr.agent.experiment.runner :as runner])
 (def dom (t2/load-domain "retail"))
-(tx/run! {:dir ".dvergr/benchmarks/retail-cmp" :domain dom :split "base"
+(tx/run! {:dir "runs/retail-cmp" :domain dom :split "base"
           :repetitions 4 :parallelism 3
           :candidates [{:id :reference :harness :reference :model "claude-code-sonnet"}
                        {:id :dvergr-tools :harness :dvergr :action-space :tools :model "claude-code-sonnet"}
@@ -1308,7 +1332,7 @@ home for the call (`runner/open-home!`):
           :user {:model "claude-code-opus"} :judge {:model "claude-code-opus"}})
 ;; Re-running the same call resumes: completed cells are skipped (while their inputs hold).
 
-(def xs (runner/open-experiment ".dvergr/benchmarks/retail-cmp")) ; the home, its room
+(def xs (runner/open-experiment "runs/retail-cmp")) ; the home, its room
 (insp/summary xs (:room-id xs))                   ; reward, pass^k, failures
 (def e (insp/episode xs (:room-id xs) attempt-id))
 (insp/print-transcript e)                        ; dialogue, REPL code, effects

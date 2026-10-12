@@ -67,8 +67,11 @@ require the former.
 ```
 
 The explicit native model choices are `"codex-subscription-sol"`,
-`"codex-subscription-terra"`, and `"codex-subscription-luna"`; their short
-aliases are `"codex-sol"`, `"codex-terra"`, and `"codex-luna"`.
+`"codex-subscription-terra"`, and `"codex-subscription-luna"` (GPT-5.6), and
+`"codex-subscription-sol-6.1"`, `"codex-subscription-luna-6"` and
+`"codex-subscription-astra-6"` (GPT-6/6.1); their short aliases are
+`"codex-sol"`, `"codex-terra"`, `"codex-luna"`, `"codex-sol-6.1"`,
+`"codex-luna-6"` and `"codex-astra-6"`.
 
 The native transport reads `$CODEX_HOME/auth.json`, falling back to
 `~/.codex/auth.json`. If you have configured
@@ -111,14 +114,26 @@ export OPENAI_BASE_URL=https://api.openai.com/v1               # optional
 export FIREWORKS_BASE_URL=https://api.fireworks.ai/inference/v1 # optional
 ```
 
-- **OpenAI and Fireworks are credential-scoped.** OpenAI reads only
-  `OPENAI_API_KEY` / `OPENAI_BASE_URL`; Fireworks reads only
-  `FIREWORKS_API_KEY` / `FIREWORKS_BASE_URL`. A key for one never registers or
-  authorizes the other. Fireworks is the default provider represented in
+- **OpenAI and Fireworks keys.** OpenAI reads `OPENAI_API_KEY` /
+  `OPENAI_BASE_URL`; Fireworks reads `FIREWORKS_API_KEY` / `FIREWORKS_BASE_URL`,
+  and falls back to `OPENAI_API_KEY` when `OPENAI_BASE_URL` points at
+  `fireworks.ai` (`fireworks-key` in `model/api/openai.clj`), the
+  OpenAI-compatible setup many tools share. In that setup `:openai` registers
+  too, with the Fireworks base URL. The Fireworks models are in
   `resources/models.edn`.
+- **The model an unpinned agent gets.** `providers/default-spec` picks the
+  first registered provider in the order Anthropic, Fireworks, OpenAI, Codex
+  subscription, Codex CLI, Claude Code, with that provider's preferred model:
+  for Fireworks that is `accounts/fireworks/models/minimax-m2p7`
+  (`preferred-default-model` in `model/providers.clj`). The registry's
+  `:defaults` in `resources/models.edn` name `minimax-m3` for compaction, and
+  the alias `minimax` resolves to m3; pin `:model` to get m3 for an agent.
 - **Claude Code** has **no API key** — it auto-detects by running `claude --version`.
   If the CLI exits 0, `:claude-code` registers and bills against your Claude
-  subscription (model pricing is `0`).
+  subscription (model pricing is `0`). Reports still price subscription models
+  at list price: each one's registry entry names the API model its tokens are
+  worth (`:list-price-of`, e.g. `claude-code-sonnet` → `claude-sonnet-5-5`), so a
+  subscription run compares with a paid one.
 - **Codex subscription** has **no API key**. Run `codex login` and choose
   **Sign in with ChatGPT**. For the default file-backed login, dvergr refreshes
   OAuth credentials inside its trusted host boundary and sends dvergr-owned
@@ -140,8 +155,9 @@ Pin an agent to the native subscription model with:
                :model "codex-subscription"}}
 ```
 
-The optional aliases `codex-sol`, `codex-terra`, and `codex-luna` select an
-explicit subscription model. To force the compatibility path, use provider and
+The optional aliases `codex-sol`, `codex-terra`, `codex-luna`,
+`codex-sol-6.1`, `codex-luna-6` and `codex-astra-6` select an explicit
+subscription model. To force the compatibility path, use provider and
 model `:codex-subscription-cli` / `"codex-subscription-cli"`.
 
 ### Provider recipes
@@ -152,7 +168,7 @@ model `:codex-subscription-cli` / `"codex-subscription-cli"`.
 | Claude Code subscription | Logged-in `claude` on `PATH` | `:claude-code` / `"claude-code-sonnet"` |
 | ChatGPT Codex subscription | `codex login` with ChatGPT | `:codex-subscription` / `"codex-subscription"` |
 | Keyring-only Codex login | Logged-in `codex` on `PATH` | `:codex-subscription-cli` / `"codex-subscription-cli"` |
-| Fireworks account | `FIREWORKS_API_KEY` | `:fireworks` / `"accounts/fireworks/models/minimax-m3"` |
+| Fireworks account | `FIREWORKS_API_KEY` | `:fireworks` / `"accounts/fireworks/models/minimax-m2p7"` (unpinned; pin `minimax-m3`) |
 | OpenAI API account | `OPENAI_API_KEY`, plus an OpenAI registry entry | `:openai` / the registered model id |
 
 The built-in registry carries Anthropic, Claude Code, Codex subscription, five
@@ -258,9 +274,11 @@ Per request (`model/chat.clj`), resolution is:
    `:thinking` and quirk defaults (like Kimi's `top_p`) are applied automatically.
 
 Agents carry `:provider` / `:model` in their config (`config.local.edn :agents`,
-materialised into Datahike actor rows). The registry's `:defaults`
-(`:primary-model`, `:compaction-model`, `:summary-model`) are read via
-`registry/get-default` for system-level model choices.
+materialised into Datahike actor rows). Of the registry's `:defaults`,
+`:compaction-model` (an agent's compaction) and `:summary-model` (room
+summaries in `orchestration/stats.clj`) are read via `registry/get-default`;
+nothing reads `:primary-model`: an unpinned agent's model comes from
+`providers/default-spec` (above).
 
 ```clojure
 :agents {:var {:provider :fireworks

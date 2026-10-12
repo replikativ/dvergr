@@ -19,6 +19,10 @@
    Theory of mind (fork + ask + discard):
      simulate-reply, imagine-conversation
 
+   Reply obligations (how a handler that owns a lifecycle, e.g. an LLM turn's
+   Run, learns how its turn ended, through wrappers it does not know):
+     reply-obligation!, carry-obligation, withhold-reply!, release-obligation!
+
    Inference (orthogonal — Open Q #11): use spindel's inference primitives
    (`choose`, `observe`, `sample`) inside any participant or room-evolution
    spin; select an inference kernel via `kernel-infer` from
