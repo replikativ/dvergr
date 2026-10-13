@@ -251,25 +251,44 @@
                             legacy-history?)))
           messages)))
 
+(defn- drop-entry! [room-id agent-id]
+  (when-let [{:keys [chat-ctx execution-ctx]}
+             (get @room-agent-ctxs [room-id agent-id])]
+    (when chat-ctx
+      (try (chat-ctx/release-sci-in! chat-ctx
+                                     (or execution-ctx (:spindel-ctx chat-ctx)))
+           (catch Throwable _ nil)))
+    (swap! room-agent-ctxs dissoc [room-id agent-id])))
+
 (defn- with-extensions!
-  "The cached working context of `k` with the extensions `sandbox` too:
-   whichever caller built it first (a turn, or a scheduled task before the
-   agent joined), the agent's extensions end up installed. Under the Room
-   monitor."
-  [k {:keys [chat-ctx sandbox-opts execution-ctx] :as entry} sandbox]
+  "The cached working context of `k` for an agent naming the extensions
+   `sandbox`, or nil when it must be rebuilt. A caller that names none (nil)
+   takes the context as it is. More extensions are installed into it; fewer
+   drop it, since an interpreter cannot give back what its code may already
+   hold. Under the Room monitor."
+  [[room-id agent-id :as k] {:keys [chat-ctx sandbox-opts execution-ctx] :as entry} sandbox]
   (let [have (set (:sandbox-extensions chat-ctx))
-        want (into have sandbox)]
-    (if (= have want)
-      chat-ctx
+        want (set sandbox)]
+    (cond
+      (or (nil? sandbox) (= have want)) chat-ctx
+
+      (every? want have)
       (let [cctx (assoc chat-ctx :sandbox-extensions want)]
-        ;; recorded before installing: an installation that fails part way is
-        ;; still released with the context (releasing what never installed is
-        ;; a no-op)
+        ;; recorded before installing, so dropping the entry releases a
+        ;; partial installation too (releasing what never installed is a
+        ;; no-op)
         (swap! room-agent-ctxs assoc k
                (assoc entry :chat-ctx cctx
                       :sandbox-opts (assoc sandbox-opts :sandbox-extensions want)))
-        (extensions/install! (chat-ctx/sci-context-in cctx execution-ctx) execution-ctx want)
-        cctx))))
+        (try
+          (extensions/install! (chat-ctx/sci-context-in cctx execution-ctx) execution-ctx
+                               (remove have want))
+          cctx
+          (catch Throwable error
+            (drop-entry! room-id agent-id)
+            (throw error))))
+
+      :else (do (drop-entry! room-id agent-id) nil))))
 
 (defn ensure-ctx!
   "Get-or-create the long-lived working chat-ctx for `agent-id` in `room`.
@@ -277,7 +296,8 @@
    On first call, create the ctx with a stable chat-id and seed its durable
    attention projection from the Room store. Subsequent calls return the
    cached ctx; live facts enter only through explicit interpreter admission.
-   `:sandbox` names the agent's sandbox extensions (`dvergr.sandbox.extensions`)."
+   `:sandbox` names the agent's sandbox extensions (`dvergr.sandbox.extensions`);
+   a cached context built with others is extended or, for fewer, rebuilt."
   [room agent-id {:keys [system-prompt budget-dollars limit sandbox]}]
   (let [room-id (:id room)
         k       [room-id agent-id]]
@@ -419,15 +439,6 @@
                      (fn [m]
                        (if (contains? m child-k) m (assoc m child-k entry))))
               (:chat-ctx (get @room-agent-ctxs child-k))))))))
-
-(defn- drop-entry! [room-id agent-id]
-  (when-let [{:keys [chat-ctx execution-ctx]}
-             (get @room-agent-ctxs [room-id agent-id])]
-    (when chat-ctx
-      (try (chat-ctx/release-sci-in! chat-ctx
-                                     (or execution-ctx (:spindel-ctx chat-ctx)))
-           (catch Throwable _ nil)))
-    (swap! room-agent-ctxs dissoc [room-id agent-id])))
 
 (defn drop-ctx!
   "Tear down the (room, agent) provider projection."

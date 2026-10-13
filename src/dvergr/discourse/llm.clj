@@ -357,7 +357,9 @@
                                 (room-context/ensure-ctx! room id
                                                           {:system-prompt  (:system-prompt spec)
                                                            :budget-dollars (:dollars budget 1.0)
-                                                           :sandbox        sandbox})
+                                                           ;; the agent's own set, so a context built
+                                                           ;; for more is rebuilt
+                                                           :sandbox        (or sandbox #{})})
                                 @fallback-chat-ctx)]
                  (case (:type msg)
 

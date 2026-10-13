@@ -14,6 +14,7 @@
             [dvergr.sandbox :as sandbox]
             [dvergr.sandbox.extensions :as extensions]
             [org.replikativ.spindel.core :as sp]
+            [sci.core :as sci]
             [org.replikativ.spindel.engine.context :as context]
             [org.replikativ.spindel.engine.core :as ec]))
 
@@ -194,6 +195,10 @@
             (is (true? (has-infer? upgraded parent-ctx)))
             (is (identical? upgraded (room-context/ensure-ctx! parent :plain {:sandbox #{:foerster/inference}})))
             (is (identical? upgraded (room-context/ensure-ctx! parent :plain {})))))
+        (testing "naming fewer rebuilds it: an interpreter cannot give back what its code holds"
+          (let [plain (room-context/ensure-ctx! parent :plain {:sandbox #{}})]
+            (is (false? (has-infer? plain parent-ctx)))
+            (is (identical? plain (room-context/ensure-ctx! parent :plain {:sandbox #{}})))))
         (testing "a fork of the room keeps them"
           (let [c (reset! child-ctx (context/fork-context parent-ctx :mode :frozen))
                 child (d/make-room {:id :ext-child :ctx c :store (mem/make)})
@@ -230,3 +235,63 @@
       (finally
         (room-context/drop-ctx! :ext-joined :analyst)
         (d/close-room! room)))))
+
+(deftest a-rejoined-agent-loses-the-extensions-it-no-longer-names
+  (let [room (d/room :ext-rejoined)
+        agent (fn [sandbox seen]
+                (llm/llm-agent
+                 (cond-> {:id :analyst
+                          :spec {:provider :mock :model "mock"}
+                          :run-turn-fn (fn [cctx _]
+                                         (deliver seen (has-infer? cctx (:ctx room)))
+                                         (chat-context/add-message! cctx {:role :assistant :content "ok"})
+                                         :complete)}
+                   sandbox (assoc :sandbox sandbox))))
+        ask! (fn []
+               (let [p (promise)]
+                 (binding [ec/*execution-context* (:ctx room)]
+                   (sp/spawn! (sp/spin (deliver p (sp/await (d/ask room :analyst {:content "hi"}))))))
+                 (deref p 60000 ::timeout)))]
+    (try
+      (let [first-seen (promise)
+            second-seen (promise)]
+        (binding [ec/*execution-context* (:ctx room)]
+          (d/join room (agent #{:foerster/inference} first-seen)))
+        (is (= "ok" (:content (ask!))))
+        (is (true? (deref first-seen 1000 ::timeout)))
+        (binding [ec/*execution-context* (:ctx room)]
+          (d/leave room :analyst)
+          (d/join room (agent nil second-seen)))
+        (is (= "ok" (:content (ask!))))
+        (is (false? (deref second-seen 1000 ::timeout))
+            "the cached interpreter of the first agent is not reused"))
+      (finally
+        (room-context/drop-ctx! :ext-rejoined :analyst)
+        (d/close-room! room)))))
+
+(deftest a-failed-installation-leaves-no-context-behind
+  (let [registry @#'extensions/registry
+        installs (atom 0)
+        ctx (context/create-execution-context)
+        room (d/make-room {:id :ext-failing :ctx ctx :store (mem/make)})]
+    (extensions/register! :test/flaky
+                          {:version 1
+                           :install (fn [sci-ctx _]
+                                      (swap! installs inc)
+                                      (sci/add-namespace! sci-ctx 'flaky-ext {'marker 1})
+                                      (when (= 1 @installs)
+                                        (throw (ex-info "installer failed part way" {}))))})
+    (try
+      (room-context/ensure-ctx! room :analyst {:budget-dollars 1.0})
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"part way"
+                            (room-context/ensure-ctx! room :analyst {:sandbox #{:test/flaky}})))
+      (is (nil? (room-context/lookup :ext-failing :analyst)) "the partly installed context is dropped")
+      (let [rebuilt (room-context/ensure-ctx! room :analyst {:sandbox #{:test/flaky}})]
+        (is (= 2 @installs) "the next call installs again")
+        (is (true? (:value (sandbox/eval-code (chat-context/sci-context-in rebuilt ctx)
+                                              "(some? (find-ns 'flaky-ext))"
+                                              :execution-context ctx :timeout-ms 30000)))))
+      (finally
+        (swap! registry dissoc :test/flaky)
+        (room-context/drop-ctx! :ext-failing :analyst)
+        (context/close-context! ctx)))))
