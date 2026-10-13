@@ -115,10 +115,6 @@
                  m))
              ops ops))
 
-(defonce ^:private settlement-locks
-  ;; fork id → the lock its settlements through the room ops take
-  (java.util.concurrent.ConcurrentHashMap.))
-
 (defn room-ops-map
   "The unified Room-ops map — `create!`/`list`/`get`/`post!`/`messages`/`children`/
    `set-parent!`/`join!`/`leave!`/`delete!`/`fork!`/`merge!`/`discard!`/`diff`/
@@ -143,7 +139,7 @@
         fork-room*      @(ns-resolve 'dvergr.discourse 'fork-room)
         merge-room*     @(ns-resolve 'dvergr.discourse 'merge-room)
         discard*        @(ns-resolve 'dvergr.discourse 'discard)
-        fork-handle*    @(ns-resolve 'dvergr.discourse 'fork-handle)
+        settlement*     @(ns-resolve 'dvergr.discourse 'settlement)
         create-room!*   @(ns-resolve 'dvergr.rooms 'create-room!)
         join-agent!*    @(ns-resolve 'dvergr.rooms 'join-agent!)
         leave-agent!*   @(ns-resolve 'dvergr.rooms 'leave-agent!)
@@ -195,28 +191,23 @@
                                 {:error (str "Fork " ref " was already settled: "
                                              (name (:op s))
                                              (when (:parent s) (str " into " (:parent s))))}))))
-        ;; The first settlement recorded stands: a discard that raced a
-        ;; merge (and found nothing left to do) does not overwrite it.
         settle!         (fn [fork settlement result]
                           (binding [rtc/*execution-context* (selected-ctx)]
                             (rtc/swap-state! [:dvergr/settled-forks]
                                              #(if (contains? % (:id fork))
                                                 %
-                                                (assoc (or % {}) (:id fork) (assoc settlement :result result)))))
-                          (settled-result (:id fork) settlement))
-        ;; One settlement of a fork at a time through these ops, in every
-        ;; interpreter: the second waits, finds the fork gone and answers from
-        ;; the first's record. Bounded, so a settlement that waits on code
-        ;; trying to settle the same fork cannot deadlock.
-        settling        (fn [fork f]
-                          (let [^java.util.concurrent.locks.ReentrantLock lock
-                                (.computeIfAbsent ^java.util.concurrent.ConcurrentHashMap settlement-locks
-                                                  (:id fork)
-                                                  (reify java.util.function.Function
-                                                    (apply [_ _] (java.util.concurrent.locks.ReentrantLock.))))]
-                            (if (.tryLock lock 60 java.util.concurrent.TimeUnit/SECONDS)
-                              (try (f) (finally (.unlock lock)))
-                              {:error (str "Fork " (:id fork) " is being settled; try again")})))
+                                                (assoc (or % {}) (:id fork) (assoc settlement :result result))))))
+        ;; The host's record of how a fork was settled (`dvergr.discourse/
+        ;; settlement`, claimed by whichever merge or discard won) becomes
+        ;; this world's; the answer is then for the settlement asked for.
+        record!         (fn [fork asked snapshot]
+                          (if-let [s (settlement* fork)]
+                            (do (settle! fork s (case (:op s)
+                                                  :merged (binding [rtc/*execution-context* (selected-ctx)]
+                                                            (view (resolve-room (:parent s))))
+                                                  :discarded snapshot))
+                                (settled-result (:id fork) asked))
+                            snapshot))
         ;; A settlement of a fork the registry no longer has is answered from
         ;; that record before the effect boundary: the boundary's authority
         ;; check knows only live rooms, and a repeat performs nothing.
@@ -337,40 +328,23 @@
                           (nil? parent) {:error (str "Room not found: " parent-ref)}
                           (nil? fork)   {:error (str "Room not found: " fork-ref)}
                           :else
-                          (settling
-                           fork
-                           (fn []
-                             (if-not (binding [rtc/*execution-context* (selected-ctx)]
-                                       (resolve-room fork-ref))
-                               (or (settled-result fork-ref {:op :merged :parent (:id parent)})
-                                   {:error (str "Fork " fork-ref " was already settled")})
-                               (let [result (binding [rtc/*execution-context* (:ctx fork)]
-                                              (merge-room* parent fork))]
-                                 (if (and (map? result) (:ctx result))
-                                   (settle! fork {:op :merged :parent (:id parent)} (view result))
-                                   result))))))))
+                          (let [asked {:op :merged :parent (:id parent)}
+                                result (try (binding [rtc/*execution-context* (:ctx fork)]
+                                              (merge-room* parent fork))
+                                            (catch clojure.lang.ExceptionInfo e
+                                              ;; another merge or discard won
+                                              (when-not (= :dvergr.discourse/already-settled (:type (ex-data e)))
+                                                (throw e))))]
+                            (if (settlement* fork)
+                              (record! fork asked (view fork))
+                              result)))))
         discard-fn  (fn [fork-ref]
                       (if-let [fork (binding [rtc/*execution-context* (selected-ctx)]
                                       (resolve-room fork-ref))]
-                        (settling
-                         fork
-                         (fn []
-                           (if-not (binding [rtc/*execution-context* (selected-ctx)]
-                                     (resolve-room fork-ref))
-                             (or (settled-result fork-ref {:op :discarded})
-                                 {:error (str "Fork " fork-ref " was already settled")})
-                             (let [snapshot (view fork)]
-                               (binding [rtc/*execution-context* (:ctx fork)]
-                                 (discard* fork))
-                               ;; an isolated fork's handle says how it was
-                               ;; settled: a merge outside these ops may have
-                               ;; won, and is recorded as the winner
-                               (if (= :merged (some-> (fork-handle* fork) :authority deref :status))
-                                 (do (settle! fork {:op :merged :parent (:parent-id snapshot)}
-                                              (binding [rtc/*execution-context* (selected-ctx)]
-                                                (view (resolve-room (:parent-id snapshot)))))
-                                     (settled-result (:id fork) {:op :discarded}))
-                                 (settle! fork {:op :discarded} snapshot))))))
+                        (let [snapshot (view fork)]
+                          (binding [rtc/*execution-context* (:ctx fork)]
+                            (discard* fork))
+                          (record! fork {:op :discarded} snapshot))
                         {:error (str "Room not found: " fork-ref)}))
         ;; Merge review — the per-system diff + tier the agent reads to decide.
         diff-fn     (fn [fork-ref]

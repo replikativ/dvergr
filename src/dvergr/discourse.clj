@@ -2032,6 +2032,32 @@
   [fork]
   (room-home-ctx fork))
 
+(defn- claim-settlement!
+  "Claim `fork`'s settlement as `settlement` ({:op :merged :parent id} or
+   {:op :discarded}). nil when this call holds it — it won, or it retries the
+   same settlement (one that failed after its substrate settled keeps its
+   claim) — else the settlement that did: whoever unregisters a fork has
+   claimed it first, in both isolation modes, so the claim on the fork's meta
+   says which merge or discard won."
+  [fork settlement]
+  (let [[old _] (swap-vals! (:meta fork) #(if (:settled %) % (assoc % :settled settlement)))
+        settled (:settled old)]
+    (when-not (= settlement settled) settled)))
+
+(defn- release-settlement!
+  "Give back a claim whose settlement failed before the substrate settled, so
+   a retry (or the other settlement) can take it."
+  [fork settlement]
+  (let [handle (fork-handle fork)]
+    (when (or (nil? handle) (ygg/open-fork? handle))
+      (swap! (:meta fork) #(if (= settlement (:settled %)) (dissoc % :settled) %)))))
+
+(defn settlement
+  "How `fork` was settled — {:op :merged :parent id} or {:op :discarded} —
+   or nil while it is open."
+  [fork]
+  (:settled @(:meta fork)))
+
 (defn discard
   "Discard a fork: deregister its participants, drop it from the
    registry, and if the fork's ctx was forked (`:isolation :ctx`), settle its
@@ -2046,7 +2072,8 @@
   (assert-settlement-released! fork :discard)
   ;; Idempotence: once unregistered, the fork is a zombie — re-discarding would
   ;; double-delete the yggdrasil branch (which errors). Guard on registry.
-  (when (binding [ec/*execution-context* (fork-home-ctx fork)] (rreg/lookup (:id fork)))
+  (when (and (binding [ec/*execution-context* (fork-home-ctx fork)] (rreg/lookup (:id fork)))
+             (nil? (claim-settlement! fork {:op :discarded})))
     (let [callbacks (drain-room-listeners! fork :discard)
           work-fence-token* (volatile! nil)]
       (try
@@ -2072,6 +2099,7 @@
           (peer-bus/post! {:type :dvergr/fork-discarded
                            :dvergr/origin (:id fork)}))
         (catch Throwable error
+          (release-settlement! fork {:op :discarded})
           (recover-room-quiescence! fork callbacks @work-fence-token* error)))))
   fork)
 
@@ -2142,6 +2170,9 @@
   ([parent fork] (merge-room parent fork {}))
   ([parent fork {:keys [merge-opts]}]
    (assert-settlement-released! fork :merge)
+   (when-let [settled (claim-settlement! fork {:op :merged :parent (:id parent)})]
+     (throw (ex-info (str "Fork " (:id fork) " was already settled: " (name (:op settled)))
+                     {:type ::already-settled :fork/id (:id fork) :settlement settled})))
    (let [callbacks (drain-room-listeners! fork :merge)
          work-fence-token* (volatile! nil)]
      (try
@@ -2203,6 +2234,7 @@
                           :dvergr/parent   (:id parent)}))
        parent
        (catch Throwable error
+         (release-settlement! fork {:op :merged :parent (:id parent)})
          (recover-room-quiescence! fork callbacks @work-fence-token* error))))))
 
 ;; ============================================================================
