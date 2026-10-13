@@ -78,12 +78,53 @@
               "merge! returns the parent")
           (is (nil? (binding [ec/*execution-context* (:ctx parent)]
                       (rreg/lookup (:id fork))))
-              "merged fork left the registry")))
+              "merged fork left the registry")
+          (is (= (:id parent) (:id (('merge! ops) (:slug parent) (:id fork))))
+              "a second merge! answers as the first")
+          (is (re-find #"already settled: merged" (:error (('discard! ops) (:id fork))))
+              "a merged fork does not discard")
+          (testing "the ops of a rebound namespace answer the same"
+            (let [rebound (kb-ns/room-ops-map (:ctx parent) nil
+                                              (select-keys parent [:id :incarnation]))]
+              (is (= (:id parent) (:id (('merge! rebound) (:slug parent) (:id fork)))))
+              (is (re-find #"already settled: merged" (:error (('discard! rebound) (:id fork)))))))))
       (testing "unknown refs are reported, not NPEs"
         (is (:error (('discard! ops) "no-such-room/fork-x")))
         (is (:error (('merge! ops) (:slug parent) "no-such-room/fork-x")))
         (is (nil? (('participants ops) "no-such-room"))))
       (finally
+        (doseq [f @forks] (try (d/discard f) (catch Throwable _)))
+        (d/close-room! parent)))))
+
+;; A discard that resolved the fork, then waited while a merge settled it,
+;; finds nothing left to do: it must not record a discard over the merge.
+(deftest a-discard-that-loses-a-race-with-a-merge-does-not-record-itself
+  (let [parent (d/make-room {:id :sci-injected-race-parent :store (memory/make)})
+        entered (promise)
+        go (promise)
+        paused? (atom false)
+        discard d/discard
+        forks (atom [])]
+    (try
+      (with-redefs [d/discard (fn [fork]
+                                (when (compare-and-set! paused? false true)
+                                  (deliver entered true)
+                                  @go)
+                                (discard fork))]
+        (let [ops (kb-ns/room-ops-map (:ctx parent) nil
+                                      (select-keys parent [:id :incarnation]))
+              view (('fork! ops) parent)
+              _ (swap! forks conj (binding [ec/*execution-context* (:ctx parent)]
+                                    (rreg/lookup (:id view))))
+              discarding (future (('discard! ops) (:id view)))]
+          (is (true? (deref entered 30000 ::timeout)))
+          (is (= (:id parent) (:id (('merge! ops) (:id parent) (:id view)))))
+          (deliver go true)
+          (is (re-find #"already settled: merged" (str (:error (deref discarding 30000 ::timeout)))))
+          (is (= (:id parent) (:id (('merge! ops) (:id parent) (:id view))))
+              "the merge stands")))
+      (finally
+        (deliver go true)
         (doseq [f @forks] (try (d/discard f) (catch Throwable _)))
         (d/close-room! parent)))))
 

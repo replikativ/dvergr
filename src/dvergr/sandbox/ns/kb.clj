@@ -139,6 +139,7 @@
         fork-room*      @(ns-resolve 'dvergr.discourse 'fork-room)
         merge-room*     @(ns-resolve 'dvergr.discourse 'merge-room)
         discard*        @(ns-resolve 'dvergr.discourse 'discard)
+        fork-handle*    @(ns-resolve 'dvergr.discourse 'fork-handle)
         create-room!*   @(ns-resolve 'dvergr.rooms 'create-room!)
         join-agent!*    @(ns-resolve 'dvergr.rooms 'join-agent!)
         leave-agent!*   @(ns-resolve 'dvergr.rooms 'leave-agent!)
@@ -179,11 +180,6 @@
         ;; rebind) answers a repeated settlement as the first did instead of
         ;; "not found" (the registry has forgotten the fork); any other
         ;; settlement of it is refused.
-        settle!         (fn [fork settlement result]
-                          (binding [rtc/*execution-context* (selected-ctx)]
-                            (rtc/swap-state! [:dvergr/settled-forks]
-                                             #(assoc (or % {}) (:id fork) (assoc settlement :result result))))
-                          result)
         settled-result  (fn [ref settlement]
                           (let [id (cond (map? ref) (:id ref)
                                          (keyword? ref) ref
@@ -195,6 +191,15 @@
                                 {:error (str "Fork " ref " was already settled: "
                                              (name (:op s))
                                              (when (:parent s) (str " into " (:parent s))))}))))
+        ;; The first settlement recorded stands: a discard that raced a
+        ;; merge (and found nothing left to do) does not overwrite it.
+        settle!         (fn [fork settlement result]
+                          (binding [rtc/*execution-context* (selected-ctx)]
+                            (rtc/swap-state! [:dvergr/settled-forks]
+                                             #(if (contains? % (:id fork))
+                                                %
+                                                (assoc (or % {}) (:id fork) (assoc settlement :result result)))))
+                          (settled-result (:id fork) settlement))
         ;; A settlement of a fork the registry no longer has is answered from
         ;; that record before the effect boundary: the boundary's authority
         ;; check knows only live rooms, and a repeat performs nothing.
@@ -325,7 +330,11 @@
                         (let [snapshot (view fork)]
                           (binding [rtc/*execution-context* (:ctx fork)]
                             (discard* fork))
-                          (settle! fork {:op :discarded} snapshot))
+                          ;; an isolated fork's handle says how it was
+                          ;; settled: a merge may have won the race
+                          (if (= :merged (some-> (fork-handle* fork) :authority deref :status))
+                            {:error (str "Fork " fork-ref " was already settled: merged")}
+                            (settle! fork {:op :discarded} snapshot)))
                         {:error (str "Room not found: " fork-ref)}))
         ;; Merge review — the per-system diff + tier the agent reads to decide.
         diff-fn     (fn [fork-ref]

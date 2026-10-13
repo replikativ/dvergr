@@ -70,7 +70,8 @@
   (with-sandbox
     (fn [sci-ctx ec]
       (let [room (binding [rtc/*execution-context* ec]
-                   (d/make-room {:id :escape-room :ctx ec :store (mem/make)}))]
+                   (d/make-room {:id :escape-room :ctx ec :store (mem/make)}))
+            created (str "escape-created-" (random-uuid))]
         (try
           (testing "a room is plain data"
             (is (= {:ok {:id :escape-room :slug "escape-room" :title "escape-room" :parent-id nil :fork? false}}
@@ -85,15 +86,14 @@
             (is (= {:ok []} (eval-in sci-ctx ec "(dvergr.room/participants (dvergr.room/get :escape-room))"))))
           (testing "every op that returns rooms returns data"
             (let [r (eval-in sci-ctx ec
-                             "(let [f (dvergr.room/fork! :escape-room)
+                             (str "(let [f (dvergr.room/fork! :escape-room)
                                     g (dvergr.room/fork! :escape-room)]
                                 {:fork! f
                                  :children (dvergr.room/children :escape-room)
                                  :forks (dvergr.room/forks)
-                                 :root (dvergr.room/root)
                                  :merge! (dvergr.room/merge! :escape-room f)
                                  :discard! (dvergr.room/discard! g)
-                                 :create! (dvergr.room/create! {:slug \"escape-created\"})})")
+                                 :create! (dvergr.room/create! {:slug \"" created "\"})})"))
                   plain? (fn plain? [x]
                            (cond (map? x) (every? (fn [[k v]] (and (plain? k) (plain? v))) x)
                                  (coll? x) (every? plain? x)
@@ -103,10 +103,23 @@
               (doseq [[op v] (:ok r)]
                 (is (plain? v) (str op " returned " (pr-str v))))
               (is (= (:id room) (get-in r [:ok :merge! :id])))
-              (is (get-in r [:ok :create! :room :id]))))
+              (is (get-in r [:ok :create! :room :id]))
+              (testing "root: the :daemon room, else the discourse root"
+                (binding [rtc/*execution-context* ec]
+                  (rtc/swap-state! [:dvergr/discourse-root] (constantly room)))
+                (let [r (eval-in sci-ctx ec "(dvergr.room/root)")]
+                  (is (= :escape-room (get-in r [:ok :id])) (pr-str r))
+                  (is (plain? (:ok r))))
+                (let [daemon (binding [rtc/*execution-context* ec]
+                               (d/make-room {:id :daemon :ctx ec :store (mem/make)}))]
+                  (try
+                    (let [r (eval-in sci-ctx ec "(dvergr.room/root)")]
+                      (is (= :daemon (get-in r [:ok :id])) (pr-str r))
+                      (is (plain? (:ok r))))
+                    (finally (d/close-room! daemon)))))))
           (finally
             (binding [rtc/*execution-context* ec]
-              (some-> (rreg/lookup (rstore/slug->room-id "escape-created")) d/close-room!))
+              (some-> (rreg/lookup (rstore/slug->room-id created)) d/close-room!))
             (d/close-room! room)))))))
 
 (deftest sensitive-path-policy-covers-every-branch
