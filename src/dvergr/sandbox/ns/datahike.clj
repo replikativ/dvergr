@@ -51,7 +51,7 @@
 (defn- db-value? [x]
   (and (some? x) (not (instance? SandboxDb x)) (dbu/db? x)))
 
-(declare world-connection? callable?)
+(declare world-connection? callable? untrusted)
 
 (defn- leak!
   "A Datahike result that would hand sandbox code a host object."
@@ -347,7 +347,8 @@
                     {:type ::tx-function :class (str (class f))})))
   (doseq [form tx-data]
     (when (or (and (sequential? form) (not (contains? tx-ops (first form))))
-              (and (map? form) (some #(contains? form %) code-attrs))
+              (some #(and (map? %) (some (partial contains? %) code-attrs))
+                    (tree-seq coll? seq form))
               (and (sequential? form) (contains? code-attrs (nth form 2 nil))))
       (throw (ex-info (str "Transaction functions and predicates (:db.fn/call, :db/fn, :db.attr/preds, "
                            ":db.entity/preds, an ident as the operation) are not available in the sandbox: " (pr-str (if (map? form) (keys form) (first form))))
@@ -372,6 +373,22 @@
          (ex-info "Certified evaluation projections are host-owned and read-only in SCI"
                   {:type ::protected-evaluation-write :tx-form (pr-str form)})))))
   tx-data)
+
+(defn- assert-no-code-datoms!
+  "Throws when transacting `tx` against `db` would assert a datom of a
+   `code-attrs` attribute, however the transaction spells it (a nested
+   entity map, a numeric attribute id, transaction metadata): `tx` is run
+   once with `d/with`, which writes nothing, and the attributes of its datoms
+   are resolved to idents."
+  [db tx]
+  (let [{:keys [tx-data db-after]} (untrusted #(d/with db tx))]
+    (doseq [datom tx-data
+            :let [a (:a datom)
+                  ident (if (keyword? a) a (:db/ident (d/entity db-after a)))]]
+      (when (contains? code-attrs ident)
+        (throw (ex-info (str "Transaction functions and predicates (" ident ") are not "
+                             "available in the sandbox")
+                        {:type ::tx-function}))))))
 
 (defn- cfg-name
   "The logical database name from a datahike config: `:store :id`, else the
@@ -462,7 +479,9 @@
                               (assert-no-certified-evaluation-write! nil [(dissoc tx :tx-data)]))
                           checked (assert-no-certified-evaluation-write!
                                    (if (= 'with sym) target @target) (tx-forms tx))
-                          tx (if (map? tx) (assoc tx :tx-data checked) checked)]
+                          tx (if (map? tx) (assoc tx :tx-data checked) checked)
+                          ;; a persisted write: what it would assert, too
+                          _ (when-not (= 'with sym) (assert-no-code-datoms! @target tx))]
                       (try
                         (sealed-result sym (untrusted #(f target tx)))
                         (catch Throwable error
