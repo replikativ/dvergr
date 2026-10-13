@@ -744,7 +744,10 @@ contexts. For example:
 
 An AgentDef with `:sandbox #{:foerster/inference}` also gets foerster's sandbox
 namespaces (`infer/run`, background jobs with `infer/start`, `model/` blocks,
-`opt/`, `diag/`, `lp/`; see `dvergr.sandbox.extensions`). Inference
+`opt/`, `diag/`, `lp/`; see `dvergr.sandbox.extensions`). A room agent names
+them the same way: `:sandbox` in its daemon config (`:agents`), or the
+`llm-agent` option; its working context in every room it joins, and in forks
+of those rooms, has them. Inference
 does not introduce an `AgentParticle` entity and does not turn every sample into
 a Run. A Run remains the durable identity of an application-level computation;
 particles are its internal execution placements unless the program explicitly

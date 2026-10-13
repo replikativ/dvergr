@@ -28,6 +28,7 @@
             [dvergr.agent.turn :as turn]
             [dvergr.agent.prompt :as prompt]
             [dvergr.agent.room-context :as room-context]
+            [dvergr.sandbox.extensions :as extensions]
             [dvergr.agent.persona :as persona]
             [dvergr.room.store :as rstore]
             [dvergr.channels.core :as channels]
@@ -283,7 +284,7 @@
 
 (defn resolve-safe-config
   "Apply security defaults to a raw agent-config; explicit values override.
-   Resolves :id, :tools and :system-prompt (→ profile markdown unless given).
+   Resolves :id, :tools, :sandbox and :system-prompt (→ profile markdown unless given).
    :tools is the agent's own (a set of tool names, a `dvergr.tools` profile
    keyword or a tool map, normalized to a tool map; `#{}` is no tools); without
    it, the agent's tags choose (`resolve-tools-fn`: chat, huginn or safe tools).
@@ -300,6 +301,10 @@
             :tools (if (some? (:tools agent-config))
                      (tools/normalize-tools (:tools agent-config))
                      ((resolve-tools-fn agent-config)))}
+           ;; sandbox extensions by name (`dvergr.sandbox.extensions`), as an
+           ;; AgentDef's :sandbox; an unknown one fails the agent's creation
+           (when (some? (:sandbox agent-config))
+             {:sandbox (extensions/checked-ids (:sandbox agent-config))})
            (when-let [sp (resolve-system-prompt (assoc agent-config :id agent-id))]
              {:system-prompt sp}))))
 
@@ -359,6 +364,7 @@
                   :system-prompt system-prompt
                   :isolation     (or (:isolation safe-config) :sci)}
         :tools   tools-map
+        :sandbox (:sandbox safe-config)
         :budget  {:dollars (or (:budget-dollars safe-config) 0.25)}
         :ctx     exec-ctx}))))
 
@@ -492,7 +498,7 @@
   "The raw config used to join `agent-id` into a room — **actor-row-first** so
    that edits made through the agent-management UI (which write the durable
    actor row, see `dvergr.agent.ops`) take effect on the next room join without
-   a daemon restart. Reads the actor row's :config (provider/model/tools/rooms/
+   a daemon restart. Reads the actor row's :config (provider/model/tools/sandbox/rooms/
    budget/description) and merges in :id + :name + :tags; falls back to the
    boot-time `daemon :config` when no row exists yet. nil if unknown to both.
    Callers pass the result through `resolve-safe-config`."
@@ -500,9 +506,13 @@
   (binding [rtc/*execution-context* (:execution-ctx daemon)]
     (if-let [actor (when-let [conn (daemon-sys-conn)]
                      (actors/lookup conn agent-id))]
-      (cond-> (assoc (or (:config actor) {}) :id agent-id)
-        (:name actor)        (assoc :name (:name actor))
-        (seq (:skills actor)) (assoc :tags (:skills actor)))
+      (let [boot (get-in daemon [:config :agents agent-id])]
+        (cond-> (assoc (or (:config actor) {}) :id agent-id)
+          (:name actor)        (assoc :name (:name actor))
+          (seq (:skills actor)) (assoc :tags (:skills actor))
+          ;; a row written before agents had :sandbox keeps the declared one
+          (and (not (contains? (:config actor) :sandbox)) (contains? boot :sandbox))
+          (assoc :sandbox (:sandbox boot))))
       (when-let [cfg (get-in daemon [:config :agents agent-id])]
         (assoc cfg :id agent-id)))))
 

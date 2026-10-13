@@ -97,7 +97,7 @@
                      :model         (or (:model opts) (:model def-spec) default-model)
                      :system-prompt sys-prompt}
              :tools tools}
-            (select-keys opts [:db-conn :budget :compaction
+            (select-keys opts [:sandbox :db-conn :budget :compaction
                                :chat-ctx :tool-ctx
                                :run-turn-fn :ctx])))))
 

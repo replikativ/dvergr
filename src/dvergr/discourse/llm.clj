@@ -51,6 +51,7 @@
             [dvergr.agent.run :as run]
             [dvergr.agent.turn :as turn]
             [dvergr.agent.room-context :as room-context]
+            [dvergr.sandbox.extensions :as extensions]
             [dvergr.agent.prompt :as prompt]
             [dvergr.discourse.commands :as commands]
             [dvergr.chat.compaction :as compaction]
@@ -259,6 +260,10 @@
                   :knowledge-worker), a set/vector of tool names, OR a map of
                   name → tool-def (pre-wrapped). Default: :dev-toolbelt
                   (`minimal-coding-tools`). Pass `#{}` for a no-tools agent.
+   :sandbox     — the sandbox extensions its clojure_eval gets, a set of
+                  `dvergr.sandbox.extensions` ids (e.g. #{:foerster/inference});
+                  an unknown id fails here. Applies to the contexts llm-agent
+                  builds, not to a caller's :chat-ctx/:participant-context.
    :db-conn     — datahike connection for chat persistence (optional)
    :budget      — {:dollars n} (default {:dollars 1.0}). When it runs out the
                   turn ends and the process is marked :awaiting-decision; a
@@ -289,7 +294,7 @@
                   dvergr.discourse.attention.
    :ctx         — discourse room's execution context
                   (default: `*execution-context*`)"
-  [{:keys [id spec tools db-conn budget compaction
+  [{:keys [id spec tools sandbox db-conn budget compaction
            chat-ctx participant-context tool-ctx run-turn-fn ctx room-safe? on-reply
            attention-policy]
     :or   {budget      {:dollars 1.0}
@@ -304,6 +309,7 @@
            tools       tools/minimal-coding-tools}}]
   {:pre [(keyword? id) (map? spec)]}
   (let [ctx       (or ctx ec/*execution-context*)
+        sandbox   (some-> sandbox extensions/checked-ids)
         ;; Room-less FALLBACK working ctx (sidecar / tests). When the
         ;; agent is joined to a ROOM, the per-[room,agent] room-context ctx is
         ;; used instead — seeded from the room store and admitted by attention,
@@ -320,7 +326,8 @@
                         :agent-id       id
                         :title          (str "agent " (name id))
                         :budget-dollars (:dollars budget 1.0)
-                        :db-conn        db-conn})]
+                        :db-conn        db-conn
+                        :sandbox-extensions sandbox})]
                 (when-let [sp (:system-prompt spec)]
                   (cc/add-message! c {:role :system :content sp}))
                 c)))
@@ -349,7 +356,10 @@
                      chat-ctx (if room
                                 (room-context/ensure-ctx! room id
                                                           {:system-prompt  (:system-prompt spec)
-                                                           :budget-dollars (:dollars budget 1.0)})
+                                                           :budget-dollars (:dollars budget 1.0)
+                                                           ;; the agent's own set, so a context built
+                                                           ;; for more is rebuilt
+                                                           :sandbox        (or sandbox #{})})
                                 @fallback-chat-ctx)]
                  (case (:type msg)
 
@@ -1024,6 +1034,7 @@
                           ;; forks therefore remain isolated from later switches.
                           :spec        @spec-atom
                           :tools       tools
+                          :sandbox     sandbox
                           :db-conn     db-conn
                           :budget      budget
                           :compaction  compaction
@@ -1040,7 +1051,10 @@
       ;; the echo-loop guard), silence ([SKIP] → no post), plain-reply. The
       ;; daemon, sidecar, and raw callers all get a loop-safe agent. Pass
       ;; :room-safe? false for a bare agent (ask-only, single-recipient use).
-      (cond-> participant
+      ;; :sandbox on the Participant: room code that builds this agent's
+      ;; working context outside a turn (scheduled code tasks) names the same
+      ;; extensions (`dvergr.rooms.scheduler`)
+      (cond-> (assoc participant :sandbox sandbox)
         room-safe? enr/with-self-filter
         room-safe? enr/with-silence
         room-safe? enr/with-plain-reply))))

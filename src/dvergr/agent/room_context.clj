@@ -25,6 +25,7 @@
             [dvergr.chat.schema :as schema]
             [dvergr.room.registry :as rreg]
             [dvergr.room.store :as rstore]
+            [dvergr.sandbox.extensions :as extensions]
             [dvergr.chat.accounting :as acct]
             [dvergr.system.db :as sdb]
             [dvergr.system.rooms :as srooms]
@@ -77,6 +78,18 @@
   (let [entity (schema/create-message-entity (assoc msg :chat-id (:chat-id chat-ctx)))]
     (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
       (swap! (:messages-signal chat-ctx) conj entity))))
+
+(defn- with-system-prompt!
+  "`chat-ctx`, opening with `prompt` when it has no system message: a
+   context rebuilt by a caller without one (a code schedule) is seeded on the
+   agent's next turn."
+  [chat-ctx prompt]
+  (when (and prompt
+             (not-any? #(= :system (:message/role %)) (chat-ctx/get-messages chat-ctx)))
+    (let [entity (schema/create-message-entity {:role :system :content prompt
+                                                :chat-id (:chat-id chat-ctx)})]
+      (chat-ctx/replace-messages! chat-ctx (into [entity] (chat-ctx/get-messages chat-ctx)))))
+  chat-ctx)
 
 (defn- fmt-clock
   "Epoch-millis or Date → \"HH:mm\", or nil."
@@ -250,25 +263,77 @@
                             legacy-history?)))
           messages)))
 
+(defn- drop-entry! [room-id agent-id]
+  (when-let [{:keys [chat-ctx execution-ctx]}
+             (get @room-agent-ctxs [room-id agent-id])]
+    (when chat-ctx
+      (try (chat-ctx/release-sci-in! chat-ctx
+                                     (or execution-ctx (:spindel-ctx chat-ctx)))
+           (catch Throwable _ nil)))
+    (swap! room-agent-ctxs dissoc [room-id agent-id])))
+
+(defn- with-extensions!
+  "The cached working context of `k` for an agent naming the extensions
+   `sandbox`, or nil when it must be rebuilt. A caller that names none (nil)
+   takes the context as it is. More extensions are installed into it; fewer
+   drop it, since an interpreter cannot give back what its code may already
+   hold. Under the Room monitor."
+  [[room-id agent-id :as k] {:keys [chat-ctx sandbox-opts execution-ctx] :as entry} sandbox]
+  (let [have (set (:sandbox-extensions chat-ctx))
+        want (set sandbox)]
+    (cond
+      (or (nil? sandbox) (= have want)) chat-ctx
+
+      (every? want have)
+      (let [cctx (assoc chat-ctx :sandbox-extensions want)]
+        ;; recorded before installing, so dropping the entry releases a
+        ;; partial installation too (releasing what never installed is a
+        ;; no-op)
+        (swap! room-agent-ctxs assoc k
+               (assoc entry :chat-ctx cctx
+                      :sandbox-opts (assoc sandbox-opts :sandbox-extensions want)))
+        (try
+          (extensions/install! (chat-ctx/sci-context-in cctx execution-ctx) execution-ctx
+                               (remove have want))
+          cctx
+          (catch Throwable error
+            (drop-entry! room-id agent-id)
+            (throw error))))
+
+      :else (do (drop-entry! room-id agent-id) nil))))
+
 (defn ensure-ctx!
   "Get-or-create the long-lived working chat-ctx for `agent-id` in `room`.
 
    On first call, create the ctx with a stable chat-id and seed its durable
    attention projection from the Room store. Subsequent calls return the
-   cached ctx; live facts enter only through explicit interpreter admission."
-  [room agent-id {:keys [system-prompt budget-dollars limit]}]
+   cached ctx; live facts enter only through explicit interpreter admission.
+   `:sandbox` names the agent's sandbox extensions (`dvergr.sandbox.extensions`);
+   a cached context built with others is extended or, for fewer, rebuilt.
+   `:sandbox :participant` takes them from the agent's Participant in the
+   room, read under the room monitor (none declared names none); for an
+   agent that is not one, the context is taken as it is."
+  [room agent-id {:keys [system-prompt budget-dollars limit sandbox]}]
   (let [room-id (:id room)
         k       [room-id agent-id]]
     ;; Room forking and unregister hold the same monitor. Cache reads belong
     ;; inside it too: a returned handle must remain live through this boundary.
     (locking (:meta room)
       (binding [ec/*execution-context* (:ctx room)]
-        (let [_ (when-not (rreg/admitted-incarnation? room)
+        (let [sandbox (if (= :participant sandbox)
+                        ;; read here, not by the caller: a declaration read
+                        ;; before waiting for the monitor may be stale
+                        (when-let [p (get @(:participants room) agent-id)]
+                          (or (:sandbox p) #{}))
+                        sandbox)
+              _ (when-not (rreg/admitted-incarnation? room)
                   (throw (ex-info "Working context requested for a closed Room incarnation"
                                   {:type ::closed-room
                                    :room-id room-id
                                    :room/incarnation (:incarnation room)})))]
-          (or (:chat-ctx (get @room-agent-ctxs k))
+          (or (when-let [entry (get @room-agent-ctxs k)]
+                (some-> (with-extensions! k entry sandbox)
+                        (with-system-prompt! system-prompt)))
               (let [;; The room's system-db UUID — the key the system resolvers
                 ;; (room-kb-conn / room-kbs / room-msgs) want; distinct from the
                 ;; in-memory keyword `room-id`. Threads to the sandbox so `dvergr.room`
@@ -308,7 +373,10 @@
                         ;; writer for this conversation; the agent's own turn messages
                         ;; stay signal-only (no redundant datahike write). Token
                      ;; accounting still persists.
-                     :durable?       false}
+                     :durable?       false
+                     ;; the agent's sandbox extensions; a fork inherits them
+                     ;; with these opts (`fork-ctx!`)
+                     :sandbox-extensions sandbox}
                     messages (hydration-messages! room agent-id limit)
                     cctx (turn/new-working-ctx sandbox-opts)
                     bound-sandbox-opts (assoc sandbox-opts
@@ -393,15 +461,6 @@
                      (fn [m]
                        (if (contains? m child-k) m (assoc m child-k entry))))
               (:chat-ctx (get @room-agent-ctxs child-k))))))))
-
-(defn- drop-entry! [room-id agent-id]
-  (when-let [{:keys [chat-ctx execution-ctx]}
-             (get @room-agent-ctxs [room-id agent-id])]
-    (when chat-ctx
-      (try (chat-ctx/release-sci-in! chat-ctx
-                                     (or execution-ctx (:spindel-ctx chat-ctx)))
-           (catch Throwable _ nil)))
-    (swap! room-agent-ctxs dissoc [room-id agent-id])))
 
 (defn drop-ctx!
   "Tear down the (room, agent) provider projection."

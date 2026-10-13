@@ -3,12 +3,21 @@
    and only them; runs record what they resolved to."
   (:require [clojure.test :refer [deftest is testing]]
             [dvergr.agent.evaluation :as evaluation]
+            [dvergr.agent.room-context :as room-context]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.turn :as turn]
             [dvergr.chat.context :as chat-context]
+            [dvergr.discourse :as d]
+            [dvergr.discourse.llm :as llm]
+            [dvergr.orchestration.daemon :as daemon]
+            [dvergr.room.store.memory :as mem]
+            [dvergr.rooms.scheduler :as scheduler]
             [dvergr.sandbox :as sandbox]
             [dvergr.sandbox.extensions :as extensions]
-            [org.replikativ.spindel.engine.context :as context]))
+            [org.replikativ.spindel.core :as sp]
+            [sci.core :as sci]
+            [org.replikativ.spindel.engine.context :as context]
+            [org.replikativ.spindel.engine.core :as ec]))
 
 (deftest the-registry-checks-what-it-is-given
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"qualified keyword"
@@ -157,3 +166,207 @@
         (chat-context/close-chat! cctx)
         (Thread/sleep 3000)
         (is (zero? (busy-chain-threads)) "releasing the interpreter cancelled it")))))
+
+(defn- has-infer? [cctx execution-ctx]
+  (:value (sandbox/eval-code (chat-context/sci-context-in cctx execution-ctx)
+                             "(some? (find-ns 'infer))"
+                             :execution-context execution-ctx :timeout-ms 30000)))
+
+(deftest room-agents-name-extensions
+  (testing "an agent's config names them; an unknown one fails its creation"
+    (is (= #{:foerster/inference}
+           (:sandbox (daemon/resolve-safe-config {:id :analyst :sandbox [:foerster/inference]}))))
+    (is (not (contains? (daemon/resolve-safe-config {:id :analyst}) :sandbox)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unknown sandbox extension"
+                          (daemon/resolve-safe-config {:id :analyst :sandbox #{:test/never-registered}})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unknown sandbox extension"
+                          (llm/llm-agent {:id :analyst :spec {} :sandbox #{:test/never-registered}})))))
+
+(deftest a-room-working-context-installs-the-agents-extensions
+  (let [parent-ctx (context/create-execution-context)
+        child-ctx (atom nil)
+        parent (d/make-room {:id :ext-parent :ctx parent-ctx :store (mem/make)})]
+    (try
+      (let [with (room-context/ensure-ctx! parent :analyst {:budget-dollars 1.0 :sandbox #{:foerster/inference}})
+            without (room-context/ensure-ctx! parent :plain {:budget-dollars 1.0})]
+        (is (true? (has-infer? with parent-ctx)))
+        (is (false? (has-infer? without parent-ctx)))
+        (testing "a context built without them (a scheduled task before the agent joined) gets them later"
+          (let [upgraded (room-context/ensure-ctx! parent :plain {:sandbox #{:foerster/inference}})]
+            (is (true? (has-infer? upgraded parent-ctx)))
+            (is (identical? upgraded (room-context/ensure-ctx! parent :plain {:sandbox #{:foerster/inference}})))
+            (is (identical? upgraded (room-context/ensure-ctx! parent :plain {})))))
+        (testing "naming fewer rebuilds it: an interpreter cannot give back what its code holds"
+          (let [plain (room-context/ensure-ctx! parent :plain {:sandbox #{}})]
+            (is (false? (has-infer? plain parent-ctx)))
+            (is (identical? plain (room-context/ensure-ctx! parent :plain {:sandbox #{}})))))
+        (testing "a fork of the room keeps them"
+          (let [c (reset! child-ctx (context/fork-context parent-ctx :mode :frozen))
+                child (d/make-room {:id :ext-child :ctx c :store (mem/make)})
+                projected (room-context/fork-ctx! parent child :analyst)]
+            (is (some? projected))
+            (is (true? (has-infer? projected c))))))
+      (finally
+        (room-context/drop-ctx! :ext-child :analyst)
+        (room-context/drop-ctx! :ext-parent :analyst)
+        (room-context/drop-ctx! :ext-parent :plain)
+        (some-> @child-ctx context/close-context!)
+        (context/close-context! parent-ctx)))))
+
+(deftest a-room-joined-agent-has-its-extensions
+  (let [room (d/room :ext-joined)
+        seen (promise)]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (d/join room (llm/llm-agent
+                      {:id :analyst
+                       :spec {:provider :mock :model "mock"}
+                       :sandbox #{:foerster/inference}
+                       :run-turn-fn (fn [cctx _]
+                                      (deliver seen (has-infer? cctx (:ctx room)))
+                                      (chat-context/add-message! cctx {:role :assistant :content "ok"})
+                                      :complete)})))
+      (let [p (promise)]
+        (binding [ec/*execution-context* (:ctx room)]
+          (sp/spawn! (sp/spin (deliver p (sp/await (d/ask room :analyst {:content "hi"}))))))
+        (is (= "ok" (:content (deref p 60000 ::timeout))))
+        (is (true? (deref seen 1000 ::timeout)))
+        (is (= #{:foerster/inference} (:sandbox (get @(:participants room) :analyst)))
+            "the Participant names them for room code outside a turn (scheduled tasks)"))
+      (finally
+        (room-context/drop-ctx! :ext-joined :analyst)
+        (d/close-room! room)))))
+
+(deftest a-rejoined-agent-loses-the-extensions-it-no-longer-names
+  (let [room (d/room :ext-rejoined)
+        agent (fn [sandbox seen]
+                (llm/llm-agent
+                 (cond-> {:id :analyst
+                          :spec {:provider :mock :model "mock"}
+                          :run-turn-fn (fn [cctx _]
+                                         (deliver seen (has-infer? cctx (:ctx room)))
+                                         (chat-context/add-message! cctx {:role :assistant :content "ok"})
+                                         :complete)}
+                   sandbox (assoc :sandbox sandbox))))
+        ask! (fn []
+               (let [p (promise)]
+                 (binding [ec/*execution-context* (:ctx room)]
+                   (sp/spawn! (sp/spin (deliver p (sp/await (d/ask room :analyst {:content "hi"}))))))
+                 (deref p 60000 ::timeout)))]
+    (try
+      (let [first-seen (promise)
+            second-seen (promise)]
+        (binding [ec/*execution-context* (:ctx room)]
+          (d/join room (agent #{:foerster/inference} first-seen)))
+        (is (= "ok" (:content (ask!))))
+        (is (true? (deref first-seen 1000 ::timeout)))
+        (binding [ec/*execution-context* (:ctx room)]
+          (d/leave room :analyst)
+          (d/join room (agent nil second-seen)))
+        (is (= "ok" (:content (ask!))))
+        (is (false? (deref second-seen 1000 ::timeout))
+            "the cached interpreter of the first agent is not reused"))
+      (finally
+        (room-context/drop-ctx! :ext-rejoined :analyst)
+        (d/close-room! room)))))
+
+(deftest a-failed-installation-leaves-no-context-behind
+  (let [registry @#'extensions/registry
+        installs (atom 0)
+        ctx (context/create-execution-context)
+        room (d/make-room {:id :ext-failing :ctx ctx :store (mem/make)})]
+    (extensions/register! :test/flaky
+                          {:version 1
+                           :install (fn [sci-ctx _]
+                                      (swap! installs inc)
+                                      (sci/add-namespace! sci-ctx 'flaky-ext {'marker 1})
+                                      (when (= 1 @installs)
+                                        (throw (ex-info "installer failed part way" {}))))})
+    (try
+      (room-context/ensure-ctx! room :analyst {:budget-dollars 1.0})
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"part way"
+                            (room-context/ensure-ctx! room :analyst {:sandbox #{:test/flaky}})))
+      (is (nil? (room-context/lookup :ext-failing :analyst)) "the partly installed context is dropped")
+      (let [rebuilt (room-context/ensure-ctx! room :analyst {:sandbox #{:test/flaky}})]
+        (is (= 2 @installs) "the next call installs again")
+        (is (true? (:value (sandbox/eval-code (chat-context/sci-context-in rebuilt ctx)
+                                              "(some? (find-ns 'flaky-ext))"
+                                              :execution-context ctx :timeout-ms 30000)))))
+      (finally
+        (swap! registry dissoc :test/flaky)
+        (room-context/drop-ctx! :ext-failing :analyst)
+        (context/close-context! ctx)))))
+
+(defn- scheduled-has-infer?
+  "Fire a code schedule for `aid` in `room` the way the scheduler does and
+   whether its code saw foerster's namespaces. `before-ctx`, when given, runs
+   after the task started and before it takes its context."
+  [room aid & [before-ctx]]
+  (let [outcome (promise)
+        ensure-ctx! room-context/ensure-ctx!]
+    (with-redefs [d/post! (fn [_ msg] (deliver outcome (:content msg)))
+                  room-context/ensure-ctx! (fn [& args]
+                                             (when before-ctx (before-ctx))
+                                             (apply ensure-ctx! args))]
+      @(#'scheduler/run-code-task! room aid {:schedule/code "(some? (find-ns 'infer))"})
+      (let [text (deref outcome 60000 ::timeout)]
+        (cond (re-find #"→ true" (str text)) true
+              (re-find #"→ false" (str text)) false
+              :else text)))))
+
+(defn- plain-agent [] (llm/llm-agent {:id :analyst :spec {:provider :mock :model "mock"}}))
+(defn- inference-agent []
+  (llm/llm-agent {:id :analyst :spec {:provider :mock :model "mock"} :sandbox #{:foerster/inference}}))
+
+(deftest a-schedule-runs-with-the-extensions-the-participant-declares
+  (let [room (d/room :ext-scheduled)]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (d/join room (inference-agent)))
+      (is (true? (scheduled-has-infer? room :analyst)))
+      (testing "after a rejoin without them, before the agent's first turn"
+        (binding [ec/*execution-context* (:ctx room)]
+          (d/leave room :analyst)
+          (d/join room (plain-agent)))
+        (is (false? (scheduled-has-infer? room :analyst))))
+      (finally
+        (room-context/drop-ctx! :ext-scheduled :analyst)
+        (d/close-room! room)))))
+
+(deftest a-schedule-reads-the-declaration-when-it-takes-the-context
+  ;; the task starts while the agent declares inference; the agent rejoins
+  ;; without it before the task takes its context
+  (let [room (d/room :ext-scheduled-race)]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (d/join room (inference-agent)))
+      (room-context/ensure-ctx! room :analyst {:sandbox #{:foerster/inference}})
+      (is (false? (scheduled-has-infer?
+                   room :analyst
+                   (fn []
+                     (binding [ec/*execution-context* (:ctx room)]
+                       (d/leave room :analyst)
+                       (d/join room (plain-agent)))))))
+      (finally
+        (room-context/drop-ctx! :ext-scheduled-race :analyst)
+        (d/close-room! room)))))
+
+(deftest a-context-rebuilt-by-a-schedule-gets-the-agents-prompt-on-its-next-turn
+  (let [room (d/room :ext-prompt)
+        system (fn [cctx] (mapv :message/content
+                                (filter #(= :system (:message/role %)) (chat-context/get-messages cctx))))]
+    (try
+      (room-context/ensure-ctx! room :analyst {:system-prompt "be an analyst" :sandbox #{:foerster/inference}})
+      (binding [ec/*execution-context* (:ctx room)]
+        (d/join room (plain-agent)))
+      (let [scheduled (room-context/ensure-ctx! room :analyst {:sandbox :participant})]
+        (is (false? (has-infer? scheduled (:ctx room))))
+        (is (= [] (system scheduled)) "the schedule names no prompt"))
+      (let [turn (room-context/ensure-ctx! room :analyst {:system-prompt "be an analyst" :sandbox #{}})]
+        (is (= ["be an analyst"] (system turn)))
+        (is (= :system (:message/role (first (chat-context/get-messages turn)))) "it opens the conversation")
+        (is (= ["be an analyst"] (system (room-context/ensure-ctx! room :analyst {:system-prompt "be an analyst" :sandbox #{}})))
+            "once"))
+      (finally
+        (room-context/drop-ctx! :ext-prompt :analyst)
+        (d/close-room! room)))))
