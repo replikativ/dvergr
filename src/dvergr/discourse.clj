@@ -2131,10 +2131,13 @@
   ;; Idempotence: once unregistered, the fork is a zombie — re-discarding would
   ;; double-delete the yggdrasil branch (which errors). Guard on registry.
   (if-not (binding [ec/*execution-context* (fork-home-ctx fork)] (rreg/lookup (:id fork)))
-    (let [done (settlement fork)]
-      (cond (nil? done) {:outcome :gone}
-            (= :discarded (:op done)) {:outcome :discarded}
-            :else {:outcome :lost :settlement done :in-progress? false}))
+    ;; a settlement unregisters the fork before it records its completion:
+    ;; its claim says which one, even in between
+    (let [done (settlement fork)
+          held (::settlement-claim @(:meta fork))]
+      (cond (= {:op :discarded} done) {:outcome :discarded}
+            (or done held) (lost-to fork held)
+            :else {:outcome :gone}))
     (let [claim (claim-settlement! fork {:op :discarded})]
       (if (map? claim)
         (lost-to fork claim)

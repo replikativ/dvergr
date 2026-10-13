@@ -576,11 +576,18 @@
      (let [parent (rreg/lookup (:parent-id fork))
            run-id (some-> fork :meta deref :run-id)]
        (let [{:keys [outcome settlement in-progress?]} (d/discard-outcome fork)]
-         (if (= :lost outcome)
-           ;; a merge holds or settled the fork: this discard did nothing,
-           ;; and the Run's status is the merge's to write
+         (cond
+           ;; another discard settled it, and wrote the Run's status
+           (and (= :lost outcome) (not in-progress?) (= :discarded (:op settlement)))
+           {:ok? true}
+
+           ;; another settlement holds or settled the fork: this discard did
+           ;; nothing, and the Run's status is that one's to write
+           (= :lost outcome)
            {:ok? false
             :error (str "fork " (:id fork) (if in-progress? " is being " " was ") (name (:op settlement)))}
+
+           :else
            (do (when (and parent run-id)
                  (agent-run/update-durable-settlement! (run-record-room fork parent) run-id :discarded reason))
                {:ok? true}))))

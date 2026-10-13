@@ -68,13 +68,14 @@
           result))))
 
 (defn- discarded
-  "Discard the work plane, reporting `status`, or the settlement of a merge
-   that holds or settled it (`:review` while that one is in progress)."
+  "Discard the work plane, reporting `status`, or the settlement that holds
+   or settled it (`:review` while that one is in progress)."
   [world status]
   (let [{:keys [outcome settlement in-progress?]} (d/discard-outcome (:work world))]
     (cond
       (not= :lost outcome) status
       in-progress? {:status :review :reason :settlement-in-progress}
+      (= :discarded (:op settlement)) {:status :discarded :reason :settled-elsewhere}
       :else {:status :merged :reason :settled-elsewhere})))
 
 (defn settle!

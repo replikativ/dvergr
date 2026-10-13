@@ -294,7 +294,8 @@
                                   (discard-outcome* fork))]
                             ;; a merge holds or settled the fork: this
                             ;; discard did nothing
-                            (if (= :lost outcome)
+                            (if (and (= :lost outcome)
+                                     (or in-progress? (not= :discarded (:op settlement))))
                               {:error (str "Fork " fork-ref (if in-progress? " is being " " was ")
                                            (name (:op settlement)))}
                               snapshot)))
