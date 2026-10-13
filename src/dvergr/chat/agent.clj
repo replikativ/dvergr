@@ -126,6 +126,15 @@
    is the path to it failing (transport, provider limits), not a verdict."
   nil)
 
+(def ^:dynamic *run-activity*
+  "When a Run binds it to a volatile of a map, a turn records `:acted? true`
+   when the model called tools, and `:silent? true` when the model, having
+   acted, replied empty twice: done, with no reply (Codex answers its output
+   schema with `{content: \"\", tool_calls: []}` then). The Run's answer is
+   then empty. Unbound (room drivers, protocols, interactive use), a second
+   empty reply fails the turn."
+  nil)
+
 (def ^:private infrastructure-error
   #"(?i)max retries|rate.?limit|too many requests|usage limit|quota|timed? ?out|timeout|connection|connect|unavailable|overloaded|provider not registered|http (5\d\d|40[18])|status (5\d\d|40[18])|interrupted|reset by peer|eof")
 
@@ -334,6 +343,9 @@
                                          (str "⚠️ BUDGET ALERT: " (:threshold-message result))
                                          :important? true))
 
+          _ (when (and (seq tool-calls) *run-activity*)
+              (vswap! *run-activity* assoc :acted? true))
+
           ;; Add assistant message if there's content
           _ (when (or (not (str/blank? content)) (seq tool-calls))
               (chat-ctx/add-message! chat-ctx
@@ -499,13 +511,22 @@
                           "Model returned no content or tools — requesting one bounded retry")
                 (chat-ctx/add-system-note! chat-ctx note :important? true)
                 :continue)
-              (do
-                (tel/log! {:level :error :id :agent/repeated-empty-response
-                           :data {:turn turn-number :run-id run-id}}
-                          "Model returned an empty response after corrective retry")
-                (record-failure! {:kind :model
-                                  :cause "empty response after a corrective retry"})
-                :error)))
+              (if (some-> *run-activity* deref :acted?)
+                ;; Twice silent after this Run acted: done, with no reply
+                ;; (the Run answers "", not an earlier message)
+                (do
+                  (vswap! *run-activity* assoc :silent? true)
+                  (tel/log! {:level :warn :id :agent/silent-finish
+                             :data {:turn turn-number :run-id run-id}}
+                            "Model ended silently after acting — turn complete without a reply")
+                  :complete)
+                (do
+                  (tel/log! {:level :error :id :agent/repeated-empty-response
+                             :data {:turn turn-number :run-id run-id}}
+                            "Model returned an empty response after corrective retry")
+                  (record-failure! {:kind :model
+                                    :cause "empty response after a corrective retry"})
+                  :error))))
 
           (and (quirks/code-fragment? content)
                (not (nudged-for-fragment? chat-ctx)))

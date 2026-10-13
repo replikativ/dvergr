@@ -759,6 +759,45 @@
       (finally
         (d/close-room! room)))))
 
+(deftest a-run-that-ends-silently-answers-nothing
+  ;; acted, wrote a code fragment as prose, then ended silently: the answer is
+  ;; empty, neither the fragment nor the tool-call message
+  (let [room (test-room :program-silent)
+        team (roster/make-agent
+              (roster/make-roster {:id :silent-team})
+              {:id :booker
+               :tools #{:clojure_eval}
+               :model-policy {:provider :codex-subscription :model "codex-subscription-sol"}
+               :program {:kind :llm :max-model-steps 4 :auto-compact? false}})
+        steps (atom 0)
+        bound (atom [])]
+    (try
+      (with-redefs [providers/ensure-initialized! (constantly nil)
+                    chat-agent/run-agent-turn!
+                    (fn [chat-ctx _]
+                      (swap! bound conj (some? chat-agent/*run-activity*))
+                      (case (swap! steps inc)
+                        1 (do (chat-context/add-message!
+                               chat-ctx {:role :assistant :content ""
+                                         :tool-uses [{:tool-use/id "call-1"
+                                                      :tool-use/name "clojure_eval"
+                                                      :tool-use/input {:code "(spit \"/out/a\" 1)"}}]})
+                              (vswap! chat-agent/*run-activity* assoc :acted? true)
+                              :continue)
+                        2 (do (chat-context/add-message!
+                               chat-ctx {:role :assistant :content "(spit \"/out/a\" 2)"})
+                              :continue)
+                        (do (vswap! chat-agent/*run-activity* assoc :silent? true)
+                            :complete)))]
+        (let [handle (binding [ec/*execution-context* (:ctx room)]
+                       (program/hire! room team :booker {:task "book"}))
+              result (binding [ec/*execution-context* (:ctx room)] @handle)]
+          (is (= :completed (:run/status result)))
+          (is (= "" (:run/value result)))
+          (is (= [true true true] @bound) "every step of the Run sees its activity")))
+      (finally
+        (d/close-room! room)))))
+
 (deftest llm-clojure-eval-can-recursively-hire-from-its-active-sci-world
   (let [room (test-room :program-llm-recursive-sci-hire)
         team (roster/make-agent
