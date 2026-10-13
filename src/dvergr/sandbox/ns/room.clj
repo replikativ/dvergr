@@ -255,20 +255,20 @@
                          ([n]
                           (safe #(when room-view
                                    (->> (d/q '[:find [(pull ?m [:message/content :message/role :message/created-at]) ...]
-                                               :where [?m :message/content _]] @room-view)
+                                               :where [?m :message/content _]] (ns-datahike/db-of room-view))
                                         (sort-by msg-time >)
                                         (take (or n 20)) vec)))))
         search-msgs    (fn [term]
                          (safe #(when room-view
                                   (let [lc (str/lower-case (str term))]
                                     (->> (d/q '[:find [(pull ?m [:message/content :message/role :message/created-at]) ...]
-                                                :where [?m :message/content _]] @room-view)
+                                                :where [?m :message/content _]] (ns-datahike/db-of room-view))
                                          (filter (fn [m] (str/includes? (str/lower-case (str (:message/content m))) lc)))
                                          (take 50) vec)))))
         schedules      (fn []
                          (safe #(when room-view
                                   (d/q '[:find [(pull ?s [*]) ...]
-                                         :where [?s :schedule/id _]] @room-view))))
+                                         :where [?s :schedule/id _]] (ns-datahike/db-of room-view)))))
         ;; Discovery: WHERE the agent's databases are + by-name access. Resolved
         ;; fork-aware under `ctx` so a fork lists/returns its branched systems.
         databases      (fn [] (safe #(when-let [room-id (current-room-id)]

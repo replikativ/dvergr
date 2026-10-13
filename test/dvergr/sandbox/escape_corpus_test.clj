@@ -31,6 +31,9 @@
             [dvergr.room.store.memory :as mem]
             [dvergr.substrate.paths :as paths]
             [dvergr.system.db :as sdb]
+            [datahike.api :as dh]
+            [dvergr.orchestration.skills :as skills]
+            [org.replikativ.spindel.yggdrasil :as ygg]
             [dvergr.sandbox :as sandbox]
             [dvergr.sandbox.deps :as deps]
             [org.replikativ.spindel.engine.core :as rtc]
@@ -443,3 +446,67 @@
       (testing "spins still run in the bound world"
         (let [r (eval-in sci ec "(require '[org.replikativ.spindel.spin.cps :refer [spin]]) @(spin (+ 1 2))")]
           (is (= 3 (:ok r)) (pr-str r)))))))
+
+(deftest database-handles-stay-with-the-host
+  ;; A Datahike database value carries its store, writer and config, and a
+  ;; connection holds them too; sandbox code that held either could act on
+  ;; the store past the write guards and the effect boundary. It gets handles:
+  ;; databases as SandboxDb and connections as WorldConnection, which only the
+  ;; mirrored Datahike API takes back.
+  (let [cfg {:store {:backend :memory :id (random-uuid)} :keep-history? true :schema-flexibility :read}
+        _ (dh/create-database cfg)
+        kb (dh/connect cfg)
+        ec (ctx/create-execution-context)
+        sci-ctx (sandbox/fork-for-session ec)]
+    (try
+      (with-redefs [ygg/system (fn [nm] (when (= "mail" nm) {:conn kb}))
+                    skills/load-all (fn [& _] {"probe" {:name "probe" :body "b" :provides [:probe] :storage {:fs :host-fs}}})]
+        (sandbox/setup-agent-namespaces! sci-ctx ec :kb-conn kb)
+        (let [ev #(eval-in sci-ctx ec (str "(require '[datahike.api :as d]) " %))]
+          (testing "a database is a handle"
+            (is (= {:ok "class dvergr.sandbox.ns.datahike.SandboxDb"}
+                   (ev "(str (type @dvergr.room/*kb*))")))
+            (is (= {:ok [false nil nil]}
+                   (ev "(let [db @dvergr.room/*kb*] [(map? db) (:store db) (:config db)])"))))
+          (testing "the mirrored API takes it back"
+            (is (= {:ok #{["note"]}}
+                   (ev "(d/transact dvergr.room/*kb* [{:title \"note\"}])
+                        (d/q '[:find ?t :where [_ :title ?t]] @dvergr.room/*kb*)")))
+            (is (= {:ok #{["note"]}}
+                   (ev "(d/q {:query '[:find ?t :where [_ :title ?t]] :args [@dvergr.room/*kb*]})"))))
+          (testing "databases come back as handles from every call"
+            (is (= {:ok [true true true true true]}
+                   (ev "(let [sealed? #(= \"class dvergr.sandbox.ns.datahike.SandboxDb\" (str (type %)))
+                              r (d/transact dvergr.room/*kb* [{:title \"b\"}])]
+                          [(sealed? (:db-after r))
+                           (sealed? (:db-after (d/with @dvergr.room/*kb* [{:title \"c\"}])))
+                           (sealed? (d/db dvergr.room/*kb*))
+                           (sealed? (d/as-of @dvergr.room/*kb* (java.util.Date.)))
+                           (sealed? (:db-after @(d/transact! dvergr.room/*kb* [{:title \"d\"}])))])"))))
+          (testing "functions Datahike calls back see handles"
+            (is (= {:ok #{[false]}}
+                   (ev "(d/q '[:find ?m :in $ ?f :where [(?f $) ?m]] @dvergr.room/*kb* map?)")))
+            (is (= {:ok false}
+                   (ev "(let [seen (atom nil)]
+                          (d/q '[:find ?t :where [_ :title ?t]]
+                               (d/filter @dvergr.room/*kb* (fn [db _] (reset! seen (map? db)) true)))
+                          @seen)"))))
+          (testing "a scratch database's connection is a handle"
+            (is (= {:ok ["class dvergr.sandbox.ns.datahike.WorldConnection" nil #{["s"]}]}
+                   (ev "(d/create-database {:store {:backend :mem :id \"scratch\"} :schema-flexibility :read})
+                        (let [c (d/connect {:store {:backend :mem :id \"scratch\"}})]
+                          (d/transact c [{:title \"s\"}])
+                          [(str (type c)) (:wrapped-atom c)
+                           (d/q '[:find ?t :where [_ :title ?t]] @c)])"))))
+          (testing "the mailbox is a handle"
+            (is (= {:ok ["class dvergr.sandbox.ns.datahike.WorldConnection"
+                         "class dvergr.sandbox.ns.datahike.WorldConnection"]}
+                   (ev "[(str (type (dvergr.mail/inbox))) (str (type dvergr.mail/*inbox*))]"))))
+          (testing "skill definitions are data"
+            (is (= {:ok [nil "b"]}
+                   (ev "(let [s (get (dvergr.skills/all) \"probe\")] [(:storage s) (:body s)])")))
+            (is (= {:ok [nil]}
+                   (ev "(mapv :storage (dvergr.skills/find :probe))"))))))
+      (finally
+        (ctx/stop-context! ec)
+        (dh/release kb)))))

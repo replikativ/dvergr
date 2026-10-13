@@ -813,6 +813,12 @@
                              'online? [:=> [:cat :keyword] :boolean]
                              'by-tag  [:=> [:cat :keyword] [:vector OnlineAgent]]})))))
 
+(defn- public-definition
+  "A skill definition as sandbox code sees it: a room skill's `:storage` is
+   the host's handle on the room repository, not data about the skill."
+  [definition]
+  (dissoc definition :storage))
+
 (defn add-skills-ns!
   "Expose the skill registry + dispatch as the `dvergr.skills` namespace in SCI.
 
@@ -867,12 +873,13 @@
                                                (utf8 (str "vetted_by: " by "\nvetted_at: " date "\n")))))))]
     (sci/add-namespace! sci-ctx 'dvergr.skills
                         (doc/with-docs
-                          {'all       (fn [] (load-all* (room-dir)))
+                          {'all       (fn [] (update-vals (load-all* (room-dir)) public-definition))
                          ;; Progressive disclosure: the system prompt shows a
                          ;; brief index; pull a skill's FULL instructions here.
                            'read      (fn [skill-name] (read-skill* skill-name (room-dir)))
                            'find      (fn [provides-tag]
-                                        (into [] (filter #(provides? provides-tag %))
+                                        (into [] (comp (filter #(provides? provides-tag %))
+                                                       (map public-definition))
                                               (vals (load-all* (room-dir)))))
                            'providers (fn [skill] (find-prov conn skill))
                            'rank      (fn [skill] (rank-prov conn skill))

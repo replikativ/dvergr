@@ -23,6 +23,7 @@
    (Discovery + by-name access to the room's MANAGED databases — KB, messages,
    created data DBs — is dvergr-specific and lives in `dvergr.room`, not here.)"
   (:require [datahike.api :as d]
+            [datahike.db.utils :as dbu]
             [datahike.query.resolve :as resolve]
             [dvergr.effects :as effects]
             [dvergr.system.rooms :as srooms]
@@ -32,10 +33,40 @@
             [sci.fork :as sci-fork]
             [sci.core :as sci]))
 
+(deftype SandboxDb [db]
+  ;; A database value as sandbox code holds it. The value itself carries its
+  ;; store, writer and config, which no sandbox code may reach; the mirrored
+  ;; Datahike fns take this back and use the value inside.
+  Object
+  (toString [_] (str "#sandbox/db " (pr-str {:max-tx (:max-tx db) :max-eid (:max-eid db)}))))
+
+(defmethod print-method SandboxDb [x ^java.io.Writer w]
+  (.write w (str x)))
+
+(defn- db-value? [x]
+  (and (some? x) (not (instance? SandboxDb x)) (dbu/db? x)))
+
+(defn seal
+  "What sandbox code gets for `x`: a database value as a SandboxDb, a
+   transaction report with its databases sealed, anything else as it is."
+  [x]
+  (cond
+    (db-value? x) (SandboxDb. x)
+    (and (map? x) (or (contains? x :db-before) (contains? x :db-after)))
+    (cond-> x
+      (contains? x :db-before) (update :db-before seal)
+      (contains? x :db-after) (update :db-after seal))
+    :else x))
+
+(defn unseal
+  "The database value of a SandboxDb, else `x`."
+  [x]
+  (if (instance? SandboxDb x) (.-db ^SandboxDb x) x))
+
 (deftype WorldConnection [resolver]
   clojure.lang.IDeref
   (deref [_]
-    @(resolver))
+    (seal @(resolver)))
 
   sci-fork/Forkable
   (fork-value [this]
@@ -46,18 +77,66 @@
 
 (defn world-connection
   "Create an ambient Datahike connection handle. Deref returns the selected
-   connection's DB; mirrored Datahike functions unwrap it to the connection."
+   connection's DB, sealed; mirrored Datahike functions unwrap it to the
+   connection."
   [resolve-conn]
   (WorldConnection. resolve-conn))
 
 (defn resolve-connection
-  "Resolve a WorldConnection, otherwise return `value` unchanged."
+  "Resolve a WorldConnection to its connection and a SandboxDb to its
+   database value, otherwise return `value` unchanged."
   [value]
-  (if (instance? WorldConnection value)
+  (cond
+    (instance? WorldConnection value)
     (or ((.-resolver ^WorldConnection value))
         (throw (ex-info "Ambient Datahike connection is unavailable in this world"
                         {:type ::connection-unavailable})))
-    value))
+
+    (instance? SandboxDb value) (unseal value)
+    :else value))
+
+(defn db-of
+  "The database value behind a WorldConnection, for host code."
+  [conn]
+  @(resolve-connection conn))
+
+(defn- sealing-fn
+  "`f` (sandbox code Datahike calls back, a query function or a filter
+   predicate) seeing sealed databases."
+  [f]
+  (if (fn? f)
+    (fn [& args] (apply f (map seal args)))
+    f))
+
+(defn- host-args
+  "The arguments of a mirrored Datahike call as the real fn takes them:
+   handles resolved, and query inputs (positional or in a query map's :args)
+   that are functions see sealed databases."
+  [sym args]
+  (let [args (mapv resolve-connection args)]
+    (case sym
+      q      (if (and (map? (first args)) (contains? (first args) :args))
+               (into [(update (first args) :args #(mapv (comp sealing-fn resolve-connection) %))]
+                     (map sealing-fn) (rest args))
+               (into [(first args)] (map sealing-fn) (rest args)))
+      filter (update args 1 sealing-fn)
+      args)))
+
+(defn- sealed-result
+  "A mirrored call's result as sandbox code gets it: databases sealed, and
+   a pending transaction sealed when it is dereferenced."
+  [x]
+  (if (and (instance? clojure.lang.IDeref x) (instance? clojure.lang.IPending x)
+           (not (instance? WorldConnection x)))
+    (reify
+      clojure.lang.IDeref
+      (deref [_] (seal @x))
+      clojure.lang.IBlockingDeref
+      (deref [_ ms timeout] (let [v (deref x ms ::timeout)]
+                              (if (= ::timeout v) timeout (seal v))))
+      clojure.lang.IPending
+      (isRealized [_] (realized? x)))
+    (seal x)))
 
 ;; The safe DATA surface of datahike.api — resolved from the real namespace so the
 ;; mirror never drifts. Lifecycle (connect/create/delete/exists?) is GUARDED below.
@@ -173,9 +252,9 @@
                                    (when-let [v (ns-resolve 'datahike.api sym)]
                                      (let [f @v]
                                        [sym (fn [& args]
-                                              (let [resolved (mapv resolve-connection args)]
+                                              (let [resolved (host-args sym args)]
                                                 (try
-                                                  (untrusted #(apply f resolved))
+                                                  (sealed-result (untrusted #(apply f resolved)))
                                                   (catch Throwable error
                                                     (throw
                                                      (ex-info
@@ -191,15 +270,15 @@
                          'transact
                          (fn [conn tx-data]
                            (let [conn (resolve-connection conn)]
-                             (untrusted #(d/transact conn
-                                                     (assert-no-certified-evaluation-write!
-                                                      conn tx-data)))))
+                             (seal (untrusted #(d/transact conn
+                                                           (assert-no-certified-evaluation-write!
+                                                            conn tx-data))))))
                          'transact!
                          (fn [conn tx-data]
                            (let [conn (resolve-connection conn)]
-                             (untrusted #(d/transact! conn
-                                                      (assert-no-certified-evaluation-write!
-                                                       conn tx-data))))))
+                             (sealed-result (untrusted #(d/transact! conn
+                                                                     (assert-no-certified-evaluation-write!
+                                                                      conn tx-data)))))))
         ;; per-sandbox ephemeral (:mem) databases, keyed by logical name
         ephemeral (atom {})
         ephemeral-map #(if binding-resolver
@@ -258,7 +337,10 @@
          (fn [cfg]
            (in-ctx
             (fn [] (let [nm (cfg-name cfg)]
-                     (or (some-> (get (ephemeral-map) nm) entry-conn)
+                     (or (when (contains? (ephemeral-map) nm)
+                           ;; a handle, like a room database: the connection
+                           ;; itself stays with the host
+                           (world-connection #(some-> (get (ephemeral-map) nm) entry-conn)))
                          (when (current-room-id) (managed-connection nm))
                          (throw (ex-info (str "No database named " (pr-str nm)
                                               " in this room — create it with create-database, or see "

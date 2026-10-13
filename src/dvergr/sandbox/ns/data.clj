@@ -1,10 +1,9 @@
 (ns dvergr.sandbox.ns.data
-  "SCI injectors — datahike read/write/diff, spindel sync/combinators/signals,
+  "SCI injectors — spindel sync/combinators/signals,
    and probabilistic inference. Split out of dvergr.sandbox (Phase 4)."
   (:require [dvergr.substrate.load :as load]
             [sci.core :as sci]
             [is.simm.partial-cps.sequence :as aseq]
-            [datahike.api :as dh]
             [dvergr.agent.roster :as roster]
             [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.sandbox.ns.doc :as doc]
@@ -202,78 +201,6 @@
                                         (let [ctx (rtc/current-execution-context)
                                               id  (next-addr! ctx "signal" {:file "sci" :line 0 :column 0})]
                                           (signal-ref-ctor id (clear-deltas initial-value))))}))))))
-
-(defn add-datahike-query-ns!
-  "Add datahike query namespace to SCI context.
-
-   Exposes read-only datahike functions:
-   - dh/q       - datalog queries
-   - dh/pull    - pull patterns
-   - dh/pull-many
-   - dh/entity  - entity maps
-   - dh/datoms  - raw datom access
-   - dh/schema  - schema inspection
-
-   Does NOT expose transact - use tools for modifications.
-
-   The db-atom should be an atom containing the current db value,
-   updated by the caller when db changes."
-  [sci-ctx db-atom]
-  (let [;; Accept canonical calls (with explicit DB as first arg) AND
-        ;; the sugared form (auto-uses session db). LLMs default to the
-        ;; canonical shape from their training; auto-prepending @db-atom
-        ;; in that case dispatches the multimethod on the wrong arg
-        ;; (a DB value instead of the index keyword) and fails opaquely.
-        db? (fn [x] (instance? datahike.db.DB x))
-        q-fn (fn [query & args]
-               ;; (q query db & inputs) OR (q query & inputs) — auto-add db
-               ;; only when the first input isn't already one.
-               (if (and (seq args) (db? (first args)))
-                 (apply dh/q query args)
-                 (apply dh/q query @db-atom args)))
-        pull-fn (fn [a b & [c]]
-                  (if (db? a) (dh/pull a b c) (dh/pull @db-atom a b)))
-        pull-many-fn (fn [a b & [c]]
-                       (if (db? a) (dh/pull-many a b c) (dh/pull-many @db-atom a b)))
-        entity-fn (fn [a & [b]]
-                    (if (db? a) (dh/entity a b) (dh/entity @db-atom a)))
-        datoms-fn (fn [a & rest]
-                    (if (db? a)
-                      (apply dh/datoms a rest)
-                      (apply dh/datoms @db-atom a rest)))
-        schema-fn (fn ([] (dh/schema @db-atom))
-                    ([db] (dh/schema db)))
-        db-fn (fn [] @db-atom)
-        ;; Fulltext memory search via datahike's native scriptum secondary index
-        ;; (dvergr.search.secondary/search). It's just a fn returning BM25-RANKED
-        ;; [[entity-id score] …], so the agent calls it INSIDE a datalog clause —
-        ;; fulltext ranking composed with structured constraints in one q:
-        ;;   (dh/q '[:find ?c ?score
-        ;;           :in $ ?ft
-        ;;           :where [(?ft :room/fulltext "gc reap") [[?e ?score]]]
-        ;;                  [?e :message/content ?c]]
-        ;;         (dh/db) dh/search)
-        ;; Resolve lazily + gracefully: the scriptum secondary-index adapter
-        ;; lives in datahike's src-secondary root, which a released build may
-        ;; not ship. The sandbox must still build; dh/search errors clearly only
-        ;; if actually called without support.
-        secondary  (try (requiring-resolve 'dvergr.search.secondary/search)
-                        (catch Throwable _ nil))
-        search-fn  (fn [ident query & [opts]]
-                     (if secondary
-                       (secondary @db-atom ident query (or opts {}))
-                       (throw (ex-info "fulltext search unavailable — datahike secondary index (:scriptum) not on classpath"
-                                       {:ident ident}))))]
-
-    (sci/add-namespace! sci-ctx 'dh
-                        {'q q-fn
-                         'pull pull-fn
-                         'pull-many pull-many-fn
-                         'entity entity-fn
-                         'datoms datoms-fn
-                         'schema schema-fn
-                         'search search-fn
-                         'db db-fn})))
 
 (defn add-inference-ns!
   "Add probabilistic programming primitives to SCI context.
