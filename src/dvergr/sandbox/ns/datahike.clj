@@ -60,10 +60,14 @@
                   {:type ::host-object :class (str (class x))})))
 
 (defn- plain?
-  "A value that holds nothing to seal: the scalars query results are made of."
+  "A scalar of the kinds Datahike stores: the leaves of a value that may cross
+   the sandbox boundary (a symbol only without metadata)."
   [x]
-  (or (nil? x) (string? x) (number? x) (keyword? x) (symbol? x) (boolean? x)
-      (uuid? x) (char? x) (inst? x)))
+  (or (nil? x) (string? x) (number? x) (keyword? x) (boolean? x)
+      (uuid? x) (char? x) (inst? x) (bytes? x)
+      (and (symbol? x) (nil? (meta x)))))
+
+(defn- sorted? [x] (instance? clojure.lang.Sorted x))
 
 (defn- seal-coll
   "`x` with `f` applied to its elements, or `x` itself when no element changed
@@ -75,30 +79,25 @@
       (rebuild x))))
 
 (defn seal
-  "What sandbox code gets for `x`, deeply: a database value as a SandboxDb,
-   within maps, vectors, sets and sequences too (a transaction report's
-   databases, a query tuple). A connection, store or other reference fails
-   closed. Entities and handles are left as they are; an entity's database
-   is reached only through the mirrored `entity-db`, which seals it. A
-   collection that holds nothing to seal comes back as it is."
+  "What sandbox code gets for `x`, deeply. Only data crosses: scalars
+   (`plain?`), and maps, vectors, sets and sequences of data, without their
+   metadata; a database value becomes a SandboxDb, a transaction report a
+   map, and handles, entities and datoms whose every slot is data pass.
+   Anything else (a connection, store, reference, function, sorted
+   collection, exception, other object) fails closed. A collection that
+   holds nothing to seal comes back as it is."
   [x]
   (cond
     (plain? x) x
+    (symbol? x) (with-meta x nil)
     (instance? SandboxDb x) x
     (world-connection? x) x
     (instance? datahike.impl.entity.Entity x) x
-    ;; a datom is data as long as its value is: a query can build one around
-    ;; anything ([(assoc ?d :v ?f) ?boxed])
-    (instance? datahike.datom.Datom x) (if (identical? (:v x) (seal (:v x))) x (leak! x))
+    (instance? datahike.datom.Datom x)
+    (if (every? #(identical? % (seal %)) [(:e x) (:a x) (:v x) (:tx x) (:added x)]) x (leak! x))
     (dbu/db? x) (SandboxDb. x)
-    (or (dc/connection? x)
-        (instance? clojure.lang.IRef x)
-        (instance? clojure.lang.IAtom x)
-        ;; a function a query built (e.g. [(constantly ?box) ?f]) closes over
-        ;; whatever it was given
-        (callable? x))
-    (leak! x)
-    (record? x) (seal (into {} x)) ; a transaction report, as a map
+    (sorted? x) (leak! x) ; its comparator is a function
+    (record? x) (if (contains? x :db-after) (seal (into {} x)) (leak! x)) ; a transaction report
     (map? x) (let [x (if (meta x) (with-meta x nil) x)]
                (if (every? (fn [[k v]] (and (identical? k (seal k)) (identical? v (seal v)))) x)
                  x
@@ -107,8 +106,24 @@
     (vector? x) (seal-coll x seal #(mapv seal %))
     (set? x) (seal-coll x seal #(into (empty %) (map seal) %))
     (seq? x) (map seal x) ; lazily: `datoms` over a large database stays a stream
-    (satisfies? kp/PEDNKeyValueStore x) (leak! x)
-    :else x))
+    ;; an index slice (`datoms`, `seek-datoms`): sealed as it is read
+    (instance? clojure.lang.Seqable x) (map seal (seq x))
+    (instance? java.lang.Iterable x) (map seal (iterator-seq (.iterator ^java.lang.Iterable x)))
+    :else (leak! x)))
+
+(defn- data?
+  "Whether `x` is data sandbox code may write: `plain?` scalars, and maps,
+   vectors, sets and sequences of data, unsorted and without metadata that
+   is not data itself."
+  [x]
+  (cond
+    (plain? x) true
+    (symbol? x) (data? (meta x))
+    (or (sorted? x) (record? x)) false
+    (or (map? x) (vector? x) (set? x) (seq? x))
+    (and (or (nil? (meta x)) (data? (meta x)))
+         (every? (if (map? x) (fn [[k v]] (and (data? k) (data? v))) data?) x))
+    :else false))
 
 (defn unseal
   "The database value of a SandboxDb, else `x`."
@@ -272,7 +287,9 @@
           more (vec more)]
       (into [(resolve-connection target)]
             (case sym
-              filter (update more 0 sealing-fn)
+              filter (if (fn? (first more))
+                       (update more 0 sealing-fn)
+                       (throw (ex-info "A filter predicate is a function" {:type ::filter-predicate})))
               more)))))
 
 (declare sandbox-error)
@@ -345,11 +362,6 @@
    calls (`:db.fn/call` would run sandbox code on the raw database) and no
    writes to certified evaluation projections."
   [db tx-data]
-  (when-let [f (first (filter callable? (tree-seq #(or (coll? %) (some? (meta %)))
-                                                  #(concat (when (coll? %) (seq %)) (some-> (meta %) vector))
-                                                  tx-data)))]
-    (throw (ex-info "A transaction is data: functions in it are not available in the sandbox"
-                    {:type ::tx-function :class (str (class f))})))
   (doseq [form tx-data]
     (when (instance? datahike.datom.Datom form)
       ;; neither a map nor a form: its entity and attribute slots would pass
@@ -382,6 +394,10 @@
         (throw
          (ex-info "Certified evaluation projections are host-owned and read-only in SCI"
                   {:type ::protected-evaluation-write :tx-form (pr-str form)})))))
+  (when-not (data? (vec tx-data))
+    (throw (ex-info (str "A transaction is data: functions in it, and values that are not "
+                         "plain data (objects, sorted collections), are not available in the sandbox")
+                    {:type ::tx-function})))
   tx-data)
 
 (defn- assert-no-code-attrs!

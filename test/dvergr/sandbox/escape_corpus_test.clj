@@ -580,6 +580,23 @@
                                           (d/q '[:find ?boxed . :in $ ?d :where [(constantly 1) ?f] [(assoc ?d :v ?f) ?boxed]]
                                                @dvergr.room/*kb* seed))"))))
                 "nor a datom built around one"))
+          (testing "only data crosses the boundary"
+            (is (re-find #"filter predicate is a function"
+                         (str (:err (ev "(d/filter @dvergr.room/*kb* (sorted-map-by compare 0 true))")))))
+            (ev "(d/create-database {:store {:backend :mem :id \"values\"} :schema-flexibility :read})")
+            (doseq [v ["(ex-info \"payload\" {})" "(sorted-set 1 2)" "(sorted-map :a 1)"]]
+              (is (re-find #"not plain data"
+                           (str (:err (ev (str "(d/transact (d/connect {:store {:backend :mem :id \"values\"}}) [[:db/add -1 :payload " v "]])")))))
+                  v))
+            (is (= {:ok [true nil]}
+                   (ev "(let [r (d/q '[:find ?s . :in $ ?s :where [_ :title _]] @dvergr.room/*kb* (with-meta 'tag {:k 1}))]
+                          [(= 'tag r) (meta r)])"))
+                "a symbol comes back without its metadata")
+            (is (re-find #"host object"
+                         (str (:err (ev "(let [seed (first (d/datoms @dvergr.room/*kb* :eavt))]
+                                          (d/q '[:find ?boxed . :in $ ?d :where [(constantly 1) ?f] [(assoc ?d :a ?f) ?boxed]]
+                                               @dvergr.room/*kb* seed))"))))
+                "a datom is checked in every slot"))
           (testing "a datom is not a transaction entry"
             (is (re-find #"datoms are not accepted"
                          (str (:err (ev "(let [d (first (d/datoms @dvergr.room/*kb* :eavt))]
