@@ -51,7 +51,7 @@
 (defn- db-value? [x]
   (and (some? x) (not (instance? SandboxDb x)) (dbu/db? x)))
 
-(declare world-connection?)
+(declare world-connection? callable?)
 
 (defn- leak!
   "A Datahike result that would hand sandbox code a host object."
@@ -90,7 +90,10 @@
     (dbu/db? x) (SandboxDb. x)
     (or (dc/connection? x)
         (instance? clojure.lang.IRef x)
-        (instance? clojure.lang.IAtom x))
+        (instance? clojure.lang.IAtom x)
+        ;; a function a query built (e.g. [(constantly ?box) ?f]) closes over
+        ;; whatever it was given
+        (callable? x))
     (leak! x)
     (record? x) (seal (into {} x)) ; a transaction report, as a map
     (map? x) (let [x (if (meta x) (with-meta x nil) x)]
@@ -238,7 +241,7 @@
   [query inputs]
   (let [query (query-form query)
         bindings (in-bindings query)
-        rules (keep-indexed (fn [i b] (when (= '% b) (nth inputs i nil))) bindings)]
+        rules (keep-indexed (fn [i b] (when (= '% b) (query-form (nth inputs i nil)))) bindings)]
     (check-bindings! bindings)
     (check-source-use! (into [query] rules))
     (into []
@@ -318,6 +321,12 @@
                    (:scorecard/id entity) (:scorecard.summary/id entity))))
     (catch Throwable _ false)))
 
+(def ^:private code-attrs
+  "Attributes whose values Datahike runs as code: a transaction function,
+   and attribute or entity predicates (symbols a later write resolves, also
+   a host write outside the sandbox's resolver)."
+  #{:db/fn :db.attr/preds :db.entity/preds})
+
 (def ^:private tx-ops
   "The transaction operations sandbox code may use: Datahike's own, as
    `datahike.db.transaction` dispatches them, without :db.fn/call (it runs a
@@ -338,10 +347,10 @@
                     {:type ::tx-function :class (str (class f))})))
   (doseq [form tx-data]
     (when (or (and (sequential? form) (not (contains? tx-ops (first form))))
-              (and (map? form) (contains? form :db/fn))
-              (and (sequential? form) (= :db/fn (nth form 2 nil))))
-      (throw (ex-info (str "Transaction functions (:db.fn/call, :db/fn, an ident as the operation) "
-                           "are not available in the sandbox: " (pr-str (if (map? form) (keys form) (first form))))
+              (and (map? form) (some #(contains? form %) code-attrs))
+              (and (sequential? form) (contains? code-attrs (nth form 2 nil))))
+      (throw (ex-info (str "Transaction functions and predicates (:db.fn/call, :db/fn, :db.attr/preds, "
+                           ":db.entity/preds, an ident as the operation) are not available in the sandbox: " (pr-str (if (map? form) (keys form) (first form))))
                       {:type ::tx-function})))
     (let [protected?
           (cond

@@ -533,6 +533,8 @@
                       "(d/q '[:find ?s :in $ % :where (leak ?s)] @dvergr.room/*kb* '[[(leak ?s) [[identity $] ?s]]])"]
                      ["a lookup's default argument"
                       "(d/q '[:find ?raw . :where [(get-else $ 999999999 :missing $) ?raw]] @dvergr.room/*kb*)"]
+                     ["a rule given as a string"
+                      "(d/q '[:find ?f . :in $ % :where (box ?f)] @dvergr.room/*kb* \"[[(box ?f) [(vector $) ?box] [(constantly ?box) ?f]]]\")"]
                      ["a namespaced name for a lookup"
                       "(d/q '[:find ?ok . :in $ ?f :where [(evil/pull $) ?ok]] @dvergr.room/*kb* identity)"]]]
               (testing what
@@ -549,6 +551,9 @@
           (testing "Datahike's own lookups still take the source"
             (is (= {:ok #{["note" "none"]}}
                    (ev "(d/q '[:find ?t ?x :where [?e :title \"note\"] [?e :title ?t] [(get-else $ ?e :missing \"none\") ?x]] @dvergr.room/*kb*)"))))
+          (testing "a query result holds no function"
+            (is (re-find #"host object"
+                         (str (:err (ev "(d/q '[:find ?f . :where [(constantly 1) ?f]] @dvergr.room/*kb*)"))))))
           (testing "transaction functions are refused, in every form"
             (doseq [code ["(d/with @dvergr.room/*kb* [[:db.fn/call (fn [db] [])]])"
                           "(d/with @dvergr.room/*kb* [{:db/ident :escape :db/fn (fn [db] [])} [:escape]])"
@@ -556,6 +561,8 @@
                           "(d/with @dvergr.room/*kb* [[:db/add -1 :db/ident :db.evil/leak] [:db/add -1 :db/fn (fn [raw] [])] [:db.evil/leak]])"
                           "(d/with @dvergr.room/*kb* [[:db/add -1 :db/ident :db.evil/leak] [:db/add -1 :db/fn 'clojure.core/identity] [:db.evil/leak]])"
                           "(d/transact dvergr.room/*kb* {:tx-data [{:title \"m\"}] :tx-meta {:hook (fn [db] db)}})"
+                          "(d/transact dvergr.room/*kb* [{:db/ident :p/x :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db.attr/preds ['clojure.core/slurp]}])"
+                          "(d/transact dvergr.room/*kb* [[:db/add 1 :db.entity/preds 'clojure.core/slurp]])"
                           "(d/transact dvergr.room/*kb* [[:db.fn/call (fn [db] [])]])"
                           "(d/transact dvergr.room/*kb* {:tx-data [[:db.fn/call (fn [db] [])]]})"
                           "(d/transact! dvergr.room/*kb* {:tx-data [(list :db.fn/call (fn [db] []))]})"]]
