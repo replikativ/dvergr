@@ -365,6 +365,10 @@
   (let [[_conn st] (mem-store)]
     (contract/assert-cross-room-scorecard-identity! st)))
 
+(deftest large-scorecard-contract
+  (let [[_conn st] (mem-store)]
+    (contract/assert-large-scorecard-round-trips! st)))
+
 (deftest finite-scorecard-aggregate-contract
   (let [[_conn st] (mem-store)]
     (contract/assert-non-finite-scorecard-aggregates-rejected!

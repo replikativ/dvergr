@@ -423,19 +423,22 @@
     :attempt/experiment-content-id :attempt/experiment-candidate
     :attempt/inputs-id
     {:attempt/run [:run/id]}
-    {:attempt/evidence-runs [:run/id]}
-    {:attempt/evidence-messages [:message/id]}
-    {:attempt/checks [:attempt.check/id :attempt.check/key
-                      :attempt.check/passed?]}])
+    {(limit :attempt/evidence-runs nil) [:run/id]}
+    {(limit :attempt/evidence-messages nil) [:message/id]}
+    {(limit :attempt/checks nil) [:attempt.check/id :attempt.check/key
+                                  :attempt.check/passed?]}])
 
+;; Cardinality-many references are pulled with (limit attr nil): Datahike's
+;; pull takes the first 1000 values by default, and a Scorecard over more
+;; than 1000 Attempts then fails its own projection check.
 (def ^:private scorecard-pull-pattern
   '[:scorecard/id :scorecard/payload-ref :scorecard/payload-blob :scorecard/payload-codec
     :scorecard/experiment-id :scorecard/experiment-version
     :scorecard/experiment-content-id :scorecard/dataset-id
     :scorecard/dataset-version :scorecard/dataset-content-id
     :scorecard/stored-at
-    {:scorecard/attempts [:attempt/id :attempt/content-id]}
-    {:scorecard/summaries
+    {(limit :scorecard/attempts nil) [:attempt/id :attempt/content-id]}
+    {(limit :scorecard/summaries nil)
      [:scorecard.summary/id :scorecard.summary/candidate-id
       :scorecard.summary/candidate-content-id
       :scorecard.summary/attempt-count :scorecard.summary/passed-count

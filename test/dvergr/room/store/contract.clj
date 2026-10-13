@@ -75,6 +75,67 @@
                             (store/-store-scorecard! st room-b scorecard)))
       (is (empty? (store/-list-scorecards st room-b {}))))))
 
+;; Datahike's pull takes the first 1000 values of a cardinality-many attribute
+;; unless told otherwise.
+(defn assert-large-scorecard-round-trips!
+  "A Scorecard over more than 1000 Attempts reads back whole."
+  [st]
+  (testing "a Scorecard over 1001 Attempts"
+    (let [room-id :large-scorecard-room
+          n 1001
+          now (java.util.Date. 1000)
+          agent (-> (roster/make-roster)
+                    (roster/make-agent {:id :candidate :program {:kind :echo}})
+                    (roster/agent :candidate))
+          definition (environment/make-environment
+                      {:id :contract/large :task :ok
+                       :verifier {:id :contract/large :version 1}
+                       :world {:isolation :ctx :settlement :review}})
+          experiment-def (experiment/make-experiment
+                          {:id :contract/large
+                           :dataset (experiment/make-dataset {:id :contract/large
+                                                              :environments [definition]})
+                           :candidates [agent]
+                           :repetitions n})
+          candidate (first (:experiment/candidates experiment-def))
+          attempts (vec (for [rep (range n)
+                              :let [run-id (random-uuid)
+                                    receipt (environment/make-attempt-receipt
+                                             definition
+                                             {:run-id run-id :provider :dvergr :model "echo"
+                                              :status :completed :started-at 1000 :elapsed-ms 10
+                                              :metrics {:program-kind :echo :model-resolution :not-applicable
+                                                        :agent-version 1 :agent-def-hash (hasch/uuid agent)
+                                                        :interpreter-version 5}
+                                              :checks {:exact? true} :reward 1.0
+                                              :trace {:runs [{:run/id run-id :run/status :completed}]}})]]
+                          [rep run-id (attempt/make-attempt
+                                       definition agent receipt
+                                       {:trace {:runs [{:run/id run-id :run/status :completed}]}}
+                                       :review)]))
+          scorecard (experiment/make-scorecard
+                     experiment-def
+                     (for [[rep _ a] attempts]
+                       {:experiment/job {:candidate/id (:candidate/id candidate)
+                                         :candidate/agent (:candidate/agent candidate)
+                                         :candidate/agent-content-id (:candidate/agent-content-id candidate)
+                                         :environment (environment/environment-ref definition)
+                                         :repetition rep}
+                        :attempt a}))]
+      (store/-store-room! st room-id {:slug (name room-id)})
+      (doseq [[_ run-id a] attempts]
+        (store/-store-run!
+         st room-id
+         {:run/id run-id :run/kind :agent-task :run/room room-id
+          :run/actor :candidate :run/trigger (random-uuid)
+          :run/status :completed :run/created-at now :run/started-at now
+          :run/updated-at now :run/ended-at (java.util.Date. 1010)
+          :run/agent-version 1 :run/program-kind :echo
+          :run/interpreter-version 5 :run/agent-def-hash (hasch/uuid agent)})
+        (store/-store-attempt! st room-id a))
+      (is (= scorecard (store/-store-scorecard! st room-id scorecard)))
+      (is (= [scorecard] (vec (store/-list-scorecards st room-id {})))))))
+
 (defn- finite-reward-overflow-scorecard []
   (let [agent (-> (roster/make-roster)
                   (roster/make-agent {:id :overflow-candidate
