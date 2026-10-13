@@ -22,8 +22,13 @@
 
    (Discovery + by-name access to the room's MANAGED databases — KB, messages,
    created data DBs — is dvergr-specific and lives in `dvergr.room`, not here.)"
-  (:require [datahike.api :as d]
+  (:require [clojure.edn :as edn]
+            [datahike.api :as d]
+            [datahike.datom]
+            [datahike.connector :as dc]
             [datahike.db.utils :as dbu]
+            [datahike.impl.entity]
+            [konserve.protocols :as kp]
             [datahike.query.resolve :as resolve]
             [dvergr.effects :as effects]
             [dvergr.system.rooms :as srooms]
@@ -46,16 +51,57 @@
 (defn- db-value? [x]
   (and (some? x) (not (instance? SandboxDb x)) (dbu/db? x)))
 
+(declare world-connection?)
+
+(defn- leak!
+  "A Datahike result that would hand sandbox code a host object."
+  [x]
+  (throw (ex-info "A Datahike result held a host object; sandbox code gets databases as handles only"
+                  {:type ::host-object :class (str (class x))})))
+
+(defn- plain?
+  "A value that holds nothing to seal: the scalars query results are made of."
+  [x]
+  (or (nil? x) (string? x) (number? x) (keyword? x) (symbol? x) (boolean? x)
+      (uuid? x) (char? x) (inst? x) (instance? datahike.datom.Datom x)))
+
+(defn- seal-coll
+  "`x` with `f` applied to its elements, or `x` itself when no element changed
+   (an ordinary query result is scanned once and not copied)."
+  [x f rebuild]
+  (let [x (if (meta x) (with-meta x nil) x)] ; metadata is not part of a result
+    (if (every? #(identical? % (f %)) x)
+      x
+      (rebuild x))))
+
 (defn seal
-  "What sandbox code gets for `x`: a database value as a SandboxDb, a
-   transaction report with its databases sealed, anything else as it is."
+  "What sandbox code gets for `x`, deeply: a database value as a SandboxDb,
+   within maps, vectors, sets and sequences too (a transaction report's
+   databases, a query tuple). A connection, store or other reference fails
+   closed. Entities and handles are left as they are; an entity's database
+   is reached only through the mirrored `entity-db`, which seals it. A
+   collection that holds nothing to seal comes back as it is."
   [x]
   (cond
-    (db-value? x) (SandboxDb. x)
-    (and (map? x) (or (contains? x :db-before) (contains? x :db-after)))
-    (cond-> x
-      (contains? x :db-before) (update :db-before seal)
-      (contains? x :db-after) (update :db-after seal))
+    (plain? x) x
+    (instance? SandboxDb x) x
+    (world-connection? x) x
+    (instance? datahike.impl.entity.Entity x) x
+    (dbu/db? x) (SandboxDb. x)
+    (or (dc/connection? x)
+        (instance? clojure.lang.IRef x)
+        (instance? clojure.lang.IAtom x))
+    (leak! x)
+    (record? x) (seal (into {} x)) ; a transaction report, as a map
+    (map? x) (let [x (if (meta x) (with-meta x nil) x)]
+               (if (every? (fn [[k v]] (and (identical? k (seal k)) (identical? v (seal v)))) x)
+                 x
+                 (persistent! (reduce-kv (fn [m k v] (assoc! m (seal k) (seal v)))
+                                         (transient (empty x)) x))))
+    (vector? x) (seal-coll x seal #(mapv seal %))
+    (set? x) (seal-coll x seal #(into (empty %) (map seal) %))
+    (seq? x) (map seal x) ; lazily: `datoms` over a large database stays a stream
+    (satisfies? kp/PEDNKeyValueStore x) (leak! x)
     :else x))
 
 (defn unseal
@@ -74,6 +120,8 @@
     ;; Spindel world, so sharing the handle selects a different Ygg connection
     ;; after a world fork rather than sharing the connection itself.
     this))
+
+(defn- world-connection? [x] (instance? WorldConnection x))
 
 (defn world-connection
   "Create an ambient Datahike connection handle. Deref returns the selected
@@ -101,33 +149,93 @@
   @(resolve-connection conn))
 
 (defn- sealing-fn
-  "`f` (sandbox code Datahike calls back, a query function or a filter
-   predicate) seeing sealed databases."
+  "`f` (sandbox code Datahike calls back: a query function, an aggregate, a
+   filter predicate) seeing sealed values; anything else as it is."
   [f]
   (if (fn? f)
     (fn [& args] (apply f (map seal args)))
     f))
 
+;; ---------------------------------------------------------------------------
+;; Queries. A database is unsealed only where the query declares a source
+;; (`$`, `$x` in :in, or the default source); a function clause may take a
+;; source only when it is one of Datahike's own lookups. Otherwise
+;; [(identity $) ?db], [(get $ :store) ?s] or [(?f $) ?x] would bind the raw
+;; database, its store or a callback over it.
+
+(def ^:private source-fns
+  "Query functions that take a database source."
+  '#{get-else get-some missing? pull})
+
+(defn- source-sym? [x]
+  (and (symbol? x) (str/starts-with? (name x) "$")))
+
+(defn- query-form [query]
+  (if (string? query) (edn/read-string query) query))
+
+(defn- in-bindings
+  "The :in of `query` (vector or map form); `[$]` when it declares none."
+  [query]
+  (let [in (if (map? query)
+             (:in query)
+             (->> query (drop-while #(not= :in %)) rest (take-while (complement keyword?))))]
+    (if (seq in) (vec in) '[$])))
+
+(defn- check-source-use!
+  "Throws when a function clause in `forms` (a query, its rules) takes a
+   source other than through `source-fns`."
+  [forms]
+  (doseq [x (tree-seq coll? seq forms)]
+    (when (and (seq? x) (symbol? (first x))
+               (not (source-sym? (first x)))
+               (not (contains? source-fns (symbol (name (first x)))))
+               (some source-sym? (rest x)))
+      (throw (ex-info (str "A query function takes a database only through "
+                           "get-else, get-some, missing? or pull: " (pr-str x))
+                      {:type ::source-in-function :clause (pr-str x)})))))
+
+(defn- query-args
+  "A query's inputs as Datahike takes them: databases unsealed in source
+   positions, sandbox functions seeing sealed values, rules checked."
+  [query inputs]
+  (let [query (query-form query)
+        bindings (in-bindings query)
+        rules (keep-indexed (fn [i b] (when (= '% b) (nth inputs i nil))) bindings)]
+    (check-source-use! (into [query] rules))
+    (into []
+          (map-indexed (fn [i v]
+                         (if (source-sym? (get bindings i)) (unseal v) (sealing-fn v))))
+          inputs)))
+
+(defn- tx-forms
+  "The transaction forms of `tx` (a collection, or a map with :tx-data)."
+  [tx]
+  (if (map? tx) (:tx-data tx) tx))
+
 (defn- host-args
-  "The arguments of a mirrored Datahike call as the real fn takes them:
-   handles resolved, and query inputs (positional or in a query map's :args)
-   that are functions see sealed databases."
+  "The arguments of a mirrored Datahike call as the real fn takes them: the
+   database (or connection) argument unsealed, query inputs as `query-args`
+   has them, a filter predicate seeing sealed databases. Any other handle
+   stays sealed, so Datahike never computes on a raw value there."
   [sym args]
-  (let [args (mapv resolve-connection args)]
-    (case sym
-      q      (if (and (map? (first args)) (contains? (first args) :args))
-               (into [(update (first args) :args #(mapv (comp sealing-fn resolve-connection) %))]
-                     (map sealing-fn) (rest args))
-               (into [(first args)] (map sealing-fn) (rest args)))
-      filter (update args 1 sealing-fn)
-      args)))
+  (case sym
+    q (if (and (map? (first args)) (contains? (first args) :query))
+        (let [{:keys [query] :as m} (first args)]
+          (into [(update m :args #(query-args query (vec %)))] (rest args)))
+        (into [(first args)] (query-args (first args) (vec (rest args)))))
+    (let [[target & more] args
+          more (vec more)]
+      (into [(resolve-connection target)]
+            (case sym
+              filter (update more 0 sealing-fn)
+              more)))))
 
 (defn- sealed-result
-  "A mirrored call's result as sandbox code gets it: databases sealed, and
-   a pending transaction sealed when it is dereferenced."
+  "A mirrored call's result as sandbox code gets it: sealed deeply, and a
+   pending transaction sealed when it is dereferenced."
   [x]
   (if (and (instance? clojure.lang.IDeref x) (instance? clojure.lang.IPending x)
-           (not (instance? WorldConnection x)))
+           (not (world-connection? x)))
     (reify
       clojure.lang.IDeref
       (deref [_] (seal @x))
@@ -137,6 +245,15 @@
       clojure.lang.IPending
       (isRealized [_] (realized? x)))
     (seal x)))
+
+(defn- sandbox-error
+  "A fresh error for sandbox code: the message, the operation and its
+   argument types, and no cause (a cause's ex-data can hold the raw values
+   Datahike was given)."
+  [sym resolved ^Throwable error]
+  (ex-info (str "Sandbox Datahike operation " sym " failed: " (ex-message error))
+           {:operation sym
+            :argument-types (mapv #(some-> % class str) resolved)}))
 
 ;; The safe DATA surface of datahike.api — resolved from the real namespace so the
 ;; mirror never drifts. Lifecycle (connect/create/delete/exists?) is GUARDED below.
@@ -151,35 +268,41 @@
                     "scorecard" "scorecard.summary"}
                   (namespace x))))
 
-(defn- certified-evaluation-entity? [conn eid]
+(defn- certified-evaluation-entity? [db eid]
   (try
-    (let [entity (d/entity @conn eid)]
+    (let [entity (d/entity db eid)]
       (boolean (or (:attempt/id entity) (:attempt.check/id entity)
                    (:scorecard/id entity) (:scorecard.summary/id entity))))
     (catch Throwable _ false)))
 
-(defn- assert-no-certified-evaluation-write! [conn tx-data]
+(defn- assert-no-certified-evaluation-write!
+  "`tx-data` when sandbox code may transact it against `db`: no function
+   calls (`:db.fn/call` would run sandbox code on the raw database) and no
+   writes to certified evaluation projections."
+  [db tx-data]
   (doseq [form tx-data]
+    (when (and (sequential? form) (= :db.fn/call (first form)))
+      (throw (ex-info "Transaction functions (:db.fn/call) are not available in the sandbox"
+                      {:type ::tx-function})))
     (let [protected?
           (cond
             (map? form)
             (or (some certified-evaluation-attr? (keys form))
-                (certified-evaluation-entity? conn (:db/id form)))
+                (certified-evaluation-entity? db (:db/id form)))
 
-            (vector? form)
+            (sequential? form)
             (let [[op eid attr] form]
-              (or (= :db.fn/call op)
-                  (certified-evaluation-attr? attr)
+              (or (certified-evaluation-attr? attr)
                   (and (vector? eid)
                        (certified-evaluation-attr? (first eid)))
                   (and (#{:db/retractEntity :db.fn/retractEntity} op)
-                       (certified-evaluation-entity? conn eid))))
+                       (certified-evaluation-entity? db eid))))
 
             :else false)]
       (when protected?
         (throw
          (ex-info "Certified evaluation projections are host-owned and read-only in SCI"
-                  {:type ::protected-evaluation-write :tx-form form})))))
+                  {:type ::protected-evaluation-write :tx-form (pr-str form)})))))
   tx-data)
 
 (defn- cfg-name
@@ -256,29 +379,23 @@
                                                 (try
                                                   (sealed-result (untrusted #(apply f resolved)))
                                                   (catch Throwable error
-                                                    (throw
-                                                     (ex-info
-                                                      ;; the cause is what the agent can act on
-                                                      (str "Sandbox Datahike operation " sym " failed: "
-                                                           (ex-message error))
-                                                      {:operation sym
-                                                       :argument-types
-                                                       (mapv #(some-> % class str) resolved)}
-                                                      error))))))])))
+                                                    (throw (sandbox-error sym resolved error))))))])))
                                  data-ops))
+        ;; Writes: the forms are checked as Datahike reads them (a collection,
+        ;; or a map's :tx-data), so the guard sees what is transacted.
+        writing   (fn [sym f conn tx]
+                    (let [target (resolve-connection conn)
+                          checked (assert-no-certified-evaluation-write!
+                                   (if (= 'with sym) target @target) (tx-forms tx))
+                          tx (if (map? tx) (assoc tx :tx-data checked) checked)]
+                      (try
+                        (sealed-result (untrusted #(f target tx)))
+                        (catch Throwable error
+                          (throw (sandbox-error sym [target tx] error))))))
         data      (assoc data
-                         'transact
-                         (fn [conn tx-data]
-                           (let [conn (resolve-connection conn)]
-                             (seal (untrusted #(d/transact conn
-                                                           (assert-no-certified-evaluation-write!
-                                                            conn tx-data))))))
-                         'transact!
-                         (fn [conn tx-data]
-                           (let [conn (resolve-connection conn)]
-                             (sealed-result (untrusted #(d/transact! conn
-                                                                     (assert-no-certified-evaluation-write!
-                                                                      conn tx-data)))))))
+                         'transact  (fn [conn tx] (writing 'transact d/transact conn tx))
+                         'transact! (fn [conn tx] (writing 'transact! d/transact! conn tx))
+                         'with      (fn [db tx] (writing 'with d/with db tx)))
         ;; per-sandbox ephemeral (:mem) databases, keyed by logical name
         ephemeral (atom {})
         ephemeral-map #(if binding-resolver
@@ -377,7 +494,7 @@
                (effects/perform! effects (cond-> {:effect kind :resource (resource-of args)}
                                            (= :db/transact kind) (assoc :bytes (tx-bytes args)))
                                  #(apply f args))))
-        tx-resource (fn [[_ tx-data]] {:datoms (count tx-data)})
+        tx-resource (fn [[_ tx]] {:datoms (count (tx-forms tx))})
         db-resource (fn [[cfg]] {:name (str (cfg-name cfg))})
         m (-> (merge data guard)
               (update 'transact #(fx :db/transact tx-resource %))

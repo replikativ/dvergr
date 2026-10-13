@@ -1,9 +1,9 @@
 (ns dvergr.sandbox.ns.mail
   "Mount the room's attached mailbox datahike conn for the SCI sandbox.
    `(dvergr.mail/inbox)` resolves it LIVE through `ygg/system` under the bound ctx
-   (fork-aware + sees a mailbox attached after this ctx was built); `*inbox*` is a
-   snapshot taken at mount time (kept for the seed's existing usage). nil when no
-   mailbox is attached. Read helpers (recent/search/unread) are agent-readable
+   (fork-aware + sees a mailbox attached after this ctx was built); `*inbox*` is the
+   same handle, set when a mailbox was attached at mount (kept for the seed's
+   existing usage). nil when no mailbox is attached. Read helpers (recent/search/unread) are agent-readable
    stdlib SOURCE in dvergr/mail/inbox.clj."
   (:require [sci.core :as sci]
             [org.replikativ.spindel.yggdrasil :as ygg]
@@ -12,16 +12,21 @@
 
 (defn add-mail-ns!
   "Mount dvergr.mail into the SCI ctx. `inbox` is a 0-arg LIVE resolver — call it
-   per-access so a fork / a later-attached mailbox is reflected; `*inbox*` is the
-   mount-time snapshot resolved under the bound (room/fork) ctx. Both are
-   connection handles (`dvergr.sandbox.ns.datahike/world-connection`): the
-   mirrored Datahike API takes them, the connection stays with the host."
+   per-access so a mailbox attached later is reflected; `*inbox*` is set when a
+   mailbox was attached at mount. Both are connection handles
+   (`dvergr.sandbox.ns.datahike/world-connection`) that resolve the mailbox in
+   the selected world at each use, so one kept across a fork reaches the fork's
+   mailbox. The mirrored Datahike API takes them; the connection stays with the
+   host."
   [sci-ctx]
-  (let [handle (fn [conn] (when conn (ns-datahike/world-connection (constantly conn))))]
+  (let [;; resolved in the selected world at each use: a handle kept across a
+        ;; fork reaches the fork's mailbox, never the parent's
+        mailbox-conn #(some-> (ygg/system "mail") :conn)
+        handle (fn [] (when (mailbox-conn) (ns-datahike/world-connection mailbox-conn)))]
     (sci/add-namespace! sci-ctx 'dvergr.mail
                         (doc/with-docs
-                          {'inbox   (fn [] (handle (some-> (ygg/system "mail") :conn)))
-                           '*inbox* (handle (some-> (ygg/system "mail") :conn))}
+                          {'inbox   handle
+                           '*inbox* (handle)}
                           ;; `*inbox*` is a conn (or nil) — a value with no
                           ;; signature to state, so it carries no entry here; the
                           ;; ns-guide overview describes it.

@@ -456,10 +456,15 @@
   (let [cfg {:store {:backend :memory :id (random-uuid)} :keep-history? true :schema-flexibility :read}
         _ (dh/create-database cfg)
         kb (dh/connect cfg)
+        other-cfg {:store {:backend :memory :id (random-uuid)} :schema-flexibility :read}
+        _ (dh/create-database other-cfg)
+        other (dh/connect other-cfg)
+        _ (dh/transact other [{:title "other mailbox"}])
+        mailbox (atom kb)
         ec (ctx/create-execution-context)
         sci-ctx (sandbox/fork-for-session ec)]
     (try
-      (with-redefs [ygg/system (fn [nm] (when (= "mail" nm) {:conn kb}))
+      (with-redefs [ygg/system (fn [nm] (when (= "mail" nm) {:conn @mailbox}))
                     skills/load-all (fn [& _] {"probe" {:name "probe" :body "b" :provides [:probe] :storage {:fs :host-fs}}})]
         (sandbox/setup-agent-namespaces! sci-ctx ec :kb-conn kb)
         (let [ev #(eval-in sci-ctx ec (str "(require '[datahike.api :as d]) " %))]
@@ -484,8 +489,8 @@
                            (sealed? (d/as-of @dvergr.room/*kb* (java.util.Date.)))
                            (sealed? (:db-after @(d/transact! dvergr.room/*kb* [{:title \"d\"}])))])"))))
           (testing "functions Datahike calls back see handles"
-            (is (= {:ok #{[false]}}
-                   (ev "(d/q '[:find ?m :in $ ?f :where [(?f $) ?m]] @dvergr.room/*kb* map?)")))
+            (is (= {:ok #{[true]}}
+                   (ev "(d/q '[:find ?m :in $ ?f :where [_ :title ?t] [(?f ?t) ?m]] @dvergr.room/*kb* string?)")))
             (is (= {:ok false}
                    (ev "(let [seen (atom nil)]
                           (d/q '[:find ?t :where [_ :title ?t]]
@@ -502,6 +507,59 @@
             (is (= {:ok ["class dvergr.sandbox.ns.datahike.WorldConnection"
                          "class dvergr.sandbox.ns.datahike.WorldConnection"]}
                    (ev "[(str (type (dvergr.mail/inbox))) (str (type dvergr.mail/*inbox*))]"))))
+          (testing "a database is unsealed only where a query declares a source"
+            (let [r (ev "(let [c (d/q '[:find ?c . :in ?c :where [(identity ?c) ?x]] dvergr.room/*kb*)]
+                           [(str (type c)) (:wrapped-atom c)])")]
+              (is (or (:err r) (= ["class dvergr.sandbox.ns.datahike.WorldConnection" nil] (:ok r)))
+                  (pr-str r)))
+            (doseq [[what code]
+                    [["identity on the source"
+                      "(d/q '[:find ?db :where [(identity $) ?db]] @dvergr.room/*kb*)"]
+                     ["a lookup on the source"
+                      "(d/q '[:find ?s . :where [(get $ :store) ?s]] @dvergr.room/*kb*)"]
+                     ["a keyword input applied to the source"
+                      "(d/q '[:find ?s . :in $ ?f :where [(?f $) ?s]] @dvergr.room/*kb* :store)"]
+                     ["a sandbox fn applied to the source"
+                      "(d/q '[:find ?m :in $ ?f :where [(?f $) ?m]] @dvergr.room/*kb* identity)"]
+                     ["a named source"
+                      "(d/q '[:find ?db :in $src :where [(identity $src) ?db]] @dvergr.room/*kb*)"]
+                     ["a rule that uses the source"
+                      "(d/q '[:find ?s :in $ % :where (leak ?s)] @dvergr.room/*kb* '[[(leak ?s) [(identity $) ?s]]])"]
+                     ["the query-map form"
+                      "(d/q {:query '[:find ?db :where [(identity $) ?db]] :args [@dvergr.room/*kb*]})"]]]
+              (testing what
+                (is (re-find #"takes a database only through" (str (:err (ev code)))) (pr-str (ev code))))))
+          (testing "Datahike's own lookups still take the source"
+            (is (= {:ok #{["note" "none"]}}
+                   (ev "(d/q '[:find ?t ?x :where [?e :title \"note\"] [?e :title ?t] [(get-else $ ?e :missing \"none\") ?x]] @dvergr.room/*kb*)"))))
+          (testing "transaction functions are refused, in every form"
+            (doseq [code ["(d/with @dvergr.room/*kb* [[:db.fn/call (fn [db] [])]])"
+                          "(d/transact dvergr.room/*kb* [[:db.fn/call (fn [db] [])]])"
+                          "(d/transact dvergr.room/*kb* {:tx-data [[:db.fn/call (fn [db] [])]]})"
+                          "(d/transact! dvergr.room/*kb* {:tx-data [(list :db.fn/call (fn [db] []))]})"]]
+              (is (re-find #":db.fn/call" (str (:err (ev code)))) code)))
+          (testing "an error carries no cause holding what Datahike was given"
+            (is (= {:ok [true false]}
+                   (ev "(try (d/pull @dvergr.room/*kb* '[*] @dvergr.room/*kb*)
+                          (catch Exception e
+                            [(nil? (ex-cause e))
+                             (boolean (some #(re-find #\"^class datahike\\.(db|connector)\\.\" (str (type %)))
+                                            (tree-seq coll? seq (ex-data e))))]))"))))
+          (testing "nested results are sealed: an entity's database, tuples, maps"
+            (is (= {:ok ["class dvergr.sandbox.ns.datahike.SandboxDb" true]}
+                   (ev "(let [e (ffirst (d/q '[:find ?e :where [?e :title \"note\"]] @dvergr.room/*kb*))
+                              ent (d/entity @dvergr.room/*kb* e)]
+                          [(str (type (d/entity-db ent)))
+                           (every? #(= \"class dvergr.sandbox.ns.datahike.SandboxDb\" (str (type %)))
+                                   ((juxt :db-before :db-after) (d/with @dvergr.room/*kb* [{:title \"w\"}])))])"))))
+          (testing "a mailbox handle follows the selected world"
+            (is (= {:ok #{["note"]}}
+                   (ev "(def kept (dvergr.mail/inbox))
+                        (d/q '[:find ?t :where [_ :title ?t] [(= ?t \"note\")]] @kept)")))
+            (reset! mailbox other)
+            (is (= {:ok #{["other mailbox"]}}
+                   (ev "(d/q '[:find ?t :where [_ :title ?t]] @kept)")))
+            (reset! mailbox kb))
           (testing "skill definitions are data"
             (is (= {:ok [nil "b"]}
                    (ev "(let [s (get (dvergr.skills/all) \"probe\")] [(:storage s) (:body s)])")))
@@ -509,4 +567,5 @@
                    (ev "(mapv :storage (dvergr.skills/find :probe))"))))))
       (finally
         (ctx/stop-context! ec)
-        (dh/release kb)))))
+        (dh/release kb)
+        (dh/release other)))))
