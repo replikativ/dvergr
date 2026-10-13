@@ -29,6 +29,8 @@
             [dvergr.room.registry :as rreg]
             [dvergr.room.store :as rstore]
             [dvergr.room.store.memory :as mem]
+            [dvergr.substrate.paths :as paths]
+            [dvergr.system.db :as sdb]
             [dvergr.sandbox :as sandbox]
             [dvergr.sandbox.deps :as deps]
             [org.replikativ.spindel.engine.core :as rtc]
@@ -67,60 +69,69 @@
   ;; Room record: code replaced a room's participants (`reset!` on its atom),
   ;; edited its meta and held its execution context, store and bus — for every
   ;; room `list` showed. CONFIRMED-OPEN before the ops returned data views.
-  (with-sandbox
-    (fn [sci-ctx ec]
-      (let [room (binding [rtc/*execution-context* ec]
-                   (d/make-room {:id :escape-room :ctx ec :store (mem/make)}))
-            created (str "escape-created-" (random-uuid))]
-        (try
-          (testing "a room is plain data"
-            (is (= {:ok {:id :escape-room :slug "escape-room" :title "escape-room" :parent-id nil :fork? false}}
-                   (eval-in sci-ctx ec "(dvergr.room/get :escape-room)")))
-            (is (= {:ok true}
-                   (eval-in sci-ctx ec "(every? #(not-any? % [:participants :meta :ctx :store :bus :fork-handle]) (dvergr.room/list))"))))
-          (testing "its atoms are out of reach"
-            (eval-in sci-ctx ec "(let [r (dvergr.room/get :escape-room)] (reset! (:participants r) {:intruder 1}))")
-            (eval-in sci-ctx ec "(dvergr.room/list :where (fn [r] (when-let [p (:participants r)] (reset! p {:intruder 1})) true))")
-            (is (not (contains? @(:participants room) :intruder))))
-          (testing "the view still addresses the room"
-            (is (= {:ok []} (eval-in sci-ctx ec "(dvergr.room/participants (dvergr.room/get :escape-room))"))))
-          (testing "every op that returns rooms returns data"
-            (let [r (eval-in sci-ctx ec
-                             (str "(let [f (dvergr.room/fork! :escape-room)
-                                    g (dvergr.room/fork! :escape-room)]
-                                {:fork! f
-                                 :children (dvergr.room/children :escape-room)
-                                 :forks (dvergr.room/forks)
-                                 :merge! (dvergr.room/merge! :escape-room f)
-                                 :discard! (dvergr.room/discard! g)
-                                 :create! (dvergr.room/create! {:slug \"" created "\"})})"))
-                  plain? (fn plain? [x]
-                           (cond (map? x) (every? (fn [[k v]] (and (plain? k) (plain? v))) x)
-                                 (coll? x) (every? plain? x)
-                                 :else (or (nil? x) (keyword? x) (string? x) (number? x)
-                                           (boolean? x) (uuid? x) (inst? x) (symbol? x))))]
-              (is (map? (:ok r)) (pr-str r))
-              (doseq [[op v] (:ok r)]
-                (is (plain? v) (str op " returned " (pr-str v))))
-              (is (= (:id room) (get-in r [:ok :merge! :id])))
-              (is (get-in r [:ok :create! :room :id]))
-              (testing "root: the :daemon room, else the discourse root"
-                (binding [rtc/*execution-context* ec]
-                  (rtc/swap-state! [:dvergr/discourse-root] (constantly room)))
-                (let [r (eval-in sci-ctx ec "(dvergr.room/root)")]
-                  (is (= :escape-room (get-in r [:ok :id])) (pr-str r))
-                  (is (plain? (:ok r))))
-                (let [daemon (binding [rtc/*execution-context* ec]
-                               (d/make-room {:id :daemon :ctx ec :store (mem/make)}))]
-                  (try
+  ;; create! provisions a room and its stores under the state root: a
+  ;; temporary one, so nothing outlives the test
+  (let [prev (paths/home)]
+    (try
+      (paths/set-home! (str (System/getProperty "java.io.tmpdir") "/dvergr-escape-" (random-uuid)))
+      (sdb/reset-conn!)
+      (with-sandbox
+        (fn [sci-ctx ec]
+          (let [room (binding [rtc/*execution-context* ec]
+                       (d/make-room {:id :escape-room :ctx ec :store (mem/make)}))
+                created (str "escape-created-" (random-uuid))]
+            (try
+              (testing "a room is plain data"
+                (is (= {:ok {:id :escape-room :slug "escape-room" :title "escape-room" :parent-id nil :fork? false}}
+                       (eval-in sci-ctx ec "(dvergr.room/get :escape-room)")))
+                (is (= {:ok true}
+                       (eval-in sci-ctx ec "(every? #(not-any? % [:participants :meta :ctx :store :bus :fork-handle]) (dvergr.room/list))"))))
+              (testing "its atoms are out of reach"
+                (eval-in sci-ctx ec "(let [r (dvergr.room/get :escape-room)] (reset! (:participants r) {:intruder 1}))")
+                (eval-in sci-ctx ec "(dvergr.room/list :where (fn [r] (when-let [p (:participants r)] (reset! p {:intruder 1})) true))")
+                (is (not (contains? @(:participants room) :intruder))))
+              (testing "the view still addresses the room"
+                (is (= {:ok []} (eval-in sci-ctx ec "(dvergr.room/participants (dvergr.room/get :escape-room))"))))
+              (testing "every op that returns rooms returns data"
+                (let [r (eval-in sci-ctx ec
+                                 (str "(let [f (dvergr.room/fork! :escape-room)
+                                        g (dvergr.room/fork! :escape-room)]
+                                    {:fork! f
+                                     :children (dvergr.room/children :escape-room)
+                                     :forks (dvergr.room/forks)
+                                     :merge! (dvergr.room/merge! :escape-room f)
+                                     :discard! (dvergr.room/discard! g)
+                                     :create! (dvergr.room/create! {:slug \"" created "\"})})"))
+                      plain? (fn plain? [x]
+                               (cond (map? x) (every? (fn [[k v]] (and (plain? k) (plain? v))) x)
+                                     (coll? x) (every? plain? x)
+                                     :else (or (nil? x) (keyword? x) (string? x) (number? x)
+                                               (boolean? x) (uuid? x) (inst? x) (symbol? x))))]
+                  (is (map? (:ok r)) (pr-str r))
+                  (doseq [[op v] (:ok r)]
+                    (is (plain? v) (str op " returned " (pr-str v))))
+                  (is (= (:id room) (get-in r [:ok :merge! :id])))
+                  (is (get-in r [:ok :create! :room :id]))
+                  (testing "root: the :daemon room, else the discourse root"
+                    (binding [rtc/*execution-context* ec]
+                      (rtc/swap-state! [:dvergr/discourse-root] (constantly room)))
                     (let [r (eval-in sci-ctx ec "(dvergr.room/root)")]
-                      (is (= :daemon (get-in r [:ok :id])) (pr-str r))
+                      (is (= :escape-room (get-in r [:ok :id])) (pr-str r))
                       (is (plain? (:ok r))))
-                    (finally (d/close-room! daemon)))))))
-          (finally
-            (binding [rtc/*execution-context* ec]
-              (some-> (rreg/lookup (rstore/slug->room-id created)) d/close-room!))
-            (d/close-room! room)))))))
+                    (let [daemon (binding [rtc/*execution-context* ec]
+                                   (d/make-room {:id :daemon :ctx ec :store (mem/make)}))]
+                      (try
+                        (let [r (eval-in sci-ctx ec "(dvergr.room/root)")]
+                          (is (= :daemon (get-in r [:ok :id])) (pr-str r))
+                          (is (plain? (:ok r))))
+                        (finally (d/close-room! daemon)))))))
+              (finally
+                (binding [rtc/*execution-context* ec]
+                  (some-> (rreg/lookup (rstore/slug->room-id created)) d/close-room!))
+                (d/close-room! room))))))
+      (finally
+        (paths/set-home! prev)
+        (sdb/reset-conn!)))))
 
 (deftest sensitive-path-policy-covers-every-branch
   ;; The pattern was wrapped across three lines; a Clojure regex literal is not
