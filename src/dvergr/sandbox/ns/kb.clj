@@ -139,7 +139,6 @@
         fork-room*      @(ns-resolve 'dvergr.discourse 'fork-room)
         merge-room*     @(ns-resolve 'dvergr.discourse 'merge-room)
         discard*        @(ns-resolve 'dvergr.discourse 'discard)
-        settlement*     @(ns-resolve 'dvergr.discourse 'settlement)
         create-room!*   @(ns-resolve 'dvergr.rooms 'create-room!)
         join-agent!*    @(ns-resolve 'dvergr.rooms 'join-agent!)
         leave-agent!*   @(ns-resolve 'dvergr.rooms 'leave-agent!)
@@ -175,57 +174,6 @@
                               (cond-> {:id (:id room) :slug (:slug room) :title (:title room)
                                        :parent-id (:parent-id room) :fork? (some? forked-from)}
                                 forked-from (assoc :forked-from forked-from)))))
-        ;; Forks this world merged or discarded, by id, kept in the world's
-        ;; state so every interpreter of it (also one rebuilt by a namespace
-        ;; rebind) answers a repeated settlement as the first did instead of
-        ;; "not found" (the registry has forgotten the fork); any other
-        ;; settlement of it is refused.
-        settled-result  (fn [ref settlement]
-                          (let [id (cond (map? ref) (:id ref)
-                                         (keyword? ref) ref
-                                         (string? ref) (slug->id* ref))]
-                            (when-let [s (binding [rtc/*execution-context* (selected-ctx)]
-                                           (rtc/get-state [:dvergr/settled-forks id]))]
-                              (if (= settlement (dissoc s :result))
-                                (:result s)
-                                {:error (str "Fork " ref " was already settled: "
-                                             (name (:op s))
-                                             (when (:parent s) (str " into " (:parent s))))}))))
-        settle!         (fn [fork settlement result]
-                          (binding [rtc/*execution-context* (selected-ctx)]
-                            (rtc/swap-state! [:dvergr/settled-forks]
-                                             #(if (contains? % (:id fork))
-                                                %
-                                                (assoc (or % {}) (:id fork) (assoc settlement :result result))))))
-        ;; The host's record of how a fork was settled (`dvergr.discourse/
-        ;; settlement`, claimed by whichever merge or discard won) becomes
-        ;; this world's; the answer is then for the settlement asked for.
-        record!         (fn [fork asked snapshot]
-                          (if-let [s (settlement* fork)]
-                            (do (settle! fork s (case (:op s)
-                                                  :merged (binding [rtc/*execution-context* (selected-ctx)]
-                                                            (view (resolve-room (:parent s))))
-                                                  :discarded snapshot))
-                                (settled-result (:id fork) asked))
-                            snapshot))
-        ;; A settlement of a fork the registry no longer has is answered from
-        ;; that record before the effect boundary: the boundary's authority
-        ;; check knows only live rooms, and a repeat performs nothing.
-        resettled       (fn [op f]
-                          (with-meta
-                            (case op
-                              merge!   (fn [parent-ref fork-ref]
-                                         (or (when-let [parent (binding [rtc/*execution-context* (selected-ctx)]
-                                                                 (when-not (resolve-room fork-ref)
-                                                                   (resolve-room parent-ref)))]
-                                               (settled-result fork-ref {:op :merged :parent (:id parent)}))
-                                             (f parent-ref fork-ref)))
-                              discard! (fn [fork-ref]
-                                         (or (when-not (binding [rtc/*execution-context* (selected-ctx)]
-                                                         (resolve-room fork-ref))
-                                               (settled-result fork-ref {:op :discarded}))
-                                             (f fork-ref))))
-                            (meta f)))
         ;; ---------- API ----------
         create-fn   (fn [{:keys [title slug type telegram-chat-id agents
                                  agent-ids parent-id]
@@ -327,24 +275,18 @@
                         (cond
                           (nil? parent) {:error (str "Room not found: " parent-ref)}
                           (nil? fork)   {:error (str "Room not found: " fork-ref)}
-                          :else
-                          (let [asked {:op :merged :parent (:id parent)}
-                                result (try (binding [rtc/*execution-context* (:ctx fork)]
-                                              (merge-room* parent fork))
-                                            (catch clojure.lang.ExceptionInfo e
-                                              ;; another merge or discard won
-                                              (when-not (= :dvergr.discourse/already-settled (:type (ex-data e)))
-                                                (throw e))))]
-                            (if (settlement* fork)
-                              (record! fork asked (view fork))
-                              result)))))
+                          :else (let [result (binding [rtc/*execution-context* (:ctx fork)]
+                                               (merge-room* parent fork))]
+                                  (if (and (map? result) (:ctx result))
+                                    (view result)
+                                    result)))))
         discard-fn  (fn [fork-ref]
                       (if-let [fork (binding [rtc/*execution-context* (selected-ctx)]
                                       (resolve-room fork-ref))]
                         (let [snapshot (view fork)]
                           (binding [rtc/*execution-context* (:ctx fork)]
                             (discard* fork))
-                          (record! fork {:op :discarded} snapshot))
+                          snapshot)
                         {:error (str "Room not found: " fork-ref)}))
         ;; Merge review — the per-system diff + tier the agent reads to decide.
         diff-fn     (fn [fork-ref]
@@ -365,29 +307,27 @@
                         (view (or (rreg-lookup* :daemon)
                                   (rtc/get-state [:dvergr/discourse-root])))))]
     (doc/with-docs
-      (-> (through-boundary
-           effects
-           {'create!      create-fn
-            'list         list-fn
-            'get          get-fn
-            'post!        post-fn
-            'messages     messages-fn
-            'children     children-fn
-            'set-parent!  set-parent-fn
-            'join!        join-fn
-            'leave!       leave-fn
-            'delete!      delete-fn
-            'fork!        fork-fn
-            'merge!       merge-fn
-            'discard!     discard-fn
-            'diff         diff-fn
-            'review       review-fn
-            'classify     fork-classify*
-            'forks        forks-fn
-            'participants participants-fn
-            'root         root-fn})
-          (update 'merge! #(resettled 'merge! %))
-          (update 'discard! #(resettled 'discard! %)))
+      (through-boundary
+       effects
+       {'create!      create-fn
+        'list         list-fn
+        'get          get-fn
+        'post!        post-fn
+        'messages     messages-fn
+        'children     children-fn
+        'set-parent!  set-parent-fn
+        'join!        join-fn
+        'leave!       leave-fn
+        'delete!      delete-fn
+        'fork!        fork-fn
+        'merge!       merge-fn
+        'discard!     discard-fn
+        'diff         diff-fn
+        'review       review-fn
+        'classify     fork-classify*
+        'forks        forks-fn
+        'participants participants-fn
+        'root         root-fn})
       '{create!      [([opts]) "Create a persistent room. `opts` takes :slug :title :agents. Rooms are the unit of work: each has its own git repo, knowledge base and schedules."]
         list         [([]) "Every room you can see, as maps {:id :slug :title :parent-id :fork?} (plain data; pass one, or its slug or id, to the other ops)."]
         get          [([ref]) "One room by slug or id, or nil."]

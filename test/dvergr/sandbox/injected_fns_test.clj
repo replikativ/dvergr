@@ -57,10 +57,8 @@
           (testing "participants and discard! accept a slug"
             (is (vector? (('participants ops) (:slug fork))))
             (is (= (:id fork) (:id (('discard! ops) (:slug fork)))))
-            (is (= (:id fork) (:id (('discard! ops) view))) "a second discard! answers as the first")
-            (is (= (:id fork) (:id (('discard! ops) (:slug fork)))) "by slug too")
-            (is (re-find #"already settled: discarded" (:error (('merge! ops) (:slug parent) view)))
-                "a discarded fork does not merge")
+            (is (:error (('discard! ops) view)) "a settled fork is gone: not found")
+            (is (:error (('merge! ops) (:slug parent) view)) "a discarded fork does not merge")
             (is (nil? (binding [ec/*execution-context* (:ctx parent)]
                         (rreg/lookup (:id fork))))
                 "discarded fork left the registry"))))
@@ -78,16 +76,7 @@
               "merge! returns the parent")
           (is (nil? (binding [ec/*execution-context* (:ctx parent)]
                       (rreg/lookup (:id fork))))
-              "merged fork left the registry")
-          (is (= (:id parent) (:id (('merge! ops) (:slug parent) (:id fork))))
-              "a second merge! answers as the first")
-          (is (re-find #"already settled: merged" (:error (('discard! ops) (:id fork))))
-              "a merged fork does not discard")
-          (testing "the ops of a rebound namespace answer the same"
-            (let [rebound (kb-ns/room-ops-map (:ctx parent) nil
-                                              (select-keys parent [:id :incarnation]))]
-              (is (= (:id parent) (:id (('merge! rebound) (:slug parent) (:id fork)))))
-              (is (re-find #"already settled: merged" (:error (('discard! rebound) (:id fork)))))))))
+              "merged fork left the registry")))
       (testing "unknown refs are reported, not NPEs"
         (is (:error (('discard! ops) "no-such-room/fork-x")))
         (is (:error (('merge! ops) (:slug parent) "no-such-room/fork-x")))
@@ -95,55 +84,6 @@
       (finally
         (doseq [f @forks] (try (d/discard f) (catch Throwable _)))
         (d/close-room! parent)))))
-
-;; Whichever merge or discard claims a fork first settles it, in both isolation
-;; modes; one that resolved the fork and lost the race answers with the
-;; winner, which the sandbox records. Each op here pauses before the host call
-;; while the host settles the fork the other way.
-(defn- paused
-  "`f` that, once, delivers `entered` and waits for `go` before running."
-  [f entered go]
-  (let [first? (atom true)]
-    (fn [& args]
-      (when (compare-and-set! first? true false)
-        (deliver entered true)
-        @go)
-      (apply f args))))
-
-(deftest a-settlement-that-loses-the-race-answers-with-the-winner
-  (doseq [isolation [:ctx :none]]
-    (testing (str "isolation " isolation)
-      (let [parent (d/make-room {:id (keyword (str "sci-race-" (name isolation))) :store (memory/make)})
-            discard d/discard
-            merge-room d/merge-room]
-        (try
-          (testing "a discard waiting while host code merges"
-            (let [entered (promise) go (promise)]
-              (with-redefs [d/discard (paused discard entered go)]
-                (let [ops (kb-ns/room-ops-map (:ctx parent) nil (select-keys parent [:id :incarnation]))
-                      view (('fork! ops) parent {:isolation isolation})
-                      fork (binding [ec/*execution-context* (:ctx parent)] (rreg/lookup (:id view)))
-                      discarding (future (('discard! ops) (:id view)))]
-                  (is (true? (deref entered 30000 ::timeout)))
-                  (is (= parent (binding [ec/*execution-context* (:ctx fork)] (merge-room parent fork))))
-                  (deliver go true)
-                  (is (re-find #"already settled: merged" (str (:error (deref discarding 30000 ::timeout)))))
-                  (is (re-find #"already settled: merged" (str (:error (('discard! ops) (:id view))))))
-                  (is (= (:id parent) (:id (('merge! ops) (:id parent) (:id view)))) "the merge stands")))))
-          (testing "a merge waiting while host code discards"
-            (let [entered (promise) go (promise)]
-              (with-redefs [d/merge-room (paused merge-room entered go)]
-                (let [ops (kb-ns/room-ops-map (:ctx parent) nil (select-keys parent [:id :incarnation]))
-                      view (('fork! ops) parent {:isolation isolation})
-                      fork (binding [ec/*execution-context* (:ctx parent)] (rreg/lookup (:id view)))
-                      merging (future (('merge! ops) (:id parent) (:id view)))]
-                  (is (true? (deref entered 30000 ::timeout)))
-                  (binding [ec/*execution-context* (:ctx fork)] (discard fork))
-                  (deliver go true)
-                  (is (re-find #"already settled: discarded" (str (:error (deref merging 30000 ::timeout)))))
-                  (is (= (:id view) (:id (('discard! ops) (:id view)))) "the discard stands")
-                  (is (re-find #"already settled: discarded" (str (:error (('merge! ops) (:id parent) (:id view))))))))))
-          (finally (d/close-room! parent)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; git/log

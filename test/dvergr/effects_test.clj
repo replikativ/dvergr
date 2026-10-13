@@ -333,14 +333,7 @@
           (testing "a fork of its room"
             (let [fork (('fork! ops) (:id home))]
               (is (:posted-to (post! (:id fork) {:content "in the fork"})))
-              (is (some? (('discard! ops) (:id fork))) "and it may discard it")
-              (testing "a repeat is answered though the fork left the registry"
-                (is (= (:id fork) (:id (('discard! ops) (:id fork)))))
-                (is (re-find #"already settled: discarded" (:error (('merge! ops) (:id home) (:id fork))))))
-              (testing "also by the ops of a rebound namespace (the record is the world's)"
-                (let [rebound (ns-kb/room-ops-map ec nil (select-keys home [:id :incarnation])
-                                                  {:acting-agent (constantly :var) :effects fx})]
-                  (is (= (:id fork) (:id (('discard! rebound) (:id fork)))))))))
+              (is (some? (('discard! ops) (:id fork))) "and it may discard it")))
           (testing "a room it joins"
             (d/join other (d/participant {:id :var :on-message (constantly nil)}))
             (is (:posted-to (post! (:id other) {:content "now a participant"})))
