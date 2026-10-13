@@ -314,20 +314,30 @@
                    (:scorecard/id entity) (:scorecard.summary/id entity))))
     (catch Throwable _ false)))
 
+(def ^:private tx-ops
+  "The transaction operations sandbox code may use: Datahike's own, as
+   `datahike.db.transaction` dispatches them, without :db.fn/call (it runs a
+   function on the raw database) and :db.ensure/preds (it runs predicates).
+   Any other keyword is an ident Datahike would call as a transaction
+   function."
+  #{:db/add :db/retract :db/retractEntity :db.fn/retractEntity :db.fn/retractAttribute
+    :db/cas :db.fn/cas :db/purge :db.purge/entity :db.purge/attribute
+    :db.history.purge/before :db.ensure/attrs})
+
 (defn- assert-no-certified-evaluation-write!
   "`tx-data` when sandbox code may transact it against `db`: no function
    calls (`:db.fn/call` would run sandbox code on the raw database) and no
    writes to certified evaluation projections."
   [db tx-data]
+  (when-let [f (first (filter callable? (tree-seq coll? seq tx-data)))]
+    (throw (ex-info "A transaction is data: functions in it are not available in the sandbox"
+                    {:type ::tx-function :class (str (class f))})))
   (doseq [form tx-data]
-    (when (or (and (sequential? form)
-                   (let [op (first form)]
-                     (or (= :db.fn/call op)
-                         (not (and (keyword? op)
-                                   (some-> (namespace op) (as-> n (or (= "db" n) (str/starts-with? n "db.")))))))))
-              (and (map? form) (contains? form :db/fn)))
-      (throw (ex-info (str "Transaction functions (:db.fn/call, :db/fn, an entity's ident as the "
-                           "operation) are not available in the sandbox")
+    (when (or (and (sequential? form) (not (contains? tx-ops (first form))))
+              (and (map? form) (contains? form :db/fn))
+              (and (sequential? form) (= :db/fn (nth form 2 nil))))
+      (throw (ex-info (str "Transaction functions (:db.fn/call, :db/fn, an ident as the operation) "
+                           "are not available in the sandbox: " (pr-str (if (map? form) (keys form) (first form))))
                       {:type ::tx-function})))
     (let [protected?
           (cond
@@ -430,6 +440,8 @@
         ;; or a map's :tx-data), so the guard sees what is transacted.
         writing   (fn [sym f conn tx]
                     (let [target (resolve-connection conn)
+                          _ (when (map? tx)
+                              (assert-no-certified-evaluation-write! nil [(dissoc tx :tx-data)]))
                           checked (assert-no-certified-evaluation-write!
                                    (if (= 'with sym) target @target) (tx-forms tx))
                           tx (if (map? tx) (assoc tx :tx-data checked) checked)]
@@ -479,11 +491,14 @@
                        (mem? cfg) (if (contains? (ephemeral-map) nm)
                                     cfg
                                     (let [c (world-memory-config cfg binding-resolver)]
+                                      ;; Datahike transacts :initial-tx on creation: the same
+                                      ;; checks as any sandbox transaction
+                                      (assert-no-certified-evaluation-write! nil (:initial-tx c))
                                       (when (d/database-exists? c)
                                         (throw (ex-info
                                                 "Scratch database exists without a live world owner"
                                                 {:name nm :physical-config c})))
-                                      (d/create-database c)
+                                      (untrusted #(d/create-database c))
                                       (swap-ephemeral! assoc nm
                                                        {:connection (d/connect c)
                                                         :config c})

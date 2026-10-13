@@ -553,10 +553,20 @@
             (doseq [code ["(d/with @dvergr.room/*kb* [[:db.fn/call (fn [db] [])]])"
                           "(d/with @dvergr.room/*kb* [{:db/ident :escape :db/fn (fn [db] [])} [:escape]])"
                           "(d/transact dvergr.room/*kb* [[:escape]])"
+                          "(d/with @dvergr.room/*kb* [[:db/add -1 :db/ident :db.evil/leak] [:db/add -1 :db/fn (fn [raw] [])] [:db.evil/leak]])"
+                          "(d/with @dvergr.room/*kb* [[:db/add -1 :db/ident :db.evil/leak] [:db/add -1 :db/fn 'clojure.core/identity] [:db.evil/leak]])"
+                          "(d/transact dvergr.room/*kb* {:tx-data [{:title \"m\"}] :tx-meta {:hook (fn [db] db)}})"
                           "(d/transact dvergr.room/*kb* [[:db.fn/call (fn [db] [])]])"
                           "(d/transact dvergr.room/*kb* {:tx-data [[:db.fn/call (fn [db] [])]]})"
                           "(d/transact! dvergr.room/*kb* {:tx-data [(list :db.fn/call (fn [db] []))]})"]]
-              (is (re-find #"Transaction functions" (str (:err (ev code)))) code)))
+              (is (re-find #"Transaction functions|functions in it" (str (:err (ev code)))) code))
+            (testing "a scratch database's initial transaction is checked before Datahike runs it"
+              (is (= {:ok [true false]}
+                     (ev "(let [ran (atom false)
+                                r (try (d/create-database {:store {:backend :mem :id \"init\"}
+                                                           :initial-tx [[:db.fn/call (fn [raw] (reset! ran true) [])]]})
+                                       (catch Exception e :refused))]
+                            [(= :refused r) @ran])")))))
           (testing "an error carries no cause holding what Datahike was given"
             (is (= {:ok [true false]}
                    (ev "(try (d/pull @dvergr.room/*kb* '[*] @dvergr.room/*kb*)
@@ -596,3 +606,26 @@
         (ctx/stop-context! ec)
         (dh/release kb)
         (dh/release other)))))
+
+(deftest query-inputs-callables-see-handles-at-any-depth
+  ;; Defence in depth behind the source rule: whatever Datahike hands a
+  ;; callable from an input (tuple, collection, relation, a var), it gets
+  ;; as a handle. Invoked here with a raw database, as Datahike would if a
+  ;; query found a way to pass one.
+  (let [cfg {:store {:backend :memory :id (random-uuid)} :schema-flexibility :read}
+        _ (dh/create-database cfg)
+        conn (dh/connect cfg)
+        raw @conn
+        query-args @#'dvergr.sandbox.ns.datahike/query-args
+        seen (atom [])
+        probe (fn [x] (swap! seen conj (str (type x))) true)
+        sealed "class dvergr.sandbox.ns.datahike.SandboxDb"]
+    (try
+      (let [[_ tuple coll rel v] (query-args '[:find ?x :in $ [?a] [?b ...] [[?c]] ?d :where [?x :t ?a]]
+                                             [raw [probe] [probe] [[probe]] (intern 'dvergr.sandbox.escape-corpus-test 'query-probe probe)])]
+        ((first tuple) raw)
+        ((first coll) raw)
+        ((ffirst rel) raw)
+        (v raw)
+        (is (= [sealed sealed sealed sealed] @seen)))
+      (finally (dh/release conn)))))
