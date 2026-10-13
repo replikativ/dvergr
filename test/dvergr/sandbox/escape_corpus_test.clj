@@ -345,3 +345,26 @@
                                         (first (:content (xml/parse-str \"<a>x</a>\")))"))))
       (is (not (reaches? sci ec "(require 'clojure.data.xml.jvm.parse) :reached")))
       (is (not (reaches? sci ec "(require 'clojure.data.xml.impl) :reached"))))))
+
+(deftest host-vars-and-the-execution-context-stay-out-of-reach
+  ;; MECHANISM: spindel's SCI class allowlist left `clojure.lang.Var` and
+  ;; `clojure.lang.Namespace` open, so static members on them reached host vars
+  ;; (and with them host functions) and the host's thread bindings, which hold
+  ;; the live execution context. CLOSED by spindel 0.1.113: both classes are
+  ;; registered closed, and SCI code gets an opaque name for the current world
+  ;; instead of the ExecutionContext.
+  (with-sandbox
+    (fn [sci ec]
+      (testing "host vars cannot be looked up"
+        (is (:err (eval-in sci ec "(clojure.lang.Var/find 'clojure.core/eval)")))
+        (is (:err (eval-in sci ec "(clojure.lang.Namespace/find 'clojure.core)"))))
+      (testing "the host's thread bindings cannot be read"
+        (is (:err (eval-in sci ec "(clojure.lang.Var/getThreadBindings)"))))
+      (testing "the current world is a name, not the host's context"
+        (let [r (eval-in sci ec "(str (type (org.replikativ.spindel.engine.core/current-execution-context)))")]
+          (is (= "class org.replikativ.spindel.sci.macro.CurrentWorld" (:ok r)) (pr-str r)))
+        (is (not (instance? org.replikativ.spindel.engine.context.ExecutionContext
+                            (:ok (eval-in sci ec "org.replikativ.spindel.engine.core/*execution-context*"))))))
+      (testing "spins still run in the bound world"
+        (let [r (eval-in sci ec "(require '[org.replikativ.spindel.spin.cps :refer [spin]]) @(spin (+ 1 2))")]
+          (is (= 3 (:ok r)) (pr-str r)))))))
