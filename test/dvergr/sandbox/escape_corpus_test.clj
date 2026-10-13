@@ -526,18 +526,37 @@
                      ["a rule that uses the source"
                       "(d/q '[:find ?s :in $ % :where (leak ?s)] @dvergr.room/*kb* '[[(leak ?s) [(identity $) ?s]]])"]
                      ["the query-map form"
-                      "(d/q {:query '[:find ?db :where [(identity $) ?db]] :args [@dvergr.room/*kb*]})"]]]
+                      "(d/q {:query '[:find ?db :where [(identity $) ?db]] :args [@dvergr.room/*kb*]})"]
+                     ["a call in vector form, from a tuple input"
+                      "(d/q '[:find ?ok . :in $ [?f] :where [[?f $] ?ok]] @dvergr.room/*kb* [(fn [db] true)])"]
+                     ["a vector call inside a rule"
+                      "(d/q '[:find ?s :in $ % :where (leak ?s)] @dvergr.room/*kb* '[[(leak ?s) [[identity $] ?s]]])"]
+                     ["a lookup's default argument"
+                      "(d/q '[:find ?raw . :where [(get-else $ 999999999 :missing $) ?raw]] @dvergr.room/*kb*)"]
+                     ["a namespaced name for a lookup"
+                      "(d/q '[:find ?ok . :in $ ?f :where [(evil/pull $) ?ok]] @dvergr.room/*kb* identity)"]]]
               (testing what
-                (is (re-find #"takes a database only through" (str (:err (ev code)))) (pr-str (ev code))))))
+                (is (re-find #"takes a database only" (str (:err (ev code)))) (pr-str (ev code)))))
+            (testing "an input cannot stand in for a lookup's name"
+              (is (re-find #"binds a variable"
+                           (str (:err (ev "(d/q '[:find ?ok . :in $ pull :where [(pull $) ?ok]] @dvergr.room/*kb* identity)"))))))
+            (testing "callables in inputs see sealed values, at any depth and as vars"
+              (is (= {:ok #{[false]}}
+                     (ev "(d/q '[:find ?m :in $ [?f ...] :where [_ :title ?t] [(?f ?t) ?m]] @dvergr.room/*kb* [map?])")))
+              (is (= {:ok #{[true]}}
+                     (ev "(defn probe-string [x] (string? x))
+                          (d/q '[:find ?m :in $ ?f :where [_ :title ?t] [(?f ?t) ?m]] @dvergr.room/*kb* #'probe-string)")))))
           (testing "Datahike's own lookups still take the source"
             (is (= {:ok #{["note" "none"]}}
                    (ev "(d/q '[:find ?t ?x :where [?e :title \"note\"] [?e :title ?t] [(get-else $ ?e :missing \"none\") ?x]] @dvergr.room/*kb*)"))))
           (testing "transaction functions are refused, in every form"
             (doseq [code ["(d/with @dvergr.room/*kb* [[:db.fn/call (fn [db] [])]])"
+                          "(d/with @dvergr.room/*kb* [{:db/ident :escape :db/fn (fn [db] [])} [:escape]])"
+                          "(d/transact dvergr.room/*kb* [[:escape]])"
                           "(d/transact dvergr.room/*kb* [[:db.fn/call (fn [db] [])]])"
                           "(d/transact dvergr.room/*kb* {:tx-data [[:db.fn/call (fn [db] [])]]})"
                           "(d/transact! dvergr.room/*kb* {:tx-data [(list :db.fn/call (fn [db] []))]})"]]
-              (is (re-find #":db.fn/call" (str (:err (ev code)))) code)))
+              (is (re-find #"Transaction functions" (str (:err (ev code)))) code)))
           (testing "an error carries no cause holding what Datahike was given"
             (is (= {:ok [true false]}
                    (ev "(try (d/pull @dvergr.room/*kb* '[*] @dvergr.room/*kb*)
@@ -552,6 +571,14 @@
                           [(str (type (d/entity-db ent)))
                            (every? #(= \"class dvergr.sandbox.ns.datahike.SandboxDb\" (str (type %)))
                                    ((juxt :db-before :db-after) (d/with @dvergr.room/*kb* [{:title \"w\"}])))])"))))
+          (testing "an entity yields attribute values, never its database"
+            (is (= {:ok [false false false]}
+                   (ev "(let [e (d/entity @dvergr.room/*kb* (ffirst (d/q '[:find ?e :where [?e :title \"note\"]] @dvergr.room/*kb*)))
+                              raw? #(boolean (re-find #\"^class datahike\\.(db|connector)\\.\" (str (type %))))
+                              reach (concat [(:db e) (get e :db) (:store e)] (vals e) (keys e) (map val (seq e))
+                                            (tree-seq coll? seq (d/pull @dvergr.room/*kb* '[*] (:db/id e))))]
+                          [(boolean (some raw? reach)) (boolean (some #(re-find #\"Atom|Connection|Store\" (str (type %))) reach))
+                           (boolean (some raw? (map :v (d/datoms @dvergr.room/*kb* :eavt))))])"))))
           (testing "a mailbox handle follows the selected world"
             (is (= {:ok #{["note"]}}
                    (ev "(def kept (dvergr.mail/inbox))

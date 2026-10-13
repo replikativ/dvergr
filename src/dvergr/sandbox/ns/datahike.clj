@@ -148,23 +148,43 @@
   [conn]
   @(resolve-connection conn))
 
+(defn- callable?
+  "Code Datahike would call: a function, a var, a multimethod, any other
+   invokable that is not data (keywords, symbols and collections are data;
+   they invoke as lookups)."
+  [x]
+  (and (ifn? x) (not (keyword? x)) (not (symbol? x)) (not (coll? x))))
+
 (defn- sealing-fn
   "`f` (sandbox code Datahike calls back: a query function, an aggregate, a
    filter predicate) seeing sealed values; anything else as it is."
   [f]
-  (if (fn? f)
+  (if (callable? f)
     (fn [& args] (apply f (map seal args)))
     f))
 
+(defn- sealing-input
+  "A query input with every callable in it, at any depth of a tuple,
+   collection or relation input, seeing sealed values."
+  [x]
+  (cond
+    (callable? x) (sealing-fn x)
+    (map? x) (into (empty x) (map (fn [[k v]] [(sealing-input k) (sealing-input v)])) x)
+    (vector? x) (mapv sealing-input x)
+    (set? x) (into (empty x) (map sealing-input) x)
+    (sequential? x) (map sealing-input x)
+    :else x))
+
 ;; ---------------------------------------------------------------------------
 ;; Queries. A database is unsealed only where the query declares a source
-;; (`$`, `$x` in :in, or the default source); a function clause may take a
-;; source only when it is one of Datahike's own lookups. Otherwise
-;; [(identity $) ?db], [(get $ :store) ?s] or [(?f $) ?x] would bind the raw
-;; database, its store or a callback over it.
+;; (`$`, `$x` in :in, or the default source). A call, in the query or its
+;; rules and in list or vector form, takes a source only as the first
+;; argument of one of Datahike's own lookups. Otherwise [(identity $) ?db],
+;; [(get $ :store) ?s], [(?f $) ?x], [[?f $] ?x] or a lookup's default
+;; argument would bind the raw database, its store or a callback over it.
 
 (def ^:private source-fns
-  "Query functions that take a database source."
+  "Query functions that take a database source, as their first argument."
   '#{get-else get-some missing? pull})
 
 (defn- source-sym? [x]
@@ -181,30 +201,49 @@
              (->> query (drop-while #(not= :in %)) rest (take-while (complement keyword?))))]
     (if (seq in) (vec in) '[$])))
 
+(defn- refuse-query! [why form]
+  (throw (ex-info (str why ": " (pr-str form))
+                  {:type ::source-in-function :clause (pr-str form)})))
+
+(defn- check-bindings!
+  "Every name an :in binds is a variable (`?x`), a source (`$`, `$x`), the
+   rules (`%`) or `_`/`...`, so no input can stand in for a function name
+   such as `pull`."
+  [bindings]
+  (doseq [x (tree-seq coll? seq bindings)
+          :when (and (symbol? x)
+                     (not (str/starts-with? (name x) "?"))
+                     (not (source-sym? x))
+                     (not (#{'% '_ '...} x)))]
+    (refuse-query! "A query input binds a variable (?x), a source ($) or the rules (%)" x)))
+
 (defn- check-source-use!
-  "Throws when a function clause in `forms` (a query, its rules) takes a
-   source other than through `source-fns`."
+  "Throws when a call in `forms` (a query, its rules) takes a source other
+   than as the first argument of an unqualified `source-fns` lookup. A form
+   that starts with a source (a data pattern or rule call on that source)
+   is not a call."
   [forms]
-  (doseq [x (tree-seq coll? seq forms)]
-    (when (and (seq? x) (symbol? (first x))
-               (not (source-sym? (first x)))
-               (not (contains? source-fns (symbol (name (first x)))))
-               (some source-sym? (rest x)))
-      (throw (ex-info (str "A query function takes a database only through "
-                           "get-else, get-some, missing? or pull: " (pr-str x))
-                      {:type ::source-in-function :clause (pr-str x)})))))
+  (doseq [x (tree-seq coll? seq forms)
+          :when (and (sequential? x) (symbol? (first x)) (not (source-sym? (first x))))]
+    (let [[f & args] x
+          lookup? (and (nil? (namespace f)) (contains? source-fns f))]
+      (when (some source-sym? (if lookup? (rest args) args))
+        (refuse-query! (str "A query function takes a database only as the first argument "
+                            "of get-else, get-some, missing? or pull")
+                       x)))))
 
 (defn- query-args
   "A query's inputs as Datahike takes them: databases unsealed in source
-   positions, sandbox functions seeing sealed values, rules checked."
+   positions, callables seeing sealed values, bindings and rules checked."
   [query inputs]
   (let [query (query-form query)
         bindings (in-bindings query)
         rules (keep-indexed (fn [i b] (when (= '% b) (nth inputs i nil))) bindings)]
+    (check-bindings! bindings)
     (check-source-use! (into [query] rules))
     (into []
           (map-indexed (fn [i v]
-                         (if (source-sym? (get bindings i)) (unseal v) (sealing-fn v))))
+                         (if (source-sym? (get bindings i)) (unseal v) (sealing-input v))))
           inputs)))
 
 (defn- tx-forms
@@ -281,8 +320,14 @@
    writes to certified evaluation projections."
   [db tx-data]
   (doseq [form tx-data]
-    (when (and (sequential? form) (= :db.fn/call (first form)))
-      (throw (ex-info "Transaction functions (:db.fn/call) are not available in the sandbox"
+    (when (or (and (sequential? form)
+                   (let [op (first form)]
+                     (or (= :db.fn/call op)
+                         (not (and (keyword? op)
+                                   (some-> (namespace op) (as-> n (or (= "db" n) (str/starts-with? n "db.")))))))))
+              (and (map? form) (contains? form :db/fn)))
+      (throw (ex-info (str "Transaction functions (:db.fn/call, :db/fn, an entity's ident as the "
+                           "operation) are not available in the sandbox")
                       {:type ::tx-function})))
     (let [protected?
           (cond
