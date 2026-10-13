@@ -115,6 +115,10 @@
                  m))
              ops ops))
 
+(defonce ^:private settlement-locks
+  ;; fork id → the lock its settlements through the room ops take
+  (java.util.concurrent.ConcurrentHashMap.))
+
 (defn room-ops-map
   "The unified Room-ops map — `create!`/`list`/`get`/`post!`/`messages`/`children`/
    `set-parent!`/`join!`/`leave!`/`delete!`/`fork!`/`merge!`/`discard!`/`diff`/
@@ -200,6 +204,19 @@
                                                 %
                                                 (assoc (or % {}) (:id fork) (assoc settlement :result result)))))
                           (settled-result (:id fork) settlement))
+        ;; One settlement of a fork at a time through these ops, in every
+        ;; interpreter: the second waits, finds the fork gone and answers from
+        ;; the first's record. Bounded, so a settlement that waits on code
+        ;; trying to settle the same fork cannot deadlock.
+        settling        (fn [fork f]
+                          (let [^java.util.concurrent.locks.ReentrantLock lock
+                                (.computeIfAbsent ^java.util.concurrent.ConcurrentHashMap settlement-locks
+                                                  (:id fork)
+                                                  (reify java.util.function.Function
+                                                    (apply [_ _] (java.util.concurrent.locks.ReentrantLock.))))]
+                            (if (.tryLock lock 60 java.util.concurrent.TimeUnit/SECONDS)
+                              (try (f) (finally (.unlock lock)))
+                              {:error (str "Fork " (:id fork) " is being settled; try again")})))
         ;; A settlement of a fork the registry no longer has is answered from
         ;; that record before the effect boundary: the boundary's authority
         ;; check knows only live rooms, and a repeat performs nothing.
@@ -319,22 +336,41 @@
                         (cond
                           (nil? parent) {:error (str "Room not found: " parent-ref)}
                           (nil? fork)   {:error (str "Room not found: " fork-ref)}
-                          :else (let [result (binding [rtc/*execution-context* (:ctx fork)]
-                                               (merge-room* parent fork))]
-                                  (if (and (map? result) (:ctx result))
-                                    (settle! fork {:op :merged :parent (:id parent)} (view result))
-                                    result)))))
+                          :else
+                          (settling
+                           fork
+                           (fn []
+                             (if-not (binding [rtc/*execution-context* (selected-ctx)]
+                                       (resolve-room fork-ref))
+                               (or (settled-result fork-ref {:op :merged :parent (:id parent)})
+                                   {:error (str "Fork " fork-ref " was already settled")})
+                               (let [result (binding [rtc/*execution-context* (:ctx fork)]
+                                              (merge-room* parent fork))]
+                                 (if (and (map? result) (:ctx result))
+                                   (settle! fork {:op :merged :parent (:id parent)} (view result))
+                                   result))))))))
         discard-fn  (fn [fork-ref]
                       (if-let [fork (binding [rtc/*execution-context* (selected-ctx)]
                                       (resolve-room fork-ref))]
-                        (let [snapshot (view fork)]
-                          (binding [rtc/*execution-context* (:ctx fork)]
-                            (discard* fork))
-                          ;; an isolated fork's handle says how it was
-                          ;; settled: a merge may have won the race
-                          (if (= :merged (some-> (fork-handle* fork) :authority deref :status))
-                            {:error (str "Fork " fork-ref " was already settled: merged")}
-                            (settle! fork {:op :discarded} snapshot)))
+                        (settling
+                         fork
+                         (fn []
+                           (if-not (binding [rtc/*execution-context* (selected-ctx)]
+                                     (resolve-room fork-ref))
+                             (or (settled-result fork-ref {:op :discarded})
+                                 {:error (str "Fork " fork-ref " was already settled")})
+                             (let [snapshot (view fork)]
+                               (binding [rtc/*execution-context* (:ctx fork)]
+                                 (discard* fork))
+                               ;; an isolated fork's handle says how it was
+                               ;; settled: a merge outside these ops may have
+                               ;; won, and is recorded as the winner
+                               (if (= :merged (some-> (fork-handle* fork) :authority deref :status))
+                                 (do (settle! fork {:op :merged :parent (:parent-id snapshot)}
+                                              (binding [rtc/*execution-context* (selected-ctx)]
+                                                (view (resolve-room (:parent-id snapshot)))))
+                                     (settled-result (:id fork) {:op :discarded}))
+                                 (settle! fork {:op :discarded} snapshot))))))
                         {:error (str "Room not found: " fork-ref)}))
         ;; Merge review — the per-system diff + tier the agent reads to decide.
         diff-fn     (fn [fork-ref]
