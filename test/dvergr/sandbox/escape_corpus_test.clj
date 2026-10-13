@@ -574,7 +574,21 @@
               (is (= {:ok #{}} (ev "(d/q '[:find ?v :where [_ :db.attr/preds ?v]] @dvergr.room/*kb*)")))))
           (testing "a query result holds no function"
             (is (re-find #"host object"
-                         (str (:err (ev "(d/q '[:find ?f . :where [(constantly 1) ?f]] @dvergr.room/*kb*)"))))))
+                         (str (:err (ev "(d/q '[:find ?f . :where [(constantly 1) ?f]] @dvergr.room/*kb*)")))))
+            (is (re-find #"host object"
+                         (str (:err (ev "(let [seed (first (d/datoms @dvergr.room/*kb* :eavt))]
+                                          (d/q '[:find ?boxed . :in $ ?d :where [(constantly 1) ?f] [(assoc ?d :v ?f) ?boxed]]
+                                               @dvergr.room/*kb* seed))"))))
+                "nor a datom built around one"))
+          (testing "a datom is not a transaction entry"
+            (is (re-find #"datoms are not accepted"
+                         (str (:err (ev "(let [d (first (d/datoms @dvergr.room/*kb* :eavt))]
+                                          (d/transact dvergr.room/*kb* [(assoc d :a :db.attr/preds :v 'clojure.core/slurp)]))"))))))
+          (testing "a function carried on metadata is refused"
+            (is (re-find #"functions in it"
+                         (str (:err (ev "(d/create-database {:store {:backend :mem :id \"meta\"} :schema-flexibility :read})
+                                         (d/transact (d/connect {:store {:backend :mem :id \"meta\"}})
+                                                     [[:db/add -1 :payload (with-meta [1] {:f (fn [] :host)})]])"))))))
           (testing "transaction functions are refused, in every form"
             (doseq [code ["(d/with @dvergr.room/*kb* [[:db.fn/call (fn [db] [])]])"
                           "(d/with @dvergr.room/*kb* [{:db/ident :escape :db/fn (fn [db] [])} [:escape]])"

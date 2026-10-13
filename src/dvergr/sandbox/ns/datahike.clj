@@ -63,7 +63,7 @@
   "A value that holds nothing to seal: the scalars query results are made of."
   [x]
   (or (nil? x) (string? x) (number? x) (keyword? x) (symbol? x) (boolean? x)
-      (uuid? x) (char? x) (inst? x) (instance? datahike.datom.Datom x)))
+      (uuid? x) (char? x) (inst? x)))
 
 (defn- seal-coll
   "`x` with `f` applied to its elements, or `x` itself when no element changed
@@ -87,6 +87,9 @@
     (instance? SandboxDb x) x
     (world-connection? x) x
     (instance? datahike.impl.entity.Entity x) x
+    ;; a datom is data as long as its value is: a query can build one around
+    ;; anything ([(assoc ?d :v ?f) ?boxed])
+    (instance? datahike.datom.Datom x) (if (identical? (:v x) (seal (:v x))) x (leak! x))
     (dbu/db? x) (SandboxDb. x)
     (or (dc/connection? x)
         (instance? clojure.lang.IRef x)
@@ -342,10 +345,17 @@
    calls (`:db.fn/call` would run sandbox code on the raw database) and no
    writes to certified evaluation projections."
   [db tx-data]
-  (when-let [f (first (filter callable? (tree-seq coll? seq tx-data)))]
+  (when-let [f (first (filter callable? (tree-seq #(or (coll? %) (some? (meta %)))
+                                                  #(concat (when (coll? %) (seq %)) (some-> (meta %) vector))
+                                                  tx-data)))]
     (throw (ex-info "A transaction is data: functions in it are not available in the sandbox"
                     {:type ::tx-function :class (str (class f))})))
   (doseq [form tx-data]
+    (when (instance? datahike.datom.Datom form)
+      ;; neither a map nor a form: its entity and attribute slots would pass
+      ;; every check below
+      (throw (ex-info "A transaction lists maps and forms; datoms are not accepted in the sandbox"
+                      {:type ::datom-entry})))
     (when (or (and (sequential? form) (not (contains? tx-ops (first form))))
               (some #(and (map? %) (some (partial contains? %) code-attrs))
                     (tree-seq coll? seq form))
