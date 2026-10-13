@@ -576,9 +576,16 @@
      (let [parent (rreg/lookup (:parent-id fork))
            run-id (some-> fork :meta deref :run-id)]
        (d/discard fork)
-       (when (and parent run-id)
-         (agent-run/update-durable-settlement! (run-record-room fork parent) run-id :discarded reason))
-       {:ok? true})
+       ;; a merge may hold or have completed the fork's settlement: then this
+       ;; discard did nothing, and the Run's status is the merge's to write
+       (if-let [other (let [held (or (d/settlement fork) (d/settlement-claim fork))]
+                        (when (and held (not= {:op :discarded} held)) held))]
+         {:ok? false
+          :error (str "fork " (:id fork) (if (d/settlement fork) " was " " is being ")
+                      (name (:op other)))}
+         (do (when (and parent run-id)
+               (agent-run/update-durable-settlement! (run-record-room fork parent) run-id :discarded reason))
+             {:ok? true})))
      (catch Throwable t {:ok? false :error (.getMessage t)}))))
 
 (defn adopt!

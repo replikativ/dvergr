@@ -139,6 +139,8 @@
         fork-room*      @(ns-resolve 'dvergr.discourse 'fork-room)
         merge-room*     @(ns-resolve 'dvergr.discourse 'merge-room)
         discard*        @(ns-resolve 'dvergr.discourse 'discard)
+        settlement*     @(ns-resolve 'dvergr.discourse 'settlement)
+        settlement-claim* @(ns-resolve 'dvergr.discourse 'settlement-claim)
         create-room!*   @(ns-resolve 'dvergr.rooms 'create-room!)
         join-agent!*    @(ns-resolve 'dvergr.rooms 'join-agent!)
         leave-agent!*   @(ns-resolve 'dvergr.rooms 'leave-agent!)
@@ -275,8 +277,13 @@
                         (cond
                           (nil? parent) {:error (str "Room not found: " parent-ref)}
                           (nil? fork)   {:error (str "Room not found: " fork-ref)}
-                          :else (let [result (binding [rtc/*execution-context* (:ctx fork)]
-                                               (merge-room* parent fork))]
+                          :else (let [result (try (binding [rtc/*execution-context* (:ctx fork)]
+                                                    (merge-room* parent fork))
+                                                  (catch clojure.lang.ExceptionInfo e
+                                                    ;; a discard holds or settled the fork
+                                                    (if (= :dvergr.discourse/already-settled (:type (ex-data e)))
+                                                      {:error (ex-message e)}
+                                                      (throw e))))]
                                   (if (and (map? result) (:ctx result))
                                     (view result)
                                     result)))))
@@ -286,7 +293,13 @@
                         (let [snapshot (view fork)]
                           (binding [rtc/*execution-context* (:ctx fork)]
                             (discard* fork))
-                          snapshot)
+                          ;; a merge may hold or have settled the fork: then
+                          ;; this discard did nothing
+                          (if-let [held (let [h (or (settlement* fork) (settlement-claim* fork))]
+                                          (when (and h (not= {:op :discarded} h)) h))]
+                            {:error (str "Fork " fork-ref (if (settlement* fork) " was " " is being ")
+                                         (name (:op held)))}
+                            snapshot))
                         {:error (str "Room not found: " fork-ref)}))
         ;; Merge review — the per-system diff + tier the agent reads to decide.
         diff-fn     (fn [fork-ref]

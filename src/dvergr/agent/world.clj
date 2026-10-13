@@ -64,6 +64,21 @@
           (reset! (:settlement world) result)
           result))))
 
+(defn- settled-as
+  "`status`, unless another settlement of the work plane won: then how it
+   was settled (`dvergr.discourse/settlement`), or `:review` while that one is
+   still in progress."
+  [world status]
+  (let [work (:work world)
+        done (d/settlement work)
+        held (d/settlement-claim work)
+        mine (case (:status status) :discarded {:op :discarded} :merged {:op :merged :parent (:id (:parent world))} nil)]
+    (cond
+      (or (nil? held) (= mine held)) status
+      (= :merged (:op done)) {:status :merged :reason :settled-elsewhere}
+      (= :discarded (:op done)) {:status :discarded :reason :settled-elsewhere}
+      :else {:status :review :reason :settlement-in-progress})))
+
 (defn settle!
   "Settle `world` after the executor has quiesced.
 
@@ -84,7 +99,7 @@
               d/discard-deferred
               d/discard)
             (:work world))
-           {:status :discarded :reason execution-status})
+           (settled-as world {:status :discarded :reason execution-status}))
 
        (= :deferred (:policy world))
        {:status :deferred :reason :policy}
@@ -94,7 +109,7 @@
 
        (= :discard (:policy world))
        (do (d/discard (:work world))
-           {:status :discarded :reason :policy})
+           (settled-as world {:status :discarded :reason :policy}))
 
        (= :review (:policy world))
        {:status :review :reason :policy}
@@ -104,6 +119,8 @@
          (d/merge-room (:parent world) (:work world))
          {:status :merged}
          (catch Throwable t
-           {:status :review
-            :reason :automatic-merge-failed
-            :error t}))))))
+           (if (= :dvergr.discourse/already-settled (:type (ex-data t)))
+             (settled-as world {:status :review :reason :settlement-in-progress})
+             {:status :review
+              :reason :automatic-merge-failed
+              :error t})))))))

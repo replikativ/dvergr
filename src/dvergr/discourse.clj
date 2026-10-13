@@ -2032,6 +2032,56 @@
   [fork]
   (room-home-ctx fork))
 
+(defn- claim-settlement!
+  "Claim the settlement of `fork` as `settlement` ({:op :merged :parent id} or
+   {:op :discarded}): nil when this call holds it — it won, or it retries the
+   same settlement — else the settlement that holds it. One claim at a time,
+   in both isolation modes; it is held until the settlement completes or its
+   recovery has finished."
+  [fork settlement]
+  (let [[old _] (swap-vals! (:meta fork) #(if (::settlement-claim %) % (assoc % ::settlement-claim settlement)))
+        held (::settlement-claim old)]
+    (when-not (= settlement held) held)))
+
+(defn- complete-settlement!
+  "Record that `settlement`, holding the claim, settled `fork`."
+  [fork settlement]
+  (swap! (:meta fork) assoc ::settled settlement))
+
+(defn- release-settlement!
+  "Give back the claim of a settlement that did not settle the substrate (its
+   handle is still open, or there is none), after its recovery ran."
+  [fork settlement]
+  (let [handle (fork-handle fork)]
+    (when (or (nil? handle) (ygg/open-fork? handle))
+      (swap! (:meta fork) #(if (= settlement (::settlement-claim %))
+                             (dissoc % ::settlement-claim)
+                             %)))))
+
+(defn settlement
+  "How `fork` was settled: {:op :merged :parent id} or {:op :discarded}, or
+   nil while it is not. Recorded only once the merge or discard completed."
+  [fork]
+  (::settled @(:meta fork)))
+
+(defn settlement-claim
+  "The settlement in progress on `fork` (or completed), or nil."
+  [fork]
+  (::settlement-claim @(:meta fork)))
+
+(defn- with-settlement-claim
+  "Run `settle` (which drains the fork's listeners and settles it) holding
+   the claim for `settlement`: recorded complete when it returns; given back
+   when it throws, after its own recovery ran."
+  [fork settlement settle]
+  (try
+    (let [result (settle)]
+      (complete-settlement! fork settlement)
+      result)
+    (catch Throwable error
+      (release-settlement! fork settlement)
+      (throw error))))
+
 (defn discard
   "Discard a fork: deregister its participants, drop it from the
    registry, and if the fork's ctx was forked (`:isolation :ctx`), settle its
@@ -2046,33 +2096,39 @@
   (assert-settlement-released! fork :discard)
   ;; Idempotence: once unregistered, the fork is a zombie — re-discarding would
   ;; double-delete the yggdrasil branch (which errors). Guard on registry.
-  (when (binding [ec/*execution-context* (fork-home-ctx fork)] (rreg/lookup (:id fork)))
-    (let [callbacks (drain-room-listeners! fork :discard)
-          work-fence-token* (volatile! nil)]
-      (try
-        (try
-          (vreset! work-fence-token* (sandbox-work/close-room-work! fork))
-          (catch Throwable error
-            (vreset! work-fence-token* (:fence (ex-data error)))
-            (throw error)))
-        (drain-room-runs! fork)                ; stop work before removing its substrate
-        (seal-room-quiescence! fork :discard)
-        (when-let [handle (fork-handle fork)]
+  (when (and (binding [ec/*execution-context* (fork-home-ctx fork)] (rreg/lookup (:id fork)))
+             ;; another settlement holds the fork: nothing to do here (the
+             ;; caller reads `settlement`/`settlement-claim` for the winner)
+             (nil? (claim-settlement! fork {:op :discarded})))
+    (with-settlement-claim
+      fork {:op :discarded}
+      (fn []
+        (let [callbacks (drain-room-listeners! fork :discard)
+              work-fence-token* (volatile! nil)]
+          (try
+            (try
+              (vreset! work-fence-token* (sandbox-work/close-room-work! fork))
+              (catch Throwable error
+                (vreset! work-fence-token* (:fence (ex-data error)))
+                (throw error)))
+            (drain-room-runs! fork)                ; stop work before removing its substrate
+            (seal-room-quiescence! fork :discard)
+            (when-let [handle (fork-handle fork)]
           ;; P2: settle the substrate first, then drop deferred grants explicitly.
           ;; If grant cleanup fails, retrying `discard` replays the cached settlement
           ;; and retries only this idempotent integration step.
-          (let [pending (binding [ec/*execution-context* (:ctx fork)]
-                          (ec/get-state [:dvergr/pending-grants]))]
-            (ygg/discard-fork! handle)
-            (srooms/drop-fork-grants! pending)))
-        (leave-all! fork)
-        (binding [ec/*execution-context* (fork-home-ctx fork)]
-          (rreg/untrack-fork! (:id fork) (some-> fork fork-handle :fork-id))
-          (rreg/unregister! (:id fork))
-          (peer-bus/post! {:type :dvergr/fork-discarded
-                           :dvergr/origin (:id fork)}))
-        (catch Throwable error
-          (recover-room-quiescence! fork callbacks @work-fence-token* error)))))
+              (let [pending (binding [ec/*execution-context* (:ctx fork)]
+                              (ec/get-state [:dvergr/pending-grants]))]
+                (ygg/discard-fork! handle)
+                (srooms/drop-fork-grants! pending)))
+            (leave-all! fork)
+            (binding [ec/*execution-context* (fork-home-ctx fork)]
+              (rreg/untrack-fork! (:id fork) (some-> fork fork-handle :fork-id))
+              (rreg/unregister! (:id fork))
+              (peer-bus/post! {:type :dvergr/fork-discarded
+                               :dvergr/origin (:id fork)}))
+            (catch Throwable error
+              (recover-room-quiescence! fork callbacks @work-fence-token* error)))))))
   fork)
 
 (defn discard-deferred
@@ -2142,16 +2198,24 @@
   ([parent fork] (merge-room parent fork {}))
   ([parent fork {:keys [merge-opts]}]
    (assert-settlement-released! fork :merge)
-   (let [callbacks (drain-room-listeners! fork :merge)
-         work-fence-token* (volatile! nil)]
-     (try
-       (try
-         (vreset! work-fence-token* (sandbox-work/close-room-work! fork))
-         (catch Throwable error
-           (vreset! work-fence-token* (:fence (ex-data error)))
-           (throw error)))
-       (drain-room-runs! fork)                 ; stop work before merging its substrate
-       (seal-room-quiescence! fork :merge)
+   (when-let [held (claim-settlement! fork {:op :merged :parent (:id parent)})]
+     (throw (ex-info (str "Fork " (:id fork) " is already "
+                          (if (= held (settlement fork)) "settled" "being settled")
+                          ": " (name (:op held)))
+                     {:type ::already-settled :fork/id (:id fork) :settlement held})))
+   (with-settlement-claim
+     fork {:op :merged :parent (:id parent)}
+     (fn []
+       (let [callbacks (drain-room-listeners! fork :merge)
+             work-fence-token* (volatile! nil)]
+         (try
+           (try
+             (vreset! work-fence-token* (sandbox-work/close-room-work! fork))
+             (catch Throwable error
+               (vreset! work-fence-token* (:fence (ex-data error)))
+               (throw error)))
+           (drain-room-runs! fork)                 ; stop work before merging its substrate
+           (seal-room-quiescence! fork :merge)
    ;; (1) SUBSTRATE merge — branched yggdrasil systems (CRDTs, datahike, git) fold
    ;; back whenever the ctx was forked (`:isolation :ctx`), INDEPENDENT of any
    ;; conversation store. These are orthogonal: a room can carry shared CRDTs with
@@ -2160,50 +2224,50 @@
    ;; branch also collapses here (bringing its messages into the parent's
    ;; conversation under the shared :chat/id); its deferred data-DB grants commit on
    ;; accept via :on-merge (store forks only).
-       (when-let [handle (fork-handle fork)]
-         (try
-           (let [pending (when (:store fork)
-                           (binding [ec/*execution-context* (:ctx fork)]
-                             (ec/get-state [:dvergr/pending-grants])))]
-             (ygg/merge-fork! handle (or merge-opts {}))
+           (when-let [handle (fork-handle fork)]
+             (try
+               (let [pending (when (:store fork)
+                               (binding [ec/*execution-context* (:ctx fork)]
+                                 (ec/get-state [:dvergr/pending-grants])))]
+                 (ygg/merge-fork! handle (or merge-opts {}))
          ;; Grant integration is deliberately outside substrate settlement. A
          ;; failure leaves the handle truthfully :merged and a retry replays the
          ;; cached merge before retrying this idempotent commit.
-             (when (:store fork)
-               (srooms/commit-fork-grants! pending)))
-           (catch Throwable e
-             (tel/log! {:level :error :id :dvergr/merge-failed
-                        :data {:fork (:id fork) :parent (:id parent) :error (str e)}}
-                       "merge-room: affine yggdrasil settlement failed")
-             (binding [ec/*execution-context* (fork-home-ctx fork)]
-               (peer-bus/post! {:type :dvergr/merge-failed :dvergr/origin (:id fork)
-                                :dvergr/parent (:id parent) :error (str e)}))
-             (throw e))))
+                 (when (:store fork)
+                   (srooms/commit-fork-grants! pending)))
+               (catch Throwable e
+                 (tel/log! {:level :error :id :dvergr/merge-failed
+                            :data {:fork (:id fork) :parent (:id parent) :error (str e)}}
+                           "merge-room: affine yggdrasil settlement failed")
+                 (binding [ec/*execution-context* (fork-home-ctx fork)]
+                   (peer-bus/post! {:type :dvergr/merge-failed :dvergr/origin (:id fork)
+                                    :dvergr/parent (:id parent) :error (str e)}))
+                 (throw e))))
    ;; (2) CONVERSATION merge — for STORE-LESS forks (`:isolation :none`, or a `:ctx`
    ;; fork without a message store), absorb the fork's post-fork bus entries into the
    ;; parent's log (merge-as-history; no re-firing of live handlers, separate buses).
    ;; A `:store` fork's messages already arrived via the datahike collapse in (1).
-       (when-not (:store fork)
-         (let [forked-at   (or (:forked-at-len fork) 0)
-               fork-log    (log fork)
-               new-entries (when (> (count fork-log) forked-at) (subvec fork-log forked-at))]
-           (when (seq new-entries)
-             (bus/append-log! (:bus parent) new-entries))))
+           (when-not (:store fork)
+             (let [forked-at   (or (:forked-at-len fork) 0)
+                   fork-log    (log fork)
+                   new-entries (when (> (count fork-log) forked-at) (subvec fork-log forked-at))]
+               (when (seq new-entries)
+                 (bus/append-log! (:bus parent) new-entries))))
   ;; Surface the merged conversation: re-seed the parent's shared message signal
   ;; (no-op if the parent has no signal) so every frontend re-renders — the merge
   ;; is a datahike collapse / log append, not a bus post.
-       (try ((requiring-resolve 'dvergr.rooms.messages/refresh!) parent)
-            (catch Throwable _ nil))
-       (leave-all! fork)
-       (binding [ec/*execution-context* (fork-home-ctx fork)]
-         (rreg/untrack-fork! (:id fork) (some-> fork fork-handle :fork-id))
-         (rreg/unregister! (:id fork))
-         (peer-bus/post! {:type            :dvergr/fork-merged
-                          :dvergr/origin   (:id fork)
-                          :dvergr/parent   (:id parent)}))
-       parent
-       (catch Throwable error
-         (recover-room-quiescence! fork callbacks @work-fence-token* error))))))
+           (try ((requiring-resolve 'dvergr.rooms.messages/refresh!) parent)
+                (catch Throwable _ nil))
+           (leave-all! fork)
+           (binding [ec/*execution-context* (fork-home-ctx fork)]
+             (rreg/untrack-fork! (:id fork) (some-> fork fork-handle :fork-id))
+             (rreg/unregister! (:id fork))
+             (peer-bus/post! {:type            :dvergr/fork-merged
+                              :dvergr/origin   (:id fork)
+                              :dvergr/parent   (:id parent)}))
+           parent
+           (catch Throwable error
+             (recover-room-quiescence! fork callbacks @work-fence-token* error))))))))
 
 ;; ============================================================================
 ;; PR-style merge review
