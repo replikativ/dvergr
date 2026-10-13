@@ -313,3 +313,75 @@
         (finally
           (deliver go true)
           (d/close-room! parent))))))
+
+(deftest a-fork-of-a-fork-being-settled-is-open
+  (let [parent (d/room :settle-nested)
+        fork (d/fork-room parent {:isolation :ctx})
+        entered (promise)
+        go (promise)
+        drain @#'d/drain-room-listeners!
+        first? (atom true)]
+    (try
+      (with-redefs-fn {#'d/drain-room-listeners!
+                       (fn [& args]
+                         (when (compare-and-set! first? true false)
+                           (deliver entered true)
+                           @go)
+                         (apply drain args))}
+        (fn []
+          (let [merging (future (d/merge-room parent fork))]
+            (is (true? (deref entered 30000 ::timeout)))
+            (is (= {:op :merged :parent (:id parent)} (d/settlement-claim fork)) "the merge holds its fork")
+            (let [child (binding [ec/*execution-context* (:ctx fork)]
+                          (d/fork-room fork {:isolation :none}))]
+              (is (nil? (d/settlement-claim child)) "the child is not settled with it")
+              (is (= {:outcome :discarded} (d/discard-outcome child))))
+            (deliver go true)
+            (is (= parent (deref merging 30000 ::timeout))))))
+      (finally
+        (deliver go true)
+        (d/close-room! parent)))))
+
+(deftest a-discard-that-lost-to-a-plain-discard-writes-the-runs-status
+  ;; the contender finds a plain d/discard holding the fork, which completes
+  ;; while the contender reads the winner: nobody else writes the Run's status
+  (let [parent (d/room :settle-plain-winner)
+        fork (d/fork-room parent {:isolation :ctx})
+        run-id (random-uuid)
+        writes (atom [])
+        drain-entered (promise) drain-go (promise)
+        reading (promise) read-go (promise)
+        contender (atom nil)
+        drain @#'d/drain-room-listeners!
+        settlement d/settlement
+        first? (atom true)]
+    (swap! (:meta fork) assoc :run-id run-id)
+    (try
+      (with-redefs-fn {#'d/drain-room-listeners!
+                       (fn [& args]
+                         (when (compare-and-set! first? true false)
+                           (deliver drain-entered true)
+                           @drain-go)
+                         (apply drain args))
+                       #'d/settlement
+                       (fn [f]
+                         (when (identical? (Thread/currentThread) @contender)
+                           (deliver reading true)
+                           @read-go)
+                         (settlement f))
+                       #'agent-run/update-durable-settlement! (fn [& args] (swap! writes conj (vec (drop 1 args))))}
+        (fn []
+          (let [winner (future (d/discard fork))
+                _ (is (true? (deref drain-entered 30000 ::timeout)))
+                result (future (reset! contender (Thread/currentThread))
+                               (binding [ec/*execution-context* (:ctx parent)] (forks/discard! fork)))]
+            (is (true? (deref reading 30000 ::timeout)))
+            (deliver drain-go true)
+            (is (= fork (deref winner 30000 ::timeout)))
+            (deliver read-go true)
+            (is (= {:ok? true} (deref result 30000 ::timeout)))
+            (is (= [[run-id :discarded :review-rejected]] @writes)))))
+      (finally
+        (deliver drain-go true)
+        (deliver read-go true)
+        (d/close-room! parent)))))

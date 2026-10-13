@@ -577,13 +577,11 @@
            run-id (some-> fork :meta deref :run-id)]
        (let [{:keys [outcome settlement in-progress?]} (d/discard-outcome fork)]
          (cond
-           ;; another discard settled it, and wrote the Run's status
-           (and (= :lost outcome) (not in-progress?) (= :discarded (:op settlement)))
-           {:ok? true}
-
-           ;; another settlement holds or settled the fork: this discard did
-           ;; nothing, and the Run's status is that one's to write
-           (= :lost outcome)
+           ;; another settlement holds the fork, or a merge settled it: this
+           ;; discard did nothing, and the Run's status is not a discard.
+           ;; One that lost to a completed discard writes it below: the
+           ;; winner may not have (a plain `d/discard`)
+           (and (= :lost outcome) (or in-progress? (not= :discarded (:op settlement))))
            {:ok? false
             :error (str "fork " (:id fork) (if in-progress? " is being " " was ") (name (:op settlement)))}
 

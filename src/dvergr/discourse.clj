@@ -1321,7 +1321,9 @@
                                   child-ctx
                                   (count parent-log)
                                   fork-store
-                                  (atom (assoc (dissoc @(:meta room) :dvergr/owned-listeners)
+                                  ;; a fork's own settlement is not its child's
+                                  (atom (assoc (dissoc @(:meta room) :dvergr/owned-listeners
+                                                       ::settlement-claim ::settled)
                                                :forked-from (:id room)
                                                :conversation-id conv-id))
                                   (when fork-handle (atom fork-handle))
