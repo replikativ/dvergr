@@ -169,15 +169,15 @@
           (is (= [:continue :continue :complete]
                  (scripted-turns! ctx [(acting 1) (response "") (response "")]))))
         (is (= {:acted? true :silent? true} @activity)))
+      (testing "a later Run, with no user message since the first one acted, still fails on silence"
+        (binding [agent/*run-activity* (volatile! {})]
+          (is (= [:continue :error] (scripted-turns! ctx [(response "") (response "")])))))
       (testing "a user message mid-Run (steering) does not undo the Run's work"
         (let [activity (volatile! {})]
           (binding [agent/*run-activity* activity]
             (is (= [:continue] (scripted-turns! ctx [(acting 2)])))
             (chat-ctx/add-message! ctx {:role :user :content "also check the date"})
             (is (= [:continue :complete] (scripted-turns! ctx [(response "") (response "")]))))))
-      (testing "a later Run that did no work of its own still fails on silence"
-        (binding [agent/*run-activity* (volatile! {})]
-          (is (= [:continue :error] (scripted-turns! ctx [(response "") (response "")])))))
       (testing "outside a Run (room drivers, protocols) silence after acting still fails"
         (is (= [:continue :continue :error]
                (scripted-turns! ctx [(acting 3) (response "") (response "")]))))
