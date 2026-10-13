@@ -566,7 +566,28 @@
                                 r (try (d/create-database {:store {:backend :mem :id \"init\"}
                                                            :initial-tx [[:db.fn/call (fn [raw] (reset! ran true) [])]]})
                                        (catch Exception e :refused))]
-                            [(= :refused r) @ran])")))))
+                            [(= :refused r) @ran])")))
+              (is (re-find #"collection of transaction forms"
+                           (str (:err (ev "(d/create-database {:store {:backend :mem :id \"path\"} :initial-tx \"/etc/hosts\"})"))))))
+            (testing "a scratch database's config cannot override Datahike's writer"
+              (is (= {:ok false}
+                     (ev "(let [ran (atom false)]
+                            (d/create-database {:store {:backend :mem :id \"writer\"} :schema-flexibility :read
+                                                :writer {:backend :self :write-fn-map {'transact! (fn [& _] (reset! ran true))}}})
+                            (let [c (d/connect {:store {:backend :mem :id \"writer\"}})]
+                              (d/transact c [{:title \"w\"}])
+                              @ran))")))))
+          (testing "an asynchronous failure carries no host object"
+            (ev "(d/transact dvergr.room/*kb* [{:db/id 77 :title \"gone\"}])
+                 (d/transact dvergr.room/*kb* [[:db/retract 77 :title \"gone\"]])")
+            (doseq [code ["(try @(d/transact! dvergr.room/*kb* [[:db.history.purge/before nil]]) :no-error
+                           (catch Exception e [(nil? (ex-cause e)) (str (ex-data e))]))"
+                          "(try (deref (d/transact! dvergr.room/*kb* [[:db.history.purge/before nil]]) 5000 :timeout) :no-error
+                           (catch Exception e [(nil? (ex-cause e)) (str (ex-data e))]))"]]
+              (let [r (ev code)]
+                (is (or (= {:ok :no-error} r)
+                        (and (true? (first (:ok r))) (not (re-find #"Connection|datahike\.db\." (second (:ok r))))))
+                    (pr-str r)))))
           (testing "an error carries no cause holding what Datahike was given"
             (is (= {:ok [true false]}
                    (ev "(try (d/pull @dvergr.room/*kb* '[*] @dvergr.room/*kb*)

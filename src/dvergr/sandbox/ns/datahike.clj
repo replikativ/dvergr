@@ -269,20 +269,24 @@
               filter (update more 0 sealing-fn)
               more)))))
 
+(declare sandbox-error)
+
 (defn- sealed-result
   "A mirrored call's result as sandbox code gets it: sealed deeply, and a
-   pending transaction sealed when it is dereferenced."
-  [x]
+   pending transaction sealed when it is dereferenced, its failure a fresh
+   sandbox error (`sandbox-error`) like a synchronous one's."
+  [sym x]
   (if (and (instance? clojure.lang.IDeref x) (instance? clojure.lang.IPending x)
            (not (world-connection? x)))
-    (reify
-      clojure.lang.IDeref
-      (deref [_] (seal @x))
-      clojure.lang.IBlockingDeref
-      (deref [_ ms timeout] (let [v (deref x ms ::timeout)]
-                              (if (= ::timeout v) timeout (seal v))))
-      clojure.lang.IPending
-      (isRealized [_] (realized? x)))
+    (let [settled (fn [f] (try (f) (catch Throwable error (throw (sandbox-error sym [] error)))))]
+      (reify
+        clojure.lang.IDeref
+        (deref [_] (settled #(seal @x)))
+        clojure.lang.IBlockingDeref
+        (deref [_ ms timeout] (settled #(let [v (deref x ms ::timeout)]
+                                          (if (= ::timeout v) timeout (seal v)))))
+        clojure.lang.IPending
+        (isRealized [_] (realized? x))))
     (seal x)))
 
 (defn- sandbox-error
@@ -387,9 +391,14 @@
                       (java.util.UUID/nameUUIDFromBytes
                        (.getBytes world-key java.nio.charset.StandardCharsets/UTF_8))
                       (random-uuid))]
-    (-> cfg
-        (assoc-in [:store :backend] :memory)
-        (assoc-in [:store :id] physical-id))))
+    (when (and (contains? cfg :initial-tx) (not (sequential? (:initial-tx cfg))))
+      ;; Datahike reads a string as a host file path
+      (throw (ex-info "A scratch database's :initial-tx is a collection of transaction forms"
+                      {:type ::initial-tx})))
+    ;; only these keys: a writer, index or store override would hand
+    ;; Datahike sandbox code to run on the raw database
+    (merge (select-keys cfg [:schema-flexibility :keep-history? :attribute-refs? :initial-tx])
+           {:store {:backend :memory :id physical-id}})))
 
 (defn dispose-ephemeral-databases!
   "Release and delete every process-global scratch database owned by the
@@ -432,7 +441,7 @@
                                        [sym (fn [& args]
                                               (let [resolved (host-args sym args)]
                                                 (try
-                                                  (sealed-result (untrusted #(apply f resolved)))
+                                                  (sealed-result sym (untrusted #(apply f resolved)))
                                                   (catch Throwable error
                                                     (throw (sandbox-error sym resolved error))))))])))
                                  data-ops))
@@ -446,7 +455,7 @@
                                    (if (= 'with sym) target @target) (tx-forms tx))
                           tx (if (map? tx) (assoc tx :tx-data checked) checked)]
                       (try
-                        (sealed-result (untrusted #(f target tx)))
+                        (sealed-result sym (untrusted #(f target tx)))
                         (catch Throwable error
                           (throw (sandbox-error sym [target tx] error))))))
         data      (assoc data
