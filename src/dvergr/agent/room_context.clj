@@ -297,7 +297,10 @@
    attention projection from the Room store. Subsequent calls return the
    cached ctx; live facts enter only through explicit interpreter admission.
    `:sandbox` names the agent's sandbox extensions (`dvergr.sandbox.extensions`);
-   a cached context built with others is extended or, for fewer, rebuilt."
+   a cached context built with others is extended or, for fewer, rebuilt.
+   `:sandbox :participant` takes them from the agent's Participant in the
+   room, read under the room monitor (none declared names none); for an
+   agent that is not one, the context is taken as it is."
   [room agent-id {:keys [system-prompt budget-dollars limit sandbox]}]
   (let [room-id (:id room)
         k       [room-id agent-id]]
@@ -305,7 +308,13 @@
     ;; inside it too: a returned handle must remain live through this boundary.
     (locking (:meta room)
       (binding [ec/*execution-context* (:ctx room)]
-        (let [_ (when-not (rreg/admitted-incarnation? room)
+        (let [sandbox (if (= :participant sandbox)
+                        ;; read here, not by the caller: a declaration read
+                        ;; before waiting for the monitor may be stale
+                        (when-let [p (get @(:participants room) agent-id)]
+                          (or (:sandbox p) #{}))
+                        sandbox)
+              _ (when-not (rreg/admitted-incarnation? room)
                   (throw (ex-info "Working context requested for a closed Room incarnation"
                                   {:type ::closed-room
                                    :room-id room-id

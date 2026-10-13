@@ -11,6 +11,7 @@
             [dvergr.discourse.llm :as llm]
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.room.store.memory :as mem]
+            [dvergr.rooms.scheduler :as scheduler]
             [dvergr.sandbox :as sandbox]
             [dvergr.sandbox.extensions :as extensions]
             [org.replikativ.spindel.core :as sp]
@@ -295,3 +296,57 @@
         (swap! registry dissoc :test/flaky)
         (room-context/drop-ctx! :ext-failing :analyst)
         (context/close-context! ctx)))))
+
+(defn- scheduled-has-infer?
+  "Fire a code schedule for `aid` in `room` the way the scheduler does and
+   whether its code saw foerster's namespaces. `before-ctx`, when given, runs
+   after the task started and before it takes its context."
+  [room aid & [before-ctx]]
+  (let [outcome (promise)
+        ensure-ctx! room-context/ensure-ctx!]
+    (with-redefs [d/post! (fn [_ msg] (deliver outcome (:content msg)))
+                  room-context/ensure-ctx! (fn [& args]
+                                             (when before-ctx (before-ctx))
+                                             (apply ensure-ctx! args))]
+      @(#'scheduler/run-code-task! room aid {:schedule/code "(some? (find-ns 'infer))"})
+      (let [text (deref outcome 60000 ::timeout)]
+        (cond (re-find #"→ true" (str text)) true
+              (re-find #"→ false" (str text)) false
+              :else text)))))
+
+(defn- plain-agent [] (llm/llm-agent {:id :analyst :spec {:provider :mock :model "mock"}}))
+(defn- inference-agent []
+  (llm/llm-agent {:id :analyst :spec {:provider :mock :model "mock"} :sandbox #{:foerster/inference}}))
+
+(deftest a-schedule-runs-with-the-extensions-the-participant-declares
+  (let [room (d/room :ext-scheduled)]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (d/join room (inference-agent)))
+      (is (true? (scheduled-has-infer? room :analyst)))
+      (testing "after a rejoin without them, before the agent's first turn"
+        (binding [ec/*execution-context* (:ctx room)]
+          (d/leave room :analyst)
+          (d/join room (plain-agent)))
+        (is (false? (scheduled-has-infer? room :analyst))))
+      (finally
+        (room-context/drop-ctx! :ext-scheduled :analyst)
+        (d/close-room! room)))))
+
+(deftest a-schedule-reads-the-declaration-when-it-takes-the-context
+  ;; the task starts while the agent declares inference; the agent rejoins
+  ;; without it before the task takes its context
+  (let [room (d/room :ext-scheduled-race)]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (d/join room (inference-agent)))
+      (room-context/ensure-ctx! room :analyst {:sandbox #{:foerster/inference}})
+      (is (false? (scheduled-has-infer?
+                   room :analyst
+                   (fn []
+                     (binding [ec/*execution-context* (:ctx room)]
+                       (d/leave room :analyst)
+                       (d/join room (plain-agent)))))))
+      (finally
+        (room-context/drop-ctx! :ext-scheduled-race :analyst)
+        (d/close-room! room)))))
