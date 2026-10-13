@@ -61,23 +61,21 @@
   (locking (:settlement world)
     (or @(:settlement world)
         (let [result (f)]
-          (reset! (:settlement world) result)
+          ;; another settlement in progress decides nothing yet: the next
+          ;; settle! tries again
+          (when-not (= :settlement-in-progress (:reason result))
+            (reset! (:settlement world) result))
           result))))
 
-(defn- settled-as
-  "`status`, unless another settlement of the work plane won: then how it
-   was settled (`dvergr.discourse/settlement`), or `:review` while that one is
-   still in progress."
+(defn- discarded
+  "Discard the work plane, reporting `status`, or the settlement of a merge
+   that holds or settled it (`:review` while that one is in progress)."
   [world status]
-  (let [work (:work world)
-        done (d/settlement work)
-        held (d/settlement-claim work)
-        mine (case (:status status) :discarded {:op :discarded} :merged {:op :merged :parent (:id (:parent world))} nil)]
+  (let [{:keys [outcome settlement in-progress?]} (d/discard-outcome (:work world))]
     (cond
-      (or (nil? held) (= mine held)) status
-      (= :merged (:op done)) {:status :merged :reason :settled-elsewhere}
-      (= :discarded (:op done)) {:status :discarded :reason :settled-elsewhere}
-      :else {:status :review :reason :settlement-in-progress})))
+      (not= :lost outcome) status
+      in-progress? {:status :review :reason :settlement-in-progress}
+      :else {:status :merged :reason :settled-elsewhere})))
 
 (defn settle!
   "Settle `world` after the executor has quiesced.
@@ -95,11 +93,10 @@
    (fn []
      (cond
        (#{:failed :cancelled} execution-status)
-       (do ((if (= :deferred (:policy world))
-              d/discard-deferred
-              d/discard)
-            (:work world))
-           (settled-as world {:status :discarded :reason execution-status}))
+       (if (= :deferred (:policy world))
+         (do (d/discard-deferred (:work world))
+             {:status :discarded :reason execution-status})
+         (discarded world {:status :discarded :reason execution-status}))
 
        (= :deferred (:policy world))
        {:status :deferred :reason :policy}
@@ -108,8 +105,7 @@
        {:status :review :reason :execution-waiting}
 
        (= :discard (:policy world))
-       (do (d/discard (:work world))
-           (settled-as world {:status :discarded :reason :policy}))
+       (discarded world {:status :discarded :reason :policy})
 
        (= :review (:policy world))
        {:status :review :reason :policy}
@@ -120,7 +116,10 @@
          {:status :merged}
          (catch Throwable t
            (if (= :dvergr.discourse/already-settled (:type (ex-data t)))
-             (settled-as world {:status :review :reason :settlement-in-progress})
+             (let [{:keys [settlement in-progress?]} (ex-data t)]
+               (cond in-progress? {:status :review :reason :settlement-in-progress}
+                     (= :discarded (:op settlement)) {:status :discarded :reason :settled-elsewhere}
+                     :else {:status :merged :reason :settled-elsewhere}))
              {:status :review
               :reason :automatic-merge-failed
               :error t})))))))

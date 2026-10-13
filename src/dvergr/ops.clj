@@ -1419,7 +1419,12 @@
     :schema [:map [:room Fork]]
     :impl (fn [daemon {:keys [room]}]
             (when-let [r (resolve-room daemon room)]
-              (in-ctx daemon (forks/discard! r) {:discarded (id->str (:id r))})))}
+              (in-ctx daemon
+                      (let [{:keys [ok? error]} (forks/discard! r)]
+                        (when-not ok?
+                          (op-error! (str "Discard of " (id->str (:id r)) " refused: " error)
+                                     ::discard-refused 409 {:error error}))
+                        {:discarded (id->str (:id r))}))))}
 
    :agent/create
    {:doc (str "Create an agent (provision a durable row + bring it online). `tools`: the agent's tool "

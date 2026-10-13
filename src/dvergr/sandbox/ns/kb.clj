@@ -138,9 +138,7 @@
         messages*       @(ns-resolve 'dvergr.discourse 'messages)
         fork-room*      @(ns-resolve 'dvergr.discourse 'fork-room)
         merge-room*     @(ns-resolve 'dvergr.discourse 'merge-room)
-        discard*        @(ns-resolve 'dvergr.discourse 'discard)
-        settlement*     @(ns-resolve 'dvergr.discourse 'settlement)
-        settlement-claim* @(ns-resolve 'dvergr.discourse 'settlement-claim)
+        discard-outcome* @(ns-resolve 'dvergr.discourse 'discard-outcome)
         create-room!*   @(ns-resolve 'dvergr.rooms 'create-room!)
         join-agent!*    @(ns-resolve 'dvergr.rooms 'join-agent!)
         leave-agent!*   @(ns-resolve 'dvergr.rooms 'leave-agent!)
@@ -291,15 +289,15 @@
                       (if-let [fork (binding [rtc/*execution-context* (selected-ctx)]
                                       (resolve-room fork-ref))]
                         (let [snapshot (view fork)]
-                          (binding [rtc/*execution-context* (:ctx fork)]
-                            (discard* fork))
-                          ;; a merge may hold or have settled the fork: then
-                          ;; this discard did nothing
-                          (if-let [held (let [h (or (settlement* fork) (settlement-claim* fork))]
-                                          (when (and h (not= {:op :discarded} h)) h))]
-                            {:error (str "Fork " fork-ref (if (settlement* fork) " was " " is being ")
-                                         (name (:op held)))}
-                            snapshot))
+                          (let [{:keys [outcome settlement in-progress?]}
+                                (binding [rtc/*execution-context* (:ctx fork)]
+                                  (discard-outcome* fork))]
+                            ;; a merge holds or settled the fork: this
+                            ;; discard did nothing
+                            (if (= :lost outcome)
+                              {:error (str "Fork " fork-ref (if in-progress? " is being " " was ")
+                                           (name (:op settlement)))}
+                              snapshot)))
                         {:error (str "Room not found: " fork-ref)}))
         ;; Merge review — the per-system diff + tier the agent reads to decide.
         diff-fn     (fn [fork-ref]
