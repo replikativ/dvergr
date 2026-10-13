@@ -350,3 +350,23 @@
       (finally
         (room-context/drop-ctx! :ext-scheduled-race :analyst)
         (d/close-room! room)))))
+
+(deftest a-context-rebuilt-by-a-schedule-gets-the-agents-prompt-on-its-next-turn
+  (let [room (d/room :ext-prompt)
+        system (fn [cctx] (mapv :message/content
+                                (filter #(= :system (:message/role %)) (chat-context/get-messages cctx))))]
+    (try
+      (room-context/ensure-ctx! room :analyst {:system-prompt "be an analyst" :sandbox #{:foerster/inference}})
+      (binding [ec/*execution-context* (:ctx room)]
+        (d/join room (plain-agent)))
+      (let [scheduled (room-context/ensure-ctx! room :analyst {:sandbox :participant})]
+        (is (false? (has-infer? scheduled (:ctx room))))
+        (is (= [] (system scheduled)) "the schedule names no prompt"))
+      (let [turn (room-context/ensure-ctx! room :analyst {:system-prompt "be an analyst" :sandbox #{}})]
+        (is (= ["be an analyst"] (system turn)))
+        (is (= :system (:message/role (first (chat-context/get-messages turn)))) "it opens the conversation")
+        (is (= ["be an analyst"] (system (room-context/ensure-ctx! room :analyst {:system-prompt "be an analyst" :sandbox #{}})))
+            "once"))
+      (finally
+        (room-context/drop-ctx! :ext-prompt :analyst)
+        (d/close-room! room)))))

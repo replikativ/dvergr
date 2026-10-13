@@ -79,6 +79,18 @@
     (binding [ec/*execution-context* (:spindel-ctx chat-ctx)]
       (swap! (:messages-signal chat-ctx) conj entity))))
 
+(defn- with-system-prompt!
+  "`chat-ctx`, opening with `prompt` when it has no system message: a
+   context rebuilt by a caller without one (a code schedule) is seeded on the
+   agent's next turn."
+  [chat-ctx prompt]
+  (when (and prompt
+             (not-any? #(= :system (:message/role %)) (chat-ctx/get-messages chat-ctx)))
+    (let [entity (schema/create-message-entity {:role :system :content prompt
+                                                :chat-id (:chat-id chat-ctx)})]
+      (chat-ctx/replace-messages! chat-ctx (into [entity] (chat-ctx/get-messages chat-ctx)))))
+  chat-ctx)
+
 (defn- fmt-clock
   "Epoch-millis or Date → \"HH:mm\", or nil."
   [ts]
@@ -320,7 +332,8 @@
                                    :room-id room-id
                                    :room/incarnation (:incarnation room)})))]
           (or (when-let [entry (get @room-agent-ctxs k)]
-                (with-extensions! k entry sandbox))
+                (some-> (with-extensions! k entry sandbox)
+                        (with-system-prompt! system-prompt)))
               (let [;; The room's system-db UUID — the key the system resolvers
                 ;; (room-kb-conn / room-kbs / room-msgs) want; distinct from the
                 ;; in-memory keyword `room-id`. Threads to the sandbox so `dvergr.room`
