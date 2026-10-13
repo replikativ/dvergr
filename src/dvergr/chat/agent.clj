@@ -101,6 +101,17 @@
         scope (or run-id latest-user-id (:chat-id chat-ctx))]
     (str empty-response-nudge "\n\nRetry scope: " scope)))
 
+(defn- acted-since-latest-user?
+  "Has the agent called a tool since the latest user message? Then an empty
+   reply means it is done and has nothing to add (Codex's schema-bound answer
+   `{content: \"\", tool_calls: []}`); its work is what it did."
+  [chat-ctx]
+  (->> (chat-ctx/get-messages chat-ctx)
+       reverse
+       (take-while #(not (#{:user "user"} (or (:role %) (:message/role %)))))
+       (some #(seq (or (:message/tool-uses %) (:tool-uses %))))
+       boolean))
+
 (defn- has-system-note? [chat-ctx note]
   (->> (chat-ctx/get-messages chat-ctx)
        (some (fn [m]
@@ -499,13 +510,22 @@
                           "Model returned no content or tools — requesting one bounded retry")
                 (chat-ctx/add-system-note! chat-ctx note :important? true)
                 :continue)
-              (do
-                (tel/log! {:level :error :id :agent/repeated-empty-response
-                           :data {:turn turn-number :run-id run-id}}
-                          "Model returned an empty response after corrective retry")
-                (record-failure! {:kind :model
-                                  :cause "empty response after a corrective retry"})
-                :error)))
+              (if (acted-since-latest-user? chat-ctx)
+                ;; Twice silent after acting: done, with no reply. The Run's
+                ;; result is empty, never an earlier tool-call message
+                ;; (`dvergr.agent.program/last-assistant-content`).
+                (do
+                  (tel/log! {:level :warn :id :agent/silent-finish
+                             :data {:turn turn-number :run-id run-id}}
+                            "Model ended silently after acting — turn complete without a reply")
+                  :complete)
+                (do
+                  (tel/log! {:level :error :id :agent/repeated-empty-response
+                             :data {:turn turn-number :run-id run-id}}
+                            "Model returned an empty response after corrective retry")
+                  (record-failure! {:kind :model
+                                    :cause "empty response after a corrective retry"})
+                  :error))))
 
           (and (quirks/code-fragment? content)
                (not (nudged-for-fragment? chat-ctx)))

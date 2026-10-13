@@ -38,6 +38,15 @@
 (defn- silent-model [_ _]
   {:content "" :tool-calls nil :usage {:input-tokens 500 :output-tokens 0} :stop-reason :end-turn})
 
+(defn- acts-then-silent-model
+  "Calls a tool once, then answers nothing (as Codex does when it is done)."
+  [messages _]
+  (if (some #(seq (:message/tool-uses %)) messages)
+    (silent-model nil nil)
+    {:content "" :tool-calls [{:id (str "call-" (random-uuid)) :name "clojure_eval"
+                               :input {:code "(+ 1 2)"}}]
+     :usage {:input-tokens 500 :output-tokens 20} :stop-reason :tool-use}))
+
 (defn- broken-provider [_ _]
   (throw (ex-info "Max retries exceeded" {:status 503})))
 
@@ -54,6 +63,15 @@
       (is (zero? (:faults p)))
       (is (= {"empty response after a corrective retry" 2} (:failures p)))
       (is (pos? (:microdollars p))))))
+
+(deftest a-model-that-acts-then-ends-silently-completes
+  ;; its work is what it did: the attempt is graded, not failed for silence,
+  ;; and its answer is empty rather than the tool-call message
+  (let [{:keys [scorecard dir]} (run-with acts-then-silent-model :repetitions 1)
+        p (cand dir)]
+    (is (nil? (:incomplete scorecard)))
+    (is (= 1 (:done p) (:verdicts p)))
+    (is (empty? (:failures p)) (pr-str (:failures p)))))
 
 (deftest a-provider-failure-is-a-fault-and-resume-re-runs-it
   (let [dir (str (System/getProperty "java.io.tmpdir") "/dvergr-visibility-" (random-uuid))

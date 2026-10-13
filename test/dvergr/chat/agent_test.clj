@@ -133,6 +133,42 @@
       (finally
         (chat-ctx/close-chat! ctx)))))
 
+(deftest silent-after-acting-completes-without-a-reply
+  ;; Codex answers its output schema with {content: "", tool_calls: []} when
+  ;; it is done: after it acted, two empty replies end the turn, not the Run.
+  (let [ctx (chat-ctx/create-chat-context {:title "silent-finish" :with-sci? false})
+        run-id (random-uuid)
+        responses (atom [(assoc (response "") :tool-calls [{:id "call-a" :name "fixture" :input {}}])
+                         (response "") (response "")])]
+    (try
+      (chat-ctx/add-message! ctx {:role :user :content "book it"})
+      (with-redefs [agent/messages->api-format (fn [messages _ _] messages)
+                    model-chat/chat (fn [& _]
+                                      (let [result (first @responses)]
+                                        (swap! responses subvec 1)
+                                        result))
+                    tools/execute (fn [_ _ _]
+                                    {:type :success :content "written"
+                                     :authorization {:decision :authorized :sources #{:test}}})]
+        (doseq [[turn outcome] [[0 :continue] [1 :continue] [2 :complete]]]
+          (is (= outcome
+                 (agent/run-agent-turn! ctx {:provider :test :model "stub" :tools {}
+                                             :auto-compact? false :turn-number turn
+                                             :run-id run-id}))
+              (str "turn " turn))))
+      (testing "a later request without tool work still fails on silence"
+        (chat-ctx/add-message! ctx {:role :user :content "and now?"})
+        (with-redefs [agent/messages->api-format (fn [messages _ _] messages)
+                      model-chat/chat (fn [& _] (response ""))]
+          (let [later (random-uuid)]
+            (is (= :continue (agent/run-agent-turn! ctx {:provider :test :model "stub" :tools {}
+                                                         :auto-compact? false :turn-number 3
+                                                         :run-id later})))
+            (is (= :error (agent/run-agent-turn! ctx {:provider :test :model "stub" :tools {}
+                                                      :auto-compact? false :turn-number 4
+                                                      :run-id later}))))))
+      (finally (chat-ctx/close-chat! ctx)))))
+
 (deftest successful-run-does-not-consume-a-later-runs-empty-retry
   (let [ctx (chat-ctx/create-chat-context
              {:title "run-scoped-empty" :with-sci? false})

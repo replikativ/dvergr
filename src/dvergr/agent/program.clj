@@ -551,13 +551,19 @@
 (defn- result-content [value]
   (if (string? value) value (pr-str value)))
 
-(defn- last-assistant-content [chat-ctx]
+(defn- last-assistant-content
+  "The Run's answer: the latest assistant message's content, or \"\" when that
+   message called tools (an agent that ended silently after acting has no
+   reply; the tool-call message is not one)."
+  [chat-ctx]
   (some->> (chat-context/get-messages chat-ctx)
            reverse
            (some (fn [message]
                    (when (= :assistant
                             (or (:message/role message) (:role message)))
-                     (or (:message/content message) (:content message)))))))
+                     (if (seq (or (:message/tool-uses message) (:tool-uses message)))
+                       ""
+                       (or (:message/content message) (:content message))))))))
 
 (defn- resolve-model-spec [agent]
   (providers/ensure-initialized!)
