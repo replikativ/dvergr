@@ -26,6 +26,8 @@
             [clojure.repl.deps]
             [clojure.test :refer [deftest is testing]]
             [dvergr.discourse :as d]
+            [dvergr.room.registry :as rreg]
+            [dvergr.room.store :as rstore]
             [dvergr.room.store.memory :as mem]
             [dvergr.sandbox :as sandbox]
             [dvergr.sandbox.deps :as deps]
@@ -81,7 +83,31 @@
             (is (not (contains? @(:participants room) :intruder))))
           (testing "the view still addresses the room"
             (is (= {:ok []} (eval-in sci-ctx ec "(dvergr.room/participants (dvergr.room/get :escape-room))"))))
-          (finally (d/close-room! room)))))))
+          (testing "every op that returns rooms returns data"
+            (let [r (eval-in sci-ctx ec
+                             "(let [f (dvergr.room/fork! :escape-room)
+                                    g (dvergr.room/fork! :escape-room)]
+                                {:fork! f
+                                 :children (dvergr.room/children :escape-room)
+                                 :forks (dvergr.room/forks)
+                                 :root (dvergr.room/root)
+                                 :merge! (dvergr.room/merge! :escape-room f)
+                                 :discard! (dvergr.room/discard! g)
+                                 :create! (dvergr.room/create! {:slug \"escape-created\"})})")
+                  plain? (fn plain? [x]
+                           (cond (map? x) (every? (fn [[k v]] (and (plain? k) (plain? v))) x)
+                                 (coll? x) (every? plain? x)
+                                 :else (or (nil? x) (keyword? x) (string? x) (number? x)
+                                           (boolean? x) (uuid? x) (inst? x) (symbol? x))))]
+              (is (map? (:ok r)) (pr-str r))
+              (doseq [[op v] (:ok r)]
+                (is (plain? v) (str op " returned " (pr-str v))))
+              (is (= (:id room) (get-in r [:ok :merge! :id])))
+              (is (get-in r [:ok :create! :room :id]))))
+          (finally
+            (binding [rtc/*execution-context* ec]
+              (some-> (rreg/lookup (rstore/slug->room-id "escape-created")) d/close-room!))
+            (d/close-room! room)))))))
 
 (deftest sensitive-path-policy-covers-every-branch
   ;; The pattern was wrapped across three lines; a Clojure regex literal is not
