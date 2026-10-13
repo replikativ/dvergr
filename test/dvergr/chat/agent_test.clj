@@ -133,40 +133,54 @@
       (finally
         (chat-ctx/close-chat! ctx)))))
 
-(deftest silent-after-acting-completes-without-a-reply
+(defn- scripted-turns!
+  "Runs `ctx`'s turns against `responses` in order (a tool call executes as a
+   success), returning each turn's outcome."
+  [ctx responses & {:keys [run-id] :or {run-id (random-uuid)}}]
+  (let [left (atom (vec responses))]
+    (with-redefs [agent/messages->api-format (fn [messages _ _] messages)
+                  model-chat/chat (fn [& _]
+                                    (let [result (first @left)]
+                                      (swap! left subvec 1)
+                                      result))
+                  tools/execute (fn [_ _ _]
+                                  {:type :success :content "written"
+                                   :authorization {:decision :authorized :sources #{:test}}})]
+      (mapv (fn [turn]
+              (agent/run-agent-turn! ctx {:provider :test :model "stub" :tools {}
+                                          :auto-compact? false :turn-number turn
+                                          :run-id run-id}))
+            (range (count responses))))))
+
+(defn- acting
+  "A reply that calls a tool; `n` keeps calls distinct (the doom-loop guard
+   ends a turn that repeats one)."
+  [n]
+  (assoc (response "") :tool-calls [{:id (str "call-" n) :name "fixture" :input {:n n}}]))
+
+(deftest silent-after-acting-completes-a-run-without-a-reply
   ;; Codex answers its output schema with {content: "", tool_calls: []} when
-  ;; it is done: after it acted, two empty replies end the turn, not the Run.
-  (let [ctx (chat-ctx/create-chat-context {:title "silent-finish" :with-sci? false})
-        run-id (random-uuid)
-        responses (atom [(assoc (response "") :tool-calls [{:id "call-a" :name "fixture" :input {}}])
-                         (response "") (response "")])]
+  ;; it is done: in a Run that acted, two empty replies end it with no reply
+  (let [ctx (chat-ctx/create-chat-context {:title "silent-finish" :with-sci? false})]
     (try
       (chat-ctx/add-message! ctx {:role :user :content "book it"})
-      (with-redefs [agent/messages->api-format (fn [messages _ _] messages)
-                    model-chat/chat (fn [& _]
-                                      (let [result (first @responses)]
-                                        (swap! responses subvec 1)
-                                        result))
-                    tools/execute (fn [_ _ _]
-                                    {:type :success :content "written"
-                                     :authorization {:decision :authorized :sources #{:test}}})]
-        (doseq [[turn outcome] [[0 :continue] [1 :continue] [2 :complete]]]
-          (is (= outcome
-                 (agent/run-agent-turn! ctx {:provider :test :model "stub" :tools {}
-                                             :auto-compact? false :turn-number turn
-                                             :run-id run-id}))
-              (str "turn " turn))))
-      (testing "a later request without tool work still fails on silence"
-        (chat-ctx/add-message! ctx {:role :user :content "and now?"})
-        (with-redefs [agent/messages->api-format (fn [messages _ _] messages)
-                      model-chat/chat (fn [& _] (response ""))]
-          (let [later (random-uuid)]
-            (is (= :continue (agent/run-agent-turn! ctx {:provider :test :model "stub" :tools {}
-                                                         :auto-compact? false :turn-number 3
-                                                         :run-id later})))
-            (is (= :error (agent/run-agent-turn! ctx {:provider :test :model "stub" :tools {}
-                                                      :auto-compact? false :turn-number 4
-                                                      :run-id later}))))))
+      (let [activity (volatile! {})]
+        (binding [agent/*run-activity* activity]
+          (is (= [:continue :continue :complete]
+                 (scripted-turns! ctx [(acting 1) (response "") (response "")]))))
+        (is (= {:acted? true :silent? true} @activity)))
+      (testing "a user message mid-Run (steering) does not undo the Run's work"
+        (let [activity (volatile! {})]
+          (binding [agent/*run-activity* activity]
+            (is (= [:continue] (scripted-turns! ctx [(acting 2)])))
+            (chat-ctx/add-message! ctx {:role :user :content "also check the date"})
+            (is (= [:continue :complete] (scripted-turns! ctx [(response "") (response "")]))))))
+      (testing "a later Run that did no work of its own still fails on silence"
+        (binding [agent/*run-activity* (volatile! {})]
+          (is (= [:continue :error] (scripted-turns! ctx [(response "") (response "")])))))
+      (testing "outside a Run (room drivers, protocols) silence after acting still fails"
+        (is (= [:continue :continue :error]
+               (scripted-turns! ctx [(acting 3) (response "") (response "")]))))
       (finally (chat-ctx/close-chat! ctx)))))
 
 (deftest successful-run-does-not-consume-a-later-runs-empty-retry

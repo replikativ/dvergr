@@ -551,19 +551,13 @@
 (defn- result-content [value]
   (if (string? value) value (pr-str value)))
 
-(defn- last-assistant-content
-  "The Run's answer: the latest assistant message's content, or \"\" when that
-   message called tools (an agent that ended silently after acting has no
-   reply; the tool-call message is not one)."
-  [chat-ctx]
+(defn- last-assistant-content [chat-ctx]
   (some->> (chat-context/get-messages chat-ctx)
            reverse
            (some (fn [message]
                    (when (= :assistant
                             (or (:message/role message) (:role message)))
-                     (if (seq (or (:message/tool-uses message) (:tool-uses message)))
-                       ""
-                       (or (:message/content message) (:content message))))))))
+                     (or (:message/content message) (:content message)))))))
 
 (defn- resolve-model-spec [agent]
   (providers/ensure-initialized!)
@@ -965,7 +959,11 @@
                           :agent/id (:agent/id agent)}
                          (::worker-error initialized))))
        (let [{:keys [chat-ctx tool-map tool-ctx model-spec model-inputs compaction]} initialized
-             posted (ratom/create-atom 0)]
+             posted (ratom/create-atom 0)
+             ;; whether this Run's model called tools, and whether it then
+             ;; ended silently (`chat-agent/*run-activity*`); a resumed Run
+             ;; starts without it, so silence right after a resume still fails
+             activity (volatile! {})]
          (loop [model-step (if-let [{:keys [step]} (::resume agent)] (inc step) 0)]
            (when (run/cancel-requested? run-id)
              (cancelled! run-id))
@@ -975,6 +973,7 @@
                   supervisor
                   (fn []
                     (binding [chat-agent/*turn-failure* failure
+                              chat-agent/*run-activity* activity
                               ;; the step is the charge scope: its debits have
                               ;; ids of this Run and step, so charging the step
                               ;; again does not charge it twice
@@ -1052,7 +1051,7 @@
                                   :failure f})))
 
                (= :complete outcome)
-               (if-let [value (last-assistant-content chat-ctx)]
+               (if-let [value (if (:silent? @activity) "" (last-assistant-content chat-ctx))]
                  (program-result :completed value)
                  (throw (ex-info "LLM program completed without an assistant result"
                                  {:type ::missing-llm-result

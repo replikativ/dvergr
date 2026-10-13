@@ -65,8 +65,8 @@
       (is (pos? (:microdollars p))))))
 
 (deftest a-model-that-acts-then-ends-silently-completes
-  ;; its work is what it did: the attempt is graded, not failed for silence,
-  ;; and its answer is empty rather than the tool-call message
+  ;; its work is what it did: the attempt is graded, not failed for silence
+  ;; (its empty answer: `program-test/a-run-that-ends-silently-answers-nothing`)
   (let [{:keys [scorecard dir]} (run-with acts-then-silent-model :repetitions 1)
         p (cand dir)]
     (is (nil? (:incomplete scorecard)))

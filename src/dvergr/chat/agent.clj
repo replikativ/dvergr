@@ -101,17 +101,6 @@
         scope (or run-id latest-user-id (:chat-id chat-ctx))]
     (str empty-response-nudge "\n\nRetry scope: " scope)))
 
-(defn- acted-since-latest-user?
-  "Has the agent called a tool since the latest user message? Then an empty
-   reply means it is done and has nothing to add (Codex's schema-bound answer
-   `{content: \"\", tool_calls: []}`); its work is what it did."
-  [chat-ctx]
-  (->> (chat-ctx/get-messages chat-ctx)
-       reverse
-       (take-while #(not (#{:user "user"} (or (:role %) (:message/role %)))))
-       (some #(seq (or (:message/tool-uses %) (:tool-uses %))))
-       boolean))
-
 (defn- has-system-note? [chat-ctx note]
   (->> (chat-ctx/get-messages chat-ctx)
        (some (fn [m]
@@ -135,6 +124,15 @@
    `{:kind :model|:infrastructure :cause text}`. `:model` is the model's own
    failure (it gave no answer), a verdict about the model; `:infrastructure`
    is the path to it failing (transport, provider limits), not a verdict."
+  nil)
+
+(def ^:dynamic *run-activity*
+  "When a Run binds it to a volatile of a map, a turn records `:acted? true`
+   when the model called tools, and `:silent? true` when the model, having
+   acted, replied empty twice: done, with no reply (Codex answers its output
+   schema with `{content: \"\", tool_calls: []}` then). The Run's answer is
+   then empty. Unbound (room drivers, protocols, interactive use), a second
+   empty reply fails the turn."
   nil)
 
 (def ^:private infrastructure-error
@@ -345,6 +343,9 @@
                                          (str "⚠️ BUDGET ALERT: " (:threshold-message result))
                                          :important? true))
 
+          _ (when (and (seq tool-calls) *run-activity*)
+              (vswap! *run-activity* assoc :acted? true))
+
           ;; Add assistant message if there's content
           _ (when (or (not (str/blank? content)) (seq tool-calls))
               (chat-ctx/add-message! chat-ctx
@@ -510,11 +511,11 @@
                           "Model returned no content or tools — requesting one bounded retry")
                 (chat-ctx/add-system-note! chat-ctx note :important? true)
                 :continue)
-              (if (acted-since-latest-user? chat-ctx)
-                ;; Twice silent after acting: done, with no reply. The Run's
-                ;; result is empty, never an earlier tool-call message
-                ;; (`dvergr.agent.program/last-assistant-content`).
+              (if (some-> *run-activity* deref :acted?)
+                ;; Twice silent after this Run acted: done, with no reply
+                ;; (the Run answers "", not an earlier message)
                 (do
+                  (vswap! *run-activity* assoc :silent? true)
                   (tel/log! {:level :warn :id :agent/silent-finish
                              :data {:turn turn-number :run-id run-id}}
                             "Model ended silently after acting — turn complete without a reply")
