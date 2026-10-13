@@ -138,7 +138,7 @@
         messages*       @(ns-resolve 'dvergr.discourse 'messages)
         fork-room*      @(ns-resolve 'dvergr.discourse 'fork-room)
         merge-room*     @(ns-resolve 'dvergr.discourse 'merge-room)
-        discard*        @(ns-resolve 'dvergr.discourse 'discard)
+        discard-outcome* @(ns-resolve 'dvergr.discourse 'discard-outcome)
         create-room!*   @(ns-resolve 'dvergr.rooms 'create-room!)
         join-agent!*    @(ns-resolve 'dvergr.rooms 'join-agent!)
         leave-agent!*   @(ns-resolve 'dvergr.rooms 'leave-agent!)
@@ -275,8 +275,13 @@
                         (cond
                           (nil? parent) {:error (str "Room not found: " parent-ref)}
                           (nil? fork)   {:error (str "Room not found: " fork-ref)}
-                          :else (let [result (binding [rtc/*execution-context* (:ctx fork)]
-                                               (merge-room* parent fork))]
+                          :else (let [result (try (binding [rtc/*execution-context* (:ctx fork)]
+                                                    (merge-room* parent fork))
+                                                  (catch clojure.lang.ExceptionInfo e
+                                                    ;; a discard holds or settled the fork
+                                                    (if (= :dvergr.discourse/already-settled (:type (ex-data e)))
+                                                      {:error (ex-message e)}
+                                                      (throw e))))]
                                   (if (and (map? result) (:ctx result))
                                     (view result)
                                     result)))))
@@ -284,9 +289,16 @@
                       (if-let [fork (binding [rtc/*execution-context* (selected-ctx)]
                                       (resolve-room fork-ref))]
                         (let [snapshot (view fork)]
-                          (binding [rtc/*execution-context* (:ctx fork)]
-                            (discard* fork))
-                          snapshot)
+                          (let [{:keys [outcome settlement in-progress?]}
+                                (binding [rtc/*execution-context* (:ctx fork)]
+                                  (discard-outcome* fork))]
+                            ;; a merge holds or settled the fork: this
+                            ;; discard did nothing
+                            (if (and (= :lost outcome)
+                                     (or in-progress? (not= :discarded (:op settlement))))
+                              {:error (str "Fork " fork-ref (if in-progress? " is being " " was ")
+                                           (name (:op settlement)))}
+                              snapshot)))
                         {:error (str "Room not found: " fork-ref)}))
         ;; Merge review — the per-system diff + tier the agent reads to decide.
         diff-fn     (fn [fork-ref]

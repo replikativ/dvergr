@@ -575,10 +575,20 @@
      (require-settleable! fork :discard)
      (let [parent (rreg/lookup (:parent-id fork))
            run-id (some-> fork :meta deref :run-id)]
-       (d/discard fork)
-       (when (and parent run-id)
-         (agent-run/update-durable-settlement! (run-record-room fork parent) run-id :discarded reason))
-       {:ok? true})
+       (let [{:keys [outcome settlement in-progress?]} (d/discard-outcome fork)]
+         (cond
+           ;; another settlement holds the fork, or a merge settled it: this
+           ;; discard did nothing, and the Run's status is not a discard.
+           ;; One that lost to a completed discard writes it below: the
+           ;; winner may not have (a plain `d/discard`)
+           (and (= :lost outcome) (or in-progress? (not= :discarded (:op settlement))))
+           {:ok? false
+            :error (str "fork " (:id fork) (if in-progress? " is being " " was ") (name (:op settlement)))}
+
+           :else
+           (do (when (and parent run-id)
+                 (agent-run/update-durable-settlement! (run-record-room fork parent) run-id :discarded reason))
+               {:ok? true}))))
      (catch Throwable t {:ok? false :error (.getMessage t)}))))
 
 (defn adopt!

@@ -262,7 +262,15 @@
 (defn discard!
   "Drop the fork and its branches without merging."
   [fork]
-  (with-ctx (fn [_ ctx _] (binding [rtc/*execution-context* ctx] (d/discard fork)) :discarded)))
+  (with-ctx (fn [_ ctx _]
+              (let [{:keys [outcome settlement in-progress?]}
+                    (binding [rtc/*execution-context* ctx] (d/discard-outcome fork))]
+                (when (and (= :lost outcome)
+                           (or in-progress? (not= :discarded (:op settlement))))
+                  (throw (ex-info (str "Fork " (:id fork) (if in-progress? " is being " " was ")
+                                       (name (:op settlement)))
+                                  {:type ::discard-refused :settlement settlement})))
+                :discarded))))
 
 (defn- promise-watching-log
   "A Java promise delivered the first time `(pred snapshot entry)` is truthy for an

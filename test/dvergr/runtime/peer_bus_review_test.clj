@@ -755,7 +755,11 @@
             contender (try
                         (d/merge-room parent fork)
                         (catch clojure.lang.ExceptionInfo error error))]
-        (is (= ::d/room-lifecycle-in-progress (:type (ex-data contender))))
+        ;; the first merge holds the fork's settlement: the contender is
+        ;; refused before it touches the lifecycle
+        (is (= ::d/already-settled (:type (ex-data contender))))
+        (is (true? (:in-progress? (ex-data contender))))
+        (is (= {:op :merged :parent (:id parent)} (d/settlement-claim fork)))
         (deliver release true)
         (is (identical? parent (deref first-merge 5000 ::timeout)))
         (is (= 1 (count (filter #(= "merge exactly once" (:content %))
