@@ -454,7 +454,7 @@
           (let [home (d/make-room {:id :world-effects-home :ctx ec :store (memory/make)})
                 _ (effects/install-world! (:ctx home) [[:admit #{:read :write}]])
                 ops (ns-kb/room-ops-map ec nil (select-keys home [:id :incarnation]))
-                fork (('fork! ops) (:id home))]
+                fork (rreg/lookup (:id (('fork! ops) (:id home))))]
             (is (= [[:admit #{:read :write}]] (effects/world-handlers (:ctx fork))))
             (effects/install-world! (:ctx fork) [[:read-only]])
             (is (= [[:admit #{:read}]] (effects/world-handlers (:ctx fork))))

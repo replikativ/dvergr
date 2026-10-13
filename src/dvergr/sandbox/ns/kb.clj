@@ -164,14 +164,16 @@
                               (keyword? ref) (rreg-lookup* ref)
                               (string? ref)  (or (rreg-lookup* ref)
                                                  (rreg-lookup* (slug->id* ref))))))
-        ;; For ops that act on a Room VALUE the caller may already hold (merge!/
-        ;; discard!/participants): resolve refs (slug/id) like fork! does, and
-        ;; fall back to a live Room value that is no longer registered (e.g. a
-        ;; second, idempotent discard!) rather than rejecting it.
-        room-value      (fn [ref]
-                          (or (resolve-room ref)
-                              (when (and (map? ref) (:ctx ref) (:participants ref))
-                                ref)))
+        ;; What sandbox code gets for a Room: plain data, never the live record
+        ;; (its participants/meta atoms, bus, execution context and store
+        ;; would let code mutate any room past the effect boundary). A view
+        ;; is also a ref: every op takes it back by its :id.
+        view            (fn [room]
+                          (when room
+                            (let [forked-from (:forked-from @(:meta room))]
+                              (cond-> {:id (:id room) :slug (:slug room) :title (:title room)
+                                       :parent-id (:parent-id room) :fork? (some? forked-from)}
+                                forked-from (assoc :forked-from forked-from)))))
         ;; ---------- API ----------
         create-fn   (fn [{:keys [title slug type telegram-chat-id agents
                                  agent-ids parent-id]
@@ -188,11 +190,13 @@
                                (seq aset)       (assoc :agent-ids aset)
                                parent-id        (assoc :parent-id parent-id)))
                             {:slug slug :title (or title slug) :agents aset
-                             :room (rreg-lookup* (slug->id* slug))}))))
+                             :room (view (rreg-lookup* (slug->id* slug)))}))))
         list-fn     (fn [& {:keys [where]}]
                       (binding [rtc/*execution-context* (selected-ctx)]
-                        (if where (rreg-list* :where where) (rreg-list*))))
-        get-fn      resolve-room
+                        ;; the caller's predicate sees views too
+                        (cond->> (mapv view (rreg-list*))
+                          where (filterv where))))
+        get-fn      (fn [ref] (view (resolve-room ref)))
         ;; The author is the acting identity from the runtime, never the
         ;; caller's: code cannot post as a human or another agent
         ;; (doc/effects.md, hardening 7). Without one (a bare sandbox) the
@@ -215,7 +219,7 @@
         children-fn (fn [ref]
                       (binding [rtc/*execution-context* (selected-ctx)]
                         (when-let [room (resolve-room ref)]
-                          (rreg-children* (:id room)))))
+                          (mapv view (rreg-children* (:id room))))))
         set-parent-fn (fn [child-ref parent-ref]
                         (let [c (resolve-room child-ref)
                               p (resolve-room parent-ref)]
@@ -264,20 +268,25 @@
                        (binding [rtc/*execution-context* (selected-ctx)]
                          (when-let [room (resolve-room ref)]
                            (binding [rtc/*execution-context* (:ctx room)]
-                             (fork-room* room (merge {:isolation :ctx} opts)))))))
+                             (view (fork-room* room (merge {:isolation :ctx} opts))))))))
         merge-fn    (fn [parent-ref fork-ref]
                       (let [[parent fork] (binding [rtc/*execution-context* (selected-ctx)]
-                                            [(room-value parent-ref) (room-value fork-ref)])]
+                                            [(resolve-room parent-ref) (resolve-room fork-ref)])]
                         (cond
                           (nil? parent) {:error (str "Room not found: " parent-ref)}
                           (nil? fork)   {:error (str "Room not found: " fork-ref)}
-                          :else (binding [rtc/*execution-context* (:ctx fork)]
-                                  (merge-room* parent fork)))))
+                          :else (let [result (binding [rtc/*execution-context* (:ctx fork)]
+                                               (merge-room* parent fork))]
+                                  (if (and (map? result) (:ctx result))
+                                    (view result)
+                                    result)))))
         discard-fn  (fn [fork-ref]
                       (if-let [fork (binding [rtc/*execution-context* (selected-ctx)]
-                                      (room-value fork-ref))]
-                        (binding [rtc/*execution-context* (:ctx fork)]
-                          (discard* fork))
+                                      (resolve-room fork-ref))]
+                        (let [snapshot (view fork)]
+                          (binding [rtc/*execution-context* (:ctx fork)]
+                            (discard* fork))
+                          snapshot)
                         {:error (str "Room not found: " fork-ref)}))
         ;; Merge review — the per-system diff + tier the agent reads to decide.
         diff-fn     (fn [fork-ref]
@@ -288,15 +297,15 @@
                         (some-> (resolve-room fork-ref) fork-review*)))
         forks-fn    (fn []
                       (binding [rtc/*execution-context* (selected-ctx)]
-                        (rreg-list* :where #(some? (:forked-from @(:meta %))))))
+                        (mapv view (rreg-list* :where #(some? (:forked-from @(:meta %)))))))
         participants-fn (fn [ref]
                           (when-let [room (binding [rtc/*execution-context* (selected-ctx)]
-                                            (room-value ref))]
+                                            (resolve-room ref))]
                             (vec (keys @(:participants room)))))
         root-fn     (fn []
                       (binding [rtc/*execution-context* (selected-ctx)]
-                        (or (rreg-lookup* :daemon)
-                            (rtc/get-state [:dvergr/discourse-root]))))]
+                        (view (or (rreg-lookup* :daemon)
+                                  (rtc/get-state [:dvergr/discourse-root])))))]
     (doc/with-docs
       (through-boundary
        effects
@@ -320,7 +329,7 @@
         'participants participants-fn
         'root         root-fn})
       '{create!      [([opts]) "Create a persistent room. `opts` takes :slug :title :agents. Rooms are the unit of work: each has its own git repo, knowledge base and schedules."]
-        list         [([]) "Every room you can see, as maps."]
+        list         [([]) "Every room you can see, as maps {:id :slug :title :parent-id :fork?} (plain data; pass one, or its slug or id, to the other ops)."]
         get          [([ref]) "One room by slug or id, or nil."]
         post!        [([ref {:keys [content]}]) "Post a message into a room — how you talk to the people and agents in it. `ref` is a slug or id; the message is a map, e.g. (dvergr.room/post! \"ops\" {:content \"deploy done\"}). You are its author: `:from` and `:source-user…` are refused."]
         messages     [([ref] [ref opts]) "Recent messages in a room, OLDEST first (chronological; the last element is the newest). `opts` takes :limit (default 100 — the most recent n) and :since (a java.util.Date)."]
@@ -329,12 +338,12 @@
         join!        [([ref who]) "Join a room so `who` (an agent id) receives its messages."]
         leave!       [([ref who]) "Stop `who` (an agent id) receiving a room's messages."]
         delete!      [([ref]) "Delete a room: it is closed and archived, its history kept (an operator can unarchive or purge it). On a fork, prefer discard!."]
-        fork!        [([ref] [ref opts]) "Branch a room into an ISOLATED copy — its own git repo AND database — so you can experiment freely. This is the safe way to attempt a substantial or risky change: fork, work, then merge! or discard!. Returns the fork Room. `opts` defaults to {:isolation :ctx}; pass {:isolation :none} only for a message-only probe that shares the parent's state."]
-        merge!       [([parent fork]) "Collapse a fork's work (git + databases + messages) back into its parent — the other half of the fork→test→merge loop. `parent` and `fork` are each a slug, id or Room. Read `diff`/`review` first to judge it. Returns the PARENT Room, or {:error …} if either room is not found."]
-        discard!     [([fork]) "Throw a fork away, keeping the parent untouched. `fork` is a slug, id or Room. Returns the fork Room, or {:error …} if it is not found."]
+        fork!        [([ref] [ref opts]) "Branch a room into an ISOLATED copy — its own git repo AND database — so you can experiment freely. This is the safe way to attempt a substantial or risky change: fork, work, then merge! or discard!. Returns the fork, as a room map. `opts` defaults to {:isolation :ctx}; pass {:isolation :none} only for a message-only probe that shares the parent's state."]
+        merge!       [([parent fork]) "Collapse a fork's work (git + databases + messages) back into its parent — the other half of the fork→test→merge loop. `parent` and `fork` are each a slug, id or room map. Read `diff`/`review` first to judge it. Returns the PARENT room map, or {:error …} if either room is not found."]
+        discard!     [([fork]) "Throw a fork away, keeping the parent untouched. `fork` is a slug, id or room map. Returns the fork's room map, or {:error …} if it is not found."]
         diff         [([fork]) "What a fork CHANGED versus its parent — code and data — so you can judge it before merging."]
         review       [([fork]) "The merge-review data for a fork, as {:tier :diff :conflicts}: `:tier` is how mergeable it is (:trivial/:reviewable/:conflict, see `classify`), `:diff` the per-system changes (as `diff`), `:conflicts` concurrent edits with the parent. Pure data — no agent is consulted; nil for a fork that is not isolated."]
         classify     [([diff conflicts]) "How mergeable a fork's diff is (its tier) — used to route it as a task vs a proposal."]
         forks        [([]) "Every fork of this room."]
-        participants [([ref]) "Who is in a room (a slug, id or Room) — agents and humans, as a vector of ids; nil if the room is not found."]
+        participants [([ref]) "Who is in a room (a slug, id or room map) — agents and humans, as a vector of ids; nil if the room is not found."]
         root         [([]) "The root room of the tree. Delegate work through dvergr.agent/hire! so it remains Run-backed and Spindel-composable."]})))
