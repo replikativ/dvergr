@@ -374,20 +374,21 @@
                   {:type ::protected-evaluation-write :tx-form (pr-str form)})))))
   tx-data)
 
-(defn- assert-no-code-datoms!
-  "Throws when transacting `tx` against `db` would assert a datom of a
-   `code-attrs` attribute, however the transaction spells it (a nested
-   entity map, a numeric attribute id, transaction metadata): `tx` is run
-   once with `d/with`, which writes nothing, and the attributes of its datoms
-   are resolved to idents."
+(defn- assert-no-code-attrs!
+  "Throws when `tx` names a `code-attrs` attribute anywhere: a map key at
+   any depth (nested entity maps, :tx-meta), or the attribute of a
+   transaction form; a numeric attribute id (:attribute-refs?) is resolved
+   against `db` first."
   [db tx]
-  (let [{:keys [tx-data db-after]} (untrusted #(d/with db tx))]
-    (doseq [datom tx-data
-            :let [a (:a datom)
-                  ident (if (keyword? a) a (:db/ident (d/entity db-after a)))]]
-      (when (contains? code-attrs ident)
-        (throw (ex-info (str "Transaction functions and predicates (" ident ") are not "
-                             "available in the sandbox")
+  (let [ident (fn [a] (if (number? a)
+                        (try (:db/ident (d/entity db a)) (catch Throwable _ nil))
+                        a))
+        code? #(contains? code-attrs (ident %))]
+    (doseq [x (tree-seq coll? seq tx)]
+      (when (or (and (map? x) (some code? (keys x)))
+                (and (sequential? x) (keyword? (first x)) (code? (nth x 2 nil))))
+        (throw (ex-info (str "Transaction functions and predicates (:db/fn, :db.attr/preds, "
+                             ":db.entity/preds) are not available in the sandbox")
                         {:type ::tx-function}))))))
 
 (defn- cfg-name
@@ -480,8 +481,7 @@
                           checked (assert-no-certified-evaluation-write!
                                    (if (= 'with sym) target @target) (tx-forms tx))
                           tx (if (map? tx) (assoc tx :tx-data checked) checked)
-                          ;; a persisted write: what it would assert, too
-                          _ (when-not (= 'with sym) (assert-no-code-datoms! @target tx))]
+                          _ (assert-no-code-attrs! (if (= 'with sym) target @target) tx)]
                       (try
                         (sealed-result sym (untrusted #(f target tx)))
                         (catch Throwable error
@@ -528,17 +528,19 @@
                        (mem? cfg) (if (contains? (ephemeral-map) nm)
                                     cfg
                                     (let [c (world-memory-config cfg binding-resolver)]
-                                      ;; Datahike transacts :initial-tx on creation: the same
-                                      ;; checks as any sandbox transaction
-                                      (assert-no-certified-evaluation-write! nil (:initial-tx c))
                                       (when (d/database-exists? c)
                                         (throw (ex-info
                                                 "Scratch database exists without a live world owner"
                                                 {:name nm :physical-config c})))
-                                      (untrusted #(d/create-database c))
-                                      (swap-ephemeral! assoc nm
-                                                       {:connection (d/connect c)
-                                                        :config c})
+                                      ;; created empty; its :initial-tx is then an ordinary
+                                      ;; sandbox transaction, with the same checks
+                                      (untrusted #(d/create-database (dissoc c :initial-tx)))
+                                      (let [conn (d/connect (dissoc c :initial-tx))]
+                                        (swap-ephemeral! assoc nm {:connection conn :config c})
+                                        (when-let [itx (seq (:initial-tx c))]
+                                          (let [itx (assert-no-certified-evaluation-write! @conn (vec itx))]
+                                            (assert-no-code-attrs! @conn itx)
+                                            (untrusted #(d/transact conn itx)))))
                                       cfg))
                        room-id    (do (srooms/create-room-db! room-id nm
                                                              ;; honour datahike's own default (:write) — don't

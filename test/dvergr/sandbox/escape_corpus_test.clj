@@ -552,28 +552,26 @@
             (is (= {:ok #{["note" "none"]}}
                    (ev "(d/q '[:find ?t ?x :where [?e :title \"note\"] [?e :title ?t] [(get-else $ ?e :missing \"none\") ?x]] @dvergr.room/*kb*)"))))
           (testing "no predicate is installed, however the transaction spells it"
-            (doseq [[what code]
-                    [["a nested entity map"
-                      "(d/transact dvergr.room/*kb* [{:title \"n\" :ref {:db/ident :p/nested :db/valueType :db.type/string
-                                                                       :db/cardinality :db.cardinality/one
-                                                                       :db.attr/preds ['clojure.core/slurp]}}])"]
-                     ["transaction metadata"
-                      "(d/transact dvergr.room/*kb* {:tx-data [{:title \"t\"}]
-                                                     :tx-meta {:db/ident :p/meta :db/valueType :db.type/string
-                                                               :db/cardinality :db.cardinality/one
-                                                               :db.attr/preds ['clojure.core/slurp]}})"]]]
-              (testing what
-                (ev code)
-                (is (= {:ok #{}} (ev "(d/q '[:find ?v :where [_ :db.attr/preds ?v]] @dvergr.room/*kb*)")))))
-            (testing "a numeric attribute id"
-              (is (= {:ok #{}}
-                     (ev "(d/create-database {:store {:backend :mem :id \"refs\"} :attribute-refs? true})
-                          (let [c (d/connect {:store {:backend :mem :id \"refs\"}})
-                                _ (d/transact c [{:db/ident :p/x :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])
-                                attr (d/q '[:find ?e . :where [?e :db/ident :p/x]] @c)
-                                preds (d/q '[:find ?e . :where [?e :db/ident :db.attr/preds]] @c)]
-                            (try (d/transact c [[:db/add attr preds 'clojure.core/slurp]]) (catch Exception _ nil))
-                            (d/q '[:find ?v :where [_ :db.attr/preds ?v]] @c))")))))
+            (let [refused? #(re-find #"Transaction functions and predicates" (str (:err %)))]
+              (testing "a nested entity map"
+                (is (refused? (ev "(d/transact dvergr.room/*kb* [{:title \"n\" :ref {:db/ident :p/nested :db.attr/preds ['clojure.core/slurp]}}])")))
+                (is (:ok (ev "(d/transact dvergr.room/*kb* [{:title \"n\" :ref {:title \"plain nested\"}}])"))
+                    "a plain nested map still transacts"))
+              (testing "transaction metadata"
+                (is (refused? (ev "(d/transact dvergr.room/*kb* {:tx-data [{:title \"t\"}] :tx-meta {:db/ident :p/meta :db.attr/preds ['clojure.core/slurp]}})"))))
+              (testing "a numeric attribute id, in a transaction and in an initial transaction"
+                (let [setup "(d/create-database {:store {:backend :mem :id \"refs\"} :attribute-refs? true})
+                             (def refs (d/connect {:store {:backend :mem :id \"refs\"}}))
+                             (d/transact refs [{:db/ident :p/x :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])
+                             (def attr (d/q '[:find ?e . :where [?e :db/ident :p/x]] @refs))
+                             (def preds (d/q '[:find ?e . :where [?e :db/ident :db.attr/preds]] @refs))"]
+                  (ev setup)
+                  (is (refused? (ev "(d/transact refs [[:db/add attr preds 'clojure.core/slurp]])")))
+                  (is (refused? (ev "(d/transact refs [{:db/id attr preds 'clojure.core/slurp}])")))
+                  (is (:ok (ev "(d/transact refs [[:db/add -1 attr \"plain\"]])")) "a plain numeric-id write still transacts")
+                  (is (refused? (ev "(d/create-database {:store {:backend :mem :id \"refs-init\"} :attribute-refs? true
+                                                         :initial-tx [[:db/add 1 preds 'clojure.core/slurp]]})")))))
+              (is (= {:ok #{}} (ev "(d/q '[:find ?v :where [_ :db.attr/preds ?v]] @dvergr.room/*kb*)")))))
           (testing "a query result holds no function"
             (is (re-find #"host object"
                          (str (:err (ev "(d/q '[:find ?f . :where [(constantly 1) ?f]] @dvergr.room/*kb*)"))))))
