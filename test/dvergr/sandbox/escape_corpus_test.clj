@@ -585,8 +585,9 @@
                           "(try (deref (d/transact! dvergr.room/*kb* [[:db.history.purge/before nil]]) 5000 :timeout) :no-error
                            (catch Exception e [(nil? (ex-cause e)) (str (ex-data e))]))"]]
               (let [r (ev code)]
-                (is (or (= {:ok :no-error} r)
-                        (and (true? (first (:ok r))) (not (re-find #"Connection|datahike\.db\." (second (:ok r))))))
+                ;; the transaction fails (purge before nil), and the error is clean
+                (is (and (vector? (:ok r)) (true? (first (:ok r)))
+                         (not (re-find #"Connection|datahike\.db\." (second (:ok r)))))
                     (pr-str r)))))
           (testing "an error carries no cause holding what Datahike was given"
             (is (= {:ok [true false]}
