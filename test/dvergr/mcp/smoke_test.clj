@@ -52,7 +52,7 @@
 (defn- text [r] (apply str (map :text (get-in r [:result :content]))))
 
 (deftest the-code-profile-is-a-repl-onto-the-whole-api
-  (ops/invoke *daemon* :room/create {:slug "smoke" :title "Smoke room"})
+  (ops/invoke *daemon* dvergr.principal/local-principal :room/create {:slug "smoke" :title "Smoke room"})
   (let [{:keys [rpc close]} (connect {:dvergr/profile "code"})]
     (try
       (is (= #{"clojure_eval" "repl_describe"}
@@ -69,7 +69,7 @@
       (finally (close)))))
 
 (deftest a-pinned-connection-works-in-its-room-only
-  (ops/invoke *daemon* :room/create {:slug "pinned" :title "Pinned room"})
+  (ops/invoke *daemon* dvergr.principal/local-principal :room/create {:slug "pinned" :title "Pinned room"})
   (let [{:keys [rpc close]} (connect {:dvergr/room "pinned" :dvergr/tools "read_file,write_file"})]
     (try
       (let [tools (get-in (rpc "tools/list" {}) [:result :tools])]
@@ -90,7 +90,7 @@
                 (clojure.string/split (System/getenv "PATH") #":"))
     (support/skip! "the-relay-serves-a-stateless-client-with-its-pins: no bb on PATH")
     (do
-      (ops/invoke *daemon* :room/create {:slug "relayed" :title "Relayed room"})
+      (ops/invoke *daemon* dvergr.principal/local-principal :room/create {:slug "relayed" :title "Relayed room"})
       (let [p (.start (doto (ProcessBuilder. ["bb" "bin/dvergr-mcp" "--no-start"
                                               "--port" (str (get-in *daemon* [:mcp-server :port]))
                                               "--room" "relayed" "--tools" "read_file,write_file"])

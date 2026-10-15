@@ -29,7 +29,7 @@
 (def ^:private host "127.0.0.1:17880")
 
 (defn- req [method uri & {:keys [headers body query]}]
-  (cond-> {:request-method method :uri uri
+  (cond-> {:request-method method :uri uri :remote-addr "127.0.0.1"
            :headers (merge {"host" host} headers)}
     query (assoc :query-string query)
     body (assoc :body (ByteArrayInputStream. (.getBytes ^String body "UTF-8")))))
@@ -130,7 +130,7 @@
 
 (deftest gets-have-no-side-effects
   (let [app (app) s (session app) calls (atom [])]
-    (with-redefs [ops/invoke (fn [_ op args] (swap! calls conj [op args]) {:id "a"})]
+    (with-redefs [ops/invoke (fn [_ _ op args] (swap! calls conj [op args]) {:id "a"})]
       (testing "the actions are no longer reachable by GET (link, img, prefetch)"
         (doseq [[uri _] room-actions]
           (let [resp (app (req :get uri))]
@@ -182,7 +182,7 @@
 
 (deftest the-json-api-refuses-cross-site-writes
   (let [app (app) calls (atom [])]
-    (with-redefs [ops/invoke (fn [_ op args] (swap! calls conj [op args]) {:ok true})]
+    (with-redefs [ops/invoke (fn [_ _ op args] (swap! calls conj [op args]) {:ok true})]
       (testing "another origin"
         (is (= 403 (:status (app (req :post "/api/v1/room_create"
                                       :headers {"content-type" "application/json"
@@ -256,3 +256,16 @@
       (let [html (dash/shell {} [:p "x"])]
         (is (str/includes? html "content=\"tok\""))
         (is (str/includes? html "X-CSRF-Token"))))))
+
+(deftest only-local-peers-without-an-authenticator
+  (testing "the default authenticator answers loopback peers only"
+    (is (= 401 (:status ((app) (assoc (req :get "/api/v1/room_list") :remote-addr "10.0.0.5")))))
+    (is (= 200 (:status ((app) (req :get "/api/v1/room_list"))))))
+  (testing "an authenticated principal gets the JSON API, not the local dashboard"
+    (let [bob {:principal/id "party/bob" :principal/kind :human :principal/scopes #{}}
+          a (app {:authenticate (fn [{:keys [bearer]}] (when (= "tb" bearer) bob))})
+          as-bob #(assoc-in % [:headers "authorization"] "Bearer tb")]
+      (is (= 401 (:status (a (req :get "/api/v1/room_list")))) "no token: nobody, even on loopback")
+      (is (= 200 (:status (a (as-bob (req :get "/api/v1/room_list"))))))
+      (is (= 403 (:status (a (as-bob (req :get "/dashboard"))))))
+      (is (= 200 (:status (a (as-bob (req :get "/api/health")))))))))

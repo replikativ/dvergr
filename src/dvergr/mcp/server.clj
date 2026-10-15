@@ -11,6 +11,11 @@
    Which tools a connection sees (profiles, toolsets), their annotations and
    the result encoding are `dvergr.mcp.surface`.
 
+   Every connection (and every HTTP request) has a principal, from the
+   daemon's authenticator (`dvergr.principal`): the selection it sees is capped
+   to what the principal may see (`surface/capped`), and every op, registry
+   tool, resource read and subscription is authorized for it.
+
    REPL workflow:
      (require '[dvergr.mcp.server :as mcp])
      (mcp/start! {:port 17888})   ; start TCP server
@@ -21,6 +26,7 @@
             [dvergr.mcp.repl :as repl]
             [dvergr.mcp.surface :as surface]
             [dvergr.ops :as ops]
+            [dvergr.principal :as principal]
             [dvergr.rooms.files :as room-files]
             [dvergr.rooms.facts :as facts]
             [dvergr.chat.context :as chat-context]
@@ -73,6 +79,13 @@
 
 (def ^:private no-daemon "No dvergr daemon is running in this process.")
 
+(defn- context-principal
+  "The principal a connection's `context` runs for (`session-context` sets
+   it); a context without one runs nothing."
+  [context]
+  (or (:principal context)
+      (throw (ex-info "No principal on this connection" {:type ::no-principal}))))
+
 (defn- op->tool
   "Project one dvergr.ops spec entry to an MCP tool: {:name :def :handler}. The
    handler resolves the live daemon, invokes the op (which ctx-binds + calls the
@@ -90,9 +103,10 @@
      (fn [context arguments]
        (if-let [dmn (current-daemon)]
          (try
-           (surface/data-result (ops/invoke dmn op (cond->> (keywordize arguments)
-                                                     (:room (some-> context :selection deref))
-                                                     (surface/pinned-args @(:selection context)))))
+           (surface/data-result (ops/invoke dmn (context-principal context) op
+                                            (cond->> (keywordize arguments)
+                                              (:room (some-> context :selection deref))
+                                              (surface/pinned-args @(:selection context)))))
            (catch Throwable e
              (surface/error-result (str "Error: " (.getMessage e)))))
          (surface/error-result no-daemon)))}))
@@ -116,22 +130,33 @@
       strict-schema))
 
 (defn- run-coding-tool
-  "Run registry tool `tname` in `room`. `clojure_eval` runs in the REPL
-   session of the connection's `selection`, which gets the ops that selection
-   shows as the `dvergr.ops` namespace (`dvergr.mcp.repl`)."
-  [dmn selection room tname input]
+  "Run registry tool `tname` in `room` for `principal`, authorized first (its
+   action on the room: `tools/authz-request`; `clojure_eval` is `:admin`).
+   `clojure_eval` runs in the REPL session of the connection's `selection`
+   and principal, which gets the ops that selection shows as the `dvergr.ops`
+   namespace (`dvergr.mcp.repl`)."
+  [dmn principal selection room tname input]
   (let [execute      (requiring-resolve 'dvergr.tools/execute)
         make-context (requiring-resolve 'dvergr.tools/make-context)
+        authz-request (requiring-resolve 'dvergr.tools/authz-request)
         ensure-ctx!  (requiring-resolve 'dvergr.agent.room-context/ensure-ctx!)
         repl?        (and selection (= "clojure_eval" tname))]
+    (ops/check! dmn principal (authz-request tname nil input room))
     (binding [ec/*execution-context* (:ctx room)]
-      (let [cctx (ensure-ctx! room (if repl? (repl/session-actor selection) :mcp) {})
+      (let [cctx (ensure-ctx! room (cond repl? (repl/session-actor selection principal)
+                                         (principal/local? principal) :mcp
+                                         :else (principal/actor principal)) {})
             sci-ctx (cond-> (chat-context/sci-context-in cctx (:ctx room))
                       repl? (repl/install! dmn selection room))]
-        (execute tname input (make-context {:sci-ctx  sci-ctx
-                                            :db-conn  (:db-conn cctx)
-                                            :chat-ctx cctx
-                                            :execution-ctx (:ctx room)}))))))
+        ;; the REPL's dvergr.ops functions run for this caller, whoever defined them
+        (binding [repl/*caller* {:principal principal :selection selection}]
+          (execute tname input (make-context {:sci-ctx  sci-ctx
+                                              :db-conn  (:db-conn cctx)
+                                              :chat-ctx cctx
+                                              :execution-ctx (:ctx room)
+                                              ;; `execute` authorizes for it again
+                                              :principal principal
+                                              :authz-room room})))))))
 
 (defn- coding-tool [tname tdef]
   (let [annotations (surface/tool-annotations tname)]
@@ -160,7 +185,8 @@
                 (str tname " needs a room: pass `room` (id or slug; room_list lists them)")
                 (str "No room " (pr-str (:room args)) "; room_list lists them")))
              (try
-               (surface/tool-result (run-coding-tool dmn (some-> context :selection deref) room tname input))
+               (surface/tool-result (run-coding-tool dmn (context-principal context)
+                                                     (some-> context :selection deref) room tname input))
                (catch Throwable e
                  (surface/error-result (str "Error: " (.getMessage e)))))))
          (surface/error-result no-daemon)))}))
@@ -193,11 +219,13 @@
                          :fns (if q fs (mapv :name fs))}))))
             vec)))")
 
-(defn- repl-describe [dmn selection room query]
+(defn- repl-describe [dmn principal selection room query]
   (let [ensure-ctx! (requiring-resolve 'dvergr.agent.room-context/ensure-ctx!)
-        eval-string* (requiring-resolve 'sci.core/eval-string*)]
+        eval-string* (requiring-resolve 'sci.core/eval-string*)
+        authz-request (requiring-resolve 'dvergr.tools/authz-request)]
+    (ops/check! dmn principal (authz-request "repl_describe" nil {} room))
     (binding [ec/*execution-context* (:ctx room)]
-      (let [cctx (ensure-ctx! room (repl/session-actor selection) {})
+      (let [cctx (ensure-ctx! room (repl/session-actor selection principal) {})
             sci-ctx (repl/install! (chat-context/sci-context-in cctx (:ctx room)) dmn selection room)]
         ;; the call is evaluated in SCI too: all-ns needs its context
         (eval-string* sci-ctx (str "(" describe-form " " (pr-str query) ")"))))))
@@ -225,8 +253,9 @@
            (if-not r
              (surface/error-result (str "No room " (pr-str room) "; room_list lists them"))
              (try
-               (surface/data-result (repl-describe dmn (or (some-> context :selection deref)
-                                                           (surface/selection {}))
+               (surface/data-result (repl-describe dmn (context-principal context)
+                                                   (or (some-> context :selection deref)
+                                                       (surface/selection {}))
                                                    r (when-not (str/blank? (str query)) query)))
                (catch Throwable e
                  (surface/error-result (str "Error: " (.getMessage e)))))))
@@ -303,9 +332,13 @@
          :def {:uriTemplate (str scheme "://{" arg "}/" rname) :name (ops/op->name op)
                :description doc :mimeType "application/json"}}))))
 
-(def ^:private ops-resources
-  ;; room_read takes a path, which its own template carries (`file-template`)
-  (mapv (fn [[op spec]] (op->resource op spec)) (dissoc (ops/reads) :room/read)))
+(def ^:private resources-of
+  (memoize (fn [reads] (mapv (fn [[op spec]] (op->resource op spec)) reads))))
+
+(defn- ops-resources []
+  ;; room_read takes a path, which its own template carries (`file-template`);
+  ;; derived from `ops/operations`, so a host's registered reads are resources too
+  (resources-of (dissoc (ops/reads) :room/read)))
 
 (def ^:private file-template
   "A room's workspace files as resources: a file's contents (text, or a blob
@@ -314,15 +347,23 @@
    :description (str "A file of a room's workspace: its contents (text, or a base64 blob for binary, "
                      "up to 4 MiB; room_read reads larger ones in chunks), or a directory's listing as JSON.")})
 
-(def resource-definitions
-  "Fixed resources + resource templates, derived from dvergr.ops reads."
-  (atom {:resources (mapv :def (filter #(= :fixed (:kind %)) ops-resources))
-         :templates (conj (mapv :def (filter #(= :template (:kind %)) ops-resources)) file-template)}))
+(defn resource-definitions
+  "Fixed resources + resource templates, derived from the reads of
+   `ops/operations` that `principal` may see (its toolsets: `surface/capped`)."
+  [principal]
+  (let [allowed (surface/principal-toolsets principal)
+        shown? (fn [{:keys [op]}]
+                 (or (nil? allowed)
+                     (contains? allowed (surface/tool-toolset (ops/op->name op) op false))))
+        rs (filter shown? (ops-resources))]
+    {:resources (mapv :def (filter #(= :fixed (:kind %)) rs))
+     :templates (cond-> (mapv :def (filter #(= :template (:kind %)) rs))
+                  (or (nil? allowed) (contains? allowed :files)) (conj file-template))}))
 
-(def ^:private fixed-by-uri
-  (into {} (for [{:keys [kind uri op]} ops-resources :when (= :fixed kind)] [uri op])))
-(def ^:private template-by-key
-  (into {} (for [{:keys [kind scheme rname op arg]} ops-resources :when (= :template kind)]
+(defn- fixed-by-uri []
+  (into {} (for [{:keys [kind uri op]} (ops-resources) :when (= :fixed kind)] [uri op])))
+(defn- template-by-key []
+  (into {} (for [{:keys [kind scheme rname op arg]} (ops-resources) :when (= :template kind)]
              [[scheme rname] {:op op :arg arg}])))
 
 (defn- uri->op+args
@@ -331,21 +372,22 @@
   (let [[scheme rst] (str/split uri #"://" 2)
         segs (str/split (or rst "") #"/")]
     (cond
-      (get fixed-by-uri uri) {:op (get fixed-by-uri uri) :args {}}
+      (get (fixed-by-uri) uri) {:op (get (fixed-by-uri) uri) :args {}}
       ;; room://{room}/files/{+path}: a workspace file or directory
       (and (= "room" scheme) (< 2 (count segs)) (= "files" (second segs)))
       {:op :room/read :file? true
        :args {:room (first segs)
               :path (str "/" (str/join "/" (map #(java.net.URLDecoder/decode (str/replace % "+" "%2B") "UTF-8")
                                                 (drop 2 segs))))}}
-      (= 2 (count segs))     (when-let [{:keys [op arg]} (get template-by-key [scheme (second segs)])]
+      (= 2 (count segs))     (when-let [{:keys [op arg]} (get (template-by-key) [scheme (second segs)])]
                                {:op op :args {arg (first segs)}})
       :else nil)))
 
 (defn- file-contents
   "The contents of the workspace file resource `uri`: the file whole (text or
-   blob), or a directory's listing as JSON."
-  [dmn uri {:keys [room path]}]
+   blob), or a directory's listing as JSON. Authorized as `room_read`."
+  [dmn principal uri {:keys [room path] :as args}]
+  (ops/authorize! dmn principal :room/read args)
   ;; uncut: a resource is a document, and a listing is a bounded page
   (let [json-text #(json/write-value-as-string % json-write-mapper)]
     (if-let [r (ops/resolve-room dmn room)]
@@ -369,27 +411,45 @@
               (throw e)))))
       (throw (ex-info (str "Resource not found: " uri) {:json-rpc/code -32002 :json-rpc/data {:uri uri}})))))
 
-(defn- read-resource [uri]
+(defn- read-resource [principal uri]
   (if-let [{:keys [op args file?]} (uri->op+args uri)]
     (if-let [dmn (current-daemon)]
       {:contents (if file?
-                   (file-contents dmn uri args)
+                   (file-contents dmn principal uri args)
                    [{:uri uri :mimeType "application/json"
-                     :text (-> (surface/data-result (ops/invoke dmn op args)) :content first :text)}])}
+                     :text (-> (surface/data-result (ops/invoke dmn principal op args)) :content first :text)}])}
       {:contents []})
     ;; the protocol's error for a resource that does not exist (the
     ;; stateless era answers it as -32602, `json-rpc/handle-stateless`)
     (throw (ex-info (str "Resource not found: " uri)
                     {:json-rpc/code -32002 :json-rpc/data {:uri uri}}))))
 
-(defonce ^:private resource-subs (atom {}))  ; uri -> #{send-fn}
+(defonce ^:private resource-subs (atom {}))  ; uri -> {send-fn principal}
 (defonce ^:private room-uris (atom {}))      ; room-id -> #{uri} with a live facts watcher
 
-(defn- notify-room! [room-id]
-  (doseq [u (get @room-uris room-id)
-          sf (get @resource-subs u)]
-    (try (sf {:jsonrpc "2.0" :method "notifications/resources/updated" :params {:uri u}})
-         (catch Throwable _ nil))))
+(declare unsubscribe-resource!)
+
+(defn- may-read-uri?
+  "Whether `principal` may read the resource `uri` now (the op it maps to,
+   authorized with its args). Anything that throws on the way denies."
+  [dmn principal uri]
+  (try (when-let [{:keys [op args]} (uri->op+args uri)]
+         (ops/authorize! dmn principal op args)
+         true)
+       (catch Exception _ false)))
+
+(defn- notify-room!
+  "Tell every subscriber of a uri about room `room-id` that it changed, each
+   authorized again first: a subscriber whose access was revoked is dropped,
+   not notified."
+  [room-id]
+  (let [dmn (current-daemon)]
+    (doseq [u (get @room-uris room-id)
+            [sf p] (get @resource-subs u)]
+      (if (may-read-uri? dmn p u)
+        (try (sf {:jsonrpc "2.0" :method "notifications/resources/updated" :params {:uri u}})
+             (catch Throwable _ nil))
+        (unsubscribe-resource! u sf)))))
 
 (defn- uri-room
   "The room a resource URI reads (`room://<room>/…`, `experiment://<room>/progress`, …)."
@@ -397,8 +457,15 @@
   (when-let [{:keys [args]} (uri->op+args uri)]
     (some->> (:room args) (ops/resolve-room dmn))))
 
-(defn- subscribe-resource! [uri send-fn]
-  (swap! resource-subs update uri (fnil conj #{}) send-fn)
+(defn- subscribe-resource!
+  "Subscribe `send-fn` to `uri` for `principal`, who must be allowed to read
+   it (else an error, -32002 as for a resource that is not there)."
+  [principal uri send-fn]
+  (when-let [dmn (current-daemon)]
+    (when-not (may-read-uri? dmn principal uri)
+      (throw (ex-info (str "Resource not found or not readable: " uri)
+                      {:json-rpc/code -32002 :json-rpc/data {:uri uri}}))))
+  (swap! resource-subs update uri (fnil assoc {}) send-fn principal)
   ;; A resource about a room is live: the room's facts feed (every durable
   ;; change: messages, Runs, tool calls, Attempts) notifies each subscribed uri
   ;; of that room, at a bounded rate. One watcher per room.
@@ -424,12 +491,12 @@
           (swap! room-uris assoc rid left))))))
 
 (defn- unsubscribe-resource! [uri send-fn]
-  (swap! resource-subs update uri disj send-fn)
+  (swap! resource-subs update uri dissoc send-fn)
   (release-uri! uri))
 
 (defn- drop-subscriber! [send-fn]
   (let [uris (keys @resource-subs)]
-    (swap! resource-subs (fn [m] (into {} (map (fn [[u s]] [u (disj s send-fn)])) m)))
+    (swap! resource-subs (fn [m] (into {} (map (fn [[u s]] [u (dissoc s send-fn)])) m)))
     (run! release-uri! uris)))
 
 ;; ============================================================================
@@ -472,13 +539,15 @@
       (safe-send! tag notification))))
 
 (defn- listen!
-  "Open subscription `id` for the connection writing through `send-fn`:
-   acknowledge (first, with the filter this server honours: tools list
-   changes and existing resource URIs; it has no prompts and does not
-   announce resource list changes), then deliver."
-  [send-fn {:keys [id params]}]
+  "Open subscription `id` for the connection writing through `send-fn`, for
+   `principal`: acknowledge (first, with the filter this server honours: tools
+   list changes and the existing resource URIs the principal may read; it has
+   no prompts and does not announce resource list changes), then deliver."
+  [principal send-fn {:keys [id params]}]
   (let [{:keys [toolsListChanged resourceSubscriptions]} (:notifications params)
-        uris (vec (filter uri->op+args resourceSubscriptions))
+        dmn (current-daemon)
+        uris (vec (filter #(and (uri->op+args %) (or (nil? dmn) (may-read-uri? dmn principal %)))
+                          resourceSubscriptions))
         accepted (cond-> {}
                    (true? toolsListChanged) (assoc :toolsListChanged true)
                    (seq uris) (assoc :resourceSubscriptions uris))
@@ -486,7 +555,7 @@
     (tag {:jsonrpc "2.0" :method "notifications/subscriptions/acknowledged"
           :params {:notifications accepted}})
     (swap! subscriptions assoc [send-fn id] {:tag tag :accepted accepted})
-    (doseq [u uris] (subscribe-resource! u tag))))
+    (doseq [u uris] (subscribe-resource! principal u tag))))
 
 (defn- end-subscription!
   "Close subscription `id` of `send-fn`; with `respond?`, send the graceful
@@ -533,6 +602,31 @@
   (broadcast-notification! "notifications/tools/list_changed" {} :toolsListChanged)
   (sync-registry-tools!))
 
+(defn sync-op-tools!
+  "Serve the ops a host registered (`ops/register-op!`) as tools beside
+   dvergr's own, as `ops/operations` is now (toolset `:host`). Clients hear of
+   a change through tools/list_changed."
+  []
+  (let [changed?
+        (locking tools-lock
+          (let [defs @tool-definitions
+                want (into (sorted-map)
+                           (for [[op spec] (ops/operations)
+                                 :when (not (contains? ops/specification op))]
+                             (let [t (op->tool op spec)] [(:name t) t])))
+                old (into {} (comp (filter :dvergr/host-op?) (map (juxt :name identity))) defs)
+                new (into {} (map (fn [[n t]] [n (assoc (:def t) :dvergr/host-op? true)])) want)]
+            (when (not= (keys old) (keys new))
+              (reset! tool-definitions (into (vec (remove :dvergr/host-op? defs)) (vals new)))
+              (swap! tool-handlers #(merge (apply dissoc % (keys old))
+                                           (into {} (map (fn [[n t]] [n (:handler t)])) want)))
+              true)))]
+    (when changed?
+      (broadcast-notification! "notifications/tools/list_changed" {} :toolsListChanged))))
+
+(sync-op-tools!)
+(ops/watch-operations! ::op-tools sync-op-tools!)
+
 ;; The registry as it is at load, then every change to it.
 (sync-registry-tools!)
 (add-watch (tools-registry) ::registry-tools
@@ -566,32 +660,38 @@
       default)))
 
 (defn session-context
-  "The per-connection dispatch context: `send-fn` writes to the client;
-   `selection` (from `surface/selection`) is the default tool selection, which
-   the client may replace in `initialize` `_meta` (handshake era) or name in
-   each request's `_meta` (stateless era, `:request-context`)."
-  [send-fn selection]
-  (let [scoped (fn [sel]
+  "The per-connection dispatch context for `principal` (authenticated by the
+   transport): `send-fn` writes to the client; `selection` (from
+   `surface/selection`) is the default tool selection, which the client may
+   replace in `initialize` `_meta` (handshake era) or name in each request's
+   `_meta` (stateless era, `:request-context`). Whatever it asks for is capped
+   to what the principal may see (`surface/capped`): a client narrows its
+   selection, never widens it. Every call, read and subscription runs for the
+   principal."
+  [send-fn selection principal]
+  (let [cap #(surface/capped principal %)
+        scoped (fn [sel]
                  {:tool-visible? (fn [td] (surface/visible? @sel td))
                   :tool-view (fn [td] (surface/pinned-view @sel td))
                   :selection sel})
-        sel (atom selection)
+        sel (atom (cap selection))
         context (merge {:session (make-session)
+                        :principal principal
                         :send-fn send-fn
                         :tool-defs tool-definitions
                         :tool-handlers tool-handlers
-                        :on-initialize (fn [params] (reset! sel (meta-selection selection params)))
-                        :resource-defs resource-definitions
-                        :read-resource read-resource
-                        :subscribe-resource subscribe-resource!
+                        :on-initialize (fn [params] (reset! sel (cap (meta-selection selection params))))
+                        :resource-defs (delay (resource-definitions principal))
+                        :read-resource #(read-resource principal %)
+                        :subscribe-resource #(subscribe-resource! principal %1 %2)
                         :unsubscribe-resource unsubscribe-resource!
-                        :listen (fn [message] (listen! send-fn message))
+                        :listen (fn [message] (listen! principal send-fn message))
                         :on-cancel (fn [id] (end-subscription! send-fn id false))}
                        (scoped sel))]
     ;; a stateless request brings its own selection in `_meta`, over the
     ;; connection's default; it does not change the connection's
     (assoc context :request-context
-           (fn [params] (merge context (scoped (atom (meta-selection selection params))))))))
+           (fn [params] (merge context (scoped (atom (cap (meta-selection selection params)))))))))
 
 ;; ============================================================================
 ;; Connection handling (shared by TCP and stdio)
@@ -674,13 +774,13 @@
   "Handle a single MCP connection. Reads JSON lines from reader,
    dispatches via json-rpc/handle-message, writes responses via writer.
    Blocks until reader is closed."
-  [^BufferedReader reader ^BufferedWriter writer label selection]
+  [^BufferedReader reader ^BufferedWriter writer label selection principal]
   (let [send-fn (fn [message]
                   (locking writer
                     (.write writer (json/write-value-as-string message json-write-mapper))
                     (.write writer "\n")
                     (.flush writer)))
-        context (session-context send-fn selection)]
+        context (session-context send-fn selection principal)]
     (swap! connected-send-fns assoc send-fn (:session context))
     (binding [*err* *err*]
       (.println *err* (str "dvergr-mcp: connection opened (" label ")"))
@@ -719,11 +819,15 @@
      :bind - Bind address (default \"127.0.0.1\" — loopback only; pass
              \"0.0.0.0\" explicitly to expose the server on the network)
      :profile, :toolsets - the default tool selection (`dvergr.mcp.surface`);
-             a client may choose its own in `initialize` `_meta`"
-  [& {:keys [port bind profile toolsets] :or {port 17888 bind "127.0.0.1"}}]
+             a client may choose its own in `initialize` `_meta`
+     :authenticate - (fn [request] -> principal | nil) for each connection
+             (`dvergr.principal`; default `principal/default-authenticate`:
+             a loopback peer is the local principal, any other is refused)"
+  [& {:keys [port bind profile toolsets authenticate] :or {port 17888 bind "127.0.0.1"}}]
   (when @server-state
     (throw (ex-info "Server already running" {:port port})))
   (let [selection (surface/selection {:profile profile :toolsets toolsets})
+        authenticate (or authenticate principal/default-authenticate)
         ^ServerSocket server-socket (ServerSocket. port 50 (java.net.InetAddress/getByName bind))
         accept-thread (Thread.
                        (fn []
@@ -740,7 +844,16 @@
                                             (try
                                               (let [reader (BufferedReader. (InputStreamReader. (.getInputStream client)))
                                                     writer (BufferedWriter. (OutputStreamWriter. (.getOutputStream client)))]
-                                                (handle-connection reader writer addr selection))
+                                                (if-let [p (authenticate {:transport :mcp-tcp
+                                                                          :remote-addr (.getHostAddress (.getInetAddress client))})]
+                                                  (handle-connection reader writer addr selection p)
+                                                  ;; refused: one error, then the connection closes
+                                                  (doto writer
+                                                    (.write (json/write-value-as-string
+                                                             {:jsonrpc "2.0" :id nil
+                                                              :error {:code -32001 :message "Not authenticated"}}))
+                                                    (.write "\n")
+                                                    (.flush))))
                                               (catch Exception e
                                                 (when-not (.isClosed client)
                                                   (binding [*err* *err*]
@@ -769,7 +882,8 @@
   []
   (locking server-state
     (or (:port @server-state)
-        (:port (start! :port 0 :bind "127.0.0.1")))))
+        (:port (start! :port 0 :bind "127.0.0.1"
+                       :authenticate (principal/authenticator (:config (current-daemon))))))))
 
 (defn stop!
   "Stop the TCP MCP server."
@@ -801,8 +915,11 @@
   "Run MCP server on stdio. Blocks until stdin closes. Tools answer only when a
    daemon runs in this process; clients normally use `bin/dvergr-mcp`, which
    relays stdio to the daemon's TCP port."
-  [& {:keys [profile toolsets]}]
+  [& {:keys [profile toolsets authenticate]}]
   (let [reader (BufferedReader. (InputStreamReader. System/in))
-        writer (BufferedWriter. (OutputStreamWriter. System/out))]
+        writer (BufferedWriter. (OutputStreamWriter. System/out))
+        p ((or authenticate principal/default-authenticate) {:transport :mcp-stdio})]
+    (when-not p
+      (throw (ex-info "stdio MCP: not authenticated" {:type ::not-authenticated})))
     (handle-connection reader writer "stdio"
-                       (surface/selection {:profile profile :toolsets toolsets}))))
+                       (surface/selection {:profile profile :toolsets toolsets}) p)))

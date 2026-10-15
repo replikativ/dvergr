@@ -9,7 +9,13 @@
    This is a MACHINE surface (curl/SDK/other services), parallel to MCP; the HTMX
    web UI keeps its own HTML endpoints (it consumes HTML, not JSON). The reitit
    ring-handler returns nil for non-/api URIs, so the hand-rolled http-kit server
-   falls through to its own routes."
+   falls through to its own routes.
+
+   Every call runs for the request's `:dvergr/principal`, which the server
+   authenticated (`dvergr.web.server`): a request without one is refused (401),
+   so mounting this handler elsewhere needs an authentication of its own. The
+   routes follow `dvergr.ops/operations`, so an op a host registers is served
+   too."
   (:require [dvergr.ops :as ops]
             [muuntaja.core :as muu]
             [reitit.ring :as ring]
@@ -44,7 +50,9 @@
     ;; only a REPL/CLI convenience fallback, never the source of truth.
     (if-let [d (or (:dvergr/daemon req) (current-daemon))]
       (try
-        {:status 200 :body (ops/invoke d op (or (:body parameters) (:query parameters) {}))}
+        (if-let [p (:dvergr/principal req)]
+          {:status 200 :body (ops/invoke d p op (or (:body parameters) (:query parameters) {}))}
+          {:status 401 :body {:error "Not authenticated" :op (ops/op->name op)}})
         (catch Throwable e
           ;; an op's failure carries its status: 4xx when the request is wrong
           {:status (ops/error-status e) :body {:error (.getMessage e) :op (ops/op->name op)}}))
@@ -61,7 +69,7 @@
        :parameters  (if read? {:query schema} {:body schema})
        :handler     (op-handler op)}}]))
 
-(def router
+(defn- make-router [operations]
   (ring/router
    [(into ["/api/v1"
            ["/swagger.json"
@@ -69,7 +77,7 @@
                    :swagger {:info {:title       "dvergr ops API"
                                     :description "Spec-derived HTTP API over dvergr.ops — one route per operation. Reads are GET (query args), writes POST (JSON body)."}}
                    :handler (swagger/create-swagger-handler)}}]]
-          (for [[op spec] ops/specification] (op-route op spec)))]
+          (for [[op spec] operations] (op-route op spec)))]
    {:data {:coercion   reitit.coercion.malli/coercion
            :muuntaja   m
            :middleware [swagger/swagger-feature
@@ -88,11 +96,17 @@
       (mk {:path "/api/v1/docs" :url "/api/v1/swagger.json"}))
     (catch Throwable _ nil)))
 
-(def handler
+(def ^:private ring-handler-for
+  ;; one handler per value of `ops/operations`: rebuilt when a host registers an op
+  (memoize (fn [operations]
+             (ring/ring-handler
+              (make-router operations)
+              (or (some-> (swagger-ui-handler) ring/routes)
+                  (constantly nil))))))
+
+(defn handler
   "Ring handler for /api/v1/* (+ Swagger UI at /api/v1/docs when reitit-swagger-ui
    is present). Returns nil on a non-matching URI so the http-kit server falls
    through to its HTML routes."
-  (ring/ring-handler
-   router
-   (or (some-> (swagger-ui-handler) ring/routes)
-       (constantly nil))))
+  [req]
+  ((ring-handler-for (ops/operations)) req))

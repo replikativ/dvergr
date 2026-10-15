@@ -31,4 +31,4 @@
     (is (every? #(= :write (:kind (ops/specification %))) w))))
 
 (deftest invoke-rejects-unknown-op
-  (is (thrown? clojure.lang.ExceptionInfo (ops/invoke nil :no/such-op {}))))
+  (is (thrown? clojure.lang.ExceptionInfo (ops/invoke nil dvergr.principal/local-principal :no/such-op {}))))

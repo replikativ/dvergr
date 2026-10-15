@@ -60,9 +60,9 @@
            :usage {:input-tokens 1200 :output-tokens 20} :stop-reason :end-turn})))))
 
 (defn- run-job [args]
-  (let [started (ops/invoke *daemon* :catalog/start args)]
+  (let [started (ops/invoke *daemon* dvergr.principal/local-principal :catalog/start args)]
     (loop [n 0]
-      (let [st (ops/invoke *daemon* :job/status {:job (:id started) :wait-ms 20000})]
+      (let [st (ops/invoke *daemon* dvergr.principal/local-principal :job/status {:job (:id started) :wait-ms 20000})]
         (if (or (not= "running" (:status st)) (< 6 n))
           (assoc st :room (:room started) :mode (:mode started))
           (recur (inc n)))))))
@@ -95,41 +95,41 @@
             (is (some #(str/includes? (pr-str %) "wiki/tessellate.md")
                       (vals (get-in x [:review :systems]))))))
         (testing "one world is adopted by a pinned merge, the other discarded"
-          (is (= (:world a) (:merged (ops/invoke *daemon* :room/merge
+          (is (= (:world a) (:merged (ops/invoke *daemon* dvergr.principal/local-principal :room/merge
                                                  {:room (:world a) :expect-state (get-in a [:review :state])}))))
-          (is (= (:world b) (:discarded (ops/invoke *daemon* :room/discard {:room (:world b)}))))
+          (is (= (:world b) (:discarded (ops/invoke *daemon* dvergr.principal/local-principal :room/discard {:room (:world b)}))))
           (let [r (ops/resolve-room *daemon* room)]
             (is (= #{"/wiki/index.md" "/wiki/tessellate.md"} (set (keys (catalog/read-tree r "/wiki")))))
             (is (nil? (forks/workspace-changes r)))))))))
 
 (deftest a-fork-s-uncommitted-files-are-reviewed-and-adopted
-  (let [room (:id (ops/invoke *daemon* :room/create {:title "fork files" :slug "fork-files"}))
-        fork (:id (ops/invoke *daemon* :room/fork {:room room}))
+  (let [room (:id (ops/invoke *daemon* dvergr.principal/local-principal :room/create {:title "fork files" :slug "fork-files"}))
+        fork (:id (ops/invoke *daemon* dvergr.principal/local-principal :room/fork {:room room}))
         f (ops/resolve-room *daemon* fork)]
     ;; A raw write, as a tool leaves it: not committed.
     (dvergr.catalog.workspace/room-fs f)
     (muschel.fs/write-string! (dvergr.catalog.workspace/room-fs f) "/notes.md" "A note." false)
-    (let [rev (ops/invoke *daemon* :room/review {:room fork})]
+    (let [rev (ops/invoke *daemon* dvergr.principal/local-principal :room/review {:room fork})]
       (is (= :reviewable (:tier rev)) "uncommitted work is not trivial")
       (is (some #(str/includes? % "notes.md") (:uncommitted rev)))
-      (ops/invoke *daemon* :room/merge {:room fork :expect-state (:state rev)})
+      (ops/invoke *daemon* dvergr.principal/local-principal :room/merge {:room fork :expect-state (:state rev)})
       (is (= {"/notes.md" "A note."} (select-keys (catalog/read-tree (ops/resolve-room *daemon* room) "/")
                                                   ["/notes.md"]))))))
 
 (deftest a-dirty-parent-refuses-a-merge-without-fencing-the-fork
   ;; geschichte refuses a merge into a dirty workspace; refused inside the merge
   ;; that left the fork fenced ("Room is already fenced for lifecycle work").
-  (let [room (:id (ops/invoke *daemon* :room/create {:title "dirty parent" :slug "dirty-parent"}))
-        fork (:id (ops/invoke *daemon* :room/fork {:room room}))
+  (let [room (:id (ops/invoke *daemon* dvergr.principal/local-principal :room/create {:title "dirty parent" :slug "dirty-parent"}))
+        fork (:id (ops/invoke *daemon* dvergr.principal/local-principal :room/fork {:room room}))
         parent (ops/resolve-room *daemon* room)]
     (muschel.fs/write-string! (dvergr.catalog.workspace/room-fs (ops/resolve-room *daemon* fork)) "/fork.md" "Fork work." false)
     (muschel.fs/write-string! (dvergr.catalog.workspace/room-fs parent) "/parent.md" "Parent work." false)
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"has uncommitted changes \(\?\? parent.md\)"
-                          (ops/invoke *daemon* :room/merge {:room fork})))
+                          (ops/invoke *daemon* dvergr.principal/local-principal :room/merge {:room fork})))
     (testing "the fork stays mergeable once the parent is clean"
       (muschel.fs/delete (dvergr.catalog.workspace/room-fs parent) "/parent.md")
       (is (nil? (forks/workspace-changes parent)))
-      (is (= fork (:merged (ops/invoke *daemon* :room/merge {:room fork}))))
+      (is (= fork (:merged (ops/invoke *daemon* dvergr.principal/local-principal :room/merge {:room fork}))))
       (is (= "Fork work." (get (catalog/read-tree parent "/") "/fork.md"))))))
 
 (deftest a-benchmark-runs-as-an-experiment-in-a-daemon-room
@@ -139,12 +139,12 @@
     (with-redefs [providers/ensure-initialized! (constantly nil)
                   chat-agent/messages->api-format (fn [messages _ _] messages)
                   model-chat/chat (wiki-writer calls)]
-      (let [started (ops/invoke *daemon* :catalog/benchmark
+      (let [started (ops/invoke *daemon* dvergr.principal/local-principal :catalog/benchmark
                                 {:workflow "wiki/v1" :models ["claude-haiku-4-5"] :repetitions 2})
             done (loop [n 0]
-                   (let [st (ops/invoke *daemon* :job/status {:job (:id started) :wait-ms 20000})]
+                   (let [st (ops/invoke *daemon* dvergr.principal/local-principal :job/status {:job (:id started) :wait-ms 20000})]
                      (if (or (not= "running" (:status st)) (< 8 n)) st (recur (inc n)))))
-            progress (ops/invoke *daemon* :experiment/progress {:room (:room started)})
+            progress (ops/invoke *daemon* dvergr.principal/local-principal :experiment/progress {:room (:room started)})
             [cand] (get-in progress [:experiments 0 :candidates])]
         (is (= "completed" (:status done)) (pr-str (dissoc done :result)))
         (is (= 1.0 (get-in done [:result :summary 0 :reward-mean])))
@@ -157,18 +157,18 @@
   ;; its Attempts and the Scorecard are kept where the caller looks.
   (let [calls (atom 0)
         bench! (fn [room]
-                 (let [started (ops/invoke *daemon* :catalog/benchmark
+                 (let [started (ops/invoke *daemon* dvergr.principal/local-principal :catalog/benchmark
                                            {:workflow "wiki/v1" :models ["claude-haiku-4-5"] :room room})]
                    [started (loop [n 0]
-                              (let [st (ops/invoke *daemon* :job/status {:job (:id started) :wait-ms 20000})]
+                              (let [st (ops/invoke *daemon* dvergr.principal/local-principal :job/status {:job (:id started) :wait-ms 20000})]
                                 (if (or (not= "running" (:status st)) (< 8 n)) st (recur (inc n)))))]))]
-    (ops/invoke *daemon* :room/create {:slug "my-benchmarks"})
+    (ops/invoke *daemon* dvergr.principal/local-principal :room/create {:slug "my-benchmarks"})
     (with-redefs [providers/ensure-initialized! (constantly nil)
                   chat-agent/messages->api-format (fn [messages _ _] messages)
                   model-chat/chat (wiki-writer calls)]
       (let [[started done] (bench! "my-benchmarks")
             [_ again] (bench! "my-benchmarks")
-            mine (:experiments (ops/invoke *daemon* :experiment/progress {:room "my-benchmarks"}))]
+            mine (:experiments (ops/invoke *daemon* dvergr.principal/local-principal :experiment/progress {:room "my-benchmarks"}))]
         (is (= "my-benchmarks" (:room started)))
         (is (not= (:room started) (:fixture-room started)))
         (is (= "completed" (:status done) (:status again)) (pr-str (dissoc done :result)))
@@ -195,7 +195,7 @@
         wf (catalog/lookup "wiki/v1")
         plan ((:experiment-plan wf) {:models ["claude-haiku-4-5"]})
         exp (runner/experiment-def (assoc plan :id :test/fork-of-room :repetitions 1))
-        _ (ops/invoke *daemon* :room/create {:slug "fork-parent"})
+        _ (ops/invoke *daemon* dvergr.principal/local-principal :room/create {:slug "fork-parent"})
         room (ops/resolve-room *daemon* "fork-parent")
         world (forks/fork! room)]
     (try
@@ -206,9 +206,9 @@
                                #(runner/run-in room (assoc plan :experiment exp :parent-run %
                                                            :world-parent world)))
               done (loop [n 0]
-                     (let [st (ops/invoke *daemon* :job/status {:job (str (:id job)) :wait-ms 20000})]
+                     (let [st (ops/invoke *daemon* dvergr.principal/local-principal :job/status {:job (str (:id job)) :wait-ms 20000})]
                        (if (or (not= "running" (:status st)) (< 8 n)) st (recur (inc n)))))
-              [cand] (get-in (ops/invoke *daemon* :experiment/progress {:room "fork-parent"})
+              [cand] (get-in (ops/invoke *daemon* dvergr.principal/local-principal :experiment/progress {:room "fork-parent"})
                              [:experiments 0 :candidates])]
           (is (= "completed" (:status done)) (pr-str (dissoc done :result)))
           (is (= 1 (:done cand) (:verdicts cand)) "the cell is certified in the room")
@@ -255,12 +255,12 @@
     (with-redefs [providers/ensure-initialized! (constantly nil)
                   chat-agent/messages->api-format (fn [messages _ _] messages)
                   model-chat/chat (reference-writer calls)]
-      (let [started (ops/invoke *daemon* :catalog/benchmark
+      (let [started (ops/invoke *daemon* dvergr.principal/local-principal :catalog/benchmark
                                 {:workflow "wiki/v3" :models ["claude-haiku-4-5"] :environments 2})
             done (loop [n 0]
-                   (let [st (ops/invoke *daemon* :job/status {:job (:id started) :wait-ms 20000})]
+                   (let [st (ops/invoke *daemon* dvergr.principal/local-principal :job/status {:job (:id started) :wait-ms 20000})]
                      (if (or (not= "running" (:status st)) (< 8 n)) st (recur (inc n)))))
-            [cand] (get-in (ops/invoke *daemon* :experiment/progress {:room (:room started)})
+            [cand] (get-in (ops/invoke *daemon* dvergr.principal/local-principal :experiment/progress {:room (:room started)})
                            [:experiments 0 :candidates])]
         (is (= "completed" (:status done)) (pr-str (dissoc done :result)))
         (is (= 2 (:done cand) (:verdicts cand)) "one cell per generated world")
@@ -281,15 +281,15 @@
       (spit (io/file src "src" "core.clj") "(ns core)\n\n(defn answer [] 41)\n")
       (git! "add" ".")
       (git! "commit" "-q" "-m" "Initial")
-      (let [imp (ops/invoke *daemon* :room/import {:room "imported-repo" :source (.getPath src)})
+      (let [imp (ops/invoke *daemon* dvergr.principal/local-principal :room/import {:room "imported-repo" :source (.getPath src)})
             r (ops/resolve-room *daemon* "imported-repo")]
         (is (= 1 (:files imp)) "the checkout's files, and not the stdlib's")
         (is (= {"/src/core.clj" "(ns core)\n\n(defn answer [] 41)\n"} (catalog/read-tree r "/src")))
         (is (thrown-with-msg? Exception #"exists"
-                              (ops/invoke *daemon* :room/import {:room "imported-repo" :source (.getPath src)})))
+                              (ops/invoke *daemon* dvergr.principal/local-principal :room/import {:room "imported-repo" :source (.getPath src)})))
         (muschel.fs/write-string! (dvergr.catalog.workspace/room-fs r) "/src/core.clj"
                                   "(ns core)\n\n(defn answer [] 42)\n" false)
-        (let [{:keys [patch files]} (ops/invoke *daemon* :room/export {:room "imported-repo"})]
+        (let [{:keys [patch files]} (ops/invoke *daemon* dvergr.principal/local-principal :room/export {:room "imported-repo"})]
           (is (= [{:status "M" :path "src/core.clj"}] files))
           (spit (io/file src "room.patch") patch)
           (git! "apply" "room.patch")
@@ -297,7 +297,7 @@
       (finally (sh/sh "rm" "-rf" (.getPath src))))))
 
 (deftest a-workflow-defined-in-a-room-is-checked-listed-and-benchmarked
-  (let [room (:id (ops/invoke *daemon* :room/create {:title "Marketing" :slug "marketing"}))
+  (let [room (:id (ops/invoke *daemon* dvergr.principal/local-principal :room/create {:title "Marketing" :slug "marketing"}))
         r (ops/resolve-room *daemon* room)
         bundle {"/workflows/competitors/workflow.edn"
                 (pr-str {:title "Competitors" :task "Write the competitors of {product} to /out/list.md."
@@ -315,34 +315,34 @@
                 "/workflows/competitors/fixtures/docs/brief.md" "Simmis vs Wato and Dust."}]
     (catalog/seed! r bundle)
     (testing "catalog_check reports the bundle and runs its checker on an answer"
-      (let [c (ops/invoke *daemon* :catalog/check {:room "marketing" :name "competitors"
-                                                   :answer {"/out/list.md" "Wato"}})]
+      (let [c (ops/invoke *daemon* dvergr.principal/local-principal :catalog/check {:room "marketing" :name "competitors"
+                                                                                    :answer {"/out/list.md" "Wato"}})]
         (is (:ok c) (pr-str c))
         (is (= ["/docs/brief.md"] (:fixtures c)))
         (is (= 0.5 (get-in c [:verdict :reward])))))
     (testing "a broken bundle says why"
       (catalog/seed! r {"/workflows/broken/workflow.edn" "{:title \"x\"}"})
-      (is (false? (:ok (ops/invoke *daemon* :catalog/check {:room "marketing" :name "broken"})))))
+      (is (false? (:ok (ops/invoke *daemon* dvergr.principal/local-principal :catalog/check {:room "marketing" :name "broken"})))))
     (testing "catalog_list with the room lists it, ad hoc until promoted"
       (is (= "ad-hoc" (:verifier (first (filter #(= "marketing/competitors" (:id %))
-                                                (ops/invoke *daemon* :catalog/list {:room "marketing"})))))))
+                                                (ops/invoke *daemon* dvergr.principal/local-principal :catalog/list {:room "marketing"})))))))
     (testing "calibrated, then promoted by the owner's connection"
-      (is (:ok? (ops/invoke *daemon* :catalog/calibrate {:room "marketing" :name "competitors"})))
-      (is (:promoted? (ops/invoke *daemon* :catalog/promote {:room "marketing" :name "competitors"})))
+      (is (:ok? (ops/invoke *daemon* dvergr.principal/local-principal :catalog/calibrate {:room "marketing" :name "competitors"})))
+      (is (:promoted? (ops/invoke *daemon* dvergr.principal/local-principal :catalog/promote {:room "marketing" :name "competitors"})))
       (is (= "room" (:verifier (first (filter #(= "marketing/competitors" (:id %))
-                                              (ops/invoke *daemon* :catalog/list {:room "marketing"})))))))
+                                              (ops/invoke *daemon* dvergr.principal/local-principal :catalog/list {:room "marketing"})))))))
     (testing "catalog_benchmark's `name`, and `experiment` as its deprecated alias"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"lowercase letters"
-                            (ops/invoke *daemon* :catalog/benchmark
+                            (ops/invoke *daemon* dvergr.principal/local-principal :catalog/benchmark
                                         {:workflow "marketing/competitors" :models ["claude-haiku-4-5"]
                                          :name "Not A Name"})))
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"lowercase letters"
-                            (ops/invoke *daemon* :catalog/benchmark
+                            (ops/invoke *daemon* dvergr.principal/local-principal :catalog/benchmark
                                         {:workflow "marketing/competitors" :models ["claude-haiku-4-5"]
                                          :experiment "Not A Name"}))
           "the alias is still read")
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"deprecated alias"
-                            (ops/invoke *daemon* :catalog/benchmark
+                            (ops/invoke *daemon* dvergr.principal/local-principal :catalog/benchmark
                                         {:workflow "marketing/competitors" :models ["claude-haiku-4-5"]
                                          :name "one" :experiment "two"}))))
     (testing "catalog_benchmark runs it as \"<room>/<name>\""
@@ -357,43 +357,43 @@
                                            :usage {:input-tokens 500 :output-tokens 20} :stop-reason :tool-use}
                                           {:content "Done." :tool-calls nil
                                            :usage {:input-tokens 600 :output-tokens 5} :stop-reason :end-turn}))]
-          (let [started (ops/invoke *daemon* :catalog/benchmark
+          (let [started (ops/invoke *daemon* dvergr.principal/local-principal :catalog/benchmark
                                     {:workflow "marketing/competitors" :models ["claude-haiku-4-5"]})
                 done (loop [n 0]
-                       (let [st (ops/invoke *daemon* :job/status {:job (:id started) :wait-ms 20000})]
+                       (let [st (ops/invoke *daemon* dvergr.principal/local-principal :job/status {:job (:id started) :wait-ms 20000})]
                          (if (or (not= "running" (:status st)) (< 8 n)) st (recur (inc n)))))]
             (is (= "completed" (:status done)) (pr-str (dissoc done :result)))
             (is (= 1.0 (get-in done [:result :summary 0 :reward-mean])))
             (testing "exported, imported into another room, deployed there on a schedule"
-              (ops/invoke *daemon* :room/create {:title "Sales" :slug "sales"})
-              (let [export (ops/invoke *daemon* :catalog/export {:room "marketing" :name "competitors"})
-                    imported (ops/invoke *daemon* :catalog/import {:room "sales" :export export :as "rivals"})]
+              (ops/invoke *daemon* dvergr.principal/local-principal :room/create {:title "Sales" :slug "sales"})
+              (let [export (ops/invoke *daemon* dvergr.principal/local-principal :catalog/export {:room "marketing" :name "competitors"})
+                    imported (ops/invoke *daemon* dvergr.principal/local-principal :catalog/import {:room "sales" :export export :as "rivals"})]
                 (is (= "sales/rivals" (:imported imported)))
                 (is (= (get-in export [:manifest :bundle]) (:bundle imported)))
                 (is (= "room" (:verifier imported)) "same content, same host: already promoted")
-                (let [d (ops/invoke *daemon* :catalog/deploy {:room "sales" :name "rivals" :agent "var"
-                                                              :every "week" :on "monday" :at "09:00"})
+                (let [d (ops/invoke *daemon* dvergr.principal/local-principal :catalog/deploy {:room "sales" :name "rivals" :agent "var"
+                                                                                               :every "week" :on "monday" :at "09:00"})
                       rows ((requiring-resolve 'dvergr.scheduler.core/list-schedules)
                             (ops/resolve-room *daemon* "sales"))]
                   (is (:schedule d))
                   (is (some #(clojure.string/includes? (str (:task %) (:schedule/task %)) "Simmis") rows)
                       (pr-str rows)))))
             (testing "its Attempts export as trajectories: turns, tool calls, effects, verdict"
-              (let [[t] (ops/invoke *daemon* :attempt/export {:room (:room started) :limit 1})]
+              (let [[t] (ops/invoke *daemon* dvergr.principal/local-principal :attempt/export {:room (:room started) :limit 1})]
                 (is (= 1.0 (:reward t)))
                 (is (= "room" (:verifier-trust t)))
                 (is (some #(= "tool-result" (:role %)) (:messages t)) (pr-str (:messages t)))
                 (is (some #(= "fs/write" (:effect %)) (:effects t)) (pr-str (:effects t))))
-              (let [{:keys [file count]} (ops/invoke *daemon* :attempt/export {:room (:room started) :file "competitors.jsonl"})]
+              (let [{:keys [file count]} (ops/invoke *daemon* dvergr.principal/local-principal :attempt/export {:room (:room started) :file "competitors.jsonl"})]
                 (is (pos? count))
                 (is (= count (clojure.core/count (clojure.string/split-lines (slurp file)))))))
             (testing "and its Scorecard says who vouches for the rewards"
-              (let [[sc] (ops/invoke *daemon* :scorecard/list {:room (:room started)})]
-                (is (= ["room"] (:verifier-trust (ops/invoke *daemon* :scorecard/detail
+              (let [[sc] (ops/invoke *daemon* dvergr.principal/local-principal :scorecard/list {:room (:room started)})]
+                (is (= ["room"] (:verifier-trust (ops/invoke *daemon* dvergr.principal/local-principal :scorecard/detail
                                                              {:room (:room started) :id (:id sc)}))))))))))))
 
 (deftest a-table-of-cases-becomes-a-certified-workflow
-  (let [room (:id (ops/invoke *daemon* :room/create {:title "Books" :slug "books"}))
+  (let [room (:id (ops/invoke *daemon* dvergr.principal/local-principal :room/create {:title "Books" :slug "books"}))
         r (ops/resolve-room *daemon* room)]
     (catalog/seed! r {"/data/cases.csv" (str "no;vendor;text;doc;account;amount\n"
                                              "1;Acme;toner;inv1.txt;4930;119,00\n"
@@ -402,21 +402,21 @@
                       "/data/inv1.txt" "Invoice 1: toner 119,00 EUR"
                       "/data/inv2.txt" "Invoice 2: rent 1.500,00 EUR"
                       "/data/inv3.txt" "Invoice 3: fuel"})
-    (let [res (ops/invoke *daemon* :catalog/cases
+    (let [res (ops/invoke *daemon* dvergr.principal/local-principal :catalog/cases
                           {:room "books" :name "invoice-coding" :table "/data/cases.csv"
                            :spec {:id "no" :inputs ["vendor" "text"] :attachments ["doc"]
                                   :expected {"account" {"rule" "exact"} "amount" {:rule "number" :tolerance 0.01}}}})]
       (is (= "books/invoice-coding" (:workflow res)))
       (is (= [3 2] [(:cases res) (:certified res)]))
       (is (= {:certified 2 :unlabelled 1} (:by-reason res)) "case 3 has no account")
-      (is (:ok (ops/invoke *daemon* :catalog/check {:room "books" :name "invoice-coding"})))
-      (is (:ok? (ops/invoke *daemon* :catalog/calibrate {:room "books" :name "invoice-coding"}))))))
+      (is (:ok (ops/invoke *daemon* dvergr.principal/local-principal :catalog/check {:room "books" :name "invoice-coding"})))
+      (is (:ok? (ops/invoke *daemon* dvergr.principal/local-principal :catalog/calibrate {:room "books" :name "invoice-coding"}))))))
 
 (deftest a-case-pack-is-built-from-scratch-over-the-room-file-ops
   ;; What an MCP client does with no checkout of its own: the table goes in
   ;; with room_write, the bundle comes back out with room_files/room_read.
-  (ops/invoke *daemon* :room/create {:title "Ledger" :slug "ledger"})
-  (let [w (ops/invoke *daemon* :room/write
+  (ops/invoke *daemon* dvergr.principal/local-principal :room/create {:title "Ledger" :slug "ledger"})
+  (let [w (ops/invoke *daemon* dvergr.principal/local-principal :room/write
                       {:room "ledger" :message "Cases from the 2025 books"
                        :files {"data/cases.csv" {"text" (str "no;vendor;text;doc;account;amount\n"
                                                              "1;Acme;toner;inv1.txt;4930;119,00\n"
@@ -426,18 +426,18 @@
                                "data/scan.pdf" {"base64" "JVBERi0xLjQKJcfsj6IK"}}})]
     (is (string? (:commit w)) (pr-str w))
     (is (= 4 (count (:written w))))
-    (let [res (ops/invoke *daemon* :catalog/cases
+    (let [res (ops/invoke *daemon* dvergr.principal/local-principal :catalog/cases
                           {:room "ledger" :name "coding" :table "/data/cases.csv"
                            :spec {:id "no" :inputs ["vendor" "text"] :attachments ["doc"]
                                   :expected {"account" {"rule" "exact"} "amount" {"rule" "number" "tolerance" 0.01}}}})]
       (is (= "ledger/coding" (:workflow res)) (pr-str res))
       (is (= 2 (:certified res))))
     (testing "the bundle is in the workspace: listed and read back"
-      (let [names (set (map :name (:entries (ops/invoke *daemon* :room/files {:room "ledger" :path "/workflows/coding"}))))]
+      (let [names (set (map :name (:entries (ops/invoke *daemon* dvergr.principal/local-principal :room/files {:room "ledger" :path "/workflows/coding"}))))]
         (is (every? names ["workflow.edn" "checker.clj" "calibration.edn" "certification.edn" "cases"]) (pr-str names)))
-      (is (str/includes? (:text (ops/invoke *daemon* :room/read {:room "ledger" :path "/workflows/coding/workflow.edn"}))
+      (is (str/includes? (:text (ops/invoke *daemon* dvergr.principal/local-principal :room/read {:room "ledger" :path "/workflows/coding/workflow.edn"}))
                          ":task"))
-      (is (= "application/pdf" (:media-type (ops/invoke *daemon* :room/read {:room "ledger" :path "data/scan.pdf"}))))
+      (is (= "application/pdf" (:media-type (ops/invoke *daemon* dvergr.principal/local-principal :room/read {:room "ledger" :path "data/scan.pdf"}))))
       (testing "and as MCP resources"
         (let [read-resource @(requiring-resolve 'dvergr.mcp.server/read-resource)
               [c] (:contents (read-resource "room://ledger/files/data/cases.csv"))
@@ -447,7 +447,7 @@
           (is (= "JVBERi0xLjQKJcfsj6IK" (:blob pdf)))
           (is (some #{"checker.clj"} (map :name (:entries (jsonista.core/read-value (:text dir) jsonista.core/keyword-keys-object-mapper))))
               "a directory as a whole JSON listing"))))
-    (is (:ok? (ops/invoke *daemon* :catalog/calibrate {:room "ledger" :name "coding"})))
+    (is (:ok? (ops/invoke *daemon* dvergr.principal/local-principal :catalog/calibrate {:room "ledger" :name "coding"})))
     (testing "benchmarked into the room, scored by the generated checker"
       (with-redefs [providers/ensure-initialized! (constantly nil)
                     chat-agent/messages->api-format (fn [messages _ _] messages)
@@ -459,13 +459,13 @@
                                          :usage {:input-tokens 500 :output-tokens 20} :stop-reason :tool-use}
                                         {:content "Booked." :tool-calls nil
                                          :usage {:input-tokens 600 :output-tokens 5} :stop-reason :end-turn}))]
-        (let [started (ops/invoke *daemon* :catalog/benchmark
+        (let [started (ops/invoke *daemon* dvergr.principal/local-principal :catalog/benchmark
                                   {:workflow "ledger/coding" :models ["claude-haiku-4-5"] :room "ledger"})
               done (loop [n 0]
-                     (let [st (ops/invoke *daemon* :job/status {:job (:id started) :wait-ms 20000})]
+                     (let [st (ops/invoke *daemon* dvergr.principal/local-principal :job/status {:job (:id started) :wait-ms 20000})]
                        (if (or (not= "running" (:status st)) (< 8 n)) st (recur (inc n)))))]
           (is (= "completed" (:status done)) (pr-str (dissoc done :result)))
-          (let [[sc] (ops/invoke *daemon* :scorecard/list {:room "ledger"})
-                detail (ops/invoke *daemon* :scorecard/detail {:room "ledger" :id (:id sc)})]
+          (let [[sc] (ops/invoke *daemon* dvergr.principal/local-principal :scorecard/list {:room "ledger"})
+                detail (ops/invoke *daemon* dvergr.principal/local-principal :scorecard/detail {:room "ledger" :id (:id sc)})]
             (is (= 1.0 (get-in detail [:leaderboard 0 :reward-mean])) (pr-str detail))
             (is (= 2 (get-in detail [:leaderboard 0 :attempts])))))))))

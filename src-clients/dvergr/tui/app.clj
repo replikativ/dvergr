@@ -1294,7 +1294,7 @@
             (= key "y")
             (do ;; the op stops the live participant then retracts the row+persona
                 ;; — one definition of "delete an agent", shared with web + MCP.
-              (dops/invoke daemon :agent/delete {:id (name id)})
+              (dops/invoke daemon dvergr.principal/local-principal :agent/delete {:id (name id)})
               (reset! room-stats-cache {})
               (reset! (:config-confirm signals) nil)
               (reset! (:config-agent signals) nil)

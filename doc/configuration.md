@@ -73,6 +73,10 @@ and storage GC. The `.nrepl-port` of a REPL is written at the project root, not 
                                                 ; and :allowed-origins ["https://dvergr.lan"]
  :mcp           {:port 17888 :bind "127.0.0.1" :profile "offload"
                  :http {:port 17889}}           ; MCP over loopback TCP, optionally Streamable HTTP; doc/mcp.md
+ :auth          {:authenticate my.host/authenticate  ; who calls (fn [request] -> principal | nil)
+                 :authorize    my.host/authorize}    ; may they (fn [principal request] -> decision)
+                                                ; default: local access only, everything allowed;
+                                                ; a hosted daemon sets both (doc/mcp.md, principals)
  :gc            {:interval-ms 21600000          ; storage GC every 6 h (default)
                  :retention-days 30}            ; default nil: keep all history, reclaim only fork garbage
  :blob-store    {:backend :s3 :bucket "…" :region "…"}  ; /drive blobs; default a filestore under .dvergr/blobs

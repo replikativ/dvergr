@@ -23,6 +23,7 @@
   (:refer-clojure :exclude [await])
   (:require [dvergr.substrate.config :as config]
             [dvergr.substrate.paths :as paths]
+            [dvergr.principal :as principal]
             [dvergr.discourse :as d]
             [dvergr.discourse.llm :as llm]
             [dvergr.agent.turn :as turn]
@@ -732,7 +733,8 @@
           {:keys [port bind profile toolsets] :or {port 17888 bind "127.0.0.1"}} mcp-config]
       (cond-> (try
                 (assoc daemon :mcp-server (start-fn :port port :bind bind
-                                                    :profile profile :toolsets toolsets))
+                                                    :profile profile :toolsets toolsets
+                                                    :authenticate (principal/authenticator (:config daemon))))
                 (catch java.net.BindException e
                   (tel/log! {:level :warn :id :daemon/mcp-bind-failed
                              :data {:port port :error (.getMessage e)}}
@@ -748,7 +750,8 @@
                   (let [h ((requiring-resolve 'dvergr.mcp.http/start!)
                            {:port hport :bind hbind :allowed-origins origins
                             :token-file (paths/path "mcp" "http-token")
-                            :profile profile :toolsets toolsets})]
+                            :profile profile :toolsets toolsets
+                            :authenticate (principal/authenticator (:config daemon))})]
                     (tel/log! {:level :info :id :daemon/mcp-http :data {:port (:port h) :bind hbind}}
                               "MCP over HTTP")
                     (assoc d :mcp-http h))

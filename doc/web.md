@@ -38,10 +38,21 @@ One server runs per process.
 
 ## Security stance
 
-Neither the dashboard nor the API authenticates anyone, and the API serves every operation of
-`dvergr.ops`, admin ones included. The server therefore binds to loopback by default. Pass
-another address (`--web-bind`, `:http {:ip …}`) only behind something that authenticates,
-such as a reverse proxy.
+Every request is authenticated through the daemon's `:authenticate` seam (transport `:web`;
+`doc/mcp.md` describes the seams and the principal). The default admits loopback peers only,
+as the local principal, and refuses any other with 401, so without an authenticator of its
+own the server, JSON API included, answers loopback only, wherever it binds. A reverse proxy
+on the same machine makes every request it forwards a loopback one: a proxied deployment
+configures an authenticator (a bearer token in `Authorization`, or what the proxy puts in a
+header) and an `:authorize` seam. What a principal may do:
+
+- the **JSON API** and the dashboard's derived actions (`dvergr.web.ops`) run each op for the
+  request's principal, authorized like every other surface (403 with `{"error": …}` when
+  denied; listings filtered);
+- **room apps** need a read of their room;
+- the rest of the **dashboard** (hand-written views and actions straight over the daemon:
+  room pages, posts, voice, fragments) answers the local principal only, 403 for anyone
+  else. `/api/health` answers anyone authenticated.
 
 Loopback keeps other machines out, but not the pages the user's own browser shows.
 `dvergr.web.guard` checks every request before it is routed:

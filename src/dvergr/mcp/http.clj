@@ -5,8 +5,12 @@
    answering through the same dispatch.
 
    Security: an `Origin` that is not loopback is refused (403, DNS
-   rebinding), and every request needs `Authorization: Bearer <token>` (401),
-   the token read from — or created at — `:token-file` (mode 0600).
+   rebinding), and every request is authenticated (401 when refused) by the
+   `:authenticate` seam (`dvergr.principal`) from its `Authorization: Bearer`
+   token; the default takes the token read from — or created at —
+   `:token-file` (mode 0600) as the local principal. A handshake session
+   belongs to the principal that opened it: a later request on it by another
+   principal is answered as for an unknown session.
 
    Stateless requests (`MCP-Protocol-Version: 2026-07-28`) carry everything:
    the `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` headers must match
@@ -26,6 +30,7 @@
             [dvergr.mcp.json-rpc :as json-rpc]
             [dvergr.mcp.server :as server]
             [dvergr.mcp.surface :as surface]
+            [dvergr.principal :as principal]
             [jsonista.core :as json]
             [org.httpkit.server :as http])
   (:import (java.nio.file Files LinkOption)
@@ -156,7 +161,9 @@
                             (when (response? m)
                               (http/send! ch (json-response (status-of m) m extra-headers) true)))))
               ;; a stateless request's context writes its own stream
-              context (if (:stateless? context) (server/session-context send-fn (:selection-value context)) context)]
+              context (if (:stateless? context)
+                        (server/session-context send-fn (:selection-value context) (:principal context))
+                        context)]
           (when listen?
             (Thread/startVirtualThread
              (fn []
@@ -183,7 +190,7 @@
         (json-rpc/stateless? message)
         (and hv (not (some #{hv} json-rpc/supported-versions))))))
 
-(defn- handle-stateless [req headers message selection]
+(defn- handle-stateless [req headers message selection principal]
   (let [hv (get headers "mcp-protocol-version")]
     (cond
       (and hv (not (some #{hv} json-rpc/stateless-versions)) (not (some #{hv} json-rpc/supported-versions)))
@@ -199,65 +206,91 @@
           (let [stream? (or (= "subscriptions/listen" (:method message))
                             (and (#{"tools/call" "resources/read"} (:method message))
                                  (some? (get-in message [:params :_meta :progressToken]))))]
-            (answer req {:stateless? true :selection-value selection :session (atom {})}
+            (answer req {:stateless? true :selection-value selection :principal principal :session (atom {})}
                     message stream? nil)))))))
 
-(defn- handle-handshake [req headers message sessions selection]
+(defn- own-session
+  "The session `sid` when `principal` opened it, else nil: a session id is
+   no credential, so another principal holding it gets nothing."
+  [sessions sid principal]
+  (let [ctx (get @sessions sid)]
+    (when (and ctx (= (:principal/id (:principal ctx)) (:principal/id principal)))
+      ctx)))
+
+(defn- handle-handshake [req headers message sessions selection principal]
   (let [sid (get headers "mcp-session-id")]
     (cond
       (= "initialize" (:method message))
       (let [new-sid (str (random-uuid))
-            ctx (server/session-context (fn [_]) selection)]
+            ctx (server/session-context (fn [_]) selection principal)]
         (swap! sessions assoc new-sid ctx)
         (answer req ctx message false {"Mcp-Session-Id" new-sid}))
 
       (nil? sid) (json-response 400 (error-body (:id message) -32600 "Mcp-Session-Id header is missing (initialize first)"))
 
-      (not (contains? @sessions sid)) (json-response 404 (error-body (:id message) -32600 "Unknown or ended session"))
+      (not (own-session sessions sid principal))
+      (json-response 404 (error-body (:id message) -32600 "Unknown or ended session"))
 
       (not (contains? message :id))
-      (do (json-rpc/handle-message (get @sessions sid) message) {:status 202})
+      (do (json-rpc/handle-message (own-session sessions sid principal) message) {:status 202})
 
-      :else (answer req (get @sessions sid) message false nil))))
+      :else (answer req (own-session sessions sid principal) message false nil))))
+
+(defn- authenticate-request
+  "The principal of request `req`, or nil: `authenticate` (the seam) on its
+   bearer token, peer and headers. A seam that throws refuses."
+  [authenticate token {:keys [headers remote-addr]}]
+  (try (authenticate {:transport :mcp-http
+                      :bearer (principal/bearer (get headers "authorization"))
+                      :remote-addr remote-addr
+                      :headers headers
+                      :local-token token})
+       (catch Exception _ nil)))
 
 (defn handler
-  "The Ring handler of the MCP endpoint."
-  [{:keys [token allowed-origins selection sessions path] :or {path "/mcp"}}]
+  "The Ring handler of the MCP endpoint. `:authenticate` is the seam
+   (default `principal/default-authenticate`: the bearer `token` is the local
+   principal); every request is authenticated, a handshake session included."
+  [{:keys [token allowed-origins selection sessions path authenticate]
+    :or {path "/mcp" authenticate principal/default-authenticate}}]
   (fn [{:keys [uri request-method headers body] :as req}]
-    (cond
-      (not= path uri) {:status 404 :body "Not found"}
+    (let [p (delay (authenticate-request authenticate token req))]
+      (cond
+        (not= path uri) {:status 404 :body "Not found"}
 
-      (not (origin-ok? (get headers "origin") (set allowed-origins)))
-      (json-response 403 (error-body nil -32600 "Forbidden origin"))
+        (not (origin-ok? (get headers "origin") (set allowed-origins)))
+        (json-response 403 (error-body nil -32600 "Forbidden origin"))
 
-      (not= (str "Bearer " token) (get headers "authorization"))
-      {:status 401 :headers {"WWW-Authenticate" "Bearer"} :body "Unauthorized"}
+        (nil? @p)
+        {:status 401 :headers {"WWW-Authenticate" "Bearer"} :body "Unauthorized"}
 
-      (= :delete request-method)
-      (if-let [sid (get headers "mcp-session-id")]
-        (do (swap! sessions dissoc sid) {:status 204})
-        {:status 405 :headers {"Allow" "POST"}})
+        (= :delete request-method)
+        (if-let [sid (get headers "mcp-session-id")]
+          (do (when (own-session sessions sid @p) (swap! sessions dissoc sid)) {:status 204})
+          {:status 405 :headers {"Allow" "POST"}})
 
-      (not= :post request-method) {:status 405 :headers {"Allow" "POST"}}
+        (not= :post request-method) {:status 405 :headers {"Allow" "POST"}}
 
-      :else
-      (let [message (try (json/read-value (slurp body) read-mapper) (catch Exception _ ::unreadable))]
-        (cond
-          (or (= ::unreadable message) (not (map? message)))
-          (json-response 400 json-rpc/parse-error-response)
+        :else
+        (let [message (try (json/read-value (slurp body) read-mapper) (catch Exception _ ::unreadable))]
+          (cond
+            (or (= ::unreadable message) (not (map? message)))
+            (json-response 400 json-rpc/parse-error-response)
 
-          (stateless-request? headers message) (handle-stateless req headers message selection)
+            (stateless-request? headers message) (handle-stateless req headers message selection @p)
 
-          :else (handle-handshake req headers message sessions selection))))))
+            :else (handle-handshake req headers message sessions selection @p)))))))
 
 (defn start!
   "Serve MCP over HTTP: `{:port 17889 :bind \"127.0.0.1\" :token-file …
-   :allowed-origins #{} :profile :toolsets}`. Returns `{:port :token :stop}`."
-  [{:keys [port bind token-file allowed-origins profile toolsets]
+   :allowed-origins #{} :profile :toolsets :authenticate}` (`:authenticate`:
+   the seam, see `handler`). Returns `{:port :token :stop}`."
+  [{:keys [port bind token-file allowed-origins profile toolsets authenticate]
     :or {port 17889 bind "127.0.0.1"}}]
   (let [token (ensure-token! token-file)
         sessions (atom {})
         stop (http/run-server (handler {:token token :allowed-origins allowed-origins :sessions sessions
+                                        :authenticate (or authenticate principal/default-authenticate)
                                         :selection (surface/selection {:profile profile :toolsets toolsets})})
                               {:port port :ip bind :legacy-return-value? false})]
     {:port (http/server-port stop) :token token

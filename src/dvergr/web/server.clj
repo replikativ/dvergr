@@ -12,7 +12,14 @@
      (stop!)
 
    API endpoints return JSON by default, HTML fragments when Accept: text/html.
-   Every state-changing route is a POST."
+   Every state-changing route is a POST.
+
+   Every request is authenticated (`dvergr.principal`, transport `:web`): by
+   default a loopback peer is the local principal and any other is refused
+   (401). The JSON API (`/api/v1/`) and the derived actions run for the
+   request's principal; room apps need a read of their room; the rest of the
+   dashboard (hand-written views over the daemon) answers the local principal
+   only (403 for anyone else)."
   (:require [org.httpkit.server :as http]
             [jsonista.core :as json]
             [clojure.string :as str]
@@ -26,6 +33,8 @@
             [dvergr.web.ops :as web-ops]
             [dvergr.web.api :as web-api]
             [dvergr.web.guard :as guard]
+            [dvergr.ops :as dops]
+            [dvergr.principal :as principal]
             [hiccup2.core :as h]
             [taoensso.telemere :as tel]))
 
@@ -155,7 +164,34 @@
 ;; Root Handler
 ;; ============================================================================
 
-(defn- root-handler [daemon req]
+(declare route dashboard-route)
+
+(defn- local-only
+  "The hand-written dashboard: views and actions straight over the daemon,
+   not through `dvergr.ops`, so the local principal's only."
+  [principal resp-fn]
+  (if (principal/local? principal)
+    (resp-fn)
+    (json-response 403 {:error "The dashboard is local; use the JSON API (/api/v1/)"})))
+
+(defn- authenticate
+  "The request's principal: the authenticator's verdict on its peer and bearer token."
+  [authenticate-fn req]
+  (try (authenticate-fn {:transport :web
+                         :remote-addr (:remote-addr req)
+                         :bearer (principal/bearer (get-in req [:headers "authorization"]))
+                         :headers (:headers req)})
+       (catch Exception e
+         (tel/log! {:level :warn :id ::authenticate-failed :data {:error (ex-message e)}})
+         nil)))
+
+(defn- root-handler [daemon authenticate-fn req]
+  (if-let [p (authenticate authenticate-fn req)]
+    (route daemon p req)
+    {:status 401 :headers {"Content-Type" "application/json" "WWW-Authenticate" "Bearer"}
+     :body "{\"error\":\"Not authenticated\"}"}))
+
+(defn- route [daemon principal req]
   ;; CRITICAL: http-kit's worker threads have no `*execution-context*`
   ;; bound, so anything that reads from the engine state (registry,
   ;; signals, peer-bus) returns empty/nil. Bind the daemon's ctx for
@@ -168,30 +204,43 @@
         ;; coercing args. A ring handler that returns nil off /api/v1/* + docs.
         ;; Thread THIS server's system value in (not a global) so the API acts
         ;; on the same world as the HTML routes — one handle, no singleton.
-          api     (web-api/handler (assoc req :dvergr/daemon daemon))
+          api     (web-api/handler (assoc req :dvergr/daemon daemon :dvergr/principal principal))
         ;; HTML action routes: dvergr.web.ops projects dvergr.ops onto HTMX-shaped
         ;; HTTP (room/agent lifecycle). Returns a ring response or nil.
-          derived (when-not api (web-ops/dispatch req daemon))]
+          derived (when-not api (web-ops/dispatch req daemon principal))]
       (cond
         api     api
         derived derived
 
-      ;; Room apps — static serving of <room worktree>/app (see dvergr.web.apps)
-        (str/starts-with? uri "/apps/")     (web-apps/handle req daemon)
+      ;; Room apps — static serving of <room worktree>/app (see dvergr.web.apps),
+      ;; for whoever may read the room
+        (str/starts-with? uri "/apps/")
+        (let [slug (second (re-find #"^/apps/([^/]+)" uri))]
+          (try (dops/authorize! daemon principal :room/read {:room slug :path "/app"})
+               (web-apps/handle req daemon)
+               (catch clojure.lang.ExceptionInfo e
+                 (json-response (dops/error-status e) {:error (ex-message e)}))))
+
+        (= uri "/api/health")               (api-health req daemon)
+
+        :else (local-only principal #(dashboard-route daemon req))))))
+
+(defn- dashboard-route [daemon req]
+  (let [uri (:uri req)]
+    (cond
 
       ;; API routes
-        (= uri "/api/health")               (api-health req daemon)
-        (= uri "/api/agents")               (api-agents req daemon)
-        (str/starts-with? uri "/api/agents/") (handle-agent-api req daemon)
-        (= uri "/api/schedules")            (api-schedules req daemon)
+      (= uri "/api/agents")               (api-agents req daemon)
+      (str/starts-with? uri "/api/agents/") (handle-agent-api req daemon)
+      (= uri "/api/schedules")            (api-schedules req daemon)
 
       ;; Whole-system stats panel (HTMX poll)
-        (= uri "/api/system")
-        (html-response 200 (web-dashboard/system-stats-fragment (:execution-ctx daemon)))
+      (= uri "/api/system")
+      (html-response 200 (web-dashboard/system-stats-fragment (:execution-ctx daemon)))
 
       ;; Rooms
-        (and (= uri "/api/rooms") (= :get (:request-method req)))
-        (html-response 200 (web-dashboard/rooms-tree-fragment (:execution-ctx daemon)))
+      (and (= uri "/api/rooms") (= :get (:request-method req)))
+      (html-response 200 (web-dashboard/rooms-tree-fragment (:execution-ctx daemon)))
 
       ;; room create / delete / fork / merge / discard are now DERIVED from
       ;; dvergr.ops via dvergr.web.ops (the `derived` branch above).
@@ -199,128 +248,128 @@
       ;; Per-room per-AGENT context bars — body of the expandable Context
       ;; panel (HTMX poll). NB: must precede the broader /stats and /messages
       ;; matches is unnecessary (distinct suffix), but keep it before /.+ catch-alls.
-        (re-matches #"/api/rooms/.+/agents-context" uri)
-        (let [slug (subs uri (count "/api/rooms/")
-                         (- (count uri) (count "/agents-context")))]
-          (html-response 200 (web-dashboard/room-agents-context-fragment
-                              (:execution-ctx daemon) slug)))
+      (re-matches #"/api/rooms/.+/agents-context" uri)
+      (let [slug (subs uri (count "/api/rooms/")
+                       (- (count uri) (count "/agents-context")))]
+        (html-response 200 (web-dashboard/room-agents-context-fragment
+                            (:execution-ctx daemon) slug)))
 
       ;; Per-room stats strip (HTMX poll)
-        (re-matches #"/api/rooms/.+/stats" uri)
-        (let [slug (subs uri (count "/api/rooms/")
-                         (- (count uri) (count "/stats")))]
-          (html-response 200 (web-dashboard/room-stats-fragment
-                              (:execution-ctx daemon) slug)))
+      (re-matches #"/api/rooms/.+/stats" uri)
+      (let [slug (subs uri (count "/api/rooms/")
+                       (- (count uri) (count "/stats")))]
+        (html-response 200 (web-dashboard/room-stats-fragment
+                            (:execution-ctx daemon) slug)))
 
       ;; Per-room messages fragment (HTMX poll)
-        (re-matches #"/api/rooms/.+/messages" uri)
-        (let [slug (subs uri (count "/api/rooms/")
-                         (- (count uri) (count "/messages")))]
-          (html-response 200 (web-dashboard/room-messages-fragment
-                              (:execution-ctx daemon) slug)))
+      (re-matches #"/api/rooms/.+/messages" uri)
+      (let [slug (subs uri (count "/api/rooms/")
+                       (- (count uri) (count "/messages")))]
+        (html-response 200 (web-dashboard/room-messages-fragment
+                            (:execution-ctx daemon) slug)))
 
       ;; Room page
-        (re-matches #"/rooms/(?!.+/(?:post|voice)$).+" uri)
-        (let [slug (subs uri (count "/rooms/"))]
-          (html-response 200 (web-dashboard/room-page (:execution-ctx daemon) slug)))
+      (re-matches #"/rooms/(?!.+/(?:post|voice)$).+" uri)
+      (let [slug (subs uri (count "/rooms/"))]
+        (html-response 200 (web-dashboard/room-page (:execution-ctx daemon) slug)))
 
       ;; Voice message to a room: raw audio body (browser MediaRecorder
       ;; webm/opus or any container whisper sniffs) → dvergr.audio.stt →
       ;; posted as a 🎤-prefixed user message, same addressing as /post.
-        (re-matches #"/rooms/.+/voice" uri)
-        (let [slug (subs uri (count "/rooms/") (- (count uri) (count "/voice")))
-              room ((requiring-resolve 'dvergr.room.registry/lookup)
-                    ((requiring-resolve 'dvergr.room.store/slug->room-id) slug))]
-          (cond
+      (re-matches #"/rooms/.+/voice" uri)
+      (let [slug (subs uri (count "/rooms/") (- (count uri) (count "/voice")))
+            room ((requiring-resolve 'dvergr.room.registry/lookup)
+                  ((requiring-resolve 'dvergr.room.store/slug->room-id) slug))]
+        (cond
             ;; Bodyless hit (browser GET, prefetch, crawler — the room-page
             ;; regex excludes /voice so those land here): not a voice upload.
-            (or (not= :post (:request-method req)) (nil? (:body req)))
-            (json-response 405 {:error "POST raw audio bytes"})
+          (or (not= :post (:request-method req)) (nil? (:body req)))
+          (json-response 405 {:error "POST raw audio bytes"})
 
             ;; Resolve the room BEFORE transcribing — no paid STT call for
             ;; a nonexistent slug.
-            (not room)
-            (json-response 404 {:error "room not found"})
+          (not room)
+          (json-response 404 {:error "room not found"})
 
-            :else
-            (let [bytes (.readAllBytes ^java.io.InputStream (:body req))
-                  mime (get-in req [:headers "content-type"] "audio/webm")
-                  text ((requiring-resolve 'dvergr.audio.stt/transcribe)
-                        {:bytes bytes :mime mime})]
-              (if (nil? text)
-                (json-response 422 {:error "no speech recognized"})
-                (let [post!   (requiring-resolve 'dvergr.discourse/post!)
-                      message (requiring-resolve 'dvergr.discourse/message)
-                      target  ((requiring-resolve 'dvergr.discourse/room-target) room)]
-                  (post! room (message :web target (str "🎤 " text) nil
-                                       {:role :user :source-user "web"}))
-                  (json-response 200 {:text text}))))))
+          :else
+          (let [bytes (.readAllBytes ^java.io.InputStream (:body req))
+                mime (get-in req [:headers "content-type"] "audio/webm")
+                text ((requiring-resolve 'dvergr.audio.stt/transcribe)
+                      {:bytes bytes :mime mime})]
+            (if (nil? text)
+              (json-response 422 {:error "no speech recognized"})
+              (let [post!   (requiring-resolve 'dvergr.discourse/post!)
+                    message (requiring-resolve 'dvergr.discourse/message)
+                    target  ((requiring-resolve 'dvergr.discourse/room-target) room)]
+                (post! room (message :web target (str "🎤 " text) nil
+                                     {:role :user :source-user "web"}))
+                (json-response 200 {:text text}))))))
 
       ;; Send a message to a room
-        (and (re-matches #"/rooms/.+/post" uri) (not= :post (:request-method req)))
-        (json-response 405 {:error "POST a form with `content`"})
+      (and (re-matches #"/rooms/.+/post" uri) (not= :post (:request-method req)))
+      (json-response 405 {:error "POST a form with `content`"})
 
-        (re-matches #"/rooms/.+/post" uri)
-        (let [slug (subs uri (count "/rooms/") (- (count uri) (count "/post")))
-              params (if (:body req) (parse-form-params req) {})
-              content (some-> (get params "content") str/trim)]
-          (require 'dvergr.discourse 'dvergr.room.registry 'dvergr.room.store
-                   'dvergr.discourse.commands)
-          (let [post!   (requiring-resolve 'dvergr.discourse/post!)
-                message (requiring-resolve 'dvergr.discourse/message)
-                execute! (requiring-resolve 'dvergr.discourse.commands/execute!)
-                cmd?    (requiring-resolve 'dvergr.discourse.commands/command-input?)
-                room    (when (seq content)
-                          ((requiring-resolve 'dvergr.room.registry/lookup)
-                           ((requiring-resolve 'dvergr.room.store/slug->room-id) slug)))
+      (re-matches #"/rooms/.+/post" uri)
+      (let [slug (subs uri (count "/rooms/") (- (count uri) (count "/post")))
+            params (if (:body req) (parse-form-params req) {})
+            content (some-> (get params "content") str/trim)]
+        (require 'dvergr.discourse 'dvergr.room.registry 'dvergr.room.store
+                 'dvergr.discourse.commands)
+        (let [post!   (requiring-resolve 'dvergr.discourse/post!)
+              message (requiring-resolve 'dvergr.discourse/message)
+              execute! (requiring-resolve 'dvergr.discourse.commands/execute!)
+              cmd?    (requiring-resolve 'dvergr.discourse.commands/command-input?)
+              room    (when (seq content)
+                        ((requiring-resolve 'dvergr.room.registry/lookup)
+                         ((requiring-resolve 'dvergr.room.store/slug->room-id) slug)))
               ;; /fork etc. switch rooms — capture the target for the redirect.
-                dest    (atom slug)
+              dest    (atom slug)
               ;; Canonical addressing — the SAME rule the TUI + REPL use
               ;; (dvergr.discourse/room-target): a 1-agent room (or a fork of
               ;; one) addresses its agent so it REPLIES; a group/empty room
               ;; broadcasts (:to nil, display-only).
-                target  (when room
-                          ((requiring-resolve 'dvergr.discourse/room-target) room))]
-            (when (and room (cmd? content))
-              (execute! content
-                        {:room room
-                         :agent-id target
-                         :daemon daemon
+              target  (when room
+                        ((requiring-resolve 'dvergr.discourse/room-target) room))]
+          (when (and room (cmd? content))
+            (execute! content
+                      {:room room
+                       :agent-id target
+                       :daemon daemon
                        ;; Operator console — grant executing tool commands.
-                         :tool-exec? true
-                         :available-tools (keys @@(requiring-resolve 'dvergr.tools/registry))
-                         :post-user!   (fn [t] (post! room (message :web target t nil {:role :user})))
-                         :notify!      (fn [t] (post! room (message :system :_activity
-                                                                    (str "⌘ " t) nil {:role :assistant})))
-                         :switch-room! (fn [nr] (reset! dest (:slug nr)))}))
-            (when (and room (not (cmd? content)))
+                       :tool-exec? true
+                       :available-tools (keys @@(requiring-resolve 'dvergr.tools/registry))
+                       :post-user!   (fn [t] (post! room (message :web target t nil {:role :user})))
+                       :notify!      (fn [t] (post! room (message :system :_activity
+                                                                  (str "⌘ " t) nil {:role :assistant})))
+                       :switch-room! (fn [nr] (reset! dest (:slug nr)))}))
+          (when (and room (not (cmd? content)))
             ;; Explicit :role :user — without it store/infer-role sees a keyword
             ;; :from and mislabels the human's post as :assistant, so the agent's
             ;; next turn rehydrates it as its OWN words and just echoes its last
             ;; reply instead of answering. (Same fix the TUI room post uses.)
-              (post! room (message :web target content nil {:role :user :source-user "web"})))
-            {:status 303 :headers {"Location" (str "/rooms/" @dest)} :body ""}))
+            (post! room (message :web target content nil {:role :user :source-user "web"})))
+          {:status 303 :headers {"Location" (str "/rooms/" @dest)} :body ""}))
 
       ;; Homepage / ops dashboard
-        (or (= uri "/") (= uri "/dashboard"))
-        (html-response 200 (web-dashboard/dashboard-page))
+      (or (= uri "/") (= uri "/dashboard"))
+      (html-response 200 (web-dashboard/dashboard-page))
 
       ;; The roster now lives in the dashboard's Agents section — keep /agents
       ;; as a redirect so old links/bookmarks land there.
-        (= uri "/agents")
-        {:status 303 :headers {"Location" "/dashboard#agents"} :body ""}
+      (= uri "/agents")
+      {:status 303 :headers {"Location" "/dashboard#agents"} :body ""}
 
       ;; Per-agent config PAGE (GET render only). The save (POST) and create
       ;; (POST /agents/new) are DERIVED from dvergr.ops via dvergr.web.ops (the
       ;; `derived` branch above), parsing the form through the shared field-spec.
-        (and (re-matches #"/agents/[^/]+/config" uri) (= :get (:request-method req)))
-        (let [id (subs uri (count "/agents/") (- (count uri) (count "/config")))]
-          (html-response 200 (web-agents/agent-config-page id)))
+      (and (re-matches #"/agents/[^/]+/config" uri) (= :get (:request-method req)))
+      (let [id (subs uri (count "/agents/") (- (count uri) (count "/config")))]
+        (html-response 200 (web-agents/agent-config-page id)))
 
       ;; agent delete / open are now DERIVED from dvergr.ops via dvergr.web.ops
       ;; (the `derived` branch above). agent/delete stops-then-deletes in the op.
 
-        :else                                (json-response 404 {:error "Not found"})))))
+      :else                                (json-response 404 {:error "Not found"}))))
 
 ;; ============================================================================
 ;; Lifecycle
@@ -330,9 +379,11 @@
   "The ring handler of the web server for `daemon`, behind the browser-boundary
    checks of `dvergr.web.guard`. Opts: `:ip` (the bind address), `:allowed-hosts`
    and `:allowed-origins` (names and origins a reverse proxy adds), `:secret`
-   (the CSRF secret; a fresh one by default)."
-  [daemon {:keys [secret] :as opts}]
-  (guard/wrap (fn [req] (root-handler daemon req))
+   (the CSRF secret; a fresh one by default), `:authenticate` (default: the
+   daemon's, `principal/authenticator`)."
+  [daemon {:keys [secret authenticate] :as opts}]
+  (guard/wrap (let [authn (or authenticate (principal/authenticator (:config daemon)))]
+                (fn [req] (root-handler daemon authn req)))
               (assoc opts :secret (or secret (guard/new-secret)))))
 
 (defn start!
@@ -341,9 +392,9 @@
    Args:
      daemon - Daemon record (for API access to agents, config, etc.)
      :port  - Port to listen on (default 17880)
-     :ip    - Bind address (default \"127.0.0.1\" — loopback only). The dashboard
-              and JSON API are UNAUTHENTICATED, so they bind to localhost; pass
-              \"0.0.0.0\" explicitly (--web-bind / :http {:ip}) to expose them.
+     :ip    - Bind address (default \"127.0.0.1\" — loopback only). Without an
+              authenticator (`:auth` in the daemon config) only loopback peers
+              are answered, so binding elsewhere needs one.
      :allowed-hosts   - extra Host names to answer (beside loopback and the bind
                         address), e.g. a reverse proxy's name
      :allowed-origins - extra origins whose state-changing requests are accepted,

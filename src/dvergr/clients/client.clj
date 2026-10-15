@@ -30,6 +30,7 @@
             [dvergr.audio.record :as rec]
             [dvergr.actors :as actors]
             [dvergr.orchestration.daemon :as daemon]
+            [dvergr.principal :as principal]
             [dvergr.discourse :as d]
             [dvergr.discourse.personas :as personas]
             [dvergr.agent.run :as run]
@@ -332,12 +333,12 @@
    e.g. (c/invoke :room/diff {:room :boardroom}). The exact call-path the other
    surfaces use — see `(c/ops)` for the catalogue."
   [op args]
-  (ops/invoke (current-daemon!) op (or args {})))
+  (ops/invoke (current-daemon!) principal/local-principal op (or args {})))
 
 (defn ops
   "The op catalogue: `{op-key :doc}` for every operation in the spec, by name."
   []
-  (into (sorted-map) (map (fn [[k v]] [k (:doc v)]) ops/specification)))
+  (into (sorted-map) (map (fn [[k v]] [k (:doc v)]) (ops/operations))))
 
 ;; ============================================================================
 ;; Durable identity — the roster (distinct from live agents)

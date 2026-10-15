@@ -54,7 +54,7 @@
   (api/handler {:request-method :post :uri uri
                 :headers {"content-type" "application/json"}
                 :body (java.io.ByteArrayInputStream. (.getBytes (json/write-value-as-string body) "UTF-8"))
-                :dvergr/daemon {:execution-ctx nil}}))
+                :dvergr/daemon {:execution-ctx nil} :dvergr/principal dvergr.principal/local-principal}))
 
 (deftest a-failed-op-is-an-http-error
   (testing "an op's client error is a 4xx with the message, never a 200"
@@ -87,8 +87,8 @@
   (testing "a JSON body's files reach the op as path -> {:text}/{:base64}/nil"
     (let [seen (atom nil)
           body "{\"room\":\"r\",\"files\":{\"data/cases.csv\":{\"text\":\"a\"},\"x.bin\":{\"base64\":\"AAE=\"},\"gone.txt\":null}}"
-          resp (with-redefs [ops/invoke (fn [_ _ args] (reset! seen args) {:ok true})]
-                 (api/handler {:request-method :post :uri "/api/v1/room_write" :dvergr/daemon {}
+          resp (with-redefs [ops/invoke (fn [_ _ _ args] (reset! seen args) {:ok true})]
+                 (api/handler {:request-method :post :uri "/api/v1/room_write" :dvergr/daemon {} :dvergr/principal dvergr.principal/local-principal
                                :headers {"content-type" "application/json" "accept" "application/json"}
                                :body (java.io.ByteArrayInputStream. (.getBytes body "UTF-8"))}))]
       (is (= 200 (:status resp)))

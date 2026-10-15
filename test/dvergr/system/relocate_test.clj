@@ -64,7 +64,7 @@
   (sdb/reset-conn!)
   (let [d (daemon/start! {:agents {}})]
     (try
-      (ops/invoke d :room/create {:title "moved" :slug "moved"})
+      (ops/invoke d dvergr.principal/local-principal :room/create {:title "moved" :slug "moved"})
       (note! (ops/resolve-room d "moved") "written-in-a")
       (finally (daemon/stop! d))))
   (let [room-id (:room/id (sdb/room-by-slug "moved"))]

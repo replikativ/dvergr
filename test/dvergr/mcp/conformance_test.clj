@@ -25,7 +25,7 @@
 ;; ---- transports: each is (fn [message] -> response or nil)
 
 (defn- in-process []
-  (let [c (server/session-context (fn [_] nil) (surface/selection {}))]
+  (let [c (server/session-context (fn [_] nil) (surface/selection {}) dvergr.principal/local-principal)]
     (fn [message] (json-rpc/handle-message c message))))
 
 (use-fixtures :once
@@ -157,7 +157,7 @@
 (defn- recording-connection [& [profile]]
   (let [seen (atom [])
         send-fn #(swap! seen conj %)
-        c (server/session-context send-fn (surface/selection {:profile (or profile "admin")}))]
+        c (server/session-context send-fn (surface/selection {:profile (or profile "admin")}) dvergr.principal/local-principal)]
     {:seen seen :send! #(server/dispatch! c send-fn %)}))
 
 (defn- listen-meta [] {:_meta (modern-meta)})

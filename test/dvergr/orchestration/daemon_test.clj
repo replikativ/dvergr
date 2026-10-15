@@ -231,7 +231,7 @@
       (try
         (with-redefs [llm/llm-agent (fn [o] (when (= :tools-op (:id o)) (reset! captured o)) (orig o))]
           (is (= {:created "tools-op"}
-                 (ops/invoke d :agent/create {:id "tools-op" :provider "fireworks" :model "t" :tools []}))))
+                 (ops/invoke d dvergr.principal/local-principal :agent/create {:id "tools-op" :provider "fireworks" :model "t" :tools []}))))
         (is (= {} (:tools @captured)) "provisioned with no tools")
         (is (= {} (:tools (daemon/resolve-safe-config (daemon/agent-join-config d :tools-op))))
             "a room join reads the stored :tools")

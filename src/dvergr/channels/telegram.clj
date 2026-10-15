@@ -666,7 +666,8 @@
               ;; room or routed to an agent. Checked first so /invite etc. aren't
               ;; mistaken for agent addressing.
                 (tc/command? text)
-                (reply! (tc/dispatch! text #(ensure-room chat-id default-agent)))
+                (reply! (tc/dispatch! text #(ensure-room chat-id default-agent)
+                                      {:user (:from msg) :chat-id chat-id}))
 
               ;; Unified slash-command registry (dvergr.discourse.commands): the
               ;; SAME surface the TUI and web dispatch through — /sandbox, /plan,

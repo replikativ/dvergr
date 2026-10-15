@@ -13,7 +13,8 @@
    (room/delete, agent create/delete) are intentionally NOT exposed here until the
    capability/auth layer lands — that's the one knob this overlay gates."
   (:require [clojure.string :as str]
-            [dvergr.ops :as ops]))
+            [dvergr.ops :as ops]
+            [dvergr.principal :as principal]))
 
 (defn- current-daemon []
   (some-> (requiring-resolve 'dvergr.orchestration.daemon/current-daemon) deref deref))
@@ -122,16 +123,26 @@
 (defn dispatch!
   "If `text` is a known ops command, run it against the current chat's room
    (resolved lazily via `room-thunk`, a 0-arg fn returning the Room, called only
-   when the command is room-scoped) and return the reply string; else nil."
-  [text room-thunk]
-  (when-let [{:keys [cmd argv]} (parse text)]
-    (when-let [{:keys [op room? args-fn reply]} (by-cmd cmd)]
-      (try
-        (let [room   (when room? (room-thunk))
-              args   (cond-> {}
-                       room?   (assoc :room (:slug room))
-                       args-fn (merge (args-fn argv)))
-              result (ops/invoke (current-daemon) op args)]
-          ((or reply str) result))
-        (catch Throwable e
-          (str "⚠ /" cmd " failed: " (.getMessage e)))))))
+   when the command is room-scoped) and return the reply string; else nil.
+   It runs for the principal the daemon's authenticator makes of the sender
+   (`{:transport :telegram :telegram/user {:id :username …} :telegram/chat-id …}`);
+   the default authenticator makes every sender that reaches the bot the
+   local principal, as before (the bot's own allowlist decides who does)."
+  ([text room-thunk] (dispatch! text room-thunk {}))
+  ([text room-thunk {:keys [user chat-id]}]
+   (when-let [{:keys [cmd argv]} (parse text)]
+     (when-let [{:keys [op room? args-fn reply]} (by-cmd cmd)]
+       (try
+         (let [daemon (current-daemon)
+               who    ((principal/authenticator (:config daemon))
+                       {:transport :telegram :telegram/user user :telegram/chat-id chat-id})]
+           (if-not who
+             (str "⚠ /" cmd ": not authorized")
+             (let [room   (when room? (room-thunk))
+                   args   (cond-> {}
+                            room?   (assoc :room (:slug room))
+                            args-fn (merge (args-fn argv)))
+                   result (ops/invoke daemon who op args)]
+               ((or reply str) result))))
+         (catch Throwable e
+           (str "⚠ /" cmd " failed: " (.getMessage e))))))))

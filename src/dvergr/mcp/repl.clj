@@ -18,25 +18,47 @@
    data. A connection's REPL has exactly the authority its tools have: only the
    ops its selection (profile, toolsets, read-only) shows are installed, and
    each selection has a session of its own (`session-actor`), so a read-only
-   connection never reaches a function another connection installed. An agent's
-   own sandbox in a room gets none of this."
+   connection never reaches a function another connection installed. A
+   principal other than the local one has sessions of its own, and every op
+   runs for the principal of the evaluation that calls it (`*caller*`, which
+   the MCP server binds around `clojure_eval`), never for the one that
+   installed or defined it: a function that reaches another session (a
+   closure kept in a shared place) carries no authority of its own, and one
+   called outside an evaluation (a Spin's later step, another thread) is
+   refused. An agent's own sandbox in a room gets none of this."
   (:require [clojure.string :as str]
             [dvergr.mcp.surface :as surface]
             [dvergr.ops :as ops]
+            [dvergr.principal :as principal]
             [dvergr.sandbox.ns.doc :as doc]
             [malli.core :as m]
             [malli.error :as me]
             [sci.core :as sci]))
 
 (defn session-actor
-  "The REPL session of `selection` in a room: one per selection, so connections
-   with different authority never share definitions (`:mcp/offload`, or
-   `:mcp/sel-<hash>` for a custom one)."
-  [{:keys [profile] :as selection}]
-  (let [authority #(-> (select-keys % [:toolsets :repl-toolsets :read-only?]) (update :read-only? boolean))]
-    (if (= (authority (surface/selection {:profile profile})) (authority selection))
-      (keyword "mcp" (name (or profile surface/default-profile)))
-      (keyword "mcp" (str "sel-" (Integer/toHexString (hash (authority selection))))))))
+  "The REPL session of `selection` (for `principal`, default the local one) in
+   a room: one per selection, so connections with different authority never
+   share definitions (`:mcp/offload`, or `:mcp/sel-<hash>` for a custom one),
+   and one per principal besides the local one (`:mcp/p-<hash>`), so tenants
+   never share them either."
+  ([selection] (session-actor selection principal/local-principal))
+  ([{:keys [profile] :as selection} principal]
+   (let [authority #(-> (select-keys % [:toolsets :repl-toolsets :read-only?]) (update :read-only? boolean))]
+     (cond
+       (not (principal/local? principal))
+       (keyword "mcp" (str "p-" (Integer/toHexString (hash [(:principal/id principal) (authority selection)]))))
+
+       (= (authority (surface/selection {:profile profile})) (authority selection))
+       (keyword "mcp" (name (or profile surface/default-profile)))
+
+       :else
+       (keyword "mcp" (str "sel-" (Integer/toHexString (hash (authority selection)))))))))
+
+(def ^:dynamic *caller*
+  "`{:principal :selection}` of the MCP evaluation now running (bound by
+   `dvergr.mcp.server` around `clojure_eval`), nil elsewhere. The `dvergr.ops`
+   functions run for it, and only for it."
+  nil)
 
 (defn- fn-name [op] (symbol (str/replace (ops/op->name op) "_" "-")))
 
@@ -49,18 +71,27 @@
                   (surface/visible? (surface/repl-selection selection)
                                     {:dvergr/toolset (surface/tool-toolset (ops/op->name op) op false)
                                      :annotations (surface/op-annotations op kind)})))
-        ops/specification))
+        (ops/operations)))
 
 (def ^:private closes-room
   "Ops that close a room: never the one the REPL runs in (closing it would wait
    for this very evaluation)."
   #{:room/delete :room/purge})
 
+(declare visible-ops)
+
 (defn- invoke-checked
-  "Validate `args` against `op`'s schema, then run it on `daemon`."
+  "Validate `args` against `op`'s schema, then run it on `daemon` for the
+   evaluation's caller (`*caller*`), when its selection shows `op`."
   [daemon room op args]
   (let [args (or args {})
-        schema (ops/malli-schema op)]
+        schema (ops/malli-schema op)
+        {:keys [principal selection]} *caller*]
+    (when-not principal
+      (throw (ex-info (str (fn-name op) " runs only inside the evaluation of a connection (clojure_eval)")
+                      {:type ::no-caller :op op})))
+    (when-not (contains? (visible-ops selection) op)
+      (throw (ex-info (str "Op " op " is not available on this connection") {:type ::unavailable :op op})))
     (when-not (map? args)
       (throw (ex-info (str (fn-name op) " takes one map of arguments") {:type ::bad-args :op op})))
     (when-not (m/validate schema args)
@@ -71,10 +102,11 @@
                  (and target (= (:id target) (:id room)))))
       (throw (ex-info (str (fn-name op) " cannot close the room this REPL runs in; call it from another room")
                       {:type ::closes-own-room :op op})))
-    (ops/invoke daemon op args)))
+    (ops/invoke daemon principal op args)))
 
 (defn ns-map
-  "The `dvergr.ops` namespace for `selection` on `daemon`, evaluating in `room`."
+  "The `dvergr.ops` namespace for `selection` on `daemon`, evaluating in `room`;
+   each function runs for the caller of the moment (`*caller*`)."
   [daemon selection room]
   (let [visible (visible-ops selection)]
     (into {'call (doc/documented

@@ -357,7 +357,10 @@
     (try (f (:daemon h))
          (finally (close-home! h)))))
 
-(defn- op [daemon k args] ((requiring-resolve 'dvergr.ops/invoke) daemon k args))
+(defn- op
+  "Op `k` on this home's daemon, as the local principal: the runner is the process."
+  [daemon k args]
+  ((requiring-resolve 'dvergr.ops/invoke) daemon @(requiring-resolve 'dvergr.principal/local-principal) k args))
 
 (defn- live-room [daemon slug] ((requiring-resolve 'dvergr.ops/resolve-room) daemon slug))
 

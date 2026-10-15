@@ -43,7 +43,7 @@
         before (branches)]
     (try
       (is (contains? (systems root) "kb:embedder") "registered on the root")
-      (ops/invoke *daemon* :room/create {:slug "scoped-room"})
+      (ops/invoke *daemon* dvergr.principal/local-principal :room/create {:slug "scoped-room"})
       (let [room (ops/resolve-room *daemon* "scoped-room")
             world (binding [ec/*execution-context* root] (forks/fork! room))]
         (try

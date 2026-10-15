@@ -22,7 +22,7 @@
     (try
       (let [d1 (daemon/start! {:agents {}})]
         (try
-          (ops/invoke d1 :room/create {:title "orphans" :slug "orphans"})
+          (ops/invoke d1 dvergr.principal/local-principal :room/create {:title "orphans" :slug "orphans"})
           (let [room (ops/resolve-room d1 "orphans")
                 at (java.util.Date.)]
             (binding [ec/*execution-context* (:ctx room)]
