@@ -255,3 +255,12 @@
         (is (not= ::waited (deref f 2000 ::waited)) "the post did not wait on the commit lock")
         (is (= 1 (count (bus/log b)))))
       (finally (.unlock lock)))))
+
+(deftest a-bus-with-only-the-batch-hook-persists-single-posts
+  (let [durable (atom [])
+        b (bus/create-bus {:durable-append-batch! (fn [msgs] (swap! durable into (map :id msgs))
+                                                    (mapv (constantly :inserted) msgs))})
+        m {:id (random-uuid) :to :x :content "alone"}]
+    (bus/post! b m)
+    (is (= [(:id m)] @durable) "a single post is written through the batch hook")
+    (is (= [(:id m)] (mapv :id (bus/log b))))))

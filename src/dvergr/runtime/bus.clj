@@ -290,7 +290,12 @@
    of the batch was written: retried after a later message, it would be
    durable after it, out of post order; it fails instead."
   [bus msgs]
-  (let [one (fn [m] (try (when-let [append! (:durable-append! bus)] (append! m))
+  (let [one (fn [m] (try (if-let [append! (:durable-append! bus)]
+                           (append! m)
+                           ;; a bus with only the batch hook writes one
+                           ;; message as a batch of one, never skipping it
+                           (when-let [batch! (:durable-append-batch! bus)]
+                             (first (batch! [m]))))
                          (catch Throwable t t)))
         failed? (fn [s] (or (= :failed s) (false? s) (instance? Throwable s)))]
     (if-let [batch! (and (next msgs) (:durable-append-batch! bus))]
