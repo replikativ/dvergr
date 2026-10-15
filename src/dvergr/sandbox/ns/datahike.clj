@@ -51,7 +51,45 @@
 (defn- db-value? [x]
   (and (some? x) (not (instance? SandboxDb x)) (dbu/db? x)))
 
-(declare world-connection? callable? untrusted)
+(declare world-connection? callable? untrusted seal)
+
+(deftype SandboxEntity [^datahike.impl.entity.Entity e]
+  ;; An entity as sandbox code holds it. Datahike's entity hands out its
+  ;; stored values as they are, and holds its database; this one reads like
+  ;; the entity (lookups, `contains?`, `keys`, `seq`, equality) and seals
+  ;; every value it hands out, a referenced entity included. The mirrored
+  ;; Datahike fns take it back.
+  clojure.lang.ILookup
+  (valAt [_ k] (seal (.valAt e k)))
+  (valAt [_ k not-found]
+    (let [v (.valAt e k ::absent)]
+      (if (identical? ::absent v) not-found (seal v))))
+  clojure.lang.IFn
+  (invoke [this k] (.valAt this k))
+  (invoke [this k not-found] (.valAt this k not-found))
+  clojure.lang.Associative
+  (containsKey [_ k] (.containsKey e k))
+  (entryAt [_ k] (when (.containsKey e k) (clojure.lang.MapEntry. k (seal (.valAt e k)))))
+  (assoc [_ _ _] (throw (UnsupportedOperationException. "An entity is read-only")))
+  clojure.lang.IPersistentCollection
+  (count [_] (count e))
+  (cons [_ _] (throw (UnsupportedOperationException. "An entity is read-only")))
+  (empty [_] (throw (UnsupportedOperationException. "An entity is read-only")))
+  (equiv [_ o] (and (instance? SandboxEntity o) (= e (.-e ^SandboxEntity o))))
+  clojure.lang.Seqable
+  (seq [_] (seq (map (fn [[k v]] (clojure.lang.MapEntry. k (seal v))) e)))
+  Object
+  (equals [this o] (.equiv this o))
+  (hashCode [_] (hash e))
+  (toString [_] (str "#sandbox/entity " (pr-str {:db/id (:db/id e)}))))
+
+(defmethod print-method SandboxEntity [x ^java.io.Writer w]
+  (.write w (str x)))
+
+(defn- unseal-entity
+  "The Datahike entity of a SandboxEntity, else `x`."
+  [x]
+  (if (instance? SandboxEntity x) (.-e ^SandboxEntity x) x))
 
 (defn- leak!
   "A Datahike result that would hand sandbox code a host object."
@@ -59,12 +97,18 @@
   (throw (ex-info "A Datahike result held a host object; sandbox code gets databases as handles only"
                   {:type ::host-object :class (str (class x))})))
 
+(def ^:private float-array-class (Class/forName "[F"))
+(def ^:private double-array-class (Class/forName "[D"))
+
 (defn- plain?
   "A scalar of the kinds Datahike stores: the leaves of a value that may cross
-   the sandbox boundary (a symbol only without metadata)."
+   the sandbox boundary (a symbol only without metadata). Byte, float and
+   double arrays are values too (`:db.type/bytes`, `:db.type/float-array`,
+   `:db.type/double-array`)."
   [x]
   (or (nil? x) (string? x) (number? x) (keyword? x) (boolean? x)
       (uuid? x) (char? x) (inst? x) (bytes? x)
+      (instance? float-array-class x) (instance? double-array-class x)
       (and (symbol? x) (nil? (meta x)))))
 
 (defn- sorted? [x] (instance? clojure.lang.Sorted x))
@@ -81,8 +125,9 @@
 (defn seal
   "What sandbox code gets for `x`, deeply. Only data crosses: scalars
    (`plain?`), and maps, vectors, sets and sequences of data, without their
-   metadata; a database value becomes a SandboxDb, a transaction report a
-   map, and handles, entities and datoms whose every slot is data pass.
+   metadata; a database value becomes a SandboxDb, an entity a SandboxEntity
+   (which seals the values it hands out), a transaction report a map, and
+   handles and datoms whose every slot is data pass.
    Anything else (a connection, store, reference, function, sorted
    collection, exception, other object) fails closed. A collection that
    holds nothing to seal comes back as it is."
@@ -92,7 +137,8 @@
     (symbol? x) (with-meta x nil)
     (instance? SandboxDb x) x
     (world-connection? x) x
-    (instance? datahike.impl.entity.Entity x) x
+    (instance? SandboxEntity x) x
+    (instance? datahike.impl.entity.Entity x) (SandboxEntity. x)
     (instance? datahike.datom.Datom x)
     (if (every? #(identical? % (seal %)) [(:e x) (:a x) (:v x) (:tx x) (:added x)]) x (leak! x))
     (dbu/db? x) (SandboxDb. x)
@@ -162,6 +208,7 @@
                         {:type ::connection-unavailable})))
 
     (instance? SandboxDb value) (unseal value)
+    (instance? SandboxEntity value) (unseal-entity value)
     :else value))
 
 (defn db-of
@@ -189,6 +236,7 @@
    collection or relation input, seeing sealed values."
   [x]
   (cond
+    (instance? SandboxEntity x) (unseal-entity x)
     (callable? x) (sealing-fn x)
     (map? x) (into (empty x) (map (fn [[k v]] [(sealing-input k) (sealing-input v)])) x)
     (vector? x) (mapv sealing-input x)

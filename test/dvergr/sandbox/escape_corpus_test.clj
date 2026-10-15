@@ -688,6 +688,63 @@
         (dh/release kb)
         (dh/release other)))))
 
+(deftest entities-seal-what-they-hand-out
+  ;; An entity hands out its stored values as they are and holds its
+  ;; database. A value the host stored (here a function) must not reach
+  ;; sandbox code through an entity lookup or traversal; ordinary reads keep
+  ;; working, and a referenced entity comes back wrapped too.
+  (let [cfg {:store {:backend :memory :id (random-uuid)} :schema-flexibility :read
+             :initial-tx [{:db/ident :child :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}]}
+        _ (dh/create-database cfg)
+        kb (dh/connect cfg)
+        _ (dh/transact kb [{:db/id -1 :title "kid"}])
+        kid (ffirst (dh/q '[:find ?e :where [?e :title "kid"]] @kb))
+        _ (dh/transact kb [{:title "parent" :child kid :f (fn [] :host)}])
+        ec (ctx/create-execution-context)
+        sci-ctx (sandbox/fork-for-session ec)]
+    (try
+      (sandbox/setup-agent-namespaces! sci-ctx ec :kb-conn kb)
+      (let [ev #(eval-in sci-ctx ec (str "(require '[datahike.api :as d])
+                                           (def e (d/entity @dvergr.room/*kb*
+                                                    (ffirst (d/q '[:find ?e :where [?e :title \"parent\"]] @dvergr.room/*kb*)))) " %))]
+        (testing "an entity is a handle that reads like an entity"
+          (is (= {:ok ["class dvergr.sandbox.ns.datahike.SandboxEntity" "parent" "parent" true #{:title}]}
+                 (ev "[(str (type e)) (:title e) (get e :title) (contains? e :title) (set (keys (:child e)))]")))
+          (is (= {:ok {:title "kid"}} (ev "(into {} (:child e))"))))
+        (is (= {:ok :none} (ev "(get e :missing :none)")))
+        (testing "a referenced entity comes back wrapped"
+          (is (= {:ok ["class dvergr.sandbox.ns.datahike.SandboxEntity" "kid"]}
+                 (ev "[(str (type (:child e))) (:title (:child e))]"))))
+        (testing "a host object stored in an attribute fails closed"
+          (is (:err (ev "(:f e)")))
+          (is (:err (ev "(e :f)")))
+          (is (:err (ev "(into {} e)")))
+          (is (:err (ev "(doall (vals e))")))
+          (is (:err (ev "(doall (keys e))")) "a traversal of an entity holding one fails as well"))
+        (testing "the mirrored API takes an entity back"
+          (is (= {:ok "class dvergr.sandbox.ns.datahike.SandboxDb"}
+                 (ev "(str (type (d/entity-db e)))")))))
+      (finally (ctx/stop-context! ec)))))
+
+(deftest numeric-arrays-are-data
+  ;; Datahike stores float and double arrays (:db.type/float-array,
+  ;; :db.type/double-array) as it stores bytes; sandbox code writes and reads
+  ;; them like any other value.
+  (let [cfg {:store {:backend :memory :id (random-uuid)} :schema-flexibility :read}
+        _ (dh/create-database cfg)
+        kb (dh/connect cfg)
+        ec (ctx/create-execution-context)
+        sci-ctx (sandbox/fork-for-session ec)]
+    (try
+      (sandbox/setup-agent-namespaces! sci-ctx ec :kb-conn kb)
+      (is (= {:ok [[1.0 2.5] [3.0 4.5] [7 8]]}
+             (eval-in sci-ctx ec "(require '[datahike.api :as d])
+                                  (d/transact dvergr.room/*kb* [{:title \"v\" :fa (float-array [1.0 2.5])
+                                                                 :da (double-array [3.0 4.5]) :ba (byte-array [7 8])}])
+                                  (let [r (first (d/q '[:find ?f ?d ?b :where [?e :fa ?f] [?e :da ?d] [?e :ba ?b]] @dvergr.room/*kb*))]
+                                    (mapv vec r))")))
+      (finally (ctx/stop-context! ec)))))
+
 (deftest query-inputs-callables-see-handles-at-any-depth
   ;; Defence in depth behind the source rule: whatever Datahike hands a
   ;; callable from an input (tuple, collection, relation, a var), it gets
