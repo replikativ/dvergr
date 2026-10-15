@@ -15,7 +15,10 @@
             [dvergr.sandbox.ns.kb :as kb-ns]
             [dvergr.sandbox.workspace :as workspace]
             [muschel.fs.geschichte :as gfs]
+            [org.replikativ.spindel.effects.await :refer [await]]
             [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.spin.combinators :as comb]
+            [org.replikativ.spindel.spin.cps :refer [spin]]
             [sci.core :as sci]))
 
 (defn- temp-dir [prefix]
@@ -83,6 +86,34 @@
         (is (nil? (('participants ops) "no-such-room"))))
       (finally
         (doseq [f @forks] (try (d/discard f) (catch Throwable _)))
+        (d/close-room! parent)))))
+
+(deftest room-teardown-ops-are-refused-inside-a-spin-body
+  ;; a continuation after an await runs on the engine's drain, which the
+  ;; teardown they wait for needs
+  (let [parent (d/make-room {:id :sci-injected-drain-parent
+                             :store (memory/make)})
+        ops    (kb-ns/room-ops-map (:ctx parent) nil
+                                   (select-keys parent [:id :incarnation]))
+        view   (('fork! ops) parent)
+        fork   (binding [ec/*execution-context* (:ctx parent)] (rreg/lookup (:id view)))
+        in-spin (fn [f]
+                  (binding [ec/*execution-context* (:ctx parent)]
+                    @(future
+                       @(spin (await (comb/sleep 1))
+                              (try (f) (catch clojure.lang.ExceptionInfo e (ex-data e)))))))]
+    (try
+      (doseq [[op call] [['merge! #(('merge! ops) (:slug parent) (:id view))]
+                         ['discard! #(('discard! ops) (:id view))]
+                         ['delete! #(('delete! ops) (:id view))]]]
+        (is (= {:type ::kb-ns/settle-in-drain :op op} (in-spin call)) (str op)))
+      (is (some? (binding [ec/*execution-context* (:ctx parent)] (rreg/lookup (:id view))))
+          "the fork is untouched")
+      (is (nil? (d/settlement-claim fork)) "and unclaimed")
+      (is (= (:id parent) (:id (('merge! ops) (:slug parent) (:id view))))
+          "outside the spin it merges")
+      (finally
+        (try (d/discard fork) (catch Throwable _))
         (d/close-room! parent)))))
 
 ;; ---------------------------------------------------------------------------

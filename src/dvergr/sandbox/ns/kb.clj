@@ -10,6 +10,7 @@
             [dvergr.effects :as effects]
             [dvergr.runtime.ctx :as runtime-ctx]
             [org.replikativ.spindel.engine.core :as rtc]
+            [org.replikativ.spindel.engine.impl.simple :as simple]
             [dvergr.sandbox.ns.doc :as doc]))
 
 (defn add-llm-ns!
@@ -114,6 +115,17 @@
                                 (meta f)))
                  m))
              ops ops))
+
+(defn- refuse-in-drain!
+  "`op` waits for a room's teardown: its Runs and listeners must stop, which
+   needs the engine's drain. A spin continuation runs on that drain, so it is
+   refused there, as `@spin` is."
+  [op]
+  (when simple/*in-drain?*
+    (throw (ex-info (str op " waits for the room's teardown, which cannot happen"
+                         " inside a spin body; call it outside the spin, e.g. on"
+                         " the value of @(spin …)")
+                    {:type ::settle-in-drain :op op}))))
 
 (defn room-ops-map
   "The unified Room-ops map — `create!`/`list`/`get`/`post!`/`messages`/`children`/
@@ -236,6 +248,7 @@
                         (leave-agent!* room agent-id)
                         {:left agent-id :room (:id room)}))
         delete-fn   (fn [ref]
+                      (refuse-in-drain! 'delete!)
                       (binding [rtc/*execution-context* (selected-ctx)]
                         (if-let [room (resolve-room ref)]
                           (do
@@ -270,6 +283,7 @@
                            (binding [rtc/*execution-context* (:ctx room)]
                              (view (fork-room* room (merge {:isolation :ctx} opts))))))))
         merge-fn    (fn [parent-ref fork-ref]
+                      (refuse-in-drain! 'merge!)
                       (let [[parent fork] (binding [rtc/*execution-context* (selected-ctx)]
                                             [(resolve-room parent-ref) (resolve-room fork-ref)])]
                         (cond
@@ -286,6 +300,7 @@
                                     (view result)
                                     result)))))
         discard-fn  (fn [fork-ref]
+                      (refuse-in-drain! 'discard!)
                       (if-let [fork (binding [rtc/*execution-context* (selected-ctx)]
                                       (resolve-room fork-ref))]
                         (let [snapshot (view fork)]
