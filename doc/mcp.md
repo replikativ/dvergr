@@ -8,8 +8,14 @@ what it cost. The tools are derived from `dvergr.ops/specification` (and the roo
 ## Connecting a client
 
 A client launches `bin/dvergr-mcp` (babashka) as a stdio server. It relays to the daemon's
-loopback TCP port (default `127.0.0.1:17888`). Its files live under the state root,
+TCP port (default `127.0.0.1:17888`). Its files live under the state root,
 `DVERGR_HOME` (default `<checkout>/.dvergr`):
+
+- it presents the state root's **local token** (`$DVERGR_HOME/local-token`, mode 0600, which
+  the daemon creates; a home from before has it in `mcp/http-token`, and that token stays
+  valid) as the first line of every connection, or `DVERGR_MCP_TOKEN` when it is given one
+  (a run token, below). A daemon accepts no connection without a credential, loopback
+  included, and the relay says so when it is refused;
 
 - when no daemon listens, it starts one (`clojure -M:cli --no-tui --mcp …`, log in
   `$DVERGR_HOME/logs/mcp-daemon.log`, nREPL port in `$DVERGR_HOME/mcp-daemon.nrepl-port`) and
@@ -59,7 +65,11 @@ agent works in a benchmark Attempt: a `claude-code-*` candidate runs `claude -p`
 Attempt's world, with this relay in `--mcp-config` (its own built-in tools disabled, only
 `mcp__dvergr__<tool>` allowed, its own loop of up to 60 turns); the CLI calls the same tools
 every other candidate gets, natively, and the evaluator scores the world when it answers. The
-daemon (or any process running an Attempt) serves MCP on a loopback port for it.
+daemon (or any process running an Attempt) serves MCP on a loopback port for it. Each
+call gets a **run token** (`principal/mint-run-token!`), passed to the relay as
+`DVERGR_MCP_TOKEN`: it authenticates as that agent, and the server pins the connection to the
+token's room and tools whatever the relay asks; it is revoked when the call ends (and expires
+after an hour).
 This path needs the relay at `bin/dvergr-mcp` under the process's working directory (a
 checkout; `DVERGR_MCP_RELAY` names another path) and babashka (`bb`) to run it. Without the
 relay, or without a work room and tools, `claude -p` answers once and calls tools through the
@@ -67,15 +77,15 @@ text `<tool_use>` protocol instead (`dvergr.model.api.claude-code`), so scores f
 paths are not the same measurement.
 
 **Over HTTP, without the relay.** Give the daemon `:mcp {:port 17888 :http {:port 17889}}` and
-it also serves Streamable HTTP at `http://127.0.0.1:17889/mcp` (loopback only). Without an
-authenticator of the daemon's own (below), requests need the bearer token the daemon writes
-to `mcp/http-token` in its state root (`$DVERGR_HOME`, default `.dvergr` in the directory it
-started in; mode 0600) on its first start; it makes the caller the local principal.
+it also serves Streamable HTTP at `http://127.0.0.1:17889/mcp`. Without an authenticator of
+the daemon's own (below), requests need the local token as a bearer: the daemon writes it to
+`local-token` in its state root (`$DVERGR_HOME`, default `.dvergr` in the directory it started
+in; mode 0600) on its first start; it makes the caller the local principal.
 Claude Code:
 
 ```sh
 claude mcp add --transport http dvergr http://127.0.0.1:17889/mcp \
-  --header "Authorization: Bearer $(cat "${DVERGR_HOME:-.dvergr}/mcp/http-token")"
+  --header "Authorization: Bearer $(cat "${DVERGR_HOME:-.dvergr}/local-token")"
 ```
 
 or in `.mcp.json`:
@@ -113,20 +123,22 @@ naming one), or, for a host that runs dvergr's rooms without a daemon, process-w
 `principal/configure!`:
 
 - **`:authenticate`** `(fn [request] -> principal | nil)`. `request` carries `:transport`
-  (`:mcp-stdio`, `:mcp-tcp`, `:mcp-http`, `:web`, `:telegram`), `:remote-addr` (the socket's
-  peer, never a forwarding header: http-kit's own `:remote-addr` is the first
-  `X-Forwarded-For` entry), `:bearer` (the `Authorization: Bearer` token), `:headers`, for MCP
-  over HTTP `:local-token` (the token file's), for Telegram `:telegram/user` and
-  `:telegram/chat-id`. nil refuses the caller: 401 over HTTP, an error and a closed connection
-  over TCP, a refusal in Telegram.
-  The default, `principal/default-authenticate`, admits local access only, as the **local
-  principal**: the stdio relay; a loopback peer of TCP or the web server; the token of
-  `mcp/http-token` from a loopback peer; a Telegram sender on a non-empty allowlist (on an open
-  one a sender is `telegram/<id>`, a principal the authorizer decides about). A request that
-  carries a forwarding header (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`, …) is never local:
-  a proxy on the same host makes every peer loopback. A listener bound off loopback refuses to
-  start with the default (`principal/check-bind!`). A configured authenticator replaces it;
-  a hosted one should not hand out the local principal at all.
+  (`:mcp-stdio`, `:mcp-tcp`, `:mcp-http`, `:web`, `:telegram`), `:bearer` (the credential: a
+  TCP connection's first line, `Authorization: Bearer`, the web's token cookie),
+  `:remote-addr` and `:headers` (for information only), `:local-token` when a listener was
+  given its own, for Telegram `:telegram/user`, `:telegram/chat-id` and `:telegram/owner?`.
+  nil refuses the caller: 401 over HTTP, an error (-32001) and a closed connection over TCP, a
+  refusal in Telegram.
+  The default, `principal/default-authenticate`, takes **credentials only**; where a request
+  comes from (loopback, a proxy's headers) grants nothing. The stdio transport of
+  `run-stdio` is its owner, the local principal. On TCP, HTTP and the web the local token
+  (`principal/local-token`, compared in constant time) is the local principal and a live run
+  token is its agent; anything else is refused. A Telegram sender is the local principal only
+  when the host names it as an owner (`:telegram {:owners [id "@name"]}`), `telegram/<id>`
+  when a non-empty allowlist lists it, else refused. A configured authenticator replaces the
+  default; a hosted one should hand out the local principal to nobody, and should map a bearer
+  it does not know through `principal/run-token-principal`, so dvergr's own agent runs
+  (`claude -p` candidates) keep their credentials.
 - **`:authorize`** `(fn [principal request] -> decision)`. `request` is `{:op :action :resource
   :resolved :args}`: the op (`:room/post`, or `:tool/clojure_eval` for a registry tool), its
   action (`:read`, `:write`, `:merge`, `:admin`), the resource as the caller named it (`[:room
@@ -421,16 +433,21 @@ Both eras of the protocol, decided per request, so one connection may carry both
   subscribe gets no notifications; a handshake connection gets list changes as before.
 
 **Streamable HTTP** (`dvergr.mcp.http`, `:mcp {:http {:port 17889}}` in the daemon config): one
-`POST /mcp` endpoint on its own loopback listener. Every request is authenticated from its
-`Authorization: Bearer <token>` (401 when refused; by default the token in
-`<state>/mcp/http-token`, mode 0600, created on first start); an `Origin` that is not loopback
-is refused (403). Stateless requests must carry
+`POST /mcp` endpoint on its own listener (loopback by default). Every request is
+authenticated from its `Authorization: Bearer <token>` (401 when refused; by default the
+local token, `<state>/local-token`, mode 0600, created on first start); an `Origin` that is not
+loopback is refused (403). Stateless requests must carry
 `MCP-Protocol-Version`, `Mcp-Method` and (for `tools/call`, `resources/read`) `Mcp-Name`
 matching the body (else 400, -32020); an unsupported version is 400 (-32022), an unknown method
 404. The response is JSON, or SSE for `subscriptions/listen` (an open stream with keep-alive
 comments) and for a long request with a `progressToken`; closing a stream cancels its request.
 Handshake clients get an `Mcp-Session-Id` from `initialize` (DELETE ends it); there is no GET
 stream (405).
+
+**TCP.** Newline-delimited JSON-RPC. The first line of a connection is its credential,
+`{"jsonrpc":"2.0","method":"dvergr/authenticate","params":{"token":"…"}}` (the local token or a
+run token, `server/tcp-auth-line`); a connection without one gets one error (-32001) and is
+closed.
 
 **The relay** (`bin/dvergr-mcp`) speaks both eras too: it forwards `server/discover` to the
 daemon (answering it itself, with the same versions, while the daemon starts), puts its

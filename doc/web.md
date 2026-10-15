@@ -18,6 +18,11 @@ clojure -M:cli --no-tui --web           # server box: no TUI
 clojure -M:cli --web --web-port 9090    # another port
 ```
 
+Like Jupyter, it prints a login URL, `[dvergr] web dashboard: http://127.0.0.1:17880/?token=…`:
+open it once; the token in it sets a cookie and the page reloads without it. The token is the
+daemon's local token, `$DVERGR_HOME/local-token`; `(:login-url (dvergr.web.server/start! …))`
+returns the same URL to a REPL.
+
 A daemon started any other way (as a library, `daemon/start!`) starts the server when its
 config has `:http`:
 
@@ -39,14 +44,19 @@ One server runs per process.
 ## Security stance
 
 Every request is authenticated through the daemon's `:authenticate` seam (transport `:web`;
-`doc/mcp.md` describes the seams and the principal). The seam sees the socket's peer, not
-http-kit's `:remote-addr` (which is the first `X-Forwarded-For` entry when that header is
-sent). The default admits a loopback peer that sends no forwarding header, as the local
-principal, and refuses anything else with 401; it refuses to start on a non-loopback bind. So
-without an authenticator of its own the server, JSON API included, answers loopback only. A
-proxied deployment configures an authenticator (a bearer token in `Authorization`, or what
-the proxy puts in a header, which only it can judge) and an `:authorize` seam. What a
-principal may do:
+`doc/mcp.md` describes the seams and the principal), from a credential alone: an
+`Authorization: Bearer` header, or the `dvergr_token` cookie. Where a request comes from
+grants nothing, loopback included. The default accepts the local token as the local
+principal and refuses anything else with 401:
+
+- `GET <path>?token=<token>` with a valid token answers 303 to `<path>` (the token is not in
+  the URL the browser keeps) and sets `dvergr_token` (HttpOnly, SameSite=Strict); a wrong one
+  is 401;
+- a script or curl sends `Authorization: Bearer $(cat $DVERGR_HOME/local-token)`.
+
+A cross-site page gets no credential: the cookie is SameSite=Strict, and the guard below
+stands besides. A proxied or hosted deployment configures an authenticator (its own
+credentials) and an `:authorize` seam. What a principal may do:
 
 - the **JSON API** and the dashboard's derived actions (`dvergr.web.ops`) run each op for the
   request's principal, authorized like every other surface (403 with `{"error": …}` when
@@ -58,7 +68,7 @@ principal may do:
   room pages, posts, voice, fragments) answers the local principal only, 403 for anyone
   else. `/api/health` answers anyone authenticated.
 
-Loopback keeps other machines out, but not the pages the user's own browser shows.
+The token keeps out whoever does not have it, but not the pages the user's own browser shows.
 `dvergr.web.guard` checks every request before it is routed:
 
 - **Host**: the request must name this server: a loopback name, the bind address, or an

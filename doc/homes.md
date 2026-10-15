@@ -34,7 +34,8 @@ interactive daemon does. The Claude Code setup token is per user too
   geschichte-workspace/       the fallback Geschichte workspace store (room-less sandboxes)
   workspace/                  the sandbox load root for room-less sandboxes (a clone of the sandbox stdlib)
   blobs/                      /drive blobs, unless :blob-store names another backend
-  mcp/http-token              the bearer token of the MCP Streamable HTTP endpoint (when :mcp :http is set)
+  local-token                 the owner's credential (mode 0600): MCP over TCP and HTTP, the web
+                              (a home from before keeps its mcp/http-token's value here)
   mcp/tools-*.edn             the stdio relay's tool cache (bin/dvergr-mcp)
   mcp-daemon.nrepl-port       written when bin/dvergr-mcp starts a daemon for itself
   logs/mcp-daemon.log         that daemon's log

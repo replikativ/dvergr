@@ -1072,6 +1072,10 @@
                     (start-fn daemon-with-tg :port port :ip ip
                               :allowed-hosts (:allowed-hosts http-config)
                               :allowed-origins (:allowed-origins http-config))
+                    ;; the token stays out of the log: it is in <home>/local-token
+                    (tel/log! {:level :info :id :daemon/web-login
+                               :data {:url (str "http://" ip ":" port "/?token=<" (paths/path "local-token") ">")}}
+                              "Web dashboard: open its URL with ?token= the content of the local-token file")
                     (assoc daemon-with-tg :http-server @@server-state-var)
                     (catch java.net.BindException e
                       (tel/log! {:level :warn

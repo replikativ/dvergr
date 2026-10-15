@@ -127,7 +127,7 @@ automatically (Datahike). Frontends are interchangeable over the one daemon:
 
 ```bash
 clojure -M:cli                 # daemon + nREPL(:7888) + TUI
-clojure -M:cli --no-tui --web  # server box: daemon + nREPL + web dashboard (127.0.0.1:17880)
+clojure -M:cli --no-tui --web  # server box: daemon + nREPL + web dashboard (prints its login URL, 127.0.0.1:17880/?token=…)
 ```
 
 **Standalone uberjar** — one file with daemon + nREPL + TUI + web + Telegram.
