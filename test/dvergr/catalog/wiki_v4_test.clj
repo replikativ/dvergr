@@ -238,3 +238,15 @@
   (testing "a quote on the index is checked too"
     (let [r (run (update (wiki (atom-page good-fm capacity-claim founded-claim)) "/wiki/index.md" str "> \"The plant delivers 987654 units a day\" [[plant#Capacity]]\n"))]
       (is (contains? (failing r) :quotes-faithful?)))))
+
+(deftest a-markdown-citation-with-a-title-is-a-citation
+  (let [claim (str/replace capacity-claim "> \"The plant delivers 500 units a day\" [[plant#Capacity]]"
+                           "> \"The plant delivers 500 units a day\" [source](/docs/plant.md#Capacity \"Capacity (2020)\")")
+        r (run (wiki (atom-page good-fm claim founded-claim)))]
+    (is (not (contains? (failing r) :every-claim-quoted?)) (str (failing r)))
+    (is (pos? (get-in r [:scores :quotes])))))
+
+(deftest a-fact-on-the-index-earns-no-coverage
+  (let [r (run (update (wiki (atom-page good-fm capacity-claim)) "/wiki/index.md" str
+                       "\n## Founded\nIt was founded in 1953 [[charter]].\n> \"founded in 1953 by forty households\" [[charter]]\n"))]
+    (is (contains? (failing r) :fact/founded))))

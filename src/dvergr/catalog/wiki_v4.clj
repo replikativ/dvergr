@@ -153,11 +153,25 @@
   (concat (for [[_ t h] (re-seq wikilink-re (str text))] {:target (str/trim t) :heading (some-> h str/trim not-empty) :kind :wiki})
           (for [[_ t h] (re-seq mdlink-re (str text))] {:target (str/trim t) :heading (some-> h str/trim not-empty) :kind :md})))
 
-(def ^:private quote-re
-  "A verbatim quote line: `> \"…\"` followed by its citations and nothing
-   else. A line with more text after the quote is prose, not a quote line, so
-   no statement hides behind a quote."
-  #"(?m)^>[ \t]*[\"“]([^\"”\n]+)[\"”][ \t]*((?:(?:\[\[[^\]\n]+\]\]|\[[^\]\n]*\]\([^)\n]*\))[ \t,;()]*)*)[ \t]*$")
+(def ^:private quote-line-re
+  "A line opening with a quote: `> \"…\"` and the rest of the line."
+  #"(?m)^>[ \t]*[\"“]([^\"”\n]+)[\"”]([^\n]*)$")
+
+(defn- citations-only?
+  "Whether the rest of a quote line is its citations and nothing else (links
+   parsed as `links` parses them, titles included; separators aside)."
+  [tail]
+  (str/blank? (-> (str tail)
+                  (str/replace #"\[\[([^\]|#]+)(?:#([^\]|]*))?(?:\|[^\]]*)?\]\]" "")
+                  (str/replace #"\[[^\]]*\]\(\s*<?([^)\s>#]+)(?:#([^)\s>]*))?>?(?:\s+\"[^\"]*\")?\s*\)" "")
+                  (str/replace #"[ \t,;()]" ""))))
+
+(defn- strip-quotes
+  "`text` without its quote lines: a line is one when the quote is followed by
+   its citations and nothing else; a line with more text after the quote is
+   prose, so no statement hides behind a quote."
+  [text]
+  (str/replace (str text) quote-line-re (fn [[whole _ tail]] (if (citations-only? tail) "" whole))))
 
 (def ^:private sources-line-re #"(?m)^\*\*Sources:\*\*.*$")
 
@@ -176,7 +190,8 @@
 (defn quotes
   "The verbatim quotes of `text`: `[{:quote q :citations [link …]}]`."
   [text]
-  (for [[_ q tail] (re-seq quote-re (str text))]
+  (for [[_ q tail] (re-seq quote-line-re (str text))
+        :when (citations-only? tail)]
     {:quote q :citations (vec (links tail))}))
 
 (defn prose
@@ -184,7 +199,7 @@
    labels (a link's target, such as `charter-1953.md`, is not a statement)."
   [text]
   (-> (str text)
-      (str/replace quote-re "")
+      strip-quotes
       (str/replace #"\[\[[^\]|]*\|([^\]]*)\]\]" "$1") ; an alias is visible text
       (str/replace #"\[\[[^\]]*\]\]" "")
       (str/replace #"\[([^\]]*)\]\([^)]*\)" "$1")))
@@ -281,7 +296,7 @@
     (-> (second (front-matter text))
         ;; quotes are attributed evidence, checked for fidelity on their own:
         ;; currency, grounding and copies judge the wiki's own words
-        (str/replace quote-re "")
+        strip-quotes
         (str/replace #"\[([^\]\n]*)\]\(\s*<?([^)\s>#]+)(?:#([^)\s>]*))?>?(?:\s+\"[^\"]*\")?\s*\)" md)
         (str/replace #"\[\[([^\]|#\n]+)(?:#([^\]|\n]*))?(?:\|([^\]\n]*))?\]\]" wiki))))
 
@@ -362,7 +377,7 @@
                                                    :relevant? (shares-evidence? (:quote q) pr)))))]
                             (assoc c :page p :id [p (:index c)] :prose pr
                                    ;; the claim's own citations: its text, quote lines aside
-                                   :cites (into #{} (keep #(doc-of p %)) (links (str/replace (:text c) quote-re "")))
+                                   :cites (into #{} (keep #(doc-of p %)) (links (strip-quotes (:text c))))
                                    :quotes qs))))
         quote-list (vec (for [c claim-list q (:quotes c)] (assoc q :page (:page c) :heading (:heading c) :claim (:id c))))
         unfaithful (vec (remove :faithful? quote-list))
@@ -410,6 +425,8 @@
                             (let [wanted (set (map #(str source "/" %) srcs))]
                               (when (some (fn [c]
                                             (and (not (contains? copied (:page c)))
+                                                 ;; the index navigates; v2 does not ground or copy-check it
+                                                 (not= index-path (:page c))
                                                  (some wanted (:cites c))
                                                  (every? #(#'wiki/term-in? (:prose c) %) terms)))
                                           claim-list)
