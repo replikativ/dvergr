@@ -51,29 +51,29 @@
   (is (nil? (cmd/match-builtins "hello"))))
 
 (deftest execute-non-command-passes-through
-  (is (= {:handled? false} (cmd/execute! "just a message" {}))))
+  (is (= {:handled? false} (cmd/execute! "just a message" {:principal dvergr.principal/local-principal}))))
 
 (deftest execute-help-notifies
   (let [seen (atom nil)
-        r (cmd/execute! "/help" {:available-tools []
+        r (cmd/execute! "/help" {:principal dvergr.principal/local-principal :available-tools []
                                  :notify! #(reset! seen %)})]
     (is (:handled? r))
     (is (:no-turn? r))
     (is (re-find #"(?s)Available commands" @seen))))
 
 (deftest execute-unknown-command
-  (let [r (cmd/execute! "/definitelynotacommand" {:available-tools []})]
+  (let [r (cmd/execute! "/definitelynotacommand" {:principal dvergr.principal/local-principal :available-tools []})]
     (is (:handled? r))
     (is (re-find #"Unknown command" (:reply r)))))
 
 (deftest execute-plan-sets-room-mode
   (let [room {:id :test-room}
         notified (atom nil)
-        r (cmd/execute! "/plan" {:available-tools [] :room room
+        r (cmd/execute! "/plan" {:principal dvergr.principal/local-principal :available-tools [] :room room
                                  :notify! #(reset! notified %)})]
     (is (:no-turn? r))
     (is (= :plan (cmd/room-mode :test-room)))
-    (cmd/execute! "/build" {:available-tools [] :room room :notify! identity})
+    (cmd/execute! "/build" {:principal dvergr.principal/local-principal :available-tools [] :room room :notify! identity})
     (is (= :build (cmd/room-mode :test-room)))))
 
 (deftest all-commands-and-execute-see-room-scope-skills-with-room-dir
@@ -96,7 +96,8 @@
               "with :room-dir, the room skill appears as /skill:roomskill"))
         (let [posted (atom nil)
               r (cmd/execute! "/skill:roomskill go"
-                              {:available-tools []
+                              {:principal dvergr.principal/local-principal
+                               :available-tools []
                                :room-dir (.getPath dir)
                                :post-user! #(reset! posted %)})]
           (is (:handled? r))

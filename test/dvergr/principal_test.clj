@@ -12,6 +12,10 @@
             [dvergr.room.registry :as rreg]
             [dvergr.room.store.memory :as memory]
             [dvergr.rooms :as rooms]
+            [dvergr.orchestration.daemon]
+            [dvergr.discourse.commands]
+            [dvergr.system.db]
+            [dvergr.substrate.paths]
             [dvergr.security.allowlist :as allowlist]
             [dvergr.tools :as tools]
             [org.replikativ.spindel.engine.context :as ctx]
@@ -42,7 +46,7 @@
 (def ^:private resource-like-keys
   "Argument names that point at something besides the room: an op taking one
    says explicitly what it acts on."
-  #{:agent :workflow :source :file :id :fork :parent :job})
+  #{:agent :agents :workflow :source :file :id :fork :parent :job :experiment :scorecard})
 
 (deftest writes-and-ops-naming-other-resources-declare-explicitly
   (doseq [[op {:keys [kind authz schema]}] (ops/operations)]
@@ -330,42 +334,20 @@
   (is (= [:global] ((:resource (ops/authz-decl :catalog/promote)) {:room "r"}))
       "promoting a verifier is trusted host-wide"))
 
-(deftest a-host-grants-what-its-principal-creates
-  (let [granted (atom [])
-        c (:execution-ctx (daemon nil))
-        dmn (assoc-in (daemon (constantly true)) [:config :auth :on-created]
-                      (fn [p r] (swap! granted conj [(:principal/id p) r])))]
-    (with-redefs [rooms/create-room! (fn [{:keys [slug]}]
-                                       (rreg/register! (d/make-room {:id (keyword slug) :ctx c :store (memory/make)}))
-                                       (keyword slug))]
-      (try
-        (ops/invoke dmn alice :room/create {:title "Mine" :slug "authz-mine"})
-        (is (= [["party/alice" [:room "authz-mine"]]] @granted))
-        (testing "the local principal needs no grant"
-          (ops/invoke dmn principal/local-principal :room/create {:title "Ours" :slug "authz-ours"})
-          (is (= 1 (count @granted))))
-        (testing "a grant that fails fails the op, loudly"
-          (let [e (try (ops/invoke (assoc-in dmn [:config :auth :on-created] (fn [& _] (throw (ex-info "no" {}))))
-                                   alice :room/create {:title "X" :slug "authz-x"})
-                       nil
-                       (catch clojure.lang.ExceptionInfo e e))]
-            (is (re-find #"could not grant" (ex-message e)))))
-        (finally
-          (binding [ec/*execution-context* c]
-            (doseq [k [:authz-mine :authz-ours :authz-x]]
-              (when-let [r (rreg/lookup k)]
-                (rreg/unregister! k) (d/close-room! r)))))))))
-
 (deftest an-agents-turn-runs-its-tool-calls-as-the-agent
   ;; the real path: an llm-agent in a room, its turn (chat.agent) asking the
   ;; model, which calls a tool; the tool call is authorized as that agent on
   ;; that room before it runs
   (let [seen (atom [])
+        asked (promise)
         calls (atom 0)
         r (d/make-room {:id :authz-turn :store (memory/make)})
         tool-call {:id "t1" :name "read_file" :input {:path "/nothing-here"}}]
     (try
-      (principal/configure! {:authorize (fn [p req] (swap! seen conj [p (dissoc req :args)]) false)})
+      (principal/configure! {:authorize (fn [p req]
+                                          (swap! seen conj [p (dissoc req :args)])
+                                          (deliver asked true)
+                                          false)})
       (with-redefs [dvergr.chat.agent/messages->api-format (fn [messages _ _] messages)
                     dvergr.model.chat/chat (fn [& _]
                                              (if (= 1 (swap! calls inc))
@@ -378,8 +360,7 @@
         (binding [ec/*execution-context* (:ctx r)]
           (sp/spawn! (sp/spin (sp/await (d/ask r :worker {:content "read it"})))))
         (do
-          (is (loop [n 0] (cond (seq @seen) true (< n 1500) (do (Thread/sleep 20) (recur (inc n))) :else false))
-              "the turn reached the authorizer")))
+          (is (true? (deref asked 30000 ::timeout)) "the turn reached the authorizer")))
       (let [[p req] (first @seen)]
         (is (= (principal/agent-principal :worker) p))
         (is (= {:op :tool/read_file :action :read :resource [:room "authz-turn"] :resolved {:room "authz-turn"}}
@@ -387,3 +368,105 @@
       (finally
         (principal/configure! {})
         (d/close-room! r)))))
+
+;; ---------------------------------------------------------------------------
+;; Creating: never someone else's room, and a failed grant can be retried
+
+(defmacro ^:private with-system-db
+  "Run `body` against a fresh system DB under a temporary home."
+  [& body]
+  `(let [prev# (dvergr.substrate.paths/home)]
+     (dvergr.substrate.paths/set-home! (str (System/getProperty "java.io.tmpdir") "/dvergr-principal-test-" (random-uuid)))
+     (dvergr.system.db/reset-conn!)
+     (try ~@body
+          (finally (dvergr.system.db/reset-conn!) (dvergr.substrate.paths/set-home! prev#)))))
+
+(deftest a-create-never-hands-over-an-existing-room
+  (with-system-db
+    (let [granted (atom [])
+          fail? (atom false)
+          c (:execution-ctx (daemon nil))
+          dmn (assoc-in (daemon (constantly true)) [:config :auth :on-created]
+                        (fn [p r] (when @fail? (throw (ex-info "grant store down" {})))
+                          (swap! granted conj [(:principal/id p) r])))
+          made (atom 0)]
+      (with-redefs [rooms/create-room! (fn [{:keys [slug title]}]
+                                         (swap! made inc)
+                                         (dvergr.system.db/create-room! {:slug slug :name title})
+                                         (when-not (rreg/lookup (keyword slug))
+                                           (rreg/register! (d/make-room {:id (keyword slug) :ctx c :store (memory/make)})))
+                                         (keyword slug))]
+        (try
+          (testing "a failed grant fails the create; the same call again grants it"
+            (reset! fail? true)
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo #"same call again"
+                                  (ops/invoke dmn alice :room/create {:title "A" :slug "authz-a"})))
+            (reset! fail? false)
+            (ops/invoke dmn alice :room/create {:title "A" :slug "authz-a"})
+            (is (= [["party/alice" [:room "authz-a"]]] @granted))
+            (is (= 1 @made) "the retry granted, it did not create again"))
+          (testing "another principal's create of that slug is refused, and grants nothing"
+            (let [e (try (ops/invoke dmn bob :room/create {:title "mine now" :slug "authz-a"}) nil
+                         (catch clojure.lang.ExceptionInfo e e))]
+              (is (= 409 (ops/error-status e)))
+              (is (= 1 (count @granted)))))
+          (testing "an existing room created by the process is nobody's to claim"
+            (ops/invoke dmn principal/local-principal :room/create {:title "L" :slug "authz-l"})
+            (is (= 1 (count @granted)) "the local principal needs no grant")
+            (is (= 409 (ops/error-status (try (ops/invoke dmn alice :room/create {:title "L" :slug "authz-l"}) nil
+                                              (catch clojure.lang.ExceptionInfo e e))))))
+          (testing "the agents a create joins are put to work"
+            (let [[seen authz] (recorder (constantly true))]
+              (ops/authorize! (daemon authz) alice :room/create {:title "x" :agents ["var" "huginn"]})
+              (is (= #{[:write [:global] nil] [:write [:agent "var"] nil] [:write [:agent "huginn"] nil]}
+                     (set @seen)))))
+          (finally
+            (binding [ec/*execution-context* c]
+              (doseq [k [:authz-a :authz-l]]
+                (when-let [r (rreg/lookup k)] (rreg/unregister! k) (d/close-room! r))))))))))
+
+(deftest a-principal-opens-its-own-dm-with-an-agent
+  (with-system-db
+    (let [opened (atom [])
+          c (:execution-ctx (daemon nil))]
+      (with-redefs [dvergr.orchestration.daemon/ensure-agent-room!
+                    (fn [_ agent-id & [{:keys [slug]}]]
+                      (let [slug (or slug (str "dm-" (name agent-id)))]
+                        (swap! opened conj slug)
+                        (dvergr.system.db/create-room! {:slug slug :name slug})
+                        (or (rreg/lookup (keyword slug))
+                            (doto (d/make-room {:id (keyword slug) :ctx c :store (memory/make)}) rreg/register!))))]
+        (try
+          (let [dmn (daemon (constantly true))]
+            (ops/invoke dmn alice :agent/open {:id "var"})
+            (ops/invoke dmn bob :agent/open {:id "var"})
+            (ops/invoke dmn principal/local-principal :agent/open {:id "var"})
+            (let [[a b l] @opened]
+              (is (= "dm-var" l) "the local user keeps the shared DM")
+              (is (not= a b) "each principal its own")
+              (is (every? #(re-matches #"dm-var-[0-9a-f]{8}" %) [a b]))))
+          (finally
+            (binding [ec/*execution-context* c]
+              (doseq [s @opened]
+                (when-let [r (rreg/lookup (keyword s))] (rreg/unregister! (keyword s)) (d/close-room! r))))))))))
+
+(deftest a-forged-local-is-refused-by-decide-itself
+  (is (false? (:allow? (principal/decide {:config {:auth {:authorize (constantly true)}}}
+                                         {:principal/id :local :principal/kind :local}
+                                         {:op :room/list :action :read :resource [:global]})))
+      "even an authorizer that allows everything is not asked"))
+
+(deftest commands-run-for-their-principal
+  (let [cmd (requiring-resolve 'dvergr.discourse.commands/execute!)
+        action (requiring-resolve 'dvergr.discourse.commands/command-action)]
+    (is (= :read (action {:name "help" :kind :builtin})))
+    (is (= :admin (action {:name "model" :kind :builtin})))
+    (is (= :write (action {:name "x" :kind :prompt})))
+    (is (= :admin (action {:name "x" :kind :handler})))
+    (is (re-find #"runs for nobody" (:reply (cmd "/model x" {:available-tools []}))))
+    (try
+      (principal/configure! {:authorize (fn [_ r] (= :read (:action r)))})
+      (is (re-find #"Not authorized" (:reply (cmd "/model x" {:principal bob :available-tools []}))))
+      (is (not (re-find #"Not authorized" (str (:reply (cmd "/help" {:principal bob :available-tools []
+                                                                     :notify! identity}))))))
+      (finally (principal/configure! {})))))

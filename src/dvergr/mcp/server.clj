@@ -470,7 +470,8 @@
   [principal uri send-fn]
   (let [dmn (current-daemon)
         m (uri->op+args uri)]
-    (when-not (and m (shown? principal (:op m)) (or (nil? dmn) (may-read-uri? dmn principal uri)))
+    ;; authorized with or without a daemon: without one, only the local principal reads
+    (when-not (and m (shown? principal (:op m)) (may-read-uri? dmn principal uri))
       (throw (ex-info (str "Resource not found or not readable: " uri)
                       {:json-rpc/code -32002 :json-rpc/data {:uri uri}}))))
   (swap! resource-subs update uri (fnil assoc {}) send-fn principal)
@@ -554,7 +555,7 @@
   [principal send-fn {:keys [id params]}]
   (let [{:keys [toolsListChanged resourceSubscriptions]} (:notifications params)
         dmn (current-daemon)
-        uris (vec (filter #(and (uri->op+args %) (or (nil? dmn) (may-read-uri? dmn principal %)))
+        uris (vec (filter #(and (uri->op+args %) (may-read-uri? dmn principal %))
                           resourceSubscriptions))
         accepted (cond-> {}
                    (true? toolsListChanged) (assoc :toolsListChanged true)

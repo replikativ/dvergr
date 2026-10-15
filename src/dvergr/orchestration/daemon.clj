@@ -646,22 +646,24 @@
    This is the in-process analogue of `ensure-dm-room!`: the venue is the
    agent itself (slug `dm-<agent>`), the transcript is persistent so the
    agent rehydrates its context from the room log, and a rich frontend
-   renders by observing the room bus (no egress Participant)."
-  [daemon agent-id]
-  (binding [rtc/*execution-context* (:execution-ctx daemon)]
-    (let [slug    (str "dm-" (name agent-id))
-          room-id (rstore/slug->room-id slug)
-          room    (or (rreg/lookup room-id)
-                      (do (rooms/create-room!
-                           {:title (str "Chat with " (name agent-id))
-                            :slug  slug
-                            :type  :dm
-                            :ctx   (:execution-ctx daemon)})
-                          (rreg/lookup room-id)))]
-      (when (and room agent-id)
-        (when-let [cfg (agent-join-config daemon agent-id)]
-          (join-agent-to-room! daemon (resolve-safe-config cfg) room)))
-      room)))
+   renders by observing the room bus (no egress Participant). `:slug` names
+   another room (a principal's own DM with the agent, `agent_open`)."
+  ([daemon agent-id] (ensure-agent-room! daemon agent-id nil))
+  ([daemon agent-id {:keys [slug]}]
+   (binding [rtc/*execution-context* (:execution-ctx daemon)]
+     (let [slug    (or slug (str "dm-" (name agent-id)))
+           room-id (rstore/slug->room-id slug)
+           room    (or (rreg/lookup room-id)
+                       (do (rooms/create-room!
+                            {:title (str "Chat with " (name agent-id))
+                             :slug  slug
+                             :type  :dm
+                             :ctx   (:execution-ctx daemon)})
+                           (rreg/lookup room-id)))]
+       (when (and room agent-id)
+         (when-let [cfg (agent-join-config daemon agent-id)]
+           (join-agent-to-room! daemon (resolve-safe-config cfg) room)))
+       room))))
 
 ;; ============================================================================
 ;; Daemon Lifecycle

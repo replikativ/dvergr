@@ -236,8 +236,15 @@
   "Ask the authorizer of `daemon` about `request` for `principal`:
    `{:allow? bool :reason str}`. The local principal is always allowed."
   [daemon principal request]
-  (if (local? principal)
+  (cond
+    (local? principal)
     {:allow? true}
+
+    ;; claims to be the process without being it: never asked, never allowed
+    (forged-local? principal)
+    {:allow? false :reason "A principal of kind :local that is not the process's is refused"}
+
+    :else
     (let [answer (try ((authorizer (:config daemon)) principal request)
                       (catch Exception e {:allow? false :reason (str "authorizer failed: " (ex-message e))}))
           allow? (if (map? answer) (true? (:allow? answer)) (true? answer))]

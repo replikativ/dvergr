@@ -122,25 +122,30 @@
 (deftest a-subscription-ends-when-its-access-does
   (let [c (session alice {:dvergr/profile "admin"})
         uri "experiment://mcp-authz-open/progress"
-        updates #(filter (fn [m] (= "notifications/resources/updated" (:method m))) @(::sent c))
+        updated? #(some (fn [m] (= "notifications/resources/updated" (:method m))) %)
+        notified (promise)
+        dropped (promise)
+        subs @#'server/resource-subs
         room (binding [ec/*execution-context* *ctx*] (rreg/lookup :mcp-authz-open))
         change! #(binding [ec/*execution-context* *ctx*]
-                   (run/finish! (:run/id (run/start! room :worker (random-uuid) nil)) :completed))
-        wait-for (fn [pred] (loop [n 0] (cond (pred) true (< n 100) (do (Thread/sleep 20) (recur (inc n))) :else false)))]
+                   (run/finish! (:run/id (run/start! room :worker (random-uuid) nil)) :completed))]
     (testing "bob may not subscribe at all"
       (is (= -32002 (get-in (json-rpc/handle-message (session bob {:dvergr/profile "admin"})
                                                      {:jsonrpc "2.0" :id 7 :method "resources/subscribe"
                                                       :params {:uri uri}})
                             [:error :code]))))
+    (add-watch (::sent c) ::notified (fn [_ _ _ sent] (when (updated? sent) (deliver notified true))))
     (json-rpc/handle-message c {:jsonrpc "2.0" :id 7 :method "resources/subscribe" :params {:uri uri}})
+    (is (contains? (get @subs uri) (:send-fn c)))
     (change!)
-    (is (wait-for #(seq (updates))) "alice is notified")
+    (is (true? (deref notified 30000 ::timeout)) "alice is notified")
+    ;; revoked: the next emit asks again, is refused, and drops the subscriber
+    (add-watch subs ::dropped (fn [_ _ _ now] (when-not (contains? (get now uri) (:send-fn c))
+                                                (deliver dropped true))))
     (reset! authorize (constantly false))
-    (Thread/sleep 400)
-    (let [n (count (updates))]
-      (change!)
-      (Thread/sleep 600)
-      (is (= n (count (updates))) "revoked: no more notifications, re-checked at emit"))))
+    (change!)
+    (is (true? (deref dropped 30000 ::timeout)) "re-checked at emit: the subscriber is dropped")
+    (remove-watch subs ::dropped)))
 
 ;; ---------------------------------------------------------------------------
 ;; Over HTTP

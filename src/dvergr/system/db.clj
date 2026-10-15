@@ -65,6 +65,9 @@
    {:db/ident :room/db-scope :db/valueType :db.type/string  :db/cardinality :db.cardinality/one} ; own message DB
    {:db/ident :room/parties  :db/valueType :db.type/ref     :db/cardinality :db.cardinality/many} ; members
    {:db/ident :room/created  :db/valueType :db.type/instant :db/cardinality :db.cardinality/one}
+   ;; the principal (dvergr.principal) a room was created for over an op, as pr-str of
+   ;; its id; set once (`claim-room!`), so a retry of that create is that principal's alone
+   {:db/ident :room/creator  :db/valueType :db.type/string  :db/cardinality :db.cardinality/one}
    ;; RF5 S4: the room REGISTRY lives here (system-db) — these are the fields the
    ;; in-memory Room + UI need that aren't otherwise derivable. `parent-slug` keeps
    ;; the hierarchy as a plain slug (no chat-id impedance); telegram-chat-id keys
@@ -273,6 +276,17 @@
 
 (defn room-by-slug [slug]
   (d/q '[:find (pull ?e [*]) . :in $ ?s :where [?e :room/slug ?s]] @(get-conn) slug))
+
+(defn claim-room!
+  "Record `creator` (a string) as the creator of room `slug`, unless one is
+   recorded already. Returns the creator now recorded: `creator` when this
+   claim won, another when the room was someone else's, nil for no room."
+  [slug creator]
+  (let [conn (get-conn)]
+    (when-let [e (d/q '[:find ?e . :in $ ?s :where [?e :room/slug ?s]] @conn slug)]
+      (try (d/transact conn [[:db/cas e :room/creator nil creator]])
+           (catch Exception _ nil))
+      (:room/creator (d/pull @conn [:room/creator] e)))))
 
 (defn room-by-telegram-id
   "Registry row for a Telegram chat-id, or nil."

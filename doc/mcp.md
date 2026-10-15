@@ -137,12 +137,22 @@ naming one), or, for a host that runs dvergr's rooms without a daemon, process-w
   that throws. The default, `principal/allow-all`, allows everything.
 - **`:on-created`** `(fn [principal resource])`, called after a principal other than the local
   one created a room (`room_create`, `room_fork`, `room_import`, `agent_open`, a catalog
-  fixture room) or an agent (`agent_create`), so the host can grant it its creator. A throw
-  fails the op with a 500 that says the thing exists.
+  fixture room) or an agent (`agent_create`), so the host can grant it its creator. It may be
+  called again for the same principal and resource: make it idempotent. When it throws, the
+  op fails (500) and is recoverable: a fork or an agent whose grant failed is removed again
+  (a retry creates it anew); a room from `room_create` or `room_import` stays, recorded as
+  that principal's (`:room/creator` in the system DB), and the same call by the same
+  principal grants it again instead of answering "exists". A catalog fixture room whose grant
+  failed stays ungranted; each benchmark makes a new one.
+
+A principal never receives a room it did not create: `room_create` and `room_import` refuse
+an existing slug (409) unless that principal created it, and `agent_open` gives each
+principal other than the local one a DM room of its own (`dm-<agent>-<hash>`; the local
+user keeps the shared `dm-<agent>`).
 
 The local principal is the process itself and is never asked. It is recognized by identity
-(an unforgeable marker), not by `:principal/kind`: `invoke` refuses a principal that claims
-kind `:local` without being it.
+(an unforgeable marker), not by `:principal/kind`: `principal/decide` and `invoke` refuse a
+principal that claims kind `:local` without being it, without asking the authorizer.
 
 What each op acts on is declared in `dvergr.ops/specification`, `:authz {:action :resource
 :also :filter}`. Every write declares it; a read with a `room` argument may leave it to the
@@ -180,7 +190,11 @@ belongs to the principal that opened it: another principal holding its `Mcp-Sess
 404.
 
 `room_post` posts as the principal (`principal/actor`); its `as` is for the local principal
-only, and refused for anyone else. `dvergr.ops/invoke` takes the principal explicitly; there is
+only, and refused for anyone else. Slash commands (`dvergr.discourse.commands`) run for the
+`:principal` their host passes and are authorized on their room as `:command/<name>`:
+`/help` reads, a prompt or skill writes (it posts a turn), a handler and every other
+built-in (`/model`, `/sandbox`, `/build`, `/fork`, `/invite`) is `:admin`; a command without
+a principal is refused. `dvergr.ops/invoke` takes the principal explicitly; there is
 no default. In-process code that holds the daemon (the REPL, the TUI, `room-run`, the
 experiment runner) passes `principal/local-principal`. A Telegram message is authenticated
 once; its ops commands, tool commands and posts all run for that principal.

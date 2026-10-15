@@ -691,6 +691,13 @@
               ;; their ops behaviour) and before agent addressing. Authz is the
               ;; bot allowlist already enforced above; executing tool-commands
               ;; add their own finer gate (step 3).
+                ;; a command posts (a prompt) or changes the room: no
+                ;; command for whoever may not post there; each command is
+                ;; then authorized on its own (`commands/command-action`)
+                (and (commands/command-input? text)
+                     (not (may-post? (ensure-room chat-id default-agent))))
+                (reply! "Access denied: you may not post in this chat's room.")
+
                 (commands/command-input? text)
                 (let [room      (ensure-room chat-id default-agent)
                       notified? (volatile! false)

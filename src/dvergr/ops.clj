@@ -50,6 +50,7 @@
             [dvergr.resource :as resource]
             [dvergr.agent.fields :as fields]
             [dvergr.rooms :as rooms]
+            [dvergr.system.db :as sdb]
             [dvergr.rooms.files :as room-files]
             [dvergr.rooms.forks :as forks]
             [dvergr.rooms.repo :as room-repo]
@@ -93,17 +94,54 @@
 (defn- created!
   "Tell the host that the calling principal created `resource` (`:on-created`,
    `dvergr.principal`), so it can grant its creator. Returns `resource`. Not
-   for the local principal, which needs no grant."
-  [daemon resource]
+   for the local principal, which needs no grant. When the grant fails,
+   `undo` (if given) removes what was created, and the op fails; without
+   `undo` the creation stays and a retry of the same op by the same
+   principal grants again (`creation`)."
+  ([daemon resource] (created! daemon resource nil))
+  ([daemon resource undo]
+   (let [p *principal*]
+     (when (and p (not (principal/local? p)))
+       (when-let [f (principal/on-created (:config daemon))]
+         (try (f p resource)
+              (catch Exception e
+                (when undo
+                  (try (undo)
+                       (catch Exception u
+                         (tel/log! {:level :error :id ::undo-failed
+                                    :data {:resource resource :error (ex-message u)}}))))
+                (op-error! (str (if undo "Not created: " (str "Created " (pr-str resource) ", but "))
+                                "the host could not grant " (pr-str resource) " to its creator: " (ex-message e)
+                                (when-not undo "; the same call again grants it"))
+                           ::created-ungranted 500 {:resource resource})))))
+     resource)))
+
+(defn- creator-of [p] (pr-str (:principal/id p)))
+
+(defn- creation
+  "How the calling principal's create of room `slug` goes: `:new` (no such
+   room), `:retry` (this principal created it before, over an op: grant it
+   again and return it), else a 409, whoever made it. The local principal
+   keeps the old idempotent create (`:new`)."
+  [slug]
+  (let [p *principal*]
+    (if (or (nil? p) (principal/local? p))
+      :new
+      (if-let [row (sdb/room-by-slug slug)]
+        (if (= (:room/creator row) (creator-of p))
+          :retry
+          (op-error! (str "Room " slug " exists") ::room-exists 409 {:room slug}))
+        :new))))
+
+(defn- claim!
+  "Record the calling principal as creator of the new room `slug`; a 409
+   when a concurrent create claimed it first."
+  [slug]
   (let [p *principal*]
     (when (and p (not (principal/local? p)))
-      (when-let [f (principal/on-created (:config daemon))]
-        (try (f p resource)
-             (catch Exception e
-               (op-error! (str "Created " (pr-str resource) ", but the host could not grant it to its creator: "
-                               (ex-message e))
-                          ::created-ungranted 500 {:resource resource})))))
-    resource))
+      (let [c (sdb/claim-room! slug (creator-of p))]
+        (when-not (= c (creator-of p))
+          (op-error! (str "Room " slug " was created by another call") ::room-exists 409 {:room slug}))))))
 
 (defn- id->str
   "Room/actor ids are keywords (built-ins) OR UUIDs (created rooms) — both → string."
@@ -736,6 +774,7 @@
               "Paired comparisons: every pair of candidates (or each against `baseline`; beyond five "
               "candidates each against the best) on the cases both have a verdict for, with the exact "
               "McNemar p (Holm-adjusted) and a verdict; also as data in `paired`.")
+    :authz {:action :read} ; `experiment`/`scorecard` are looked up in `room` only
     :kind :read
     :schema [:map [:room Room]
              [:scorecard {:optional true} [:string {:description "scorecard content id"}]]
@@ -1036,6 +1075,7 @@
 
    :scorecard/list
    {:doc "Completed Scorecards of a room, newest first, each with its leaderboard (candidates ranked by reward, then cost per pass)."
+    :authz {:action :read} ; `experiment`/`scorecard` are looked up in `room` only
     :kind :read
     :schema [:map [:room Room]
              [:limit {:optional true} [:int {:description "max scorecards (default 20)"}]]
@@ -1187,8 +1227,11 @@
                         {:posted true :room (id->str (:id r))}))))}
 
    :room/create
-   {:doc "Create a new room."
-    :authz {:action :write :resource on-global}
+   {:doc (str "Create a new room. An existing slug is refused (409), except that the principal "
+              "that created it may call again (its creator grant is made again).")
+    :authz {:action :write :resource on-global
+            ;; the agents it joins are put to work
+            :also (fn [_ {:keys [agents]}] (mapv (fn [a] [:write [:agent a]]) agents))}
     :kind :write
     :schema [:map [:title :string]
              [:slug {:optional true} :string]
@@ -1196,11 +1239,14 @@
     :impl (fn [daemon {:keys [title slug agents]}]
             (in-ctx daemon
                     (let [sl (or slug (slugify title))]
-                ;; create-room! returns the room-id keyword; look the live Room up.
-                      (rooms/create-room! (cond-> {:title title :slug sl}
-                                            agents (assoc :agent-ids (mapv keyword agents))))
-                      (doto (room-data (rreg/lookup (keyword sl)))
-                        (#(created! daemon [:room (:id %)]))))))}
+                      (when (= :new (creation sl))
+                        ;; create-room! returns the room-id keyword; look the live Room up.
+                        (rooms/create-room! (cond-> {:title title :slug sl}
+                                              agents (assoc :agent-ids (mapv keyword agents))))
+                        (claim! sl))
+                      (let [rd (room-data (rreg/lookup (keyword sl)))]
+                        (created! daemon [:room (or (:id rd) sl)])
+                        rd))))}
 
    :room/delete
    {:doc (str "Delete a room: close it and archive it, so it is neither listed nor started again. "
@@ -1439,8 +1485,11 @@
     :schema [:map [:room Room]]
     :impl (fn [daemon {:keys [room]}]
             (when-let [r (resolve-room daemon room)]
-              (doto (room-result daemon (in-ctx daemon (forks/fork! r)))
-                (#(created! daemon [:room (:id %)])))))}
+              (let [f (room-result daemon (in-ctx daemon (forks/fork! r)))]
+                ;; a fork whose grant failed is discarded: a retry forks anew
+                (created! daemon [:room (:id f)]
+                          #(in-ctx daemon (some-> (resolve-room daemon (:id f)) forks/discard!)))
+                f)))}
 
    :room/merge
    {:doc "Reconcile-merge a fork back into its parent. Pass `expect-state` (from room_review or a workflow attempt's review) to merge only the state that was reviewed: a fork that changed since is refused."
@@ -1528,8 +1577,11 @@
              [:title {:optional true} :string]
              [:branch {:optional true} [:string {:description "branch of a local checkout (default: its current one)"}]]]
     :impl (fn [daemon {:keys [room source title branch]}]
-            (doto (in-ctx daemon (room-repo/import-room! {:slug room :title title :source source :branch branch}))
-              ((fn [_] (created! daemon [:room (or (some-> (resolve-room daemon room) :id id->str) room)])))))}
+            (let [grant! #(created! daemon [:room (or (some-> (resolve-room daemon room) :id id->str) room)])]
+              (if (= :retry (creation room))
+                (do (grant!) {:room room :retried true})
+                (doto (in-ctx daemon (room-repo/import-room! {:slug room :title title :source source :branch branch}))
+                  ((fn [_] (claim! room) (grant!)))))))}
 
    :room/export
    {:doc (str "The room's changes since room_import, as a patch for `git apply` in the source checkout "
@@ -1577,7 +1629,9 @@
                                    daemon (assoc fields :id kid))
                           (op-error! (str "Could not create agent " id ": no system database")
                                      ::create-failed 500 {:id id}))
-                        (created! daemon [:agent id])
+                        (created! daemon [:agent id]
+                                  ;; an agent whose grant failed is removed: a retry creates it anew
+                                  #(aops/delete-agent! kid))
                         {:created id}))))}
 
    :agent/update
@@ -1600,11 +1654,22 @@
     :kind :write
     :schema [:map [:id AgentId]]
     :impl (fn [daemon {:keys [id]}]
-            (some-> (room-result daemon
+            ;; the local user shares the agent's DM room `dm-<agent>`; any other
+            ;; principal gets one of its own, so nobody reads another's transcript
+            (let [p *principal*
+                  own? (and p (not (principal/local? p)))
+                  slug (when own?
+                         (str "dm-" (name (keyword id)) "-"
+                              (subs (str (java.util.UUID/nameUUIDFromBytes (.getBytes (creator-of p) "UTF-8"))) 0 8)))
+                  r (room-result daemon
                                  (in-ctx daemon
                                          ((requiring-resolve 'dvergr.orchestration.daemon/ensure-agent-room!)
-                                          daemon (keyword id))))
-                    (doto (#(created! daemon [:room (:id %)])))))}
+                                          daemon (keyword id) (when own? {:slug slug}))))]
+              (when (and r own?)
+                (claim! slug)
+                ;; its own room by construction: granted on every open (idempotent)
+                (created! daemon [:room (:id r)]))
+              r))}
 
    :room/invite
    {:doc "Invite (join) an agent into a room."

@@ -220,12 +220,13 @@
       ;; Room apps — static serving of <room worktree>/app (see dvergr.web.apps),
       ;; for whoever may read the room
         (str/starts-with? uri "/apps/")
-        ;; decoded as dvergr.web.apps decodes it, so the room authorized is the room served
-        (let [slug (some-> (second (re-find #"^/apps/([^/]+)" uri)) (java.net.URLDecoder/decode "UTF-8"))]
-          (try (dops/authorize! daemon principal :room/read {:room slug :path "/app"})
-               (web-apps/handle req daemon)
-               (catch clojure.lang.ExceptionInfo e
-                 (json-response (dops/error-status e) {:error (ex-message e)}))))
+        ;; authorized on the very room row web-apps resolves and then serves
+        (try (web-apps/handle req daemon
+                              (fn [row slug]
+                                (dops/authorize! daemon principal :room/read
+                                                 {:room (or (:room/slug row) slug) :path "/app"})))
+             (catch clojure.lang.ExceptionInfo e
+               (json-response (dops/error-status e) {:error (ex-message e)})))
 
         (= uri "/api/health")               (api-health req daemon)
 

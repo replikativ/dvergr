@@ -24,6 +24,9 @@
 
      :argv         parsed argument vector (after the command name)
      :args-str     raw argument string (everything after the name)
+     :principal    who typed the command (`dvergr.principal`; required: a
+                   command without one is refused). Each command is
+                   authorized for it on the room (`command-action`)
      :room         the current Room (may be nil)
      :agent-id     the focused agent keyword (may be nil)
      :daemon       the daemon map (for built-ins that need it)
@@ -41,7 +44,8 @@
 
    `execute!` returns {:handled? bool :no-turn? bool :reply <string-or-nil>}."
   (:require [clojure.string :as str]
-            [dvergr.orchestration.skills :as skills]))
+            [dvergr.orchestration.skills :as skills]
+            [dvergr.principal :as principal]))
 
 ;; ============================================================================
 ;; Registry
@@ -239,6 +243,39 @@
     (when post-user! (post-user! body))
     {:handled? true :no-turn? false}))
 
+(def ^:private read-commands
+  "Built-ins that only show something."
+  #{"help" "commands" "worktree"})
+
+(defn command-action
+  "What command `cmd` does to its room, for the authorizer: `:read` for the
+   built-ins that only show something; `:read` for an agent-scoped tool
+   command too, whose tool call is authorized on its own (`dvergr.tools`);
+   `:write` for a prompt or a skill (they post a turn); `:admin` for a
+   handler (it evaluates Clojure) and every other built-in (/model,
+   /sandbox, /build, /fork, /invite change the agent or the room)."
+  [cmd]
+  (cond
+    (:authz-action cmd) (:authz-action cmd)
+    (contains? read-commands (:name cmd)) :read
+    (= :tool (:kind cmd)) :read
+    (#{:prompt :skill} (:kind cmd)) :write
+    :else :admin))
+
+(defn- refusal
+  "Why `principal` may not run `cmd` in `room`, or nil."
+  [principal cmd room]
+  (if-not principal
+    "This command runs for nobody: the host passed no :principal"
+    (let [rid (some-> (:id room) (#(if (keyword? %) (name %) (str %))))
+          {:keys [allow? reason]}
+          (principal/decide (principal/current-daemon) principal
+                            {:op (keyword "command" (str (:name cmd)))
+                             :action (command-action cmd)
+                             :resource (if rid [:room rid] [:global])
+                             :resolved (when rid {:room rid})})]
+      (when-not allow? reason))))
+
 (defn execute!
   "Parse `text`, resolve the command, run it with host `ctx`. Returns
    {:handled? bool :no-turn? bool :reply <string-or-nil>}; :handled? false means
@@ -252,6 +289,9 @@
         {:handled? true :no-turn? true
          :reply (str "Unknown command /" (:name parsed)
                      ". Try /help.")}
+
+        (refusal (:principal ctx) cmd (:room ctx))
+        {:handled? true :no-turn? true :reply (refusal (:principal ctx) cmd (:room ctx))}
 
         (:run cmd)        ((:run cmd) ctx*)         ; :builtin
         (= :prompt  (:kind cmd)) (run-prompt!  cmd ctx*)
