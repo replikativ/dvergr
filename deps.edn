@@ -32,8 +32,9 @@
         ;; Dvergr uses the async sequence/CPS namespaces directly; keep this a
         ;; direct dependency instead of relying on Spindel's implementation deps.
         ;; partial-cps moved to org.replikativ (namespaces unchanged:
-        ;; is.simm.partial-cps.*); the old is.simm jar is excluded from every
-        ;; dependency that still pulls it, so one copy is on the classpath.
+        ;; is.simm.partial-cps.*). Every released dependency now depends on it;
+        ;; only the :local checkouts below still exclude the old is.simm jar,
+        ;; for checkouts that predate the move.
         org.replikativ/partial-cps {:mvn/version "0.1.68"}
 
         ;; Spindel — Reactive runtime with CoW forking.
@@ -119,8 +120,7 @@
         ;; Geschichte — authoritative virtual filesystem + Git compatibility.
         ;; Geschichte remains the authoritative virtual filesystem; its
         ;; Yggdrasil adapter lives only in Yggdrasil.
-        org.replikativ/geschichte  {:mvn/version "0.1.17"
-                                    :exclusions  [is.simm/partial-cps]}
+        org.replikativ/geschichte  {:mvn/version "0.1.19"}
 
         ;; rewrite-clj for structural editing
         rewrite-clj/rewrite-clj    {:mvn/version "1.1.48"}
@@ -128,8 +128,7 @@
         ;; Datahike — persistent Datalog storage
         ;; Keep the direct dependency current: Dvergr uses Datahike's API and
         ;; transaction predicates itself, not merely through Geschichte.
-        org.replikativ/datahike    {:mvn/version "0.8.1903"
-                                    :exclusions  [is.simm/partial-cps]}
+        org.replikativ/datahike    {:mvn/version "0.8.1904"}
         ;; 0.1.37 provides conserved resource vectors, durable receipts, and
         ;; mandatory Datahike invariants for Run resource delegation.
         ;; 0.1.38 settles a world's book by replay (ADR-172, `kontor.settlement`):
@@ -139,8 +138,8 @@
         ;; Yggdrasil — CoW branching for git and Datahike
         ;; 0.3.46 merges a diverged Geschichte overlay three-way (#24): a fork
         ;; whose parent gained a commit meanwhile merges instead of fencing.
-        org.replikativ/yggdrasil   {:mvn/version "0.3.46"
-                                    :exclusions  [org.babashka/sci is.simm/partial-cps]}
+        org.replikativ/yggdrasil   {:mvn/version "0.3.48"
+                                    :exclusions  [org.babashka/sci]}
 
         ;; Scriptum — CoW Lucene indices for fulltext search
         org.replikativ/scriptum    {:mvn/version "0.1.32"}
@@ -200,7 +199,7 @@
                        io.forward/clojure-mail {:mvn/version "1.0.8"} ; mail intake
                        org.replikativ/briefkasten {:mvn/version "0.1.2"} ; briefkasten (mail)
                        org.replikativ/spindel-tui {:mvn/version "0.1.14"}
-                       org.replikativ/pg-datahike {:mvn/version "0.1.290"}
+                       org.replikativ/pg-datahike {:mvn/version "0.1.319"}
                        org.xerial/sqlite-jdbc {:mvn/version "3.50.3.0"}
                        org.replikativ/rechentafel {:mvn/version "0.1.11"} ; SpreadsheetBench
                        org.apache.poi/poi-ooxml {:mvn/version "5.5.1"} org.apache.poi/poi-ooxml-full {:mvn/version "5.5.1"}}}
@@ -217,7 +216,7 @@
                        io.forward/clojure-mail {:mvn/version "1.0.8"} ; mail intake
                        org.replikativ/briefkasten {:mvn/version "0.1.2"} ; briefkasten (mail)
                        org.replikativ/spindel-tui {:mvn/version "0.1.14"}
-                       org.replikativ/pg-datahike {:mvn/version "0.1.290"}
+                       org.replikativ/pg-datahike {:mvn/version "0.1.319"}
                        org.xerial/sqlite-jdbc {:mvn/version "3.50.3.0"}
                        org.replikativ/rechentafel {:mvn/version "0.1.11"} ; SpreadsheetBench
                        org.apache.poi/poi-ooxml {:mvn/version "5.5.1"} org.apache.poi/poi-ooxml-full {:mvn/version "5.5.1"}
@@ -236,7 +235,7 @@
   ;; git dep with `:deps/root "benchmarks"`. See benchmarks/README.md.
   :benchmarks {:extra-paths ["benchmarks/src" "benchmarks/resources"]
                ;; BIRD: SQLite (the gold) and SQL over Datahike
-               :extra-deps {org.replikativ/pg-datahike {:mvn/version "0.1.290"}
+               :extra-deps {org.replikativ/pg-datahike {:mvn/version "0.1.319"}
                             org.xerial/sqlite-jdbc {:mvn/version "3.50.3.0"}
                        org.replikativ/rechentafel {:mvn/version "0.1.11"} ; SpreadsheetBench
                        org.apache.poi/poi-ooxml {:mvn/version "5.5.1"} org.apache.poi/poi-ooxml-full {:mvn/version "5.5.1"}}}
