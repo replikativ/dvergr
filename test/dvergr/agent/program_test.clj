@@ -922,7 +922,7 @@
           (let [result (binding [ec/*execution-context* (:ctx room)]
                          (tools/execute
                           tool-name {:task "inspect" :profile "worker"}
-                          {:room room
+                          {:principal dvergr.principal/local-principal :room room
                            :execution-ctx (:ctx room)
                            :run-id parent-run
                            :model-policy {:provider :test :model "stub"}}))

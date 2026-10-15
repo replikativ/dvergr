@@ -7,7 +7,7 @@
 (deftest advertised-edit-operations-work-on-virtual-files
   (let [{:keys [close!] :as repository} (gfs/memory-repository! {:name "edit-operations"})
         filesystem (gfs/make-root repository)
-        context (tools/make-context {:cwd "/" :filesystem filesystem})
+        context (tools/make-context {:principal dvergr.principal/local-principal :cwd "/" :filesystem filesystem})
         original "(ns demo)\n(defn answer [] 41)\n"
         form '(defn answer [] 41)
         helper '(defn helper [] 42)]

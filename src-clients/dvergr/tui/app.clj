@@ -157,6 +157,8 @@
      ;; Operator console (already backed by an nREPL) — grant the executing
      ;; agent-scoped tool commands (/clojure_eval <agent> …).
      :tool-exec?      true
+     ;; the operator at the terminal is the process
+     :principal       dvergr.principal/local-principal
      :available-tools (keys @@(requiring-resolve 'dvergr.tools/registry))
      :post-user!
      (fn [text]

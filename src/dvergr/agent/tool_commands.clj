@@ -53,7 +53,7 @@
     :else       (str r)))
 
 (defn- run-tool-command [tool-name param-kw]
-  (fn [{:keys [room agent-id args-str notify! tool-exec?]}]
+  (fn [{:keys [room agent-id args-str notify! tool-exec? principal]}]
     (let [say (fn [m] (when notify! (notify! m)) {:handled? true :no-turn? true :reply m})]
       (cond
         (not tool-exec?)
@@ -78,7 +78,10 @@
                                  :db-conn       (:db-conn cc)
                                  :tools         {tool-name tool} ; allowlist = just this tool
                                  :isolation     :sci
-                                 :execution-ctx (:ctx room)})
+                                 :execution-ctx (:ctx room)
+                                 ;; the operator who typed the command, not the agent
+                                 :principal     principal
+                                 :authz-room    room})
                       out      (result->str (tools/execute tool-name {param-kw arg} tool-ctx))]
                   (say (str "» " (name aid) " " tool-name "\n" out))))
               (say (str "@" (name aid) " has no active sandbox yet — message it once.")))))))))

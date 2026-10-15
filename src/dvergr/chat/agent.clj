@@ -213,6 +213,8 @@
    - :model - LLM model
    - :tools - Tool registry
    - :tool-ctx - Tool execution context
+   - :actor - the agent the turn runs for, when there is no :tool-ctx (its
+              tool calls are authorized as it; without either they are refused)
    - :on-text - Callback for text chunks
    - :on-reply - (fn [reply-content] → {:content str :notes [str…]}) optional
                  embedder hook run on the assistant's text reply BEFORE it is
@@ -232,7 +234,7 @@
    - :complete if agent is done (no tool calls)
    - :cancelled if the turn was cancelled
    - :error if something failed"
-  [chat-ctx {:keys [provider model tools tool-ctx on-text auto-compact? compaction-model turn-number cancel?
+  [chat-ctx {:keys [provider model tools tool-ctx actor on-text auto-compact? compaction-model turn-number cancel?
                     system-suffix on-reply run-id model-opts]
              :or {auto-compact? true}}]
   (try
@@ -390,7 +392,8 @@
               ;; can short-circuit; we also check between tools.
               ctx (or (some-> tool-ctx (assoc :cancel? cancel?))
                       (tools/make-context {:cwd ((requiring-resolve 'dvergr.substrate.git/safe-workspace-root))
-                                           :cancel? cancel?}))
+                                           :cancel? cancel?
+                                           :actor actor}))
 
               ;; Execute tools sequentially. Reduce instead of mapv so a
               ;; mid-batch cancel stops dispatching further calls — any

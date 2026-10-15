@@ -13,11 +13,15 @@
       :principal/claims {…}}               ; the authenticator's evidence, opaque here
 
    `local-principal` is the process itself: whoever holds the daemon (its REPL,
-   the TUI, room-run, Telegram commands) or reaches it the way only the local
-   user can (the stdio relay, loopback TCP, the token file of MCP over HTTP).
-   It is never sent to the authorizer. Only `default-authenticate` (and the
-   in-process callers that hold the daemon, which name it explicitly) produce
-   it; nothing defaults to it: `dvergr.ops/invoke` takes a principal.
+   the TUI, room-run) or reaches it the way only the local user can (the stdio
+   relay, a loopback socket peer with no forwarding header, the token file of
+   MCP over HTTP from such a peer, a sender on a non-empty Telegram allowlist).
+   It is never sent to the authorizer. It is recognized by identity (an
+   unforgeable marker, `local?`), never by its `:principal/kind`: a map an
+   authenticator builds cannot become it, and `dvergr.ops/invoke` refuses a
+   principal that claims kind `:local` without being it. Only
+   `default-authenticate` (and the in-process callers that hold the daemon,
+   which name it explicitly) produce it; nothing defaults to it.
 
    Two seams, configured on the daemon (`:auth` in its config) or, for a host
    that runs dvergr's rooms without a daemon, process-wide (`configure!`); the
@@ -28,9 +32,13 @@
                       :remote-addr \"…\" :bearer \"…\" :headers {…}
                       :local-token \"…\"             ; MCP over HTTP: <state>/mcp/http-token
                       :telegram/user {…} :telegram/chat-id …}
-        nil refuses the caller (401, a closed connection, a refused command).
-        Configuring one REPLACES `default-authenticate`; call it from yours to
-        keep local access.
+        `:remote-addr` is the socket peer, never a forwarding header (those are
+        in `:headers`; behind a proxy, deciding what they are worth is the
+        authenticator's job). nil refuses the caller (401, a closed
+        connection, a refused command). Configuring one REPLACES
+        `default-authenticate`; a hosted authenticator should not return the
+        local principal at all. A listener bound to a non-loopback address
+        refuses to start with the default (`check-bind!`).
 
      :authorize (fn [principal request] -> decision)
         `request` is {:op :room/post :action :write :resource [:room \"general\"]
@@ -39,21 +47,40 @@
         resource as the caller named it, and what dvergr resolved it to (a
         room's id; a job's room and owner; nil when it resolves to nothing). A
         decision is true/false/nil or {:allow? bool :reason \"…\"}. A throw
-        denies (so does a resolution that throws). Default: `allow-all`."
-  (:require [clojure.string :as str]))
+        denies (so does a resolution that throws). `:resolved nil` means the
+        handle names nothing: deny it, except for the ops that create what
+        they name. Default: `allow-all`.
+
+     :on-created (fn [principal resource]) — called after an op created
+        `resource` (`[:room id]`, `[:agent id]`) for a principal other than the
+        local one, so the host can grant its creator; a throw fails the op
+        (the thing exists; the error says so)."
+  (:require [clojure.string :as str]
+            [dvergr.security.allowlist :as allowlist]))
 
 ;; ============================================================================
 ;; Principals
 ;; ============================================================================
 
+(def ^:private local-marker
+  ;; identity, not a value: no EDN, JSON or claim can produce it
+  (Object.))
+
 (def local-principal
   "The process itself (see the ns doc): every toolset, never asked about."
-  {:principal/id :local :principal/kind :local :principal/scopes #{:dvergr/admin}})
+  {:principal/id :local :principal/kind :local :principal/scopes #{:dvergr/admin}
+   ::local local-marker})
 
 (defn local?
-  "Whether `principal` is the local one."
+  "Whether `principal` is the local one: it carries the process's marker. A
+   map that only says `:principal/kind :local` is not."
   [principal]
-  (= :local (:principal/kind principal)))
+  (identical? local-marker (::local principal)))
+
+(defn forged-local?
+  "Whether `principal` claims kind `:local` without being the local one."
+  [principal]
+  (and (= :local (:principal/kind principal)) (not (local? principal))))
 
 (defn agent-principal
   "The principal of the agent `actor` (an actor keyword), as its tool calls run."
@@ -90,18 +117,56 @@
   [authorization]
   (some->> authorization (re-matches #"(?i)Bearer\s+(\S+)") second))
 
+(def forwarding-headers
+  "Headers a proxy adds to name the client it forwards for. Their presence
+   means the socket peer is not the client."
+  #{"x-forwarded-for" "forwarded" "x-real-ip" "x-forwarded-host" "x-client-ip"})
+
+(defn forwarded?
+  "Whether ring-style `headers` (lower-case names) carry a forwarding header."
+  [headers]
+  (boolean (some #(contains? forwarding-headers (str/lower-case (str %))) (keys headers))))
+
+(defn socket-peer
+  "The IP of the socket peer of an http-kit `req` (its `:async-channel`), or
+   nil when it cannot be told. Not `:remote-addr`: http-kit fills that from
+   `X-Forwarded-For` when the header is present."
+  [req]
+  (try
+    (when-let [ch (:async-channel req)]
+      (let [f (doto (.getDeclaredField (class ch) "key") (.setAccessible true))
+            ^java.nio.channels.SelectionKey k (.get f ch)
+            ^java.nio.channels.SocketChannel sc (.channel k)
+            addr (.getRemoteAddress sc)]
+        (when (instance? java.net.InetSocketAddress addr)
+          (.getHostAddress (.getAddress ^java.net.InetSocketAddress addr)))))
+    (catch Exception _ nil)))
+
+(defn telegram-principal
+  "The principal of Telegram sender `user` (its `:from`): `telegram/<id>`, a
+   human with no scopes."
+  [user]
+  {:principal/id (str "telegram/" (:id user)) :principal/kind :human :principal/scopes #{}})
+
 (defn default-authenticate
-  "Local access only: the stdio relay; TCP and the web server from a loopback
-   peer; MCP over HTTP with the token of `<state>/mcp/http-token`; a Telegram
-   sender who reached the bot (its allowlist decides who does). Each is the
-   local principal; anything else is refused."
-  [{:keys [transport remote-addr local-token] :as request}]
-  (when (case transport
-          (:mcp-stdio :telegram) true
-          (:mcp-tcp :web) (loopback? remote-addr)
-          :mcp-http (constant-time= local-token (:bearer request))
-          false)
-    local-principal))
+  "Local access only. The local principal for: the stdio relay; a loopback
+   socket peer of TCP or the web server; MCP over HTTP with the token of
+   `<state>/mcp/http-token` from a loopback peer; a Telegram sender on a
+   non-empty allowlist. A request with a forwarding header is never local
+   (a proxy on the same host makes every peer loopback). Any other TCP, web
+   or HTTP caller is refused; another Telegram sender (an open allowlist) is
+   `telegram-principal`, which the authorizer decides about."
+  [{:keys [transport remote-addr local-token headers] :as request}]
+  (let [direct? (and (loopback? remote-addr) (not (forwarded? headers)))]
+    (case transport
+      :mcp-stdio local-principal
+      (:mcp-tcp :web) (when direct? local-principal)
+      :mcp-http (when (and direct? (constant-time= local-token (:bearer request))) local-principal)
+      :telegram (let [user (:telegram/user request)]
+                  (if (and (not (allowlist/open?)) (allowlist/allowed? user))
+                    local-principal
+                    (when (allowlist/allowed? user) (telegram-principal user))))
+      nil)))
 
 (defn allow-all
   "The default authorizer: everything (local trust)."
@@ -117,11 +182,28 @@
 (defonce ^:private configured (atom {}))
 
 (defn configure!
-  "Set the process-wide seams, `{:authenticate f :authorize f}` (either may be
+  "Set the process-wide seams, `{:authenticate f :authorize f :on-created f}` (any may be
    left out), for hosts without a daemon or a daemon without `:auth`. nil
    values reset to the defaults."
   [seams]
-  (reset! configured (select-keys seams [:authenticate :authorize])))
+  (reset! configured (select-keys seams [:authenticate :authorize :on-created])))
+
+(defn on-created
+  "The on-created fn: daemon `config`'s `[:auth :on-created]`, else the
+   process-wide one, else nil."
+  [config]
+  (or (seam (get-in config [:auth :on-created])) (seam (:on-created @configured))))
+
+(defn check-bind!
+  "Refuse a listener on `bind` (an address) that would authenticate with
+   `authenticate` = `default-authenticate` while not on loopback: the default
+   trusts the network position of its peers, which a non-loopback bind gives
+   to everyone who can reach it."
+  [listener bind authenticate]
+  (when (and (identical? authenticate default-authenticate) (not (loopback? bind)))
+    (throw (ex-info (str listener " on " bind " needs an authenticator (:auth :authenticate): "
+                         "the default admits loopback peers only and is refused off loopback")
+                    {:type ::default-off-loopback :listener listener :bind bind}))))
 
 (defn authenticator
   "The authenticate fn: daemon `config`'s `[:auth :authenticate]`, else the

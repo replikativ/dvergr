@@ -88,6 +88,23 @@
   (let [p *principal*]
     (cond-> m (and p (not (principal/local? p))) (assoc :actor (principal/actor p)))))
 
+(declare op-error!)
+
+(defn- created!
+  "Tell the host that the calling principal created `resource` (`:on-created`,
+   `dvergr.principal`), so it can grant its creator. Returns `resource`. Not
+   for the local principal, which needs no grant."
+  [daemon resource]
+  (let [p *principal*]
+    (when (and p (not (principal/local? p)))
+      (when-let [f (principal/on-created (:config daemon))]
+        (try (f p resource)
+             (catch Exception e
+               (op-error! (str "Created " (pr-str resource) ", but the host could not grant it to its creator: "
+                               (ex-message e))
+                          ::created-ungranted 500 {:resource resource})))))
+    resource))
+
 (defn- id->str
   "Room/actor ids are keywords (built-ins) OR UUIDs (created rooms) — both → string."
   [id]
@@ -605,6 +622,17 @@
 (defn- on-agent [{:keys [id]}] [:agent id])
 (defn- on-job [{:keys [job]}] [:job job])
 
+(defn- by-profile
+  "A Run with the developer profile edits files and runs a shell: the room's
+   whole capability, so `:admin`; a worker's is a `:write`."
+  [{:keys [profile]}]
+  (if (= "developer" profile) :admin :write))
+
+(defn- using-agent
+  "An `:also`: the agent `k` names is put to work (its budget, its tools)."
+  [k]
+  (fn [_ args] (when-let [a (get args k)] [[:write [:agent a]]])))
+
 (defn- visible
   "A `:filter`: the rows of a listing the caller may read, each the resource
    `(kind (get row k))`."
@@ -651,6 +679,7 @@
 
    :run/detail
    {:doc "One durable Run: status, settlement, error, world, timestamps."
+    :authz {:action :read} ; `id` is looked up in `room` only
     :kind :read
     :schema [:map [:room Room] [:id [:string {:description "run id"}]]]
     :impl (fn [daemon {:keys [room id]}]
@@ -754,7 +783,7 @@
    {:doc (str "Promote a room's workflow bundle on this host: it is calibrated now and, when "
               "calibration holds, its verifier is trusted as :room (not :ad-hoc) on every Attempt "
               "and Scorecard from then on. A changed bundle is new and must be promoted again.")
-    :authz {:action :admin}
+    :authz {:action :admin :resource on-global} ; a verifier trusted host-wide
     :kind :write
     :schema [:map [:room Room] [:name :string]]
     :impl (fn [daemon {:keys [room name]}]
@@ -777,6 +806,7 @@
    {:doc (str "Install a workflow export ({manifest, files}, from catalog_export) in a room as "
               "workflows/<as or its name>/, committed; refused when the files are not the bundle the "
               "manifest names. Its verifier is ad hoc here until promoted.")
+    :authz {:action :write}
     :kind :write
     :schema [:map [:room Room]
              [:export [:map [:manifest :map] [:files [:map-of :string :string]]]]
@@ -801,6 +831,7 @@
               "others cannot (no or duplicate id, an outcome left empty, the same inputs with "
               "different outcomes, an outcome its rule cannot read); the result counts them. "
               "Then catalog_calibrate and catalog_benchmark the bundle as any other.")
+    :authz {:action :write}
     :kind :write
     :schema [:map [:room Room] [:name :string]
              [:table [:string {:description "path of the table in the room's workspace"}]]
@@ -847,6 +878,7 @@
               "params filled from `params`) to `agent`, a participant, on each fire, e.g. {every: "
               "\"week\", on: \"monday\", at: \"09:00\"}. Pick the agent from the workflow's "
               "Scorecard. The room's REPL lists and cancels it (dvergr.scheduler/list, cancel).")
+    :authz {:action :write :also (using-agent :agent)}
     :kind :write
     :schema [:map [:room Room] [:name :string]
              [:agent [:string {:description "the agent (a participant of the room) that runs it"}]]
@@ -874,6 +906,7 @@
               "(web.edn), so every later attempt meets the same web and scores are comparable "
               "over time. Search is lexical over those pages. Calibrate and promote it like any "
               "bundle.")
+    :authz {:action :write}
     :kind :write
     :schema [:map [:room Room] [:name :string]
              [:as {:optional true} [:string {:description "the frozen bundle's name (default <name>-frozen)"}]]]
@@ -967,7 +1000,9 @@
               "exports/ directory. `min-reward` keeps only Attempts scoring at least that.")
     ;; A write: with `file` it creates or overwrites a file, so it must not be a
     ;; GET (the HTTP API routes reads as GETs, which a cross-site page can issue).
-    :authz {:action #(if (:file %) :admin :read)} ; `file` writes under the state root
+    :authz {:action :read
+            ;; `file` writes under the host's state root
+            :also (fn [_ args] (when (:file args) [[:admin [:global]]]))}
     :kind :write
     :schema [:map [:room Room]
              [:limit {:optional true} [:int {:min 1 :max 1000 :description "max attempts (default 20)"}]]
@@ -989,6 +1024,7 @@
 
    :attempt/detail
    {:doc "One certified Attempt with its evidence: transcript, calls, traces, result."
+    :authz {:action :read} ; `id` is looked up in `room` only
     :kind :read
     :schema [:map [:room Room] [:id [:string {:description "attempt id"}]]]
     :impl (fn [daemon {:keys [room id]}]
@@ -1019,6 +1055,7 @@
               "cost, in none of its `spend` or cost per pass. `paired`: the "
               "paired comparisons (each against `baseline`, else every pair, beyond five candidates each against the best): on the cases both have a verdict "
               "for, both passed / A only / B only / both failed, the exact McNemar p, Holm-adjusted, and a verdict.")
+    :authz {:action :read} ; `id` is looked up in `room` only
     :kind :read
     :schema [:map [:room Room] [:id [:string {:description "scorecard content id"}]]
              [:baseline {:optional true} [:string {:description "candidate to compare the others against (default: the top of the leaderboard for `comparison`; for `paired` every pair, beyond five candidates each against the best)"}]]]
@@ -1127,6 +1164,7 @@
    ;; ---- writes (tools) ----
    :room/post
    {:doc "Post a message into a room — participate in the chat. The room's agents react."
+    :authz {:action :write}
     :kind :write
     :schema [:map [:room Room]
              [:text [:string {:description "message text"}]]
@@ -1161,7 +1199,8 @@
                 ;; create-room! returns the room-id keyword; look the live Room up.
                       (rooms/create-room! (cond-> {:title title :slug sl}
                                             agents (assoc :agent-ids (mapv keyword agents))))
-                      (room-data (rreg/lookup (keyword sl))))))}
+                      (doto (room-data (rreg/lookup (keyword sl)))
+                        (#(created! daemon [:room (:id %)]))))))}
 
    :room/delete
    {:doc (str "Delete a room: close it and archive it, so it is neither listed nor started again. "
@@ -1211,6 +1250,7 @@
               "every attempt's outcome, score, bill and diff, which attempts read the same external "
               "sources (their agreement is not independent confirmation), with the world to adopt: "
               "room_merge one world, room_discard the others.")
+    :authz {:action by-profile}
     :kind :write
     :schema WorkflowArgs
     :impl (fn [daemon {:keys [room] :as args}]
@@ -1225,6 +1265,7 @@
               "attempt's outcome, bill and review, the per-model table and the room's wallet. "
               "Adopt one world with room_merge {room: world, expect-state: review.state}, "
               "room_discard the others. job_cancel stops it.")
+    :authz {:action by-profile}
     :kind :write
     :schema WorkflowArgs
     :impl (fn [daemon {:keys [room] :as args}]
@@ -1237,6 +1278,7 @@
               "scored against known answers: compare models and prompts. With `room`: on "
               "your room's own files, scored by what can be checked without answers. "
               "Poll job_status; adopt a world with room_merge.")
+    :authz {:action #(if (:room %) :admin :write)} ; a developer Run on the room's files; else a new fixture room
     :kind :write
     :schema [:map
              [:workflow [:string {:description "catalog workflow id, e.g. wiki/v1"}]]
@@ -1256,6 +1298,7 @@
                         (in-ctx daemon
                                 (rooms/create-room! {:title (str (:title wf) " (benchmark)") :slug slug})
                                 (let [r (rreg/lookup (keyword slug))]
+                                  (created! daemon [:room (id->str (:id r))])
                                   (catalog/seed! r ((get-in wf [:benchmark :fixtures])))
                                   r))))
                   {:keys [task profile evaluator environment-id]} (catalog/plan wf {:benchmark? benchmark?})]
@@ -1275,6 +1318,12 @@
               "attempts still fork the new fixture room. Returns a job; experiment_progress "
               "{room} shows every certified cell while it runs. `name` names the experiment so a "
               "later call resumes it (`experiment` is its deprecated alias).")
+    :authz {:action :write
+            ;; always a new fixture room; a room workflow (\"<room>/<name>\") reads that room's bundle
+            :also (fn [_ {:keys [workflow]}]
+                    (let [[_ rref] (when-not (get catalog/workflows (keyword workflow))
+                                     (re-find #"^([^/]+)/([^/]+)$" (str workflow)))]
+                      (cond-> [[:write [:global]]] rref (conj [:read [:room rref]]))))}
     :kind :write
     :schema [:map
              [:workflow [:string {:description "catalog workflow id, e.g. wiki/v2"}]]
@@ -1328,7 +1377,8 @@
                   slug (str "bench-" (slugify (subs (str (:id wf)) 1)) "-" (subs (str (random-uuid)) 0 8))
                   r (in-ctx daemon
                             (rooms/create-room! {:title (str (:title wf) " (benchmark)") :slug slug})
-                            (rreg/lookup (keyword slug)))
+                            (doto (rreg/lookup (keyword slug))
+                              (#(created! daemon [:room (id->str (:id %))]))))
                   exp (runner/experiment-def (assoc plan :id (keyword (or exp-name slug))
                                                     :repetitions (or repetitions 1)
                                                     ;; the host's versions: a resume never mixes two
@@ -1384,19 +1434,23 @@
 
    :room/fork
    {:doc "Fork a room for speculative work (O(1) copy-on-write); merge or discard later."
+    :authz {:action :write}
     :kind :write
     :schema [:map [:room Room]]
     :impl (fn [daemon {:keys [room]}]
             (when-let [r (resolve-room daemon room)]
-              (room-result daemon (in-ctx daemon (forks/fork! r)))))}
+              (doto (room-result daemon (in-ctx daemon (forks/fork! r)))
+                (#(created! daemon [:room (:id %)])))))}
 
    :room/merge
    {:doc "Reconcile-merge a fork back into its parent. Pass `expect-state` (from room_review or a workflow attempt's review) to merge only the state that was reviewed: a fork that changed since is refused."
-    :authz {:action :merge
-            ;; the merge lands on the fork's parent: a write there too
+    :authz {:action :read
+            ;; the merge lands on the fork's parent: a merge there; no parent, no merge
             :also (fn [daemon {:keys [room]}]
-                    (when-let [parent (some-> (resolve-room daemon room) :parent-id)]
-                      [[:write [:room (id->str parent)]]]))}
+                    (let [parent (some-> (resolve-room daemon room) :parent-id)]
+                      (when-not parent
+                        (throw (ex-info (str "No fork " room " with a parent to merge into") {:room room})))
+                      [[:merge [:room (id->str parent)]]]))}
     :kind :write
     :schema [:map [:room Fork]
              [:expect-state {:optional true}
@@ -1439,6 +1493,7 @@
               "(conflicted). Refused while the workspace has staged "
               "changes, and for a path that is a symbolic link. A read-only world refuses it. "
               "History is the room's: room_fork to try changes, room_diff/room_merge to adopt them.")
+    :authz {:action :write}
     :kind :write
     :schema [:map [:room Room]
              [:files [:map-of {:description "path -> {text} | {base64} | null (remove)"
@@ -1473,11 +1528,13 @@
              [:title {:optional true} :string]
              [:branch {:optional true} [:string {:description "branch of a local checkout (default: its current one)"}]]]
     :impl (fn [daemon {:keys [room source title branch]}]
-            (in-ctx daemon (room-repo/import-room! {:slug room :title title :source source :branch branch})))}
+            (doto (in-ctx daemon (room-repo/import-room! {:slug room :title title :source source :branch branch}))
+              (#(created! daemon [:room (or (some-> (resolve-room daemon room) :id id->str) room)]))))}
 
    :room/export
    {:doc (str "The room's changes since room_import, as a patch for `git apply` in the source checkout "
               "(after adopting an attempt with room_merge). Commits the room's pending work first.")
+    :authz {:action :write}
     :kind :write
     :schema [:map [:room Room]]
     :impl (fn [daemon {:keys [room]}]
@@ -1520,6 +1577,7 @@
                                    daemon (assoc fields :id kid))
                           (op-error! (str "Could not create agent " id ": no system database")
                                      ::create-failed 500 {:id id}))
+                        (created! daemon [:agent id])
                         {:created id}))))}
 
    :agent/update
@@ -1542,13 +1600,15 @@
     :kind :write
     :schema [:map [:id AgentId]]
     :impl (fn [daemon {:keys [id]}]
-            (room-result daemon
-                         (in-ctx daemon
-                                 ((requiring-resolve 'dvergr.orchestration.daemon/ensure-agent-room!)
-                                  daemon (keyword id)))))}
+            (some-> (room-result daemon
+                                 (in-ctx daemon
+                                         ((requiring-resolve 'dvergr.orchestration.daemon/ensure-agent-room!)
+                                          daemon (keyword id))))
+                    (doto (#(created! daemon [:room (:id %)])))))}
 
    :room/invite
    {:doc "Invite (join) an agent into a room."
+    :authz {:action :write :also (using-agent :agent)}
     :kind :write
     :schema [:map [:room Room] [:agent AgentId]]
     :impl (fn [daemon {:keys [room agent]}]
@@ -1755,6 +1815,9 @@
   [daemon principal op args]
   (when-not (map? principal)
     (throw (ex-info "invoke needs a principal (dvergr.principal)" {:type ::no-principal :op op})))
+  (when (principal/forged-local? principal)
+    (op-error! "A principal of kind :local that is not the process's is refused"
+               ::principal/denied 403 {:op op}))
   (if-let [{:keys [impl]} (get (operations) op)]
     (let [args (or args {})]
       (authorize! daemon principal op args)

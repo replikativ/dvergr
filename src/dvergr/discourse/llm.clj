@@ -421,7 +421,9 @@
                                          ;; any tool outside this set (defense in depth
                                          ;; vs. hallucinated / injected tool names).
                                             :tools     tool-map
-                                            :isolation (or (:isolation spec) :sci)})
+                                            :isolation (or (:isolation spec) :sci)
+                                         ;; the agent its tool calls run for
+                                            :actor     id})
                                       ;; P2c: the room's own + attached code repos for
                                       ;; the SCI load-fn (resolved first, base after).
                                           (assoc :workspace-roots

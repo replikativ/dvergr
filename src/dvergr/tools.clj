@@ -607,15 +607,18 @@
   "nil when the caller of this tool call may make it, else the denial: the
    caller is `:principal` in `ctx`, or the agent `:actor` whose turn it is;
    the room is the durable one the call acts for (`:authz-room`, the
-   `:control-room` of a nested world, else `:room`). Without either caller
-   (a host call) nothing is asked, as before."
+   `:control-room` of a nested world, else `:room`). A call that names
+   neither runs for nobody and is refused: a host call passes
+   `principal/local-principal` as `:principal`."
   [tool-name tool input ctx]
-  (when-let [p (or (:principal ctx) (some-> (:actor ctx) principal/agent-principal))]
+  (if-let [p (or (:principal ctx) (some-> (:actor ctx) principal/agent-principal))]
     (let [room (or (:authz-room ctx) (:control-room ctx) (:room ctx))
           {:keys [allow? reason]} (principal/decide (principal/current-daemon) p
                                                     (authz-request tool-name tool input room))]
       (when-not allow?
-        {:decision :denied :sources #{:principal-authorizer} :reason reason}))))
+        {:decision :denied :sources #{:principal-authorizer} :reason reason}))
+    {:decision :denied :sources #{:principal-authorizer}
+     :reason (str "Tool call " tool-name " runs for nobody: its context names no :principal or :actor")}))
 
 (defn execute
   "Execute a tool by name with given input and context.

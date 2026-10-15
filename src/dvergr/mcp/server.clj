@@ -347,15 +347,19 @@
    :description (str "A file of a room's workspace: its contents (text, or a base64 blob for binary, "
                      "up to 4 MiB; room_read reads larger ones in chunks), or a directory's listing as JSON.")})
 
+(defn- shown?
+  "Whether `principal` may see op `op`'s resources: its toolset is within the
+   principal's (`surface/principal-toolsets`), as for the tools."
+  [principal op]
+  (let [allowed (surface/principal-toolsets principal)]
+    (or (nil? allowed) (contains? allowed (surface/tool-toolset (ops/op->name op) op false)))))
+
 (defn resource-definitions
   "Fixed resources + resource templates, derived from the reads of
    `ops/operations` that `principal` may see (its toolsets: `surface/capped`)."
   [principal]
   (let [allowed (surface/principal-toolsets principal)
-        shown? (fn [{:keys [op]}]
-                 (or (nil? allowed)
-                     (contains? allowed (surface/tool-toolset (ops/op->name op) op false))))
-        rs (filter shown? (ops-resources))]
+        rs (filter #(shown? principal (:op %)) (ops-resources))]
     {:resources (mapv :def (filter #(= :fixed (:kind %)) rs))
      :templates (cond-> (mapv :def (filter #(= :template (:kind %)) rs))
                   (or (nil? allowed) (contains? allowed :files)) (conj file-template))}))
@@ -412,7 +416,9 @@
       (throw (ex-info (str "Resource not found: " uri) {:json-rpc/code -32002 :json-rpc/data {:uri uri}})))))
 
 (defn- read-resource [principal uri]
-  (if-let [{:keys [op args file?]} (uri->op+args uri)]
+  (if-let [{:keys [op args file?]} (when-let [m (uri->op+args uri)]
+                                     ;; outside the principal's toolsets: not there
+                                     (when (shown? principal (:op m)) m))]
     (if-let [dmn (current-daemon)]
       {:contents (if file?
                    (file-contents dmn principal uri args)
@@ -434,8 +440,9 @@
    authorized with its args). Anything that throws on the way denies."
   [dmn principal uri]
   (try (when-let [{:keys [op args]} (uri->op+args uri)]
-         (ops/authorize! dmn principal op args)
-         true)
+         (when (shown? principal op)
+           (ops/authorize! dmn principal op args)
+           true))
        (catch Exception _ false)))
 
 (defn- notify-room!
@@ -461,8 +468,9 @@
   "Subscribe `send-fn` to `uri` for `principal`, who must be allowed to read
    it (else an error, -32002 as for a resource that is not there)."
   [principal uri send-fn]
-  (when-let [dmn (current-daemon)]
-    (when-not (may-read-uri? dmn principal uri)
+  (let [dmn (current-daemon)
+        m (uri->op+args uri)]
+    (when-not (and m (shown? principal (:op m)) (or (nil? dmn) (may-read-uri? dmn principal uri)))
       (throw (ex-info (str "Resource not found or not readable: " uri)
                       {:json-rpc/code -32002 :json-rpc/data {:uri uri}}))))
   (swap! resource-subs update uri (fnil assoc {}) send-fn principal)
@@ -669,6 +677,8 @@
    selection, never widens it. Every call, read and subscription runs for the
    principal."
   [send-fn selection principal]
+  (when-not (and (map? principal) (some? (:principal/id principal)))
+    (throw (ex-info "A connection needs a principal with an id" {:type ::no-principal})))
   (let [cap #(surface/capped principal %)
         scoped (fn [sel]
                  {:tool-visible? (fn [td] (surface/visible? @sel td))
@@ -828,6 +838,7 @@
     (throw (ex-info "Server already running" {:port port})))
   (let [selection (surface/selection {:profile profile :toolsets toolsets})
         authenticate (or authenticate principal/default-authenticate)
+        _ (principal/check-bind! "MCP over TCP" bind authenticate)
         ^ServerSocket server-socket (ServerSocket. port 50 (java.net.InetAddress/getByName bind))
         accept-thread (Thread.
                        (fn []

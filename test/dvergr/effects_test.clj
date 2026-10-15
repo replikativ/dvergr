@@ -289,7 +289,7 @@
         (let [cctx (turn/new-working-ctx {:execution-ctx ec :title "meter" :durable? false})
               r (binding [rtc/*execution-context* ec]
                   (tools/execute "clojure_eval" {:code "(+ 1 2)"}
-                                 (tools/make-context {:sci-ctx (chat-context/sci-context-in cctx ec)
+                                 (tools/make-context {:principal dvergr.principal/local-principal :sci-ctx (chat-context/sci-context-in cctx ec)
                                                       :chat-ctx cctx :execution-ctx ec
                                                       :isolation :sci
                                                       :cwd (System/getProperty "java.io.tmpdir")})))]
@@ -535,7 +535,7 @@
       (spit (io/file root "notes.md") "inside")
       (let [cctx (turn/new-working-ctx {:execution-ctx ec :title "tools" :durable? false :agent-id :mcp/code
                                         :effects [[:read-only]]})
-            tctx (tools/make-context {:cwd (str root) :chat-ctx cctx :execution-ctx ec})
+            tctx (tools/make-context {:principal dvergr.principal/local-principal :cwd (str root) :chat-ctx cctx :execution-ctx ec})
             run #(binding [rtc/*execution-context* ec] (tools/execute %1 %2 tctx))]
         (testing "a read runs; a write is refused by the world's read-only mode and never happens"
           (is (re-find #"inside" (str (:content (run "read_file" {:path "notes.md"})))))
@@ -580,7 +580,7 @@
                 before @conn
                 cctx (turn/new-working-ctx {:execution-ctx ec :title "tools-ro" :durable? false :agent-id :mcp/code
                                             :effects [[:read-only]]})
-                tctx (tools/make-context {:cwd (str root) :chat-ctx cctx :execution-ctx ec :db-conn conn
+                tctx (tools/make-context {:principal dvergr.principal/local-principal :cwd (str root) :chat-ctx cctx :execution-ctx ec :db-conn conn
                                           :isolation :native})
                 run #(binding [rtc/*execution-context* ec] (tools/execute %1 %2 tctx))]
             (with-redefs [dvergr.agent.persona/write-prompt! (touch :profile)
@@ -663,7 +663,7 @@
                                           :effects [[:read-only]]})
               tool (fn [n & {:as more}]
                      (merge {:name n :execute (fn [_ _] (swap! ran conj n) {:type :success :content "did it"})} more))
-              tctx (tools/make-context {:cwd (str root) :chat-ctx cctx :execution-ctx ec
+              tctx (tools/make-context {:principal dvergr.principal/local-principal :cwd (str root) :chat-ctx cctx :execution-ctx ec
                                         :tools {"mystery" (tool "mystery")
                                                 ;; a replacement under a built-in's name does
                                                 ;; not inherit the built-in's classification
@@ -684,7 +684,7 @@
     (try
       (let [cctx (turn/new-working-ctx {:execution-ctx ec :title "native" :durable? false :agent-id :mcp/code
                                         :effects [[:admit #{:process :global}]]})
-            tctx (tools/make-context {:cwd (str root) :chat-ctx cctx :execution-ctx ec :isolation :native})
+            tctx (tools/make-context {:principal dvergr.principal/local-principal :cwd (str root) :chat-ctx cctx :execution-ctx ec :isolation :native})
             r (binding [rtc/*execution-context* ec]
                 (tools/execute "clojure_eval" {:code "(+ 1 2)"} tctx))]
         (is (= :error (:type r)))

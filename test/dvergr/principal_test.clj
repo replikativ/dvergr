@@ -3,13 +3,16 @@
    declares what it acts on, `ops/invoke` asks the authorizer before it acts,
    a listing shows only what the caller may read, a post never names someone
    else, and a host can add ops and seams without a daemon."
-  (:require [clojure.test :refer [deftest is testing use-fixtures]]
+  (:require [clojure.set]
+            [clojure.test :refer [deftest is testing use-fixtures]]
             [dvergr.discourse :as d]
             [dvergr.jobs :as jobs]
             [dvergr.ops :as ops]
             [dvergr.principal :as principal]
             [dvergr.room.registry :as rreg]
             [dvergr.room.store.memory :as memory]
+            [dvergr.rooms :as rooms]
+            [dvergr.security.allowlist :as allowlist]
             [dvergr.tools :as tools]
             [org.replikativ.spindel.engine.context :as ctx]
             [org.replikativ.spindel.engine.core :as ec]))
@@ -35,6 +38,27 @@
           (is (contains? principal/actions a)))
         (is (contains? resource-kinds (first ((:resource decl) {:room "r" :id "i" :job "j"}))))))))
 
+(def ^:private resource-like-keys
+  "Argument names that point at something besides the room: an op taking one
+   says explicitly what it acts on."
+  #{:agent :workflow :source :file :id :fork :parent :job})
+
+(deftest writes-and-ops-naming-other-resources-declare-explicitly
+  (doseq [[op {:keys [kind authz schema]}] (ops/operations)]
+    (when (= :write kind)
+      (is (:action authz) (str op ": a write declares its :authz")))
+    (let [ks (set (keep #(when (vector? %) (first %)) (rest schema)))]
+      (when (seq (clojure.set/intersection ks resource-like-keys))
+        (is (some? authz) (str op " takes " (clojure.set/intersection ks resource-like-keys)
+                               ": it declares what it acts on"))))))
+
+(deftest every-registry-tool-is-classified
+  ;; a new tool must say what it does to its room: an effect class, or an
+  ;; entry in tools/tool-authz (unclassified falls back to :admin, and fails here)
+  (doseq [[tname tool] @tools/registry]
+    (is (or (contains? tools/tool-authz tname) (some? (tools/effect-classification tool)))
+        (str tname " has no classification"))))
+
 (deftest acting-on-a-room-is-never-global
   (testing "an op whose schema names a required room acts on that room"
     (doseq [[op _] (ops/operations)
@@ -42,7 +66,7 @@
                               (rest (ops/malli-schema op)))]
             :when (and entry (not (and (map? (second entry)) (:optional (second entry)))))
             ;; these two create the room their `room` names: there is none to act on yet
-            :when (not (#{:room/import} op))]
+            :when (not (#{:room/import :catalog/promote} op))]
       (is (= [:room "r"] ((:resource (ops/authz-decl op)) {:room "r"})) (str op)))))
 
 (deftest every-registry-tool-declares-its-action
@@ -192,9 +216,46 @@
     (is (nil? (auth {:transport :mcp-tcp :remote-addr "10.1.2.3"})))
     (is (principal/local? (auth {:transport :web :remote-addr "/0:0:0:0:0:0:0:1"})))
     (is (nil? (auth {:transport :web :remote-addr nil})) "an unknown peer is no local one")
-    (is (principal/local? (auth {:transport :mcp-http :bearer "t" :local-token "t"})))
-    (is (nil? (auth {:transport :mcp-http :bearer "x" :local-token "t"})))
-    (is (nil? (auth {:transport :mcp-http :bearer nil :local-token "t"})))))
+    (is (principal/local? (auth {:transport :mcp-http :bearer "t" :local-token "t" :remote-addr "127.0.0.1"})))
+    (is (nil? (auth {:transport :mcp-http :bearer "t" :local-token "t" :remote-addr "10.1.2.3"}))
+        "the token is local access only from a local peer")
+    (is (nil? (auth {:transport :mcp-http :bearer "x" :local-token "t" :remote-addr "127.0.0.1"})))
+    (is (nil? (auth {:transport :mcp-http :bearer nil :local-token "t" :remote-addr "127.0.0.1"})))
+    (testing "a forwarding header is never local: a proxy on this host makes every peer loopback"
+      (doseq [h ["x-forwarded-for" "forwarded" "x-real-ip"]]
+        (is (nil? (auth {:transport :web :remote-addr "127.0.0.1" :headers {h "127.0.0.1"}})) h)
+        (is (nil? (auth {:transport :mcp-http :bearer "t" :local-token "t" :remote-addr "127.0.0.1"
+                         :headers {h "127.0.0.1"}})) h)))
+    (testing "the default refuses a non-loopback listener"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"needs an authenticator"
+                            (principal/check-bind! "x" "0.0.0.0" principal/default-authenticate)))
+      (is (nil? (principal/check-bind! "x" "0.0.0.0" (fn [_] nil))))
+      (is (nil? (principal/check-bind! "x" "127.0.0.1" principal/default-authenticate))))))
+
+(deftest local-is-an-identity-not-a-claim
+  (let [forged {:principal/id :local :principal/kind :local :principal/scopes #{:dvergr/admin}}]
+    (is (principal/local? principal/local-principal))
+    (is (principal/local? (assoc principal/local-principal :principal/claims {:x 1})) "it survives assoc")
+    (is (not (principal/local? forged)))
+    (is (not (principal/local? (select-keys principal/local-principal
+                                            [:principal/id :principal/kind :principal/scopes])))
+        "nor a copy of its keys")
+    (let [e (try (ops/invoke (daemon (constantly true)) forged :room/list {}) nil
+                 (catch clojure.lang.ExceptionInfo e e))]
+      (is (= 403 (ops/error-status e)) "invoke refuses a principal claiming :local"))))
+
+(deftest a-telegram-sender-is-local-only-on-a-closed-allowlist
+  (let [user {:id 42 :username "alice"}
+        auth #(principal/default-authenticate {:transport :telegram :telegram/user %})]
+    (try
+      (allowlist/set-strict! false)
+      (allowlist/set-users! [])
+      (is (= "telegram/42" (:principal/id (auth user))) "an open allowlist: a principal, never local")
+      (is (not (principal/local? (auth user))))
+      (allowlist/set-users! [42])
+      (is (principal/local? (auth user)) "listed on a non-empty allowlist: the operator")
+      (is (nil? (auth {:id 7})) "not listed: nobody")
+      (finally (allowlist/set-users! []) (allowlist/set-strict! false)))))
 
 (deftest an-agents-tool-call-is-authorized-as-the-agent
   (let [seen (atom nil)]
@@ -212,3 +273,82 @@
         (tools/execute "nobody_knows" {} {})
         (is (nil? @seen)))
       (finally (principal/configure! {})))))
+
+;; ---------------------------------------------------------------------------
+;; Declarations that point past their room
+
+(defn- recorder [allow?]
+  (let [seen (atom [])]
+    [seen (fn [_ r] (swap! seen conj [(:action r) (:resource r) (:resolved r)]) (allow? r))]))
+
+(deftest a-merge-needs-a-merge-on-the-parent-and-a-read-of-the-fork
+  (let [fork (d/make-room {:id :authz-fork :parent-id :authz-open :ctx (:execution-ctx (daemon nil))
+                           :store (memory/make)})]
+    (try
+      (binding [ec/*execution-context* (:execution-ctx (daemon nil))] (rreg/register! fork))
+      (let [[seen authz] (recorder (constantly true))]
+        (ops/authorize! (daemon authz) alice :room/merge {:room "authz-fork"})
+        (is (= [[:read [:room "authz-fork"] {:room "authz-fork"}]
+                [:merge [:room "authz-open"] {:room "authz-open"}]]
+               @seen)))
+      (testing "writing the fork is not enough: the merge lands on the parent"
+        (let [[_ authz] (recorder #(not= :merge (:action %)))]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (ops/authorize! (daemon authz) alice :room/merge {:room "authz-fork"})))))
+      (testing "no parent, no merge (fail closed)"
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (ops/authorize! (daemon (constantly true)) alice :room/merge {:room "authz-open"}))))
+      (finally
+        (binding [ec/*execution-context* (:execution-ctx (daemon nil))]
+          (try (rreg/unregister! :authz-fork) (catch Throwable _ nil)))
+        (d/close-room! fork)))))
+
+(deftest a-room-workflow-benchmark-reads-its-room-and-creates-one
+  (let [[seen authz] (recorder (constantly true))]
+    (ops/authorize! (daemon authz) alice :catalog/benchmark {:workflow "authz-closed/sums" :models ["m"]})
+    (is (= #{[:write [:global] nil] [:read [:room "authz-closed"] {:room "authz-closed"}]}
+           (set @seen))))
+  (testing "a catalog workflow names no room"
+    (let [[seen authz] (recorder (constantly true))]
+      (ops/authorize! (daemon authz) alice :catalog/benchmark {:workflow "wiki/v1" :models ["m"]})
+      (is (= #{[:write [:global] nil]} (set @seen))))))
+
+(deftest what-else-an-op-puts-to-work-is-authorized-too
+  (let [[seen authz] (recorder (constantly true))]
+    (ops/authorize! (daemon authz) alice :room/invite {:room "authz-open" :agent "var"})
+    (is (some #{[:write [:agent "var"] nil]} @seen) "inviting an agent puts it to work"))
+  (testing "a developer Run is the room's whole capability"
+    (is (= :admin (:action (ops/authz-request (daemon nil) :workflow/start {:room "r" :task "t" :profile "developer"}))))
+    (is (= :write (:action (ops/authz-request (daemon nil) :workflow/start {:room "r" :task "t"})))))
+  (testing "an export to a file writes the host's state root"
+    (let [[seen authz] (recorder (constantly true))]
+      (ops/authorize! (daemon authz) alice :attempt/export {:room "authz-open" :file "x.jsonl"})
+      (is (some #{[:admin [:global] nil]} @seen))))
+  (is (= [:global] ((:resource (ops/authz-decl :catalog/promote)) {:room "r"}))
+      "promoting a verifier is trusted host-wide"))
+
+(deftest a-host-grants-what-its-principal-creates
+  (let [granted (atom [])
+        c (:execution-ctx (daemon nil))
+        dmn (assoc-in (daemon (constantly true)) [:config :auth :on-created]
+                      (fn [p r] (swap! granted conj [(:principal/id p) r])))]
+    (with-redefs [rooms/create-room! (fn [{:keys [slug]}]
+                                       (rreg/register! (d/make-room {:id (keyword slug) :ctx c :store (memory/make)}))
+                                       (keyword slug))]
+      (try
+        (ops/invoke dmn alice :room/create {:title "Mine" :slug "authz-mine"})
+        (is (= [["party/alice" [:room "authz-mine"]]] @granted))
+        (testing "the local principal needs no grant"
+          (ops/invoke dmn principal/local-principal :room/create {:title "Ours" :slug "authz-ours"})
+          (is (= 1 (count @granted))))
+        (testing "a grant that fails fails the op, loudly"
+          (let [e (try (ops/invoke (assoc-in dmn [:config :auth :on-created] (fn [& _] (throw (ex-info "no" {}))))
+                                   alice :room/create {:title "X" :slug "authz-x"})
+                       nil
+                       (catch clojure.lang.ExceptionInfo e e))]
+            (is (re-find #"could not grant" (ex-message e)))))
+        (finally
+          (binding [ec/*execution-context* c]
+            (doseq [k [:authz-mine :authz-ours :authz-x]]
+              (when-let [r (rreg/lookup k)]
+                (rreg/unregister! k) (d/close-room! r)))))))))

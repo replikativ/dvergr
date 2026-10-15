@@ -16,6 +16,8 @@
             [dvergr.channels.core :as channels]
             [dvergr.adapters.core :as adapters]
             [dvergr.security.allowlist :as allowlist]
+            [dvergr.principal :as principal]
+            [dvergr.ops :as ops]
             [dvergr.actors :as actors]
             [dvergr.channels.telegram-commands :as tc]
             [dvergr.discourse.commands :as commands]
@@ -659,15 +661,28 @@
           (when (and (:voice msg) text send-fn)
             (try (reply! text) (catch Throwable _ nil)))
           (when (and chat-id text (not (str/blank? text)))
-            (let [parsed (parse-command text)]
+            (let [parsed (parse-command text)
+                  ;; who the sender is, once per message: commands, tool
+                  ;; commands and posts all run for it (the default makes a
+                  ;; sender on a non-empty allowlist the local principal)
+                  who    (try ((principal/authenticator (:config daemon))
+                               {:transport :telegram :telegram/user user-info :telegram/chat-id chat-id})
+                              (catch Exception _ nil))
+                  ;; a post (or one addressed to an agent) writes the chat's room
+                  may-post? (fn [room]
+                              (try (ops/authorize! daemon who :room/post {:room (:slug room) :text text})
+                                   true
+                                   (catch clojure.lang.ExceptionInfo _ false)))]
               (cond
+                (nil? who)
+                (reply! "Access denied. You are not authorized to use this bot.")
+
               ;; Spec-derived ops commands (/stats /fork /system /invite …) run
               ;; against THIS chat's room and reply directly — never posted to the
               ;; room or routed to an agent. Checked first so /invite etc. aren't
               ;; mistaken for agent addressing.
                 (tc/command? text)
-                (reply! (tc/dispatch! text #(ensure-room chat-id default-agent)
-                                      {:user (:from msg) :chat-id chat-id}))
+                (reply! (tc/dispatch! text #(ensure-room chat-id default-agent) who))
 
               ;; Unified slash-command registry (dvergr.discourse.commands): the
               ;; SAME surface the TUI and web dispatch through — /sandbox, /plan,
@@ -687,6 +702,7 @@
                                   :daemon     daemon
                                   :exec-ctx   ctx
                                   :tool-exec? tool-exec?
+                                  :principal  who
                                   :notify!    notify!
                                  ;; A :prompt/:skill command posts a user turn.
                                   :post-user! (fn [t]
@@ -704,16 +720,20 @@
 
                 (:agent-id parsed)
                 (if (actors/online? (:agent-id parsed))
-                  (let [target (:agent-id parsed)]
-                    (ensure-room chat-id target)   ; make sure target is joined
-                    (working!)
-                    (adapters/inbound! (assoc adapter :default-agent target)
-                                       {:chat-id chat-id :user user-info :text (:text parsed)}))
+                  (let [target (:agent-id parsed)
+                        room (ensure-room chat-id target)]   ; make sure target is joined
+                    (if-not (may-post? room)
+                      (reply! "Access denied: you may not post in this chat's room.")
+                      (do (working!)
+                          (adapters/inbound! (assoc adapter :default-agent target)
+                                             {:chat-id chat-id :user user-info :text (:text parsed)}))))
                   (reply! (str "Unknown agent: " (name (:agent-id parsed))
                                "\n\nUse /agents to see available agents.")))
 
                 :else
-                (do (working!)
-                    (adapters/inbound! adapter
-                                       (cond-> {:chat-id chat-id :user user-info :text text}
-                                         attachment (assoc :attachment attachment))))))))))))
+                (if-not (may-post? (ensure-room chat-id default-agent))
+                  (reply! "Access denied: you may not post in this chat's room.")
+                  (do (working!)
+                      (adapters/inbound! adapter
+                                         (cond-> {:chat-id chat-id :user user-info :text text}
+                                           attachment (assoc :attachment attachment)))))))))))))

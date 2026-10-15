@@ -147,7 +147,7 @@
   (testing "the tool adapter cannot bypass the SCI delegation ceiling"
     (let [result (tools/execute
                   "spawn_agent" {:task "spend recursively"}
-                  {:room {}
+                  {:principal dvergr.principal/local-principal :room {}
                    :execution-ctx :present
                    :agent-program-ceiling {:program-kinds #{:echo :scripted}
                                            :provider-effects? false}})]

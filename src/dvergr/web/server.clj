@@ -178,7 +178,12 @@
   "The request's principal: the authenticator's verdict on its peer and bearer token."
   [authenticate-fn req]
   (try (authenticate-fn {:transport :web
-                         :remote-addr (:remote-addr req)
+                         ;; the socket's peer: http-kit's :remote-addr is
+                         ;; X-Forwarded-For when that header is sent (a ring
+                         ;; map without a socket, in tests, has only :remote-addr)
+                         :remote-addr (if (:async-channel req)
+                                        (principal/socket-peer req)
+                                        (:remote-addr req))
                          :bearer (principal/bearer (get-in req [:headers "authorization"]))
                          :headers (:headers req)})
        (catch Exception e
@@ -337,6 +342,8 @@
                        :daemon daemon
                        ;; Operator console — grant executing tool commands.
                        :tool-exec? true
+                       ;; the dashboard is the local principal's (`local-only`)
+                       :principal principal/local-principal
                        :available-tools (keys @@(requiring-resolve 'dvergr.tools/registry))
                        :post-user!   (fn [t] (post! room (message :web target t nil {:role :user})))
                        :notify!      (fn [t] (post! room (message :system :_activity
@@ -393,22 +400,26 @@
      daemon - Daemon record (for API access to agents, config, etc.)
      :port  - Port to listen on (default 17880)
      :ip    - Bind address (default \"127.0.0.1\" — loopback only). Without an
-              authenticator (`:auth` in the daemon config) only loopback peers
-              are answered, so binding elsewhere needs one.
+              authenticator (`:auth` in the daemon config, or `:authenticate`)
+              only direct loopback peers are answered, and a non-loopback bind
+              is refused (`principal/check-bind!`).
+     :authenticate - the seam (default: the daemon's, `principal/authenticator`)
      :allowed-hosts   - extra Host names to answer (beside loopback and the bind
                         address), e.g. a reverse proxy's name
      :allowed-origins - extra origins whose state-changing requests are accepted,
                         e.g. \"https://dvergr.example.com\" behind a proxy
 
    Returns the server state map."
-  [daemon & {:keys [port ip allowed-hosts allowed-origins] :or {port 17880 ip "127.0.0.1"}}]
+  [daemon & {:keys [port ip allowed-hosts allowed-origins authenticate] :or {port 17880 ip "127.0.0.1"}}]
   (when @server-state
     (tel/log! {:level :warn :id ::already-running :data {:port (:port @server-state)}})
     (throw (ex-info "Server already running" {:port (:port @server-state)})))
   (tel/log! {:level :info :id ::starting :data {:ip ip :port port}} "Starting HTTP server")
-  (let [stop-fn (http/run-server
+  (let [authn (or authenticate (principal/authenticator (:config daemon)))
+        _ (principal/check-bind! "The web server" ip authn)
+        stop-fn (http/run-server
                  (handler daemon {:ip ip :allowed-hosts allowed-hosts
-                                  :allowed-origins allowed-origins})
+                                  :allowed-origins allowed-origins :authenticate authn})
                  {:port port
                   :ip   ip
                   :max-body (* 1024 1024)  ; 1MB max body

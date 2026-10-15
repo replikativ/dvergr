@@ -7,8 +7,10 @@
    Security: an `Origin` that is not loopback is refused (403, DNS
    rebinding), and every request is authenticated (401 when refused) by the
    `:authenticate` seam (`dvergr.principal`) from its `Authorization: Bearer`
-   token; the default takes the token read from — or created at —
-   `:token-file` (mode 0600) as the local principal. A handshake session
+   token and socket peer; the default takes the token read from — or created
+   at — `:token-file` (mode 0600), sent by a loopback peer without a
+   forwarding header, as the local principal, and refuses a non-loopback
+   bind. A handshake session
    belongs to the principal that opened it: a later request on it by another
    principal is answered as for an unknown session.
 
@@ -239,10 +241,11 @@
 (defn- authenticate-request
   "The principal of request `req`, or nil: `authenticate` (the seam) on its
    bearer token, peer and headers. A seam that throws refuses."
-  [authenticate token {:keys [headers remote-addr]}]
+  [authenticate token {:keys [headers remote-addr] :as req}]
   (try (authenticate {:transport :mcp-http
                       :bearer (principal/bearer (get headers "authorization"))
-                      :remote-addr remote-addr
+                      ;; the socket's peer, not http-kit's X-Forwarded-For
+                      :remote-addr (if (:async-channel req) (principal/socket-peer req) remote-addr)
                       :headers headers
                       :local-token token})
        (catch Exception _ nil)))
@@ -287,6 +290,7 @@
    the seam, see `handler`). Returns `{:port :token :stop}`."
   [{:keys [port bind token-file allowed-origins profile toolsets authenticate]
     :or {port 17889 bind "127.0.0.1"}}]
+  (principal/check-bind! "MCP over HTTP" bind (or authenticate principal/default-authenticate))
   (let [token (ensure-token! token-file)
         sessions (atom {})
         stop (http/run-server (handler {:token token :allowed-origins allowed-origins :sessions sessions
