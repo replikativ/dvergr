@@ -2,7 +2,9 @@
   "The web server's browser boundary: Host (DNS rebinding), Origin, the CSRF
    token, side-effect-free GETs, no wildcard CORS, and escaped HTML. Requests
    go straight to `server/handler`, so no port is bound."
-  (:require [clojure.string :as str]
+  (:require [clojure.java.shell]
+            [clojure.java.io]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [dvergr.discourse :as discourse]
             [dvergr.discourse.commands :as commands]
@@ -105,8 +107,56 @@
     (testing "a page navigation without the header gets the login page, no data"
       (let [{:keys [status body]} (a (no-auth (req :get "/dashboard" :headers {"cookie" (str "dvergr_session=" sid)})))]
         (is (= 200 status))
-        (is (str/includes? body "sessionStorage"))
+        (is (str/includes? body "data-dvergr-auth=\"shell\""))
         (is (not (str/includes? body "agents-list")))))))
+
+(deftest a-refused-session-is-dropped-not-retried
+  ;; a session that ended (restart, expiry, a new token): 401, and the page
+  ;; is told to drop it, so it never loops on it
+  (let [a (app)
+        page (a (req :get "/dashboard" :headers {"authorization" "Bearer 00000000000000000000000000000000000000000000000000000000000000aa"}))
+        api (a (req :get "/api/rooms" :headers {"authorization" "Bearer nope"}))]
+    (is (= 401 (:status page)))
+    (is (str/includes? (:body page) "data-dvergr-auth=\"rejected\""))
+    (is (= 401 (:status api)) "an htmx fragment: 401, which the page script turns into a logout")))
+
+(deftest the-page-scripts-are-served-from-this-origin
+  (let [a (app)
+        no-auth #(update % :headers dissoc "authorization")]
+    (doseq [f ["/static/htmx-2.0.4.min.js" "/static/dvergr.js"]]
+      (let [{:keys [status headers body]} (a (no-auth (req :get f)))]
+        (is (= 200 status) f)
+        (is (str/starts-with? (get headers "Content-Type") "text/javascript") f)
+        (is (pos? (count body)) f)))
+    (let [{:keys [status headers]} (a (no-auth (req :get "/dvergr-sw.js")))]
+      (is (= 200 status))
+      (is (= "/" (get headers "Service-Worker-Allowed"))))
+    (is (not (str/includes? (str (:body (a (no-auth (req :get "/static/../web/server.clj"))))) "defn"))
+        "nothing but those files")
+    (testing "the pages allow no other script, inline or remote"
+      (let [csp (get-in (a (req :get "/dashboard")) [:headers "Content-Security-Policy"])]
+        (is (str/includes? csp "script-src 'self'"))
+        (is (str/includes? csp "object-src 'none'"))
+        (is (str/includes? csp "base-uri 'none'"))
+        (is (not (str/includes? csp "unsafe-inline")))))))
+
+(deftest the-service-worker-attaches-the-session-to-this-origin-only
+  (if-not (some #(.canExecute (java.io.File. (str % "/node")))
+                (str/split (System/getenv "PATH") #":"))
+    (println "skipped: no node on PATH")
+    (let [sw (.getPath (clojure.java.io/file (clojure.java.io/resource "dvergr/web/static/dvergr-sw.js")))
+          js (str "const {attaches}=require(" (pr-str sw) ");"
+                  "const o='http://127.0.0.1:17880';"
+                  "const cases=[['http://127.0.0.1:17880/dashboard',true],['/api/rooms',false],"
+                  "['http://127.0.0.1:17880/api/v1/room_list',true],['http://127.0.0.1:3000/x',false],"
+                  "['http://localhost:17880/x',false],['https://127.0.0.1:17880/x',false],"
+                  "['https://evil.example/x',false],['http://127.0.0.1:17880.evil.example/x',false],"
+                  "['http://127.0.0.1:17880/apps/r/~ab/',false],['http://127.0.0.1:17880/dvergr-sw.js',false]];"
+                  "for(const [u,want] of cases){if(attaches(u,o)!==want){console.log('FAIL',u);process.exit(1);}}"
+                  "console.log('ok');")
+          {:keys [exit out err]} (clojure.java.shell/sh "node" "-e" js)]
+      (is (zero? exit) (str out err))
+      (is (str/includes? out "ok")))))
 
 (deftest voice-uploads-need-a-credential
   (let [app (app)]
@@ -245,11 +295,13 @@
         (is (str/includes? html "action=\"/agents/a/open\""))
         (is (str/includes? html "x &amp; y"))
         (is (not (str/includes? html "&amp;amp;")))))
-    (testing "the page shell sends the session as a header, from sessionStorage"
+    (testing "the page shell loads this origin's scripts, and no inline handler"
       (let [html (dash/shell {} [:p "x"])]
-        (is (str/includes? html "sessionStorage"))
-        (is (str/includes? html "htmx:configRequest"))
-        (is (not (str/includes? html "csrf")))))))
+        (is (str/includes? html "src=\"/static/htmx-2.0.4.min.js\""))
+        (is (str/includes? html "src=\"/static/dvergr.js\""))
+        (is (str/includes? html "data-dvergr-auth=\"page\""))
+        (is (not (re-find #"on(click|submit)=" html)))
+        (is (not (str/includes? html "unpkg.com")))))))
 
 (deftest every-request-needs-a-credential
   (let [no-token #(update % :headers dissoc "authorization")]
@@ -328,7 +380,8 @@
           (is (= 200 (:status resp)))
           (is (= "<p>/apps/r/index.html</p>" (:body resp)) "served as the room's app")
           (is (= "sandbox allow-scripts" (get-in resp [:headers "Content-Security-Policy"]))
-              "an opaque origin: no session, Origin null")))
+              "an opaque origin: no session, Origin null")
+          (is (= "no-referrer" (get-in resp [:headers "Referrer-Policy"])) "its capability stays out of Referers")))
       (is (= 401 (:status (a (no-auth (req :get (str/replace (str url) "/r/" "/other/"))))))
           "a link is for its own room only")
       (is (= 401 (:status (a (no-auth (req :get (str "/apps/r/~" (apply str (repeat 64 "0")) "/")))))))))
@@ -339,7 +392,7 @@
 (deftest every-response-refuses-framing-and-sniffing
   (doseq [uri ["/api/health" "/dashboard" "/nonexistent"]]
     (let [{:keys [headers]} ((app) (req :get uri))]
-      (is (= "frame-ancestors 'none'" (get headers "Content-Security-Policy")) uri)
+      (is (str/includes? (get headers "Content-Security-Policy") "frame-ancestors 'none'") uri)
       (is (= "DENY" (get headers "X-Frame-Options")) uri)
       (is (= "nosniff" (get headers "X-Content-Type-Options")) uri)))
   (is (= "DENY" (get-in ((app) (req :get "/x" :headers {"host" "evil.example"})) [:headers "X-Frame-Options"]))

@@ -35,6 +35,7 @@
             [dvergr.web.guard :as guard]
             [dvergr.ops :as dops]
             [dvergr.principal :as principal]
+            [clojure.java.io :as io]
             [hiccup2.core :as h]
             [hiccup.util :as hu]
             [taoensso.telemere :as tel]))
@@ -246,28 +247,53 @@
       principal)))
 
 (defn- login-page
-  "The page a browser without a session sees: it picks a session up from
-   the fragment and loads the page asked for with it, or asks for the token
-   (POSTed, so it stays out of the history)."
-  [error]
+  "The page a browser without an accepted session sees (`state` `:shell`: none
+   sent; `:rejected`: the one sent was refused, so the page drops it and never
+   retries it). Its script (/static/dvergr.js) picks a new session up from the
+   fragment, has the service worker attach it, or asks for the token (POSTed,
+   so it stays out of the history)."
+  [state error]
   (str
+   "<!DOCTYPE html>"
    (h/html
-    [:html
+    [:html {:data-dvergr-auth (name state)}
      [:head [:meta {:charset "utf-8"}] [:title "dvergr"]
-      [:script (hu/raw-string web-dashboard/auth-script)]
+      (for [src web-dashboard/static-scripts] [:script {:src src}])
       [:style "body{background:#111;color:#ddd;font-family:sans-serif;margin:3em}
                input{background:#18181b;border:1px solid #333;color:#e0e0e0;padding:6px 10px}"]]
      [:body
       [:div#login {:style "display:none"}
        [:h1 "dvergr"]
-       (when error [:p {:style "color:#d77"} error])
-       [:form {:method "post" :action "/login" :data-plain "1"}
-        [:p "The token is in " [:code "$DVERGR_HOME/local-token"] "."]
+       [:p#login-note {:style "color:#d77"} error]
+       [:form {:method "post" :action "/login"}
+        [:p "The token is in the daemon's state root, " [:code "local-token"] "."]
         [:input {:type "password" :name "token" :autocomplete "off" :placeholder "local token"}]
-        " " [:button {:type "submit"} "Open"]]]
-      [:script (hu/raw-string
-                "if(sessionStorage.getItem('dvergr-sid')){window.dvergrGo(location.href,null,true);}
-                 else{document.getElementById('login').style.display='block';}")]]])))
+        " " [:button {:type "submit"} "Open"]]]]])))
+
+(def ^:private page-csp
+  "The dashboard's pages run this origin's scripts only (vendored htmx and
+   /static/dvergr.js; no inline script, no eval), embed no plugins, keep their
+   base URL, and are framed by nobody."
+  "script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+
+(defn- static-file
+  "A file of resources/dvergr/web/static, public (no credential: scripts the
+   login page needs), or nil."
+  [uri]
+  (when-let [[_ f] (re-matches #"/static/([a-z0-9.-]+\.js)" (str uri))]
+    (when-let [r (io/resource (str "dvergr/web/static/" f))]
+      {:status 200
+       :headers {"Content-Type" "text/javascript; charset=utf-8" "Cache-Control" "no-cache"}
+       :body (slurp r)})))
+
+(defn- service-worker
+  "The service worker that attaches the session (dvergr-sw.js), at the root so
+   its scope is the whole origin."
+  []
+  {:status 200
+   :headers {"Content-Type" "text/javascript; charset=utf-8" "Cache-Control" "no-cache"
+             "Service-Worker-Allowed" "/"}
+   :body (slurp (io/resource "dvergr/web/static/dvergr-sw.js"))})
 
 (defn- login-response
   "After a valid token: a new session, and a redirect to `path` with the
@@ -299,23 +325,34 @@
                                                    {:room (or (:room/slug row) slug) :path "/app"})))
                (catch clojure.lang.ExceptionInfo e
                  (json-response (dops/error-status e) {:error (ex-message e)})))
-          (assoc-in [:headers "Content-Security-Policy"] "sandbox allow-scripts")))
+          (assoc-in [:headers "Content-Security-Policy"] "sandbox allow-scripts")
+          ;; its capability is in its URL: never in a Referer
+          (assoc-in [:headers "Referrer-Policy"] "no-referrer")))
 
 (defn- app-by-capability
   "`/apps/<slug>/~<cap>/<path>`: a room app through a capability link
    (`/api/app-link`), its read authorized for the principal that minted it.
    nil when `req` is not such a request."
   [daemon app-caps req]
-  (when-let [[_ slug cap rest] (re-matches #"/apps/([^/]+)/~([0-9a-f]{64})(/.*)?" (str (:uri req)))]
-    (let [{:keys [principal room expires-at]} (get @app-caps cap)]
+  (when-let [[_ enc cap rest] (re-matches #"/apps/([^/]+)/~([0-9a-f]{64})(/.*)?" (str (:uri req)))]
+    (let [slug (java.net.URLDecoder/decode enc "UTF-8")    ; as the link was minted (and web-apps decodes)
+          {:keys [principal room expires-at]} (get @app-caps cap)]
       (cond
         (or (nil? principal) (not= room slug) (< expires-at (System/currentTimeMillis)))
         {:status 401 :headers {"Content-Type" "text/plain"} :body "This app link expired; open the app from its room again."}
 
         (nil? rest)
-        {:status 301 :headers {"Location" (str "/apps/" slug "/~" cap "/")} :body ""}
+        {:status 301 :headers {"Location" (str "/apps/" enc "/~" cap "/")} :body ""}
 
-        :else (serve-app daemon principal (assoc req :uri (str "/apps/" slug rest)))))))
+        :else (serve-app daemon principal (assoc req :uri (str "/apps/" enc rest)))))))
+
+(defn- login-error
+  "What a refused login says: generic, so a caller without a credential learns
+   nothing of the server's files; a token replaced for being exposed says so."
+  []
+  (if @principal/rotation-notice
+    "That token opens nothing: the local token was replaced (its file was readable by others)."
+    "That token opens nothing."))
 
 (def ^:private unauthorized
   {:status 401 :headers {"Content-Type" "application/json" "WWW-Authenticate" "Bearer"}
@@ -333,35 +370,48 @@
    capability links. A request whose Origin is `null` (a sandboxed room app)
    reaches no room app or API at all."
   [daemon authenticate-fn sessions app-caps req]
-  (let [uri (str (:uri req))]
+  (let [uri (str (:uri req))
+        cap-resp (when (str/starts-with? uri "/apps/") (app-by-capability daemon app-caps req))]
     (cond
       (and (= "null" (get-in req [:headers "origin"])) (not (str/starts-with? uri "/apps/")))
       {:status 403 :headers {"Content-Type" "application/json"}
        :body "{\"error\":\"A sandboxed page (Origin null) may not call this server\"}"}
 
-      (app-by-capability daemon app-caps req) (app-by-capability daemon app-caps req)
+      (= "/dvergr-sw.js" uri) (service-worker)
+
+      (static-file uri) (static-file uri)
+
+      cap-resp cap-resp
 
       (and (#{:get :head} (:request-method req)) (query-param req "token"))
       (if-let [p (authenticate authenticate-fn req (query-param req "token"))]
         (login-response sessions p uri)
         {:status 401 :headers {"Content-Type" "text/html; charset=utf-8"}
-         :body (login-page (str "That token opens nothing." (some->> @principal/rotation-notice (str " "))))})
+         :body (login-page :shell (login-error))})
 
       (and (= :post (:request-method req)) (= "/login" uri))
       (if-let [p (authenticate authenticate-fn req (form-param req "token"))]
         (login-response sessions p "/")
         {:status 401 :headers {"Content-Type" "text/html; charset=utf-8"}
-         :body (login-page (str "That token opens nothing." (some->> @principal/rotation-notice (str " "))))})
+         :body (login-page :shell (login-error))})
 
       :else
       (let [bearer (principal/bearer (get-in req [:headers "authorization"]))
             sid-p (session-principal sessions bearer)
             p (or sid-p (when bearer (authenticate authenticate-fn req bearer)))]
         (cond
+          ;; a credential was sent and refused (a session that ended): 401, and
+          ;; for a page the login page, told to drop that session, not retry it
+          (and (nil? p) bearer)
+          (if (page-request? req)
+            {:status 401 :headers {"Content-Type" "text/html; charset=utf-8" "Cache-Control" "no-store"}
+             :body (login-page :rejected nil)}
+            unauthorized)
+
           (nil? p)
           (if (page-request? req)
             {:status 200 :headers {"Content-Type" "text/html; charset=utf-8" "Cache-Control" "no-store"}
-             :body (login-page nil)}
+             :body (login-page :shell nil)}
             unauthorized)
 
           (and (= :post (:request-method req)) (= "/logout" uri))
@@ -375,7 +425,8 @@
                    (swap! app-caps (fn [m] (assoc (into {} (remove #(< (:expires-at (val %)) now)) m)
                                                   cap {:principal p :room slug
                                                        :expires-at (+ now app-link-ttl-ms)})))
-                   (json-response 200 {:url (str "/apps/" (java.net.URLEncoder/encode (str slug) "UTF-8") "/~" cap "/")}))
+                   (json-response 200 {:url (str "/apps/" (str/replace (java.net.URLEncoder/encode (str slug) "UTF-8") "+" "%20")
+                                                 "/~" cap "/")}))
                  (catch clojure.lang.ExceptionInfo e
                    (json-response (dops/error-status e) {:error (ex-message e)}))))
 
@@ -390,7 +441,7 @@
       (when (map? resp)
         (cond-> (assoc-in resp [:headers "X-Content-Type-Options"] "nosniff")
           (not (str/starts-with? (str (:uri req)) "/apps/"))
-          (-> (assoc-in [:headers "Content-Security-Policy"] "frame-ancestors 'none'")
+          (-> (assoc-in [:headers "Content-Security-Policy"] page-csp)
               (assoc-in [:headers "X-Frame-Options"] "DENY")))))))
 
 (defn- route [daemon principal req]

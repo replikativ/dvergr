@@ -175,7 +175,7 @@
               (try (let [st (web-start d :port web-port :ip web-bind
                                        :allowed-hosts (:allowed-hosts (config/http-config))
                                        :allowed-origins (:allowed-origins (config/http-config)))]
-                     ;; Jupyter-style: this URL logs the browser in (a cookie)
+                     ;; Jupyter-style: this URL logs the browser in (a session the page keeps)
                      (.println console (str "[dvergr] web dashboard: " (:login-url st)))
                      (.flush console))
                    (catch Throwable t

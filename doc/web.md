@@ -56,25 +56,33 @@ is refused here.
 
 - `GET <path>?token=<token>` (or the login page's POST to `/login`) with a valid token opens
   a session and answers 303 to `<path>#sid=<id>`. A fragment is never sent to a server nor
-  in a `Referer`; the page's script (`dashboard/auth-script`) keeps the id in
-  `sessionStorage`, which is this origin's alone (this port's), and sends it as the header on
-  every request of this origin: htmx's, `fetch`'s, and the navigations and form posts it
-  performs itself (a plain navigation could not carry a header). A navigation without the
-  header gets the login page, which loads the page asked for with the session it holds.
-  Sessions last 12 h, at most 1000 are kept, a new local token ends them all, and `POST
-  /logout` ends one. A wrong token is 401;
+  in a `Referer`. The page script (`/static/dvergr.js`) keeps the id in IndexedDB, which is
+  this origin's alone (this port's) and shared by its tabs, and registers a **service worker**
+  (`/dvergr-sw.js`, scope `/`) that adds `Authorization: Bearer <id>` to every request of this
+  origin, room apps excepted: navigations, form posts, htmx, `fetch`, new tabs, back and
+  forward. So pages render and forms submit natively. A navigation without a session gets
+  the login page (200); one with a session the server refuses (it ended: a restart, 12 h, a
+  new local token, eviction) gets it with 401, and its script drops that session instead of
+  retrying it; an htmx request refused with 401 logs the page out. Sessions last 12 h, at
+  most 1000 are kept, a new local token ends them all, and `POST /logout` (the page's "log
+  out") ends the session for every tab of the browser. A wrong token is 401;
 - a script or curl sends `Authorization: Bearer $(cat $DVERGR_HOME/local-token)`.
 
 A cross-site page cannot send the header, so it needs no CSRF token; the guard below stands
-besides. A proxied or hosted deployment configures an authenticator (its own credentials) and
+besides. A service worker needs a secure context: `http://127.0.0.1`/`localhost`, or HTTPS (a
+proxy with TLS); a dashboard opened over plain HTTP on another address cannot keep a session
+(scripts can still send the header). The pages run only this origin's scripts (vendored
+htmx, `/static/dvergr.js`; `Content-Security-Policy: script-src 'self'; object-src 'none';
+base-uri 'none'`), with no inline script or handler. A proxied or hosted deployment configures an authenticator (its own credentials) and
 an `:authorize` seam. What a principal may do:
 
 - the **JSON API** and the dashboard's derived actions (`dvergr.web.ops`) run each op for the
   request's principal, authorized like every other surface (403 with `{"error": …}` when
   denied; listings filtered);
 - **room apps** need a read of their room. A browser opens one through a capability link the
-  room page mints per click (`/api/app-link?room=…` → `/apps/<room>/~<capability>/`, an hour,
-  that room only), since a navigation carries no header. An app is agent-written, so every
+  room page mints per click on its "▶ app" (`/api/app-link?room=…` →
+  `/apps/<room>/~<capability>/`, an hour, that room only, `Referrer-Policy: no-referrer`):
+  the service worker gives apps no session. An app is agent-written, so every
   response under `/apps/` carries `Content-Security-Policy: sandbox allow-scripts`: its
   scripts run in an opaque origin and their requests say `Origin: null`, which this server
   refuses outside `/apps/` (403);

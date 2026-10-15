@@ -187,7 +187,8 @@
       (do (tel/log! {:level :warn :id ::token-exposed :data {:file (str f)}}
                     "A token file was readable by others; it is replaced with a new token")
           (reset! rotation-notice
-                  (str "The local token was replaced: " f " was readable by others. Read the new one there."))
+                  ;; generic: told to callers without a credential, so no path
+                  "the local token was replaced because its file was readable by others; read it again")
           nil)
       :else (not-empty (str/trim (slurp f))))))
 
