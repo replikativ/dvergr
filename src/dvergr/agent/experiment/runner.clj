@@ -183,7 +183,7 @@
    into a Scorecard with another's (provider prompt and grader versions are
    already in it)."
   [["org.replikativ" "spindel"] ["org.replikativ" "datahike"] ["org.replikativ" "pg-datahike"]
-   ["org.replikativ" "rechentafel"] ["org.replikativ" "kontor"] ["is.simm" "partial-cps"]
+   ["org.replikativ" "rechentafel"] ["org.replikativ" "kontor"] ["org.replikativ" "partial-cps"]
    ["org.babashka" "sci"]])
 
 (defn library-versions

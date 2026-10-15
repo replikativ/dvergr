@@ -267,10 +267,10 @@
   ;; exclude src-secondary), so we add it here for the source-override dev path.
   :local {:extra-paths ["../datahike/src-secondary"]
           :extra-deps {org.replikativ/sci         {:local/root "../sci"}
-                       org.replikativ/datahike    {:local/root "../datahike"}
+                       org.replikativ/datahike    {:local/root "../datahike" :exclusions [is.simm/partial-cps]}
                        org.replikativ/scriptum    {:local/root "../scriptum"}
-                       org.replikativ/yggdrasil   {:local/root "../yggdrasil"}
-                       org.replikativ/spindel     {:local/root "../spindel"}
+                       org.replikativ/yggdrasil   {:local/root "../yggdrasil" :exclusions [is.simm/partial-cps]}
+                       org.replikativ/spindel     {:local/root "../spindel" :exclusions [is.simm/partial-cps]}
                        org.replikativ/spindel-tui {:local/root "../spindel-tui"}
                        org.replikativ/muschel     {:local/root "../muschel"}}}
 
