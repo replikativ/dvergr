@@ -58,7 +58,7 @@ Verified by reading the code on main (2026-10-15):
 Found by tests (2026-10-16):
 
 - **G6, the ledger authority could not split.**  `dvergr.resource.authority/authority` did not implement `PResourceAuthority/balance`, which `world-scope/copy!` asks to split a world's remainder between its copies, so SMC under `:world-policy :fork` with the ledger authority failed at the first resampling.
-- **G7, spend in particle threads is not charged.**  Particle code runs on spindel's executor threads, where the caller's `dvergr.resource/*spend-wallet*` binding is absent, so a charge made inside a particle finds no spend wallet and is not recorded.  Charging it needs the world, not the thread, to carry the charge scope: a world with a wallet of its own charges it under a scope named by its fork id, with a per-world debit counter in its state, so a retried step still debits once.
+- **G7, spend in particle threads is not charged.**  Particle code runs on spindel's executor threads, where the caller's `dvergr.resource/*spend-wallet*` binding is absent, so a charge made inside a particle finds no spend wallet and is not recorded.  Charging it needs the world, not the thread, to carry the charge scope: a world with a wallet of its own charges it under a scope named by its fork id, with a per-world debit counter in its state, so a retried step still debits once.  Spindel stays unaware of the ledger: the world records its Room's id, and dvergr finds the Room through a process-local registry.
 
 ## Plan
 
