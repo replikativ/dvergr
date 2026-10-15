@@ -5,10 +5,12 @@
             [sci.core :as sci]
             [is.simm.partial-cps.sequence :as aseq]
             [dvergr.agent.roster :as roster]
+            [dvergr.resource :as resource]
             [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.sandbox.ns.doc :as doc]
             [dvergr.sandbox.work :as sandbox-work]
             [org.replikativ.spindel.engine.core :as rtc]
+            [org.replikativ.spindel.engine.protocols :as rtp]
             [org.replikativ.spindel.effects.await :as sp-await]
             [org.replikativ.spindel.spin.cps :as sp]
             [org.replikativ.spindel.core :as sync]))
@@ -202,6 +204,36 @@
                                               id  (next-addr! ctx "signal" {:file "sci" :line 0 :column 0})]
                                           (signal-ref-ctor id (clear-deltas initial-value))))}))))))
 
+(defn- funded-world-opts
+  "The inference options of a sandbox call. `:grant-microdollars` funds the
+   inference from the calling world's wallet (doc/design/speculation.md):
+   the particles, forked from this world, split the grant and pay their
+   model spend from their share, and what they leave returns when they are
+   discarded. It needs `:world-policy :fork` and a world whose savepoint
+   session carries the ledger authority (a Run's world). An `:authority`
+   never comes from the sandbox."
+  [opts]
+  (let [opts (dissoc opts :authority :grant)
+        amount (:grant-microdollars opts)]
+    (if (nil? amount)
+      opts
+      (let [authority (some-> rtc/*execution-context*
+                              (rtp/get-state [:savepoint/session])
+                              :scope deref :authority)]
+        (when-not (and (number? amount) (pos? amount))
+          (throw (ex-info ":grant-microdollars is a positive number"
+                          {:type ::invalid-grant :grant-microdollars amount})))
+        (when-not (= :fork (:world-policy opts))
+          (throw (ex-info "A grant funds particle worlds forked from this one: pass :world-policy :fork"
+                          {:type ::grant-needs-fork :world-policy (:world-policy opts)})))
+        (when-not authority
+          (throw (ex-info "This world has no budget to grant from (it is not a Run's world)"
+                          {:type ::no-authority})))
+        (-> opts
+            (dissoc :grant-microdollars)
+            (assoc :authority authority
+                   :grant {resource/microdollars (bigdec amount)}))))))
+
 (defn add-inference-ns!
   "Add probabilistic programming primitives to SCI context.
 
@@ -374,7 +406,7 @@
         kernel*     @(resolve 'org.replikativ.foerster.core/kernel-infer)
         steer*      @(resolve 'org.replikativ.foerster.steer/model)
         world-opts  (fn [opts]
-                      (merge {:world-policy :fresh} (or opts {})))]
+                      (funded-world-opts (merge {:world-policy :fresh} (or opts {}))))]
     (sci/add-namespace!
      sci-ctx 'infer
      (doc/with-docs
@@ -408,7 +440,7 @@
         'log-weights :posterior/log-weights
         'ess         :posterior/ess
         'worlds      :posterior/worlds}
-       '{smc-infer [([model particles] [model particles opts]) "Run SMC, in fresh worlds by default; pass {:world-policy :fork} for a model that needs room state."]
+       '{smc-infer [([model particles] [model particles opts]) "Run SMC, in fresh worlds by default; pass {:world-policy :fork} for a model that needs room state. With :grant-microdollars n (and :world-policy :fork) the particles split n microdollars of this Run's budget and pay their model calls from their share."]
          importance-sampling [([model particles] [model particles opts]) "Run importance sampling with canonical particle worlds by default."]
          kernel-infer [([model kernel particles] [model kernel particles opts]) "Run a Spindel inference kernel with canonical particle worlds by default."]
          steer [([{:keys [init step value reward done? max-steps]}]) "A model that steers a process by SMC: `step` (state → next state, a spin or value; its randomness — a model call, a tool — is the proposal), `value` (state → log ψ, the reward to come: a verifier, judge or process reward), `reward` (final state → log potential), `done?`. Targets p(trajectory)·exp(reward); resamples at every step on the twist log ψ_t − log ψ_{t−1}. Run it with smc-infer, e.g. (infer/smc-infer (infer/steer {...}) 8 {:resampling :stratified})."]

@@ -7,7 +7,9 @@
    Kontor transfer from its parent wallet."
   (:require [dvergr.agent.attempt.governance :as attempt-governance]
             [dvergr.room.store :as store]
-            [kontor.resource :as kontor])
+            [kontor.resource :as kontor]
+            [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.engine.protocols :as rtp])
   (:import [java.nio.charset StandardCharsets]
            [java.util UUID]))
 
@@ -230,6 +232,14 @@
   (or (get @wallet-locks wallet)
       (get (swap! wallet-locks #(if (contains? % wallet) % (assoc % wallet (Object.)))) wallet)))
 
+(defn- world-payer
+  "`payer`, or the current world's own wallet when the ledger authority
+   granted it one."
+  [payer]
+  (if-let [own (some-> ec/*execution-context* (rtp/get-state [:dvergr/wallet :wallet]))]
+    (assoc payer :wallet own)
+    payer))
+
 (defn charge-spend!
   "Consume `cost` microdollars of model spend from the bound spend wallet.
    The provider was already paid, so the ledger cannot refuse it: a cost
@@ -239,11 +249,18 @@
    binding's charge scope (`spending`): when that debit was already made (the
    scope charged again, a retried step), it is not made twice. Returns
    `{:charged n :exhausted? bool}`, or nil when no wallet is bound or there is
-   nothing to charge."
+   nothing to charge.
+
+   Spend follows the world (doc/design/speculation.md, Law 4): when the
+   current world was granted a wallet of its own by the ledger authority
+   (`dvergr.resource.authority`), the charge is taken from that wallet, so a
+   forked world cannot spend more than its share; otherwise the bound payer
+   pays."
   [cost]
   (when-let [{:keys [payer scope debits]} *spend-wallet*]
     (when (and payer (pos? cost))
-      (let [{:keys [room wallet]} payer
+      (let [payer (world-payer payer)
+            {:keys [room wallet]} payer
             id (spend-debit-id scope (swap! debits inc))]
         (locking (wallet-lock wallet)
           (if-let [done (store/-resource-receipt (resource-store! room) id)]

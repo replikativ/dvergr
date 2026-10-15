@@ -111,3 +111,27 @@
                      (:value pure)))))))
       (finally
         (context/stop-context! root)))))
+
+(deftest a-grant-funds-forked-particles-from-the-calling-world
+  ;; doc/design/speculation.md: :grant-microdollars becomes the ledger
+  ;; authority of the calling world's savepoint session and a microUSD grant
+  (let [funded @#'dvergr.sandbox.ns.data/funded-world-opts
+        authority (Object.)
+        world (org.replikativ.spindel.engine.context/create-execution-context)]
+    (try
+      (is (= {:world-policy :fresh} (funded {:world-policy :fresh :authority :forged}))
+          "no grant: nothing added, and an :authority from the sandbox is dropped")
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #":world-policy :fork"
+                            (funded {:world-policy :fresh :grant-microdollars 10})))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"positive number"
+                            (funded {:world-policy :fork :grant-microdollars -1})))
+      (binding [org.replikativ.spindel.engine.core/*execution-context* world]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no budget"
+                              (funded {:world-policy :fork :grant-microdollars 10})))
+        (org.replikativ.spindel.engine.protocols/swap-state!
+         world [:savepoint/session] (constantly {:scope (atom {:authority authority})}))
+        (is (= {:world-policy :fork :authority authority
+                :grant {dvergr.resource/microdollars 10M}}
+               (funded {:world-policy :fork :grant-microdollars 10}))))
+      (finally
+        (org.replikativ.spindel.engine.context/stop-context! world)))))

@@ -48,7 +48,7 @@
     (store/-transfer-resources! (store! room)
                                 {:id transfer-id :kind :grant :source source :destination account
                                  :resources resources :effective-date (java.util.Date.)})
-    (rtp/swap-state! ctx [:dvergr/wallet] (constantly {:account account :from source}))
+    (rtp/swap-state! ctx [:dvergr/wallet] (constantly {:account account :wallet wallet-id :from source}))
     account))
 
 (defn- remaining [room account]
@@ -84,6 +84,13 @@
          {:id (stable-id :dvergr/escrow-transfer key) :kind :grant
           :source source :destination (kontor/account-ref escrow-id) :resources left
           :effective-date (java.util.Date.)}))))
+
+  (balance [_ context]
+    ;; what a world's own wallet has left, for `world-scope/copy!` to split
+    ;; between its copies; a world without one (a Run's world) has nothing
+    ;; a copy may split
+    (when-let [account (rtp/get-state context [:dvergr/wallet :account])]
+      (remaining room account)))
 
   (claim! [_ key context]
     (let [escrow (kontor/account-ref (stable-id :dvergr/escrow key))
