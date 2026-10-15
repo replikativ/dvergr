@@ -104,28 +104,34 @@
      'participants (read :participants)
      'root         (read :root)}))
 
+(def ^:private teardown-ops
+  "The room ops that wait for a room's teardown: its Runs and listeners must
+   stop, which needs the engine's drain."
+  #{'delete! 'merge! 'discard!})
+
+(defn- refuse-on-drain!
+  "A spin continuation runs on the drain, which `op`'s teardown needs: it is
+   refused there, as `@spin` is."
+  [op]
+  (when (simple/on-drain-thread?)
+    (throw (ex-info (str op " waits for the room's teardown, which cannot happen"
+                         " inside a spin body; call it outside the spin, e.g. on"
+                         " the value of @(spin …)")
+                    {:type ::settle-in-drain :op op}))))
+
 (defn- through-boundary
-  "Route every room op through the effect boundary (`dvergr.effects`)."
+  "Route every room op through the effect boundary (`dvergr.effects`), a
+   teardown op only off the drain."
   [effects ops]
   (reduce-kv (fn [m sym f]
                (if-let [[kind resource] (get room-effects sym)]
                  (assoc m sym (with-meta (fn [& args]
+                                           (when (teardown-ops sym) (refuse-on-drain! sym))
                                            (effects/perform! effects {:effect kind :resource (resource args)}
                                                              #(apply f args)))
                                 (meta f)))
                  m))
              ops ops))
-
-(defn- refuse-in-drain!
-  "`op` waits for a room's teardown: its Runs and listeners must stop, which
-   needs the engine's drain. A spin continuation runs on that drain, so it is
-   refused there, as `@spin` is."
-  [op]
-  (when simple/*in-drain?*
-    (throw (ex-info (str op " waits for the room's teardown, which cannot happen"
-                         " inside a spin body; call it outside the spin, e.g. on"
-                         " the value of @(spin …)")
-                    {:type ::settle-in-drain :op op}))))
 
 (defn room-ops-map
   "The unified Room-ops map — `create!`/`list`/`get`/`post!`/`messages`/`children`/
@@ -248,7 +254,6 @@
                         (leave-agent!* room agent-id)
                         {:left agent-id :room (:id room)}))
         delete-fn   (fn [ref]
-                      (refuse-in-drain! 'delete!)
                       (binding [rtc/*execution-context* (selected-ctx)]
                         (if-let [room (resolve-room ref)]
                           (do
@@ -283,7 +288,6 @@
                            (binding [rtc/*execution-context* (:ctx room)]
                              (view (fork-room* room (merge {:isolation :ctx} opts))))))))
         merge-fn    (fn [parent-ref fork-ref]
-                      (refuse-in-drain! 'merge!)
                       (let [[parent fork] (binding [rtc/*execution-context* (selected-ctx)]
                                             [(resolve-room parent-ref) (resolve-room fork-ref)])]
                         (cond
@@ -300,7 +304,6 @@
                                     (view result)
                                     result)))))
         discard-fn  (fn [fork-ref]
-                      (refuse-in-drain! 'discard!)
                       (if-let [fork (binding [rtc/*execution-context* (selected-ctx)]
                                       (resolve-room fork-ref))]
                         (let [snapshot (view fork)]
