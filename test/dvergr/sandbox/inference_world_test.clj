@@ -135,3 +135,26 @@
                (funded {:world-policy :fork :grant-microdollars 10}))))
       (finally
         (org.replikativ.spindel.engine.context/stop-context! world)))))
+
+(deftest a-model-needs-only-infer-and-dist
+  ;; sample, observe and factor from infer/, as foerster.core re-exports them,
+  ;; and the current distributions (uniform-discrete) in dist/
+  (let [root (context/create-execution-context)]
+    (try
+      (binding [ec/*execution-context* root]
+        (let [sci-ctx (sandbox/fork-for-session root)]
+          (data-ns/add-inference-ns! sci-ctx)
+          (let [mean (sci/eval-string*
+                      sci-ctx
+                      (str "(require '[org.replikativ.spindel.spin.cps :refer [spin]] "
+                           "         '[infer :refer [sample observe factor]]) "
+                           "(def model "
+                           "  (spin (let [a (sample (dist/uniform-discrete 1 7) :id :a) "
+                           "              b (sample (dist/uniform-discrete 1 7) :id :b)] "
+                           "         (factor (if (= 7 (+ a b)) 0.0 ##-Inf)) "
+                           "         (observe (dist/normal (+ a b) 1.0) 7.0 :id :reading) "
+                           "         a))) "
+                           "(:mean (infer/query @(infer/importance-sampling model 2000) identity))"))]
+            (is (< 3.0 mean 4.0) (str mean)))))
+      (finally
+        (context/stop-context! root)))))
