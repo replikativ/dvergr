@@ -186,7 +186,7 @@
         calls (atom 0)
         invoke ops/invoke]
     (with-redefs [runner/admit-for (fn [& _] (fn [_] (swap! asked inc) {:reason "allowance reached"}))
-                  ops/invoke (fn [d k args] (when (= :catalog/benchmark k) (swap! benchmarks inc)) (invoke d k args))]
+                  ops/invoke (fn [d p k args] (when (= :catalog/benchmark k) (swap! benchmarks inc)) (invoke d p k args))]
       (let [r (bench! (writer calls "Wato") b home)]
         (is (= "refused" (get-in r [:job :reason])) (pr-str (:job r)))
         (is (pos? @asked))

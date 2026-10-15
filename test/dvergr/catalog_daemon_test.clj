@@ -440,9 +440,9 @@
       (is (= "application/pdf" (:media-type (ops/invoke *daemon* dvergr.principal/local-principal :room/read {:room "ledger" :path "data/scan.pdf"}))))
       (testing "and as MCP resources"
         (let [read-resource @(requiring-resolve 'dvergr.mcp.server/read-resource)
-              [c] (:contents (read-resource "room://ledger/files/data/cases.csv"))
-              [pdf] (:contents (read-resource "room://ledger/files/data/scan.pdf"))
-              [dir] (:contents (read-resource "room://ledger/files/workflows/coding"))]
+              [c] (:contents (read-resource dvergr.principal/local-principal "room://ledger/files/data/cases.csv"))
+              [pdf] (:contents (read-resource dvergr.principal/local-principal "room://ledger/files/data/scan.pdf"))
+              [dir] (:contents (read-resource dvergr.principal/local-principal "room://ledger/files/workflows/coding"))]
           (is (str/starts-with? (:text c) "no;vendor"))
           (is (= "JVBERi0xLjQKJcfsj6IK" (:blob pdf)))
           (is (some #{"checker.clj"} (map :name (:entries (jsonista.core/read-value (:text dir) jsonista.core/keyword-keys-object-mapper))))
