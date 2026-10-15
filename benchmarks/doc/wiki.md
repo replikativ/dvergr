@@ -252,5 +252,40 @@ Next for the wiki benchmark:
   a paid run. Spends recorded before fold exactly as they did (stored Scorecards
   still validate).
 
-Open: an LLM judge tier for prose faithfulness.
+**v4: atoms, overviews and quoted claims** (`dvergr.catalog.wiki-v4`). A wiki in the
+two-tier shape of Sam's vault-wiki contracts, scored on v3's generated worlds:
+`/wiki/atoms/<slug>.md` (front matter `type`, `source`, `entry-point`; one claim per
+`##` heading; a `**Sources:**` line), `/wiki/overviews/<slug>.md` (`type: overview`,
+linking the atoms it synthesises) and `/wiki/index.md` linking the overviews. A claim
+carries its evidence as a verbatim quote, `> "…" [[doc]]` or `[[doc#Section]]` (a source
+without sections is cited whole; the quote pins the place). `score-wiki-v4` keeps v2's
+currency, grounding, entities, relations, distractors and copies (it runs
+`score-wiki-v2` on the wiki with its wikilinks as v2's links), counts a fact only in a
+claim that cites one of its sources, and adds:
+
+- quoted claims: every claim that cites a document carries a faithful quote; a wiki
+  without quotes earns no quote credit;
+- quote fidelity: every quote is in the section it cites after vault-wiki's normaliser
+  (currency signs, thousands separators, `5 %`, number words, dates, whitespace, case),
+  with scan artefacts of the source undone; each 1% unfaithful costs 5% of the weight;
+- claim headers: every quote sits under a heading (one claim, one citable slot);
+- citations: every citation names a document and its section exists;
+- front matter: an atom has type, a source list naming documents and an entry-point, and
+  its Sources line lists the same documents; an overview is `type: overview`;
+- tiers: every atom is linked from an overview, every overview from the index, links
+  resolve.
+
+Calibration (`test/dvergr/catalog/wiki_v4_test.clj`, 45 worlds over seeds, scales,
+prose and noise): the generated reference wiki (v3's reference pages as atoms, one claim
+per paragraph, each quoting the sentence of every cited source that supports it best,
+avoiding stale values and distractors) scores 1.0 with every check true; a misquoted
+number, a quote above the first heading, a citation of a missing section, an atom no
+overview links, an atom without front matter, a Sources line out of step, a stale value,
+invented numbers, a wiki without citations, a wiki without quotes, the distractor's
+facts and missing pages each fail their own check and score lower; a dump scores below
+0.5. Not yet a catalog workflow (`catalog_start`/`experiment!` take versions 1–3).
+
+Open: an LLM judge tier for prose faithfulness (vault-wiki's paraphrase rubric:
+matches / softens / inverts / inserts), and wiki/v4 as a catalog workflow and
+experiment.
 
