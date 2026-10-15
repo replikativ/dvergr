@@ -33,6 +33,7 @@
             [org.replikativ.spindel.effects.track :refer [track]]
             [org.replikativ.spindel.incremental.interval :as iv]
             [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.engine.impl.simple :as simple]
             [taoensso.telemere :as tel]))
 
 ;; room-id → handle atom {:running? bool}
@@ -69,31 +70,35 @@
    way; a fire never throws out of the scheduler."
   [room aid s]
   (future
-    (let [outcome
-          (try
-            (let [cctx (room-context/ensure-ctx!
-                        room aid
+    ;; A future conveys its caller's bindings; the eval is not on the
+    ;; scheduler spin's drain.
+    (binding [simple/*in-drain?* false
+              ec/*spin-id* nil]
+      (let [outcome
+            (try
+              (let [cctx (room-context/ensure-ctx!
+                          room aid
                         ;; the extensions its Participant declares now (a
                         ;; context built before the agent joined gets them on
                         ;; its first turn)
-                        {:sandbox :participant})
-                  {:keys [success value error]}
-                  (sandbox/eval-code
-                   (chat-context/sci-context-in cctx (:ctx room)) (:schedule/code s)
-                   :timeout-ms (* 5 60 1000) :realize? true
-                   :execution-context (:ctx room))]
-              (if success
-                (str "⏱ " (or (:schedule/description s) "code task") " → "
-                     (subs value 0 (min 500 (count value))))
+                          {:sandbox :participant})
+                    {:keys [success value error]}
+                    (sandbox/eval-code
+                     (chat-context/sci-context-in cctx (:ctx room)) (:schedule/code s)
+                     :timeout-ms (* 5 60 1000) :realize? true
+                     :execution-context (:ctx room))]
+                (if success
+                  (str "⏱ " (or (:schedule/description s) "code task") " → "
+                       (subs value 0 (min 500 (count value))))
+                  (str "⏱ " (or (:schedule/description s) "code task")
+                       " FAILED: " (:message error))))
+              (catch Throwable t
                 (str "⏱ " (or (:schedule/description s) "code task")
-                     " FAILED: " (:message error))))
-            (catch Throwable t
-              (str "⏱ " (or (:schedule/description s) "code task")
-                   " FAILED: " (ex-message t))))]
-      (disc/post! room (disc/message :scheduler :_activity outcome nil
-                                     {:role :assistant
-                                      :source :scheduler
-                                      :schedule-id (:schedule/id s)})))))
+                     " FAILED: " (ex-message t))))]
+        (disc/post! room (disc/message :scheduler :_activity outcome nil
+                                       {:role :assistant
+                                        :source :scheduler
+                                        :schedule-id (:schedule/id s)}))))))
 
 (defn- fire-one!
   "Fire one schedule: a :schedule/code task evals in the agent's sandbox

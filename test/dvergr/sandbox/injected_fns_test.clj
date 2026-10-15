@@ -15,7 +15,11 @@
             [dvergr.sandbox.ns.kb :as kb-ns]
             [dvergr.sandbox.workspace :as workspace]
             [muschel.fs.geschichte :as gfs]
+            [org.replikativ.spindel.effects.await :refer [await]]
             [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.engine.impl.simple :as simple]
+            [org.replikativ.spindel.spin.combinators :as comb]
+            [org.replikativ.spindel.spin.cps :refer [spin]]
             [sci.core :as sci]))
 
 (defn- temp-dir [prefix]
@@ -83,6 +87,53 @@
         (is (nil? (('participants ops) "no-such-room"))))
       (finally
         (doseq [f @forks] (try (d/discard f) (catch Throwable _)))
+        (d/close-room! parent)))))
+
+(deftest room-teardown-ops-are-refused-on-the-drain
+  ;; a continuation after an await runs on the engine's drain, which the
+  ;; teardown they wait for needs
+  (let [parent (d/make-room {:id :sci-injected-drain-parent
+                             :store (memory/make)})
+        effects (atom [])
+        ops    (kb-ns/room-ops-map (:ctx parent) nil
+                                   (select-keys parent [:id :incarnation])
+                                   {:effects (constantly {:handlers [(fn [e next]
+                                                                       (swap! effects conj (:effect e))
+                                                                       (next e))]})})
+        fork!  #(binding [ec/*execution-context* (:ctx parent)]
+                  (let [view (('fork! ops) parent)]
+                    [view (rreg/lookup (:id view))]))
+        registered? #(some? (binding [ec/*execution-context* (:ctx parent)] (rreg/lookup (:id %))))
+        refusal #(try (%) nil (catch clojure.lang.ExceptionInfo e (ex-data e)))
+        in-spin (fn [f]
+                  (binding [ec/*execution-context* (:ctx parent)]
+                    @(future @(spin (await (comb/sleep 1)) (f)))))
+        [view fork] (fork!)
+        settled (atom [fork])]
+    (try
+      (testing "from a continuation"
+        (reset! effects [])
+        (doseq [[op call] [['merge! #(('merge! ops) (:slug parent) (:id view))]
+                           ['discard! #(('discard! ops) (:id view))]
+                           ['delete! #(('delete! ops) (:id view))]]]
+          (is (= {:type ::kb-ns/settle-in-drain :op op} (in-spin #(refusal call))) (str op)))
+        (is (= [] @effects) "refused before the effect boundary")
+        (is (registered? view) "the fork is untouched")
+        (is (nil? (d/settlement-claim fork)) "and unclaimed"))
+      (testing "a bound-fn that captured the off-drain binding, run on the drain"
+        (let [call (binding [simple/*in-drain?* false]
+                     (bound-fn [] (refusal #(('discard! ops) (:id view)))))]
+          (is (= {:type ::kb-ns/settle-in-drain :op 'discard!} (in-spin call)))
+          (is (registered? view))))
+      (testing "a future a continuation starts is off the drain"
+        (let [[view' fork'] (fork!)]
+          (swap! settled conj fork')
+          (is (= (:id view') (:id (in-spin #(deref (future (('discard! ops) (:id view'))))))))
+          (is (not (registered? view')))))
+      (is (= (:id parent) (:id (('merge! ops) (:slug parent) (:id view))))
+          "outside the spin it merges")
+      (finally
+        (doseq [f @settled] (try (d/discard f) (catch Throwable _)))
         (d/close-room! parent)))))
 
 ;; ---------------------------------------------------------------------------

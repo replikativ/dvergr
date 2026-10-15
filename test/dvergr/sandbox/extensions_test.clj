@@ -17,7 +17,8 @@
             [org.replikativ.spindel.core :as sp]
             [sci.core :as sci]
             [org.replikativ.spindel.engine.context :as context]
-            [org.replikativ.spindel.engine.core :as ec]))
+            [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.engine.impl.simple :as simple]))
 
 (deftest the-registry-checks-what-it-is-given
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"qualified keyword"
@@ -313,6 +314,24 @@
         (cond (re-find #"→ true" (str text)) true
               (re-find #"→ false" (str text)) false
               :else text)))))
+
+(deftest a-schedule-fired-from-the-drain-evaluates-off-it
+  ;; the scheduler spin fires on the drain; its task runs on a future, which
+  ;; must not inherit the drain's guard: the code may deref a Spin
+  (let [room (d/room :ext-scheduled-drain)
+        outcome (promise)]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (d/join room (llm/llm-agent {:id :analyst :spec {:provider :mock :model "mock"}})))
+      (with-redefs [d/post! (fn [_ msg] (deliver outcome (:content msg)))]
+        @(binding [simple/*in-drain?* true]
+           (#'scheduler/run-code-task!
+            room :analyst
+            {:schedule/code "(require '[org.replikativ.spindel.spin.cps :refer [spin]]) @(spin (+ 1 2))"}))
+        (is (re-find #"→ 3" (str (deref outcome 60000 ::timeout)))))
+      (finally
+        (room-context/drop-ctx! :ext-scheduled-drain :analyst)
+        (d/close-room! room)))))
 
 (defn- plain-agent [] (llm/llm-agent {:id :analyst :spec {:provider :mock :model "mock"}}))
 (defn- inference-agent []

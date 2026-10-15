@@ -10,6 +10,7 @@
             [dvergr.effects :as effects]
             [dvergr.runtime.ctx :as runtime-ctx]
             [org.replikativ.spindel.engine.core :as rtc]
+            [org.replikativ.spindel.engine.impl.simple :as simple]
             [dvergr.sandbox.ns.doc :as doc]))
 
 (defn add-llm-ns!
@@ -103,12 +104,29 @@
      'participants (read :participants)
      'root         (read :root)}))
 
+(def ^:private teardown-ops
+  "The room ops that wait for a room's teardown: its Runs and listeners must
+   stop, which needs the engine's drain."
+  #{'delete! 'merge! 'discard!})
+
+(defn- refuse-on-drain!
+  "A spin continuation runs on the drain, which `op`'s teardown needs: it is
+   refused there, as `@spin` is."
+  [op]
+  (when (simple/on-drain-thread?)
+    (throw (ex-info (str op " waits for the room's teardown, which cannot happen"
+                         " inside a spin body; call it outside the spin, e.g. on"
+                         " the value of @(spin …)")
+                    {:type ::settle-in-drain :op op}))))
+
 (defn- through-boundary
-  "Route every room op through the effect boundary (`dvergr.effects`)."
+  "Route every room op through the effect boundary (`dvergr.effects`), a
+   teardown op only off the drain."
   [effects ops]
   (reduce-kv (fn [m sym f]
                (if-let [[kind resource] (get room-effects sym)]
                  (assoc m sym (with-meta (fn [& args]
+                                           (when (teardown-ops sym) (refuse-on-drain! sym))
                                            (effects/perform! effects {:effect kind :resource (resource args)}
                                                              #(apply f args)))
                                 (meta f)))
