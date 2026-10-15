@@ -56,7 +56,7 @@
    quotes too. Pages outside atoms/ and overviews/ earn nothing.
 
    Where this differs from vault-wiki: number words are replaced as whole
-   words (its table replaces substrings, so " someone " became " some1 " on both
+   words (its table replaces substrings, so `someone` became `some1` on both
    sides); a quote must have three words and share a number or a word with
    its claim, and every document a claim cites must be quoted in it; a
    sectioned source must be cited by section (a bare [[doc]] only on the
