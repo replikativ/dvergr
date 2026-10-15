@@ -95,7 +95,7 @@
     // a room's app: a capability link minted now (the app is sandboxed and
     // carries no session), opened in a new window without an opener
     var w = window.open('about:blank', '_blank');
-    fetch('/api/app-link?room=' + encodeURIComponent(t.getAttribute('data-app')))
+    fetch('/api/app-link?room=' + encodeURIComponent(t.getAttribute('data-app')), { method: 'POST' })
       .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
       .then(function (j) { if (!j.url) throw new Error('no link'); if (w) { w.opener = null; w.location = j.url; } })
       .catch(function (err) { if (w) w.close(); t.title = 'could not open the app: ' + err.message; });

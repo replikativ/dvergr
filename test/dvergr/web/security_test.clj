@@ -130,7 +130,7 @@
         (is (pos? (count body)) f)))
     (let [{:keys [status headers]} (a (no-auth (req :get "/dvergr-sw.js")))]
       (is (= 200 status))
-      (is (= "/" (get headers "Service-Worker-Allowed"))))
+      (is (nil? (get headers "Service-Worker-Allowed")) "its scope is its own path's, the root: no widening"))
     (is (not (str/includes? (str (:body (a (no-auth (req :get "/static/../web/server.clj"))))) "defn"))
         "nothing but those files")
     (testing "the pages allow no other script, inline or remote"
@@ -138,25 +138,57 @@
         (is (str/includes? csp "script-src 'self'"))
         (is (str/includes? csp "object-src 'none'"))
         (is (str/includes? csp "base-uri 'none'"))
-        (is (not (str/includes? csp "unsafe-inline")))))))
+        (is (str/includes? csp "form-action 'self'"))
+        (is (str/includes? csp "default-src 'self'"))
+        (is (= "script-src 'self'" (some #(when (str/starts-with? % "script-src") %) (map str/trim (str/split csp #";"))))
+            "scripts: this origin's files only (inline styles stay allowed)")))))
 
 (deftest the-service-worker-attaches-the-session-to-this-origin-only
+  ;; a navigation reaches the worker whoever started it: a change (not GET)
+  ;; gets the session only when its referrer is this origin
   (if-not (some #(.canExecute (java.io.File. (str % "/node")))
                 (str/split (System/getenv "PATH") #":"))
     (println "skipped: no node on PATH")
     (let [sw (.getPath (clojure.java.io/file (clojure.java.io/resource "dvergr/web/static/dvergr-sw.js")))
           js (str "const {attaches}=require(" (pr-str sw) ");"
-                  "const o='http://127.0.0.1:17880';"
-                  "const cases=[['http://127.0.0.1:17880/dashboard',true],['/api/rooms',false],"
-                  "['http://127.0.0.1:17880/api/v1/room_list',true],['http://127.0.0.1:3000/x',false],"
-                  "['http://localhost:17880/x',false],['https://127.0.0.1:17880/x',false],"
-                  "['https://evil.example/x',false],['http://127.0.0.1:17880.evil.example/x',false],"
-                  "['http://127.0.0.1:17880/apps/r/~ab/',false],['http://127.0.0.1:17880/dvergr-sw.js',false]];"
-                  "for(const [u,want] of cases){if(attaches(u,o)!==want){console.log('FAIL',u);process.exit(1);}}"
-                  "console.log('ok');")
+                  "const o='http://127.0.0.1:17880', me=o+'/dashboard';"
+                  "const r=(url,method,referrer,mode)=>({url,method:method||'GET',referrer:referrer||'',mode:mode||'navigate'});"
+                  "const cases=["
+                  "[r(o+'/dashboard'),true,'a GET navigation with no referrer (bookmark, new tab)'],"
+                  "[r(o+'/dashboard','GET','https://evil.example/'),true,'a GET navigation from elsewhere (no GET changes anything)'],"
+                  "[r(o+'/rooms/r/post','POST',me),true,'a same-origin form post'],"
+                  "[r(o+'/rooms/r/post','POST','https://evil.example/x'),false,'a cross-site form post'],"
+                  "[r(o+'/rooms/r/post','POST','http://127.0.0.1:3000/x'),false,'a post from another local port'],"
+                  "[r(o+'/rooms/r/post','POST',''),false,'a post without referrer (stripped): fail closed'],"
+                  "[r(o+'/rooms/r/post','POST','about:client'),false,'about:client'],"
+                  "[r(o+'/api/v1/room_create','PUT',me,'cors'),true,'a same-origin fetch that writes'],"
+                  "[r(o+'/api/rooms','DELETE','https://evil.example/','cors'),false,'a cross-site write of any method'],"
+                  "[r('http://127.0.0.1:3000/x'),false,'another port'],[r('http://localhost:17880/x'),false,'localhost is another origin'],"
+                  "[r('https://127.0.0.1:17880/x'),false,'another scheme'],[r('http://127.0.0.1:17880.evil.example/x'),false,'a look-alike host'],"
+                  "[r(o+'/apps/r/~ab/'),false,'a room app'],[r(o+'/dvergr-sw.js'),false,'the worker itself']];"
+                  "let bad=0;for(const [q,want,why] of cases){if(attaches(q,o)!==want){console.log('FAIL',why);bad++;}}"
+                  "console.log(bad?'failed':'ok');process.exit(bad?1:0);")
           {:keys [exit out err]} (clojure.java.shell/sh "node" "-e" js)]
       (is (zero? exit) (str out err))
       (is (str/includes? out "ok")))))
+
+(deftest a-sessions-change-must-pass-the-workers-check
+  ;; the server's backstop: a session id authorizes a change only with the
+  ;; header the worker adds after its same-origin check (an older worker,
+  ;; without the check, never adds it); a script with the token needs none
+  (let [a (app)
+        sid (second (re-find #"#sid=(.+)$" (get-in (a (update (assoc (req :get "/") :query-string (str "token=" (principal/local-token)))
+                                                              :headers dissoc "authorization"))
+                                                   [:headers "Location"])))
+        post (fn [headers] (a (req :post "/api/v1/room_create"
+                                   :headers (merge {"content-type" "application/json"} headers)
+                                   :body "{\"title\":\"x\"}")))]
+    (with-redefs [ops/invoke (fn [& _] {:ok true})]
+      (is (= 403 (:status (post {"authorization" (str "Bearer " sid)}))))
+      (is (= 200 (:status (post {"authorization" (str "Bearer " sid) "x-dvergr-request" "1"}))))
+      (is (= 200 (:status (post {}))) "the local token (a script) needs no such header"))
+    (testing "minting an app link changes state: POST only"
+      (is (not= 200 (:status (a (req :get "/api/app-link" :query "room=r"))))))))
 
 (deftest voice-uploads-need-a-credential
   (let [app (app)]
@@ -331,7 +363,8 @@
             (is (= 303 (:status r)))
             (is (re-find #"^/#sid=" (get-in r [:headers "Location"])))))
         (testing "log out ends the session"
-          (is (= 204 (:status (a (as-sid (req :post "/logout" :headers {"origin" (str "http://" host)}))))))
+          (is (= 204 (:status (a (as-sid (req :post "/logout" :headers {"origin" (str "http://" host)
+                                                                        "x-dvergr-request" "1"}))))))
           (is (= 401 (:status (a (as-sid (req :get "/api/v1/room_list")))))))
         (testing "a new local token ends every session"
           (let [sid2 (second (re-find #"#sid=(.+)$" (get-in (login) [:headers "Location"])))]
@@ -372,7 +405,7 @@
                 ops/authorize! (fn [& _] nil)]
     (let [a (app)
           no-auth #(update % :headers dissoc "authorization")
-          link (a (req :get "/api/app-link" :query "room=r"))
+          link (a (req :post "/api/app-link" :query "room=r" :headers {"origin" (str "http://" host)}))
           url (get (jsonista.core/read-value (:body link)) "url")]
       (is (re-matches #"/apps/r/~[0-9a-f]{64}/" (str url)) (pr-str link))
       (testing "the browser opens it without any credential, and the app is sandboxed"

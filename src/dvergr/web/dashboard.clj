@@ -232,10 +232,12 @@
    page loads `static-scripts` (the session is the service worker's)."
   [{:keys [title extra-css]} & body]
   (str
+   "<!DOCTYPE html>"
    (h/html
     [:html {:data-dvergr-auth "page"}
      [:head
       [:meta {:charset "utf-8"}]
+      [:link {:rel "icon" :href "data:,"}]
       [:meta {:name "viewport" :content "width=device-width, initial-scale=1"}]
       [:title (str "dvergr" (when title (str " · " title)))]
       (for [src static-scripts] [:script {:src src}])

@@ -258,6 +258,7 @@
    (h/html
     [:html {:data-dvergr-auth (name state)}
      [:head [:meta {:charset "utf-8"}] [:title "dvergr"]
+      [:link {:rel "icon" :href "data:,"}]
       (for [src web-dashboard/static-scripts] [:script {:src src}])
       [:style "body{background:#111;color:#ddd;font-family:sans-serif;margin:3em}
                input{background:#18181b;border:1px solid #333;color:#e0e0e0;padding:6px 10px}"]]
@@ -273,8 +274,10 @@
 (def ^:private page-csp
   "The dashboard's pages run this origin's scripts only (vendored htmx and
    /static/dvergr.js; no inline script, no eval), embed no plugins, keep their
-   base URL, and are framed by nobody."
-  "script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+   base URL, post forms to this origin only, and are framed by nobody (the
+   pages' own inline styles stay allowed)."
+  (str "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+       "connect-src 'self'; form-action 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"))
 
 (defn- static-file
   "A file of resources/dvergr/web/static, public (no credential: scripts the
@@ -291,8 +294,7 @@
    its scope is the whole origin."
   []
   {:status 200
-   :headers {"Content-Type" "text/javascript; charset=utf-8" "Cache-Control" "no-cache"
-             "Service-Worker-Allowed" "/"}
+   :headers {"Content-Type" "text/javascript; charset=utf-8" "Cache-Control" "no-cache"}
    :body (slurp (io/resource "dvergr/web/static/dvergr-sw.js"))})
 
 (defn- login-response
@@ -414,10 +416,17 @@
              :body (login-page :shell nil)}
             unauthorized)
 
+          ;; a session's change must have passed the service worker's same-origin
+          ;; check (it adds the header then); a script with the token needs none
+          (and sid-p (not (#{:get :head :options} (:request-method req)))
+               (not= "1" (get-in req [:headers "x-dvergr-request"])))
+          {:status 403 :headers {"Content-Type" "application/json"}
+           :body "{\"error\":\"A session's change must come from this origin's pages\"}"}
+
           (and (= :post (:request-method req)) (= "/logout" uri))
           (do (when sid-p (swap! sessions dissoc bearer)) {:status 204 :body ""})
 
-          (= "/api/app-link" uri)
+          (and (= "/api/app-link" uri) (= :post (:request-method req)))
           (let [slug (query-param req "room")]
             (try (dops/authorize! daemon p :room/read {:room slug :path "/app"})
                  (let [cap (principal/random-token)
