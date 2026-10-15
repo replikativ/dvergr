@@ -219,3 +219,39 @@
       (is (empty? @(:pending (:bus room))) "no admitted message is left without a committer")
       (is (= (set (map :id goods)) (set (keep #(when ((set (map :id goods)) (:id %)) (:id %)) (d/log room)))))
       (finally (d/close-room! room)))))
+
+(deftest a-message-failed-before-a-written-one-is-not-retried-after-it
+  ;; A batch that fails A (transiently) but writes B: retrying A on its own
+  ;; would make it durable after B, while the log has A before B. A fails.
+  (let [a (random-uuid) bm (random-uuid) durable (atom []) entered (promise) release (promise)
+        first? (atom true)
+        b (bus/create-bus
+           {:durable-append! (fn [m]
+                               (when (compare-and-set! first? true false) (deliver entered true) @release)
+                               (swap! durable conj (:id m)) :inserted)
+            :durable-append-batch! (fn [msgs]
+                                     (mapv (fn [m] (if (= a (:id m)) :failed
+                                                       (do (swap! durable conj (:id m)) :inserted)))
+                                           msgs))})
+        first-post (future (bus/post! b {:id (random-uuid) :to :x :content "first"}))
+        _ (deref entered 2000 nil)
+        ;; admitted together, A before B, behind the held first commit
+        dones (bus/enqueue-all! b [{:id a :to :x :content "a"} {:id bm :to :x :content "b"}])
+        _ (deliver release true)
+        _ @first-post
+        errors (mapv (fn [done] (try (bus/await-post! b done) nil (catch Throwable t t))) dones)]
+    (is (= (mapv :id (bus/log b)) @durable) "log order is durable order")
+    (is (not-any? #(= a (:id %)) (bus/log b)) "A is not made durable after B")
+    (is (= 1 (count (remove nil? errors))) "A's post fails, B's succeeds")))
+
+(deftest a-bus-without-a-store-never-waits-on-the-commit-lock
+  ;; nothing to make durable: a post (also from the drain thread) is on the
+  ;; log at once, whatever another thread holds
+  (let [b (bus/create-bus {})
+        ^java.util.concurrent.locks.ReentrantLock lock (:commit-lock b)]
+    (.lock lock)
+    (try
+      (let [f (future (bus/post! b {:id (random-uuid) :to :x :content "free"}))]
+        (is (not= ::waited (deref f 2000 ::waited)) "the post did not wait on the commit lock")
+        (is (= 1 (count (bus/log b)))))
+      (finally (.unlock lock)))))

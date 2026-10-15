@@ -575,7 +575,7 @@
    successor once it is admitted, and `release-resume!` ends the reservation
    either way."
   [room run-id]
-  (locking (room-lock (:id room))
+  (with-room-exclusive (:id room)
     (let [existing (some-> (:store room) (store/-load-run (store/conversation-id room) run-id))]
       (when-let [blocker (resume-blocker room run-id existing)]
         (throw blocker))
@@ -598,7 +598,7 @@
    was. Returns the updated Run; throws when it has no savepoint, is live, or
    was resumed before."
   [room run-id resumed-by]
-  (locking (room-lock (:id room))
+  (with-room-exclusive (:id room)
     (let [room-store (:store room)
           room-id (store/conversation-id room)
           existing (some-> room-store (store/-load-run room-id run-id))]
@@ -615,7 +615,7 @@
    successor failed before it executed. A claim by another Run is left alone.
    Returns the updated Run, or nil when there was nothing to withdraw."
   [room run-id resumed-by]
-  (locking (room-lock (:id room))
+  (with-room-exclusive (:id room)
     (let [room-store (:store room)
           room-id (store/conversation-id room)
           existing (some-> room-store (store/-load-run room-id run-id))]

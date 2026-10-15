@@ -286,7 +286,9 @@
   "Persist `msgs` in order: one write through `durable-append-batch!` when the
    bus has it; one status per message (nil without a durability hook). A
    failed batch is retried message by message, so one bad message fails
-   only itself."
+   only itself. A message the batch failed is retried only when no later one
+   of the batch was written: retried after a later message, it would be
+   durable after it, out of post order; it fails instead."
   [bus msgs]
   (let [one (fn [m] (try (when-let [append! (:durable-append! bus)] (append! m))
                          (catch Throwable t t)))
@@ -296,7 +298,9 @@
         (if (and statuses (= (count statuses) (count msgs)))
           ;; keep what the batch wrote: retrying a written message would read
           ;; it back as a duplicate and never publish it
-          (mapv (fn [m s] (if (failed? s) (one m) s)) msgs statuses)
+          (let [last-written (reduce-kv (fn [acc i s] (if (failed? s) acc i)) -1 statuses)]
+            (into [] (map-indexed (fn [i [m s]] (if (and (failed? s) (> i last-written)) (one m) s)))
+                  (map vector msgs statuses)))
           ;; the batch threw: nothing of it is known written
           (mapv one msgs)))
       (mapv one msgs))))
@@ -370,8 +374,14 @@
    (queued or being committed), or nil. Read this BEFORE the log: a message
    leaves these only after it is on the log."
   [bus id]
-  (some (fn [[m _]] (when (= id (:id m)) m))
-        (concat @(:committing bus) @(:pending bus))))
+  ;; `pending` before `committing`: the committer records a batch as being
+  ;; committed before it leaves `pending`, so read in this order no moment
+  ;; misses it (the opposite order could read `committing` before the batch
+  ;; arrived and `pending` after it left).
+  (let [pending @(:pending bus)
+        committing @(:committing bus)]
+    (some (fn [[m _]] (when (= id (:id m)) m))
+          (concat committing pending))))
 
 (defn await-post!
   "Wait until the post behind `done` is durable and on the log (committing
@@ -416,7 +426,12 @@
    commit): each is admitted in post order, one committer persists everything
    admitted in one write and publishes it in that order."
   [bus msg]
-  (await-post! bus (enqueue! bus msg)))
+  (if (or (:durable-append! bus) (:durable-append-batch! bus))
+    (await-post! bus (enqueue! bus msg))
+    ;; Nothing to make durable: on the log at once, as before group commit,
+    ;; without the commit lock (a post from the drain thread never waits on
+    ;; another poster's commit).
+    (do (publish! bus (stamp msg)) nil)))
 
 (defn post-many!
   "Post a sequence of messages in order."
