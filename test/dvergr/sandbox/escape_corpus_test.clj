@@ -721,6 +721,11 @@
           (is (:err (ev "(into {} e)")))
           (is (:err (ev "(doall (vals e))")))
           (is (:err (ev "(doall (keys e))")) "a traversal of an entity holding one fails as well"))
+        (testing "a query computing on an entity input sees sealed values"
+          (is (= {:ok "parent"} (ev "(d/q '[:find ?t . :in ?e :where [(get ?e :title) ?t]] e)")))
+          (is (:err (ev "(d/q '[:find ?x . :in ?e :where [(get ?e :f) ?f] [(apply ?f []) ?x]] e)"))))
+        (testing "an empty entity collection is a map"
+          (is (= {:ok {}} (ev "(empty e)"))))
         (testing "the mirrored API takes an entity back"
           (is (= {:ok "class dvergr.sandbox.ns.datahike.SandboxDb"}
                  (ev "(str (type (d/entity-db e)))")))))

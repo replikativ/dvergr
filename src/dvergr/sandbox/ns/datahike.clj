@@ -53,6 +53,10 @@
 
 (declare world-connection? callable? untrusted seal)
 
+(def ^:private absent
+  "The not-found marker of an entity lookup: an object no stored value is."
+  (Object.))
+
 (deftype SandboxEntity [^datahike.impl.entity.Entity e]
   ;; An entity as sandbox code holds it. Datahike's entity hands out its
   ;; stored values as they are, and holds its database; this one reads like
@@ -62,8 +66,8 @@
   clojure.lang.ILookup
   (valAt [_ k] (seal (.valAt e k)))
   (valAt [_ k not-found]
-    (let [v (.valAt e k ::absent)]
-      (if (identical? ::absent v) not-found (seal v))))
+    (let [v (.valAt e k absent)]
+      (if (identical? absent v) not-found (seal v))))
   clojure.lang.IFn
   (invoke [this k] (.valAt this k))
   (invoke [this k not-found] (.valAt this k not-found))
@@ -74,7 +78,7 @@
   clojure.lang.IPersistentCollection
   (count [_] (count e))
   (cons [_ _] (throw (UnsupportedOperationException. "An entity is read-only")))
-  (empty [_] (throw (UnsupportedOperationException. "An entity is read-only")))
+  (empty [_] {})
   (equiv [_ o] (and (instance? SandboxEntity o) (= e (.-e ^SandboxEntity o))))
   clojure.lang.Seqable
   (seq [_] (seq (map (fn [[k v]] (clojure.lang.MapEntry. k (seal v))) e)))
@@ -235,8 +239,9 @@
   "A query input with every callable in it, at any depth of a tuple,
    collection or relation input, seeing sealed values."
   [x]
+  ;; An entity stays a SandboxEntity here: a query computes on its
+  ;; attributes (a function clause over it), so its values stay sealed.
   (cond
-    (instance? SandboxEntity x) (unseal-entity x)
     (callable? x) (sealing-fn x)
     (map? x) (into (empty x) (map (fn [[k v]] [(sealing-input k) (sealing-input v)])) x)
     (vector? x) (mapv sealing-input x)
