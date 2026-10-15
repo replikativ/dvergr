@@ -142,7 +142,7 @@
              "--disable" "plugins"
              "--disable" "hooks"
              "-c" "web_search=\"disabled\""
-             "-c" "update_plan_enabled=false"
+             "-c" "tools.update_plan.enabled=false"
              "-C" workspace
              "--output-schema" schema-path]
       model (into ["--model" model])
