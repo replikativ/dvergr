@@ -13,6 +13,9 @@
    - `room-kb-conns`    — all KBs a room may read (own + attached).
    - `room-load-roots`  — ordered repo roots for the SCI load-fn.
    - `room-mount-spec`  — muschel composite-fs mount data.
+   - `room-database-by-name` — any attached database by name, with whether the
+                          sandbox may write it (`grant-permits?`; the host's
+                          vocabulary through `set-grant-permits!`).
 
    Resolvers require a bound execution context (always true in a turn; tests bind
    one). No manual conn caching — yggdrasil owns resolution."
@@ -33,7 +36,9 @@
             [dvergr.substrate.datahike :as sdh]
             [dvergr.substrate.kontor-book :as kontor-book]
             [org.replikativ.spindel.yggdrasil :as ygg]
-            [org.replikativ.spindel.engine.core :as ec]))
+            [org.replikativ.spindel.engine.core :as ec]
+            [yggdrasil.gc :as ygg-gc]
+            [yggdrasil.protocols :as ygg-protocols]))
 
 ;; room-id → the room's OWN execution context (RF5 S2). A `fork-context` of the
 ;; daemon root whose composite holds ONLY this room's systems (msgs/kb/repo), so
@@ -384,6 +389,40 @@
 
 (def ^:private perm-rank {:owner 0 :read-write 1 :read 2})
 
+;; What a grant's permission lets the room do with the system. dvergr's own
+;; vocabulary is :owner, :read-write and :read; a host that records grants in
+;; the same system DB may use more words (simmis adds :merge), so the host
+;; answers for its vocabulary through `set-grant-permits!`.
+
+(def default-write-permissions
+  "The permissions that let a room write a system, when no host hook is set."
+  #{:owner :read-write})
+
+(defonce ^:private grant-permits-hook (atom nil))
+
+(defn set-grant-permits!
+  "Host hook: `f` is `(fn [permission action] -> boolean)`, asked whether a
+   grant with `permission` (the `:grant/permission` keyword) lets the room do
+   `action` to the attached system. dvergr asks `:write` (transact a database
+   from the sandbox, the default KB `knowledge_add` targets, GC of the
+   system's storage). The hook answers for every permission, dvergr's own
+   included; an unknown one should answer false. nil restores the default,
+   `default-write-permissions`."
+  [f]
+  (reset! grant-permits-hook f))
+
+(defn grant-permits?
+  "Whether a grant with `permission` lets the room do `action` (`:write`) to
+   the attached system: the host hook's answer (`set-grant-permits!`), else
+   membership in `default-write-permissions`."
+  [permission action]
+  (boolean
+   (if-let [f @grant-permits-hook]
+     (f permission action)
+     (case action
+       :write (contains? default-write-permissions permission)
+       false))))
+
 (defn- resolve-type [room-id type]
   (->> (sdb/systems-for-room-of-type room-id type)
        (sort-by #(perm-rank (:permission %) 9))
@@ -438,7 +477,7 @@
   "The room's writable KBs, `:owner` first — every one `knowledge_add` MAY
    target, not just the one it does by default."
   [room-id]
-  (filterv #(#{:owner :read-write} (:permission %)) (room-kbs room-id)))
+  (filterv #(grant-permits? (:permission %) :write) (room-kbs room-id)))
 
 (defn room-kb-conn
   "Fork-aware conn to a room's writable KB — where `knowledge_add` writes.
@@ -629,33 +668,97 @@
 (defn delete-room-db!
   "Remove an agent-created data DB `db-name` from the room: detach + retract the
    grant + drop it from the composite + delete the store. KB/msgs are NOT
-   deletable here. Returns true if a DB was removed."
+   deletable here, and neither is a data DB the room holds on any grant but
+   `:owner` (one attached from another room): deleting it would delete the
+   owner's store. Returns true if a DB was removed."
   [room-id db-name]
-  (when-let [{:keys [path]} (first (filter #(= (name db-name) (:slug %)) (room-data-dbs room-id)))]
+  (when-let [{:keys [path]} (first (filter #(and (= (name db-name) (:slug %))
+                                                 (= :owner (:permission %)))
+                                           (room-data-dbs room-id)))]
     (try (ygg/unregister! (data-system-name path)) (catch Throwable _))
     (sdb/delete-system-by-scope! room-id path)
     (try (sdh/delete-database! (data-cfg path)) (catch Throwable _))
     true))
 
+(defn- sandbox-writable?
+  "Whether sandbox code may transact a database of `type` the room holds on a
+   grant with `permission`. A messages store never: messages are posted
+   through the posting API, which records who posted them."
+  [type permission]
+  (and (not= :msgs type) (grant-permits? permission :write)))
+
 (defn room-databases
-  "Every datahike database attached to `room-id` as `{:name :type :permission}` —
-   the room's own KB + messages store + any agent-created data DBs. This is the
+  "Every datahike database attached to `room-id` as `{:name :type :permission
+   :writable?}` — the room's own KB + messages store + any agent-created data
+   DBs, and the KBs attached from other rooms. `:writable?` is whether sandbox
+   code may transact it (`sandbox-writable?`). This is the
    `dvergr.room/databases` discovery surface."
   [room-id]
-  (vec (concat (map (fn [k] {:name (:slug k) :type :kb   :permission (:permission k)}) (room-kbs room-id))
-               (map (fn [m] {:name (:slug m) :type :msgs :permission (:permission m)}) (room-msgs room-id))
-               (map (fn [d] {:name (:slug d) :type :data :permission (:permission d)}) (room-data-dbs room-id)))))
+  (vec (for [[type dbs] [[:kb (room-kbs room-id)] [:msgs (room-msgs room-id)] [:data (room-data-dbs room-id)]]
+             {:keys [slug permission]} dbs]
+         {:name slug :type type :permission permission
+          :writable? (sandbox-writable? type permission)})))
+
+(defn room-database-by-name
+  "The datahike database attached to `room-id` named `db-name` — a data DB,
+   KB or messages store, in that order — as `{:conn :type :permission
+   :writable?}`, the conn fork-aware; nil if no match. `:writable?` is
+   whether sandbox code may transact it (`room-databases`)."
+  [room-id db-name]
+  (let [nm (name db-name)]
+    (some (fn [[type dbs system-name]]
+            (some (fn [{:keys [slug path permission]}]
+                    (when (= nm slug)
+                      (when-let [conn (:conn (ygg/system (system-name path)))]
+                        {:conn conn :type type :permission permission
+                         :writable? (sandbox-writable? type permission)})))
+                  dbs))
+          [[:data (room-data-dbs room-id) data-system-name]
+           [:kb (room-kbs room-id) kb-system-name]
+           [:msgs (room-msgs room-id) msgs-system-name]])))
 
 (defn room-conn-by-name
   "Fork-aware conn to ANY datahike database attached to `room-id` resolved by its
-   name — KB, messages store, or an agent-created data DB. nil if no match."
+   name — KB, messages store, or an agent-created data DB. nil if no match.
+   Host code only: it ignores the grant's permission (`room-database-by-name`
+   says what it allows)."
   [room-id db-name]
-  (let [nm (name db-name)]
-    (or (room-db-conn room-id nm)
-        (some (fn [{:keys [slug path]}] (when (= nm slug) (:conn (ygg/system (kb-system-name path)))))
-              (room-kbs room-id))
-        (some (fn [{:keys [slug path]}] (when (= nm slug) (:conn (ygg/system (msgs-system-name path)))))
-              (room-msgs room-id)))))
+  (:conn (room-database-by-name room-id db-name)))
+
+(defn- system-name
+  "The Yggdrasil system id a registry system of `type` at `scope` registers
+   under in a room's composite, or nil for a type that registers none."
+  [type scope]
+  (case type
+    :kb (kb-system-name scope)
+    :msgs (msgs-system-name scope)
+    :repo (repo-system-name scope)
+    :data (data-system-name scope)
+    :book (book-system-name scope)
+    nil))
+
+(defn gc-room!
+  "Reclaim unreachable storage of the room's systems in the bound ctx (the
+   room's, or a fork of it), as `ygg/gc!` does, but only of the systems the
+   room may write: one attached on a grant that does not permit `:write` (a
+   KB attached `:read` from another room) is that room's storage, and its GC
+   (`:remove-before` collapses history) is the owner's to run. Systems the
+   room holds on no grant (a mailbox) are the room's own. Returns {system-id
+   -> report}, or nil if nothing was collected."
+  ([room-id] (gc-room! room-id {}))
+  ([room-id opts]
+   (let [foreign (into #{}
+                       (keep (fn [{:keys [system permission]}]
+                               (when-not (grant-permits? permission :write)
+                                 (system-name (:system/type system) (:system/scope system)))))
+                       (when room-id (sdb/systems-for-room room-id)))
+         reports (into {}
+                       (keep (fn [[sid sys]]
+                               (when (and (not (contains? foreign sid))
+                                          (satisfies? ygg-protocols/GarbageCollectable sys))
+                                 [sid (ygg-gc/gc-system! sys opts)])))
+                       (ygg/registered-systems))]
+     (when (seq reports) reports))))
 
 (defn room-load-roots
   "Ordered virtual Geschichte roots for the SCI load-fn — own first, attached

@@ -101,20 +101,21 @@
                 world-fork fork-tool-ctx
                 (str "(require '[datahike.api :as d] '[dvergr.room :as room]) "
                      "(def fork-local " (pr-str probe-id) ") "
-                     "(d/transact room/*room* [{:message/id " (pr-str probe-id)
-                     " :message/content \"child-world-probe\"}]) "
+                     ;; the room's KB: *room* (the messages store) is read-only
+                     "(d/transact room/*kb* [{:entity/title " (pr-str (str probe-id))
+                     " :entity/summary \"child-world-probe\"}]) "
                      "{:var fork-local "
                      " :db (d/q '[:find ?v . :in $ ?id :where "
-                     "[?e :message/id ?id] [?e :message/content ?v]] "
-                     "@room/*room* " (pr-str probe-id) ")}"))
+                     "[?e :entity/title ?id] [?e :entity/summary ?v]] "
+                     "@room/*kb* " (pr-str (str probe-id)) ")}"))
                parent-after-fork
                (eval!
                 parent tool-ctx
                 (str "(require '[datahike.api :as d] '[dvergr.room :as room]) "
                      "{:var-defined? (boolean (resolve 'fork-local)) "
                      " :db (d/q '[:find ?v . :in $ ?id :where "
-                     "[?e :message/id ?id] [?e :message/content ?v]] "
-                     "@room/*room* " (pr-str probe-id) ")}"))
+                     "[?e :entity/title ?id] [?e :entity/summary ?v]] "
+                     "@room/*kb* " (pr-str (str probe-id)) ")}"))
                create-value (get-in create-result [:metadata :value])
                inspect-value (get-in inspect-result [:metadata :value])
                fork-value (get-in fork-result [:metadata :value])
