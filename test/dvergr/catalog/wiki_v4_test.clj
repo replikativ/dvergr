@@ -33,7 +33,7 @@
   (let [[fm body] (v4/front-matter "---\ntype: entity\nsource: [a.md, b.md]\nentry-point: \"What it is\"\ntags:\n  - x\n  - y\n---\n# T\n")]
     (is (= {:type "entity" :source ["a.md" "b.md"] :entry-point "What it is" :tags ["x" "y"]} fm))
     (is (= "# T\n" body)))
-  (is (= [{:heading nil :text "intro\n"} {:heading "One" :text "a\n> \"q\" [[d]]\n"}]
+  (is (= [{:heading nil :text "intro\n" :index 0} {:heading "One" :text "a\n> \"q\" [[d]]\n" :index 1}]
          (v4/claims "intro\n## One\na\n> \"q\" [[d]]\n")))
   (is (= [{:quote "q" :citations [{:target "d" :heading "S" :kind :wiki}]}]
          (v4/quotes "> \"q\" [[d#S]]")))
@@ -73,40 +73,54 @@
      :orphan (update ref overview (fn [t] (str/replace t (re-pattern (str "(?m)^- \\[\\[atoms/" (v4/slug (:plant-new w)) "\\]\\].*\n")) "")))
      :no-front-matter (update ref plant #(str/replace % #"(?s)^---\n.*?\n---\n" ""))
      :sources-out-of-sync (update ref coop #(str/replace % #"(?m)^(\*\*Sources:\*\* \[\[[^\]]+\]\]), .*$" "$1"))
-     :stale (assoc ref plant (str "---\ntype: entity\nsource: [" (:report-1 n) "]\nentry-point: The plant.\n---\n# " (:plant-new w)
-                                  "\n\n## Capacity\n\nThe " (:plant-old w) " plant runs at " (get-in (g/gold w) [:stale 2 :value 0])
-                                  " for the " (:org w) " ([[" (v4/slug (:org w)) "]]) [[" (str/replace (:report-1 n) #"\.md$" "") "]].\n\n"
-                                  "**Sources:** [[" (str/replace (:report-1 n) #"\.md$" "") "]]\n"))
+     :stale (update ref plant
+                    (fn [t] (let [r1 (str/replace (:report-1 n) #"\.md$" "")
+                                  pr (str "The " (:plant-old w) " plant runs at " (get-in (g/gold w) [:stale 2 :value 0]) " [[" r1 "]].")
+                                  q (#'v4/best-sentence (get docs (str "/docs/" (:report-1 n))) pr [])]
+                              (str t "\n## Capacity now\n\n" pr "\n> \"" q "\" [[" r1 "]]\n"))))
      :invented-numbers (update ref coop str "\n## Staff\n\nIt employs 312 people, runs 77 stations, laid 380 kilometres of"
                                " mains and opened its laboratory in 1987.\n")
-     :uncited (into {} (map (fn [[p t]] [p (-> t (str/replace #"\[\[(?!atoms/|overviews/)[^\]]+\]\]" ""))])) ref)
+     ;; the claims' own citations gone; quotes, Sources lines and front matter kept
+     :uncited (into {} (map (fn [[p t]]
+                              [p (->> (str/split-lines t)
+                                      (map #(if (or (str/starts-with? % ">") (str/starts-with? % "**Sources:**"))
+                                              %
+                                              (str/replace % #"\[\[(?!atoms/|overviews/)[^\]]+\]\]" "")))
+                                      (str/join "\n"))]))
+                    ref)
      :distractor (update ref coop str "\n## Nearby\n\n" (:director w) " plans a pumping station at " (:other-site w) " for "
                          (:other-farms w) " farms [[" (str/replace (:other n) #"\.md$" "") "]].\n")
      :unquoted (into {} (map (fn [[p t]] [p (str/replace t #"(?m)^> \"[^\"]+\" \[\[[^\]]+\]\]\n" "")])) ref)
      :partial (select-keys ref ["/wiki/index.md" overview coop plant])}))
 
 (def ^:private expected
-  "The check each damage must fail."
-  {:dump :no-copied-pages?
-   :misquote :quotes-faithful?
-   :headless :every-quote-under-a-heading?
-   :bad-citation :citations-valid?
-   :orphan :no-orphan-atoms?
-   :no-front-matter :front-matter?
-   :sources-out-of-sync :front-matter?
-   :stale :current/plant-capacity-old
-   :invented-numbers :grounded?
-   :uncited :fact/founded
-   :distractor :no-distractor-facts?
-   :unquoted :every-claim-quoted?
-   :partial :links-valid?})
+  "The check each damage must fail, and the checks it may fail besides (a
+   keyword namespace such as :fact stands for all its checks); `:any` for a
+   wiki damaged everywhere."
+  {:dump [:no-copied-pages? :any]
+   :misquote [:quotes-faithful? #{:every-claim-quoted?}]
+   :headless [:every-quote-under-a-heading? #{:every-claim-quoted?}]
+   :bad-citation [:citations-valid? #{:quotes-faithful? :every-claim-quoted?}]
+   :orphan [:no-orphan-atoms? #{}]
+   :no-front-matter [:front-matter? #{}]
+   :sources-out-of-sync [:front-matter? #{}]
+   :stale [:current/plant-capacity-old #{:current}]
+   :invented-numbers [:grounded? #{}]
+   :uncited [:fact/founded #{:fact :every-claim-quoted?}]
+   :distractor [:no-distractor-facts? #{:every-claim-quoted? :front-matter?}]
+   :unquoted [:every-claim-quoted? #{}]
+   :partial [:links-valid? #{:fact :entity :current}]})
 
-(deftest each-damage-fails-its-check-and-costs-on-every-seed
+(defn- allowed? [allowed k]
+  (or (= :any allowed) (contains? allowed k) (contains? allowed (some-> (namespace k) keyword))))
+
+(deftest each-damage-fails-its-check-only-and-costs-on-every-seed
   (doseq [w worlds
           :let [ref (:reward (score w (v4/reference-wiki w)))]
           [k pages] (variants w)
-          :let [r (score w pages)]]
-    (is (contains? (failing r) (expected k)) (str (label w) ": " k " fails " (failing r)))
+          :let [r (score w pages) [must allowed] (expected k) f (failing r)]]
+    (is (contains? f must) (str (label w) ": " k " fails " f))
+    (is (every? #(or (= must %) (allowed? allowed %)) f) (str (label w) ": " k " also fails " (disj f must)))
     (is (< (:reward r) ref) (str (label w) ": " k " scores " (:reward r)))))
 
 (deftest a-dump-and-an-uncited-wiki-score-low
@@ -114,3 +128,93 @@
           :let [vs (variants w)]]
     (is (< (:reward (score w (:dump vs))) 0.5) (label w))
     (is (< (:reward (score w (:uncited vs))) 0.7) (label w))))
+
+;; ============================================================================
+;; Fixtures: the paths the generated worlds do not reach
+;; ============================================================================
+
+(def ^:private docs
+  {"/docs/plant.md" "---\ndate: 2020\n---\n# The plant\n\n## Capacity\nThe plant delivers 500 units a day.\n\n## Staff\nIt employs forty people from the valley.\n"
+   "/docs/charter.md" "---\ndate: 1953\n---\n# Charter\n\nThe cooperative was founded in 1953 by forty households.\n"})
+
+(def ^:private gold
+  {:entities {} :relations [] :distractors [] :stale []
+   :facts [{:id :founded :terms ["1953"] :sources ["charter.md"]}
+           {:id :capacity :terms ["500 units"] :sources ["plant.md"]}]})
+
+(defn- atom-page [fm & claims]
+  (str "---\n" fm "\n---\n# Atom\n\n" (str/join "\n" claims) "\n**Sources:** [[plant]], [[charter]]\n"))
+
+(defn- wiki [& atom-texts]
+  (into {"/wiki/index.md" "# W\n\n- [[overviews/o]]\n"
+         "/wiki/overviews/o.md" (str "---\ntype: overview\n---\n# O\n\n"
+                                     (str/join (for [i (range (count atom-texts))] (str "- [[atoms/a" i "]]\n"))))}
+        (map-indexed (fn [i t] [(str "/wiki/atoms/a" i ".md") t]) atom-texts)))
+
+(def ^:private good-fm "type: entity\nsource: [plant.md, charter.md]\nentry-point: The plant and the cooperative.")
+(def ^:private capacity-claim "## Capacity\nThe plant delivers 500 units a day [[plant#Capacity]].\n> \"The plant delivers 500 units a day\" [[plant#Capacity]]\n")
+(def ^:private founded-claim "## Founded\nIt was founded in 1953 [[charter]].\n> \"founded in 1953 by forty households\" [[charter]]\n")
+
+(defn- run [pages] (v4/score-wiki-v4 {:pages pages :sources docs :gold gold}))
+
+(deftest a-sectioned-source-is-cited-by-section
+  (let [r (run (wiki (atom-page good-fm capacity-claim founded-claim)))]
+    (is (empty? (failing r)) (str (failing r) " " (:scores r)))
+    (is (= 1.0 (:reward r))))
+  (testing "citing a sectioned document whole is not enough"
+    (let [r (run (wiki (atom-page good-fm (str/replace capacity-claim "[[plant#Capacity]]" "[[plant]]") founded-claim)))]
+      (is (contains? (failing r) :citations-valid?))
+      (is (contains? (failing r) :quotes-faithful?))))
+  (testing "a quote from another section is not faithful"
+    (let [r (run (wiki (atom-page good-fm (str/replace capacity-claim "> \"The plant delivers 500 units a day\" [[plant#Capacity]]"
+                                                       "> \"The plant delivers 500 units a day\" [[plant#Staff]]")
+                                  founded-claim)))]
+      (is (contains? (failing r) :quotes-faithful?)))))
+
+(deftest a-quote-must-carry-evidence-for-its-claim
+  (testing "an empty quote is not evidence"
+    (let [r (run (wiki (atom-page good-fm (str/replace capacity-claim "\"The plant delivers 500 units a day\"" "\" \"") founded-claim)))]
+      (is (contains? (failing r) :quotes-faithful?))
+      (is (contains? (failing r) :every-claim-quoted?))))
+  (testing "a faithful quote about something else does not evidence the claim"
+    (let [r (run (wiki (atom-page good-fm (str/replace capacity-claim "> \"The plant delivers 500 units a day\" [[plant#Capacity]]"
+                                                       "> \"It employs forty people from the valley\" [[plant#Staff]]")
+                                  founded-claim)))]
+      (is (not (contains? (failing r) :quotes-faithful?)))
+      (is (contains? (failing r) :every-claim-quoted?))))
+  (testing "two claims under one heading do not share a quote"
+    (let [r (run (wiki (atom-page good-fm capacity-claim "## Capacity\nIt delivers 500 units a day [[plant#Capacity]].\n" founded-claim)))]
+      (is (contains? (failing r) :every-claim-quoted?)))))
+
+(deftest a-fact-counts-in-the-claims-own-words
+  (testing "stated only inside a quote"
+    (let [r (run (wiki (atom-page good-fm capacity-claim "## Founded\nOn its founding [[charter]].\n> \"founded in 1953 by forty households\" [[charter]]\n")))]
+      (is (contains? (failing r) :fact/founded))))
+  (testing "stated only in a link's target"
+    (let [r (run (wiki (atom-page good-fm capacity-claim "## Founded\nSee [the charter](/docs/charter.md#1953) [[charter]].\n> \"founded in 1953 by forty households\" [[charter]]\n")))]
+      (is (contains? (failing r) :fact/founded))))
+  (testing "a Sources line does not cite for the last claim"
+    (let [r (run (wiki (atom-page good-fm capacity-claim "## Founded\nIt was founded in 1953.\n")))]
+      (is (contains? (failing r) :fact/founded)))))
+
+(deftest front-matter-is-checked-and-never-crashes-scoring
+  (is (map? (run (wiki (atom-page "type: entity\nsource: plant.md\n  - charter.md\nentry-point: x" capacity-claim founded-claim))))
+      "a list item after a scalar makes a list, it does not crash scoring")
+  (doseq [fm ["type: []\nsource: [plant.md, charter.md]\nentry-point: x"
+              "type: entity\nsource: [plant.md, charter.md]\nentry-point: []"
+              "type: entity\nsource: [plant.md]\nentry-point: x"
+              "type: overview\nsource: [plant.md, charter.md]\nentry-point: x"]]
+    (let [r (run (wiki (atom-page fm capacity-claim founded-claim)))]
+      (is (contains? (failing r) :front-matter?) fm))))
+
+(deftest links-resolve-from-their-page
+  (let [pages (assoc (wiki (atom-page good-fm capacity-claim founded-claim))
+                     "/wiki/overviews/o.md" "---\ntype: overview\n---\n# O\n\n- [A](../atoms/a0.md)\n- [P](p.md)\n")
+        with-p (assoc pages "/wiki/overviews/p.md" "---\ntype: overview\n---\n# P\n\n- [[atoms/a0]]\n")]
+    (is (contains? (failing (run pages)) :links-valid?) "p.md is /wiki/overviews/p.md, which does not exist")
+    (is (not (contains? (failing (run with-p)) :links-valid?)))))
+
+(deftest pages-outside-the-tiers-earn-nothing
+  (let [r (run (assoc (wiki (atom-page good-fm capacity-claim founded-claim)) "/wiki/extra.md" "# Extra\n\nMore.\n"))]
+    (is (contains? (failing r) :no-untiered-pages?))
+    (is (< (:reward r) 1.0))))

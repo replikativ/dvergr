@@ -273,7 +273,15 @@ claim that cites one of its sources, and adds:
 - front matter: an atom has type, a source list naming documents and an entry-point, and
   its Sources line lists the same documents; an overview is `type: overview`;
 - tiers: every atom is linked from an overview, every overview from the index, links
-  resolve.
+  (also to a page's section) resolve; pages outside atoms/ and overviews/ earn nothing.
+
+A claim's own words carry its facts: coverage, currency and grounding ignore quote
+lines (attributed evidence, checked by fidelity), link targets and the Sources line; a
+quote needs three words and must share a number or word with its claim, and every
+document a claim cites must be quoted in it; a sectioned source is cited by section
+(a bare `[[doc]]` only on the Sources line or for a source without sections).
+Deviations from vault-wiki: number words are replaced as whole words (upstream replaces
+substrings); overviews are checked as navigation, not synthesis.
 
 Calibration (`test/dvergr/catalog/wiki_v4_test.clj`, 45 worlds over seeds, scales,
 prose and noise): the generated reference wiki (v3's reference pages as atoms, one claim
@@ -282,8 +290,10 @@ avoiding stale values and distractors) scores 1.0 with every check true; a misqu
 number, a quote above the first heading, a citation of a missing section, an atom no
 overview links, an atom without front matter, a Sources line out of step, a stale value,
 invented numbers, a wiki without citations, a wiki without quotes, the distractor's
-facts and missing pages each fail their own check and score lower; a dump scores below
-0.5. Not yet a catalog workflow (`catalog_start`/`experiment!` take versions 1–3).
+facts and missing pages each fail their own check, and only the checks their damage
+necessarily touches, and score lower; a dump scores below 0.5. Unit fixtures cover
+sectioned sources, empty and irrelevant quotes, facts only in quotes or link targets,
+malformed front matter, relative links, duplicate headings and untiered pages. Not yet a catalog workflow (`catalog_start`/`experiment!` take versions 1–3).
 
 Open: an LLM judge tier for prose faithfulness (vault-wiki's paraphrase rubric:
 matches / softens / inverts / inserts), and wiki/v4 as a catalog workflow and
