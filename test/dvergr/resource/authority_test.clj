@@ -232,3 +232,88 @@
       (finally
         (kontor-governance/ungovern! conn)
         (d/close-room! room)))))
+
+(deftest spend-follows-the-world
+  ;; doc/design/speculation.md, Law 4: a model call made in a world that was
+  ;; granted a share is charged to that share, not to the wallet the charge
+  ;; scope names, and cannot spend more than the share
+  (let [[room conn] (ledger-room)
+        root (context/create-execution-context)
+        room-wallet (kontor/account-ref (resource/room-wallet-id (:id room)))
+        auth (authority/authority room)]
+    (try
+      (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 10M}})
+      (let [scope (open-scope auth)
+            child (:child-ctx (cps #(world-scope/fork! scope root {:grant {resource/microdollars 3M}} %1 %2)))
+            child-wallet (authority/wallet-of room child)
+            payer (resource/room-spend-wallet room)]
+        (testing "a charge in the funded world is taken from its share"
+          (binding [resource/*spend-wallet* (resource/spending payer [:test :child])
+                    ec/*execution-context* child]
+            (is (= 2M (:charged (resource/charge-spend! 2M)))))
+          (is (= 1M (usd room child-wallet)))
+          (is (= 7M (usd room room-wallet)) "the Room paid only the grant"))
+        (testing "the share bounds the world's spend"
+          (binding [resource/*spend-wallet* (resource/spending payer [:test :child-more])
+                    ec/*execution-context* child]
+            (let [{:keys [charged exhausted?]} (resource/charge-spend! 5M)]
+              (is (= 1M charged))
+              (is exhausted?)))
+          (is (= 0M (usd room child-wallet)))
+          (is (= 7M (usd room room-wallet))))
+        (testing "a funded world is charged where no charge scope is bound"
+          (let [other (:child-ctx (cps #(world-scope/fork! scope root {:grant {resource/microdollars 2M}} %1 %2)))]
+            (binding [ec/*execution-context* other]
+              (is (= 1M (:charged (resource/charge-spend! 1M)))))
+            (is (= 1M (usd room (authority/wallet-of room other))))
+            (is (= 5M (usd room room-wallet)) "7M less the 2M granted")))
+        (testing "outside a funded world the charge scope's payer pays, as before"
+          (binding [resource/*spend-wallet* (resource/spending payer [:test :root])
+                    ec/*execution-context* root]
+            (resource/charge-spend! 1M))
+          (is (= 4M (usd room room-wallet))))
+        (testing "conserved: discarding returns the 1M left in the second world, 5M were spent"
+          (close-scope scope)
+          (is (= 5M (usd room room-wallet)))))
+      (finally
+        (context/stop-context! root)
+        (kontor-governance/ungovern! conn)
+        (d/close-room! room)))))
+
+(deftest inference-particles-split-a-grant
+  ;; doc/design/speculation.md, Laws 2 to 4 for inference: particles forked
+  ;; from a funded world split its grant when SMC copies them (the
+  ;; authority's `balance`), pay their spend from their share on the
+  ;; executor threads that run them, and return what they leave
+  (let [[room conn] (ledger-room)
+        root (context/create-execution-context)
+        room-wallet (kontor/account-ref (resource/room-wallet-id (:id room)))
+        smc-infer @(requiring-resolve 'org.replikativ.foerster.core/smc-infer)
+        spin* (requiring-resolve 'org.replikativ.spindel.core/spin)
+        payer (do (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 100M}})
+                  (resource/room-spend-wallet room))
+        model (fn []
+                (binding [ec/*execution-context* root]
+                  (eval `(org.replikativ.spindel.core/spin
+                          (let [x# (org.replikativ.foerster.effects/sample
+                                    (org.replikativ.foerster.dist/normal 0.0 1.0) :id :x)]
+                            (resource/charge-spend! 1M)
+                            x#)))))
+        measure (atom nil)]
+    (try
+      (binding [resource/*spend-wallet* (resource/spending payer [:test :inference])
+                ec/*execution-context* root]
+        (let [p (promise)]
+          ((smc-infer (model) 4 {:world-policy :fork :authority (authority/authority room)
+                                 :grant {resource/microdollars 8M}})
+           #(deliver p [:ok %]) #(deliver p [:error %]))
+          (let [[k v] (deref p 60000 [:error (ex-info "timed out" {})])]
+            (if (= :error k) (throw v) (reset! measure v)))))
+      (testing "the inference ran in funded particle worlds, copied at resampling"
+        (is (= 4 (count ((requiring-resolve 'org.replikativ.foerster.measure/get-particles) @measure)))))
+      (testing "four particles spent 1M each from their shares, the rest came back"
+        (is (= 96M (usd room room-wallet))))
+      (finally
+        (context/stop-context! root)
+        (kontor-governance/ungovern! conn)
+        (d/close-room! room)))))

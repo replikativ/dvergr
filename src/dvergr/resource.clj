@@ -7,7 +7,9 @@
    Kontor transfer from its parent wallet."
   (:require [dvergr.agent.attempt.governance :as attempt-governance]
             [dvergr.room.store :as store]
-            [kontor.resource :as kontor])
+            [kontor.resource :as kontor]
+            [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.engine.protocols :as rtp])
   (:import [java.nio.charset StandardCharsets]
            [java.util UUID]))
 
@@ -230,6 +232,47 @@
   (or (get @wallet-locks wallet)
       (get (swap! wallet-locks #(if (contains? % wallet) % (assoc % wallet (Object.)))) wallet)))
 
+(defonce ^:private ledger-rooms
+  ;; room id -> the control Room whose ledger holds the wallets a ledger
+  ;; authority opened: a world records only its Room's id, since a Room
+  ;; (store, connection) cannot live in forked state
+  (atom {}))
+
+(defn register-ledger-room!
+  "Make `room`'s ledger reachable from the wallets of worlds its authority
+   funds (`dvergr.resource.authority/authority` calls it)."
+  [room]
+  (swap! ledger-rooms assoc (:id room) room)
+  room)
+
+(defn- world-charge
+  "Where a charge made now goes, and the ordinal of its debit.
+
+   Spend follows the world (doc/design/speculation.md, Law 4): a world the
+   ledger authority funded carries its own wallet and its own charge scope
+   in its state, so its spend is charged to its share on whatever thread runs
+   it. Inside a bound charge scope (`*spend-wallet*`, e.g. a Run's model
+   step) the binding's ordinal names the debit, scoped further by the world;
+   without one, a counter in the world's state does, so a replayed world
+   debits the same ids. Otherwise the binding's payer pays, as before."
+  []
+  (let [bound *spend-wallet*
+        ctx ec/*execution-context*
+        {:keys [wallet room-id]} (some-> ctx (rtp/get-state [:dvergr/wallet]))
+        room (when wallet (or (get @ledger-rooms room-id) (get-in bound [:payer :room])))]
+    (cond
+      (and wallet room)
+      {:payer {:room room :wallet wallet}
+       :id (if bound
+             (spend-debit-id [(:scope bound) (:fork-id ctx)] (swap! (:debits bound) inc))
+             (let [n (volatile! nil)]
+               (rtp/swap-state! ctx [:dvergr/wallet :debits] #(vreset! n (inc (or % 0))))
+               (spend-debit-id [:dvergr/world (:fork-id ctx)] @n)))}
+
+      (:payer bound)
+      {:payer (:payer bound)
+       :id (spend-debit-id (:scope bound) (swap! (:debits bound) inc))})))
+
 (defn charge-spend!
   "Consume `cost` microdollars of model spend from the bound spend wallet.
    The provider was already paid, so the ledger cannot refuse it: a cost
@@ -239,12 +282,18 @@
    binding's charge scope (`spending`): when that debit was already made (the
    scope charged again, a retried step), it is not made twice. Returns
    `{:charged n :exhausted? bool}`, or nil when no wallet is bound or there is
-   nothing to charge."
+   nothing to charge.
+
+   Spend follows the world (doc/design/speculation.md, Law 4): when the
+   current world was granted a wallet of its own by the ledger authority
+   (`dvergr.resource.authority`), the charge is taken from that wallet, so a
+   forked world cannot spend more than its share, also where no charge scope
+   is bound (particle code on an executor thread); otherwise the bound payer
+   pays.  See `world-charge`."
   [cost]
-  (when-let [{:keys [payer scope debits]} *spend-wallet*]
-    (when (and payer (pos? cost))
-      (let [{:keys [room wallet]} payer
-            id (spend-debit-id scope (swap! debits inc))]
+  (when (pos? cost)
+    (when-let [{:keys [payer id]} (world-charge)]
+      (let [{:keys [room wallet]} payer]
         (locking (wallet-lock wallet)
           (if-let [done (store/-resource-receipt (resource-store! room) id)]
             {:charged (get-in done [:resources microdollars] 0M)
@@ -281,10 +330,11 @@
    a chat context (a protocol's driver or reference candidate, a judge).
    A chat context's turns are charged by `chat.context/account-usage!`."
   [model usage]
-  (when-let [{:keys [calls]} *spend-wallet*]
-    (when (map? usage)
-      (swap! calls conj {:model model :usage usage})
-      (charge-spend! (:microdollars ((requiring-resolve 'dvergr.agent.spend/of-usage) model usage) 0)))))
+  (when (map? usage)
+    (when-let [{:keys [calls]} *spend-wallet*]
+      (swap! calls conj {:model model :usage usage}))
+    ;; charged where no scope is bound too: in a world with its own wallet
+    (charge-spend! (:microdollars ((requiring-resolve 'dvergr.agent.spend/of-usage) model usage) 0))))
 
 (defn admit-model-dispatch!
   "Spend one admission immediately before native model egress. No read/check/
