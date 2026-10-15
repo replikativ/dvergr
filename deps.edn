@@ -104,9 +104,9 @@
         ;; SMCP3, barrier factors and foerster.steer (infer/steer).
         ;; 0.1.100: foerster.sandbox (the :foerster/inference extension) and
         ;; :seed for Markov-chain kernels.
-        ;; 0.1.113: particle MCMC in foerster.sandbox, foerster.core's
+        ;; 0.1.114: particle MCMC, exact enumeration and PMMH in foerster.sandbox, foerster.core's
         ;; re-exported effects, the current distributions; MIT licence.
-        org.replikativ/foerster    {:mvn/version "0.1.113"}
+        org.replikativ/foerster    {:mvn/version "0.1.114"}
 
         ;; muschel — bash → AST → safely runnable shell.
         ;; muschel.session.spindel is fork-aware via spindel/fork-context
