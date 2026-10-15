@@ -265,7 +265,15 @@
             r2 (v4/score-structure {:pages unquoted :sources (g/documents w)})]
         (is (false? (get-in r2 [:checks :every-claim-quoted?])))
         (is (< (:reward r2) 1.0)))))
-  (is (= 0.0 (:reward (v4/score-structure {:pages {} :sources {}})))))
+  (is (= 0.0 (:reward (v4/score-structure {:pages {} :sources {}}))))
+  (testing "an uncited claim beside a quoted one fails without gold"
+    (let [w (g/world 1)
+          ref (v4/reference-wiki w)
+          [p t] (first (filter #(str/starts-with? (key %) "/wiki/atoms/") ref))
+          bad (assoc ref p (str/replace t "\n**Sources:**" "\n## The river flows west\n\nThe river flows west past the plant.\n\n**Sources:**"))
+          r (v4/score-structure {:pages bad :sources (g/documents w)})]
+      (is (false? (get-in r [:checks :every-claim-cites?])))
+      (is (< (:reward r) 1.0)))))
 
 (deftest the-v4-plan-runs-on-v3-worlds-with-its-own-task-and-checker
   (let [plan (wiki/experiment-plan {:version 4 :n 2 :models ["claude-haiku-4-5"]})

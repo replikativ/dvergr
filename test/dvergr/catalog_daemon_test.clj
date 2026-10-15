@@ -286,6 +286,20 @@
         (is (= 2 (:done cand) (:verdicts cand)) "one cell per generated world")
         (is (= 1.0 (:reward-mean cand)) "the v4 reference of each world scores top against that world's gold")))))
 
+(deftest catalog-start-runs-wiki-v4-on-its-benchmark-world
+  ;; catalog_start's benchmark mode: world 1, the fixed-gold evaluator, whose
+  ;; ref must match the environment the workflow builds
+  (let [calls (atom 0)]
+    (with-redefs [providers/ensure-initialized! (constantly nil)
+                  chat-agent/messages->api-format (fn [messages _ _] messages)
+                  model-chat/chat (reference-writer calls v4/reference-wiki)]
+      (let [{:keys [status result mode] :as done} (run-job {:workflow "wiki/v4" :attempts 1 :models ["claude-haiku-4-5"]})
+            [a] (:attempts result)]
+        (is (= "completed" status) (pr-str (dissoc done :result)))
+        (is (= "benchmark" mode))
+        (is (= 1.0 (:reward a)) (pr-str (:checks a)))
+        (is (true? (get-in a [:checks :every-claim-quoted?])))))))
+
 (deftest a-checkout-becomes-a-room-and-its-changes-a-patch
   ;; A daemon room's repository starts as a clone of the sandbox stdlib; an
   ;; imported room's starts as a clone of the client's checkout instead.

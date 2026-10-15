@@ -73,8 +73,7 @@
             [dvergr.agent.workflow :as workflow]
             [dvergr.catalog.wiki :as wiki]
             [dvergr.catalog.wiki-gen :as gen]
-            [dvergr.catalog.workspace :as ws]
-            [hasch.core :as hasch]))
+            [dvergr.catalog.workspace :as ws]))
 
 (def params {:source "/docs" :target "/wiki"})
 
@@ -392,6 +391,11 @@
         ;; claim, faithfully and to the point (vault-wiki: load-bearing facts
         ;; are quoted)
         citing-claims (filter #(seq (:cites %)) claim-list)
+        ;; an atom's claim that says something (three words) and cites nothing
+        uncited (vec (for [c claim-list
+                           :when (and (= :atom (tier-of (:page c))) (:heading c) (empty? (:cites c))
+                                      (<= 3 (count (re-seq #"\p{L}+" (str (:prose c))))))]
+                       {:page (:page c) :heading (:heading c)}))
         unquoted (vec (keep (fn [c]
                               (let [evidenced (into #{} (comp (filter #(and (:faithful? %) (:relevant? %))) (mapcat :docs)) (:quotes c))
                                     missing (remove evidenced (:cites c))]
@@ -499,6 +503,8 @@
                 :unfaithful-quotes (vec (take 10 (map #(select-keys % [:page :heading :quote]) unfaithful)))
                 :headless-quotes (vec (take 10 (map #(select-keys % [:page :quote]) headless)))
                 :unquoted-claims (vec (take 10 unquoted))
+                :uncited-claims (vec (take 10 uncited))
+                :uncited-claim-count (count uncited)
                 :bad-citations (vec (take 10 bad-citations))
                 :front-matter-problems front-problems
                 :orphan-atoms orphans :unindexed-overviews unindexed :broken-links broken-links
@@ -646,6 +652,8 @@
        "Under it, for every document it cites, a verbatim sentence from that document on a line of its own:\n"
        "> \"The exact sentence from the document.\" [[charter#Section]]\n"
        "End each atom with a line **Sources:** [[charter]], [[annual-report-2019]].\n\n"
+       "Link related atoms to each other as [[atoms/<slug>]] (a person to the organisation they worked "
+       "for, a project to its designer).\n\n"
        "Overviews, " target "/overviews/<slug>.md: front matter `type: overview`, linking the atoms they cover "
        "as [[atoms/<slug>]]; every atom is linked from an overview.\n\n"
        "Index, " target "/index.md: links every overview as [[overviews/<slug>]].\n\n"
@@ -658,8 +666,10 @@
   {:entities {} :facts [] :stale [] :current [] :distractors [] :relations []})
 
 (def structure-checks
-  "The checks that need no gold: structure, evidence, links, grounding, copies."
-  [:has-atoms? :has-overviews? :index? :quotes-faithful? :every-claim-quoted?
+  "The checks that need no gold: structure, evidence, links, grounding, copies,
+   and every claim of an atom citing a source (with gold, coverage and
+   currency judge what is said; without it, nothing would)."
+  [:has-atoms? :has-overviews? :index? :every-claim-cites? :quotes-faithful? :every-claim-quoted?
    :every-quote-under-a-heading? :citations-valid? :front-matter? :no-orphan-atoms?
    :no-untiered-pages? :links-valid? :grounded? :no-copied-pages?])
 
@@ -668,7 +678,7 @@
    share passed as the reward. `{:scores :checks :reward}`."
   [opts]
   (let [{:keys [scores checks]} (score-wiki-v4 (assoc opts :gold no-gold))
-        checks (select-keys checks structure-checks)]
+        checks (select-keys (assoc checks :every-claim-cites? (zero? (:uncited-claim-count scores))) structure-checks)]
     {:scores (dissoc scores :coverage :currency :entities :relations :stale-values :distractor-terms)
      :checks checks
      :reward (if (:has-atoms? checks)
@@ -680,28 +690,29 @@
    gold of each attempt's environment (a v3 world, `wiki/world-of`); with
    `:structure? true`, `score-structure` (no gold)."
   [{:keys [source target gold structure?]}]
+  ;; no basis: catalog_start's environments carry the verifier's id and
+  ;; version only
   (evaluation/make-evaluator
-   (cond-> {:id (if structure? :catalog/wiki-structure :catalog/wiki)
-            :version (if structure? 1 4)
-            :capture (fn [{world :world/room}]
-                       {:pages (ws/read-tree world target)
-                        :sources (ws/read-tree world source)})
-            :observe (fn [{:keys [default result environment] captured :execution/evidence}]
-                       (let [opts {:pages (:pages captured) :sources (:sources captured)
-                                   :target target :source source}
-                             scored (if structure?
-                                      (score-structure opts)
-                                      (score-wiki-v4 (assoc opts :gold (or gold (:gold (wiki/world-of environment))))))]
-                         (assoc default
-                                :run-status (:run/status result)
-                                :pages (:pages captured)
-                                :scores (:scores scored)
-                                :checks (:checks scored)
-                                :reward (:reward scored))))
-            :verify (fn [_ {:keys [run-status checks reward]}]
-                      {:checks (assoc checks :completed? (= :completed run-status))
-                       :reward (if (= :completed run-status) reward 0.0)})}
-     gold (assoc :basis {:gold (str (hasch/uuid gold))}))))
+   {:id (if structure? :catalog/wiki-structure :catalog/wiki)
+    :version (if structure? 1 4)
+    :capture (fn [{world :world/room}]
+               {:pages (ws/read-tree world target)
+                :sources (ws/read-tree world source)})
+    :observe (fn [{:keys [default result environment] captured :execution/evidence}]
+               (let [opts {:pages (:pages captured) :sources (:sources captured)
+                           :target target :source source}
+                     scored (if structure?
+                              (score-structure opts)
+                              (score-wiki-v4 (assoc opts :gold (or gold (:gold (wiki/world-of environment))))))]
+                 (assoc default
+                        :run-status (:run/status result)
+                        :pages (:pages captured)
+                        :scores (:scores scored)
+                        :checks (:checks scored)
+                        :reward (:reward scored))))
+    :verify (fn [_ {:keys [run-status checks reward]}]
+              {:checks (assoc checks :completed? (= :completed run-status))
+               :reward (if (= :completed run-status) reward 0.0)})}))
 
 (defn experiment-plan
   "v3's plan (`wiki/experiment-plan` with `:version 3`: its worlds, splits and
