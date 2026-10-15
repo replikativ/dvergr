@@ -724,6 +724,13 @@
         (testing "a query computing on an entity input sees sealed values"
           (is (= {:ok "parent"} (ev "(d/q '[:find ?t . :in ?e :where [(get ?e :title) ?t]] e)")))
           (is (:err (ev "(d/q '[:find ?x . :in ?e :where [(get ?e :f) ?f] [(apply ?f []) ?x]] e)"))))
+        (testing "a stored host value reached by a data pattern is neither called nor passed on"
+          (is (:err (ev "(d/q '[:find ?x . :where [?e :title \"parent\"] [?e :f ?f] [(apply ?f []) ?x]] @dvergr.room/*kb*)")))
+          (is (:err (ev "(d/q '[:find ?x . :where [?e :title \"parent\"] [?e :f ?f] [(?f) ?x]] @dvergr.room/*kb*)")))
+          (is (:err (ev "(d/q '[:find ?x . :where [?e :title \"parent\"] [(get-else $ ?e :f nil) ?f] [(apply ?f []) ?x]] @dvergr.room/*kb*)")))
+          (is (:err (ev "(d/q '[:find ?x . :in $ % :where (r ?x)] @dvergr.room/*kb* '[[(r ?x) [?e :f ?f] [(apply ?f []) ?x]]])")))
+          (is (= {:ok "PARENT"} (ev "(d/q '[:find ?u . :where [?e :title \"parent\"] [?e :title ?t] [(clojure.string/upper-case ?t) ?u]] @dvergr.room/*kb*)"))
+              "ordinary function clauses over data still work"))
         (testing "an empty entity collection is a map"
           (is (= {:ok {}} (ev "(empty e)"))))
         (testing "the mirrored API takes an entity back"

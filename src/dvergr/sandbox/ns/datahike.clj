@@ -306,6 +306,26 @@
                             "of get-else, get-some, missing? or pull")
                        x)))))
 
+(defn- in-variables
+  "The variables (`?x`) an :in binds, at any depth of its bindings."
+  [bindings]
+  (into #{} (filter #(and (symbol? %) (str/starts-with? (name %) "?")))
+        (tree-seq coll? seq bindings)))
+
+(defn- check-call-heads!
+  "Throws when a call in `forms` (a query, its rules) names its function by a
+   variable that no :in binds. An input callable is wrapped to see sealed
+   values; a variable bound by a data pattern would be a stored value, called
+   as it is (`[?e :f ?f] [(?f) ?x]`). A call is a list anywhere, or the
+   leading vector of a clause."
+  [forms inputs]
+  (let [var-head? #(and (symbol? %) (str/starts-with? (name %) "?") (not (contains? inputs %)))]
+    (doseq [x (tree-seq coll? seq forms)
+            :let [call (cond (and (seq? x) (seq x)) x
+                             (and (vector? x) (sequential? (first x))) (first x))]
+            :when (and call (var-head? (first call)))]
+      (refuse-query! "A query calls a function only by name or through a query input" call))))
+
 (defn- query-args
   "A query's inputs as Datahike takes them: databases unsealed in source
    positions, callables seeing sealed values, bindings and rules checked."
@@ -315,6 +335,7 @@
         rules (keep-indexed (fn [i b] (when (= '% b) (query-form (nth inputs i nil)))) bindings)]
     (check-bindings! bindings)
     (check-source-use! (into [query] rules))
+    (check-call-heads! (into [query] rules) (in-variables bindings))
     (into []
           (map-indexed (fn [i v]
                          (if (source-sym? (get bindings i)) (unseal v) (sealing-input v))))
@@ -527,6 +548,22 @@
       (binding-swap! assoc :ephemeral-databases {})
       errors)))
 
+(def ^:private sealing-safe-fns
+  "Datahike's `safe-fns` (pure core, string and math functions), each seeing
+   its arguments sealed: a stored host object that a query clause reaches
+   (through a data pattern, `get-else`, a rule) fails closed instead of
+   being called or passed on. Built once, so Datahike's plan cache, keyed by
+   the resolver, keeps its entries."
+  (into {} (map (fn [[sym f]] [sym (sealing-fn f)])) resolve/safe-fns))
+
+(defn- sandbox-symbol-resolver
+  "`safe-symbol-resolver` with the pure functions sealing their arguments;
+   Datahike's own query functions (`q`, `pull`, ...), which take a database
+   by design, and the registry as they are."
+  [sym]
+  (or (get sealing-safe-fns sym)
+      (resolve/safe-symbol-resolver sym)))
+
 (defn untrusted
   "Run `f` resolving query/predicate function symbols as Datahike's server
    does (`safe-symbol-resolver`: pure clojure.core, clojure.string,
@@ -535,7 +572,7 @@
    [(slurp ?p) ?x] or [(clojure.java.shell/sh ...) ?x] would run on the host
    past SCI."
   [f]
-  (binding [resolve/*symbol-resolver* resolve/safe-symbol-resolver] (f)))
+  (binding [resolve/*symbol-resolver* sandbox-symbol-resolver] (f)))
 
 (defn add-datahike-ns!
   "Mount the faithful datahike API under `datahike.api`, with lifecycle fns
