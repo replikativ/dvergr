@@ -218,3 +218,23 @@
   (let [r (run (assoc (wiki (atom-page good-fm capacity-claim founded-claim)) "/wiki/extra.md" "# Extra\n\nMore.\n"))]
     (is (contains? (failing r) :no-untiered-pages?))
     (is (< (:reward r) 1.0))))
+
+(deftest nothing-hides-behind-a-quote-a-label-or-the-index
+  (testing "text after a quote's citation is prose, and grounding reads it"
+    (let [r (run (wiki (atom-page good-fm (str/replace capacity-claim "a day\" [[plant#Capacity]]\n" "a day\" [[plant#Capacity]] It employs 987654 people.\n") founded-claim)))]
+      (is (contains? (failing r) :grounded?))))
+  (testing "a link's label is visible text"
+    (let [r (run (wiki (atom-page good-fm (str capacity-claim "It employs [987654 people](/docs/plant.md#Staff).\n") founded-claim)))]
+      (is (contains? (failing r) :grounded?))))
+  (testing "a quote evidences only the documents that hold it"
+    (let [r (run (wiki (atom-page good-fm (str "## Both\nThe plant delivers 500 units a day [[plant#Capacity]] and it was founded in 1953 [[charter]].\n"
+                                               "> \"The plant delivers 500 units a day\" [[plant#Capacity]] [[charter]]\n"))))]
+      (is (contains? (failing r) :quotes-faithful?))
+      (is (contains? (failing r) :every-claim-quoted?))))
+  (testing "a section named on a Sources line must exist, on every Sources line"
+    (let [bad (fn [line] (run (wiki (str (atom-page good-fm capacity-claim founded-claim) line))))]
+      (is (contains? (failing (run (wiki (str/replace (atom-page good-fm capacity-claim founded-claim) "**Sources:** [[plant]]" "**Sources:** [[plant#No such section]]")))) :citations-valid?))
+      (is (contains? (failing (bad "**Sources:** [[plant#No such section]]\n")) :citations-valid?))))
+  (testing "a quote on the index is checked too"
+    (let [r (run (update (wiki (atom-page good-fm capacity-claim founded-claim)) "/wiki/index.md" str "> \"The plant delivers 987654 units a day\" [[plant#Capacity]]\n"))]
+      (is (contains? (failing r) :quotes-faithful?)))))

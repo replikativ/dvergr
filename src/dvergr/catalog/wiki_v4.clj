@@ -154,8 +154,10 @@
           (for [[_ t h] (re-seq mdlink-re (str text))] {:target (str/trim t) :heading (some-> h str/trim not-empty) :kind :md})))
 
 (def ^:private quote-re
-  "A verbatim quote line: `> \"…\"` and its citation."
-  #"(?m)^>\s*[\"“]([^\"”]+)[\"”]\s*(.*)$")
+  "A verbatim quote line: `> \"…\"` followed by its citations and nothing
+   else. A line with more text after the quote is prose, not a quote line, so
+   no statement hides behind a quote."
+  #"(?m)^>[ \t]*[\"“]([^\"”\n]+)[\"”][ \t]*((?:(?:\[\[[^\]\n]+\]\]|\[[^\]\n]*\]\([^)\n]*\))[ \t,;()]*)*)[ \t]*$")
 
 (def ^:private sources-line-re #"(?m)^\*\*Sources:\*\*.*$")
 
@@ -183,6 +185,7 @@
   [text]
   (-> (str text)
       (str/replace quote-re "")
+      (str/replace #"\[\[[^\]|]*\|([^\]]*)\]\]" "$1") ; an alias is visible text
       (str/replace #"\[\[[^\]]*\]\]" "")
       (str/replace #"\[([^\]]*)\]\([^)]*\)" "$1")))
 
@@ -261,22 +264,26 @@
    v2's markdown link with an absolute target and a neutral label:
    `[[charter]]` → `[source](/docs/charter.md)`, `[[atoms/x]]` → `[page](/wiki/atoms/x.md)`."
   [docs pages source target-dir page text]
-  (let [canonical (fn [l whole]
+  (let [canonical (fn [l]
                     (if-let [d (resolve-doc docs source page l)]
                       (str "[source](" d ")")
-                      (if-let [p (resolve-page pages target-dir page l)]
-                        (str "[page](" p ")")
-                        ;; names nothing: a broken link (v4 reports it), not
-                        ;; text for v2 to read numbers from
-                        "")))]
+                      (when-let [p (resolve-page pages target-dir page l)]
+                        (str "[page](" p ")"))))
+        ;; a link's label (a markdown label, a wikilink's alias) is visible
+        ;; text and stays for v2 to read; the target becomes canonical, or
+        ;; goes when it names nothing (a broken link, reported by v4)
+        md (fn [[_ label t h]]
+             (let [c (canonical {:target (str/trim t) :heading h :kind :md})]
+               (str label (when c (str " " c)))))
+        wiki (fn [[_ t h alias]]
+               (let [c (canonical {:target (str/trim t) :heading h :kind :wiki})]
+                 (str (some-> alias (str " ")) c)))]
     (-> (second (front-matter text))
         ;; quotes are attributed evidence, checked for fidelity on their own:
         ;; currency, grounding and copies judge the wiki's own words
         (str/replace quote-re "")
-        (str/replace wikilink-re (fn [[whole t h]] (canonical {:target (str/trim t) :heading h :kind :wiki} whole)))
-        (str/replace mdlink-re (fn [[whole t h]] (if (str/starts-with? whole "[source](") whole
-                                                     (if (str/starts-with? whole "[page](") whole
-                                                         (canonical {:target (str/trim t) :heading h :kind :md} whole))))))))
+        (str/replace #"\[([^\]\n]*)\]\(\s*<?([^)\s>#]+)(?:#([^)\s>]*))?>?(?:\s+\"[^\"]*\")?\s*\)" md)
+        (str/replace #"\[\[([^\]|#\n]+)(?:#([^\]|\n]*))?(?:\|([^\]\n]*))?\]\]" wiki))))
 
 ;; ============================================================================
 ;; The score
@@ -336,17 +343,22 @@
              :sources sources :gold gold :target target :source source})
         copied (set (get-in v2 [:scores :copied-pages]))
         ;; ---- claims and their evidence ----
-        claim-list (vec (for [[p {:keys [body]}] content
+        ;; claims of atoms, overviews and the index: a quote anywhere is
+        ;; checked (the index is not a place to hide one)
+        claim-list (vec (for [[p {:keys [body]}] (merge content (select-keys parsed [index-path]))
                               c (claims body)]
                           (let [pr (prose (:text c))
                                 qs (vec (for [q (quotes (:text c))]
                                           (let [docs (keep #(when-let [d (doc-of p %)] [% d]) (:citations q))
-                                                ok? (and (substantive? (:quote q))
-                                                         (some (fn [[l _]]
-                                                                 (when-let [t (cited-text sources source p l)]
-                                                                   (str/includes? (source-text t) (normalize (:quote q)))))
-                                                               docs))]
-                                            (assoc q :docs (set (map second docs)) :faithful? (boolean ok?)
+                                                ;; evidence for exactly the documents whose cited
+                                                ;; text holds the quote
+                                                holding (when (substantive? (:quote q))
+                                                          (set (keep (fn [[l d]]
+                                                                       (when-let [t (cited-text sources source p l)]
+                                                                         (when (str/includes? (source-text t) (normalize (:quote q))) d)))
+                                                                     docs)))
+                                                ok? (and (seq holding) (= (count holding) (count (set (map second docs)))))]
+                                            (assoc q :docs (set holding) :faithful? (boolean ok?)
                                                    :relevant? (shares-evidence? (:quote q) pr)))))]
                             (assoc c :page p :id [p (:index c)] :prose pr
                                    ;; the claim's own citations: its text, quote lines aside
@@ -370,7 +382,8 @@
         ;; names the document, it need not name a section)
         all-links (for [[p {:keys [links]}] (select-keys parsed (keys tiered-pages)) l links] [p l])
         bibliography (for [[p {:keys [body]}] (select-keys parsed (keys tiered-pages))
-                           l (links (or (re-find sources-line-re (str body)) ""))]
+                           line (re-seq sources-line-re (str body))
+                           l (links line)]
                        [p l])
         cited-links (for [[p {:keys [body]}] (select-keys parsed (keys tiered-pages))
                           l (links (str/replace (str body) sources-line-re ""))]
@@ -380,7 +393,9 @@
         doc-links (concat (for [[p l] cited-links :when (doc-of p l)] [p l false])
                           (for [[p l] bibliography :when (doc-of p l)] [p l true]))
         bad-citations (vec (for [[p l bib?] doc-links
-                                 :when (not (and (doc-of p l) (or bib? (cited-text sources source p l))))]
+                                 ;; a bibliography entry may name a document without a section;
+                                 ;; a section it names must exist
+                                 :when (not (and (doc-of p l) (or (and bib? (nil? (:heading l))) (cited-text sources source p l))))]
                              {:page p :target (:target l) :heading (:heading l)}))
         page-headings (fn [p] (into #{(slug (str (second (re-find #"(?m)^#\s+(.*)$" (get-in parsed [p :body] "")))))}
                                     (keep #(some-> (:heading %) slug)) (claims (get-in parsed [p :body]))))
@@ -401,7 +416,8 @@
                                 id))))
                     (:facts gold))
         ;; ---- front matter ----
-        sources-line (fn [body] (re-find sources-line-re (str body)))
+        ;; all of a page's Sources lines, as one
+        sources-line (fn [body] (some->> (re-seq sources-line-re (str body)) seq (str/join "\n")))
         claim-docs (fn [p] (into #{} (comp (filter #(= p (:page %))) (mapcat (fn [c] (into (:cites c) (mapcat :docs (:quotes c))))))
                                  claim-list))
         atom-problems (into {}
