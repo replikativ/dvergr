@@ -55,13 +55,16 @@ Verified by reading the code on main (2026-10-15):
 - **G4, no effect classes.**  Capabilities carry no classification, so a speculative world cannot tell a refusable effect from a free one (Law 7).
 - **G5, an old foerster.**  dvergr pins foerster 0.1.100.  The sandbox lacks particle MCMC (foerster#73), exact enumeration and PMMH, `foerster.core`'s re-exported effects (foerster#79), and the newer distributions.
 
-To confirm by a test before relying on it: that a `:fork` particle's model call is charged to the Run's wallet as G1 and G2 predict.
+Found by tests (2026-10-16):
+
+- **G6, the ledger authority could not split.**  `dvergr.resource.authority/authority` did not implement `PResourceAuthority/balance`, which `world-scope/copy!` asks to split a world's remainder between its copies, so SMC under `:world-policy :fork` with the ledger authority failed at the first resampling.
+- **G7, spend in particle threads is not charged.**  Particle code runs on spindel's executor threads, where the caller's `dvergr.resource/*spend-wallet*` binding is absent, so a charge made inside a particle finds no spend wallet and is not recorded.  Charging it needs the world, not the thread, to carry the charge scope: a world with a wallet of its own charges it under a scope named by its fork id, with a per-world debit counter in its state, so a retried step still debits once.
 
 ## Plan
 
 Each step lands with the tests of the laws it makes true.
 
-1. **Accounting (G1, G2; Laws 2 to 4).**  Bind the spend wallet from the world: when a world has a wallet of its own (`[:dvergr/wallet]`), model calls made in it charge that wallet, falling back to the Run's.  Pass the room's ledger authority to the sandbox's `infer/` together with a `:grant` the agent names, and test conservation: N particles that make model calls, resampled, then the ledger's totals.
+1. **Accounting (G1, G2, G6, G7; Laws 2 to 4).**  Bind the spend wallet from the world: when a world has a wallet of its own (`[:dvergr/wallet]`), model calls made in it charge that wallet, falling back to the Run's.  Pass the room's ledger authority to the sandbox's `infer/` together with a `:grant` the agent names, and test conservation: N particles that make model calls, resampled, then the ledger's totals.
 2. **foerster in the sandbox (G5).**  Bump foerster, extend `dist/` to the current constructors, add `:enumerate` and `:pmmh` to `foerster.sandbox`, and register `foerster.core`'s effect names in the sandbox's breakpoints.
 3. **Runs as worlds of a scope (G3; Laws 1 and 5).**  The enabling change step 6 of unified-worlds named: a spindel scope whose fork and discard dvergr supplies (a Run world is a Room fork, with store, registry and context), with affine ownership, quiescence and authority unchanged.  Best-of-n and `steer` over Runs then use one implementation.
 4. **Effect classes (G4; Law 7).**  Classify capabilities as forkable, charged or irreversible; refuse or defer the irreversible ones in speculative worlds, and run deferred obligations at the root's settlement.
