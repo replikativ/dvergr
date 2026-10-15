@@ -97,6 +97,15 @@ jobs:
             sudo tar -xzf /tmp/bb.tar.gz -C /usr/local/bin bb
             bb --version
       - run:
+          # the dashboard's service worker (dvergr-sw.js) is tested under
+          # node: without it that test makes no assertion and fails
+          name: Install node 22.12.0
+          command: |
+            curl -sSL -o /tmp/node.tar.xz \
+              https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-x64.tar.xz
+            sudo tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 node-v22.12.0-linux-x64/bin/node
+            node --version
+      - run:
           name: Run tests (kaocha), this container's share of the namespaces
           command: |
             mkdir -p target/test-split test-results/kaocha
