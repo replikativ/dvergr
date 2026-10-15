@@ -48,7 +48,7 @@
     (store/-transfer-resources! (store! room)
                                 {:id transfer-id :kind :grant :source source :destination account
                                  :resources resources :effective-date (java.util.Date.)})
-    (rtp/swap-state! ctx [:dvergr/wallet] (constantly {:account account :wallet wallet-id :from source}))
+    (rtp/swap-state! ctx [:dvergr/wallet] (constantly {:account account :wallet wallet-id :room-id (:id room) :from source}))
     account))
 
 (defn- remaining [room account]
@@ -111,4 +111,4 @@
 (defn authority
   "The ledger authority of control Room `room`."
   [room]
-  (->LedgerAuthority room))
+  (->LedgerAuthority (resource/register-ledger-room! room)))
