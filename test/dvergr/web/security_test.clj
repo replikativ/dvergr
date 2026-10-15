@@ -269,3 +269,21 @@
       (is (= 200 (:status (a (as-bob (req :get "/api/v1/room_list"))))))
       (is (= 403 (:status (a (as-bob (req :get "/dashboard"))))))
       (is (= 200 (:status (a (as-bob (req :get "/api/health")))))))))
+
+(deftest a-forwarding-header-never-makes-a-local-caller-over-real-http
+  (let [server (org.httpkit.server/run-server (app) {:port 0 :ip "127.0.0.1" :legacy-return-value? false})
+        port (org.httpkit.server/server-port server)
+        client (java.net.http.HttpClient/newHttpClient)
+        get-status (fn [headers]
+                     (let [b (java.net.http.HttpRequest/newBuilder
+                              (java.net.URI. (str "http://127.0.0.1:" port "/api/v1/room_list")))]
+                       (doseq [[k v] headers] (.header b k v))
+                       (.statusCode (.send client (.build b) (java.net.http.HttpResponse$BodyHandlers/ofString)))))]
+    (try
+      (is (= 200 (get-status {})) "a loopback peer is local")
+      (doseq [h ["X-Forwarded-For" "Forwarded" "X-Real-IP"]]
+        (is (= 401 (get-status {h "127.0.0.1"})) (str h ": a forwarded request is not")))
+      (finally (org.httpkit.server/server-stop! server))))
+  (testing "the default authenticator refuses a non-loopback bind"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"needs an authenticator"
+                          (server/start! (mock-daemon) :port 0 :ip "0.0.0.0")))))

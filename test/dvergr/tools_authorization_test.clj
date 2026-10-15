@@ -27,9 +27,9 @@
           result (tools/execute
                   "effect" {}
                   {:principal dvergr.principal/local-principal :tools {"effect" (tool (constantly {:decision :denied
-                                                       :sources #{:simmis-rebac}
-                                                       :reason "room access revoked"})
-                                          called)}})]
+                                                                                                   :sources #{:simmis-rebac}
+                                                                                                   :reason "room access revoked"})
+                                                                                      called)}})]
       (is (zero? @called))
       (is (= :error (:type result)))
       (is (= :denied (get-in result [:authorization :decision])))))
@@ -39,7 +39,7 @@
           result (tools/execute
                   "effect" {}
                   {:principal dvergr.principal/local-principal :tools {"effect" (tool (fn [& _] (throw (ex-info "policy unavailable" {})))
-                                          called)}})]
+                                                                                      called)}})]
       (is (zero? @called))
       (is (= #{:agent-tool-grant :authorization-error}
              (get-in result [:authorization :sources]))))))
@@ -57,9 +57,9 @@
   (let [result (tools/execute
                 "effect" {}
                 {:principal dvergr.principal/local-principal :tools {"effect" {:name "effect"
-                                   :authorize (constantly {:decision :authorized
-                                                           :sources #{:simmis-rebac}})
-                                   :execute (fn [& _] (throw (ex-info "effect failed" {})))}}})]
+                                                                               :authorize (constantly {:decision :authorized
+                                                                                                       :sources #{:simmis-rebac}})
+                                                                               :execute (fn [& _] (throw (ex-info "effect failed" {})))}}})]
     (is (= :error (:type result)))
     (is (= {:decision :authorized
             :sources #{:agent-tool-grant :simmis-rebac}}

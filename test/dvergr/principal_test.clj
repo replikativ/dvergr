@@ -15,6 +15,7 @@
             [dvergr.security.allowlist :as allowlist]
             [dvergr.tools :as tools]
             [org.replikativ.spindel.engine.context :as ctx]
+            [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]))
 
 (def alice {:principal/id "party/alice" :principal/kind :human :principal/scopes #{:dvergr/admin}})
@@ -268,9 +269,11 @@
       (is (= [(principal/agent-principal :var)
               {:op :tool/read_file :action :read :resource [:room "r"] :resolved {:room "r"}}]
              @seen))
-      (testing "a host call (no principal, no actor) is not asked, as before"
+      (testing "a call for nobody (no principal, no actor) is refused, unasked"
         (reset! seen nil)
-        (tools/execute "nobody_knows" {} {})
+        (let [r (tools/execute "read_file" {:path "/x"} {})]
+          (is (= :error (:type r)))
+          (is (re-find #"runs for nobody" (:error r))))
         (is (nil? @seen)))
       (finally (principal/configure! {})))))
 
@@ -352,3 +355,35 @@
             (doseq [k [:authz-mine :authz-ours :authz-x]]
               (when-let [r (rreg/lookup k)]
                 (rreg/unregister! k) (d/close-room! r)))))))))
+
+(deftest an-agents-turn-runs-its-tool-calls-as-the-agent
+  ;; the real path: an llm-agent in a room, its turn (chat.agent) asking the
+  ;; model, which calls a tool; the tool call is authorized as that agent on
+  ;; that room before it runs
+  (let [seen (atom [])
+        calls (atom 0)
+        r (d/make-room {:id :authz-turn :store (memory/make)})
+        tool-call {:id "t1" :name "read_file" :input {:path "/nothing-here"}}]
+    (try
+      (principal/configure! {:authorize (fn [p req] (swap! seen conj [p (dissoc req :args)]) false)})
+      (with-redefs [dvergr.chat.agent/messages->api-format (fn [messages _ _] messages)
+                    dvergr.model.chat/chat (fn [& _]
+                                             (if (= 1 (swap! calls inc))
+                                               {:content "" :tool-calls [tool-call] :usage {} :stop-reason :tool-use}
+                                               {:content "done" :tool-calls [] :usage {} :stop-reason :stop}))]
+        (binding [ec/*execution-context* (:ctx r)]
+          (d/join r ((requiring-resolve 'dvergr.discourse.llm/llm-agent)
+                     {:id :worker :spec {:provider :test :model "stub"}
+                      :tools {"read_file" (tools/get-tool "read_file")}})))
+        (binding [ec/*execution-context* (:ctx r)]
+          (sp/spawn! (sp/spin (sp/await (d/ask r :worker {:content "read it"})))))
+        (do
+          (is (loop [n 0] (cond (seq @seen) true (< n 1500) (do (Thread/sleep 20) (recur (inc n))) :else false))
+              "the turn reached the authorizer")))
+      (let [[p req] (first @seen)]
+        (is (= (principal/agent-principal :worker) p))
+        (is (= {:op :tool/read_file :action :read :resource [:room "authz-turn"] :resolved {:room "authz-turn"}}
+               req)))
+      (finally
+        (principal/configure! {})
+        (d/close-room! r)))))

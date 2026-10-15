@@ -200,3 +200,42 @@
           (is (true? (get-in r [:body :result :isError])))
           (is (re-find #"Not authorized" (get-in r [:body :result :content 0 :text])))))
       (finally ((:stop s))))))
+
+(deftest resources-follow-the-scope-cap
+  (let [rooms-only (assoc alice :principal/scopes #{:toolset/rooms})
+        c (session rooms-only)
+        uri "experiment://mcp-authz-open/progress"]
+    (testing "a resource of a toolset outside the scopes is not there"
+      (is (= -32002 (get-in (json-rpc/handle-message c {:jsonrpc "2.0" :id 5 :method "resources/read"
+                                                        :params {:uri uri}})
+                            [:error :code])))
+      (is (= -32002 (get-in (json-rpc/handle-message c {:jsonrpc "2.0" :id 6 :method "resources/subscribe"
+                                                        :params {:uri uri}})
+                            [:error :code])))
+      (is (not-any? #(= "experiment_progress" (:name %))
+                    (get-in (json-rpc/handle-message c {:jsonrpc "2.0" :id 7 :method "resources/templates/list"
+                                                        :params {}})
+                            [:result :resourceTemplates]))))
+    (testing "within them it reads"
+      (is (seq (get-in (json-rpc/handle-message c {:jsonrpc "2.0" :id 8 :method "resources/read"
+                                                   :params {:uri "room://mcp-authz-open/messages"}})
+                       [:result :contents]))))))
+
+(deftest a-forwarding-header-never-makes-a-local-caller-over-real-http
+  ;; http-kit's :remote-addr IS the first X-Forwarded-For entry; the seam must
+  ;; see the socket's peer, and the default must refuse any forwarded request
+  (let [token-file (str (System/getProperty "java.io.tmpdir") "/dvergr-mcp-xff-" (random-uuid) "/token")
+        seen (atom nil)
+        s (mcp-http/start! {:port 0 :token-file token-file :profile "admin"})
+        t (mcp-http/start! {:port 0 :token-file token-file :profile "admin"
+                            :authenticate (fn [r] (reset! seen (:remote-addr r)) nil)})
+        init {:jsonrpc "2.0" :id 1 :method "initialize"
+              :params {:protocolVersion "2025-06-18" :capabilities {} :clientInfo {:name "t" :version "1"}}}
+        legacy {"MCP-Protocol-Version" "2025-06-18"}]
+    (try
+      (is (= 200 (:status (http-call (:port s) (:token s) init legacy))) "the token, directly: local")
+      (is (= 401 (:status (http-call (:port s) (:token s) init (assoc legacy "X-Forwarded-For" "127.0.0.1"))))
+          "the same token, forwarded: refused")
+      (http-call (:port t) "x" init (assoc legacy "X-Forwarded-For" "10.9.9.9"))
+      (is (= "127.0.0.1" @seen) "the authenticator sees the socket's peer, not the header")
+      (finally ((:stop s)) ((:stop t))))))

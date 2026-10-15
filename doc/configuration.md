@@ -74,7 +74,8 @@ and storage GC. The `.nrepl-port` of a REPL is written at the project root, not 
  :mcp           {:port 17888 :bind "127.0.0.1" :profile "offload"
                  :http {:port 17889}}           ; MCP over loopback TCP, optionally Streamable HTTP; doc/mcp.md
  :auth          {:authenticate my.host/authenticate  ; who calls (fn [request] -> principal | nil)
-                 :authorize    my.host/authorize}    ; may they (fn [principal request] -> decision)
+                 :authorize    my.host/authorize     ; may they (fn [principal request] -> decision)
+                 :on-created   my.host/grant-creator} ; (fn [principal resource]) after a create
                                                 ; default: local access only, everything allowed;
                                                 ; a hosted daemon sets both (doc/mcp.md, principals)
  :gc            {:interval-ms 21600000          ; storage GC every 6 h (default)

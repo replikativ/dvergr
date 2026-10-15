@@ -107,55 +107,83 @@ Every call has a **principal** (`dvergr.principal`), a plain map:
  :principal/claims {…}}                 ; the authenticator's evidence, opaque to dvergr
 ```
 
-Two seams decide who it is and what it may do. Both are set in the daemon config, `:auth
-{:authenticate f :authorize f}` (a function, or a qualified symbol naming one), or, for a host
-that runs dvergr's rooms without a daemon, process-wide with `principal/configure!`:
+Three seams decide who it is, what it may do, and what it owns. They are set in the daemon
+config, `:auth {:authenticate f :authorize f :on-created f}` (a function, or a qualified symbol
+naming one), or, for a host that runs dvergr's rooms without a daemon, process-wide with
+`principal/configure!`:
 
 - **`:authenticate`** `(fn [request] -> principal | nil)`. `request` carries `:transport`
-  (`:mcp-stdio`, `:mcp-tcp`, `:mcp-http`, `:web`, `:telegram`), `:remote-addr`, `:bearer` (the
-  `Authorization: Bearer` token), `:headers`, and for MCP over HTTP `:local-token` (the token
-  file's). nil refuses the caller: 401 over HTTP, an error and a closed connection over TCP.
-  The default, `principal/default-authenticate`, admits local access only: the stdio relay, a
-  loopback TCP peer, the token of `mcp/http-token` over HTTP; each is the **local principal**.
-  A configured authenticator replaces it (call it from yours to keep local access).
+  (`:mcp-stdio`, `:mcp-tcp`, `:mcp-http`, `:web`, `:telegram`), `:remote-addr` (the socket's
+  peer, never a forwarding header: http-kit's own `:remote-addr` is the first
+  `X-Forwarded-For` entry), `:bearer` (the `Authorization: Bearer` token), `:headers`, for MCP
+  over HTTP `:local-token` (the token file's), for Telegram `:telegram/user` and
+  `:telegram/chat-id`. nil refuses the caller: 401 over HTTP, an error and a closed connection
+  over TCP, a refusal in Telegram.
+  The default, `principal/default-authenticate`, admits local access only, as the **local
+  principal**: the stdio relay; a loopback peer of TCP or the web server; the token of
+  `mcp/http-token` from a loopback peer; a Telegram sender on a non-empty allowlist (on an open
+  one a sender is `telegram/<id>`, a principal the authorizer decides about). A request that
+  carries a forwarding header (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`, …) is never local:
+  a proxy on the same host makes every peer loopback. A listener bound off loopback refuses to
+  start with the default (`principal/check-bind!`). A configured authenticator replaces it;
+  a hosted one should not hand out the local principal at all.
 - **`:authorize`** `(fn [principal request] -> decision)`. `request` is `{:op :action :resource
   :resolved :args}`: the op (`:room/post`, or `:tool/clojure_eval` for a registry tool), its
   action (`:read`, `:write`, `:merge`, `:admin`), the resource as the caller named it (`[:room
   "general"]`, `[:job "<id>"]`, `[:agent "var"]`, `[:global]`) and what dvergr resolved it to
   (`{:room "<room id>"}`; for a job also `:owner`, the actor that started it; nil for a handle
-  that resolves to nothing). A decision is a boolean or `{:allow? … :reason …}`. A throw denies,
-  and so does a resolution that throws. The default, `principal/allow-all`, allows everything.
-  The local principal is never asked: it is the process itself.
+  that resolves to nothing). Deny `:resolved nil` except where the op creates what it names.
+  A decision is a boolean or `{:allow? … :reason …}`. A throw denies, and so does a resolution
+  that throws. The default, `principal/allow-all`, allows everything.
+- **`:on-created`** `(fn [principal resource])`, called after a principal other than the local
+  one created a room (`room_create`, `room_fork`, `room_import`, `agent_open`, a catalog
+  fixture room) or an agent (`agent_create`), so the host can grant it its creator. A throw
+  fails the op with a 500 that says the thing exists.
 
-What each op acts on is declared in `dvergr.ops/specification`, `:authz {:action :resource}`,
-or derived: an op with a `room` argument acts on that room, reading it when it is a read and
-writing it when it is a write. Archiving (`room_delete`), discarding a fork, purging, agent
-administration, imports from a host path and the admin toolset are `:admin`; `room_merge`
-also writes the fork's parent. Listings (`room_list`,
+The local principal is the process itself and is never asked. It is recognized by identity
+(an unforgeable marker), not by `:principal/kind`: `invoke` refuses a principal that claims
+kind `:local` without being it.
+
+What each op acts on is declared in `dvergr.ops/specification`, `:authz {:action :resource
+:also :filter}`. Every write declares it; a read with a `room` argument may leave it to the
+default (reading that room). `:also` adds checks beyond the op's own resource:
+`room_merge` reads the fork and needs `:merge` on its parent (no parent, no merge);
+`catalog_benchmark` writes `[:global]` (it creates a fixture room) and reads the room of a
+room workflow (`<room>/<name>`); `room_invite` and `catalog_deploy` write the agent they put
+to work; `attempt_export` with `file` is `:admin` on `[:global]` (the host's state root).
+Archiving (`room_delete`), discarding a fork, purging, agent administration, imports from a
+host path, promoting a verifier (`[:global]`) and the admin toolset are `:admin`; so is a
+developer-profile Run (`workflow_start`/`workflow_attempt` with `profile: developer`,
+`catalog_start` on a room), whose agents edit files and run a shell. Listings (`room_list`,
 `job_list`) show only the rows the principal may read. A job records the principal that
-started it as its owner. Registry tools are authorized per call too: `clojure_eval`, `shell`
-and `run_tests` are `:admin` on their room (the room's whole capability), the others `:read`
-or `:write` as their effect is, and a tool without an effect class `:admin`.
-`dvergr.principal-test` checks that every op and every registry tool has a declaration.
+started it as its owner.
+
+Registry tools are authorized per call, for the principal in the tool context (MCP, operator
+commands) or the agent whose turn it is (`:actor`), on the room the call acts for:
+`clojure_eval`, `shell` and `run_tests` are `:admin` (the room's whole capability), the others
+`:read` or `:write` as their effect is, a tool without a classification `:admin`. A call that
+names neither a principal nor an actor is refused; host code passes
+`principal/local-principal`. `dvergr.principal-test` checks that every op and every registry
+tool has a declaration.
 
 The principal reaches every surface: each MCP connection (and each HTTP request) is
 authenticated, every tool call, resource read and subscription is authorized for it, and a
-denial is a tool error (`isError: true`, "Not authorized: …") or, for a subscription, `-32002`.
+denial is a tool error (`isError: true`, "Not authorized: …") or, for a resource, `-32002`.
 A subscription is authorized again before each notification: one whose access was revoked is
 dropped. What a client asks for in `_meta` (`dvergr/profile`, `dvergr/toolsets`,
 `dvergr/tools`) is **capped** to the principal's scopes (`surface/capped`): `:toolset/<name>`
-grants a toolset, `:dvergr/admin` all of them, `:dvergr/read-only` keeps it read-only. A client
-narrows its selection, never widens it; a principal without scopes sees no tools. Tools
-registered at runtime (`register-tool!`, the `extra` toolset) have no authorization of their
-own and are the local principal's only. An HTTP handshake session belongs to the principal
-that opened it: another principal holding its `Mcp-Session-Id` gets 404.
+grants a toolset, `:dvergr/admin` all of them, `:dvergr/read-only` keeps it read-only. The cap
+holds for resources too. A client narrows its selection, never widens it; a principal without
+scopes sees no tools. Tools registered at runtime (`register-tool!`, the `extra` toolset) have
+no authorization of their own and are the local principal's only. An HTTP handshake session
+belongs to the principal that opened it: another principal holding its `Mcp-Session-Id` gets
+404.
 
 `room_post` posts as the principal (`principal/actor`); its `as` is for the local principal
 only, and refused for anyone else. `dvergr.ops/invoke` takes the principal explicitly; there is
 no default. In-process code that holds the daemon (the REPL, the TUI, `room-run`, the
-experiment runner) passes `principal/local-principal`. Telegram commands run for whatever the
-authenticator makes of the sender (`:telegram/user`, `:telegram/chat-id`; by default the
-local principal, as the bot's own allowlist decides who reaches it).
+experiment runner) passes `principal/local-principal`. A Telegram message is authenticated
+once; its ops commands, tool commands and posts all run for that principal.
 
 A host adds its own ops with `ops/register-op!` (a spec entry as in `specification`, with an
 `:authz` unless its schema has a `room`): MCP serves it (toolset `host`), the JSON API routes

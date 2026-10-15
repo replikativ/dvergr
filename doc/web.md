@@ -39,17 +39,21 @@ One server runs per process.
 ## Security stance
 
 Every request is authenticated through the daemon's `:authenticate` seam (transport `:web`;
-`doc/mcp.md` describes the seams and the principal). The default admits loopback peers only,
-as the local principal, and refuses any other with 401, so without an authenticator of its
-own the server, JSON API included, answers loopback only, wherever it binds. A reverse proxy
-on the same machine makes every request it forwards a loopback one: a proxied deployment
-configures an authenticator (a bearer token in `Authorization`, or what the proxy puts in a
-header) and an `:authorize` seam. What a principal may do:
+`doc/mcp.md` describes the seams and the principal). The seam sees the socket's peer, not
+http-kit's `:remote-addr` (which is the first `X-Forwarded-For` entry when that header is
+sent). The default admits a loopback peer that sends no forwarding header, as the local
+principal, and refuses anything else with 401; it refuses to start on a non-loopback bind. So
+without an authenticator of its own the server, JSON API included, answers loopback only. A
+proxied deployment configures an authenticator (a bearer token in `Authorization`, or what
+the proxy puts in a header, which only it can judge) and an `:authorize` seam. What a
+principal may do:
 
 - the **JSON API** and the dashboard's derived actions (`dvergr.web.ops`) run each op for the
   request's principal, authorized like every other surface (403 with `{"error": …}` when
   denied; listings filtered);
-- **room apps** need a read of their room;
+- **room apps** need a read of their room. They are served from the dashboard's own origin,
+  so an app's script runs with the same origin as the API; a host that serves untrusted
+  rooms' apps to other principals should put them on an origin of their own;
 - the rest of the **dashboard** (hand-written views and actions straight over the daemon:
   room pages, posts, voice, fragments) answers the local principal only, 403 for anyone
   else. `/api/health` answers anyone authenticated.

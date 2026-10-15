@@ -66,7 +66,7 @@
            (binding [ec/*execution-context* (:ctx parent)]
              (tools/make-context
               {:principal dvergr.principal/local-principal :sci-ctx       (chat-context/sci-context-in
-                               chat-ctx (:ctx parent))
+                                                                           chat-ctx (:ctx parent))
                :chat-ctx      chat-ctx
                :execution-ctx (:ctx parent)
                :isolation     :sci
@@ -90,7 +90,7 @@
          (let [fork-tool-ctx
                (tools/make-context
                 {:principal dvergr.principal/local-principal :sci-ctx       (chat-context/sci-context-in
-                                 chat-ctx (:ctx world-fork))
+                                                                             chat-ctx (:ctx world-fork))
                  :chat-ctx      chat-ctx
                  :execution-ctx (:ctx world-fork)
                  :isolation     :sci
