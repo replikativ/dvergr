@@ -293,9 +293,17 @@ invented numbers, a wiki without citations, a wiki without quotes, the distracto
 facts and missing pages each fail their own check, and only the checks their damage
 necessarily touches, and score lower; a dump scores below 0.5. Unit fixtures cover
 sectioned sources, empty and irrelevant quotes, facts only in quotes or link targets,
-malformed front matter, relative links, duplicate headings and untiered pages. Not yet a catalog workflow (`catalog_start`/`experiment!` take versions 1–3).
+malformed front matter, relative links, duplicate headings and untiered pages.
+
+- Run: `catalog_benchmark {workflow: "wiki/v4", models, environments: 6}` or
+  `(wiki/experiment! {:version 4 :n 6 …})`: v3's worlds, splits and knobs (`:split`,
+  `:scale`, `:prose`, `:noise`) with v4's task (the layout above, spelled out) and
+  checker. End to end (`catalog_daemon_test`): the v4 reference of each world scores 1.0.
+- On a room of your own (`catalog_start {workflow: "wiki/v4"}` without the benchmark set):
+  `score-structure`, the checks that need no known answers (atoms, overviews, index,
+  faithful quotes, quoted claims, claim headings, citations, front matter, tiers,
+  links, grounding, copies), the share passed as the reward.
 
 Open: an LLM judge tier for prose faithfulness (vault-wiki's paraphrase rubric:
-matches / softens / inverts / inserts), and wiki/v4 as a catalog workflow and
-experiment.
+matches / softens / inverts / inserts).
 

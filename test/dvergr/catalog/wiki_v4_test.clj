@@ -5,6 +5,8 @@
    check it damaged and scores lower."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [dvergr.agent.evaluation :as evaluation]
+            [dvergr.catalog.wiki :as wiki]
             [dvergr.catalog.wiki-gen :as g]
             [dvergr.catalog.wiki-v4 :as v4]))
 
@@ -250,3 +252,31 @@
   (let [r (run (update (wiki (atom-page good-fm capacity-claim)) "/wiki/index.md" str
                        "\n## Founded\nIt was founded in 1953 [[charter]].\n> \"founded in 1953 by forty households\" [[charter]]\n"))]
     (is (contains? (failing r) :fact/founded))))
+
+(deftest a-room-without-gold-is-scored-on-structure
+  (doseq [seed [1 2 3]]
+    (let [w (g/world seed)
+          ref (v4/reference-wiki w)
+          r (v4/score-structure {:pages ref :sources (g/documents w)})]
+      (is (= (set v4/structure-checks) (set (keys (:checks r)))))
+      (is (every? true? (vals (:checks r))) (str seed " " (:checks r)))
+      (is (= 1.0 (:reward r)))
+      (let [unquoted (into {} (map (fn [[p t]] [p (str/replace t #"(?m)^> .*\n" "")])) ref)
+            r2 (v4/score-structure {:pages unquoted :sources (g/documents w)})]
+        (is (false? (get-in r2 [:checks :every-claim-quoted?])))
+        (is (< (:reward r2) 1.0)))))
+  (is (= 0.0 (:reward (v4/score-structure {:pages {} :sources {}})))))
+
+(deftest the-v4-plan-runs-on-v3-worlds-with-its-own-task-and-checker
+  (let [plan (wiki/experiment-plan {:version 4 :n 2 :models ["claude-haiku-4-5"]})
+        ev (get-in plan [:capabilities :evaluator])
+        ref (evaluation/evaluator-ref ev)]
+    (is (= [:catalog/wiki-v4 :catalog/wiki-v4] (mapv :environment/id (:environments plan))))
+    (is (= [{:seed 1 :split :dev :generator g/version} {:seed 2 :split :dev :generator g/version}]
+           (mapv :environment/metadata (:environments plan))))
+    (is (every? #(= (select-keys ref [:verifier/id :verifier/version])
+                    (select-keys (:environment/verifier %) [:verifier/id :verifier/version]))
+                (:environments plan)))
+    (is (= 4 (:verifier/version ref)))
+    (is (str/includes? (:environment/task (first (:environments plan))) "/wiki/atoms/"))
+    (is (= :catalog/wiki-v4 (get-in plan [:dataset :id])))))

@@ -13,11 +13,14 @@
    Workflows:
      :wiki/v1 — a wiki from a folder of documents (`dvergr.catalog.wiki`);
      :wiki/v2 — the same, on a harder hand-written world;
-     :wiki/v3 — v2's checker on generated worlds (`dvergr.catalog.wiki-gen`)."
+     :wiki/v3 — v2's checker on generated worlds (`dvergr.catalog.wiki-gen`);
+     :wiki/v4 — atoms, overviews and quoted claims on v3's worlds
+                (`dvergr.catalog.wiki-v4`)."
   (:require [clojure.string :as str]
             [dvergr.agent.evaluators :as evaluators]
             [dvergr.catalog.wiki :as wiki]
             [dvergr.catalog.wiki-gen :as gen]
+            [dvergr.catalog.wiki-v4 :as v4]
             [dvergr.catalog.workspace :as ws]))
 
 (def seed! ws/seed!)
@@ -72,7 +75,23 @@
                    (wiki/evaluator params)))
     ;; One world, for catalog_start's benchmark mode; catalog_benchmark runs many.
     :benchmark {:fixtures #(gen/documents (gen/world 1)) :gold #(gen/gold (gen/world 1))}
-    :experiment-plan #(wiki/experiment-plan (assoc % :version 3))}})
+    :experiment-plan #(wiki/experiment-plan (assoc % :version 3))}
+
+   :wiki/v4
+   {:id :wiki/v4
+    :title "Two-tier wiki with quoted claims (v4)"
+    :doc (str "A wiki of atoms (one claim per heading, each with a verbatim quote from every document "
+              "it cites) and overviews, after vault-wiki's contracts, on v3's generated worlds. On "
+              "your own room: the checks that need no known answers (structure, quotes, citations, "
+              "front matter, tiers, links, grounding).")
+    :params v4/params
+    :profile "developer"
+    :task v4/task
+    :evaluator (fn [params gold]
+                 (v4/evaluator (if gold (assoc params :gold gold) (assoc params :structure? true))))
+    ;; One world, for catalog_start's benchmark mode; catalog_benchmark runs many.
+    :benchmark {:fixtures #(gen/documents (gen/world 1)) :gold #(gen/gold (gen/world 1))}
+    :experiment-plan #(wiki/experiment-plan (assoc % :version 4))}})
 
 (defn lookup
   "The catalog workflow `id` (keyword or \"ns/name\" string), or throws."

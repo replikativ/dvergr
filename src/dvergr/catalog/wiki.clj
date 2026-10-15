@@ -563,7 +563,7 @@
 (defn real-gold [corpus]
   (edn/read-string (slurp (io/resource (str (:dir (real-corpora corpus)) "/gold.edn")))))
 
-(defn- world-of
+(defn world-of
   "`{:docs :gold}` of a wiki/v3 environment: a generated world (`:seed`) or a
    real corpus (`:corpus`)."
   [environment]
@@ -630,7 +630,7 @@
             (or seeds (gen/seeds split n test-key))))))
 
 (defn experiment-plan
-  "What running a benchmark set (`version` 1, the default, 2 or 3) needs,
+  "What running a benchmark set (`version` 1, the default, 2, 3 or 4) needs,
    wherever it runs: capabilities, environments, the candidate team (one per
    model), the model specs, the dataset. v3 takes `:split` (`:dev`, the
    default, `:test`, or `:real` for the real corpora), `:n` worlds (default
@@ -639,9 +639,12 @@
    default 0), `:noise` (kinds of noise in the documents, 0–4, default 0; see
    `dvergr.catalog.wiki-gen`), explicit `:seeds` or `:corpora`, and the
    held-out split's key (`:test-key`, default the environment variable
-   DVERGR_WIKI_TEST_KEY)."
+   DVERGR_WIKI_TEST_KEY). v4 (`dvergr.catalog.wiki-v4`) runs on v3's worlds
+   with its own task and checker and takes the same options."
   [{:keys [models budget-dollars timeout-ms prompt version] :or {version 1} :as opts}]
-  (if (= 3 version)
+  (cond
+    (= 4 version) ((requiring-resolve 'dvergr.catalog.wiki-v4/experiment-plan) opts)
+    (= 3 version)
     (let [setup (world-setup-v3)
           ev (evaluator-v3 params)
           envs (environments-v3 setup ev (update opts :test-key #(or % (System/getenv "DVERGR_WIKI_TEST_KEY"))))
@@ -655,7 +658,7 @@
        :dataset {:id :catalog/wiki-v3
                  :metadata {:generator gen/version :split (or (:split opts) :dev)
                             :worlds (mapv #(let [m (:environment/metadata %)] (or (:seed m) (:corpus m))) envs)}}})
-    (experiment-plan-v1-v2 opts)))
+    :else (experiment-plan-v1-v2 opts)))
 
 (defn- experiment-plan-v1-v2
   [{:keys [models budget-dollars timeout-ms prompt version] :or {version 1}}]

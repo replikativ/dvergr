@@ -67,8 +67,14 @@
    model; it is not part of this deterministic score."
   (:require [clojure.set :as set]
             [clojure.string :as str]
+            [dvergr.agent.environment :as environment]
+            [dvergr.agent.evaluation :as evaluation]
+            [dvergr.agent.roster :as roster]
+            [dvergr.agent.workflow :as workflow]
             [dvergr.catalog.wiki :as wiki]
-            [dvergr.catalog.wiki-gen :as gen]))
+            [dvergr.catalog.wiki-gen :as gen]
+            [dvergr.catalog.workspace :as ws]
+            [hasch.core :as hasch]))
 
 (def params {:source "/docs" :target "/wiki"})
 
@@ -621,3 +627,106 @@
                          ;; page that cites nothing would be an ungrounded claim
                          (str/join (for [[p _] atoms] (str "- [[atoms/" (stem p) "]]\n"))))
            "/wiki/index.md" (str "# " (:place w) " wiki\n\n- [[overviews/" (slug (:org w)) "]]\n"))))
+
+;; ============================================================================
+;; As a workflow and an experiment
+;; ============================================================================
+
+(defn task
+  "The v4 instruction: v2's content rules in the two-tier layout this checker
+   scores."
+  [{:keys [source target]}]
+  (str "The folder " source " contains source documents. Write a wiki in " target " from them, in two tiers.\n\n"
+       "Atoms, " target "/atoms/<slug>.md: one page per important entity (the organisation, people, places, "
+       "projects, events). Each starts with front matter\n"
+       "---\ntype: entity\nsource: [charter.md, annual-report-2019.md]\nentry-point: One line on what the page is for.\n---\n"
+       "(type is entity, concept or event; source lists exactly the documents the page's claims cite), then "
+       "`# Title`, then one claim per `## ` heading. A claim states its facts in your own words and cites the "
+       "document they come from as [[charter]], or as [[charter#Section]] when the document has `##` sections. "
+       "Under it, for every document it cites, a verbatim sentence from that document on a line of its own:\n"
+       "> \"The exact sentence from the document.\" [[charter#Section]]\n"
+       "End each atom with a line **Sources:** [[charter]], [[annual-report-2019]].\n\n"
+       "Overviews, " target "/overviews/<slug>.md: front matter `type: overview`, linking the atoms they cover "
+       "as [[atoms/<slug>]]; every atom is linked from an overview.\n\n"
+       "Index, " target "/index.md: links every overview as [[overviews/<slug>]].\n\n"
+       "The documents differ in authority and date; some are outdated or wrong. State the current value and mark "
+       "older ones as former. Do not copy documents beyond the quotes, and do not include facts about organisations "
+       "other than the one the documents are about. Use the file tools to read and write files."))
+
+(def ^:private no-gold
+  "A gold with nothing to find: what a room without known answers is scored on."
+  {:entities {} :facts [] :stale [] :current [] :distractors [] :relations []})
+
+(def structure-checks
+  "The checks that need no gold: structure, evidence, links, grounding, copies."
+  [:has-atoms? :has-overviews? :index? :quotes-faithful? :every-claim-quoted?
+   :every-quote-under-a-heading? :citations-valid? :front-matter? :no-orphan-atoms?
+   :no-untiered-pages? :links-valid? :grounded? :no-copied-pages?])
+
+(defn score-structure
+  "Score a v4 wiki without gold (a user's room): `structure-checks`, with the
+   share passed as the reward. `{:scores :checks :reward}`."
+  [opts]
+  (let [{:keys [scores checks]} (score-wiki-v4 (assoc opts :gold no-gold))
+        checks (select-keys checks structure-checks)]
+    {:scores (dissoc scores :coverage :currency :entities :relations :stale-values :distractor-terms)
+     :checks checks
+     :reward (if (:has-atoms? checks)
+               (/ (Math/round (* 1000.0 (/ (count (filter true? (vals checks))) (count checks)))) 1000.0)
+               0.0)}))
+
+(defn evaluator
+  "The v4 checker as an Evaluator: against `gold` (one fixed world), else the
+   gold of each attempt's environment (a v3 world, `wiki/world-of`); with
+   `:structure? true`, `score-structure` (no gold)."
+  [{:keys [source target gold structure?]}]
+  (evaluation/make-evaluator
+   (cond-> {:id (if structure? :catalog/wiki-structure :catalog/wiki)
+            :version (if structure? 1 4)
+            :capture (fn [{world :world/room}]
+                       {:pages (ws/read-tree world target)
+                        :sources (ws/read-tree world source)})
+            :observe (fn [{:keys [default result environment] captured :execution/evidence}]
+                       (let [opts {:pages (:pages captured) :sources (:sources captured)
+                                   :target target :source source}
+                             scored (if structure?
+                                      (score-structure opts)
+                                      (score-wiki-v4 (assoc opts :gold (or gold (:gold (wiki/world-of environment))))))]
+                         (assoc default
+                                :run-status (:run/status result)
+                                :pages (:pages captured)
+                                :scores (:scores scored)
+                                :checks (:checks scored)
+                                :reward (:reward scored))))
+            :verify (fn [_ {:keys [run-status checks reward]}]
+                      {:checks (assoc checks :completed? (= :completed run-status))
+                       :reward (if (= :completed run-status) reward 0.0)})}
+     gold (assoc :basis {:gold (str (hasch/uuid gold))}))))
+
+(defn experiment-plan
+  "v3's plan (`wiki/experiment-plan` with `:version 3`: its worlds, splits and
+   knobs) with v4's task and checker."
+  [{:keys [models budget-dollars prompt] :as opts}]
+  (let [setup (wiki/world-setup-v3)
+        ev (evaluator params)
+        ref (evaluation/evaluator-ref ev)
+        v3-envs (wiki/environments-v3 setup ev (update opts :test-key #(or % (System/getenv "DVERGR_WIKI_TEST_KEY"))))
+        envs (mapv (fn [e]
+                     (environment/make-environment
+                      {:id :catalog/wiki-v4
+                       :task (task params)
+                       :verifier {:id (:verifier/id ref) :version (:verifier/version ref)}
+                       :limits (:environment/limits e)
+                       :world (:environment/world e)
+                       :metadata (:environment/metadata e)}))
+                   v3-envs)
+        {:keys [team ids]} (workflow/candidates {:models models :profile "developer"
+                                                 :budget-dollars budget-dollars :prompt prompt})]
+    {:benchmark :catalog-wiki
+     :capabilities {:world-setup setup :evaluator ev}
+     :environments envs
+     :team team
+     :models (mapv #(:agent/model-policy (roster/agent team %)) ids)
+     :dataset {:id :catalog/wiki-v4
+               :metadata {:generator gen/version :split (or (:split opts) :dev)
+                          :worlds (mapv #(let [m (:environment/metadata %)] (or (:seed m) (:corpus m))) envs)}}}))
