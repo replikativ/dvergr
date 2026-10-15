@@ -326,6 +326,19 @@
             :when (and call (var-head? (first call)))]
       (refuse-query! "A query calls a function only by name or through a query input" call))))
 
+(defn- check-no-nested-query!
+  "Throws when `forms` (a query, its rules) call `q`. A nested query is a
+   query built-in, run without the checks and sealing of this boundary, and
+   it may not take a database here (`check-source-use!`): it could only
+   compute on values the outer query hands it, such as a stored value bound
+   by a data pattern."
+  [forms]
+  (doseq [x (tree-seq coll? seq forms)
+          :let [call (cond (and (seq? x) (seq x)) x
+                           (and (vector? x) (sequential? (first x))) (first x))]
+          :when (and call (symbol? (first call)) (= "q" (name (first call))))]
+    (refuse-query! "A sandbox query does not nest queries" call)))
+
 (defn- query-args
   "A query's inputs as Datahike takes them: databases unsealed in source
    positions, callables seeing sealed values, bindings and rules checked."
@@ -335,7 +348,12 @@
         rules (keep-indexed (fn [i b] (when (= '% b) (query-form (nth inputs i nil)))) bindings)]
     (check-bindings! bindings)
     (check-source-use! (into [query] rules))
-    (check-call-heads! (into [query] rules) (in-variables bindings))
+    ;; A rule's variables are its own (renamed when the rule expands), so an
+    ;; outer input of the same name says nothing about them: a rule calls
+    ;; functions by name only.
+    (check-no-nested-query! (into [query] rules))
+    (check-call-heads! [query] (in-variables bindings))
+    (check-call-heads! (vec rules) #{})
     (into []
           (map-indexed (fn [i v]
                          (if (source-sym? (get bindings i)) (unseal v) (sealing-input v))))
@@ -558,8 +576,8 @@
 
 (defn- sandbox-symbol-resolver
   "`safe-symbol-resolver` with the pure functions sealing their arguments;
-   Datahike's own query functions (`q`, `pull`, ...), which take a database
-   by design, and the registry as they are."
+   Datahike's own query functions (`pull`, `datoms`, ...), which take a
+   database by design, and the registry as they are."
   [sym]
   (or (get sealing-safe-fns sym)
       (resolve/safe-symbol-resolver sym)))

@@ -729,6 +729,12 @@
           (is (:err (ev "(d/q '[:find ?x . :where [?e :title \"parent\"] [?e :f ?f] [(?f) ?x]] @dvergr.room/*kb*)")))
           (is (:err (ev "(d/q '[:find ?x . :where [?e :title \"parent\"] [(get-else $ ?e :f nil) ?f] [(apply ?f []) ?x]] @dvergr.room/*kb*)")))
           (is (:err (ev "(d/q '[:find ?x . :in $ % :where (r ?x)] @dvergr.room/*kb* '[[(r ?x) [?e :f ?f] [(apply ?f []) ?x]]])")))
+          (is (:err (ev "(d/q '[:find ?x . :where [?e :title \"parent\"] [?e :f ?f] [(q \"[:find ?y . :in ?f :where [(?f) ?y]]\" ?f) ?x]] @dvergr.room/*kb*)"))
+              "a nested query is checked like a top-level one")
+          (is (:err (ev "(d/q '[:find ?x . :in $ % ?f :where (r ?x)] @dvergr.room/*kb* '[[(r ?x) [?e :f ?f] [(?f) ?x]]] (fn [] :mine))"))
+              "a rule's own variable is not the outer input of the same name")
+          (is (re-find #"does not nest" (str (:err (ev "(d/q '[:find ?y . :where [(q [:find ?t . :where [_ :title ?t]] [[1]]) ?y]] @dvergr.room/*kb*)"))))
+              "a nested query is refused as such")
           (is (= {:ok "PARENT"} (ev "(d/q '[:find ?u . :where [?e :title \"parent\"] [?e :title ?t] [(clojure.string/upper-case ?t) ?u]] @dvergr.room/*kb*)"))
               "ordinary function clauses over data still work"))
         (testing "an empty entity collection is a map"
