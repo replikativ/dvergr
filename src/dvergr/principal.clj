@@ -56,7 +56,8 @@
         local one, so the host can grant its creator. It may be called again
         for the same principal and resource (a retry): make it idempotent."
   (:require [clojure.string :as str]
-            [dvergr.security.allowlist :as allowlist]))
+            [dvergr.security.allowlist :as allowlist]
+            [taoensso.telemere :as tel]))
 
 ;; ============================================================================
 ;; Principals
@@ -101,8 +102,11 @@
 ;; Authentication
 ;; ============================================================================
 
-(defn- constant-time= [^String a ^String b]
-  (and a b (java.security.MessageDigest/isEqual (.getBytes a "UTF-8") (.getBytes b "UTF-8"))))
+(defn- constant-time=
+  "Equal, compared in constant time; never for a blank or missing value."
+  [^String a ^String b]
+  (and (not (str/blank? a)) (not (str/blank? b))
+       (java.security.MessageDigest/isEqual (.getBytes a "UTF-8") (.getBytes b "UTF-8"))))
 
 (defn bearer
   "The token of an `Authorization: Bearer …` header value, or nil."
@@ -111,25 +115,71 @@
 
 ;; ---- the local token: the owner's credential --------------------------------
 
-(defn- random-token []
+(defn random-token
+  "32 random bytes, hex."
+  []
   (let [b (byte-array 32)]
     (.nextBytes (java.security.SecureRandom.) b)
     (.formatHex (java.util.HexFormat/of) b)))
 
-(defn- write-private! [^java.io.File f ^String content]
-  (.mkdirs (.getParentFile f))
-  (spit f content)
-  (try (java.nio.file.Files/setPosixFilePermissions
-        (.toPath f) (java.nio.file.attribute.PosixFilePermissions/fromString "rw-------"))
-       (catch UnsupportedOperationException _ nil)))
+(def ^:private owner-only (java.nio.file.attribute.PosixFilePermissions/fromString "rw-------"))
+(def ^:private owner-dir (java.nio.file.attribute.PosixFilePermissions/fromString "rwx------"))
+
+(defn- posix? [^java.nio.file.Path path]
+  (try (some? (java.nio.file.Files/getPosixFilePermissions
+               path (into-array java.nio.file.LinkOption [java.nio.file.LinkOption/NOFOLLOW_LINKS])))
+       (catch UnsupportedOperationException _ false)))
+
+(defn private-dir!
+  "Make directory `dir` (creating it) readable by its owner only (0700)."
+  [dir]
+  (let [path (.toPath (java.io.File. (str dir)))]
+    (java.nio.file.Files/createDirectories path (make-array java.nio.file.attribute.FileAttribute 0))
+    (when (posix? path)
+      (java.nio.file.Files/setPosixFilePermissions path owner-dir))
+    path))
+
+(defn- write-private!
+  "Write `content` to `f` as the owner's alone: a new temp file created with
+   mode 0600 (never readable on the way), then moved over `f` atomically."
+  [^java.io.File f ^String content]
+  (let [dir (private-dir! (.getParentFile f))
+        posix (posix? dir)
+        tmp (if posix
+              (java.nio.file.Files/createTempFile dir ".token-" ".tmp"
+                                                  (into-array java.nio.file.attribute.FileAttribute
+                                                              [(java.nio.file.attribute.PosixFilePermissions/asFileAttribute owner-only)]))
+              (java.nio.file.Files/createTempFile dir ".token-" ".tmp" (make-array java.nio.file.attribute.FileAttribute 0)))]
+    (java.nio.file.Files/writeString tmp content (make-array java.nio.file.OpenOption 0))
+    (java.nio.file.Files/move tmp (.toPath f) (into-array java.nio.file.CopyOption
+                                                          [java.nio.file.StandardCopyOption/ATOMIC_MOVE
+                                                           java.nio.file.StandardCopyOption/REPLACE_EXISTING]))))
+
+(defn- read-private
+  "The token in `f`, or nil when it is missing, blank, a symbolic link, or
+   readable by others than its owner (then it is no secret any more: the
+   caller makes a new one)."
+  [^java.io.File f]
+  (let [path (.toPath f)
+        nofollow (into-array java.nio.file.LinkOption [java.nio.file.LinkOption/NOFOLLOW_LINKS])]
+    (cond
+      (not (java.nio.file.Files/exists path nofollow)) nil
+      (java.nio.file.Files/isSymbolicLink path)
+      (throw (ex-info (str f " is a symbolic link; refusing it as a credential") {:type ::token-symlink :file (str f)}))
+      (and (posix? path)
+           (not= owner-only (java.nio.file.Files/getPosixFilePermissions path nofollow)))
+      (do (tel/log! {:level :warn :id ::token-exposed :data {:file (str f)}}
+                    "A token file was readable by others; it is replaced with a new token")
+          nil)
+      :else (not-empty (str/trim (slurp f))))))
 
 (defn ensure-token!
-  "The token in `file`, created (random, mode 0600) when missing."
+  "The token in `file`, created (random, mode 0600, its directory 0700) when
+   missing, blank, or readable by others."
   [file]
   (let [f (java.io.File. (str file))]
-    (if (.isFile f)
-      (str/trim (slurp f))
-      (let [t (random-token)] (write-private! f t) t))))
+    (or (read-private f)
+        (let [t (random-token)] (write-private! f t) t))))
 
 (defn local-token-file
   "Where the local token of the state root `home` lives: `<home>/local-token`."
@@ -140,19 +190,20 @@
   "The local token of the state root `home` (default: this process's,
    `dvergr.substrate.paths/home`), created (mode 0600) when missing. A home
    from before it had one keeps the token of its `mcp/http-token`, so a
-   client configured with that one still connects."
+   client configured with that one still connects (and now reaches the web
+   and TCP with it too)."
   ([] (local-token ((requiring-resolve 'dvergr.substrate.paths/home))))
   ([home]
    (let [f (local-token-file home)
          old (java.io.File. (str home) "mcp/http-token")]
-     (if (and (not (.isFile f)) (.isFile old))
-       (let [t (str/trim (slurp old))] (write-private! f t) t)
-       (ensure-token! f)))))
+     (or (read-private f)
+         (when-let [t (and (.isFile old) (read-private old))] (write-private! f t) t)
+         (ensure-token! f)))))
 
 ;; ---- run tokens: an agent's credential for one invocation --------------------
 
 (defonce ^:private run-tokens
-  ;; token -> {:principal :expires-at}
+  ;; token -> {:principal :expires-at :on-revoke #{fn}}
   (atom {}))
 
 (defn mint-run-token!
@@ -160,25 +211,39 @@
    `claude -p` candidate through `bin/dvergr-mcp`): it authenticates as
    `(agent-principal actor)`, pinned to room `room` (an id string) and the
    tool names `tools`, until `revoke-run-token!` or `ttl-ms` (default an
-   hour). Returns the token."
+   hour). It carries no scope of its own: the pins are all it may use, over
+   MCP only. Returns the token."
   [{:keys [actor room tools ttl-ms] :or {ttl-ms 3600000}}]
   (let [t (random-token)]
     (swap! run-tokens assoc t
            {:principal (assoc (agent-principal (or actor :agent))
                               :principal/id (str "run/" (subs t 0 16))
                               :principal/actor (or actor :agent)
-                              ;; every toolset, then cut to exactly the pinned tools and room
-                              :principal/scopes #{:dvergr/admin}
                               :principal/room (str room)
                               :principal/tools (set (map str tools)))
             :expires-at (+ (System/currentTimeMillis) ttl-ms)})
     t))
 
-(defn revoke-run-token!
-  "End run token `t`: it authenticates nobody from now on."
-  [t]
-  (swap! run-tokens dissoc t)
+(defn on-revoke!
+  "Call `(f)` when run token `t` ends (revoked or expired): a connection
+   authenticated with it closes."
+  [t f]
+  (swap! run-tokens (fn [m] (if (contains? m t) (update-in m [t :on-revoke] (fnil conj #{}) f) m)))
   nil)
+
+(defn revoke-run-token!
+  "End run token `t`: it authenticates nobody from now on, and what it
+   authenticated is closed."
+  [t]
+  (let [[old _] (swap-vals! run-tokens dissoc t)]
+    (doseq [f (get-in old [t :on-revoke])]
+      (try (f) (catch Exception _ nil))))
+  nil)
+
+(defn run-token?
+  "Whether `t` is a live run token."
+  [t]
+  (boolean (and t (get @run-tokens t))))
 
 (defn run-token-principal
   "The principal of run token `t`, or nil (unknown, revoked or expired). A
@@ -191,6 +256,14 @@
         (nil? principal) nil
         (< expires-at (System/currentTimeMillis)) (do (revoke-run-token! t) nil)
         :else principal))))
+
+(defn- live-run?
+  "Whether the run principal `principal` still has a live token."
+  [principal]
+  (let [id (:principal/id principal)]
+    (boolean (some (fn [[_ {:keys [expires-at] p :principal}]]
+                     (and (= id (:principal/id p)) (>= expires-at (System/currentTimeMillis))))
+                   @run-tokens))))
 
 (defn pinned?
   "Whether `principal` is pinned to one room (a run token's)."
@@ -293,6 +366,10 @@
     ;; claims to be the process without being it: never asked, never allowed
     (forged-local? principal)
     {:allow? false :reason "A principal of kind :local that is not the process's is refused"}
+
+    ;; a run token that ended authorizes nothing more (an open stream, a session)
+    (and (pinned? principal) (not (live-run? principal)))
+    {:allow? false :reason "This run token has ended"}
 
     ;; a run token works in its room only, whatever the authorizer would allow
     (and (pinned? principal) (not= (:principal/room principal) (:room (:resolved request))))

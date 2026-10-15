@@ -254,4 +254,11 @@
         (is (= "mcp-authz-open" (get-in r [:result :structuredContent "id"])) "its room, not the one asked for"))
       (is (true? (get-in (call-tool c "room_detail" {:room "mcp-authz-closed"}) [:result :isError]))
           "naming another room is refused")
+      (is (not-any? #(= "room_messages" (:name %))
+                    (get-in (json-rpc/handle-message c {:jsonrpc "2.0" :id 9 :method "resources/templates/list" :params {}})
+                            [:result :resourceTemplates]))
+          "resources follow the pinned tools too")
+      (is (= -32002 (get-in (json-rpc/handle-message c {:jsonrpc "2.0" :id 10 :method "resources/read"
+                                                        :params {:uri "room://mcp-authz-open/messages"}})
+                            [:error :code])))
       (finally (principal/revoke-run-token! t)))))

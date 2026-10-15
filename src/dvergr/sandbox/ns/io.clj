@@ -58,10 +58,12 @@
    `.git` is on it because a repository's config and hooks are host command
    execution for whoever runs git there next (`diff.external`, a `clean`
    filter, a `pre-commit` hook); a path through `.git` is never workspace
-   content."
+   content. The home's credentials (`local-token`, the legacy
+   `mcp/http-token`, `jwt-secret`) and its MCP socket are on it too: a
+   sandbox that reads one acts as the owner."
   [path]
   (when (and path
-             (re-find #"(?i)(\.ssh[/\\]|\.gnupg[/\\]|/etc/shadow|/etc/passwd|/etc/sudoers|/proc/|/sys/|\.aws[/\\]|\.azure[/\\]|\.gcloud[/\\]|/run/secrets|\.env$|\.env\.|(^|[/\\])\.git([/\\]|$))"
+             (re-find #"(?i)(\.ssh[/\\]|\.gnupg[/\\]|/etc/shadow|/etc/passwd|/etc/sudoers|/proc/|/sys/|\.aws[/\\]|\.azure[/\\]|\.gcloud[/\\]|/run/secrets|\.env$|\.env\.|(^|[/\\])\.git([/\\]|$)|(^|[/\\])local-token$|(^|[/\\])http-token$|(^|[/\\])jwt-secret$|(^|[/\\])mcp\.sock$)"
                       path))
     (throw (ex-info "Access denied: sensitive path" {:path path}))))
 

@@ -491,3 +491,90 @@
       (is (not (re-find #"Not authorized" (str (:reply (cmd "/help" {:principal bob :available-tools []
                                                                      :notify! identity}))))))
       (finally (principal/configure! {})))))
+
+;; ---------------------------------------------------------------------------
+;; The credentials themselves
+
+(deftest a-blank-token-is-no-credential
+  (is (nil? (principal/default-authenticate {:transport :web :bearer "" :local-token ""})))
+  (is (nil? (principal/default-authenticate {:transport :web :bearer "  " :local-token "  "})))
+  (let [dir (java.io.File. (str (System/getProperty "java.io.tmpdir") "/dvergr-blank-" (random-uuid)))
+        f (java.io.File. dir "t")]
+    (.mkdirs dir)
+    (spit f "  \n")
+    (java.nio.file.Files/setPosixFilePermissions (.toPath f) (java.nio.file.attribute.PosixFilePermissions/fromString "rw-------"))
+    (let [t (principal/ensure-token! f)]
+      (is (= 64 (count t)) "a blank file gets a new token")
+      (is (= t (clojure.string/trim (slurp f)))))))
+
+(deftest a-token-file-is-the-owners-alone
+  (let [home (java.io.File. (str (System/getProperty "java.io.tmpdir") "/dvergr-perm-" (random-uuid)))
+        perms #(java.nio.file.attribute.PosixFilePermissions/toString
+                (java.nio.file.Files/getPosixFilePermissions (.toPath ^java.io.File %) (make-array java.nio.file.LinkOption 0)))
+        t (principal/local-token home)
+        f (principal/local-token-file home)]
+    (is (= "rw-------" (perms f)) "created 0600")
+    (is (= "rwx------" (perms home)) "in a 0700 home")
+    (testing "readable by others: no secret any more, so a new one"
+      (java.nio.file.Files/setPosixFilePermissions (.toPath f) (java.nio.file.attribute.PosixFilePermissions/fromString "rw-r--r--"))
+      (let [t2 (principal/local-token home)]
+        (is (not= t t2))
+        (is (= "rw-------" (perms f)))))
+    (testing "a symbolic link is refused"
+      (let [other (java.io.File. home "elsewhere")]
+        (spit other "x")
+        (.delete f)
+        (java.nio.file.Files/createSymbolicLink (.toPath f) (.toPath other) (make-array java.nio.file.attribute.FileAttribute 0))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"symbolic link" (principal/local-token home)))))))
+
+(deftest a-run-principal-carries-no-scope-of-its-own
+  (let [t (principal/mint-run-token! {:actor :w :room "r" :tools ["read_file"]})]
+    (try
+      (is (empty? (:principal/scopes (principal/run-token-principal t))))
+      (testing "a revoked run's principal authorizes nothing more, even held on to"
+        (let [p (principal/run-token-principal t)
+              closed (atom false)]
+          (principal/on-revoke! t #(reset! closed true))
+          (principal/revoke-run-token! t)
+          (is @closed "what it authenticated is closed")
+          (is (not (:allow? (principal/decide (daemon (constantly true)) p
+                                              {:op :room/read :action :read :resource [:room "r"] :resolved {:room "r"}}))))))
+      (finally (principal/revoke-run-token! t)))))
+
+(deftest a-claim-holds-only-the-room-its-create-made
+  (with-system-db
+    (let [c (:execution-ctx (daemon nil))
+          dmn (daemon (constantly true))
+          fail? (atom false)]
+      (with-redefs [rooms/create-room! (fn [{:keys [slug title]}]
+                                         (when @fail? (throw (ex-info "provisioning failed" {})))
+                                         (dvergr.system.db/create-room! {:slug slug :name title})
+                                         (when-not (rreg/lookup (keyword slug))
+                                           (rreg/register! (d/make-room {:id (keyword slug) :ctx c :store (memory/make)})))
+                                         (keyword slug))]
+        (try
+          (testing "a create that fails to provision releases its claim"
+            (reset! fail? true)
+            (is (thrown? Exception (ops/invoke dmn bob :room/create {:title "B" :slug "authz-b"})))
+            (is (nil? (dvergr.system.db/room-claim "authz-b"))))
+          (testing "so the owner's later room of that slug is never the attacker's retry"
+            (reset! fail? false)
+            (ops/invoke dmn principal/local-principal :room/create {:title "Owner's" :slug "authz-b"})
+            (is (= 409 (ops/error-status (try (ops/invoke dmn bob :room/create {:title "B" :slug "authz-b"}) nil
+                                              (catch clojure.lang.ExceptionInfo e e))))))
+          (testing "the process takes a claimed slug over"
+            (with-redefs [rooms/create-room! (fn [_] (throw (ex-info "not yet" {})))]
+              (dvergr.system.db/claim-room! "authz-c" (pr-str "party/bob")))
+            (ops/invoke dmn principal/local-principal :room/create {:title "C" :slug "authz-c"})
+            (is (nil? (dvergr.system.db/room-claim "authz-c")))
+            (is (= 409 (ops/error-status (try (ops/invoke dmn bob :room/create {:title "C" :slug "authz-c"}) nil
+                                              (catch clojure.lang.ExceptionInfo e e))))))
+          (finally
+            (binding [ec/*execution-context* c]
+              (doseq [k [:authz-b :authz-c]]
+                (when-let [r (rreg/lookup k)] (rreg/unregister! k) (d/close-room! r))))))))))
+
+(deftest telegram-owners-are-numeric-ids
+  (is (nil? (dvergr.orchestration.daemon/check-telegram-owners! {:owners [12345]})))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"numeric"
+                        (dvergr.orchestration.daemon/check-telegram-owners! {:owners [12345 "@me"]}))))

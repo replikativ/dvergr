@@ -19,9 +19,12 @@ clojure -M:cli --web --web-port 9090    # another port
 ```
 
 Like Jupyter, it prints a login URL, `[dvergr] web dashboard: http://127.0.0.1:17880/?token=…`:
-open it once; the token in it sets a cookie and the page reloads without it. The token is the
-daemon's local token, `$DVERGR_HOME/local-token`; `(:login-url (dvergr.web.server/start! …))`
-returns the same URL to a REPL.
+open it once; it opens a browser session and the page reloads without the token. The token is
+the daemon's local token, `$DVERGR_HOME/local-token` (a home from before keeps the value of
+its `mcp/http-token`, which therefore now opens the web and TCP too);
+`(:login-url (dvergr.web.server/start! …))` returns the same URL to a REPL (the server does not
+keep it). The browser's history keeps the URL you opened, token included: treat it as you
+treat the token file.
 
 A daemon started any other way (as a library, `daemon/start!`) starts the server when its
 config has `:http`:
@@ -45,13 +48,17 @@ One server runs per process.
 
 Every request is authenticated through the daemon's `:authenticate` seam (transport `:web`;
 `doc/mcp.md` describes the seams and the principal), from a credential alone: an
-`Authorization: Bearer` header, or the `dvergr_token` cookie. Where a request comes from
-grants nothing, loopback included. The default accepts the local token as the local
-principal and refuses anything else with 401:
+`Authorization: Bearer` header, or a browser session. Where a request comes from grants
+nothing, loopback included. The default accepts the local token as the local principal and
+refuses anything else with 401; a run token (an agent's, `doc/mcp.md`) is for MCP only and
+is refused here:
 
-- `GET <path>?token=<token>` with a valid token answers 303 to `<path>` (the token is not in
-  the URL the browser keeps) and sets `dvergr_token` (HttpOnly, SameSite=Strict); a wrong one
-  is 401;
+- `GET <path>?token=<token>` with a valid token opens a session and answers 303 to `<path>`
+  (one leading `/`: a redirect never leaves this server). The cookie, `dvergr_session`
+  (HttpOnly, SameSite=Strict, 12 h), holds a random session id the server maps to the
+  principal, never the token: cookies are not scoped by port, so any other server on this
+  host (an agent's dev server, say) receives this cookie, and it is worth nothing there. Each
+  login makes a new id. A wrong token is 401;
 - a script or curl sends `Authorization: Bearer $(cat $DVERGR_HOME/local-token)`.
 
 A cross-site page gets no credential: the cookie is SameSite=Strict, and the guard below
@@ -61,9 +68,10 @@ credentials) and an `:authorize` seam. What a principal may do:
 - the **JSON API** and the dashboard's derived actions (`dvergr.web.ops`) run each op for the
   request's principal, authorized like every other surface (403 with `{"error": …}` when
   denied; listings filtered);
-- **room apps** need a read of their room. They are served from the dashboard's own origin,
-  so an app's script runs with the same origin as the API; a host that serves untrusted
-  rooms' apps to other principals should put them on an origin of their own;
+- **room apps** need a read of their room. An app is agent-written, so every response under
+  `/apps/` carries `Content-Security-Policy: sandbox allow-scripts`: its scripts run in an
+  opaque origin, the session cookie is not sent for them, and their requests say
+  `Origin: null`, which this server refuses outside `/apps/` (403);
 - the rest of the **dashboard** (hand-written views and actions straight over the daemon:
   room pages, posts, voice, fragments) answers the local principal only, 403 for anyone
   else. `/api/health` answers anyone authenticated.

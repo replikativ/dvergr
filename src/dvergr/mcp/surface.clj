@@ -146,7 +146,9 @@
   [principal]
   (let [scopes (set (:principal/scopes principal))]
     (when-not (= :local (:principal/kind principal))
-      (disj (if (contains? scopes :dvergr/admin)
+      (disj (if (or (contains? scopes :dvergr/admin)
+                    ;; a run token: its pinned tools decide, by name (`capped`)
+                    (some? (:principal/tools principal)))
               (set (keys toolsets))
               (into #{} (keep #(when (= "toolset" (namespace %)) (keyword (name %)))) scopes))
             :extra))))

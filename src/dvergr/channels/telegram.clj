@@ -600,9 +600,9 @@
           owners    (set (get-in (:config daemon) [:telegram :owners]))
           who       (try ((principal/authenticator (:config daemon))
                           {:transport :telegram :telegram/user user-info :telegram/chat-id chat-id
-                           ;; the operator, by `:telegram {:owners [id "@name"]}`
-                           :telegram/owner? (boolean (or (owners (:id user-info))
-                                                         (some-> (:username user-info) (#(owners (str "@" %))))))})
+                           ;; the operator, by `:telegram {:owners [id …]}`: numeric ids
+                           ;; only (a username can be changed and taken by someone else)
+                           :telegram/owner? (boolean (and (integer? (:id user-info)) (owners (:id user-info))))})
                          (catch Exception _ nil))
           working!  (fn [] (when typing-fn (try (typing-fn chat-id) (catch Throwable _ nil))))]
       ;; Allowlist FIRST — before the file download / STT / store-file

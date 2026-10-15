@@ -722,6 +722,16 @@
     (reset! gc-thread nil)
     (when-not (= thread (Thread/currentThread)) (.join thread 60000))))
 
+(defn check-telegram-owners!
+  "Refuse `:telegram {:owners …}` entries that are not numeric Telegram user
+   ids: an owner acts as the operator, and a username can be changed and
+   taken by someone else."
+  [tg-config]
+  (when-let [bad (seq (remove integer? (:owners tg-config)))]
+    (throw (ex-info (str ":telegram :owners takes numeric Telegram user ids only (a username "
+                         "can be changed and reused): " (pr-str bad))
+                    {:type ::invalid-config :owners (vec bad)}))))
+
 (defn- start-mcp!
   "Start the MCP server on the daemon's loopback TCP port when `mcp-config` is
    given (`{:port 17888 :bind \"127.0.0.1\" :profile \"offload\" :toolsets …}`),
@@ -1020,6 +1030,7 @@
     (let [daemon-with-tg
           (if-let [tg-config (:telegram config)]
             (do
+              (check-telegram-owners! tg-config)
               (tel/log! {:id :daemon/telegram-connecting} "Connecting Telegram bot")
               (let [token   (:token tg-config)
                     default-agent-id (or (:default-agent config) :var)

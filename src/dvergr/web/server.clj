@@ -174,21 +174,27 @@
     (resp-fn)
     (json-response 403 {:error "The dashboard is local; use the JSON API (/api/v1/)"})))
 
-(def token-cookie
-  "The cookie that carries the dashboard's credential after the login URL."
-  "dvergr_token")
+(def session-cookie
+  "The cookie of a browser session the login URL opened: a random id the
+   server maps to its principal, never a credential that works elsewhere."
+  "dvergr_session")
+
+(def session-ttl-ms
+  "How long a browser session lasts after its login."
+  (* 12 60 60 1000))
 
 (defn- authenticate
-  "The principal of credential `token` (a bearer, the token cookie, the login
-   URL's `token`), or nil."
+  "The principal of credential `token` (a bearer, the login URL's `token`),
+   or nil. A run token (a pinned agent's) is for MCP only, never the web."
   [authenticate-fn req token]
-  (try (authenticate-fn {:transport :web
-                         :bearer token
-                         :remote-addr (:remote-addr req)
-                         :headers (:headers req)})
-       (catch Exception e
-         (tel/log! {:level :warn :id ::authenticate-failed :data {:error (ex-message e)}})
-         nil)))
+  (let [p (try (authenticate-fn {:transport :web
+                                 :bearer token
+                                 :remote-addr (:remote-addr req)
+                                 :headers (:headers req)})
+               (catch Exception e
+                 (tel/log! {:level :warn :id ::authenticate-failed :data {:error (ex-message e)}})
+                 nil))]
+    (when-not (principal/pinned? p) p)))
 
 (defn- login-token
   "The `token` query parameter of `req` (the login URL's), or nil."
@@ -202,26 +208,56 @@
   {:status 401 :headers {"Content-Type" "application/json" "WWW-Authenticate" "Bearer"}
    :body "{\"error\":\"Not authenticated: open the URL with ?token= the daemon printed, or send Authorization: Bearer\"}"})
 
+(defn- local-path
+  "`uri` when it is a path of this server (one leading `/`), else `/`: a
+   redirect never leaves it (`//host` is another server)."
+  [uri]
+  (if (and (str/starts-with? (str uri) "/") (not (str/starts-with? (str uri) "//"))) uri "/"))
+
+(defn- session-principal
+  "The principal of the live session `sid` in `sessions`, or nil."
+  [sessions sid]
+  (when-let [{:keys [principal expires-at]} (and sid (get @sessions sid))]
+    (if (< expires-at (System/currentTimeMillis))
+      (do (swap! sessions dissoc sid) nil)
+      principal)))
+
 (defn- root-handler
-  "Jupyter-style: `GET <any>?token=<token>` with a valid token sets the token
-   cookie (HttpOnly, SameSite=Strict) and redirects to the same path without
-   it; every other request authenticates by `Authorization: Bearer` or that
-   cookie. A cross-site request carries neither (the cookie is Strict), and
-   the guard's CSRF token and JSON-only API writes stand besides."
-  [daemon authenticate-fn req]
-  (if-let [t (and (#{:get :head} (:request-method req)) (login-token req))]
-    (if (authenticate authenticate-fn req t)
-      {:status 303
-       :headers {"Location" (or (not-empty (:uri req)) "/")
-                 "Set-Cookie" (str token-cookie "=" t "; Path=/; HttpOnly; SameSite=Strict")
-                 "Cache-Control" "no-store"}
-       :body ""}
-      unauthorized)
-    (let [token (or (principal/bearer (get-in req [:headers "authorization"]))
-                    (guard/cookie-value req token-cookie))]
-      (if-let [p (when token (authenticate authenticate-fn req token))]
-        (route daemon p req)
-        unauthorized))))
+  "Jupyter-style: `GET <path>?token=<token>` with a valid token opens a
+   browser session: a random session id in a cookie (HttpOnly,
+   SameSite=Strict; the token itself is never a cookie: cookies are not
+   scoped by port, so another server on this host would receive it), and a
+   redirect to the same path without the token. Every other request
+   authenticates by `Authorization: Bearer` or that session. A request whose
+   Origin is `null` (a sandboxed room app, `dvergr.web.apps`) reaches no
+   room app or API at all."
+  [daemon authenticate-fn sessions req]
+  (cond
+    (and (= "null" (get-in req [:headers "origin"]))
+         (not (str/starts-with? (str (:uri req)) "/apps/")))
+    {:status 403 :headers {"Content-Type" "application/json"}
+     :body "{\"error\":\"A sandboxed page (Origin null) may not call this server\"}"}
+
+    :else
+    (if-let [t (and (#{:get :head} (:request-method req)) (login-token req))]
+      (if-let [p (authenticate authenticate-fn req t)]
+        (let [sid (principal/random-token)]
+          ;; a new id at every login; the one the browser had is dropped
+          (some->> (guard/cookie-value req session-cookie) (swap! sessions dissoc))
+          (swap! sessions assoc sid {:principal p :expires-at (+ (System/currentTimeMillis) session-ttl-ms)})
+          {:status 303
+           :headers {"Location" (local-path (not-empty (:uri req)))
+                     "Set-Cookie" (str session-cookie "=" sid "; Path=/; HttpOnly; SameSite=Strict; Max-Age="
+                                       (quot session-ttl-ms 1000))
+                     "Cache-Control" "no-store"
+                     "Referrer-Policy" "no-referrer"}
+           :body ""})
+        unauthorized)
+      (let [token (principal/bearer (get-in req [:headers "authorization"]))
+            p (if token
+                (authenticate authenticate-fn req token)
+                (session-principal sessions (guard/cookie-value req session-cookie)))]
+        (if p (route daemon p req) unauthorized)))))
 
 (defn- route [daemon principal req]
   ;; CRITICAL: http-kit's worker threads have no `*execution-context*`
@@ -248,12 +284,15 @@
       ;; for whoever may read the room
         (str/starts-with? uri "/apps/")
         ;; authorized on the very room row web-apps resolves and then serves
-        (try (web-apps/handle req daemon
-                              (fn [row slug]
-                                (dops/authorize! daemon principal :room/read
-                                                 {:room (or (:room/slug row) slug) :path "/app"})))
-             (catch clojure.lang.ExceptionInfo e
-               (json-response (dops/error-status e) {:error (ex-message e)})))
+        ;; an app is agent-written: sandboxed (an opaque origin, `Origin: null`),
+        ;; so its scripts get neither the session cookie nor this server's origin
+        (some-> (try (web-apps/handle req daemon
+                                      (fn [row slug]
+                                        (dops/authorize! daemon principal :room/read
+                                                         {:room (or (:room/slug row) slug) :path "/app"})))
+                     (catch clojure.lang.ExceptionInfo e
+                       (json-response (dops/error-status e) {:error (ex-message e)})))
+                (assoc-in [:headers "Content-Security-Policy"] "sandbox allow-scripts"))
 
         (= uri "/api/health")               (api-health req daemon)
 
@@ -418,8 +457,9 @@
    (the CSRF secret; a fresh one by default), `:authenticate` (default: the
    daemon's, `principal/authenticator`)."
   [daemon {:keys [secret authenticate] :as opts}]
-  (guard/wrap (let [authn (or authenticate (principal/authenticator (:config daemon)))]
-                (fn [req] (root-handler daemon authn req)))
+  (guard/wrap (let [authn (or authenticate (principal/authenticator (:config daemon)))
+                    sessions (atom {})]
+                (fn [req] (root-handler daemon authn sessions req)))
               (assoc opts :secret (or secret (guard/new-secret)))))
 
 (defn start!
@@ -430,7 +470,7 @@
      :port  - Port to listen on (default 17880)
      :ip    - Bind address (default \"127.0.0.1\"). Every request needs a
               credential, wherever it comes from: the local token (the login
-              URL, `:login-url` of the result, sets a cookie) or what the
+              URL, `:login-url` of the result, opens a session) or what the
               daemon's authenticator accepts.
      :authenticate - the seam (default: the daemon's, `principal/authenticator`)
      :allowed-hosts   - extra Host names to answer (beside loopback and the bind
@@ -455,15 +495,15 @@
     (reset! server-state {:stop-fn stop-fn
                           :port port
                           :ip ip
-                          ;; Jupyter-style: open it once, the cookie does the rest
-                          :login-url (str "http://" (if (#{"0.0.0.0" "::"} ip) "127.0.0.1" ip) ":"
-                                          port "/?token="
-                                          (principal/local-token))
                           :daemon daemon
                           :started-at (System/currentTimeMillis)})
     (tel/log! {:level :info :id ::started :data {:url (str "http://" ip ":" port)}}
-              "HTTP server started (the login URL with its token is in the server state, :login-url)")
-    @server-state))
+              "HTTP server started (start! returns its login URL, :login-url)")
+    ;; Jupyter-style: open it once, the session does the rest. Returned to the
+    ;; caller (the CLI prints it), never kept in the server state.
+    (assoc @server-state
+           :login-url (str "http://" (if (#{"0.0.0.0" "::"} ip) "127.0.0.1" ip) ":"
+                           port "/?token=" (principal/local-token)))))
 
 (defn stop!
   "Stop the HTTP server."

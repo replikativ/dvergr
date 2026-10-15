@@ -50,7 +50,7 @@ and storage GC. The `.nrepl-port` of a REPL is written at the project root, not 
  ;; Channels (secrets fall back to env). See doc/channels.md.
  :telegram      {:token "…"                   ; or env TELEGRAM_BOT_TOKEN
                  :tool-commands? false        ; allow /clojure_eval etc. from Telegram (default off)
-                 :owners [12345 "@me"]}        ; senders who act as the local principal (the operator)
+                 :owners [12345]}              ; numeric ids of senders who act as the local principal (the operator)
  :allowed-users [{:id 12345 :username "…"}]   ; Telegram access control: listed senders act as telegram/<id>;
                                               ; empty lets messages in but identifies nobody (commands, posts refused)
  :strict-allowlist? true                      ; empty :allowed-users denies everyone (default false)

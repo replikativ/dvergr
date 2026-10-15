@@ -277,3 +277,16 @@
               "a loopback peer without the token gets one error")
           (is (nil? (.readLine r)) "and the connection closes")))
       (finally (when started? (server/stop!))))))
+
+(deftest an-oversized-credential-line-is-refused
+  (let [started? (not (:running (server/status)))]
+    (when started? (server/start! :port 0))
+    (try
+      (with-open [s (Socket. "127.0.0.1" (int (:port (server/status))))]
+        (.setSoTimeout s 10000)
+        (let [r (BufferedReader. (InputStreamReader. (.getInputStream s)))
+              w (BufferedWriter. (OutputStreamWriter. (.getOutputStream s)))]
+          ;; past the 8 KiB a credential line may take, with no newline in sight
+          (doto w (.write (apply str (repeat 9000 "a"))) (.flush))
+          (is (= -32001 (get-in (json/read-value (.readLine r) read-mapper) [:error :code])))))
+      (finally (when started? (server/stop!))))))

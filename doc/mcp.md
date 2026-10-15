@@ -8,14 +8,20 @@ what it cost. The tools are derived from `dvergr.ops/specification` (and the roo
 ## Connecting a client
 
 A client launches `bin/dvergr-mcp` (babashka) as a stdio server. It relays to the daemon's
-TCP port (default `127.0.0.1:17888`). Its files live under the state root,
-`DVERGR_HOME` (default `<checkout>/.dvergr`):
+**Unix domain socket** in the state root (`$DVERGR_HOME/mcp.sock`; when that path is too long
+for a socket, `/tmp/dvergr-<user>/<hash>.sock` in a directory checked to be this user's and
+0700; `server/socket-path`). Only this user can reach it, so the relay never hands its
+credential to whatever holds a TCP port first (another user may bind 17888 before the
+daemon). `--tcp` (with `--port`, `--host`) uses the daemon's TCP port instead, and then the
+credential goes to whoever holds it. Its files live under the state root, `DVERGR_HOME`
+(default `<checkout>/.dvergr`, made 0700):
 
 - it presents the state root's **local token** (`$DVERGR_HOME/local-token`, mode 0600, which
-  the daemon creates; a home from before has it in `mcp/http-token`, and that token stays
-  valid) as the first line of every connection, or `DVERGR_MCP_TOKEN` when it is given one
-  (a run token, below). A daemon accepts no connection without a credential, loopback
-  included, and the relay says so when it is refused;
+  the daemon creates; a home from before has it in `mcp/http-token`, and that value stays
+  valid and now opens the web and TCP too) as the first line of every connection, or
+  `DVERGR_MCP_TOKEN` when it is given one (a run token, below). A daemon accepts no
+  connection without a credential, its socket included, and the relay says so when it is
+  refused;
 
 - when no daemon listens, it starts one (`clojure -M:cli --no-tui --mcp …`, log in
   `$DVERGR_HOME/logs/mcp-daemon.log`, nREPL port in `$DVERGR_HOME/mcp-daemon.nrepl-port`) and
@@ -68,8 +74,10 @@ every other candidate gets, natively, and the evaluator scores the world when it
 daemon (or any process running an Attempt) serves MCP on a loopback port for it. Each
 call gets a **run token** (`principal/mint-run-token!`), passed to the relay as
 `DVERGR_MCP_TOKEN`: it authenticates as that agent, and the server pins the connection to the
-token's room and tools whatever the relay asks; it is revoked when the call ends (and expires
-after an hour).
+token's room and tools whatever the relay asks (resources included: only those its tools
+name). It carries no scope of its own and is accepted over MCP only, never by the web. It is
+revoked when the call ends, however it ends (and expires after an hour); its connections close
+then, and its principal authorizes nothing more.
 This path needs the relay at `bin/dvergr-mcp` under the process's working directory (a
 checkout; `DVERGR_MCP_RELAY` names another path) and babashka (`bb`) to run it. Without the
 relay, or without a work room and tools, `claude -p` answers once and calls tools through the
@@ -134,7 +142,8 @@ naming one), or, for a host that runs dvergr's rooms without a daemon, process-w
   `run-stdio` is its owner, the local principal. On TCP, HTTP and the web the local token
   (`principal/local-token`, compared in constant time) is the local principal and a live run
   token is its agent; anything else is refused. A Telegram sender is the local principal only
-  when the host names it as an owner (`:telegram {:owners [id "@name"]}`), `telegram/<id>`
+  when the host names it as an owner (`:telegram {:owners [id …]}`, numeric ids only: a
+  username can be changed and taken), `telegram/<id>`
   when a non-empty allowlist lists it, else refused. A configured authenticator replaces the
   default; a hosted one should hand out the local principal to nobody, and should map a bearer
   it does not know through `principal/run-token-principal`, so dvergr's own agent runs
@@ -444,10 +453,11 @@ comments) and for a long request with a `progressToken`; closing a stream cancel
 Handshake clients get an `Mcp-Session-Id` from `initialize` (DELETE ends it); there is no GET
 stream (405).
 
-**TCP.** Newline-delimited JSON-RPC. The first line of a connection is its credential,
-`{"jsonrpc":"2.0","method":"dvergr/authenticate","params":{"token":"…"}}` (the local token or a
-run token, `server/tcp-auth-line`); a connection without one gets one error (-32001) and is
-closed.
+**TCP and the Unix domain socket.** Newline-delimited JSON-RPC. The first line of a connection
+is its credential, `{"jsonrpc":"2.0","method":"dvergr/authenticate","params":{"token":"…"}}`
+(the local token or a run token, `server/tcp-auth-line`), at most 8 KiB, within 10 s; a
+connection without one gets one error (-32001) and is closed. At most 256 connections are
+open at once. A connection a run token opened closes when the token ends.
 
 **The relay** (`bin/dvergr-mcp`) speaks both eras too: it forwards `server/discover` to the
 daemon (answering it itself, with the same versions, while the daemon starts), puts its

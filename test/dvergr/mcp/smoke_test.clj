@@ -187,7 +187,8 @@
                 (clojure.string/split (System/getenv "PATH") #":"))
     (support/skip! "the-relay-refuses-a-daemon-of-another-home: no bb on PATH")
     (let [other (str (System/getProperty "java.io.tmpdir") "/dvergr-mcp-other-" (random-uuid))
-          p (.start (doto (ProcessBuilder. ["bb" "bin/dvergr-mcp" "--no-start"
+          ;; --tcp: over its socket this relay would never even reach that daemon
+          p (.start (doto (ProcessBuilder. ["bb" "bin/dvergr-mcp" "--no-start" "--tcp"
                                             "--port" (str (get-in *daemon* [:mcp-server :port]))])
                       (-> .environment (.put "DVERGR_HOME" other))))
           out (BufferedWriter. (OutputStreamWriter. (.getOutputStream p)))
@@ -236,7 +237,7 @@
                   (catch Exception _ nil)))
               (recur)))
           (catch Exception _ nil)))
-      (let [p (.start (doto (ProcessBuilder. ["bb" "bin/dvergr-mcp" "--no-start" "--port" (str (.getLocalPort server))])
+      (let [p (.start (doto (ProcessBuilder. ["bb" "bin/dvergr-mcp" "--no-start" "--tcp" "--port" (str (.getLocalPort server))])
                         (-> .environment (.put "DVERGR_HOME" (paths/home)))))
             out (BufferedWriter. (OutputStreamWriter. (.getOutputStream p)))
             in (BufferedReader. (InputStreamReader. (.getInputStream p)))
@@ -251,4 +252,31 @@
           (send! {:jsonrpc "2.0" :id 2 :method "tools/call" :params {:name "room_list" :arguments {}}})
           (let [r (await #(= 2 (:id %)))]
             (is (re-find #"does not report its home" (str (get-in r [:result :content 0 :text]))) (pr-str r)))
+          (finally (.destroy p)))))))
+
+(deftest the-relay-never-hands-its-credential-to-a-tcp-port
+  ;; another user may bind the daemon's TCP port first: without --tcp the
+  ;; relay only ever talks to the Unix domain socket of its own home
+  (if-not (some #(.canExecute (java.io.File. (str % "/bb")))
+                (clojure.string/split (System/getenv "PATH") #":"))
+    (support/skip! "the-relay-never-hands-its-credential-to-a-tcp-port: no bb on PATH")
+    (with-open [squatter (java.net.ServerSocket. 0 50 (java.net.InetAddress/getLoopbackAddress))]
+      (let [seen (promise)
+            _ (future (try (let [s (.accept squatter)] (deliver seen s)) (catch Exception _ nil)))
+            home (str (System/getProperty "java.io.tmpdir") "/dvergr-squat-" (random-uuid))
+            _ (dvergr.principal/local-token home)       ; a home with a token, and no daemon
+            p (.start (doto (ProcessBuilder. ["bb" "bin/dvergr-mcp" "--no-start" "--port" (str (.getLocalPort squatter))])
+                        (-> .environment (.put "DVERGR_HOME" home))))
+            out (BufferedWriter. (OutputStreamWriter. (.getOutputStream p)))
+            in (BufferedReader. (InputStreamReader. (.getInputStream p)))
+            send! (fn [m] (.write out (j/write-value-as-string m)) (.write out "\n") (.flush out))
+            read! (fn [] (j/read-value (.readLine in) j/keyword-keys-object-mapper))]
+        (try
+          (send! {:jsonrpc "2.0" :id 1 :method "initialize"
+                  :params {:protocolVersion "2025-06-18" :capabilities {} :clientInfo {:name "t" :version "0"}}})
+          (read!)
+          (send! {:jsonrpc "2.0" :id 2 :method "tools/call" :params {:name "room_list" :arguments {}}})
+          (let [r (loop [m (read!)] (if (= 2 (:id m)) m (recur (read!))))]
+            (is (re-find #"not reachable on .*mcp\.sock" (str (get-in r [:result :content 0 :text]))) (pr-str r)))
+          (is (= ::none (deref seen 1000 ::none)) "the port's holder never got a connection")
           (finally (.destroy p)))))))

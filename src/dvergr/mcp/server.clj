@@ -349,20 +349,22 @@
 
 (defn- shown?
   "Whether `principal` may see op `op`'s resources: its toolset is within the
-   principal's (`surface/principal-toolsets`), as for the tools."
+   principal's (`surface/principal-toolsets`), as for the tools, and a run
+   token's pinned tools name it."
   [principal op]
-  (let [allowed (surface/principal-toolsets principal)]
-    (or (nil? allowed) (contains? allowed (surface/tool-toolset (ops/op->name op) op false)))))
+  (let [allowed (surface/principal-toolsets principal)
+        pinned (:principal/tools principal)]
+    (and (or (nil? allowed) (contains? allowed (surface/tool-toolset (ops/op->name op) op false)))
+         (or (nil? pinned) (contains? pinned (ops/op->name op))))))
 
 (defn resource-definitions
   "Fixed resources + resource templates, derived from the reads of
    `ops/operations` that `principal` may see (its toolsets: `surface/capped`)."
   [principal]
-  (let [allowed (surface/principal-toolsets principal)
-        rs (filter #(shown? principal (:op %)) (ops-resources))]
+  (let [rs (filter #(shown? principal (:op %)) (ops-resources))]
     {:resources (mapv :def (filter #(= :fixed (:kind %)) rs))
      :templates (cond-> (mapv :def (filter #(= :template (:kind %)) rs))
-                  (or (nil? allowed) (contains? allowed :files)) (conj file-template))}))
+                  (shown? principal :room/read) (conj file-template))}))
 
 (defn- fixed-by-uri []
   (into {} (for [{:keys [kind uri op]} (ops-resources) :when (= :fixed kind)] [uri op])))
@@ -825,90 +827,196 @@
   [token]
   (json/write-value-as-string {:jsonrpc "2.0" :method "dvergr/authenticate" :params {:token token}}))
 
-(defn- tcp-principal
-  "The principal of a TCP connection from its first line (`tcp-auth-line`),
-   or nil: a missing, unreadable or refused credential."
-  [authenticate ^BufferedReader reader remote-addr]
-  (let [first-line (.readLine reader)
-        msg (try (json/read-value (str first-line) json-read-mapper) (catch Exception _ nil))]
-    (when (= "dvergr/authenticate" (:method msg))
-      (try (authenticate {:transport :mcp-tcp :bearer (some-> msg :params :token str)
-                          :remote-addr remote-addr})
-           (catch Exception _ nil)))))
-
 (defonce ^:private server-state (atom nil))
 (defonce connections (atom #{}))
 
+(def ^:private max-auth-line
+  "Longest first line (the credential) a connection may send."
+  8192)
+
+(def ^:private auth-timeout-ms
+  "How long a connection has to send its credential."
+  10000)
+
+(def ^:private max-connections
+  "Connections open at once, authenticated or not; more are closed at once."
+  256)
+
+(defn- read-auth-line
+  "The first line of `reader`, at most `max-auth-line` chars, or nil."
+  [^BufferedReader reader]
+  (let [sb (StringBuilder.)]
+    (loop []
+      (let [c (.read reader)]
+        (cond
+          (or (neg? c) (= c (int \newline))) (when (pos? (.length sb)) (str sb))
+          (>= (.length sb) max-auth-line) nil
+          :else (do (.append sb (char c)) (recur)))))))
+
+(defn- stream-principal
+  "The principal of a connection from its first line (`tcp-auth-line`), and
+   the token it presented; nil for a missing, oversized, unreadable or
+   refused credential."
+  [authenticate ^BufferedReader reader transport remote-addr]
+  (let [msg (try (json/read-value (str (read-auth-line reader)) json-read-mapper) (catch Exception _ nil))
+        token (some-> msg :params :token str)]
+    (when (= "dvergr/authenticate" (:method msg))
+      (when-let [p (try (authenticate {:transport transport :bearer token :remote-addr remote-addr})
+                        (catch Exception _ nil))]
+        [p token]))))
+
+(defn- serve-stream!
+  "Serve one connection (a TCP socket or a Unix domain socket channel,
+   `closeable`, with its streams): its credential first, within
+   `auth-timeout-ms`, then MCP for its principal. A connection authenticated
+   by a run token closes when that token ends."
+  [^java.io.Closeable closeable in out label selection authenticate transport remote-addr]
+  (let [reader (BufferedReader. (InputStreamReader. in))
+        writer (BufferedWriter. (OutputStreamWriter. out))
+        authed (promise)]
+    ;; no credential in time: closed (a socket timeout does not reach a channel)
+    (Thread/startVirtualThread
+     #(when-not (deref authed auth-timeout-ms nil) (try (.close closeable) (catch Exception _ nil))))
+    (if-let [[p token] (stream-principal authenticate reader transport remote-addr)]
+      (do (deliver authed true)
+          (when (principal/run-token? token)
+            (principal/on-revoke! token #(try (.close closeable) (catch Exception _ nil))))
+          (handle-connection reader writer label selection p))
+      (do (deliver authed true)
+          ;; refused: one error, then the connection closes
+          (doto writer
+            (.write (json/write-value-as-string
+                     {:jsonrpc "2.0" :id nil :error {:code -32001 :message "Not authenticated"}}))
+            (.write "\n")
+            (.flush))))))
+
+(defn- serve-in-thread!
+  "Serve `closeable` on a thread of its own, unless `max-connections` are open."
+  [^java.io.Closeable closeable label f]
+  (if (>= (count @connections) max-connections)
+    (try (.close closeable) (catch Exception _ nil))
+    (do (swap! connections conj closeable)
+        (doto (Thread.
+               (fn []
+                 (try (f)
+                      (catch Exception e
+                        (binding [*err* *err*]
+                          (.println *err* (str "dvergr-mcp: error on " label ": " (.getMessage e)))
+                          (.flush *err*)))
+                      (finally
+                        (swap! connections disj closeable)
+                        (try (.close closeable) (catch Exception _ nil))))))
+          (.setDaemon true)
+          (.start)))))
+
+(defn socket-path
+  "The Unix domain socket of the MCP server of state root `home`:
+   `<home>/mcp.sock` (the home is 0700, `principal/private-dir!`), or, when
+   that path is too long for a socket, one under `/tmp/dvergr-<user>` (0700,
+   checked to be this user's), named by a hash of the home."
+  [home]
+  (let [home (.getCanonicalPath (java.io.File. (str home)))
+        p (str home "/mcp.sock")]
+    (if (<= (count (.getBytes p "UTF-8")) 100)
+      p
+      (let [dir (str "/tmp/dvergr-" (System/getProperty "user.name"))
+            h (.formatHex (java.util.HexFormat/of)
+                          (.digest (java.security.MessageDigest/getInstance "SHA-256") (.getBytes home "UTF-8")))]
+        (str dir "/" (subs h 0 16) ".sock")))))
+
+(defn- open-socket-channel
+  "Bind a Unix domain socket for state root `home` (`socket-path`), in a
+   directory only this user may enter; nil (logged) when that cannot be
+   assured."
+  [home]
+  (try
+    (let [p (socket-path home)
+          dir (.getParentFile (java.io.File. ^String p))
+          dpath (principal/private-dir! dir)
+          owner (str (java.nio.file.Files/getOwner dpath (make-array java.nio.file.LinkOption 0)))]
+      (when-not (= owner (System/getProperty "user.name"))
+        (throw (ex-info (str dir " belongs to " owner) {:dir (str dir)})))
+      (java.nio.file.Files/deleteIfExists (.toPath (java.io.File. ^String p)))
+      (doto (java.nio.channels.ServerSocketChannel/open java.net.StandardProtocolFamily/UNIX)
+        (.bind (java.net.UnixDomainSocketAddress/of ^String p))))
+    (catch Exception e
+      (binding [*err* *err*]
+        (.println *err* (str "dvergr-mcp: no Unix domain socket for " home ": " (.getMessage e)))
+        (.flush *err*))
+      nil)))
+
 (defn start!
-  "Start TCP MCP server. Returns the server state.
+  "Start the MCP server: on a Unix domain socket in the state root
+   (`socket-path`, what `bin/dvergr-mcp` uses: only this user can reach it,
+   so the relay never hands its credential to a server squatting a port) and
+   on TCP. Returns the server state.
    Options:
      :port - TCP port (default 17888)
-     :bind - Bind address (default \"127.0.0.1\" — loopback only; pass
-             \"0.0.0.0\" explicitly to expose the server on the network)
+     :bind - Bind address (default \"127.0.0.1\"; pass \"0.0.0.0\" explicitly to
+             expose the server on the network)
+     :home - the state root of the socket (default `dvergr.substrate.paths/home`)
      :profile, :toolsets - the default tool selection (`dvergr.mcp.surface`);
              a client may choose its own in `initialize` `_meta`
      :authenticate - (fn [request] -> principal | nil) for each connection
              (`dvergr.principal`; default `principal/default-authenticate`).
              A connection's first line is its credential,
              `{\"jsonrpc\":\"2.0\",\"method\":\"dvergr/authenticate\",\"params\":{\"token\":\"…\"}}`
-             (`tcp-auth-line`): the local token, or a run token. Without
-             it the connection gets one error (-32001) and is closed."
-  [& {:keys [port bind profile toolsets authenticate] :or {port 17888 bind "127.0.0.1"}}]
+             (`tcp-auth-line`, at most 8 KiB, within 10 s): the local token,
+             or a run token. Without it the connection gets one error
+             (-32001) and is closed."
+  [& {:keys [port bind home profile toolsets authenticate] :or {port 17888 bind "127.0.0.1"}}]
   (when @server-state
     (throw (ex-info "Server already running" {:port port})))
   (let [selection (surface/selection {:profile profile :toolsets toolsets})
         authenticate (or authenticate principal/default-authenticate)
+        home (or home (paths/home))
         ^ServerSocket server-socket (ServerSocket. port 50 (java.net.InetAddress/getByName bind))
+        ^java.nio.channels.ServerSocketChannel uds (open-socket-channel home)
         accept-thread (Thread.
                        (fn []
                          (loop []
                            (when-not (.isClosed server-socket)
-                             (let [client (try (.accept server-socket)
-                                               (catch Exception _e nil))]
-                               (when client
-                                 (let [^Socket client client
-                                       addr (str (.getInetAddress client) ":" (.getPort client))]
-                                   (swap! connections conj client)
-                                   (doto (Thread.
-                                          (fn []
-                                            (try
-                                              (let [reader (BufferedReader. (InputStreamReader. (.getInputStream client)))
-                                                    writer (BufferedWriter. (OutputStreamWriter. (.getOutputStream client)))]
-                                                (if-let [p (tcp-principal authenticate reader
-                                                                          (.getHostAddress (.getInetAddress client)))]
-                                                  (handle-connection reader writer addr selection p)
-                                                  ;; refused: one error, then the connection closes
-                                                  (doto writer
-                                                    (.write (json/write-value-as-string
-                                                             {:jsonrpc "2.0" :id nil
-                                                              :error {:code -32001 :message "Not authenticated"}}))
-                                                    (.write "\n")
-                                                    (.flush))))
-                                              (catch Exception e
-                                                (when-not (.isClosed client)
-                                                  (binding [*err* *err*]
-                                                    (.println *err* (str "dvergr-mcp: error on " addr ": " (.getMessage e)))
-                                                    (.flush *err*))))
-                                              (finally
-                                                (swap! connections disj client)
-                                                (.close client)))))
-                                     (.setDaemon true)
-                                     (.start))))
-                               (recur)))))
-                       "dvergr-mcp-accept")]
+                             (when-let [^Socket client (try (.accept server-socket) (catch Exception _e nil))]
+                               (let [addr (str (.getInetAddress client) ":" (.getPort client))]
+                                 (serve-in-thread!
+                                  client addr
+                                  #(serve-stream! client (.getInputStream client) (.getOutputStream client)
+                                                  addr selection authenticate :mcp-tcp
+                                                  (.getHostAddress (.getInetAddress client))))))
+                             (recur))))
+                       "dvergr-mcp-accept")
+        uds-thread (when uds
+                     (doto (Thread.
+                            (fn []
+                              (loop []
+                                (when (.isOpen uds)
+                                  (when-let [^java.nio.channels.SocketChannel ch (try (.accept uds) (catch Exception _ nil))]
+                                    (serve-in-thread!
+                                     ch "unix"
+                                     #(serve-stream! ch (java.nio.channels.Channels/newInputStream ch)
+                                                     (java.nio.channels.Channels/newOutputStream ch)
+                                                     "unix" selection authenticate :mcp-tcp nil)))
+                                  (recur))))
+                            "dvergr-mcp-accept-unix")
+                       (.setDaemon true)))]
     (.setDaemon accept-thread true)
     (.start accept-thread)
+    (some-> ^Thread uds-thread .start)
     (reset! server-state {:server-socket server-socket
+                          :uds uds
+                          :socket-path (when uds (socket-path home))
                           :accept-thread accept-thread
                           :port (.getLocalPort server-socket)})
-    (.println *err* (str "dvergr-mcp: TCP server listening on " bind ":" (.getLocalPort server-socket)))
+    (.println *err* (str "dvergr-mcp: listening on " bind ":" (.getLocalPort server-socket)
+                         (when uds (str " and " (socket-path home)))))
     (.flush *err*)
-    {:port (.getLocalPort server-socket) :bind bind}))
+    {:port (.getLocalPort server-socket) :bind bind :socket-path (when uds (socket-path home))}))
 
 (defn listening-port
   "The port of this process's MCP server: the daemon's when it runs one, else
    a loopback server started on an ephemeral port (an external agent, e.g.
-   `claude -p` as a benchmark candidate, reaches a room through it)."
+   `claude -p` as a benchmark candidate, reaches a room through it; its
+   relay uses the server's Unix domain socket in this home)."
   []
   (locking server-state
     (or (:port @server-state)
@@ -916,17 +1024,20 @@
                        :authenticate (principal/authenticator (:config (current-daemon))))))))
 
 (defn stop!
-  "Stop the TCP MCP server."
+  "Stop the MCP server (TCP and the Unix domain socket)."
   []
-  (when-let [{:keys [^ServerSocket server-socket]} @server-state]
+  (when-let [{:keys [^ServerSocket server-socket uds socket-path]} @server-state]
     ;; subscriptions end gracefully: a response before the stream closes
     (close-subscriptions!)
     (.close server-socket)
-    (doseq [^Socket conn @connections]
+    (when uds
+      (try (.close ^java.io.Closeable uds) (catch Exception _ nil))
+      (try (java.nio.file.Files/deleteIfExists (.toPath (java.io.File. ^String socket-path))) (catch Exception _ nil)))
+    (doseq [^java.io.Closeable conn @connections]
       (try (.close conn) (catch Exception _)))
     (reset! connections #{})
     (reset! server-state nil)
-    (.println *err* "dvergr-mcp: TCP server stopped")
+    (.println *err* "dvergr-mcp: server stopped")
     (.flush *err*)
     :stopped))
 

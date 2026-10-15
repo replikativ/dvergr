@@ -32,7 +32,8 @@ transcription, no file writes, no agent turn. Match by Telegram numeric `:id`
 (stable) or `:username`. Who a sender then *is* is the authenticator's
 (`dvergr.principal`, doc/mcp.md): by default a sender listed in a non-empty
 `:allowed-users` acts as `telegram/<id>`, and only a sender in `:telegram
-{:owners [id "@name"]}` acts as the operator (the local principal). With an
+{:owners [id …]}` (numeric ids only: a username can be changed and reused; the
+daemon refuses to start with anything else) acts as the operator (the local principal). With an
 empty `:allowed-users` the bot lets messages through the gate but identifies
 nobody, so it answers every message with a refusal before any side effect: list
 yourself (and as owner, for the operator's commands). Set

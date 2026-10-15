@@ -633,15 +633,23 @@
      :cache-creation-tokens cache-creation
      :raw-input-tokens input}))
 
+(declare run-claude-streaming*)
+
 (defn- run-claude-streaming
   "Execute claude -p with streaming. Parses tool_call blocks from the response.
-   Returns the final parsed response with :content and :tool-calls."
+   Returns the final parsed response with :content and :tool-calls. An agent
+   into a work room calls the tools natively over MCP with a run token, which
+   ends with the call, however it ends."
   [messages opts]
+  (let [agent (agent-invocation opts)]
+    (try (run-claude-streaming* messages opts agent)
+         (finally (some-> agent :token principal/revoke-run-token!)))))
+
+(defn- run-claude-streaming*
+  [messages opts agent]
   (let [prompt (format-conversation messages)
         system-prompt (extract-system-prompt messages opts)
-        ;; An agent into a work room calls the tools natively over MCP;
-        ;; otherwise the tool definitions go into the system prompt as text.
-        agent (agent-invocation opts)
+        ;; otherwise the tool definitions go into the system prompt as text
         tools (when-not agent (:tools opts))
         tools-prompt (build-tools-prompt tools)
         note (:system-note @settings)
@@ -781,8 +789,6 @@
           (throw t)))
       (finally
         (reset! monitor-done? true)
-        ;; the call is over: its agent's credential with it
-        (some-> agent :token principal/revoke-run-token!)
         ;; Process termination plus closing all streams releases reader
         ;; futures on success, cancellation, callback failure, and malformed
         ;; output. Terminate first: closing a reader waits for the reader's

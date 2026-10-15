@@ -121,25 +121,43 @@
 (defn- creation
   "How the calling principal's create of room `slug` goes, decided BEFORE
    anything is provisioned: `:new` (the slug is now claimed for it and no
-   room exists), `:retry` (it claimed the slug before and the room exists:
-   grant it again and return it), else a 409: the slug is someone else's
-   claim, or a room nobody claimed (the process's) has it, or a concurrent
+   room exists), `:retry` (its create provisioned the room that has the
+   slug now: grant it again and return it), else a 409: the slug is someone
+   else's claim, a room its claim did not provision has it, or a concurrent
    create claimed it first. The local principal keeps the old idempotent
-   create (`:new`, nothing claimed)."
+   create and takes the slug over: any claim on it is dropped."
   [slug]
   (let [p *principal*]
     (if (or (nil? p) (principal/local? p))
-      :new
+      (do (sdb/release-claim! slug) :new)
       (let [me (creator-of p)
-            claimed (sdb/room-claim slug)
+            claim (sdb/room-claim slug)
             row (sdb/room-by-slug slug)
             taken #(op-error! (str "Room " slug " exists") ::room-exists 409 {:room slug})]
         (cond
-          (= me claimed) (if row :retry :new)
-          claimed (taken)
+          (= me (:creator claim)) (cond (nil? row) :new
+                                        (= (:room claim) (:room/id row)) :retry
+                                        :else (taken))
+          claim (taken)
           row (taken)
           (= me (sdb/claim-room! slug me)) :new
           :else (taken))))))
+
+(defn- provisioned!
+  "Run `create` (provisions room `slug`) for the claim `creation` made: on
+   success record the room on the claim, on failure release the claim, so a
+   slug is never held by a create that did not make its room."
+  [slug create]
+  (let [p *principal*
+        claimed? (and p (not (principal/local? p)))]
+    (try
+      (let [r (create)]
+        (when claimed?
+          (when-let [rid (:room/id (sdb/room-by-slug slug))] (sdb/claim-provisioned! slug rid)))
+        r)
+      (catch Throwable t
+        (when claimed? (try (sdb/release-claim! slug) (catch Exception _ nil)))
+        (throw t)))))
 
 (defn- id->str
   "Room/actor ids are keywords (built-ins) OR UUIDs (created rooms) — both → string."
@@ -1239,8 +1257,8 @@
                     (let [sl (or slug (slugify title))]
                       (when (= :new (creation sl))
                         ;; create-room! returns the room-id keyword; look the live Room up.
-                        (rooms/create-room! (cond-> {:title title :slug sl}
-                                              agents (assoc :agent-ids (mapv keyword agents)))))
+                        (provisioned! sl #(rooms/create-room! (cond-> {:title title :slug sl}
+                                                                agents (assoc :agent-ids (mapv keyword agents))))))
                       (let [rd (room-data (rreg/lookup (keyword sl)))]
                         (created! daemon [:room (or (:id rd) sl)])
                         rd))))}
@@ -1285,6 +1303,8 @@
             (let [{:keys [ok? error owned-systems-removed]} (in-ctx daemon (rooms/purge-room! room))]
               (when-not ok?
                 (throw (ex-info (str "Could not purge " room ": " error) {:type ::purge-failed :room room})))
+              ;; the slug is free again: no claim outlives its room
+              (sdb/release-claim! room)
               {:purged room :owned-systems-removed owned-systems-removed}))}
 
    :workflow/attempt
@@ -1577,7 +1597,7 @@
             (let [grant! #(created! daemon [:room (or (some-> (resolve-room daemon room) :id id->str) room)])]
               (if (= :retry (creation room))
                 (do (grant!) {:room room :retried true})
-                (doto (in-ctx daemon (room-repo/import-room! {:slug room :title title :source source :branch branch}))
+                (doto (provisioned! room #(in-ctx daemon (room-repo/import-room! {:slug room :title title :source source :branch branch})))
                   ((fn [_] (grant!)))))))}
 
    :room/export
@@ -1660,10 +1680,10 @@
                               (subs (str (java.util.UUID/nameUUIDFromBytes (.getBytes (creator-of p) "UTF-8"))) 0 8)))
                   ;; claimed before the room exists: nobody else's room by that name
                   _ (when own? (creation slug))
-                  r (room-result daemon
-                                 (in-ctx daemon
-                                         ((requiring-resolve 'dvergr.orchestration.daemon/ensure-agent-room!)
-                                          daemon (keyword id) (when own? {:slug slug}))))]
+                  open! #(in-ctx daemon
+                                 ((requiring-resolve 'dvergr.orchestration.daemon/ensure-agent-room!)
+                                  daemon (keyword id) (when own? {:slug slug})))
+                  r (room-result daemon (if own? (provisioned! slug open!) (open!)))]
               (when (and r own?)
                 ;; its own room by construction: granted on every open (idempotent)
                 (created! daemon [:room (:id r)]))

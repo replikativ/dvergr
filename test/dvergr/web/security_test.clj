@@ -15,6 +15,7 @@
             [dvergr.web.dashboard :as dash]
             [dvergr.web.guard :as guard]
             [dvergr.web.server :as server]
+            [dvergr.web.apps :as web-apps]
             [dvergr.principal :as principal]
             [hiccup2.core :as h]
             [org.replikativ.spindel.engine.context :as ctx])
@@ -267,15 +268,21 @@
     (testing "loopback without a credential is nobody"
       (is (= 401 (:status ((app) (no-token (req :get "/api/v1/room_list"))))))
       (is (= 401 (:status ((app) (no-token (req :get "/dashboard")))))))
-    (testing "Jupyter-style: the login URL sets a Strict cookie and strips the token"
+    (testing "Jupyter-style: the login URL opens a session (a Strict cookie) and strips the token"
       (let [a (app)
             resp (a (no-token (assoc (req :get "/dashboard") :query-string (str "token=" (principal/local-token)))))
             cookies (let [c (get-in resp [:headers "Set-Cookie"])] (if (string? c) [c] c))
-            cookie (some #(when (str/starts-with? % "dvergr_token=") %) cookies)]
+            cookie (some #(when (str/starts-with? % "dvergr_session=") %) cookies)]
         (is (= 303 (:status resp)))
         (is (= "/dashboard" (get-in resp [:headers "Location"])) "the token is not in the URL it lands on")
         (is (re-find #"HttpOnly" cookie))
         (is (re-find #"SameSite=Strict" cookie))
+        (is (not (str/includes? (str cookies) (principal/local-token)))
+            "the cookie is a session id, never the token (cookies are not scoped by port)")
+        (is (= 401 (:status (a (no-token (req :get "/api/v1/room_list" :headers {"cookie" (str "dvergr_session=" (principal/local-token))})))))
+            "the token as a cookie is no session")
+        (let [again (a (no-token (assoc (req :get "/") :query-string (str "token=" (principal/local-token)))))]
+          (is (not= (str (get-in again [:headers "Set-Cookie"])) (str cookies)) "a new session id at every login"))
         (is (= 200 (:status (a (no-token (req :get "/api/v1/room_list"
                                               :headers {"cookie" (first (str/split cookie #";"))})))))
             "the cookie authenticates what follows")
@@ -306,3 +313,33 @@
         (is (= 401 (get-status {h "127.0.0.1"})) (str h " without the token: refused"))
         (is (= 200 (get-status (assoc bearer h "10.9.9.9"))) (str h " with the token: the owner")))
       (finally (org.httpkit.server/server-stop! server)))))
+
+(deftest room-apps-are-sandboxed-and-sandboxed-pages-reach-nothing
+  (with-redefs [web-apps/handle (fn [_ _ authorize!] (authorize! {:room/slug "r"} "r")
+                                  {:status 200 :headers {"Content-Type" "text/html"} :body "<script>…</script>"})
+                ops/authorize! (fn [& _] nil)]
+    (let [resp ((app) (req :get "/apps/r/index.html"))]
+      (is (= "sandbox allow-scripts" (get-in resp [:headers "Content-Security-Policy"]))
+          "an app's scripts run in an opaque origin: no session cookie, Origin null")))
+  (testing "a request from such a page (Origin: null) is refused before anything else, credential or not"
+    (is (= 403 (:status ((app) (req :get "/api/v1/room_list" :headers {"origin" "null"})))))
+    (is (= 403 (:status ((app) (req :get "/dashboard" :headers {"origin" "null"})))))))
+
+(deftest a-run-token-is-no-web-credential
+  (let [t (principal/mint-run-token! {:actor :agent :room "r" :tools ["room_list"]})]
+    (try
+      (is (= 401 (:status ((app) (req :get "/api/v1/room_list" :headers {"authorization" (str "Bearer " t)})))))
+      (is (= 401 (:status ((app) (update (assoc (req :get "/") :query-string (str "token=" t)) :headers dissoc "authorization")))))
+      (finally (principal/revoke-run-token! t)))))
+
+(deftest the-login-redirect-stays-on-this-server
+  (let [resp ((app) (update (assoc (req :get "//evil.example/x") :query-string (str "token=" (principal/local-token)))
+                            :headers dissoc "authorization"))]
+    (is (= "/" (get-in resp [:headers "Location"])))))
+
+(deftest the-login-url-is-returned-not-kept
+  (let [st (server/start! (mock-daemon) :port 0)]
+    (try
+      (is (str/includes? (:login-url st) "?token="))
+      (is (nil? (:login-url @server/server-state)) "not in the server state")
+      (finally (server/stop!)))))
