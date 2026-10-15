@@ -1529,7 +1529,7 @@
              [:branch {:optional true} [:string {:description "branch of a local checkout (default: its current one)"}]]]
     :impl (fn [daemon {:keys [room source title branch]}]
             (doto (in-ctx daemon (room-repo/import-room! {:slug room :title title :source source :branch branch}))
-              (#(created! daemon [:room (or (some-> (resolve-room daemon room) :id id->str) room)]))))}
+              ((fn [_] (created! daemon [:room (or (some-> (resolve-room daemon room) :id id->str) room)])))))}
 
    :room/export
    {:doc (str "The room's changes since room_import, as a patch for `git apply` in the source checkout "

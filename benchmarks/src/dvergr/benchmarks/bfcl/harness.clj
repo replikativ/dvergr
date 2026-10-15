@@ -148,7 +148,8 @@
                       (chat-agent/run-agent-turn!
                        chat-ctx {:provider provider :model model
                                  :tools tool-map
-                                 :tool-ctx {:chat-ctx chat-ctx :tools tool-map :sci-ctx sci-ctx}
+                                 :tool-ctx {:principal dvergr.principal/local-principal ; the harness, in process
+                                            :chat-ctx chat-ctx :tools tool-map :sci-ctx sci-ctx}
                                  :model-opts (when (some? parallel-tool-calls)
                                                {:parallel-tool-calls parallel-tool-calls})
                                  :auto-compact? false :turn-number 0}))

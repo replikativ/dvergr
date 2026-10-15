@@ -100,7 +100,8 @@
                                 schemas)
                    :repl (do (ep/install-tau2-fns! sci-ctx domain call!)
                              {"clojure_eval" (tools/get-tool "clojure_eval")}))
-        tool-ctx {:chat-ctx chat-ctx :tools tool-map :sci-ctx sci-ctx :execution-ctx (:ctx room)}]
+        tool-ctx {:principal dvergr.principal/local-principal ; the harness, in process, on its own world
+                  :chat-ctx chat-ctx :tools tool-map :sci-ctx sci-ctx :execution-ctx (:ctx room)}]
     (try
       (chat-context/add-message! chat-ctx {:role :system :content (ep/agent-system-prompt domain agent)})
       (chat-context/add-message! chat-ctx {:role :assistant :content t2/first-agent-message})

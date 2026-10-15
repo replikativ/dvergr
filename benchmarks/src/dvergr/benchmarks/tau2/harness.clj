@@ -126,7 +126,8 @@
         tool-map (case action-space
                    :tools (schema-tools domain call!)
                    :repl (repl-tools domain sci-ctx (:ctx room)))
-        tool-ctx {:chat-ctx chat-ctx :tools tool-map :sci-ctx sci-ctx}]
+        tool-ctx {:principal dvergr.principal/local-principal ; the harness, in process, on its own world
+                  :chat-ctx chat-ctx :tools tool-map :sci-ctx sci-ctx}]
     (chat-context/add-message! chat-ctx {:role :system
                                          :content (t2/agent-system-prompt domain)})
     (chat-context/add-message! chat-ctx {:role :assistant :content t2/first-agent-message})

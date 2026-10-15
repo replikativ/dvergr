@@ -169,7 +169,8 @@
                                         chat-agent/*turn-failure* failure]
                                 (chat-agent/run-agent-turn!
                                  chat-ctx {:provider provider :model model :tools tool-map
-                                           :tool-ctx {:chat-ctx chat-ctx :tools tool-map :sci-ctx sci-ctx}
+                                           :tool-ctx {:principal dvergr.principal/local-principal ; the harness, in process
+                                                      :chat-ctx chat-ctx :tools tool-map :sci-ctx sci-ctx}
                                            :auto-compact? false :turn-number turn}))]
                   ;; a failure of the path to the model (transport, provider
                   ;; limits) is not the model's: the cell faults and is run
