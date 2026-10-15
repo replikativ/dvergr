@@ -19,12 +19,12 @@ clojure -M:cli --web --web-port 9090    # another port
 ```
 
 Like Jupyter, it prints a login URL, `[dvergr] web dashboard: http://127.0.0.1:17880/?token=…`:
-open it once; it opens a browser session and the page reloads without the token. The token is
-the daemon's local token, `$DVERGR_HOME/local-token` (a home from before keeps the value of
-its `mcp/http-token`, which therefore now opens the web and TCP too);
-`(:login-url (dvergr.web.server/start! …))` returns the same URL to a REPL (the server does not
-keep it). The browser's history keeps the URL you opened, token included: treat it as you
-treat the token file.
+open it once and the page reloads, logged in, without the token. The token is the daemon's
+local token, `$DVERGR_HOME/local-token` (a home from before keeps the value of its
+`mcp/http-token`, which therefore now opens the web and TCP too). The login page also takes
+the token in a form (a POST, so it stays out of the browser's history; the printed URL does
+not). `(:login-url (dvergr.web.server/start! …))` returns the URL to a REPL; the server does
+not keep it.
 
 A daemon started any other way (as a library, `daemon/start!`) starts the server when its
 config has `:http`:
@@ -47,48 +47,53 @@ One server runs per process.
 ## Security stance
 
 Every request is authenticated through the daemon's `:authenticate` seam (transport `:web`;
-`doc/mcp.md` describes the seams and the principal), from a credential alone: an
-`Authorization: Bearer` header, or a browser session. Where a request comes from grants
-nothing, loopback included. The default accepts the local token as the local principal and
-refuses anything else with 401; a run token (an agent's, `doc/mcp.md`) is for MCP only and
-is refused here:
+`doc/mcp.md` describes the seams and the principal), from the `Authorization: Bearer` header
+alone: the local token, or a browser session's id. No credential ever travels in a cookie:
+cookies are not scoped by port, so every server on this host (an agent's dev server on
+`127.0.0.1:3000`, say) would receive one and could replay it. Where a request comes from
+grants nothing, loopback included. A run token (an agent's, `doc/mcp.md`) is for MCP only and
+is refused here.
 
-- `GET <path>?token=<token>` with a valid token opens a session and answers 303 to `<path>`
-  (one leading `/`: a redirect never leaves this server). The cookie, `dvergr_session`
-  (HttpOnly, SameSite=Strict, 12 h), holds a random session id the server maps to the
-  principal, never the token: cookies are not scoped by port, so any other server on this
-  host (an agent's dev server, say) receives this cookie, and it is worth nothing there. Each
-  login makes a new id. A wrong token is 401;
+- `GET <path>?token=<token>` (or the login page's POST to `/login`) with a valid token opens
+  a session and answers 303 to `<path>#sid=<id>`. A fragment is never sent to a server nor
+  in a `Referer`; the page's script (`dashboard/auth-script`) keeps the id in
+  `sessionStorage`, which is this origin's alone (this port's), and sends it as the header on
+  every request of this origin: htmx's, `fetch`'s, and the navigations and form posts it
+  performs itself (a plain navigation could not carry a header). A navigation without the
+  header gets the login page, which loads the page asked for with the session it holds.
+  Sessions last 12 h, at most 1000 are kept, a new local token ends them all, and `POST
+  /logout` ends one. A wrong token is 401;
 - a script or curl sends `Authorization: Bearer $(cat $DVERGR_HOME/local-token)`.
 
-A cross-site page gets no credential: the cookie is SameSite=Strict, and the guard below
-stands besides. A proxied or hosted deployment configures an authenticator (its own
-credentials) and an `:authorize` seam. What a principal may do:
+A cross-site page cannot send the header, so it needs no CSRF token; the guard below stands
+besides. A proxied or hosted deployment configures an authenticator (its own credentials) and
+an `:authorize` seam. What a principal may do:
 
 - the **JSON API** and the dashboard's derived actions (`dvergr.web.ops`) run each op for the
   request's principal, authorized like every other surface (403 with `{"error": …}` when
   denied; listings filtered);
-- **room apps** need a read of their room. An app is agent-written, so every response under
-  `/apps/` carries `Content-Security-Policy: sandbox allow-scripts`: its scripts run in an
-  opaque origin, the session cookie is not sent for them, and their requests say
-  `Origin: null`, which this server refuses outside `/apps/` (403);
+- **room apps** need a read of their room. A browser opens one through a capability link the
+  room page mints per click (`/api/app-link?room=…` → `/apps/<room>/~<capability>/`, an hour,
+  that room only), since a navigation carries no header. An app is agent-written, so every
+  response under `/apps/` carries `Content-Security-Policy: sandbox allow-scripts`: its
+  scripts run in an opaque origin and their requests say `Origin: null`, which this server
+  refuses outside `/apps/` (403);
 - the rest of the **dashboard** (hand-written views and actions straight over the daemon:
   room pages, posts, voice, fragments) answers the local principal only, 403 for anyone
   else. `/api/health` answers anyone authenticated.
 
-The token keeps out whoever does not have it, but not the pages the user's own browser shows.
-`dvergr.web.guard` checks every request before it is routed:
+Every response outside `/apps/` refuses to be framed (`Content-Security-Policy:
+frame-ancestors 'none'`, `X-Frame-Options: DENY`), and none is content-sniffed
+(`X-Content-Type-Options: nosniff`). `dvergr.web.guard` checks every request before it is
+routed:
 
 - **Host**: the request must name this server: a loopback name, the bind address, or an
   `:allowed-hosts` entry. A DNS name rebound to 127.0.0.1 fails here, reads included.
 - **Origin**: a state-changing request (anything but GET, HEAD, OPTIONS) that names an origin
   (`Origin`, or `Referer` without it) must name this server's own or an `:allowed-origins`
   entry. A client such as curl sends neither and passes.
-- **CSRF token**: a state-changing request to the HTML UI must carry the session's token
-  (`X-CSRF-Token` header or the `csrf` form field). The token is an HMAC of the session cookie
-  under a secret made when the server starts.
-- The JSON API has no session. Its writes must be `application/json` (else 415), which a cross-site page
-  can send only after a CORS preflight, and the server grants none.
+- The JSON API's writes must be `application/json` (else 415), which a cross-site page can
+  send only after a CORS preflight, and the server grants none.
 
 Requests are limited to 1 MiB. Every route that changes state is a POST.
 

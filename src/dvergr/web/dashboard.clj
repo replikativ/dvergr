@@ -14,8 +14,7 @@
             [nextjournal.markdown.transform :as mdt]
             [dvergr.activity :as activity]
             [dvergr.rooms.tree :as rooms-tree]
-            [dvergr.rooms.stats :as rstats]
-            [dvergr.web.guard :as guard]))
+            [dvergr.rooms.stats :as rstats]))
 
 (def ^:private css
   "body {
@@ -202,11 +201,58 @@
 ;; dashboard at `/` IS the index (rooms + agents + schedules), and sub-pages link
 ;; back to it via their own header.
 
+(def auth-script
+  "The browser half of the dashboard's credential (`dvergr.web.server`): the
+   session id arrives once in the URL fragment (`#sid=…`, never sent to a
+   server nor in a Referer), lives in `sessionStorage` (this origin's: this
+   port's), and goes out only as `Authorization: Bearer` on this origin's
+   requests: htmx's, `fetch`'s, and the navigations and form posts this
+   script performs itself (a plain navigation could not carry the header).
+   No cookie carries it, so no other site or port can send it."
+  "(function(){
+  var K='dvergr-sid';
+  var m=location.hash.match(/^#sid=([0-9a-f]+)$/);
+  if(m){sessionStorage.setItem(K,m[1]);history.replaceState(null,'',location.pathname+location.search);}
+  function sid(){return sessionStorage.getItem(K);}
+  function same(u){try{return new URL(u,location.href).origin===location.origin;}catch(e){return false;}}
+  if(!window.__dvergrFetch){
+    var f=window.fetch.bind(window);window.__dvergrFetch=f;
+    window.fetch=function(u,o){o=o||{};
+      if(same(typeof u==='string'?u:u.url)&&sid()){var h=new Headers(o.headers||{});
+        if(!h.has('Authorization'))h.set('Authorization','Bearer '+sid());o.headers=h;}
+      return f(u,o);};
+    window.addEventListener('popstate',function(){window.dvergrGo(location.href,null,true);});}
+  function render(r,replace){
+    if(r.status===401){sessionStorage.removeItem(K);location.replace('/');return;}
+    return r.text().then(function(t){
+      history[replace?'replaceState':'pushState'](null,'',r.url.replace(/#.*$/,''));
+      document.open();document.write(t);document.close();});}
+  window.dvergrGo=function(url,opts,replace){return window.fetch(url,opts||{}).then(function(r){return render(r,replace);});};
+  window.dvergrLogout=function(){window.fetch('/logout',{method:'POST'}).then(function(){
+    sessionStorage.removeItem(K);location.replace('/');});};
+  window.dvergrApp=function(slug){var w=window.open('about:blank','_blank');
+    window.fetch('/api/app-link?room='+encodeURIComponent(slug)).then(function(r){return r.json();})
+      .then(function(j){if(w){w.opener=null;w.location=j.url;}});};
+  document.addEventListener('htmx:configRequest',function(e){if(sid())e.detail.headers['Authorization']='Bearer '+sid();});
+  document.addEventListener('click',function(e){
+    var a=e.target.closest&&e.target.closest('a[href]');
+    if(!a||a.target||e.defaultPrevented||e.button!==0||e.metaKey||e.ctrlKey||e.shiftKey)return;
+    var h=a.getAttribute('href');
+    if(!h||h.charAt(0)==='#'||!same(a.href)||new URL(a.href).pathname.indexOf('/apps/')===0)return;
+    e.preventDefault();window.dvergrGo(a.href);});
+  document.addEventListener('submit',function(e){
+    var f=e.target;if(e.defaultPrevented||f.dataset.plain||!same(f.action))return;
+    e.preventDefault();
+    window.dvergrGo(f.action,{method:(f.getAttribute('method')||'post').toUpperCase(),
+      body:new URLSearchParams(new FormData(f)),
+      headers:{'Content-Type':'application/x-www-form-urlencoded'}});});
+})();")
+
 (defn csrf-field
-  "The hidden form field carrying the request's CSRF token (`dvergr.web.guard`).
-   Every POST form of the UI includes it."
+  "Formerly the CSRF token's field; the credential now travels in a header
+   (`auth-script`), which a cross-site form cannot send, so there is none."
   []
-  [:input {:type "hidden" :name "csrf" :value guard/*csrf-token*}])
+  nil)
 
 (defn post-button
   "A one-button POST form: the state-changing counterpart of a link (a GET must
@@ -222,8 +268,7 @@
 (defn shell
   "Wrap hiccup `body` in the shared <html> chrome. Opts: :title (appended to the
    page title) and :extra-css (page-specific styles, e.g. the config form). The
-   request's CSRF token goes into a meta tag (for scripts) and the body's
-   hx-headers (for htmx requests)."
+   page carries `auth-script`, which sends the session as a header."
   [{:keys [title extra-css]} & body]
   (str
    (h/html
@@ -231,14 +276,14 @@
      [:head
       [:meta {:charset "utf-8"}]
       [:meta {:name "viewport" :content "width=device-width, initial-scale=1"}]
-      (when-let [t guard/*csrf-token*] [:meta {:name "csrf-token" :content t}])
       [:title (str "dvergr" (when title (str " · " title)))]
+      [:script (hu/raw-string auth-script)]
       [:script {:src "https://unpkg.com/htmx.org@2.0.4" :crossorigin "anonymous"}]
       [:style (hu/raw-string css)]
       (when extra-css [:style (hu/raw-string extra-css)])]
-     [:body (when-let [t guard/*csrf-token*]
-              {:hx-headers (str "{\"X-CSRF-Token\": \"" t "\"}")})
-      [:div.container body]]])))
+     [:body
+      [:div.container body
+       [:div.footer [:a {:href "#" :onclick "dvergrLogout();return false;"} "log out"]]]]])))
 
 ;; =============================================================================
 ;; Tree rendering — same data source as the TUI tree view
@@ -647,7 +692,9 @@
         (when (some-> ((requiring-resolve 'dvergr.system.db/room-by-slug) slug)
                       :room/id
                       ((requiring-resolve 'dvergr.web.apps/app-exists?)))
-          [:a {:href (str "/apps/" slug "/") :target "_blank"
+          ;; a capability link, minted per click (the app is sandboxed and
+          ;; cannot carry the session header): `dvergr.web.server`
+          [:a {:href "#" :data-slug slug :onclick "dvergrApp(this.dataset.slug);return false;"
                :style "font-size:0.45em;color:#52b788;margin-left:12px;
                         border:1px solid #2a4a3a;border-radius:5px;padding:2px 8px;
                         text-decoration:none;"}
@@ -754,8 +801,7 @@
                            btn.textContent='…';btn.style.borderColor='#333';
                            var blob=new Blob(chunks,{type:'audio/webm'});
                            fetch('/rooms/'+btn.dataset.slug+'/voice',
-                                 {method:'POST',body:blob,headers:{'Content-Type':'audio/webm',
-                                  'X-CSRF-Token':document.querySelector('meta[name=csrf-token]').content}})
+                                 {method:'POST',body:blob,headers:{'Content-Type':'audio/webm'}})
                              .then(function(r){return r.json();})
                              .then(function(j){btn.textContent='🎤';
                                if(j.error){btn.title=j.error;}})

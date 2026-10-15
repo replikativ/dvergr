@@ -39,9 +39,10 @@
             (is (nil? (get @@#'dvergr.rooms.scheduler/room-schedulers :deployed))))
           (testing "a second home in the same process is refused"
             (is (thrown-with-msg? clojure.lang.ExceptionInfo #"runs a daemon" (runner/open-home! (tmp)))))
-          (testing "a candidate's MCP server is loopback, on an ephemeral port, and closed with the home"
-            (let [port (mcp/listening-port)]
-              (is (not (#{7888 8080 17880 17888 17889} port)))))
+          (testing "a candidate's MCP server is the home's socket alone (no TCP), and closed with the home"
+            (let [st (mcp/ensure-listening!)]
+              (is (nil? (:port st)) "no TCP port")
+              (is (some? (:socket-path st)))))
           (finally (runner/close-home! h))))
       (is (not (:running (mcp/status))))
       (is (false? @@#'dvergr.rooms.scheduler/suspended) "schedules run again outside it")

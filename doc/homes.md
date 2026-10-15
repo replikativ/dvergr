@@ -80,8 +80,8 @@ is three steps:
   `{:agents {} :headless? true :gc false}`): no Telegram, web or MCP listener, no agents
   (neither configured, autostart nor room members), the home's schedules suspended
   (`dvergr.rooms.scheduler/suspend!`), no storage GC. A Claude Code candidate that works in a
-  room reaches it over MCP on a loopback server on an ephemeral port
-  (`dvergr.mcp.server/listening-port`). Returns the handle `close-home!` takes.
+  room reaches it over MCP on the home's Unix domain socket
+  (`dvergr.mcp.server/ensure-listening!`). Returns the handle `close-home!` takes.
 - `(dvergr.agent.experiment.runner/run-in room opts)` runs the experiment in a room of that
   home, as a Spin.
 - `(dvergr.agent.experiment.runner/close-home! handle)` stops the daemon (and an MCP server a

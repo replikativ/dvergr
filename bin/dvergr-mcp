@@ -73,18 +73,56 @@
 (def start? (not (flag? "--no-start")))
 (def tcp? (flag? "--tcp"))
 
+(defn- nofollow [] (into-array java.nio.file.LinkOption [java.nio.file.LinkOption/NOFOLLOW_LINKS]))
+
+(def uid
+  "This process's numeric user id."
+  (let [f (java.io.File/createTempFile "dvergr-uid" nil)]
+    (try (java.nio.file.Files/getAttribute (.toPath f) "unix:uid" (nofollow))
+         (finally (.delete f)))))
+
+(defn- private-dir?
+  "A directory, not a link, this uid's, mode 0700 (as the daemon checks it)."
+  [dir]
+  (let [p (.toPath (java.io.File. (str dir)))]
+    (and (java.nio.file.Files/isDirectory p (nofollow))
+         (not (java.nio.file.Files/isSymbolicLink p))
+         (= uid (java.nio.file.Files/getAttribute p "unix:uid" (nofollow)))
+         (= "rwx------" (java.nio.file.attribute.PosixFilePermissions/toString
+                         (java.nio.file.Files/getPosixFilePermissions p (nofollow)))))))
+
 (def socket-path
   "The daemon's Unix domain socket for this state root (as
-   `dvergr.mcp.server/socket-path` computes it)."
+   `dvergr.mcp.server/socket-path` computes it): <home>/mcp.sock, else, for a
+   home too long for a socket path, one in the user's runtime directory
+   ($XDG_RUNTIME_DIR or /run/user/<uid>, under dvergr/), else /tmp/dvergr-<uid>."
   (let [home (canonical state-root)
         p (str home "/mcp.sock")]
     (if (<= (count (.getBytes p "UTF-8")) 100)
       p
-      (str "/tmp/dvergr-" (System/getProperty "user.name") "/"
-           (subs (apply str (map #(format "%02x" (bit-and % 0xff))
-                                 (.digest (java.security.MessageDigest/getInstance "SHA-256") (.getBytes home "UTF-8"))))
-                 0 16)
-           ".sock"))))
+      (let [runtime (some #(when (and % (private-dir? %)) %)
+                          [(System/getenv "XDG_RUNTIME_DIR") (str "/run/user/" uid)])
+            dir (if runtime (str runtime "/dvergr") (str "/tmp/dvergr-" uid))]
+        (str dir "/"
+             (subs (apply str (map #(format "%02x" (bit-and % 0xff))
+                                   (.digest (java.security.MessageDigest/getInstance "SHA-256") (.getBytes home "UTF-8"))))
+                   0 16)
+             ".sock")))))
+
+(defn- socket-refusal
+  "Why the socket at `socket-path` may not be trusted with the credential, or
+   nil: its directory must be this user's and closed (0700, not a link), the
+   socket this user's. Anyone could have made one in a shared directory."
+  []
+  (let [f (java.io.File. ^String socket-path)
+        sp (.toPath f)]
+    (cond
+      (not (private-dir? (.getParentFile f)))
+      (str (.getParentFile f) " is not this user's private directory (owned by uid " uid ", mode 0700, not a link)")
+      (java.nio.file.Files/isSymbolicLink sp) (str socket-path " is a symbolic link")
+      (not= uid (java.nio.file.Files/getAttribute sp "unix:uid" (nofollow)))
+      (str socket-path " belongs to another user"))))
+
 (def wait-ms (* 1000 (parse-long (or (arg "--wait-s") "120"))))
 (def start-argv
   "The daemon's start command: DVERGR_MCP_START (split as a shell would), else
@@ -92,8 +130,9 @@
    argument, whatever the path holds)."
   (if-let [cmd (env "DVERGR_MCP_START")]
     (p/tokenize cmd)
-    ["clojure" "-M:cli" "--no-tui" "--mcp" "--mcp-port" (str port)
-     "-p" "0" "--nrepl-port-file" (str (fs/file state-root "mcp-daemon.nrepl-port"))]))
+    (cond-> ["clojure" "-M:cli" "--no-tui" "--mcp"
+             "-p" "0" "--nrepl-port-file" (str (fs/file state-root "mcp-daemon.nrepl-port"))]
+      tcp? (into ["--mcp-tcp" "--mcp-port" (str port)]))))
 
 (def versions ["2024-11-05" "2025-03-26" "2025-06-18" "2025-11-25"])
 (def stateless-versions ["2026-07-28"])
@@ -241,11 +280,13 @@
         {:in (.getInputStream s) :out (.getOutputStream s) :close #(.close s)})
 
       (fs/exists? socket-path)
+      (if-let [why (socket-refusal)]
+        (do (log "refusing the socket:" why) (swap! state assoc :refused (str "refusing the daemon's socket: " why)) nil)
       (let [ch (java.nio.channels.SocketChannel/open java.net.StandardProtocolFamily/UNIX)]
         (.connect ch (java.net.UnixDomainSocketAddress/of ^String socket-path))
         {:in (java.nio.channels.Channels/newInputStream ch)
          :out (java.nio.channels.Channels/newOutputStream ch)
-         :close #(.close ch)}))
+         :close #(.close ch)})))
     (catch Exception _ nil)))
 
 (defn- running-daemon-pid

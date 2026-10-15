@@ -291,8 +291,8 @@
 (defn open-home!
   "Make `dir` the process's dvergr home and start a headless daemon on it:
    no Telegram, web, MCP listener, agents, schedules or storage GC (a Claude Code candidate's MCP
-   calls get a loopback server on an ephemeral port, `dvergr.mcp.server/
-   listening-port`). The home holds the system DB and the rooms' stores
+   calls get a server on the home's Unix domain socket, `dvergr.mcp.server/
+   ensure-listening!`). The home holds the system DB and the rooms' stores
    registered there; a moved home is adopted, a copied one refused
    (`dvergr.system.home/claim!`). Refuses a directory of the old experiment
    layout, and a process that already runs a daemon (run in its home with

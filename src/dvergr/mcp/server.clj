@@ -842,6 +842,19 @@
   "Connections open at once, authenticated or not; more are closed at once."
   256)
 
+(def ^:private max-unauthenticated
+  "Connections that have not sent their credential yet; more are closed."
+  32)
+
+(defonce ^:private open-count (atom 0))
+(defonce ^:private pending-count (atom 0))
+
+(defn- take-slot!
+  "Count one more in `counter` if it is below `limit`, atomically: true when it was."
+  [counter limit]
+  (let [[old new] (swap-vals! counter #(if (< % limit) (inc %) %))]
+    (not= old new)))
+
 (defn- read-auth-line
   "The first line of `reader`, at most `max-auth-line` chars, or nil."
   [^BufferedReader reader]
@@ -873,11 +886,15 @@
   [^java.io.Closeable closeable in out label selection authenticate transport remote-addr]
   (let [reader (BufferedReader. (InputStreamReader. in))
         writer (BufferedWriter. (OutputStreamWriter. out))
-        authed (promise)]
+        authed (promise)
+        _ (when-not (take-slot! pending-count max-unauthenticated)
+            (throw (ex-info "too many connections awaiting their credential" {})))
+        release! (let [done (atom false)] #(when (compare-and-set! done false true) (swap! pending-count dec)))]
     ;; no credential in time: closed (a socket timeout does not reach a channel)
     (Thread/startVirtualThread
      #(when-not (deref authed auth-timeout-ms nil) (try (.close closeable) (catch Exception _ nil))))
-    (if-let [[p token] (stream-principal authenticate reader transport remote-addr)]
+    (if-let [[p token] (try (stream-principal authenticate reader transport remote-addr)
+                            (finally (release!)))]
       (do (deliver authed true)
           (when (principal/run-token? token)
             (principal/on-revoke! token #(try (.close closeable) (catch Exception _ nil))))
@@ -886,14 +903,17 @@
           ;; refused: one error, then the connection closes
           (doto writer
             (.write (json/write-value-as-string
-                     {:jsonrpc "2.0" :id nil :error {:code -32001 :message "Not authenticated"}}))
+                     {:jsonrpc "2.0" :id nil
+                      :error {:code -32001
+                              :message (str "Not authenticated"
+                                            (some->> @principal/rotation-notice (str ": ")))}}))
             (.write "\n")
             (.flush))))))
 
 (defn- serve-in-thread!
   "Serve `closeable` on a thread of its own, unless `max-connections` are open."
   [^java.io.Closeable closeable label f]
-  (if (>= (count @connections) max-connections)
+  (if-not (take-slot! open-count max-connections)
     (try (.close closeable) (catch Exception _ nil))
     (do (swap! connections conj closeable)
         (doto (Thread.
@@ -905,37 +925,76 @@
                           (.flush *err*)))
                       (finally
                         (swap! connections disj closeable)
+                        (swap! open-count dec)
                         (try (.close closeable) (catch Exception _ nil))))))
           (.setDaemon true)
           (.start)))))
 
+(defn- nofollow [] (into-array java.nio.file.LinkOption [java.nio.file.LinkOption/NOFOLLOW_LINKS]))
+
+(defn- uid
+  "This process's numeric user id (the owner of a file it creates)."
+  []
+  (let [f (java.io.File/createTempFile "dvergr-uid" nil)]
+    (try (java.nio.file.Files/getAttribute (.toPath f) "unix:uid" (nofollow))
+         (finally (.delete f)))))
+
+(defn private-dir?
+  "Whether `dir` is a directory, not a symbolic link, owned by this user
+   (by uid) and closed to everyone else (mode 0700)."
+  [dir]
+  (let [p (.toPath (java.io.File. (str dir)))]
+    (and (java.nio.file.Files/isDirectory p (nofollow))
+         (not (java.nio.file.Files/isSymbolicLink p))
+         (= (uid) (java.nio.file.Files/getAttribute p "unix:uid" (nofollow)))
+         (= "rwx------" (java.nio.file.attribute.PosixFilePermissions/toString
+                         (java.nio.file.Files/getPosixFilePermissions p (nofollow)))))))
+
+(defn socket-dir
+  "Where the socket of a home whose own path is too long for one lives: the
+   user's runtime directory (`$XDG_RUNTIME_DIR`, else `/run/user/<uid>`)
+   under `dvergr/`, else `/tmp/dvergr-<uid>`."
+  []
+  (let [runtime (some #(when (and % (private-dir? %)) %)
+                      [(System/getenv "XDG_RUNTIME_DIR") (str "/run/user/" (uid))])]
+    (if runtime (str runtime "/dvergr") (str "/tmp/dvergr-" (uid)))))
+
 (defn socket-path
   "The Unix domain socket of the MCP server of state root `home`:
    `<home>/mcp.sock` (the home is 0700, `principal/private-dir!`), or, when
-   that path is too long for a socket, one under `/tmp/dvergr-<user>` (0700,
-   checked to be this user's), named by a hash of the home."
+   that path is too long for a socket, `<socket-dir>/<hash of home>.sock`."
   [home]
   (let [home (.getCanonicalPath (java.io.File. (str home)))
         p (str home "/mcp.sock")]
     (if (<= (count (.getBytes p "UTF-8")) 100)
       p
-      (let [dir (str "/tmp/dvergr-" (System/getProperty "user.name"))
-            h (.formatHex (java.util.HexFormat/of)
+      (let [h (.formatHex (java.util.HexFormat/of)
                           (.digest (java.security.MessageDigest/getInstance "SHA-256") (.getBytes home "UTF-8")))]
-        (str dir "/" (subs h 0 16) ".sock")))))
+        (str (socket-dir) "/" (subs h 0 16) ".sock")))))
 
 (defn- open-socket-channel
   "Bind a Unix domain socket for state root `home` (`socket-path`), in a
-   directory only this user may enter; nil (logged) when that cannot be
-   assured."
+   directory only this user may enter: created 0700 when missing, else
+   checked (not followed when a symbolic link, owned by this uid, 0700);
+   nil (logged) when that cannot be assured."
   [home]
   (try
     (let [p (socket-path home)
           dir (.getParentFile (java.io.File. ^String p))
-          dpath (principal/private-dir! dir)
-          owner (str (java.nio.file.Files/getOwner dpath (make-array java.nio.file.LinkOption 0)))]
-      (when-not (= owner (System/getProperty "user.name"))
-        (throw (ex-info (str dir " belongs to " owner) {:dir (str dir)})))
+          dpath (.toPath dir)]
+      (when-not (java.nio.file.Files/exists dpath (nofollow))
+        (java.nio.file.Files/createDirectory
+         dpath (into-array java.nio.file.attribute.FileAttribute
+                           [(java.nio.file.attribute.PosixFilePermissions/asFileAttribute
+                             (java.nio.file.attribute.PosixFilePermissions/fromString "rwx------"))])))
+      ;; this user's own directory, not a link: closed to others (0700)
+      (when (and (java.nio.file.Files/isDirectory dpath (nofollow))
+                 (not (java.nio.file.Files/isSymbolicLink dpath))
+                 (= (uid) (java.nio.file.Files/getAttribute dpath "unix:uid" (nofollow))))
+        (java.nio.file.Files/setPosixFilePermissions
+         dpath (java.nio.file.attribute.PosixFilePermissions/fromString "rwx------")))
+      (when-not (private-dir? dir)
+        (throw (ex-info (str dir " is not this user's private directory (0700, not a link)") {:dir (str dir)})))
       (java.nio.file.Files/deleteIfExists (.toPath (java.io.File. ^String p)))
       (doto (java.nio.channels.ServerSocketChannel/open java.net.StandardProtocolFamily/UNIX)
         (.bind (java.net.UnixDomainSocketAddress/of ^String p))))
@@ -946,11 +1005,13 @@
       nil)))
 
 (defn start!
-  "Start the MCP server: on a Unix domain socket in the state root
+  "Start the MCP server: on a Unix domain socket for the state root
    (`socket-path`, what `bin/dvergr-mcp` uses: only this user can reach it,
-   so the relay never hands its credential to a server squatting a port) and
-   on TCP. Returns the server state.
+   so the relay never hands its credential to a server squatting a port),
+   and on TCP when `:tcp?` (off by default: a TCP client hands its
+   credential to whatever holds the port). Returns the server state.
    Options:
+     :tcp? - also listen on TCP (default false)
      :port - TCP port (default 17888)
      :bind - Bind address (default \"127.0.0.1\"; pass \"0.0.0.0\" explicitly to
              expose the server on the network)
@@ -964,27 +1025,31 @@
              (`tcp-auth-line`, at most 8 KiB, within 10 s): the local token,
              or a run token. Without it the connection gets one error
              (-32001) and is closed."
-  [& {:keys [port bind home profile toolsets authenticate] :or {port 17888 bind "127.0.0.1"}}]
+  [& {:keys [tcp? port bind home profile toolsets authenticate] :or {port 17888 bind "127.0.0.1"}}]
   (when @server-state
     (throw (ex-info "Server already running" {:port port})))
   (let [selection (surface/selection {:profile profile :toolsets toolsets})
         authenticate (or authenticate principal/default-authenticate)
         home (or home (paths/home))
-        ^ServerSocket server-socket (ServerSocket. port 50 (java.net.InetAddress/getByName bind))
+        ^ServerSocket server-socket (when tcp? (ServerSocket. port 50 (java.net.InetAddress/getByName bind)))
         ^java.nio.channels.ServerSocketChannel uds (open-socket-channel home)
-        accept-thread (Thread.
-                       (fn []
-                         (loop []
-                           (when-not (.isClosed server-socket)
-                             (when-let [^Socket client (try (.accept server-socket) (catch Exception _e nil))]
-                               (let [addr (str (.getInetAddress client) ":" (.getPort client))]
-                                 (serve-in-thread!
-                                  client addr
-                                  #(serve-stream! client (.getInputStream client) (.getOutputStream client)
-                                                  addr selection authenticate :mcp-tcp
-                                                  (.getHostAddress (.getInetAddress client))))))
-                             (recur))))
-                       "dvergr-mcp-accept")
+        _ (when-not (or server-socket uds)
+            (throw (ex-info "MCP: neither a Unix domain socket nor TCP (:tcp)" {:home (str home)})))
+        accept-thread (when server-socket
+                        (doto (Thread.
+                               (fn []
+                                 (loop []
+                                   (when-not (.isClosed server-socket)
+                                     (when-let [^Socket client (try (.accept server-socket) (catch Exception _e nil))]
+                                       (let [addr (str (.getInetAddress client) ":" (.getPort client))]
+                                         (serve-in-thread!
+                                          client addr
+                                          #(serve-stream! client (.getInputStream client) (.getOutputStream client)
+                                                          addr selection authenticate :mcp-tcp
+                                                          (.getHostAddress (.getInetAddress client))))))
+                                     (recur))))
+                               "dvergr-mcp-accept")
+                          (.setDaemon true)))
         uds-thread (when uds
                      (doto (Thread.
                             (fn []
@@ -998,30 +1063,30 @@
                                                      "unix" selection authenticate :mcp-tcp nil)))
                                   (recur))))
                             "dvergr-mcp-accept-unix")
-                       (.setDaemon true)))]
-    (.setDaemon accept-thread true)
-    (.start accept-thread)
+                       (.setDaemon true)))
+        tcp-port (some-> server-socket .getLocalPort)]
+    (some-> ^Thread accept-thread .start)
     (some-> ^Thread uds-thread .start)
     (reset! server-state {:server-socket server-socket
                           :uds uds
                           :socket-path (when uds (socket-path home))
                           :accept-thread accept-thread
-                          :port (.getLocalPort server-socket)})
-    (.println *err* (str "dvergr-mcp: listening on " bind ":" (.getLocalPort server-socket)
-                         (when uds (str " and " (socket-path home)))))
+                          :port tcp-port})
+    (.println *err* (str "dvergr-mcp: listening on "
+                         (str/join " and " (remove nil? [(when uds (socket-path home))
+                                                         (when tcp-port (str bind ":" tcp-port))]))))
     (.flush *err*)
-    {:port (.getLocalPort server-socket) :bind bind :socket-path (when uds (socket-path home))}))
+    {:port tcp-port :bind bind :socket-path (when uds (socket-path home))}))
 
-(defn listening-port
-  "The port of this process's MCP server: the daemon's when it runs one, else
-   a loopback server started on an ephemeral port (an external agent, e.g.
-   `claude -p` as a benchmark candidate, reaches a room through it; its
-   relay uses the server's Unix domain socket in this home)."
+(defn ensure-listening!
+  "This process's MCP server, started (its Unix domain socket only) when none
+   runs: an external agent (`claude -p` as a benchmark candidate) reaches a
+   room through it, over the relay. Returns the server state."
   []
   (locking server-state
-    (or (:port @server-state)
-        (:port (start! :port 0 :bind "127.0.0.1"
-                       :authenticate (principal/authenticator (:config (current-daemon))))))))
+    (or @server-state
+        (do (start! :authenticate (principal/authenticator (:config (current-daemon))))
+            @server-state))))
 
 (defn stop!
   "Stop the MCP server (TCP and the Unix domain socket)."
@@ -1029,7 +1094,7 @@
   (when-let [{:keys [^ServerSocket server-socket uds socket-path]} @server-state]
     ;; subscriptions end gracefully: a response before the stream closes
     (close-subscriptions!)
-    (.close server-socket)
+    (some-> server-socket .close)
     (when uds
       (try (.close ^java.io.Closeable uds) (catch Exception _ nil))
       (try (java.nio.file.Files/deleteIfExists (.toPath (java.io.File. ^String socket-path))) (catch Exception _ nil)))

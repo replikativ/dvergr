@@ -36,6 +36,7 @@
             [dvergr.ops :as dops]
             [dvergr.principal :as principal]
             [hiccup2.core :as h]
+            [hiccup.util :as hu]
             [taoensso.telemere :as tel]))
 
 ;; ============================================================================
@@ -174,18 +175,21 @@
     (resp-fn)
     (json-response 403 {:error "The dashboard is local; use the JSON API (/api/v1/)"})))
 
-(def session-cookie
-  "The cookie of a browser session the login URL opened: a random id the
-   server maps to its principal, never a credential that works elsewhere."
-  "dvergr_session")
-
 (def session-ttl-ms
   "How long a browser session lasts after its login."
   (* 12 60 60 1000))
 
+(def ^:private max-sessions
+  "Browser sessions kept at once; the oldest go first."
+  1000)
+
+(def app-link-ttl-ms
+  "How long a room app's capability link lasts."
+  (* 60 60 1000))
+
 (defn- authenticate
-  "The principal of credential `token` (a bearer, the login URL's `token`),
-   or nil. A run token (a pinned agent's) is for MCP only, never the web."
+  "The principal of credential `token` (a bearer, the login's token), or
+   nil. A run token (a pinned agent's) is for MCP only, never the web."
   [authenticate-fn req token]
   (let [p (try (authenticate-fn {:transport :web
                                  :bearer token
@@ -196,17 +200,19 @@
                  nil))]
     (when-not (principal/pinned? p) p)))
 
-(defn- login-token
-  "The `token` query parameter of `req` (the login URL's), or nil."
-  [req]
+(defn- query-param [req k]
   (some (fn [part]
-          (let [[k v] (str/split part #"=" 2)]
-            (when (= "token" k) (some-> v (java.net.URLDecoder/decode "UTF-8")))))
+          (let [[pk v] (str/split part #"=" 2)]
+            (when (= k pk) (some-> v (java.net.URLDecoder/decode "UTF-8")))))
         (some-> (:query-string req) (str/split #"&"))))
 
-(def ^:private unauthorized
-  {:status 401 :headers {"Content-Type" "application/json" "WWW-Authenticate" "Bearer"}
-   :body "{\"error\":\"Not authenticated: open the URL with ?token= the daemon printed, or send Authorization: Bearer\"}"})
+(defn- form-param
+  "Field `k` of `req`'s urlencoded body (read once)."
+  [req k]
+  (some-> (:body req) slurp (str/split #"&")
+          (->> (some (fn [part]
+                       (let [[pk v] (str/split part #"=" 2)]
+                         (when (= k pk) (some-> v (str/replace "+" " ") (java.net.URLDecoder/decode "UTF-8")))))))))
 
 (defn- local-path
   "`uri` when it is a path of this server (one leading `/`), else `/`: a
@@ -214,50 +220,178 @@
   [uri]
   (if (and (str/starts-with? (str uri) "/") (not (str/starts-with? (str uri) "//"))) uri "/"))
 
+(defn- open-session!
+  "A new session for `principal` in `sessions`: expired ones are swept, the
+   oldest dropped beyond `max-sessions`. Returns its id."
+  [sessions principal]
+  (let [sid (principal/random-token)
+        now (System/currentTimeMillis)]
+    (swap! sessions
+           (fn [m]
+             (let [live (into {} (remove (fn [[_ v]] (< (:expires-at v) now))) m)
+                   kept (if (< (count live) max-sessions)
+                          live
+                          (into {} (take (dec max-sessions) (sort-by (comp - :expires-at val) live))))]
+               (assoc kept sid {:principal principal :expires-at (+ now session-ttl-ms)
+                                ;; a new local token ends every session opened before it
+                                :generation @principal/token-generation}))))
+    sid))
+
 (defn- session-principal
   "The principal of the live session `sid` in `sessions`, or nil."
   [sessions sid]
-  (when-let [{:keys [principal expires-at]} (and sid (get @sessions sid))]
-    (if (< expires-at (System/currentTimeMillis))
+  (when-let [{:keys [principal expires-at generation]} (and sid (get @sessions sid))]
+    (if (or (< expires-at (System/currentTimeMillis)) (not= generation @principal/token-generation))
       (do (swap! sessions dissoc sid) nil)
       principal)))
 
-(defn- root-handler
-  "Jupyter-style: `GET <path>?token=<token>` with a valid token opens a
-   browser session: a random session id in a cookie (HttpOnly,
-   SameSite=Strict; the token itself is never a cookie: cookies are not
-   scoped by port, so another server on this host would receive it), and a
-   redirect to the same path without the token. Every other request
-   authenticates by `Authorization: Bearer` or that session. A request whose
-   Origin is `null` (a sandboxed room app, `dvergr.web.apps`) reaches no
-   room app or API at all."
-  [daemon authenticate-fn sessions req]
-  (cond
-    (and (= "null" (get-in req [:headers "origin"]))
-         (not (str/starts-with? (str (:uri req)) "/apps/")))
-    {:status 403 :headers {"Content-Type" "application/json"}
-     :body "{\"error\":\"A sandboxed page (Origin null) may not call this server\"}"}
+(defn- login-page
+  "The page a browser without a session sees: it picks a session up from
+   the fragment and loads the page asked for with it, or asks for the token
+   (POSTed, so it stays out of the history)."
+  [error]
+  (str
+   (h/html
+    [:html
+     [:head [:meta {:charset "utf-8"}] [:title "dvergr"]
+      [:script (hu/raw-string web-dashboard/auth-script)]
+      [:style "body{background:#111;color:#ddd;font-family:sans-serif;margin:3em}
+               input{background:#18181b;border:1px solid #333;color:#e0e0e0;padding:6px 10px}"]]
+     [:body
+      [:div#login {:style "display:none"}
+       [:h1 "dvergr"]
+       (when error [:p {:style "color:#d77"} error])
+       [:form {:method "post" :action "/login" :data-plain "1"}
+        [:p "The token is in " [:code "$DVERGR_HOME/local-token"] "."]
+        [:input {:type "password" :name "token" :autocomplete "off" :placeholder "local token"}]
+        " " [:button {:type "submit"} "Open"]]]
+      [:script (hu/raw-string
+                "if(sessionStorage.getItem('dvergr-sid')){window.dvergrGo(location.href,null,true);}
+                 else{document.getElementById('login').style.display='block';}")]]])))
 
-    :else
-    (if-let [t (and (#{:get :head} (:request-method req)) (login-token req))]
-      (if-let [p (authenticate authenticate-fn req t)]
-        (let [sid (principal/random-token)]
-          ;; a new id at every login; the one the browser had is dropped
-          (some->> (guard/cookie-value req session-cookie) (swap! sessions dissoc))
-          (swap! sessions assoc sid {:principal p :expires-at (+ (System/currentTimeMillis) session-ttl-ms)})
-          {:status 303
-           :headers {"Location" (local-path (not-empty (:uri req)))
-                     "Set-Cookie" (str session-cookie "=" sid "; Path=/; HttpOnly; SameSite=Strict; Max-Age="
-                                       (quot session-ttl-ms 1000))
-                     "Cache-Control" "no-store"
-                     "Referrer-Policy" "no-referrer"}
-           :body ""})
-        unauthorized)
-      (let [token (principal/bearer (get-in req [:headers "authorization"]))
-            p (if token
-                (authenticate authenticate-fn req token)
-                (session-principal sessions (guard/cookie-value req session-cookie)))]
-        (if p (route daemon p req) unauthorized)))))
+(defn- login-response
+  "After a valid token: a new session, and a redirect to `path` with the
+   session id in the fragment, which the page's script keeps (no cookie)."
+  [sessions principal path]
+  (let [sid (open-session! sessions principal)]
+    {:status 303
+     :headers {"Location" (str (local-path path) "#sid=" sid)
+               "Cache-Control" "no-store"
+               "Referrer-Policy" "no-referrer"}
+     :body ""}))
+
+(defn- page-request?
+  "A browser navigation to a page (not the API, a room app, or a fragment
+   htmx fetches): answered with the login page when it has no session."
+  [req]
+  (and (#{:get :head} (:request-method req))
+       (not (str/starts-with? (str (:uri req)) "/api/"))
+       (not (str/starts-with? (str (:uri req)) "/apps/"))))
+
+(defn- serve-app
+  "A room app for `principal` (its read of the room authorized on the very
+   row `dvergr.web.apps` serves), sandboxed: an opaque origin, so its scripts
+   reach nothing of this server."
+  [daemon principal req]
+  (some-> (try (web-apps/handle req daemon
+                                (fn [row slug]
+                                  (dops/authorize! daemon principal :room/read
+                                                   {:room (or (:room/slug row) slug) :path "/app"})))
+               (catch clojure.lang.ExceptionInfo e
+                 (json-response (dops/error-status e) {:error (ex-message e)})))
+          (assoc-in [:headers "Content-Security-Policy"] "sandbox allow-scripts")))
+
+(defn- app-by-capability
+  "`/apps/<slug>/~<cap>/<path>`: a room app through a capability link
+   (`/api/app-link`), its read authorized for the principal that minted it.
+   nil when `req` is not such a request."
+  [daemon app-caps req]
+  (when-let [[_ slug cap rest] (re-matches #"/apps/([^/]+)/~([0-9a-f]{64})(/.*)?" (str (:uri req)))]
+    (let [{:keys [principal room expires-at]} (get @app-caps cap)]
+      (cond
+        (or (nil? principal) (not= room slug) (< expires-at (System/currentTimeMillis)))
+        {:status 401 :headers {"Content-Type" "text/plain"} :body "This app link expired; open the app from its room again."}
+
+        (nil? rest)
+        {:status 301 :headers {"Location" (str "/apps/" slug "/~" cap "/")} :body ""}
+
+        :else (serve-app daemon principal (assoc req :uri (str "/apps/" slug rest)))))))
+
+(def ^:private unauthorized
+  {:status 401 :headers {"Content-Type" "application/json" "WWW-Authenticate" "Bearer"}
+   :body "{\"error\":\"Not authenticated: open the URL with ?token= the daemon printed, or send Authorization: Bearer\"}"})
+
+(defn- root-handler
+  "Credentials travel only in the `Authorization` header (`Bearer`: the local
+   token, or a browser session id), never in a cookie: cookies are not scoped
+   by port, so any server on this host would receive one and could replay
+   it. A browser logs in Jupyter-style: `GET <path>?token=<token>` (or a
+   POST of `token` to `/login`, which keeps it out of the history) opens a
+   session and redirects to `<path>#sid=<id>`; the page's script keeps the id
+   in `sessionStorage` and sends it as the header (`dashboard/auth-script`).
+   A page navigation without one gets the login page; room apps open through
+   capability links. A request whose Origin is `null` (a sandboxed room app)
+   reaches no room app or API at all."
+  [daemon authenticate-fn sessions app-caps req]
+  (let [uri (str (:uri req))]
+    (cond
+      (and (= "null" (get-in req [:headers "origin"])) (not (str/starts-with? uri "/apps/")))
+      {:status 403 :headers {"Content-Type" "application/json"}
+       :body "{\"error\":\"A sandboxed page (Origin null) may not call this server\"}"}
+
+      (app-by-capability daemon app-caps req) (app-by-capability daemon app-caps req)
+
+      (and (#{:get :head} (:request-method req)) (query-param req "token"))
+      (if-let [p (authenticate authenticate-fn req (query-param req "token"))]
+        (login-response sessions p uri)
+        {:status 401 :headers {"Content-Type" "text/html; charset=utf-8"}
+         :body (login-page (str "That token opens nothing." (some->> @principal/rotation-notice (str " "))))})
+
+      (and (= :post (:request-method req)) (= "/login" uri))
+      (if-let [p (authenticate authenticate-fn req (form-param req "token"))]
+        (login-response sessions p "/")
+        {:status 401 :headers {"Content-Type" "text/html; charset=utf-8"}
+         :body (login-page (str "That token opens nothing." (some->> @principal/rotation-notice (str " "))))})
+
+      :else
+      (let [bearer (principal/bearer (get-in req [:headers "authorization"]))
+            sid-p (session-principal sessions bearer)
+            p (or sid-p (when bearer (authenticate authenticate-fn req bearer)))]
+        (cond
+          (nil? p)
+          (if (page-request? req)
+            {:status 200 :headers {"Content-Type" "text/html; charset=utf-8" "Cache-Control" "no-store"}
+             :body (login-page nil)}
+            unauthorized)
+
+          (and (= :post (:request-method req)) (= "/logout" uri))
+          (do (when sid-p (swap! sessions dissoc bearer)) {:status 204 :body ""})
+
+          (= "/api/app-link" uri)
+          (let [slug (query-param req "room")]
+            (try (dops/authorize! daemon p :room/read {:room slug :path "/app"})
+                 (let [cap (principal/random-token)
+                       now (System/currentTimeMillis)]
+                   (swap! app-caps (fn [m] (assoc (into {} (remove #(< (:expires-at (val %)) now)) m)
+                                                  cap {:principal p :room slug
+                                                       :expires-at (+ now app-link-ttl-ms)})))
+                   (json-response 200 {:url (str "/apps/" (java.net.URLEncoder/encode (str slug) "UTF-8") "/~" cap "/")}))
+                 (catch clojure.lang.ExceptionInfo e
+                   (json-response (dops/error-status e) {:error (ex-message e)}))))
+
+          :else (route daemon p req))))))
+
+(defn- with-security-headers
+  "Every response: no framing (clickjacking) and no content sniffing; a room
+   app keeps its own sandbox policy."
+  [handler]
+  (fn [req]
+    (let [resp (handler req)]
+      (when (map? resp)
+        (cond-> (assoc-in resp [:headers "X-Content-Type-Options"] "nosniff")
+          (not (str/starts-with? (str (:uri req)) "/apps/"))
+          (-> (assoc-in [:headers "Content-Security-Policy"] "frame-ancestors 'none'")
+              (assoc-in [:headers "X-Frame-Options"] "DENY")))))))
 
 (defn- route [daemon principal req]
   ;; CRITICAL: http-kit's worker threads have no `*execution-context*`
@@ -282,17 +416,8 @@
 
       ;; Room apps — static serving of <room worktree>/app (see dvergr.web.apps),
       ;; for whoever may read the room
-        (str/starts-with? uri "/apps/")
-        ;; authorized on the very room row web-apps resolves and then serves
-        ;; an app is agent-written: sandboxed (an opaque origin, `Origin: null`),
-        ;; so its scripts get neither the session cookie nor this server's origin
-        (some-> (try (web-apps/handle req daemon
-                                      (fn [row slug]
-                                        (dops/authorize! daemon principal :room/read
-                                                         {:room (or (:room/slug row) slug) :path "/app"})))
-                     (catch clojure.lang.ExceptionInfo e
-                       (json-response (dops/error-status e) {:error (ex-message e)})))
-                (assoc-in [:headers "Content-Security-Policy"] "sandbox allow-scripts"))
+        ;; an app with the header (a program); a browser opens it by capability
+        (str/starts-with? uri "/apps/") (serve-app daemon principal req)
 
         (= uri "/api/health")               (api-health req daemon)
 
@@ -453,14 +578,15 @@
 (defn handler
   "The ring handler of the web server for `daemon`, behind the browser-boundary
    checks of `dvergr.web.guard`. Opts: `:ip` (the bind address), `:allowed-hosts`
-   and `:allowed-origins` (names and origins a reverse proxy adds), `:secret`
-   (the CSRF secret; a fresh one by default), `:authenticate` (default: the
-   daemon's, `principal/authenticator`)."
-  [daemon {:keys [secret authenticate] :as opts}]
-  (guard/wrap (let [authn (or authenticate (principal/authenticator (:config daemon)))
-                    sessions (atom {})]
-                (fn [req] (root-handler daemon authn sessions req)))
-              (assoc opts :secret (or secret (guard/new-secret)))))
+   and `:allowed-origins` (names and origins a reverse proxy adds),
+   `:authenticate` (default: the daemon's, `principal/authenticator`)."
+  [daemon {:keys [authenticate] :as opts}]
+  (with-security-headers
+    (guard/wrap (let [authn (or authenticate (principal/authenticator (:config daemon)))
+                      sessions (atom {})
+                      app-caps (atom {})]
+                  (fn [req] (root-handler daemon authn sessions app-caps req)))
+                opts)))
 
 (defn start!
   "Start the HTTP server.

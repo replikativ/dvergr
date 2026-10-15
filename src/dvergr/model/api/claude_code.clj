@@ -488,14 +488,14 @@
    relay asks. Nil when no relay or server is available."
   [room-id tool-names token]
   (when-let [relay (relay-command)]
-    (let [port ((requiring-resolve 'dvergr.mcp.server/listening-port))]
-      (json/write-value-as-string
-       {:mcpServers {:dvergr {:type "stdio" :command relay
-                              :args ["--port" (str port) "--no-start"
-                                     "--room" room-id "--tools" (str/join "," tool-names)]
+    (do ((requiring-resolve 'dvergr.mcp.server/ensure-listening!))
+        (json/write-value-as-string
+         {:mcpServers {:dvergr {:type "stdio" :command relay
+                              ;; the relay reaches the server over the home's socket
+                                :args ["--no-start" "--room" room-id "--tools" (str/join "," tool-names)]
                               ;; the run token: this agent, this room, these tools
-                              :env {"DVERGR_HOME" (paths/home)
-                                    "DVERGR_MCP_TOKEN" token}}}}))))
+                                :env {"DVERGR_HOME" (paths/home)
+                                      "DVERGR_MCP_TOKEN" token}}}}))))
 
 (defn- agent-invocation
   "When `opts` name a work room (`:room-id`) and tools, the CLI runs as an

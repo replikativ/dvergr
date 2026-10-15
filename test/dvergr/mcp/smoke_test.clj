@@ -21,7 +21,7 @@
     (let [prev-home (paths/home)]
       (paths/set-home! (str (System/getProperty "java.io.tmpdir") "/dvergr-mcp-smoke-" (random-uuid)))
       (sdb/reset-conn!)
-      (let [d (daemon/start! {:agents {} :mcp {:port 0 :http {:port 0}}})]
+      (let [d (daemon/start! {:agents {} :mcp {:tcp true :port 0 :http {:port 0}}})]
         (try
           (binding [*daemon* d] (f))
           (finally
@@ -280,3 +280,35 @@
             (is (re-find #"not reachable on .*\.sock" (str (get-in r [:result :content 0 :text]))) (pr-str r)))
           (is (= ::none (deref seen 1000 ::none)) "the port's holder never got a connection")
           (finally (.destroy p)))))))
+
+(deftest the-relay-trusts-only-a-socket-in-a-private-directory
+  ;; a socket in a directory others may enter (or own) could be anyone's:
+  ;; the relay checks before it sends its credential, the daemon before it binds
+  (if-not (some #(.canExecute (java.io.File. (str % "/bb")))
+                (clojure.string/split (System/getenv "PATH") #":"))
+    (support/skip! "the-relay-trusts-only-a-socket-in-a-private-directory: no bb on PATH")
+    (let [home (str "/tmp/dvergr-open-" (subs (str (random-uuid)) 0 8))
+          dir (java.io.File. home)
+          _ (.mkdirs dir)
+          _ (java.nio.file.Files/setPosixFilePermissions (.toPath dir) (java.nio.file.attribute.PosixFilePermissions/fromString "rwxr-xr-x"))
+          sock (doto (java.nio.channels.ServerSocketChannel/open java.net.StandardProtocolFamily/UNIX)
+                 (.bind (java.net.UnixDomainSocketAddress/of (str home "/mcp.sock"))))
+          accepted (promise)
+          _ (future (try (deliver accepted (.accept sock)) (catch Exception _ nil)))
+          p (.start (doto (ProcessBuilder. ["bb" "bin/dvergr-mcp" "--no-start"])
+                      (-> .environment (.put "DVERGR_HOME" home))))
+          out (BufferedWriter. (OutputStreamWriter. (.getOutputStream p)))
+          in (BufferedReader. (InputStreamReader. (.getInputStream p)))
+          send! (fn [m] (.write out (j/write-value-as-string m)) (.write out "\n") (.flush out))
+          read! (fn [] (j/read-value (.readLine in) j/keyword-keys-object-mapper))]
+      (try
+        (send! {:jsonrpc "2.0" :id 1 :method "initialize"
+                :params {:protocolVersion "2025-06-18" :capabilities {} :clientInfo {:name "t" :version "0"}}})
+        (read!)
+        (send! {:jsonrpc "2.0" :id 2 :method "tools/call" :params {:name "room_list" :arguments {}}})
+        (let [r (loop [m (read!)] (if (= 2 (:id m)) m (recur (read!))))]
+          (is (re-find #"private directory" (str (get-in r [:result :content 0 :text]))) (pr-str r)))
+        (is (= ::none (deref accepted 1000 ::none)) "it never connected")
+        (is (not (dvergr.mcp.server/private-dir? home)) "and the daemon would not bind there either")
+        (finally (.destroy p) (.close sock)
+                 (java.nio.file.Files/deleteIfExists (.toPath (java.io.File. (str home "/mcp.sock")))))))))

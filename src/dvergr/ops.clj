@@ -153,6 +153,10 @@
     (try
       (let [r (create)]
         (when claimed?
+          ;; the process took the slug over meanwhile: the room is not this create's
+          (when-not (= (creator-of p) (:creator (sdb/room-claim slug)))
+            (op-error! (str "Room " slug " was taken over while it was being created") ::room-exists 409
+                       {:room slug}))
           (when-let [rid (:room/id (sdb/room-by-slug slug))] (sdb/claim-provisioned! slug rid)))
         r)
       (catch Throwable t

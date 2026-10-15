@@ -28,9 +28,10 @@ clojure -M:cli --no-tui --web
 | `--no-tui` | — | run without the TUI (daemon + nREPL only) |
 | `--web` | — | also start the web dashboard |
 | `--web-port PORT` | `17880` | web dashboard port (with `--web`) |
-| `--web-bind IP` | `127.0.0.1` | web bind address. Every request needs a credential wherever it comes from: the CLI prints a login URL (`http://127.0.0.1:17880/?token=…`, the local token of `$DVERGR_HOME/local-token`) that sets a cookie, or send `Authorization: Bearer`; an authenticator (`:auth`, doc/mcp.md) adds others. The server also checks the Host header (DNS rebinding), the Origin of every state-changing request and a per-session CSRF token; a reverse proxy's name and origin go in `:http {:allowed-hosts […] :allowed-origins […]}` |
-| `--mcp` | — | also serve MCP on loopback TCP (clients connect through `bin/dvergr-mcp`; [mcp.md](mcp.md)). The daemon names its state root in `server/discover`'s `_meta` (`dvergr/home`), and the relay refuses a daemon of another state root |
-| `--mcp-port PORT` | `17888` | MCP port (with `--mcp`) |
+| `--web-bind IP` | `127.0.0.1` | web bind address. Every request needs a credential wherever it comes from: the CLI prints a login URL (`http://127.0.0.1:17880/?token=…`, the local token of `$DVERGR_HOME/local-token`) that opens a browser session (kept by the page, sent as a header, never a cookie), or send `Authorization: Bearer`; an authenticator (`:auth`, doc/mcp.md) adds others. The server also checks the Host header (DNS rebinding) and the Origin of every state-changing request; a reverse proxy's name and origin go in `:http {:allowed-hosts […] :allowed-origins […]}` |
+| `--mcp` | — | also serve MCP on the home's Unix domain socket (clients connect through `bin/dvergr-mcp`; [mcp.md](mcp.md)). The daemon names its state root in `server/discover`'s `_meta` (`dvergr/home`), and the relay refuses a daemon of another state root |
+| `--mcp-tcp` | — | with `--mcp`, also on loopback TCP (off by default: a TCP client sends its token to whoever holds the port) |
+| `--mcp-port PORT` | `17888` | MCP TCP port (with `--mcp-tcp`) |
 | `-h`, `--help` | — | show usage |
 
 **Provider, model, and agents are not CLI flags** — they come from

@@ -139,6 +139,16 @@
       (java.nio.file.Files/setPosixFilePermissions path owner-dir))
     path))
 
+(defonce ^{:doc "Why the local token was last replaced (an exposed file), for the
+  refusals clients see; nil when it never was."}
+  rotation-notice
+  (atom nil))
+
+(defonce ^{:doc "Bumped whenever a token file is written anew: browser sessions opened
+  before end with it (`dvergr.web.server`)."}
+  token-generation
+  (atom 0))
+
 (defn- write-private!
   "Write `content` to `f` as the owner's alone: a new temp file created with
    mode 0600 (never readable on the way), then moved over `f` atomically."
@@ -153,7 +163,8 @@
     (java.nio.file.Files/writeString tmp content (make-array java.nio.file.OpenOption 0))
     (java.nio.file.Files/move tmp (.toPath f) (into-array java.nio.file.CopyOption
                                                           [java.nio.file.StandardCopyOption/ATOMIC_MOVE
-                                                           java.nio.file.StandardCopyOption/REPLACE_EXISTING]))))
+                                                           java.nio.file.StandardCopyOption/REPLACE_EXISTING]))
+    (swap! token-generation inc)))
 
 (defn- read-private
   "The token in `f`, or nil when it is missing, blank, a symbolic link, or
@@ -166,10 +177,17 @@
       (not (java.nio.file.Files/exists path nofollow)) nil
       (java.nio.file.Files/isSymbolicLink path)
       (throw (ex-info (str f " is a symbolic link; refusing it as a credential") {:type ::token-symlink :file (str f)}))
+      ;; only group and other bits matter (0400 is as private as 0600)
       (and (posix? path)
-           (not= owner-only (java.nio.file.Files/getPosixFilePermissions path nofollow)))
+           (some (set (java.nio.file.Files/getPosixFilePermissions path nofollow))
+                 [java.nio.file.attribute.PosixFilePermission/GROUP_READ
+                  java.nio.file.attribute.PosixFilePermission/GROUP_WRITE
+                  java.nio.file.attribute.PosixFilePermission/OTHERS_READ
+                  java.nio.file.attribute.PosixFilePermission/OTHERS_WRITE]))
       (do (tel/log! {:level :warn :id ::token-exposed :data {:file (str f)}}
                     "A token file was readable by others; it is replaced with a new token")
+          (reset! rotation-notice
+                  (str "The local token was replaced: " f " was readable by others. Read the new one there."))
           nil)
       :else (not-empty (str/trim (slurp f))))))
 

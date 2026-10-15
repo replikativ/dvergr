@@ -59,11 +59,12 @@
    execution for whoever runs git there next (`diff.external`, a `clean`
    filter, a `pre-commit` hook); a path through `.git` is never workspace
    content. The home's credentials (`local-token`, the legacy
-   `mcp/http-token`, `jwt-secret`) and its MCP socket are on it too: a
+   `mcp/http-token`, `jwt-secret`) and its MCP socket (in the home, or the
+   runtime/tmp fallback `…/dvergr[-<uid>]/<hash>.sock`) are on it too: a
    sandbox that reads one acts as the owner."
   [path]
   (when (and path
-             (re-find #"(?i)(\.ssh[/\\]|\.gnupg[/\\]|/etc/shadow|/etc/passwd|/etc/sudoers|/proc/|/sys/|\.aws[/\\]|\.azure[/\\]|\.gcloud[/\\]|/run/secrets|\.env$|\.env\.|(^|[/\\])\.git([/\\]|$)|(^|[/\\])local-token$|(^|[/\\])http-token$|(^|[/\\])jwt-secret$|(^|[/\\])mcp\.sock$)"
+             (re-find #"(?i)(\.ssh[/\\]|\.gnupg[/\\]|/etc/shadow|/etc/passwd|/etc/sudoers|/proc/|/sys/|\.aws[/\\]|\.azure[/\\]|\.gcloud[/\\]|/run/secrets|\.env$|\.env\.|(^|[/\\])\.git([/\\]|$)|(^|[/\\])local-token$|(^|[/\\])http-token$|(^|[/\\])jwt-secret$|(^|[/\\])mcp\.sock$|[/\\]dvergr(-[^/\\]+)?[/\\][0-9a-f]{16}\.sock$)"
                       path))
     (throw (ex-info "Access denied: sensitive path" {:path path}))))
 

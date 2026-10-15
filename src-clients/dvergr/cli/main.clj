@@ -12,7 +12,7 @@
      clj -M:cli --web                 ; web dashboard on 127.0.0.1:17880 (loopback)
      clj -M:cli --no-tui --web        ; server box: daemon + nREPL + web, no TUI
      clj -M:cli --web --web-port 9090 ; web on a custom port
-     clj -M:cli --no-tui --mcp        ; MCP on 127.0.0.1:17888 (see bin/dvergr-mcp)
+     clj -M:cli --no-tui --mcp        ; MCP on the home's socket (see bin/dvergr-mcp); --mcp-tcp adds 127.0.0.1:17888
      clj -M:cli --help
 
    The nREPL server is the integration seam for Claude Code, Cursor,
@@ -46,8 +46,9 @@
    [nil  "--web-port PORT" "Web dashboard port (with --web)"
     :default  17880
     :parse-fn #(Integer/parseInt %)]
-   [nil  "--mcp"        "Also serve MCP on loopback TCP (clients connect through bin/dvergr-mcp)"]
-   [nil  "--mcp-port PORT" "MCP port (with --mcp)"
+   [nil  "--mcp"        "Also serve MCP on the home's Unix domain socket (clients connect through bin/dvergr-mcp)"]
+   [nil  "--mcp-tcp"    "With --mcp, also on loopback TCP (--mcp-port): a TCP client sends its token to whoever holds the port"]
+   [nil  "--mcp-port PORT" "MCP TCP port (with --mcp-tcp)"
     :default  17888
     :parse-fn #(Integer/parseInt %)]
    [nil  "--web-bind IP" "Web dashboard bind address (with --web, default 127.0.0.1); every request needs the local token (the printed login URL) or a credential your :auth accepts; see :http :allowed-hosts for a proxy"
@@ -118,7 +119,7 @@
       (do (println summary) (System/exit 0))
 
       :else
-      (let [{:keys [port no-tui web web-port web-bind mcp mcp-port nrepl-port-file]} options
+      (let [{:keys [port no-tui web web-port web-bind mcp mcp-tcp mcp-port nrepl-port-file]} options
             tui-run        (when-not no-tui (resolve-tui-run))
             web-start      (when web (resolve-web-start))
             web-stop       (resolve-web-stop)
@@ -153,7 +154,9 @@
           (dvergr-log/init!)                 ; from here, console output goes to the log
           (let [d (try
                     (daemon/start-from-config!
-                     (when mcp {:mcp (merge (:mcp (config/daemon-config)) {:port mcp-port})}))
+                     (when mcp {:mcp (merge (:mcp (config/daemon-config))
+                                            {:port mcp-port}
+                                            (when mcp-tcp {:tcp true}))}))
                     (catch Throwable t
                       ;; Boot failed. `init!` has already redirected the console to
                       ;; the log, so the error would otherwise vanish and the

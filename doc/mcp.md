@@ -9,11 +9,15 @@ what it cost. The tools are derived from `dvergr.ops/specification` (and the roo
 
 A client launches `bin/dvergr-mcp` (babashka) as a stdio server. It relays to the daemon's
 **Unix domain socket** in the state root (`$DVERGR_HOME/mcp.sock`; when that path is too long
-for a socket, `/tmp/dvergr-<user>/<hash>.sock` in a directory checked to be this user's and
-0700; `server/socket-path`). Only this user can reach it, so the relay never hands its
-credential to whatever holds a TCP port first (another user may bind 17888 before the
-daemon). `--tcp` (with `--port`, `--host`) uses the daemon's TCP port instead, and then the
-credential goes to whoever holds it. Its files live under the state root, `DVERGR_HOME`
+for a socket, `<runtime>/dvergr/<hash>.sock` in the user's runtime directory,
+`$XDG_RUNTIME_DIR` or `/run/user/<uid>`, else `/tmp/dvergr-<uid>/<hash>.sock`;
+`server/socket-path`). The daemon binds it only in a directory that is this uid's, mode 0700
+and not a symbolic link (it closes its own home to 0700, refuses any other), and the relay
+checks the same, and that the socket is this uid's, before it sends its credential. So
+only this user can be at the other end, and the relay never hands its credential to
+whatever holds a TCP port first (another user may bind 17888 before the daemon). `--tcp`
+(with `--port`, `--host`) uses the daemon's TCP port instead, when the daemon has one
+(`:tcp true`), and then the credential goes to whoever holds it. Its files live under the state root, `DVERGR_HOME`
 (default `<checkout>/.dvergr`, made 0700):
 
 - it presents the state root's **local token** (`$DVERGR_HOME/local-token`, mode 0600, which
@@ -60,8 +64,10 @@ Options (flags or environment): `--profile` / `DVERGR_MCP_PROFILE`, `--toolsets 
 (the checkout the daemon starts in), `DVERGR_HOME` (state root), `DVERGR_MCP_START` (the start
 command), `--no-start`, `--wait-s` (default 120).
 
-To run the daemon yourself: `clojure -M:cli --no-tui --mcp [--mcp-port 17888]`, or
-`:mcp {:port 17888 :profile "offload"}` in the config file. The daemon inherits its
+To run the daemon yourself: `clojure -M:cli --no-tui --mcp`, or `:mcp {:profile "offload"}`
+in the config file: MCP on the home's socket. TCP is opt-in, `--mcp-tcp [--mcp-port 17888]`
+or `:mcp {:tcp true :port 17888}`, for clients that cannot use the socket (the relay then
+needs `--tcp`). The daemon inherits its
 environment: a `TELEGRAM_BOT_TOKEN` there connects that bot.
 
 **A connection pinned to one room.** `--room ROOM --tools read_file,write_file` gives a
@@ -71,7 +77,7 @@ agent works in a benchmark Attempt: a `claude-code-*` candidate runs `claude -p`
 Attempt's world, with this relay in `--mcp-config` (its own built-in tools disabled, only
 `mcp__dvergr__<tool>` allowed, its own loop of up to 60 turns); the CLI calls the same tools
 every other candidate gets, natively, and the evaluator scores the world when it answers. The
-daemon (or any process running an Attempt) serves MCP on a loopback port for it. Each
+daemon (or any process running an Attempt) serves MCP on its home's socket for it. Each
 call gets a **run token** (`principal/mint-run-token!`), passed to the relay as
 `DVERGR_MCP_TOKEN`: it authenticates as that agent, and the server pins the connection to the
 token's room and tools whatever the relay asks (resources included: only those its tools
@@ -132,7 +138,7 @@ naming one), or, for a host that runs dvergr's rooms without a daemon, process-w
 
 - **`:authenticate`** `(fn [request] -> principal | nil)`. `request` carries `:transport`
   (`:mcp-stdio`, `:mcp-tcp`, `:mcp-http`, `:web`, `:telegram`), `:bearer` (the credential: a
-  TCP connection's first line, `Authorization: Bearer`, the web's token cookie),
+  TCP connection's first line, `Authorization: Bearer`; never a cookie),
   `:remote-addr` and `:headers` (for information only), `:local-token` when a listener was
   given its own, for Telegram `:telegram/user`, `:telegram/chat-id` and `:telegram/owner?`.
   nil refuses the caller: 401 over HTTP, an error (-32001) and a closed connection over TCP, a
@@ -456,8 +462,10 @@ stream (405).
 **TCP and the Unix domain socket.** Newline-delimited JSON-RPC. The first line of a connection
 is its credential, `{"jsonrpc":"2.0","method":"dvergr/authenticate","params":{"token":"…"}}`
 (the local token or a run token, `server/tcp-auth-line`), at most 8 KiB, within 10 s; a
-connection without one gets one error (-32001) and is closed. At most 256 connections are
-open at once. A connection a run token opened closes when the token ends.
+connection without one gets one error (-32001; it also says when the local token was replaced
+because its file was readable by others) and is closed. At most 256 connections are open at
+once, at most 32 of them still without a credential. A connection a run token opened closes
+when the token ends. TCP is off unless the daemon's config says `:tcp true`.
 
 **The relay** (`bin/dvergr-mcp`) speaks both eras too: it forwards `server/discover` to the
 daemon (answering it itself, with the same versions, while the daemon starts), puts its

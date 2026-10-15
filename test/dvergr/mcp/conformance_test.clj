@@ -32,7 +32,7 @@
   (fn [f]
     ;; this namespace's own server, stopped after: a daemon test starts one too
     (let [started? (not (:running (server/status)))]
-      (when started? (server/start! :port 0))
+      (when started? (server/start! :tcp? true :port 0))
       (try (f) (finally (when started? (server/stop!)))))))
 
 (def ^:private read-mapper (json/object-mapper {:decode-key-fn keyword}))
@@ -265,7 +265,7 @@
 
 (deftest a-tcp-connection-without-a-credential-is-refused
   (let [started? (not (:running (server/status)))]
-    (when started? (server/start! :port 0))
+    (when started? (server/start! :tcp? true :port 0))
     (try
       (with-open [s (Socket. "127.0.0.1" (int (:port (server/status))))]
         (.setSoTimeout s 10000)
@@ -280,7 +280,7 @@
 
 (deftest an-oversized-credential-line-is-refused
   (let [started? (not (:running (server/status)))]
-    (when started? (server/start! :port 0))
+    (when started? (server/start! :tcp? true :port 0))
     (try
       (with-open [s (Socket. "127.0.0.1" (int (:port (server/status))))]
         (.setSoTimeout s 10000)

@@ -114,18 +114,13 @@
       (is (clojure.string/includes? (get-in resp [:headers "location"]) "#agents")))))
 
 (deftest test-agent-api-unknown
-  (testing "POST to unknown agent returns 404 (with the session's CSRF token)"
-    (let [page (http/get (str "http://localhost:" test-port "/dashboard")
-                         {:as :string :throw-exceptions false :headers {"Authorization" (str "Bearer " (dvergr.principal/local-token))}})
-          cookie (first (clojure.string/split (get-in page [:headers "set-cookie"]) #";"))
-          token (second (re-find #"content=\"([0-9a-f]{64})\"" (:body page)))
-          post (fn [headers]
+  (testing "POST to unknown agent returns 404 with the credential header, 401 without"
+    (let [post (fn [headers]
                  (http/post (str "http://localhost:" test-port "/api/agents/nonexistent/inbox")
                             {:as :string :throw-exceptions false
-                             :content-type :json :headers (assoc headers "Authorization" (str "Bearer " (dvergr.principal/local-token)))
-                             :body "{}"}))]
-      (is (= 403 (:status (post {}))) "without a token")
-      (is (= 404 (:status (post {"cookie" cookie "x-csrf-token" token})))))))
+                             :content-type :json :headers headers :body "{}"}))]
+      (is (= 401 (:status (post {}))) "without a credential")
+      (is (= 404 (:status (post {"Authorization" (str "Bearer " (dvergr.principal/local-token))})))))))
 
 (deftest test-server-lifecycle
   (testing "running? reflects server state"

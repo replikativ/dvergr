@@ -746,7 +746,7 @@
           _ (principal/local-token)
           {:keys [port bind profile toolsets] :or {port 17888 bind "127.0.0.1"}} mcp-config]
       (cond-> (try
-                (assoc daemon :mcp-server (start-fn :port port :bind bind
+                (assoc daemon :mcp-server (start-fn :tcp? (boolean (:tcp mcp-config)) :port port :bind bind
                                                     :profile profile :toolsets toolsets
                                                     :authenticate (principal/authenticator (:config daemon))))
                 (catch java.net.BindException e

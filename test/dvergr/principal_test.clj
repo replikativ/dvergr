@@ -578,3 +578,24 @@
   (is (nil? (dvergr.orchestration.daemon/check-telegram-owners! {:owners [12345]})))
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"numeric"
                         (dvergr.orchestration.daemon/check-telegram-owners! {:owners [12345 "@me"]}))))
+
+(deftest an-owner-only-token-file-may-be-read-only
+  (let [home (java.io.File. (str (System/getProperty "java.io.tmpdir") "/dvergr-ro-" (random-uuid)))
+        t (principal/local-token home)
+        f (principal/local-token-file home)]
+    (java.nio.file.Files/setPosixFilePermissions (.toPath f) (java.nio.file.attribute.PosixFilePermissions/fromString "r--------"))
+    (is (= t (principal/local-token home)) "0400 is as private as 0600: kept")))
+
+(deftest a-slug-taken-over-mid-create-is-not-granted
+  (with-system-db
+    (let [c (:execution-ctx (daemon nil))
+          granted (atom [])
+          dmn (assoc-in (daemon (constantly true)) [:config :auth :on-created] (fn [p r] (swap! granted conj r)))]
+      (with-redefs [rooms/create-room! (fn [{:keys [slug title]}]
+                                         ;; the process takes the slug over while this create provisions
+                                         (dvergr.system.db/release-claim! slug)
+                                         (dvergr.system.db/create-room! {:slug slug :name title})
+                                         (keyword slug))]
+        (is (= 409 (ops/error-status (try (ops/invoke dmn bob :room/create {:title "D" :slug "authz-d"}) nil
+                                          (catch clojure.lang.ExceptionInfo e e)))))
+        (is (empty? @granted) "nothing granted for a room that is not this create's")))))

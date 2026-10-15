@@ -73,8 +73,9 @@ and storage GC. The `.nrepl-port` of a REPL is written at the project root, not 
  :http          {:port 17880 :ip "127.0.0.1"}   ; web dashboard + JSON API (needs the web deps); starts only when set (or `--web`);
                                                 ; behind a proxy (or TLS terminator) add :allowed-hosts ["dvergr.lan"]
                                                 ; and :allowed-origins ["https://dvergr.lan"]
- :mcp           {:port 17888 :bind "127.0.0.1" :profile "offload"
-                 :http {:port 17889}}           ; MCP over loopback TCP, optionally Streamable HTTP; doc/mcp.md
+ :mcp           {:profile "offload"               ; MCP on the home's Unix domain socket (bin/dvergr-mcp)
+                 :tcp true :port 17888 :bind "127.0.0.1" ; also TCP (default off)
+                 :http {:port 17889}}           ; and Streamable HTTP; doc/mcp.md
  ;; Who may call: by default the local token ($DVERGR_HOME/local-token) is the owner on MCP
  ;; (TCP, HTTP) and the web; nothing is trusted for where it comes from. doc/mcp.md, principals.
  :auth          {:authenticate my.host/authenticate  ; who calls (fn [request] -> principal | nil)
