@@ -45,7 +45,7 @@
   ([fork reason]
    (release-deferred! fork reason (constantly true)))
   ([fork reason claim!]
-   (locking (:meta fork)
+   (d/with-room-lock fork
      (let [parent (rreg/lookup (:parent-id fork))
            live (rreg/lookup (:id fork))
            meta @(:meta fork)
@@ -105,7 +105,7 @@
 (defn retry-deferred-discard-abort!
   "Restore a live world fenced by a failed durable discard compensation."
   [fork]
-  (locking (:meta fork)
+  (d/with-room-lock fork
     (let [meta @(:meta fork)
           parent (rreg/lookup (:parent-id fork))
           live (rreg/lookup (:id fork))
