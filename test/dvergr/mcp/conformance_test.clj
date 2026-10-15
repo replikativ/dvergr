@@ -45,6 +45,8 @@
         r (BufferedReader. (InputStreamReader. (.getInputStream s)))
         w (BufferedWriter. (OutputStreamWriter. (.getOutputStream s)))]
     (.setSoTimeout s 10000)
+    ;; the connection's credential, its first line
+    (doto w (.write (server/tcp-auth-line (dvergr.principal/local-token))) (.write "\n") (.flush))
     (fn
       ([] (.close s))
       ([message]
@@ -260,3 +262,18 @@
         vec-of (fn [nm] (some->> (re-find (re-pattern (str "\\(def " nm " (\\[[^\\]]*\\])\\)")) src) second read-string))]
     (is (= json-rpc/supported-versions (vec-of "versions")))
     (is (= json-rpc/stateless-versions (vec-of "stateless-versions")))))
+
+(deftest a-tcp-connection-without-a-credential-is-refused
+  (let [started? (not (:running (server/status)))]
+    (when started? (server/start! :port 0))
+    (try
+      (with-open [s (Socket. "127.0.0.1" (int (:port (server/status))))]
+        (.setSoTimeout s 10000)
+        (let [r (BufferedReader. (InputStreamReader. (.getInputStream s)))
+              w (BufferedWriter. (OutputStreamWriter. (.getOutputStream s)))]
+          (doto w (.write (json/write-value-as-string {:jsonrpc "2.0" :id 1 :method "tools/list" :params {}}))
+                (.write "\n") (.flush))
+          (is (= -32001 (get-in (json/read-value (.readLine r) read-mapper) [:error :code]))
+              "a loopback peer without the token gets one error")
+          (is (nil? (.readLine r)) "and the connection closes")))
+      (finally (when started? (server/stop!))))))

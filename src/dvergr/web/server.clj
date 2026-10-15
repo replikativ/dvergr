@@ -174,27 +174,54 @@
     (resp-fn)
     (json-response 403 {:error "The dashboard is local; use the JSON API (/api/v1/)"})))
 
+(def token-cookie
+  "The cookie that carries the dashboard's credential after the login URL."
+  "dvergr_token")
+
 (defn- authenticate
-  "The request's principal: the authenticator's verdict on its peer and bearer token."
-  [authenticate-fn req]
+  "The principal of credential `token` (a bearer, the token cookie, the login
+   URL's `token`), or nil."
+  [authenticate-fn req token]
   (try (authenticate-fn {:transport :web
-                         ;; the socket's peer: http-kit's :remote-addr is
-                         ;; X-Forwarded-For when that header is sent (a ring
-                         ;; map without a socket, in tests, has only :remote-addr)
-                         :remote-addr (if (:async-channel req)
-                                        (principal/socket-peer req)
-                                        (:remote-addr req))
-                         :bearer (principal/bearer (get-in req [:headers "authorization"]))
+                         :bearer token
+                         :remote-addr (:remote-addr req)
                          :headers (:headers req)})
        (catch Exception e
          (tel/log! {:level :warn :id ::authenticate-failed :data {:error (ex-message e)}})
          nil)))
 
-(defn- root-handler [daemon authenticate-fn req]
-  (if-let [p (authenticate authenticate-fn req)]
-    (route daemon p req)
-    {:status 401 :headers {"Content-Type" "application/json" "WWW-Authenticate" "Bearer"}
-     :body "{\"error\":\"Not authenticated\"}"}))
+(defn- login-token
+  "The `token` query parameter of `req` (the login URL's), or nil."
+  [req]
+  (some (fn [part]
+          (let [[k v] (str/split part #"=" 2)]
+            (when (= "token" k) (some-> v (java.net.URLDecoder/decode "UTF-8")))))
+        (some-> (:query-string req) (str/split #"&"))))
+
+(def ^:private unauthorized
+  {:status 401 :headers {"Content-Type" "application/json" "WWW-Authenticate" "Bearer"}
+   :body "{\"error\":\"Not authenticated: open the URL with ?token= the daemon printed, or send Authorization: Bearer\"}"})
+
+(defn- root-handler
+  "Jupyter-style: `GET <any>?token=<token>` with a valid token sets the token
+   cookie (HttpOnly, SameSite=Strict) and redirects to the same path without
+   it; every other request authenticates by `Authorization: Bearer` or that
+   cookie. A cross-site request carries neither (the cookie is Strict), and
+   the guard's CSRF token and JSON-only API writes stand besides."
+  [daemon authenticate-fn req]
+  (if-let [t (and (#{:get :head} (:request-method req)) (login-token req))]
+    (if (authenticate authenticate-fn req t)
+      {:status 303
+       :headers {"Location" (or (not-empty (:uri req)) "/")
+                 "Set-Cookie" (str token-cookie "=" t "; Path=/; HttpOnly; SameSite=Strict")
+                 "Cache-Control" "no-store"}
+       :body ""}
+      unauthorized)
+    (let [token (or (principal/bearer (get-in req [:headers "authorization"]))
+                    (guard/cookie-value req token-cookie))]
+      (if-let [p (when token (authenticate authenticate-fn req token))]
+        (route daemon p req)
+        unauthorized))))
 
 (defn- route [daemon principal req]
   ;; CRITICAL: http-kit's worker threads have no `*execution-context*`
@@ -401,10 +428,10 @@
    Args:
      daemon - Daemon record (for API access to agents, config, etc.)
      :port  - Port to listen on (default 17880)
-     :ip    - Bind address (default \"127.0.0.1\" — loopback only). Without an
-              authenticator (`:auth` in the daemon config, or `:authenticate`)
-              only direct loopback peers are answered, and a non-loopback bind
-              is refused (`principal/check-bind!`).
+     :ip    - Bind address (default \"127.0.0.1\"). Every request needs a
+              credential, wherever it comes from: the local token (the login
+              URL, `:login-url` of the result, sets a cookie) or what the
+              daemon's authenticator accepts.
      :authenticate - the seam (default: the daemon's, `principal/authenticator`)
      :allowed-hosts   - extra Host names to answer (beside loopback and the bind
                         address), e.g. a reverse proxy's name
@@ -418,7 +445,6 @@
     (throw (ex-info "Server already running" {:port (:port @server-state)})))
   (tel/log! {:level :info :id ::starting :data {:ip ip :port port}} "Starting HTTP server")
   (let [authn (or authenticate (principal/authenticator (:config daemon)))
-        _ (principal/check-bind! "The web server" ip authn)
         stop-fn (http/run-server
                  (handler daemon {:ip ip :allowed-hosts allowed-hosts
                                   :allowed-origins allowed-origins :authenticate authn})
@@ -429,9 +455,14 @@
     (reset! server-state {:stop-fn stop-fn
                           :port port
                           :ip ip
+                          ;; Jupyter-style: open it once, the cookie does the rest
+                          :login-url (str "http://" (if (#{"0.0.0.0" "::"} ip) "127.0.0.1" ip) ":"
+                                          port "/?token="
+                                          (principal/local-token))
                           :daemon daemon
                           :started-at (System/currentTimeMillis)})
-    (tel/log! {:level :info :id ::started :data {:url (str "http://" ip ":" port)}} "HTTP server started")
+    (tel/log! {:level :info :id ::started :data {:url (str "http://" ip ":" port)}}
+              "HTTP server started (the login URL with its token is in the server state, :login-url)")
     @server-state))
 
 (defn stop!

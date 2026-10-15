@@ -226,21 +226,32 @@
                                                    :params {:uri "room://mcp-authz-open/messages"}})
                        [:result :contents]))))))
 
-(deftest a-forwarding-header-never-makes-a-local-caller-over-real-http
-  ;; http-kit's :remote-addr IS the first X-Forwarded-For entry; the seam must
-  ;; see the socket's peer, and the default must refuse any forwarded request
+(deftest over-real-http-only-the-credential-counts
+  ;; where a request comes from (loopback, a proxy's headers) grants nothing
   (let [token-file (str (System/getProperty "java.io.tmpdir") "/dvergr-mcp-xff-" (random-uuid) "/token")
-        seen (atom nil)
         s (mcp-http/start! {:port 0 :token-file token-file :profile "admin"})
-        t (mcp-http/start! {:port 0 :token-file token-file :profile "admin"
-                            :authenticate (fn [r] (reset! seen (:remote-addr r)) nil)})
         init {:jsonrpc "2.0" :id 1 :method "initialize"
               :params {:protocolVersion "2025-06-18" :capabilities {} :clientInfo {:name "t" :version "1"}}}
         legacy {"MCP-Protocol-Version" "2025-06-18"}]
     (try
-      (is (= 200 (:status (http-call (:port s) (:token s) init legacy))) "the token, directly: local")
-      (is (= 401 (:status (http-call (:port s) (:token s) init (assoc legacy "X-Forwarded-For" "127.0.0.1"))))
-          "the same token, forwarded: refused")
-      (http-call (:port t) "x" init (assoc legacy "X-Forwarded-For" "10.9.9.9"))
-      (is (= "127.0.0.1" @seen) "the authenticator sees the socket's peer, not the header")
-      (finally ((:stop s)) ((:stop t))))))
+      (is (= 200 (:status (http-call (:port s) (:token s) init legacy))) "the local token: the owner")
+      (is (= 200 (:status (http-call (:port s) (:token s) init (assoc legacy "X-Forwarded-For" "10.9.9.9"))))
+          "proxied with the token: still the owner")
+      (is (= 401 (:status (http-call (:port s) "nope" init (assoc legacy "X-Forwarded-For" "127.0.0.1"))))
+          "proxied without it: refused")
+      (finally ((:stop s))))))
+
+(deftest a-run-token-pins-its-connection-server-side
+  ;; the agent's credential decides its room and tools, not what its relay asks
+  (reset! authorize (constantly true)) ; the pins alone decide here
+  (let [t (principal/mint-run-token! {:actor :worker :room "mcp-authz-open" :tools ["room_detail"]})
+        p (principal/run-token-principal t)
+        c (session p {:dvergr/profile "admin" :dvergr/room "mcp-authz-closed"})]
+    (try
+      (is (= #{"room_detail"} (tool-names c)) "exactly its tools, whatever the profile")
+      (let [r (call-tool c "room_detail" {})]
+        (is (false? (get-in r [:result :isError])) (pr-str r))
+        (is (= "mcp-authz-open" (get-in r [:result :structuredContent "id"])) "its room, not the one asked for"))
+      (is (true? (get-in (call-tool c "room_detail" {:room "mcp-authz-closed"}) [:result :isError]))
+          "naming another room is refused")
+      (finally (principal/revoke-run-token! t)))))

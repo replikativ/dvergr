@@ -214,28 +214,48 @@
 ;; ---------------------------------------------------------------------------
 ;; Authentication defaults
 
-(deftest the-default-authenticator-admits-local-access-only
+(deftest the-default-authenticator-takes-credentials-only
   (let [auth principal/default-authenticate]
-    (is (principal/local? (auth {:transport :mcp-stdio})))
-    (is (principal/local? (auth {:transport :mcp-tcp :remote-addr "127.0.0.1"})))
-    (is (nil? (auth {:transport :mcp-tcp :remote-addr "10.1.2.3"})))
-    (is (principal/local? (auth {:transport :web :remote-addr "/0:0:0:0:0:0:0:1"})))
-    (is (nil? (auth {:transport :web :remote-addr nil})) "an unknown peer is no local one")
-    (is (principal/local? (auth {:transport :mcp-http :bearer "t" :local-token "t" :remote-addr "127.0.0.1"})))
-    (is (nil? (auth {:transport :mcp-http :bearer "t" :local-token "t" :remote-addr "10.1.2.3"}))
-        "the token is local access only from a local peer")
-    (is (nil? (auth {:transport :mcp-http :bearer "x" :local-token "t" :remote-addr "127.0.0.1"})))
-    (is (nil? (auth {:transport :mcp-http :bearer nil :local-token "t" :remote-addr "127.0.0.1"})))
-    (testing "a forwarding header is never local: a proxy on this host makes every peer loopback"
-      (doseq [h ["x-forwarded-for" "forwarded" "x-real-ip"]]
-        (is (nil? (auth {:transport :web :remote-addr "127.0.0.1" :headers {h "127.0.0.1"}})) h)
-        (is (nil? (auth {:transport :mcp-http :bearer "t" :local-token "t" :remote-addr "127.0.0.1"
-                         :headers {h "127.0.0.1"}})) h)))
-    (testing "the default refuses a non-loopback listener"
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"needs an authenticator"
-                            (principal/check-bind! "x" "0.0.0.0" principal/default-authenticate)))
-      (is (nil? (principal/check-bind! "x" "0.0.0.0" (fn [_] nil))))
-      (is (nil? (principal/check-bind! "x" "127.0.0.1" principal/default-authenticate))))))
+    (is (principal/local? (auth {:transport :mcp-stdio})) "stdio: its owner spawned it")
+    (testing "the local token is the local principal, on every network transport"
+      (doseq [t [:mcp-tcp :mcp-http :web]]
+        (is (principal/local? (auth {:transport t :bearer "t" :local-token "t"})) (str t))
+        (is (nil? (auth {:transport t :bearer "x" :local-token "t"})) (str t ": a wrong token"))
+        (is (nil? (auth {:transport t :local-token "t" :remote-addr "127.0.0.1"}))
+            (str t ": loopback without a token is nobody"))))
+    (testing "where the request comes from grants nothing, a proxy's headers included"
+      (is (principal/local? (auth {:transport :web :bearer "t" :local-token "t" :remote-addr "10.1.2.3"
+                                   :headers {"x-forwarded-for" "10.9.9.9"}})))
+      (is (nil? (auth {:transport :web :remote-addr "127.0.0.1" :headers {"x-forwarded-for" "127.0.0.1"}}))))
+    (testing "without :local-token, the home's"
+      (is (principal/local? (auth {:transport :web :bearer (principal/local-token)}))))
+    (testing "a run token is its agent, pinned; revoked or expired it is nobody"
+      (let [t (principal/mint-run-token! {:actor :worker :room "r1" :tools ["read_file"]})
+            p (auth {:transport :mcp-tcp :bearer t})]
+        (is (= :worker (principal/actor p)))
+        (is (not (principal/local? p)))
+        (is (= "r1" (:principal/room p)))
+        (is (= #{"read_file"} (:principal/tools p)))
+        (principal/revoke-run-token! t)
+        (is (nil? (auth {:transport :mcp-tcp :bearer t}))))
+      (let [t (principal/mint-run-token! {:actor :worker :room "r1" :tools [] :ttl-ms -1})]
+        (is (nil? (auth {:transport :mcp-tcp :bearer t})) "expired")))))
+
+(deftest a-run-token-works-in-its-room-only
+  (let [t (principal/mint-run-token! {:actor :worker :room "authz-open" :tools ["room_detail"]})
+        p (principal/run-token-principal t)]
+    (try
+      (is (:allow? (principal/decide (daemon (constantly true)) p
+                                     {:op :room/detail :action :read :resource [:room "authz-open"]
+                                      :resolved {:room "authz-open"}})))
+      (is (not (:allow? (principal/decide (daemon (constantly true)) p
+                                          {:op :room/detail :action :read :resource [:room "authz-closed"]
+                                           :resolved {:room "authz-closed"}})))
+          "another room: refused whatever the authorizer says")
+      (is (not (:allow? (principal/decide (daemon (constantly true)) p
+                                          {:op :room/create :action :write :resource [:global]})))
+          "nor anything global")
+      (finally (principal/revoke-run-token! t)))))
 
 (deftest local-is-an-identity-not-a-claim
   (let [forged {:principal/id :local :principal/kind :local :principal/scopes #{:dvergr/admin}}]
@@ -249,17 +269,18 @@
                  (catch clojure.lang.ExceptionInfo e e))]
       (is (= 403 (ops/error-status e)) "invoke refuses a principal claiming :local"))))
 
-(deftest a-telegram-sender-is-local-only-on-a-closed-allowlist
+(deftest a-telegram-sender-is-local-only-as-a-configured-owner
   (let [user {:id 42 :username "alice"}
-        auth #(principal/default-authenticate {:transport :telegram :telegram/user %})]
+        auth #(principal/default-authenticate (merge {:transport :telegram :telegram/user %1} %2))]
     (try
       (allowlist/set-strict! false)
       (allowlist/set-users! [])
-      (is (= "telegram/42" (:principal/id (auth user))) "an open allowlist: a principal, never local")
-      (is (not (principal/local? (auth user))))
+      (is (nil? (auth user {})) "an open (empty) allowlist identifies nobody")
       (allowlist/set-users! [42])
-      (is (principal/local? (auth user)) "listed on a non-empty allowlist: the operator")
-      (is (nil? (auth {:id 7})) "not listed: nobody")
+      (is (= "telegram/42" (:principal/id (auth user {}))) "listed: a principal of its own")
+      (is (not (principal/local? (auth user {}))) "never the local one by being listed")
+      (is (nil? (auth {:id 7} {})) "not listed: nobody")
+      (is (principal/local? (auth user {:telegram/owner? true})) "the configured owner is the operator")
       (finally (allowlist/set-users! []) (allowlist/set-strict! false)))))
 
 (deftest an-agents-tool-call-is-authorized-as-the-agent

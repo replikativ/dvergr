@@ -158,8 +158,16 @@
    narrows its selection in `_meta`; this is what keeps it from widening it."
   [principal selection]
   (let [allowed (principal-toolsets principal)
-        read-only? (contains? (set (:principal/scopes principal)) :dvergr/read-only)]
+        read-only? (contains? (set (:principal/scopes principal)) :dvergr/read-only)
+        pinned-tools (:principal/tools principal)
+        pinned-room (:principal/room principal)]
     (cond-> selection
+      ;; a run token's pins, server-side: its room, exactly its tools (a
+      ;; client may ask for fewer, never others)
+      pinned-room (assoc :room pinned-room)
+      pinned-tools (assoc :tools (if-let [asked (:tools selection)]
+                                   (set/intersection (set asked) (set pinned-tools))
+                                   (set pinned-tools)))
       allowed (-> (update :toolsets set/intersection allowed)
                   (assoc :allowed allowed))
       (and allowed (:repl-toolsets selection)) (update :repl-toolsets set/intersection allowed)

@@ -820,6 +820,22 @@
 ;; TCP transport
 ;; ============================================================================
 
+(defn tcp-auth-line
+  "The first line a TCP client sends: its credential `token`."
+  [token]
+  (json/write-value-as-string {:jsonrpc "2.0" :method "dvergr/authenticate" :params {:token token}}))
+
+(defn- tcp-principal
+  "The principal of a TCP connection from its first line (`tcp-auth-line`),
+   or nil: a missing, unreadable or refused credential."
+  [authenticate ^BufferedReader reader remote-addr]
+  (let [first-line (.readLine reader)
+        msg (try (json/read-value (str first-line) json-read-mapper) (catch Exception _ nil))]
+    (when (= "dvergr/authenticate" (:method msg))
+      (try (authenticate {:transport :mcp-tcp :bearer (some-> msg :params :token str)
+                          :remote-addr remote-addr})
+           (catch Exception _ nil)))))
+
 (defonce ^:private server-state (atom nil))
 (defonce connections (atom #{}))
 
@@ -832,14 +848,16 @@
      :profile, :toolsets - the default tool selection (`dvergr.mcp.surface`);
              a client may choose its own in `initialize` `_meta`
      :authenticate - (fn [request] -> principal | nil) for each connection
-             (`dvergr.principal`; default `principal/default-authenticate`:
-             a loopback peer is the local principal, any other is refused)"
+             (`dvergr.principal`; default `principal/default-authenticate`).
+             A connection's first line is its credential,
+             `{\"jsonrpc\":\"2.0\",\"method\":\"dvergr/authenticate\",\"params\":{\"token\":\"…\"}}`
+             (`tcp-auth-line`): the local token, or a run token. Without
+             it the connection gets one error (-32001) and is closed."
   [& {:keys [port bind profile toolsets authenticate] :or {port 17888 bind "127.0.0.1"}}]
   (when @server-state
     (throw (ex-info "Server already running" {:port port})))
   (let [selection (surface/selection {:profile profile :toolsets toolsets})
         authenticate (or authenticate principal/default-authenticate)
-        _ (principal/check-bind! "MCP over TCP" bind authenticate)
         ^ServerSocket server-socket (ServerSocket. port 50 (java.net.InetAddress/getByName bind))
         accept-thread (Thread.
                        (fn []
@@ -856,8 +874,8 @@
                                             (try
                                               (let [reader (BufferedReader. (InputStreamReader. (.getInputStream client)))
                                                     writer (BufferedWriter. (OutputStreamWriter. (.getOutputStream client)))]
-                                                (if-let [p (authenticate {:transport :mcp-tcp
-                                                                          :remote-addr (.getHostAddress (.getInetAddress client))})]
+                                                (if-let [p (tcp-principal authenticate reader
+                                                                          (.getHostAddress (.getInetAddress client)))]
                                                   (handle-connection reader writer addr selection p)
                                                   ;; refused: one error, then the connection closes
                                                   (doto writer

@@ -149,7 +149,9 @@
 ;; ---------------------------------------------------------------------------
 ;; Sessions and tokens
 
-(defn- cookie-value [req name]
+(defn cookie-value
+  "The value of cookie `name` in `req`, or nil."
+  [req name]
   (some (fn [part]
           (let [[k v] (str/split (str/trim part) #"=" 2)]
             (when (= k name) v)))
@@ -228,6 +230,8 @@
               (let [resp (binding [*csrf-token* token] (handler req))]
                 (cond-> resp
                   (and new-sid (map? resp))
-                  (assoc-in [:headers "Set-Cookie"]
-                            (str session-cookie "=" new-sid
-                                 "; Path=/; HttpOnly; SameSite=Lax")))))))))))
+                  ;; beside any cookie the handler sets (the login's token cookie)
+                  (update-in [:headers "Set-Cookie"]
+                             (fn [c]
+                               (let [sid (str session-cookie "=" new-sid "; Path=/; HttpOnly; SameSite=Lax")]
+                                 (cond (nil? c) sid (string? c) [c sid] :else (conj (vec c) sid))))))))))))))

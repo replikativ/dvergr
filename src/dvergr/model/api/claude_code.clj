@@ -24,6 +24,7 @@
             [dvergr.model.subscription :as subscription]
             [dvergr.chat.tool-schema :as tool-schema]
             [dvergr.substrate.paths :as paths]
+            [dvergr.principal :as principal]
             [jsonista.core :as json]
             [clojure.string :as str]
             [taoensso.telemere :as tel])
@@ -481,29 +482,38 @@
    `tool-names`: dvergr's MCP server through the stdio relay, the connection
    pinned to that room. The relay gets this process's state root as
    `DVERGR_HOME`: it keeps its files there (never in the checkout's
-   `.dvergr`) and refuses a daemon on that port with another home. Nil when
-   no relay or server is available."
-  [room-id tool-names]
+   `.dvergr`) and refuses a daemon on that port with another home. Its
+   credential is `token`, a run token (`dvergr.principal/mint-run-token!`):
+   the server pins the connection to that room and those tools whatever the
+   relay asks. Nil when no relay or server is available."
+  [room-id tool-names token]
   (when-let [relay (relay-command)]
     (let [port ((requiring-resolve 'dvergr.mcp.server/listening-port))]
       (json/write-value-as-string
        {:mcpServers {:dvergr {:type "stdio" :command relay
                               :args ["--port" (str port) "--no-start"
                                      "--room" room-id "--tools" (str/join "," tool-names)]
-                              :env {"DVERGR_HOME" (paths/home)}}}}))))
+                              ;; the run token: this agent, this room, these tools
+                              :env {"DVERGR_HOME" (paths/home)
+                                    "DVERGR_MCP_TOKEN" token}}}}))))
 
 (defn- agent-invocation
   "When `opts` name a work room (`:room-id`) and tools, the CLI runs as an
    agent INTO that room: dvergr's tools over MCP, natively called, and the
-   CLI's own loop; the call returns its final answer. Else nil (the text
-   protocol)."
+   CLI's own loop; the call returns its final answer. Its run token
+   (`:token`) is revoked when the call ends (`run-claude-streaming`). Else
+   nil (the text protocol)."
   [opts]
   (let [room-id (:room-id opts)
         tool-names (vec (keep :name (:tools opts)))]
-    (when (and room-id (seq tool-names))
-      (when-let [config (agent-mcp-config room-id tool-names)]
-        {:mcp-config config
-         :allowed (mapv #(str "mcp__dvergr__" %) tool-names)}))))
+    (when (and room-id (seq tool-names) (relay-command))
+      (let [token (principal/mint-run-token! {:actor (or (:actor opts) :claude-code)
+                                              :room room-id :tools tool-names})]
+        (if-let [config (agent-mcp-config room-id tool-names token)]
+          {:mcp-config config
+           :token token
+           :allowed (mapv #(str "mcp__dvergr__" %) tool-names)}
+          (principal/revoke-run-token! token))))))
 
 (defn- build-command
   "Build the claude CLI command with arguments. With `:agent` (see
@@ -771,6 +781,8 @@
           (throw t)))
       (finally
         (reset! monitor-done? true)
+        ;; the call is over: its agent's credential with it
+        (some-> agent :token principal/revoke-run-token!)
         ;; Process termination plus closing all streams releases reader
         ;; futures on success, cancellation, callback failure, and malformed
         ;; output. Terminate first: closing a reader waits for the reader's

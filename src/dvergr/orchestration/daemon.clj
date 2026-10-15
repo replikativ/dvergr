@@ -732,6 +732,8 @@
   (if-not mcp-config
     daemon
     (let [start-fn (requiring-resolve 'dvergr.mcp.server/start!)
+          ;; the owner's credential, before any listener: clients read it
+          _ (principal/local-token)
           {:keys [port bind profile toolsets] :or {port 17888 bind "127.0.0.1"}} mcp-config]
       (cond-> (try
                 (assoc daemon :mcp-server (start-fn :port port :bind bind
@@ -751,7 +753,6 @@
                 (try
                   (let [h ((requiring-resolve 'dvergr.mcp.http/start!)
                            {:port hport :bind hbind :allowed-origins origins
-                            :token-file (paths/path "mcp" "http-token")
                             :profile profile :toolsets toolsets
                             :authenticate (principal/authenticator (:config daemon))})]
                     (tel/log! {:level :info :id :daemon/mcp-http :data {:port (:port h) :bind hbind}}

@@ -15,6 +15,7 @@
             [dvergr.web.dashboard :as dash]
             [dvergr.web.guard :as guard]
             [dvergr.web.server :as server]
+            [dvergr.principal :as principal]
             [hiccup2.core :as h]
             [org.replikativ.spindel.engine.context :as ctx])
   (:import (java.io ByteArrayInputStream)))
@@ -30,7 +31,8 @@
 
 (defn- req [method uri & {:keys [headers body query]}]
   (cond-> {:request-method method :uri uri :remote-addr "127.0.0.1"
-           :headers (merge {"host" host} headers)}
+           ;; the local token: the owner's credential
+           :headers (merge {"host" host "authorization" (str "Bearer " (principal/local-token))} headers)}
     query (assoc :query-string query)
     body (assoc :body (ByteArrayInputStream. (.getBytes ^String body "UTF-8")))))
 
@@ -257,20 +259,38 @@
         (is (str/includes? html "content=\"tok\""))
         (is (str/includes? html "X-CSRF-Token"))))))
 
-(deftest only-local-peers-without-an-authenticator
-  (testing "the default authenticator answers loopback peers only"
-    (is (= 401 (:status ((app) (assoc (req :get "/api/v1/room_list") :remote-addr "10.0.0.5")))))
-    (is (= 200 (:status ((app) (req :get "/api/v1/room_list"))))))
-  (testing "an authenticated principal gets the JSON API, not the local dashboard"
-    (let [bob {:principal/id "party/bob" :principal/kind :human :principal/scopes #{}}
-          a (app {:authenticate (fn [{:keys [bearer]}] (when (= "tb" bearer) bob))})
-          as-bob #(assoc-in % [:headers "authorization"] "Bearer tb")]
-      (is (= 401 (:status (a (req :get "/api/v1/room_list")))) "no token: nobody, even on loopback")
-      (is (= 200 (:status (a (as-bob (req :get "/api/v1/room_list"))))))
-      (is (= 403 (:status (a (as-bob (req :get "/dashboard"))))))
-      (is (= 200 (:status (a (as-bob (req :get "/api/health")))))))))
+(deftest every-request-needs-a-credential
+  (let [no-token #(update % :headers dissoc "authorization")]
+    (testing "the local token is the owner, wherever the request comes from"
+      (is (= 200 (:status ((app) (req :get "/api/v1/room_list")))))
+      (is (= 200 (:status ((app) (assoc (req :get "/api/v1/room_list") :remote-addr "10.0.0.5"))))))
+    (testing "loopback without a credential is nobody"
+      (is (= 401 (:status ((app) (no-token (req :get "/api/v1/room_list"))))))
+      (is (= 401 (:status ((app) (no-token (req :get "/dashboard")))))))
+    (testing "Jupyter-style: the login URL sets a Strict cookie and strips the token"
+      (let [a (app)
+            resp (a (no-token (assoc (req :get "/dashboard") :query-string (str "token=" (principal/local-token)))))
+            cookies (let [c (get-in resp [:headers "Set-Cookie"])] (if (string? c) [c] c))
+            cookie (some #(when (str/starts-with? % "dvergr_token=") %) cookies)]
+        (is (= 303 (:status resp)))
+        (is (= "/dashboard" (get-in resp [:headers "Location"])) "the token is not in the URL it lands on")
+        (is (re-find #"HttpOnly" cookie))
+        (is (re-find #"SameSite=Strict" cookie))
+        (is (= 200 (:status (a (no-token (req :get "/api/v1/room_list"
+                                              :headers {"cookie" (first (str/split cookie #";"))})))))
+            "the cookie authenticates what follows")
+        (is (= 401 (:status (a (no-token (assoc (req :get "/") :query-string "token=wrong"))))))))))
 
-(deftest a-forwarding-header-never-makes-a-local-caller-over-real-http
+(deftest an-authenticated-principal-gets-the-api-not-the-local-dashboard
+  (let [bob {:principal/id "party/bob" :principal/kind :human :principal/scopes #{}}
+        a (app {:authenticate (fn [{:keys [bearer]}] (when (= "tb" bearer) bob))})
+        as-bob #(assoc-in % [:headers "authorization"] "Bearer tb")]
+    (is (= 401 (:status (a (update (req :get "/api/v1/room_list") :headers dissoc "authorization")))))
+    (is (= 200 (:status (a (as-bob (req :get "/api/v1/room_list"))))))
+    (is (= 403 (:status (a (as-bob (req :get "/dashboard"))))))
+    (is (= 200 (:status (a (as-bob (req :get "/api/health"))))))))
+
+(deftest a-proxied-request-is-judged-by-its-credential-over-real-http
   (let [server (org.httpkit.server/run-server (app) {:port 0 :ip "127.0.0.1" :legacy-return-value? false})
         port (org.httpkit.server/server-port server)
         client (java.net.http.HttpClient/newHttpClient)
@@ -278,12 +298,11 @@
                      (let [b (java.net.http.HttpRequest/newBuilder
                               (java.net.URI. (str "http://127.0.0.1:" port "/api/v1/room_list")))]
                        (doseq [[k v] headers] (.header b k v))
-                       (.statusCode (.send client (.build b) (java.net.http.HttpResponse$BodyHandlers/ofString)))))]
+                       (.statusCode (.send client (.build b) (java.net.http.HttpResponse$BodyHandlers/ofString)))))
+        bearer {"Authorization" (str "Bearer " (principal/local-token))}]
     (try
-      (is (= 200 (get-status {})) "a loopback peer is local")
+      (is (= 401 (get-status {})) "loopback without the token: refused")
       (doseq [h ["X-Forwarded-For" "Forwarded" "X-Real-IP"]]
-        (is (= 401 (get-status {h "127.0.0.1"})) (str h ": a forwarded request is not")))
-      (finally (org.httpkit.server/server-stop! server))))
-  (testing "the default authenticator refuses a non-loopback bind"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"needs an authenticator"
-                          (server/start! (mock-daemon) :port 0 :ip "0.0.0.0")))))
+        (is (= 401 (get-status {h "127.0.0.1"})) (str h " without the token: refused"))
+        (is (= 200 (get-status (assoc bearer h "10.9.9.9"))) (str h " with the token: the owner")))
+      (finally (org.httpkit.server/server-stop! server)))))

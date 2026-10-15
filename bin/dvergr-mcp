@@ -18,6 +18,10 @@
 ;;   external agent (claude -p, codex exec) its Attempt's world this way.
 ;;                  [--port 17888] [--host 127.0.0.1] [--dir <dvergr checkout>]
 ;;                  [--no-start] [--wait-s 120]
+;; Credential: the first line of every connection is
+;;   {"jsonrpc":"2.0","method":"dvergr/authenticate","params":{"token":…}}
+;; with DVERGR_MCP_TOKEN (a run token an agent was given), else the state
+;; root's local-token (mcp/http-token in a home from before it).
 ;; Environment: DVERGR_HOME (the state root, default <checkout>/.dvergr),
 ;;              DVERGR_MCP_PORT, DVERGR_MCP_PROFILE, DVERGR_MCP_TOOLSETS,
 ;;              DVERGR_MCP_ROOM, DVERGR_MCP_TOOLS, DVERGR_DIR,
@@ -51,6 +55,14 @@
 (def state-root
   "The daemon's state root: DVERGR_HOME, else the checkout's .dvergr."
   (str (fs/absolutize (or (env "DVERGR_HOME") (fs/file dir ".dvergr")))))
+
+(defn- token
+  "The credential this relay presents: DVERGR_MCP_TOKEN, else the home's
+   local token (read at each connect: a daemon it started writes it)."
+  []
+  (or (env "DVERGR_MCP_TOKEN")
+      (some (fn [f] (when (fs/exists? f) (not-empty (str/trim (slurp (str f))))))
+            [(fs/file state-root "local-token") (fs/file state-root "mcp" "http-token")])))
 
 (defn- canonical [path] (.getCanonicalPath (java.io.File. (str path))))
 (def start? (not (flag? "--no-start")))
@@ -273,9 +285,11 @@
       (loop []
         (when-some [line (.readLine reader)]
           (let [msg (try (json/parse-string line true) (catch Exception _ nil))]
-            (if (= id (:id msg))
-              (or (get-in msg [:result :_meta :dvergr/home]) :unknown)
-              (recur)))))
+            (cond
+              ;; the credential was refused (the connection closes after it)
+              (= -32001 (get-in msg [:error :code])) :refused
+              (= id (:id msg)) (or (get-in msg [:result :_meta :dvergr/home]) :unknown)
+              :else (recur)))))
       (catch java.net.SocketTimeoutException _ nil)
       (finally (.setSoTimeout s 0)))))
 
@@ -284,6 +298,12 @@
   [conn s reader]
   (let [home (daemon-home conn s reader)]
     (cond
+      (= :refused home)
+      (str "the dvergr daemon on " host ":" port " refused this relay's credential (the local token of "
+           state-root ", DVERGR_HOME, or DVERGR_MCP_TOKEN): it keeps its state in another home, or this "
+           "home has no local-token yet. Refusing to attach: give this relay another --port "
+           "(DVERGR_MCP_PORT), or set DVERGR_HOME to that daemon's home.")
+
       (= :unknown home)
       (str "the server on " host ":" port " does not report its home (an older dvergr daemon, or not "
            "dvergr), so it may keep its state elsewhere than this relay's home " state-root
@@ -306,7 +326,9 @@
     (if-let [s (try-connect)]
       (let [conn {:socket s
                   :writer (BufferedWriter. (OutputStreamWriter. (.getOutputStream s) "UTF-8"))}
-            reader (BufferedReader. (InputStreamReader. (.getInputStream s) "UTF-8"))]
+            reader (BufferedReader. (InputStreamReader. (.getInputStream s) "UTF-8"))
+            ;; the connection's credential, its first line
+            _ (send! conn {:jsonrpc "2.0" :method "dvergr/authenticate" :params {:token (token)}})]
         (if-let [why (home-refusal conn s reader)]
           (do (log why)
               (try (.close ^Socket s) (catch Exception _ nil))

@@ -663,10 +663,15 @@
           (when (and chat-id text (not (str/blank? text)))
             (let [parsed (parse-command text)
                   ;; who the sender is, once per message: commands, tool
-                  ;; commands and posts all run for it (the default makes a
-                  ;; sender on a non-empty allowlist the local principal)
+                  ;; commands and posts all run for it (the default: an owner
+                  ;; is the local principal, a sender on a non-empty allowlist
+                  ;; `telegram/<id>`, anyone else nobody)
+                  owners (set (get-in (:config daemon) [:telegram :owners]))
                   who    (try ((principal/authenticator (:config daemon))
-                               {:transport :telegram :telegram/user user-info :telegram/chat-id chat-id})
+                               {:transport :telegram :telegram/user user-info :telegram/chat-id chat-id
+                                ;; the operator, by `:telegram {:owners [id "@name"]}`: the local principal
+                                :telegram/owner? (boolean (or (owners (:id user-info))
+                                                              (some-> (:username user-info) (#(owners (str "@" %))))))})
                               (catch Exception _ nil))
                   ;; a post (or one addressed to an agent) writes the chat's room
                   may-post? (fn [room]

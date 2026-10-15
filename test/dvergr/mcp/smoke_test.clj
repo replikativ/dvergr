@@ -38,6 +38,8 @@
         out (BufferedWriter. (OutputStreamWriter. (.getOutputStream s)))
         n (atom 0)
         send! (fn [m] (.write out (j/write-value-as-string m)) (.write out "\n") (.flush out))
+        ;; the connection's credential, its first line
+        _ (send! {:jsonrpc "2.0" :method "dvergr/authenticate" :params {:token (dvergr.principal/local-token)}})
         rpc (fn [method params]
               (let [id (swap! n inc)]
                 (send! {:jsonrpc "2.0" :id id :method method :params params})
@@ -118,6 +120,48 @@
             (is (= 3 (get-in ack [:params :_meta :io.modelcontextprotocol/subscriptionId]))))
           (finally (.destroy p)))))))
 
+(deftest the-relay-with-a-run-token-is-pinned-by-the-server
+  ;; what a claude -p candidate gets: DVERGR_MCP_TOKEN, a run token, and no
+  ;; pins of its own; the daemon pins the connection to the token's room and
+  ;; tools, and refuses the token once it is revoked
+  (if-not (some #(.canExecute (java.io.File. (str % "/bb")))
+                (clojure.string/split (System/getenv "PATH") #":"))
+    (support/skip! "the-relay-with-a-run-token-is-pinned-by-the-server: no bb on PATH")
+    (do
+      (ops/invoke *daemon* dvergr.principal/local-principal :room/create {:slug "run-room" :title "Run room"})
+      (let [t (dvergr.principal/mint-run-token! {:actor :candidate :room "run-room" :tools ["read_file"]})
+            start #(.start (doto (ProcessBuilder. ["bb" "bin/dvergr-mcp" "--no-start"
+                                                   "--port" (str (get-in *daemon* [:mcp-server :port]))])
+                             (-> .environment (doto (.put "DVERGR_HOME" (paths/home))
+                                                (.put "DVERGR_MCP_TOKEN" t)))))
+            session (fn [p]
+                      (let [out (BufferedWriter. (OutputStreamWriter. (.getOutputStream p)))
+                            in (BufferedReader. (InputStreamReader. (.getInputStream p)))
+                            meta {:io.modelcontextprotocol/protocolVersion "2026-07-28"
+                                  :io.modelcontextprotocol/clientInfo {:name "run" :version "0"}
+                                  :io.modelcontextprotocol/clientCapabilities {}
+                                  :dvergr/profile "admin"}]
+                        (fn [id method params]
+                          (.write out (j/write-value-as-string {:jsonrpc "2.0" :id id :method method
+                                                                :params (assoc params :_meta meta)}))
+                          (.write out "\n") (.flush out)
+                          (loop [n 0]
+                            (let [m (j/read-value (.readLine in) j/keyword-keys-object-mapper)]
+                              (if (or (= id (:id m)) (> n 50)) m (recur (inc n))))))))
+            p (start)]
+        (try
+          (let [call (session p)]
+            (is (= #{"read_file"} (set (map :name (get-in (call 1 "tools/list" {}) [:result :tools]))))
+                "exactly the token's tools, though it asked for the admin profile"))
+          (finally (.destroy p)))
+        (dvergr.principal/revoke-run-token! t)
+        (let [p (start)]
+          (try
+            (let [r ((session p) 2 "tools/call" {:name "read_file" :arguments {:path "/x"}})]
+              (is (re-find #"credential" (str (get-in r [:result :content 0 :text]) (get-in r [:error :message])))
+                  "revoked: the relay cannot attach"))
+            (finally (.destroy p))))))))
+
 (deftest the-daemon-serves-mcp-over-http
   (let [{:keys [port token]} (:mcp-http *daemon*)
         body {:jsonrpc "2.0" :id 1 :method "tools/list"
@@ -160,7 +204,8 @@
         (send! {:jsonrpc "2.0" :id 2 :method "tools/call" :params {:name "room_list" :arguments {}}})
         (let [r (await #(= 2 (:id %)))
               text (str (get-in r [:result :content 0 :text]) (get-in r [:error :message]))]
-          (is (re-find #"keeps its state in" text) (pr-str r))
+          ;; it cannot even ask that daemon its home: its credential is another home's
+          (is (re-find #"refused this relay's credential" text) (pr-str r))
           (is (re-find #"--port" text) "it says what to do"))
         (is (not (.exists (java.io.File. other "mcp"))) "and wrote no tool cache from that daemon")
         (finally (.destroy p))))))

@@ -119,29 +119,27 @@
 (defn- creator-of [p] (pr-str (:principal/id p)))
 
 (defn- creation
-  "How the calling principal's create of room `slug` goes: `:new` (no such
-   room), `:retry` (this principal created it before, over an op: grant it
-   again and return it), else a 409, whoever made it. The local principal
-   keeps the old idempotent create (`:new`)."
+  "How the calling principal's create of room `slug` goes, decided BEFORE
+   anything is provisioned: `:new` (the slug is now claimed for it and no
+   room exists), `:retry` (it claimed the slug before and the room exists:
+   grant it again and return it), else a 409: the slug is someone else's
+   claim, or a room nobody claimed (the process's) has it, or a concurrent
+   create claimed it first. The local principal keeps the old idempotent
+   create (`:new`, nothing claimed)."
   [slug]
   (let [p *principal*]
     (if (or (nil? p) (principal/local? p))
       :new
-      (if-let [row (sdb/room-by-slug slug)]
-        (if (= (:room/creator row) (creator-of p))
-          :retry
-          (op-error! (str "Room " slug " exists") ::room-exists 409 {:room slug}))
-        :new))))
-
-(defn- claim!
-  "Record the calling principal as creator of the new room `slug`; a 409
-   when a concurrent create claimed it first."
-  [slug]
-  (let [p *principal*]
-    (when (and p (not (principal/local? p)))
-      (let [c (sdb/claim-room! slug (creator-of p))]
-        (when-not (= c (creator-of p))
-          (op-error! (str "Room " slug " was created by another call") ::room-exists 409 {:room slug}))))))
+      (let [me (creator-of p)
+            claimed (sdb/room-claim slug)
+            row (sdb/room-by-slug slug)
+            taken #(op-error! (str "Room " slug " exists") ::room-exists 409 {:room slug})]
+        (cond
+          (= me claimed) (if row :retry :new)
+          claimed (taken)
+          row (taken)
+          (= me (sdb/claim-room! slug me)) :new
+          :else (taken))))))
 
 (defn- id->str
   "Room/actor ids are keywords (built-ins) OR UUIDs (created rooms) — both → string."
@@ -1242,8 +1240,7 @@
                       (when (= :new (creation sl))
                         ;; create-room! returns the room-id keyword; look the live Room up.
                         (rooms/create-room! (cond-> {:title title :slug sl}
-                                              agents (assoc :agent-ids (mapv keyword agents))))
-                        (claim! sl))
+                                              agents (assoc :agent-ids (mapv keyword agents)))))
                       (let [rd (room-data (rreg/lookup (keyword sl)))]
                         (created! daemon [:room (or (:id rd) sl)])
                         rd))))}
@@ -1581,7 +1578,7 @@
               (if (= :retry (creation room))
                 (do (grant!) {:room room :retried true})
                 (doto (in-ctx daemon (room-repo/import-room! {:slug room :title title :source source :branch branch}))
-                  ((fn [_] (claim! room) (grant!)))))))}
+                  ((fn [_] (grant!)))))))}
 
    :room/export
    {:doc (str "The room's changes since room_import, as a patch for `git apply` in the source checkout "
@@ -1661,12 +1658,13 @@
                   slug (when own?
                          (str "dm-" (name (keyword id)) "-"
                               (subs (str (java.util.UUID/nameUUIDFromBytes (.getBytes (creator-of p) "UTF-8"))) 0 8)))
+                  ;; claimed before the room exists: nobody else's room by that name
+                  _ (when own? (creation slug))
                   r (room-result daemon
                                  (in-ctx daemon
                                          ((requiring-resolve 'dvergr.orchestration.daemon/ensure-agent-room!)
                                           daemon (keyword id) (when own? {:slug slug}))))]
               (when (and r own?)
-                (claim! slug)
                 ;; its own room by construction: granted on every open (idempotent)
                 (created! daemon [:room (:id r)]))
               r))}
