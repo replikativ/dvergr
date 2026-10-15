@@ -31,6 +31,9 @@
             [dvergr.room.store.memory :as mem]
             [dvergr.substrate.paths :as paths]
             [dvergr.system.db :as sdb]
+            [datahike.api :as dh]
+            [dvergr.orchestration.skills :as skills]
+            [org.replikativ.spindel.yggdrasil :as ygg]
             [dvergr.sandbox :as sandbox]
             [dvergr.sandbox.deps :as deps]
             [org.replikativ.spindel.engine.core :as rtc]
@@ -443,3 +446,342 @@
       (testing "spins still run in the bound world"
         (let [r (eval-in sci ec "(require '[org.replikativ.spindel.spin.cps :refer [spin]]) @(spin (+ 1 2))")]
           (is (= 3 (:ok r)) (pr-str r)))))))
+
+(deftest database-handles-stay-with-the-host
+  ;; A Datahike database value carries its store, writer and config, and a
+  ;; connection holds them too; sandbox code that held either could act on
+  ;; the store past the write guards and the effect boundary. It gets handles:
+  ;; databases as SandboxDb and connections as WorldConnection, which only the
+  ;; mirrored Datahike API takes back.
+  (let [cfg {:store {:backend :memory :id (random-uuid)} :keep-history? true :schema-flexibility :read}
+        _ (dh/create-database cfg)
+        kb (dh/connect cfg)
+        other-cfg {:store {:backend :memory :id (random-uuid)} :schema-flexibility :read}
+        _ (dh/create-database other-cfg)
+        other (dh/connect other-cfg)
+        _ (dh/transact other [{:title "other mailbox"}])
+        mailbox (atom kb)
+        ec (ctx/create-execution-context)
+        sci-ctx (sandbox/fork-for-session ec)]
+    (try
+      (with-redefs [ygg/system (fn [nm] (when (= "mail" nm) {:conn @mailbox}))
+                    skills/load-all (fn [& _] {"probe" {:name "probe" :body "b" :provides [:probe] :storage {:fs :host-fs}}})]
+        (sandbox/setup-agent-namespaces! sci-ctx ec :kb-conn kb)
+        (let [ev #(eval-in sci-ctx ec (str "(require '[datahike.api :as d]) " %))]
+          (testing "a database is a handle"
+            (is (= {:ok "class dvergr.sandbox.ns.datahike.SandboxDb"}
+                   (ev "(str (type @dvergr.room/*kb*))")))
+            (is (= {:ok [false nil nil]}
+                   (ev "(let [db @dvergr.room/*kb*] [(map? db) (:store db) (:config db)])"))))
+          (testing "the mirrored API takes it back"
+            (is (= {:ok #{["note"]}}
+                   (ev "(d/transact dvergr.room/*kb* [{:title \"note\"}])
+                        (d/q '[:find ?t :where [_ :title ?t]] @dvergr.room/*kb*)")))
+            (is (= {:ok #{["note"]}}
+                   (ev "(d/q {:query '[:find ?t :where [_ :title ?t]] :args [@dvergr.room/*kb*]})"))))
+          (testing "databases come back as handles from every call"
+            (is (= {:ok [true true true true true]}
+                   (ev "(let [sealed? #(= \"class dvergr.sandbox.ns.datahike.SandboxDb\" (str (type %)))
+                              r (d/transact dvergr.room/*kb* [{:title \"b\"}])]
+                          [(sealed? (:db-after r))
+                           (sealed? (:db-after (d/with @dvergr.room/*kb* [{:title \"c\"}])))
+                           (sealed? (d/db dvergr.room/*kb*))
+                           (sealed? (d/as-of @dvergr.room/*kb* (java.util.Date.)))
+                           (sealed? (:db-after @(d/transact! dvergr.room/*kb* [{:title \"d\"}])))])"))))
+          (testing "functions Datahike calls back see handles"
+            (is (= {:ok #{[true]}}
+                   (ev "(d/q '[:find ?m :in $ ?f :where [_ :title ?t] [(?f ?t) ?m]] @dvergr.room/*kb* string?)")))
+            (is (= {:ok false}
+                   (ev "(let [seen (atom nil)]
+                          (d/q '[:find ?t :where [_ :title ?t]]
+                               (d/filter @dvergr.room/*kb* (fn [db _] (reset! seen (map? db)) true)))
+                          @seen)"))))
+          (testing "a scratch database's connection is a handle"
+            (is (= {:ok ["class dvergr.sandbox.ns.datahike.WorldConnection" nil #{["s"]}]}
+                   (ev "(d/create-database {:store {:backend :mem :id \"scratch\"} :schema-flexibility :read})
+                        (let [c (d/connect {:store {:backend :mem :id \"scratch\"}})]
+                          (d/transact c [{:title \"s\"}])
+                          [(str (type c)) (:wrapped-atom c)
+                           (d/q '[:find ?t :where [_ :title ?t]] @c)])"))))
+          (testing "the mailbox is a handle"
+            (is (= {:ok ["class dvergr.sandbox.ns.datahike.WorldConnection"
+                         "class dvergr.sandbox.ns.datahike.WorldConnection"]}
+                   (ev "[(str (type (dvergr.mail/inbox))) (str (type dvergr.mail/*inbox*))]"))))
+          (testing "a database is unsealed only where a query declares a source"
+            (let [r (ev "(let [c (d/q '[:find ?c . :in ?c :where [(identity ?c) ?x]] dvergr.room/*kb*)]
+                           [(str (type c)) (:wrapped-atom c)])")]
+              (is (or (:err r) (= ["class dvergr.sandbox.ns.datahike.WorldConnection" nil] (:ok r)))
+                  (pr-str r)))
+            (doseq [[what code]
+                    [["identity on the source"
+                      "(d/q '[:find ?db :where [(identity $) ?db]] @dvergr.room/*kb*)"]
+                     ["a lookup on the source"
+                      "(d/q '[:find ?s . :where [(get $ :store) ?s]] @dvergr.room/*kb*)"]
+                     ["a keyword input applied to the source"
+                      "(d/q '[:find ?s . :in $ ?f :where [(?f $) ?s]] @dvergr.room/*kb* :store)"]
+                     ["a sandbox fn applied to the source"
+                      "(d/q '[:find ?m :in $ ?f :where [(?f $) ?m]] @dvergr.room/*kb* identity)"]
+                     ["a named source"
+                      "(d/q '[:find ?db :in $src :where [(identity $src) ?db]] @dvergr.room/*kb*)"]
+                     ["a rule that uses the source"
+                      "(d/q '[:find ?s :in $ % :where (leak ?s)] @dvergr.room/*kb* '[[(leak ?s) [(identity $) ?s]]])"]
+                     ["the query-map form"
+                      "(d/q {:query '[:find ?db :where [(identity $) ?db]] :args [@dvergr.room/*kb*]})"]
+                     ["a call in vector form, from a tuple input"
+                      "(d/q '[:find ?ok . :in $ [?f] :where [[?f $] ?ok]] @dvergr.room/*kb* [(fn [db] true)])"]
+                     ["a vector call inside a rule"
+                      "(d/q '[:find ?s :in $ % :where (leak ?s)] @dvergr.room/*kb* '[[(leak ?s) [[identity $] ?s]]])"]
+                     ["a lookup's default argument"
+                      "(d/q '[:find ?raw . :where [(get-else $ 999999999 :missing $) ?raw]] @dvergr.room/*kb*)"]
+                     ["a rule given as a string"
+                      "(d/q '[:find ?f . :in $ % :where (box ?f)] @dvergr.room/*kb* \"[[(box ?f) [(vector $) ?box] [(constantly ?box) ?f]]]\")"]
+                     ["a namespaced name for a lookup"
+                      "(d/q '[:find ?ok . :in $ ?f :where [(evil/pull $) ?ok]] @dvergr.room/*kb* identity)"]]]
+              (testing what
+                (is (re-find #"takes a database only" (str (:err (ev code)))) (pr-str (ev code)))))
+            (testing "an input cannot stand in for a lookup's name"
+              (is (re-find #"binds a variable"
+                           (str (:err (ev "(d/q '[:find ?ok . :in $ pull :where [(pull $) ?ok]] @dvergr.room/*kb* identity)"))))))
+            (testing "callables in inputs see sealed values, at any depth and as vars"
+              (is (= {:ok #{[false]}}
+                     (ev "(d/q '[:find ?m :in $ [?f ...] :where [_ :title ?t] [(?f ?t) ?m]] @dvergr.room/*kb* [map?])")))
+              (is (= {:ok #{[true]}}
+                     (ev "(defn probe-string [x] (string? x))
+                          (d/q '[:find ?m :in $ ?f :where [_ :title ?t] [(?f ?t) ?m]] @dvergr.room/*kb* #'probe-string)")))))
+          (testing "Datahike's own lookups still take the source"
+            (is (= {:ok #{["note" "none"]}}
+                   (ev "(d/q '[:find ?t ?x :where [?e :title \"note\"] [?e :title ?t] [(get-else $ ?e :missing \"none\") ?x]] @dvergr.room/*kb*)"))))
+          (testing "no predicate is installed, however the transaction spells it"
+            (let [refused? #(re-find #"Transaction functions and predicates" (str (:err %)))]
+              (testing "a nested entity map"
+                (is (refused? (ev "(d/transact dvergr.room/*kb* [{:title \"n\" :ref {:db/ident :p/nested :db.attr/preds ['clojure.core/slurp]}}])")))
+                (is (:ok (ev "(d/transact dvergr.room/*kb* [{:title \"n\" :ref {:title \"plain nested\"}}])"))
+                    "a plain nested map still transacts"))
+              (testing "transaction metadata"
+                (is (refused? (ev "(d/transact dvergr.room/*kb* {:tx-data [{:title \"t\"}] :tx-meta {:db/ident :p/meta :db.attr/preds ['clojure.core/slurp]}})"))))
+              (testing "a numeric attribute id, in a transaction and in an initial transaction"
+                (let [setup "(d/create-database {:store {:backend :mem :id \"refs\"} :attribute-refs? true})
+                             (def refs (d/connect {:store {:backend :mem :id \"refs\"}}))
+                             (d/transact refs [{:db/ident :p/x :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])
+                             (def attr (d/q '[:find ?e . :where [?e :db/ident :p/x]] @refs))
+                             (def preds (d/q '[:find ?e . :where [?e :db/ident :db.attr/preds]] @refs))"]
+                  (ev setup)
+                  (is (refused? (ev "(d/transact refs [[:db/add attr preds 'clojure.core/slurp]])")))
+                  (is (refused? (ev "(d/transact refs [{:db/id attr preds 'clojure.core/slurp}])")))
+                  (is (:ok (ev "(d/transact refs [[:db/add -1 attr \"plain\"]])")) "a plain numeric-id write still transacts")
+                  (is (refused? (ev "(d/create-database {:store {:backend :mem :id \"refs-init\"} :attribute-refs? true
+                                                         :initial-tx [[:db/add 1 preds 'clojure.core/slurp]]})")))))
+              (is (= {:ok #{}} (ev "(d/q '[:find ?v :where [_ :db.attr/preds ?v]] @dvergr.room/*kb*)")))))
+          (testing "a query result holds no function"
+            (is (re-find #"host object"
+                         (str (:err (ev "(d/q '[:find ?f . :where [(constantly 1) ?f]] @dvergr.room/*kb*)")))))
+            (is (re-find #"host object"
+                         (str (:err (ev "(let [seed (first (d/datoms @dvergr.room/*kb* :eavt))]
+                                          (d/q '[:find ?boxed . :in $ ?d :where [(constantly 1) ?f] [(assoc ?d :v ?f) ?boxed]]
+                                               @dvergr.room/*kb* seed))"))))
+                "nor a datom built around one"))
+          (testing "only data crosses the boundary"
+            (is (re-find #"filter predicate is a function"
+                         (str (:err (ev "(d/filter @dvergr.room/*kb* (sorted-map-by compare 0 true))")))))
+            (ev "(d/create-database {:store {:backend :mem :id \"values\"} :schema-flexibility :read})")
+            (doseq [v ["(ex-info \"payload\" {})" "(sorted-set 1 2)" "(sorted-map :a 1)"]]
+              (is (re-find #"not plain data"
+                           (str (:err (ev (str "(d/transact (d/connect {:store {:backend :mem :id \"values\"}}) [[:db/add -1 :payload " v "]])")))))
+                  v))
+            (is (= {:ok [true nil]}
+                   (ev "(let [r (d/q '[:find ?s . :in $ ?s :where [_ :title _]] @dvergr.room/*kb* (with-meta 'tag {:k 1}))]
+                          [(= 'tag r) (meta r)])"))
+                "a symbol comes back without its metadata")
+            (is (re-find #"host object"
+                         (str (:err (ev "(let [seed (first (d/datoms @dvergr.room/*kb* :eavt))]
+                                          (d/q '[:find ?boxed . :in $ ?d :where [(constantly 1) ?f] [(assoc ?d :a ?f) ?boxed]]
+                                               @dvergr.room/*kb* seed))"))))
+                "a datom is checked in every slot"))
+          (testing "a datom is not a transaction entry"
+            (is (re-find #"datoms are not accepted"
+                         (str (:err (ev "(let [d (first (d/datoms @dvergr.room/*kb* :eavt))]
+                                          (d/transact dvergr.room/*kb* [(assoc d :a :db.attr/preds :v 'clojure.core/slurp)]))"))))))
+          (testing "a function carried on metadata is refused"
+            (is (re-find #"functions in it"
+                         (str (:err (ev "(d/create-database {:store {:backend :mem :id \"meta\"} :schema-flexibility :read})
+                                         (d/transact (d/connect {:store {:backend :mem :id \"meta\"}})
+                                                     [[:db/add -1 :payload (with-meta [1] {:f (fn [] :host)})]])"))))))
+          (testing "transaction functions are refused, in every form"
+            (doseq [code ["(d/with @dvergr.room/*kb* [[:db.fn/call (fn [db] [])]])"
+                          "(d/with @dvergr.room/*kb* [{:db/ident :escape :db/fn (fn [db] [])} [:escape]])"
+                          "(d/transact dvergr.room/*kb* [[:escape]])"
+                          "(d/with @dvergr.room/*kb* [[:db/add -1 :db/ident :db.evil/leak] [:db/add -1 :db/fn (fn [raw] [])] [:db.evil/leak]])"
+                          "(d/with @dvergr.room/*kb* [[:db/add -1 :db/ident :db.evil/leak] [:db/add -1 :db/fn 'clojure.core/identity] [:db.evil/leak]])"
+                          "(d/transact dvergr.room/*kb* {:tx-data [{:title \"m\"}] :tx-meta {:hook (fn [db] db)}})"
+                          "(d/transact dvergr.room/*kb* [{:db/ident :p/x :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db.attr/preds ['clojure.core/slurp]}])"
+                          "(d/transact dvergr.room/*kb* [[:db/add 1 :db.entity/preds 'clojure.core/slurp]])"
+                          "(d/transact dvergr.room/*kb* [[:db.fn/call (fn [db] [])]])"
+                          "(d/transact dvergr.room/*kb* {:tx-data [[:db.fn/call (fn [db] [])]]})"
+                          "(d/transact! dvergr.room/*kb* {:tx-data [(list :db.fn/call (fn [db] []))]})"]]
+              (is (re-find #"Transaction functions|functions in it" (str (:err (ev code)))) code))
+            (testing "a scratch database's initial transaction is checked before Datahike runs it"
+              (is (= {:ok [true false]}
+                     (ev "(let [ran (atom false)
+                                r (try (d/create-database {:store {:backend :mem :id \"init\"}
+                                                           :initial-tx [[:db.fn/call (fn [raw] (reset! ran true) [])]]})
+                                       (catch Exception e :refused))]
+                            [(= :refused r) @ran])")))
+              (is (re-find #"collection of transaction forms"
+                           (str (:err (ev "(d/create-database {:store {:backend :mem :id \"path\"} :initial-tx \"/etc/hosts\"})"))))))
+            (testing "a scratch database's config cannot override Datahike's writer"
+              (is (= {:ok false}
+                     (ev "(let [ran (atom false)]
+                            (d/create-database {:store {:backend :mem :id \"writer\"} :schema-flexibility :read
+                                                :writer {:backend :self :write-fn-map {'transact! (fn [& _] (reset! ran true))}}})
+                            (let [c (d/connect {:store {:backend :mem :id \"writer\"}})]
+                              (d/transact c [{:title \"w\"}])
+                              @ran))")))))
+          (testing "an asynchronous failure carries no host object"
+            (ev "(d/transact dvergr.room/*kb* [{:db/id 77 :title \"gone\"}])
+                 (d/transact dvergr.room/*kb* [[:db/retract 77 :title \"gone\"]])")
+            (doseq [code ["(try @(d/transact! dvergr.room/*kb* [[:db.history.purge/before nil]]) :no-error
+                           (catch Exception e [(nil? (ex-cause e)) (str (ex-data e))]))"
+                          "(try (deref (d/transact! dvergr.room/*kb* [[:db.history.purge/before nil]]) 5000 :timeout) :no-error
+                           (catch Exception e [(nil? (ex-cause e)) (str (ex-data e))]))"]]
+              (let [r (ev code)]
+                ;; the transaction fails (purge before nil), and the error is clean
+                (is (and (vector? (:ok r)) (true? (first (:ok r)))
+                         (not (re-find #"Connection|datahike\.db\." (second (:ok r)))))
+                    (pr-str r)))))
+          (testing "an error carries no cause holding what Datahike was given"
+            (is (= {:ok [true false]}
+                   (ev "(try (d/pull @dvergr.room/*kb* '[*] @dvergr.room/*kb*)
+                          (catch Exception e
+                            [(nil? (ex-cause e))
+                             (boolean (some #(re-find #\"^class datahike\\.(db|connector)\\.\" (str (type %)))
+                                            (tree-seq coll? seq (ex-data e))))]))"))))
+          (testing "nested results are sealed: an entity's database, tuples, maps"
+            (is (= {:ok ["class dvergr.sandbox.ns.datahike.SandboxDb" true]}
+                   (ev "(let [e (ffirst (d/q '[:find ?e :where [?e :title \"note\"]] @dvergr.room/*kb*))
+                              ent (d/entity @dvergr.room/*kb* e)]
+                          [(str (type (d/entity-db ent)))
+                           (every? #(= \"class dvergr.sandbox.ns.datahike.SandboxDb\" (str (type %)))
+                                   ((juxt :db-before :db-after) (d/with @dvergr.room/*kb* [{:title \"w\"}])))])"))))
+          (testing "an entity yields attribute values, never its database"
+            (is (= {:ok [false false false]}
+                   (ev "(let [e (d/entity @dvergr.room/*kb* (ffirst (d/q '[:find ?e :where [?e :title \"note\"]] @dvergr.room/*kb*)))
+                              raw? #(boolean (re-find #\"^class datahike\\.(db|connector)\\.\" (str (type %))))
+                              reach (concat [(:db e) (get e :db) (:store e)] (vals e) (keys e) (map val (seq e))
+                                            (tree-seq coll? seq (d/pull @dvergr.room/*kb* '[*] (:db/id e))))]
+                          [(boolean (some raw? reach)) (boolean (some #(re-find #\"Atom|Connection|Store\" (str (type %))) reach))
+                           (boolean (some raw? (map :v (d/datoms @dvergr.room/*kb* :eavt))))])"))))
+          (testing "a mailbox handle follows the selected world"
+            (is (= {:ok #{["note"]}}
+                   (ev "(def kept (dvergr.mail/inbox))
+                        (d/q '[:find ?t :where [_ :title ?t] [(= ?t \"note\")]] @kept)")))
+            (reset! mailbox other)
+            (is (= {:ok #{["other mailbox"]}}
+                   (ev "(d/q '[:find ?t :where [_ :title ?t]] @kept)")))
+            (reset! mailbox kb))
+          (testing "skill definitions are data"
+            (is (= {:ok [nil "b"]}
+                   (ev "(let [s (get (dvergr.skills/all) \"probe\")] [(:storage s) (:body s)])")))
+            (is (= {:ok [nil]}
+                   (ev "(mapv :storage (dvergr.skills/find :probe))"))))))
+      (finally
+        (ctx/stop-context! ec)
+        (dh/release kb)
+        (dh/release other)))))
+
+(deftest entities-seal-what-they-hand-out
+  ;; An entity hands out its stored values as they are and holds its
+  ;; database. A value the host stored (here a function) must not reach
+  ;; sandbox code through an entity lookup or traversal; ordinary reads keep
+  ;; working, and a referenced entity comes back wrapped too.
+  (let [cfg {:store {:backend :memory :id (random-uuid)} :schema-flexibility :read
+             :initial-tx [{:db/ident :child :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}]}
+        _ (dh/create-database cfg)
+        kb (dh/connect cfg)
+        _ (dh/transact kb [{:db/id -1 :title "kid"}])
+        kid (ffirst (dh/q '[:find ?e :where [?e :title "kid"]] @kb))
+        _ (dh/transact kb [{:title "parent" :child kid :f (fn [] :host)}])
+        ec (ctx/create-execution-context)
+        sci-ctx (sandbox/fork-for-session ec)]
+    (try
+      (sandbox/setup-agent-namespaces! sci-ctx ec :kb-conn kb)
+      (let [ev #(eval-in sci-ctx ec (str "(require '[datahike.api :as d])
+                                           (def e (d/entity @dvergr.room/*kb*
+                                                    (ffirst (d/q '[:find ?e :where [?e :title \"parent\"]] @dvergr.room/*kb*)))) " %))]
+        (testing "an entity is a handle that reads like an entity"
+          (is (= {:ok ["class dvergr.sandbox.ns.datahike.SandboxEntity" "parent" "parent" true #{:title}]}
+                 (ev "[(str (type e)) (:title e) (get e :title) (contains? e :title) (set (keys (:child e)))]")))
+          (is (= {:ok {:title "kid"}} (ev "(into {} (:child e))"))))
+        (is (= {:ok :none} (ev "(get e :missing :none)")))
+        (testing "a referenced entity comes back wrapped"
+          (is (= {:ok ["class dvergr.sandbox.ns.datahike.SandboxEntity" "kid"]}
+                 (ev "[(str (type (:child e))) (:title (:child e))]"))))
+        (testing "a host object stored in an attribute fails closed"
+          (is (:err (ev "(:f e)")))
+          (is (:err (ev "(e :f)")))
+          (is (:err (ev "(into {} e)")))
+          (is (:err (ev "(doall (vals e))")))
+          (is (:err (ev "(doall (keys e))")) "a traversal of an entity holding one fails as well"))
+        (testing "a query computing on an entity input sees sealed values"
+          (is (= {:ok "parent"} (ev "(d/q '[:find ?t . :in ?e :where [(get ?e :title) ?t]] e)")))
+          (is (:err (ev "(d/q '[:find ?x . :in ?e :where [(get ?e :f) ?f] [(apply ?f []) ?x]] e)"))))
+        (testing "a stored host value reached by a data pattern is neither called nor passed on"
+          (is (:err (ev "(d/q '[:find ?x . :where [?e :title \"parent\"] [?e :f ?f] [(apply ?f []) ?x]] @dvergr.room/*kb*)")))
+          (is (:err (ev "(d/q '[:find ?x . :where [?e :title \"parent\"] [?e :f ?f] [(?f) ?x]] @dvergr.room/*kb*)")))
+          (is (:err (ev "(d/q '[:find ?x . :where [?e :title \"parent\"] [(get-else $ ?e :f nil) ?f] [(apply ?f []) ?x]] @dvergr.room/*kb*)")))
+          (is (:err (ev "(d/q '[:find ?x . :in $ % :where (r ?x)] @dvergr.room/*kb* '[[(r ?x) [?e :f ?f] [(apply ?f []) ?x]]])")))
+          (is (:err (ev "(d/q '[:find ?x . :where [?e :title \"parent\"] [?e :f ?f] [(q \"[:find ?y . :in ?f :where [(?f) ?y]]\" ?f) ?x]] @dvergr.room/*kb*)"))
+              "a nested query is checked like a top-level one")
+          (is (:err (ev "(d/q '[:find ?x . :in $ % ?f :where (r ?x)] @dvergr.room/*kb* '[[(r ?x) [?e :f ?f] [(?f) ?x]]] (fn [] :mine))"))
+              "a rule's own variable is not the outer input of the same name")
+          (is (re-find #"does not nest" (str (:err (ev "(d/q '[:find ?y . :where [(q [:find ?t . :where [_ :title ?t]] [[1]]) ?y]] @dvergr.room/*kb*)"))))
+              "a nested query is refused as such")
+          (is (= {:ok "PARENT"} (ev "(d/q '[:find ?u . :where [?e :title \"parent\"] [?e :title ?t] [(clojure.string/upper-case ?t) ?u]] @dvergr.room/*kb*)"))
+              "ordinary function clauses over data still work"))
+        (testing "an empty entity collection is a map"
+          (is (= {:ok {}} (ev "(empty e)"))))
+        (testing "the mirrored API takes an entity back"
+          (is (= {:ok "class dvergr.sandbox.ns.datahike.SandboxDb"}
+                 (ev "(str (type (d/entity-db e)))")))))
+      (finally (ctx/stop-context! ec)))))
+
+(deftest numeric-arrays-are-data
+  ;; Datahike stores float and double arrays (:db.type/float-array,
+  ;; :db.type/double-array) as it stores bytes; sandbox code writes and reads
+  ;; them like any other value.
+  (let [cfg {:store {:backend :memory :id (random-uuid)} :schema-flexibility :read}
+        _ (dh/create-database cfg)
+        kb (dh/connect cfg)
+        ec (ctx/create-execution-context)
+        sci-ctx (sandbox/fork-for-session ec)]
+    (try
+      (sandbox/setup-agent-namespaces! sci-ctx ec :kb-conn kb)
+      (is (= {:ok [[1.0 2.5] [3.0 4.5] [7 8]]}
+             (eval-in sci-ctx ec "(require '[datahike.api :as d])
+                                  (d/transact dvergr.room/*kb* [{:title \"v\" :fa (float-array [1.0 2.5])
+                                                                 :da (double-array [3.0 4.5]) :ba (byte-array [7 8])}])
+                                  (let [r (first (d/q '[:find ?f ?d ?b :where [?e :fa ?f] [?e :da ?d] [?e :ba ?b]] @dvergr.room/*kb*))]
+                                    (mapv vec r))")))
+      (finally (ctx/stop-context! ec)))))
+
+(deftest query-inputs-callables-see-handles-at-any-depth
+  ;; Defence in depth behind the source rule: whatever Datahike hands a
+  ;; callable from an input (tuple, collection, relation, a var), it gets
+  ;; as a handle. Invoked here with a raw database, as Datahike would if a
+  ;; query found a way to pass one.
+  (let [cfg {:store {:backend :memory :id (random-uuid)} :schema-flexibility :read}
+        _ (dh/create-database cfg)
+        conn (dh/connect cfg)
+        raw @conn
+        query-args @#'dvergr.sandbox.ns.datahike/query-args
+        seen (atom [])
+        probe (fn [x] (swap! seen conj (str (type x))) true)
+        sealed "class dvergr.sandbox.ns.datahike.SandboxDb"]
+    (try
+      (let [[_ tuple coll rel v] (query-args '[:find ?x :in $ [?a] [?b ...] [[?c]] ?d :where [?x :t ?a]]
+                                             [raw [probe] [probe] [[probe]] (intern 'dvergr.sandbox.escape-corpus-test 'query-probe probe)])]
+        ((first tuple) raw)
+        ((first coll) raw)
+        ((ffirst rel) raw)
+        (v raw)
+        (is (= [sealed sealed sealed sealed] @seen)))
+      (finally (dh/release conn)))))
