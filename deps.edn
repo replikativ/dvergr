@@ -31,7 +31,10 @@
 
         ;; Dvergr uses the async sequence/CPS namespaces directly; keep this a
         ;; direct dependency instead of relying on Spindel's implementation deps.
-        is.simm/partial-cps        {:mvn/version "0.1.66"}
+        ;; partial-cps moved to org.replikativ (namespaces unchanged:
+        ;; is.simm.partial-cps.*); the old is.simm jar is excluded from every
+        ;; dependency that still pulls it, so one copy is on the classpath.
+        org.replikativ/partial-cps {:mvn/version "0.1.68"}
 
         ;; Spindel — Reactive runtime with CoW forking.
         ;; 0.1.35 (#27 lost-wakeup redesign + follow-ups): continuation
@@ -93,7 +96,7 @@
         ;; 0.1.113: SCI code gets an opaque name for its world, not the
         ;; ExecutionContext; clojure.lang.Var/Namespace are closed classes;
         ;; bound-fn runs in the fork it is called in (#121).
-        org.replikativ/spindel     {:mvn/version "0.1.114"}
+        org.replikativ/spindel     {:mvn/version "0.1.122"}
         ;; probabilistic inference in forkable worlds, split out of spindel:
         ;; the sandbox's infer/ and dist/ namespaces (foerster.core, .dist).
         ;; 0.1.45: savepoint inference throughout, resample-move, tempering,
@@ -116,7 +119,8 @@
         ;; Geschichte — authoritative virtual filesystem + Git compatibility.
         ;; Geschichte remains the authoritative virtual filesystem; its
         ;; Yggdrasil adapter lives only in Yggdrasil.
-        org.replikativ/geschichte  {:mvn/version "0.1.17"}
+        org.replikativ/geschichte  {:mvn/version "0.1.17"
+                                    :exclusions  [is.simm/partial-cps]}
 
         ;; rewrite-clj for structural editing
         rewrite-clj/rewrite-clj    {:mvn/version "1.1.48"}
@@ -124,7 +128,8 @@
         ;; Datahike — persistent Datalog storage
         ;; Keep the direct dependency current: Dvergr uses Datahike's API and
         ;; transaction predicates itself, not merely through Geschichte.
-        org.replikativ/datahike    {:mvn/version "0.8.1903"}
+        org.replikativ/datahike    {:mvn/version "0.8.1903"
+                                    :exclusions  [is.simm/partial-cps]}
         ;; 0.1.37 provides conserved resource vectors, durable receipts, and
         ;; mandatory Datahike invariants for Run resource delegation.
         ;; 0.1.38 settles a world's book by replay (ADR-172, `kontor.settlement`):
@@ -135,7 +140,7 @@
         ;; 0.3.46 merges a diverged Geschichte overlay three-way (#24): a fork
         ;; whose parent gained a commit meanwhile merges instead of fencing.
         org.replikativ/yggdrasil   {:mvn/version "0.3.46"
-                                    :exclusions  [org.babashka/sci]}
+                                    :exclusions  [org.babashka/sci is.simm/partial-cps]}
 
         ;; Scriptum — CoW Lucene indices for fulltext search
         org.replikativ/scriptum    {:mvn/version "0.1.32"}
