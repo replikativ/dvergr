@@ -14,8 +14,7 @@
             [nextjournal.markdown.transform :as mdt]
             [dvergr.activity :as activity]
             [dvergr.rooms.tree :as rooms-tree]
-            [dvergr.rooms.stats :as rstats]
-            [dvergr.web.guard :as guard]))
+            [dvergr.rooms.stats :as rstats]))
 
 (def ^:private css
   "body {
@@ -202,11 +201,19 @@
 ;; dashboard at `/` IS the index (rooms + agents + schedules), and sub-pages link
 ;; back to it via their own header.
 
+(def static-scripts
+  "The scripts every page loads, all from this origin (the pages' CSP allows
+   no other and no inline script): htmx, vendored, and the page script, which
+   keeps the browser session and registers the service worker that attaches
+   it (`dvergr.web.server`)."
+  ["/static/htmx-2.0.4.min.js" "/static/dvergr.js"])
+
 (defn csrf-field
-  "The hidden form field carrying the request's CSRF token (`dvergr.web.guard`).
-   Every POST form of the UI includes it."
+  "Formerly the CSRF token's field; the credential now travels in a header
+   (the service worker attaches it), which a cross-site form cannot send,
+   so there is none."
   []
-  [:input {:type "hidden" :name "csrf" :value guard/*csrf-token*}])
+  nil)
 
 (defn post-button
   "A one-button POST form: the state-changing counterpart of a link (a GET must
@@ -214,31 +221,31 @@
    so ids in it cannot break out of the script."
   [action label & {:keys [class confirm]}]
   [:form.post-action (cond-> {:method "post" :action action}
-                       confirm (assoc :data-confirm confirm
-                                      :onsubmit "return confirm(this.dataset.confirm);"))
+                       ;; /static/dvergr.js asks before it submits
+                       confirm (assoc :data-confirm confirm))
    (csrf-field)
    [:button {:type "submit" :class class} label]])
 
 (defn shell
   "Wrap hiccup `body` in the shared <html> chrome. Opts: :title (appended to the
    page title) and :extra-css (page-specific styles, e.g. the config form). The
-   request's CSRF token goes into a meta tag (for scripts) and the body's
-   hx-headers (for htmx requests)."
+   page loads `static-scripts` (the session is the service worker's)."
   [{:keys [title extra-css]} & body]
   (str
+   "<!DOCTYPE html>"
    (h/html
-    [:html
+    [:html {:data-dvergr-auth "page"}
      [:head
       [:meta {:charset "utf-8"}]
+      [:link {:rel "icon" :href "data:,"}]
       [:meta {:name "viewport" :content "width=device-width, initial-scale=1"}]
-      (when-let [t guard/*csrf-token*] [:meta {:name "csrf-token" :content t}])
       [:title (str "dvergr" (when title (str " · " title)))]
-      [:script {:src "https://unpkg.com/htmx.org@2.0.4" :crossorigin "anonymous"}]
+      (for [src static-scripts] [:script {:src src}])
       [:style (hu/raw-string css)]
       (when extra-css [:style (hu/raw-string extra-css)])]
-     [:body (when-let [t guard/*csrf-token*]
-              {:hx-headers (str "{\"X-CSRF-Token\": \"" t "\"}")})
-      [:div.container body]]])))
+     [:body
+      [:div.container body
+       [:div.footer [:a {:href "#" :data-dvergr-logout "1"} "log out"]]]]])))
 
 ;; =============================================================================
 ;; Tree rendering — same data source as the TUI tree view
@@ -647,7 +654,9 @@
         (when (some-> ((requiring-resolve 'dvergr.system.db/room-by-slug) slug)
                       :room/id
                       ((requiring-resolve 'dvergr.web.apps/app-exists?)))
-          [:a {:href (str "/apps/" slug "/") :target "_blank"
+          ;; a capability link, minted per click (the app is sandboxed and
+          ;; cannot carry the session header): `dvergr.web.server`
+          [:a {:href "#" :data-app slug
                :style "font-size:0.45em;color:#52b788;margin-left:12px;
                         border:1px solid #2a4a3a;border-radius:5px;padding:2px 8px;
                         text-decoration:none;"}
@@ -729,49 +738,9 @@
                                      cursor:pointer;"}
             "🎤"]]))
        [:div.footer "dvergr · room"]
-        ;; Keep the chat pinned to the newest message — but only auto-scroll
-        ;; when the user is already near the bottom, so reading history isn't
-        ;; interrupted by the 3s poll's innerHTML swap (which else jumps to top).
-       [:script (hu/raw-string
-                 "(function(){var box=document.querySelector('.msg-list');if(!box)return;
-                     var stick=true;
-                     box.addEventListener('scroll',function(){
-                       stick=(box.scrollHeight-box.scrollTop-box.clientHeight)<80;});
-                     document.body.addEventListener('htmx:afterSwap',function(e){
-                       if(e.target===box&&stick){box.scrollTop=box.scrollHeight;}});})();")]
-        ;; Voice input: toggle recording; on stop POST the webm/opus blob to
-        ;; /rooms/<slug>/voice. Errors surface on the button title/label.
-       [:script (hu/raw-string
-                 "(function(){var btn=document.getElementById('mic-btn');if(!btn)return;
-                     var rec=null,chunks=[];
-                     btn.addEventListener('click',function(){
-                       if(rec&&rec.state==='recording'){rec.stop();return;}
-                       navigator.mediaDevices.getUserMedia({audio:true}).then(function(stream){
-                         chunks=[];rec=new MediaRecorder(stream,{mimeType:'audio/webm'});
-                         rec.ondataavailable=function(e){chunks.push(e.data);};
-                         rec.onstop=function(){
-                           stream.getTracks().forEach(function(t){t.stop();});
-                           btn.textContent='…';btn.style.borderColor='#333';
-                           var blob=new Blob(chunks,{type:'audio/webm'});
-                           fetch('/rooms/'+btn.dataset.slug+'/voice',
-                                 {method:'POST',body:blob,headers:{'Content-Type':'audio/webm',
-                                  'X-CSRF-Token':document.querySelector('meta[name=csrf-token]').content}})
-                             .then(function(r){return r.json();})
-                             .then(function(j){btn.textContent='🎤';
-                               if(j.error){btn.title=j.error;}})
-                             .catch(function(){btn.textContent='🎤';btn.title='upload failed';});};
-                         rec.start();
-                         btn.textContent='⏺';btn.style.borderColor='#b85252';
-                       }).catch(function(){btn.title='microphone unavailable';});
-                     });})();")]
-        ;; Persist the Context panel's open/closed state across reloads (keyed
-        ;; per room slug). The <details> is static, so this runs once on load.
-       [:script (hu/raw-string
-                 "(function(){var d=document.querySelector('.ctx-footer');if(!d)return;
-                     var k='ctx-open:'+d.dataset.slug,v=localStorage.getItem(k);
-                     if(v==='1')d.open=true; else if(v==='0')d.open=false;
-                     d.addEventListener('toggle',function(){
-                       localStorage.setItem(k,d.open?'1':'0');});})();")]))))
+       ;; the page's behaviour (chat scroll, voice, the Context panel) is
+       ;; /static/dvergr.js: the pages allow no inline script
+       ))))
 
 (defn room-messages-fragment
   "HTMX-friendly hiccup for a Room's message log."

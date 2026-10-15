@@ -35,13 +35,14 @@
           (is (every? nil? (map #(get (:daemon h) %) [:telegram-ch :http-server :mcp-server :mcp-http])))
           (is (not (:running (mcp/status))) "no MCP server on a fixed port")
           (testing "its rooms run no schedules"
-            (ops/invoke (:daemon h) :room/create {:title "Deployed" :slug "deployed"})
+            (ops/invoke (:daemon h) dvergr.principal/local-principal :room/create {:title "Deployed" :slug "deployed"})
             (is (nil? (get @@#'dvergr.rooms.scheduler/room-schedulers :deployed))))
           (testing "a second home in the same process is refused"
             (is (thrown-with-msg? clojure.lang.ExceptionInfo #"runs a daemon" (runner/open-home! (tmp)))))
-          (testing "a candidate's MCP server is loopback, on an ephemeral port, and closed with the home"
-            (let [port (mcp/listening-port)]
-              (is (not (#{7888 8080 17880 17888 17889} port)))))
+          (testing "a candidate's MCP server is the home's socket alone (no TCP), and closed with the home"
+            (let [st (mcp/ensure-listening!)]
+              (is (nil? (:port st)) "no TCP port")
+              (is (some? (:socket-path st)))))
           (finally (runner/close-home! h))))
       (is (not (:running (mcp/status))))
       (is (false? @@#'dvergr.rooms.scheduler/suspended) "schedules run again outside it")
@@ -113,7 +114,7 @@
           (is (= d @daemon/current-daemon) "no second daemon")
           (is (= 1 (:attempt-count (first (get-in r [:scorecard :scorecard/summary])))))
           (is (some? (ops/resolve-room d (:room r))) "a room of the daemon's home")
-          (is (:complete (ops/invoke d :experiment/report {:room (:room r)})))
+          (is (:complete (ops/invoke d dvergr.principal/local-principal :experiment/report {:room (:room r)})))
           (testing "a setup that fails gives Claude Code's settings back"
             (let [before (cc/settings-snapshot)]
               (with-redefs [cc/cli-version (constantly nil)]

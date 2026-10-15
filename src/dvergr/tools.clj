@@ -14,6 +14,7 @@
             [dvergr.tools.structural :as structural]
             [dvergr.chat.compaction :as compaction]
             [dvergr.chat.tool-schema :as tool-schema]
+            [dvergr.principal :as principal]
             [geschichte.content]
             [geschichte.repo]
             [muschel.fs :as mfs]
@@ -558,6 +559,67 @@
   [ctx]
   (or (:effect-boundary ctx) (tool-boundary ctx)))
 
+;; ---------------------------------------------------------------------------
+;; Principal authorization (dvergr.principal): who runs a tool, on which room
+;; ---------------------------------------------------------------------------
+
+(def tool-authz
+  "The room action of the registry tools whose effect class understates them.
+   `clojure_eval` (and what evaluates code: `run_tests`, `shell`) is the room's
+   whole capability, so it is `:admin`; the rest follow `tool-action`."
+  {"clojure_eval" :admin, "shell" :admin, "run_tests" :admin,
+   "update_agent_profile" :admin,
+   "spawn_agent" :write, "propose_change" :write, "llm_call" :write
+   ;; served by MCP beside the registry: lists the REPL session's API
+   "repl_describe" :read})
+
+(defn tool-action
+  "The action a call of `tool` (named `tool-name`) with `input` takes on its
+   room: `tool-authz`, else `:read` when its effect only reads (`:reads`, or
+   an `:fs/read`/`:fs/list` effect), `:write` for any other classified effect,
+   and `:admin` for an unclassified tool (fail closed)."
+  [tool-name tool input]
+  (or (get tool-authz tool-name)
+      (let [c (some-> tool effect-classification)]
+        (cond
+          (nil? c) :admin
+          (= :reads c) :read
+          (fn? c) (let [e (try (c input) (catch Exception _ nil))]
+                    (if (or (= :reads e) (contains? #{:fs/read :fs/list} (:effect e))) :read :write))
+          :else :write))))
+
+(defn- room-id-str [room]
+  (let [id (:id room)] (if (keyword? id) (name id) (some-> id str))))
+
+(defn authz-request
+  "The authorizer's view of a call of registry tool `tool-name` (`tool`, or the
+   registry's) with `input` in `room` (a Room, or nil): `{:op :tool/<name>
+   :action :resource [:room id] :resolved {:room id} :args}`."
+  [tool-name tool input room]
+  (let [rid (some-> room room-id-str)]
+    {:op (keyword "tool" tool-name)
+     :action (tool-action tool-name (or tool (get @registry tool-name)) input)
+     :resource (if rid [:room rid] [:global])
+     :resolved (when rid {:room rid})
+     :args input}))
+
+(defn- principal-denial
+  "nil when the caller of this tool call may make it, else the denial: the
+   caller is `:principal` in `ctx`, or the agent `:actor` whose turn it is;
+   the room is the durable one the call acts for (`:authz-room`, the
+   `:control-room` of a nested world, else `:room`). A call that names
+   neither runs for nobody and is refused: a host call passes
+   `principal/local-principal` as `:principal`."
+  [tool-name tool input ctx]
+  (if-let [p (or (:principal ctx) (some-> (:actor ctx) principal/agent-principal))]
+    (let [room (or (:authz-room ctx) (:control-room ctx) (:room ctx))
+          {:keys [allow? reason]} (principal/decide (principal/current-daemon) p
+                                                    (authz-request tool-name tool input room))]
+      (when-not allow?
+        {:decision :denied :sources #{:principal-authorizer} :reason reason}))
+    {:decision :denied :sources #{:principal-authorizer}
+     :reason (str "Tool call " tool-name " runs for nobody: its context names no :principal or :actor")}))
+
 (defn execute
   "Execute a tool by name with given input and context.
 
@@ -580,21 +642,23 @@
       (let [default-decision {:decision :authorized
                               :sources #{(if local :agent-tool-grant
                                              :runtime-registry)}}
-            decision (if-let [authorize (:authorize tool)]
-                       (try
-                         (let [answer (authorize input ctx)]
-                           (if (contains? #{:authorized :denied :requires-decision}
-                                          (:decision answer))
-                             (update answer :sources
-                                     #(into (:sources default-decision) (or % #{})))
+            decision (if-let [denied (principal-denial tool-name tool input ctx)]
+                       denied
+                       (if-let [authorize (:authorize tool)]
+                         (try
+                           (let [answer (authorize input ctx)]
+                             (if (contains? #{:authorized :denied :requires-decision}
+                                            (:decision answer))
+                               (update answer :sources
+                                       #(into (:sources default-decision) (or % #{})))
+                               {:decision :denied
+                                :sources #{:agent-tool-grant :authorization-error}
+                                :reason "Authorizer returned no valid decision"}))
+                           (catch Exception e
                              {:decision :denied
                               :sources #{:agent-tool-grant :authorization-error}
-                              :reason "Authorizer returned no valid decision"}))
-                         (catch Exception e
-                           {:decision :denied
-                            :sources #{:agent-tool-grant :authorization-error}
-                            :reason (.getMessage e)}))
-                       default-decision)]
+                              :reason (.getMessage e)}))
+                         default-decision))]
         (if (= :authorized (:decision decision))
           (try
             ;; The runtime, not the tool implementation, owns this field: an

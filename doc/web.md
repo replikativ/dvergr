@@ -18,6 +18,14 @@ clojure -M:cli --no-tui --web           # server box: no TUI
 clojure -M:cli --web --web-port 9090    # another port
 ```
 
+Like Jupyter, it prints a login URL, `[dvergr] web dashboard: http://127.0.0.1:17880/?token=…`:
+open it once and the page reloads, logged in, without the token. The token is the daemon's
+local token, `$DVERGR_HOME/local-token` (a home from before keeps the value of its
+`mcp/http-token`, which therefore now opens the web and TCP too). The login page also takes
+the token in a form (a POST, so it stays out of the browser's history; the printed URL does
+not). `(:login-url (dvergr.web.server/start! …))` returns the URL to a REPL; the server does
+not keep it.
+
 A daemon started any other way (as a library, `daemon/start!`) starts the server when its
 config has `:http`:
 
@@ -38,24 +46,75 @@ One server runs per process.
 
 ## Security stance
 
-Neither the dashboard nor the API authenticates anyone, and the API serves every operation of
-`dvergr.ops`, admin ones included. The server therefore binds to loopback by default. Pass
-another address (`--web-bind`, `:http {:ip …}`) only behind something that authenticates,
-such as a reverse proxy.
+Every request is authenticated through the daemon's `:authenticate` seam (transport `:web`;
+`doc/mcp.md` describes the seams and the principal), from the `Authorization: Bearer` header
+alone: the local token, or a browser session's id. No credential ever travels in a cookie:
+cookies are not scoped by port, so every server on this host (an agent's dev server on
+`127.0.0.1:3000`, say) would receive one and could replay it. Where a request comes from
+grants nothing, loopback included. A run token (an agent's, `doc/mcp.md`) is for MCP only and
+is refused here.
 
-Loopback keeps other machines out, but not the pages the user's own browser shows.
-`dvergr.web.guard` checks every request before it is routed:
+- `GET <path>?token=<token>` (or the login page's POST to `/login`) with a valid token opens
+  a session and answers 303 to `<path>#sid=<id>`. A fragment is never sent to a server nor
+  in a `Referer`. The page script (`/static/dvergr.js`) keeps the id in IndexedDB, which is
+  this origin's alone (this port's) and shared by its tabs (it survives a browser restart,
+  for the session's 12 h), and registers a **service worker** (`/dvergr-sw.js`, scope `/`)
+  that adds `Authorization: Bearer <id>` to requests of this origin, room apps excepted:
+  navigations, form posts, htmx, `fetch`, new tabs, back and forward. So pages render and
+  forms submit natively. A navigation reaches the worker whoever started it, so the worker
+  gives the session to a request that changes something (any method but GET/HEAD) only when
+  its referrer is this origin; a cross-site form, or one that strips its referrer, gets none
+  (fail closed). GETs get it (bookmarks, new tabs, links from elsewhere), so no GET route
+  changes anything: the pages, the htmx fragments under `/api/` (rooms, agents, system,
+  schedules, a room's stats, messages and context), the JSON API's reads, `/api/health`,
+  room apps, `/static/`, the worker; minting an app link is a POST. As a backstop the server
+  refuses a session's change that lacks `X-Dvergr-Request: 1`, which the worker adds only
+  after that check (an outdated worker without it never adds it); a script with the local
+  token needs no such header. The worker re-issues a request with its own integrity,
+  keepalive and abort signal. A navigation without a session gets
+  the login page (200); one with a session the server refuses (it ended: a restart, 12 h, a
+  new local token, eviction) gets it with 401, and its script drops that session instead of
+  retrying it; an htmx request refused with 401 logs the page out. Sessions last 12 h, at
+  most 1000 are kept, a new local token ends them all, and `POST /logout` (the page's "log
+  out") ends the session for every tab of the browser. A wrong token is 401;
+- a script or curl sends `Authorization: Bearer $(cat $DVERGR_HOME/local-token)`.
+
+A cross-site page cannot send the header, so it needs no CSRF token; the guard below stands
+besides. A service worker needs a secure context: `http://127.0.0.1`/`localhost`, or HTTPS (a
+proxy with TLS); a dashboard opened over plain HTTP on another address cannot keep a session
+(scripts can still send the header). The pages run only this origin's scripts (vendored
+htmx, `/static/dvergr.js`), with no inline script or handler: `Content-Security-Policy:
+default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'
+data:; connect-src 'self'; form-action 'self'; object-src 'none'; base-uri 'none';
+frame-ancestors 'none'`. A proxied or hosted deployment configures an authenticator (its own credentials) and
+an `:authorize` seam. What a principal may do:
+
+- the **JSON API** and the dashboard's derived actions (`dvergr.web.ops`) run each op for the
+  request's principal, authorized like every other surface (403 with `{"error": …}` when
+  denied; listings filtered);
+- **room apps** need a read of their room. A browser opens one through a capability link the
+  room page mints per click on its "▶ app" (`/api/app-link?room=…` →
+  `/apps/<room>/~<capability>/`, an hour, that room only, `Referrer-Policy: no-referrer`):
+  the service worker gives apps no session. An app is agent-written, so every
+  response under `/apps/` carries `Content-Security-Policy: sandbox allow-scripts`: its
+  scripts run in an opaque origin and their requests say `Origin: null`, which this server
+  refuses outside `/apps/` (403);
+- the rest of the **dashboard** (hand-written views and actions straight over the daemon:
+  room pages, posts, voice, fragments) answers the local principal only, 403 for anyone
+  else. `/api/health` answers anyone authenticated.
+
+Every response outside `/apps/` refuses to be framed (`Content-Security-Policy:
+frame-ancestors 'none'`, `X-Frame-Options: DENY`), and none is content-sniffed
+(`X-Content-Type-Options: nosniff`). `dvergr.web.guard` checks every request before it is
+routed:
 
 - **Host**: the request must name this server: a loopback name, the bind address, or an
   `:allowed-hosts` entry. A DNS name rebound to 127.0.0.1 fails here, reads included.
 - **Origin**: a state-changing request (anything but GET, HEAD, OPTIONS) that names an origin
   (`Origin`, or `Referer` without it) must name this server's own or an `:allowed-origins`
   entry. A client such as curl sends neither and passes.
-- **CSRF token**: a state-changing request to the HTML UI must carry the session's token
-  (`X-CSRF-Token` header or the `csrf` form field). The token is an HMAC of the session cookie
-  under a secret made when the server starts.
-- The JSON API has no session. Its writes must be `application/json` (else 415), which a cross-site page
-  can send only after a CORS preflight, and the server grants none.
+- The JSON API's writes must be `application/json` (else 415), which a cross-site page can
+  send only after a CORS preflight, and the server grants none.
 
 Requests are limited to 1 MiB. Every route that changes state is a POST.
 

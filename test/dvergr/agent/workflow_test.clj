@@ -69,7 +69,7 @@
     (try
       (binding [ec/*execution-context* (:ctx room)] (rreg/register! room))
       (with-stub-model calls
-        (let [out (ops/invoke {:execution-ctx (:ctx room)} :workflow/attempt
+        (let [out (ops/invoke {:execution-ctx (:ctx room)} dvergr.principal/local-principal :workflow/attempt
                               {:room "workflow-op-test" :task "summarise" :attempts 2
                                :models ["claude-haiku-4-5"]})]
           (is (= :write (:kind (ops/specification :workflow/attempt))))
@@ -84,8 +84,8 @@
             (is (= [] (:shared-sources out))))
           (testing "adoption goes through the existing fork ops"
             (let [[a b] (map :world (:attempts out))]
-              (is (= a (:merged (ops/invoke {:execution-ctx (:ctx room)} :room/merge {:room a}))))
-              (is (= {:discarded b} (ops/invoke {:execution-ctx (:ctx room)} :room/discard {:room b})))))))
+              (is (= a (:merged (ops/invoke {:execution-ctx (:ctx room)} dvergr.principal/local-principal :room/merge {:room a}))))
+              (is (= {:discarded b} (ops/invoke {:execution-ctx (:ctx room)} dvergr.principal/local-principal :room/discard {:room b})))))))
       (finally
         (try (binding [ec/*execution-context* (:ctx room)] (rreg/unregister! (:id room))) (catch Throwable _ nil))
         (d/close-room! room)))))
@@ -115,14 +115,14 @@
   (with-room [room :workflow-job-test]
     (let [daemon {:execution-ctx (:ctx room)} calls (atom [])]
       (with-stub-model calls
-        (let [started (ops/invoke daemon :workflow/start
+        (let [started (ops/invoke daemon dvergr.principal/local-principal :workflow/start
                                   {:room "workflow-job-test" :task "summarise" :attempts 2
                                    :models ["claude-haiku-4-5"]})
               job (:id started)]
           (is (= "running" (:status started)) "returns at once")
           (is (pos? (:poll-after-ms started)))
           (let [done (loop [n 0]
-                       (let [st (ops/invoke daemon :job/status {:job job :wait-ms 5000})]
+                       (let [st (ops/invoke daemon dvergr.principal/local-principal :job/status {:job job :wait-ms 5000})]
                          (if (or (not= "running" (:status st)) (< 20 n)) st (recur (inc n)))))
                 result (:result done)]
             (is (= "completed" (:status done)) (pr-str (dissoc done :result)))
@@ -140,13 +140,13 @@
             (is (every? #(string? (get-in % [:review :state])) (:attempts result))
                 "each attempt's review carries the state to pin a merge to")
             (is (contains? result :wallet) "the result says what is left to spend")
-            (is (some #(= job (:id %)) (ops/invoke daemon :job/list {:room "workflow-job-test"})))
-            (is (not-any? :result (ops/invoke daemon :job/list {})) "lists stay small")
+            (is (some #(= job (:id %)) (ops/invoke daemon dvergr.principal/local-principal :job/list {:room "workflow-job-test"})))
+            (is (not-any? :result (ops/invoke daemon dvergr.principal/local-principal :job/list {})) "lists stay small")
             (let [[a b] (:attempts result)]
-              (is (= (:world a) (:merged (ops/invoke daemon :room/merge
+              (is (= (:world a) (:merged (ops/invoke daemon dvergr.principal/local-principal :room/merge
                                                      {:room (:world a)
                                                       :expect-state (get-in a [:review :state])}))))
-              (ops/invoke daemon :room/discard {:room (:world b)}))))))))
+              (ops/invoke daemon dvergr.principal/local-principal :room/discard {:room (:world b)}))))))))
 
 (deftest a-job-can-be-cancelled
   (with-room [room :workflow-cancel-test]
@@ -157,13 +157,13 @@
                                       (deref release 20000 nil)
                                       {:content "late" :tool-calls nil
                                        :usage {:input-tokens 1 :output-tokens 1} :stop-reason :end-turn})]
-        (let [job (:id (ops/invoke daemon :workflow/start
+        (let [job (:id (ops/invoke daemon dvergr.principal/local-principal :workflow/start
                                    {:room "workflow-cancel-test" :task "slow" :models ["claude-haiku-4-5"]}))
-              cancelled (ops/invoke daemon :job/cancel {:job job})]
+              cancelled (ops/invoke daemon dvergr.principal/local-principal :job/cancel {:job job})]
           (is (= "cancelled" (:status cancelled)))
           (deliver release true)
           (Thread/sleep 500)
-          (is (= "cancelled" (:status (ops/invoke daemon :job/status {:job job})))
+          (is (= "cancelled" (:status (ops/invoke daemon dvergr.principal/local-principal :job/status {:job job})))
               "work finishing after the cancel does not revive the job"))))))
 
 (deftest a-merge-is-pinned-to-the-reviewed-state
@@ -172,12 +172,12 @@
           fork (binding [ec/*execution-context* (:ctx room)] (forks/fork! room))
           fid (name (:id fork))]
       (with-redefs [forks/state-token (fn [_] "state-now")]
-        (is (= "state-now" (:state (ops/invoke daemon :room/review {:room fid}))))
+        (is (= "state-now" (:state (ops/invoke daemon dvergr.principal/local-principal :room/review {:room fid}))))
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"changed since it was reviewed"
-                              (ops/invoke daemon :room/merge {:room fid :expect-state "state-then"})))
+                              (ops/invoke daemon dvergr.principal/local-principal :room/merge {:room fid :expect-state "state-then"})))
         (is (some? (binding [ec/*execution-context* (:ctx room)] (rreg/lookup (:id fork))))
             "a refused merge leaves the fork open")
-        (is (= fid (:merged (ops/invoke daemon :room/merge {:room fid :expect-state "state-now"}))))))))
+        (is (= fid (:merged (ops/invoke daemon dvergr.principal/local-principal :room/merge {:room fid :expect-state "state-now"}))))))))
 
 (deftest a-failed-merge-is-reported-as-a-failure
   (with-room [room :workflow-merge-fail-test]
@@ -185,7 +185,7 @@
           fork (binding [ec/*execution-context* (:ctx room)] (forks/fork! room))]
       (with-redefs [forks/reconcile-merge! (fn [_] {:ok? false :error "parent is gone"})]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"failed: parent is gone"
-                              (ops/invoke daemon :room/merge {:room (name (:id fork))})))))))
+                              (ops/invoke daemon dvergr.principal/local-principal :room/merge {:room (name (:id fork))})))))))
 
 (deftest a-daemon-room-is-evaluated-in-its-own-context
   ;; A daemon room's context is a fork of the daemon's (dvergr.system.rooms).
@@ -199,10 +199,10 @@
     (try
       (binding [ec/*execution-context* (:ctx host)] (rreg/register! room))
       (with-stub-model calls
-        (let [job (:id (ops/invoke daemon :workflow/start
+        (let [job (:id (ops/invoke daemon dvergr.principal/local-principal :workflow/start
                                    {:room "workflow-child" :task "summarise" :attempts 2
                                     :models ["claude-haiku-4-5"] :timeout-ms 20000}))
-              done (ops/invoke daemon :job/status {:job job :wait-ms 25000})]
+              done (ops/invoke daemon dvergr.principal/local-principal :job/status {:job job :wait-ms 25000})]
           (is (= "completed" (:status done)) (pr-str (dissoc done :result)))
           (is (= ["completed" "completed"] (mapv :status (get-in done [:result :attempts]))))))
       (finally

@@ -22,7 +22,7 @@
 (defn- post-form [uri body]
   (web-ops/dispatch {:request-method :post :uri uri
                      :body (java.io.ByteArrayInputStream. (.getBytes ^String body "UTF-8"))}
-                    {:execution-ctx nil}))
+                    {:execution-ctx nil} dvergr.principal/local-principal))
 
 (deftest a-failed-form-op-answers-with-its-status
   (testing "the agent forms are held to the ops' rules: a bad value is a 400 and writes nothing"

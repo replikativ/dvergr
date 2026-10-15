@@ -177,54 +177,54 @@
 
 (deftest update-op-stores-wire-tags-and-provider-typed
   (ops/create-agent! {:id :w :model "m1" :tags #{:old}})
-  (spec/invoke dmn :agent/update {:id "w" :patch {:tags "a b" :provider "openai"}})
+  (spec/invoke dmn dvergr.principal/local-principal :agent/update {:id "w" :patch {:tags "a b" :provider "openai"}})
   (let [a (ops/get-agent :w)]
     (is (= #{:a :b} (:tags a)) "tags are keywords, the old one replaced")
     (is (= :openai (:provider a)) "provider is a keyword")))
 
 (deftest update-op-rejects-an-invalid-patch-before-writing
   (ops/create-agent! {:id :w :model "m1" :tags #{:old}})
-  (is (= 400 (status-of #(spec/invoke dmn :agent/update {:id "w" :patch {:model "m2" :tags 42}}))))
+  (is (= 400 (status-of #(spec/invoke dmn dvergr.principal/local-principal :agent/update {:id "w" :patch {:model "m2" :tags 42}}))))
   (let [a (ops/get-agent :w)]
     (is (= "m1" (:model a)) "nothing of the patch was applied")
     (is (= #{:old} (:tags a)))))
 
 (deftest update-op-refuses-unknown-tool-profiles-and-unbounded-budgets
   (ops/create-agent! {:id :w :model "m1" :budget-dollars 0.5})
-  (is (= 400 (status-of #(spec/invoke dmn :agent/update {:id "w" :patch {:tools :typo}}))))
-  (is (= 400 (status-of #(spec/invoke dmn :agent/update {:id "w" :patch {:budget-dollars "Infinity"}}))))
+  (is (= 400 (status-of #(spec/invoke dmn dvergr.principal/local-principal :agent/update {:id "w" :patch {:tools :typo}}))))
+  (is (= 400 (status-of #(spec/invoke dmn dvergr.principal/local-principal :agent/update {:id "w" :patch {:budget-dollars "Infinity"}}))))
   (let [a (ops/get-agent :w)]
     (is (nil? (:tools a)))
     (is (= 0.5 (:budget-dollars a))))
-  (spec/invoke dmn :agent/update {:id "w" :patch {:tools ["read_file"]}})
+  (spec/invoke dmn dvergr.principal/local-principal :agent/update {:id "w" :patch {:tools ["read_file"]}})
   (is (= #{:read_file} (:tools (ops/get-agent :w))) "tool names are stored"))
 
 (deftest update-op-of-an-unknown-agent-is-an-error
-  (is (= 404 (status-of #(spec/invoke dmn :agent/update {:id "ghost" :patch {:model "x"}})))))
+  (is (= 404 (status-of #(spec/invoke dmn dvergr.principal/local-principal :agent/update {:id "ghost" :patch {:model "x"}})))))
 
 (deftest create-op-stores-wire-values-typed-and-refuses-bad-ids
   (with-redefs [daemon/provision-agent! (fn [_ fields] (ops/create-agent! fields))]
     (is (= {:created "probe"}
-           (spec/invoke dmn :agent/create {:id " probe " :tags "a b" :provider "openai"})))
+           (spec/invoke dmn dvergr.principal/local-principal :agent/create {:id " probe " :tags "a b" :provider "openai"})))
     (let [a (ops/get-agent :probe)]
       (is (= #{:a :b} (:tags a)))
       (is (= :openai (:provider a))))
-    (is (= 400 (status-of #(spec/invoke dmn :agent/create {:id "   "}))) "a blank id")
-    (is (= 409 (status-of #(spec/invoke dmn :agent/create {:id "probe"}))) "a taken id")
-    (is (= 400 (status-of #(spec/invoke dmn :agent/create {:id "p2" :tags 42}))))
+    (is (= 400 (status-of #(spec/invoke dmn dvergr.principal/local-principal :agent/create {:id "   "}))) "a blank id")
+    (is (= 409 (status-of #(spec/invoke dmn dvergr.principal/local-principal :agent/create {:id "probe"}))) "a taken id")
+    (is (= 400 (status-of #(spec/invoke dmn dvergr.principal/local-principal :agent/create {:id "p2" :tags 42}))))
     (is (nil? (ops/get-agent :p2)) "an invalid create writes nothing")))
 
 (deftest invite-op-of-an-unknown-agent-or-room-is-an-error
   (with-redefs [spec/resolve-room (fn [_ room] (when (= "r" room) {:id :r}))
                 daemon/agent-join-config (fn [_ _] nil)]
-    (is (= 404 (status-of #(spec/invoke dmn :room/invite {:room "r" :agent "nobody"}))))
-    (is (= 404 (status-of #(spec/invoke dmn :room/invite {:room "nowhere" :agent "nobody"}))))))
+    (is (= 404 (status-of #(spec/invoke dmn dvergr.principal/local-principal :room/invite {:room "r" :agent "nobody"}))))
+    (is (= 404 (status-of #(spec/invoke dmn dvergr.principal/local-principal :room/invite {:room "nowhere" :agent "nobody"}))))))
 
 (deftest create-op-keeps-a-keyword-ids-namespace
   (with-redefs [daemon/provision-agent! (fn [_ fields] (ops/create-agent! fields))]
-    (is (= {:created "team/reviewer"} (spec/invoke dmn :agent/create {:id :team/reviewer})))
+    (is (= {:created "team/reviewer"} (spec/invoke dmn dvergr.principal/local-principal :agent/create {:id :team/reviewer})))
     (is (some? (ops/get-agent :team/reviewer)))
-    (is (= 409 (status-of #(spec/invoke dmn :agent/create {:id "team/reviewer"})))
+    (is (= 409 (status-of #(spec/invoke dmn dvergr.principal/local-principal :agent/create {:id "team/reviewer"})))
         "the keyword and the string name the same agent")))
 
 (deftest tags-round-trip-through-the-form

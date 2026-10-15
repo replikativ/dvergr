@@ -69,7 +69,7 @@
     (is (= 1.0 (:links-valid scores)) "external links and bare anchors are ignored")))
 
 (deftest the-catalog-is-listed-and-its-benchmark-set-loads
-  (let [listed (ops/invoke {:execution-ctx nil} :catalog/list {})]
+  (let [listed (ops/invoke {:execution-ctx nil} dvergr.principal/local-principal :catalog/list {})]
     (is (some #(= "wiki/v1" (:id %)) listed)))
   (let [wf (catalog/lookup "wiki/v1")
         fixtures ((get-in wf [:benchmark :fixtures]))

@@ -29,7 +29,7 @@
             _ (io/add-http-ns! sci-ctx)
             ;; A saved function must select the invocation scope, not its setup room.
             _ (sci/eval-string* sci-ctx "(def saved-get babashka.http-client/get)")
-            ctx {:control-room room :run-id run-id :tool-use-id "call-1"
+            ctx {:principal dvergr.principal/local-principal :control-room room :run-id run-id :tool-use-id "call-1"
                  :sci-ctx sci-ctx :execution-ctx (:ctx room)}]
         (try
           ;; Hato/JDK returns Integer, not Clojure's default Long literal.

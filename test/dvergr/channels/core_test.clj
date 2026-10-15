@@ -141,12 +141,12 @@
     (let [{:keys [channel]} (make-mock-channel)]
       (ch/connect! channel)
 
-      (let [ctx (tools/make-context {:cwd "."})
+      (let [ctx (tools/make-context {:principal dvergr.principal/local-principal :cwd "."})
             result (tools/execute "mock_read" {} ctx)]
         (is (= :success (:type result)))
         (is (= "mock read result" (:content result))))
 
-      (let [ctx (tools/make-context {:cwd "."})
+      (let [ctx (tools/make-context {:principal dvergr.principal/local-principal :cwd "."})
             result (tools/execute "mock_write" {:data "hello"} ctx)]
         (is (= :success (:type result)))
         (is (= "wrote: hello" (:content result))))

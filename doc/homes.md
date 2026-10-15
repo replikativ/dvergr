@@ -34,7 +34,9 @@ interactive daemon does. The Claude Code setup token is per user too
   geschichte-workspace/       the fallback Geschichte workspace store (room-less sandboxes)
   workspace/                  the sandbox load root for room-less sandboxes (a clone of the sandbox stdlib)
   blobs/                      /drive blobs, unless :blob-store names another backend
-  mcp/http-token              the bearer token of the MCP Streamable HTTP endpoint (when :mcp :http is set)
+  local-token                 the owner's credential (mode 0600): MCP over TCP and HTTP, the web
+  mcp.sock                    the MCP server's Unix domain socket (bin/dvergr-mcp connects here)
+                              (a home from before keeps its mcp/http-token's value here)
   mcp/tools-*.edn             the stdio relay's tool cache (bin/dvergr-mcp)
   mcp-daemon.nrepl-port       written when bin/dvergr-mcp starts a daemon for itself
   logs/mcp-daemon.log         that daemon's log
@@ -78,8 +80,8 @@ is three steps:
   `{:agents {} :headless? true :gc false}`): no Telegram, web or MCP listener, no agents
   (neither configured, autostart nor room members), the home's schedules suspended
   (`dvergr.rooms.scheduler/suspend!`), no storage GC. A Claude Code candidate that works in a
-  room reaches it over MCP on a loopback server on an ephemeral port
-  (`dvergr.mcp.server/listening-port`). Returns the handle `close-home!` takes.
+  room reaches it over MCP on the home's Unix domain socket
+  (`dvergr.mcp.server/ensure-listening!`). Returns the handle `close-home!` takes.
 - `(dvergr.agent.experiment.runner/run-in room opts)` runs the experiment in a room of that
   home, as a Spin.
 - `(dvergr.agent.experiment.runner/close-home! handle)` stops the daemon (and an MCP server a

@@ -247,7 +247,9 @@ main; nREPL and cider-nrepl come from `:dev` or `:cli`.
 opt-in. `:cli` and `:dev` bundle them; a bare `:local` boot is headless.
 Add the `:web` alias for the dashboard there, e.g. `clojure -M:local:web`.
 The dashboard then serves on
-`http://127.0.0.1:17880` (when `:http` is set in config).
+`http://127.0.0.1:17880` (when `:http` is set in config); open it with the
+login URL the CLI prints (`/?token=…`, the token of `$DVERGR_HOME/local-token`),
+see [web.md](web.md).
 
 **Agent doesn't reply** — make sure the provider is configured.
 `(providers/ensure-initialized!)` must run before the first

@@ -2,7 +2,9 @@
   "The web server's browser boundary: Host (DNS rebinding), Origin, the CSRF
    token, side-effect-free GETs, no wildcard CORS, and escaped HTML. Requests
    go straight to `server/handler`, so no port is bound."
-  (:require [clojure.string :as str]
+  (:require [clojure.java.shell]
+            [clojure.java.io]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [dvergr.discourse :as discourse]
             [dvergr.discourse.commands :as commands]
@@ -15,6 +17,8 @@
             [dvergr.web.dashboard :as dash]
             [dvergr.web.guard :as guard]
             [dvergr.web.server :as server]
+            [dvergr.web.apps :as web-apps]
+            [dvergr.principal :as principal]
             [hiccup2.core :as h]
             [org.replikativ.spindel.engine.context :as ctx])
   (:import (java.io ByteArrayInputStream)))
@@ -29,18 +33,17 @@
 (def ^:private host "127.0.0.1:17880")
 
 (defn- req [method uri & {:keys [headers body query]}]
-  (cond-> {:request-method method :uri uri
-           :headers (merge {"host" host} headers)}
+  (cond-> {:request-method method :uri uri :remote-addr "127.0.0.1"
+           ;; the local token: the owner's credential
+           :headers (merge {"host" host "authorization" (str "Bearer " (principal/local-token))} headers)}
     query (assoc :query-string query)
     body (assoc :body (ByteArrayInputStream. (.getBytes ^String body "UTF-8")))))
 
 (defn- session
-  "A browser session: the cookie and the token the dashboard hands out."
-  [app]
-  (let [resp (app (req :get "/dashboard"))
-        cookie (some-> (get-in resp [:headers "Set-Cookie"]) (str/split #";") first)
-        token (second (re-find #"content=\"([0-9a-f]{64})\"" (:body resp)))]
-    {:cookie cookie :token token}))
+  "Formerly a cookie and a CSRF token; the credential is the request's
+   `Authorization` header now (`req`), so there is nothing to carry."
+  [_app]
+  {})
 
 (defn- form-post [app uri form {:keys [cookie]} & {:keys [headers]}]
   (app (req :post uri
@@ -88,40 +91,113 @@
                                        :headers {"origin" "http://127.0.0.1:3000"})))))
       (is (empty? @calls) "nothing ran"))))
 
-(deftest a-missing-or-wrong-csrf-token-is-refused
-  (let [app (app) s (session app) other (session app) calls (atom [])]
-    (is (re-matches #"[0-9a-f]{64}" (str (:token s))) "the dashboard carries a token")
-    (is (str/includes? (str (:cookie s)) guard/session-cookie) "and sets a session cookie")
-    (with-room calls
-      (testing "no token"
-        (is (= 403 (:status (form-post app "/rooms/r/post" eval-cmd s)))))
-      (testing "no session cookie"
-        (is (= 403 (:status (form-post app "/rooms/r/post" (str eval-cmd "&csrf=" (:token s)) {})))))
-      (testing "a wrong token"
-        (is (= 403 (:status (form-post app "/rooms/r/post" (str eval-cmd "&csrf=" (apply str (repeat 64 "0"))) s)))))
-      (testing "another session's token"
-        (is (= 403 (:status (form-post app "/rooms/r/post" (str eval-cmd "&csrf=" (:token other)) s)))))
-      (testing "a token from another server (restarted: new secret)"
-        (let [s2 (session (dvergr.web.security-test/app))]
-          (is (= 403 (:status (form-post app "/rooms/r/post" (str eval-cmd "&csrf=" (:token s2)) s))))))
-      (is (empty? @calls))
-      (testing "the same-origin form with its token goes through"
-        (let [resp (form-post app "/rooms/r/post" (str eval-cmd "&csrf=" (:token s)) s)]
-          (is (= 303 (:status resp)))
-          (is (= [:execute] (map first @calls)))))
-      (testing "the token may come as the X-CSRF-Token header (htmx, fetch)"
-        (reset! calls [])
-        (is (= 303 (:status (form-post app "/rooms/r/post" "content=hello" s
-                                       :headers {"x-csrf-token" (:token s)}))))
-        (is (= [:post] (map first @calls)))))))
+(deftest a-cookie-authenticates-nothing
+  ;; cookies are not scoped by port: any server on this host receives them,
+  ;; so no credential ever travels in one
+  (let [a (app)
+        no-auth #(update % :headers dissoc "authorization")
+        login (a (no-auth (assoc (req :get "/dashboard") :query-string (str "token=" (principal/local-token)))))
+        sid (second (re-find #"#sid=([0-9a-f]+)$" (str (get-in login [:headers "Location"]))))]
+    (is (= 303 (:status login)))
+    (is (some? sid) "the session id rides in the fragment")
+    (is (nil? (get-in login [:headers "Set-Cookie"])) "and no cookie is set")
+    (is (= 401 (:status (a (no-auth (req :get "/api/v1/room_list" :headers {"cookie" (str "dvergr_session=" sid)}))))))
+    (is (= 401 (:status (a (no-auth (req :get "/api/v1/room_list" :headers {"cookie" (str "dvergr_token=" (principal/local-token))}))))))
+    (is (= 200 (:status (a (req :get "/api/v1/room_list" :headers {"authorization" (str "Bearer " sid)})))))
+    (testing "a page navigation without the header gets the login page, no data"
+      (let [{:keys [status body]} (a (no-auth (req :get "/dashboard" :headers {"cookie" (str "dvergr_session=" sid)})))]
+        (is (= 200 status))
+        (is (str/includes? body "data-dvergr-auth=\"shell\""))
+        (is (not (str/includes? body "agents-list")))))))
 
-(deftest voice-uploads-need-the-token
-  (let [app (app) s (session app)]
+(deftest a-refused-session-is-dropped-not-retried
+  ;; a session that ended (restart, expiry, a new token): 401, and the page
+  ;; is told to drop it, so it never loops on it
+  (let [a (app)
+        page (a (req :get "/dashboard" :headers {"authorization" "Bearer 00000000000000000000000000000000000000000000000000000000000000aa"}))
+        api (a (req :get "/api/rooms" :headers {"authorization" "Bearer nope"}))]
+    (is (= 401 (:status page)))
+    (is (str/includes? (:body page) "data-dvergr-auth=\"rejected\""))
+    (is (= 401 (:status api)) "an htmx fragment: 401, which the page script turns into a logout")))
+
+(deftest the-page-scripts-are-served-from-this-origin
+  (let [a (app)
+        no-auth #(update % :headers dissoc "authorization")]
+    (doseq [f ["/static/htmx-2.0.4.min.js" "/static/dvergr.js"]]
+      (let [{:keys [status headers body]} (a (no-auth (req :get f)))]
+        (is (= 200 status) f)
+        (is (str/starts-with? (get headers "Content-Type") "text/javascript") f)
+        (is (pos? (count body)) f)))
+    (let [{:keys [status headers]} (a (no-auth (req :get "/dvergr-sw.js")))]
+      (is (= 200 status))
+      (is (nil? (get headers "Service-Worker-Allowed")) "its scope is its own path's, the root: no widening"))
+    (is (not (str/includes? (str (:body (a (no-auth (req :get "/static/../web/server.clj"))))) "defn"))
+        "nothing but those files")
+    (testing "the pages allow no other script, inline or remote"
+      (let [csp (get-in (a (req :get "/dashboard")) [:headers "Content-Security-Policy"])]
+        (is (str/includes? csp "script-src 'self'"))
+        (is (str/includes? csp "object-src 'none'"))
+        (is (str/includes? csp "base-uri 'none'"))
+        (is (str/includes? csp "form-action 'self'"))
+        (is (str/includes? csp "default-src 'self'"))
+        (is (= "script-src 'self'" (some #(when (str/starts-with? % "script-src") %) (map str/trim (str/split csp #";"))))
+            "scripts: this origin's files only (inline styles stay allowed)")))))
+
+(deftest the-service-worker-attaches-the-session-to-this-origin-only
+  ;; a navigation reaches the worker whoever started it: a change (not GET)
+  ;; gets the session only when its referrer is this origin
+  (if-not (some #(.canExecute (java.io.File. (str % "/node")))
+                (str/split (System/getenv "PATH") #":"))
+    (println "skipped: no node on PATH")
+    (let [sw (.getPath (clojure.java.io/file (clojure.java.io/resource "dvergr/web/static/dvergr-sw.js")))
+          js (str "const {attaches}=require(" (pr-str sw) ");"
+                  "const o='http://127.0.0.1:17880', me=o+'/dashboard';"
+                  "const r=(url,method,referrer,mode)=>({url,method:method||'GET',referrer:referrer||'',mode:mode||'navigate'});"
+                  "const cases=["
+                  "[r(o+'/dashboard'),true,'a GET navigation with no referrer (bookmark, new tab)'],"
+                  "[r(o+'/dashboard','GET','https://evil.example/'),true,'a GET navigation from elsewhere (no GET changes anything)'],"
+                  "[r(o+'/rooms/r/post','POST',me),true,'a same-origin form post'],"
+                  "[r(o+'/rooms/r/post','POST','https://evil.example/x'),false,'a cross-site form post'],"
+                  "[r(o+'/rooms/r/post','POST','http://127.0.0.1:3000/x'),false,'a post from another local port'],"
+                  "[r(o+'/rooms/r/post','POST',''),false,'a post without referrer (stripped): fail closed'],"
+                  "[r(o+'/rooms/r/post','POST','about:client'),false,'about:client'],"
+                  "[r(o+'/api/v1/room_create','PUT',me,'cors'),true,'a same-origin fetch that writes'],"
+                  "[r(o+'/api/rooms','DELETE','https://evil.example/','cors'),false,'a cross-site write of any method'],"
+                  "[r('http://127.0.0.1:3000/x'),false,'another port'],[r('http://localhost:17880/x'),false,'localhost is another origin'],"
+                  "[r('https://127.0.0.1:17880/x'),false,'another scheme'],[r('http://127.0.0.1:17880.evil.example/x'),false,'a look-alike host'],"
+                  "[r(o+'/apps/r/~ab/'),false,'a room app'],[r(o+'/dvergr-sw.js'),false,'the worker itself']];"
+                  "let bad=0;for(const [q,want,why] of cases){if(attaches(q,o)!==want){console.log('FAIL',why);bad++;}}"
+                  "console.log(bad?'failed':'ok');process.exit(bad?1:0);")
+          {:keys [exit out err]} (clojure.java.shell/sh "node" "-e" js)]
+      (is (zero? exit) (str out err))
+      (is (str/includes? out "ok")))))
+
+(deftest a-sessions-change-must-pass-the-workers-check
+  ;; the server's backstop: a session id authorizes a change only with the
+  ;; header the worker adds after its same-origin check (an older worker,
+  ;; without the check, never adds it); a script with the token needs none
+  (let [a (app)
+        sid (second (re-find #"#sid=(.+)$" (get-in (a (update (assoc (req :get "/") :query-string (str "token=" (principal/local-token)))
+                                                              :headers dissoc "authorization"))
+                                                   [:headers "Location"])))
+        post (fn [headers] (a (req :post "/api/v1/room_create"
+                                   :headers (merge {"content-type" "application/json"} headers)
+                                   :body "{\"title\":\"x\"}")))]
+    (with-redefs [ops/invoke (fn [& _] {:ok true})]
+      (is (= 403 (:status (post {"authorization" (str "Bearer " sid)}))))
+      (is (= 200 (:status (post {"authorization" (str "Bearer " sid) "x-dvergr-request" "1"}))))
+      (is (= 200 (:status (post {}))) "the local token (a script) needs no such header"))
+    (testing "minting an app link changes state: POST only"
+      (is (not= 200 (:status (a (req :get "/api/app-link" :query "room=r"))))))))
+
+(deftest voice-uploads-need-a-credential
+  (let [app (app)]
     (with-redefs [rstore/slug->room-id identity rreg/lookup (constantly nil)]
-      (is (= 403 (:status (app (req :post "/rooms/r/voice"
-                                    :headers {"content-type" "audio/webm" "cookie" (:cookie s)
-                                              "origin" (str "http://" host)}
-                                    :body "audio"))))))))
+      (is (= 401 (:status (app (update (req :post "/rooms/r/voice"
+                                            :headers {"content-type" "audio/webm"
+                                                      "origin" (str "http://" host)}
+                                            :body "audio")
+                                       :headers dissoc "authorization"))))))))
 
 (def ^:private room-actions
   [["/api/rooms/r/delete" :room/delete] ["/api/rooms/r/fork" :room/fork]
@@ -130,7 +206,7 @@
 
 (deftest gets-have-no-side-effects
   (let [app (app) s (session app) calls (atom [])]
-    (with-redefs [ops/invoke (fn [_ op args] (swap! calls conj [op args]) {:id "a"})]
+    (with-redefs [ops/invoke (fn [_ _ op args] (swap! calls conj [op args]) {:id "a"})]
       (testing "the actions are no longer reachable by GET (link, img, prefetch)"
         (doseq [[uri _] room-actions]
           (let [resp (app (req :get uri))]
@@ -182,7 +258,7 @@
 
 (deftest the-json-api-refuses-cross-site-writes
   (let [app (app) calls (atom [])]
-    (with-redefs [ops/invoke (fn [_ op args] (swap! calls conj [op args]) {:ok true})]
+    (with-redefs [ops/invoke (fn [_ _ op args] (swap! calls conj [op args]) {:ok true})]
       (testing "another origin"
         (is (= 403 (:status (app (req :post "/api/v1/room_create"
                                       :headers {"content-type" "application/json"
@@ -232,15 +308,14 @@
           (is (= 301 (:status resp)))
           (is (not (re-find #"[\r\n]" (get-in resp [:headers "Location"])))))))))
 
-(deftest templates-post-their-actions-with-the-token
-  (binding [guard/*csrf-token* "tok"]
+(deftest templates-post-their-actions
+  (do
     (testing "the room tree's fork and delete are POST forms"
       (let [html (str (h/html (#'dash/room-node-hiccup {:slug "s" :title "t"} {})))]
         (is (not (str/includes? html "href=\"/api/rooms/s/")))
         (is (str/includes? html "action=\"/api/rooms/s/fork\""))
         (is (str/includes? html "action=\"/api/rooms/s/delete\""))
-        (is (str/includes? html "method=\"post\""))
-        (is (str/includes? html "value=\"tok\""))))
+        (is (str/includes? html "method=\"post\""))))
     (testing "a fork's merge and discard are POST forms"
       (let [html (str (h/html (#'dash/fork-node-hiccup {:slug "s/fork-1" :title "f"} {})))]
         (is (not (str/includes? html "href=\"/api/rooms/s/fork-1/")))
@@ -252,7 +327,125 @@
         (is (str/includes? html "action=\"/agents/a/open\""))
         (is (str/includes? html "x &amp; y"))
         (is (not (str/includes? html "&amp;amp;")))))
-    (testing "the page shell hands htmx and scripts the token"
+    (testing "the page shell loads this origin's scripts, and no inline handler"
       (let [html (dash/shell {} [:p "x"])]
-        (is (str/includes? html "content=\"tok\""))
-        (is (str/includes? html "X-CSRF-Token"))))))
+        (is (str/includes? html "src=\"/static/htmx-2.0.4.min.js\""))
+        (is (str/includes? html "src=\"/static/dvergr.js\""))
+        (is (str/includes? html "data-dvergr-auth=\"page\""))
+        (is (not (re-find #"on(click|submit)=" html)))
+        (is (not (str/includes? html "unpkg.com")))))))
+
+(deftest every-request-needs-a-credential
+  (let [no-token #(update % :headers dissoc "authorization")]
+    (testing "the local token is the owner, wherever the request comes from"
+      (is (= 200 (:status ((app) (req :get "/api/v1/room_list")))))
+      (is (= 200 (:status ((app) (assoc (req :get "/api/v1/room_list") :remote-addr "10.0.0.5"))))))
+    (testing "loopback without a credential is nobody"
+      (is (= 401 (:status ((app) (no-token (req :get "/api/v1/room_list"))))))
+      (let [{:keys [status body]} ((app) (no-token (req :get "/dashboard")))]
+        (is (= 200 status) "a page: the login page")
+        (is (str/includes? body "local-token") "it asks for the token")
+        (is (not (str/includes? body "agents-list")) "and shows nothing")))
+    (testing "Jupyter-style: the login URL opens a session in the fragment, the header carries it"
+      (let [a (app)
+            login (fn [] (a (no-token (assoc (req :get "/dashboard") :query-string (str "token=" (principal/local-token))))))
+            resp (login)
+            sid (second (re-find #"^/dashboard#sid=([0-9a-f]{64})$" (str (get-in resp [:headers "Location"]))))
+            as-sid #(assoc-in (no-token %) [:headers "authorization"] (str "Bearer " sid))]
+        (is (= 303 (:status resp)))
+        (is (some? sid) "the token is not in the URL it lands on; the session id is in its fragment")
+        (is (= 200 (:status (a (as-sid (req :get "/api/v1/room_list"))))))
+        (is (not= sid (second (re-find #"#sid=(.+)$" (get-in (login) [:headers "Location"])))) "a new id at every login")
+        (testing "a POSTed token logs in too, without the history"
+          (let [r (a (no-token (req :post "/login" :headers {"content-type" "application/x-www-form-urlencoded"
+                                                             "origin" (str "http://" host)}
+                                    :body (str "token=" (principal/local-token)))))]
+            (is (= 303 (:status r)))
+            (is (re-find #"^/#sid=" (get-in r [:headers "Location"])))))
+        (testing "log out ends the session"
+          (is (= 204 (:status (a (as-sid (req :post "/logout" :headers {"origin" (str "http://" host)
+                                                                        "x-dvergr-request" "1"}))))))
+          (is (= 401 (:status (a (as-sid (req :get "/api/v1/room_list")))))))
+        (testing "a new local token ends every session"
+          (let [sid2 (second (re-find #"#sid=(.+)$" (get-in (login) [:headers "Location"])))]
+            (swap! principal/token-generation inc)
+            (is (= 401 (:status (a (assoc-in (no-token (req :get "/api/v1/room_list"))
+                                             [:headers "authorization"] (str "Bearer " sid2))))))))
+        (is (= 401 (:status (a (no-token (assoc (req :get "/") :query-string "token=wrong"))))))))))
+
+(deftest an-authenticated-principal-gets-the-api-not-the-local-dashboard
+  (let [bob {:principal/id "party/bob" :principal/kind :human :principal/scopes #{}}
+        a (app {:authenticate (fn [{:keys [bearer]}] (when (= "tb" bearer) bob))})
+        as-bob #(assoc-in % [:headers "authorization"] "Bearer tb")]
+    (is (= 401 (:status (a (update (req :get "/api/v1/room_list") :headers dissoc "authorization")))))
+    (is (= 200 (:status (a (as-bob (req :get "/api/v1/room_list"))))))
+    (is (= 403 (:status (a (as-bob (req :get "/dashboard"))))))
+    (is (= 200 (:status (a (as-bob (req :get "/api/health"))))))))
+
+(deftest a-proxied-request-is-judged-by-its-credential-over-real-http
+  (let [server (org.httpkit.server/run-server (app) {:port 0 :ip "127.0.0.1" :legacy-return-value? false})
+        port (org.httpkit.server/server-port server)
+        client (java.net.http.HttpClient/newHttpClient)
+        get-status (fn [headers]
+                     (let [b (java.net.http.HttpRequest/newBuilder
+                              (java.net.URI. (str "http://127.0.0.1:" port "/api/v1/room_list")))]
+                       (doseq [[k v] headers] (.header b k v))
+                       (.statusCode (.send client (.build b) (java.net.http.HttpResponse$BodyHandlers/ofString)))))
+        bearer {"Authorization" (str "Bearer " (principal/local-token))}]
+    (try
+      (is (= 401 (get-status {})) "loopback without the token: refused")
+      (doseq [h ["X-Forwarded-For" "Forwarded" "X-Real-IP"]]
+        (is (= 401 (get-status {h "127.0.0.1"})) (str h " without the token: refused"))
+        (is (= 200 (get-status (assoc bearer h "10.9.9.9"))) (str h " with the token: the owner")))
+      (finally (org.httpkit.server/server-stop! server)))))
+
+(deftest room-apps-open-by-capability-sandboxed
+  (with-redefs [web-apps/handle (fn [r _ authorize!] (authorize! {:room/slug "r"} "r")
+                                  {:status 200 :headers {"Content-Type" "text/html"} :body (str "<p>" (:uri r) "</p>")})
+                ops/authorize! (fn [& _] nil)]
+    (let [a (app)
+          no-auth #(update % :headers dissoc "authorization")
+          link (a (req :post "/api/app-link" :query "room=r" :headers {"origin" (str "http://" host)}))
+          url (get (jsonista.core/read-value (:body link)) "url")]
+      (is (re-matches #"/apps/r/~[0-9a-f]{64}/" (str url)) (pr-str link))
+      (testing "the browser opens it without any credential, and the app is sandboxed"
+        (let [resp (a (no-auth (req :get (str url "index.html"))))]
+          (is (= 200 (:status resp)))
+          (is (= "<p>/apps/r/index.html</p>" (:body resp)) "served as the room's app")
+          (is (= "sandbox allow-scripts" (get-in resp [:headers "Content-Security-Policy"]))
+              "an opaque origin: no session, Origin null")
+          (is (= "no-referrer" (get-in resp [:headers "Referrer-Policy"])) "its capability stays out of Referers")))
+      (is (= 401 (:status (a (no-auth (req :get (str/replace (str url) "/r/" "/other/"))))))
+          "a link is for its own room only")
+      (is (= 401 (:status (a (no-auth (req :get (str "/apps/r/~" (apply str (repeat 64 "0")) "/")))))))))
+  (testing "a request from such a page (Origin: null) is refused before anything else, credential or not"
+    (is (= 403 (:status ((app) (req :get "/api/v1/room_list" :headers {"origin" "null"})))))
+    (is (= 403 (:status ((app) (req :get "/dashboard" :headers {"origin" "null"})))))))
+
+(deftest every-response-refuses-framing-and-sniffing
+  (doseq [uri ["/api/health" "/dashboard" "/nonexistent"]]
+    (let [{:keys [headers]} ((app) (req :get uri))]
+      (is (str/includes? (get headers "Content-Security-Policy") "frame-ancestors 'none'") uri)
+      (is (= "DENY" (get headers "X-Frame-Options")) uri)
+      (is (= "nosniff" (get headers "X-Content-Type-Options")) uri)))
+  (is (= "DENY" (get-in ((app) (req :get "/x" :headers {"host" "evil.example"})) [:headers "X-Frame-Options"]))
+      "the guard's refusals too"))
+
+(deftest a-run-token-is-no-web-credential
+  (let [t (principal/mint-run-token! {:actor :agent :room "r" :tools ["room_list"]})]
+    (try
+      (is (= 401 (:status ((app) (req :get "/api/v1/room_list" :headers {"authorization" (str "Bearer " t)})))))
+      (is (= 401 (:status ((app) (update (assoc (req :get "/") :query-string (str "token=" t)) :headers dissoc "authorization")))))
+      (finally (principal/revoke-run-token! t)))))
+
+(deftest the-login-redirect-stays-on-this-server
+  (let [resp ((app) (update (assoc (req :get "//evil.example/x") :query-string (str "token=" (principal/local-token)))
+                            :headers dissoc "authorization"))]
+    (is (re-find #"^/#sid=" (get-in resp [:headers "Location"])))))
+
+(deftest the-login-url-is-returned-not-kept
+  (let [st (server/start! (mock-daemon) :port 0)]
+    (try
+      (is (str/includes? (:login-url st) "?token="))
+      (is (nil? (:login-url @server/server-state)) "not in the server state")
+      (finally (server/stop!)))))

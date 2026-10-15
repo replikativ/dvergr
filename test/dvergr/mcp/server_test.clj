@@ -21,7 +21,7 @@
             [org.replikativ.spindel.engine.core :as ec]))
 
 (defn- ctx []
-  (server/session-context (fn [_] nil) (surface/selection {:profile "admin"})))
+  (server/session-context (fn [_] nil) (surface/selection {:profile "admin"}) dvergr.principal/local-principal))
 
 (defn- init! [c]
   (json-rpc/handle-message c {:jsonrpc "2.0" :id 1 :method "initialize"
@@ -40,7 +40,7 @@
 
 (deftest resources-derived-from-reads
   (testing "fixed resources + templates derive from the spec's :read ops"
-    (let [{:keys [resources templates]} @server/resource-definitions]
+    (let [{:keys [resources templates]} (server/resource-definitions dvergr.principal/local-principal)]
       (is (some #(= "room://list" (:uri %)) resources))
       (is (some #(= "agent://list" (:uri %)) resources))
       (is (some #(= "room://{room}/messages" (:uriTemplate %)) templates))
@@ -82,7 +82,7 @@
           [:result :tools]))
 
 (defn- session [& [meta]]
-  (let [c (server/session-context (fn [_] nil) (surface/selection {}))]
+  (let [c (server/session-context (fn [_] nil) (surface/selection {}) dvergr.principal/local-principal)]
     (json-rpc/handle-message c {:jsonrpc "2.0" :id 1 :method "initialize"
                                 :params (cond-> {:protocolVersion "2025-06-18" :capabilities {}
                                                  :clientInfo {:name "t" :version "1"}}
@@ -125,12 +125,12 @@
     (is (and (ro "room_files") (ro "room_read") (not (ro "room_write"))))
     (is (= {:readOnlyHint false :destructiveHint true :idempotentHint true :openWorldHint false}
            (select-keys (:annotations write) [:readOnlyHint :destructiveHint :idempotentHint :openWorldHint])))
-    (is (some #(= "room://{room}/files/{+path}" (:uriTemplate %)) (:templates @server/resource-definitions)))
-    (is (not-any? #(= "room_read" (:name %)) (:templates @server/resource-definitions))
+    (is (some #(= "room://{room}/files/{+path}" (:uriTemplate %)) (:templates (server/resource-definitions dvergr.principal/local-principal))))
+    (is (not-any? #(= "room_read" (:name %)) (:templates (server/resource-definitions dvergr.principal/local-principal)))
         "room_read's path is in the file template, not a template of its own")))
 
 (deftest an-unknown-profile-fails-at-connect
-  (let [c (server/session-context (fn [_] nil) (surface/selection {}))
+  (let [c (server/session-context (fn [_] nil) (surface/selection {}) dvergr.principal/local-principal)
         resp (json-rpc/handle-message c {:jsonrpc "2.0" :id 1 :method "initialize"
                                          :params {:protocolVersion "2025-06-18"
                                                   :_meta {:dvergr/profile "everything"}}})]
@@ -184,7 +184,7 @@
   (doseq [v ["2024-11-05" "2025-03-26" "2025-06-18" "2025-11-25"]]
     (is (= v (json-rpc/negotiate-version v))))
   (is (= "2025-11-25" (json-rpc/negotiate-version "2099-01-01")) "else the latest")
-  (let [resp (json-rpc/handle-message (server/session-context (fn [_] nil) (surface/selection {}))
+  (let [resp (json-rpc/handle-message (server/session-context (fn [_] nil) (surface/selection {}) dvergr.principal/local-principal)
                                       {:jsonrpc "2.0" :id 1 :method "initialize"
                                        :params {:protocolVersion "2025-06-18"}})]
     (is (= "2025-06-18" (get-in resp [:result :protocolVersion])))
@@ -234,7 +234,7 @@
   ;; change of the room, and experiment progress is a read of the room.
   (let [room (d/make-room {:id :mcp-sub-test :store (memory/make)})
         sent (atom [])
-        c (server/session-context #(swap! sent conj %) (surface/selection {:profile "admin"}))
+        c (server/session-context #(swap! sent conj %) (surface/selection {:profile "admin"}) dvergr.principal/local-principal)
         uri "experiment://mcp-sub-test/progress"
         updates #(filter (fn [m] (and (= "notifications/resources/updated" (:method m))
                                       (= uri (get-in m [:params :uri]))))
@@ -270,7 +270,7 @@
 (deftest repl-describe-lists-the-api-of-a-repl-session
   (let [ctx (sci.core/init {})
         describe #(sci.core/eval-string* ctx (str "(" @#'server/describe-form " " (pr-str %) ")"))]
-    (with-redefs [ops/invoke (fn [_ op _] {:op op})]
+    (with-redefs [ops/invoke (fn [_ _ op _] {:op op})]
       (dvergr.mcp.repl/install! ctx ::daemon (surface/selection {:profile "code"}) {:id :here}))
     (let [all (describe nil)
           ops-ns (first (filter #(= "dvergr.ops" (:ns %)) all))]

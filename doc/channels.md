@@ -29,9 +29,15 @@ slash-command menu (`setMyCommands`, derived from `dvergr.ops`).
 Every inbound message is gated by `:allowed-users` **before any side effect**:
 an unauthorized sender gets a polite refusal and nothing else runs — no paid
 transcription, no file writes, no agent turn. Match by Telegram numeric `:id`
-(stable) or `:username`. An empty or absent `:allowed-users` allows everyone
-(only sensible for a private bot); the daemon then logs a `SECURITY` warning at
-start. Set `:strict-allowlist? true` to make an empty list deny everyone instead.
+(stable) or `:username`. Who a sender then *is* is the authenticator's
+(`dvergr.principal`, doc/mcp.md): by default a sender listed in a non-empty
+`:allowed-users` acts as `telegram/<id>`, and only a sender in `:telegram
+{:owners [id …]}` (numeric ids only: a username can be changed and reused; the
+daemon refuses to start with anything else) acts as the operator (the local principal). With an
+empty `:allowed-users` the bot lets messages through the gate but identifies
+nobody, so it answers every message with a refusal before any side effect: list
+yourself (and as owner, for the operator's commands). Set
+`:strict-allowlist? true` to make an empty list deny at the gate already.
 The daemon installs both on every start, replacing the previous state, and
 `start-from-config!` (what `clojure -M:cli` uses) re-reads the config file, so
 removing a user from the config and restarting takes effect.

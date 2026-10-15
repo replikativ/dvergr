@@ -10,7 +10,8 @@
    automation clients, strict-schema model APIs), so the default profile is
    small, every tool carries annotations, and every result is JSON text plus
    the same value as `structuredContent`."
-  (:require [clojure.string :as str]
+  (:require [clojure.set :as set]
+            [clojure.string :as str]
             [jsonista.core :as json]))
 
 ;; ============================================================================
@@ -74,6 +75,7 @@
    :system   "Daemon and room statistics"
    :admin    "Archived rooms: bring one back, or purge it for good"
    :code     "File, search, shell and task tools, for hosts without their own"
+   :host     "Ops the host registered (dvergr.ops/register-op!)"
    :extra    "Tools registered at runtime (channels)"})
 
 (def profiles
@@ -94,10 +96,11 @@
 
 (defn tool-toolset
   "The toolset of the tool called `tool-name`; `op` when it is a `dvergr.ops`
-   op, else a registry tool (`:code` unless listed) or a runtime one."
+   op (`:host` when a host registered it), else a registry tool (`:code`
+   unless listed) or a runtime one."
   [tool-name op registry?]
   (cond
-    op (get op-toolsets op :extra)
+    op (get op-toolsets op :host)
     registry? (get coding-toolsets tool-name :code)
     :else :extra))
 
@@ -134,6 +137,44 @@
       (seq tools) (assoc :tools (set (map (comp str/trim name)
                                           (if (string? tools) (str/split tools #",") tools)))))))
 
+(defn principal-toolsets
+  "The toolsets `principal` may be shown, from its `:principal/scopes`: nil
+   (no cap) for the local principal, every toolset with `:dvergr/admin`, else
+   the toolsets its `:toolset/<name>` scopes name (none without any). Never
+   `:extra` for anyone but the local principal: a tool registered at runtime
+   (`dvergr.mcp.server/register-tool!`) has no authorization of its own."
+  [principal]
+  (let [scopes (set (:principal/scopes principal))]
+    (when-not (= :local (:principal/kind principal))
+      (disj (if (or (contains? scopes :dvergr/admin)
+                    ;; a run token: its pinned tools decide, by name (`capped`)
+                    (some? (:principal/tools principal)))
+              (set (keys toolsets))
+              (into #{} (keep #(when (= "toolset" (namespace %)) (keyword (name %)))) scopes))
+            :extra))))
+
+(defn capped
+  "`selection` as far as `principal` may see: its toolsets (and REPL toolsets)
+   intersected with `principal-toolsets`, which also bounds `:tools` (kept as
+   `:allowed`), and read-only with the `:dvergr/read-only` scope. A client
+   narrows its selection in `_meta`; this is what keeps it from widening it."
+  [principal selection]
+  (let [allowed (principal-toolsets principal)
+        read-only? (contains? (set (:principal/scopes principal)) :dvergr/read-only)
+        pinned-tools (:principal/tools principal)
+        pinned-room (:principal/room principal)]
+    (cond-> selection
+      ;; a run token's pins, server-side: its room, exactly its tools (a
+      ;; client may ask for fewer, never others)
+      pinned-room (assoc :room pinned-room)
+      pinned-tools (assoc :tools (if-let [asked (:tools selection)]
+                                   (set/intersection (set asked) (set pinned-tools))
+                                   (set pinned-tools)))
+      allowed (-> (update :toolsets set/intersection allowed)
+                  (assoc :allowed allowed))
+      (and allowed (:repl-toolsets selection)) (update :repl-toolsets set/intersection allowed)
+      read-only? (assoc :read-only? true))))
+
 (defn repl-selection
   "The selection whose ops a REPL of `selection` may call: its
    `:repl-toolsets` when it names them, else what it lists."
@@ -143,9 +184,12 @@
 
 (defn visible?
   "Whether a tool definition (with `:dvergr/toolset`) is in `selection`. A
-   selection with `:tools` (a set of names) sees exactly those."
+   selection with `:tools` (a set of names) sees exactly those; a capped one
+   (`capped`) never sees a toolset outside its `:allowed`."
   [selection tool-def]
-  (and (if-let [only (:tools selection)]
+  (and (or (nil? (:allowed selection))
+           (contains? (:allowed selection) (:dvergr/toolset tool-def)))
+       (if-let [only (:tools selection)]
          (contains? only (:name tool-def))
          (contains? (:toolsets selection) (:dvergr/toolset tool-def)))
        (or (not (:read-only? selection))

@@ -234,13 +234,13 @@
     (is (nil? (invocation {:tools tools})) "no room: the text protocol")
     (is (nil? (invocation {:room-id "w"})) "no tools: nothing to call")
     (with-redefs [claude-code/relay-command (constantly "/x/bin/dvergr-mcp")
-                  dvergr.mcp.server/listening-port (constantly 4711)]
+                  dvergr.mcp.server/ensure-listening! (constantly {})]
       (let [agent (invocation {:room-id "world-1" :tools tools})
             cmd (build {:model "claude-code-haiku" :agent agent})
             after (fn [flag] (second (drop-while #(not= flag %) cmd)))
             config (jsonista.core/read-value (after "--mcp-config"))]
         (is (= ["mcp__dvergr__read_file" "mcp__dvergr__write_file"] (:allowed agent)))
-        (is (= ["--port" "4711" "--no-start" "--room" "world-1" "--tools" "read_file,write_file"]
+        (is (= ["--no-start" "--room" "world-1" "--tools" "read_file,write_file"]
                (get-in config ["mcpServers" "dvergr" "args"])) "pinned to its room and tools")
         (is (= (dvergr.substrate.paths/home) (get-in config ["mcpServers" "dvergr" "env" "DVERGR_HOME"]))
             "the relay keeps its files in this process's home")

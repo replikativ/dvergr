@@ -105,7 +105,7 @@
                                           :chat {:id (:chat_id body)}}})}))]
         (ch/connect! tg-ch)
 
-        (let [ctx (tools/make-context {:cwd "."})
+        (let [ctx (tools/make-context {:principal dvergr.principal/local-principal :cwd "."})
               result (tools/execute "telegram_send"
                                     {:chat_id 12345 :text "Hello!"}
                                     ctx)]
@@ -134,7 +134,7 @@
                                                    :date 1700000000}}]})})]
         (ch/connect! tg-ch)
 
-        (let [ctx (tools/make-context {:cwd "."})
+        (let [ctx (tools/make-context {:principal dvergr.principal/local-principal :cwd "."})
               result (tools/execute "telegram_updates" {:limit 5} ctx)]
           (is (= :success (:type result)))
           (is (clojure.string/includes? (:content result) "Test"))

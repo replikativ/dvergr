@@ -50,6 +50,7 @@
             [dvergr.resource :as resource]
             [dvergr.agent.fields :as fields]
             [dvergr.rooms :as rooms]
+            [dvergr.system.db :as sdb]
             [dvergr.rooms.files :as room-files]
             [dvergr.rooms.forks :as forks]
             [dvergr.rooms.repo :as room-repo]
@@ -58,6 +59,7 @@
             [dvergr.room.store :as rstore]
             [dvergr.discourse :as d]
             [dvergr.model.registry :as reg]
+            [dvergr.principal :as principal]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.yggdrasil :as ygg]
             [taoensso.telemere :as tel]))
@@ -73,6 +75,93 @@
 
 (defmacro ^:private in-ctx [daemon & body]
   `(binding [ec/*execution-context* (dctx ~daemon)] ~@body))
+
+(def ^:dynamic *principal*
+  "The principal the current op runs for, bound by `invoke` (nil outside it).
+   An op whose effect depends on who calls it reads it: `:room/post` posts as
+   it, a job records it as its owner."
+  nil)
+
+(defn- job-opts
+  "`jobs/start!` options `m`, owned by the calling principal unless it is the
+   local one (whose jobs stay the process's, `:dvergr`)."
+  [m]
+  (let [p *principal*]
+    (cond-> m (and p (not (principal/local? p))) (assoc :actor (principal/actor p)))))
+
+(declare op-error!)
+
+(defn- created!
+  "Tell the host that the calling principal created `resource` (`:on-created`,
+   `dvergr.principal`), so it can grant its creator. Returns `resource`. Not
+   for the local principal, which needs no grant. When the grant fails,
+   `undo` (if given) removes what was created, and the op fails; without
+   `undo` the creation stays and a retry of the same op by the same
+   principal grants again (`creation`)."
+  ([daemon resource] (created! daemon resource nil))
+  ([daemon resource undo]
+   (let [p *principal*]
+     (when (and p (not (principal/local? p)))
+       (when-let [f (principal/on-created (:config daemon))]
+         (try (f p resource)
+              (catch Exception e
+                (when undo
+                  (try (undo)
+                       (catch Exception u
+                         (tel/log! {:level :error :id ::undo-failed
+                                    :data {:resource resource :error (ex-message u)}}))))
+                (op-error! (str (if undo "Not created: " (str "Created " (pr-str resource) ", but "))
+                                "the host could not grant " (pr-str resource) " to its creator: " (ex-message e)
+                                (when-not undo "; the same call again grants it"))
+                           ::created-ungranted 500 {:resource resource})))))
+     resource)))
+
+(defn- creator-of [p] (pr-str (:principal/id p)))
+
+(defn- creation
+  "How the calling principal's create of room `slug` goes, decided BEFORE
+   anything is provisioned: `:new` (the slug is now claimed for it and no
+   room exists), `:retry` (its create provisioned the room that has the
+   slug now: grant it again and return it), else a 409: the slug is someone
+   else's claim, a room its claim did not provision has it, or a concurrent
+   create claimed it first. The local principal keeps the old idempotent
+   create and takes the slug over: any claim on it is dropped."
+  [slug]
+  (let [p *principal*]
+    (if (or (nil? p) (principal/local? p))
+      (do (sdb/release-claim! slug) :new)
+      (let [me (creator-of p)
+            claim (sdb/room-claim slug)
+            row (sdb/room-by-slug slug)
+            taken #(op-error! (str "Room " slug " exists") ::room-exists 409 {:room slug})]
+        (cond
+          (= me (:creator claim)) (cond (nil? row) :new
+                                        (= (:room claim) (:room/id row)) :retry
+                                        :else (taken))
+          claim (taken)
+          row (taken)
+          (= me (sdb/claim-room! slug me)) :new
+          :else (taken))))))
+
+(defn- provisioned!
+  "Run `create` (provisions room `slug`) for the claim `creation` made: on
+   success record the room on the claim, on failure release the claim, so a
+   slug is never held by a create that did not make its room."
+  [slug create]
+  (let [p *principal*
+        claimed? (and p (not (principal/local? p)))]
+    (try
+      (let [r (create)]
+        (when claimed?
+          ;; the process took the slug over meanwhile: the room is not this create's
+          (when-not (= (creator-of p) (:creator (sdb/room-claim slug)))
+            (op-error! (str "Room " slug " was taken over while it was being created") ::room-exists 409
+                       {:room slug}))
+          (when-let [rid (:room/id (sdb/room-by-slug slug))] (sdb/claim-provisioned! slug rid)))
+        r)
+      (catch Throwable t
+        (when claimed? (try (sdb/release-claim! slug) (catch Exception _ nil)))
+        (throw t)))))
 
 (defn- id->str
   "Room/actor ids are keywords (built-ins) OR UUIDs (created rooms) — both → string."
@@ -522,7 +611,7 @@
   [daemon r op opts]
   (let [finish (promise)]
     (-> (in-ctx daemon
-                (jobs/start! r {:kind :workflow}
+                (jobs/start! r (job-opts {:kind :workflow})
                              (fn [job-id]
                                (let [{:keys [spin] :as started}
                                      (workflow/start r (assoc opts :parent-run job-id))]
@@ -571,6 +660,44 @@
 (def ^:private AgentId [:string {:description "agent id"}])
 
 ;; ============================================================================
+;; Authorization: what each op acts on
+;; ============================================================================
+;;
+;; Every op declares what it acts on, `:authz {:action :resource}`, so a host's
+;; authorizer (`dvergr.principal`) can decide per call without knowing the op:
+;;   :action   — :read | :write | :merge | :admin, or a fn of the args to one
+;;   :resource — (fn [args] -> [:room room] | [:agent id] | [:job id] | [:global])
+;;   :also     — optional (fn [daemon args] -> [[action resource] …]): further
+;;               checks (a merge writes the fork's parent too)
+;;   :filter   — optional (fn [visible? result] -> result): drop what the caller
+;;               may not read from a listing; `visible?` takes a resource
+;; An op whose schema has `:room` may leave it out: it acts on that room
+;; (`[:global]` when the room is optional and absent), as its `:kind` says
+;; (`authz-decl`). Every other op declares it; `dvergr.principal-test` checks both.
+
+(defn- on-room [{:keys [room]}] [:room room])
+(defn- on-global [_] [:global])
+(defn- on-agent [{:keys [id]}] [:agent id])
+(defn- on-job [{:keys [job]}] [:job job])
+
+(defn- by-profile
+  "A Run with the developer profile edits files and runs a shell: the room's
+   whole capability, so `:admin`; a worker's is a `:write`."
+  [{:keys [profile]}]
+  (if (= "developer" profile) :admin :write))
+
+(defn- using-agent
+  "An `:also`: the agent `k` names is put to work (its budget, its tools)."
+  [k]
+  (fn [_ args] (when-let [a (get args k)] [[:write [:agent a]]])))
+
+(defn- visible
+  "A `:filter`: the rows of a listing the caller may read, each the resource
+   `(kind (get row k))`."
+  [kind k]
+  (fn [visible? rows] (filterv #(visible? [kind (get % k)]) rows)))
+
+;; ============================================================================
 ;; The specification
 ;; ============================================================================
 
@@ -578,6 +705,7 @@
   {;; ---- reads (resources) ----
    :room/list
    {:doc "List all rooms (id, title, participants)."
+    :authz {:action :read :resource on-global :filter (visible :room :id)}
     :kind :read
     :schema [:map]
     :impl (fn [daemon _] (in-ctx daemon (mapv room-data (rreg/list-rooms))))}
@@ -609,6 +737,7 @@
 
    :run/detail
    {:doc "One durable Run: status, settlement, error, world, timestamps."
+    :authz {:action :read} ; `id` is looked up in `room` only
     :kind :read
     :schema [:map [:room Room] [:id [:string {:description "run id"}]]]
     :impl (fn [daemon {:keys [room id]}]
@@ -622,6 +751,7 @@
               "starts where the old one was; the old Run's remaining budget moves to it. A Run is "
               "resumed once. The step it stopped in is redone: if that step had posted, committed or "
               "run a shell command, check its effects first.")
+    :authz {:action :admin}
     :kind :write
     :schema [:map [:room Room] [:run [:string {:description "the stopped Run's id"}]]]
     :impl (fn [daemon {:keys [room run]}]
@@ -664,6 +794,7 @@
               "Paired comparisons: every pair of candidates (or each against `baseline`; beyond five "
               "candidates each against the best) on the cases both have a verdict for, with the exact "
               "McNemar p (Holm-adjusted) and a verdict; also as data in `paired`.")
+    :authz {:action :read} ; `experiment`/`scorecard` are looked up in `room` only
     :kind :read
     :schema [:map [:room Room]
              [:scorecard {:optional true} [:string {:description "scorecard content id"}]]
@@ -711,6 +842,7 @@
    {:doc (str "Promote a room's workflow bundle on this host: it is calibrated now and, when "
               "calibration holds, its verifier is trusted as :room (not :ad-hoc) on every Attempt "
               "and Scorecard from then on. A changed bundle is new and must be promoted again.")
+    :authz {:action :admin :resource on-global} ; a verifier trusted host-wide
     :kind :write
     :schema [:map [:room Room] [:name :string]]
     :impl (fn [daemon {:keys [room name]}]
@@ -733,6 +865,7 @@
    {:doc (str "Install a workflow export ({manifest, files}, from catalog_export) in a room as "
               "workflows/<as or its name>/, committed; refused when the files are not the bundle the "
               "manifest names. Its verifier is ad hoc here until promoted.")
+    :authz {:action :write}
     :kind :write
     :schema [:map [:room Room]
              [:export [:map [:manifest :map] [:files [:map-of :string :string]]]]
@@ -757,6 +890,7 @@
               "others cannot (no or duplicate id, an outcome left empty, the same inputs with "
               "different outcomes, an outcome its rule cannot read); the result counts them. "
               "Then catalog_calibrate and catalog_benchmark the bundle as any other.")
+    :authz {:action :write}
     :kind :write
     :schema [:map [:room Room] [:name :string]
              [:table [:string {:description "path of the table in the room's workspace"}]]
@@ -803,6 +937,7 @@
               "params filled from `params`) to `agent`, a participant, on each fire, e.g. {every: "
               "\"week\", on: \"monday\", at: \"09:00\"}. Pick the agent from the workflow's "
               "Scorecard. The room's REPL lists and cancels it (dvergr.scheduler/list, cancel).")
+    :authz {:action :write :also (using-agent :agent)}
     :kind :write
     :schema [:map [:room Room] [:name :string]
              [:agent [:string {:description "the agent (a participant of the room) that runs it"}]]
@@ -830,6 +965,7 @@
               "(web.edn), so every later attempt meets the same web and scores are comparable "
               "over time. Search is lexical over those pages. Calibrate and promote it like any "
               "bundle.")
+    :authz {:action :write}
     :kind :write
     :schema [:map [:room Room] [:name :string]
              [:as {:optional true} [:string {:description "the frozen bundle's name (default <name>-frozen)"}]]]
@@ -878,6 +1014,7 @@
               "common client call timeouts) waits that long for it to finish before answering. "
               "A benchmark job's status has `progress`: cells with a verdict of the total, faults, "
               "the phase.")
+    :authz {:action :read :resource on-job}
     :kind :read
     :schema [:map [:job [:string {:description "job id"}]]
              [:wait-ms {:optional true} [:int {:min 0 :max 25000 :description "wait up to this long (default 0)"}]]]
@@ -889,6 +1026,7 @@
 
    :job/list
    {:doc "Jobs, newest first (running and recently finished), optionally of one room; results omitted."
+    :authz {:action :read :filter (visible :job :id)}
     :kind :read
     :schema [:map [:room {:optional true} Room]]
     :impl (fn [daemon {:keys [room]}]
@@ -921,6 +1059,9 @@
               "exports/ directory. `min-reward` keeps only Attempts scoring at least that.")
     ;; A write: with `file` it creates or overwrites a file, so it must not be a
     ;; GET (the HTTP API routes reads as GETs, which a cross-site page can issue).
+    :authz {:action :read
+            ;; `file` writes under the host's state root
+            :also (fn [_ args] (when (:file args) [[:admin [:global]]]))}
     :kind :write
     :schema [:map [:room Room]
              [:limit {:optional true} [:int {:min 1 :max 1000 :description "max attempts (default 20)"}]]
@@ -942,6 +1083,7 @@
 
    :attempt/detail
    {:doc "One certified Attempt with its evidence: transcript, calls, traces, result."
+    :authz {:action :read} ; `id` is looked up in `room` only
     :kind :read
     :schema [:map [:room Room] [:id [:string {:description "attempt id"}]]]
     :impl (fn [daemon {:keys [room id]}]
@@ -953,6 +1095,7 @@
 
    :scorecard/list
    {:doc "Completed Scorecards of a room, newest first, each with its leaderboard (candidates ranked by reward, then cost per pass)."
+    :authz {:action :read} ; `experiment`/`scorecard` are looked up in `room` only
     :kind :read
     :schema [:map [:room Room]
              [:limit {:optional true} [:int {:description "max scorecards (default 20)"}]]
@@ -972,6 +1115,7 @@
               "cost, in none of its `spend` or cost per pass. `paired`: the "
               "paired comparisons (each against `baseline`, else every pair, beyond five candidates each against the best): on the cases both have a verdict "
               "for, both passed / A only / B only / both failed, the exact McNemar p, Holm-adjusted, and a verdict.")
+    :authz {:action :read} ; `id` is looked up in `room` only
     :kind :read
     :schema [:map [:room Room] [:id [:string {:description "scorecard content id"}]]
              [:baseline {:optional true} [:string {:description "candidate to compare the others against (default: the top of the leaderboard for `comparison`; for `paired` every pair, beyond five candidates each against the best)"}]]]
@@ -985,12 +1129,14 @@
 
    :agent/list
    {:doc "List all agents (durable — includes offline), with model/provider/status."
+    :authz {:action :read :resource on-global}
     :kind :read
     :schema [:map]
     :impl (fn [daemon _] (in-ctx daemon (vec (aops/list-agents))))}
 
    :agent/config
    {:doc "An agent's full configuration (model, provider, tags, prompt source)."
+    :authz {:action :read :resource on-agent}
     :kind :read
     :schema [:map [:id AgentId]]
     :impl (fn [daemon {:keys [id]}] (in-ctx daemon (aops/get-agent (keyword id))))}
@@ -1060,6 +1206,7 @@
 
    :models/list
    {:doc "Available LLM models (for agent configuration): id, name, provider, context."
+    :authz {:action :read :resource on-global}
     :kind :read
     :schema [:map]
     :impl (fn [daemon _]
@@ -1068,6 +1215,7 @@
 
    :system/stats
    {:doc "Whole-system rollup — room count, message count, agents online, total cost."
+    :authz {:action :read :resource on-global}
     :kind :read
     :schema [:map]
     :impl (fn [daemon _]
@@ -1076,20 +1224,34 @@
    ;; ---- writes (tools) ----
    :room/post
    {:doc "Post a message into a room — participate in the chat. The room's agents react."
+    :authz {:action :write}
     :kind :write
     :schema [:map [:room Room]
              [:text [:string {:description "message text"}]]
              [:as {:optional true}
-              [:string {:description "poster actor (binding-specific: :local, the tg-user, :mcp …); default :mcp"}]]]
+              [:string {:description "poster actor, for local callers only (:local, the tg-user, :mcp …); default :mcp"}]]]
+    ;; Who posts is the caller: an authenticated principal posts as itself
+    ;; (`principal/actor`) and may not name another; only the local principal
+    ;; (the process, its own tools) chooses, with `as`.
     :impl (fn [daemon {:keys [room text as]}]
-            (when-let [r (resolve-room daemon room)]
-              (in-ctx daemon
-                      (d/post! r (d/message (or (some-> as keyword) :mcp)
-                                            (d/room-target r) text nil {:role :user}))
-                      {:posted true :room (id->str (:id r))})))}
+            (let [p *principal*
+                  poster (cond (nil? p) (op-error! "room_post runs through invoke, for a principal"
+                                                   ::principal/denied 403 {})
+                               (principal/local? p) (or (some-> as keyword) :mcp)
+                               (some? as) (op-error! "`as` is for local callers only: a principal posts as itself"
+                                                     ::principal/denied 403 {:as as})
+                               :else (principal/actor p))]
+              (when-let [r (resolve-room daemon room)]
+                (in-ctx daemon
+                        (d/post! r (d/message poster (d/room-target r) text nil {:role :user}))
+                        {:posted true :room (id->str (:id r))}))))}
 
    :room/create
-   {:doc "Create a new room."
+   {:doc (str "Create a new room. An existing slug is refused (409), except that the principal "
+              "that created it may call again (its creator grant is made again).")
+    :authz {:action :write :resource on-global
+            ;; the agents it joins are put to work
+            :also (fn [_ {:keys [agents]}] (mapv (fn [a] [:write [:agent a]]) agents))}
     :kind :write
     :schema [:map [:title :string]
              [:slug {:optional true} :string]
@@ -1097,15 +1259,19 @@
     :impl (fn [daemon {:keys [title slug agents]}]
             (in-ctx daemon
                     (let [sl (or slug (slugify title))]
-                ;; create-room! returns the room-id keyword; look the live Room up.
-                      (rooms/create-room! (cond-> {:title title :slug sl}
-                                            agents (assoc :agent-ids (mapv keyword agents))))
-                      (room-data (rreg/lookup (keyword sl))))))}
+                      (when (= :new (creation sl))
+                        ;; create-room! returns the room-id keyword; look the live Room up.
+                        (provisioned! sl #(rooms/create-room! (cond-> {:title title :slug sl}
+                                                                agents (assoc :agent-ids (mapv keyword agents))))))
+                      (let [rd (room-data (rreg/lookup (keyword sl)))]
+                        (created! daemon [:room (or (:id rd) sl)])
+                        rd))))}
 
    :room/delete
    {:doc (str "Delete a room: close it and archive it, so it is neither listed nor started again. "
               "Its conversation, records and stores are kept (history is kept): room_unarchive brings "
               "it back, room_purge removes it for good.")
+    :authz {:action :admin} ;; archives the room (dvergr.authority: deleting is :admin)
     :kind :write
     :schema [:map [:room Room]]
     :impl (fn [daemon {:keys [room]}]
@@ -1117,6 +1283,7 @@
 
    :room/unarchive
    {:doc "Bring an archived room back, with its conversation, records and stores as they were."
+    :authz {:action :admin}
     :kind :write
     :schema [:map [:room [:string {:description "slug of the archived room"}]]]
     :impl (fn [daemon {:keys [room]}]
@@ -1129,6 +1296,7 @@
    {:doc (str "Remove an archived room for good: its registry entry and the stores it owns "
               "(messages, knowledge base, repository). Irreversible. Only an archived room "
               "(room_delete first), and `confirm` must repeat its slug.")
+    :authz {:action :admin}
     :kind :write
     :schema [:map
              [:room [:string {:description "slug of the archived room"}]]
@@ -1139,6 +1307,8 @@
             (let [{:keys [ok? error owned-systems-removed]} (in-ctx daemon (rooms/purge-room! room))]
               (when-not ok?
                 (throw (ex-info (str "Could not purge " room ": " error) {:type ::purge-failed :room room})))
+              ;; the slug is free again: no claim outlives its room
+              (sdb/release-claim! room)
               {:purged room :owned-systems-removed owned-systems-removed}))}
 
    :workflow/attempt
@@ -1147,6 +1317,7 @@
               "every attempt's outcome, score, bill and diff, which attempts read the same external "
               "sources (their agreement is not independent confirmation), with the world to adopt: "
               "room_merge one world, room_discard the others.")
+    :authz {:action by-profile}
     :kind :write
     :schema WorkflowArgs
     :impl (fn [daemon {:keys [room] :as args}]
@@ -1161,6 +1332,7 @@
               "attempt's outcome, bill and review, the per-model table and the room's wallet. "
               "Adopt one world with room_merge {room: world, expect-state: review.state}, "
               "room_discard the others. job_cancel stops it.")
+    :authz {:action by-profile}
     :kind :write
     :schema WorkflowArgs
     :impl (fn [daemon {:keys [room] :as args}]
@@ -1173,6 +1345,7 @@
               "scored against known answers: compare models and prompts. With `room`: on "
               "your room's own files, scored by what can be checked without answers. "
               "Poll job_status; adopt a world with room_merge.")
+    :authz {:action #(if (:room %) :admin :write)} ; a developer Run on the room's files; else a new fixture room
     :kind :write
     :schema [:map
              [:workflow [:string {:description "catalog workflow id, e.g. wiki/v1"}]]
@@ -1192,6 +1365,7 @@
                         (in-ctx daemon
                                 (rooms/create-room! {:title (str (:title wf) " (benchmark)") :slug slug})
                                 (let [r (rreg/lookup (keyword slug))]
+                                  (created! daemon [:room (id->str (:id r))])
                                   (catalog/seed! r ((get-in wf [:benchmark :fixtures])))
                                   r))))
                   {:keys [task profile evaluator environment-id]} (catalog/plan wf {:benchmark? benchmark?})]
@@ -1211,6 +1385,12 @@
               "attempts still fork the new fixture room. Returns a job; experiment_progress "
               "{room} shows every certified cell while it runs. `name` names the experiment so a "
               "later call resumes it (`experiment` is its deprecated alias).")
+    :authz {:action :write
+            ;; always a new fixture room; a room workflow (\"<room>/<name>\") reads that room's bundle
+            :also (fn [_ {:keys [workflow]}]
+                    (let [[_ rref] (when-not (get catalog/workflows (keyword workflow))
+                                     (re-find #"^([^/]+)/([^/]+)$" (str workflow)))]
+                      (cond-> [[:write [:global]]] rref (conj [:read [:room rref]]))))}
     :kind :write
     :schema [:map
              [:workflow [:string {:description "catalog workflow id, e.g. wiki/v2"}]]
@@ -1264,7 +1444,8 @@
                   slug (str "bench-" (slugify (subs (str (:id wf)) 1)) "-" (subs (str (random-uuid)) 0 8))
                   r (in-ctx daemon
                             (rooms/create-room! {:title (str (:title wf) " (benchmark)") :slug slug})
-                            (rreg/lookup (keyword slug)))
+                            (doto (rreg/lookup (keyword slug))
+                              (#(created! daemon [:room (id->str (:id %))]))))
                   exp (runner/experiment-def (assoc plan :id (keyword (or exp-name slug))
                                                     :repetitions (or repetitions 1)
                                                     ;; the host's versions: a resume never mixes two
@@ -1277,7 +1458,7 @@
                           (doto
                            (if control
                             ;; The records in `control`, the worlds forked from `r`.
-                             (jobs/start! control {:kind :experiment :ctx (:ctx r)}
+                             (jobs/start! control (job-opts {:kind :experiment :ctx (:ctx r)})
                                           #(runner/run-in control (assoc plan :experiment exp :parent-run %
                                                                          :world-parent r))
                                          ;; an allowance stopped it: running again resumes
@@ -1291,7 +1472,7 @@
                                                          (tel/log! {:level :warn :id ::fixture-room-not-archived
                                                                     :data {:room (id->str (:id r)) :error error}}
                                                                    "A benchmark's fixture room could not be archived")))))
-                             (jobs/start! r {:kind :experiment}
+                             (jobs/start! r (job-opts {:kind :experiment})
                                           #(runner/run-in r (assoc plan :experiment exp :parent-run %))
                                           :reason-of refused-reason))
                             (#(do (swap! job-experiments assoc (:id %) (:experiment/content-id exp))
@@ -1311,6 +1492,7 @@
 
    :job/cancel
    {:doc "Cancel a running job (e.g. a workflow_start): its attempts are stopped."
+    :authz {:action :write :resource on-job}
     :kind :write
     :schema [:map [:job [:string {:description "job id"}]]]
     :impl (fn [daemon {:keys [job]}]
@@ -1319,14 +1501,26 @@
 
    :room/fork
    {:doc "Fork a room for speculative work (O(1) copy-on-write); merge or discard later."
+    :authz {:action :write}
     :kind :write
     :schema [:map [:room Room]]
     :impl (fn [daemon {:keys [room]}]
             (when-let [r (resolve-room daemon room)]
-              (room-result daemon (in-ctx daemon (forks/fork! r)))))}
+              (let [f (room-result daemon (in-ctx daemon (forks/fork! r)))]
+                ;; a fork whose grant failed is discarded: a retry forks anew
+                (created! daemon [:room (:id f)]
+                          #(in-ctx daemon (some-> (resolve-room daemon (:id f)) forks/discard!)))
+                f)))}
 
    :room/merge
    {:doc "Reconcile-merge a fork back into its parent. Pass `expect-state` (from room_review or a workflow attempt's review) to merge only the state that was reviewed: a fork that changed since is refused."
+    :authz {:action :read
+            ;; the merge lands on the fork's parent: a merge there; no parent, no merge
+            :also (fn [daemon {:keys [room]}]
+                    (let [parent (some-> (resolve-room daemon room) :parent-id)]
+                      (when-not parent
+                        (throw (ex-info (str "No fork " room " with a parent to merge into") {:room room})))
+                      [[:merge [:room (id->str parent)]]]))}
     :kind :write
     :schema [:map [:room Fork]
              [:expect-state {:optional true}
@@ -1369,6 +1563,7 @@
               "(conflicted). Refused while the workspace has staged "
               "changes, and for a path that is a symbolic link. A read-only world refuses it. "
               "History is the room's: room_fork to try changes, room_diff/room_merge to adopt them.")
+    :authz {:action :write}
     :kind :write
     :schema [:map [:room Room]
              [:files [:map-of {:description "path -> {text} | {base64} | null (remove)"
@@ -1396,17 +1591,23 @@
               "(path; its committed state) or a remote URL (https, ssh), with history. Its agents then "
               "work on it in forks (workflow_start), reviewed and merged as usual; room_export returns "
               "the changes as a patch.")
+    :authz {:action :admin :resource on-global} ; reads a host path or the network
     :kind :write
     :schema [:map [:room [:string {:description "slug of the NEW room"}]]
              [:source [:string {:description "local checkout path, or https/ssh Git URL"}]]
              [:title {:optional true} :string]
              [:branch {:optional true} [:string {:description "branch of a local checkout (default: its current one)"}]]]
     :impl (fn [daemon {:keys [room source title branch]}]
-            (in-ctx daemon (room-repo/import-room! {:slug room :title title :source source :branch branch})))}
+            (let [grant! #(created! daemon [:room (or (some-> (resolve-room daemon room) :id id->str) room)])]
+              (if (= :retry (creation room))
+                (do (grant!) {:room room :retried true})
+                (doto (provisioned! room #(in-ctx daemon (room-repo/import-room! {:slug room :title title :source source :branch branch})))
+                  ((fn [_] (grant!)))))))}
 
    :room/export
    {:doc (str "The room's changes since room_import, as a patch for `git apply` in the source checkout "
               "(after adopting an attempt with room_merge). Commits the room's pending work first.")
+    :authz {:action :write}
     :kind :write
     :schema [:map [:room Room]]
     :impl (fn [daemon {:keys [room]}]
@@ -1415,6 +1616,7 @@
 
    :room/discard
    {:doc "Discard a fork without merging."
+    :authz {:action :admin} ;; drops the fork for good (dvergr.authority: discarding is :admin)
     :kind :write
     :schema [:map [:room Fork]]
     :impl (fn [daemon {:keys [room]}]
@@ -1430,6 +1632,7 @@
    {:doc (str "Create an agent (provision a durable row + bring it online). `tools`: the agent's tool "
               "names ([] for none); without it, its tags choose. Errors: a blank id or a bad field "
               "value (400), an id already taken (409).")
+    :authz {:action :admin :resource on-agent}
     :kind :write
     :schema (fields/create-schema)
     :impl (fn [daemon {:keys [id] :as args}]
@@ -1447,12 +1650,16 @@
                                    daemon (assoc fields :id kid))
                           (op-error! (str "Could not create agent " id ": no system database")
                                      ::create-failed 500 {:id id}))
+                        (created! daemon [:agent id]
+                                  ;; an agent whose grant failed is removed: a retry creates it anew
+                                  #(aops/delete-agent! kid))
                         {:created id}))))}
 
    :agent/update
    {:doc (str "Update an agent's config (partial patch: model/provider/tags/prompt/…, and `tools`: "
               "the agent's tool names, [] for none). Errors: a bad field value (400), an unknown "
               "agent (404).")
+    :authz {:action :admin :resource on-agent}
     :kind :write
     :schema [:map [:id AgentId] [:patch (fields/update-schema)]]
     :impl (fn [daemon {:keys [id patch]}]
@@ -1464,16 +1671,31 @@
 
    :agent/open
    {:doc "Open (ensure) a direct-message room with an agent; returns the room."
+    :authz {:action :write :resource on-agent}
     :kind :write
     :schema [:map [:id AgentId]]
     :impl (fn [daemon {:keys [id]}]
-            (room-result daemon
-                         (in-ctx daemon
+            ;; the local user shares the agent's DM room `dm-<agent>`; any other
+            ;; principal gets one of its own, so nobody reads another's transcript
+            (let [p *principal*
+                  own? (and p (not (principal/local? p)))
+                  slug (when own?
+                         (str "dm-" (name (keyword id)) "-"
+                              (subs (str (java.util.UUID/nameUUIDFromBytes (.getBytes (creator-of p) "UTF-8"))) 0 8)))
+                  ;; claimed before the room exists: nobody else's room by that name
+                  _ (when own? (creation slug))
+                  open! #(in-ctx daemon
                                  ((requiring-resolve 'dvergr.orchestration.daemon/ensure-agent-room!)
-                                  daemon (keyword id)))))}
+                                  daemon (keyword id) (when own? {:slug slug})))
+                  r (room-result daemon (if own? (provisioned! slug open!) (open!)))]
+              (when (and r own?)
+                ;; its own room by construction: granted on every open (idempotent)
+                (created! daemon [:room (:id r)]))
+              r))}
 
    :room/invite
    {:doc "Invite (join) an agent into a room."
+    :authz {:action :write :also (using-agent :agent)}
     :kind :write
     :schema [:map [:room Room] [:agent AgentId]]
     :impl (fn [daemon {:keys [room agent]}]
@@ -1490,6 +1712,7 @@
    :agent/delete
    {:doc (str "Delete an agent — stop the live participant, then retract its row + persona. "
               "Idempotent: an unknown id answers {deleted id} too.")
+    :authz {:action :admin :resource on-agent}
     :kind :write
     :schema [:map [:id AgentId]]
     :impl (fn [daemon {:keys [id]}]
@@ -1505,6 +1728,48 @@
 ;; Derivation helpers
 ;; ============================================================================
 
+(defonce ^:private registered
+  ;; op key -> spec: the ops a host adds (`register-op!`)
+  (atom {}))
+
+(defn operations
+  "Every op: `specification` and those registered (`register-op!`). The
+   bindings (MCP tools and resources, the JSON API, the MCP REPL) project this."
+  []
+  (merge specification @registered))
+
+(declare decl-of)
+
+(defn register-op!
+  "Add op `op` (a qualified keyword) to `operations`, with a spec as in
+   `specification` (`:doc :kind :schema :impl`, and `:authz` unless its schema
+   has a `:room`), so every binding serves it and every call of it is
+   authorized like dvergr's own. Refuses an op without an authz declaration and
+   one that would replace a dvergr op. Returns `op`."
+  [op spec]
+  (when (contains? specification op)
+    (throw (ex-info (str "Op " op " is dvergr's own") {:type ::taken :op op})))
+  (when-not (and (qualified-keyword? op) (#{:read :write} (:kind spec)) (ifn? (:impl spec)))
+    (throw (ex-info (str "Op " op " needs a qualified key, :kind :read or :write and an :impl")
+                    {:type ::invalid-op :op op})))
+  (when-not (decl-of spec)
+    (throw (ex-info (str "Op " op " declares no :authz and has no :room to derive it from")
+                    {:type ::no-authz :op op})))
+  (swap! registered assoc op spec)
+  op)
+
+(defn unregister-op!
+  "Remove a registered op."
+  [op]
+  (swap! registered dissoc op)
+  nil)
+
+(defn watch-operations!
+  "Call `(f)` under `k` whenever the registered ops change (a binding that
+   projects them re-derives)."
+  [k f]
+  (add-watch registered k (fn [_ _ old new] (when-not (identical? old new) (f)))))
+
 (defn op->name
   "Op key → flat binding name: `:room/post` → \"room_post\"."
   [op]
@@ -1514,7 +1779,7 @@
   "The malli args schema for op `op` (a `[:map …]`) — the source the HTTP/JSON
    API coerces against directly."
   [op]
-  (:schema (get specification op)))
+  (:schema (get (operations) op)))
 
 (defn input-schema
   "JSON Schema for op `op`'s args — the malli `:schema` projected via
@@ -1522,13 +1787,130 @@
   [op]
   (mjs/transform (malli-schema op)))
 
-(defn reads  [] (into {} (filter (comp #(= :read  (:kind %)) val) specification)))
-(defn writes [] (into {} (filter (comp #(= :write (:kind %)) val) specification)))
+(defn reads  [] (into {} (filter (comp #(= :read  (:kind %)) val) (operations))))
+(defn writes [] (into {} (filter (comp #(= :write (:kind %)) val) (operations))))
+
+(defn- room-entry
+  "The `:room` entry of a `[:map …]` schema, or nil."
+  [sch]
+  (when (and (vector? sch) (= :map (first sch)))
+    (some #(when (and (vector? %) (= :room (first %))) %) (rest sch))))
+
+(defn- decl-of
+  "What the op of spec entry `spec` acts on (see `authz-decl`), or nil."
+  [{:keys [kind authz schema]}]
+  (let [entry (room-entry schema)
+        derived (when entry
+                  {:action (if (= :read kind) :read :write)
+                   :resource (if (and (map? (second entry)) (:optional (second entry)))
+                               (fn [{:keys [room]}] (if room [:room room] [:global]))
+                               on-room)})
+        decl (merge derived authz)]
+    (when (and (:action decl) (:resource decl))
+      decl)))
+
+(defn authz-decl
+  "What op `op` acts on: its `:authz`, over the declaration its schema and
+   `:kind` imply (an op with a `room` acts on that room, a read reads it, a
+   write writes it; `[:global]` when the room is optional and absent). nil
+   when neither says: such an op must declare it."
+  [op]
+  (decl-of (get (operations) op)))
+
+(defn resolve-resource
+  "What dvergr knows of `resource`: a room (`[:room id-or-slug]`) as its id,
+   a job (`[:job id]`) as its room's id and its owner (the actor that started
+   it), else nil (a handle that resolves to nothing, an agent, `[:global]`).
+   The authorizer gets both; it decides what an unresolved handle means."
+  [daemon [kind x]]
+  (case kind
+    :room (when (some? x)
+            (when-let [r (resolve-room daemon x)] {:room (id->str (:id r))}))
+    :job (when-let [{:keys [room owner]} (in-ctx daemon (some-> (uuid-arg x) jobs/owner))]
+           {:room (id->str (:id room)) :owner owner})
+    nil))
+
+(defn authz-request
+  "The authorizer's view of a call of `op` with `args`: `{:op :action
+   :resource :resolved :args}` (`resolve-resource`)."
+  [daemon op args]
+  (let [{:keys [action resource]} (authz-decl op)
+        r (resource args)]
+    {:op op
+     :action (if (fn? action) (action args) action)
+     :resource r
+     :resolved (resolve-resource daemon r)
+     :args args}))
+
+(defn check!
+  "Throw a 403 op error unless the authorizer allows `request` for `principal`."
+  [daemon principal request]
+  (let [{:keys [allow? reason]} (principal/decide daemon principal request)]
+    (when-not allow?
+      (op-error! reason ::principal/denied 403
+                 (select-keys request [:op :action :resource])))))
+
+(defn- fail-closed
+  "`(f)`, or a 403 when it throws: an authorization whose resource cannot be
+   resolved is denied, never skipped."
+  [op f]
+  (try (f)
+       (catch clojure.lang.ExceptionInfo e
+         (if (= ::principal/denied (:type (ex-data e)))
+           (throw e)
+           (op-error! (str "Not authorized: " (op->name op) " (" (ex-message e) ")")
+                      ::principal/denied 403 {:op op})))
+       (catch Exception e
+         (op-error! (str "Not authorized: " (op->name op) " (" (ex-message e) ")")
+                    ::principal/denied 403 {:op op}))))
+
+(defn authorize!
+  "Throw unless `principal` may call `op` with `args` on `daemon`: the op's own
+   declaration, then its `:also` checks. Anything that throws on the way denies."
+  [daemon principal op args]
+  (when-not (principal/local? principal)
+    (fail-closed
+     op
+     #(do (check! daemon principal (authz-request daemon op args))
+          (when-let [also (:also (authz-decl op))]
+            (doseq [[action resource] (also daemon args)]
+              (check! daemon principal {:op op :action action :resource resource
+                                        :resolved (resolve-resource daemon resource) :args args})))))))
+
+(defn visible?
+  "Whether `principal` may read `resource` (a listing's row) for `op`. A
+   resolution that throws hides it."
+  [daemon principal op resource]
+  (or (principal/local? principal)
+      (try (:allow? (principal/decide daemon principal
+                                      {:op op :action :read :resource resource
+                                       :resolved (resolve-resource daemon resource)}))
+           (catch Exception _ false))))
 
 (defn invoke
-  "Run op `op` (a spec key) with `args` (a keyword map) against `daemon`. Returns
-   the op's data result, or throws. The single call-path every binding uses."
-  [daemon op args]
-  (if-let [{:keys [impl]} (get specification op)]
-    (impl daemon (or args {}))
+  "Run op `op` (a key of `operations`) with `args` (a keyword map) against
+   `daemon` for `principal`: authorized first (`authorize!`; a 403 op error
+   when denied), a listing filtered to what the principal may read. Returns
+   the op's data result, or throws. The single call-path every binding uses.
+
+   There is no default principal. A surface passes the one it authenticated
+   (`dvergr.principal`); in-process code that holds the daemon (the REPL, the
+   TUI, room-run, the experiment runner) passes `principal/local-principal`.
+   `daemon` is anything with the `:execution-ctx` the ops run in and, for
+   the seams, a `:config` with `:auth`: a host without a dvergr daemon passes
+   `{:execution-ctx ctx}` and configures the seams with `principal/configure!`."
+  [daemon principal op args]
+  (when-not (map? principal)
+    (throw (ex-info "invoke needs a principal (dvergr.principal)" {:type ::no-principal :op op})))
+  (when (principal/forged-local? principal)
+    (op-error! "A principal of kind :local that is not the process's is refused"
+               ::principal/denied 403 {:op op}))
+  (if-let [{:keys [impl]} (get (operations) op)]
+    (let [args (or args {})]
+      (authorize! daemon principal op args)
+      (let [result (binding [*principal* principal] (impl daemon args))
+            filt (:filter (authz-decl op))]
+        (if (and filt (not (principal/local? principal)))
+          (filt #(visible? daemon principal op %) result)
+          result)))
     (throw (ex-info (str "Unknown op: " op) {:op op}))))

@@ -16,7 +16,7 @@
   (let [{:keys [conn close!] :as repository}
         (gfs/memory-repository! {:name "structured-tools"})
         filesystem (gfs/make-root repository)
-        ctx (tools/make-context {:cwd "/" :filesystem filesystem})]
+        ctx (tools/make-context {:principal dvergr.principal/local-principal :cwd "/" :filesystem filesystem})]
     (try
       (is (= :success (:type (tools/execute "write_file"
                                             {:path "src/demo.clj"
@@ -72,7 +72,7 @@
         workspace {:conn conn :id [(get-in @conn [:config :store :id]) :db]
                    :repository repository}
         filesystem (gfs/make-root repository)
-        tctx (tools/make-context {:cwd "/" :filesystem filesystem})
+        tctx (tools/make-context {:principal dvergr.principal/local-principal :cwd "/" :filesystem filesystem})
         ctx (sci/init {})]
     (try
       (io/add-fs-ns! ctx :filesystem filesystem)
@@ -345,7 +345,7 @@
     (spit (java.io.File. dir ".env") "SECRET=hunter2\n")
     (spit (java.io.File. dir ".env.local") "SECRET=hunter3\n")
     (spit (java.io.File. dir ".ssh/id_rsa") "SECRET key\n")
-    (let [run (fn [input] (tools/execute "grep" input {:cwd (str dir)}))]
+    (let [run (fn [input] (tools/execute "grep" input {:principal dvergr.principal/local-principal :cwd (str dir)}))]
       (testing "sensitive files are not searched"
         (let [{:keys [content]} (run {:pattern "SECRET"})]
           (is (str/includes? content "src/a.txt:1:SECRET is mentioned here"))

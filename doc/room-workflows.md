@@ -121,7 +121,7 @@ first N cases of a dataset in a fixed shuffle (seed 20261001), so the same N giv
 cases every time. It prints each candidate's reward and two costs, then the report from
 `experiment_report` (to stdout, or to `--report FILE` when given), and exits 1 when cells did
 not finish. A `claude-code-*` candidate works through dvergr's MCP tools, which the home's
-daemon serves on an ephemeral loopback port. `dvergr.catalog.room/experiment!` (and
+daemon serves on its home's Unix domain socket. `dvergr.catalog.room/experiment!` (and
 `dvergr.catalog.room-run/benchmark!`) is the same path from the REPL.
 
 **Billed and list price.** `billed` is what the run was charged: about $0 for subscription

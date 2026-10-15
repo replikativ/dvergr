@@ -8,8 +8,24 @@ what it cost. The tools are derived from `dvergr.ops/specification` (and the roo
 ## Connecting a client
 
 A client launches `bin/dvergr-mcp` (babashka) as a stdio server. It relays to the daemon's
-loopback TCP port (default `127.0.0.1:17888`). Its files live under the state root,
-`DVERGR_HOME` (default `<checkout>/.dvergr`):
+**Unix domain socket** in the state root (`$DVERGR_HOME/mcp.sock`; when that path is too long
+for a socket, `<runtime>/dvergr/<hash>.sock` in the user's runtime directory,
+`$XDG_RUNTIME_DIR` or `/run/user/<uid>`, else `/tmp/dvergr-<uid>/<hash>.sock`;
+`server/socket-path`). The daemon binds it only in a directory that is this uid's, mode 0700
+and not a symbolic link (it closes its own home to 0700, refuses any other), and the relay
+checks the same, and that the socket is this uid's, before it sends its credential. So
+only this user can be at the other end, and the relay never hands its credential to
+whatever holds a TCP port first (another user may bind 17888 before the daemon). `--tcp`
+(with `--port`, `--host`) uses the daemon's TCP port instead, when the daemon has one
+(`:tcp true`), and then the credential goes to whoever holds it. Its files live under the state root, `DVERGR_HOME`
+(default `<checkout>/.dvergr`, made 0700):
+
+- it presents the state root's **local token** (`$DVERGR_HOME/local-token`, mode 0600, which
+  the daemon creates; a home from before has it in `mcp/http-token`, and that value stays
+  valid and now opens the web and TCP too) as the first line of every connection, or
+  `DVERGR_MCP_TOKEN` when it is given one (a run token, below). A daemon accepts no
+  connection without a credential, its socket included, and the relay says so when it is
+  refused;
 
 - when no daemon listens, it starts one (`clojure -M:cli --no-tui --mcp …`, log in
   `$DVERGR_HOME/logs/mcp-daemon.log`, nREPL port in `$DVERGR_HOME/mcp-daemon.nrepl-port`) and
@@ -48,8 +64,10 @@ Options (flags or environment): `--profile` / `DVERGR_MCP_PROFILE`, `--toolsets 
 (the checkout the daemon starts in), `DVERGR_HOME` (state root), `DVERGR_MCP_START` (the start
 command), `--no-start`, `--wait-s` (default 120).
 
-To run the daemon yourself: `clojure -M:cli --no-tui --mcp [--mcp-port 17888]`, or
-`:mcp {:port 17888 :profile "offload"}` in the config file. The daemon inherits its
+To run the daemon yourself: `clojure -M:cli --no-tui --mcp`, or `:mcp {:profile "offload"}`
+in the config file: MCP on the home's socket. TCP is opt-in, `--mcp-tcp [--mcp-port 17888]`
+or `:mcp {:tcp true :port 17888}`, for clients that cannot use the socket (the relay then
+needs `--tcp`). The daemon inherits its
 environment: a `TELEGRAM_BOT_TOKEN` there connects that bot.
 
 **A connection pinned to one room.** `--room ROOM --tools read_file,write_file` gives a
@@ -59,7 +77,13 @@ agent works in a benchmark Attempt: a `claude-code-*` candidate runs `claude -p`
 Attempt's world, with this relay in `--mcp-config` (its own built-in tools disabled, only
 `mcp__dvergr__<tool>` allowed, its own loop of up to 60 turns); the CLI calls the same tools
 every other candidate gets, natively, and the evaluator scores the world when it answers. The
-daemon (or any process running an Attempt) serves MCP on a loopback port for it.
+daemon (or any process running an Attempt) serves MCP on its home's socket for it. Each
+call gets a **run token** (`principal/mint-run-token!`), passed to the relay as
+`DVERGR_MCP_TOKEN`: it authenticates as that agent, and the server pins the connection to the
+token's room and tools whatever the relay asks (resources included: only those its tools
+name). It carries no scope of its own and is accepted over MCP only, never by the web. It is
+revoked when the call ends, however it ends (and expires after an hour); its connections close
+then, and its principal authorizes nothing more.
 This path needs the relay at `bin/dvergr-mcp` under the process's working directory (a
 checkout; `DVERGR_MCP_RELAY` names another path) and babashka (`bb`) to run it. Without the
 relay, or without a work room and tools, `claude -p` answers once and calls tools through the
@@ -67,14 +91,15 @@ text `<tool_use>` protocol instead (`dvergr.model.api.claude-code`), so scores f
 paths are not the same measurement.
 
 **Over HTTP, without the relay.** Give the daemon `:mcp {:port 17888 :http {:port 17889}}` and
-it also serves Streamable HTTP at `http://127.0.0.1:17889/mcp` (loopback only). Requests need
-the bearer token the daemon writes to `mcp/http-token` in its state root (`$DVERGR_HOME`, default
-`.dvergr` in the directory it started in; mode 0600) on its first start.
+it also serves Streamable HTTP at `http://127.0.0.1:17889/mcp`. Without an authenticator of
+the daemon's own (below), requests need the local token as a bearer: the daemon writes it to
+`local-token` in its state root (`$DVERGR_HOME`, default `.dvergr` in the directory it started
+in; mode 0600) on its first start; it makes the caller the local principal.
 Claude Code:
 
 ```sh
 claude mcp add --transport http dvergr http://127.0.0.1:17889/mcp \
-  --header "Authorization: Bearer $(cat "${DVERGR_HOME:-.dvergr}/mcp/http-token")"
+  --header "Authorization: Bearer $(cat "${DVERGR_HOME:-.dvergr}/local-token")"
 ```
 
 or in `.mcp.json`:
@@ -91,6 +116,120 @@ Other clients that speak Streamable HTTP take the same URL and header. The selec
 Which to use: the **stdio relay** starts the daemon when none runs and hides its restarts, so a
 client never sees its server die; **HTTP** needs a running daemon, has no relay process, and
 is the way to a hosted dvergr (behind a TLS proxy; the listener itself stays on loopback).
+A hosted dvergr also needs an authenticator and an authorizer of its own (below): the
+defaults trust whoever reaches the daemon the way only its local user can.
+
+## Who is calling: principals, authentication, authorization
+
+Every call has a **principal** (`dvergr.principal`), a plain map:
+
+```clojure
+{:principal/id     "party/5f0c…"        ; stable, compared by =
+ :principal/kind   :human               ; :human | :agent | :local
+ :principal/actor  :party/5f0c…         ; who it posts as (default: derived from the id)
+ :principal/scopes #{:toolset/rooms}    ; what MCP may show it
+ :principal/claims {…}}                 ; the authenticator's evidence, opaque to dvergr
+```
+
+Three seams decide who it is, what it may do, and what it owns. They are set in the daemon
+config, `:auth {:authenticate f :authorize f :on-created f}` (a function, or a qualified symbol
+naming one), or, for a host that runs dvergr's rooms without a daemon, process-wide with
+`principal/configure!`:
+
+- **`:authenticate`** `(fn [request] -> principal | nil)`. `request` carries `:transport`
+  (`:mcp-stdio`, `:mcp-tcp`, `:mcp-http`, `:web`, `:telegram`), `:bearer` (the credential: a
+  TCP connection's first line, `Authorization: Bearer`; never a cookie),
+  `:remote-addr` and `:headers` (for information only), `:local-token` when a listener was
+  given its own, for Telegram `:telegram/user`, `:telegram/chat-id` and `:telegram/owner?`.
+  nil refuses the caller: 401 over HTTP, an error (-32001) and a closed connection over TCP, a
+  refusal in Telegram.
+  The default, `principal/default-authenticate`, takes **credentials only**; where a request
+  comes from (loopback, a proxy's headers) grants nothing. The stdio transport of
+  `run-stdio` is its owner, the local principal. On TCP, HTTP and the web the local token
+  (`principal/local-token`, compared in constant time) is the local principal and a live run
+  token is its agent; anything else is refused. A Telegram sender is the local principal only
+  when the host names it as an owner (`:telegram {:owners [id …]}`, numeric ids only: a
+  username can be changed and taken), `telegram/<id>`
+  when a non-empty allowlist lists it, else refused. A configured authenticator replaces the
+  default; a hosted one should hand out the local principal to nobody, and should map a bearer
+  it does not know through `principal/run-token-principal`, so dvergr's own agent runs
+  (`claude -p` candidates) keep their credentials.
+- **`:authorize`** `(fn [principal request] -> decision)`. `request` is `{:op :action :resource
+  :resolved :args}`: the op (`:room/post`, or `:tool/clojure_eval` for a registry tool), its
+  action (`:read`, `:write`, `:merge`, `:admin`), the resource as the caller named it (`[:room
+  "general"]`, `[:job "<id>"]`, `[:agent "var"]`, `[:global]`) and what dvergr resolved it to
+  (`{:room "<room id>"}`; for a job also `:owner`, the actor that started it; nil for a handle
+  that resolves to nothing). Deny `:resolved nil` except where the op creates what it names.
+  A decision is a boolean or `{:allow? … :reason …}`. A throw denies, and so does a resolution
+  that throws. The default, `principal/allow-all`, allows everything.
+- **`:on-created`** `(fn [principal resource])`, called after a principal other than the local
+  one created a room (`room_create`, `room_fork`, `room_import`, `agent_open`, a catalog
+  fixture room) or an agent (`agent_create`), so the host can grant it its creator. It may be
+  called again for the same principal and resource: make it idempotent. When it throws, the
+  op fails (500) and is recoverable: a fork or an agent whose grant failed is removed again
+  (a retry creates it anew); a room from `room_create` or `room_import` stays, recorded as
+  that principal's (`:room/creator` in the system DB), and the same call by the same
+  principal grants it again instead of answering "exists". A catalog fixture room whose grant
+  failed stays ungranted; each benchmark makes a new one.
+
+A principal never receives a room it did not create: `room_create` and `room_import` refuse
+an existing slug (409) unless that principal created it, and `agent_open` gives each
+principal other than the local one a DM room of its own (`dm-<agent>-<hash>`; the local
+user keeps the shared `dm-<agent>`).
+
+The local principal is the process itself and is never asked. It is recognized by identity
+(an unforgeable marker), not by `:principal/kind`: `principal/decide` and `invoke` refuse a
+principal that claims kind `:local` without being it, without asking the authorizer.
+
+What each op acts on is declared in `dvergr.ops/specification`, `:authz {:action :resource
+:also :filter}`. Every write declares it; a read with a `room` argument may leave it to the
+default (reading that room). `:also` adds checks beyond the op's own resource:
+`room_merge` reads the fork and needs `:merge` on its parent (no parent, no merge);
+`catalog_benchmark` writes `[:global]` (it creates a fixture room) and reads the room of a
+room workflow (`<room>/<name>`); `room_invite` and `catalog_deploy` write the agent they put
+to work; `attempt_export` with `file` is `:admin` on `[:global]` (the host's state root).
+Archiving (`room_delete`), discarding a fork, purging, agent administration, imports from a
+host path, promoting a verifier (`[:global]`) and the admin toolset are `:admin`; so is a
+developer-profile Run (`workflow_start`/`workflow_attempt` with `profile: developer`,
+`catalog_start` on a room), whose agents edit files and run a shell. Listings (`room_list`,
+`job_list`) show only the rows the principal may read. A job records the principal that
+started it as its owner.
+
+Registry tools are authorized per call, for the principal in the tool context (MCP, operator
+commands) or the agent whose turn it is (`:actor`), on the room the call acts for:
+`clojure_eval`, `shell` and `run_tests` are `:admin` (the room's whole capability), the others
+`:read` or `:write` as their effect is, a tool without a classification `:admin`. A call that
+names neither a principal nor an actor is refused; host code passes
+`principal/local-principal`. `dvergr.principal-test` checks that every op and every registry
+tool has a declaration.
+
+The principal reaches every surface: each MCP connection (and each HTTP request) is
+authenticated, every tool call, resource read and subscription is authorized for it, and a
+denial is a tool error (`isError: true`, "Not authorized: …") or, for a resource, `-32002`.
+A subscription is authorized again before each notification: one whose access was revoked is
+dropped. What a client asks for in `_meta` (`dvergr/profile`, `dvergr/toolsets`,
+`dvergr/tools`) is **capped** to the principal's scopes (`surface/capped`): `:toolset/<name>`
+grants a toolset, `:dvergr/admin` all of them, `:dvergr/read-only` keeps it read-only. The cap
+holds for resources too. A client narrows its selection, never widens it; a principal without
+scopes sees no tools. Tools registered at runtime (`register-tool!`, the `extra` toolset) have
+no authorization of their own and are the local principal's only. An HTTP handshake session
+belongs to the principal that opened it: another principal holding its `Mcp-Session-Id` gets
+404.
+
+`room_post` posts as the principal (`principal/actor`); its `as` is for the local principal
+only, and refused for anyone else. Slash commands (`dvergr.discourse.commands`) run for the
+`:principal` their host passes and are authorized on their room as `:command/<name>`:
+`/help` reads, a prompt or skill writes (it posts a turn), a handler and every other
+built-in (`/model`, `/sandbox`, `/build`, `/fork`, `/invite`) is `:admin`; a command without
+a principal is refused. `dvergr.ops/invoke` takes the principal explicitly; there is
+no default. In-process code that holds the daemon (the REPL, the TUI, `room-run`, the
+experiment runner) passes `principal/local-principal`. A Telegram message is authenticated
+once; its ops commands, tool commands and posts all run for that principal.
+
+A host adds its own ops with `ops/register-op!` (a spec entry as in `specification`, with an
+`:authz` unless its schema has a `room`): MCP serves it (toolset `host`), the JSON API routes
+it, the REPL's `dvergr.ops` has it, and each call is authorized as dvergr's own. A host without
+a dvergr daemon calls `ops/invoke` with `{:execution-ctx ctx}` as the daemon.
 
 ## Profiles and toolsets
 
@@ -121,6 +260,7 @@ neither listed nor callable.
 | `agents` | agent administration (`agent_create`/`agent_update` take `tools`, below), `room_invite` |
 | `system` | statistics |
 | `admin` | `room_unarchive` brings an archived room back, `room_purge` removes it and its stores for good, `catalog_promote`, `run_resume` (admin profile only) |
+| `host` | ops a host registered (`dvergr.ops/register-op!`); none by default |
 | `code` | every `dvergr.tools` registry tool but `clojure_eval` and `repl_describe`: files, search, shell, tasks, and the `schedule_*` and `mail_*` tools the daemon registers at start; for hosts without their own (off by default). The list follows the registry (`tools/list_changed`) |
 | `extra` | tools registered at runtime that are neither ops nor registry tools (channels) |
 
@@ -263,7 +403,10 @@ around 40, and every definition costs context in every session.
 
   The REPL has exactly the authority of the connection's tools: only the ops its selection
   shows are installed, and each selection has a REPL session of its own (`:mcp/offload`, …),
-  so a connection never reaches a function another one installed. `room-delete` and
+  so a connection never reaches a function another one installed; a principal other than the
+  local one has sessions of its own besides. Each function runs for the principal and
+  selection of the evaluation calling it (`dvergr.mcp.repl/*caller*`), never for whoever
+  defined it, and is refused outside an evaluation (a later step of a Spin, another thread). `room-delete` and
   `room-purge` refuse the room the REPL runs in. An agent's own sandbox gets none of this.
 - REPL definitions live in the daemon's memory: they do not survive a daemon restart. Keep
   lasting code in the room's workspace.
@@ -305,15 +448,24 @@ Both eras of the protocol, decided per request, so one connection may carry both
   subscribe gets no notifications; a handshake connection gets list changes as before.
 
 **Streamable HTTP** (`dvergr.mcp.http`, `:mcp {:http {:port 17889}}` in the daemon config): one
-`POST /mcp` endpoint on its own loopback listener. Every request needs `Authorization: Bearer
-<token>` (the token is in `<state>/mcp/http-token`, mode 0600, created on first start); an
-`Origin` that is not loopback is refused (403). Stateless requests must carry
+`POST /mcp` endpoint on its own listener (loopback by default). Every request is
+authenticated from its `Authorization: Bearer <token>` (401 when refused; by default the
+local token, `<state>/local-token`, mode 0600, created on first start); an `Origin` that is not
+loopback is refused (403). Stateless requests must carry
 `MCP-Protocol-Version`, `Mcp-Method` and (for `tools/call`, `resources/read`) `Mcp-Name`
 matching the body (else 400, -32020); an unsupported version is 400 (-32022), an unknown method
 404. The response is JSON, or SSE for `subscriptions/listen` (an open stream with keep-alive
 comments) and for a long request with a `progressToken`; closing a stream cancels its request.
 Handshake clients get an `Mcp-Session-Id` from `initialize` (DELETE ends it); there is no GET
 stream (405).
+
+**TCP and the Unix domain socket.** Newline-delimited JSON-RPC. The first line of a connection
+is its credential, `{"jsonrpc":"2.0","method":"dvergr/authenticate","params":{"token":"…"}}`
+(the local token or a run token, `server/tcp-auth-line`), at most 8 KiB, within 10 s; a
+connection without one gets one error (-32001; it also says when the local token was replaced
+because its file was readable by others) and is closed. At most 256 connections are open at
+once, at most 32 of them still without a credential. A connection a run token opened closes
+when the token ends. TCP is off unless the daemon's config says `:tcp true`.
 
 **The relay** (`bin/dvergr-mcp`) speaks both eras too: it forwards `server/discover` to the
 daemon (answering it itself, with the same versions, while the daemon starts), puts its
@@ -340,7 +492,8 @@ finishes gets no response. Its work is not interrupted: a job keeps running unti
 1. Native tools for Codex as a benchmark candidate (Claude Code's CLI already reaches a Run's
    tools over `--mcp-config`, above); a read-only eval (needs a restricted sandbox, not only fewer
    ops) and evals metered to the wallet.
-2. Hosted use: OAuth on the HTTP transport (instead of the local bearer token), and
-   multi-round-trip requests (sampling, elicitation) if a tool needs input from the client.
+2. Hosted use: an OAuth flow on the HTTP transport (the authenticator seam takes a validated
+   token today), and multi-round-trip requests (sampling, elicitation) if a tool needs input
+   from the client.
 3. A `data` toolset over pg-datahike (load a `pg_dump`, migrate on a fork, merge), and a client
    test pass over Cursor, VS Code, Gemini CLI, n8n and ChatGPT.

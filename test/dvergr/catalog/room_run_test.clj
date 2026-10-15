@@ -93,19 +93,19 @@
     (testing "the report reads back through experiment_report, and the bundle is in the room"
       (runner/with-home home
         (fn [daemon]
-          (let [{:keys [markdown complete]} (ops/invoke daemon :experiment/report {:room "competitors"})]
+          (let [{:keys [markdown complete]} (ops/invoke daemon dvergr.principal/local-principal :experiment/report {:room "competitors"})]
             (is complete)
             (is (str/includes? markdown "## Frontier")))
           (is (= (get room-test/files "checker.clj")
-                 (:text (ops/invoke daemon :room/read {:room "competitors"
-                                                       :path "workflows/competitors/checker.clj"})))))))
+                 (:text (ops/invoke daemon dvergr.principal/local-principal :room/read {:room "competitors"
+                                                                                        :path "workflows/competitors/checker.clj"})))))))
     (testing "a file of the bundle that became a directory syncs"
       (runner/with-home home
         (fn [daemon]
           (room-run/sync-bundle! daemon "competitors" "competitors" (assoc room-test/files "fixtures/notes" "a file"))
           (room-run/sync-bundle! daemon "competitors" "competitors" (assoc room-test/files "fixtures/notes/a.md" "now a directory"))
-          (is (= "now a directory" (:text (ops/invoke daemon :room/read {:room "competitors"
-                                                                         :path "workflows/competitors/fixtures/notes/a.md"})))))))
+          (is (= "now a directory" (:text (ops/invoke daemon dvergr.principal/local-principal :room/read {:room "competitors"
+                                                                                                          :path "workflows/competitors/fixtures/notes/a.md"})))))))
     (testing "and a directory that became a file again, across a reopened home"
       (runner/with-home home
         (fn [daemon]
@@ -113,15 +113,15 @@
       (runner/with-home home
         (fn [daemon]
           (room-run/sync-bundle! daemon "competitors" "competitors" (assoc room-test/files "fixtures/deep" "a file again"))
-          (is (= "a file again" (:text (ops/invoke daemon :room/read {:room "competitors"
-                                                                      :path "workflows/competitors/fixtures/deep"})))))))
+          (is (= "a file again" (:text (ops/invoke daemon dvergr.principal/local-principal :room/read {:room "competitors"
+                                                                                                       :path "workflows/competitors/fixtures/deep"})))))))
     (testing "a file removed from the bundle is removed from the room"
       (let [smaller (room-wf/bundle "competitors" (dissoc room-test/files "gold.edn"))]
         (runner/with-home home
           (fn [daemon]
             (room-run/sync-bundle! daemon "competitors" "competitors" (:files smaller))
-            (is (thrown? Exception (ops/invoke daemon :room/read {:room "competitors"
-                                                                  :path "workflows/competitors/gold.edn"})))))))))
+            (is (thrown? Exception (ops/invoke daemon dvergr.principal/local-principal :room/read {:room "competitors"
+                                                                                                   :path "workflows/competitors/gold.edn"})))))))))
 
 (deftest faulted-cells-run-again-on-resume
   (let [home (tmp "dvergr-room-run-home-")
@@ -186,7 +186,7 @@
         calls (atom 0)
         invoke ops/invoke]
     (with-redefs [runner/admit-for (fn [& _] (fn [_] (swap! asked inc) {:reason "allowance reached"}))
-                  ops/invoke (fn [d k args] (when (= :catalog/benchmark k) (swap! benchmarks inc)) (invoke d k args))]
+                  ops/invoke (fn [d p k args] (when (= :catalog/benchmark k) (swap! benchmarks inc)) (invoke d p k args))]
       (let [r (bench! (writer calls "Wato") b home)]
         (is (= "refused" (get-in r [:job :reason])) (pr-str (:job r)))
         (is (pos? @asked))
@@ -212,7 +212,7 @@
     (testing "a second run writes nothing: the room already holds the bundle"
       (let [writes (atom 0)
             invoke ops/invoke]
-        (with-redefs [ops/invoke (fn [d k a] (when (= :room/write k) (swap! writes inc)) (invoke d k a))]
+        (with-redefs [ops/invoke (fn [d p k a] (when (= :room/write k) (swap! writes inc)) (invoke d p k a))]
           (room-run/benchmark! b {:home home :check? true}))
         (is (zero? @writes))))))
 
@@ -221,7 +221,7 @@
         list-dir muschel.fs/list-dir]
     (runner/with-home home
       (fn [daemon]
-        (ops/invoke daemon :room/create {:title "Sums" :slug "sums"})
+        (ops/invoke daemon dvergr.principal/local-principal :room/create {:title "Sums" :slug "sums"})
         (room-run/sync-bundle! daemon "sums" "sums" case-files)
         (let [r (ops/resolve-room daemon "sums")]
           (with-redefs [muschel.fs/list-dir (fn [fs path]

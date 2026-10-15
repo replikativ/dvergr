@@ -2,8 +2,11 @@
   "The browser boundary of the web server. Binding to loopback keeps other
    machines out, but not the user's own browser: any page it shows can submit
    a form to `http://127.0.0.1:17880`, and a DNS name rebound to 127.0.0.1
-   makes the dashboard same-origin with the attacker's page. Three checks
-   close that:
+   makes the dashboard same-origin with the attacker's page. Two checks
+   close that, besides the credential, which a page can never send for the
+   user: it travels only in the `Authorization` header (`dvergr.web.server`),
+   never in a cookie, so a cross-site request carries none and needs no CSRF
+   token:
 
    - Host: every request must name this server — a loopback name, the bind
      address (every local interface address when bound to a wildcard), or a
@@ -11,49 +14,11 @@
    - Origin: a state-changing request (not GET/HEAD/OPTIONS) whose `Origin` —
      or, without one, `Referer` — is not this server's own origin (the Host it
      was sent to) or a configured `:allowed-origins` entry is refused.
-   - CSRF token: a state-changing request to the HTML UI must carry the
-     session's token, in the `X-CSRF-Token` header or the `csrf` form field.
-     The session is a random id in an HttpOnly cookie; the token is an HMAC of
-     it under a secret minted when the server starts, so a cookie set by
-     another local site does not yield a valid token. Pages read the token from
-     `*csrf-token*` while they render. The JSON API under `/api/v1/` has no
-     session; its writes must be `application/json`, which a cross-site page
-     can only send after a CORS preflight that this server does not grant."
+   The JSON API's writes must besides be `application/json`, which a
+   cross-site page can only send after a CORS preflight that this server
+   does not grant."
   (:require [clojure.string :as str])
-  (:import (java.io ByteArrayInputStream)
-           (java.net InetAddress NetworkInterface URI)
-           (java.nio.charset StandardCharsets)
-           (java.security MessageDigest SecureRandom)
-           (javax.crypto Mac)
-           (javax.crypto.spec SecretKeySpec)
-           (java.util HexFormat)))
-
-(def ^:dynamic *csrf-token*
-  "The CSRF token of the request being handled, for the page it renders."
-  nil)
-
-(def session-cookie "dvergr_sid")
-
-(defn- random-hex [n]
-  (let [b (byte-array n)]
-    (.nextBytes (SecureRandom.) b)
-    (.formatHex (HexFormat/of) b)))
-
-(defn new-secret
-  "A fresh secret for the session tokens of one server."
-  []
-  (random-hex 32))
-
-(defn csrf-token
-  "The CSRF token of session id `sid` under `secret`."
-  [secret sid]
-  (let [mac (Mac/getInstance "HmacSHA256")]
-    (.init mac (SecretKeySpec. (.getBytes ^String secret StandardCharsets/UTF_8) "HmacSHA256"))
-    (.formatHex (HexFormat/of) (.doFinal mac (.getBytes ^String sid StandardCharsets/UTF_8)))))
-
-(defn- constant-time= [^String a ^String b]
-  (and a b (MessageDigest/isEqual (.getBytes a StandardCharsets/UTF_8)
-                                  (.getBytes b StandardCharsets/UTF_8))))
+  (:import (java.net InetAddress NetworkInterface URI)))
 
 ;; ---------------------------------------------------------------------------
 ;; Hosts
@@ -149,39 +114,6 @@
 ;; ---------------------------------------------------------------------------
 ;; Sessions and tokens
 
-(defn- cookie-value [req name]
-  (some (fn [part]
-          (let [[k v] (str/split (str/trim part) #"=" 2)]
-            (when (= k name) v)))
-        (some-> (get-in req [:headers "cookie"]) (str/split #";"))))
-
-(defn- session-id [req]
-  (let [v (cookie-value req session-cookie)]
-    (when (and v (re-matches #"[0-9a-f]{32}" v)) v)))
-
-(defn- form-urlencoded? [req]
-  (some-> (get-in req [:headers "content-type"]) str/lower-case
-          (str/starts-with? "application/x-www-form-urlencoded")))
-
-(defn- form-field
-  "The value of field `k` in an urlencoded body string."
-  [body k]
-  (some (fn [pair]
-          (let [[fk v] (str/split pair #"=" 2)]
-            (when (= k (java.net.URLDecoder/decode (or fk "") "UTF-8"))
-              (java.net.URLDecoder/decode (str/replace (or v "") #"\+" " ") "UTF-8"))))
-        (str/split body #"&")))
-
-(defn- buffer-body
-  "`req` with its form body read into memory (and re-readable), plus the body
-   string."
-  [req]
-  (if (and (:body req) (form-urlencoded? req))
-    (let [bytes (.readAllBytes ^java.io.InputStream (:body req))]
-      [(assoc req :body (ByteArrayInputStream. bytes))
-       (String. bytes StandardCharsets/UTF_8)])
-    [req nil]))
-
 ;; ---------------------------------------------------------------------------
 ;; The middleware
 
@@ -195,20 +127,17 @@
           (str/starts-with? "application/json")))
 
 (defn wrap
-  "Ring middleware applying the Host, Origin and CSRF checks to `handler`.
-   Opts: `:secret` (from `new-secret`), `:ip` (the bind address),
-   `:allowed-hosts` and `:allowed-origins` (for a reverse proxy)."
-  [handler {:keys [secret ip allowed-hosts allowed-origins]}]
+  "Ring middleware applying the Host and Origin checks to `handler`.
+   Opts: `:ip` (the bind address), `:allowed-hosts` and `:allowed-origins`
+   (for a reverse proxy)."
+  [handler {:keys [ip allowed-hosts allowed-origins]}]
   (let [hosts (host-set ip allowed-hosts)]
     (fn [req]
       (let [headers (:headers req)
             host (get headers "host")
             unsafe? (not (safe-methods (:request-method req)))
             origin (or (get headers "origin") (get headers "referer"))
-            api? (str/starts-with? (or (:uri req) "") "/api/v1/")
-            sid (session-id req)
-            new-sid (when-not sid (random-hex 16))
-            token (csrf-token secret (or sid new-sid))]
+            api? (str/starts-with? (or (:uri req) "") "/api/v1/")]
         (cond
           (not (host-allowed? host hosts))
           (forbidden "Forbidden: unknown Host")
@@ -220,14 +149,4 @@
           {:status 415 :headers {"Content-Type" "text/plain; charset=utf-8"}
            :body "API writes take application/json"}
 
-          :else
-          (let [[req body] (if (and unsafe? (not api?)) (buffer-body req) [req nil])
-                sent (or (get headers "x-csrf-token") (some-> body (form-field "csrf")))]
-            (if (and unsafe? (not api?) (not (and sid (constant-time= sent token))))
-              (forbidden "Forbidden: missing or stale CSRF token (reload the page)")
-              (let [resp (binding [*csrf-token* token] (handler req))]
-                (cond-> resp
-                  (and new-sid (map? resp))
-                  (assoc-in [:headers "Set-Cookie"]
-                            (str session-cookie "=" new-sid
-                                 "; Path=/; HttpOnly; SameSite=Lax")))))))))))
+          :else (handler req))))))

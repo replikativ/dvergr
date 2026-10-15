@@ -77,9 +77,10 @@
                   :body "<p>Could not open chat — no chat DB connection.</p>"}))}])
 
 (defn dispatch
-  "If `req` matches a spec-derived web route, run the op via `ops/invoke` and return
-   a ring response; else nil (the caller falls through to the hand-written routes)."
-  [req daemon]
+  "If `req` matches a spec-derived web route, run the op via `ops/invoke` for
+   `principal` (the request's, which the server authenticated) and return a
+   ring response; else nil (the caller falls through to the hand-written routes)."
+  [req daemon principal]
   (let [uri (:uri req) method (:request-method req)]
     (some (fn [entry]
             (when (= method (:method entry))
@@ -88,7 +89,7 @@
                       form  (when (= :post method) (parse-form req))
                       args  ((:args entry) slots form)]
                   (try
-                    ((:respond entry) (ops/invoke daemon (:op entry) args) slots)
+                    ((:respond entry) (ops/invoke daemon principal (:op entry) args) slots)
                     ;; a failed op answers with its status (4xx for a bad request)
                     (catch clojure.lang.ExceptionInfo e
                       (tel/log! {:level :warn :id :web.ops/failed

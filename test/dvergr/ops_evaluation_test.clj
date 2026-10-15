@@ -54,7 +54,7 @@
               (is (= :read (:kind (ops/specification op))) (str op))
               (is (string? (ops/op->name op)))))
           (testing "attempts are leaderboard rows with a bill"
-            (let [rows (ops/invoke daemon :attempt/list {:room "ops-evaluation-test"})]
+            (let [rows (ops/invoke daemon dvergr.principal/local-principal :attempt/list {:room "ops-evaluation-test"})]
               (is (= 2 (count rows)))
               (doseq [row rows]
                 (is (= "alpha" (:agent row)))
@@ -65,19 +65,19 @@
                 (is (map? (:spend row)))
                 (is (number? (:dollars (:spend row))))
                 (is (not (contains? row :evidence)) "list rows carry no evidence"))
-              (let [one (ops/invoke daemon :attempt/detail {:room "ops-evaluation-test" :id (:id (first rows))})]
+              (let [one (ops/invoke daemon dvergr.principal/local-principal :attempt/detail {:room "ops-evaluation-test" :id (:id (first rows))})]
                 (is (= (:id (first rows)) (:id one)))
                 (is (contains? one :evidence) "detail carries the evidence"))
-              (is (= 1 (count (ops/invoke daemon :attempt/list
+              (is (= 1 (count (ops/invoke daemon dvergr.principal/local-principal :attempt/list
                                           {:room "ops-evaluation-test" :environment "ops-test/t1"}))))))
           (testing "runs are listed and readable one by one"
-            (let [runs (ops/invoke daemon :run/list {:room "ops-evaluation-test"})]
+            (let [runs (ops/invoke daemon dvergr.principal/local-principal :run/list {:room "ops-evaluation-test"})]
               (is (<= 2 (count runs)))
               (is (every? #(and (string? (:id %)) (string? (:status %))) runs))
               (is (= (:id (first runs))
-                     (:id (ops/invoke daemon :run/detail {:room "ops-evaluation-test" :id (:id (first runs))}))))))
+                     (:id (ops/invoke daemon dvergr.principal/local-principal :run/detail {:room "ops-evaluation-test" :id (:id (first runs))}))))))
           (testing "a scorecard is a leaderboard"
-            (let [[sc :as scs] (ops/invoke daemon :scorecard/list {:room "ops-evaluation-test"})]
+            (let [[sc :as scs] (ops/invoke daemon dvergr.principal/local-principal :scorecard/list {:room "ops-evaluation-test"})]
               (is (= 1 (count scs)))
               (is (= "ops-test/exp" (get-in sc [:experiment :id])))
               (is (= 2 (:cells sc)))
@@ -90,7 +90,7 @@
               (is (= [1.0 1.0] (:reward-interval (first (:leaderboard sc)))))
               (is (map? (:spend (first (:leaderboard sc)))))
               (is (not (contains? sc :entries)))
-              (let [full (ops/invoke daemon :scorecard/detail {:room "ops-evaluation-test" :id (:id sc)})]
+              (let [full (ops/invoke daemon dvergr.principal/local-principal :scorecard/detail {:room "ops-evaluation-test" :id (:id sc)})]
                 (is (= 2 (count (:entries full))))
                 (is (every? :passed? (:entries full)))
                 (is (= {"alpha" {"exact?" 1.0}} (:check-rates full)) "each check's pass rate"))))))

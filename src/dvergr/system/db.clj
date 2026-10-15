@@ -65,6 +65,13 @@
    {:db/ident :room/db-scope :db/valueType :db.type/string  :db/cardinality :db.cardinality/one} ; own message DB
    {:db/ident :room/parties  :db/valueType :db.type/ref     :db/cardinality :db.cardinality/many} ; members
    {:db/ident :room/created  :db/valueType :db.type/instant :db/cardinality :db.cardinality/one}
+   ;; a slug claimed by the principal (dvergr.principal) that creates a room over an op,
+   ;; as pr-str of its id; claimed once (`claim-room!`) BEFORE the room is provisioned,
+   ;; so a concurrent create of that slug loses before it touches the room
+   {:db/ident :room-claim/slug    :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/unique :db.unique/value}
+   {:db/ident :room-claim/creator :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   ;; the room the claim's create provisioned (set after it succeeded): only that room is the claimant's
+   {:db/ident :room-claim/room    :db/valueType :db.type/uuid   :db/cardinality :db.cardinality/one}
    ;; RF5 S4: the room REGISTRY lives here (system-db) — these are the fields the
    ;; in-memory Room + UI need that aren't otherwise derivable. `parent-slug` keeps
    ;; the hierarchy as a plain slug (no chat-id impedance); telegram-chat-id keys
@@ -273,6 +280,36 @@
 
 (defn room-by-slug [slug]
   (d/q '[:find (pull ?e [*]) . :in $ ?s :where [?e :room/slug ?s]] @(get-conn) slug))
+
+(defn room-claim
+  "The claim on slug `slug` (`claim-room!`): `{:creator :room}` (`:room` the
+   uuid of the room its create provisioned, once it did), or nil."
+  [slug]
+  (when-let [e (d/q '[:find ?e . :in $ ?s :where [?e :room-claim/slug ?s]] @(get-conn) slug)]
+    (let [{:room-claim/keys [creator room]} (d/pull @(get-conn) [:room-claim/creator :room-claim/room] e)]
+      {:creator creator :room room})))
+
+(defn claim-room!
+  "Claim slug `slug` for `creator` (a string), unless it is claimed already
+   (the slug is unique: a second claim fails in the transaction). Returns
+   the claimant now recorded: `creator` when this claim won."
+  [slug creator]
+  (try (d/transact (get-conn) [{:room-claim/slug slug :room-claim/creator creator}])
+       (catch Exception _ nil))
+  (:creator (room-claim slug)))
+
+(defn claim-provisioned!
+  "Record on the claim of `slug` the room its create provisioned (`room-id`)."
+  [slug room-id]
+  (when-let [e (d/q '[:find ?e . :in $ ?s :where [?e :room-claim/slug ?s]] @(get-conn) slug)]
+    (d/transact (get-conn) [{:db/id e :room-claim/room room-id}])))
+
+(defn release-claim!
+  "Drop the claim on `slug` (its create failed, the room was purged, or the
+   process takes the slug over)."
+  [slug]
+  (when-let [e (d/q '[:find ?e . :in $ ?s :where [?e :room-claim/slug ?s]] @(get-conn) slug)]
+    (d/transact (get-conn) [[:db/retractEntity e]])))
 
 (defn room-by-telegram-id
   "Registry row for a Telegram chat-id, or nil."

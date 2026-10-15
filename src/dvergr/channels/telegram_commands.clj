@@ -13,7 +13,8 @@
    (room/delete, agent create/delete) are intentionally NOT exposed here until the
    capability/auth layer lands — that's the one knob this overlay gates."
   (:require [clojure.string :as str]
-            [dvergr.ops :as ops]))
+            [dvergr.ops :as ops]
+            [dvergr.principal :as principal]))
 
 (defn- current-daemon []
   (some-> (requiring-resolve 'dvergr.orchestration.daemon/current-daemon) deref deref))
@@ -122,8 +123,10 @@
 (defn dispatch!
   "If `text` is a known ops command, run it against the current chat's room
    (resolved lazily via `room-thunk`, a 0-arg fn returning the Room, called only
-   when the command is room-scoped) and return the reply string; else nil."
-  [text room-thunk]
+   when the command is room-scoped) and return the reply string; else nil.
+   It runs for `who`, the principal the inbound message authenticated as
+   (`dvergr.channels.telegram/handle-inbound!`)."
+  [text room-thunk who]
   (when-let [{:keys [cmd argv]} (parse text)]
     (when-let [{:keys [op room? args-fn reply]} (by-cmd cmd)]
       (try
@@ -131,7 +134,7 @@
               args   (cond-> {}
                        room?   (assoc :room (:slug room))
                        args-fn (merge (args-fn argv)))
-              result (ops/invoke (current-daemon) op args)]
+              result (ops/invoke (current-daemon) who op args)]
           ((or reply str) result))
         (catch Throwable e
           (str "⚠ /" cmd " failed: " (.getMessage e)))))))

@@ -25,6 +25,7 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.tools.cli :as cli]
+            [dvergr.principal :as principal]
             [datahike.blob :as blob]
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.experiment :as experiment]
@@ -59,7 +60,7 @@
     (if-let [[d & more] (seq todo)]
       (let [entries (loop [offset 0 acc []]
                       (let [{:keys [entries next-offset]}
-                            (try (ops/invoke daemon :room/files {:room room :path d :offset offset})
+                            (try (ops/invoke daemon principal/local-principal :room/files {:room room :path d :offset offset})
                                  (catch clojure.lang.ExceptionInfo e
                                    (if (= :dvergr.rooms.files/not-found (:type (ex-data e))) {} (throw e))))
                             acc (into acc entries)]
@@ -100,7 +101,7 @@
         b (room-wf/bundle name files)
         write! (fn [batch]
                  (when (seq batch)
-                   (:commit (ops/invoke daemon :room/write
+                   (:commit (ops/invoke daemon principal/local-principal :room/write
                                         {:room room :files (into {} batch)
                                          :message (str "Workflow bundle " name " " (subs (str (:id b)) 0 8))}))))]
     ;; removals first, on their own: a file the bundle turned into a
@@ -119,7 +120,7 @@
    done of the total, faults, phase)."
   [daemon job on-progress]
   (loop [seen nil]
-    (let [st (ops/invoke daemon :job/status {:job (:id job) :wait-ms 20000})
+    (let [st (ops/invoke daemon principal/local-principal :job/status {:job (:id job) :wait-ms 20000})
           p (:progress st)]
       (when (and on-progress p (not= p seen)) (on-progress p))
       (if (or (= "running" (:status st)) (false? (:settled st))) (recur (or p seen)) st))))
@@ -136,7 +137,7 @@
              :else n))))
 
 (defn- verdicts [daemon room experiment-id]
-  (->> (:experiments (ops/invoke daemon :experiment/progress {:room room}))
+  (->> (:experiments (ops/invoke daemon principal/local-principal :experiment/progress {:room room}))
        (filter #(= experiment-id (str (:experiment/content-id %))))
        (mapcat :candidates) (map :verdicts) (reduce + 0)))
 
@@ -177,12 +178,12 @@
   (runner/with-home home
     (fn [daemon]
       (when-not (ops/resolve-room daemon name)
-        (ops/invoke daemon :room/create {:title (str "Workflow " (get-in b [:definition :title] name)) :slug name}))
+        (ops/invoke daemon principal/local-principal :room/create {:title (str "Workflow " (get-in b [:definition :title] name)) :slug name}))
       (sync-bundle! daemon name name files)
       ;; what the benchmark reads back from the room must be exactly the
       ;; bundle given (`verify!` on what calibrate/benchmark report)
       (if check?
-        (let [c (ops/invoke daemon :catalog/calibrate {:room name :name name})]
+        (let [c (ops/invoke daemon principal/local-principal :catalog/calibrate {:room name :name name})]
           (verify! b (:bundle c))
           {:home (str home) :room name :calibration c})
         (let [args (cond-> {:workflow (str name "/" name) :models (vec models) :room name :name name
@@ -194,14 +195,14 @@
                      parallelism (assoc :parallelism parallelism)
                      params (assoc :params params)
                      prompt (assoc :prompt prompt))
-              report-of #(ops/invoke daemon :experiment/report
+              report-of #(ops/invoke daemon principal/local-principal :experiment/report
                                      {:room name :title (get-in b [:definition :title]) :experiment %})
               [done exp-id report]
               (loop [n 0]
-                (let [{exp-id :experiment :as job} (ops/invoke daemon :catalog/benchmark args)
+                (let [{exp-id :experiment :as job} (ops/invoke daemon principal/local-principal :catalog/benchmark args)
                       _ (try (verify! b (:bundle job))
                              (catch Throwable t
-                               (ops/invoke daemon :job/cancel {:job (:id job)})
+                               (ops/invoke daemon principal/local-principal :job/cancel {:job (:id job)})
                                (throw t)))
                       st (wait-for daemon job on-progress)
                       report (report-of exp-id)]

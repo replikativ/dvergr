@@ -25,14 +25,14 @@
 ;; ---- transports: each is (fn [message] -> response or nil)
 
 (defn- in-process []
-  (let [c (server/session-context (fn [_] nil) (surface/selection {}))]
+  (let [c (server/session-context (fn [_] nil) (surface/selection {}) dvergr.principal/local-principal)]
     (fn [message] (json-rpc/handle-message c message))))
 
 (use-fixtures :once
   (fn [f]
     ;; this namespace's own server, stopped after: a daemon test starts one too
     (let [started? (not (:running (server/status)))]
-      (when started? (server/start! :port 0))
+      (when started? (server/start! :tcp? true :port 0))
       (try (f) (finally (when started? (server/stop!)))))))
 
 (def ^:private read-mapper (json/object-mapper {:decode-key-fn keyword}))
@@ -45,6 +45,8 @@
         r (BufferedReader. (InputStreamReader. (.getInputStream s)))
         w (BufferedWriter. (OutputStreamWriter. (.getOutputStream s)))]
     (.setSoTimeout s 10000)
+    ;; the connection's credential, its first line
+    (doto w (.write (server/tcp-auth-line (dvergr.principal/local-token))) (.write "\n") (.flush))
     (fn
       ([] (.close s))
       ([message]
@@ -157,7 +159,7 @@
 (defn- recording-connection [& [profile]]
   (let [seen (atom [])
         send-fn #(swap! seen conj %)
-        c (server/session-context send-fn (surface/selection {:profile (or profile "admin")}))]
+        c (server/session-context send-fn (surface/selection {:profile (or profile "admin")}) dvergr.principal/local-principal)]
     {:seen seen :send! #(server/dispatch! c send-fn %)}))
 
 (defn- listen-meta [] {:_meta (modern-meta)})
@@ -260,3 +262,31 @@
         vec-of (fn [nm] (some->> (re-find (re-pattern (str "\\(def " nm " (\\[[^\\]]*\\])\\)")) src) second read-string))]
     (is (= json-rpc/supported-versions (vec-of "versions")))
     (is (= json-rpc/stateless-versions (vec-of "stateless-versions")))))
+
+(deftest a-tcp-connection-without-a-credential-is-refused
+  (let [started? (not (:running (server/status)))]
+    (when started? (server/start! :tcp? true :port 0))
+    (try
+      (with-open [s (Socket. "127.0.0.1" (int (:port (server/status))))]
+        (.setSoTimeout s 10000)
+        (let [r (BufferedReader. (InputStreamReader. (.getInputStream s)))
+              w (BufferedWriter. (OutputStreamWriter. (.getOutputStream s)))]
+          (doto w (.write (json/write-value-as-string {:jsonrpc "2.0" :id 1 :method "tools/list" :params {}}))
+                (.write "\n") (.flush))
+          (is (= -32001 (get-in (json/read-value (.readLine r) read-mapper) [:error :code]))
+              "a loopback peer without the token gets one error")
+          (is (nil? (.readLine r)) "and the connection closes")))
+      (finally (when started? (server/stop!))))))
+
+(deftest an-oversized-credential-line-is-refused
+  (let [started? (not (:running (server/status)))]
+    (when started? (server/start! :tcp? true :port 0))
+    (try
+      (with-open [s (Socket. "127.0.0.1" (int (:port (server/status))))]
+        (.setSoTimeout s 10000)
+        (let [r (BufferedReader. (InputStreamReader. (.getInputStream s)))
+              w (BufferedWriter. (OutputStreamWriter. (.getOutputStream s)))]
+          ;; past the 8 KiB a credential line may take, with no newline in sight
+          (doto w (.write (apply str (repeat 9000 "a"))) (.flush))
+          (is (= -32001 (get-in (json/read-value (.readLine r) read-mapper) [:error :code])))))
+      (finally (when started? (server/stop!))))))

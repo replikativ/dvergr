@@ -49,8 +49,10 @@ and storage GC. The `.nrepl-port` of a REPL is written at the project root, not 
 
  ;; Channels (secrets fall back to env). See doc/channels.md.
  :telegram      {:token "…"                   ; or env TELEGRAM_BOT_TOKEN
-                 :tool-commands? false}       ; allow /clojure_eval etc. from Telegram (default off)
- :allowed-users [{:id 12345 :username "…"}]   ; Telegram access control (empty = everyone)
+                 :tool-commands? false        ; allow /clojure_eval etc. from Telegram (default off)
+                 :owners [12345]}              ; numeric ids of senders who act as the local principal (the operator)
+ :allowed-users [{:id 12345 :username "…"}]   ; Telegram access control: listed senders act as telegram/<id>;
+                                              ; empty lets messages in but identifies nobody (commands, posts refused)
  :strict-allowlist? true                      ; empty :allowed-users denies everyone (default false)
  :notify-chat-ids [12345]                     ; route intake output to these chats
  :zulip         {:email "…" :api-key "…" :site "…"}
@@ -71,8 +73,16 @@ and storage GC. The `.nrepl-port` of a REPL is written at the project root, not 
  :http          {:port 17880 :ip "127.0.0.1"}   ; web dashboard + JSON API (needs the web deps); starts only when set (or `--web`);
                                                 ; behind a proxy (or TLS terminator) add :allowed-hosts ["dvergr.lan"]
                                                 ; and :allowed-origins ["https://dvergr.lan"]
- :mcp           {:port 17888 :bind "127.0.0.1" :profile "offload"
-                 :http {:port 17889}}           ; MCP over loopback TCP, optionally Streamable HTTP; doc/mcp.md
+ :mcp           {:profile "offload"               ; MCP on the home's Unix domain socket (bin/dvergr-mcp)
+                 :tcp true :port 17888 :bind "127.0.0.1" ; also TCP (default off)
+                 :http {:port 17889}}           ; and Streamable HTTP; doc/mcp.md
+ ;; Who may call: by default the local token ($DVERGR_HOME/local-token) is the owner on MCP
+ ;; (TCP, HTTP) and the web; nothing is trusted for where it comes from. doc/mcp.md, principals.
+ :auth          {:authenticate my.host/authenticate  ; who calls (fn [request] -> principal | nil)
+                 :authorize    my.host/authorize     ; may they (fn [principal request] -> decision)
+                 :on-created   my.host/grant-creator} ; (fn [principal resource]) after a create
+                                                ; default: local access only, everything allowed;
+                                                ; a hosted daemon sets both (doc/mcp.md, principals)
  :gc            {:interval-ms 21600000          ; storage GC every 6 h (default)
                  :retention-days 30}            ; default nil: keep all history, reclaim only fork garbage
  :blob-store    {:backend :s3 :bucket "…" :region "…"}  ; /drive blobs; default a filestore under .dvergr/blobs

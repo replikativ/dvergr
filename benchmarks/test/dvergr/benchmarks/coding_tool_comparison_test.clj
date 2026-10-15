@@ -65,7 +65,7 @@
 (deftest editing-tools-operate-on-the-virtual-filesystem
   (let [{:keys [close!] :as repository} (gfs/memory-repository! {:name "coding-edit-tools"})
         filesystem (gfs/make-root repository)
-        context (tools/make-context {:cwd "/" :filesystem filesystem})]
+        context (tools/make-context {:principal dvergr.principal/local-principal :cwd "/" :filesystem filesystem})]
     (try
       (is (= :success (:type (tools/execute "write_file"
                                             {:path "src/demo.clj" :content "(ns demo)\n(defn answer [] 41)\n"}

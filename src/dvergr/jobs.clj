@@ -34,7 +34,9 @@
 ;; waiters block on. Process-local handles, never state: status is the Run's.
 (defonce ^:private live (atom {}))
 
-(defn- room-of [id]
+(defn job-room
+  "The room job `id` (its Run's uuid) is stored in, or nil."
+  [id]
   (when (uuid? id)
     (or (get-in @live [id :room])
         (some (fn [room]
@@ -43,11 +45,20 @@
                   room))
               (rreg/list-rooms :where #(some? (:store %)))))))
 
+(defn owner
+  "Who started job `id`: `{:room <Room> :owner <actor>}` (its Run's actor,
+   `:dvergr` unless `start!` was given one), or nil for an unknown job."
+  [id]
+  (when-let [room (job-room id)]
+    {:room room
+     :owner (:run/actor (binding [ec/*execution-context* (:ctx room)] (run/run room id)))}))
+
 (defn- job [room r]
   (when r
     {:id (:run/id r)
      :kind (:run/kind r)
      :room (:id room)
+     :owner (:run/actor r)
      :status (:run/status r)
      :started-at (:run/started-at r)
      :finished-at (:run/ended-at r)
@@ -59,18 +70,19 @@
    once. The job is a durable Run of `kind` (one of `kinds`), stored before
    `work` is called; pass its id to the evaluations `work` starts as their
    `:parent-run`. `:parent` makes the job itself a child Run (a sub-experiment
-   of the Run that started it); `:ctx` is the context `work`'s Spin runs in
+   of the Run that started it); `:actor` is who starts it, its owner (default
+   `:dvergr`, the process); `:ctx` is the context `work`'s Spin runs in
    (default `room`'s, where the job Run is stored). `finish`, a fn of the
    Spin's value, runs before the Run completes; `reason-of`, a fn of the
    value, the reason a completed Run records (a keyword, or nil); `settled`, a
    fn of the final status and the value (or the error), after it has settled,
    whatever the outcome."
-  [room {:keys [kind parent ctx]} work & {:keys [finish settled reason-of]}]
+  [room {:keys [kind parent ctx actor]} work & {:keys [finish settled reason-of]}]
   (when-not (contains? kinds kind)
     (throw (ex-info "Unknown job kind" {:type ::unknown-kind :kind kind :kinds kinds})))
   (let [ctx (or ctx (:ctx room))
         r (binding [ec/*execution-context* (:ctx room)]
-            (run/start! room :dvergr (random-uuid) nil
+            (run/start! room (or actor :dvergr) (random-uuid) nil
                         (cond-> {:kind kind} parent (assoc :parent parent))))
         id (:run/id r)
         done (promise)]
@@ -135,7 +147,7 @@
    room it is stored in (`:room-value`) for callers that read its results."
   ([id] (status id 0))
   ([id wait-ms]
-   (when-let [room (room-of id)]
+   (when-let [room (job-room id)]
      (when (pos? (or wait-ms 0))
        (when-let [done (get-in @live [id :done])]
          (deref done (min max-wait-ms (long wait-ms)) nil)))
@@ -149,7 +161,7 @@
    and settles it `:cancelled`. Returns the job, or nil for an unknown id. A
    finished job is returned unchanged."
   [id]
-  (when (room-of id)
+  (when (job-room id)
     (when (run/cancel-run! id)
       (when-let [done (get-in @live [id :done])]
         (deref done max-wait-ms nil)))

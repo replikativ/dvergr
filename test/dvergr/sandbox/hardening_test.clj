@@ -61,7 +61,7 @@
 
 (deftest file-tools-stay-in-their-workspace-on-the-host-disk
   (let [root (.getAbsoluteFile (doto (io/file (System/getProperty "java.io.tmpdir") (str "hardening-" (random-uuid))) .mkdirs))
-        ctx (tools/make-context {:cwd (str root)})
+        ctx (tools/make-context {:principal dvergr.principal/local-principal :cwd (str root)})
         read (fn [path] (tools/execute "read_file" {:path path} ctx))]
     (try
       (spit (io/file root "notes.md") "inside")
@@ -185,7 +185,7 @@
     (with-redefs [dvergr.agent.persona/write-prompt! (fn [id _content] (swap! written conj id) true)]
       (let [run (fn [agent-id target]
                   (tools/execute "update_agent_profile" {:agent-name target :content "# me"}
-                                 (tools/make-context {:cwd (System/getProperty "java.io.tmpdir")
+                                 (tools/make-context {:principal dvergr.principal/local-principal :cwd (System/getProperty "java.io.tmpdir")
                                                       :chat-ctx {:agent-id agent-id}})))]
         (is (= :success (:type (run :var "var"))))
         (is (= :error (:type (run :var "huginn"))))

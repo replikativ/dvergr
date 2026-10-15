@@ -231,7 +231,7 @@
       (try
         (with-redefs [llm/llm-agent (fn [o] (when (= :tools-op (:id o)) (reset! captured o)) (orig o))]
           (is (= {:created "tools-op"}
-                 (ops/invoke d :agent/create {:id "tools-op" :provider "fireworks" :model "t" :tools []}))))
+                 (ops/invoke d dvergr.principal/local-principal :agent/create {:id "tools-op" :provider "fireworks" :model "t" :tools []}))))
         (is (= {} (:tools @captured)) "provisioned with no tools")
         (is (= {} (:tools (daemon/resolve-safe-config (daemon/agent-join-config d :tools-op))))
             "a room join reads the stored :tools")
@@ -277,11 +277,15 @@
           adapter (tg/make-daemon-adapter caps)
           chat-id 778899
           uid     4242]
-      (tg/handle-inbound! adapter
-                          {:chat-id chat-id
-                           :text    "hello from telegram"
-                           :from    {:id uid :username "tguser" :first_name "TG"}}
-                          caps)
+      ;; a sender is someone only when the allowlist names it (dvergr.principal)
+      (dvergr.security.allowlist/set-users! [uid])
+      (try
+        (tg/handle-inbound! adapter
+                            {:chat-id chat-id
+                             :text    "hello from telegram"
+                             :from    {:id uid :username "tguser" :first_name "TG"}}
+                            caps)
+        (finally (dvergr.security.allowlist/set-users! [])))
       (let [actor (actors/lookup-by-external-ref conn :telegram uid)]
         (is (some? actor) "user-actor materialized")
         (is (= :human (:kind actor)))

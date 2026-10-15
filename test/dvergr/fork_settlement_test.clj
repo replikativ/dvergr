@@ -264,7 +264,7 @@
         (let [merging (future (d/merge-room parent fork))]
           (is (true? (deref entered 30000 ::timeout)))
           (is (thrown-with-msg? clojure.lang.ExceptionInfo #"refused: fork .* is being merged"
-                                (ops/invoke {:execution-ctx (:ctx parent)} :room/discard
+                                (ops/invoke {:execution-ctx (:ctx parent)} dvergr.principal/local-principal :room/discard
                                             {:room (subs (str (:id fork)) 1)})))
           (deliver go true)
           (is (= parent (deref merging 30000 ::timeout)))))

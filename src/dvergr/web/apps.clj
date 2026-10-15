@@ -93,35 +93,39 @@
 (defn handle
   "Handle GET /apps/<room-slug>[/<path>] — serve the file from the room's
    current worktree `app/` dir. Returns a ring response, or nil when the
-   uri isn't ours."
-  [req _daemon]
-  (let [uri (:uri req)]
-    (when (str/starts-with? uri "/apps/")
-      (if-not (#{:get :head} (:request-method req))
-        {:status 405 :headers {"Allow" "GET, HEAD"} :body "GET only"}
-        (let [rest-uri (subs uri (count "/apps/"))
-              [slug path] (str/split rest-uri #"/" 2)
-              slug (java.net.URLDecoder/decode (or slug "") "UTF-8")]
-          (cond
-            (str/blank? slug)
-            {:status 404 :headers {"Content-Type" "text/plain"} :body "no room slug"}
+   uri isn't ours. `authorize!`, when given, is called with the room row
+   resolved here before anything is served, so the room authorized is the
+   room served (`dvergr.web.server`)."
+  ([req daemon] (handle req daemon nil))
+  ([req _daemon authorize!]
+   (let [uri (:uri req)]
+     (when (str/starts-with? uri "/apps/")
+       (if-not (#{:get :head} (:request-method req))
+         {:status 405 :headers {"Allow" "GET, HEAD"} :body "GET only"}
+         (let [rest-uri (subs uri (count "/apps/"))
+               [slug path] (str/split rest-uri #"/" 2)
+               slug (java.net.URLDecoder/decode (or slug "") "UTF-8")]
+           (cond
+             (str/blank? slug)
+             {:status 404 :headers {"Content-Type" "text/plain"} :body "no room slug"}
 
             ;; /apps/<slug> (no trailing slash) → redirect so relative asset
             ;; URLs inside index.html resolve under /apps/<slug>/.
-            (nil? path)
-            {:status 301 :headers {"Location" (str uri "/")} :body ""}
+             (nil? path)
+             {:status 301 :headers {"Location" (str uri "/")} :body ""}
 
-            :else
-            (let [room (sdb/room-by-slug slug)
-                  root (some-> room :room/id app-root)
-                  rel  (if (str/blank? path) "index.html" path)
-                  rel  (if (str/ends-with? rel "/") (str rel "index.html") rel)
-                  path (when root (safe-path root rel))]
-              (if (and path (= :file (:type (mfs/stat (:fs root) path))))
-                {:status 200
-                 :headers {"Content-Type" (content-type path)
+             :else
+             (let [room (sdb/room-by-slug slug)
+                   _ (when authorize! (authorize! room slug))
+                   root (some-> room :room/id app-root)
+                   rel  (if (str/blank? path) "index.html" path)
+                   rel  (if (str/ends-with? rel "/") (str rel "index.html") rel)
+                   path (when root (safe-path root rel))]
+               (if (and path (= :file (:type (mfs/stat (:fs root) path))))
+                 {:status 200
+                  :headers {"Content-Type" (content-type path)
                            ;; live-iterate loop: agents rewrite files, humans reload
-                           "Cache-Control" "no-cache"}
-                 :body (java.io.ByteArrayInputStream.
-                        ^bytes (mfs/read-bytes (:fs root) path))}
-                (not-found slug)))))))))
+                            "Cache-Control" "no-cache"}
+                  :body (java.io.ByteArrayInputStream.
+                         ^bytes (mfs/read-bytes (:fs root) path))}
+                 (not-found slug))))))))))

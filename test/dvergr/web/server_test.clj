@@ -2,6 +2,7 @@
   "Tests for the HTTP server, API routes, and agent UI mounting."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [dvergr.web.server :as server]
+            [dvergr.principal]
             [dvergr.tools :as tools]
             [hato.client :as http]
             [jsonista.core :as json]
@@ -42,7 +43,8 @@
 
 (defn- get-json [path]
   (let [resp (http/get (str "http://localhost:" test-port path)
-                       {:as :string :throw-exceptions false})]
+                       {:as :string :throw-exceptions false
+                        :headers {"Authorization" (str "Bearer " (dvergr.principal/local-token))}})]
     {:status (:status resp)
      :body (json/read-value (:body resp) json-mapper)}))
 
@@ -50,7 +52,8 @@
   (let [resp (http/get (str "http://localhost:" test-port path)
                        {:as :string
                         :throw-exceptions false
-                        :headers {"Accept" "text/html"}})]
+                        :headers {"Accept" "text/html"
+                                  "Authorization" (str "Bearer " (dvergr.principal/local-token))}})]
     {:status (:status resp)
      :body (:body resp)}))
 
@@ -105,22 +108,19 @@
 (deftest test-agents-redirects-to-dashboard
   (testing "GET /agents redirects to the dashboard's Agents section"
     (let [resp (http/get (str "http://localhost:" test-port "/agents")
-                         {:as :string :throw-exceptions false :redirect-policy :none})]
+                         {:as :string :throw-exceptions false :redirect-policy :none
+                          :headers {"Authorization" (str "Bearer " (dvergr.principal/local-token))}})]
       (is (= 303 (:status resp)))
       (is (clojure.string/includes? (get-in resp [:headers "location"]) "#agents")))))
 
 (deftest test-agent-api-unknown
-  (testing "POST to unknown agent returns 404 (with the session's CSRF token)"
-    (let [page (http/get (str "http://localhost:" test-port "/dashboard")
-                         {:as :string :throw-exceptions false})
-          cookie (first (clojure.string/split (get-in page [:headers "set-cookie"]) #";"))
-          token (second (re-find #"content=\"([0-9a-f]{64})\"" (:body page)))
-          post (fn [headers]
+  (testing "POST to unknown agent returns 404 with the credential header, 401 without"
+    (let [post (fn [headers]
                  (http/post (str "http://localhost:" test-port "/api/agents/nonexistent/inbox")
                             {:as :string :throw-exceptions false
                              :content-type :json :headers headers :body "{}"}))]
-      (is (= 403 (:status (post {}))) "without a token")
-      (is (= 404 (:status (post {"cookie" cookie "x-csrf-token" token})))))))
+      (is (= 401 (:status (post {}))) "without a credential")
+      (is (= 404 (:status (post {"Authorization" (str "Bearer " (dvergr.principal/local-token))})))))))
 
 (deftest test-server-lifecycle
   (testing "running? reflects server state"
