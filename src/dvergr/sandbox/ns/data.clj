@@ -234,6 +234,29 @@
             (assoc :authority authority
                    :grant {resource/microdollars (bigdec amount)}))))))
 
+(defn- install-infer-effects!
+  "sample, observe, factor and deterministic in the sandbox's infer/, as
+   foerster.core re-exports them outside: a model needs one require besides
+   the distributions, `(require '[infer :refer [sample observe factor]])`.
+   They are named SCI vars (the CPS transform resolves a call to its var's
+   qualified name) with breakpoints dispatching to foerster's effects, like
+   their org.replikativ.foerster.effects names (`add-inference-ns!`)."
+  [sci-ctx]
+  (sci/eval-string* sci-ctx
+                    "(in-ns 'infer)
+     (defn sample [& _] (throw (ex-info \"sample called outside spin context\" {})))
+     (defn observe [& _] (throw (ex-info \"observe called outside spin context\" {})))
+     (defn factor [& _] (throw (ex-info \"factor called outside spin context\" {})))
+     (defn deterministic [& _] (throw (ex-info \"deterministic called outside spin context\" {})))
+     (in-ns 'is.simm.partial-cps.async)
+     (def breakpoints
+       (assoc breakpoints
+         'infer/sample        'is.simm.partial-cps.async/sample-bp
+         'infer/observe       'is.simm.partial-cps.async/observe-bp
+         'infer/factor        'is.simm.partial-cps.async/factor-bp
+         'infer/deterministic 'is.simm.partial-cps.async/deterministic-bp))
+     (in-ns 'user)"))
+
 (defn add-inference-ns!
   "Add probabilistic programming primitives to SCI context.
 
@@ -262,10 +285,13 @@
    completes. A fork per particle costs about three times as much.
 
    Namespaces added:
-   - dist/   — foerster distributions: normal, uniform, exponential, gamma
-               (shape, SCALE), beta, poisson, bernoulli, flip, discrete,
-               categorical, dirichlet, mvn, student-t, chi-squared
-   - infer/  — smc-infer, importance-sampling, kernel-infer, steer, query, predict
+   - dist/   — foerster distributions: every constructor of foerster.dist
+               (normal, uniform, uniform-discrete, gamma (shape, SCALE), beta,
+               poisson, binomial, categorical, dirichlet, mvn, student-t, …,
+               and the wrappers truncated, censored, zero-inflated, hurdle)
+   - infer/  — smc-infer, importance-sampling, kernel-infer, steer, query, predict,
+               and sample, observe, factor, deterministic as in foerster.core:
+               (require '[infer :refer [sample observe factor]])
    - org.replikativ.foerster.effects/ — sample, observe, choose, factor
      (`(factor w :barrier true)` resamples there), deterministic (as CPS
      breakpoints)
@@ -392,9 +418,14 @@
   (sci/add-namespace! sci-ctx 'dist
                       (let [d (find-ns 'org.replikativ.foerster.dist)]
                         (into {} (map (fn [sym] [sym @(ns-resolve d sym)]))
-                              '[normal uniform exponential gamma beta poisson
-                                bernoulli flip discrete categorical dirichlet
-                                mvn student-t chi-squared])))
+                              '[normal uniform exponential gamma gamma-mean-sd beta
+                                poisson negative-binomial binomial beta-binomial
+                                bernoulli bernoulli-logit binomial-logit flip
+                                discrete categorical uniform-discrete dirichlet
+                                mvn student-t half-student-t chi-squared
+                                log-normal half-normal cauchy half-cauchy weibull
+                                laplace inverse-gamma gumbel zero-sum-normal
+                                truncated censored zero-inflated hurdle])))
 
   ;; Inference runners — these take/return Spins and compose with await in Spin
   ;; bodies. Fresh worlds by default: they cannot reach the ambient room (a
@@ -449,7 +480,8 @@
          values [([posterior]) "Return each particle's portable program result in posterior order."]
          log-weights [([measure]) "Return posterior particle log weights."]
          ess [([measure]) "Return effective sample size."]
-         worlds [([measure]) "Return portable canonical world descriptors retained in posterior projections; never live settlement handles."]}))))
+         worlds [([measure]) "Return portable canonical world descriptors retained in posterior projections; never live settlement handles."]})))
+  (install-infer-effects! sci-ctx))
 
 (defonce ^:private foerster-sessions
   ;; sci env → {:namespaces foerster.sandbox maps :jobs atom}: the job
@@ -459,7 +491,8 @@
 
 (def ^:private dvergr-infer
   "dvergr's own infer/ entries (`add-inference-ns!`), which keep their meaning."
-  '#{smc-infer importance-sampling kernel-infer steer query predict values log-weights ess worlds})
+  '#{smc-infer importance-sampling kernel-infer steer query predict values log-weights ess worlds
+     sample observe factor deterministic})
 
 (def ^:private foerster-limits
   "What one call may ask of the host (foerster.sandbox): particles or
