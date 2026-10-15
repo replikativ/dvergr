@@ -69,6 +69,7 @@
             [clojure.string :as str]
             [dvergr.agent.environment :as environment]
             [dvergr.agent.evaluation :as evaluation]
+            [dvergr.agent.review :as review]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.workflow :as workflow]
             [dvergr.catalog.wiki :as wiki]
@@ -741,3 +742,13 @@
      :dataset {:id :catalog/wiki-v4
                :metadata {:generator gen/version :split (or (:split opts) :dev)
                           :worlds (mapv #(let [m (:environment/metadata %)] (or (:seed m) (:corpus m))) envs)}}}))
+
+(defmethod review/run-check :wiki/v4
+  ;; A review check: the world's /wiki scored without gold (`score-structure`);
+  ;; it passes with every structure check true, or `[:wiki/v4 {:min-reward r}]`.
+  [check {:keys [fork]}]
+  (let [{:keys [min-reward]} (when (vector? check) (second check))
+        {:keys [checks reward]} (score-structure {:pages (ws/read-tree fork (:target params))
+                                                  :sources (ws/read-tree fork (:source params))})]
+    {:pass? (if min-reward (<= min-reward reward) (every? true? (vals checks)))
+     :evidence {:reward reward :failed (vec (sort (keep (fn [[k v]] (when-not v k)) checks)))}}))

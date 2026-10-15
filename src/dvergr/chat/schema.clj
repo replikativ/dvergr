@@ -1032,6 +1032,44 @@
 ;; Attention Schema
 ;; ============================================================================
 
+(def review-schema
+  "Reviews of retained worlds (`dvergr.agent.review`): the decision on one
+   world, with its checks and verdict as an exact EDN payload and a typed index
+   for listing."
+  [{:db/ident :review/id
+    :db/valueType :db.type/uuid
+    :db/unique :db.unique/identity
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :review/chat
+    :db/valueType :db.type/ref
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :review/run-id
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :review/world
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :review/decision
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :review/reviewed-at
+    :db/valueType :db.type/instant
+    :db/cardinality :db.cardinality/one
+    :db/index true}
+
+   {:db/ident :review/payload-edn
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/doc "The exact Review record, as EDN"}])
+
 (def attention-schema
   "Durable participant-specific control/memory projections over Room messages."
   [{:db/ident :attention/id
@@ -1500,6 +1538,7 @@
                attempt-schema
                scorecard-schema
                attention-schema
+               review-schema
                tool-call-schema
                ledger-schema
                budget-schema

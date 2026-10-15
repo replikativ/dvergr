@@ -169,6 +169,21 @@
      :environment-id, :environment-content-id, :provider, :model, and :status;
      :limit is applied after filtering."))
 
+(defprotocol PReviewStore
+  "Reviews of retained worlds (`dvergr.agent.review`): one immutable record per
+   review, holding its checks, the reviewer's verdict and the decision."
+
+  (-store-review! [this room-id review]
+    "Persist one validated Review. Repeating identical content is idempotent;
+     different content under the same id is an error.")
+
+  (-load-review [this room-id review-id]
+    "Return one Review by id in `room-id`, else nil.")
+
+  (-list-reviews [this room-id opts]
+    "Return Reviews newest first. Optional exact filters :decision and
+     :run-id; :limit (default 100) after filtering."))
+
 (defprotocol PFactFeed
   "Notification of durable change: every message, Run, tool call, Attempt,
    Scorecard or ledger entry a store records. The one change feed views of a
@@ -275,6 +290,24 @@
                       {:type :room-store/invalid-attention-result-run
                        :applied applied :result-run result-run}))))
   applied)
+
+(def review-decisions #{:merged :escalated :discarded})
+
+(defn validate-review!
+  "Validate one Review record (`dvergr.agent.review`) and return it."
+  [review]
+  (let [bad (fn [msg] (throw (ex-info msg {:type :room-store/invalid-review :review review})))]
+    (when-not (uuid? (:review/id review)) (bad ":review/id must be a UUID"))
+    (when-not (contains? review-decisions (:review/decision review))
+      (bad (str ":review/decision must be one of " review-decisions)))
+    (when-not (string? (:review/world review)) (bad ":review/world must be a string"))
+    (when (and (:review/run-id review) (not (uuid? (:review/run-id review))))
+      (bad ":review/run-id must be a UUID"))
+    (when-not (inst? (:review/reviewed-at review)) (bad ":review/reviewed-at must be an instant"))
+    (when-not (vector? (:review/checks review)) (bad ":review/checks must be a vector"))
+    (when-not (= review (edn/read-string (pr-str review)))
+      (bad "A Review must be portable EDN"))
+    review))
 
 (defn validate-attention!
   "Validate one durable participant attention projection and return it."

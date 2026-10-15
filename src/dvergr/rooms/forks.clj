@@ -219,7 +219,7 @@
   (when (ctx-fork? fork)
     (ygg/context-conflicts (:ctx fork))))
 
-(defn- delta-trivial?
+(defn delta-trivial?
   "Did the FORK contribute nothing meaningful in this system? Duck-typed over
    the yggdrasil diff records (GitDiff :files, DatahikeDiff :summary, DiffError).
 

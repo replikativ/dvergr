@@ -428,6 +428,10 @@
   (let [[_conn st] (mem-store)]
     (contract/assert-attention-projection! st :attention-datahike)))
 
+(deftest review-records-contract
+  (let [[_conn st] (mem-store)]
+    (contract/assert-review-records! st :reviews-datahike)))
+
 (deftest concurrent-attention-identity-contract
   (let [[_conn st] (mem-store)]
     (contract/assert-concurrent-attention-identity!

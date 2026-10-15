@@ -241,7 +241,7 @@ neither listed nor callable.
 | --- | --- | --- |
 | `offload` (default) | rooms, worlds, attempts, catalog, wallets, repl | 26 |
 | `bench` | rooms, files, attempts, catalog, bench, wallets | 32 |
-| `code` | repl, describe (its REPL calls the ops of rooms, files, worlds, attempts, catalog, bench, wallets) | 2 |
+| `code` | repl, describe (its REPL calls the ops of rooms, files, worlds, reviews, attempts, catalog, bench, wallets) | 2 |
 | `readonly` | every read op | read-only only |
 | `admin` | everything | all |
 
@@ -252,6 +252,7 @@ neither listed nor callable.
 | `worlds` | fork, review, diff, merge, discard |
 | `attempts` | `workflow_start` and the job tools; Attempts, Scorecards |
 | `runs` | the blocking `workflow_attempt`; Runs |
+| `reviews` | `review_list`: reviews of retained worlds (checks, verdict, decision); `decision: escalated` is what waits for a person |
 | `catalog` | `catalog_list`, `catalog_start`: workflows with their own checker |
 | `bench` | `catalog_benchmark`, `catalog_check`, `catalog_calibrate`, `catalog_cases`, `catalog_freeze`, `catalog_deploy`, `catalog_export`, `catalog_import`, `experiment_progress`, `experiment_report`, `attempt_export` |
 | `wallets` | `room_wallet`, `models_list` |
