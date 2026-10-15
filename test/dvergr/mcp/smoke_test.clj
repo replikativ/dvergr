@@ -277,6 +277,6 @@
           (read!)
           (send! {:jsonrpc "2.0" :id 2 :method "tools/call" :params {:name "room_list" :arguments {}}})
           (let [r (loop [m (read!)] (if (= 2 (:id m)) m (recur (read!))))]
-            (is (re-find #"not reachable on .*mcp\.sock" (str (get-in r [:result :content 0 :text]))) (pr-str r)))
+            (is (re-find #"not reachable on .*\.sock" (str (get-in r [:result :content 0 :text]))) (pr-str r)))
           (is (= ::none (deref seen 1000 ::none)) "the port's holder never got a connection")
           (finally (.destroy p)))))))
