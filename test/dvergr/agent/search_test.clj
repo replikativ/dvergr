@@ -4,6 +4,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [dvergr.agent.run :as run]
             [dvergr.agent.search :as search]
+            [dvergr.agent.workflow :as workflow]
             [dvergr.chat.agent :as chat-agent]
             [dvergr.discourse :as d]
             [dvergr.model.chat :as model-chat]
@@ -69,7 +70,7 @@
         (testing "the heaviest member's world was merged, the next kept, the last discarded"
           (is (= [:discard :merge :review] (mapv :search/decision members)))
           (is (= (:run/id (second members)) (:search/selected outcome)))
-          (is (every? (comp :ok? :search/outcome) members)))
+          (is (every? #(= :settled (:search/status %)) members)))
         (binding [ec/*execution-context* (:ctx room)]
           (testing "only the retained world is still open"
             (is (some? (rreg/lookup (:world (first (:review by-decision))))))
@@ -78,7 +79,7 @@
         (testing "every member's Run records the search, its weight and its decision"
           (doseq [{:keys [run/id search/weight search/decision]} members]
             (is (= {:search/id (:search/id outcome) :search/policy :automatic :search/members 3
-                    :search/weight weight :search/decision decision}
+                    :search/weight weight :search/decision decision :search/status :settled}
                    (durable-search room id)))))
         (testing "the Runs' settlement follows the decision"
           (let [status #(:run/settlement-status
@@ -97,3 +98,49 @@
         (is (every? #(= ##-Inf (:search/weight (durable-search room (:run/id %))))
                     (:search/members outcome))
             "an impossible weight survives the EDN round trip")))))
+
+(deftest invalid-options-run-nothing
+  (with-room :search-invalid-test
+    (fn [room]
+      (let [calls (atom 0)]
+        (with-redefs [model-chat/chat (fn [_ _] (swap! calls inc) (throw (ex-info "no call expected" {})))]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (search/search! room {:task "t" :attempts 2 :models ["claude-haiku-4-5"] :policy :best})))
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (search/search! room {:task "t" :attempts 2 :models ["claude-haiku-4-5"] :retain -1}))))
+        (is (zero? @calls) "no attempt ran")))))
+
+(deftest members-the-search-does-not-hold-are-refused-before-anything-settles
+  (with-room :search-foreign-test
+    (fn [room]
+      ;; ordinary attempts: released to review, not held by a search
+      (let [rows (workflow/attempt! room {:task "t" :attempts 2 :models ["claude-haiku-4-5"]})]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not held by the search"
+                              (search/select! room rows {:policy :automatic})))
+        (binding [ec/*execution-context* (:ctx room)]
+          (is (every? #(some? (rreg/lookup (:world %))) rows) "no world was settled"))
+        (is (every? #(nil? (durable-search room (get-in % [:attempt :attempt/receipt :attempt/run-id]))) rows)
+            "nothing was recorded")))))
+
+(deftest a-search-retried-with-its-id-leaves-settled-members-alone
+  (with-room :search-retry-test
+    (fn [room]
+      (let [members (workflow/attempt! room {:task "t" :attempts 2 :models ["claude-haiku-4-5"]
+                                             :hold? true :effects search/speculative-effects})
+            first-run (search/select! room members {:policy :review})
+            again (search/select! room members {:policy :review :search-id (:search/id first-run)})]
+        (is (= (map (juxt :search/decision :search/status) (:search/members first-run))
+               (map (juxt :search/decision :search/status) (:search/members again))))
+        (is (= [:review :discard] (mapv :search/decision (:search/members again))))))))
+
+(deftest search-records-are-strings-and-survive-updates-that-omit-them
+  (let [s (memory/make)
+        room-id "parity-room"
+        run {:run/id (random-uuid) :run/kind :llm :run/room :r :run/actor :a
+             :run/trigger (random-uuid) :run/status :running
+             :run/created-at (java.util.Date.) :run/started-at (java.util.Date.)
+             :run/updated-at (java.util.Date.)}]
+    (is (thrown? clojure.lang.ExceptionInfo (store/-store-run! s room-id (assoc run :run/search {:not "a string"}))))
+    (store/-store-run! s room-id (assoc run :run/search "{:search/id 1}"))
+    (store/-store-run! s room-id (assoc run :run/updated-at (java.util.Date.)))
+    (is (= "{:search/id 1}" (:run/search (store/-load-run s room-id (:run/id run)))))))

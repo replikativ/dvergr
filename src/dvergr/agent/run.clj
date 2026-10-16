@@ -531,17 +531,20 @@
    terminal Run: it changes neither its lifecycle nor its identity."
   [room run-id search]
   (when-let [room-store (:store room)]
-    (let [room-id (store/conversation-id room)
-          existing (store/-load-run room-store room-id run-id)]
-      (when-not existing
-        (throw (ex-info "A search member is not a durable Run in this Room"
-                        {:type ::run-not-found :run/id run-id :run/room (:id room)})))
-      (or (store/-store-run! room-store room-id
-                             (assoc existing
-                                    :run/search (pr-str search)
-                                    :run/updated-at (java.util.Date.)))
-          (throw (ex-info "A search record was not durable"
-                          {:type ::search-not-durable :run/id run-id}))))))
+    ;; read and write under the Room's exclusive lock, as the resume claim
+    ;; does, so neither loses the other's write
+    (with-room-exclusive (:id room)
+      (let [room-id (store/conversation-id room)
+            existing (store/-load-run room-store room-id run-id)]
+        (when-not existing
+          (throw (ex-info "A search member is not a durable Run in this Room"
+                          {:type ::run-not-found :run/id run-id :run/room (:id room)})))
+        (or (store/-store-run! room-store room-id
+                               (assoc existing
+                                      :run/search (pr-str search)
+                                      :run/updated-at (java.util.Date.)))
+            (throw (ex-info "A search record was not durable"
+                            {:type ::search-not-durable :run/id run-id})))))))
 
 (defn search-record
   "The search record of durable `run` (`record-search!`), as data, or nil."

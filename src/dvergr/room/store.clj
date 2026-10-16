@@ -459,6 +459,9 @@
                     {:type :room-store/invalid-run
                      :key :run/caused-by
                      :run run})))
+  (when (and (contains? run :run/search) (not (string? (:run/search run))))
+    (throw (ex-info ":run/search must be an EDN string"
+                    {:type :room-store/invalid-run :key :run/search :run-id (:run/id run)})))
   (when (and (:run/roster run) (not (keyword? (:run/roster run))))
     (throw (ex-info ":run/roster must be a keyword"
                     {:type :room-store/invalid-run :key :run/roster :run run})))
@@ -526,7 +529,11 @@
                      :update-status (:run/status run)
                      :existing-ended-at (:run/ended-at existing)
                      :update-ended-at (:run/ended-at run)})))
-  run)
+  ;; a search record (dvergr.agent.search) is replaced, never dropped: an
+  ;; update written from a live Run that never saw it keeps it, in both stores
+  (cond-> run
+    (and existing (:run/search existing) (not (contains? run :run/search)))
+    (assoc :run/search (:run/search existing))))
 
 (defn validate-run-causes!
   "Validate newly asserted causal edges through `load-cause`.

@@ -643,7 +643,7 @@
   ([room team agent-ref definition evaluator]
    (evaluate room team agent-ref definition evaluator {}))
   ([room team agent-ref definition evaluator
-    {:keys [from parent-run world-setup cleanup-group protocol metrics world-parent]
+    {:keys [from parent-run world-setup cleanup-group protocol metrics world-parent hold?]
      :or {from :environment} :as opts}]
    (environment/validate-environment definition)
    (require-matching-evaluator! definition evaluator)
@@ -661,7 +661,8 @@
          (:environment/world definition)
          model-limits (when agent (require-supported-policy! definition agent protocol))]
      (when-let [unknown (seq (remove #{:from :parent-run :world-setup
-                                       :cleanup-group :protocol :metrics :world-parent}
+                                       :cleanup-group :protocol :metrics :world-parent
+                                       :hold?}
                                      (keys opts)))]
        (throw (ex-info "Evaluation contains unknown options"
                        {:type ::unknown-evaluation-options
@@ -905,9 +906,18 @@
                            (compare-and-set! state :scoring :cancelled))
                          (if (or deferred? (claim!))
                            (let [final-settlement
-                                 (if deferred?
-                                   (settle-certified! fork settlement claim!)
-                                   (:run/settlement-status result))
+                                 (cond
+                                   ;; host-only: a search holds its members
+                                   ;; behind the deferred gate until it has
+                                   ;; decided (dvergr.agent.search); the
+                                   ;; certification is durable either way
+                                   (and deferred? hold?)
+                                   (if (claim!)
+                                     :deferred
+                                     (throw (ex-info "Held evaluation world lost its settlement race"
+                                                     {:type ::settlement-failed :fork/id (:id fork)})))
+                                   deferred? (settle-certified! fork settlement claim!)
+                                   :else (:run/settlement-status result))
                                  result (assoc result
                                                :run/settlement-status
                                                (case final-settlement
