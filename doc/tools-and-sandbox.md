@@ -146,8 +146,10 @@ cancellable.
   the collections and returns `{system-id :started}`); a store attached `:read`, or one
   detached since, is its owner's to delete and collect. A fork does not carry a write
   past a grant either: merging a fork that changed a database the room may no longer
-  write (`dvergr.system.rooms/assert-merge-permitted!`, in `dvergr.discourse/merge-room`)
-  is refused, and the fork can be discarded. The handle offers nothing else:
+  write (`dvergr.system.rooms/assert-merge-permitted!`, in `dvergr.discourse/merge-room`;
+  datoms added or retracted) is refused, and the fork can be discarded. The grants that
+  decide are those of the durable room the fork descends from, recorded on the fork
+  when it is made, and a fork merges only into the room it was forked from. The handle offers nothing else:
   no `swap!`/`reset!`, no `:store`, no field access, no `load-entities` (not mirrored).
   `dvergr.sandbox.grant-write-test` runs each of these attacks against a provisioned room.
 - **Gated deps**: `clojure.repl.deps/add-libs` is available (`dvergr.sandbox.deps`) but

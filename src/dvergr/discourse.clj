@@ -2298,12 +2298,21 @@
   ([parent fork] (merge-room parent fork {}))
   ([parent fork {:keys [merge-opts]}]
    (assert-settlement-released! fork :merge)
+   ;; the substrate merge lands in the context the fork was forked from,
+   ;; whatever `parent` names: a fork merges into its own parent only
+   (when-let [origin (some-> fork :meta deref :forked-from)]
+     (when (not= origin (:id parent))
+       (throw (ex-info (str "Fork " (:id fork) " was forked from " origin
+                            ", not " (:id parent) "; it merges into its own parent only")
+                       {:type ::not-the-parent :fork/id (:id fork)
+                        :forked-from origin :parent (:id parent)}))))
    ;; a merge writes the parent's systems: only those the grants of the
-   ;; durable room (the parent, or the room a parent fork descends from)
-   ;; permit it to write, checked now (a grant may have been downgraded or
-   ;; detached since the fork wrote), before the fork is claimed
+   ;; durable room the fork descends from (recorded on the fork when it was
+   ;; made, not taken from the caller) permit it to write, checked now (a
+   ;; grant may have been downgraded or detached since the fork wrote),
+   ;; before the fork is claimed
    (when (fork-handle fork)
-     (srooms/assert-merge-permitted! (or (some-> parent :meta deref :origin-slug) (:slug parent))
+     (srooms/assert-merge-permitted! (or (some-> fork :meta deref :origin-slug) (:slug parent))
                                      (:ctx fork)))
    (let [claim (claim-settlement! fork {:op :merged :parent (:id parent)})]
      (when (map? claim)

@@ -248,6 +248,29 @@
         (testing "a fork that only retracted from C's KB"
           (refused-merge "(d/transact (room/db \"room-c-kb\") [[:db/retractEntity [:entity/title \"c-victim\"]]])")
           (is (contains? (titles :c) "c-victim") "C's KB is unchanged"))
+        (testing "naming another parent, one whose grants permit the write, does not help"
+          ;; the substrate merge lands in the fork's own parent, whatever room
+          ;; the call names
+          (let [other (binding [rtc/*execution-context* (:root @world)]
+                        (registry/lookup (droom/create-room! {:slug "other-parent" :title "other" :parent-id false})))
+                other-uuid (:room/id (sdb/room-by-slug "other-parent"))]
+            (try
+              (sdb/attach! other-uuid (:kb-id c) :read-write)
+              (sdb/attach! room-uuid (:kb-id c) :read-write)
+              (let [fork (fork-of)
+                    in-fork (sandbox-in (:ctx fork))]
+                (is (:ok (in-fork "(d/transact (room/db \"room-c-kb\") [{:entity/title \"c-via-other\"}])")))
+                (sdb/attach! room-uuid (:kb-id c) :read)
+                (let [r (in-room (str "(room/merge! \"other-parent\" " (pr-str (:slug fork)) ")"))]
+                  (is (re-find #"merges into its own parent only" (str (:err r))) (pr-str r)))
+                (let [r (in-room (str "(room/merge! \"merger\" " (pr-str (:slug fork)) ")"))]
+                  (is (re-find #"may not write" (str (:err r))) (pr-str r)))
+                (is (not (contains? (titles :c) "c-via-other")) "C's KB is unchanged")
+                (in-room (str "(room/discard! " (pr-str (:slug fork)) ")")))
+              (finally
+                (binding [rtc/*execution-context* (:ctx other)]
+                  (try (governance/ungovern! (:conn (:store other))) (catch Throwable _))
+                  (discourse/close-room! other))))))
         (testing "a fork that writes only what the room may write merges"
           (let [fork (fork-of)
                 in-fork (sandbox-in (:ctx fork))]
