@@ -1038,9 +1038,12 @@
    for listing."
   [{:db/ident :review/id
     :db/valueType :db.type/uuid
-    ;; a value, not an identity: a second write of an id adds no entity and
-    ;; upserts none (it fails), so a Review cannot be overwritten
-    :db/unique :db.unique/value
+    ;; an identity: a merge that replays a Review the parent already holds
+    ;; (a fork inherits the room's Reviews) upserts it instead of colliding.
+    ;; A different payload under a stored id is refused by the store (checked
+    ;; before and after the write); ids are random, so only a bug writes one.
+    ;; Rooms that installed it as :db.unique/value are updated on connect.
+    :db/unique :db.unique/identity
     :db/cardinality :db.cardinality/one}
 
    {:db/ident :review/chat

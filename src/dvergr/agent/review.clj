@@ -150,13 +150,16 @@
 
 (defn- escalate! [room review]
   (try
-    (d/post! room {:from :reviewer
-                   :content (str "Review of " (:review/world review) " needs a person: "
-                                 (str/join "; " (:review/reasons review))
-                                 " (review_list, decision escalated)")
-                   :metadata (cond-> {:kind :review/escalated
+    ;; a room message like any other (`d/message`): conversation listeners
+    ;; (`on-each-message`, mirrors, a chat projection) see it
+    (d/post! room (d/message :reviewer (d/room-target room)
+                             (str "Review of " (:review/world review) " needs a person: "
+                                  (str/join "; " (:review/reasons review))
+                                  " (review_list, decision escalated)")
+                             nil
+                             (cond-> {:kind :review/escalated
                                       :object {:kind :review :id (:review/id review)}}
-                               (:review/run-id review) (assoc :run-id (:review/run-id review)))})
+                               (:review/run-id review) (assoc :run-id (:review/run-id review)))))
     (catch Throwable _ nil))
   review)
 

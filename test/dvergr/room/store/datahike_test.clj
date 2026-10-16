@@ -874,3 +874,23 @@
           "making the store upgrades its schema")
       (store/-store-room! st :older-room {:slug "older-room"})
       (is (nil? (store/-load-attempt st :older-room (random-uuid))) "and Attempts read again"))))
+
+(deftest concurrent-reviews-under-one-id-keep-the-first
+  (let [[_conn st] (mem-store)
+        rooms [:reviews-race-a :reviews-race-b]
+        _ (doseq [r rooms] (store/-store-room! st r {:slug (name r) :title "race"}))
+        id (random-uuid)
+        review (fn [world] {:review/id id :review/world world :review/state-token "s" :review/checks []
+                            :review/decision :escalated :review/reviewed-at (java.util.Date. 1787860800000)})
+        go (java.util.concurrent.CountDownLatch. 1)
+        attempts (vec (for [[r w] [[:reviews-race-a "w1"] [:reviews-race-a "w2"] [:reviews-race-b "w3"]]]
+                        (future (.await go)
+                                (try (store/-store-review! st r (review w)) [r w]
+                                     (catch clojure.lang.ExceptionInfo _ nil)))))
+        _ (.countDown go)
+        won (keep deref attempts)]
+    (is (= 1 (count won)) "one write wins; the others are refused, not merged in")
+    (let [[r w] (first won)
+          other (first (remove #{r} rooms))]
+      (is (= w (:review/world (store/-load-review st r id))) "the winner's Review, in the winner's room")
+      (is (nil? (store/-load-review st other id)) "not moved to another room"))))
