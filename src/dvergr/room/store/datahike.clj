@@ -1620,18 +1620,16 @@
           collision #(ex-info "A Review is immutable" {:type :room-store/review-identity-collision :review/id id})]
       (if-let [e (existing)]
         (if (same? e) review (throw (collision)))
-        (do (try (dh/transact conn [(cond-> {:db/id "review"
-                                             :review/id id
-                                             :review/chat [:chat/id (:chat/id ent)]
-                                             :review/world (:review/world review)
-                                             :review/decision (:review/decision review)
-                                             :review/reviewed-at (:review/reviewed-at review)
-                                             :review/payload-edn payload}
-                                      (:review/run-id review) (assoc :review/run-id (:review/run-id review)))])
-                 ;; a concurrent writer of the same id won (unique value): identical is fine
-                 (catch Throwable t
-                   (let [e (existing)]
-                     (when-not (and e (same? e)) (throw (if e (collision) t))))))
+        (do (dh/transact conn [(cond-> {:review/id id
+                                        :review/chat [:chat/id (:chat/id ent)]
+                                        :review/world (:review/world review)
+                                        :review/decision (:review/decision review)
+                                        :review/reviewed-at (:review/reviewed-at review)
+                                        :review/payload-edn payload}
+                                 (:review/run-id review) (assoc :review/run-id (:review/run-id review)))])
+            ;; an identity upserts: a concurrent writer of the same id with
+            ;; other content would have replaced it, so read it back
+            (when-not (some-> (existing) same?) (throw (collision)))
             review))))
 
   (-load-review [{:keys [conn]} room-id review-id]

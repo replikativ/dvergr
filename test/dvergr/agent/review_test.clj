@@ -232,3 +232,25 @@
       (is (= :escalated (:review/decision rv)))
       (is (some? m) "on-each-message sees the escalation")
       (is (= (:review/id rv) (get-in m [:metadata :object :id]))))))
+
+(deftest sibling-worlds-reviewed-in-turn-both-merge
+  ;; simmis: fork A, review it, post; fork B (it inherits A's Review), review,
+  ;; post; merge A, then B. B's merge replayed the inherited Review and failed
+  ;; on its unique id, leaving B half-released
+  (let [room (:id (op :room/create {:title "rv-sib" :slug "rv-sib"}))
+        r #(ops/resolve-room *daemon* room)
+        spec {:review/checks [:fork/review-tier] :review/on-pass :propose}
+        post! #(d/post! (r) (d/message :someone (d/room-target (r)) % nil {:role :system}))
+        a (:id (op :room/fork {:room room}))
+        _ (op :room/write {:room a :files (texts {"wiki/a.md" "a\n"})})
+        ra (review/review! (r) (fork-id a) spec)
+        _ (post! "after A")
+        b (:id (op :room/fork {:room room}))
+        _ (op :room/write {:room b :files (texts {"wiki/b.md" "b\n"})})
+        rb (review/review! (r) (fork-id b) spec)
+        _ (post! "after B")]
+    (is (:merged (op :room/merge {:room a :expect-state (:review/state-token ra)})))
+    (is (:merged (op :room/merge {:room b :expect-state (:review/state-token rb)})))
+    (is (= {"/wiki/a.md" "a\n" "/wiki/b.md" "b\n"} (catalog/read-tree (r) "/wiki")))
+    (is (= #{(:review/id ra) (:review/id rb)} (set (map :review/id (review/reviews (r)))))
+        "each Review once")))
